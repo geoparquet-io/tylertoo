@@ -40,6 +40,38 @@ impl TileCoord {
             lat_max,
         }
     }
+
+    /// Get the parent tile at zoom level z-1.
+    ///
+    /// Each tile at zoom z has exactly one parent at zoom z-1.
+    /// The parent contains this tile and its 3 siblings (2x2 grid).
+    /// Returns `None` at zoom 0 (no parent).
+    pub fn parent(&self) -> Option<TileCoord> {
+        if self.z == 0 {
+            return None;
+        }
+        Some(TileCoord::new(self.x / 2, self.y / 2, self.z - 1))
+    }
+
+    /// Get the four child tiles at zoom level z+1.
+    ///
+    /// Each tile at zoom z has exactly four children at zoom z+1,
+    /// forming a 2x2 grid that exactly covers the parent tile.
+    /// Returns `None` at zoom 30 (maximum supported zoom).
+    pub fn children(&self) -> Option<[TileCoord; 4]> {
+        if self.z >= 30 {
+            return None;
+        }
+        let child_z = self.z + 1;
+        let cx = self.x * 2;
+        let cy = self.y * 2;
+        Some([
+            TileCoord::new(cx, cy, child_z),         // top-left
+            TileCoord::new(cx + 1, cy, child_z),     // top-right
+            TileCoord::new(cx, cy + 1, child_z),     // bottom-left
+            TileCoord::new(cx + 1, cy + 1, child_z), // bottom-right
+        ])
+    }
 }
 
 /// Geographic bounding box
@@ -344,6 +376,118 @@ mod tests {
         for tile in &tiles {
             assert_eq!(tile.z, 4);
         }
+    }
+
+    // ========== Parent/Children Tests ==========
+
+    #[test]
+    fn test_tile_parent_at_zoom_0() {
+        let tile = TileCoord::new(0, 0, 0);
+        assert_eq!(tile.parent(), None, "Zoom 0 tile has no parent");
+    }
+
+    #[test]
+    fn test_tile_parent_at_zoom_1() {
+        // All four z=1 tiles should have z=0/0/0 as parent
+        for x in 0..2 {
+            for y in 0..2 {
+                let tile = TileCoord::new(x, y, 1);
+                let parent = tile.parent().expect("z=1 tile should have parent");
+                assert_eq!(parent, TileCoord::new(0, 0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn test_tile_parent_at_higher_zoom() {
+        let tile = TileCoord::new(5, 7, 4);
+        let parent = tile.parent().expect("Should have parent");
+        assert_eq!(parent, TileCoord::new(2, 3, 3));
+
+        let grandparent = parent.parent().expect("Should have grandparent");
+        assert_eq!(grandparent, TileCoord::new(1, 1, 2));
+    }
+
+    #[test]
+    fn test_tile_children() {
+        let tile = TileCoord::new(1, 2, 3);
+        let children = tile.children().expect("Should have children");
+
+        assert_eq!(children[0], TileCoord::new(2, 4, 4)); // top-left
+        assert_eq!(children[1], TileCoord::new(3, 4, 4)); // top-right
+        assert_eq!(children[2], TileCoord::new(2, 5, 4)); // bottom-left
+        assert_eq!(children[3], TileCoord::new(3, 5, 4)); // bottom-right
+    }
+
+    #[test]
+    fn test_tile_children_at_max_zoom() {
+        let tile = TileCoord::new(0, 0, 30);
+        assert_eq!(tile.children(), None, "Zoom 30 tile has no children");
+    }
+
+    #[test]
+    fn test_parent_child_round_trip() {
+        // A tile's parent's children should include the original tile
+        let tile = TileCoord::new(5, 7, 4);
+        let parent = tile.parent().unwrap();
+        let siblings = parent.children().unwrap();
+        assert!(
+            siblings.contains(&tile),
+            "Parent's children should include original tile"
+        );
+    }
+
+    #[test]
+    fn test_child_parent_round_trip() {
+        // Each child's parent should be the original tile
+        let tile = TileCoord::new(3, 2, 5);
+        let children = tile.children().unwrap();
+        for child in &children {
+            assert_eq!(
+                child.parent().unwrap(),
+                tile,
+                "Each child's parent should be the original tile"
+            );
+        }
+    }
+
+    #[test]
+    fn test_children_cover_parent_bounds() {
+        // The four children should collectively cover the parent's bounds
+        let parent = TileCoord::new(1, 1, 2);
+        let parent_bounds = parent.bounds();
+        let children = parent.children().unwrap();
+
+        // Find the bounding box of all children
+        let mut min_lng = f64::INFINITY;
+        let mut max_lng = f64::NEG_INFINITY;
+        let mut min_lat = f64::INFINITY;
+        let mut max_lat = f64::NEG_INFINITY;
+
+        for child in &children {
+            let b = child.bounds();
+            min_lng = min_lng.min(b.lng_min);
+            max_lng = max_lng.max(b.lng_max);
+            min_lat = min_lat.min(b.lat_min);
+            max_lat = max_lat.max(b.lat_max);
+        }
+
+        assert!(
+            (min_lng - parent_bounds.lng_min).abs() < 1e-10,
+            "Children lng_min should match parent"
+        );
+        assert!(
+            (max_lng - parent_bounds.lng_max).abs() < 1e-10,
+            "Children lng_max should match parent"
+        );
+        assert!(
+            (min_lat - parent_bounds.lat_min).abs() < 1e-10,
+            "Children lat_min should match parent"
+        );
+        assert!(
+            (max_lat - parent_bounds.lat_max).abs() < 1e-10,
+            "Children lat_max should match parent"
+        );
     }
 
     #[test]

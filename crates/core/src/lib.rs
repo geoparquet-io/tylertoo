@@ -35,6 +35,7 @@ pub mod external_sort;
 pub mod feature_drop;
 #[cfg(test)]
 mod golden;
+pub mod hierarchical_clip;
 #[cfg(test)]
 mod integration_tests;
 pub mod memory;

@@ -862,192 +862,74 @@ fn generate_tiles_to_writer_internal(
             let base_simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
             result.time_simplify = simplify_start.elapsed();
 
-            // Count total tiles for this geometry across all zoom levels (for progress)
-            let total_tiles_for_geom: usize = (config.min_zoom..=config.max_zoom)
-                .map(|z| tiles_for_bbox(&geom_bbox, z).count())
-                .sum();
+            // Hierarchical clipping: clip at min_zoom first, then clip parent
+            // results for child tiles at higher zoom levels. This avoids
+            // re-clipping the full original geometry for every tile.
+            // See issue #38 for rationale.
+            let clip_start = std::time::Instant::now();
+            let (clip_results, clip_stats) = crate::hierarchical_clip::clip_geometry_hierarchical(
+                &base_simplified,
+                &geom_bbox,
+                config.min_zoom,
+                config.max_zoom,
+                config.buffer_pixels,
+                config.extent,
+            );
+            result.time_clip = clip_start.elapsed();
+            result.clip_count = clip_stats.clip_ops;
+            result.tiles_touched = clip_stats.tiles_processed;
 
-            // Threshold for parallel tile processing within a single geometry (PR #36)
-            const PARALLEL_THRESHOLD: usize = 1000;
+            // Process clip results: validate, drop, encode to WKB, create records
+            // Collect into a Vec first for deterministic ordering
+            let mut clip_entries: Vec<_> = clip_results.into_iter().collect();
+            clip_entries
+                .sort_by(|(a, _), (b, _)| tile_id(a.z, a.x, a.y).cmp(&tile_id(b.z, b.x, b.y)));
 
-            // Process tiles - parallel for large geometries, sequential for small
-            // Skip parallelism if deterministic mode is enabled
-            if total_tiles_for_geom >= PARALLEL_THRESHOLD && !config.deterministic {
-                // PARALLEL PATH (PR #36): Process tiles within this geometry in parallel
+            for (tile_coord, clipped) in clip_entries {
+                let tile_bounds = tile_coord.bounds();
 
-                // Collect all (z, tile_coord) pairs across all zoom levels
-                let all_tiles: Vec<(u8, TileCoord)> = (config.min_zoom..=config.max_zoom)
-                    .flat_map(|z| tiles_for_bbox(&geom_bbox, z).map(move |tc| (z, tc)))
-                    .collect();
+                // Validate (simplification already done above)
+                let validated = match filter_valid_geometry(&clipped) {
+                    Some(v) => v,
+                    None => continue,
+                };
 
-                // Process tiles in parallel - each returns Option<(record, clip_time, wkb_time)>
-                let tile_results: Vec<_> = all_tiles
-                    .into_par_iter()
-                    .filter_map(|(z, tile_coord)| {
-                        let tile_bounds = tile_coord.bounds();
-                        let buffer = buffer_pixels_to_degrees(
-                            config.buffer_pixels,
-                            &tile_bounds,
-                            config.extent,
-                        );
-
-                        // Check if geometry bbox intersects buffered tile bounds
-                        let buffered_lng_min = tile_bounds.lng_min - buffer;
-                        let buffered_lng_max = tile_bounds.lng_max + buffer;
-                        let buffered_lat_min = tile_bounds.lat_min - buffer;
-                        let buffered_lat_max = tile_bounds.lat_max + buffer;
-
-                        let intersects = geom_bbox.lng_max >= buffered_lng_min
-                            && geom_bbox.lng_min <= buffered_lng_max
-                            && geom_bbox.lat_max >= buffered_lat_min
-                            && geom_bbox.lat_min <= buffered_lat_max;
-
-                        if !intersects {
-                            return None;
-                        }
-
-                        // Clip the pre-simplified geometry to tile bounds
-                        let clip_start = std::time::Instant::now();
-                        let clipped = clip_geometry(&base_simplified, &tile_bounds, buffer)?;
-                        let clip_elapsed = clip_start.elapsed();
-
-                        // Validate (simplification already done above)
-                        let validated = filter_valid_geometry(&clipped)?;
-
-                        // Check dropping rules after clipping
-                        if should_drop_geometry(
-                            &validated,
-                            z,
-                            config.max_zoom,
-                            config.extent,
-                            &tile_bounds,
-                            feat_idx,
-                        ) {
-                            return None;
-                        }
-
-                        // Serialize geometry to WKB
-                        let wkb_start = std::time::Instant::now();
-                        let wkb = match geometry_to_wkb(&validated) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                log::warn!("Failed to serialize geometry to WKB: {}", e);
-                                return None;
-                            }
-                        };
-                        let wkb_elapsed = wkb_start.elapsed();
-
-                        // Create record with tile_id and coordinates
-                        let tid = tile_id(z, tile_coord.x, tile_coord.y);
-                        let record = TileFeatureRecord::new(
-                            tid,
-                            z,
-                            tile_coord.x,
-                            tile_coord.y,
-                            feat_idx,
-                            wkb,
-                            vec![], // Empty properties for now
-                        );
-
-                        Some((record, clip_elapsed, wkb_elapsed))
-                    })
-                    .collect();
-
-                // Aggregate results
-                result.tiles_touched = total_tiles_for_geom as u64;
-
-                // Sort by tile_id for deterministic insertion order
-                let mut sorted_results = tile_results;
-                sorted_results.sort_by_key(|(r, _, _)| r.tile_id);
-
-                for (record, clip_elapsed, wkb_elapsed) in sorted_results {
-                    result.time_clip += clip_elapsed;
-                    result.time_wkb += wkb_elapsed;
-                    result.clip_count += 1;
-                    result.records.push(record);
+                // Check dropping rules after clipping
+                if should_drop_geometry(
+                    &validated,
+                    tile_coord.z,
+                    config.max_zoom,
+                    config.extent,
+                    &tile_bounds,
+                    feat_idx,
+                ) {
+                    continue;
                 }
-            } else {
-                // SEQUENTIAL PATH: Original code for small geometries
-                for z in config.min_zoom..=config.max_zoom {
-                    let tiles: Vec<_> = tiles_for_bbox(&geom_bbox, z).collect();
 
-                    for tile_coord in tiles.into_iter() {
-                        result.tiles_touched += 1;
-                        let tile_bounds = tile_coord.bounds();
-                        let buffer = buffer_pixels_to_degrees(
-                            config.buffer_pixels,
-                            &tile_bounds,
-                            config.extent,
-                        );
-
-                        // Check if geometry bbox intersects buffered tile bounds
-                        let buffered_lng_min = tile_bounds.lng_min - buffer;
-                        let buffered_lng_max = tile_bounds.lng_max + buffer;
-                        let buffered_lat_min = tile_bounds.lat_min - buffer;
-                        let buffered_lat_max = tile_bounds.lat_max + buffer;
-
-                        let intersects = geom_bbox.lng_max >= buffered_lng_min
-                            && geom_bbox.lng_min <= buffered_lng_max
-                            && geom_bbox.lat_max >= buffered_lat_min
-                            && geom_bbox.lat_min <= buffered_lat_max;
-
-                        if !intersects {
-                            continue;
-                        }
-
-                        // Clip the pre-simplified geometry to tile bounds
-                        let clip_start = std::time::Instant::now();
-                        let clipped = match clip_geometry(&base_simplified, &tile_bounds, buffer) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-                        result.time_clip += clip_start.elapsed();
-                        result.clip_count += 1;
-
-                        // Validate (simplification already done above)
-                        let validated = match filter_valid_geometry(&clipped) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-
-                        // Check dropping rules after clipping
-                        if should_drop_geometry(
-                            &validated,
-                            z,
-                            config.max_zoom,
-                            config.extent,
-                            &tile_bounds,
-                            feat_idx,
-                        ) {
-                            continue;
-                        }
-
-                        // Serialize geometry to WKB
-                        let wkb_start = std::time::Instant::now();
-                        let wkb = match geometry_to_wkb(&validated) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                log::warn!("Failed to serialize geometry to WKB: {}", e);
-                                continue;
-                            }
-                        };
-                        result.time_wkb += wkb_start.elapsed();
-
-                        // Create record with tile_id and coordinates
-                        let tid = tile_id(z, tile_coord.x, tile_coord.y);
-                        let record = TileFeatureRecord::new(
-                            tid,
-                            z,
-                            tile_coord.x,
-                            tile_coord.y,
-                            feat_idx,
-                            wkb,
-                            vec![], // Empty properties for now
-                        );
-
-                        result.records.push(record);
+                // Serialize geometry to WKB
+                let wkb_start = std::time::Instant::now();
+                let wkb = match geometry_to_wkb(&validated) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::warn!("Failed to serialize geometry to WKB: {}", e);
+                        continue;
                     }
-                }
+                };
+                result.time_wkb += wkb_start.elapsed();
+
+                // Create record with tile_id and coordinates
+                let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
+                let record = TileFeatureRecord::new(
+                    tid,
+                    tile_coord.z,
+                    tile_coord.x,
+                    tile_coord.y,
+                    feat_idx,
+                    wkb,
+                    vec![], // Empty properties for now
+                );
+
+                result.records.push(record);
             }
 
             result
@@ -1374,7 +1256,9 @@ pub fn generate_tiles_streaming_with_stats(
         let mut sorted = geometries;
         sort_geometries(&mut sorted, config_clone.use_hilbert);
 
-        // For each geometry, find all tiles it intersects across all zoom levels
+        // For each geometry, use hierarchical clipping across all zoom levels.
+        // This clips from parent tile results instead of the original geometry,
+        // reducing redundant work. See issue #38.
         for geom in sorted {
             let geom_bbox = match geom.bounding_rect() {
                 Some(rect) => {
@@ -1383,46 +1267,32 @@ pub fn generate_tiles_streaming_with_stats(
                 None => continue, // Skip geometries without bounds
             };
 
-            // Process all zoom levels for this geometry
-            for z in config_clone.min_zoom..=config_clone.max_zoom {
-                // Get tiles that might contain this geometry
-                let tiles = tiles_for_bbox(&geom_bbox, z);
+            // Pre-simplify at max zoom tolerance (consistent with production pipeline)
+            let simplified = simplify_for_zoom(&geom, config_clone.max_zoom, config_clone.extent);
 
-                for tile_coord in tiles {
-                    let tile_bounds = tile_coord.bounds();
-                    let buffer = buffer_pixels_to_degrees(
-                        config_clone.buffer_pixels,
-                        &tile_bounds,
-                        config_clone.extent,
-                    );
+            // Hierarchical clipping: clip once at min_zoom, then clip parent
+            // results for child tiles at higher zoom levels
+            let (clip_results, _clip_stats) = crate::hierarchical_clip::clip_geometry_hierarchical(
+                &simplified,
+                &geom_bbox,
+                config_clone.min_zoom,
+                config_clone.max_zoom,
+                config_clone.buffer_pixels,
+                config_clone.extent,
+            );
 
-                    // Check if geometry bbox intersects buffered tile bounds
-                    // Inline intersection check instead of method call
-                    let buffered_lng_min = tile_bounds.lng_min - buffer;
-                    let buffered_lng_max = tile_bounds.lng_max + buffer;
-                    let buffered_lat_min = tile_bounds.lat_min - buffer;
-                    let buffered_lat_max = tile_bounds.lat_max + buffer;
+            for (tile_coord, clipped_geom) in clip_results {
+                // Track memory for accumulated (already clipped) geometry
+                let geom_size = estimate_geometry_size(&clipped_geom);
+                memory_tracker.add(geom_size);
 
-                    let intersects = geom_bbox.lng_max >= buffered_lng_min
-                        && geom_bbox.lng_min <= buffered_lng_max
-                        && geom_bbox.lat_max >= buffered_lat_min
-                        && geom_bbox.lat_min <= buffered_lat_max;
-
-                    if !intersects {
-                        continue;
-                    }
-
-                    // Track memory for accumulated geometry
-                    let geom_size = estimate_geometry_size(&geom);
-                    memory_tracker.add(geom_size);
-
-                    // Store feature for this tile (clipping happens when encoding)
-                    tile_features
-                        .entry((z, tile_coord.x, tile_coord.y))
-                        .or_default()
-                        .push((geom.clone(), global_feature_index));
-                }
+                // Store pre-clipped feature for this tile
+                tile_features
+                    .entry((tile_coord.z, tile_coord.x, tile_coord.y))
+                    .or_default()
+                    .push((clipped_geom, global_feature_index));
             }
+
             global_feature_index += 1;
         }
 
@@ -1438,9 +1308,8 @@ pub fn generate_tiles_streaming_with_stats(
     for ((z, x, y), features) in tile_features {
         let coord = TileCoord::new(x, y, z);
         let tile_bounds = coord.bounds();
-        let buffer = buffer_pixels_to_degrees(config.buffer_pixels, &tile_bounds, config.extent);
 
-        // Process features for this tile
+        // Process features for this tile (already pre-clipped via hierarchical_clip)
         let mut layer_builder = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
         let mut feature_count = 0;
 
@@ -1456,14 +1325,9 @@ pub fn generate_tiles_streaming_with_stats(
         };
 
         for (geom, feat_idx) in features {
-            // PERFORMANCE: Simplify first, then clip
-            let simplified_geom = simplify_for_zoom(&geom, z, config.extent);
-            let clipped = match clip_geometry(&simplified_geom, &tile_bounds, buffer) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let validated = match filter_valid_geometry(&clipped) {
+            // Geometries are already pre-clipped and pre-simplified via
+            // hierarchical_clip in Step 4. Only validate here.
+            let validated = match filter_valid_geometry(&geom) {
                 Some(v) => v,
                 None => continue,
             };
