@@ -53,3 +53,7 @@ harness = false
 [[bench]]
 name = "streaming"
 harness = false
+
+[[bench]]
+name = "clipping"
+harness = false

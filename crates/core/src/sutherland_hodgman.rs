@@ -116,8 +116,7 @@ fn clip_ring_against_edge(ring: &[Coord<f64>], edge: Edge, bounds: &TileBounds) 
 
     let mut s = &ring[n - 1]; // Start with the last vertex
 
-    for i in 0..n {
-        let e = &ring[i];
+    for e in ring.iter().take(n) {
         let e_inside = is_inside(e, edge, bounds);
         let s_inside = is_inside(s, edge, bounds);
 
