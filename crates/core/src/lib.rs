@@ -47,6 +47,7 @@ pub mod simplify;
 pub mod spatial_index;
 pub mod tile;
 pub mod validate;
+pub mod wagyu_clip;
 pub mod wkb;
 
 // Re-export PropertyFilter for convenience

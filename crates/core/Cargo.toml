@@ -34,6 +34,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 extsort = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
+wagyu-rs = "0.2"
 
 [build-dependencies]
 prost-build = { workspace = true }
