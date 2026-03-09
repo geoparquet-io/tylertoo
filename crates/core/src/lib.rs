@@ -45,6 +45,7 @@ pub mod property_filter;
 pub mod quality;
 pub mod simplify;
 pub mod spatial_index;
+pub mod sutherland_hodgman;
 pub mod tile;
 pub mod validate;
 pub mod wagyu_clip;

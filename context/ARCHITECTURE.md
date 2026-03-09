@@ -16,6 +16,24 @@ Design decisions and tippecanoe divergences.
 | Metadata | Basic `vector_layers` | Full layer/field/tilestats | Field metadata planned |
 | Simplification | Custom tolerance formula | `tile.cpp` | Tuned to match output quality |
 | Density dropping | Grid-cell limiting | Hilbert-gap selection | Simpler, similar results |
+| Polygon clipping | Sutherland-Hodgman (f64) | Sutherland-Hodgman (int) | Same algorithm, different coordinate space |
+
+## Polygon Clipping: Sutherland-Hodgman
+
+**DIVERGENCE**: Tippecanoe uses Sutherland-Hodgman in integer tile coordinates (0-4096). We use the same Sutherland-Hodgman algorithm but operate in f64 geographic coordinates to avoid coordinate conversion overhead.
+
+**Why Sutherland-Hodgman instead of Wagyu/Vatti:**
+- Tile clipping is always against axis-aligned rectangles
+- SH is O(n) per polygon ring; Vatti is O(n log n) for general boolean ops
+- A 316k-coordinate polygon clips in 0.02s with SH vs 10.4s with Wagyu (500x faster)
+- SH matches tippecanoe's clip.cpp approach exactly
+
+**Known behavior difference from Wagyu:**
+- SH does not split disconnected clipping results into separate polygons
+- A U-shape clipped across its opening produces a single (possibly self-touching) polygon, not two
+- For tile rendering purposes, this is acceptable and matches tippecanoe's behavior
+
+**Wagyu is retained** in `wagyu_clip.rs` for potential future use in complex boolean operations, but is not used in the hot clipping path.
 
 ## Density-Based Dropping
 
@@ -212,7 +230,9 @@ Use `config.with_quiet(true)` to suppress warnings. See `quality.rs` for impleme
 crates/core/src/
 ├── lib.rs              # Public API
 ├── tile.rs             # TileCoord, TileBounds
-├── clip.rs             # Geometry clipping
+├── clip.rs             # Geometry clipping (dispatcher)
+├── sutherland_hodgman.rs # O(n) polygon clipping for axis-aligned rectangles
+├── wagyu_clip.rs       # Wagyu/Vatti clipping (retained for complex boolean ops)
 ├── simplify.rs         # RDP simplification
 ├── validate.rs         # Geometry validation
 ├── mvt.rs              # MVT encoding
