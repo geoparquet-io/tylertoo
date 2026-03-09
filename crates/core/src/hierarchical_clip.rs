@@ -418,7 +418,7 @@ mod tests {
         // Hierarchical should process the same number of tiles
         // (it clips every tile, just uses a smaller source geometry)
         assert!(
-            hierarchical_results.len() > 0,
+            !hierarchical_results.is_empty(),
             "Should produce some tile results"
         );
 
