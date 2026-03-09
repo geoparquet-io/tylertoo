@@ -10,6 +10,7 @@
 //!   Buffer is measured in "screen pixels" where 1 pixel = 1/256th of tile width
 //! - **Clipping method**: Features are clipped to tile boundary + buffer zone
 //! - **Duplication**: Features may appear in multiple tiles if they span boundaries
+//! - **Algorithm**: Uses wagyu's Vatti clipper (same as tippecanoe) for robust polygon clipping
 //!
 //! See: https://github.com/felt/tippecanoe (clipping documentation)
 
@@ -19,6 +20,7 @@ use geo::{
 };
 
 use crate::tile::TileBounds;
+use crate::wagyu_clip;
 
 /// Default buffer in pixels (matches tippecanoe's common usage)
 /// Tippecanoe default is 5, but CLAUDE.md specifies 8 for this project
@@ -181,7 +183,11 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
     }
 }
 
-/// Clip a polygon to bounds using intersection
+/// Clip a polygon to bounds using wagyu's Vatti algorithm.
+///
+/// This uses the same algorithm as tippecanoe for robust polygon clipping,
+/// handling complex cases like self-intersecting polygons and producing
+/// valid OGC-compliant output.
 ///
 /// Returns `Geometry::Polygon` if clipping results in a single polygon,
 /// or `Geometry::MultiPolygon` if the clip creates multiple disconnected parts
@@ -202,128 +208,11 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         return Some(Geometry::Polygon(poly.clone()));
     }
 
-    // Use Sutherland-Hodgman for axis-aligned rect clipping (O(n) vs O(n²))
-    let clipped_exterior = sutherland_hodgman_clip(poly.exterior(), bounds);
-    if clipped_exterior.0.len() < 3 {
-        return None;
-    }
-
-    // Clip interior rings (holes)
-    let mut clipped_interiors = Vec::new();
-    for interior in poly.interiors() {
-        let clipped_interior = sutherland_hodgman_clip(interior, bounds);
-        if clipped_interior.0.len() >= 3 {
-            clipped_interiors.push(clipped_interior);
-        }
-    }
-
-    Some(Geometry::Polygon(Polygon::new(
-        clipped_exterior,
-        clipped_interiors,
-    )))
+    // Use wagyu's Vatti algorithm for robust clipping (same as tippecanoe)
+    wagyu_clip::clip_polygon_wagyu(poly, bounds, wagyu_clip::DEFAULT_EXTENT)
 }
 
-/// Sutherland-Hodgman polygon clipping algorithm for axis-aligned rectangles.
-/// O(n) complexity vs O(n²) for general polygon intersection.
-fn sutherland_hodgman_clip(ring: &LineString<f64>, bounds: &TileBounds) -> LineString<f64> {
-    let mut output: Vec<Coord<f64>> = ring.0.clone();
-
-    // Clip against each edge of the rectangle
-    // Left edge
-    output = clip_against_edge(
-        &output,
-        |c| c.x >= bounds.lng_min,
-        |c1, c2| {
-            let t = (bounds.lng_min - c1.x) / (c2.x - c1.x);
-            Coord {
-                x: bounds.lng_min,
-                y: c1.y + t * (c2.y - c1.y),
-            }
-        },
-    );
-
-    // Right edge
-    output = clip_against_edge(
-        &output,
-        |c| c.x <= bounds.lng_max,
-        |c1, c2| {
-            let t = (bounds.lng_max - c1.x) / (c2.x - c1.x);
-            Coord {
-                x: bounds.lng_max,
-                y: c1.y + t * (c2.y - c1.y),
-            }
-        },
-    );
-
-    // Bottom edge
-    output = clip_against_edge(
-        &output,
-        |c| c.y >= bounds.lat_min,
-        |c1, c2| {
-            let t = (bounds.lat_min - c1.y) / (c2.y - c1.y);
-            Coord {
-                x: c1.x + t * (c2.x - c1.x),
-                y: bounds.lat_min,
-            }
-        },
-    );
-
-    // Top edge
-    output = clip_against_edge(
-        &output,
-        |c| c.y <= bounds.lat_max,
-        |c1, c2| {
-            let t = (bounds.lat_max - c1.y) / (c2.y - c1.y);
-            Coord {
-                x: c1.x + t * (c2.x - c1.x),
-                y: bounds.lat_max,
-            }
-        },
-    );
-
-    // Close the ring if needed
-    if !output.is_empty() && output.first() != output.last() {
-        output.push(output[0]);
-    }
-
-    LineString::new(output)
-}
-
-/// Clip polygon vertices against a single edge
-fn clip_against_edge<F, I>(vertices: &[Coord<f64>], inside: F, intersect: I) -> Vec<Coord<f64>>
-where
-    F: Fn(&Coord<f64>) -> bool,
-    I: Fn(&Coord<f64>, &Coord<f64>) -> Coord<f64>,
-{
-    if vertices.is_empty() {
-        return Vec::new();
-    }
-
-    let mut output = Vec::with_capacity(vertices.len());
-
-    for i in 0..vertices.len() {
-        let current = &vertices[i];
-        let next = &vertices[(i + 1) % vertices.len()];
-
-        let current_inside = inside(current);
-        let next_inside = inside(next);
-
-        if current_inside {
-            output.push(*current);
-            if !next_inside {
-                // Exiting: add intersection
-                output.push(intersect(current, next));
-            }
-        } else if next_inside {
-            // Entering: add intersection
-            output.push(intersect(current, next));
-        }
-    }
-
-    output
-}
-
-/// Clip a multipolygon to bounds
+/// Clip a multipolygon to bounds using wagyu's Vatti algorithm.
 fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<MultiPolygon<f64>> {
     // Quick rejection test
     let mp_rect = mp.bounding_rect()?;
@@ -340,11 +229,14 @@ fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<Mult
         return Some(mp.clone());
     }
 
-    // Clip each polygon individually using fast Sutherland-Hodgman
+    // Clip each polygon individually using wagyu
+    // Note: clip_polygon may return MultiPolygon if clipping creates multiple parts
     let mut clipped_polys = Vec::new();
     for poly in &mp.0 {
-        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds) {
-            clipped_polys.push(clipped);
+        match clip_polygon(poly, bounds) {
+            Some(Geometry::Polygon(clipped)) => clipped_polys.push(clipped),
+            Some(Geometry::MultiPolygon(multi)) => clipped_polys.extend(multi.0),
+            _ => {}
         }
     }
 

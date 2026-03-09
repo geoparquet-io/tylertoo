@@ -62,10 +62,10 @@ pub fn simplify_for_zoom(geom: &Geometry<f64>, zoom: u8, extent: u32) -> Geometr
             if ls.0.len() < 2 {
                 return geom.clone();
             }
-            Geometry::LineString(ls.simplify(&tolerance))
+            Geometry::LineString(ls.simplify(tolerance))
         }
-        Geometry::Polygon(poly) => Geometry::Polygon(poly.simplify(&tolerance)),
-        Geometry::MultiPolygon(mp) => Geometry::MultiPolygon(mp.simplify(&tolerance)),
+        Geometry::Polygon(poly) => Geometry::Polygon(poly.simplify(tolerance)),
+        Geometry::MultiPolygon(mp) => Geometry::MultiPolygon(mp.simplify(tolerance)),
         Geometry::MultiLineString(mls) => {
             // Handle degenerate linestrings within the multi - return unchanged
             // (they'll be filtered by filter_valid_geometry later)
@@ -76,7 +76,7 @@ pub fn simplify_for_zoom(geom: &Geometry<f64>, zoom: u8, extent: u32) -> Geometr
                     if ls.0.len() < 2 {
                         ls.clone()
                     } else {
-                        ls.simplify(&tolerance)
+                        ls.simplify(tolerance)
                     }
                 })
                 .collect();
@@ -240,14 +240,14 @@ pub fn simplify_in_tile_coords(
             // Transform to tile coords
             let tile_ls = linestring_to_tile_coords(ls, bounds, extent);
             // Simplify in tile space
-            let simplified = tile_ls.simplify(&pixel_tolerance);
+            let simplified = tile_ls.simplify(pixel_tolerance);
             // Transform back to geo coords
             Geometry::LineString(linestring_to_geo_coords(&simplified, bounds, extent))
         }
 
         Geometry::Polygon(poly) => {
             let tile_poly = polygon_to_tile_coords(poly, bounds, extent);
-            let simplified = tile_poly.simplify(&pixel_tolerance);
+            let simplified = tile_poly.simplify(pixel_tolerance);
             Geometry::Polygon(polygon_to_geo_coords(&simplified, bounds, extent))
         }
 
@@ -256,7 +256,7 @@ pub fn simplify_in_tile_coords(
                 mp.0.iter()
                     .map(|poly| {
                         let tile_poly = polygon_to_tile_coords(poly, bounds, extent);
-                        let simplified = tile_poly.simplify(&pixel_tolerance);
+                        let simplified = tile_poly.simplify(pixel_tolerance);
                         polygon_to_geo_coords(&simplified, bounds, extent)
                     })
                     .collect();
@@ -269,7 +269,7 @@ pub fn simplify_in_tile_coords(
                 .iter()
                 .map(|ls| {
                     let tile_ls = linestring_to_tile_coords(ls, bounds, extent);
-                    let simplified = tile_ls.simplify(&pixel_tolerance);
+                    let simplified = tile_ls.simplify(pixel_tolerance);
                     linestring_to_geo_coords(&simplified, bounds, extent)
                 })
                 .collect();
@@ -321,12 +321,12 @@ pub fn simplify_to_tile_coords(
 
         Geometry::LineString(ls) => {
             let tile_ls = linestring_to_tile_coords(ls, bounds, extent);
-            Geometry::LineString(tile_ls.simplify(&pixel_tolerance))
+            Geometry::LineString(tile_ls.simplify(pixel_tolerance))
         }
 
         Geometry::Polygon(poly) => {
             let tile_poly = polygon_to_tile_coords(poly, bounds, extent);
-            Geometry::Polygon(tile_poly.simplify(&pixel_tolerance))
+            Geometry::Polygon(tile_poly.simplify(pixel_tolerance))
         }
 
         Geometry::MultiPolygon(mp) => {
@@ -334,7 +334,7 @@ pub fn simplify_to_tile_coords(
                 mp.0.iter()
                     .map(|poly| {
                         let tile_poly = polygon_to_tile_coords(poly, bounds, extent);
-                        tile_poly.simplify(&pixel_tolerance)
+                        tile_poly.simplify(pixel_tolerance)
                     })
                     .collect();
             Geometry::MultiPolygon(MultiPolygon::new(simplified_polys))
@@ -346,7 +346,7 @@ pub fn simplify_to_tile_coords(
                 .iter()
                 .map(|ls| {
                     let tile_ls = linestring_to_tile_coords(ls, bounds, extent);
-                    tile_ls.simplify(&pixel_tolerance)
+                    tile_ls.simplify(pixel_tolerance)
                 })
                 .collect();
             Geometry::MultiLineString(MultiLineString::new(simplified_lines))
