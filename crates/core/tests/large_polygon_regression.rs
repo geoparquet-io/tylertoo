@@ -4,7 +4,7 @@
 //! completes in a reasonable time. It catches regressions like the wagyu
 //! pathological slowdown that was fixed by switching to Sutherland-Hodgman.
 //!
-//! Run with: cargo test --release -p gpq-tiles-core --test large_polygon_regression -- --ignored --nocapture
+//! Run with: cargo test --release -p gpq-tiles-core --test large_polygon_regression -- --nocapture
 //!
 //! Expected: ~70 seconds for adm2_polygons.parquet (z0-z8)
 
@@ -22,7 +22,6 @@ const MAX_CONVERSION_TIME: Duration = Duration::from_secs(180);
 const MIN_EXPECTED_TILES: u64 = 40_000;
 
 #[test]
-#[ignore] // Run explicitly - requires large fixture file and takes ~70 seconds
 fn test_adm2_conversion_completes_in_reasonable_time() {
     let input_path = Path::new(ADM2_FIXTURE);
     if !input_path.exists() {
@@ -96,7 +95,6 @@ fn test_adm2_conversion_completes_in_reasonable_time() {
 
 /// Quick smoke test with a smaller zoom range for CI
 #[test]
-#[ignore] // Still requires fixture
 fn test_adm2_smoke_test_z0_z5() {
     let input_path = Path::new(ADM2_FIXTURE);
     if !input_path.exists() {
