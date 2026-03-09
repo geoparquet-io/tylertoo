@@ -90,7 +90,7 @@ fn test_adm2_conversion_completes_in_reasonable_time() {
     let _ = std::fs::remove_file(&output_path);
 }
 
-/// Quick smoke test with a smaller zoom range for CI
+/// Quick smoke test with a smaller zoom range
 #[test]
 fn test_adm2_smoke_test_z0_z5() {
     let input_path = Path::new(ADM2_FIXTURE);
