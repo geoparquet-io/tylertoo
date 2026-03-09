@@ -115,6 +115,11 @@ pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     // Convert longitude to tile x
     let x = ((lng + 180.0) / 360.0 * n).floor() as u32;
 
+    // Clamp latitude to Web Mercator bounds to prevent tile coordinate overflow.
+    // Web Mercator is defined for ~±85.0511° but we use ±85.05° for safety margin.
+    // Without this clamp, lat=-90° produces y values 6-20x larger than valid bounds.
+    let lat = lat.clamp(-85.05, 85.05);
+
     // Convert latitude to tile y (Web Mercator)
     let lat_rad = lat.to_radians();
     let y = ((1.0 - lat_rad.tan().asinh() / PI) / 2.0 * n).floor() as u32;
