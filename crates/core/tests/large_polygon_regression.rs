@@ -18,9 +18,6 @@ const ADM2_FIXTURE: &str = "../../tests/fixtures/realdata/adm2_polygons.parquet"
 /// Maximum allowed time for conversion (3 minutes - generous buffer over expected ~70s)
 const MAX_CONVERSION_TIME: Duration = Duration::from_secs(180);
 
-/// Minimum expected tiles (sanity check that conversion actually worked)
-const MIN_EXPECTED_TILES: u64 = 40_000;
-
 #[test]
 fn test_adm2_conversion_completes_in_reasonable_time() {
     let input_path = Path::new(ADM2_FIXTURE);
