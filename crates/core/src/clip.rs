@@ -10,7 +10,10 @@
 //!   Buffer is measured in "screen pixels" where 1 pixel = 1/256th of tile width
 //! - **Clipping method**: Features are clipped to tile boundary + buffer zone
 //! - **Duplication**: Features may appear in multiple tiles if they span boundaries
-//! - **Algorithm**: Uses wagyu's Vatti clipper (same as tippecanoe) for robust polygon clipping
+//! - **Algorithm**: Uses Sutherland-Hodgman for polygon clipping against axis-aligned
+//!   tile boundaries (same approach as tippecanoe's clip.cpp). This is O(n) and
+//!   specialized for rectangle clipping, replacing the general-purpose Vatti/wagyu
+//!   algorithm which was O(n log n) and pathologically slow on complex polygons.
 //!
 //! See: https://github.com/felt/tippecanoe (clipping documentation)
 
@@ -19,8 +22,8 @@ use geo::{
     Polygon, Rect,
 };
 
+use crate::sutherland_hodgman;
 use crate::tile::TileBounds;
-use crate::wagyu_clip;
 
 /// Default buffer in pixels (matches tippecanoe's common usage)
 /// Tippecanoe default is 5, but CLAUDE.md specifies 8 for this project
@@ -183,15 +186,19 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
     }
 }
 
-/// Clip a polygon to bounds using wagyu's Vatti algorithm.
+/// Clip a polygon to bounds using Sutherland-Hodgman algorithm.
 ///
-/// This uses the same algorithm as tippecanoe for robust polygon clipping,
-/// handling complex cases like self-intersecting polygons and producing
-/// valid OGC-compliant output.
+/// Uses Sutherland-Hodgman for O(n) clipping against axis-aligned tile boundaries.
+/// This matches tippecanoe's approach (clip.cpp) and is significantly faster than
+/// general-purpose polygon clipping (wagyu/Vatti) for rectangle clipping.
 ///
-/// Returns `Geometry::Polygon` if clipping results in a single polygon,
-/// or `Geometry::MultiPolygon` if the clip creates multiple disconnected parts
-/// (e.g., a U-shaped polygon clipped across its opening).
+/// # DIVERGENCE FROM TIPPECANOE: coordinate space
+/// Tippecanoe operates in integer tile coordinates (0-4096).
+/// We operate in f64 geographic coordinates to avoid coordinate conversion overhead.
+/// The algorithm is identical; only the coordinate space differs.
+///
+/// Returns `Geometry::Polygon` with the clipped result, or `None` if the polygon
+/// doesn't intersect the bounds.
 fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
     // Quick rejection test
     let poly_rect = poly.bounding_rect()?;
@@ -208,11 +215,11 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         return Some(Geometry::Polygon(poly.clone()));
     }
 
-    // Use wagyu's Vatti algorithm for robust clipping (same as tippecanoe)
-    wagyu_clip::clip_polygon_wagyu(poly, bounds, wagyu_clip::DEFAULT_EXTENT)
+    // Use Sutherland-Hodgman for O(n) rectangle clipping
+    sutherland_hodgman::clip_polygon_sh(poly, bounds)
 }
 
-/// Clip a multipolygon to bounds using wagyu's Vatti algorithm.
+/// Clip a multipolygon to bounds using Sutherland-Hodgman algorithm.
 fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<MultiPolygon<f64>> {
     // Quick rejection test
     let mp_rect = mp.bounding_rect()?;
@@ -229,14 +236,11 @@ fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<Mult
         return Some(mp.clone());
     }
 
-    // Clip each polygon individually using wagyu
-    // Note: clip_polygon may return MultiPolygon if clipping creates multiple parts
+    // Clip each polygon individually using Sutherland-Hodgman
     let mut clipped_polys = Vec::new();
     for poly in &mp.0 {
-        match clip_polygon(poly, bounds) {
-            Some(Geometry::Polygon(clipped)) => clipped_polys.push(clipped),
-            Some(Geometry::MultiPolygon(multi)) => clipped_polys.extend(multi.0),
-            _ => {}
+        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds) {
+            clipped_polys.push(clipped);
         }
     }
 
@@ -468,15 +472,16 @@ mod tests {
     }
 
     #[test]
-    fn test_clip_polygon_multipart_result() {
-        // U-shaped polygon that, when clipped by a horizontal band,
-        // produces two disconnected polygons (the two "arms" of the U)
+    fn test_clip_polygon_u_shape() {
+        // U-shaped polygon clipped by a horizontal band.
+        //
+        // DIVERGENCE FROM WAGYU: Sutherland-Hodgman does not split disconnected
+        // parts into separate polygons. It produces a single (possibly self-touching)
+        // polygon. For tile rendering, this is acceptable and matches tippecanoe's
+        // Sutherland-Hodgman behavior in clip.cpp.
         let bounds = TileBounds::new(0.0, 4.0, 10.0, 6.0); // Horizontal band
 
         // U-shape: two vertical bars connected at the bottom
-        // Left bar: x=1-2, y=0-10
-        // Right bar: x=8-9, y=0-10
-        // Bottom connector: x=1-9, y=0-2
         let u_shape = Polygon::new(
             LineString::from(vec![
                 Coord { x: 1.0, y: 0.0 },
@@ -496,19 +501,24 @@ mod tests {
         let result = clip_polygon(&u_shape, &bounds);
         assert!(result.is_some(), "U-shape should intersect the band");
 
-        // Should produce a MultiPolygon (two separate rectangles from the arms)
+        // Should produce a Polygon (SH produces a single polygon, not MultiPolygon)
         match result.unwrap() {
-            Geometry::MultiPolygon(mp) => {
-                assert_eq!(
-                    mp.0.len(),
-                    2,
-                    "Should have 2 polygon parts (left and right arms)"
-                );
+            Geometry::Polygon(p) => {
+                // Verify all coords within bounds
+                for coord in p.exterior().coords() {
+                    assert!(
+                        coord.x >= 0.0 && coord.x <= 10.0,
+                        "x={} out of bounds",
+                        coord.x
+                    );
+                    assert!(
+                        coord.y >= 4.0 - 1e-10 && coord.y <= 6.0 + 1e-10,
+                        "y={} out of bounds",
+                        coord.y
+                    );
+                }
             }
-            Geometry::Polygon(_) => {
-                // This is also acceptable if geo merges them somehow
-            }
-            other => panic!("Expected Polygon or MultiPolygon, got {:?}", other),
+            other => panic!("Expected Polygon, got {:?}", other),
         }
     }
 }
