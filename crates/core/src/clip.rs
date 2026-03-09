@@ -104,6 +104,18 @@ fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
         && rect.min().y <= bounds.lat_max
 }
 
+/// Check if a rectangle is fully contained within the given bounds
+fn is_fully_inside(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
+    rect.min().x >= bounds.lng_min
+        && rect.max().x <= bounds.lng_max
+        && rect.min().y >= bounds.lat_min
+        && rect.max().y <= bounds.lat_max
+}
+
+// ============================================================================
+// Geometry Clipping Functions
+// ============================================================================
+
 /// Clip a point to bounds (simple containment check)
 fn clip_point(point: &Point<f64>, bounds: &TileBounds) -> Option<Point<f64>> {
     if point.x() >= bounds.lng_min
@@ -200,18 +212,14 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
 /// Returns `Geometry::Polygon` with the clipped result, or `None` if the polygon
 /// doesn't intersect the bounds.
 fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
-    // Quick rejection test
+    // Quick rejection test using bounding box
     let poly_rect = poly.bounding_rect()?;
     if !intersects_bounds(&poly_rect, bounds) {
         return None;
     }
 
     // FAST PATH: If polygon is fully inside bounds, return as-is (no clipping needed)
-    if poly_rect.min().x >= bounds.lng_min
-        && poly_rect.max().x <= bounds.lng_max
-        && poly_rect.min().y >= bounds.lat_min
-        && poly_rect.max().y <= bounds.lat_max
-    {
+    if is_fully_inside(&poly_rect, bounds) {
         return Some(Geometry::Polygon(poly.clone()));
     }
 
@@ -220,25 +228,54 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
 }
 
 /// Clip a multipolygon to bounds using Sutherland-Hodgman algorithm.
+///
+/// Applies a two-level bounding box filter:
+/// 1. Overall MultiPolygon bbox check (fast rejection for the whole geometry)
+/// 2. Per-polygon bbox check (skips sub-polygons that don't intersect the tile)
+///
+/// For MultiPolygons like Antarctica (7453 sub-polygons spanning the globe),
+/// the per-polygon filter eliminates the vast majority of sub-polygons before
+/// any clipping work is done.
 fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<MultiPolygon<f64>> {
-    // Quick rejection test
+    // Level 1: Quick rejection using overall MultiPolygon bbox
     let mp_rect = mp.bounding_rect()?;
     if !intersects_bounds(&mp_rect, bounds) {
         return None;
     }
 
-    // FAST PATH: If multipolygon is fully inside bounds, return as-is
-    if mp_rect.min().x >= bounds.lng_min
-        && mp_rect.max().x <= bounds.lng_max
-        && mp_rect.min().y >= bounds.lat_min
-        && mp_rect.max().y <= bounds.lat_max
-    {
+    // FAST PATH: If entire multipolygon is fully inside bounds, return as-is
+    if is_fully_inside(&mp_rect, bounds) {
         return Some(mp.clone());
     }
 
-    // Clip each polygon individually using Sutherland-Hodgman
+    // Level 2: Per-polygon bbox filter + clip
+    // Each polygon is individually tested with its own bounding box before
+    // any clipping is attempted. This avoids expensive operations for
+    // sub-polygons that are far from the tile.
     let mut clipped_polys = Vec::new();
     for poly in &mp.0 {
+        // Per-polygon bbox filter: compute each polygon's bbox and check
+        // intersection before calling into the clip pipeline
+        let poly_rect = match poly.bounding_rect() {
+            Some(r) => r,
+            None => continue, // Degenerate polygon, skip
+        };
+
+        if !intersects_bounds(&poly_rect, bounds) {
+            // This polygon's bbox doesn't intersect the tile -- skip entirely.
+            // This is the key optimization: for a MultiPolygon with 7453 polygons
+            // where only ~100 intersect the tile, we skip 7353 polygons here
+            // without any clipping work.
+            continue;
+        }
+
+        // FAST PATH: If this polygon is fully inside bounds, add as-is
+        if is_fully_inside(&poly_rect, bounds) {
+            clipped_polys.push(poly.clone());
+            continue;
+        }
+
+        // Polygon intersects but isn't fully inside -- needs clipping with SH
         if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds) {
             clipped_polys.push(clipped);
         }
@@ -469,6 +506,338 @@ mod tests {
         // With buffer: should clip to buffered bounds
         let result_with_buffer = clip_geometry(&poly, &bounds, buffer);
         assert!(result_with_buffer.is_some());
+    }
+
+    // ========== Bounding Box Pre-filter Tests ==========
+
+    #[test]
+    fn test_multipolygon_bbox_prefilter_skips_distant_polygons() {
+        // Simulates an "Antarctica-like" MultiPolygon: many sub-polygons spread
+        // across a wide geographic area, clipped to a small tile that only
+        // intersects a handful of them.
+        //
+        // This verifies that per-polygon bbox filtering correctly:
+        // 1. Produces output only for the intersecting polygons
+        // 2. Returns None for the non-intersecting ones
+        //
+        // The tile covers a 10x10 degree area at (0,0)-(10,10).
+        // We create 1000 polygons:
+        //   - 990 are outside the tile (spread from x=20..200)
+        //   - 10 are inside the tile (at x=1..9, y=1..9)
+        let tile_bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        let mut polygons = Vec::with_capacity(1000);
+
+        // 10 polygons inside the tile
+        for i in 0..10 {
+            let x = 1.0 + (i as f64) * 0.8;
+            let y = 1.0 + (i as f64) * 0.8;
+            polygons.push(Polygon::new(
+                LineString::from(vec![
+                    Coord { x, y },
+                    Coord { x: x + 0.5, y },
+                    Coord {
+                        x: x + 0.5,
+                        y: y + 0.5,
+                    },
+                    Coord { x, y: y + 0.5 },
+                    Coord { x, y },
+                ]),
+                vec![],
+            ));
+        }
+
+        // 990 polygons outside the tile (far away, scattered in x=20..200)
+        for i in 0..990 {
+            let x = 20.0 + (i as f64) * 0.18;
+            let y = -80.0 + (i as f64) * 0.16;
+            polygons.push(Polygon::new(
+                LineString::from(vec![
+                    Coord { x, y },
+                    Coord { x: x + 0.1, y },
+                    Coord {
+                        x: x + 0.1,
+                        y: y + 0.1,
+                    },
+                    Coord { x, y: y + 0.1 },
+                    Coord { x, y },
+                ]),
+                vec![],
+            ));
+        }
+
+        let mp = MultiPolygon::new(polygons);
+
+        // Clip to the tile
+        let result = clip_multipolygon(&mp, &tile_bounds);
+
+        // Should produce output (the 10 inside polygons)
+        assert!(
+            result.is_some(),
+            "Should produce output for the intersecting polygons"
+        );
+
+        let clipped_mp = result.unwrap();
+        // Should have approximately 10 polygons (the ones inside the tile)
+        // Exact count may vary slightly due to clipping artifacts
+        assert!(
+            clipped_mp.0.len() >= 8 && clipped_mp.0.len() <= 12,
+            "Expected ~10 output polygons, got {}",
+            clipped_mp.0.len()
+        );
+
+        // All output coordinates should be within tile bounds
+        for poly in &clipped_mp.0 {
+            let bbox = poly.bounding_rect().unwrap();
+            assert!(
+                bbox.min().x >= 0.0 - 0.01 && bbox.max().x <= 10.0 + 0.01,
+                "Output polygon x outside tile bounds: {:?}",
+                bbox
+            );
+            assert!(
+                bbox.min().y >= 0.0 - 0.01 && bbox.max().y <= 10.0 + 0.01,
+                "Output polygon y outside tile bounds: {:?}",
+                bbox
+            );
+        }
+    }
+
+    #[test]
+    fn test_multipolygon_bbox_prefilter_all_outside() {
+        // All polygons are outside the tile -- should return None quickly
+        let tile_bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        let polygons: Vec<Polygon<f64>> = (0..500)
+            .map(|i| {
+                let x = 50.0 + (i as f64) * 0.2;
+                let y = 50.0 + (i as f64) * 0.1;
+                Polygon::new(
+                    LineString::from(vec![
+                        Coord { x, y },
+                        Coord { x: x + 0.1, y },
+                        Coord {
+                            x: x + 0.1,
+                            y: y + 0.1,
+                        },
+                        Coord { x, y: y + 0.1 },
+                        Coord { x, y },
+                    ]),
+                    vec![],
+                )
+            })
+            .collect();
+
+        let mp = MultiPolygon::new(polygons);
+        let result = clip_multipolygon(&mp, &tile_bounds);
+        assert!(
+            result.is_none(),
+            "All-outside multipolygon should return None"
+        );
+    }
+
+    #[test]
+    fn test_bbox_prefilter_large_polygon_preclip() {
+        // A single large polygon spanning a huge area (-180 to +180 longitude)
+        // is clipped to a small 10-degree tile. The pre-clip optimization should
+        // reduce the coordinate count before sending to the expensive wagyu clipper.
+        let tile_bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        // Build a large polygon with many coordinates spanning the entire globe.
+        // This simulates a complex coastline polygon.
+        let mut coords: Vec<Coord<f64>> = Vec::new();
+        // Bottom edge: many points from -180 to +180
+        for i in 0..360 {
+            let x = -180.0 + i as f64;
+            let y = -60.0 + (i as f64 * 0.1).sin() * 2.0; // Wavy bottom edge
+            coords.push(Coord { x, y });
+        }
+        // Top edge: many points from +180 back to -180
+        for i in (0..360).rev() {
+            let x = -180.0 + i as f64;
+            let y = 60.0 + (i as f64 * 0.1).cos() * 2.0; // Wavy top edge
+            coords.push(Coord { x, y });
+        }
+        // Close the polygon
+        coords.push(coords[0]);
+
+        let large_poly = Polygon::new(LineString::from(coords.clone()), vec![]);
+
+        // Total input coordinates
+        let total_input_coords = coords.len();
+        assert!(
+            total_input_coords > 700,
+            "Test polygon should have many coordinates, got {}",
+            total_input_coords
+        );
+
+        // Clip to small tile
+        let result = clip_polygon(&large_poly, &tile_bounds);
+        assert!(result.is_some(), "Large polygon should intersect the tile");
+
+        // Verify the clipped result is reasonable
+        match result.unwrap() {
+            Geometry::Polygon(p) => {
+                let output_coords = p.exterior().coords().count();
+                // The clipped polygon should have far fewer coordinates than input
+                assert!(
+                    output_coords < total_input_coords / 2,
+                    "Clipped polygon should have fewer coords than input: {} vs {}",
+                    output_coords,
+                    total_input_coords
+                );
+            }
+            Geometry::MultiPolygon(mp) => {
+                let total_output: usize = mp.0.iter().map(|p| p.exterior().coords().count()).sum();
+                assert!(
+                    total_output < total_input_coords / 2,
+                    "Clipped multipolygon should have fewer coords than input: {} vs {}",
+                    total_output,
+                    total_input_coords
+                );
+            }
+            other => panic!("Expected Polygon or MultiPolygon, got {:?}", other),
+        }
+    }
+
+    // ========== Sutherland-Hodgman Clipping Unit Tests ==========
+
+    #[test]
+    fn test_sutherland_hodgman_fully_inside() {
+        // Polygon fully inside clip bounds -- should be unchanged
+        use crate::sutherland_hodgman::clip_polygon_sh;
+
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 2.0, y: 2.0 },
+                Coord { x: 8.0, y: 2.0 },
+                Coord { x: 8.0, y: 8.0 },
+                Coord { x: 2.0, y: 8.0 },
+                Coord { x: 2.0, y: 2.0 },
+            ]),
+            vec![],
+        );
+
+        let result = clip_polygon_sh(&poly, &bounds);
+        assert!(result.is_some(), "Fully inside polygon should be preserved");
+        match result.unwrap() {
+            Geometry::Polygon(p) => {
+                // Should preserve all 4 vertices + closing
+                assert_eq!(
+                    p.exterior().0.len(),
+                    5,
+                    "Should have 5 coords (4 vertices + close)"
+                );
+            }
+            other => panic!("Expected Polygon, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sutherland_hodgman_fully_outside() {
+        // Polygon fully outside clip bounds -- should return None
+        use crate::sutherland_hodgman::clip_polygon_sh;
+
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 20.0, y: 20.0 },
+                Coord { x: 30.0, y: 20.0 },
+                Coord { x: 30.0, y: 30.0 },
+                Coord { x: 20.0, y: 30.0 },
+                Coord { x: 20.0, y: 20.0 },
+            ]),
+            vec![],
+        );
+
+        let result = clip_polygon_sh(&poly, &bounds);
+        assert!(result.is_none(), "Fully outside polygon should be empty");
+    }
+
+    #[test]
+    fn test_sutherland_hodgman_partial_clip() {
+        // Polygon overlapping the right edge of the bounds
+        use crate::sutherland_hodgman::clip_polygon_sh;
+
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 5.0, y: 2.0 },
+                Coord { x: 15.0, y: 2.0 },
+                Coord { x: 15.0, y: 8.0 },
+                Coord { x: 5.0, y: 8.0 },
+                Coord { x: 5.0, y: 2.0 },
+            ]),
+            vec![],
+        );
+
+        let result = clip_polygon_sh(&poly, &bounds);
+        assert!(
+            result.is_some(),
+            "Partially overlapping polygon should produce output"
+        );
+        // Verify all result coords are within bounds
+        match result.unwrap() {
+            Geometry::Polygon(p) => {
+                for coord in p.exterior().coords() {
+                    assert!(
+                        coord.x >= 0.0 - 0.001 && coord.x <= 10.0 + 0.001,
+                        "x out of bounds: {}",
+                        coord.x
+                    );
+                    assert!(
+                        coord.y >= 0.0 - 0.001 && coord.y <= 10.0 + 0.001,
+                        "y out of bounds: {}",
+                        coord.y
+                    );
+                }
+            }
+            other => panic!("Expected Polygon, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sutherland_hodgman_large_polygon_reduction() {
+        // A polygon with many coordinates spanning a large area, clipped to a
+        // small box. Tests that Sutherland-Hodgman reduces coordinate count.
+        use crate::sutherland_hodgman::clip_polygon_sh;
+
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        // Create a polygon with 720 coords spanning -180 to +180
+        let mut coords = Vec::new();
+        for i in 0..360 {
+            coords.push(Coord {
+                x: -180.0 + i as f64,
+                y: -50.0,
+            });
+        }
+        for i in (0..360).rev() {
+            coords.push(Coord {
+                x: -180.0 + i as f64,
+                y: 50.0,
+            });
+        }
+        coords.push(coords[0]); // close
+
+        let input_count = coords.len();
+        let poly = Polygon::new(LineString::from(coords), vec![]);
+
+        let result = clip_polygon_sh(&poly, &bounds);
+        assert!(result.is_some(), "Clipped polygon should not be empty");
+
+        match result.unwrap() {
+            Geometry::Polygon(p) => {
+                let output_count = p.exterior().0.len();
+                assert!(
+                    output_count < input_count / 10,
+                    "Sutherland-Hodgman should dramatically reduce coordinates: {} -> {}",
+                    input_count,
+                    output_count
+                );
+            }
+            other => panic!("Expected Polygon, got {:?}", other),
+        }
     }
 
     #[test]
