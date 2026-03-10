@@ -9,6 +9,7 @@ use gpq_tiles_core::pipeline::{
     generate_tiles_to_writer_with_progress, ProgressEvent, TilerConfig,
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
+use gpq_tiles_core::validate_wgs84;
 use gpq_tiles_core::PropertyFilter;
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
@@ -63,10 +64,11 @@ struct Args {
     #[arg(short = 'X', long = "exclude-all")]
     exclude_all: bool,
 
-    /// Compression algorithm for tiles (zstd, gzip, brotli, none)
+    /// Compression algorithm for tiles (gzip, zstd, brotli, none)
     ///
-    /// Zstd is recommended: faster encoding/decoding than gzip at similar ratios.
-    #[arg(long, default_value = "zstd")]
+    /// Gzip is the default for maximum compatibility with PMTiles viewers.
+    /// Use --compression zstd for faster encoding when your viewer supports it.
+    #[arg(long, default_value = "gzip")]
     compression: String,
 
     /// Enable verbose logging with progress bars
@@ -131,6 +133,9 @@ fn main() -> Result<()> {
     let compression = args
         .parse_compression()
         .context("Failed to parse compression")?;
+
+    // Validate input file uses WGS84 (EPSG:4326) coordinates
+    validate_wgs84(&args.input).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // Derive layer name from input filename if not specified
     let layer_name = args.layer_name.clone().unwrap_or_else(|| {
