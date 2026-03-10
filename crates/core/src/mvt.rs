@@ -217,34 +217,48 @@ pub fn encode_world_points(coords: &[WorldCoord], tile: &TileCoord, extent: u32)
 /// # Returns
 /// MVT geometry command stream, or empty vec if fewer than 2 points
 pub fn encode_world_linestring(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> Vec<u32> {
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+    encode_world_linestring_with_cursor(coords, tile, extent, &mut cursor_x, &mut cursor_y)
+}
+
+/// Encode a linestring with an external cursor for delta encoding.
+///
+/// This variant is used for MultiLineString encoding where the cursor must
+/// be maintained across multiple linestrings per the MVT spec.
+pub fn encode_world_linestring_with_cursor(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    cursor_x: &mut i32,
+    cursor_y: &mut i32,
+) -> Vec<u32> {
     if coords.len() < 2 {
         return vec![];
     }
 
     let mut geometry = Vec::with_capacity(3 + (coords.len() - 1) * 2);
-    let mut cursor_x = 0i32;
-    let mut cursor_y = 0i32;
 
     // First point: MoveTo
     let (x, y) = world_to_tile_local(&coords[0], tile, extent);
-    let dx = x - cursor_x;
-    let dy = y - cursor_y;
+    let dx = x - *cursor_x;
+    let dy = y - *cursor_y;
     geometry.push(command_encode(CMD_MOVE_TO, 1));
     geometry.push(zigzag_encode(dx));
     geometry.push(zigzag_encode(dy));
-    cursor_x = x;
-    cursor_y = y;
+    *cursor_x = x;
+    *cursor_y = y;
 
     // Remaining points: LineTo
     geometry.push(command_encode(CMD_LINE_TO, (coords.len() - 1) as u32));
     for coord in &coords[1..] {
         let (x, y) = world_to_tile_local(coord, tile, extent);
-        let dx = x - cursor_x;
-        let dy = y - cursor_y;
+        let dx = x - *cursor_x;
+        let dy = y - *cursor_y;
         geometry.push(zigzag_encode(dx));
         geometry.push(zigzag_encode(dy));
-        cursor_x = x;
-        cursor_y = y;
+        *cursor_x = x;
+        *cursor_y = y;
     }
 
     geometry
@@ -330,17 +344,39 @@ pub fn encode_world_polygon(
     tile: &TileCoord,
     extent: u32,
 ) -> Vec<u32> {
-    let mut geometry = Vec::new();
     let mut cursor_x = 0i32;
     let mut cursor_y = 0i32;
+    encode_world_polygon_with_cursor(
+        exterior,
+        interiors,
+        tile,
+        extent,
+        &mut cursor_x,
+        &mut cursor_y,
+    )
+}
+
+/// Encode a polygon with an external cursor for delta encoding.
+///
+/// This variant is used for MultiPolygon encoding where the cursor must
+/// be maintained across multiple polygons per the MVT spec.
+pub fn encode_world_polygon_with_cursor(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile: &TileCoord,
+    extent: u32,
+    cursor_x: &mut i32,
+    cursor_y: &mut i32,
+) -> Vec<u32> {
+    let mut geometry = Vec::new();
 
     // Exterior ring
-    let ext_cmds = encode_world_ring(exterior, tile, extent, &mut cursor_x, &mut cursor_y);
+    let ext_cmds = encode_world_ring(exterior, tile, extent, cursor_x, cursor_y);
     geometry.extend(ext_cmds);
 
     // Interior rings (holes)
     for interior in interiors {
-        let int_cmds = encode_world_ring(interior, tile, extent, &mut cursor_x, &mut cursor_y);
+        let int_cmds = encode_world_ring(interior, tile, extent, cursor_x, cursor_y);
         geometry.extend(int_cmds);
     }
 
@@ -724,6 +760,118 @@ impl LayerBuilder {
         bounds: &TileBounds,
     ) {
         let (geom_commands, geom_type) = encode_geometry(geometry, bounds, self.extent);
+
+        // Skip empty geometries
+        if geom_commands.is_empty() && geom_type == GeomType::Unknown {
+            return;
+        }
+
+        // Encode tags as [key_idx, value_idx, key_idx, value_idx, ...]
+        let mut tags = Vec::with_capacity(properties.len() * 2);
+        for (key, value) in properties {
+            let key_idx = self.get_or_insert_key(key);
+            let value_idx = self.get_or_insert_value(value);
+            tags.push(key_idx);
+            tags.push(value_idx);
+        }
+
+        let feature = Feature {
+            id,
+            tags,
+            r#type: Some(geom_type as i32),
+            geometry: geom_commands,
+        };
+
+        self.features.push(feature);
+    }
+
+    /// Add a feature from WorldClippedGeometry directly.
+    ///
+    /// This method encodes WorldCoord geometries directly without going through
+    /// geo::Geometry, avoiding floating-point conversions.
+    ///
+    /// # Arguments
+    /// * `id` - Optional feature ID
+    /// * `geometry` - The WorldClippedGeometry to encode
+    /// * `properties` - Feature properties as key-value pairs
+    /// * `tile` - The tile coordinates for the geometry
+    pub fn add_feature_world(
+        &mut self,
+        id: Option<u64>,
+        geometry: &crate::hierarchical_clip::WorldClippedGeometry,
+        properties: &[(String, PropertyValue)],
+        tile: &TileCoord,
+    ) {
+        use crate::hierarchical_clip::WorldClippedGeometry;
+
+        let (geom_commands, geom_type) = match geometry {
+            WorldClippedGeometry::Point(p) => {
+                let cmds = encode_world_points(&[*p], tile, self.extent);
+                (cmds, GeomType::Point)
+            }
+            WorldClippedGeometry::LineString(coords) => {
+                let cmds = encode_world_linestring(coords, tile, self.extent);
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Linestring)
+                }
+            }
+            WorldClippedGeometry::Polygon {
+                exterior,
+                interiors,
+            } => {
+                let cmds = encode_world_polygon(exterior, interiors, tile, self.extent);
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Polygon)
+                }
+            }
+            WorldClippedGeometry::MultiPoint(points) => {
+                let cmds = encode_world_points(points, tile, self.extent);
+                (cmds, GeomType::Point)
+            }
+            WorldClippedGeometry::MultiLineString(lines) => {
+                let mut cmds = Vec::new();
+                let mut cursor_x = 0i32;
+                let mut cursor_y = 0i32;
+                for line in lines {
+                    cmds.extend(encode_world_linestring_with_cursor(
+                        line,
+                        tile,
+                        self.extent,
+                        &mut cursor_x,
+                        &mut cursor_y,
+                    ));
+                }
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Linestring)
+                }
+            }
+            WorldClippedGeometry::MultiPolygon(polys) => {
+                let mut cmds = Vec::new();
+                let mut cursor_x = 0i32;
+                let mut cursor_y = 0i32;
+                for (ext, ints) in polys {
+                    cmds.extend(encode_world_polygon_with_cursor(
+                        ext,
+                        ints,
+                        tile,
+                        self.extent,
+                        &mut cursor_x,
+                        &mut cursor_y,
+                    ));
+                }
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Polygon)
+                }
+            }
+        };
 
         // Skip empty geometries
         if geom_commands.is_empty() && geom_type == GeomType::Unknown {

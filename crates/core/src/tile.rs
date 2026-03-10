@@ -144,8 +144,13 @@ impl TileBounds {
 pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     let n = 2_f64.powi(zoom as i32);
 
+    // Maximum valid tile coordinate at this zoom level
+    let max_coord = 2_u32.pow(zoom as u32).saturating_sub(1);
+
     // Convert longitude to tile x
+    // Clamp to valid range to handle lng=180° edge case (which would produce x=2^z)
     let x = ((lng + 180.0) / 360.0 * n).floor() as u32;
+    let x = x.min(max_coord);
 
     // Clamp latitude to Web Mercator bounds to prevent tile coordinate overflow.
     // Web Mercator is defined for ~±85.0511° but we use ±85.05° for safety margin.
@@ -153,8 +158,10 @@ pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     let lat = lat.clamp(-85.05, 85.05);
 
     // Convert latitude to tile y (Web Mercator)
+    // Clamp to valid range for the same edge case reasons
     let lat_rad = lat.to_radians();
     let y = ((1.0 - lat_rad.tan().asinh() / PI) / 2.0 * n).floor() as u32;
+    let y = y.min(max_coord);
 
     TileCoord::new(x, y, zoom)
 }
@@ -509,5 +516,61 @@ mod tests {
             x_coords.len(),
             x_coords
         );
+    }
+
+    #[test]
+    fn test_lng_lat_to_tile_boundary_clamping() {
+        // Test that lng=180 and lat=-85.05 don't produce out-of-bounds tile coordinates
+        // This was a bug: lng=180 at zoom 0 produced x=1, but only x=0 is valid at zoom 0
+
+        // At zoom 0, only tile (0,0,0) exists
+        let tile = lng_lat_to_tile(180.0, 0.0, 0);
+        assert_eq!(tile.x, 0, "lng=180 at zoom 0 should clamp to x=0");
+        assert_eq!(tile.y, 0, "lat=0 at zoom 0 should be y=0");
+
+        let tile = lng_lat_to_tile(180.0, -85.05, 0);
+        assert_eq!(tile.x, 0, "lng=180 at zoom 0 should clamp to x=0");
+        assert_eq!(tile.y, 0, "lat=-85.05 at zoom 0 should clamp to y=0");
+
+        // At zoom 1, only x in [0,1] and y in [0,1] are valid
+        let tile = lng_lat_to_tile(180.0, 0.0, 1);
+        assert!(tile.x <= 1, "lng=180 at zoom 1 should have x <= 1");
+
+        // Test various edge cases
+        for zoom in 0..=10 {
+            let max_valid = 2_u32.pow(zoom as u32) - 1;
+
+            let tile_pos180 = lng_lat_to_tile(180.0, 0.0, zoom);
+            assert!(
+                tile_pos180.x <= max_valid,
+                "lng=180 at zoom {} should have x <= {}, got {}",
+                zoom,
+                max_valid,
+                tile_pos180.x
+            );
+
+            let tile_neg180 = lng_lat_to_tile(-180.0, 0.0, zoom);
+            assert_eq!(
+                tile_neg180.x, 0,
+                "lng=-180 at zoom {} should have x = 0",
+                zoom
+            );
+
+            let tile_north_pole = lng_lat_to_tile(0.0, 85.05, zoom);
+            assert!(
+                tile_north_pole.y <= max_valid,
+                "lat=85.05 at zoom {} should have y <= {}",
+                zoom,
+                max_valid
+            );
+
+            let tile_south_pole = lng_lat_to_tile(0.0, -85.05, zoom);
+            assert!(
+                tile_south_pole.y <= max_valid,
+                "lat=-85.05 at zoom {} should have y <= {}",
+                zoom,
+                max_valid
+            );
+        }
     }
 }
