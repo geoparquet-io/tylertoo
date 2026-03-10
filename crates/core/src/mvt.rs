@@ -749,6 +749,101 @@ impl LayerBuilder {
         self.features.push(feature);
     }
 
+    /// Add a feature from WorldClippedGeometry directly.
+    ///
+    /// This method encodes WorldCoord geometries directly without going through
+    /// geo::Geometry, avoiding floating-point conversions.
+    ///
+    /// # Arguments
+    /// * `id` - Optional feature ID
+    /// * `geometry` - The WorldClippedGeometry to encode
+    /// * `properties` - Feature properties as key-value pairs
+    /// * `tile` - The tile coordinates for the geometry
+    pub fn add_feature_world(
+        &mut self,
+        id: Option<u64>,
+        geometry: &crate::hierarchical_clip::WorldClippedGeometry,
+        properties: &[(String, PropertyValue)],
+        tile: &TileCoord,
+    ) {
+        use crate::hierarchical_clip::WorldClippedGeometry;
+
+        let (geom_commands, geom_type) = match geometry {
+            WorldClippedGeometry::Point(p) => {
+                let cmds = encode_world_points(&[*p], tile, self.extent);
+                (cmds, GeomType::Point)
+            }
+            WorldClippedGeometry::LineString(coords) => {
+                let cmds = encode_world_linestring(coords, tile, self.extent);
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Linestring)
+                }
+            }
+            WorldClippedGeometry::Polygon {
+                exterior,
+                interiors,
+            } => {
+                let cmds = encode_world_polygon(exterior, interiors, tile, self.extent);
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Polygon)
+                }
+            }
+            WorldClippedGeometry::MultiPoint(points) => {
+                let cmds = encode_world_points(points, tile, self.extent);
+                (cmds, GeomType::Point)
+            }
+            WorldClippedGeometry::MultiLineString(lines) => {
+                let mut cmds = Vec::new();
+                for line in lines {
+                    cmds.extend(encode_world_linestring(line, tile, self.extent));
+                }
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Linestring)
+                }
+            }
+            WorldClippedGeometry::MultiPolygon(polys) => {
+                let mut cmds = Vec::new();
+                for (ext, ints) in polys {
+                    cmds.extend(encode_world_polygon(ext, ints, tile, self.extent));
+                }
+                if cmds.is_empty() {
+                    (vec![], GeomType::Unknown)
+                } else {
+                    (cmds, GeomType::Polygon)
+                }
+            }
+        };
+
+        // Skip empty geometries
+        if geom_commands.is_empty() && geom_type == GeomType::Unknown {
+            return;
+        }
+
+        // Encode tags as [key_idx, value_idx, key_idx, value_idx, ...]
+        let mut tags = Vec::with_capacity(properties.len() * 2);
+        for (key, value) in properties {
+            let key_idx = self.get_or_insert_key(key);
+            let value_idx = self.get_or_insert_value(value);
+            tags.push(key_idx);
+            tags.push(value_idx);
+        }
+
+        let feature = Feature {
+            id,
+            tags,
+            r#type: Some(geom_type as i32),
+            geometry: geom_commands,
+        };
+
+        self.features.push(feature);
+    }
+
     /// Build the MVT Layer.
     pub fn build(self) -> Layer {
         Layer {

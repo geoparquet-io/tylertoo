@@ -279,6 +279,182 @@ pub enum WorldClippedGeometry {
     MultiPolygon(Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)>),
 }
 
+impl WorldClippedGeometry {
+    /// Serialize to bytes for external sorting.
+    ///
+    /// Format: type byte + geometry-specific data
+    /// - Point: type(1) + x(4) + y(4) = 9 bytes
+    /// - LineString: type(1) + len(4) + coords(8*len)
+    /// - Polygon: type(1) + ext_len(4) + ext_coords + num_holes(4) + [hole_len + hole_coords]*
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        match self {
+            WorldClippedGeometry::Point(p) => {
+                buf.push(0);
+                buf.extend_from_slice(&p.x.to_le_bytes());
+                buf.extend_from_slice(&p.y.to_le_bytes());
+            }
+            WorldClippedGeometry::LineString(coords) => {
+                buf.push(1);
+                buf.extend_from_slice(&(coords.len() as u32).to_le_bytes());
+                for c in coords {
+                    buf.extend_from_slice(&c.x.to_le_bytes());
+                    buf.extend_from_slice(&c.y.to_le_bytes());
+                }
+            }
+            WorldClippedGeometry::Polygon {
+                exterior,
+                interiors,
+            } => {
+                buf.push(2);
+                buf.extend_from_slice(&(exterior.len() as u32).to_le_bytes());
+                for c in exterior {
+                    buf.extend_from_slice(&c.x.to_le_bytes());
+                    buf.extend_from_slice(&c.y.to_le_bytes());
+                }
+                buf.extend_from_slice(&(interiors.len() as u32).to_le_bytes());
+                for hole in interiors {
+                    buf.extend_from_slice(&(hole.len() as u32).to_le_bytes());
+                    for c in hole {
+                        buf.extend_from_slice(&c.x.to_le_bytes());
+                        buf.extend_from_slice(&c.y.to_le_bytes());
+                    }
+                }
+            }
+            WorldClippedGeometry::MultiPoint(points) => {
+                buf.push(3);
+                buf.extend_from_slice(&(points.len() as u32).to_le_bytes());
+                for p in points {
+                    buf.extend_from_slice(&p.x.to_le_bytes());
+                    buf.extend_from_slice(&p.y.to_le_bytes());
+                }
+            }
+            WorldClippedGeometry::MultiLineString(lines) => {
+                buf.push(4);
+                buf.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+                for line in lines {
+                    buf.extend_from_slice(&(line.len() as u32).to_le_bytes());
+                    for c in line {
+                        buf.extend_from_slice(&c.x.to_le_bytes());
+                        buf.extend_from_slice(&c.y.to_le_bytes());
+                    }
+                }
+            }
+            WorldClippedGeometry::MultiPolygon(polys) => {
+                buf.push(5);
+                buf.extend_from_slice(&(polys.len() as u32).to_le_bytes());
+                for (exterior, interiors) in polys {
+                    buf.extend_from_slice(&(exterior.len() as u32).to_le_bytes());
+                    for c in exterior {
+                        buf.extend_from_slice(&c.x.to_le_bytes());
+                        buf.extend_from_slice(&c.y.to_le_bytes());
+                    }
+                    buf.extend_from_slice(&(interiors.len() as u32).to_le_bytes());
+                    for hole in interiors {
+                        buf.extend_from_slice(&(hole.len() as u32).to_le_bytes());
+                        for c in hole {
+                            buf.extend_from_slice(&c.x.to_le_bytes());
+                            buf.extend_from_slice(&c.y.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+        let mut pos = 0;
+
+        let read_u32 = |pos: &mut usize| -> Option<u32> {
+            if *pos + 4 > data.len() {
+                return None;
+            }
+            let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
+            *pos += 4;
+            Some(val)
+        };
+
+        let read_coord = |pos: &mut usize| -> Option<WorldCoord> {
+            let x = read_u32(pos)?;
+            let y = read_u32(pos)?;
+            Some(WorldCoord::new(x, y))
+        };
+
+        let read_ring = |pos: &mut usize| -> Option<Vec<WorldCoord>> {
+            let len = read_u32(pos)? as usize;
+            let mut coords = Vec::with_capacity(len);
+            for _ in 0..len {
+                coords.push(read_coord(pos)?);
+            }
+            Some(coords)
+        };
+
+        let geom_type = data[pos];
+        pos += 1;
+
+        match geom_type {
+            0 => {
+                // Point
+                let coord = read_coord(&mut pos)?;
+                Some(WorldClippedGeometry::Point(coord))
+            }
+            1 => {
+                // LineString
+                let coords = read_ring(&mut pos)?;
+                Some(WorldClippedGeometry::LineString(coords))
+            }
+            2 => {
+                // Polygon
+                let exterior = read_ring(&mut pos)?;
+                let num_holes = read_u32(&mut pos)? as usize;
+                let mut interiors = Vec::with_capacity(num_holes);
+                for _ in 0..num_holes {
+                    interiors.push(read_ring(&mut pos)?);
+                }
+                Some(WorldClippedGeometry::Polygon {
+                    exterior,
+                    interiors,
+                })
+            }
+            3 => {
+                // MultiPoint
+                let points = read_ring(&mut pos)?;
+                Some(WorldClippedGeometry::MultiPoint(points))
+            }
+            4 => {
+                // MultiLineString
+                let num_lines = read_u32(&mut pos)? as usize;
+                let mut lines = Vec::with_capacity(num_lines);
+                for _ in 0..num_lines {
+                    lines.push(read_ring(&mut pos)?);
+                }
+                Some(WorldClippedGeometry::MultiLineString(lines))
+            }
+            5 => {
+                // MultiPolygon
+                let num_polys = read_u32(&mut pos)? as usize;
+                let mut polys = Vec::with_capacity(num_polys);
+                for _ in 0..num_polys {
+                    let exterior = read_ring(&mut pos)?;
+                    let num_holes = read_u32(&mut pos)? as usize;
+                    let mut interiors = Vec::with_capacity(num_holes);
+                    for _ in 0..num_holes {
+                        interiors.push(read_ring(&mut pos)?);
+                    }
+                    polys.push((exterior, interiors));
+                }
+                Some(WorldClippedGeometry::MultiPolygon(polys))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Convert a geo::Geometry<f64> to WorldCoord representation.
 ///
 /// This is the entry point for the Phase 2 pipeline - convert once at the start,
@@ -332,7 +508,7 @@ fn geometry_to_world(geom: &Geometry<f64>) -> Option<WorldClippedGeometry> {
         Geometry::MultiPolygon(mp) => {
             let polys: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = mp
                 .iter()
-                .map(|poly| polygon_to_world_rings(poly))
+                .map(polygon_to_world_rings)
                 .filter(|(ext, _)| !ext.is_empty())
                 .collect();
             if polys.is_empty() {
