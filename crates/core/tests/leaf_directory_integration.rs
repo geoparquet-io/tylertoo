@@ -4,7 +4,6 @@
 //! structured with leaf directories to fit in the initial 16KB HTTP range request.
 
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
@@ -155,7 +154,7 @@ fn test_root_directory_always_fits_in_16kb() {
         let _ = fs::remove_file(output_path);
         writer.finalize(output_path).unwrap();
 
-        let (root_dir_length, leaf_dirs_offset, leaf_dirs_length) =
+        let (root_dir_length, _leaf_dirs_offset, leaf_dirs_length) =
             read_pmtiles_header(output_path);
 
         eprintln!(
