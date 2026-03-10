@@ -101,6 +101,47 @@ Python API now has full feature parity with CLI.
 [0.2.0]: https://github.com/geoparquet-io/gpq-tiles/releases/tag/v0.2.0
 [0.1.0]: https://github.com/geoparquet-io/gpq-tiles/releases/tag/v0.1.0
 
+## v0.5.0 (2026-03-10)
+
+### Feat
+
+- **core**: wire up pipeline to use WorldCoord throughout (Phase 2)
+- **core**: add WorldCoord-based hierarchical clipping (Phase 2)
+- **core**: add WorldCoord-based feature drop functions (Phase 2)
+- **core**: add WorldCoord support to MVT encoding and validation (Phase 1)
+- **core**: add WorldCoord support to clipping modules (Phase 1)
+- **core**: add WorldCoord-based simplification functions (Phase 1)
+- **core**: add WorldCoord type for 32-bit integer coordinates (Phase 0)
+- **clip**: integrate wagyu-rs for robust polygon clipping
+- add --deterministic flag and fix PR #63 review feedback
+
+### Fix
+
+- **clip**: enable U-shape split test with wagyu-rs v0.2.1
+- **clip**: add wagyu fallback for edge case geometry handling (#94)
+- change default compression to gzip and add CRS validation
+- change default compression to gzip for compatibility
+- implement leaf directory support for large PMTiles archives
+- **core**: clamp tile coordinates and bounds to valid ranges
+- **core**: fix issue #83 - geometry coordinates collapsing to zeros
+- resolve clippy warnings in tests
+- **core**: align feature_drop coordinate precision with MVT encoding
+- **ci**: download fixtures from release instead of LFS
+- **ci**: remove 1.8GB fixture from LFS to fix bandwidth quota
+- Remove unused MIN_EXPECTED_TILES constant
+- Remove #[ignore] from regression tests - fixture is in LFS
+- use is_empty() instead of len() > 0 for Clippy
+- Fix clippy warning and add clipping benchmarks
+- **tile**: clamp latitude to Web Mercator bounds
+- use wagyu-rs from crates.io instead of path dependency
+- **ci**: update benchmark group names after consolidation
+
+### Perf
+
+- Add pre-clip bounding box filter for large geometries
+- Implement hierarchical clipping across zoom levels
+- Replace Wagyu with Sutherland-Hodgman for tile clipping
+
 ## v0.4.0 (2026-02-25)
 
 ### Feat
