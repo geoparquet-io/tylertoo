@@ -19,7 +19,8 @@
 //! Geographic Coords → Transform to tile coords → Simplify (pixels) → Encode
 //! ```
 
-use crate::tile::TileBounds;
+use crate::tile::{TileBounds, TileCoord};
+use crate::world_coord::{WorldCoord, WORLD_SCALE};
 use geo::{Coord, Geometry, LineString, MultiLineString, MultiPolygon, Point, Polygon, Simplify};
 
 /// Default pixel tolerance for simplification (matches tippecanoe)
@@ -279,6 +280,212 @@ pub fn simplify_in_tile_coords(
         // GeometryCollection and other types pass through unchanged
         other => other.clone(),
     }
+}
+
+// ============================================================================
+// WorldCoord-based Simplification (Phase 1: integer coordinate migration)
+// ============================================================================
+//
+// These functions provide simplification through the WorldCoord integer
+// coordinate system, matching tippecanoe's internal representation.
+//
+// The pipeline is:
+//   WorldCoord → tile-local f64 → RDP simplify → tile-local f64 → WorldCoord
+//
+// This is preferred over the geographic coordinate path because:
+// 1. Web Mercator projection is applied once (in lng_lat_to_world)
+// 2. Tile-local conversion from WorldCoord is a simple linear operation
+// 3. Simplification is automatically latitude-independent (projection is baked in)
+// ============================================================================
+
+/// Convert a WorldCoord to tile-local f64 coordinates for RDP simplification.
+///
+/// This is the WorldCoord equivalent of [`geo_to_tile_coords_f64`]. The key
+/// difference is that WorldCoord already has Web Mercator projection baked in,
+/// so the conversion is a simple linear transformation.
+///
+/// # Arguments
+/// * `coord` - World coordinate
+/// * `tile` - The tile to project into
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// (x, y) in tile-local coordinates as f64 for precision during simplification
+#[inline]
+fn world_to_tile_local_f64(coord: WorldCoord, tile: &TileCoord, extent: u32) -> (f64, f64) {
+    let extent_f = extent as f64;
+
+    if tile.z == 0 {
+        // At zoom 0, the entire world is one tile
+        let x = (coord.x as f64) / (WORLD_SCALE as f64) * extent_f;
+        let y = (coord.y as f64) / (WORLD_SCALE as f64) * extent_f;
+        return (x, y);
+    }
+
+    let shift = 32 - tile.z as u32;
+    let tile_size = 1_u64 << shift;
+
+    // World position of tile's top-left corner
+    let tile_x = (tile.x as u64) << shift;
+    let tile_y = (tile.y as u64) << shift;
+
+    // Position within tile, scaled to extent (f64 for RDP precision)
+    let x = (coord.x as f64 - tile_x as f64) / tile_size as f64 * extent_f;
+    let y = (coord.y as f64 - tile_y as f64) / tile_size as f64 * extent_f;
+
+    (x, y)
+}
+
+/// Convert tile-local f64 coordinates back to WorldCoord.
+///
+/// This is the inverse of [`world_to_tile_local_f64`].
+///
+/// # Arguments
+/// * `x` - X coordinate in tile-local space
+/// * `y` - Y coordinate in tile-local space
+/// * `tile` - The tile the coordinates are relative to
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// WorldCoord in global space
+#[inline]
+fn tile_local_f64_to_world(x: f64, y: f64, tile: &TileCoord, extent: u32) -> WorldCoord {
+    let extent_f = extent as f64;
+
+    if tile.z == 0 {
+        let world_x = (x / extent_f * WORLD_SCALE as f64) as u32;
+        let world_y = (y / extent_f * WORLD_SCALE as f64) as u32;
+        return WorldCoord::new(world_x, world_y);
+    }
+
+    let shift = 32 - tile.z as u32;
+    let tile_size = 1_u64 << shift;
+
+    // World position of tile's top-left corner
+    let tile_world_x = (tile.x as u64) << shift;
+    let tile_world_y = (tile.y as u64) << shift;
+
+    // Convert local f64 to world coordinates
+    let world_x = (tile_world_x as f64 + x / extent_f * tile_size as f64) as u32;
+    let world_y = (tile_world_y as f64 + y / extent_f * tile_size as f64) as u32;
+
+    WorldCoord::new(world_x, world_y)
+}
+
+/// Transform a slice of WorldCoords to a tile-local LineString<f64> for simplification.
+fn world_coords_to_tile_linestring(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+) -> LineString<f64> {
+    let points: Vec<Coord<f64>> = coords
+        .iter()
+        .map(|wc| {
+            let (x, y) = world_to_tile_local_f64(*wc, tile, extent);
+            Coord { x, y }
+        })
+        .collect();
+    LineString::new(points)
+}
+
+/// Transform a tile-local LineString<f64> back to WorldCoords.
+fn tile_linestring_to_world_coords(
+    ls: &LineString<f64>,
+    tile: &TileCoord,
+    extent: u32,
+) -> Vec<WorldCoord> {
+    ls.coords()
+        .map(|c| tile_local_f64_to_world(c.x, c.y, tile, extent))
+        .collect()
+}
+
+/// Simplify a polyline given as WorldCoords using Douglas-Peucker in tile-local space.
+///
+/// This is the primary WorldCoord simplification function. It:
+/// 1. Converts WorldCoords to tile-local f64 coordinates
+/// 2. Applies RDP simplification with the given pixel tolerance
+/// 3. Converts back to WorldCoords
+///
+/// # Arguments
+/// * `coords` - Polyline vertices in world coordinates
+/// * `tile` - The tile context for coordinate transformation
+/// * `extent` - Tile extent (typically 4096)
+/// * `pixel_tolerance` - Simplification tolerance in pixels (typically 1.0)
+///
+/// # Returns
+/// Simplified polyline as a Vec of WorldCoords.
+/// Returns the input unchanged if fewer than 2 points.
+pub fn simplify_world_linestring(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> Vec<WorldCoord> {
+    if coords.len() < 2 {
+        return coords.to_vec();
+    }
+
+    // Transform to tile-local f64
+    let tile_ls = world_coords_to_tile_linestring(coords, tile, extent);
+
+    // Apply RDP simplification in tile pixel space
+    let simplified = tile_ls.simplify(pixel_tolerance);
+
+    // Transform back to WorldCoords
+    tile_linestring_to_world_coords(&simplified, tile, extent)
+}
+
+/// Simplify a polygon ring (exterior or interior) given as WorldCoords.
+///
+/// Same as [`simplify_world_linestring`] but ensures the ring is closed
+/// (first == last point) after simplification.
+pub fn simplify_world_ring(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> Vec<WorldCoord> {
+    if coords.len() < 4 {
+        // A valid ring needs at least 4 points (3 unique + closing)
+        return coords.to_vec();
+    }
+
+    let tile_ls = world_coords_to_tile_linestring(coords, tile, extent);
+    let simplified = tile_ls.simplify(pixel_tolerance);
+    let mut result = tile_linestring_to_world_coords(&simplified, tile, extent);
+
+    // Ensure the ring is closed
+    if result.len() >= 2 && result.first() != result.last() {
+        result.push(result[0]);
+    }
+
+    result
+}
+
+/// Get the simplified vertex count for a WorldCoord polyline without
+/// materializing the result. Useful for feature dropping decisions.
+///
+/// # Arguments
+/// * `coords` - Polyline vertices in world coordinates
+/// * `tile` - The tile context for coordinate transformation
+/// * `extent` - Tile extent (typically 4096)
+/// * `pixel_tolerance` - Simplification tolerance in pixels
+///
+/// # Returns
+/// Number of vertices after simplification
+pub fn world_simplified_vertex_count(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> usize {
+    if coords.len() < 2 {
+        return coords.len();
+    }
+
+    let tile_ls = world_coords_to_tile_linestring(coords, tile, extent);
+    let simplified = tile_ls.simplify(pixel_tolerance);
+    simplified.coords().count()
 }
 
 /// Simplify geometry in tile-local coordinates, returning tile coordinates.
@@ -664,5 +871,485 @@ mod tests {
             matches!(simplified, Geometry::LineString(_)),
             "Should return a LineString geometry"
         );
+    }
+
+    // ========================================================================
+    // WorldCoord-based Simplification Tests (Phase 1)
+    // ========================================================================
+
+    mod world_coord_tests {
+        use super::*;
+        use crate::tile::TileCoord;
+        use crate::world_coord::{lng_lat_to_world, WorldCoord, WORLD_HALF};
+
+        // ---- Coordinate conversion round-trip tests ----
+
+        #[test]
+        fn test_world_to_tile_local_f64_round_trip() {
+            // A point at the center of a tile should round-trip through f64 conversion
+            let tile = TileCoord::new(100, 200, 10);
+            let extent = 4096u32;
+
+            // Create a world coordinate near the center of this tile
+            let shift = 32 - 10u32;
+            let tile_origin_x = (100u64) << shift;
+            let tile_origin_y = (200u64) << shift;
+            let tile_size = 1u64 << shift;
+            let center_x = (tile_origin_x + tile_size / 2) as u32;
+            let center_y = (tile_origin_y + tile_size / 2) as u32;
+            let original = WorldCoord::new(center_x, center_y);
+
+            // Convert to tile-local f64
+            let (local_x, local_y) = world_to_tile_local_f64(original, &tile, extent);
+
+            // Should be near center of tile (extent/2)
+            assert!(
+                (local_x - 2048.0).abs() < 1.0,
+                "Expected local_x near 2048, got {}",
+                local_x
+            );
+            assert!(
+                (local_y - 2048.0).abs() < 1.0,
+                "Expected local_y near 2048, got {}",
+                local_y
+            );
+
+            // Convert back to WorldCoord
+            let recovered = tile_local_f64_to_world(local_x, local_y, &tile, extent);
+
+            // Should be very close to original (within rounding)
+            let dx = (original.x as i64 - recovered.x as i64).unsigned_abs();
+            let dy = (original.y as i64 - recovered.y as i64).unsigned_abs();
+            // Allow tolerance of tile_size/extent (~1 world unit per pixel at this zoom)
+            let max_error = (tile_size / extent as u64) + 1;
+            assert!(
+                dx <= max_error,
+                "X round-trip error too large: {} (max {})",
+                dx,
+                max_error
+            );
+            assert!(
+                dy <= max_error,
+                "Y round-trip error too large: {} (max {})",
+                dy,
+                max_error
+            );
+        }
+
+        #[test]
+        fn test_world_to_tile_local_f64_zoom_0() {
+            let tile = TileCoord::new(0, 0, 0);
+            let extent = 4096u32;
+
+            // Null Island (center of world) at zoom 0
+            let center = WorldCoord::new(WORLD_HALF, WORLD_HALF);
+            let (lx, ly) = world_to_tile_local_f64(center, &tile, extent);
+
+            assert!(
+                (lx - 2048.0).abs() < 1.0,
+                "Center of world at z0 should be at extent/2, got {}",
+                lx
+            );
+            assert!(
+                (ly - 2048.0).abs() < 1.0,
+                "Center of world at z0 should be at extent/2, got {}",
+                ly
+            );
+
+            // Northwest corner of world
+            let nw = WorldCoord::new(0, 0);
+            let (lx, ly) = world_to_tile_local_f64(nw, &tile, extent);
+            assert!(
+                lx.abs() < 1.0,
+                "NW corner at z0 should be near x=0, got {}",
+                lx
+            );
+            assert!(
+                ly.abs() < 1.0,
+                "NW corner at z0 should be near y=0, got {}",
+                ly
+            );
+        }
+
+        #[test]
+        fn test_tile_local_f64_to_world_zoom_0() {
+            let tile = TileCoord::new(0, 0, 0);
+            let extent = 4096u32;
+
+            // Center of zoom 0 tile
+            let wc = tile_local_f64_to_world(2048.0, 2048.0, &tile, extent);
+            // Should be near WORLD_HALF for both x and y
+            let half = WORLD_HALF as i64;
+            assert!(
+                (wc.x as i64 - half).unsigned_abs() < 1_000_000,
+                "x should be near WORLD_HALF, got {}",
+                wc.x
+            );
+            assert!(
+                (wc.y as i64 - half).unsigned_abs() < 1_000_000,
+                "y should be near WORLD_HALF, got {}",
+                wc.y
+            );
+        }
+
+        // ---- Simplification tests ----
+
+        #[test]
+        fn test_simplify_world_linestring_reduces_vertices() {
+            // Create a line with 100 points that has small oscillations.
+            // The points trace a roughly straight path from left to right across
+            // the tile, with tiny vertical deviations (< 1 pixel) that RDP should
+            // collapse at 1px tolerance.
+            let tile = TileCoord::new(16, 16, 5);
+            let extent = 4096u32;
+            let shift = 32 - 5u32;
+            let tile_origin_x = (16u64) << shift;
+            let tile_origin_y = (16u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            // World units per pixel at this zoom+extent
+            let world_per_pixel = tile_size / extent as u64;
+
+            // Create 100 points with sub-pixel oscillation (0.3 pixels)
+            let coords: Vec<WorldCoord> = (0..100)
+                .map(|i| {
+                    let x = tile_origin_x + (i as u64 * tile_size / 99);
+                    let y_base = tile_origin_y + tile_size / 2;
+                    // Oscillation of 0.3 pixels - below the 1px tolerance
+                    let osc = ((i as f64 * 0.1).sin() * 0.3 * world_per_pixel as f64) as i64;
+                    WorldCoord::new(x as u32, (y_base as i64 + osc) as u32)
+                })
+                .collect();
+
+            let simplified = simplify_world_linestring(&coords, &tile, extent, 1.0);
+
+            assert!(
+                simplified.len() < coords.len(),
+                "Expected fewer vertices after simplification: got {}, original {}",
+                simplified.len(),
+                coords.len()
+            );
+            assert!(
+                simplified.len() >= 2,
+                "Simplified line should have at least 2 points"
+            );
+        }
+
+        #[test]
+        fn test_simplify_world_linestring_preserves_short() {
+            // A line with fewer than 2 points should be returned unchanged
+            let tile = TileCoord::new(0, 0, 0);
+            let single = vec![WorldCoord::new(100, 200)];
+            let result = simplify_world_linestring(&single, &tile, 4096, 1.0);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0], single[0]);
+
+            let empty: Vec<WorldCoord> = vec![];
+            let result = simplify_world_linestring(&empty, &tile, 4096, 1.0);
+            assert_eq!(result.len(), 0);
+        }
+
+        #[test]
+        fn test_simplify_world_linestring_straight_line_collapses() {
+            // A perfectly straight line should simplify to just 2 points
+            let tile = TileCoord::new(16, 16, 5);
+            let extent = 4096u32;
+            let shift = 32 - 5u32;
+            let tile_origin_x = (16u64) << shift;
+            let tile_origin_y = (16u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            // 20 collinear points
+            let coords: Vec<WorldCoord> = (0..20)
+                .map(|i| {
+                    let x = tile_origin_x + (i as u64 * tile_size / 19);
+                    let y = tile_origin_y + tile_size / 2;
+                    WorldCoord::new(x as u32, y as u32)
+                })
+                .collect();
+
+            let simplified = simplify_world_linestring(&coords, &tile, extent, 1.0);
+            assert_eq!(
+                simplified.len(),
+                2,
+                "Straight line should simplify to 2 endpoints, got {}",
+                simplified.len()
+            );
+        }
+
+        #[test]
+        fn test_simplify_world_ring_stays_closed() {
+            // Create a simple ring (triangle) in world coordinates
+            let tile = TileCoord::new(16, 16, 5);
+            let extent = 4096u32;
+            let shift = 32 - 5u32;
+            let tile_origin_x = (16u64) << shift;
+            let tile_origin_y = (16u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            // Triangle ring with many intermediate points
+            let mut coords: Vec<WorldCoord> = Vec::new();
+            let cx = tile_origin_x + tile_size / 2;
+            let cy = tile_origin_y + tile_size / 2;
+            let radius = tile_size / 4;
+
+            // Create a circle approximation with 36 points
+            for i in 0..=36 {
+                let angle = (i as f64) * 2.0 * std::f64::consts::PI / 36.0;
+                let x = cx as f64 + radius as f64 * angle.cos();
+                let y = cy as f64 + radius as f64 * angle.sin();
+                coords.push(WorldCoord::new(x as u32, y as u32));
+            }
+
+            let simplified = simplify_world_ring(&coords, &tile, extent, 1.0);
+
+            // Ring should still be closed
+            assert!(
+                simplified.len() >= 4,
+                "Simplified ring should have at least 4 points (3 + closing), got {}",
+                simplified.len()
+            );
+            assert_eq!(
+                simplified.first(),
+                simplified.last(),
+                "Simplified ring should be closed (first == last)"
+            );
+        }
+
+        #[test]
+        fn test_world_simplified_vertex_count() {
+            // Verify vertex count matches actual simplification result
+            let tile = TileCoord::new(16, 16, 5);
+            let extent = 4096u32;
+            let shift = 32 - 5u32;
+            let tile_origin_x = (16u64) << shift;
+            let tile_origin_y = (16u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            // Create zigzag
+            let coords: Vec<WorldCoord> = (0..30)
+                .map(|i| {
+                    let x = tile_origin_x + (i as u64 * tile_size / 29);
+                    let y_base = tile_origin_y + tile_size / 2;
+                    let oscillation = if i % 2 == 0 { tile_size / 20 } else { 0 };
+                    WorldCoord::new(x as u32, (y_base + oscillation) as u32)
+                })
+                .collect();
+
+            let count = world_simplified_vertex_count(&coords, &tile, extent, 1.0);
+            let simplified = simplify_world_linestring(&coords, &tile, extent, 1.0);
+
+            assert_eq!(
+                count,
+                simplified.len(),
+                "Vertex count should match actual simplification result"
+            );
+        }
+
+        // ---- Consistency with f64 path tests ----
+
+        #[test]
+        fn test_world_path_matches_f64_path_for_equator() {
+            // For points near the equator, the WorldCoord path and the
+            // TileBounds-based f64 path should produce similar results.
+            //
+            // At the equator, the linear degree-to-pixel mapping and the
+            // Mercator-projected WorldCoord mapping are closest, so results
+            // should be nearly identical.
+            let tile = TileCoord::new(16, 16, 5); // Near equator
+            let bounds = tile.bounds();
+            let extent = 4096u32;
+
+            // Create a zigzag in geographic coordinates within the tile
+            let num_points = 30;
+            let width = bounds.lng_max - bounds.lng_min;
+            let height = bounds.lat_max - bounds.lat_min;
+            let center_lat = (bounds.lat_min + bounds.lat_max) / 2.0;
+            let start_lng = bounds.lng_min + width * 0.1;
+
+            let geo_coords: Vec<Coord<f64>> = (0..num_points)
+                .map(|i| {
+                    let x = start_lng + (i as f64 / (num_points - 1) as f64) * width * 0.8;
+                    let y = center_lat + (if i % 2 == 0 { 1.0 } else { -1.0 }) * height * 0.05;
+                    Coord { x, y }
+                })
+                .collect();
+
+            // Convert to WorldCoords
+            let world_coords: Vec<WorldCoord> = geo_coords
+                .iter()
+                .map(|c| lng_lat_to_world(c.x, c.y))
+                .collect();
+
+            // Simplify via f64 path (existing TileBounds-based)
+            let line = LineString::new(geo_coords);
+            let geom = Geometry::LineString(line);
+            let f64_simplified = simplify_to_tile_coords(&geom, &bounds, extent, 1.0);
+            let f64_count = if let Geometry::LineString(ls) = &f64_simplified {
+                ls.coords().count()
+            } else {
+                panic!("Expected LineString");
+            };
+
+            // Simplify via WorldCoord path
+            let world_simplified = simplify_world_linestring(&world_coords, &tile, extent, 1.0);
+
+            // At the equator, vertex counts should be very close
+            // (they may not be exactly equal due to slightly different projections
+            // in the TileBounds path vs WorldCoord Mercator path)
+            let diff = (f64_count as i32 - world_simplified.len() as i32).unsigned_abs();
+            assert!(
+                diff <= 3,
+                "WorldCoord and f64 paths should produce similar results near equator.\n\
+                 f64 path: {} vertices, WorldCoord path: {} vertices, diff: {}",
+                f64_count,
+                world_simplified.len(),
+                diff
+            );
+        }
+
+        #[test]
+        fn test_world_simplification_is_latitude_independent() {
+            // The key advantage of WorldCoord-based simplification:
+            // identical tile-relative patterns at different latitudes should
+            // simplify to the same vertex count because Web Mercator projection
+            // is already baked into WorldCoord.
+            let extent = 4096u32;
+            let zoom = 5u8;
+
+            // Get tiles at equator and at high latitude
+            let tile_equator = TileCoord::new(16, 16, zoom); // Near equator
+            let tile_arctic = TileCoord::new(16, 8, zoom); // Near 60N
+
+            // Create identical patterns in tile-local space, then convert to WorldCoord
+            fn make_zigzag_world(
+                tile: &TileCoord,
+                _extent: u32,
+                num_points: usize,
+            ) -> Vec<WorldCoord> {
+                let shift = 32 - tile.z as u32;
+                let tile_origin_x = (tile.x as u64) << shift;
+                let tile_origin_y = (tile.y as u64) << shift;
+                let tile_size = 1u64 << shift;
+
+                (0..num_points)
+                    .map(|i| {
+                        // Span 50% of tile width
+                        let x = tile_origin_x
+                            + tile_size / 4
+                            + (i as u64 * tile_size / 2 / (num_points as u64 - 1));
+                        // Center + 5% oscillation
+                        let y_base = tile_origin_y + tile_size / 2;
+                        let oscillation = if i % 2 == 0 {
+                            (tile_size / 20) as i64
+                        } else {
+                            -((tile_size / 20) as i64)
+                        };
+                        WorldCoord::new(x as u32, (y_base as i64 + oscillation) as u32)
+                    })
+                    .collect()
+            }
+
+            let coords_equator = make_zigzag_world(&tile_equator, extent, 50);
+            let coords_arctic = make_zigzag_world(&tile_arctic, extent, 50);
+
+            let simplified_equator =
+                simplify_world_linestring(&coords_equator, &tile_equator, extent, 1.0);
+            let simplified_arctic =
+                simplify_world_linestring(&coords_arctic, &tile_arctic, extent, 1.0);
+
+            // Both should produce the same vertex count because the patterns
+            // are identical in tile-local pixel space
+            assert_eq!(
+                simplified_equator.len(),
+                simplified_arctic.len(),
+                "WorldCoord simplification should be latitude-independent.\n\
+                 Equator: {} vertices, Arctic: {} vertices",
+                simplified_equator.len(),
+                simplified_arctic.len()
+            );
+        }
+
+        #[test]
+        fn test_world_tolerance_scales_with_zoom() {
+            // At higher zoom levels, tolerance is smaller in world coordinate space,
+            // which means more vertices should be preserved.
+            let extent = 4096u32;
+
+            // Create a line that spans a tile at zoom 5 with known oscillation
+            fn make_line_at_zoom(zoom: u8) -> (Vec<WorldCoord>, TileCoord) {
+                let tile = TileCoord::new(16, 16, zoom);
+                let shift = 32 - zoom as u32;
+                let tile_origin_x = (16u64) << shift;
+                let tile_origin_y = (16u64) << shift;
+                let tile_size = 1u64 << shift;
+
+                let coords: Vec<WorldCoord> = (0..50)
+                    .map(|i| {
+                        let x = tile_origin_x + (i as u64 * tile_size / 49);
+                        let y_base = tile_origin_y + tile_size / 2;
+                        // Oscillation of 2% of tile height (about 82 pixels)
+                        let oscillation = if i % 2 == 0 { tile_size / 50 } else { 0 };
+                        WorldCoord::new(x as u32, (y_base + oscillation) as u32)
+                    })
+                    .collect();
+                (coords, tile)
+            }
+
+            let (coords_z5, tile_z5) = make_line_at_zoom(5);
+            let (coords_z10, tile_z10) = make_line_at_zoom(10);
+
+            let count_z5 = world_simplified_vertex_count(&coords_z5, &tile_z5, extent, 1.0);
+            let count_z10 = world_simplified_vertex_count(&coords_z10, &tile_z10, extent, 1.0);
+
+            // Both should produce the same count because the oscillation
+            // is the same fraction of the tile (2%), so in pixel space
+            // the pattern is identical (about 82 pixels oscillation >> 1 pixel tolerance)
+            assert_eq!(
+                count_z5, count_z10,
+                "Same tile-relative pattern should simplify identically at any zoom.\n\
+                 z5: {} vertices, z10: {} vertices",
+                count_z5, count_z10
+            );
+        }
+
+        #[test]
+        fn test_world_to_tile_local_f64_consistency_with_integer_method() {
+            // The f64 tile-local conversion should be consistent with
+            // WorldCoord::to_tile_local() (the integer version)
+            let tile = TileCoord::new(1234, 5678, 14);
+            let extent = 4096u32;
+
+            // Test several points within the tile
+            let shift = 32 - 14u32;
+            let tile_origin_x = (1234u64) << shift;
+            let tile_origin_y = (5678u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            for frac in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+                let x = (tile_origin_x as f64 + frac * tile_size as f64) as u32;
+                let y = (tile_origin_y as f64 + frac * tile_size as f64) as u32;
+                let wc = WorldCoord::new(x, y);
+
+                let (f64_x, f64_y) = world_to_tile_local_f64(wc, &tile, extent);
+                let (i32_x, i32_y) = wc.to_tile_local(&tile, extent);
+
+                // The f64 version and i32 version should agree to within 1 pixel
+                assert!(
+                    (f64_x - i32_x as f64).abs() < 1.5,
+                    "f64 and i32 x disagree at frac={}: f64={}, i32={}",
+                    frac,
+                    f64_x,
+                    i32_x
+                );
+                assert!(
+                    (f64_y - i32_y as f64).abs() < 1.5,
+                    "f64 and i32 y disagree at frac={}: f64={}, i32={}",
+                    frac,
+                    f64_y,
+                    i32_y
+                );
+            }
+        }
     }
 }
