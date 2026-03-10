@@ -30,7 +30,8 @@
 //! Like `simplify.rs`, all calculations are done in tile-local pixel coordinates
 //! to ensure consistent behavior regardless of geographic location (latitude).
 
-use crate::tile::TileBounds;
+use crate::tile::{TileBounds, TileCoord};
+use crate::world_coord::WorldCoord;
 use geo::{Area, Coord, LineString, MultiLineString, MultiPoint, Point, Polygon};
 use std::hash::{Hash, Hasher};
 
@@ -658,6 +659,215 @@ pub fn density_drop_rate(zoom: u8, max_zoom: u8, features_per_cell: usize) -> f6
     let expected_per_cell = density_factor * (features_per_cell as f64);
     let keep_rate = (features_per_cell as f64) / expected_per_cell;
     1.0 - keep_rate
+}
+
+// =============================================================================
+// WORLDCOORD-NATIVE FEATURE DROPPING (Issue #85 - Integer Coordinate Migration)
+// =============================================================================
+
+/// Calculate the area of a ring using the shoelace formula with i64 arithmetic.
+///
+/// Returns the **signed** area in world coordinate units squared. Positive for
+/// counter-clockwise (exterior) rings, negative for clockwise (interior) rings.
+///
+/// # Algorithm
+///
+/// Uses the shoelace formula: `2A = Σ(x_i * y_{i+1} - x_{i+1} * y_i)`
+///
+/// We use i64 for the accumulator because:
+/// - Each `x * y` product can be up to `u32::MAX * u32::MAX ≈ 2^64`
+/// - But since we're computing differences, they fit in i64
+/// - The sum of up to millions of such differences still fits in i64
+///
+/// # Arguments
+/// * `coords` - The ring coordinates (first and last should be the same for closed rings)
+///
+/// # Returns
+/// Signed area * 2 (to avoid division). Divide by 2 for actual area.
+pub fn world_ring_area(coords: &[WorldCoord]) -> i64 {
+    if coords.len() < 3 {
+        return 0;
+    }
+
+    let mut sum: i64 = 0;
+    for i in 0..coords.len() - 1 {
+        let c0 = &coords[i];
+        let c1 = &coords[i + 1];
+        // Cross product: x0 * y1 - x1 * y0
+        // Using i64 to handle the full range of u32 * u32
+        sum += (c0.x as i64) * (c1.y as i64) - (c1.x as i64) * (c0.y as i64);
+    }
+
+    sum
+}
+
+/// Check if a polygon is too small to render at the given tile and zoom.
+///
+/// This is the WorldCoord-native equivalent of `should_drop_tiny_polygon`.
+/// It uses integer arithmetic throughout for precision and performance.
+///
+/// # Algorithm
+///
+/// 1. Calculate polygon area in world units using shoelace formula
+/// 2. Convert threshold from square pixels to square world units
+/// 3. Compare: if area < threshold, the polygon may be dropped
+///
+/// # Arguments
+/// * `exterior` - The exterior ring coordinates
+/// * `interiors` - Interior ring coordinates (holes)
+/// * `tile` - The tile being rendered
+/// * `extent` - Tile extent in pixels (typically 4096)
+/// * `threshold_pixels_sq` - Minimum area in square pixels (default: 4.0)
+///
+/// # Returns
+/// `true` if the polygon should be dropped, `false` if it should be kept.
+pub fn should_drop_tiny_polygon_world(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile: &TileCoord,
+    extent: u32,
+    threshold_pixels_sq: f64,
+) -> bool {
+    // Calculate exterior area (absolute value, as winding may vary)
+    let exterior_area = world_ring_area(exterior).unsigned_abs();
+
+    // Subtract interior (hole) areas
+    let mut total_area = exterior_area;
+    for interior in interiors {
+        let hole_area = world_ring_area(interior).unsigned_abs();
+        total_area = total_area.saturating_sub(hole_area);
+    }
+
+    // The shoelace formula returns 2 * area, so divide by 2
+    let area_world_units = total_area / 2;
+
+    // Zero area is always dropped
+    if area_world_units == 0 {
+        return true;
+    }
+
+    // Convert threshold from square pixels to square world units
+    // At zoom z, one pixel = 2^(32-z) / extent world units
+    // So one square pixel = (2^(32-z) / extent)^2 world units squared
+    let world_units_per_pixel = if tile.z == 0 {
+        (1_u64 << 32) / extent as u64
+    } else {
+        (1_u64 << (32 - tile.z as u32)) / extent as u64
+    };
+
+    // Square pixels → square world units
+    // Use u128 for intermediate to avoid overflow
+    let world_units_per_pixel_sq =
+        (world_units_per_pixel as u128) * (world_units_per_pixel as u128);
+    let threshold_world_sq = (threshold_pixels_sq * world_units_per_pixel_sq as f64) as u128;
+
+    // Compare area to threshold
+    if (area_world_units as u128) >= threshold_world_sq {
+        return false; // Large enough, keep
+    }
+
+    // Diffuse probability dropping for small polygons
+    let keep_probability = (area_world_units as f64) / (threshold_world_sq as f64);
+
+    // Deterministic hash based on coordinates
+    let hash = world_coords_hash(exterior);
+    let hash_normalized = (hash as f64) / (u64::MAX as f64);
+
+    hash_normalized >= keep_probability
+}
+
+/// Calculate the length of a linestring in world units.
+///
+/// Uses integer arithmetic for exact computation.
+///
+/// # Arguments
+/// * `coords` - The linestring coordinates
+///
+/// # Returns
+/// The length in world units (not squared).
+pub fn world_linestring_length(coords: &[WorldCoord]) -> u64 {
+    if coords.len() < 2 {
+        return 0;
+    }
+
+    let mut total_length: u64 = 0;
+    for i in 0..coords.len() - 1 {
+        let c0 = &coords[i];
+        let c1 = &coords[i + 1];
+
+        // Calculate distance using integer arithmetic
+        // dx and dy can be negative, so use i64
+        let dx = (c1.x as i64) - (c0.x as i64);
+        let dy = (c1.y as i64) - (c0.y as i64);
+
+        // Euclidean distance: sqrt(dx^2 + dy^2)
+        // Use f64 for sqrt, convert back to u64
+        let dist_sq = (dx * dx + dy * dy) as f64;
+        total_length += dist_sq.sqrt() as u64;
+    }
+
+    total_length
+}
+
+/// Check if a linestring is too short to render at the given tile.
+///
+/// This is the WorldCoord-native equivalent of `should_drop_tiny_line`.
+/// A line is considered "tiny" if its total length is less than the threshold
+/// when measured in pixels.
+///
+/// # Arguments
+/// * `coords` - The linestring coordinates
+/// * `tile` - The tile being rendered
+/// * `extent` - Tile extent in pixels (typically 4096)
+/// * `threshold_pixels` - Minimum length in pixels (default: 1.0)
+///
+/// # Returns
+/// `true` if the line should be dropped, `false` if it should be kept.
+pub fn should_drop_tiny_line_world(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    threshold_pixels: f64,
+) -> bool {
+    // Empty or single-point lines should be dropped
+    if coords.len() < 2 {
+        return true;
+    }
+
+    // Calculate length in world units
+    let length_world = world_linestring_length(coords);
+
+    // Zero length is always dropped
+    if length_world == 0 {
+        return true;
+    }
+
+    // Convert threshold from pixels to world units
+    // At zoom z, one pixel = 2^(32-z) / extent world units
+    let world_units_per_pixel = if tile.z == 0 {
+        (1_u64 << 32) / extent as u64
+    } else {
+        (1_u64 << (32 - tile.z as u32)) / extent as u64
+    };
+
+    let threshold_world = (threshold_pixels * world_units_per_pixel as f64) as u64;
+
+    // Drop if shorter than threshold
+    length_world < threshold_world
+}
+
+/// Deterministic hash for WorldCoord arrays.
+///
+/// Used for consistent probabilistic dropping decisions.
+fn world_coords_hash(coords: &[WorldCoord]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+
+    let mut hasher = DefaultHasher::new();
+    for coord in coords {
+        coord.x.hash(&mut hasher);
+        coord.y.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -1943,5 +2153,336 @@ mod tests {
                 );
             }
         }
+    }
+
+    // =========================================================================
+    // WORLDCOORD-NATIVE TESTS (Issue #85)
+    // =========================================================================
+
+    use crate::world_coord::WorldCoord;
+
+    /// Helper to create a square ring of WorldCoords centered at a position.
+    /// Returns coordinates in counter-clockwise order (positive area).
+    fn world_square_ring(center_x: u32, center_y: u32, half_side: u32) -> Vec<WorldCoord> {
+        vec![
+            WorldCoord::new(center_x - half_side, center_y - half_side), // top-left
+            WorldCoord::new(center_x - half_side, center_y + half_side), // bottom-left
+            WorldCoord::new(center_x + half_side, center_y + half_side), // bottom-right
+            WorldCoord::new(center_x + half_side, center_y - half_side), // top-right
+            WorldCoord::new(center_x - half_side, center_y - half_side), // close ring
+        ]
+    }
+
+    // -------------------------------------------------------------------------
+    // world_ring_area tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_world_ring_area_unit_square() {
+        // A 2x2 square (half_side = 1) should have area 4 world units
+        // Shoelace returns 2*area, so we expect 8
+        let ring = world_square_ring(100, 100, 1);
+        let area = world_ring_area(&ring);
+        assert_eq!(
+            area.abs(),
+            8,
+            "2x2 square should have shoelace area of 8 (2*actual area)"
+        );
+    }
+
+    #[test]
+    fn test_world_ring_area_10x10_square() {
+        // A 20x20 square (half_side = 10) should have area 400 world units
+        // Shoelace returns 2*area, so we expect 800
+        let ring = world_square_ring(1000, 1000, 10);
+        let area = world_ring_area(&ring);
+        assert_eq!(
+            area.abs(),
+            800,
+            "20x20 square should have shoelace area of 800 (2*actual area)"
+        );
+    }
+
+    #[test]
+    fn test_world_ring_area_degenerate() {
+        // Degenerate cases
+        let empty: Vec<WorldCoord> = vec![];
+        assert_eq!(
+            world_ring_area(&empty),
+            0,
+            "Empty ring should have zero area"
+        );
+
+        let single = vec![WorldCoord::new(100, 100)];
+        assert_eq!(
+            world_ring_area(&single),
+            0,
+            "Single point should have zero area"
+        );
+
+        let two_points = vec![WorldCoord::new(100, 100), WorldCoord::new(200, 200)];
+        assert_eq!(
+            world_ring_area(&two_points),
+            0,
+            "Two points should have zero area"
+        );
+    }
+
+    #[test]
+    fn test_world_ring_area_large_coordinates() {
+        // Test with large coordinates near u32::MAX to verify no overflow
+        let center = u32::MAX / 2;
+        let half_side = 1_000_000; // Large side, but area still fits in i64
+        let ring = world_square_ring(center, center, half_side);
+        let area = world_ring_area(&ring);
+
+        // Expected: (2 * half_side)^2 = 4 * 10^12 world units squared
+        // Shoelace returns 2x, so 8 * 10^12
+        let expected = 2_i64 * (2 * half_side as i64) * (2 * half_side as i64);
+        assert_eq!(
+            area.abs(),
+            expected,
+            "Large square area calculation should not overflow"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // should_drop_tiny_polygon_world tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_world_polygon_large_never_dropped() {
+        // At zoom 14, extent 4096:
+        // tile_size = 2^(32-14) = 2^18 = 262144 world units
+        // pixel_size = 262144 / 4096 = 64 world units
+        // A 1000x1000 world unit square = (1000/64)^2 ≈ 244 sq pixels - definitely kept
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+
+        let center_x = 8192_u64 * 262144 + 131072; // Center of tile
+        let center_y = 8192_u64 * 262144 + 131072;
+        let half_side = 500;
+
+        let exterior = world_square_ring(center_x as u32, center_y as u32, half_side);
+        let should_drop = should_drop_tiny_polygon_world(
+            &exterior,
+            &[],
+            &tile,
+            extent,
+            DEFAULT_TINY_POLYGON_THRESHOLD,
+        );
+
+        assert!(
+            !should_drop,
+            "Large polygon (244 sq pixels) should never be dropped"
+        );
+    }
+
+    #[test]
+    fn test_world_polygon_zero_area_always_dropped() {
+        let tile = TileCoord::new(0, 0, 10);
+        let extent = 4096;
+
+        // Degenerate polygon (all same point)
+        let degenerate = vec![
+            WorldCoord::new(1000, 1000),
+            WorldCoord::new(1000, 1000),
+            WorldCoord::new(1000, 1000),
+            WorldCoord::new(1000, 1000),
+        ];
+
+        let should_drop = should_drop_tiny_polygon_world(
+            &degenerate,
+            &[],
+            &tile,
+            extent,
+            DEFAULT_TINY_POLYGON_THRESHOLD,
+        );
+
+        assert!(should_drop, "Zero-area polygon should always be dropped");
+    }
+
+    #[test]
+    fn test_world_polygon_with_hole() {
+        // Create a large exterior with a large hole - net area should be small
+        let tile = TileCoord::new(0, 0, 10);
+        let extent = 4096;
+
+        // Exterior: 1000x1000 = 1,000,000 sq world units
+        let exterior = world_square_ring(1_000_000, 1_000_000, 500);
+
+        // Interior (hole): 990x990 ≈ 980,100 sq world units
+        // Net area ≈ 19,900 sq world units - still pretty small at this zoom
+        let interior = world_square_ring(1_000_000, 1_000_000, 495);
+
+        let should_drop = should_drop_tiny_polygon_world(
+            &exterior,
+            &[interior],
+            &tile,
+            extent,
+            DEFAULT_TINY_POLYGON_THRESHOLD,
+        );
+
+        // At zoom 10, pixel = 2^22 / 4096 = 1024 world units
+        // 19,900 sq world units / (1024^2) ≈ 0.019 sq pixels - very tiny
+        assert!(
+            should_drop,
+            "Polygon with large hole (tiny net area) should likely be dropped"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // world_linestring_length tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_world_linestring_length_horizontal() {
+        let coords = vec![
+            WorldCoord::new(100, 100),
+            WorldCoord::new(200, 100), // 100 units right
+        ];
+        let length = world_linestring_length(&coords);
+        assert_eq!(length, 100, "Horizontal line should have length 100");
+    }
+
+    #[test]
+    fn test_world_linestring_length_vertical() {
+        let coords = vec![
+            WorldCoord::new(100, 100),
+            WorldCoord::new(100, 350), // 250 units down
+        ];
+        let length = world_linestring_length(&coords);
+        assert_eq!(length, 250, "Vertical line should have length 250");
+    }
+
+    #[test]
+    fn test_world_linestring_length_diagonal() {
+        // 3-4-5 triangle: length = sqrt(3^2 + 4^2) = 5
+        let coords = vec![WorldCoord::new(100, 100), WorldCoord::new(103, 104)];
+        let length = world_linestring_length(&coords);
+        assert_eq!(length, 5, "3-4-5 diagonal should have length 5");
+    }
+
+    #[test]
+    fn test_world_linestring_length_multi_segment() {
+        // Two segments: 100 horizontal + 100 vertical = 200 total
+        let coords = vec![
+            WorldCoord::new(0, 0),
+            WorldCoord::new(100, 0),   // 100 units
+            WorldCoord::new(100, 100), // 100 units
+        ];
+        let length = world_linestring_length(&coords);
+        assert_eq!(length, 200, "Two 100-unit segments should total 200");
+    }
+
+    #[test]
+    fn test_world_linestring_length_degenerate() {
+        let empty: Vec<WorldCoord> = vec![];
+        assert_eq!(
+            world_linestring_length(&empty),
+            0,
+            "Empty linestring should have zero length"
+        );
+
+        let single = vec![WorldCoord::new(100, 100)];
+        assert_eq!(
+            world_linestring_length(&single),
+            0,
+            "Single point should have zero length"
+        );
+
+        let zero_length = vec![WorldCoord::new(100, 100), WorldCoord::new(100, 100)];
+        assert_eq!(
+            world_linestring_length(&zero_length),
+            0,
+            "Zero-length line should have zero length"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // should_drop_tiny_line_world tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_world_line_long_never_dropped() {
+        // At zoom 14, pixel = 64 world units
+        // A 10000 world unit line = 156 pixels - definitely kept
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+
+        let coords = vec![
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+            WorldCoord::new(2_000_010_000, 2_000_000_000), // 10000 units horizontal
+        ];
+
+        let should_drop = should_drop_tiny_line_world(&coords, &tile, extent, 1.0);
+        assert!(
+            !should_drop,
+            "Long line (156 pixels) should never be dropped"
+        );
+    }
+
+    #[test]
+    fn test_world_line_short_dropped() {
+        // At zoom 0, pixel = 2^32 / 4096 ≈ 1,048,576 world units
+        // A 100 world unit line = 0.0001 pixels - should be dropped
+        let tile = TileCoord::new(0, 0, 0);
+        let extent = 4096;
+
+        let coords = vec![
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+            WorldCoord::new(2_000_000_100, 2_000_000_000), // 100 units horizontal
+        ];
+
+        let should_drop = should_drop_tiny_line_world(&coords, &tile, extent, 1.0);
+        assert!(
+            should_drop,
+            "Tiny line (0.0001 pixels at zoom 0) should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_world_line_empty_dropped() {
+        let tile = TileCoord::new(0, 0, 10);
+        let extent = 4096;
+
+        let empty: Vec<WorldCoord> = vec![];
+        assert!(
+            should_drop_tiny_line_world(&empty, &tile, extent, 1.0),
+            "Empty line should be dropped"
+        );
+
+        let single = vec![WorldCoord::new(100, 100)];
+        assert!(
+            should_drop_tiny_line_world(&single, &tile, extent, 1.0),
+            "Single-point line should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_world_line_zoom_sensitivity() {
+        let extent = 4096;
+
+        // A 10000 world unit line
+        let coords = vec![
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+            WorldCoord::new(2_000_010_000, 2_000_000_000),
+        ];
+
+        // At high zoom (small pixels), line is visible
+        let high_zoom_tile = TileCoord::new(0, 0, 20);
+        assert!(
+            !should_drop_tiny_line_world(&coords, &high_zoom_tile, extent, 1.0),
+            "10000 world unit line should be visible at zoom 20"
+        );
+
+        // At low zoom (large pixels), same line may be dropped
+        // At zoom 0, pixel = 2^32 / 4096 ≈ 1M world units
+        // 10000 / 1M = 0.01 pixels
+        let low_zoom_tile = TileCoord::new(0, 0, 0);
+        assert!(
+            should_drop_tiny_line_world(&coords, &low_zoom_tile, extent, 1.0),
+            "10000 world unit line should be dropped at zoom 0"
+        );
     }
 }
