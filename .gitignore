@@ -44,6 +44,9 @@ lcov.info
 # Benchmarks
 target/criterion/
 
+# Large benchmark fixtures (download manually, not tracked in repo)
+tests/fixtures/realdata/adm2_polygons.parquet
+
 # Mutation testing
 mutants.out/
 
