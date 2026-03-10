@@ -319,6 +319,200 @@ pub fn encode_directory(entries: &[DirEntry]) -> Vec<u8> {
     buf
 }
 
+/// Decode directory entries from PMTiles columnar format
+///
+/// This is the inverse of encode_directory, used for reading and testing.
+pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
+    let mut offset = 0;
+
+    // Number of entries
+    let (count, consumed) = decode_varint(&data[offset..])?;
+    offset += consumed;
+    let count = count as usize;
+
+    if count == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut entries = Vec::with_capacity(count);
+
+    // Decode delta-encoded tile IDs
+    let mut last_id = 0u64;
+    for _ in 0..count {
+        let (delta, consumed) = decode_varint(&data[offset..])?;
+        offset += consumed;
+        last_id += delta;
+        entries.push(DirEntry {
+            tile_id: last_id,
+            offset: 0,
+            length: 0,
+            run_length: 0,
+        });
+    }
+
+    // Decode run lengths
+    for entry in entries.iter_mut() {
+        let (run_length, consumed) = decode_varint(&data[offset..])?;
+        offset += consumed;
+        entry.run_length = run_length as u32;
+    }
+
+    // Decode lengths
+    for entry in entries.iter_mut() {
+        let (length, consumed) = decode_varint(&data[offset..])?;
+        offset += consumed;
+        entry.length = length as u32;
+    }
+
+    // Decode offsets (with contiguous encoding)
+    let mut expected_offset = 0u64;
+    for (i, entry) in entries.iter_mut().enumerate() {
+        let (encoded_offset, consumed) = decode_varint(&data[offset..])?;
+        offset += consumed;
+
+        if encoded_offset == 0 && i > 0 {
+            // Contiguous: use expected offset
+            entry.offset = expected_offset;
+        } else {
+            // Explicit offset (stored as offset + 1)
+            entry.offset = encoded_offset.saturating_sub(1);
+        }
+
+        // Update expected offset for next entry
+        if entry.run_length > 0 {
+            expected_offset = entry.offset + entry.length as u64;
+        }
+    }
+
+    Some(entries)
+}
+
+// ============================================================================
+// Leaf Directory Support (Issue #88)
+// ============================================================================
+
+/// Maximum size for root directory to fit in initial 16KB HTTP range request.
+/// PMTiles header is 127 bytes, leaving 16384 - 127 = 16257 bytes for root directory.
+const MAX_ROOT_DIR_BYTES: usize = 16384 - 127;
+
+/// Initial leaf size when partitioning entries (matches tippecanoe)
+const INITIAL_LEAF_SIZE: usize = 4096;
+
+/// Result of building root and leaf directories
+#[derive(Debug)]
+pub struct DirectoryLayout {
+    /// Compressed root directory (may contain leaf pointers or direct tile entries)
+    pub root_bytes: Vec<u8>,
+    /// Compressed leaf directories concatenated (empty if no leaves needed)
+    pub leaves_bytes: Vec<u8>,
+    /// Number of leaf directories (0 if all entries fit in root)
+    pub num_leaves: usize,
+}
+
+/// Build leaf directories by partitioning entries into chunks.
+///
+/// Each chunk becomes a leaf directory. The root directory contains
+/// pointers to these leaves (entries with run_length=0).
+///
+/// # Arguments
+/// * `entries` - All tile directory entries
+/// * `leaf_size` - Number of entries per leaf directory
+/// * `compression` - Compression algorithm to use
+fn build_root_leaves(
+    entries: &[DirEntry],
+    leaf_size: usize,
+    compression: Compression,
+) -> std::io::Result<DirectoryLayout> {
+    let mut root_entries = Vec::new();
+    let mut leaves_bytes = Vec::new();
+    let mut num_leaves = 0;
+
+    // Partition entries into leaf directories
+    for chunk in entries.chunks(leaf_size) {
+        num_leaves += 1;
+
+        // Serialize and compress this leaf
+        let leaf_encoded = encode_directory(chunk);
+        let leaf_compressed = compression::compress(&leaf_encoded, compression)?;
+
+        // Root entry points to this leaf:
+        // - tile_id = first tile ID in this leaf
+        // - offset = position within leaves_bytes
+        // - length = size of compressed leaf
+        // - run_length = 0 (indicates leaf pointer, not tile entry)
+        root_entries.push(DirEntry {
+            tile_id: chunk[0].tile_id,
+            offset: leaves_bytes.len() as u64,
+            length: leaf_compressed.len() as u32,
+            run_length: 0, // CRITICAL: 0 means this is a leaf pointer
+        });
+
+        leaves_bytes.extend(leaf_compressed);
+    }
+
+    // Serialize and compress root directory
+    let root_encoded = encode_directory(&root_entries);
+    let root_compressed = compression::compress(&root_encoded, compression)?;
+
+    Ok(DirectoryLayout {
+        root_bytes: root_compressed,
+        leaves_bytes,
+        num_leaves,
+    })
+}
+
+/// Create optimized directory structure, using leaf directories if needed.
+///
+/// Follows the tippecanoe algorithm:
+/// 1. Try to fit all entries in a single root directory
+/// 2. If root exceeds MAX_ROOT_DIR_BYTES, partition into leaf directories
+/// 3. If root still exceeds limit, double leaf_size and retry
+///
+/// This ensures the root directory always fits in the initial HTTP range request,
+/// which is critical for pmtiles-js and other clients that fetch 16KB initially.
+///
+/// # Arguments
+/// * `entries` - All tile directory entries (must be sorted by tile_id)
+/// * `compression` - Compression algorithm to use
+pub fn make_root_leaves(
+    entries: &[DirEntry],
+    compression: Compression,
+) -> std::io::Result<DirectoryLayout> {
+    // Try single directory first (no leaves)
+    let single_encoded = encode_directory(entries);
+    let single_compressed = compression::compress(&single_encoded, compression)?;
+
+    if single_compressed.len() <= MAX_ROOT_DIR_BYTES {
+        // Fits in root - no leaf directories needed
+        return Ok(DirectoryLayout {
+            root_bytes: single_compressed,
+            leaves_bytes: Vec::new(),
+            num_leaves: 0,
+        });
+    }
+
+    // Need leaf directories - iterate with increasing leaf_size until root fits
+    let mut leaf_size = INITIAL_LEAF_SIZE;
+
+    loop {
+        let layout = build_root_leaves(entries, leaf_size, compression)?;
+
+        if layout.root_bytes.len() <= MAX_ROOT_DIR_BYTES {
+            return Ok(layout);
+        }
+
+        // Root still too big - double leaf_size (fewer, larger leaves = smaller root)
+        leaf_size *= 2;
+
+        // Safety check: if leaf_size exceeds entry count, something is wrong
+        if leaf_size > entries.len() * 2 {
+            // Fall back to single leaf containing everything
+            // (This shouldn't happen in practice)
+            return build_root_leaves(entries, entries.len(), compression);
+        }
+    }
+}
+
 /// Compress data with gzip (backward compatibility wrapper)
 pub fn gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
     compression::compress(data, Compression::Gzip)
@@ -1058,10 +1252,10 @@ impl StreamingPmtilesWriter {
         // Build run-length encoded directory entries
         let dir_entries = self.build_directory_entries();
 
-        // Encode and compress directory
-        let dir_bytes = encode_directory(&dir_entries);
-        let compressed_dir = compression::compress(&dir_bytes, self.internal_compression)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to compress directory: {}", e)))?;
+        // Build directory structure with leaf directories if needed (Issue #88)
+        // This ensures root directory fits in the initial 16KB HTTP range request
+        let dir_layout = make_root_leaves(&dir_entries, self.internal_compression)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to build directory: {}", e)))?;
 
         // Build metadata JSON
         let metadata = self.build_metadata_json();
@@ -1070,11 +1264,14 @@ impl StreamingPmtilesWriter {
                 .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
 
         // Calculate section offsets
+        // Layout: Header | Root Dir | Metadata | Leaf Dirs | Tile Data
         let root_dir_offset = 127u64;
-        let root_dir_length = compressed_dir.len() as u64;
+        let root_dir_length = dir_layout.root_bytes.len() as u64;
         let metadata_offset = root_dir_offset + root_dir_length;
         let metadata_length = compressed_metadata.len() as u64;
-        let tile_data_offset = metadata_offset + metadata_length;
+        let leaf_dirs_offset = metadata_offset + metadata_length;
+        let leaf_dirs_length = dir_layout.leaves_bytes.len() as u64;
+        let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
         let tile_data_length = self.current_offset;
 
         // Build header
@@ -1083,8 +1280,12 @@ impl StreamingPmtilesWriter {
             root_dir_length,
             json_metadata_offset: metadata_offset,
             json_metadata_length: metadata_length,
-            leaf_dirs_offset: 0,
-            leaf_dirs_length: 0,
+            leaf_dirs_offset: if leaf_dirs_length > 0 {
+                leaf_dirs_offset
+            } else {
+                0
+            },
+            leaf_dirs_length,
             tile_data_offset,
             tile_data_length,
             addressed_tiles_count: self.stats.total_tiles,
@@ -1127,15 +1328,22 @@ impl StreamingPmtilesWriter {
             .write_all(&header.to_bytes())
             .map_err(|e| Error::PMTilesWrite(format!("Failed to write header: {}", e)))?;
 
-        // Write directory
+        // Write root directory
         writer
-            .write_all(&compressed_dir)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write directory: {}", e)))?;
+            .write_all(&dir_layout.root_bytes)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write root directory: {}", e)))?;
 
         // Write metadata
         writer
             .write_all(&compressed_metadata)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
+
+        // Write leaf directories (if any)
+        if !dir_layout.leaves_bytes.is_empty() {
+            writer.write_all(&dir_layout.leaves_bytes).map_err(|e| {
+                Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e))
+            })?;
+        }
 
         // Copy tile data from temp file
         let mut temp_reader = File::open(&self.temp_path)
@@ -2299,6 +2507,164 @@ mod tests {
             "Should have total feature count 225, got: {}",
             metadata_json
         );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    // -------------------------------------------------------------------------
+    // Leaf Directory Tests (Issue #88)
+    // -------------------------------------------------------------------------
+
+    /// PMTiles initial HTTP range request size (16KB)
+    const INITIAL_FETCH_SIZE: usize = 16384;
+    /// PMTiles header size
+    const HEADER_SIZE: usize = 127;
+    /// Maximum root directory size that fits in initial fetch
+    const MAX_ROOT_DIR_SIZE: usize = INITIAL_FETCH_SIZE - HEADER_SIZE;
+
+    #[test]
+    fn test_large_archive_uses_leaf_directories() {
+        // Create enough tiles to exceed 16KB root directory
+        // gzip compresses directory entries very well (~2-5 bytes/entry compressed)
+        // Need 10,000+ entries to reliably exceed the 16KB threshold
+        let num_tiles = 10_000;
+
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        // Add many tiles at zoom 12 (distributed across tile space)
+        // Using higher zoom means larger tile_ids = less compressible
+        for i in 0..num_tiles {
+            let x = i % 4096;
+            let y = i / 4096;
+            let data = vec![0x1a, (i & 0xff) as u8, ((i >> 8) & 0xff) as u8];
+            writer.add_tile(12, x as u32, y as u32, &data).unwrap();
+        }
+
+        let output_path = Path::new("/tmp/test-leaf-directories.pmtiles");
+        let _ = fs::remove_file(output_path);
+        writer.finalize(output_path).unwrap();
+
+        // Read the header and verify leaf directories are used
+        let data = fs::read(output_path).unwrap();
+
+        // Extract header fields
+        let root_dir_length = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+        let leaf_dirs_offset = u64::from_le_bytes(data[40..48].try_into().unwrap());
+        let leaf_dirs_length = u64::from_le_bytes(data[48..56].try_into().unwrap());
+
+        // Debug output
+        eprintln!(
+            "Archive stats: root_dir_length={}, leaf_dirs_offset={}, leaf_dirs_length={}, MAX={}",
+            root_dir_length, leaf_dirs_offset, leaf_dirs_length, MAX_ROOT_DIR_SIZE
+        );
+
+        // Root directory must fit in initial fetch (16KB - 127 byte header)
+        assert!(
+            root_dir_length <= MAX_ROOT_DIR_SIZE,
+            "Root directory ({} bytes) must fit in initial fetch ({} bytes)",
+            root_dir_length,
+            MAX_ROOT_DIR_SIZE
+        );
+
+        // With 10,000 tiles, we MUST have leaf directories
+        assert!(
+            leaf_dirs_offset > 0,
+            "Large archive should have leaf directories (offset={})",
+            leaf_dirs_offset
+        );
+        assert!(
+            leaf_dirs_length > 0,
+            "Large archive should have leaf directories (length={})",
+            leaf_dirs_length
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_small_archive_no_leaf_directories() {
+        // Small archive should NOT use leaf directories (they're overhead)
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+
+        // Add just a few tiles
+        for i in 0..10 {
+            let data = vec![0x1a, i as u8];
+            writer.add_tile(0, 0, 0, &data).unwrap();
+        }
+
+        let output_path = Path::new("/tmp/test-no-leaf-directories.pmtiles");
+        let _ = fs::remove_file(output_path);
+        writer.finalize(output_path).unwrap();
+
+        let data = fs::read(output_path).unwrap();
+        let leaf_dirs_offset = u64::from_le_bytes(data[40..48].try_into().unwrap());
+        let leaf_dirs_length = u64::from_le_bytes(data[48..56].try_into().unwrap());
+
+        // Small archive should have no leaf directories
+        assert_eq!(
+            leaf_dirs_offset, 0,
+            "Small archive should not have leaf directories"
+        );
+        assert_eq!(
+            leaf_dirs_length, 0,
+            "Small archive should not have leaf directories"
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_leaf_directory_entries_have_run_length_zero() {
+        // When leaf directories are used, root entries pointing to them
+        // must have run_length = 0 (per PMTiles spec)
+        let num_tiles = 3000;
+
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+
+        for i in 0..num_tiles {
+            let x = i % 1024;
+            let y = i / 1024;
+            let data = vec![0x1a, (i & 0xff) as u8];
+            writer.add_tile(10, x as u32, y as u32, &data).unwrap();
+        }
+
+        let output_path = Path::new("/tmp/test-leaf-run-length.pmtiles");
+        let _ = fs::remove_file(output_path);
+        writer.finalize(output_path).unwrap();
+
+        let data = fs::read(output_path).unwrap();
+
+        // Extract and decompress root directory
+        let root_dir_offset = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+        let root_dir_length = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+        let leaf_dirs_length = u64::from_le_bytes(data[48..56].try_into().unwrap());
+
+        // Only check if we have leaf directories
+        if leaf_dirs_length > 0 {
+            let compressed_root = &data[root_dir_offset..root_dir_offset + root_dir_length];
+
+            use flate2::read::GzDecoder;
+            use std::io::Read;
+            let mut decoder = GzDecoder::new(compressed_root);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).unwrap();
+
+            // Decode directory to verify run_length = 0 for leaf pointers
+            let entries = decode_directory(&decompressed).unwrap();
+
+            // All entries in root should be leaf pointers (run_length = 0)
+            for entry in &entries {
+                assert_eq!(
+                    entry.run_length, 0,
+                    "Root directory entries pointing to leaves must have run_length=0, got {}",
+                    entry.run_length
+                );
+            }
+        }
 
         let _ = fs::remove_file(output_path);
     }
