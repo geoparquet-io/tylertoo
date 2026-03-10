@@ -26,7 +26,7 @@
 
 use std::f64::consts::PI;
 
-use crate::tile::TileCoord;
+use crate::tile::{TileBounds, TileCoord};
 
 /// World scale: 2^32 units cover the entire world at zoom 0.
 pub const WORLD_SCALE: u64 = 1_u64 << 32;
@@ -240,6 +240,186 @@ pub fn tile_local_to_world(
         (tile_world_y as i64 + (local_y as i64) * tile_size as i64 / extent as i64) as u32;
 
     WorldCoord::new(world_x, world_y)
+}
+
+// ============================================================================
+// WorldBounds: Axis-aligned bounding box in world coordinate space
+// ============================================================================
+
+/// Axis-aligned bounding box in 32-bit world coordinate space.
+///
+/// Represents a rectangular region for tile clipping and intersection tests.
+/// Uses `u32` coordinates matching the `WorldCoord` system.
+///
+/// # Coordinate System
+///
+/// - `x_min` / `x_max`: Horizontal bounds [0, 2^32) where X increases eastward
+/// - `y_min` / `y_max`: Vertical bounds [0, 2^32) where Y increases southward
+///
+/// # Relationship to Tiles
+///
+/// At zoom level `z`, a tile's world bounds span exactly `2^(32-z)` units in
+/// each dimension. The buffer for clipping can be computed in world units:
+///
+/// ```text
+/// buffer_world = tile_size * buffer_pixels / extent
+///              = 2^(32-z) * 8 / 4096
+/// ```
+///
+/// This replaces the imprecise `buffer_pixels_to_degrees` calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorldBounds {
+    pub x_min: u32,
+    pub y_min: u32,
+    pub x_max: u32,
+    pub y_max: u32,
+}
+
+impl WorldBounds {
+    /// Create a new world bounds from min/max coordinates.
+    #[inline]
+    pub const fn new(x_min: u32, y_min: u32, x_max: u32, y_max: u32) -> Self {
+        Self {
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+        }
+    }
+
+    /// Create world bounds for a tile at the given coordinate.
+    ///
+    /// At zoom `z`, each tile spans `2^(32-z)` world units in each dimension.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gpq_tiles_core::world_coord::WorldBounds;
+    /// use gpq_tiles_core::tile::TileCoord;
+    ///
+    /// // Zoom 0: single tile covers entire world
+    /// let bounds = WorldBounds::from_tile(&TileCoord::new(0, 0, 0));
+    /// assert_eq!(bounds.x_min, 0);
+    /// assert_eq!(bounds.y_min, 0);
+    /// assert_eq!(bounds.x_max, u32::MAX);
+    /// assert_eq!(bounds.y_max, u32::MAX);
+    /// ```
+    pub fn from_tile(tile: &TileCoord) -> Self {
+        if tile.z == 0 {
+            return Self::new(0, 0, u32::MAX, u32::MAX);
+        }
+
+        let shift = 32 - tile.z as u32;
+        let tile_size = 1_u64 << shift;
+
+        let x_min = ((tile.x as u64) << shift) as u32;
+        let y_min = ((tile.y as u64) << shift) as u32;
+
+        // Saturate to u32::MAX to avoid overflow at tile boundaries
+        let x_max = ((tile.x as u64 + 1) * tile_size - 1).min(u32::MAX as u64) as u32;
+        let y_max = ((tile.y as u64 + 1) * tile_size - 1).min(u32::MAX as u64) as u32;
+
+        Self::new(x_min, y_min, x_max, y_max)
+    }
+
+    /// Create world bounds for a tile with a buffer in pixels.
+    ///
+    /// The buffer is converted to world units based on the tile size and extent:
+    /// `buffer_world = tile_size_world * buffer_pixels / extent`
+    ///
+    /// This is the integer-precision equivalent of `buffer_pixels_to_degrees`.
+    ///
+    /// # Arguments
+    /// * `tile` - The tile coordinate
+    /// * `buffer_pixels` - Buffer in pixels (e.g., 8)
+    /// * `extent` - Tile extent (e.g., 4096)
+    pub fn from_tile_with_buffer(tile: &TileCoord, buffer_pixels: u32, extent: u32) -> Self {
+        let base = Self::from_tile(tile);
+
+        if buffer_pixels == 0 {
+            return base;
+        }
+
+        // Tile size in world units at this zoom level
+        let tile_size_world: u64 = if tile.z == 0 {
+            WORLD_SCALE
+        } else {
+            1_u64 << (32 - tile.z as u32)
+        };
+
+        // Buffer in world units: tile_size * buffer_pixels / extent
+        // Use u64 to avoid overflow
+        let buffer_world = (tile_size_world * buffer_pixels as u64 / extent as u64) as u32;
+
+        Self::new(
+            base.x_min.saturating_sub(buffer_world),
+            base.y_min.saturating_sub(buffer_world),
+            base.x_max.saturating_add(buffer_world),
+            base.y_max.saturating_add(buffer_world),
+        )
+    }
+
+    /// Check if a point is inside (or on the boundary of) these bounds.
+    #[inline]
+    pub fn contains(&self, coord: &WorldCoord) -> bool {
+        coord.x >= self.x_min
+            && coord.x <= self.x_max
+            && coord.y >= self.y_min
+            && coord.y <= self.y_max
+    }
+
+    /// Check if these bounds intersect with another bounds.
+    #[inline]
+    pub fn intersects(&self, other: &WorldBounds) -> bool {
+        self.x_max >= other.x_min
+            && self.x_min <= other.x_max
+            && self.y_max >= other.y_min
+            && self.y_min <= other.y_max
+    }
+
+    /// Check if another bounds is fully contained within this bounds.
+    #[inline]
+    pub fn contains_bounds(&self, other: &WorldBounds) -> bool {
+        other.x_min >= self.x_min
+            && other.x_max <= self.x_max
+            && other.y_min >= self.y_min
+            && other.y_max <= self.y_max
+    }
+
+    /// Width of the bounds in world units.
+    #[inline]
+    pub fn width(&self) -> u32 {
+        self.x_max - self.x_min
+    }
+
+    /// Height of the bounds in world units.
+    #[inline]
+    pub fn height(&self) -> u32 {
+        self.y_max - self.y_min
+    }
+
+    /// Convert to f64-based TileBounds (geographic coordinates).
+    ///
+    /// This is a convenience method for interoperability with the existing
+    /// f64-based pipeline during Phase 1 migration.
+    pub fn to_tile_bounds(&self) -> TileBounds {
+        let (lng_min, lat_max) = world_to_lng_lat(WorldCoord::new(self.x_min, self.y_min));
+        let (lng_max, lat_min) = world_to_lng_lat(WorldCoord::new(self.x_max, self.y_max));
+        TileBounds::new(lng_min, lat_min, lng_max, lat_max)
+    }
+
+    /// Create WorldBounds from f64-based TileBounds (geographic coordinates).
+    ///
+    /// Converts the geographic bounds to world coordinate space.
+    /// Note: This involves the Web Mercator projection, so lat/y mapping is non-linear.
+    pub fn from_tile_bounds(bounds: &TileBounds) -> Self {
+        // In world coord space, Y increases southward, so:
+        // - lat_max (north) → smaller y value
+        // - lat_min (south) → larger y value
+        let nw = lng_lat_to_world(bounds.lng_min, bounds.lat_max);
+        let se = lng_lat_to_world(bounds.lng_max, bounds.lat_min);
+        Self::new(nw.x, nw.y, se.x, se.y)
+    }
 }
 
 #[cfg(test)]
@@ -616,5 +796,149 @@ mod tests {
         set.insert(WorldCoord::new(100, 201));
 
         assert_eq!(set.len(), 2);
+    }
+
+    // ========== WorldBounds Tests ==========
+
+    #[test]
+    fn test_world_bounds_from_tile_zoom0() {
+        let tile = TileCoord::new(0, 0, 0);
+        let bounds = WorldBounds::from_tile(&tile);
+        assert_eq!(bounds.x_min, 0);
+        assert_eq!(bounds.y_min, 0);
+        assert_eq!(bounds.x_max, u32::MAX);
+        assert_eq!(bounds.y_max, u32::MAX);
+    }
+
+    #[test]
+    fn test_world_bounds_from_tile_zoom1() {
+        // At zoom 1, tile (0,0) covers the NW quadrant: [0, 2^31)
+        let tile = TileCoord::new(0, 0, 1);
+        let bounds = WorldBounds::from_tile(&tile);
+        assert_eq!(bounds.x_min, 0);
+        assert_eq!(bounds.y_min, 0);
+        // tile_size = 2^31, so max = 2^31 - 1
+        assert_eq!(bounds.x_max, (1u64 << 31) as u32 - 1);
+        assert_eq!(bounds.y_max, (1u64 << 31) as u32 - 1);
+    }
+
+    #[test]
+    fn test_world_bounds_from_tile_zoom1_se() {
+        // At zoom 1, tile (1,1) covers the SE quadrant: [2^31, 2^32)
+        let tile = TileCoord::new(1, 1, 1);
+        let bounds = WorldBounds::from_tile(&tile);
+        assert_eq!(bounds.x_min, 1u32 << 31);
+        assert_eq!(bounds.y_min, 1u32 << 31);
+        assert_eq!(bounds.x_max, u32::MAX);
+        assert_eq!(bounds.y_max, u32::MAX);
+    }
+
+    #[test]
+    fn test_world_bounds_contains_point() {
+        let bounds = WorldBounds::new(100, 100, 200, 200);
+        assert!(bounds.contains(&WorldCoord::new(150, 150)));
+        assert!(bounds.contains(&WorldCoord::new(100, 100))); // on boundary
+        assert!(bounds.contains(&WorldCoord::new(200, 200))); // on boundary
+        assert!(!bounds.contains(&WorldCoord::new(99, 150)));
+        assert!(!bounds.contains(&WorldCoord::new(201, 150)));
+    }
+
+    #[test]
+    fn test_world_bounds_intersects() {
+        let a = WorldBounds::new(0, 0, 100, 100);
+        let b = WorldBounds::new(50, 50, 150, 150);
+        let c = WorldBounds::new(200, 200, 300, 300);
+
+        assert!(a.intersects(&b));
+        assert!(b.intersects(&a));
+        assert!(!a.intersects(&c));
+        assert!(!c.intersects(&a));
+    }
+
+    #[test]
+    fn test_world_bounds_contains_bounds() {
+        let outer = WorldBounds::new(0, 0, 1000, 1000);
+        let inner = WorldBounds::new(100, 100, 500, 500);
+        let partial = WorldBounds::new(500, 500, 1500, 1500);
+
+        assert!(outer.contains_bounds(&inner));
+        assert!(!inner.contains_bounds(&outer));
+        assert!(!outer.contains_bounds(&partial));
+    }
+
+    #[test]
+    fn test_world_bounds_with_buffer() {
+        // Use a tile that is NOT at the world edge, so buffer can expand in all directions
+        let tile = TileCoord::new(1, 1, 2);
+        let base = WorldBounds::from_tile(&tile);
+        let buffered = WorldBounds::from_tile_with_buffer(&tile, 8, 4096);
+
+        // Buffer should expand bounds in all directions
+        assert!(
+            buffered.x_min < base.x_min,
+            "buffered x_min {} should be < base x_min {}",
+            buffered.x_min,
+            base.x_min
+        );
+        assert!(
+            buffered.y_min < base.y_min,
+            "buffered y_min {} should be < base y_min {}",
+            buffered.y_min,
+            base.y_min
+        );
+        assert!(
+            buffered.x_max > base.x_max,
+            "buffered x_max {} should be > base x_max {}",
+            buffered.x_max,
+            base.x_max
+        );
+        assert!(
+            buffered.y_max > base.y_max,
+            "buffered y_max {} should be > base y_max {}",
+            buffered.y_max,
+            base.y_max
+        );
+
+        // Buffer amount: tile_size = 2^30, buffer = 2^30 * 8 / 4096 = 2097152
+        let expected_buffer = ((1u64 << 30) * 8 / 4096) as u32;
+        assert_eq!(base.x_min - buffered.x_min, expected_buffer);
+    }
+
+    #[test]
+    fn test_world_bounds_buffer_saturates_at_edges() {
+        // Tile at (0,0) with buffer should not underflow below 0
+        let tile = TileCoord::new(0, 0, 1);
+        let buffered = WorldBounds::from_tile_with_buffer(&tile, 8, 4096);
+        assert_eq!(buffered.x_min, 0); // saturated
+        assert_eq!(buffered.y_min, 0); // saturated
+    }
+
+    #[test]
+    fn test_world_bounds_round_trip_via_tile_bounds() {
+        // Convert a tile to WorldBounds, then to TileBounds, then back
+        let tile = TileCoord::new(4, 3, 3);
+        let world_bounds = WorldBounds::from_tile(&tile);
+        let tile_bounds = world_bounds.to_tile_bounds();
+        let world_bounds_rt = WorldBounds::from_tile_bounds(&tile_bounds);
+
+        // Should be approximately equal (small rounding from f64 conversion)
+        let x_diff = (world_bounds.x_min as i64 - world_bounds_rt.x_min as i64).unsigned_abs();
+        let y_diff = (world_bounds.y_min as i64 - world_bounds_rt.y_min as i64).unsigned_abs();
+
+        // Allow tolerance of ~100 world units (sub-meter precision loss from f64 round-trip)
+        assert!(
+            x_diff < 1000,
+            "x_min round-trip drift too large: {} vs {} (diff={})",
+            world_bounds.x_min,
+            world_bounds_rt.x_min,
+            x_diff
+        );
+        assert!(
+            y_diff < 1000,
+            "y_min round-trip drift too large: {} vs {} (diff={})",
+            world_bounds.y_min,
+            world_bounds_rt.y_min,
+            y_diff
+        );
     }
 }

@@ -237,6 +237,284 @@ pub fn clip_multipolygon_sh(
 }
 
 // ============================================================================
+// WorldCoord-based Sutherland-Hodgman (integer coordinates)
+// ============================================================================
+//
+// These functions implement the same Sutherland-Hodgman algorithm using
+// WorldCoord integer coordinates instead of f64 geographic coordinates.
+// This matches tippecanoe's approach more closely and eliminates
+// floating-point precision issues in clipping.
+//
+// PHASE 1: These are additive -- the f64 versions above remain unchanged.
+// Phase 2 will migrate the pipeline to call these instead.
+
+use crate::world_coord::{WorldBounds, WorldCoord};
+
+/// A coordinate in i64 space for intermediate clipping calculations.
+///
+/// We use i64 (not u32) because:
+/// 1. Intersection calculations can produce intermediate values outside [0, 2^32)
+/// 2. Buffer regions extend beyond tile boundaries (negative offsets)
+/// 3. The Sutherland-Hodgman intersection formula requires signed arithmetic
+///
+/// After clipping, results are converted back to WorldCoord (u32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipCoord {
+    pub x: i64,
+    pub y: i64,
+}
+
+impl ClipCoord {
+    #[inline]
+    pub const fn new(x: i64, y: i64) -> Self {
+        Self { x, y }
+    }
+
+    /// Convert from WorldCoord (u32) to ClipCoord (i64).
+    #[inline]
+    pub fn from_world(coord: WorldCoord) -> Self {
+        Self {
+            x: coord.x as i64,
+            y: coord.y as i64,
+        }
+    }
+
+    /// Convert to WorldCoord (u32), clamping to valid range.
+    #[inline]
+    pub fn to_world(&self) -> WorldCoord {
+        WorldCoord::new(
+            self.x.clamp(0, u32::MAX as i64) as u32,
+            self.y.clamp(0, u32::MAX as i64) as u32,
+        )
+    }
+}
+
+/// Bounds in i64 space for clipping (allows buffer regions outside [0, 2^32)).
+#[derive(Debug, Clone, Copy)]
+struct ClipBounds {
+    x_min: i64,
+    y_min: i64,
+    x_max: i64,
+    y_max: i64,
+}
+
+impl ClipBounds {
+    fn from_world_bounds(bounds: &WorldBounds) -> Self {
+        Self {
+            x_min: bounds.x_min as i64,
+            y_min: bounds.y_min as i64,
+            x_max: bounds.x_max as i64,
+            y_max: bounds.y_max as i64,
+        }
+    }
+}
+
+/// Check if a point is inside the given edge in integer space.
+///
+/// In world coordinate space:
+/// - Left edge: x >= x_min
+/// - Right edge: x <= x_max
+/// - Top edge: y >= y_min (y increases southward, so "top" = min y)
+/// - Bottom edge: y <= y_max
+#[inline]
+fn is_inside_world(coord: &ClipCoord, edge: Edge, bounds: &ClipBounds) -> bool {
+    match edge {
+        Edge::Left => coord.x >= bounds.x_min,
+        Edge::Right => coord.x <= bounds.x_max,
+        // In world coords, Y increases southward:
+        // "Top" = northern edge = y_min, "Bottom" = southern edge = y_max
+        Edge::Top => coord.y >= bounds.y_min,
+        Edge::Bottom => coord.y <= bounds.y_max,
+    }
+}
+
+/// Compute intersection of segment (a -> b) with an edge in integer space.
+///
+/// Uses integer arithmetic with rounding to maintain precision.
+/// The parametric form: P = A + t * (B - A) where t = (edge - A.axis) / (B.axis - A.axis)
+///
+/// For integer coordinates, we compute the cross-axis value as:
+///   cross = A.cross + (edge - A.axis) * (B.cross - A.cross) / (B.axis - A.axis)
+///
+/// This uses i64 arithmetic throughout to avoid overflow for u32 coordinate differences.
+#[inline]
+fn intersect_world(a: &ClipCoord, b: &ClipCoord, edge: Edge, bounds: &ClipBounds) -> ClipCoord {
+    match edge {
+        Edge::Left => {
+            let dx = b.x - a.x;
+            if dx == 0 {
+                return ClipCoord::new(bounds.x_min, a.y);
+            }
+            let t_num = bounds.x_min - a.x;
+            let dy = b.y - a.y;
+            // Use i128 for the multiplication to avoid overflow
+            let y = a.y + ((t_num as i128 * dy as i128) / dx as i128) as i64;
+            ClipCoord::new(bounds.x_min, y)
+        }
+        Edge::Right => {
+            let dx = b.x - a.x;
+            if dx == 0 {
+                return ClipCoord::new(bounds.x_max, a.y);
+            }
+            let t_num = bounds.x_max - a.x;
+            let dy = b.y - a.y;
+            let y = a.y + ((t_num as i128 * dy as i128) / dx as i128) as i64;
+            ClipCoord::new(bounds.x_max, y)
+        }
+        Edge::Top => {
+            let dy = b.y - a.y;
+            if dy == 0 {
+                return ClipCoord::new(a.x, bounds.y_min);
+            }
+            let t_num = bounds.y_min - a.y;
+            let dx = b.x - a.x;
+            let x = a.x + ((t_num as i128 * dx as i128) / dy as i128) as i64;
+            ClipCoord::new(x, bounds.y_min)
+        }
+        Edge::Bottom => {
+            let dy = b.y - a.y;
+            if dy == 0 {
+                return ClipCoord::new(a.x, bounds.y_max);
+            }
+            let t_num = bounds.y_max - a.y;
+            let dx = b.x - a.x;
+            let x = a.x + ((t_num as i128 * dx as i128) / dy as i128) as i64;
+            ClipCoord::new(x, bounds.y_max)
+        }
+    }
+}
+
+/// Clip a ring of WorldCoord-based coordinates against a single edge.
+///
+/// Same algorithm as `clip_ring_against_edge` but operates in integer space.
+fn clip_ring_against_edge_world(
+    ring: &[ClipCoord],
+    edge: Edge,
+    bounds: &ClipBounds,
+) -> Vec<ClipCoord> {
+    if ring.is_empty() {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(ring.len());
+
+    // Handle closed ring (first == last)
+    let n = if ring.len() >= 2 && ring[0] == ring[ring.len() - 1] {
+        ring.len() - 1
+    } else {
+        ring.len()
+    };
+
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut s = &ring[n - 1];
+
+    for e in ring.iter().take(n) {
+        let e_inside = is_inside_world(e, edge, bounds);
+        let s_inside = is_inside_world(s, edge, bounds);
+
+        match (s_inside, e_inside) {
+            (true, true) => {
+                output.push(*e);
+            }
+            (true, false) => {
+                output.push(intersect_world(s, e, edge, bounds));
+            }
+            (false, true) => {
+                output.push(intersect_world(s, e, edge, bounds));
+                output.push(*e);
+            }
+            (false, false) => {}
+        }
+
+        s = e;
+    }
+
+    output
+}
+
+/// Clip a ring of WorldCoord points against all four edges of a WorldBounds rectangle.
+///
+/// Returns the clipped ring as ClipCoord points, or empty if fully outside.
+fn clip_ring_world(coords: &[ClipCoord], bounds: &WorldBounds) -> Vec<ClipCoord> {
+    let clip_bounds = ClipBounds::from_world_bounds(bounds);
+
+    // In world coordinate space:
+    // - Left/Right clip on X axis
+    // - Top/Bottom clip on Y axis (top = y_min, bottom = y_max)
+    let edges = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+
+    let mut current = coords.to_vec();
+
+    for &edge in &edges {
+        if current.is_empty() {
+            return Vec::new();
+        }
+        current = clip_ring_against_edge_world(&current, edge, &clip_bounds);
+    }
+
+    // Close the ring if it has enough points
+    if current.len() >= 3 {
+        if current[0] != current[current.len() - 1] {
+            current.push(current[0]);
+        }
+        current
+    } else {
+        Vec::new()
+    }
+}
+
+/// Clip a polygon using Sutherland-Hodgman in WorldCoord integer space.
+///
+/// This is the integer-coordinate equivalent of `clip_polygon_sh`.
+/// It operates directly in world coordinate space, eliminating
+/// floating-point precision issues.
+///
+/// # Arguments
+/// * `exterior` - Exterior ring as WorldCoord points
+/// * `interiors` - Interior rings (holes) as WorldCoord points
+/// * `bounds` - Clipping bounds in world coordinate space
+///
+/// # Returns
+/// * `Some((clipped_exterior, clipped_interiors))` - Clipped rings as WorldCoord vectors
+/// * `None` - If the polygon doesn't intersect the bounds
+pub fn clip_polygon_sh_world(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    bounds: &WorldBounds,
+) -> Option<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> {
+    // Convert exterior to ClipCoord for signed arithmetic
+    let ext_clip: Vec<ClipCoord> = exterior.iter().map(|c| ClipCoord::from_world(*c)).collect();
+
+    let clipped_ext = clip_ring_world(&ext_clip, bounds);
+    if clipped_ext.is_empty() {
+        return None;
+    }
+
+    // Convert back to WorldCoord
+    let result_exterior: Vec<WorldCoord> = clipped_ext.iter().map(|c| c.to_world()).collect();
+
+    // Clip interior rings
+    let result_interiors: Vec<Vec<WorldCoord>> = interiors
+        .iter()
+        .filter_map(|interior| {
+            let int_clip: Vec<ClipCoord> =
+                interior.iter().map(|c| ClipCoord::from_world(*c)).collect();
+            let clipped = clip_ring_world(&int_clip, bounds);
+            if clipped.len() >= 4 {
+                Some(clipped.iter().map(|c| c.to_world()).collect())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Some((result_exterior, result_interiors))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -863,5 +1141,367 @@ mod tests {
         let ring: Vec<Coord<f64>> = vec![];
         let result = clip_ring(&ring, &bounds);
         assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // WorldCoord-based Sutherland-Hodgman tests
+    // ========================================================================
+
+    mod world_tests {
+        use super::*;
+        use crate::world_coord::{WorldBounds, WorldCoord};
+
+        /// Helper: create a WorldBounds representing a box from (1000, 1000) to (5000, 5000)
+        fn test_world_bounds() -> WorldBounds {
+            WorldBounds::new(1000, 1000, 5000, 5000)
+        }
+
+        #[test]
+        fn test_clip_coord_roundtrip() {
+            let world = WorldCoord::new(12345, 67890);
+            let clip = ClipCoord::from_world(world);
+            let back = clip.to_world();
+            assert_eq!(world, back);
+        }
+
+        #[test]
+        fn test_clip_coord_clamping() {
+            // Negative values clamp to 0
+            let clip = ClipCoord::new(-100, -200);
+            let world = clip.to_world();
+            assert_eq!(world.x, 0);
+            assert_eq!(world.y, 0);
+
+            // Values above u32::MAX clamp
+            let clip = ClipCoord::new(u32::MAX as i64 + 100, u32::MAX as i64 + 200);
+            let world = clip.to_world();
+            assert_eq!(world.x, u32::MAX);
+            assert_eq!(world.y, u32::MAX);
+        }
+
+        #[test]
+        fn test_world_sh_fully_inside() {
+            let bounds = test_world_bounds();
+            // Square fully inside: (2000, 2000) to (4000, 4000)
+            let exterior = vec![
+                WorldCoord::new(2000, 2000),
+                WorldCoord::new(4000, 2000),
+                WorldCoord::new(4000, 4000),
+                WorldCoord::new(2000, 4000),
+                WorldCoord::new(2000, 2000), // close
+            ];
+
+            let result = clip_polygon_sh_world(&exterior, &[], &bounds);
+            assert!(result.is_some(), "Fully inside polygon should be preserved");
+
+            let (ext, ints) = result.unwrap();
+            assert!(ext.len() >= 4, "Should have at least 4 vertices");
+            assert!(ints.is_empty(), "No holes expected");
+
+            // All coords should be within bounds
+            for coord in &ext {
+                assert!(
+                    coord.x >= bounds.x_min && coord.x <= bounds.x_max,
+                    "x={} out of bounds [{}, {}]",
+                    coord.x,
+                    bounds.x_min,
+                    bounds.x_max
+                );
+                assert!(
+                    coord.y >= bounds.y_min && coord.y <= bounds.y_max,
+                    "y={} out of bounds [{}, {}]",
+                    coord.y,
+                    bounds.y_min,
+                    bounds.y_max
+                );
+            }
+        }
+
+        #[test]
+        fn test_world_sh_fully_outside() {
+            let bounds = test_world_bounds();
+            // Square fully outside: (6000, 6000) to (8000, 8000)
+            let exterior = vec![
+                WorldCoord::new(6000, 6000),
+                WorldCoord::new(8000, 6000),
+                WorldCoord::new(8000, 8000),
+                WorldCoord::new(6000, 8000),
+                WorldCoord::new(6000, 6000),
+            ];
+
+            let result = clip_polygon_sh_world(&exterior, &[], &bounds);
+            assert!(result.is_none(), "Fully outside polygon should return None");
+        }
+
+        #[test]
+        fn test_world_sh_partial_clip_right_edge() {
+            let bounds = test_world_bounds(); // (1000, 1000) to (5000, 5000)
+                                              // Square straddling right edge: (3000, 2000) to (7000, 4000)
+            let exterior = vec![
+                WorldCoord::new(3000, 2000),
+                WorldCoord::new(7000, 2000),
+                WorldCoord::new(7000, 4000),
+                WorldCoord::new(3000, 4000),
+                WorldCoord::new(3000, 2000),
+            ];
+
+            let result = clip_polygon_sh_world(&exterior, &[], &bounds);
+            assert!(
+                result.is_some(),
+                "Partially overlapping should produce output"
+            );
+
+            let (ext, _) = result.unwrap();
+            // All output coords should be within bounds
+            for coord in &ext {
+                assert!(
+                    coord.x >= bounds.x_min && coord.x <= bounds.x_max,
+                    "x={} out of bounds",
+                    coord.x
+                );
+                assert!(
+                    coord.y >= bounds.y_min && coord.y <= bounds.y_max,
+                    "y={} out of bounds",
+                    coord.y
+                );
+            }
+        }
+
+        #[test]
+        fn test_world_sh_partial_clip_corner() {
+            let bounds = test_world_bounds(); // (1000, 1000) to (5000, 5000)
+                                              // Square straddling top-left corner: (0, 0) to (3000, 3000)
+            let exterior = vec![
+                WorldCoord::new(0, 0),
+                WorldCoord::new(3000, 0),
+                WorldCoord::new(3000, 3000),
+                WorldCoord::new(0, 3000),
+                WorldCoord::new(0, 0),
+            ];
+
+            let result = clip_polygon_sh_world(&exterior, &[], &bounds);
+            assert!(result.is_some(), "Corner-overlap should produce output");
+
+            let (ext, _) = result.unwrap();
+            for coord in &ext {
+                assert!(
+                    coord.x >= bounds.x_min && coord.x <= bounds.x_max,
+                    "x={} out of bounds",
+                    coord.x
+                );
+                assert!(
+                    coord.y >= bounds.y_min && coord.y <= bounds.y_max,
+                    "y={} out of bounds",
+                    coord.y
+                );
+            }
+        }
+
+        #[test]
+        fn test_world_sh_with_hole() {
+            let bounds = WorldBounds::new(0, 0, 10000, 10000);
+            // Exterior covers entire bounds and beyond
+            let exterior = vec![
+                WorldCoord::new(0, 0),
+                WorldCoord::new(12000, 0),
+                WorldCoord::new(12000, 12000),
+                WorldCoord::new(0, 12000),
+                WorldCoord::new(0, 0),
+            ];
+            // Hole fully inside bounds
+            let hole = vec![
+                WorldCoord::new(3000, 3000),
+                WorldCoord::new(7000, 3000),
+                WorldCoord::new(7000, 7000),
+                WorldCoord::new(3000, 7000),
+                WorldCoord::new(3000, 3000),
+            ];
+
+            let result = clip_polygon_sh_world(&exterior, &[hole], &bounds);
+            assert!(result.is_some());
+
+            let (_, ints) = result.unwrap();
+            assert_eq!(ints.len(), 1, "Hole inside bounds should be preserved");
+        }
+
+        #[test]
+        fn test_world_sh_hole_outside_bounds() {
+            let bounds = WorldBounds::new(0, 0, 10000, 10000);
+            let exterior = vec![
+                WorldCoord::new(0, 0),
+                WorldCoord::new(12000, 0),
+                WorldCoord::new(12000, 12000),
+                WorldCoord::new(0, 12000),
+                WorldCoord::new(0, 0),
+            ];
+            // Hole completely outside bounds
+            let hole = vec![
+                WorldCoord::new(20000, 20000),
+                WorldCoord::new(30000, 20000),
+                WorldCoord::new(30000, 30000),
+                WorldCoord::new(20000, 30000),
+                WorldCoord::new(20000, 20000),
+            ];
+
+            let result = clip_polygon_sh_world(&exterior, &[hole], &bounds);
+            assert!(result.is_some());
+
+            let (_, ints) = result.unwrap();
+            assert_eq!(ints.len(), 0, "Hole outside bounds should be removed");
+        }
+
+        #[test]
+        fn test_world_sh_consistency_with_f64() {
+            // Verify that WorldCoord-based SH produces equivalent results to f64-based SH
+            // for a simple case that can be represented exactly in both coordinate systems.
+            //
+            // We use a tile at zoom 4 and a simple square polygon that partially
+            // overlaps the tile.
+            use crate::tile::TileCoord;
+            use crate::world_coord::lng_lat_to_world;
+
+            let tile = TileCoord::new(8, 5, 4);
+            let tile_bounds_f64 = tile.bounds();
+            let tile_bounds_world = WorldBounds::from_tile(&tile);
+
+            // Create a polygon that spans from tile center to beyond the right edge
+            let tile_center_lng = (tile_bounds_f64.lng_min + tile_bounds_f64.lng_max) / 2.0;
+            let tile_center_lat = (tile_bounds_f64.lat_min + tile_bounds_f64.lat_max) / 2.0;
+
+            // Simple square from tile center to beyond right/bottom edge
+            let poly_f64 = Polygon::new(
+                LineString::from(vec![
+                    Coord {
+                        x: tile_center_lng,
+                        y: tile_center_lat,
+                    },
+                    Coord {
+                        x: tile_bounds_f64.lng_max + 5.0,
+                        y: tile_center_lat,
+                    },
+                    Coord {
+                        x: tile_bounds_f64.lng_max + 5.0,
+                        y: tile_bounds_f64.lat_min - 5.0,
+                    },
+                    Coord {
+                        x: tile_center_lng,
+                        y: tile_bounds_f64.lat_min - 5.0,
+                    },
+                    Coord {
+                        x: tile_center_lng,
+                        y: tile_center_lat,
+                    },
+                ]),
+                vec![],
+            );
+
+            // f64 clip
+            let f64_result = clip_polygon_sh(&poly_f64, &tile_bounds_f64);
+            assert!(f64_result.is_some(), "f64 clip should produce output");
+
+            // WorldCoord clip
+            let world_exterior: Vec<WorldCoord> = poly_f64
+                .exterior()
+                .coords()
+                .map(|c| lng_lat_to_world(c.x, c.y))
+                .collect();
+
+            let world_result = clip_polygon_sh_world(&world_exterior, &[], &tile_bounds_world);
+            assert!(
+                world_result.is_some(),
+                "WorldCoord clip should produce output"
+            );
+
+            // Both should produce output with similar vertex count
+            let f64_count = match f64_result.unwrap() {
+                Geometry::Polygon(p) => p.exterior().coords().count(),
+                _ => panic!("Expected Polygon from f64 clip"),
+            };
+            let (world_ext, _) = world_result.unwrap();
+            let world_count = world_ext.len();
+
+            // Vertex counts should be similar (exact match not required due to
+            // coordinate system differences)
+            assert!(
+                (f64_count as i32 - world_count as i32).unsigned_abs() <= 2,
+                "Vertex count mismatch: f64={}, world={}",
+                f64_count,
+                world_count
+            );
+        }
+
+        #[test]
+        fn test_world_sh_large_coordinate_values() {
+            // Test with coordinates near u32::MAX to verify no overflow
+            let bounds = WorldBounds::new(
+                u32::MAX - 10000,
+                u32::MAX - 10000,
+                u32::MAX - 1000,
+                u32::MAX - 1000,
+            );
+
+            let exterior = vec![
+                WorldCoord::new(u32::MAX - 8000, u32::MAX - 8000),
+                WorldCoord::new(u32::MAX - 2000, u32::MAX - 8000),
+                WorldCoord::new(u32::MAX - 2000, u32::MAX - 2000),
+                WorldCoord::new(u32::MAX - 8000, u32::MAX - 2000),
+                WorldCoord::new(u32::MAX - 8000, u32::MAX - 8000),
+            ];
+
+            let result = clip_polygon_sh_world(&exterior, &[], &bounds);
+            assert!(result.is_some(), "Should handle coordinates near u32::MAX");
+
+            let (ext, _) = result.unwrap();
+            for coord in &ext {
+                assert!(
+                    coord.x >= bounds.x_min && coord.x <= bounds.x_max,
+                    "x={} out of bounds [{}, {}]",
+                    coord.x,
+                    bounds.x_min,
+                    bounds.x_max
+                );
+            }
+        }
+
+        #[test]
+        fn test_world_sh_performance_10k_vertices() {
+            // Performance regression test for WorldCoord-based SH
+            let bounds = WorldBounds::new(1000, 1000, 5000, 5000);
+            let n = 10_000usize;
+            let center_x = 3000i64;
+            let center_y = 3000i64;
+            let radius = 4000i64;
+
+            let mut exterior = Vec::with_capacity(n + 1);
+            for i in 0..n {
+                let angle = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+                let x = center_x + (radius as f64 * angle.cos()) as i64;
+                let y = center_y + (radius as f64 * angle.sin()) as i64;
+                exterior.push(WorldCoord::new(
+                    x.clamp(0, u32::MAX as i64) as u32,
+                    y.clamp(0, u32::MAX as i64) as u32,
+                ));
+            }
+            exterior.push(exterior[0]); // close
+
+            let start = std::time::Instant::now();
+            let result = clip_polygon_sh_world(&exterior, &[], &bounds);
+            let elapsed = start.elapsed();
+
+            assert!(result.is_some());
+            assert!(
+                elapsed.as_millis() < 100,
+                "WorldCoord SH clipping {} vertices took {}ms (should be <100ms)",
+                n,
+                elapsed.as_millis()
+            );
+        }
+
+        #[test]
+        fn test_world_sh_empty_input() {
+            let bounds = test_world_bounds();
+            let result = clip_polygon_sh_world(&[], &[], &bounds);
+            assert!(result.is_none(), "Empty exterior should return None");
+        }
     }
 }

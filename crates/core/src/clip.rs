@@ -288,6 +288,131 @@ fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<Mult
     }
 }
 
+// ============================================================================
+// WorldCoord-based Clipping Functions (Phase 1)
+// ============================================================================
+//
+// These functions provide WorldCoord-native clipping that operates in
+// 32-bit integer world coordinate space. They eliminate the floating-point
+// precision issues in buffer calculation and tile boundary comparisons.
+//
+// PHASE 1: Additive -- the f64 versions above remain the primary API.
+// Phase 2 will migrate the pipeline to call these instead.
+
+use crate::world_coord::{lng_lat_to_world, WorldBounds, WorldCoord};
+
+/// Compute buffer size in world coordinate units for a given tile.
+///
+/// This is the integer-precision replacement for `buffer_pixels_to_degrees`.
+/// The calculation is exact: `buffer_world = tile_size * buffer_pixels / extent`
+///
+/// # Arguments
+/// * `zoom` - Zoom level of the tile
+/// * `buffer_pixels` - Buffer size in pixels (e.g., 8)
+/// * `extent` - Tile extent in pixels (e.g., 4096)
+///
+/// # Returns
+/// Buffer size in world coordinate units
+pub fn buffer_pixels_to_world(zoom: u8, buffer_pixels: u32, extent: u32) -> u32 {
+    let tile_size_world: u64 = if zoom == 0 {
+        crate::world_coord::WORLD_SCALE
+    } else {
+        1_u64 << (32 - zoom as u32)
+    };
+    (tile_size_world * buffer_pixels as u64 / extent as u64) as u32
+}
+
+/// Clip a point in WorldCoord space to WorldBounds.
+///
+/// # Returns
+/// The point if inside the bounds, or `None` if outside.
+pub fn clip_point_world(point: &WorldCoord, bounds: &WorldBounds) -> Option<WorldCoord> {
+    if bounds.contains(point) {
+        Some(*point)
+    } else {
+        None
+    }
+}
+
+/// Clip a polygon in WorldCoord space using Sutherland-Hodgman.
+///
+/// This is the integer-coordinate equivalent of `clip_polygon`. It uses
+/// the WorldCoord-based SH algorithm for exact clipping in world space.
+///
+/// # Arguments
+/// * `exterior` - Exterior ring as WorldCoord points
+/// * `interiors` - Interior rings (holes) as WorldCoord points
+/// * `bounds` - Tile bounds in world coordinate space
+///
+/// # Returns
+/// Clipped exterior and interior rings, or `None` if no intersection
+///
+/// # Fast Paths
+/// - Returns `None` immediately if the polygon's bbox doesn't intersect bounds
+/// - Returns the polygon as-is if fully inside bounds
+pub fn clip_polygon_world(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    bounds: &WorldBounds,
+) -> Option<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> {
+    // Quick bbox rejection
+    let poly_bounds = worldcoord_bbox(exterior)?;
+    if !bounds.intersects(&poly_bounds) {
+        return None;
+    }
+
+    // Fast path: fully inside
+    if bounds.contains_bounds(&poly_bounds) {
+        return Some((exterior.to_vec(), interiors.to_vec()));
+    }
+
+    // Clip with Sutherland-Hodgman
+    sutherland_hodgman::clip_polygon_sh_world(exterior, interiors, bounds)
+}
+
+/// Compute the axis-aligned bounding box of a WorldCoord ring.
+fn worldcoord_bbox(coords: &[WorldCoord]) -> Option<WorldBounds> {
+    if coords.is_empty() {
+        return None;
+    }
+
+    let mut x_min = u32::MAX;
+    let mut y_min = u32::MAX;
+    let mut x_max = 0u32;
+    let mut y_max = 0u32;
+
+    for c in coords {
+        x_min = x_min.min(c.x);
+        y_min = y_min.min(c.y);
+        x_max = x_max.max(c.x);
+        y_max = y_max.max(c.y);
+    }
+
+    Some(WorldBounds::new(x_min, y_min, x_max, y_max))
+}
+
+/// Convert a geo::Polygon<f64> to WorldCoord rings for clipping.
+///
+/// This is a convenience function for the Phase 1 migration -- it converts
+/// from the existing f64 representation to WorldCoord for clipping, then
+/// results can be converted back. In Phase 2, geometries will already be
+/// in WorldCoord format.
+pub fn polygon_to_world_rings(poly: &Polygon<f64>) -> (Vec<WorldCoord>, Vec<Vec<WorldCoord>>) {
+    let exterior: Vec<WorldCoord> = poly
+        .exterior()
+        .coords()
+        .map(|c| lng_lat_to_world(c.x, c.y))
+        .collect();
+
+    let interiors: Vec<Vec<WorldCoord>> = poly
+        .interiors()
+        .iter()
+        .map(|ring| ring.coords().map(|c| lng_lat_to_world(c.x, c.y)).collect())
+        .collect();
+
+    (exterior, interiors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,6 +1013,240 @@ mod tests {
                 }
             }
             other => panic!("Expected Polygon, got {:?}", other),
+        }
+    }
+
+    // ========== WorldCoord-based Clipping Tests ==========
+
+    mod world_tests {
+        use super::*;
+        use crate::tile::TileCoord;
+        use crate::world_coord::{lng_lat_to_world, WorldBounds, WorldCoord};
+
+        #[test]
+        fn test_buffer_pixels_to_world_zoom0() {
+            // At zoom 0, tile_size = 2^32, buffer = 2^32 * 8 / 4096
+            let buffer = buffer_pixels_to_world(0, 8, 4096);
+            let expected = (crate::world_coord::WORLD_SCALE * 8 / 4096) as u32;
+            assert_eq!(buffer, expected);
+        }
+
+        #[test]
+        fn test_buffer_pixels_to_world_zoom10() {
+            // At zoom 10, tile_size = 2^22 = 4194304
+            // buffer = 4194304 * 8 / 4096 = 8192
+            let buffer = buffer_pixels_to_world(10, 8, 4096);
+            assert_eq!(buffer, 8192);
+        }
+
+        #[test]
+        fn test_buffer_pixels_to_world_consistency_with_degrees() {
+            // Verify that the integer buffer is approximately consistent
+            // with the f64 buffer for a specific tile
+            let tile = TileCoord::new(512, 512, 10);
+            let tile_bounds = tile.bounds();
+
+            let f64_buffer = buffer_pixels_to_degrees(8, &tile_bounds, 4096);
+            let world_buffer = buffer_pixels_to_world(10, 8, 4096);
+
+            // Convert f64 buffer to approximate world units for comparison
+            // At equator, 1 degree longitude ~ 2^32 / 360 world units
+            let approx_world_from_f64 =
+                (f64_buffer * crate::world_coord::WORLD_SCALE as f64 / 360.0) as u32;
+
+            // Should be within ~10% (imprecise due to different calculation paths)
+            let ratio = world_buffer as f64 / approx_world_from_f64 as f64;
+            assert!(
+                (0.8..=1.2).contains(&ratio),
+                "Integer buffer ({}) should be roughly consistent with f64 buffer ({} -> ~{} world units), ratio={}",
+                world_buffer, f64_buffer, approx_world_from_f64, ratio
+            );
+        }
+
+        #[test]
+        fn test_clip_point_world_inside() {
+            let bounds = WorldBounds::new(1000, 1000, 5000, 5000);
+            let point = WorldCoord::new(3000, 3000);
+            assert!(clip_point_world(&point, &bounds).is_some());
+        }
+
+        #[test]
+        fn test_clip_point_world_outside() {
+            let bounds = WorldBounds::new(1000, 1000, 5000, 5000);
+            let point = WorldCoord::new(6000, 3000);
+            assert!(clip_point_world(&point, &bounds).is_none());
+        }
+
+        #[test]
+        fn test_clip_point_world_on_boundary() {
+            let bounds = WorldBounds::new(1000, 1000, 5000, 5000);
+            let point = WorldCoord::new(5000, 3000);
+            assert!(clip_point_world(&point, &bounds).is_some());
+        }
+
+        #[test]
+        fn test_clip_polygon_world_fully_inside() {
+            let bounds = WorldBounds::new(0, 0, 10000, 10000);
+            let exterior = vec![
+                WorldCoord::new(2000, 2000),
+                WorldCoord::new(8000, 2000),
+                WorldCoord::new(8000, 8000),
+                WorldCoord::new(2000, 8000),
+                WorldCoord::new(2000, 2000),
+            ];
+
+            let result = clip_polygon_world(&exterior, &[], &bounds);
+            assert!(result.is_some());
+            let (ext, _) = result.unwrap();
+            // Fully inside -- should be returned as-is
+            assert_eq!(ext.len(), exterior.len());
+        }
+
+        #[test]
+        fn test_clip_polygon_world_fully_outside() {
+            let bounds = WorldBounds::new(0, 0, 10000, 10000);
+            let exterior = vec![
+                WorldCoord::new(20000, 20000),
+                WorldCoord::new(30000, 20000),
+                WorldCoord::new(30000, 30000),
+                WorldCoord::new(20000, 30000),
+                WorldCoord::new(20000, 20000),
+            ];
+
+            let result = clip_polygon_world(&exterior, &[], &bounds);
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_clip_polygon_world_partial() {
+            let bounds = WorldBounds::new(1000, 1000, 5000, 5000);
+            // Polygon straddling the right edge
+            let exterior = vec![
+                WorldCoord::new(3000, 2000),
+                WorldCoord::new(7000, 2000),
+                WorldCoord::new(7000, 4000),
+                WorldCoord::new(3000, 4000),
+                WorldCoord::new(3000, 2000),
+            ];
+
+            let result = clip_polygon_world(&exterior, &[], &bounds);
+            assert!(result.is_some());
+
+            let (ext, _) = result.unwrap();
+            for coord in &ext {
+                assert!(
+                    coord.x >= bounds.x_min && coord.x <= bounds.x_max,
+                    "x={} out of bounds",
+                    coord.x
+                );
+                assert!(
+                    coord.y >= bounds.y_min && coord.y <= bounds.y_max,
+                    "y={} out of bounds",
+                    coord.y
+                );
+            }
+        }
+
+        #[test]
+        fn test_polygon_to_world_rings_roundtrip() {
+            // Verify that polygon_to_world_rings produces reasonable WorldCoord rings
+            let poly = Polygon::new(
+                LineString::from(vec![
+                    Coord {
+                        x: -73.985,
+                        y: 40.748,
+                    },
+                    Coord {
+                        x: -73.980,
+                        y: 40.748,
+                    },
+                    Coord {
+                        x: -73.980,
+                        y: 40.752,
+                    },
+                    Coord {
+                        x: -73.985,
+                        y: 40.752,
+                    },
+                    Coord {
+                        x: -73.985,
+                        y: 40.748,
+                    },
+                ]),
+                vec![],
+            );
+
+            let (ext, ints) = polygon_to_world_rings(&poly);
+            assert_eq!(ext.len(), 5, "Should have 5 coords (4 vertices + close)");
+            assert!(ints.is_empty(), "Should have no holes");
+
+            // Verify coords are in expected range (NYC is in western hemisphere,
+            // northern hemisphere, so x < WORLD_HALF, y < WORLD_HALF)
+            for coord in &ext {
+                assert!(
+                    coord.x > 0 && coord.x < u32::MAX,
+                    "x={} should be in valid range",
+                    coord.x
+                );
+                assert!(
+                    coord.y > 0 && coord.y < u32::MAX,
+                    "y={} should be in valid range",
+                    coord.y
+                );
+            }
+        }
+
+        #[test]
+        fn test_worldcoord_bbox_computation() {
+            let coords = vec![
+                WorldCoord::new(100, 200),
+                WorldCoord::new(500, 100),
+                WorldCoord::new(300, 600),
+            ];
+
+            let bbox = worldcoord_bbox(&coords).unwrap();
+            assert_eq!(bbox.x_min, 100);
+            assert_eq!(bbox.y_min, 100);
+            assert_eq!(bbox.x_max, 500);
+            assert_eq!(bbox.y_max, 600);
+        }
+
+        #[test]
+        fn test_worldcoord_bbox_empty() {
+            let coords: Vec<WorldCoord> = vec![];
+            assert!(worldcoord_bbox(&coords).is_none());
+        }
+
+        #[test]
+        fn test_clip_polygon_world_with_real_tile() {
+            // Test clipping a polygon in WorldCoord space using a real tile
+            let tile = TileCoord::new(150, 192, 9);
+            let bounds = WorldBounds::from_tile(&tile);
+            let buffered = WorldBounds::from_tile_with_buffer(&tile, 8, 4096);
+
+            // Create a polygon that spans the tile and slightly beyond
+            let tile_f64 = tile.bounds();
+            let center_lng = (tile_f64.lng_min + tile_f64.lng_max) / 2.0;
+            let center_lat = (tile_f64.lat_min + tile_f64.lat_max) / 2.0;
+
+            let exterior: Vec<WorldCoord> = vec![
+                lng_lat_to_world(center_lng, center_lat),
+                lng_lat_to_world(tile_f64.lng_max + 0.5, center_lat),
+                lng_lat_to_world(tile_f64.lng_max + 0.5, tile_f64.lat_min - 0.5),
+                lng_lat_to_world(center_lng, tile_f64.lat_min - 0.5),
+                lng_lat_to_world(center_lng, center_lat),
+            ];
+
+            // Clip to unbuffered tile bounds
+            let result = clip_polygon_world(&exterior, &[], &bounds);
+            assert!(result.is_some(), "Should intersect the tile");
+
+            // Clip to buffered tile bounds
+            let result_buffered = clip_polygon_world(&exterior, &[], &buffered);
+            assert!(
+                result_buffered.is_some(),
+                "Should intersect the buffered tile"
+            );
         }
     }
 }

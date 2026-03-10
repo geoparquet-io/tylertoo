@@ -437,6 +437,202 @@ pub fn clip_multipolygon_wagyu_with_buffer(
 }
 
 // ============================================================================
+// WorldCoord-based Wagyu Clipping (Phase 1)
+// ============================================================================
+//
+// These functions provide WorldCoord-to-wagyu conversion that bypasses
+// the f64 TileBounds normalization step. Since WorldCoord is already in
+// a global integer coordinate system, we can convert directly to wagyu's
+// tile-local integer coordinates with a simple shift and scale operation.
+//
+// PHASE 1: Additive -- the f64 versions above remain unchanged.
+
+use crate::world_coord::{WorldBounds, WorldCoord};
+
+/// Convert a WorldCoord to wagyu tile-local integer coordinates.
+///
+/// This replaces the two-step process of:
+/// 1. f64 geographic -> f64 normalized (geo_to_wagyu_coord)
+///
+/// Instead, it directly converts from world space to tile-local space:
+/// `local = (world - tile_origin) * extent / tile_size`
+///
+/// # Arguments
+/// * `coord` - World coordinate to convert
+/// * `tile_bounds` - The tile's world bounds
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// WagyuPoint in tile-local integer coordinates
+pub fn world_to_wagyu_coord(
+    coord: &WorldCoord,
+    tile_bounds: &WorldBounds,
+    extent: u32,
+) -> WagyuPoint<i64> {
+    let tile_width = tile_bounds.x_max as i64 - tile_bounds.x_min as i64 + 1;
+    let tile_height = tile_bounds.y_max as i64 - tile_bounds.y_min as i64 + 1;
+    let extent_i = extent as i64;
+
+    // Convert from world space to tile-local space
+    let x = (coord.x as i64 - tile_bounds.x_min as i64) * extent_i / tile_width;
+    let y = (coord.y as i64 - tile_bounds.y_min as i64) * extent_i / tile_height;
+
+    WagyuPoint::new(x, y)
+}
+
+/// Convert wagyu tile-local integer coordinates back to WorldCoord.
+///
+/// Inverse of `world_to_wagyu_coord`.
+///
+/// # Arguments
+/// * `x` - X coordinate in tile-local space
+/// * `y` - Y coordinate in tile-local space
+/// * `tile_bounds` - The tile's world bounds
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// WorldCoord in global space
+pub fn wagyu_to_world_coord(x: i64, y: i64, tile_bounds: &WorldBounds, extent: u32) -> WorldCoord {
+    let tile_width = tile_bounds.x_max as i64 - tile_bounds.x_min as i64 + 1;
+    let tile_height = tile_bounds.y_max as i64 - tile_bounds.y_min as i64 + 1;
+    let extent_i = extent as i64;
+
+    let world_x = tile_bounds.x_min as i64 + x * tile_width / extent_i;
+    let world_y = tile_bounds.y_min as i64 + y * tile_height / extent_i;
+
+    WorldCoord::new(
+        world_x.clamp(0, u32::MAX as i64) as u32,
+        world_y.clamp(0, u32::MAX as i64) as u32,
+    )
+}
+
+/// Convert WorldCoord polygon rings to wagyu format.
+///
+/// This is the WorldCoord equivalent of `polygon_to_wagyu_rings`.
+pub fn world_polygon_to_wagyu_rings(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile_bounds: &WorldBounds,
+    extent: u32,
+) -> Vec<Vec<WagyuPoint<i64>>> {
+    let mut rings = Vec::with_capacity(1 + interiors.len());
+
+    let exterior_ring: Vec<WagyuPoint<i64>> = exterior
+        .iter()
+        .map(|c| world_to_wagyu_coord(c, tile_bounds, extent))
+        .collect();
+    rings.push(exterior_ring);
+
+    for interior in interiors {
+        let interior_ring: Vec<WagyuPoint<i64>> = interior
+            .iter()
+            .map(|c| world_to_wagyu_coord(c, tile_bounds, extent))
+            .collect();
+        rings.push(interior_ring);
+    }
+
+    rings
+}
+
+/// Clip a polygon in WorldCoord space using wagyu's Vatti algorithm.
+///
+/// This is the WorldCoord equivalent of `clip_polygon_wagyu`.
+/// It converts WorldCoord points to wagyu tile-local coordinates,
+/// performs the clipping, then converts back.
+///
+/// # Arguments
+/// * `exterior` - Exterior ring as WorldCoord points
+/// * `interiors` - Interior rings (holes) as WorldCoord points
+/// * `tile_bounds` - The tile's world bounds
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// Clipped exterior and interior rings in WorldCoord space, or None
+pub fn clip_polygon_wagyu_world(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile_bounds: &WorldBounds,
+    extent: u32,
+) -> Option<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> {
+    clip_polygon_wagyu_world_with_buffer(exterior, interiors, tile_bounds, extent, 0)
+}
+
+/// Clip a polygon in WorldCoord space with buffer using wagyu.
+pub fn clip_polygon_wagyu_world_with_buffer(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile_bounds: &WorldBounds,
+    extent: u32,
+    buffer: i64,
+) -> Option<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> {
+    let subject_rings = world_polygon_to_wagyu_rings(exterior, interiors, tile_bounds, extent);
+
+    let clip_ring = if buffer > 0 {
+        create_clip_box_with_buffer(extent, buffer)
+    } else {
+        create_clip_box(extent)
+    };
+
+    let mut clipper: Wagyu<i64> = Wagyu::new();
+
+    for ring in &subject_rings {
+        if ring.len() >= 3 {
+            clipper.add_ring(ring, PolygonType::Subject);
+        }
+    }
+
+    clipper.add_ring(&clip_ring, PolygonType::Clip);
+
+    let result = clipper
+        .execute(
+            Operation::Intersection,
+            FillType::EvenOdd,
+            FillType::EvenOdd,
+        )
+        .ok()?;
+
+    if result.0.is_empty() {
+        return None;
+    }
+
+    // Convert back to WorldCoord
+    let mut all_exteriors: Vec<WorldCoord> = Vec::new();
+    let mut all_interiors: Vec<Vec<WorldCoord>> = Vec::new();
+
+    for poly in &result.0 {
+        let ext_coords: Vec<WorldCoord> = poly
+            .exterior()
+            .coords()
+            .map(|c| wagyu_to_world_coord(c.x, c.y, tile_bounds, extent))
+            .collect();
+
+        if all_exteriors.is_empty() {
+            // First polygon becomes the exterior
+            all_exteriors = ext_coords;
+
+            // Add its holes
+            for interior in poly.interiors() {
+                let int_coords: Vec<WorldCoord> = interior
+                    .coords()
+                    .map(|c| wagyu_to_world_coord(c.x, c.y, tile_bounds, extent))
+                    .collect();
+                all_interiors.push(int_coords);
+            }
+        } else {
+            // Additional polygons are treated as separate results
+            // For simplicity in Phase 1, we just return the first polygon
+            // Phase 2 will handle multi-polygon results properly
+        }
+    }
+
+    if all_exteriors.is_empty() {
+        None
+    } else {
+        Some((all_exteriors, all_interiors))
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -766,5 +962,189 @@ mod tests {
         let result = clip_polygon_wagyu(&poly, &bounds, 4096);
         // Should produce some output (either Polygon or MultiPolygon)
         assert!(result.is_some(), "U-shape should intersect horizontal band");
+    }
+
+    // ========================================================================
+    // WorldCoord-based wagyu conversion and clipping tests
+    // ========================================================================
+
+    mod world_tests {
+        use super::*;
+        use crate::tile::TileCoord;
+        use crate::world_coord::{WorldBounds, WorldCoord};
+
+        #[test]
+        fn test_world_to_wagyu_coord_center() {
+            // A point at the center of the tile should map to (extent/2, extent/2)
+            let tile = TileCoord::new(1, 1, 2);
+            let tile_bounds = WorldBounds::from_tile(&tile);
+
+            let center_x = (tile_bounds.x_min as u64 + tile_bounds.x_max as u64) / 2;
+            let center_y = (tile_bounds.y_min as u64 + tile_bounds.y_max as u64) / 2;
+            let center = WorldCoord::new(center_x as u32, center_y as u32);
+
+            let wagyu_pt = world_to_wagyu_coord(&center, &tile_bounds, 4096);
+
+            // Should be approximately at (2048, 2048)
+            assert!(
+                (wagyu_pt.x - 2048).abs() <= 1,
+                "Center x should be ~2048, got {}",
+                wagyu_pt.x
+            );
+            assert!(
+                (wagyu_pt.y - 2048).abs() <= 1,
+                "Center y should be ~2048, got {}",
+                wagyu_pt.y
+            );
+        }
+
+        #[test]
+        fn test_world_to_wagyu_coord_origin() {
+            // A point at the tile's top-left corner should map to (0, 0)
+            let tile = TileCoord::new(1, 1, 2);
+            let tile_bounds = WorldBounds::from_tile(&tile);
+
+            let origin = WorldCoord::new(tile_bounds.x_min, tile_bounds.y_min);
+            let wagyu_pt = world_to_wagyu_coord(&origin, &tile_bounds, 4096);
+
+            assert_eq!(wagyu_pt.x, 0, "Origin x should be 0");
+            assert_eq!(wagyu_pt.y, 0, "Origin y should be 0");
+        }
+
+        #[test]
+        fn test_world_wagyu_roundtrip() {
+            let tile = TileCoord::new(5, 3, 4);
+            let tile_bounds = WorldBounds::from_tile(&tile);
+            let extent = 4096;
+
+            // Test various points within the tile
+            let test_points = [
+                WorldCoord::new(
+                    tile_bounds.x_min + (tile_bounds.width() / 4),
+                    tile_bounds.y_min + (tile_bounds.height() / 4),
+                ),
+                WorldCoord::new(
+                    tile_bounds.x_min + (tile_bounds.width() / 2),
+                    tile_bounds.y_min + (tile_bounds.height() / 2),
+                ),
+                WorldCoord::new(
+                    tile_bounds.x_min + (tile_bounds.width() * 3 / 4),
+                    tile_bounds.y_min + (tile_bounds.height() * 3 / 4),
+                ),
+            ];
+
+            for original in &test_points {
+                let wagyu_pt = world_to_wagyu_coord(original, &tile_bounds, extent);
+                let back = wagyu_to_world_coord(wagyu_pt.x, wagyu_pt.y, &tile_bounds, extent);
+
+                // Allow small rounding error (1 world unit at most)
+                let x_diff = (original.x as i64 - back.x as i64).unsigned_abs();
+                let y_diff = (original.y as i64 - back.y as i64).unsigned_abs();
+
+                // tile_size / extent = quantization step size
+                let max_error = (tile_bounds.width() / extent) as u64 + 1;
+
+                assert!(
+                    x_diff <= max_error,
+                    "x round-trip error too large: {} vs {} (diff={}, max_error={})",
+                    original.x,
+                    back.x,
+                    x_diff,
+                    max_error
+                );
+                assert!(
+                    y_diff <= max_error,
+                    "y round-trip error too large: {} vs {} (diff={}, max_error={})",
+                    original.y,
+                    back.y,
+                    y_diff,
+                    max_error
+                );
+            }
+        }
+
+        #[test]
+        fn test_clip_polygon_wagyu_world_fully_inside() {
+            let tile = TileCoord::new(2, 2, 3);
+            let tile_bounds = WorldBounds::from_tile(&tile);
+
+            // Polygon well inside the tile
+            let quarter_w = tile_bounds.width() / 4;
+            let quarter_h = tile_bounds.height() / 4;
+
+            let exterior = vec![
+                WorldCoord::new(tile_bounds.x_min + quarter_w, tile_bounds.y_min + quarter_h),
+                WorldCoord::new(
+                    tile_bounds.x_min + 3 * quarter_w,
+                    tile_bounds.y_min + quarter_h,
+                ),
+                WorldCoord::new(
+                    tile_bounds.x_min + 3 * quarter_w,
+                    tile_bounds.y_min + 3 * quarter_h,
+                ),
+                WorldCoord::new(
+                    tile_bounds.x_min + quarter_w,
+                    tile_bounds.y_min + 3 * quarter_h,
+                ),
+                WorldCoord::new(tile_bounds.x_min + quarter_w, tile_bounds.y_min + quarter_h),
+            ];
+
+            let result = clip_polygon_wagyu_world(&exterior, &[], &tile_bounds, 4096);
+            assert!(
+                result.is_some(),
+                "Fully inside polygon should be clipped (kept)"
+            );
+        }
+
+        #[test]
+        fn test_clip_polygon_wagyu_world_fully_outside() {
+            let tile = TileCoord::new(2, 2, 3);
+            let tile_bounds = WorldBounds::from_tile(&tile);
+
+            // Polygon completely outside -- use a tile far away
+            let far_tile = TileCoord::new(6, 6, 3);
+            let far_bounds = WorldBounds::from_tile(&far_tile);
+
+            let exterior = vec![
+                WorldCoord::new(far_bounds.x_min + 100, far_bounds.y_min + 100),
+                WorldCoord::new(far_bounds.x_max - 100, far_bounds.y_min + 100),
+                WorldCoord::new(far_bounds.x_max - 100, far_bounds.y_max - 100),
+                WorldCoord::new(far_bounds.x_min + 100, far_bounds.y_max - 100),
+                WorldCoord::new(far_bounds.x_min + 100, far_bounds.y_min + 100),
+            ];
+
+            let result = clip_polygon_wagyu_world(&exterior, &[], &tile_bounds, 4096);
+            assert!(result.is_none(), "Fully outside polygon should return None");
+        }
+
+        #[test]
+        fn test_clip_polygon_wagyu_world_partial() {
+            let tile = TileCoord::new(2, 2, 3);
+            let tile_bounds = WorldBounds::from_tile(&tile);
+
+            // Polygon spanning across the right edge
+            let half_w = tile_bounds.width() / 2;
+            let quarter_h = tile_bounds.height() / 4;
+
+            let exterior = vec![
+                WorldCoord::new(tile_bounds.x_min + half_w, tile_bounds.y_min + quarter_h),
+                WorldCoord::new(
+                    tile_bounds.x_max + half_w, // extends beyond
+                    tile_bounds.y_min + quarter_h,
+                ),
+                WorldCoord::new(
+                    tile_bounds.x_max + half_w,
+                    tile_bounds.y_min + 3 * quarter_h,
+                ),
+                WorldCoord::new(
+                    tile_bounds.x_min + half_w,
+                    tile_bounds.y_min + 3 * quarter_h,
+                ),
+                WorldCoord::new(tile_bounds.x_min + half_w, tile_bounds.y_min + quarter_h),
+            ];
+
+            let result = clip_polygon_wagyu_world(&exterior, &[], &tile_bounds, 4096);
+            assert!(result.is_some(), "Partial overlap should produce output");
+        }
     }
 }
