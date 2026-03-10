@@ -150,40 +150,8 @@ jobs:
         run: brew install protobuf
 
       - name: Run all tests (excluding slow regression tests)
+        # Large polygon regression tests are run manually - see tests/fixtures/realdata/README.md
         run: cargo test --all-features -- --skip large_polygon_regression
-
-  # Large polygon regression tests (release mode for performance)
-  regression-test:
-    name: Regression Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          lfs: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-release-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Run regression tests (release mode)
-        run: cargo test --release -p gpq-tiles-core --test large_polygon_regression -- --nocapture
-        timeout-minutes: 10
 
   # Coverage reporting
   coverage:

@@ -19,8 +19,25 @@ Production data samples for testing gpq-tiles tiling performance.
 
 ## Git LFS
 
-Large fixtures are tracked with Git LFS. After cloning:
+Most fixtures are tracked with Git LFS. After cloning:
 
 ```bash
 git lfs pull
 ```
+
+## Large Benchmark Files (Manual Download)
+
+Some benchmark files are too large to track in the repository:
+
+### `adm2_polygons.parquet` (1.8 GB, ~472k features)
+
+Used for large polygon regression benchmarks. This file is **not tracked** — download manually if needed.
+
+To run the regression benchmark:
+
+```bash
+# Place adm2_polygons.parquet in this directory, then:
+cargo test --release -p gpq-tiles-core --test large_polygon_regression -- --nocapture
+```
+
+The test automatically skips if the file is not present.

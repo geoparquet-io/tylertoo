@@ -7,6 +7,10 @@
 //! Run with: cargo test --release -p gpq-tiles-core --test large_polygon_regression -- --nocapture
 //!
 //! Expected: ~70 seconds for adm2_polygons.parquet (z0-z8)
+//!
+//! NOTE: The fixture file is NOT tracked in the repository (too large at 1.8GB).
+//! Download it manually and place in tests/fixtures/realdata/ to run this test.
+//! See tests/fixtures/realdata/README.md for details.
 
 use gpq_tiles_core::{Config, Converter};
 use std::path::Path;
