@@ -221,13 +221,9 @@ fn test_hole_intersecting_exterior_produces_valid_output() {
 ///
 /// S-H produces a single polygon that traces along the clip boundary.
 ///
-/// TODO(#94): This test is ignored because wagyu-rs produces unexpected
-/// output for this edge case. The self-intersecting polygon case (which is
-/// more common in real-world data) works correctly. This case needs deeper
-/// investigation of wagyu-rs coordinate handling for polygons that extend
-/// significantly outside the clip bounds.
+/// Fixed in wagyu-rs v0.2.1 - the clip operation now correctly produces
+/// two separate polygons for U-shapes that are split by the clip boundary.
 #[test]
-#[ignore = "wagyu-rs produces unexpected output for U-shapes extending outside bounds - needs investigation"]
 fn test_u_shape_split_produces_multipolygon() {
     // Create a U-shaped polygon manually
     let u_shape = Polygon::new(

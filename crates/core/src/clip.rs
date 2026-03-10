@@ -442,7 +442,7 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         Some(Geometry::Polygon(p)) => {
             // Check for structural issues OR boundary-connecting edges
             // (the latter indicates S-H connected disconnected regions)
-            if geometry_has_structural_issues(&sh_result.as_ref().unwrap())
+            if geometry_has_structural_issues(sh_result.as_ref().unwrap())
                 || has_boundary_connecting_edges(p, bounds)
             {
                 wagyu_clip::clip_polygon_wagyu(poly, bounds, DEFAULT_EXTENT)
