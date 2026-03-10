@@ -229,6 +229,347 @@ pub fn intersects_tile_world(
     geom_bbox.intersects(&tile_bounds)
 }
 
+// ============================================================================
+// WorldCoord-based Hierarchical Clipping (Phase 2)
+// ============================================================================
+//
+// This provides a WorldCoord-native hierarchical clipping pipeline.
+// Instead of operating in f64 geographic coordinates and converting at each step,
+// this version converts the input geometry to WorldCoord once at the start,
+// then performs all clipping operations in integer space.
+//
+// Benefits:
+// - Exact arithmetic: no floating-point precision errors in buffer calculations
+// - Single conversion: input → WorldCoord once, not per-tile
+// - Cache efficiency: parent results cached as WorldCoord, no re-conversion
+
+use crate::clip::{clip_point_world, clip_polygon_world, polygon_to_world_rings};
+use crate::world_coord::{lng_lat_to_world, WorldCoord};
+
+/// Result of WorldCoord-based hierarchical clipping.
+///
+/// Maps each tile coordinate to its clipped geometry in WorldCoord space.
+pub type WorldClipResults = HashMap<TileCoord, WorldClippedGeometry>;
+
+/// A geometry clipped to tile bounds in WorldCoord space.
+///
+/// This enum represents the various geometry types that can result from clipping.
+/// All coordinates are in 32-bit world coordinate space.
+#[derive(Debug, Clone)]
+pub enum WorldClippedGeometry {
+    /// A single point.
+    Point(WorldCoord),
+
+    /// A linestring (sequence of connected points).
+    LineString(Vec<WorldCoord>),
+
+    /// A polygon with exterior ring and optional interior rings (holes).
+    Polygon {
+        exterior: Vec<WorldCoord>,
+        interiors: Vec<Vec<WorldCoord>>,
+    },
+
+    /// Multiple points.
+    MultiPoint(Vec<WorldCoord>),
+
+    /// Multiple linestrings.
+    MultiLineString(Vec<Vec<WorldCoord>>),
+
+    /// Multiple polygons, each with exterior and interior rings.
+    MultiPolygon(Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)>),
+}
+
+/// Convert a geo::Geometry<f64> to WorldCoord representation.
+///
+/// This is the entry point for the Phase 2 pipeline - convert once at the start,
+/// then all operations are in integer space.
+fn geometry_to_world(geom: &Geometry<f64>) -> Option<WorldClippedGeometry> {
+    match geom {
+        Geometry::Point(p) => {
+            let wc = lng_lat_to_world(p.x(), p.y());
+            Some(WorldClippedGeometry::Point(wc))
+        }
+        Geometry::LineString(ls) => {
+            let coords: Vec<WorldCoord> = ls.coords().map(|c| lng_lat_to_world(c.x, c.y)).collect();
+            if coords.is_empty() {
+                None
+            } else {
+                Some(WorldClippedGeometry::LineString(coords))
+            }
+        }
+        Geometry::Polygon(poly) => {
+            let (exterior, interiors) = polygon_to_world_rings(poly);
+            if exterior.is_empty() {
+                None
+            } else {
+                Some(WorldClippedGeometry::Polygon {
+                    exterior,
+                    interiors,
+                })
+            }
+        }
+        Geometry::MultiPoint(mp) => {
+            let points: Vec<WorldCoord> =
+                mp.iter().map(|p| lng_lat_to_world(p.x(), p.y())).collect();
+            if points.is_empty() {
+                None
+            } else {
+                Some(WorldClippedGeometry::MultiPoint(points))
+            }
+        }
+        Geometry::MultiLineString(mls) => {
+            let lines: Vec<Vec<WorldCoord>> = mls
+                .iter()
+                .map(|ls| ls.coords().map(|c| lng_lat_to_world(c.x, c.y)).collect())
+                .filter(|v: &Vec<WorldCoord>| !v.is_empty())
+                .collect();
+            if lines.is_empty() {
+                None
+            } else {
+                Some(WorldClippedGeometry::MultiLineString(lines))
+            }
+        }
+        Geometry::MultiPolygon(mp) => {
+            let polys: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = mp
+                .iter()
+                .map(|poly| polygon_to_world_rings(poly))
+                .filter(|(ext, _)| !ext.is_empty())
+                .collect();
+            if polys.is_empty() {
+                None
+            } else {
+                Some(WorldClippedGeometry::MultiPolygon(polys))
+            }
+        }
+        // Other geometry types (GeometryCollection, etc.) - not supported yet
+        _ => None,
+    }
+}
+
+/// Compute the WorldBounds of a WorldClippedGeometry.
+fn world_geometry_bounds(geom: &WorldClippedGeometry) -> Option<WorldBounds> {
+    let mut x_min = u32::MAX;
+    let mut y_min = u32::MAX;
+    let mut x_max = 0u32;
+    let mut y_max = 0u32;
+
+    let mut update_bounds = |coord: &WorldCoord| {
+        x_min = x_min.min(coord.x);
+        y_min = y_min.min(coord.y);
+        x_max = x_max.max(coord.x);
+        y_max = y_max.max(coord.y);
+    };
+
+    match geom {
+        WorldClippedGeometry::Point(p) => {
+            update_bounds(p);
+        }
+        WorldClippedGeometry::LineString(coords) => {
+            for c in coords {
+                update_bounds(c);
+            }
+        }
+        WorldClippedGeometry::Polygon { exterior, .. } => {
+            for c in exterior {
+                update_bounds(c);
+            }
+        }
+        WorldClippedGeometry::MultiPoint(points) => {
+            for p in points {
+                update_bounds(p);
+            }
+        }
+        WorldClippedGeometry::MultiLineString(lines) => {
+            for line in lines {
+                for c in line {
+                    update_bounds(c);
+                }
+            }
+        }
+        WorldClippedGeometry::MultiPolygon(polys) => {
+            for (ext, _) in polys {
+                for c in ext {
+                    update_bounds(c);
+                }
+            }
+        }
+    }
+
+    if x_min <= x_max && y_min <= y_max {
+        Some(WorldBounds::new(x_min, y_min, x_max, y_max))
+    } else {
+        None
+    }
+}
+
+/// Clip a WorldClippedGeometry to the given WorldBounds.
+///
+/// Returns the clipped geometry, or None if the geometry doesn't intersect the bounds.
+fn clip_world_geometry(
+    geom: &WorldClippedGeometry,
+    bounds: &WorldBounds,
+) -> Option<WorldClippedGeometry> {
+    match geom {
+        WorldClippedGeometry::Point(p) => {
+            clip_point_world(p, bounds).map(WorldClippedGeometry::Point)
+        }
+        WorldClippedGeometry::LineString(coords) => {
+            // LineString clipping in WorldCoord not yet implemented - use bbox check
+            let geom_bounds = world_geometry_bounds(geom)?;
+            if bounds.intersects(&geom_bounds) {
+                // Return the original linestring if it intersects
+                // TODO: Implement proper linestring clipping in WorldCoord space
+                Some(WorldClippedGeometry::LineString(coords.clone()))
+            } else {
+                None
+            }
+        }
+        WorldClippedGeometry::Polygon {
+            exterior,
+            interiors,
+        } => clip_polygon_world(exterior, interiors, bounds).map(|(ext, ints)| {
+            WorldClippedGeometry::Polygon {
+                exterior: ext,
+                interiors: ints,
+            }
+        }),
+        WorldClippedGeometry::MultiPoint(points) => {
+            let clipped: Vec<WorldCoord> = points
+                .iter()
+                .filter_map(|p| clip_point_world(p, bounds))
+                .collect();
+            if clipped.is_empty() {
+                None
+            } else {
+                Some(WorldClippedGeometry::MultiPoint(clipped))
+            }
+        }
+        WorldClippedGeometry::MultiLineString(lines) => {
+            // MultiLineString clipping in WorldCoord not yet implemented - use bbox check
+            let geom_bounds = world_geometry_bounds(geom)?;
+            if bounds.intersects(&geom_bounds) {
+                Some(WorldClippedGeometry::MultiLineString(lines.clone()))
+            } else {
+                None
+            }
+        }
+        WorldClippedGeometry::MultiPolygon(polys) => {
+            let clipped: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = polys
+                .iter()
+                .filter_map(|(ext, ints)| clip_polygon_world(ext, ints, bounds))
+                .collect();
+            if clipped.is_empty() {
+                None
+            } else {
+                Some(WorldClippedGeometry::MultiPolygon(clipped))
+            }
+        }
+    }
+}
+
+/// Clip a geometry hierarchically across all tiles in a zoom range, using WorldCoord space.
+///
+/// This is the Phase 2 WorldCoord-native version of `clip_geometry_hierarchical`.
+/// It converts the input geometry to WorldCoord once at the start, then performs
+/// all clipping operations in integer space.
+///
+/// # Arguments
+///
+/// * `geom` - The geometry to clip (in f64 geographic coordinates)
+/// * `geom_bbox` - Bounding box of the geometry (for tile intersection tests)
+/// * `min_zoom` - Minimum zoom level to clip at
+/// * `max_zoom` - Maximum zoom level to clip at
+/// * `buffer_pixels` - Buffer in pixels around tile bounds
+/// * `extent` - Tile extent in pixels (typically 4096)
+///
+/// # Returns
+///
+/// A tuple of (world_clip_results, clip_stats) where world_clip_results maps each tile
+/// to its clipped geometry in WorldCoord space, and clip_stats tracks operation counts.
+///
+/// # Algorithm
+///
+/// 1. Convert input geometry to WorldCoord once
+/// 2. At min_zoom: clip geometry to each tile using WorldBounds
+/// 3. At each subsequent zoom level z:
+///    a. For each tile at z, find its parent at z-1
+///    b. If the parent clip result exists, clip that instead of the original
+///    c. If no parent result, fall back to original geometry
+/// 4. All operations use integer arithmetic (no f64 conversions per-tile)
+pub fn clip_geometry_hierarchical_world(
+    geom: &Geometry<f64>,
+    geom_bbox: &TileBounds,
+    min_zoom: u8,
+    max_zoom: u8,
+    buffer_pixels: u32,
+    extent: u32,
+) -> (WorldClipResults, ClipStats) {
+    use crate::tile::tiles_for_bbox;
+
+    let mut results: WorldClipResults = HashMap::new();
+    let mut stats = ClipStats::default();
+
+    // Convert input geometry to WorldCoord once
+    let world_geom = match geometry_to_world(geom) {
+        Some(wg) => wg,
+        None => return (results, stats),
+    };
+
+    // Convert geometry bbox to WorldBounds for intersection tests
+    let geom_world_bbox = WorldBounds::from_tile_bounds(geom_bbox);
+
+    // Cache: stores clipped geometry per tile for parent lookups
+    let mut prev_zoom_cache: HashMap<TileCoord, WorldClippedGeometry> = HashMap::new();
+    let mut curr_zoom_cache: HashMap<TileCoord, WorldClippedGeometry> = HashMap::new();
+
+    for z in min_zoom..=max_zoom {
+        let tiles: Vec<TileCoord> = tiles_for_bbox(geom_bbox, z).collect();
+
+        for tile_coord in tiles {
+            stats.tiles_processed += 1;
+
+            // Get tile bounds with buffer in WorldCoord space
+            let tile_world_bounds =
+                WorldBounds::from_tile_with_buffer(&tile_coord, buffer_pixels, extent);
+
+            // Quick bbox rejection in world coords (exact, no float errors)
+            if !geom_world_bbox.intersects(&tile_world_bounds) {
+                continue;
+            }
+
+            // Try to use parent's clip result for efficiency
+            let source_geom = if z > min_zoom {
+                if let Some(parent) = tile_coord.parent() {
+                    if let Some(parent_clipped) = prev_zoom_cache.get(&parent) {
+                        stats.cache_hits += 1;
+                        parent_clipped
+                    } else {
+                        // Parent had no clip result - fall back to original
+                        &world_geom
+                    }
+                } else {
+                    &world_geom
+                }
+            } else {
+                &world_geom
+            };
+
+            // Perform the clip operation in WorldCoord space
+            stats.clip_ops += 1;
+            if let Some(clipped) = clip_world_geometry(source_geom, &tile_world_bounds) {
+                curr_zoom_cache.insert(tile_coord, clipped.clone());
+                results.insert(tile_coord, clipped);
+            }
+        }
+
+        // Rotate caches: current becomes previous for next zoom level
+        prev_zoom_cache = curr_zoom_cache;
+        curr_zoom_cache = HashMap::new();
+    }
+
+    (results, stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,6 +1100,288 @@ mod tests {
                 just_outside.intersects(&tile_bounds_buffered),
                 "Should intersect with buffer"
             );
+        }
+
+        // ====================================================================
+        // WorldCoord-based Hierarchical Clipping Tests (Phase 2)
+        // ====================================================================
+
+        #[test]
+        fn test_world_hierarchical_clip_point() {
+            // A point should produce WorldCoord results in exactly one tile per zoom
+            let point = Geometry::Point(point!(x: 1.55, y: 42.55));
+            let bbox = TileBounds::new(1.55, 42.55, 1.55, 42.55);
+
+            let (results, stats) = clip_geometry_hierarchical_world(&point, &bbox, 0, 4, 8, 4096);
+
+            // Point should be in exactly one tile per zoom level
+            for z in 0..=4u8 {
+                let tiles_at_z: Vec<_> = results.keys().filter(|tc| tc.z == z).collect();
+                assert_eq!(
+                    tiles_at_z.len(),
+                    1,
+                    "Point should be in exactly 1 tile at zoom {}",
+                    z
+                );
+
+                // Verify the result is a Point variant
+                let tile = tiles_at_z[0];
+                match &results[tile] {
+                    WorldClippedGeometry::Point(_) => {}
+                    other => panic!("Expected Point, got {:?}", other),
+                }
+            }
+
+            assert_eq!(results.len(), 5, "Should have results for 5 zoom levels");
+            assert!(stats.clip_ops > 0, "Should have performed clip operations");
+        }
+
+        #[test]
+        fn test_world_hierarchical_clip_polygon_same_tiles_as_f64() {
+            // A polygon should produce results for the same tiles as the f64 version
+            let poly = Geometry::Polygon(polygon![
+                (x: -5.0, y: -5.0),
+                (x: 5.0, y: -5.0),
+                (x: 5.0, y: 5.0),
+                (x: -5.0, y: 5.0),
+                (x: -5.0, y: -5.0),
+            ]);
+            let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+
+            let (world_results, world_stats) =
+                clip_geometry_hierarchical_world(&poly, &bbox, 0, 3, 8, 4096);
+            let (f64_results, f64_stats) = clip_geometry_hierarchical(&poly, &bbox, 0, 3, 8, 4096);
+
+            // Should have same number of tiles
+            assert_eq!(
+                world_results.len(),
+                f64_results.len(),
+                "World and f64 should produce same number of tile results. \
+                 World: {}, f64: {}",
+                world_results.len(),
+                f64_results.len()
+            );
+
+            // Every tile in f64 should also be in world results
+            for tile_coord in f64_results.keys() {
+                assert!(
+                    world_results.contains_key(tile_coord),
+                    "Tile {:?} in f64 results but not in world results",
+                    tile_coord
+                );
+            }
+
+            // Similar clip stats
+            assert_eq!(
+                world_stats.clip_ops, f64_stats.clip_ops,
+                "Clip ops should match"
+            );
+        }
+
+        #[test]
+        fn test_world_hierarchical_clip_polygon_produces_polygons() {
+            // Verify that polygon clipping produces Polygon variants
+            let poly = Geometry::Polygon(polygon![
+                (x: -5.0, y: -5.0),
+                (x: 5.0, y: -5.0),
+                (x: 5.0, y: 5.0),
+                (x: -5.0, y: 5.0),
+                (x: -5.0, y: -5.0),
+            ]);
+            let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+
+            let (results, _) = clip_geometry_hierarchical_world(&poly, &bbox, 0, 2, 8, 4096);
+
+            for (tile, geom) in &results {
+                match geom {
+                    WorldClippedGeometry::Polygon { exterior, .. } => {
+                        assert!(
+                            exterior.len() >= 3,
+                            "Polygon at {:?} should have at least 3 vertices, got {}",
+                            tile,
+                            exterior.len()
+                        );
+                    }
+                    other => panic!("Expected Polygon at {:?}, got {:?}", tile, other),
+                }
+            }
+        }
+
+        #[test]
+        fn test_world_hierarchical_uses_parent_cache() {
+            // Large polygon should show cache hits from parent reuse
+            let poly = Geometry::Polygon(polygon![
+                (x: -20.0, y: -20.0),
+                (x: 20.0, y: -20.0),
+                (x: 20.0, y: 20.0),
+                (x: -20.0, y: 20.0),
+                (x: -20.0, y: -20.0),
+            ]);
+            let bbox = TileBounds::new(-20.0, -20.0, 20.0, 20.0);
+
+            let (_results, stats) = clip_geometry_hierarchical_world(&poly, &bbox, 0, 4, 8, 4096);
+
+            // Should have cache hits at z>0
+            assert!(
+                stats.cache_hits > 0,
+                "Should have cache hits from parent reuse. Got: {:?}",
+                stats
+            );
+
+            // Cache hits should be a significant fraction of clip ops
+            assert!(
+                stats.cache_hits > stats.clip_ops / 3,
+                "Cache hits ({}) should be > 1/3 of clip ops ({})",
+                stats.cache_hits,
+                stats.clip_ops
+            );
+        }
+
+        #[test]
+        fn test_world_hierarchical_invalid_coords_are_clamped() {
+            // WorldCoord conversion clamps invalid coordinates to valid Web Mercator bounds.
+            // A point at (200.0, 200.0) gets clamped to approximately (180.0, 85.05).
+            // This means it DOES produce results (unlike the f64 version which
+            // uses raw bbox rejection before clamping).
+            let point = Geometry::Point(point!(x: 200.0, y: 200.0));
+            // Note: We need the bbox to also be in a valid range for tiles_for_bbox to work
+            // Using clamped values that match where the point will end up
+            let bbox = TileBounds::new(179.0, 85.0, 180.0, 86.0);
+
+            let (results, stats) = clip_geometry_hierarchical_world(&point, &bbox, 0, 2, 8, 4096);
+
+            // WorldCoord clamps coords to valid range, so point IS in valid tiles
+            assert!(
+                !results.is_empty(),
+                "WorldCoord clamps invalid coords - point should be in valid tiles"
+            );
+            assert!(
+                stats.clip_ops > 0,
+                "Should have performed clip operations for clamped point"
+            );
+        }
+
+        #[test]
+        fn test_world_hierarchical_single_zoom() {
+            // With min_zoom == max_zoom, should behave same as regular hierarchical
+            let poly = Geometry::Polygon(polygon![
+                (x: -5.0, y: -5.0),
+                (x: 5.0, y: -5.0),
+                (x: 5.0, y: 5.0),
+                (x: -5.0, y: 5.0),
+                (x: -5.0, y: -5.0),
+            ]);
+            let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+
+            let (_results, stats) = clip_geometry_hierarchical_world(&poly, &bbox, 3, 3, 8, 4096);
+
+            // Single zoom level means no parent cache possible
+            assert_eq!(stats.cache_hits, 0, "Single zoom should have no cache hits");
+            assert!(stats.clip_ops > 0, "Should still perform clip operations");
+        }
+
+        #[test]
+        fn test_world_hierarchical_multipolygon() {
+            // MultiPolygon should be handled correctly
+            use geo::MultiPolygon;
+
+            let mp = Geometry::MultiPolygon(MultiPolygon::new(vec![
+                polygon![
+                    (x: -5.0, y: -5.0),
+                    (x: 0.0, y: -5.0),
+                    (x: 0.0, y: 0.0),
+                    (x: -5.0, y: 0.0),
+                    (x: -5.0, y: -5.0),
+                ],
+                polygon![
+                    (x: 0.0, y: 0.0),
+                    (x: 5.0, y: 0.0),
+                    (x: 5.0, y: 5.0),
+                    (x: 0.0, y: 5.0),
+                    (x: 0.0, y: 0.0),
+                ],
+            ]));
+            let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+
+            let (results, stats) = clip_geometry_hierarchical_world(&mp, &bbox, 0, 2, 8, 4096);
+
+            assert!(!results.is_empty(), "Should have results for MultiPolygon");
+            assert!(stats.clip_ops > 0, "Should have performed clip operations");
+
+            // Verify results are MultiPolygon variants
+            for (tile, geom) in &results {
+                match geom {
+                    WorldClippedGeometry::MultiPolygon(polys) => {
+                        assert!(
+                            !polys.is_empty(),
+                            "MultiPolygon at {:?} should not be empty",
+                            tile
+                        );
+                    }
+                    other => panic!("Expected MultiPolygon at {:?}, got {:?}", tile, other),
+                }
+            }
+        }
+
+        #[test]
+        fn test_world_clipped_geometry_bounds() {
+            // Test that world_geometry_bounds computes correct bounds
+            use crate::world_coord::WorldCoord;
+
+            let poly = WorldClippedGeometry::Polygon {
+                exterior: vec![
+                    WorldCoord::new(100, 200),
+                    WorldCoord::new(500, 200),
+                    WorldCoord::new(500, 600),
+                    WorldCoord::new(100, 600),
+                    WorldCoord::new(100, 200),
+                ],
+                interiors: vec![],
+            };
+
+            let bounds = world_geometry_bounds(&poly).unwrap();
+            assert_eq!(bounds.x_min, 100);
+            assert_eq!(bounds.y_min, 200);
+            assert_eq!(bounds.x_max, 500);
+            assert_eq!(bounds.y_max, 600);
+        }
+
+        #[test]
+        fn test_geometry_to_world_point() {
+            let point = Geometry::Point(point!(x: 0.0, y: 0.0));
+            let world = geometry_to_world(&point).unwrap();
+
+            match world {
+                WorldClippedGeometry::Point(wc) => {
+                    // Null Island should be at world center
+                    assert_eq!(wc.x, crate::world_coord::WORLD_HALF);
+                    assert_eq!(wc.y, crate::world_coord::WORLD_HALF);
+                }
+                other => panic!("Expected Point, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_geometry_to_world_polygon() {
+            let poly = Geometry::Polygon(polygon![
+                (x: -5.0, y: -5.0),
+                (x: 5.0, y: -5.0),
+                (x: 5.0, y: 5.0),
+                (x: -5.0, y: 5.0),
+                (x: -5.0, y: -5.0),
+            ]);
+            let world = geometry_to_world(&poly).unwrap();
+
+            match world {
+                WorldClippedGeometry::Polygon {
+                    exterior,
+                    interiors,
+                } => {
+                    assert_eq!(exterior.len(), 5, "Should have 5 vertices (closed ring)");
+                    assert!(interiors.is_empty(), "Should have no holes");
+                }
+                other => panic!("Expected Polygon, got {:?}", other),
+            }
         }
     }
 }
