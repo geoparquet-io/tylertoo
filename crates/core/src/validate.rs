@@ -24,6 +24,8 @@
 //! assert!(is_valid_geometry(&Geometry::LineString(line)));
 //! ```
 
+use crate::tile::TileCoord;
+use crate::world_coord::WorldCoord;
 use geo::{Area, Geometry, LineString, MultiLineString, MultiPolygon, Polygon};
 
 /// Minimum number of points for a valid polygon ring (3 unique + closing = 4)
@@ -272,6 +274,202 @@ fn filter_multi_polygon(mp: &MultiPolygon<f64>) -> Option<Geometry<f64>> {
     } else {
         Some(Geometry::MultiPolygon(MultiPolygon::new(valid_polygons)))
     }
+}
+
+// =========================================================================
+// WorldCoord Validation
+// =========================================================================
+//
+// These functions validate geometries represented as WorldCoord sequences,
+// which is the integer-coordinate representation used in the tiling pipeline.
+// This allows validation to happen before MVT encoding, using the same
+// coordinate system that will be used for encoding.
+
+/// Result of WorldCoord validation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldCoordValidation {
+    /// Coordinates are valid
+    Valid,
+    /// Coordinates are invalid
+    Invalid(WorldCoordInvalidReason),
+}
+
+/// Reason why WorldCoord geometry is invalid
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldCoordInvalidReason {
+    /// Too few coordinates for the geometry type
+    TooFewCoords { required: usize, actual: usize },
+    /// All tile-local coordinates collapse to the same pixel (degenerate)
+    DegenerateInTile,
+    /// Ring has zero area in tile-local coordinates (collinear or coincident)
+    ZeroAreaRing,
+    /// Empty coordinate sequence
+    Empty,
+}
+
+impl WorldCoordValidation {
+    /// Returns true if valid
+    pub fn is_valid(&self) -> bool {
+        matches!(self, WorldCoordValidation::Valid)
+    }
+}
+
+/// Check if a WorldCoord falls within a specific tile.
+///
+/// This is useful for verifying that a coordinate actually belongs to the
+/// tile it is being encoded into.
+///
+/// # Arguments
+/// * `coord` - World coordinate to check
+/// * `tile` - The tile to check containment in
+///
+/// # Returns
+/// `true` if the coordinate falls within the tile bounds
+pub fn world_coord_in_tile(coord: &WorldCoord, tile: &TileCoord) -> bool {
+    if tile.z == 0 {
+        // At zoom 0, the entire world is one tile
+        return true;
+    }
+
+    let shift = 32 - tile.z as u32;
+
+    // Tile bounds in world coordinates
+    let tile_min_x = (tile.x as u64) << shift;
+    let tile_max_x = ((tile.x + 1) as u64) << shift;
+    let tile_min_y = (tile.y as u64) << shift;
+    let tile_max_y = ((tile.y + 1) as u64) << shift;
+
+    let cx = coord.x as u64;
+    let cy = coord.y as u64;
+
+    cx >= tile_min_x && cx < tile_max_x && cy >= tile_min_y && cy < tile_max_y
+}
+
+/// Check if a WorldCoord falls within a tile's buffered region.
+///
+/// Buffer extends the tile bounds by the given number of extent units.
+/// This is useful for including features that extend slightly beyond
+/// tile boundaries for seamless rendering.
+///
+/// # Arguments
+/// * `coord` - World coordinate to check
+/// * `tile` - The tile
+/// * `extent` - Tile extent (typically 4096)
+/// * `buffer` - Buffer in extent units (e.g., 64 for ~1.5% buffer)
+///
+/// # Returns
+/// `true` if the coordinate falls within the buffered tile bounds
+pub fn world_coord_in_tile_buffer(
+    coord: &WorldCoord,
+    tile: &TileCoord,
+    extent: u32,
+    buffer: u32,
+) -> bool {
+    let (local_x, local_y) = coord.to_tile_local(tile, extent);
+    let buf = buffer as i32;
+    let ext = extent as i32;
+
+    local_x >= -buf && local_x <= ext + buf && local_y >= -buf && local_y <= ext + buf
+}
+
+/// Validate a ring of WorldCoords for MVT encoding.
+///
+/// Checks:
+/// - Minimum point count (4 for a valid ring: 3 unique + closing)
+/// - Non-zero area in tile-local coordinates (detects degenerate rings)
+///
+/// # Arguments
+/// * `coords` - Ring coordinates
+/// * `tile` - Target tile for area calculation
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// Validation result
+pub fn validate_world_ring(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+) -> WorldCoordValidation {
+    if coords.is_empty() {
+        return WorldCoordValidation::Invalid(WorldCoordInvalidReason::Empty);
+    }
+
+    if coords.len() < MIN_POLYGON_RING_POINTS {
+        return WorldCoordValidation::Invalid(WorldCoordInvalidReason::TooFewCoords {
+            required: MIN_POLYGON_RING_POINTS,
+            actual: coords.len(),
+        });
+    }
+
+    // Calculate signed area using the shoelace formula in tile-local coordinates.
+    // Using i64 to avoid overflow with i32 coordinates.
+    let mut area2: i64 = 0;
+    let locals: Vec<(i32, i32)> = coords
+        .iter()
+        .map(|c| c.to_tile_local(tile, extent))
+        .collect();
+
+    for i in 0..locals.len() - 1 {
+        let (x1, y1) = locals[i];
+        let (x2, y2) = locals[i + 1];
+        area2 += (x1 as i64) * (y2 as i64) - (x2 as i64) * (y1 as i64);
+    }
+
+    // area2 is 2 * signed area. If zero, the ring is degenerate.
+    if area2 == 0 {
+        return WorldCoordValidation::Invalid(WorldCoordInvalidReason::ZeroAreaRing);
+    }
+
+    WorldCoordValidation::Valid
+}
+
+/// Validate a linestring of WorldCoords for MVT encoding.
+///
+/// Checks minimum point count (2 for a valid linestring).
+///
+/// # Arguments
+/// * `coords` - LineString coordinates
+///
+/// # Returns
+/// Validation result
+pub fn validate_world_linestring(coords: &[WorldCoord]) -> WorldCoordValidation {
+    if coords.is_empty() {
+        return WorldCoordValidation::Invalid(WorldCoordInvalidReason::Empty);
+    }
+
+    if coords.len() < MIN_LINESTRING_POINTS {
+        return WorldCoordValidation::Invalid(WorldCoordInvalidReason::TooFewCoords {
+            required: MIN_LINESTRING_POINTS,
+            actual: coords.len(),
+        });
+    }
+
+    WorldCoordValidation::Valid
+}
+
+/// Check if a ring of WorldCoords will produce a degenerate geometry in a specific tile.
+///
+/// A ring is degenerate in a tile if all its tile-local coordinates round to the
+/// same pixel, meaning the ring has zero visual area in the rendered tile.
+///
+/// # Arguments
+/// * `coords` - Ring coordinates
+/// * `tile` - Target tile
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// `true` if the ring is degenerate (all points collapse to same pixel)
+pub fn is_degenerate_in_tile(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> bool {
+    if coords.len() < 2 {
+        return true;
+    }
+
+    let (first_x, first_y) = coords[0].to_tile_local(tile, extent);
+
+    coords[1..].iter().all(|c| {
+        let (x, y) = c.to_tile_local(tile, extent);
+        x == first_x && y == first_y
+    })
 }
 
 #[cfg(test)]
@@ -739,5 +937,307 @@ mod tests {
         assert!(!valid.is_invalid());
         assert!(!invalid.is_valid());
         assert!(invalid.is_invalid());
+    }
+
+    // =========================================================================
+    // WORLDCOORD VALIDATION TESTS
+    // =========================================================================
+
+    use crate::tile::TileCoord;
+    use crate::world_coord::lng_lat_to_world;
+
+    // ---- world_coord_in_tile tests ----
+
+    #[test]
+    fn test_world_coord_in_tile_zoom0_always_contained() {
+        // At zoom 0, the entire world is one tile
+        let tile = TileCoord::new(0, 0, 0);
+        let coord = lng_lat_to_world(0.0, 0.0);
+        assert!(world_coord_in_tile(&coord, &tile));
+
+        let nw = lng_lat_to_world(-180.0, 85.0);
+        assert!(world_coord_in_tile(&nw, &tile));
+
+        let se = lng_lat_to_world(179.0, -85.0);
+        assert!(world_coord_in_tile(&se, &tile));
+    }
+
+    #[test]
+    fn test_world_coord_in_tile_zoom1_quadrants() {
+        // At zoom 1, world is split into 4 tiles
+        // Null Island (0, 0) should be in tile (1, 1) - eastern, southern hemisphere
+        let coord = lng_lat_to_world(0.0, 0.0);
+
+        assert!(
+            !world_coord_in_tile(&coord, &TileCoord::new(0, 0, 1)),
+            "Null Island should NOT be in NW tile"
+        );
+        assert!(
+            world_coord_in_tile(&coord, &TileCoord::new(1, 1, 1)),
+            "Null Island should be in SE tile"
+        );
+    }
+
+    #[test]
+    fn test_world_coord_in_tile_point_inside() {
+        // NYC at zoom 14
+        let coord = lng_lat_to_world(-73.985, 40.748);
+        let tile = coord.to_tile(14);
+        assert!(world_coord_in_tile(&coord, &tile));
+    }
+
+    #[test]
+    fn test_world_coord_in_tile_point_outside() {
+        // NYC coordinate, but check a completely different tile
+        let coord = lng_lat_to_world(-73.985, 40.748);
+        let wrong_tile = TileCoord::new(0, 0, 14); // Way off
+        assert!(!world_coord_in_tile(&coord, &wrong_tile));
+    }
+
+    // ---- world_coord_in_tile_buffer tests ----
+
+    #[test]
+    fn test_world_coord_in_tile_buffer_inside() {
+        let coord = lng_lat_to_world(0.0, 0.0);
+        let tile = coord.to_tile(10);
+        assert!(world_coord_in_tile_buffer(&coord, &tile, 4096, 64));
+    }
+
+    #[test]
+    fn test_world_coord_in_tile_buffer_edge() {
+        // A point just outside the tile should be within the buffer region
+        let tile = TileCoord::new(512, 512, 10);
+        let extent = 4096u32;
+        let buffer = 256u32;
+
+        // Get tile's edge in world coords and go slightly beyond
+        let shift = 32 - 10u32;
+        let tile_max_x = ((tile.x + 1) as u64) << shift;
+        // Point just beyond tile's right edge
+        let just_outside = WorldCoord::new(
+            tile_max_x as u32 + 1,
+            ((tile.y as u64) << shift) as u32 + 1000,
+        );
+        let (local_x, _) = just_outside.to_tile_local(&tile, extent);
+
+        if local_x > extent as i32 && local_x <= extent as i32 + buffer as i32 {
+            assert!(world_coord_in_tile_buffer(
+                &just_outside,
+                &tile,
+                extent,
+                buffer
+            ));
+        }
+    }
+
+    // ---- validate_world_linestring tests ----
+
+    #[test]
+    fn test_validate_world_linestring_valid() {
+        let coords = vec![lng_lat_to_world(0.0, 0.0), lng_lat_to_world(1.0, 1.0)];
+        assert!(validate_world_linestring(&coords).is_valid());
+    }
+
+    #[test]
+    fn test_validate_world_linestring_too_short() {
+        let coords = vec![lng_lat_to_world(0.0, 0.0)];
+        let result = validate_world_linestring(&coords);
+        assert_eq!(
+            result,
+            WorldCoordValidation::Invalid(WorldCoordInvalidReason::TooFewCoords {
+                required: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_world_linestring_empty() {
+        let result = validate_world_linestring(&[]);
+        assert_eq!(
+            result,
+            WorldCoordValidation::Invalid(WorldCoordInvalidReason::Empty)
+        );
+    }
+
+    // ---- validate_world_ring tests ----
+
+    #[test]
+    fn test_validate_world_ring_valid_triangle() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![
+            lng_lat_to_world(-90.0, 45.0),
+            lng_lat_to_world(0.0, -45.0),
+            lng_lat_to_world(90.0, 45.0),
+            lng_lat_to_world(-90.0, 45.0), // closing
+        ];
+        assert!(validate_world_ring(&coords, &tile, 4096).is_valid());
+    }
+
+    #[test]
+    fn test_validate_world_ring_too_few_points() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![
+            lng_lat_to_world(0.0, 0.0),
+            lng_lat_to_world(1.0, 0.0),
+            lng_lat_to_world(0.0, 0.0), // only 3 points, need 4
+        ];
+        let result = validate_world_ring(&coords, &tile, 4096);
+        assert_eq!(
+            result,
+            WorldCoordValidation::Invalid(WorldCoordInvalidReason::TooFewCoords {
+                required: 4,
+                actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_world_ring_empty() {
+        let tile = TileCoord::new(0, 0, 0);
+        let result = validate_world_ring(&[], &tile, 4096);
+        assert_eq!(
+            result,
+            WorldCoordValidation::Invalid(WorldCoordInvalidReason::Empty)
+        );
+    }
+
+    #[test]
+    fn test_validate_world_ring_collinear_zero_area() {
+        // All points on the same line - zero area
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![
+            lng_lat_to_world(-90.0, 0.0),
+            lng_lat_to_world(0.0, 0.0),
+            lng_lat_to_world(90.0, 0.0),
+            lng_lat_to_world(-90.0, 0.0), // closing
+        ];
+        let result = validate_world_ring(&coords, &tile, 4096);
+        assert_eq!(
+            result,
+            WorldCoordValidation::Invalid(WorldCoordInvalidReason::ZeroAreaRing)
+        );
+    }
+
+    #[test]
+    fn test_validate_world_ring_coincident_zero_area() {
+        // All points at the same location - zero area
+        let tile = TileCoord::new(0, 0, 0);
+        let same = lng_lat_to_world(0.0, 0.0);
+        let coords = vec![same, same, same, same];
+        let result = validate_world_ring(&coords, &tile, 4096);
+        assert_eq!(
+            result,
+            WorldCoordValidation::Invalid(WorldCoordInvalidReason::ZeroAreaRing)
+        );
+    }
+
+    // ---- is_degenerate_in_tile tests ----
+
+    #[test]
+    fn test_is_degenerate_in_tile_large_polygon_not_degenerate() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![
+            lng_lat_to_world(-90.0, 45.0),
+            lng_lat_to_world(0.0, -45.0),
+            lng_lat_to_world(90.0, 45.0),
+            lng_lat_to_world(-90.0, 45.0),
+        ];
+        assert!(!is_degenerate_in_tile(&coords, &tile, 4096));
+    }
+
+    #[test]
+    fn test_is_degenerate_in_tile_tiny_polygon_at_high_zoom() {
+        // A very tiny polygon that collapses to a single pixel at zoom 0
+        // with extent 4096
+        let coord = lng_lat_to_world(0.0, 0.0);
+        // All points are the same in world coords => definitely degenerate
+        let coords = vec![coord, coord, coord, coord];
+        let tile = TileCoord::new(0, 0, 0);
+        assert!(is_degenerate_in_tile(&coords, &tile, 4096));
+    }
+
+    #[test]
+    fn test_is_degenerate_in_tile_single_point() {
+        let coord = lng_lat_to_world(0.0, 0.0);
+        let tile = TileCoord::new(0, 0, 0);
+        assert!(is_degenerate_in_tile(&[coord], &tile, 4096));
+    }
+
+    #[test]
+    fn test_is_degenerate_in_tile_empty() {
+        let tile = TileCoord::new(0, 0, 0);
+        assert!(is_degenerate_in_tile(&[], &tile, 4096));
+    }
+
+    // ---- WorldCoordValidation API tests ----
+
+    #[test]
+    fn test_world_coord_validation_is_valid() {
+        let valid = WorldCoordValidation::Valid;
+        let invalid = WorldCoordValidation::Invalid(WorldCoordInvalidReason::Empty);
+
+        assert!(valid.is_valid());
+        assert!(!invalid.is_valid());
+    }
+
+    // ---- Consistency tests: WorldCoord validation agrees with f64 validation ----
+
+    #[test]
+    fn test_world_coord_ring_validation_agrees_with_f64_for_valid_polygon() {
+        // A valid polygon should pass both f64 and WorldCoord validation
+        let tile = TileCoord::new(0, 0, 0);
+        let points = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ];
+
+        // f64 validation
+        let poly = make_polygon(&points);
+        let f64_result = validate_polygon(&poly);
+        assert!(f64_result.is_valid(), "f64 polygon should be valid");
+
+        // WorldCoord validation
+        let world_coords: Vec<WorldCoord> = points
+            .iter()
+            .map(|&(lng, lat)| lng_lat_to_world(lng, lat))
+            .collect();
+        let wc_result = validate_world_ring(&world_coords, &tile, 4096);
+        assert!(wc_result.is_valid(), "WorldCoord ring should be valid");
+    }
+
+    #[test]
+    fn test_world_coord_ring_validation_agrees_with_f64_for_degenerate() {
+        // A degenerate polygon (collinear) should fail both validations
+        let tile = TileCoord::new(0, 0, 0);
+        let points = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (20.0, 0.0),
+            (30.0, 0.0),
+            (0.0, 0.0),
+        ];
+
+        // f64 validation
+        let poly = make_polygon(&points);
+        let f64_result = validate_polygon(&poly);
+        assert!(
+            !f64_result.is_valid(),
+            "f64 polygon should be invalid (zero area)"
+        );
+
+        // WorldCoord validation
+        let world_coords: Vec<WorldCoord> = points
+            .iter()
+            .map(|&(lng, lat)| lng_lat_to_world(lng, lat))
+            .collect();
+        let wc_result = validate_world_ring(&world_coords, &tile, 4096);
+        assert!(
+            !wc_result.is_valid(),
+            "WorldCoord ring should be invalid (zero area)"
+        );
     }
 }
