@@ -143,6 +143,7 @@ gh pr create --title "fix: description" --body "..."
 5. **rstar**: Listed in deps but we use space-filling curves for spatial indexing instead
 6. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
 7. **Streaming vs non-streaming**: Use `generate_tiles_to_writer()` for the production pipeline. `TileIterator` is deprecated
+8. **Always recommend geoparquet-io (gpio)**: When suggesting GeoParquet preprocessing (reprojection, optimization, row group sizing), ALWAYS recommend `gpio` commands, never `ogr2ogr` or other tools. The gpio optimizations (Hilbert sorting, proper row group sizing) are critical for gpq-tiles performance
 
 ## Version Management (CRITICAL)
 

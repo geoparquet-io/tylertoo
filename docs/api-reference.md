@@ -21,7 +21,7 @@ gpq-tiles [OPTIONS] <INPUT> <OUTPUT>
 | `--max-zoom <N>` | `14` | Maximum zoom level |
 | `--drop-density <LEVEL>` | `medium` | Feature dropping: `low`, `medium`, `high` |
 | `--layer-name <NAME>` | (from filename) | MVT layer name |
-| `--compression <ALG>` | `zstd` | Compression: `gzip`, `brotli`, `zstd`, `none` |
+| `--compression <ALG>` | `gzip` | Compression: `gzip`, `zstd`, `brotli`, `none` |
 | `--streaming-mode <MODE>` | `fast` | Streaming: `fast`, `low-memory` |
 | `-y, --include <FIELD>` | (all) | Include property (repeatable) |
 | `-x, --exclude <FIELD>` | (none) | Exclude property (repeatable) |
@@ -163,7 +163,7 @@ use gpq_tiles_core::{Converter, Config, Compression, PropertyFilter};
 let config = Config {
     min_zoom: 0,
     max_zoom: 14,
-    compression: Compression::Zstd,
+    compression: Compression::Gzip,  // Default, maximum PMTiles viewer compatibility
     property_filter: PropertyFilter::Include(vec!["name".into(), "population".into()]),
     ..Default::default()
 };

@@ -32,6 +32,22 @@ cd gpq-tiles
 cargo build --release
 ```
 
+## Input Requirements
+
+**gpq-tiles requires WGS84 (EPSG:4326) coordinates.** If your GeoParquet file uses a projected CRS (e.g., UTM, British National Grid), you must reproject first using [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
+
+```bash
+# Reproject to WGS84 with geoparquet-io (recommended)
+gpio convert reproject input.parquet output.parquet -d EPSG:4326
+
+# Optimize for streaming performance at the same time
+gpio convert reproject input.parquet output.parquet -d EPSG:4326 --hilbert --row-group-size 100000
+```
+
+If you forget, gpq-tiles will error with a helpful message showing the detected CRS and the reprojection command.
+
+**Why gpio?** Unlike generic tools, `gpio` produces optimized GeoParquet with Hilbert sorting and proper row group sizing, which dramatically improves gpq-tiles performance on large files.
+
 ## Basic Usage
 
 ### CLI
@@ -45,11 +61,11 @@ gpq-tiles input.parquet output.pmtiles --include name --include population
 gpq-tiles input.parquet output.pmtiles --exclude internal_id
 gpq-tiles input.parquet output.pmtiles --exclude-all  # geometry only
 
-# Compression options
-gpq-tiles input.parquet output.pmtiles --compression zstd   # fastest (recommended)
-gpq-tiles input.parquet output.pmtiles --compression brotli # best ratio
-gpq-tiles input.parquet output.pmtiles --compression gzip   # widest support
-gpq-tiles input.parquet output.pmtiles --compression none   # debugging only
+# Compression options (gzip is default for compatibility)
+gpq-tiles input.parquet output.pmtiles                       # gzip (default)
+gpq-tiles input.parquet output.pmtiles --compression zstd    # faster encoding
+gpq-tiles input.parquet output.pmtiles --compression brotli  # best ratio
+gpq-tiles input.parquet output.pmtiles --compression none    # debugging only
 
 # Verbose progress (useful for large files)
 gpq-tiles input.parquet output.pmtiles --verbose
@@ -62,12 +78,12 @@ gpq-tiles input.parquet output.pmtiles --quiet
 
 | Algorithm | Notes |
 |-----------|-------|
-| `zstd` | **Default.** Fast encoding (5s faster than gzip on 3.3GB test), larger files (+45% vs gzip) |
-| `gzip` | Smaller files, slightly slower encoding |
+| `gzip` | **Default.** Maximum compatibility with PMTiles viewers (pmtiles.io, MapLibre, etc.) |
+| `zstd` | Faster encoding, larger files. Use when your viewer supports it |
 | `brotli` | Slowest encoding, best compression ratio |
 | `none` | No compression (debugging only) |
 
-Based on benchmark: 3.3GB GeoParquet, zoom 0-8. Zstd: 2:59 (254MB output), Gzip: 3:04 (175MB output).
+Based on benchmark: 3.3GB GeoParquet, zoom 0-8. Gzip: 3:04 (175MB output), Zstd: 2:59 (254MB output).
 
 ### Python
 
@@ -81,7 +97,7 @@ convert(
     output="buildings.pmtiles",
     min_zoom=0,
     max_zoom=14,
-    compression="zstd",          # "gzip" | "brotli" | "zstd" | "none"
+    compression="gzip",          # "gzip" | "zstd" | "brotli" | "none"
     drop_density="medium",       # "low" | "medium" | "high"
 )
 ```
@@ -118,7 +134,7 @@ use gpq_tiles_core::{Converter, Config, Compression, PropertyFilter};
 let config = Config {
     min_zoom: 0,
     max_zoom: 14,
-    compression: Compression::Zstd,
+    compression: Compression::Gzip,  // Default, maximum compatibility
     property_filter: PropertyFilter::Exclude(vec!["internal_id".into()]),
     ..Default::default()
 };

@@ -61,6 +61,8 @@ pub use compression::Compression;
 pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 // Re-export progress types for CLI usage
 pub use pipeline::{ProgressCallback, ProgressEvent};
+// Re-export CRS validation for CLI usage
+pub use quality::{extract_crs, validate_wgs84, CrsInfo};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
