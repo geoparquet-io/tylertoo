@@ -117,6 +117,8 @@ jobs:
         rust: [stable, beta]
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Download test fixtures
         run: |
@@ -167,6 +169,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Download test fixtures
         run: |
