@@ -17,13 +17,21 @@ Production data samples for testing gpq-tiles tiling performance.
 - **Google Open Buildings** — CC BY 4.0
 - **Road detections** — derived from ML model outputs
 
-## Git LFS
+## Getting Fixtures
 
-Most fixtures are tracked with Git LFS. After cloning:
+### CI Environment
+
+Fixtures are automatically downloaded from the `fixtures-v1` release during CI runs.
+
+### Local Development
+
+Download fixtures from the release:
 
 ```bash
-git lfs pull
+gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
 ```
+
+Or manually from: https://github.com/geoparquet-io/gpq-tiles/releases/tag/fixtures-v1
 
 ## Large Benchmark Files (Manual Download)
 
