@@ -3110,4 +3110,107 @@ mod tests {
             "deterministic should be disabled when set to false"
         );
     }
+
+    // ========== Tile ID Uniqueness Tests ==========
+    // These tests verify that each tile_id appears exactly once in the output.
+    // Duplicate tile_ids cause pmtiles.io viewer to fail.
+
+    #[test]
+    fn test_no_duplicate_tile_ids_in_output() {
+        // This test verifies the fix for the bug where lng=180 coordinates
+        // produced invalid tile coordinates, causing duplicate tile_ids.
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::collections::HashSet;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let config = TilerConfig::new(0, 8).with_quiet(true);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        generate_tiles_to_writer(fixture, &config, &mut writer).expect("Should generate tiles");
+
+        let output_path = Path::new("/tmp/test-no-duplicate-tile-ids.pmtiles");
+        let _ = fs::remove_file(output_path);
+
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        // Read the PMTiles file and verify no duplicate tile_ids
+        let file_data = fs::read(output_path).expect("Should read file");
+        assert!(file_data.len() >= 127, "File should have header");
+
+        // Parse header to get root directory location
+        let root_dir_offset = u64::from_le_bytes(file_data[8..16].try_into().unwrap());
+        let root_dir_len = u64::from_le_bytes(file_data[16..24].try_into().unwrap());
+
+        // Decompress root directory
+        use std::io::Read;
+        let compressed =
+            &file_data[root_dir_offset as usize..(root_dir_offset + root_dir_len) as usize];
+        let mut decoder = flate2::read::GzDecoder::new(compressed);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .expect("Should decompress directory");
+
+        // Parse directory entries (columnar format)
+        let mut pos = 0;
+        let (num_entries, new_pos) = read_varint(&decompressed, pos);
+        pos = new_pos;
+
+        // Read all tile_ids
+        let mut tile_ids = Vec::with_capacity(num_entries as usize);
+        let mut last_id: u64 = 0;
+        for _ in 0..num_entries {
+            let (delta, new_pos) = read_varint(&decompressed, pos);
+            pos = new_pos;
+            last_id = last_id.wrapping_add(delta);
+            tile_ids.push(last_id);
+        }
+
+        // Check for duplicates
+        let unique_ids: HashSet<u64> = tile_ids.iter().cloned().collect();
+        assert_eq!(
+            unique_ids.len(),
+            tile_ids.len(),
+            "All tile_ids should be unique. Found {} duplicates out of {} entries",
+            tile_ids.len() - unique_ids.len(),
+            tile_ids.len()
+        );
+
+        // Also verify we have the expected number of tiles
+        assert_eq!(
+            write_stats.total_tiles as usize,
+            tile_ids.len(),
+            "Directory entries should match total tiles"
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    /// Helper function to read a varint from a byte slice
+    fn read_varint(data: &[u8], mut pos: usize) -> (u64, usize) {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        loop {
+            if pos >= data.len() {
+                return (0, pos);
+            }
+            let b = data[pos];
+            pos += 1;
+            result |= ((b & 0x7f) as u64) << shift;
+            if (b & 0x80) == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        (result, pos)
+    }
 }

@@ -607,8 +607,15 @@ impl PmtilesWriter {
     }
 
     /// Set geographic bounds for the tileset
+    ///
+    /// Latitude values are clamped to Web Mercator bounds (±85.05°).
     pub fn set_bounds(&mut self, bounds: &TileBounds) {
-        self.bounds = *bounds;
+        self.bounds = TileBounds::new(
+            bounds.lng_min,
+            bounds.lat_min.clamp(-85.05, 85.05),
+            bounds.lng_max,
+            bounds.lat_max.clamp(-85.05, 85.05),
+        );
     }
 
     /// Get the number of tiles added
@@ -943,8 +950,15 @@ impl StreamingPmtilesWriter {
     }
 
     /// Set geographic bounds.
+    ///
+    /// Latitude values are clamped to Web Mercator bounds (±85.05°).
     pub fn set_bounds(&mut self, bounds: &TileBounds) {
-        self.bounds = *bounds;
+        self.bounds = TileBounds::new(
+            bounds.lng_min,
+            bounds.lat_min.clamp(-85.05, 85.05),
+            bounds.lng_max,
+            bounds.lat_max.clamp(-85.05, 85.05),
+        );
     }
 
     /// Get current statistics.
