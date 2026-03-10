@@ -1,0 +1,3 @@
+[submodule "tests/fixtures/geometry-test-data"]
+	path = tests/fixtures/geometry-test-data
+	url = https://github.com/chrieke/geojson-invalid-geometry.git
