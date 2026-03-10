@@ -217,34 +217,48 @@ pub fn encode_world_points(coords: &[WorldCoord], tile: &TileCoord, extent: u32)
 /// # Returns
 /// MVT geometry command stream, or empty vec if fewer than 2 points
 pub fn encode_world_linestring(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> Vec<u32> {
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+    encode_world_linestring_with_cursor(coords, tile, extent, &mut cursor_x, &mut cursor_y)
+}
+
+/// Encode a linestring with an external cursor for delta encoding.
+///
+/// This variant is used for MultiLineString encoding where the cursor must
+/// be maintained across multiple linestrings per the MVT spec.
+pub fn encode_world_linestring_with_cursor(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    cursor_x: &mut i32,
+    cursor_y: &mut i32,
+) -> Vec<u32> {
     if coords.len() < 2 {
         return vec![];
     }
 
     let mut geometry = Vec::with_capacity(3 + (coords.len() - 1) * 2);
-    let mut cursor_x = 0i32;
-    let mut cursor_y = 0i32;
 
     // First point: MoveTo
     let (x, y) = world_to_tile_local(&coords[0], tile, extent);
-    let dx = x - cursor_x;
-    let dy = y - cursor_y;
+    let dx = x - *cursor_x;
+    let dy = y - *cursor_y;
     geometry.push(command_encode(CMD_MOVE_TO, 1));
     geometry.push(zigzag_encode(dx));
     geometry.push(zigzag_encode(dy));
-    cursor_x = x;
-    cursor_y = y;
+    *cursor_x = x;
+    *cursor_y = y;
 
     // Remaining points: LineTo
     geometry.push(command_encode(CMD_LINE_TO, (coords.len() - 1) as u32));
     for coord in &coords[1..] {
         let (x, y) = world_to_tile_local(coord, tile, extent);
-        let dx = x - cursor_x;
-        let dy = y - cursor_y;
+        let dx = x - *cursor_x;
+        let dy = y - *cursor_y;
         geometry.push(zigzag_encode(dx));
         geometry.push(zigzag_encode(dy));
-        cursor_x = x;
-        cursor_y = y;
+        *cursor_x = x;
+        *cursor_y = y;
     }
 
     geometry
@@ -330,17 +344,39 @@ pub fn encode_world_polygon(
     tile: &TileCoord,
     extent: u32,
 ) -> Vec<u32> {
-    let mut geometry = Vec::new();
     let mut cursor_x = 0i32;
     let mut cursor_y = 0i32;
+    encode_world_polygon_with_cursor(
+        exterior,
+        interiors,
+        tile,
+        extent,
+        &mut cursor_x,
+        &mut cursor_y,
+    )
+}
+
+/// Encode a polygon with an external cursor for delta encoding.
+///
+/// This variant is used for MultiPolygon encoding where the cursor must
+/// be maintained across multiple polygons per the MVT spec.
+pub fn encode_world_polygon_with_cursor(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile: &TileCoord,
+    extent: u32,
+    cursor_x: &mut i32,
+    cursor_y: &mut i32,
+) -> Vec<u32> {
+    let mut geometry = Vec::new();
 
     // Exterior ring
-    let ext_cmds = encode_world_ring(exterior, tile, extent, &mut cursor_x, &mut cursor_y);
+    let ext_cmds = encode_world_ring(exterior, tile, extent, cursor_x, cursor_y);
     geometry.extend(ext_cmds);
 
     // Interior rings (holes)
     for interior in interiors {
-        let int_cmds = encode_world_ring(interior, tile, extent, &mut cursor_x, &mut cursor_y);
+        let int_cmds = encode_world_ring(interior, tile, extent, cursor_x, cursor_y);
         geometry.extend(int_cmds);
     }
 
@@ -798,8 +834,16 @@ impl LayerBuilder {
             }
             WorldClippedGeometry::MultiLineString(lines) => {
                 let mut cmds = Vec::new();
+                let mut cursor_x = 0i32;
+                let mut cursor_y = 0i32;
                 for line in lines {
-                    cmds.extend(encode_world_linestring(line, tile, self.extent));
+                    cmds.extend(encode_world_linestring_with_cursor(
+                        line,
+                        tile,
+                        self.extent,
+                        &mut cursor_x,
+                        &mut cursor_y,
+                    ));
                 }
                 if cmds.is_empty() {
                     (vec![], GeomType::Unknown)
@@ -809,8 +853,17 @@ impl LayerBuilder {
             }
             WorldClippedGeometry::MultiPolygon(polys) => {
                 let mut cmds = Vec::new();
+                let mut cursor_x = 0i32;
+                let mut cursor_y = 0i32;
                 for (ext, ints) in polys {
-                    cmds.extend(encode_world_polygon(ext, ints, tile, self.extent));
+                    cmds.extend(encode_world_polygon_with_cursor(
+                        ext,
+                        ints,
+                        tile,
+                        self.extent,
+                        &mut cursor_x,
+                        &mut cursor_y,
+                    ));
                 }
                 if cmds.is_empty() {
                     (vec![], GeomType::Unknown)

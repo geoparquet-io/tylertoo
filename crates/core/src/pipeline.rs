@@ -1115,9 +1115,12 @@ fn generate_tiles_to_writer_internal(
                 let mut feature_count = 0;
 
                 // Phase 2: Use add_feature_world for direct WorldCoord encoding
+                // Filter out degenerate geometries that collapse to a single pixel
                 for (geom, feat_idx) in current_features.drain(..) {
-                    layer_builder.add_feature_world(Some(feat_idx), &geom, &[], &coord);
-                    feature_count += 1;
+                    if !geom.is_degenerate_in_tile(&coord, config.extent) {
+                        layer_builder.add_feature_world(Some(feat_idx), &geom, &[], &coord);
+                        feature_count += 1;
+                    }
                 }
 
                 if feature_count > 0 {
@@ -1164,9 +1167,12 @@ fn generate_tiles_to_writer_internal(
             let mut feature_count = 0;
 
             // Phase 2: Use add_feature_world for direct WorldCoord encoding
+            // Filter out degenerate geometries that collapse to a single pixel
             for (geom, feat_idx) in current_features {
-                layer_builder.add_feature_world(Some(feat_idx), &geom, &[], &coord);
-                feature_count += 1;
+                if !geom.is_degenerate_in_tile(&coord, config.extent) {
+                    layer_builder.add_feature_world(Some(feat_idx), &geom, &[], &coord);
+                    feature_count += 1;
+                }
             }
 
             if feature_count > 0 {

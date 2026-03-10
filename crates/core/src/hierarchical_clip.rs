@@ -453,6 +453,53 @@ impl WorldClippedGeometry {
             _ => None,
         }
     }
+
+    /// Check if this geometry is degenerate (collapses to a point) in the given tile.
+    ///
+    /// A geometry is degenerate if all its coordinates map to the same tile-local pixel
+    /// after quantization. This can happen when a geometry is too small for the tile's
+    /// resolution.
+    ///
+    /// # Arguments
+    /// * `tile` - The tile to check degeneracy in
+    /// * `extent` - Tile extent (typically 4096)
+    ///
+    /// # Returns
+    /// `true` if the geometry is degenerate in this tile
+    pub fn is_degenerate_in_tile(&self, tile: &crate::tile::TileCoord, extent: u32) -> bool {
+        match self {
+            WorldClippedGeometry::Point(_) => false, // Points are never degenerate
+            WorldClippedGeometry::LineString(coords) => coords_are_degenerate(coords, tile, extent),
+            WorldClippedGeometry::Polygon { exterior, .. } => {
+                coords_are_degenerate(exterior, tile, extent)
+            }
+            WorldClippedGeometry::MultiPoint(_) => false, // MultiPoints are never degenerate
+            WorldClippedGeometry::MultiLineString(lines) => lines
+                .iter()
+                .all(|line| coords_are_degenerate(line, tile, extent)),
+            WorldClippedGeometry::MultiPolygon(polys) => polys
+                .iter()
+                .all(|(ext, _)| coords_are_degenerate(ext, tile, extent)),
+        }
+    }
+}
+
+/// Check if all coordinates collapse to the same tile-local pixel.
+fn coords_are_degenerate(
+    coords: &[WorldCoord],
+    tile: &crate::tile::TileCoord,
+    extent: u32,
+) -> bool {
+    if coords.len() < 2 {
+        return true;
+    }
+
+    let (first_x, first_y) = coords[0].to_tile_local(tile, extent);
+
+    coords[1..].iter().all(|c| {
+        let (x, y) = c.to_tile_local(tile, extent);
+        x == first_x && y == first_y
+    })
 }
 
 /// Convert a geo::Geometry<f64> to WorldCoord representation.
@@ -1557,6 +1604,458 @@ mod tests {
                     assert!(interiors.is_empty(), "Should have no holes");
                 }
                 other => panic!("Expected Polygon, got {:?}", other),
+            }
+        }
+
+        // ========== Serialization Round-Trip Tests ==========
+
+        #[test]
+        fn test_roundtrip_point_to_bytes_from_bytes() {
+            let coord = WorldCoord::new(1_000_000, 2_000_000);
+            let geom = WorldClippedGeometry::Point(coord);
+            let bytes = geom.to_bytes();
+            let restored = WorldClippedGeometry::from_bytes(&bytes).unwrap();
+            match restored {
+                WorldClippedGeometry::Point(p) => {
+                    assert_eq!(p.x, 1_000_000);
+                    assert_eq!(p.y, 2_000_000);
+                }
+                other => panic!("Expected Point, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_roundtrip_polygon_to_bytes_from_bytes() {
+            // Use coordinates that span a realistic range for a polygon
+            // within a single tile at zoom 14
+            let coords = vec![
+                WorldCoord::new(2_147_483_648, 2_147_483_648), // ~Null Island
+                WorldCoord::new(2_147_500_000, 2_147_483_648), // East
+                WorldCoord::new(2_147_500_000, 2_147_500_000), // SE
+                WorldCoord::new(2_147_483_648, 2_147_500_000), // South
+                WorldCoord::new(2_147_483_648, 2_147_483_648), // Close
+            ];
+            let hole = vec![
+                WorldCoord::new(2_147_490_000, 2_147_490_000),
+                WorldCoord::new(2_147_495_000, 2_147_490_000),
+                WorldCoord::new(2_147_495_000, 2_147_495_000),
+                WorldCoord::new(2_147_490_000, 2_147_495_000),
+                WorldCoord::new(2_147_490_000, 2_147_490_000),
+            ];
+            let geom = WorldClippedGeometry::Polygon {
+                exterior: coords.clone(),
+                interiors: vec![hole.clone()],
+            };
+
+            let bytes = geom.to_bytes();
+            let restored = WorldClippedGeometry::from_bytes(&bytes).unwrap();
+
+            match restored {
+                WorldClippedGeometry::Polygon {
+                    exterior,
+                    interiors,
+                } => {
+                    assert_eq!(exterior.len(), 5, "Exterior ring length mismatch");
+                    assert_eq!(interiors.len(), 1, "Should have 1 hole");
+                    assert_eq!(interiors[0].len(), 5, "Hole ring length mismatch");
+
+                    // Verify every coordinate survived the round-trip
+                    for (i, (orig, restored)) in coords.iter().zip(exterior.iter()).enumerate() {
+                        assert_eq!(
+                            orig.x, restored.x,
+                            "Exterior coord {} x mismatch: {} vs {}",
+                            i, orig.x, restored.x
+                        );
+                        assert_eq!(
+                            orig.y, restored.y,
+                            "Exterior coord {} y mismatch: {} vs {}",
+                            i, orig.y, restored.y
+                        );
+                    }
+                    for (i, (orig, restored)) in hole.iter().zip(interiors[0].iter()).enumerate() {
+                        assert_eq!(
+                            orig.x, restored.x,
+                            "Hole coord {} x mismatch: {} vs {}",
+                            i, orig.x, restored.x
+                        );
+                        assert_eq!(
+                            orig.y, restored.y,
+                            "Hole coord {} y mismatch: {} vs {}",
+                            i, orig.y, restored.y
+                        );
+                    }
+                }
+                other => panic!("Expected Polygon, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_roundtrip_multipolygon_to_bytes_from_bytes() {
+            let poly1_ext = vec![
+                WorldCoord::new(100, 200),
+                WorldCoord::new(300, 200),
+                WorldCoord::new(300, 400),
+                WorldCoord::new(100, 400),
+                WorldCoord::new(100, 200),
+            ];
+            let poly2_ext = vec![
+                WorldCoord::new(500, 600),
+                WorldCoord::new(700, 600),
+                WorldCoord::new(700, 800),
+                WorldCoord::new(500, 800),
+                WorldCoord::new(500, 600),
+            ];
+            let geom = WorldClippedGeometry::MultiPolygon(vec![
+                (poly1_ext.clone(), vec![]),
+                (poly2_ext.clone(), vec![]),
+            ]);
+
+            let bytes = geom.to_bytes();
+            let restored = WorldClippedGeometry::from_bytes(&bytes).unwrap();
+
+            match restored {
+                WorldClippedGeometry::MultiPolygon(polys) => {
+                    assert_eq!(polys.len(), 2);
+                    assert_eq!(polys[0].0, poly1_ext);
+                    assert_eq!(polys[1].0, poly2_ext);
+                }
+                other => panic!("Expected MultiPolygon, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_roundtrip_linestring_to_bytes_from_bytes() {
+            let coords = vec![
+                WorldCoord::new(1_000_000, 2_000_000),
+                WorldCoord::new(1_100_000, 2_100_000),
+                WorldCoord::new(1_200_000, 2_000_000),
+            ];
+            let geom = WorldClippedGeometry::LineString(coords.clone());
+
+            let bytes = geom.to_bytes();
+            let restored = WorldClippedGeometry::from_bytes(&bytes).unwrap();
+
+            match restored {
+                WorldClippedGeometry::LineString(restored_coords) => {
+                    assert_eq!(restored_coords, coords);
+                }
+                other => panic!("Expected LineString, got {:?}", other),
+            }
+        }
+
+        /// Diagnostic test: verify that a realistic polygon produces
+        /// non-zero deltas in MVT encoding after round-tripping through
+        /// to_bytes/from_bytes.
+        #[test]
+        fn test_polygon_roundtrip_produces_nonzero_mvt_deltas() {
+            use crate::mvt::encode_world_polygon;
+
+            // Create a polygon near NYC at zoom 14
+            let lng_center = -73.985;
+            let lat_center = 40.749;
+
+            // Polygon spanning ~0.01 degrees (roughly 1km)
+            let half = 0.005;
+            let coords = vec![
+                lng_lat_to_world(lng_center - half, lat_center - half),
+                lng_lat_to_world(lng_center + half, lat_center - half),
+                lng_lat_to_world(lng_center + half, lat_center + half),
+                lng_lat_to_world(lng_center - half, lat_center + half),
+                lng_lat_to_world(lng_center - half, lat_center - half), // close
+            ];
+
+            // Verify coordinates are distinct in world space
+            for i in 0..4 {
+                for j in (i + 1)..4 {
+                    assert!(
+                        coords[i] != coords[j],
+                        "World coords {} and {} should differ: {:?} vs {:?}",
+                        i,
+                        j,
+                        coords[i],
+                        coords[j]
+                    );
+                }
+            }
+
+            // Round-trip through serialization
+            let geom = WorldClippedGeometry::Polygon {
+                exterior: coords.clone(),
+                interiors: vec![],
+            };
+            let bytes = geom.to_bytes();
+            let restored = WorldClippedGeometry::from_bytes(&bytes).unwrap();
+
+            let restored_coords = match &restored {
+                WorldClippedGeometry::Polygon { exterior, .. } => exterior,
+                other => panic!("Expected Polygon, got {:?}", other),
+            };
+
+            // Verify coordinates survived serialization
+            for (i, (orig, rest)) in coords.iter().zip(restored_coords.iter()).enumerate() {
+                assert_eq!(
+                    orig, rest,
+                    "Coord {} changed during serialization: {:?} -> {:?}",
+                    i, orig, rest
+                );
+            }
+
+            // Now encode to MVT and verify non-zero deltas
+            let tile = coords[0].to_tile(14);
+            let extent = 4096u32;
+            let mvt_commands = encode_world_polygon(restored_coords, &[], &tile, extent);
+
+            // MVT polygon: MoveTo(1), dx, dy, LineTo(n-2), [dx, dy]*, ClosePath(1)
+            // commands[0] = MoveTo(1) command
+            // commands[1] = zigzag(dx0)
+            // commands[2] = zigzag(dy0)
+            // commands[3] = LineTo(n) command
+            // commands[4..] = zigzag deltas for subsequent points
+            assert!(
+                mvt_commands.len() >= 8,
+                "MVT should have enough commands, got {}",
+                mvt_commands.len()
+            );
+
+            // Check that LineTo deltas are non-zero
+            // After MoveTo(1) + 2 coords + LineTo cmd = index 3
+            // LineTo deltas start at index 4
+            let has_nonzero_delta = mvt_commands[4..]
+                .chunks(2)
+                .any(|pair| pair[0] != 0 || pair[1] != 0);
+
+            assert!(
+                has_nonzero_delta,
+                "MVT deltas should be non-zero for a real polygon. Commands: {:?}",
+                mvt_commands
+            );
+
+            // Print diagnostic info
+            println!("WorldCoords:");
+            for (i, c) in restored_coords.iter().enumerate() {
+                let (lx, ly) = c.to_tile_local(&tile, extent);
+                println!(
+                    "  [{}] world=({}, {}) tile_local=({}, {})",
+                    i, c.x, c.y, lx, ly
+                );
+            }
+            println!("MVT commands: {:?}", mvt_commands);
+        }
+
+        /// Test the full pipeline path: create polygon in geo coords -> convert to WorldCoord
+        /// -> clip to tile bounds -> serialize -> deserialize -> MVT encode.
+        /// This replicates the exact path taken by pipeline.rs.
+        #[test]
+        fn test_full_pipeline_path_clipped_polygon_mvt_deltas() {
+            use crate::mvt::encode_world_polygon;
+
+            // Create a polygon that straddles a tile boundary at zoom 5
+            // This forces clipping to produce a new polygon shape
+            let poly = Geometry::Polygon(geo::polygon![
+                (x: 10.0, y: 44.0),
+                (x: 12.0, y: 44.0),
+                (x: 12.0, y: 46.0),
+                (x: 10.0, y: 46.0),
+                (x: 10.0, y: 44.0),
+            ]);
+            let bbox = TileBounds::new(10.0, 44.0, 12.0, 46.0);
+
+            let (clip_results, _stats) =
+                clip_geometry_hierarchical_world(&poly, &bbox, 5, 5, 8, 4096);
+
+            assert!(!clip_results.is_empty(), "Should have at least one tile");
+
+            for (tile_coord, world_geom) in &clip_results {
+                // Serialize -> deserialize (exact pipeline path)
+                let bytes = world_geom.to_bytes();
+                let restored =
+                    WorldClippedGeometry::from_bytes(&bytes).expect("from_bytes should succeed");
+
+                // Encode to MVT
+                let (exterior, interiors) = match &restored {
+                    WorldClippedGeometry::Polygon {
+                        exterior,
+                        interiors,
+                    } => (exterior, interiors),
+                    WorldClippedGeometry::MultiPolygon(polys) => {
+                        // Check first polygon
+                        (&polys[0].0, &polys[0].1)
+                    }
+                    other => {
+                        println!("Skipping non-polygon geom: {:?}", other);
+                        continue;
+                    }
+                };
+
+                let mvt_commands = encode_world_polygon(exterior, interiors, tile_coord, 4096);
+
+                if mvt_commands.is_empty() {
+                    continue; // Degenerate polygon was dropped
+                }
+
+                // Print diagnostic info
+                println!(
+                    "Tile z{}/x{}/y{}:",
+                    tile_coord.z, tile_coord.x, tile_coord.y
+                );
+                for (i, c) in exterior.iter().enumerate() {
+                    let (lx, ly) = c.to_tile_local(tile_coord, 4096);
+                    println!(
+                        "  [{}] world=({}, {}) tile_local=({}, {})",
+                        i, c.x, c.y, lx, ly
+                    );
+                }
+                println!(
+                    "  MVT commands ({} u32s): {:?}",
+                    mvt_commands.len(),
+                    mvt_commands
+                );
+
+                // Check for all-zero deltas after first coord
+                // MVT polygon: MoveTo(1), dx, dy, LineTo(n), [dx,dy]*, ClosePath(1)
+                // LineTo deltas start at index 4
+                if mvt_commands.len() > 4 {
+                    let line_to_deltas = &mvt_commands[4..mvt_commands.len() - 1];
+                    let all_zero = line_to_deltas.iter().all(|&v| v == 0);
+                    assert!(
+                        !all_zero || line_to_deltas.is_empty(),
+                        "Tile z{}/x{}/y{}: ALL deltas are zero after first coord! \
+                         This is the Issue #83 bug. Commands: {:?}",
+                        tile_coord.z,
+                        tile_coord.x,
+                        tile_coord.y,
+                        mvt_commands
+                    );
+                }
+            }
+        }
+
+        /// Test at zoom 0 with a small polygon -- this is where precision collapse
+        /// is most likely because tile_size (2^32) >> extent (4096).
+        #[test]
+        fn test_small_polygon_at_zoom_0_mvt_encoding() {
+            use crate::mvt::encode_world_polygon;
+
+            // A small polygon (0.01 degrees) at null island
+            let poly = Geometry::Polygon(geo::polygon![
+                (x: -0.005, y: -0.005),
+                (x: 0.005, y: -0.005),
+                (x: 0.005, y: 0.005),
+                (x: -0.005, y: 0.005),
+                (x: -0.005, y: -0.005),
+            ]);
+            let bbox = TileBounds::new(-0.005, -0.005, 0.005, 0.005);
+
+            let (clip_results, _stats) =
+                clip_geometry_hierarchical_world(&poly, &bbox, 0, 0, 8, 4096);
+
+            println!("\n=== Small polygon at zoom 0 ===");
+
+            for (tile_coord, world_geom) in &clip_results {
+                let (exterior, interiors) = match world_geom {
+                    WorldClippedGeometry::Polygon {
+                        exterior,
+                        interiors,
+                    } => (exterior, interiors.as_slice()),
+                    _ => continue,
+                };
+
+                let mvt_commands = encode_world_polygon(exterior, interiors, tile_coord, 4096);
+
+                println!(
+                    "Tile z{}/x{}/y{}:",
+                    tile_coord.z, tile_coord.x, tile_coord.y
+                );
+                for (i, c) in exterior.iter().enumerate() {
+                    let (lx, ly) = c.to_tile_local(tile_coord, 4096);
+                    println!(
+                        "  [{}] world=({}, {}) tile_local=({}, {})",
+                        i, c.x, c.y, lx, ly
+                    );
+                }
+                println!("  MVT commands: {:?}", mvt_commands);
+
+                // At zoom 0, a 0.01-degree polygon spans ~0.06 pixels.
+                // All points will map to the same tile-local coordinate.
+                // This is EXPECTED behavior -- such tiny polygons should be
+                // dropped by the feature_drop filter before reaching MVT encoding.
+                let all_same_tile_local = {
+                    let first = exterior[0].to_tile_local(tile_coord, 4096);
+                    exterior
+                        .iter()
+                        .all(|c| c.to_tile_local(tile_coord, 4096) == first)
+                };
+
+                if all_same_tile_local {
+                    println!(
+                        "  NOTE: All coords map to same tile_local -- \
+                         polygon is sub-pixel at this zoom. \
+                         Feature filter should drop this."
+                    );
+                }
+            }
+        }
+
+        /// Test at zoom 14 where precision is sufficient -- ensures the pipeline
+        /// works correctly for the common case.
+        #[test]
+        fn test_clipped_polygon_at_zoom_14() {
+            use crate::mvt::encode_world_polygon;
+
+            // A polygon near NYC that spans ~0.01 degrees
+            let poly = Geometry::Polygon(geo::polygon![
+                (x: -74.00, y: 40.74),
+                (x: -73.99, y: 40.74),
+                (x: -73.99, y: 40.75),
+                (x: -74.00, y: 40.75),
+                (x: -74.00, y: 40.74),
+            ]);
+            let bbox = TileBounds::new(-74.00, 40.74, -73.99, 40.75);
+
+            let (clip_results, _stats) =
+                clip_geometry_hierarchical_world(&poly, &bbox, 14, 14, 8, 4096);
+
+            println!("\n=== Polygon at zoom 14 near NYC ===");
+            assert!(!clip_results.is_empty(), "Should produce tiles at zoom 14");
+
+            for (tile_coord, world_geom) in &clip_results {
+                let bytes = world_geom.to_bytes();
+                let restored = WorldClippedGeometry::from_bytes(&bytes).unwrap();
+
+                let (exterior, interiors) = match &restored {
+                    WorldClippedGeometry::Polygon {
+                        exterior,
+                        interiors,
+                    } => (exterior, interiors.as_slice()),
+                    _ => continue,
+                };
+
+                let mvt_commands = encode_world_polygon(exterior, interiors, tile_coord, 4096);
+
+                if mvt_commands.is_empty() {
+                    continue;
+                }
+
+                println!(
+                    "Tile z{}/x{}/y{}:",
+                    tile_coord.z, tile_coord.x, tile_coord.y
+                );
+                for (i, c) in exterior.iter().enumerate() {
+                    let (lx, ly) = c.to_tile_local(tile_coord, 4096);
+                    println!(
+                        "  [{}] world=({}, {}) tile_local=({}, {})",
+                        i, c.x, c.y, lx, ly
+                    );
+                }
+                println!("  MVT commands: {:?}", mvt_commands);
+
+                // At zoom 14, a 0.01-degree polygon spans ~150 pixels
+                // and should definitely produce non-zero deltas
+                if mvt_commands.len() > 4 {
+                    let line_to_deltas = &mvt_commands[4..mvt_commands.len() - 1];
+                    let has_nonzero = line_to_deltas.chunks(2).any(|p| p[0] != 0 || p[1] != 0);
+                    assert!(has_nonzero, "Zoom 14 polygon should have non-zero deltas!");
+                }
             }
         }
     }
