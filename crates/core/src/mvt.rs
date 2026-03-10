@@ -1464,8 +1464,8 @@ mod tests {
         // Decode first delta - should be the absolute position of first point
         let first_x = zigzag_decode(commands[1]);
         let first_y = zigzag_decode(commands[2]);
-        assert!(first_x >= 0 && first_x <= 4096);
-        assert!(first_y >= 0 && first_y <= 4096);
+        assert!((0..=4096).contains(&first_x));
+        assert!((0..=4096).contains(&first_y));
     }
 
     #[test]

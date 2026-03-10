@@ -618,12 +618,12 @@ mod tests {
         let (local_x, local_y) = coord.to_tile_local(&tile, extent);
 
         assert!(
-            local_x >= 0 && local_x < 10,
+            (0..10).contains(&local_x),
             "Northwest should be near x=0, got {}",
             local_x
         );
         assert!(
-            local_y >= 0 && local_y < 10,
+            (0..10).contains(&local_y),
             "Northwest should be near y=0, got {}",
             local_y
         );
@@ -764,14 +764,8 @@ mod tests {
         // The difference might be small but should exist
         // (depending on which tile the points fall in)
         // This test mainly verifies no overflow/precision loss
-        assert!(
-            local1 >= 0 || local1 < 0,
-            "Local coord 1 should be valid i32"
-        );
-        assert!(
-            local2 >= 0 || local2 < 0,
-            "Local coord 2 should be valid i32"
-        );
+        // If we got here without panic, the conversion succeeded
+        let _ = (local1, local2); // Use values to avoid unused warnings
     }
 
     // ========== World Coordinate Arithmetic Tests ==========
