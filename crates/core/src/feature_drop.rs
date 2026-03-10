@@ -218,6 +218,26 @@ pub fn polygon_area_in_tile_coords(
 ///
 /// Tile coordinates range from 0 to extent (typically 4096).
 /// The tile bounds define the geographic extent being mapped.
+///
+/// # Issue #83 Fix: Precision Alignment with MVT Encoding
+///
+/// Coordinates are **rounded** to match the precision used by MVT encoding
+/// (see `mvt.rs::geo_to_tile_coords` which uses `.round() as i32`).
+///
+/// This ensures that `polygon_area_in_tile_coords` calculates area using the
+/// same discrete coordinates that will appear in the final MVT output. Without
+/// this rounding, a polygon could:
+/// 1. Pass the `should_drop_tiny_polygon` check (f64 area > 0)
+/// 2. Collapse to zero area when encoded to MVT (all corners round to same pixel)
+///
+/// This caused blank tiles in issue #83.
+///
+/// # Divergence from Tippecanoe
+///
+/// Tippecanoe works in 32-bit integer world coordinates throughout the pipeline,
+/// so this precision issue doesn't arise. We work in f64 geographic coordinates
+/// and round here (for filtering) and in mvt.rs (for encoding) to ensure consistency.
+/// See issue #85 for tracking full tippecanoe parity.
 #[inline]
 fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) -> (f64, f64) {
     let extent_f = extent as f64;
@@ -227,8 +247,10 @@ fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) -> (
     let y_ratio = (lat - bounds.lat_min) / (bounds.lat_max - bounds.lat_min);
 
     // Scale to extent and flip Y (tile coords have Y increasing downward)
-    let x = x_ratio * extent_f;
-    let y = (1.0 - y_ratio) * extent_f;
+    // IMPORTANT: Round to match MVT encoding precision (mvt.rs uses .round() as i32)
+    // This ensures filtering decisions align with actual MVT output coordinates.
+    let x = (x_ratio * extent_f).round();
+    let y = ((1.0 - y_ratio) * extent_f).round();
 
     (x, y)
 }
@@ -1032,28 +1054,31 @@ mod tests {
         let extent = 4096;
 
         // Create multiple small polygons at different positions (different hashes)
-        // All are ~2 sq pixels (50% of threshold = 50% drop probability)
+        // With integer rounding (Issue #83 fix), a 1.414x1.414 f64 polygon rounds
+        // to a 2x2 = 4 sq pixel polygon. We use 1.0 size to get ~1 sq pixel after
+        // rounding, which is 25% of threshold = ~75% drop probability.
         let mut drop_count = 0;
         let mut keep_count = 0;
         let num_tests = 100;
 
         for i in 0..num_tests {
-            // Create 1.414x1.414 pixel polygon (≈2 sq pixels)
-            // Vary position to get different geometry hashes
+            // Create 1.0x1.0 pixel polygon (≈1 sq pixel after rounding)
+            // Note: With integer rounding, areas are quantized. A 1.0 pixel square
+            // may round to 0, 1, or 2 sq pixels depending on alignment.
             let offset = (i as f64) * 10.0;
             let polygon = create_square_polygon_in_tile_coords(
                 1000.0 + offset,
                 1000.0 + offset,
-                1.414,
+                1.0,
                 &tile_bounds,
                 extent,
             );
 
             let area = polygon_area_in_tile_coords(&polygon, &tile_bounds, extent);
-            // Allow some tolerance in area calculation
+            // With integer rounding, area should be a small integer (0, 1, 2, or 4)
             assert!(
-                (1.5..=2.5).contains(&area),
-                "Polygon {} should be ~2 sq pixels, got {}",
+                area <= 4.0,
+                "Polygon {} should be <= 4 sq pixels (small polygon), got {}",
                 i,
                 area
             );
@@ -1070,12 +1095,12 @@ mod tests {
             }
         }
 
-        // With 50% drop probability, we expect roughly half dropped, half kept
-        // Allow 20% margin for statistical variance
+        // Small polygons (< 4 sq pixel threshold) should be mostly dropped
+        // but some may be kept due to probabilistic diffuse dropping
         let drop_ratio = drop_count as f64 / num_tests as f64;
         assert!(
-            (0.3..=0.7).contains(&drop_ratio),
-            "Expected ~50% drop rate for 2 sq pixel polygons, got {:.0}% ({} dropped, {} kept)",
+            drop_ratio > 0.5,
+            "Expected >50% drop rate for small polygons, got {:.0}% ({} dropped, {} kept)",
             drop_ratio * 100.0,
             drop_count,
             keep_count
@@ -1795,5 +1820,128 @@ mod tests {
             !dropper.should_drop(5000.0, 5000.0, 8),
             "Over-max coords should be clamped"
         );
+    }
+
+    // =========================================================================
+    // TEST: Issue #83 - Precision mismatch between filtering and MVT encoding
+    // =========================================================================
+    //
+    // This test verifies that the area calculation in feature_drop uses the same
+    // coordinate precision as MVT encoding. Without this fix, a polygon could:
+    // 1. Pass the should_drop_tiny_polygon check (using f64 coords with non-zero area)
+    // 2. Collapse to zero area when encoded to MVT (using i32 rounded coords)
+    //
+    // This caused blank tiles in issue #83.
+    #[test]
+    fn test_issue_83_precision_mismatch_between_filtering_and_mvt_encoding() {
+        // Zoom 0 tile bounds (full world in Web Mercator)
+        let tile_bounds = TileBounds::new(-180.0, -85.05112878, 180.0, 85.05112878);
+        let extent = 4096u32;
+
+        // At zoom 0:
+        // - Tile spans 360° longitude × 170.1° latitude
+        // - Each pixel is ~0.088° × 0.042°
+        // - Coordinates within ~0.044° will round to the same pixel
+
+        // Create a 0.01° × 0.01° polygon near the origin
+        // This is ~0.11 × 0.24 pixels - smaller than 1 pixel
+        let small_polygon = Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 0.01, y: 0.0 },
+                Coord { x: 0.01, y: 0.01 },
+                Coord { x: 0.0, y: 0.01 },
+                Coord { x: 0.0, y: 0.0 }, // Close the ring
+            ]),
+            vec![],
+        );
+
+        // Calculate area using our function
+        let area = polygon_area_in_tile_coords(&small_polygon, &tile_bounds, extent);
+
+        // The key assertion: at zoom 0, this polygon should have effectively zero area
+        // because all its corners round to the same pixel.
+        //
+        // Before the fix: area would be ~0.027 sq pixels (f64 calculation)
+        // After the fix: area should be 0 (i32 rounded calculation)
+        assert!(
+            area < 0.01,
+            "Issue #83: A 0.01° polygon at zoom 0 should have ~0 area after rounding \
+             (all corners collapse to same pixel), but got {} sq pixels. \
+             This indicates precision mismatch between filtering and MVT encoding.",
+            area
+        );
+    }
+
+    // =========================================================================
+    // TEST: Filtering decision must match MVT encoding outcome
+    // =========================================================================
+    //
+    // If should_drop_tiny_polygon returns false (keep the polygon), then the
+    // polygon MUST produce valid (non-degenerate) MVT output. This is the
+    // invariant that issue #83 violated.
+    #[test]
+    fn test_filtering_matches_mvt_encoding_precision() {
+        // Test at zoom 0 where precision issues are most severe
+        let tile_bounds = TileBounds::new(-180.0, -85.05112878, 180.0, 85.05112878);
+        let extent = 4096u32;
+
+        // Create polygons of increasing size until one passes the filter
+        let sizes = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0];
+
+        for size in sizes {
+            let polygon = Polygon::new(
+                LineString::new(vec![
+                    Coord { x: 0.0, y: 0.0 },
+                    Coord { x: size, y: 0.0 },
+                    Coord { x: size, y: size },
+                    Coord { x: 0.0, y: size },
+                    Coord { x: 0.0, y: 0.0 },
+                ]),
+                vec![],
+            );
+
+            let should_drop = should_drop_tiny_polygon(
+                &polygon,
+                &tile_bounds,
+                extent,
+                DEFAULT_TINY_POLYGON_THRESHOLD,
+            );
+
+            if !should_drop {
+                // If we decide to KEEP this polygon, verify it has meaningful area
+                let area = polygon_area_in_tile_coords(&polygon, &tile_bounds, extent);
+                assert!(
+                    area >= 1.0,
+                    "Issue #83 invariant violated: Polygon of size {}° was kept by filter \
+                     but has area {} sq pixels. Kept polygons must have >= 1 sq pixel area \
+                     to produce valid MVT output.",
+                    size,
+                    area
+                );
+
+                // Also verify the corners don't all collapse to the same point
+                let corners = [
+                    geo_to_tile_coords(0.0, 0.0, &tile_bounds, extent),
+                    geo_to_tile_coords(size, 0.0, &tile_bounds, extent),
+                    geo_to_tile_coords(size, size, &tile_bounds, extent),
+                    geo_to_tile_coords(0.0, size, &tile_bounds, extent),
+                ];
+
+                // Count unique corners (after rounding, which geo_to_tile_coords should do)
+                let unique_corners: std::collections::HashSet<_> = corners
+                    .iter()
+                    .map(|(x, y)| (x.round() as i32, y.round() as i32))
+                    .collect();
+
+                assert!(
+                    unique_corners.len() >= 3,
+                    "Issue #83 invariant violated: Polygon of size {}° was kept but has only {} \
+                     unique corners after rounding. Need at least 3 for valid polygon.",
+                    size,
+                    unique_corners.len()
+                );
+            }
+        }
     }
 }

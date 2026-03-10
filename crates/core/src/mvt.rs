@@ -11,9 +11,10 @@
 //!
 //! Reference: <https://github.com/mapbox/vector-tile-spec>
 
-use crate::tile::TileBounds;
+use crate::tile::{TileBounds, TileCoord};
 use crate::vector_tile::tile::{Feature, GeomType, Layer, Value};
 use crate::vector_tile::Tile;
+use crate::world_coord::WorldCoord;
 use geo::orient::{Direction, Orient};
 use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use std::collections::HashMap;
@@ -143,6 +144,207 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
     let y = ((1.0 - y_ratio) * extent_f).round() as i32;
 
     (x, y)
+}
+
+// ============================================================================
+// WorldCoord → Tile-Local Coordinate Transformation
+// ============================================================================
+
+/// Transform a WorldCoord to tile-local MVT coordinates.
+///
+/// This is the integer-coordinate equivalent of `geo_to_tile_coords`.
+/// It uses `WorldCoord::to_tile_local` for the projection, which avoids
+/// floating-point imprecision in the coordinate transformation pipeline.
+///
+/// # Arguments
+/// * `coord` - World coordinate to transform
+/// * `tile` - Target tile for local coordinate system
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// (x, y) in tile-local coordinates where (0,0) is top-left
+#[inline]
+pub fn world_to_tile_local(coord: &WorldCoord, tile: &TileCoord, extent: u32) -> (i32, i32) {
+    coord.to_tile_local(tile, extent)
+}
+
+/// Encode a slice of WorldCoords as an MVT point geometry.
+///
+/// For a single point, produces MoveTo(1) + zigzag(x) + zigzag(y).
+/// For multiple points (MultiPoint), produces MoveTo(n) + delta-encoded pairs.
+///
+/// # Arguments
+/// * `coords` - World coordinates to encode
+/// * `tile` - Target tile
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// MVT geometry command stream
+pub fn encode_world_points(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> Vec<u32> {
+    if coords.is_empty() {
+        return vec![];
+    }
+
+    let mut geometry = Vec::with_capacity(1 + coords.len() * 2);
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+
+    geometry.push(command_encode(CMD_MOVE_TO, coords.len() as u32));
+
+    for coord in coords {
+        let (x, y) = world_to_tile_local(coord, tile, extent);
+        let dx = x - cursor_x;
+        let dy = y - cursor_y;
+        geometry.push(zigzag_encode(dx));
+        geometry.push(zigzag_encode(dy));
+        cursor_x = x;
+        cursor_y = y;
+    }
+
+    geometry
+}
+
+/// Encode a slice of WorldCoords as an MVT linestring geometry.
+///
+/// Produces MoveTo(1) for the first point, then LineTo(n-1) for remaining points,
+/// all delta-encoded.
+///
+/// # Arguments
+/// * `coords` - World coordinates forming the linestring (must have >= 2 points)
+/// * `tile` - Target tile
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// MVT geometry command stream, or empty vec if fewer than 2 points
+pub fn encode_world_linestring(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> Vec<u32> {
+    if coords.len() < 2 {
+        return vec![];
+    }
+
+    let mut geometry = Vec::with_capacity(3 + (coords.len() - 1) * 2);
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+
+    // First point: MoveTo
+    let (x, y) = world_to_tile_local(&coords[0], tile, extent);
+    let dx = x - cursor_x;
+    let dy = y - cursor_y;
+    geometry.push(command_encode(CMD_MOVE_TO, 1));
+    geometry.push(zigzag_encode(dx));
+    geometry.push(zigzag_encode(dy));
+    cursor_x = x;
+    cursor_y = y;
+
+    // Remaining points: LineTo
+    geometry.push(command_encode(CMD_LINE_TO, (coords.len() - 1) as u32));
+    for coord in &coords[1..] {
+        let (x, y) = world_to_tile_local(coord, tile, extent);
+        let dx = x - cursor_x;
+        let dy = y - cursor_y;
+        geometry.push(zigzag_encode(dx));
+        geometry.push(zigzag_encode(dy));
+        cursor_x = x;
+        cursor_y = y;
+    }
+
+    geometry
+}
+
+/// Encode a ring of WorldCoords as part of an MVT polygon geometry.
+///
+/// Produces MoveTo(1) for first point, LineTo(n-2) for interior points
+/// (skipping the closing point), and ClosePath(1).
+///
+/// # Arguments
+/// * `coords` - World coordinates forming the ring (must have >= 4 points, last == first)
+/// * `tile` - Target tile
+/// * `extent` - Tile extent (typically 4096)
+/// * `cursor_x` - Mutable cursor X position (for delta encoding across rings)
+/// * `cursor_y` - Mutable cursor Y position
+///
+/// # Returns
+/// MVT geometry command stream, or empty vec if fewer than 4 points
+pub fn encode_world_ring(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    cursor_x: &mut i32,
+    cursor_y: &mut i32,
+) -> Vec<u32> {
+    // Rings must have at least 4 points (3 unique + closing point)
+    if coords.len() < 4 {
+        return vec![];
+    }
+
+    let mut geometry = Vec::with_capacity(4 + (coords.len() - 2) * 2);
+
+    // First point: MoveTo
+    let (x, y) = world_to_tile_local(&coords[0], tile, extent);
+    let dx = x - *cursor_x;
+    let dy = y - *cursor_y;
+    geometry.push(command_encode(CMD_MOVE_TO, 1));
+    geometry.push(zigzag_encode(dx));
+    geometry.push(zigzag_encode(dy));
+    *cursor_x = x;
+    *cursor_y = y;
+
+    // Interior points: LineTo (skip last point since ClosePath handles it)
+    let line_to_count = coords.len() - 2;
+    if line_to_count > 0 {
+        geometry.push(command_encode(CMD_LINE_TO, line_to_count as u32));
+        for coord in coords.iter().skip(1).take(line_to_count) {
+            let (x, y) = world_to_tile_local(coord, tile, extent);
+            let dx = x - *cursor_x;
+            let dy = y - *cursor_y;
+            geometry.push(zigzag_encode(dx));
+            geometry.push(zigzag_encode(dy));
+            *cursor_x = x;
+            *cursor_y = y;
+        }
+    }
+
+    // ClosePath (implicitly returns to first point)
+    geometry.push(command_encode(CMD_CLOSE_PATH, 1));
+
+    geometry
+}
+
+/// Encode a polygon from WorldCoord rings as MVT geometry commands.
+///
+/// # Arguments
+/// * `exterior` - Exterior ring coordinates (must have >= 4 points, last == first)
+/// * `interiors` - Interior ring (hole) coordinates
+/// * `tile` - Target tile
+/// * `extent` - Tile extent (typically 4096)
+///
+/// # Returns
+/// MVT geometry command stream
+///
+/// # Note
+/// Callers are responsible for ensuring correct winding order.
+/// WorldCoord polygons should already have exterior rings clockwise
+/// and interior rings counter-clockwise in tile-local coordinates.
+pub fn encode_world_polygon(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile: &TileCoord,
+    extent: u32,
+) -> Vec<u32> {
+    let mut geometry = Vec::new();
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+
+    // Exterior ring
+    let ext_cmds = encode_world_ring(exterior, tile, extent, &mut cursor_x, &mut cursor_y);
+    geometry.extend(ext_cmds);
+
+    // Interior rings (holes)
+    for interior in interiors {
+        let int_cmds = encode_world_ring(interior, tile, extent, &mut cursor_x, &mut cursor_y);
+        geometry.extend(int_cmds);
+    }
+
+    geometry
 }
 
 // ============================================================================
@@ -1168,5 +1370,402 @@ mod tests {
         // The encoded geometry should be the same for both inputs
         // because winding correction normalizes them
         assert_eq!(commands_cw, commands_ccw);
+    }
+
+    // ------------------------------------------------------------------------
+    // WorldCoord Encoding Tests
+    // ------------------------------------------------------------------------
+
+    use crate::tile::TileCoord;
+    use crate::world_coord::lng_lat_to_world;
+
+    #[test]
+    fn test_world_to_tile_local_center_of_world() {
+        // Null Island (0, 0) in world coords is (WORLD_HALF, WORLD_HALF)
+        // In tile 0/0/0 with extent 4096, this should be (2048, 2048)
+        let coord = lng_lat_to_world(0.0, 0.0);
+        let tile = TileCoord::new(0, 0, 0);
+        let (x, y) = world_to_tile_local(&coord, &tile, 4096);
+
+        assert!(
+            (x - 2048).abs() <= 1,
+            "Center of world in tile 0/0/0 should be near 2048, got {}",
+            x
+        );
+        assert!(
+            (y - 2048).abs() <= 1,
+            "Center of world in tile 0/0/0 should be near 2048, got {}",
+            y
+        );
+    }
+
+    #[test]
+    fn test_world_to_tile_local_x_matches_f64_path() {
+        // X coordinates should match between f64 and WorldCoord paths
+        // because longitude is linearly mapped in both cases.
+        //
+        // DIVERGENCE FROM F64 PATH:
+        // Y coordinates differ because geo_to_tile_coords linearly interpolates
+        // latitude within TileBounds, while WorldCoord uses the correct Mercator
+        // projection. The WorldCoord path is more accurate for Y coordinates.
+        let tile = TileCoord::new(0, 0, 1);
+        let bounds = tile.bounds();
+        let extent = 4096;
+
+        // Center of tile in longitude
+        let lng = (bounds.lng_min + bounds.lng_max) / 2.0;
+        let lat = (bounds.lat_min + bounds.lat_max) / 2.0;
+
+        // f64 path
+        let (f64_x, _f64_y) = geo_to_tile_coords(lng, lat, &bounds, extent);
+
+        // WorldCoord path
+        let world = lng_lat_to_world(lng, lat);
+        let (wc_x, _wc_y) = world_to_tile_local(&world, &tile, extent);
+
+        // X should match closely (both linear in longitude)
+        assert!(
+            (f64_x - wc_x).abs() <= 1,
+            "X mismatch: f64={} vs WorldCoord={}",
+            f64_x,
+            wc_x
+        );
+
+        // Y values differ because f64 path linearly interpolates latitude
+        // while WorldCoord uses Mercator projection. This is expected and
+        // WorldCoord is the more correct approach.
+    }
+
+    #[test]
+    fn test_encode_world_points_single() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coord = lng_lat_to_world(0.0, 0.0);
+        let commands = encode_world_points(&[coord], &tile, 4096);
+
+        // Should be: [MoveTo(1), zigzag(x), zigzag(y)]
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0], command_encode(CMD_MOVE_TO, 1));
+    }
+
+    #[test]
+    fn test_encode_world_points_multiple_delta_encoded() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![
+            lng_lat_to_world(-90.0, 45.0),
+            lng_lat_to_world(0.0, 0.0),
+            lng_lat_to_world(90.0, -45.0),
+        ];
+        let commands = encode_world_points(&coords, &tile, 4096);
+
+        // MoveTo(3) + 3 * (dx, dy) = 1 + 6 = 7
+        assert_eq!(commands.len(), 7);
+        assert_eq!(commands[0], command_encode(CMD_MOVE_TO, 3));
+
+        // Decode first delta - should be the absolute position of first point
+        let first_x = zigzag_decode(commands[1]);
+        let first_y = zigzag_decode(commands[2]);
+        assert!((0..=4096).contains(&first_x));
+        assert!((0..=4096).contains(&first_y));
+    }
+
+    #[test]
+    fn test_encode_world_points_empty() {
+        let tile = TileCoord::new(0, 0, 0);
+        let commands = encode_world_points(&[], &tile, 4096);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_encode_world_linestring_simple() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![
+            lng_lat_to_world(-90.0, 45.0),
+            lng_lat_to_world(0.0, 0.0),
+            lng_lat_to_world(90.0, -45.0),
+        ];
+        let commands = encode_world_linestring(&coords, &tile, 4096);
+
+        // MoveTo(1) + 2 coords + LineTo(2) + 4 coords = 8
+        assert_eq!(commands.len(), 8);
+        assert_eq!(commands[0], command_encode(CMD_MOVE_TO, 1));
+        assert_eq!(commands[3], command_encode(CMD_LINE_TO, 2));
+    }
+
+    #[test]
+    fn test_encode_world_linestring_too_short() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![lng_lat_to_world(0.0, 0.0)];
+        let commands = encode_world_linestring(&coords, &tile, 4096);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_encode_world_linestring_empty() {
+        let tile = TileCoord::new(0, 0, 0);
+        let commands = encode_world_linestring(&[], &tile, 4096);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_encode_world_ring_triangle() {
+        let tile = TileCoord::new(0, 0, 0);
+        // Triangle with closing point: 4 points
+        let coords = vec![
+            lng_lat_to_world(-90.0, 45.0),
+            lng_lat_to_world(0.0, -45.0),
+            lng_lat_to_world(90.0, 45.0),
+            lng_lat_to_world(-90.0, 45.0), // closing
+        ];
+        let mut cx = 0i32;
+        let mut cy = 0i32;
+        let commands = encode_world_ring(&coords, &tile, 4096, &mut cx, &mut cy);
+
+        // 4 coords, line_to_count = 4 - 2 = 2
+        // MoveTo(1) + zigzag(dx) + zigzag(dy) + LineTo(2) + 2*(zigzag(dx)+zigzag(dy)) + ClosePath(1)
+        // = 1 + 2 + 1 + 4 + 1 = 9
+        assert_eq!(commands.len(), 9);
+        assert_eq!(command_decode(commands[0]).0, CMD_MOVE_TO);
+        assert_eq!(command_decode(*commands.last().unwrap()).0, CMD_CLOSE_PATH);
+    }
+
+    #[test]
+    fn test_encode_world_ring_too_few_points() {
+        let tile = TileCoord::new(0, 0, 0);
+        let coords = vec![
+            lng_lat_to_world(0.0, 0.0),
+            lng_lat_to_world(1.0, 0.0),
+            lng_lat_to_world(0.0, 0.0),
+        ];
+        let mut cx = 0i32;
+        let mut cy = 0i32;
+        let commands = encode_world_ring(&coords, &tile, 4096, &mut cx, &mut cy);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_encode_world_polygon_simple() {
+        let tile = TileCoord::new(0, 0, 0);
+        let exterior = vec![
+            lng_lat_to_world(-90.0, 45.0),
+            lng_lat_to_world(0.0, -45.0),
+            lng_lat_to_world(90.0, 45.0),
+            lng_lat_to_world(-90.0, 45.0), // closing
+        ];
+        let commands = encode_world_polygon(&exterior, &[], &tile, 4096);
+
+        assert!(!commands.is_empty());
+        assert_eq!(command_decode(commands[0]).0, CMD_MOVE_TO);
+        assert_eq!(command_decode(*commands.last().unwrap()).0, CMD_CLOSE_PATH);
+    }
+
+    #[test]
+    fn test_encode_world_polygon_with_hole() {
+        let tile = TileCoord::new(0, 0, 0);
+
+        let exterior = vec![
+            lng_lat_to_world(-90.0, 60.0),
+            lng_lat_to_world(-90.0, -60.0),
+            lng_lat_to_world(90.0, -60.0),
+            lng_lat_to_world(90.0, 60.0),
+            lng_lat_to_world(-90.0, 60.0), // closing
+        ];
+
+        let hole = vec![
+            lng_lat_to_world(-45.0, 30.0),
+            lng_lat_to_world(-45.0, -30.0),
+            lng_lat_to_world(45.0, -30.0),
+            lng_lat_to_world(45.0, 30.0),
+            lng_lat_to_world(-45.0, 30.0), // closing
+        ];
+
+        let commands = encode_world_polygon(&exterior, &[hole], &tile, 4096);
+
+        assert!(!commands.is_empty());
+
+        // Walk the command stream properly to count ClosePath commands.
+        // We must skip over coordinate parameters (not interpret them as commands).
+        let mut close_count = 0;
+        let mut i = 0;
+        while i < commands.len() {
+            let (cmd_id, count) = command_decode(commands[i]);
+            i += 1;
+            match cmd_id {
+                CMD_MOVE_TO | CMD_LINE_TO => {
+                    // Skip count * 2 coordinate values (dx, dy pairs)
+                    i += count as usize * 2;
+                }
+                CMD_CLOSE_PATH => {
+                    close_count += 1;
+                    // ClosePath has no parameters
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            close_count, 2,
+            "Should have 2 ClosePath commands (exterior + hole)"
+        );
+    }
+
+    #[test]
+    fn test_world_coord_encoding_consistency_with_f64() {
+        // Core consistency test: encoding the same geographic point through
+        // both paths should produce the same MVT commands (within rounding)
+        let tile = TileCoord::new(1234, 2345, 14);
+        let bounds = tile.bounds();
+        let extent = 4096;
+
+        // Pick a point inside the tile
+        let lng = (bounds.lng_min + bounds.lng_max) / 2.0;
+        let lat = (bounds.lat_min + bounds.lat_max) / 2.0;
+
+        // f64 path
+        let f64_commands = encode_point(&point!(x: lng, y: lat), &bounds, extent);
+
+        // WorldCoord path
+        let world = lng_lat_to_world(lng, lat);
+        let wc_commands = encode_world_points(&[world], &tile, extent);
+
+        // Both should be 3 commands: MoveTo(1), zigzag(x), zigzag(y)
+        assert_eq!(f64_commands.len(), 3);
+        assert_eq!(wc_commands.len(), 3);
+
+        // MoveTo command should be identical
+        assert_eq!(f64_commands[0], wc_commands[0]);
+
+        // Coordinates should be within 1 unit (rounding difference between paths)
+        let f64_x = zigzag_decode(f64_commands[1]);
+        let wc_x = zigzag_decode(wc_commands[1]);
+        let f64_y = zigzag_decode(f64_commands[2]);
+        let wc_y = zigzag_decode(wc_commands[2]);
+
+        assert!(
+            (f64_x - wc_x).abs() <= 1,
+            "X mismatch: f64={} vs WorldCoord={}",
+            f64_x,
+            wc_x
+        );
+        assert!(
+            (f64_y - wc_y).abs() <= 1,
+            "Y mismatch: f64={} vs WorldCoord={}",
+            f64_y,
+            wc_y
+        );
+    }
+
+    #[test]
+    fn test_world_coord_linestring_consistency_with_f64() {
+        // Test that encoding a linestring through both paths gives similar structure.
+        //
+        // DIVERGENCE FROM F64 PATH:
+        // The f64 path (geo_to_tile_coords) linearly interpolates latitude in TileBounds,
+        // while WorldCoord uses the Mercator projection. X coordinates (longitude) match
+        // closely, but Y coordinates differ because Mercator is non-linear in latitude.
+        // The WorldCoord path is more accurate.
+        let tile = TileCoord::new(10, 10, 5);
+        let bounds = tile.bounds();
+        let extent = 4096;
+
+        // Points inside tile
+        let lng1 = bounds.lng_min + (bounds.lng_max - bounds.lng_min) * 0.25;
+        let lat1 = bounds.lat_min + (bounds.lat_max - bounds.lat_min) * 0.25;
+        let lng2 = bounds.lng_min + (bounds.lng_max - bounds.lng_min) * 0.75;
+        let lat2 = bounds.lat_min + (bounds.lat_max - bounds.lat_min) * 0.75;
+
+        // f64 path
+        let line = line_string![(x: lng1, y: lat1), (x: lng2, y: lat2)];
+        let f64_commands = encode_linestring(&line, &bounds, extent);
+
+        // WorldCoord path
+        let world_coords = vec![lng_lat_to_world(lng1, lat1), lng_lat_to_world(lng2, lat2)];
+        let wc_commands = encode_world_linestring(&world_coords, &tile, extent);
+
+        // Both should have same structure: MoveTo(1) + 2 coords + LineTo(1) + 2 coords = 6
+        assert_eq!(f64_commands.len(), wc_commands.len());
+
+        // Command structure should match exactly
+        assert_eq!(f64_commands[0], wc_commands[0]); // MoveTo(1)
+        assert_eq!(f64_commands[3], wc_commands[3]); // LineTo(1)
+
+        // X coordinates (indices 1, 4) should be close (both linear in longitude)
+        for i in [1, 4] {
+            let f64_val = zigzag_decode(f64_commands[i]);
+            let wc_val = zigzag_decode(wc_commands[i]);
+            assert!(
+                (f64_val - wc_val).abs() <= 2,
+                "X command[{}] mismatch: f64={} vs WorldCoord={}",
+                i,
+                f64_val,
+                wc_val
+            );
+        }
+
+        // Y coordinates (indices 2, 5) may differ due to Mercator vs linear interpolation
+        // Just verify they are within valid tile extent range
+        for i in [2, 5] {
+            let wc_val = zigzag_decode(wc_commands[i]);
+            // For the first Y it's absolute, for delta it can be negative
+            // Just verify the values are reasonable (not overflowing)
+            assert!(
+                wc_val.abs() <= extent as i32 * 2,
+                "Y command[{}] out of range: {}",
+                i,
+                wc_val
+            );
+        }
+    }
+
+    #[test]
+    fn test_world_coord_cursor_state_across_rings() {
+        // Verify that cursor state is correctly maintained across multiple rings
+        let tile = TileCoord::new(0, 0, 0);
+        let extent = 4096;
+
+        let ring1 = vec![
+            lng_lat_to_world(-90.0, 45.0),
+            lng_lat_to_world(-90.0, -45.0),
+            lng_lat_to_world(0.0, -45.0),
+            lng_lat_to_world(-90.0, 45.0), // closing
+        ];
+
+        let ring2 = vec![
+            lng_lat_to_world(0.0, 45.0),
+            lng_lat_to_world(0.0, -45.0),
+            lng_lat_to_world(90.0, -45.0),
+            lng_lat_to_world(0.0, 45.0), // closing
+        ];
+
+        let mut cx = 0i32;
+        let mut cy = 0i32;
+        let cmds1 = encode_world_ring(&ring1, &tile, extent, &mut cx, &mut cy);
+        let cmds2 = encode_world_ring(&ring2, &tile, extent, &mut cx, &mut cy);
+
+        // Both rings should have produced commands
+        assert!(!cmds1.is_empty());
+        assert!(!cmds2.is_empty());
+
+        // The second ring's first delta should not be from (0,0) - it should be from
+        // where the cursor ended after the first ring
+        // (This verifies cursor state is carried across rings)
+        let ring2_dx = zigzag_decode(cmds2[1]);
+        let ring2_dy = zigzag_decode(cmds2[2]);
+
+        // If cursor state wasn't maintained, dx/dy would be the absolute position
+        // of the first point of ring2. Instead, it should be the delta from ring1's
+        // last cursor position.
+        let (ring2_first_x, ring2_first_y) = world_to_tile_local(&ring2[0], &tile, extent);
+
+        // The delta encoding means these values should differ from the absolute position
+        // (unless the cursor happened to be at origin, which it shouldn't be after ring1)
+        assert!(
+            ring2_dx != ring2_first_x || ring2_dy != ring2_first_y,
+            "Ring2's first delta should be relative to ring1's last cursor position, \
+             not absolute. dx={}, dy={}, abs_x={}, abs_y={}",
+            ring2_dx,
+            ring2_dy,
+            ring2_first_x,
+            ring2_first_y
+        );
     }
 }

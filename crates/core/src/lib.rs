@@ -51,6 +51,7 @@ pub mod tile;
 pub mod validate;
 pub mod wagyu_clip;
 pub mod wkb;
+pub mod world_coord;
 
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;

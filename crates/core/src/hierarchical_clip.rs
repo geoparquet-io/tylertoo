@@ -152,6 +152,83 @@ pub fn clip_geometry_hierarchical(
     (results, stats)
 }
 
+// ============================================================================
+// WorldCoord-based Hierarchical Clipping (Phase 1)
+// ============================================================================
+//
+// This provides an alternative bbox intersection test using WorldBounds
+// instead of f64 TileBounds. The integer-based intersection test is exact
+// and avoids floating-point precision issues in buffer calculations.
+//
+// PHASE 1: Additive -- the f64 version above remains the primary API.
+
+use crate::world_coord::WorldBounds;
+
+/// WorldCoord-based bounding box for geometry intersection tests.
+///
+/// This type can be computed once from a geometry's extent and reused
+/// across all zoom levels for intersection testing with WorldBounds tiles.
+/// It replaces the imprecise f64 TileBounds used for bbox rejection.
+///
+/// In Phase 2, this will replace `TileBounds` in the hierarchical clipping pipeline.
+#[derive(Debug, Clone, Copy)]
+pub struct WorldGeomBounds {
+    pub bounds: WorldBounds,
+}
+
+impl WorldGeomBounds {
+    /// Create from a TileBounds (f64 geographic coordinates).
+    pub fn from_tile_bounds(tile_bounds: &TileBounds) -> Self {
+        Self {
+            bounds: WorldBounds::from_tile_bounds(tile_bounds),
+        }
+    }
+
+    /// Check if this geometry's bounds intersect a tile's buffered world bounds.
+    ///
+    /// This is the integer-precision replacement for the f64 intersection test
+    /// in `clip_geometry_hierarchical`.
+    #[inline]
+    pub fn intersects_tile_buffered(
+        &self,
+        tile: &TileCoord,
+        buffer_pixels: u32,
+        extent: u32,
+    ) -> bool {
+        let tile_bounds = WorldBounds::from_tile_with_buffer(tile, buffer_pixels, extent);
+        self.bounds.intersects(&tile_bounds)
+    }
+
+    /// Check if this geometry's bounds intersect a WorldBounds directly.
+    #[inline]
+    pub fn intersects_world_bounds(&self, bounds: &WorldBounds) -> bool {
+        self.bounds.intersects(bounds)
+    }
+}
+
+/// Check if a geometry bbox (in world coords) intersects a tile's buffered bounds.
+///
+/// This is a standalone function for use in places where `WorldGeomBounds`
+/// is not yet constructed.
+///
+/// # Arguments
+/// * `geom_bbox` - Geometry's bounding box in world coordinates
+/// * `tile` - The tile to test against
+/// * `buffer_pixels` - Buffer in pixels
+/// * `extent` - Tile extent
+///
+/// # Returns
+/// `true` if the geometry bbox intersects the tile's buffered bounds
+pub fn intersects_tile_world(
+    geom_bbox: &WorldBounds,
+    tile: &TileCoord,
+    buffer_pixels: u32,
+    extent: u32,
+) -> bool {
+    let tile_bounds = WorldBounds::from_tile_with_buffer(tile, buffer_pixels, extent);
+    geom_bbox.intersects(&tile_bounds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +625,140 @@ mod tests {
         eprintln!("{}", "=".repeat(90));
         eprintln!("Note: Same # of clip ops, but hierarchical clips use SMALLER source geometries");
         eprintln!("(parent clip results instead of the original geometry, reducing computation)\n");
+    }
+
+    // ========================================================================
+    // WorldCoord-based intersection tests
+    // ========================================================================
+
+    mod world_tests {
+        use super::*;
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldBounds;
+
+        #[test]
+        fn test_world_geom_bounds_from_tile_bounds() {
+            let tile_bounds = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+            let world_geom = WorldGeomBounds::from_tile_bounds(&tile_bounds);
+
+            // Should produce valid world bounds
+            assert!(
+                world_geom.bounds.x_min < world_geom.bounds.x_max,
+                "x_min ({}) should be < x_max ({})",
+                world_geom.bounds.x_min,
+                world_geom.bounds.x_max
+            );
+            assert!(
+                world_geom.bounds.y_min < world_geom.bounds.y_max,
+                "y_min ({}) should be < y_max ({})",
+                world_geom.bounds.y_min,
+                world_geom.bounds.y_max
+            );
+        }
+
+        #[test]
+        fn test_world_geom_intersects_tile() {
+            // A geometry bbox covering (-5, -5) to (5, 5) in geographic coords
+            let geom_bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+            let world_geom = WorldGeomBounds::from_tile_bounds(&geom_bbox);
+
+            // Tile at zoom 0 should always intersect (covers the whole world)
+            let tile_z0 = TileCoord::new(0, 0, 0);
+            assert!(
+                world_geom.intersects_tile_buffered(&tile_z0, 8, 4096),
+                "z0 tile should intersect any geometry"
+            );
+
+            // Tile at zoom 1, tile (1,1) = SE quadrant, should intersect
+            // (geometry spans the origin which is at the junction of all z1 tiles)
+            let tile_z1_se = TileCoord::new(1, 1, 1);
+            assert!(
+                world_geom.intersects_tile_buffered(&tile_z1_se, 8, 4096),
+                "z1 SE tile should intersect geometry spanning origin"
+            );
+        }
+
+        #[test]
+        fn test_world_geom_does_not_intersect_distant_tile() {
+            // A geometry bbox covering a small area near NYC
+            let geom_bbox = TileBounds::new(-74.0, 40.7, -73.9, 40.8);
+            let world_geom = WorldGeomBounds::from_tile_bounds(&geom_bbox);
+
+            // A tile on the other side of the world (e.g., Pacific Ocean)
+            // At zoom 4, tile (0, 8) is in the far west
+            let distant_tile = TileCoord::new(14, 8, 4);
+            assert!(
+                !world_geom.intersects_tile_buffered(&distant_tile, 8, 4096),
+                "Distant tile should not intersect NYC geometry"
+            );
+        }
+
+        #[test]
+        fn test_intersects_tile_world_consistency_with_f64() {
+            // Verify that the WorldBounds intersection test produces the same
+            // results as the f64 intersection test for a range of tiles.
+            let geom_bbox_f64 = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+            let geom_bbox_world = WorldBounds::from_tile_bounds(&geom_bbox_f64);
+
+            use crate::tile::tiles_for_bbox;
+
+            for z in 0..=5u8 {
+                let tiles: Vec<TileCoord> = tiles_for_bbox(&geom_bbox_f64, z).collect();
+
+                for tile in &tiles {
+                    let tile_bounds = tile.bounds();
+                    let buffer_f64 = buffer_pixels_to_degrees(8, &tile_bounds, 4096);
+
+                    // f64 intersection test (from the existing code)
+                    let buffered_lng_min = tile_bounds.lng_min - buffer_f64;
+                    let buffered_lng_max = tile_bounds.lng_max + buffer_f64;
+                    let buffered_lat_min = tile_bounds.lat_min - buffer_f64;
+                    let buffered_lat_max = tile_bounds.lat_max + buffer_f64;
+
+                    let f64_intersects = geom_bbox_f64.lng_max >= buffered_lng_min
+                        && geom_bbox_f64.lng_min <= buffered_lng_max
+                        && geom_bbox_f64.lat_max >= buffered_lat_min
+                        && geom_bbox_f64.lat_min <= buffered_lat_max;
+
+                    // WorldCoord intersection test
+                    let world_intersects = intersects_tile_world(&geom_bbox_world, tile, 8, 4096);
+
+                    assert_eq!(
+                        f64_intersects, world_intersects,
+                        "Intersection mismatch at tile {:?} z{}: f64={}, world={}",
+                        tile, z, f64_intersects, world_intersects
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_intersects_tile_world_with_buffer() {
+            // A geometry bbox at the edge of a tile -- should NOT intersect without buffer,
+            // but SHOULD intersect with buffer.
+            let tile = TileCoord::new(8, 5, 4);
+            let tile_bounds_world = WorldBounds::from_tile(&tile);
+
+            // Place geometry just outside the right edge of the tile
+            let just_outside = WorldBounds::new(
+                tile_bounds_world.x_max + 1,
+                tile_bounds_world.y_min + 100,
+                tile_bounds_world.x_max + 1000,
+                tile_bounds_world.y_max - 100,
+            );
+
+            // Without buffer: should not intersect
+            assert!(
+                !just_outside.intersects(&tile_bounds_world),
+                "Should not intersect without buffer"
+            );
+
+            // With buffer: should intersect (buffer extends the tile bounds)
+            let tile_bounds_buffered = WorldBounds::from_tile_with_buffer(&tile, 8, 4096);
+            assert!(
+                just_outside.intersects(&tile_bounds_buffered),
+                "Should intersect with buffer"
+            );
+        }
     }
 }
