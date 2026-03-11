@@ -273,14 +273,16 @@ where
 
     // Process each row group separately
     for rg_idx in 0..num_row_groups {
-        // Span: Opening file and building reader for this row group
+        // Span: Building reader for this row group (file handle reused via try_clone)
         let (reader, _batch_size) = {
             let _open_span = info_span!("parquet_open_rowgroup", row_group = rg_idx).entered();
 
-            let file = std::fs::File::open(path)
-                .map_err(|e| Error::GeoParquetRead(format!("Failed to reopen file: {}", e)))?;
+            // Reuse file handle via try_clone() - avoids reopening file for each row group
+            let file_clone = file.try_clone().map_err(|e| {
+                Error::GeoParquetRead(format!("Failed to clone file handle: {}", e))
+            })?;
 
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file_clone)
                 .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
             let batch_size = builder.metadata().row_group(rg_idx).num_rows() as usize;
