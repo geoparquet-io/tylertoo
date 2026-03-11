@@ -101,6 +101,39 @@ Python API now has full feature parity with CLI.
 [0.2.0]: https://github.com/geoparquet-io/gpq-tiles/releases/tag/v0.2.0
 [0.1.0]: https://github.com/geoparquet-io/gpq-tiles/releases/tag/v0.1.0
 
+## v0.6.0 (2026-03-11)
+
+### Feat
+
+- implement point clustering with position averaging (#25)
+- implement accumulator system for attribute aggregation (#23)
+- implement gap-based density detection (#24)
+- support WKT geometry encoding (#35)
+- implement tiny polygon accumulation (#85)
+- **profiling**: add fine-grained spans to read_parquet phase
+- add time profiling with tracing
+- add memory profiling with dhat
+
+### Fix
+
+- remove needless borrow in benchmark
+- resolve clippy warnings and unused imports
+- remove WKT fixture from repo, tests skip when missing
+- gracefully skip WKT tests when fixture is missing
+- skip profiling integration tests when dhat-heap feature enabled
+- use tempfile crate for proper temp directory isolation in tests
+- use cross-platform temp directories in integration tests
+
+### Refactor
+
+- replace wagyu-rs with i_overlay for polygon clipping
+
+### Perf
+
+- parallel row group I/O for ~24% speedup
+- reuse file handle across row groups (#41)
+- parallelize tile encoding in Phase 3 (#90)
+
 ## v0.5.0 (2026-03-10)
 
 ### Feat

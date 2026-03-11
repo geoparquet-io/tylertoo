@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Nissim Lebovits <nlebovits@pm.me>"]
@@ -19,7 +19,7 @@ categories = ["science", "data-structures", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-gpq-tiles-core = { path = "crates/core", version = "0.5.0" }
+gpq-tiles-core = { path = "crates/core", version = "0.6.0" }
 
 # Core geospatial dependencies
 geoarrow = "0.4"
