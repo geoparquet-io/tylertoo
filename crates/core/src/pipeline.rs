@@ -31,6 +31,7 @@ use crate::feature_drop::{
     should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
     DensityDropConfig, DensityDropper, TinyPolygonAccumulator, DEFAULT_TINY_POLYGON_THRESHOLD,
 };
+use crate::gap_density::{scale_for_zoom, GapBasedSelector};
 use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeometry};
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
@@ -192,6 +193,21 @@ pub struct TilerConfig {
     /// When disabled, tiny polygons are dropped using diffuse probability
     /// (the legacy behavior).
     pub enable_tiny_polygon_accumulation: bool,
+    /// Gamma parameter for gap-based density dropping (default: None = use grid-based).
+    ///
+    /// When set, uses tippecanoe's gap-based algorithm instead of grid-based.
+    /// This uses Hilbert index gaps to determine which features to drop:
+    ///
+    /// - `gamma = 0.0`: Gap-based dropping disabled (use grid-based instead)
+    /// - `gamma = 1.0`: Linear spacing
+    /// - `gamma = 2.0`: "Reduces dots < 1 pixel apart to square root of original"
+    ///   (tippecanoe's default for dense data)
+    /// - Higher gamma = more aggressive dropping of closely-spaced features
+    ///
+    /// This is activated via `--drop-densest-as-needed --gamma=2.0` in tippecanoe.
+    /// When `gamma` is `Some(value > 0.0)`, gap-based selection is used instead
+    /// of grid-based density dropping.
+    pub gamma: Option<f64>,
 }
 
 impl Default for TilerConfig {
@@ -223,6 +239,8 @@ impl Default for TilerConfig {
             // Tiny polygon accumulation is enabled by default (matches tippecanoe)
             // This preserves visual density by emitting synthetic squares
             enable_tiny_polygon_accumulation: true,
+            // Gap-based dropping disabled by default - use grid-based instead
+            gamma: None,
         }
     }
 }
@@ -403,6 +421,51 @@ impl TilerConfig {
     /// ```
     pub fn with_tiny_polygon_accumulation(mut self, enable: bool) -> Self {
         self.enable_tiny_polygon_accumulation = enable;
+        self
+    }
+
+    /// Set the gamma parameter for gap-based density dropping.
+    ///
+    /// When set to a value > 0, uses tippecanoe's gap-based algorithm instead
+    /// of grid-based density dropping. The gap-based algorithm uses Hilbert
+    /// index gaps to determine which features to drop, providing better
+    /// preservation of spatial distribution.
+    ///
+    /// # Arguments
+    ///
+    /// * `gamma` - Exponential spacing parameter. Use 2.0 for tippecanoe's
+    ///   default behavior (reduces dots < 1 pixel apart to square root of original).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// // Enable gap-based density dropping with gamma=2.0 (tippecanoe default)
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_gamma(2.0);
+    /// ```
+    pub fn with_gamma(mut self, gamma: f64) -> Self {
+        self.gamma = Some(gamma);
+        self
+    }
+
+    /// Enable gap-based density dropping (--drop-densest-as-needed).
+    ///
+    /// This is a convenience method that sets gamma=2.0, which is tippecanoe's
+    /// default for `--drop-densest-as-needed`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// // Enable gap-based density dropping with default gamma
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_drop_densest_as_needed();
+    /// ```
+    pub fn with_drop_densest_as_needed(mut self) -> Self {
+        self.gamma = Some(2.0);
         self
     }
 }
@@ -1698,8 +1761,13 @@ pub fn generate_tiles_streaming_with_stats(
         let mut layer_builder = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
         let mut feature_count = 0;
 
-        // Set up density dropper if enabled
-        let mut density_dropper = if config.enable_density_drop {
+        // Set up density dropping - gap-based takes precedence over grid-based
+        let mut gap_selector = config
+            .gamma
+            .filter(|&g| g > 0.0)
+            .map(|gamma| GapBasedSelector::new(gamma).with_scale(scale_for_zoom(z)));
+
+        let mut density_dropper = if gap_selector.is_none() && config.enable_density_drop {
             let density_config = DensityDropConfig::new()
                 .with_cell_size(config.density_cell_size)
                 .with_max_features_per_cell(config.density_max_per_cell)
@@ -1729,8 +1797,14 @@ pub fn generate_tiles_streaming_with_stats(
                 continue;
             }
 
-            // Density dropping
-            if let Some(ref mut dropper) = density_dropper {
+            // Density dropping - gap-based (tippecanoe-compatible) or grid-based
+            if let Some(ref mut selector) = gap_selector {
+                // Gap-based: use Hilbert index to determine spacing
+                if selector.should_drop_geometry(&validated) {
+                    continue;
+                }
+            } else if let Some(ref mut dropper) = density_dropper {
+                // Grid-based: limit features per grid cell
                 if dropper.should_drop_geometry(&validated, &tile_bounds, config.extent, z) {
                     continue;
                 }
@@ -1846,7 +1920,13 @@ impl TileIterator {
         let mut layer_builder = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
 
         // Create density dropper for this tile if enabled
-        let mut density_dropper = if config.enable_density_drop {
+        // Gap-based takes precedence over grid-based when gamma is set
+        let mut gap_selector = config
+            .gamma
+            .filter(|&g| g > 0.0)
+            .map(|gamma| GapBasedSelector::new(gamma).with_scale(scale_for_zoom(coord.z)));
+
+        let mut density_dropper = if gap_selector.is_none() && config.enable_density_drop {
             let density_config = DensityDropConfig::new()
                 .with_cell_size(config.density_cell_size)
                 .with_max_features_per_cell(config.density_max_per_cell)
@@ -1879,9 +1959,14 @@ impl TileIterator {
                     }
 
                     // Apply density-based dropping if enabled
-                    // This limits the number of features per grid cell to prevent
-                    // cluttered tiles at low zoom levels
-                    if let Some(ref mut dropper) = density_dropper {
+                    // Gap-based (tippecanoe-compatible) or grid-based (simplified)
+                    if let Some(ref mut selector) = gap_selector {
+                        // Gap-based: use Hilbert index to determine spacing
+                        if selector.should_drop_geometry(&valid_geom) {
+                            continue;
+                        }
+                    } else if let Some(ref mut dropper) = density_dropper {
+                        // Grid-based: limit features per grid cell
                         if dropper.should_drop_geometry(
                             &valid_geom,
                             &bounds,

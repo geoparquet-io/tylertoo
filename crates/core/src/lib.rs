@@ -44,6 +44,7 @@ pub mod compression;
 pub mod dedup;
 pub mod external_sort;
 pub mod feature_drop;
+pub mod gap_density;
 #[cfg(test)]
 mod golden;
 pub mod hierarchical_clip;

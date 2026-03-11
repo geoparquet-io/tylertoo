@@ -45,6 +45,29 @@ struct Args {
     #[arg(long, default_value = "medium")]
     drop_density: String,
 
+    /// Enable gap-based density dropping (tippecanoe-compatible).
+    ///
+    /// Uses Hilbert index gaps to determine which features to drop,
+    /// providing better preservation of spatial distribution than
+    /// grid-based dropping. Equivalent to tippecanoe's --drop-densest-as-needed.
+    ///
+    /// When enabled without --gamma, uses gamma=2.0 (tippecanoe default).
+    #[arg(long)]
+    drop_densest_as_needed: bool,
+
+    /// Gamma parameter for gap-based density dropping.
+    ///
+    /// Controls the exponential spacing for feature selection:
+    /// - gamma=0: Disabled (use grid-based instead)
+    /// - gamma=1: Linear spacing
+    /// - gamma=2: "Reduces dots < 1 pixel apart to square root of original"
+    ///   (tippecanoe default when using --drop-densest-as-needed)
+    /// - Higher values = more aggressive dropping of closely-spaced features
+    ///
+    /// Implies --drop-densest-as-needed when set.
+    #[arg(long)]
+    gamma: Option<f64>,
+
     /// Layer name for the output tiles (default: derived from input filename)
     #[arg(long)]
     layer_name: Option<String>,
@@ -205,12 +228,20 @@ fn main() -> Result<()> {
     });
 
     // Build TilerConfig - always quiet since we use progress bars
-    let tiler_config = TilerConfig::new(args.min_zoom, args.max_zoom)
+    let mut tiler_config = TilerConfig::new(args.min_zoom, args.max_zoom)
         .with_extent(4096)
         .with_layer_name(&layer_name)
         .with_property_filter(property_filter)
         .with_quiet(true) // Suppress log output when we have progress bars
         .with_deterministic(args.deterministic);
+
+    // Configure gap-based density dropping if requested
+    // --gamma takes precedence, otherwise --drop-densest-as-needed uses gamma=2.0
+    if let Some(gamma) = args.gamma {
+        tiler_config = tiler_config.with_gamma(gamma);
+    } else if args.drop_densest_as_needed {
+        tiler_config = tiler_config.with_drop_densest_as_needed();
+    }
 
     // Print configuration in verbose mode
     if args.verbose {
@@ -219,6 +250,9 @@ fn main() -> Result<()> {
         eprintln!("  Output: {}", args.output.display());
         eprintln!("  Zoom: {}-{}", args.min_zoom, args.max_zoom);
         eprintln!("  Compression: {}", args.compression);
+        if let Some(gamma) = tiler_config.gamma {
+            eprintln!("  Density dropping: gap-based (gamma={})", gamma);
+        }
         if args.deterministic {
             eprintln!("  Processing: deterministic (sequential)");
         }
