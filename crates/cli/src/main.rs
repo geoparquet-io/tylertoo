@@ -120,6 +120,12 @@ impl Args {
 }
 
 fn main() -> Result<()> {
+    // Initialize dhat profiler if feature is enabled
+    // This must be at the very start of main() - the profiler outputs
+    // dhat-heap.json on Drop (program exit)
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let args = Args::parse();
 
     // Initialize logging - suppress when verbose (we use progress bars instead)

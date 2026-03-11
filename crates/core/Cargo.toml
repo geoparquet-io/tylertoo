@@ -12,7 +12,12 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+dhat-heap = ["dhat"]
+
 [dependencies]
+dhat = { version = "0.3", optional = true }
 geoarrow = { workspace = true }
 geoarrow-array = { workspace = true }
 geo-traits = { workspace = true }
