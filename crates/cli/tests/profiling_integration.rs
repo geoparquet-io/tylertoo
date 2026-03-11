@@ -4,6 +4,9 @@
 //! - `--profile` produces console timing summary
 //! - `--trace-output` produces valid Chrome trace JSON
 //! - Both flags can be used together
+//!
+//! Note: These tests are skipped when running with the `dhat-heap` feature
+//! because dhat's heap profiling interferes with file operations.
 
 use std::fs;
 use std::path::Path;
@@ -23,6 +26,10 @@ fn cli_binary() -> String {
 
 /// Test that --profile flag produces timing summary output
 #[test]
+#[cfg_attr(
+    feature = "dhat-heap",
+    ignore = "dhat-heap interferes with file operations"
+)]
 fn test_profile_flag_produces_timing_summary() {
     let fixture = fixture_path();
     if !Path::new(fixture).exists() {
@@ -64,6 +71,10 @@ fn test_profile_flag_produces_timing_summary() {
 
 /// Test that --trace-output flag produces valid JSON file
 #[test]
+#[cfg_attr(
+    feature = "dhat-heap",
+    ignore = "dhat-heap interferes with file operations"
+)]
 fn test_trace_output_produces_valid_json() {
     let fixture = fixture_path();
     if !Path::new(fixture).exists() {
@@ -126,6 +137,10 @@ fn test_trace_output_produces_valid_json() {
 
 /// Test that both --profile and --trace-output can be used together
 #[test]
+#[cfg_attr(
+    feature = "dhat-heap",
+    ignore = "dhat-heap interferes with file operations"
+)]
 fn test_combined_profile_and_trace_output() {
     let fixture = fixture_path();
     if !Path::new(fixture).exists() {
@@ -180,6 +195,10 @@ fn test_combined_profile_and_trace_output() {
 
 /// Test that trace file contains expected span names
 #[test]
+#[cfg_attr(
+    feature = "dhat-heap",
+    ignore = "dhat-heap interferes with file operations"
+)]
 fn test_trace_contains_expected_spans() {
     let fixture = fixture_path();
     if !Path::new(fixture).exists() {
@@ -243,6 +262,10 @@ fn test_trace_contains_expected_spans() {
 
 /// Test that CLI runs without profiling flags (baseline)
 #[test]
+#[cfg_attr(
+    feature = "dhat-heap",
+    ignore = "dhat-heap interferes with file operations"
+)]
 fn test_cli_runs_without_profiling() {
     let fixture = fixture_path();
     if !Path::new(fixture).exists() {
