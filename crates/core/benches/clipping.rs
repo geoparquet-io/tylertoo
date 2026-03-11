@@ -1,6 +1,6 @@
 // Benchmark suite for polygon clipping performance
 //
-// Compares Sutherland-Hodgman (tile clipping) vs Wagyu (general boolean ops)
+// Compares Sutherland-Hodgman (tile clipping) vs i_overlay (general boolean ops)
 // on polygons of varying complexity.
 //
 // Run with: cargo bench --package gpq-tiles-core -- clipping
@@ -8,9 +8,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, LineString, Polygon};
 use gpq_tiles_core::clip::clip_geometry;
+use gpq_tiles_core::ioverlay_clip::clip_polygon_ioverlay;
 use gpq_tiles_core::sutherland_hodgman::clip_polygon_sh;
 use gpq_tiles_core::tile::TileBounds;
-use gpq_tiles_core::wagyu_clip::{clip_polygon_wagyu, DEFAULT_EXTENT};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -100,13 +100,13 @@ fn bench_sutherland_hodgman(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark Wagyu clipping at various polygon sizes (for comparison)
-fn bench_wagyu(c: &mut Criterion) {
-    let mut group = c.benchmark_group("wagyu");
+/// Benchmark i_overlay clipping at various polygon sizes (for comparison)
+fn bench_ioverlay(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ioverlay");
 
     let bounds = TileBounds::new(-67.5, -66.51, -56.25, -61.61);
 
-    // Only test smaller sizes for wagyu (it's too slow for large polygons)
+    // Test various sizes for i_overlay
     for size in [100, 1_000, 10_000].iter() {
         let center = (
             (bounds.lng_min + bounds.lng_max) / 2.0,
@@ -117,7 +117,7 @@ fn bench_wagyu(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &poly, |b, poly| {
-            b.iter(|| clip_polygon_wagyu(black_box(poly), black_box(&bounds), DEFAULT_EXTENT));
+            b.iter(|| clip_polygon_ioverlay(black_box(poly), black_box(&bounds)));
         });
     }
 
@@ -144,10 +144,10 @@ fn bench_wide_polygon(c: &mut Criterion) {
         );
     }
 
-    // Also test wagyu on the smallest wide polygon for comparison
+    // Also test i_overlay on the smallest wide polygon for comparison
     let small_wide = generate_wide_polygon(1_000);
-    group.bench_function("wagyu/1000", |b| {
-        b.iter(|| clip_polygon_wagyu(black_box(&small_wide), black_box(&bounds), DEFAULT_EXTENT));
+    group.bench_function("ioverlay/1000", |b| {
+        b.iter(|| clip_polygon_ioverlay(black_box(&small_wide), black_box(&bounds)));
     });
 
     group.finish();
@@ -202,11 +202,10 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
         b.iter(|| clip_geometry(black_box(&geom), black_box(&bounds), 0.0));
     });
 
-    // Note: Wagyu benchmark omitted because it takes ~10s per iteration
-    // Uncomment to compare, but it will be slow:
-    // group.bench_function("wagyu", |b| {
-    //     b.iter(|| clip_polygon_wagyu(black_box(&poly), black_box(&bounds), DEFAULT_EXTENT));
-    // });
+    // Benchmark i_overlay (for comparison)
+    group.bench_function("ioverlay", |b| {
+        b.iter(|| clip_polygon_ioverlay(black_box(&poly), black_box(&bounds)));
+    });
 
     group.finish();
 }
@@ -214,7 +213,7 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_sutherland_hodgman,
-    bench_wagyu,
+    bench_ioverlay,
     bench_wide_polygon,
     bench_clip_geometry,
     bench_antarctica_polygon,
