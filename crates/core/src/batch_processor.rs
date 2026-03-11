@@ -255,6 +255,7 @@ where
 {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
+    use tracing::info_span;
 
     let file = std::fs::File::open(path)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
@@ -272,24 +273,37 @@ where
 
     // Process each row group separately
     for rg_idx in 0..num_row_groups {
-        let file = std::fs::File::open(path)
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to reopen file: {}", e)))?;
+        // Span: Opening file and building reader for this row group
+        let (reader, _batch_size) = {
+            let _open_span = info_span!("parquet_open_rowgroup", row_group = rg_idx).entered();
 
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+            let file = std::fs::File::open(path)
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to reopen file: {}", e)))?;
 
-        // Select only the current row group
-        let reader = builder
-            .with_row_groups(vec![rg_idx])
-            .build()
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+            let batch_size = builder.metadata().row_group(rg_idx).num_rows() as usize;
+
+            // Select only the current row group
+            let reader = builder
+                .with_row_groups(vec![rg_idx])
+                .build()
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+            (reader, batch_size)
+        };
 
         let mut row_group_geometries = Vec::new();
         let mut row_count = 0;
 
         for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+            // Span: Reading Arrow batch from Parquet (decompression happens here)
+            let batch = {
+                let _read_span = info_span!("parquet_read_batch", row_group = rg_idx).entered();
+                batch_result
+                    .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?
+            };
 
             // Find geometry column by name
             let schema = batch.schema();
@@ -302,14 +316,30 @@ where
             let geom_col = batch.column(geom_idx);
             let geom_field = schema.field(geom_idx);
 
-            // Convert Arrow array to GeoArrow geometry array
-            let geom_array: Arc<dyn GeoArrowArray> =
+            // Span: Converting Arrow array to GeoArrow geometry array
+            let geom_array: Arc<dyn GeoArrowArray> = {
+                let _parse_span = info_span!(
+                    "geoarrow_parse",
+                    row_group = rg_idx,
+                    rows = batch.num_rows()
+                )
+                .entered();
                 from_arrow_array(geom_col.as_ref(), geom_field).map_err(|e| {
                     Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
-                })?;
+                })?
+            };
 
-            // Extract geometries from this batch into the row group's vector
-            extract_geometries_from_array(geom_array.as_ref(), &mut row_group_geometries)?;
+            // Span: Extracting geometries (GeoArrow -> geo::Geometry conversion)
+            {
+                let _extract_span = info_span!(
+                    "geometry_extract",
+                    row_group = rg_idx,
+                    rows = batch.num_rows()
+                )
+                .entered();
+                extract_geometries_from_array(geom_array.as_ref(), &mut row_group_geometries)?;
+            }
+
             row_count += batch.num_rows();
         }
 
