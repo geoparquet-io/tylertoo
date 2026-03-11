@@ -15,7 +15,7 @@ Design decisions and tippecanoe divergences.
 |------|--------------|------------|-------|
 | Metadata | Basic `vector_layers` | Full layer/field/tilestats | Field metadata planned |
 | Simplification | Custom tolerance formula | `tile.cpp` | Tuned to match output quality |
-| Density dropping | Grid-cell limiting | Hilbert-gap selection | Simpler, similar results |
+| Density dropping | **Gap-based OR Grid-based** | Hilbert-gap selection | **MATCHES** with `--gamma` (Issue #24) |
 | Polygon clipping | Sutherland-Hodgman (f64) | Sutherland-Hodgman (int) | Same algorithm, different coordinate space |
 | Tiny polygon handling | **Accumulation** | Accumulation | **MATCHES** (Issue #85) |
 
@@ -38,10 +38,42 @@ Design decisions and tippecanoe divergences.
 
 ## Density-Based Dropping
 
-**DIVERGENCE**: Tippecanoe uses Hilbert curve ordering with gap-based selection (squared distance between consecutive features). We use grid-cell limiting — simpler and faster, but doesn't preserve spatial distribution as well.
+**MATCHES TIPPECANOE** (with `--gamma`): We now support tippecanoe's gap-based selection algorithm using Hilbert index gaps.
+
+### Gap-Based Selection (Recommended)
+
+**Reference**: tippecanoe `tile.cpp:manage_gap()`
+
+The gap-based algorithm processes features sorted by Hilbert curve index and uses the gap between consecutive features to decide whether to drop. This provides excellent preservation of spatial distribution.
 
 ```rust
-// Enable density dropping
+// Enable gap-based dropping (tippecanoe-compatible)
+let config = TilerConfig::new(0, 14)
+    .with_drop_densest_as_needed();  // gamma=2.0 (tippecanoe default)
+
+// Or with custom gamma
+let config = TilerConfig::new(0, 14)
+    .with_gamma(2.0);  // Explicit gamma value
+```
+
+**CLI:**
+```bash
+gpq-tiles input.parquet output.pmtiles --drop-densest-as-needed
+gpq-tiles input.parquet output.pmtiles --gamma=2.0
+```
+
+**Gamma values:**
+- `gamma=0`: Disabled (use grid-based instead)
+- `gamma=1`: Linear spacing
+- `gamma=2`: "Reduces dots < 1 pixel apart to square root of original" (tippecanoe default)
+- Higher values: More aggressive dropping of closely-spaced features
+
+### Grid-Based Selection (Legacy)
+
+For backward compatibility, we also support simpler grid-cell limiting:
+
+```rust
+// Enable grid-based density dropping
 let config = TilerConfig::new(0, 14)
     .with_density_drop(true)
     .with_density_cell_size(32);   // Pixels per cell
@@ -55,6 +87,8 @@ let config = TilerConfig::new(0, 14)
 | 32px | 128×128 | 23 |
 | 64px | 64×64 | 13 |
 | 128px | 32×32 | 9 |
+
+**Note:** Gap-based selection takes precedence when `gamma` is set.
 
 ## Tiny Polygon Accumulation (Issue #85)
 
