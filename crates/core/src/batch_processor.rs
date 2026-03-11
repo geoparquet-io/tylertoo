@@ -13,6 +13,7 @@ use geoarrow::datatypes::GeoArrowType;
 use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tracing::instrument;
 
 use crate::tile::TileBounds;
 use crate::{Error, Result};
@@ -185,6 +186,7 @@ where
 /// # Returns
 ///
 /// Vector of all geometries in the file
+#[instrument(name = "read_parquet", skip_all, fields(path = %path.display()))]
 pub fn extract_geometries(path: &Path) -> Result<Vec<Geometry<f64>>> {
     let mut geometries = Vec::new();
 
@@ -246,6 +248,7 @@ pub struct RowGroupInfo {
 /// # Returns
 ///
 /// Total number of geometries processed
+#[instrument(name = "read_parquet", skip(callback), fields(path = %path.display()))]
 pub fn process_geometries_by_row_group<F>(path: &Path, mut callback: F) -> Result<usize>
 where
     F: FnMut(RowGroupInfo, Vec<Geometry<f64>>) -> Result<()>,
