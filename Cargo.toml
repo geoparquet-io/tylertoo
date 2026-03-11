@@ -39,6 +39,7 @@ prost-build = "0.13"
 # Parallelism and spatial indexing
 rayon = "1.10"
 rstar = "0.12"
+crossbeam-channel = "0.5"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

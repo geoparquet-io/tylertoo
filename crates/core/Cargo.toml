@@ -30,6 +30,7 @@ geozero = { workspace = true }
 prost = { workspace = true }
 rayon = { workspace = true }
 rstar = { workspace = true }
+crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 tracing = { workspace = true }

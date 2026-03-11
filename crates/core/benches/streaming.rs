@@ -11,7 +11,9 @@
 // - fieldmaps-madagascar-adm4.parquet (17K features) - production scale
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use gpq_tiles_core::batch_processor::process_geometries_by_row_group;
+use gpq_tiles_core::batch_processor::{
+    process_geometries_by_row_group, process_geometries_parallel, DEFAULT_PARALLEL_READERS,
+};
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::pipeline::{generate_tiles_to_writer, TilerConfig};
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
@@ -162,8 +164,14 @@ fn bench_memory_budgets(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark just the row-group reading (file handle reuse optimization)
-/// This isolates the parquet reading from tile generation.
+/// Benchmark just the row-group reading: sequential vs parallel.
+///
+/// Compares the performance of:
+/// - Sequential: process_geometries_by_row_group (original)
+/// - Parallel: process_geometries_parallel (new, #108 + #109)
+///
+/// This isolates the parquet reading from tile generation to measure
+/// the raw I/O and decompression throughput improvement.
 fn bench_rowgroup_reading(c: &mut Criterion) {
     if !fixture_exists(FIXTURE_MULTI_RG) {
         eprintln!("Skipping row-group reading benchmark: fixture not found");
@@ -175,7 +183,8 @@ fn bench_rowgroup_reading(c: &mut Criterion) {
     let mut group = c.benchmark_group("rowgroup_reading");
     group.sample_size(30);
 
-    group.bench_function("multi_rowgroup_file", |b| {
+    // Sequential baseline (original implementation)
+    group.bench_function("sequential", |b| {
         b.iter(|| {
             let mut total = 0usize;
             process_geometries_by_row_group(fixture_path, |_info, geoms| {
@@ -186,6 +195,34 @@ fn bench_rowgroup_reading(c: &mut Criterion) {
             black_box(total)
         })
     });
+
+    // Parallel implementation (Issues #108 + #109)
+    group.bench_function("parallel_4_readers", |b| {
+        b.iter(|| {
+            let total = std::sync::atomic::AtomicUsize::new(0);
+            process_geometries_parallel(fixture_path, DEFAULT_PARALLEL_READERS, |_info, geoms| {
+                total.fetch_add(geoms.len(), std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
+            .expect("Should read all row groups");
+            black_box(total.load(std::sync::atomic::Ordering::Relaxed))
+        })
+    });
+
+    // Parallel with different concurrency levels
+    for num_readers in [1, 2, 8] {
+        group.bench_function(format!("parallel_{}_readers", num_readers), |b| {
+            b.iter(|| {
+                let total = std::sync::atomic::AtomicUsize::new(0);
+                process_geometries_parallel(fixture_path, num_readers, |_info, geoms| {
+                    total.fetch_add(geoms.len(), std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                })
+                .expect("Should read all row groups");
+                black_box(total.load(std::sync::atomic::Ordering::Relaxed))
+            })
+        });
+    }
 
     group.finish();
 }
