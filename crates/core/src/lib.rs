@@ -4,6 +4,12 @@
 //! This library provides the foundational functionality for reading GeoParquet files
 //! and converting them into PMTiles vector tile archives with MVT encoding.
 //!
+//! # Memory Profiling
+//!
+//! Build with `--features dhat-heap` to enable heap profiling with dhat.
+//! When enabled, the program will write `dhat-heap.json` on exit which can
+//! be analyzed at <https://nnethercote.github.io/dh_view/dh_view.html>
+//!
 //! # Examples
 //!
 //! ```no_run
@@ -18,6 +24,11 @@
 //! let converter = Converter::new(config);
 //! converter.convert("input.parquet", "output.pmtiles").unwrap();
 //! ```
+
+// dhat global allocator - must be at crate root
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::path::Path;
 use thiserror::Error;
