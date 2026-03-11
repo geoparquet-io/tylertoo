@@ -137,6 +137,18 @@ where
             let arr = array.as_wkb_view();
             process_typed_array(arr, row_offset, callback)
         }
+        GeoArrowType::Wkt(_) => {
+            let arr = array.as_wkt::<i32>();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::LargeWkt(_) => {
+            let arr = array.as_wkt::<i64>();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::WktView(_) => {
+            let arr = array.as_wkt_view();
+            process_typed_array(arr, row_offset, callback)
+        }
         _ => Err(Error::GeoParquetRead(format!(
             "Unsupported geometry type: {:?}",
             array.data_type()
@@ -407,6 +419,18 @@ fn extract_geometries_from_array(
             let arr = array.as_wkb_view();
             extract_typed_array(arr, output)
         }
+        GeoArrowType::Wkt(_) => {
+            let arr = array.as_wkt::<i32>();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::LargeWkt(_) => {
+            let arr = array.as_wkt::<i64>();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::WktView(_) => {
+            let arr = array.as_wkt_view();
+            extract_typed_array(arr, output)
+        }
         _ => Err(Error::GeoParquetRead(format!(
             "Unsupported geometry type: {:?}",
             array.data_type()
@@ -661,6 +685,34 @@ mod tests {
             batch_geometries.len(),
             "Row-group and batch processing should produce same count"
         );
+    }
+
+    /// Test that WKT-encoded GeoParquet files can be read.
+    /// See: https://github.com/geoparquet-io/gpq-tiles/issues/35
+    #[test]
+    fn test_wkt_encoded_parquet() {
+        let fixture = Path::new("../../tests/fixtures/realdata/wkt-encoded.parquet");
+        if !fixture.exists() {
+            panic!("WKT fixture not found - run fixture generation script first");
+        }
+
+        let mut count = 0;
+        let result = process_geometries(fixture, |geom, _idx| {
+            // Verify we get valid polygons (the fixture contains building footprints)
+            assert!(
+                matches!(
+                    geom,
+                    geo::Geometry::Polygon(_) | geo::Geometry::MultiPolygon(_)
+                ),
+                "Expected Polygon or MultiPolygon, got {:?}",
+                geom
+            );
+            count += 1;
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "Should read WKT file: {:?}", result.err());
+        assert_eq!(count, 100, "Should have 100 features, got {}", count);
     }
 
     /// Test that row group indices are sequential and correct.
