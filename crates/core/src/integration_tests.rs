@@ -654,7 +654,9 @@ mod tests {
 
         let input_path = Path::new(FIXTURE_DIR).join("wkt-encoded.parquet");
         if !input_path.exists() {
-            eprintln!("Skipping: WKT fixture not found (not in fixtures-v1 release yet)");
+            eprintln!(
+                "Skipping: WKT fixture not found (generate locally - see batch_processor tests)"
+            );
             return;
         }
 
@@ -720,7 +722,9 @@ mod tests {
     fn test_e2e_wkt_tiles_decode_as_mvt() {
         let input_path = Path::new(FIXTURE_DIR).join("wkt-encoded.parquet");
         if !input_path.exists() {
-            eprintln!("Skipping: WKT fixture not found (not in fixtures-v1 release yet)");
+            eprintln!(
+                "Skipping: WKT fixture not found (generate locally - see batch_processor tests)"
+            );
             return;
         }
 

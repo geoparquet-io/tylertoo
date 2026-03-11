@@ -689,11 +689,30 @@ mod tests {
 
     /// Test that WKT-encoded GeoParquet files can be read.
     /// See: https://github.com/geoparquet-io/gpq-tiles/issues/35
+    ///
+    /// To generate the fixture locally:
+    /// ```bash
+    /// cd tests/fixtures/realdata && uv run python -c "
+    /// import geopandas as gpd
+    /// import pyarrow as pa
+    /// import pyarrow.parquet as pq
+    /// import json
+    /// gdf = gpd.read_parquet('open-buildings.parquet').head(100)
+    /// wkt_strings = gdf.geometry.to_wkt()
+    /// arrays = [pa.array(wkt_strings.tolist(), type=pa.utf8()) if col == 'geometry'
+    ///           else pa.array(gdf[col].tolist()) for col in gdf.columns]
+    /// table = pa.table(dict(zip(gdf.columns, arrays)))
+    /// geo_meta = {'version': '1.1.0', 'primary_column': 'geometry',
+    ///             'columns': {'geometry': {'encoding': 'WKT', 'geometry_types': ['Polygon']}}}
+    /// table = table.replace_schema_metadata({b'geo': json.dumps(geo_meta).encode()})
+    /// pq.write_table(table, 'wkt-encoded.parquet')
+    /// "
+    /// ```
     #[test]
     fn test_wkt_encoded_parquet() {
         let fixture = Path::new("../../tests/fixtures/realdata/wkt-encoded.parquet");
         if !fixture.exists() {
-            eprintln!("Skipping: WKT fixture not found (not in fixtures-v1 release yet)");
+            eprintln!("Skipping: WKT fixture not found (generate locally - see test docstring)");
             return;
         }
 
