@@ -10,7 +10,7 @@ use gpq_tiles_core::pipeline::{
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::validate_wgs84;
-use gpq_tiles_core::PropertyFilter;
+use gpq_tiles_core::{AccumulatorConfig, AccumulatorOp, PropertyFilter};
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,37 @@ struct Args {
     #[arg(short = 'X', long = "exclude-all")]
     exclude_all: bool,
 
+    /// Define attribute accumulation for feature merging.
+    /// Format: ATTRIBUTE:OPERATION (e.g., population:sum, names:comma).
+    /// Matches tippecanoe's -ac flag.
+    ///
+    /// Supported operations: sum, product, mean, max, min, concat, comma, count
+    ///
+    /// Example: --accumulate population:sum --accumulate names:comma
+    #[arg(long = "accumulate", value_name = "ATTR:OP")]
+    accumulate: Vec<String>,
+
+    /// Cluster points within a specified distance (in 256-pixel tile units).
+    /// Matches tippecanoe's --cluster-distance flag.
+    ///
+    /// When set, nearby points are grouped together and replaced with a single
+    /// point at their centroid. Properties are accumulated according to
+    /// --accumulate settings.
+    ///
+    /// Typical values: 50 (default in tippecanoe), 25 (less aggressive), 100 (more aggressive).
+    /// Requires --cluster-maxzoom to also be set.
+    #[arg(long = "cluster-distance", value_name = "PIXELS")]
+    cluster_distance: Option<u32>,
+
+    /// Maximum zoom level at which to cluster points.
+    /// Matches tippecanoe's --cluster-maxzoom flag.
+    ///
+    /// At zoom levels above this, points are kept separate.
+    /// Typically set to max_zoom - 2 or so.
+    /// Requires --cluster-distance to also be set.
+    #[arg(long = "cluster-maxzoom", value_name = "ZOOM")]
+    cluster_maxzoom: Option<u8>,
+
     /// Compression algorithm for tiles (gzip, zstd, brotli, none)
     ///
     /// Gzip is the default for maximum compatibility with PMTiles viewers.
@@ -158,6 +189,57 @@ impl Args {
             )
         })
     }
+
+    /// Parse --accumulate arguments into AccumulatorConfig.
+    ///
+    /// Format: ATTRIBUTE:OPERATION (e.g., population:sum)
+    fn parse_accumulator_config(&self) -> Result<Option<AccumulatorConfig>> {
+        if self.accumulate.is_empty() {
+            return Ok(None);
+        }
+
+        let mut config = AccumulatorConfig::new();
+
+        for spec in &self.accumulate {
+            let parts: Vec<&str> = spec.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                anyhow::bail!(
+                    "Invalid accumulate format: '{}'. Expected ATTRIBUTE:OPERATION (e.g., population:sum)",
+                    spec
+                );
+            }
+
+            let attribute = parts[0];
+            let op_str = parts[1];
+
+            let op = AccumulatorOp::parse(op_str).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid accumulator operation: '{}'. Valid operations: sum, product, mean, max, min, concat, comma, count",
+                    op_str
+                )
+            })?;
+
+            config.set_operation(attribute, op);
+        }
+
+        Ok(Some(config))
+    }
+
+    /// Parse --cluster-distance and --cluster-maxzoom into cluster configuration.
+    ///
+    /// Both flags must be specified together or neither.
+    fn parse_cluster_config(&self) -> Result<Option<(u32, u8)>> {
+        match (self.cluster_distance, self.cluster_maxzoom) {
+            (Some(distance), Some(maxzoom)) => Ok(Some((distance, maxzoom))),
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                anyhow::bail!("--cluster-distance requires --cluster-maxzoom to also be set")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("--cluster-maxzoom requires --cluster-distance to also be set")
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -214,6 +296,12 @@ fn main() -> Result<()> {
     let compression = args
         .parse_compression()
         .context("Failed to parse compression")?;
+    let accumulator_config = args
+        .parse_accumulator_config()
+        .context("Failed to parse accumulator config")?;
+    let cluster_config = args
+        .parse_cluster_config()
+        .context("Failed to parse cluster config")?;
 
     // Validate input file uses WGS84 (EPSG:4326) coordinates
     validate_wgs84(&args.input).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -243,6 +331,16 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_drop_densest_as_needed();
     }
 
+    // Add accumulator config if specified
+    if let Some(acc_config) = accumulator_config {
+        tiler_config = tiler_config.with_accumulator(acc_config);
+    }
+
+    // Add cluster config if specified
+    if let Some((distance, maxzoom)) = cluster_config {
+        tiler_config = tiler_config.with_cluster(distance, maxzoom);
+    }
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -255,6 +353,18 @@ fn main() -> Result<()> {
         }
         if args.deterministic {
             eprintln!("  Processing: deterministic (sequential)");
+        }
+        if let Some(ref acc_config) = tiler_config.accumulator_config {
+            eprintln!("  Accumulators:");
+            for (attr, op) in acc_config.operations() {
+                eprintln!("    {}: {}", attr, op);
+            }
+        }
+        if let Some(ref cluster) = tiler_config.cluster_config {
+            eprintln!(
+                "  Clustering: distance={}, max_zoom={}",
+                cluster.distance, cluster.max_zoom
+            );
         }
         eprintln!();
     }

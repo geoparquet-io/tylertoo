@@ -18,6 +18,8 @@ Design decisions and tippecanoe divergences.
 | Density dropping | **Gap-based OR Grid-based** | Hilbert-gap selection | **MATCHES** with `--gamma` (Issue #24) |
 | Polygon clipping | Sutherland-Hodgman (f64) | Sutherland-Hodgman (int) | Same algorithm, different coordinate space |
 | Tiny polygon handling | **Accumulation** | Accumulation | **MATCHES** (Issue #85) |
+| Point clustering | **Hilbert proximity + incremental centroid** | Hilbert proximity + incremental centroid | **MATCHES** (Issue #25) |
+| Attribute accumulation | **Configurable accumulators** | Configurable accumulators | **MATCHES** (Issue #23) |
 
 ## Polygon Clipping: Sutherland-Hodgman
 
@@ -129,6 +131,130 @@ let config = TilerConfig::new(0, 14)
 **Why this matters:**
 
 At low zoom levels, many small features (building footprints, parcels) become sub-pixel and would disappear entirely with simple dropping. By accumulating them, we preserve the visual density — a city with 10,000 tiny buildings still shows as a populated area, not empty space.
+
+## Attribute Accumulation (Issue #23)
+
+**MATCHES TIPPECANOE**: When features are merged during tile generation, attributes can be combined using configurable accumulator operations. This matches tippecanoe's `-ac` flag behavior.
+
+**Reference**: tippecanoe command-line options and attribute accumulation
+
+**Supported Operations:**
+
+| Operation | Behavior | Type Handling |
+|-----------|----------|---------------|
+| `sum`     | Add numeric values | Strings → 0.0 |
+| `product` | Multiply numeric values | Strings → 0.0, missing → 1.0 |
+| `mean`    | Running average with count tracking | Stored as Float |
+| `max`     | Keep maximum value | Strings skipped |
+| `min`     | Keep minimum value | Strings skipped |
+| `concat`  | Concatenate strings directly | Numbers → string |
+| `comma`   | Concatenate with comma separator | Numbers → string |
+| `count`   | Count merged features | Increments per accumulation |
+
+**CLI Usage:**
+
+```bash
+gpq-tiles input.parquet output.pmtiles \
+  --accumulate population:sum \
+  --accumulate names:comma \
+  --accumulate max_height:max
+```
+
+**API Usage:**
+
+```rust
+use gpq_tiles_core::accumulator::{AccumulatorConfig, AccumulatorOp};
+use gpq_tiles_core::pipeline::TilerConfig;
+
+let mut acc_config = AccumulatorConfig::new();
+acc_config.set_operation("population", AccumulatorOp::Sum);
+acc_config.set_operation("names", AccumulatorOp::Comma);
+
+let config = TilerConfig::new(0, 14)
+    .with_accumulator(acc_config);
+```
+
+**Key Behaviors (tippecanoe-compatible):**
+
+1. **Unspecified attributes are DROPPED**: Only attributes with configured operations are preserved in the output. This matches tippecanoe's behavior.
+
+2. **Mean requires count tracking**: The accumulator tracks a separate count per mean attribute to compute correct running averages.
+
+3. **Type coercion rules**:
+   - Numeric ops (`sum`, `product`, `mean`): strings treated as 0.0
+   - Comparison ops (`min`, `max`): strings are skipped, numeric value preserved
+   - String ops (`concat`, `comma`): numbers converted to string representation
+
+**Implementation:**
+
+- Module: `crates/core/src/accumulator.rs`
+- `AccumulatorConfig` stores per-attribute operations and mean counts
+- `accumulate()` method modifies target properties in-place
+
+## Point Clustering (Issue #25)
+
+**MATCHES TIPPECANOE**: Nearby points are clustered together at lower zoom levels, with their positions averaged to produce cluster centroids. This reduces visual clutter while preserving geographic patterns.
+
+**Reference**: tippecanoe `mvt.cpp` cluster distance calculation and `write_tile()` clustering logic
+
+**How it works:**
+
+1. Points are sorted by Hilbert curve index (spatial locality)
+2. For each zoom level <= `cluster_maxzoom`:
+   - Calculate cluster gap threshold: `((1 << (32 - z)) / 256 * distance)²`
+   - Sequential scan: if `point.hilbert_index - cluster.hilbert_index < cluster_gap`, merge into cluster
+   - Use Welford's incremental algorithm for centroid averaging: `new_mean = old_mean + (new_value - old_mean) / n`
+3. Emit clustered points with `cluster_count` property
+
+**CLI Usage:**
+
+```bash
+gpq-tiles input.parquet output.pmtiles \
+  --cluster-distance=50 \
+  --cluster-maxzoom=12 \
+  --accumulate count:sum
+```
+
+**API Usage:**
+
+```rust
+use gpq_tiles_core::pipeline::TilerConfig;
+
+let config = TilerConfig::new(0, 14)
+    .with_cluster(50, 12);  // 50px distance, max zoom 12
+```
+
+**Cluster Distance Reference** (at zoom 10, 256-pixel tile):
+
+| Distance | Approximate Radius | Use Case |
+|----------|-------------------|----------|
+| 25 | ~0.5 tile | Fine-grained clustering |
+| 50 | ~1 tile | Default (tippecanoe) |
+| 100 | ~2 tiles | Aggressive clustering |
+
+**Key Behaviors (tippecanoe-compatible):**
+
+1. **Hilbert proximity, not Euclidean distance**: Clustering uses Hilbert curve index difference, which approximates spatial proximity while enabling efficient sequential processing.
+
+2. **Incremental centroid calculation**: Uses Welford's algorithm for numerically stable running mean - matches tippecanoe's approach.
+
+3. **Zoom-dependent clustering**: Cluster gap increases at lower zooms (more aggressive clustering), disabled above `cluster_maxzoom`.
+
+4. **Only points cluster with points**: Polygons, lines, and other geometry types are unaffected by clustering.
+
+5. **`cluster_count` property**: Clustered points include a `cluster_count` property indicating how many original points were merged.
+
+**Current Limitations:**
+
+- Property accumulation during clustering requires the full property pipeline (not yet implemented)
+- For now, clustering preserves geometry and adds `cluster_count` but does not accumulate source feature properties
+
+**Implementation:**
+
+- Module: `crates/core/src/clustering.rs`
+- `ClusterConfig` stores distance and max_zoom settings
+- `PointClusterer` performs the actual clustering using `IndexedPoint` structures
+- Pipeline integration in `encode_tile_from_raw()` function
 
 ## Spatial Indexing
 
@@ -304,6 +430,7 @@ Use `config.with_quiet(true)` to suppress warnings. See `quality.rs` for impleme
 ```
 crates/core/src/
 ├── lib.rs              # Public API
+├── accumulator.rs      # Attribute accumulation for feature merging
 ├── tile.rs             # TileCoord, TileBounds
 ├── clip.rs             # Geometry clipping (dispatcher)
 ├── sutherland_hodgman.rs # O(n) polygon clipping for axis-aligned rectangles

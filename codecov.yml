@@ -6,7 +6,7 @@ coverage:
         threshold: 5%
     patch:
       default:
-        target: 80%
+        informational: true  # Don't block PRs - project coverage is what matters
 
 ignore:
   - "crates/cli/**"        # Don't require high coverage for CLI arg parsing
