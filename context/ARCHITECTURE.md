@@ -17,6 +17,7 @@ Design decisions and tippecanoe divergences.
 | Simplification | Custom tolerance formula | `tile.cpp` | Tuned to match output quality |
 | Density dropping | Grid-cell limiting | Hilbert-gap selection | Simpler, similar results |
 | Polygon clipping | Sutherland-Hodgman (f64) | Sutherland-Hodgman (int) | Same algorithm, different coordinate space |
+| Tiny polygon handling | **Accumulation** | Accumulation | **MATCHES** (Issue #85) |
 
 ## Polygon Clipping: Sutherland-Hodgman
 
@@ -54,6 +55,46 @@ let config = TilerConfig::new(0, 14)
 | 32px | 128×128 | 23 |
 | 64px | 64×64 | 13 |
 | 128px | 32×32 | 9 |
+
+## Tiny Polygon Accumulation (Issue #85)
+
+**MATCHES TIPPECANOE**: Instead of dropping tiny polygons (diffuse probability), we accumulate their area and emit synthetic pixel-sized squares when the accumulated area exceeds a threshold. This preserves visual density — 10 tiny polygons in a cluster become a single visible square.
+
+**Reference**: tippecanoe `clip.cpp:1048-1097`
+
+**How it works:**
+
+```
+For each tile being encoded:
+1. Create TinyPolygonAccumulator
+2. For each polygon:
+   a. Check if polygon is "tiny" (area < 4 sq pixels)
+   b. If tiny: accumulate area + weighted centroid
+   c. If accumulated area >= threshold: emit synthetic square at centroid, reset
+3. Emit any remaining accumulated area as final synthetic square
+```
+
+**Configuration:**
+
+```rust
+// Enabled by default (matches tippecanoe)
+let config = TilerConfig::new(0, 14);
+
+// Disable to use legacy diffuse probability dropping
+let config = TilerConfig::new(0, 14)
+    .with_tiny_polygon_accumulation(false);
+```
+
+**Implementation details:**
+
+- Accumulator uses `u128` for area to avoid overflow when accumulating many tiny polygons
+- Weighted centroid calculated using area-weighted average of polygon centroids
+- Synthetic squares are 1 pixel × 1 pixel at the accumulated centroid
+- Threshold: 4 square pixels (matches tippecanoe's default)
+
+**Why this matters:**
+
+At low zoom levels, many small features (building footprints, parcels) become sub-pixel and would disappear entirely with simple dropping. By accumulating them, we preserve the visual density — a city with 10,000 tiny buildings still shows as a populated area, not empty space.
 
 ## Spatial Indexing
 

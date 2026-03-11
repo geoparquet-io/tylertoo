@@ -190,6 +190,63 @@ fn bench_rowgroup_reading(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark tiny polygon accumulation vs dropping (Issue #85)
+///
+/// This benchmark compares performance with and without tiny polygon accumulation
+/// to verify there's no significant performance regression from the feature.
+fn bench_tiny_polygon_accumulation(c: &mut Criterion) {
+    if !fixture_exists(FIXTURE_SMALL) {
+        eprintln!("Skipping tiny polygon accumulation benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_SMALL);
+
+    let mut group = c.benchmark_group("tiny_polygon_handling");
+    group.throughput(Throughput::Elements(1000)); // ~1K features
+    group.sample_size(30);
+
+    // Benchmark with accumulation ENABLED (default, matches tippecanoe)
+    let config_accumulation = TilerConfig::new(0, 8)
+        .with_quiet(true)
+        .with_tiny_polygon_accumulation(true);
+
+    group.bench_with_input(
+        BenchmarkId::new("mode", "accumulation"),
+        &config_accumulation,
+        |b, config| {
+            b.iter(|| {
+                let mut writer =
+                    StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+                let stats = generate_tiles_to_writer(fixture_path, config, &mut writer)
+                    .expect("Pipeline should work");
+                black_box(stats)
+            })
+        },
+    );
+
+    // Benchmark with accumulation DISABLED (legacy dropping behavior)
+    let config_dropping = TilerConfig::new(0, 8)
+        .with_quiet(true)
+        .with_tiny_polygon_accumulation(false);
+
+    group.bench_with_input(
+        BenchmarkId::new("mode", "dropping"),
+        &config_dropping,
+        |b, config| {
+            b.iter(|| {
+                let mut writer =
+                    StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+                let stats = generate_tiles_to_writer(fixture_path, config, &mut writer)
+                    .expect("Pipeline should work");
+                black_box(stats)
+            })
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
     name = fast_benchmarks;
     config = Criterion::default().sample_size(50);
@@ -199,7 +256,7 @@ criterion_group!(
 criterion_group!(
     name = medium_benchmarks;
     config = Criterion::default().sample_size(30);
-    targets = bench_multi_rowgroup, bench_rowgroup_reading
+    targets = bench_multi_rowgroup, bench_rowgroup_reading, bench_tiny_polygon_accumulation
 );
 
 criterion_group!(

@@ -870,6 +870,263 @@ fn world_coords_hash(coords: &[WorldCoord]) -> u64 {
     hasher.finish()
 }
 
+// =============================================================================
+// TinyPolygonAccumulator - Tippecanoe-style tiny polygon accumulation
+// =============================================================================
+//
+// Instead of dropping tiny polygons, this accumulator:
+// 1. Tracks accumulated area from tiny polygons
+// 2. Tracks the area-weighted centroid of accumulated polygons
+// 3. When accumulated area exceeds threshold, emits a synthetic pixel-sized square
+//
+// This preserves visual density - 10 tiny polygons in a cluster become a single
+// visible square, rather than disappearing entirely.
+//
+// Reference: tippecanoe clip.cpp:1048-1097
+// =============================================================================
+
+/// Accumulates tiny polygons and emits synthetic squares when threshold is exceeded.
+///
+/// Tippecanoe's approach to tiny polygons: instead of dropping them, accumulate
+/// their area. When the accumulated area exceeds a threshold (typically 1 pixel²),
+/// emit a synthetic pixel-sized square at the centroid of the accumulated polygons.
+///
+/// This preserves visual density - if an area has many tiny polygons that would
+/// individually be too small to see, they collectively produce visible markers.
+///
+/// # Example
+///
+/// ```ignore
+/// use gpq_tiles_core::feature_drop::{TinyPolygonAccumulator, DEFAULT_TINY_POLYGON_THRESHOLD};
+/// use gpq_tiles_core::tile::TileCoord;
+/// use gpq_tiles_core::world_coord::WorldCoord;
+///
+/// let tile = TileCoord::new(8192, 8192, 14);
+/// let mut accumulator = TinyPolygonAccumulator::new(tile, 4096, DEFAULT_TINY_POLYGON_THRESHOLD);
+///
+/// // Add tiny polygons as they're encountered
+/// accumulator.accumulate(&exterior_ring, &interior_rings);
+///
+/// // When threshold is exceeded, emit a synthetic square
+/// if accumulator.should_emit() {
+///     if let Some((exterior, interiors)) = accumulator.emit_synthetic_square() {
+///         // Add synthetic square to tile output
+///     }
+/// }
+/// ```
+///
+/// # Algorithm (matches tippecanoe clip.cpp:1048-1097)
+///
+/// 1. For each tiny polygon:
+///    - Calculate area in world units
+///    - Add to accumulated area
+///    - Update weighted centroid
+///
+/// 2. When accumulated area >= threshold (in world units):
+///    - Create a 1-pixel square centered at the weighted centroid
+///    - Reset accumulator for next batch
+///
+/// # Divergence from Tippecanoe
+///
+/// Tippecanoe accumulates in "long long" (64-bit signed) units and uses
+/// world coordinates directly. We use u128 for intermediate calculations
+/// to avoid overflow when accumulating many polygons.
+#[derive(Debug, Clone)]
+pub struct TinyPolygonAccumulator {
+    /// The tile this accumulator is collecting for
+    tile: TileCoord,
+    /// Tile extent in pixels (typically 4096)
+    extent: u32,
+    /// Threshold in square pixels when to emit synthetic square
+    threshold_sq_pixels: f64,
+    /// Accumulated area in square world units
+    accumulated_area: u128,
+    /// Weighted sum of X coordinates (for centroid calculation)
+    weighted_x: u128,
+    /// Weighted sum of Y coordinates (for centroid calculation)
+    weighted_y: u128,
+    /// World units per pixel at this zoom level
+    world_units_per_pixel: u64,
+    /// Threshold in square world units (precomputed from threshold_sq_pixels)
+    threshold_world_sq: u128,
+}
+
+impl TinyPolygonAccumulator {
+    /// Create a new accumulator for the given tile.
+    ///
+    /// # Arguments
+    /// * `tile` - The tile being processed
+    /// * `extent` - Tile extent in pixels (typically 4096)
+    /// * `threshold_sq_pixels` - Minimum accumulated area in square pixels to emit
+    ///
+    /// # Returns
+    /// A new accumulator with zero accumulated area
+    pub fn new(tile: TileCoord, extent: u32, threshold_sq_pixels: f64) -> Self {
+        // Calculate world units per pixel at this zoom level
+        let world_units_per_pixel = if tile.z >= 32 {
+            1_u64
+        } else if tile.z == 0 {
+            // At zoom 0, tile covers the whole world (2^32 units) with `extent` pixels
+            (1_u64 << 32) / extent as u64
+        } else {
+            // At zoom z, each tile covers 2^(32-z) world units, divided into extent pixels
+            (1_u64 << (32 - tile.z as u32)) / extent as u64
+        };
+
+        // Convert threshold from square pixels to square world units
+        let world_units_per_pixel_sq =
+            (world_units_per_pixel as u128) * (world_units_per_pixel as u128);
+        let threshold_world_sq = (threshold_sq_pixels * world_units_per_pixel_sq as f64) as u128;
+
+        Self {
+            tile,
+            extent,
+            threshold_sq_pixels,
+            accumulated_area: 0,
+            weighted_x: 0,
+            weighted_y: 0,
+            world_units_per_pixel,
+            threshold_world_sq,
+        }
+    }
+
+    /// Accumulate a tiny polygon's area and centroid.
+    ///
+    /// # Arguments
+    /// * `exterior` - The exterior ring coordinates
+    /// * `interiors` - Interior ring coordinates (holes)
+    ///
+    /// The polygon's area is added to the accumulator, and its centroid
+    /// contributes to the weighted centroid calculation.
+    pub fn accumulate(&mut self, exterior: &[WorldCoord], interiors: &[Vec<WorldCoord>]) {
+        // Calculate exterior area using shoelace formula
+        let exterior_area = world_ring_area(exterior).unsigned_abs() as u128;
+
+        // Subtract interior (hole) areas
+        let interior_area: u128 = interiors
+            .iter()
+            .map(|ring| world_ring_area(ring).unsigned_abs() as u128)
+            .sum();
+
+        // Net area (exterior minus holes)
+        let net_area = exterior_area.saturating_sub(interior_area);
+
+        if net_area == 0 {
+            return; // Don't accumulate zero-area polygons
+        }
+
+        // Calculate centroid of this polygon (simple average of exterior ring)
+        // For a more accurate centroid we'd use the signed area formula,
+        // but for tiny polygons the difference is negligible
+        let (sum_x, sum_y, count) = exterior.iter().fold((0_u128, 0_u128, 0_u128), |acc, c| {
+            (acc.0 + c.x as u128, acc.1 + c.y as u128, acc.2 + 1)
+        });
+
+        if count == 0 {
+            return;
+        }
+
+        let centroid_x = sum_x / count;
+        let centroid_y = sum_y / count;
+
+        // Update weighted centroid: weight by area
+        // weighted_x = sum(area_i * centroid_x_i)
+        // weighted_y = sum(area_i * centroid_y_i)
+        self.weighted_x += net_area * centroid_x;
+        self.weighted_y += net_area * centroid_y;
+        self.accumulated_area += net_area;
+    }
+
+    /// Get the current accumulated area in square world units.
+    ///
+    /// Returns 0 if no polygons have been accumulated since the last emission.
+    pub fn accumulated_area(&self) -> u128 {
+        self.accumulated_area
+    }
+
+    /// Check if the accumulated area has exceeded the threshold.
+    ///
+    /// Returns `true` if a synthetic square should be emitted.
+    pub fn should_emit(&self) -> bool {
+        self.accumulated_area >= self.threshold_world_sq
+    }
+
+    /// Emit a synthetic pixel-sized square at the weighted centroid.
+    ///
+    /// # Returns
+    /// - `Some((exterior, interiors))` if threshold was met, containing the
+    ///   synthetic square's exterior ring (5 points, closed) and empty interiors
+    /// - `None` if threshold was not met or no area has been accumulated
+    ///
+    /// # Side Effects
+    /// Resets the accumulator after emission (only if threshold was met).
+    pub fn emit_synthetic_square(&mut self) -> Option<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> {
+        // Don't emit if no area accumulated or threshold not met
+        if self.accumulated_area == 0 || !self.should_emit() {
+            return None;
+        }
+
+        // Calculate weighted centroid
+        let centroid_x = (self.weighted_x / self.accumulated_area) as u32;
+        let centroid_y = (self.weighted_y / self.accumulated_area) as u32;
+
+        // Create a 1-pixel square centered at the centroid
+        let half_pixel = (self.world_units_per_pixel / 2) as u32;
+
+        // Handle potential overflow near world coordinate boundaries
+        let min_x = centroid_x.saturating_sub(half_pixel);
+        let max_x = centroid_x.saturating_add(half_pixel);
+        let min_y = centroid_y.saturating_sub(half_pixel);
+        let max_y = centroid_y.saturating_add(half_pixel);
+
+        // Create closed ring (5 points)
+        let exterior = vec![
+            WorldCoord::new(min_x, min_y), // top-left
+            WorldCoord::new(max_x, min_y), // top-right
+            WorldCoord::new(max_x, max_y), // bottom-right
+            WorldCoord::new(min_x, max_y), // bottom-left
+            WorldCoord::new(min_x, min_y), // close ring
+        ];
+
+        // Reset accumulator for next batch
+        self.accumulated_area = 0;
+        self.weighted_x = 0;
+        self.weighted_y = 0;
+
+        // Return synthetic square with no holes
+        Some((exterior, Vec::new()))
+    }
+
+    /// Reset the accumulator without emitting.
+    ///
+    /// Use this when starting a new tile or when you need to discard
+    /// accumulated state.
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        self.accumulated_area = 0;
+        self.weighted_x = 0;
+        self.weighted_y = 0;
+    }
+
+    /// Get the tile this accumulator is associated with.
+    #[allow(dead_code)]
+    pub fn tile(&self) -> &TileCoord {
+        &self.tile
+    }
+
+    /// Get the extent in pixels.
+    #[allow(dead_code)]
+    pub fn extent(&self) -> u32 {
+        self.extent
+    }
+
+    /// Get the threshold in square pixels.
+    #[allow(dead_code)]
+    pub fn threshold_sq_pixels(&self) -> f64 {
+        self.threshold_sq_pixels
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2483,6 +2740,350 @@ mod tests {
         assert!(
             should_drop_tiny_line_world(&coords, &low_zoom_tile, extent, 1.0),
             "10000 world unit line should be dropped at zoom 0"
+        );
+    }
+
+    // =========================================================================
+    // TinyPolygonAccumulator tests - Issue #85
+    // =========================================================================
+    //
+    // These tests verify the tippecanoe-style tiny polygon accumulation strategy.
+    // Instead of dropping tiny polygons, we accumulate their area and emit
+    // synthetic pixel-sized squares when the accumulated area exceeds a threshold.
+    // This preserves visual density - 10 tiny polygons become one visible square.
+    //
+    // Reference: tippecanoe clip.cpp:1048-1097
+
+    #[test]
+    fn test_tiny_polygon_accumulator_basic_creation() {
+        // Create an accumulator with default threshold (4 sq pixels)
+        let tile = TileCoord::new(0, 0, 14);
+        let extent = 4096;
+        let accumulator = TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        assert_eq!(accumulator.accumulated_area(), 0);
+        assert!(!accumulator.should_emit());
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_accumulates_area() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // At zoom 14, 1 pixel = 64 world units
+        // 1 square pixel = 64 * 64 = 4096 square world units
+        // Create a tiny polygon with area ~1000 sq world units (~0.24 sq pixels)
+        let tiny_exterior = vec![
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+            WorldCoord::new(2_000_001_000, 2_000_000_000), // 1000 units right
+            WorldCoord::new(2_000_001_000, 2_000_000_001), // 1 unit down
+            WorldCoord::new(2_000_000_000, 2_000_000_001), // back
+            WorldCoord::new(2_000_000_000, 2_000_000_000), // close
+        ];
+
+        accumulator.accumulate(&tiny_exterior, &[]);
+
+        assert!(accumulator.accumulated_area() > 0);
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_emits_when_threshold_exceeded() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        // Threshold of 4 sq pixels
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // At zoom 14, pixel = 64 world units, so 1 sq pixel = 4096 sq world units
+        // Threshold is 4 sq pixels = 16384 sq world units
+        // Create polygons that together exceed this threshold
+
+        // Each polygon: 100 x 100 = 10000 sq world units (~2.4 sq pixels)
+        for i in 0..3 {
+            let offset = i * 200;
+            let tiny_exterior = vec![
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+            ];
+            accumulator.accumulate(&tiny_exterior, &[]);
+        }
+
+        // After 3 polygons of ~2.4 sq pixels each = ~7.2 sq pixels total
+        // This exceeds the 4 sq pixel threshold
+        assert!(
+            accumulator.should_emit(),
+            "Should emit after accumulated area exceeds threshold"
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_emits_synthetic_square() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // Add enough tiny polygons to trigger emission
+        for i in 0..5 {
+            let offset = i * 200;
+            let tiny_exterior = vec![
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+            ];
+            accumulator.accumulate(&tiny_exterior, &[]);
+        }
+
+        assert!(accumulator.should_emit());
+
+        // Emit the synthetic square
+        let synthetic = accumulator.emit_synthetic_square();
+        assert!(synthetic.is_some(), "Should emit a synthetic square");
+
+        let (exterior, interiors) = synthetic.unwrap();
+        // Synthetic square should have 5 points (closed ring)
+        assert_eq!(exterior.len(), 5, "Synthetic square should have 5 points");
+        // Should have no holes
+        assert!(
+            interiors.is_empty(),
+            "Synthetic square should have no holes"
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_resets_after_emission() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // Add enough to trigger emission
+        for i in 0..5 {
+            let offset = i * 200;
+            let tiny_exterior = vec![
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+            ];
+            accumulator.accumulate(&tiny_exterior, &[]);
+        }
+
+        // Emit
+        let _ = accumulator.emit_synthetic_square();
+
+        // After emission, accumulator should be reset
+        assert_eq!(
+            accumulator.accumulated_area(),
+            0,
+            "Accumulated area should reset after emission"
+        );
+        assert!(
+            !accumulator.should_emit(),
+            "Should not emit immediately after reset"
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_centroid_tracking() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // Add a single tiny polygon centered at a known location
+        // Center should be at approximately (2_000_000_050, 2_000_000_050)
+        let tiny_exterior = vec![
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+            WorldCoord::new(2_000_000_100, 2_000_000_000),
+            WorldCoord::new(2_000_000_100, 2_000_000_100),
+            WorldCoord::new(2_000_000_000, 2_000_000_100),
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+        ];
+
+        // Add enough to exceed threshold
+        for _ in 0..5 {
+            accumulator.accumulate(&tiny_exterior, &[]);
+        }
+
+        let synthetic = accumulator.emit_synthetic_square();
+        assert!(synthetic.is_some());
+
+        let (exterior, _) = synthetic.unwrap();
+        // The synthetic square should be centered near (2_000_000_050, 2_000_000_050)
+        // Check that the center of the emitted square is close to expected
+        let min_x = exterior.iter().map(|c| c.x).min().unwrap();
+        let max_x = exterior.iter().map(|c| c.x).max().unwrap();
+        let min_y = exterior.iter().map(|c| c.y).min().unwrap();
+        let max_y = exterior.iter().map(|c| c.y).max().unwrap();
+        let center_x = (min_x + max_x) / 2;
+        let center_y = (min_y + max_y) / 2;
+
+        // Should be within 100 world units of expected center
+        assert!(
+            (center_x as i64 - 2_000_000_050).abs() < 100,
+            "Synthetic square center X should be near polygon centroid"
+        );
+        assert!(
+            (center_y as i64 - 2_000_000_050).abs() < 100,
+            "Synthetic square center Y should be near polygon centroid"
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_synthetic_square_is_one_pixel() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // Add enough tiny polygons to trigger emission
+        for i in 0..5 {
+            let offset = i * 200;
+            let tiny_exterior = vec![
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+            ];
+            accumulator.accumulate(&tiny_exterior, &[]);
+        }
+
+        let synthetic = accumulator.emit_synthetic_square();
+        let (exterior, _) = synthetic.unwrap();
+
+        // At zoom 14, 1 pixel = 64 world units
+        // The synthetic square should be approximately 1 pixel in size
+        let min_x = exterior.iter().map(|c| c.x).min().unwrap();
+        let max_x = exterior.iter().map(|c| c.x).max().unwrap();
+        let min_y = exterior.iter().map(|c| c.y).min().unwrap();
+        let max_y = exterior.iter().map(|c| c.y).max().unwrap();
+
+        let width = max_x - min_x;
+        let height = max_y - min_y;
+
+        // At zoom 14, 1 pixel = 64 world units
+        // Allow some tolerance
+        let pixel_size = 64u32;
+        assert!(
+            width >= pixel_size / 2 && width <= pixel_size * 2,
+            "Synthetic square width should be approximately 1 pixel (64 world units), got {}",
+            width
+        );
+        assert!(
+            height >= pixel_size / 2 && height <= pixel_size * 2,
+            "Synthetic square height should be approximately 1 pixel (64 world units), got {}",
+            height
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_handles_holes() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // Polygon with a small hole - net area should still be positive
+        let exterior = vec![
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+            WorldCoord::new(2_000_000_100, 2_000_000_000),
+            WorldCoord::new(2_000_000_100, 2_000_000_100),
+            WorldCoord::new(2_000_000_000, 2_000_000_100),
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+        ];
+
+        // Small interior hole (10x10 = 100 sq units vs 10000 sq unit exterior)
+        let interior = vec![
+            WorldCoord::new(2_000_000_040, 2_000_000_040),
+            WorldCoord::new(2_000_000_050, 2_000_000_040),
+            WorldCoord::new(2_000_000_050, 2_000_000_050),
+            WorldCoord::new(2_000_000_040, 2_000_000_050),
+            WorldCoord::new(2_000_000_040, 2_000_000_040),
+        ];
+
+        accumulator.accumulate(&exterior, &[interior]);
+
+        // Net area should be exterior - interior
+        assert!(
+            accumulator.accumulated_area() > 0,
+            "Net area after subtracting hole should be positive"
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_no_emit_below_threshold() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        // Add just one tiny polygon - not enough to exceed threshold
+        let tiny_exterior = vec![
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+            WorldCoord::new(2_000_000_010, 2_000_000_000),
+            WorldCoord::new(2_000_000_010, 2_000_000_010),
+            WorldCoord::new(2_000_000_000, 2_000_000_010),
+            WorldCoord::new(2_000_000_000, 2_000_000_000),
+        ];
+
+        accumulator.accumulate(&tiny_exterior, &[]);
+
+        assert!(
+            !accumulator.should_emit(),
+            "Should not emit when accumulated area is below threshold"
+        );
+
+        // Emit should return None when threshold not met
+        let synthetic = accumulator.emit_synthetic_square();
+        assert!(
+            synthetic.is_none(),
+            "emit_synthetic_square should return None below threshold"
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_accumulator_multiple_emissions() {
+        let tile = TileCoord::new(8192, 8192, 14);
+        let extent = 4096;
+        let mut accumulator =
+            TinyPolygonAccumulator::new(tile, extent, DEFAULT_TINY_POLYGON_THRESHOLD);
+
+        let mut emission_count = 0;
+
+        // Add enough polygons for multiple emissions
+        for i in 0..20 {
+            let offset = i * 200;
+            let tiny_exterior = vec![
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_000),
+                WorldCoord::new(2_000_000_100 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_100),
+                WorldCoord::new(2_000_000_000 + offset, 2_000_000_000),
+            ];
+            accumulator.accumulate(&tiny_exterior, &[]);
+
+            if accumulator.should_emit() {
+                let _ = accumulator.emit_synthetic_square();
+                emission_count += 1;
+            }
+        }
+
+        // With 20 polygons of ~2.4 sq pixels each = ~48 sq pixels total
+        // At threshold of 4 sq pixels, we should get ~10-12 emissions
+        assert!(
+            emission_count >= 5,
+            "Should emit multiple times for many tiny polygons, got {} emissions",
+            emission_count
         );
     }
 }
