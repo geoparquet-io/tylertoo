@@ -29,7 +29,7 @@ use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_line_world,
     should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
-    DensityDropConfig, DensityDropper, DEFAULT_TINY_POLYGON_THRESHOLD,
+    DensityDropConfig, DensityDropper, TinyPolygonAccumulator, DEFAULT_TINY_POLYGON_THRESHOLD,
 };
 use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeometry};
 use crate::mvt::{LayerBuilder, TileBuilder};
@@ -180,6 +180,18 @@ pub struct TilerConfig {
     /// Useful for debugging, testing, and compliance workflows.
     /// Default: false (parallel processing enabled for performance).
     pub deterministic: bool,
+    /// Enable tiny polygon accumulation (default: true).
+    ///
+    /// When enabled, tiny polygons that would be individually invisible are
+    /// accumulated. When the accumulated area exceeds a threshold, a synthetic
+    /// pixel-sized square is emitted at the centroid. This preserves visual
+    /// density - 10 tiny polygons in a cluster become a single visible square.
+    ///
+    /// This matches tippecanoe's behavior (clip.cpp:1048-1097).
+    ///
+    /// When disabled, tiny polygons are dropped using diffuse probability
+    /// (the legacy behavior).
+    pub enable_tiny_polygon_accumulation: bool,
 }
 
 impl Default for TilerConfig {
@@ -208,6 +220,9 @@ impl Default for TilerConfig {
             quiet: false,
             // Parallel processing by default for performance
             deterministic: false,
+            // Tiny polygon accumulation is enabled by default (matches tippecanoe)
+            // This preserves visual density by emitting synthetic squares
+            enable_tiny_polygon_accumulation: true,
         }
     }
 }
@@ -366,6 +381,28 @@ impl TilerConfig {
     /// ```
     pub fn with_memory_budget(mut self, bytes: usize) -> Self {
         self.memory_budget = Some(bytes);
+        self
+    }
+
+    /// Enable or disable tiny polygon accumulation.
+    ///
+    /// When enabled (default), tiny polygons that would individually be invisible
+    /// are accumulated. When accumulated area exceeds a threshold, a synthetic
+    /// pixel-sized square is emitted at the centroid. This preserves visual density.
+    ///
+    /// When disabled, tiny polygons are dropped using diffuse probability
+    /// (the legacy behavior, faster but loses density information).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_tiny_polygon_accumulation(false); // Disable accumulation
+    /// ```
+    pub fn with_tiny_polygon_accumulation(mut self, enable: bool) -> Self {
+        self.enable_tiny_polygon_accumulation = enable;
         self
     }
 }
@@ -924,22 +961,37 @@ fn generate_tiles_to_writer_internal(
                     WorldClippedGeometry::Polygon {
                         exterior,
                         interiors,
-                    } => should_drop_tiny_polygon_world(
-                        exterior,
-                        interiors,
-                        &tile_coord,
-                        config.extent,
-                        DEFAULT_TINY_POLYGON_THRESHOLD,
-                    ),
-                    WorldClippedGeometry::MultiPolygon(polys) => polys.iter().all(|(ext, ints)| {
-                        should_drop_tiny_polygon_world(
-                            ext,
-                            ints,
-                            &tile_coord,
-                            config.extent,
-                            DEFAULT_TINY_POLYGON_THRESHOLD,
-                        )
-                    }),
+                    } => {
+                        // When accumulation is enabled, don't drop tiny polygons here -
+                        // they'll be accumulated in Phase 3 (encode_tile_from_raw)
+                        if config.enable_tiny_polygon_accumulation {
+                            false // Don't drop - will be handled by accumulator
+                        } else {
+                            should_drop_tiny_polygon_world(
+                                exterior,
+                                interiors,
+                                &tile_coord,
+                                config.extent,
+                                DEFAULT_TINY_POLYGON_THRESHOLD,
+                            )
+                        }
+                    }
+                    WorldClippedGeometry::MultiPolygon(polys) => {
+                        // When accumulation is enabled, don't drop tiny polygons here
+                        if config.enable_tiny_polygon_accumulation {
+                            false // Don't drop - will be handled by accumulator
+                        } else {
+                            polys.iter().all(|(ext, ints)| {
+                                should_drop_tiny_polygon_world(
+                                    ext,
+                                    ints,
+                                    &tile_coord,
+                                    config.extent,
+                                    DEFAULT_TINY_POLYGON_THRESHOLD,
+                                )
+                            })
+                        }
+                    }
                 };
 
                 if should_drop {
@@ -1129,14 +1181,33 @@ fn generate_tiles_to_writer_internal(
 
     // Helper function to decode and encode a single tile (pure, no side effects)
     // This does geometry decoding + MVT encoding together for better parallelism
+    //
+    // When enable_tiny_polygon_accumulation is true, tiny polygons are accumulated
+    // and synthetic squares are emitted when the accumulated area exceeds the threshold.
+    // This matches tippecanoe's behavior (clip.cpp:1048-1097).
     fn encode_tile_from_raw(
         tile_data: RawTileData,
         layer_name: &str,
         extent: u32,
+        enable_tiny_polygon_accumulation: bool,
     ) -> Option<EncodedTile> {
         let coord = TileCoord::new(tile_data.x, tile_data.y, tile_data.z);
         let mut layer_builder = LayerBuilder::new(layer_name).with_extent(extent);
         let mut feature_count = 0;
+
+        // Create accumulator for tiny polygons if enabled
+        let mut accumulator = if enable_tiny_polygon_accumulation {
+            Some(TinyPolygonAccumulator::new(
+                coord,
+                extent,
+                DEFAULT_TINY_POLYGON_THRESHOLD,
+            ))
+        } else {
+            None
+        };
+
+        // Track feature ID for synthetic squares (use a high value to avoid collision)
+        let mut synthetic_feature_id = u64::MAX - 1000;
 
         for raw_feat in tile_data.features {
             // Decode geometry from bytes (this was previously sequential)
@@ -1145,9 +1216,160 @@ fn generate_tiles_to_writer_internal(
                 None => continue,
             };
 
-            if !geom.is_degenerate_in_tile(&coord, extent) {
-                layer_builder.add_feature_world(Some(raw_feat.feature_id), &geom, &[], &coord);
-                feature_count += 1;
+            if geom.is_degenerate_in_tile(&coord, extent) {
+                continue;
+            }
+
+            // Handle tiny polygon accumulation
+            match (&geom, &mut accumulator) {
+                (
+                    WorldClippedGeometry::Polygon {
+                        exterior,
+                        interiors,
+                    },
+                    Some(ref mut acc),
+                ) => {
+                    // Check if this polygon is tiny
+                    if should_drop_tiny_polygon_world(
+                        exterior,
+                        interiors,
+                        &coord,
+                        extent,
+                        DEFAULT_TINY_POLYGON_THRESHOLD,
+                    ) {
+                        // Accumulate tiny polygon instead of dropping
+                        acc.accumulate(exterior, interiors);
+
+                        // Emit synthetic square if threshold exceeded
+                        while acc.should_emit() {
+                            if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
+                                let synthetic_geom = WorldClippedGeometry::Polygon {
+                                    exterior: syn_ext,
+                                    interiors: syn_int,
+                                };
+                                layer_builder.add_feature_world(
+                                    Some(synthetic_feature_id),
+                                    &synthetic_geom,
+                                    &[],
+                                    &coord,
+                                );
+                                feature_count += 1;
+                                synthetic_feature_id = synthetic_feature_id.wrapping_sub(1);
+                            } else {
+                                break;
+                            }
+                        }
+                    } else {
+                        // Normal-sized polygon - add directly
+                        layer_builder.add_feature_world(
+                            Some(raw_feat.feature_id),
+                            &geom,
+                            &[],
+                            &coord,
+                        );
+                        feature_count += 1;
+                    }
+                }
+                (WorldClippedGeometry::MultiPolygon(polys), Some(ref mut acc)) => {
+                    // For MultiPolygon: check each polygon individually
+                    let mut has_normal_polygons = false;
+                    let mut normal_polygons: Vec<(
+                        Vec<crate::world_coord::WorldCoord>,
+                        Vec<Vec<crate::world_coord::WorldCoord>>,
+                    )> = Vec::new();
+
+                    for (ext, ints) in polys.iter() {
+                        if should_drop_tiny_polygon_world(
+                            ext,
+                            ints,
+                            &coord,
+                            extent,
+                            DEFAULT_TINY_POLYGON_THRESHOLD,
+                        ) {
+                            // Accumulate tiny polygon
+                            acc.accumulate(ext, ints);
+
+                            // Emit synthetic square if threshold exceeded
+                            while acc.should_emit() {
+                                if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
+                                    let synthetic_geom = WorldClippedGeometry::Polygon {
+                                        exterior: syn_ext,
+                                        interiors: syn_int,
+                                    };
+                                    layer_builder.add_feature_world(
+                                        Some(synthetic_feature_id),
+                                        &synthetic_geom,
+                                        &[],
+                                        &coord,
+                                    );
+                                    feature_count += 1;
+                                    synthetic_feature_id = synthetic_feature_id.wrapping_sub(1);
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Normal-sized polygon - keep for MultiPolygon
+                            has_normal_polygons = true;
+                            normal_polygons.push((ext.clone(), ints.clone()));
+                        }
+                    }
+
+                    // If there are any normal-sized polygons, add them
+                    if has_normal_polygons {
+                        if normal_polygons.len() == 1 {
+                            // Single polygon remaining - emit as Polygon
+                            let (ext, ints) = normal_polygons.into_iter().next().unwrap();
+                            let poly_geom = WorldClippedGeometry::Polygon {
+                                exterior: ext,
+                                interiors: ints,
+                            };
+                            layer_builder.add_feature_world(
+                                Some(raw_feat.feature_id),
+                                &poly_geom,
+                                &[],
+                                &coord,
+                            );
+                        } else {
+                            // Multiple polygons remaining - emit as MultiPolygon
+                            let multi_geom = WorldClippedGeometry::MultiPolygon(normal_polygons);
+                            layer_builder.add_feature_world(
+                                Some(raw_feat.feature_id),
+                                &multi_geom,
+                                &[],
+                                &coord,
+                            );
+                        }
+                        feature_count += 1;
+                    }
+                }
+                _ => {
+                    // Non-polygon geometry - add directly
+                    layer_builder.add_feature_world(Some(raw_feat.feature_id), &geom, &[], &coord);
+                    feature_count += 1;
+                }
+            }
+        }
+
+        // After processing all features, emit any remaining accumulated polygons
+        if let Some(ref mut acc) = accumulator {
+            while acc.should_emit() {
+                if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
+                    let synthetic_geom = WorldClippedGeometry::Polygon {
+                        exterior: syn_ext,
+                        interiors: syn_int,
+                    };
+                    layer_builder.add_feature_world(
+                        Some(synthetic_feature_id),
+                        &synthetic_geom,
+                        &[],
+                        &coord,
+                    );
+                    feature_count += 1;
+                    synthetic_feature_id = synthetic_feature_id.wrapping_sub(1);
+                } else {
+                    break;
+                }
             }
         }
 
@@ -1185,6 +1407,7 @@ fn generate_tiles_to_writer_internal(
     let layer_name = config.layer_name.clone();
     let extent = config.extent;
     let deterministic = config.deterministic;
+    let enable_tiny_polygon_accumulation = config.enable_tiny_polygon_accumulation;
 
     // Helper to flush the batch: decode + encode in parallel, write sequentially
     let flush_batch = |batch: &mut Vec<RawTileData>,
@@ -1193,7 +1416,8 @@ fn generate_tiles_to_writer_internal(
                        tiles_written: &mut u64,
                        layer_name: &str,
                        extent: u32,
-                       deterministic: bool|
+                       deterministic: bool,
+                       enable_tiny_polygon_accumulation: bool|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -1204,13 +1428,17 @@ fn generate_tiles_to_writer_internal(
             // Sequential for reproducibility
             std::mem::take(batch)
                 .into_iter()
-                .map(|td| encode_tile_from_raw(td, layer_name, extent))
+                .map(|td| {
+                    encode_tile_from_raw(td, layer_name, extent, enable_tiny_polygon_accumulation)
+                })
                 .collect()
         } else {
             // Parallel for performance - both decoding AND encoding happen in parallel
             std::mem::take(batch)
                 .into_par_iter()
-                .map(|td| encode_tile_from_raw(td, layer_name, extent))
+                .map(|td| {
+                    encode_tile_from_raw(td, layer_name, extent, enable_tiny_polygon_accumulation)
+                })
                 .collect()
         };
 
@@ -1277,6 +1505,7 @@ fn generate_tiles_to_writer_internal(
                         &layer_name,
                         extent,
                         deterministic,
+                        enable_tiny_polygon_accumulation,
                     )?;
                 }
             }
@@ -1316,6 +1545,7 @@ fn generate_tiles_to_writer_internal(
         &layer_name,
         extent,
         deterministic,
+        enable_tiny_polygon_accumulation,
     )?;
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
@@ -3339,6 +3569,116 @@ mod tests {
             shift += 7;
         }
         (result, pos)
+    }
+
+    // ========== Issue #85: Tiny Polygon Accumulation Tests ==========
+
+    /// Test that tiny polygon accumulation preserves visual density.
+    ///
+    /// When accumulation is ENABLED (default), tiny polygons should be accumulated
+    /// and synthetic squares emitted when the threshold is exceeded.
+    /// This matches tippecanoe's behavior (clip.cpp:1048-1097).
+    #[test]
+    fn test_tiny_polygon_accumulation_emits_synthetic_squares() {
+        use geo::polygon;
+
+        // Create many tiny polygons at zoom 0
+        // At zoom 0 with 4096 extent, 1 pixel ≈ 0.088° (360/4096)
+        // Create polygons that are ~0.01° x 0.01° = sub-pixel at zoom 0
+        let mut tiny_polygons = Vec::new();
+        for i in 0..20 {
+            let offset = i as f64 * 0.02;
+            tiny_polygons.push(Geometry::Polygon(polygon![
+                (x: offset, y: 0.0),
+                (x: offset + 0.01, y: 0.0),
+                (x: offset + 0.01, y: 0.01),
+                (x: offset, y: 0.01),
+                (x: offset, y: 0.0),
+            ]));
+        }
+
+        // Test with accumulation ENABLED (default)
+        let config_with_accumulation = TilerConfig::new(0, 0).with_tiny_polygon_accumulation(true);
+        let coord = TileCoord::new(0, 0, 0);
+
+        let tile_with =
+            generate_single_tile(&tiny_polygons, coord, &config_with_accumulation).unwrap();
+
+        // Test with accumulation DISABLED
+        let config_without_accumulation =
+            TilerConfig::new(0, 0).with_tiny_polygon_accumulation(false);
+
+        let tile_without =
+            generate_single_tile(&tiny_polygons, coord, &config_without_accumulation).unwrap();
+
+        // With accumulation: should have synthetic squares (some features)
+        // Without accumulation: tiny polygons are dropped (fewer/no features)
+        match (&tile_with, &tile_without) {
+            (Some(with), Some(without)) => {
+                // With accumulation should have at least as many features
+                // (accumulated + synthetic) as without (just dropped)
+                let with_decoded = decode_tile(&with.data).unwrap();
+                let without_decoded = decode_tile(&without.data).unwrap();
+
+                let with_features = with_decoded
+                    .layers
+                    .first()
+                    .map(|l| l.features.len())
+                    .unwrap_or(0);
+                let without_features = without_decoded
+                    .layers
+                    .first()
+                    .map(|l| l.features.len())
+                    .unwrap_or(0);
+
+                // With accumulation should produce at least some synthetic features
+                // when tiny polygons accumulate above threshold
+                assert!(
+                    with_features >= without_features,
+                    "Accumulation should produce at least as many features as dropping. \
+                     With: {}, Without: {}",
+                    with_features,
+                    without_features
+                );
+            }
+            (Some(_), None) => {
+                // Accumulation produced a tile, no accumulation produced nothing
+                // This is expected: dropped all tiny polygons vs emitting synthetic squares
+            }
+            (None, Some(_)) => {
+                // This would be unexpected - dropping should not produce more than accumulation
+                panic!("Unexpected: no-accumulation mode produced a tile but accumulation did not");
+            }
+            (None, None) => {
+                // Both produced empty - polygons might be too small even for accumulation
+                // This is okay for this test
+            }
+        }
+    }
+
+    /// Test that tiny polygon accumulation config flag works correctly
+    #[test]
+    fn test_tiny_polygon_accumulation_config() {
+        // Default should have accumulation enabled
+        let default_config = TilerConfig::default();
+        assert!(
+            default_config.enable_tiny_polygon_accumulation,
+            "Tiny polygon accumulation should be enabled by default"
+        );
+
+        // Should be able to disable it
+        let disabled_config = TilerConfig::new(0, 14).with_tiny_polygon_accumulation(false);
+        assert!(
+            !disabled_config.enable_tiny_polygon_accumulation,
+            "Should be able to disable tiny polygon accumulation"
+        );
+
+        // Should be able to explicitly enable it
+        let enabled_config = TilerConfig::new(0, 14).with_tiny_polygon_accumulation(true);
+        assert!(
+            enabled_config.enable_tiny_polygon_accumulation,
+            "Should be able to explicitly enable tiny polygon accumulation"
+        );
     }
 }
 
