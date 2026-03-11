@@ -99,6 +99,27 @@ struct Args {
     #[arg(long = "accumulate", value_name = "ATTR:OP")]
     accumulate: Vec<String>,
 
+    /// Cluster points within a specified distance (in 256-pixel tile units).
+    /// Matches tippecanoe's --cluster-distance flag.
+    ///
+    /// When set, nearby points are grouped together and replaced with a single
+    /// point at their centroid. Properties are accumulated according to
+    /// --accumulate settings.
+    ///
+    /// Typical values: 50 (default in tippecanoe), 25 (less aggressive), 100 (more aggressive).
+    /// Requires --cluster-maxzoom to also be set.
+    #[arg(long = "cluster-distance", value_name = "PIXELS")]
+    cluster_distance: Option<u32>,
+
+    /// Maximum zoom level at which to cluster points.
+    /// Matches tippecanoe's --cluster-maxzoom flag.
+    ///
+    /// At zoom levels above this, points are kept separate.
+    /// Typically set to max_zoom - 2 or so.
+    /// Requires --cluster-distance to also be set.
+    #[arg(long = "cluster-maxzoom", value_name = "ZOOM")]
+    cluster_maxzoom: Option<u8>,
+
     /// Compression algorithm for tiles (gzip, zstd, brotli, none)
     ///
     /// Gzip is the default for maximum compatibility with PMTiles viewers.
@@ -203,6 +224,22 @@ impl Args {
 
         Ok(Some(config))
     }
+
+    /// Parse --cluster-distance and --cluster-maxzoom into cluster configuration.
+    ///
+    /// Both flags must be specified together or neither.
+    fn parse_cluster_config(&self) -> Result<Option<(u32, u8)>> {
+        match (self.cluster_distance, self.cluster_maxzoom) {
+            (Some(distance), Some(maxzoom)) => Ok(Some((distance, maxzoom))),
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                anyhow::bail!("--cluster-distance requires --cluster-maxzoom to also be set")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("--cluster-maxzoom requires --cluster-distance to also be set")
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -262,6 +299,9 @@ fn main() -> Result<()> {
     let accumulator_config = args
         .parse_accumulator_config()
         .context("Failed to parse accumulator config")?;
+    let cluster_config = args
+        .parse_cluster_config()
+        .context("Failed to parse cluster config")?;
 
     // Validate input file uses WGS84 (EPSG:4326) coordinates
     validate_wgs84(&args.input).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -296,6 +336,11 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_accumulator(acc_config);
     }
 
+    // Add cluster config if specified
+    if let Some((distance, maxzoom)) = cluster_config {
+        tiler_config = tiler_config.with_cluster(distance, maxzoom);
+    }
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -314,6 +359,12 @@ fn main() -> Result<()> {
             for (attr, op) in acc_config.operations() {
                 eprintln!("    {}: {}", attr, op);
             }
+        }
+        if let Some(ref cluster) = tiler_config.cluster_config {
+            eprintln!(
+                "  Clustering: distance={}, max_zoom={}",
+                cluster.distance, cluster.max_zoom
+            );
         }
         eprintln!();
     }

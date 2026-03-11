@@ -41,6 +41,7 @@ pub mod vector_tile {
 pub mod accumulator;
 pub mod batch_processor;
 pub mod clip;
+pub mod clustering;
 pub mod compression;
 pub mod dedup;
 pub mod external_sort;
@@ -68,6 +69,8 @@ pub mod world_coord;
 
 // Re-export accumulator types for CLI usage
 pub use accumulator::{AccumulatorConfig, AccumulatorOp};
+// Re-export clustering types for CLI usage
+pub use clustering::{ClusterConfig, IndexedPoint, PointClusterer};
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;
 // Re-export Compression from compression module for public API

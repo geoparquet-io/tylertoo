@@ -27,6 +27,7 @@ use crate::batch_processor::{
     extract_field_metadata, extract_geometries, process_geometries_by_row_group, RowGroupInfo,
 };
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
+use crate::clustering::ClusterConfig;
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_line_world,
     should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
@@ -218,6 +219,17 @@ pub struct TilerConfig {
     /// If None, no attribute accumulation is performed (attributes from the
     /// first feature are kept).
     pub accumulator_config: Option<AccumulatorConfig>,
+
+    /// Point clustering configuration.
+    ///
+    /// When enabled, nearby points are clustered together at lower zoom levels.
+    /// The centroid of each cluster replaces the individual points, and properties
+    /// are accumulated according to the accumulator configuration.
+    ///
+    /// Matches tippecanoe's `--cluster-distance` and `--cluster-maxzoom` flags.
+    ///
+    /// If None, no point clustering is performed.
+    pub cluster_config: Option<ClusterConfig>,
 }
 
 impl Default for TilerConfig {
@@ -253,6 +265,8 @@ impl Default for TilerConfig {
             gamma: None,
             // No attribute accumulation by default
             accumulator_config: None,
+            // No point clustering by default
+            cluster_config: None,
         }
     }
 }
@@ -501,6 +515,37 @@ impl TilerConfig {
     /// ```
     pub fn with_accumulator(mut self, config: AccumulatorConfig) -> Self {
         self.accumulator_config = Some(config);
+        self
+    }
+
+    /// Enable point clustering with the specified configuration.
+    ///
+    /// When enabled, nearby points are clustered together at lower zoom levels.
+    /// This matches tippecanoe's `--cluster-distance` and `--cluster-maxzoom` flags.
+    ///
+    /// # Arguments
+    ///
+    /// * `distance` - Cluster distance in 256-pixel tile units (tippecanoe default: 50)
+    /// * `max_zoom` - Maximum zoom level for clustering (features above this zoom are not clustered)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_cluster(50, 12); // Cluster within 50px up to zoom 12
+    /// ```
+    pub fn with_cluster(mut self, distance: u32, max_zoom: u8) -> Self {
+        self.cluster_config = Some(ClusterConfig::new(distance, max_zoom));
+        self
+    }
+
+    /// Enable point clustering with a ClusterConfig.
+    ///
+    /// Alternative to `with_cluster()` when you have a pre-built config.
+    pub fn with_cluster_config(mut self, config: ClusterConfig) -> Self {
+        self.cluster_config = Some(config);
         self
     }
 }
@@ -1283,12 +1328,19 @@ fn generate_tiles_to_writer_internal(
     // When enable_tiny_polygon_accumulation is true, tiny polygons are accumulated
     // and synthetic squares are emitted when the accumulated area exceeds the threshold.
     // This matches tippecanoe's behavior (clip.cpp:1048-1097).
+    //
+    // When cluster_config is Some, point clustering is performed at the appropriate zoom levels.
     fn encode_tile_from_raw(
         tile_data: RawTileData,
         layer_name: &str,
         extent: u32,
         enable_tiny_polygon_accumulation: bool,
+        cluster_config: Option<&ClusterConfig>,
     ) -> Option<EncodedTile> {
+        use crate::clustering::{IndexedPoint, PointClusterer};
+        use crate::mvt::PropertyValue;
+        use crate::world_coord::WorldCoord;
+
         let coord = TileCoord::new(tile_data.x, tile_data.y, tile_data.z);
         let mut layer_builder = LayerBuilder::new(layer_name).with_extent(extent);
         let mut feature_count = 0;
@@ -1307,6 +1359,271 @@ fn generate_tiles_to_writer_internal(
         // Track feature ID for synthetic squares (use a high value to avoid collision)
         let mut synthetic_feature_id = u64::MAX - 1000;
 
+        // Point clustering: if enabled, collect all points first, cluster them, then process
+        let should_cluster = cluster_config
+            .map(|cc| coord.z <= cc.max_zoom)
+            .unwrap_or(false);
+
+        if should_cluster {
+            let cc = cluster_config.unwrap();
+
+            // Decode all features, separating points from non-points
+            let mut points_to_cluster: Vec<(u64, WorldCoord)> = Vec::new();
+            let mut non_point_features: Vec<(u64, WorldClippedGeometry)> = Vec::new();
+
+            for raw_feat in tile_data.features.iter() {
+                let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
+                    Some(g) => g,
+                    None => continue,
+                };
+
+                if geom.is_degenerate_in_tile(&coord, extent) {
+                    continue;
+                }
+
+                match geom {
+                    WorldClippedGeometry::Point(p) => {
+                        points_to_cluster.push((raw_feat.feature_id, p));
+                    }
+                    _ => {
+                        non_point_features.push((raw_feat.feature_id, geom));
+                    }
+                }
+            }
+
+            // Cluster the points using Hilbert index proximity
+            if !points_to_cluster.is_empty() {
+                // Convert to IndexedPoints for clustering
+                use crate::spatial_index::{encode_hilbert, lng_lat_to_world_coords};
+                use std::collections::HashMap;
+
+                let indexed_points: Vec<IndexedPoint> = points_to_cluster
+                    .iter()
+                    .map(|(feat_id, wc)| {
+                        // Convert WorldCoord back to lng/lat for Hilbert indexing
+                        let lng = (wc.x as f64 / (1u64 << 32) as f64) * 360.0 - 180.0;
+                        let lat_rad =
+                            std::f64::consts::PI * (1.0 - 2.0 * wc.y as f64 / (1u64 << 32) as f64);
+                        let lat = lat_rad.sinh().atan().to_degrees();
+
+                        let (wx, wy) = lng_lat_to_world_coords(lng, lat);
+                        let hilbert = encode_hilbert(wx, wy);
+
+                        // Store feature_id in properties for tracking
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "__feature_id".to_string(),
+                            crate::wkb::PropertyValue::UInt(*feat_id),
+                        );
+
+                        IndexedPoint {
+                            point: geo::Point::new(lng, lat),
+                            hilbert_index: hilbert,
+                            world_x: wx,
+                            world_y: wy,
+                            properties: props,
+                        }
+                    })
+                    .collect();
+
+                // Create clusterer and cluster points
+                let clusterer = PointClusterer::new(cc.clone(), None);
+                let clustered = clusterer.cluster(indexed_points, coord.z);
+
+                // Add clustered points to the layer
+                for cp in clustered {
+                    // Convert clustered point back to WorldCoord
+                    let (wx, wy) = lng_lat_to_world_coords(cp.point.x(), cp.point.y());
+
+                    // Use the world coordinates directly (already u32)
+                    let wc = WorldCoord { x: wx, y: wy };
+
+                    let point_geom = WorldClippedGeometry::Point(wc);
+
+                    // Build properties for MVT (include cluster_count if present)
+                    let mut props: Vec<(String, PropertyValue)> = Vec::new();
+                    if let Some(crate::wkb::PropertyValue::UInt(count)) =
+                        cp.properties.get("cluster_count")
+                    {
+                        props.push(("cluster_count".to_string(), PropertyValue::UInt(*count)));
+                    }
+
+                    // Get feature ID (use original if single point, or synthetic for cluster)
+                    let feat_id = if cp.properties.contains_key("cluster_count") {
+                        // This is a cluster - use synthetic ID
+                        synthetic_feature_id = synthetic_feature_id.wrapping_sub(1);
+                        Some(synthetic_feature_id)
+                    } else {
+                        // Single point - use original ID
+                        cp.properties.get("__feature_id").and_then(|v| match v {
+                            crate::wkb::PropertyValue::UInt(id) => Some(*id),
+                            _ => None,
+                        })
+                    };
+
+                    layer_builder.add_feature_world(feat_id, &point_geom, &props, &coord);
+                    feature_count += 1;
+                }
+            }
+
+            // Process non-point features with existing polygon accumulation logic
+            for (feat_id, geom) in non_point_features {
+                // Handle tiny polygon accumulation
+                match (&geom, &mut accumulator) {
+                    (
+                        WorldClippedGeometry::Polygon {
+                            exterior,
+                            interiors,
+                        },
+                        Some(ref mut acc),
+                    ) => {
+                        if should_drop_tiny_polygon_world(
+                            exterior,
+                            interiors,
+                            &coord,
+                            extent,
+                            DEFAULT_TINY_POLYGON_THRESHOLD,
+                        ) {
+                            acc.accumulate(exterior, interiors);
+                            while acc.should_emit() {
+                                if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
+                                    let synthetic_geom = WorldClippedGeometry::Polygon {
+                                        exterior: syn_ext,
+                                        interiors: syn_int,
+                                    };
+                                    layer_builder.add_feature_world(
+                                        Some(synthetic_feature_id),
+                                        &synthetic_geom,
+                                        &[],
+                                        &coord,
+                                    );
+                                    feature_count += 1;
+                                    synthetic_feature_id = synthetic_feature_id.wrapping_sub(1);
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            layer_builder.add_feature_world(Some(feat_id), &geom, &[], &coord);
+                            feature_count += 1;
+                        }
+                    }
+                    (WorldClippedGeometry::MultiPolygon(polys), Some(ref mut acc)) => {
+                        let mut has_normal_polygons = false;
+                        let mut normal_polygons: Vec<(
+                            Vec<crate::world_coord::WorldCoord>,
+                            Vec<Vec<crate::world_coord::WorldCoord>>,
+                        )> = Vec::new();
+
+                        for (ext, ints) in polys.iter() {
+                            if should_drop_tiny_polygon_world(
+                                ext,
+                                ints,
+                                &coord,
+                                extent,
+                                DEFAULT_TINY_POLYGON_THRESHOLD,
+                            ) {
+                                acc.accumulate(ext, ints);
+                                while acc.should_emit() {
+                                    if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
+                                        let synthetic_geom = WorldClippedGeometry::Polygon {
+                                            exterior: syn_ext,
+                                            interiors: syn_int,
+                                        };
+                                        layer_builder.add_feature_world(
+                                            Some(synthetic_feature_id),
+                                            &synthetic_geom,
+                                            &[],
+                                            &coord,
+                                        );
+                                        feature_count += 1;
+                                        synthetic_feature_id = synthetic_feature_id.wrapping_sub(1);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                has_normal_polygons = true;
+                                normal_polygons.push((ext.clone(), ints.clone()));
+                            }
+                        }
+
+                        if has_normal_polygons {
+                            if normal_polygons.len() == 1 {
+                                let (ext, ints) = normal_polygons.into_iter().next().unwrap();
+                                let poly_geom = WorldClippedGeometry::Polygon {
+                                    exterior: ext,
+                                    interiors: ints,
+                                };
+                                layer_builder.add_feature_world(
+                                    Some(feat_id),
+                                    &poly_geom,
+                                    &[],
+                                    &coord,
+                                );
+                            } else {
+                                let multi_geom =
+                                    WorldClippedGeometry::MultiPolygon(normal_polygons);
+                                layer_builder.add_feature_world(
+                                    Some(feat_id),
+                                    &multi_geom,
+                                    &[],
+                                    &coord,
+                                );
+                            }
+                            feature_count += 1;
+                        }
+                    }
+                    _ => {
+                        layer_builder.add_feature_world(Some(feat_id), &geom, &[], &coord);
+                        feature_count += 1;
+                    }
+                }
+            }
+
+            // Emit remaining accumulated tiny polygons
+            if let Some(ref mut acc) = accumulator {
+                while acc.should_emit() {
+                    if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
+                        let synthetic_geom = WorldClippedGeometry::Polygon {
+                            exterior: syn_ext,
+                            interiors: syn_int,
+                        };
+                        layer_builder.add_feature_world(
+                            Some(synthetic_feature_id),
+                            &synthetic_geom,
+                            &[],
+                            &coord,
+                        );
+                        feature_count += 1;
+                        synthetic_feature_id = synthetic_feature_id.wrapping_sub(1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Return early - we've processed everything
+            if feature_count > 0 {
+                let layer = layer_builder.build();
+                let mut tile_builder = TileBuilder::new();
+                tile_builder.add_layer(layer);
+                let tile = tile_builder.build();
+                let encoded = tile.encode_to_vec();
+
+                return Some(EncodedTile {
+                    z: tile_data.z,
+                    x: tile_data.x,
+                    y: tile_data.y,
+                    data: encoded,
+                    feature_count,
+                });
+            } else {
+                return None;
+            }
+        }
+
+        // Non-clustering path: original loop
         for raw_feat in tile_data.features {
             // Decode geometry from bytes (this was previously sequential)
             let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
@@ -1506,6 +1823,7 @@ fn generate_tiles_to_writer_internal(
     let extent = config.extent;
     let deterministic = config.deterministic;
     let enable_tiny_polygon_accumulation = config.enable_tiny_polygon_accumulation;
+    let cluster_config = config.cluster_config.clone();
 
     // Helper to flush the batch: decode + encode in parallel, write sequentially
     let flush_batch = |batch: &mut Vec<RawTileData>,
@@ -1515,7 +1833,8 @@ fn generate_tiles_to_writer_internal(
                        layer_name: &str,
                        extent: u32,
                        deterministic: bool,
-                       enable_tiny_polygon_accumulation: bool|
+                       enable_tiny_polygon_accumulation: bool,
+                       cluster_config: Option<&ClusterConfig>|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -1527,7 +1846,13 @@ fn generate_tiles_to_writer_internal(
             std::mem::take(batch)
                 .into_iter()
                 .map(|td| {
-                    encode_tile_from_raw(td, layer_name, extent, enable_tiny_polygon_accumulation)
+                    encode_tile_from_raw(
+                        td,
+                        layer_name,
+                        extent,
+                        enable_tiny_polygon_accumulation,
+                        cluster_config,
+                    )
                 })
                 .collect()
         } else {
@@ -1535,7 +1860,13 @@ fn generate_tiles_to_writer_internal(
             std::mem::take(batch)
                 .into_par_iter()
                 .map(|td| {
-                    encode_tile_from_raw(td, layer_name, extent, enable_tiny_polygon_accumulation)
+                    encode_tile_from_raw(
+                        td,
+                        layer_name,
+                        extent,
+                        enable_tiny_polygon_accumulation,
+                        cluster_config,
+                    )
                 })
                 .collect()
         };
@@ -1604,6 +1935,7 @@ fn generate_tiles_to_writer_internal(
                         extent,
                         deterministic,
                         enable_tiny_polygon_accumulation,
+                        cluster_config.as_ref(),
                     )?;
                 }
             }
@@ -1644,6 +1976,7 @@ fn generate_tiles_to_writer_internal(
         extent,
         deterministic,
         enable_tiny_polygon_accumulation,
+        cluster_config.as_ref(),
     )?;
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
@@ -3881,5 +4214,75 @@ mod tracing_tests {
         // Just verify the pipeline runs successfully with tracing spans in place
         let result = generate_tiles_to_writer(fixture_path, &config, &mut writer);
         assert!(result.is_ok(), "Tile generation should succeed");
+    }
+
+    // ========== Point Clustering Tests ==========
+
+    #[test]
+    fn test_cluster_config_builder() {
+        // Test that cluster config can be built correctly
+        let config = TilerConfig::new(0, 14).with_cluster(50, 12); // 50px distance, max zoom 12
+
+        assert!(config.cluster_config.is_some());
+        let cc = config.cluster_config.unwrap();
+        assert_eq!(cc.distance, 50);
+        assert_eq!(cc.max_zoom, 12);
+    }
+
+    #[test]
+    fn test_cluster_config_cluster_gap() {
+        use crate::clustering::ClusterConfig;
+
+        let config = ClusterConfig::new(50, 14);
+
+        // At zoom 14: scale = (1 << 18) / 256 = 1024
+        // gap = (1024 * 50)^2 = 2,621,440,000,000
+        let gap_z14 = config.cluster_gap(14);
+        let expected_z14 = (1024u64 * 50).pow(2);
+        assert_eq!(gap_z14, expected_z14);
+
+        // At zoom 10: scale = (1 << 22) / 256 = 16384
+        // gap = (16384 * 50)^2 = much larger
+        let gap_z10 = config.cluster_gap(10);
+        let expected_z10 = (16384u64 * 50).pow(2);
+        assert_eq!(gap_z10, expected_z10);
+
+        // Gap should decrease with zoom (higher zoom = more precision = smaller gap)
+        assert!(gap_z10 > gap_z14);
+    }
+
+    #[test]
+    fn test_pipeline_with_clustering_enabled_on_polygons() {
+        // Test that enabling clustering doesn't break polygon processing
+        // (clustering only affects points, polygons should pass through unchanged)
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Enable clustering - should not affect polygon processing
+        let config = TilerConfig::new(0, 6).with_quiet(true).with_cluster(50, 4); // Cluster within 50px up to zoom 4
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("Should generate tiles with clustering enabled");
+
+        let output_path = Path::new("/tmp/test-clustering-with-polygons.pmtiles");
+        let _ = fs::remove_file(output_path);
+
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        // Should still produce tiles (polygons should be processed normally)
+        assert!(write_stats.total_tiles > 0, "Should produce tiles");
+        assert!(stats.peak_bytes > 0, "Should track memory usage");
+
+        let _ = fs::remove_file(output_path);
     }
 }
