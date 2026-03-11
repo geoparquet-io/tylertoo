@@ -188,6 +188,90 @@ fn bench_hilbert_vs_zorder(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark parallel vs sequential (deterministic) encoding
+/// This measures the impact of parallel tile encoding.
+fn bench_parallel_vs_sequential(c: &mut Criterion) {
+    if !fixture_exists(FIXTURE_SMALL) {
+        eprintln!("Skipping parallel_vs_sequential benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_SMALL);
+
+    let mut group = c.benchmark_group("parallel_vs_sequential");
+    group.throughput(Throughput::Elements(1000));
+
+    // Parallel (default) - uses rayon for tile encoding
+    let config_parallel = TilerConfig::new(0, 10).with_quiet(true);
+    group.bench_function("parallel", |b| {
+        b.iter(|| {
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_parallel, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
+        })
+    });
+
+    // Sequential (deterministic) - single-threaded for reproducibility
+    let config_sequential = TilerConfig::new(0, 10)
+        .with_quiet(true)
+        .with_deterministic(true);
+    group.bench_function("sequential", |b| {
+        b.iter(|| {
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_sequential, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
+        })
+    });
+
+    group.finish();
+}
+
+/// Benchmark parallel vs sequential on LARGE fixture for more significant results
+fn bench_large_parallel_vs_sequential(c: &mut Criterion) {
+    if !fixture_exists(FIXTURE_LARGE) {
+        eprintln!("Skipping large_parallel_vs_sequential benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_LARGE);
+
+    let mut group = c.benchmark_group("large_parallel_vs_sequential");
+    group.throughput(Throughput::Elements(17465));
+    group.sample_size(10);
+
+    // Parallel (default)
+    let config_parallel = TilerConfig::new(0, 10).with_quiet(true);
+    group.bench_function("parallel", |b| {
+        b.iter(|| {
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_parallel, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
+        })
+    });
+
+    // Sequential (deterministic)
+    let config_sequential = TilerConfig::new(0, 10)
+        .with_quiet(true)
+        .with_deterministic(true);
+    group.bench_function("sequential", |b| {
+        b.iter(|| {
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_sequential, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
+        })
+    });
+
+    group.finish();
+}
+
 /// Benchmark production pipeline on LARGE fixture (17K features)
 /// This is the main benchmark for measuring real-world performance.
 fn bench_large_full_pipeline(c: &mut Criterion) {
@@ -263,6 +347,7 @@ criterion_group!(
     benches,
     bench_single_tile,
     bench_full_pipeline,
+    bench_parallel_vs_sequential,
     bench_density_dropping,
     bench_hilbert_vs_zorder,
 );
@@ -270,7 +355,7 @@ criterion_group!(
 criterion_group!(
     name = large_benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_large_full_pipeline, bench_compression
+    targets = bench_large_full_pipeline, bench_large_parallel_vs_sequential, bench_compression
 );
 
 criterion_main!(benches, large_benches);
