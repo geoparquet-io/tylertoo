@@ -24,7 +24,8 @@ use geo::Geometry;
 
 use crate::accumulator::AccumulatorConfig;
 use crate::batch_processor::{
-    extract_field_metadata, extract_geometries, process_geometries_by_row_group, RowGroupInfo,
+    extract_field_metadata, extract_geometries, process_geometries_parallel, RowGroupInfo,
+    DEFAULT_PARALLEL_READERS,
 };
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::clustering::ClusterConfig;
@@ -970,258 +971,266 @@ fn generate_tiles_to_writer_internal(
 
     let records_written = AtomicU64::new(0);
     let geoms_processed = AtomicU64::new(0);
+    let row_groups_completed = AtomicU64::new(0);
 
     // Phase 1 span: Read GeoParquet and clip geometries
+    // Use parallel row group reader for overlapped I/O and parallel decompression
     let _phase1_span = tracing::info_span!("read_parquet", path = %input_path.display()).entered();
 
-    process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
-        // Row group span for detailed tracing
-        let _rg_span = tracing::info_span!(
-            "row_group",
-            index = rg_info.index,
-            row_count = rg_info.num_rows
-        )
-        .entered();
-        let features_in_group = geometries.len();
+    process_geometries_parallel(
+        input_path,
+        DEFAULT_PARALLEL_READERS,
+        |rg_info: RowGroupInfo, geometries| {
+            // Row group span for detailed tracing
+            let _rg_span = tracing::info_span!(
+                "row_group",
+                index = rg_info.index,
+                row_count = rg_info.num_rows
+            )
+            .entered();
+            let features_in_group = geometries.len();
 
-        if let Some(ref cb) = progress {
-            cb(ProgressEvent::Phase1Progress {
-                row_group: rg_info.index,
-                total_row_groups,
-                features_in_group,
-                records_written: records_written.load(Ordering::Relaxed),
-            });
-        }
-        if !config.quiet {
-            tracing::info!(
-                "Processing row group {}/{} with {} features",
-                rg_info.index + 1,
-                total_row_groups,
-                rg_info.num_rows
-            );
-        }
+            // Track completed row groups (may arrive out of order due to parallel reads)
+            let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // PROFILING: Track time spent in each phase
-        let rg_start = std::time::Instant::now();
+            if let Some(ref cb) = progress {
+                cb(ProgressEvent::Phase1Progress {
+                    row_group: completed as usize,
+                    total_row_groups,
+                    features_in_group,
+                    records_written: records_written.load(Ordering::Relaxed),
+                });
+            }
+            if !config.quiet {
+                tracing::info!(
+                    "Processing row group {}/{} with {} features",
+                    completed,
+                    total_row_groups,
+                    rg_info.num_rows
+                );
+            }
 
-        // Sort geometries within row group for better locality
-        let sort_start = std::time::Instant::now();
-        let mut sorted = geometries;
-        sort_geometries(&mut sorted, config.use_hilbert);
-        let time_sort = sort_start.elapsed();
+            // PROFILING: Track time spent in each phase
+            let rg_start = std::time::Instant::now();
 
-        let num_geoms = sorted.len();
+            // Sort geometries within row group for better locality
+            let sort_start = std::time::Instant::now();
+            let mut sorted = geometries;
+            sort_geometries(&mut sorted, config.use_hilbert);
+            let time_sort = sort_start.elapsed();
 
-        // Assign feature indices upfront for all geometries in this row group
-        // This ensures deterministic feature IDs regardless of parallel execution order
-        let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
+            let num_geoms = sorted.len();
 
-        // Result type for per-geometry processing stats
-        struct GeomResult {
-            records: Vec<TileFeatureRecord>,
-            time_clip: std::time::Duration,
-            time_simplify: std::time::Duration,
-            time_wkb: std::time::Duration,
-            clip_count: u64,
-            tiles_touched: u64,
-            bounds: Option<TileBounds>,
-        }
+            // Assign feature indices upfront for all geometries in this row group
+            // This ensures deterministic feature IDs regardless of parallel execution order
+            let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
 
-        // Process geometries - either in parallel or sequentially based on config
-        let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
-            let feat_idx = base_feat_idx + geom_idx as u64;
+            // Result type for per-geometry processing stats
+            struct GeomResult {
+                records: Vec<TileFeatureRecord>,
+                time_clip: std::time::Duration,
+                time_simplify: std::time::Duration,
+                time_wkb: std::time::Duration,
+                clip_count: u64,
+                tiles_touched: u64,
+                bounds: Option<TileBounds>,
+            }
 
-            let mut result = GeomResult {
-                records: Vec::new(),
-                time_clip: std::time::Duration::ZERO,
-                time_simplify: std::time::Duration::ZERO,
-                time_wkb: std::time::Duration::ZERO,
-                clip_count: 0,
-                tiles_touched: 0,
-                bounds: None,
-            };
+            // Process geometries - either in parallel or sequentially based on config
+            let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
+                let feat_idx = base_feat_idx + geom_idx as u64;
 
-            let geom_bbox = match geom.bounding_rect() {
-                Some(rect) => {
-                    let bounds =
-                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                    result.bounds = Some(bounds);
-                    bounds
-                }
-                None => return result,
-            };
+                let mut result = GeomResult {
+                    records: Vec::new(),
+                    time_clip: std::time::Duration::ZERO,
+                    time_simplify: std::time::Duration::ZERO,
+                    time_wkb: std::time::Duration::ZERO,
+                    clip_count: 0,
+                    tiles_touched: 0,
+                    bounds: None,
+                };
 
-            // Pre-simplify geometry ONCE at the MAX zoom level tolerance
-            let simplify_start = std::time::Instant::now();
-            let base_simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
-            result.time_simplify = simplify_start.elapsed();
-
-            // Hierarchical clipping in WorldCoord space: clip at min_zoom first,
-            // then clip parent results for child tiles at higher zoom levels.
-            // This avoids re-clipping the full original geometry for every tile.
-            // See issue #38 for rationale.
-            //
-            // Phase 2 change: Use WorldCoord-based clipping for integer precision
-            // throughout the pipeline. This eliminates f64 accumulation errors.
-            let clip_start = std::time::Instant::now();
-            let (clip_results, clip_stats) = clip_geometry_hierarchical_world(
-                &base_simplified,
-                &geom_bbox,
-                config.min_zoom,
-                config.max_zoom,
-                config.buffer_pixels,
-                config.extent,
-            );
-            result.time_clip = clip_start.elapsed();
-            result.clip_count = clip_stats.clip_ops;
-            result.tiles_touched = clip_stats.tiles_processed;
-
-            // Process clip results: validate, drop, serialize to bytes, create records
-            // Collect into a Vec first for deterministic ordering
-            let mut clip_entries: Vec<_> = clip_results.into_iter().collect();
-            clip_entries
-                .sort_by(|(a, _), (b, _)| tile_id(a.z, a.x, a.y).cmp(&tile_id(b.z, b.x, b.y)));
-
-            for (tile_coord, clipped) in clip_entries {
-                // Check dropping rules using WorldCoord-based functions
-                let should_drop = match &clipped {
-                    WorldClippedGeometry::Point(_) => {
-                        // Point dropping uses feature index for density
-                        should_drop_point(
-                            &geo::Point::new(0.0, 0.0),
-                            tile_coord.z,
-                            config.max_zoom,
-                            feat_idx,
-                        )
+                let geom_bbox = match geom.bounding_rect() {
+                    Some(rect) => {
+                        let bounds =
+                            TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+                        result.bounds = Some(bounds);
+                        bounds
                     }
-                    WorldClippedGeometry::MultiPoint(points) => points.is_empty(),
-                    WorldClippedGeometry::LineString(coords) => {
-                        should_drop_tiny_line_world(coords, &tile_coord, config.extent, 1.0)
-                    }
-                    WorldClippedGeometry::MultiLineString(lines) => lines.iter().all(|line| {
-                        should_drop_tiny_line_world(line, &tile_coord, config.extent, 1.0)
-                    }),
-                    WorldClippedGeometry::Polygon {
-                        exterior,
-                        interiors,
-                    } => {
-                        // When accumulation is enabled, don't drop tiny polygons here -
-                        // they'll be accumulated in Phase 3 (encode_tile_from_raw)
-                        if config.enable_tiny_polygon_accumulation {
-                            false // Don't drop - will be handled by accumulator
-                        } else {
-                            should_drop_tiny_polygon_world(
-                                exterior,
-                                interiors,
-                                &tile_coord,
-                                config.extent,
-                                DEFAULT_TINY_POLYGON_THRESHOLD,
+                    None => return result,
+                };
+
+                // Pre-simplify geometry ONCE at the MAX zoom level tolerance
+                let simplify_start = std::time::Instant::now();
+                let base_simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
+                result.time_simplify = simplify_start.elapsed();
+
+                // Hierarchical clipping in WorldCoord space: clip at min_zoom first,
+                // then clip parent results for child tiles at higher zoom levels.
+                // This avoids re-clipping the full original geometry for every tile.
+                // See issue #38 for rationale.
+                //
+                // Phase 2 change: Use WorldCoord-based clipping for integer precision
+                // throughout the pipeline. This eliminates f64 accumulation errors.
+                let clip_start = std::time::Instant::now();
+                let (clip_results, clip_stats) = clip_geometry_hierarchical_world(
+                    &base_simplified,
+                    &geom_bbox,
+                    config.min_zoom,
+                    config.max_zoom,
+                    config.buffer_pixels,
+                    config.extent,
+                );
+                result.time_clip = clip_start.elapsed();
+                result.clip_count = clip_stats.clip_ops;
+                result.tiles_touched = clip_stats.tiles_processed;
+
+                // Process clip results: validate, drop, serialize to bytes, create records
+                // Collect into a Vec first for deterministic ordering
+                let mut clip_entries: Vec<_> = clip_results.into_iter().collect();
+                clip_entries
+                    .sort_by(|(a, _), (b, _)| tile_id(a.z, a.x, a.y).cmp(&tile_id(b.z, b.x, b.y)));
+
+                for (tile_coord, clipped) in clip_entries {
+                    // Check dropping rules using WorldCoord-based functions
+                    let should_drop = match &clipped {
+                        WorldClippedGeometry::Point(_) => {
+                            // Point dropping uses feature index for density
+                            should_drop_point(
+                                &geo::Point::new(0.0, 0.0),
+                                tile_coord.z,
+                                config.max_zoom,
+                                feat_idx,
                             )
                         }
-                    }
-                    WorldClippedGeometry::MultiPolygon(polys) => {
-                        // When accumulation is enabled, don't drop tiny polygons here
-                        if config.enable_tiny_polygon_accumulation {
-                            false // Don't drop - will be handled by accumulator
-                        } else {
-                            polys.iter().all(|(ext, ints)| {
+                        WorldClippedGeometry::MultiPoint(points) => points.is_empty(),
+                        WorldClippedGeometry::LineString(coords) => {
+                            should_drop_tiny_line_world(coords, &tile_coord, config.extent, 1.0)
+                        }
+                        WorldClippedGeometry::MultiLineString(lines) => lines.iter().all(|line| {
+                            should_drop_tiny_line_world(line, &tile_coord, config.extent, 1.0)
+                        }),
+                        WorldClippedGeometry::Polygon {
+                            exterior,
+                            interiors,
+                        } => {
+                            // When accumulation is enabled, don't drop tiny polygons here -
+                            // they'll be accumulated in Phase 3 (encode_tile_from_raw)
+                            if config.enable_tiny_polygon_accumulation {
+                                false // Don't drop - will be handled by accumulator
+                            } else {
                                 should_drop_tiny_polygon_world(
-                                    ext,
-                                    ints,
+                                    exterior,
+                                    interiors,
                                     &tile_coord,
                                     config.extent,
                                     DEFAULT_TINY_POLYGON_THRESHOLD,
                                 )
-                            })
+                            }
                         }
+                        WorldClippedGeometry::MultiPolygon(polys) => {
+                            // When accumulation is enabled, don't drop tiny polygons here
+                            if config.enable_tiny_polygon_accumulation {
+                                false // Don't drop - will be handled by accumulator
+                            } else {
+                                polys.iter().all(|(ext, ints)| {
+                                    should_drop_tiny_polygon_world(
+                                        ext,
+                                        ints,
+                                        &tile_coord,
+                                        config.extent,
+                                        DEFAULT_TINY_POLYGON_THRESHOLD,
+                                    )
+                                })
+                            }
+                        }
+                    };
+
+                    if should_drop {
+                        continue;
                     }
-                };
 
-                if should_drop {
-                    continue;
+                    // Serialize WorldClippedGeometry to bytes (replacing WKB)
+                    let serialize_start = std::time::Instant::now();
+                    let geom_bytes = clipped.to_bytes();
+                    result.time_wkb += serialize_start.elapsed();
+
+                    // Create record with tile_id and coordinates
+                    let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
+                    let record = TileFeatureRecord::new(
+                        tid,
+                        tile_coord.z,
+                        tile_coord.x,
+                        tile_coord.y,
+                        feat_idx,
+                        geom_bytes,
+                        vec![], // Empty properties for now
+                    );
+
+                    result.records.push(record);
                 }
 
-                // Serialize WorldClippedGeometry to bytes (replacing WKB)
-                let serialize_start = std::time::Instant::now();
-                let geom_bytes = clipped.to_bytes();
-                result.time_wkb += serialize_start.elapsed();
+                result
+            };
 
-                // Create record with tile_id and coordinates
-                let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
-                let record = TileFeatureRecord::new(
-                    tid,
-                    tile_coord.z,
-                    tile_coord.x,
-                    tile_coord.y,
-                    feat_idx,
-                    geom_bytes,
-                    vec![], // Empty properties for now
-                );
+            // Use parallel or sequential geometry processing based on deterministic flag
+            let results: Vec<GeomResult> = if config.deterministic {
+                // SEQUENTIAL: For reproducible output
+                sorted
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, geom)| process_geometry(idx, geom))
+                    .collect()
+            } else {
+                // PARALLEL: For performance (default)
+                sorted
+                    .into_iter()
+                    .enumerate()
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .map(|(idx, geom)| process_geometry(idx, geom))
+                    .collect()
+            };
 
-                result.records.push(record);
-            }
+            // Aggregate all results and write to sorter
+            let mut time_clip = std::time::Duration::ZERO;
+            let mut time_simplify = std::time::Duration::ZERO;
+            let mut time_wkb = std::time::Duration::ZERO;
+            let mut time_sorter_add = std::time::Duration::ZERO;
+            let mut clip_count = 0u64;
+            let mut tiles_touched = 0u64;
 
-            result
-        };
+            for result in results {
+                time_clip += result.time_clip;
+                time_simplify += result.time_simplify;
+                time_wkb += result.time_wkb;
+                clip_count += result.clip_count;
+                tiles_touched += result.tiles_touched;
 
-        // Use parallel or sequential geometry processing based on deterministic flag
-        let results: Vec<GeomResult> = if config.deterministic {
-            // SEQUENTIAL: For reproducible output
-            sorted
-                .into_iter()
-                .enumerate()
-                .map(|(idx, geom)| process_geometry(idx, geom))
-                .collect()
-        } else {
-            // PARALLEL: For performance (default)
-            sorted
-                .into_iter()
-                .enumerate()
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .map(|(idx, geom)| process_geometry(idx, geom))
-                .collect()
-        };
-
-        // Aggregate all results and write to sorter
-        let mut time_clip = std::time::Duration::ZERO;
-        let mut time_simplify = std::time::Duration::ZERO;
-        let mut time_wkb = std::time::Duration::ZERO;
-        let mut time_sorter_add = std::time::Duration::ZERO;
-        let mut clip_count = 0u64;
-        let mut tiles_touched = 0u64;
-
-        for result in results {
-            time_clip += result.time_clip;
-            time_simplify += result.time_simplify;
-            time_wkb += result.time_wkb;
-            clip_count += result.clip_count;
-            tiles_touched += result.tiles_touched;
-
-            // Update global bounds
-            if let Some(bounds) = result.bounds {
-                global_bounds.lock().unwrap().expand(&bounds);
-            }
-
-            // Add records to sorter
-            let sorter_start = std::time::Instant::now();
-            {
-                let mut sorter_guard = sorter.lock().unwrap();
-                let mut tracker_guard = memory_tracker.lock().unwrap();
-                for record in result.records {
-                    let record_size = RECORD_FIXED_OVERHEAD + record.geometry_wkb.len();
-                    tracker_guard.add(record_size);
-                    sorter_guard.add(record);
-                    records_written.fetch_add(1, Ordering::Relaxed);
+                // Update global bounds
+                if let Some(bounds) = result.bounds {
+                    global_bounds.lock().unwrap().expand(&bounds);
                 }
+
+                // Add records to sorter
+                let sorter_start = std::time::Instant::now();
+                {
+                    let mut sorter_guard = sorter.lock().unwrap();
+                    let mut tracker_guard = memory_tracker.lock().unwrap();
+                    for record in result.records {
+                        let record_size = RECORD_FIXED_OVERHEAD + record.geometry_wkb.len();
+                        tracker_guard.add(record_size);
+                        sorter_guard.add(record);
+                        records_written.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                time_sorter_add += sorter_start.elapsed();
             }
-            time_sorter_add += sorter_start.elapsed();
-        }
 
-        geoms_processed.fetch_add(num_geoms as u64, Ordering::Relaxed);
+            geoms_processed.fetch_add(num_geoms as u64, Ordering::Relaxed);
 
-        // Log timing at debug level (use RUST_LOG=debug to see)
-        log::debug!(
+            // Log timing at debug level (use RUST_LOG=debug to see)
+            log::debug!(
             "RG {}: {:.2}s | sort={:.2}s clip={:.2}s ({} ops) simplify={:.2}s wkb={:.2}s sorter={:.2}s | tiles={}",
             rg_info.index,
             rg_start.elapsed().as_secs_f64(),
@@ -1234,8 +1243,9 @@ fn generate_tiles_to_writer_internal(
             tiles_touched,
         );
 
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     // After Phase 1, sorter memory is released when it starts sorting to disk
     // Reset current memory as records are now on disk during sort
@@ -2050,73 +2060,79 @@ pub fn generate_tiles_streaming_with_stats(
     // Clone config for closure
     let config_clone = config.clone();
 
-    // Step 4: Process each row group independently
-    process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
-        // Track memory for this row group
-        let row_group_mem: usize = geometries.iter().map(estimate_geometry_size).sum();
-        memory_tracker.add(row_group_mem);
+    // Step 4: Process each row group independently with parallel I/O
+    process_geometries_parallel(
+        input_path,
+        DEFAULT_PARALLEL_READERS,
+        |rg_info: RowGroupInfo, geometries| {
+            // Track memory for this row group
+            let row_group_mem: usize = geometries.iter().map(estimate_geometry_size).sum();
+            memory_tracker.add(row_group_mem);
 
-        // Check budget and log warning if exceeded
-        if memory_tracker.is_over_budget() {
-            memory_tracker.record_budget_exceeded();
-            log::warn!(
-                "Row group {} ({} features) exceeds memory budget: {} > {}",
-                rg_info.index,
-                rg_info.num_rows,
-                crate::memory::format_bytes(memory_tracker.current()),
-                crate::memory::format_bytes(memory_tracker.budget().unwrap_or(0))
-            );
-        }
-
-        // Sort geometries within this row group for better locality
-        let mut sorted = geometries;
-        sort_geometries(&mut sorted, config_clone.use_hilbert);
-
-        // For each geometry, use hierarchical clipping across all zoom levels.
-        // This clips from parent tile results instead of the original geometry,
-        // reducing redundant work. See issue #38.
-        for geom in sorted {
-            let geom_bbox = match geom.bounding_rect() {
-                Some(rect) => {
-                    TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
-                }
-                None => continue, // Skip geometries without bounds
-            };
-
-            // Pre-simplify at max zoom tolerance (consistent with production pipeline)
-            let simplified = simplify_for_zoom(&geom, config_clone.max_zoom, config_clone.extent);
-
-            // Hierarchical clipping: clip once at min_zoom, then clip parent
-            // results for child tiles at higher zoom levels
-            let (clip_results, _clip_stats) = crate::hierarchical_clip::clip_geometry_hierarchical(
-                &simplified,
-                &geom_bbox,
-                config_clone.min_zoom,
-                config_clone.max_zoom,
-                config_clone.buffer_pixels,
-                config_clone.extent,
-            );
-
-            for (tile_coord, clipped_geom) in clip_results {
-                // Track memory for accumulated (already clipped) geometry
-                let geom_size = estimate_geometry_size(&clipped_geom);
-                memory_tracker.add(geom_size);
-
-                // Store pre-clipped feature for this tile
-                tile_features
-                    .entry((tile_coord.z, tile_coord.x, tile_coord.y))
-                    .or_default()
-                    .push((clipped_geom, global_feature_index));
+            // Check budget and log warning if exceeded
+            if memory_tracker.is_over_budget() {
+                memory_tracker.record_budget_exceeded();
+                log::warn!(
+                    "Row group {} ({} features) exceeds memory budget: {} > {}",
+                    rg_info.index,
+                    rg_info.num_rows,
+                    crate::memory::format_bytes(memory_tracker.current()),
+                    crate::memory::format_bytes(memory_tracker.budget().unwrap_or(0))
+                );
             }
 
-            global_feature_index += 1;
-        }
+            // Sort geometries within this row group for better locality
+            let mut sorted = geometries;
+            sort_geometries(&mut sorted, config_clone.use_hilbert);
 
-        // "Free" the row group memory (geometries go out of scope after this closure)
-        memory_tracker.remove(row_group_mem);
+            // For each geometry, use hierarchical clipping across all zoom levels.
+            // This clips from parent tile results instead of the original geometry,
+            // reducing redundant work. See issue #38.
+            for geom in sorted {
+                let geom_bbox = match geom.bounding_rect() {
+                    Some(rect) => {
+                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
+                    }
+                    None => continue, // Skip geometries without bounds
+                };
 
-        Ok(())
-    })?;
+                // Pre-simplify at max zoom tolerance (consistent with production pipeline)
+                let simplified =
+                    simplify_for_zoom(&geom, config_clone.max_zoom, config_clone.extent);
+
+                // Hierarchical clipping: clip once at min_zoom, then clip parent
+                // results for child tiles at higher zoom levels
+                let (clip_results, _clip_stats) =
+                    crate::hierarchical_clip::clip_geometry_hierarchical(
+                        &simplified,
+                        &geom_bbox,
+                        config_clone.min_zoom,
+                        config_clone.max_zoom,
+                        config_clone.buffer_pixels,
+                        config_clone.extent,
+                    );
+
+                for (tile_coord, clipped_geom) in clip_results {
+                    // Track memory for accumulated (already clipped) geometry
+                    let geom_size = estimate_geometry_size(&clipped_geom);
+                    memory_tracker.add(geom_size);
+
+                    // Store pre-clipped feature for this tile
+                    tile_features
+                        .entry((tile_coord.z, tile_coord.x, tile_coord.y))
+                        .or_default()
+                        .push((clipped_geom, global_feature_index));
+                }
+
+                global_feature_index += 1;
+            }
+
+            // "Free" the row group memory (geometries go out of scope after this closure)
+            memory_tracker.remove(row_group_mem);
+
+            Ok(())
+        },
+    )?;
 
     // Step 5: Generate tiles from accumulated features
     let mut tiles: Vec<GeneratedTile> = Vec::new();

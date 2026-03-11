@@ -518,7 +518,8 @@ fn run_with_progress(
 
                 if let Some(ref pb) = *phase1_pb_clone.lock().unwrap() {
                     // Convert spinner to progress bar once we know the total
-                    if row_group == 0 {
+                    // row_group is now a completed count (1, 2, 3...) not an index
+                    if row_group == 1 {
                         pb.set_length(total_rg as u64);
                         pb.set_style(
                             ProgressStyle::default_bar()
@@ -527,7 +528,7 @@ fn run_with_progress(
                                 .progress_chars("█▓▒░  "),
                         );
                     }
-                    pb.set_position(row_group as u64 + 1);
+                    pb.set_position(row_group as u64);
                     pb.set_message(format!("{} records", format_number(records_written)));
                 }
             }

@@ -458,6 +458,192 @@ where
     Ok(())
 }
 
+/// Default number of parallel row group readers.
+/// 4 provides good parallelism without excessive memory usage.
+pub const DEFAULT_PARALLEL_READERS: usize = 4;
+
+/// Result from a parallel row group read operation.
+enum RowGroupReadResult {
+    /// Successfully read a row group
+    Ok {
+        info: RowGroupInfo,
+        geometries: Vec<Geometry<f64>>,
+    },
+    /// Error reading a row group
+    Err(Error),
+}
+
+/// Read a single row group from a GeoParquet file.
+///
+/// This function opens its own file handle, making it safe for parallel use.
+fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Vec<Geometry<f64>>)> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+    let parquet_reader = SerializedFileReader::new(
+        file.try_clone()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to clone file handle: {}", e)))?,
+    )
+    .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
+
+    let num_row_groups = parquet_reader.metadata().num_row_groups();
+    if rg_idx >= num_row_groups {
+        return Err(Error::GeoParquetRead(format!(
+            "Row group {} out of range (file has {})",
+            rg_idx, num_row_groups
+        )));
+    }
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+    let reader = builder
+        .with_row_groups(vec![rg_idx])
+        .build()
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+    let mut geometries = Vec::new();
+    let mut row_count = 0;
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+
+        let schema = batch.schema();
+        let geom_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+            .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+
+        let geom_col = batch.column(geom_idx);
+        let geom_field = schema.field(geom_idx);
+
+        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), geom_field)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e)))?;
+
+        extract_geometries_from_array(geom_array.as_ref(), &mut geometries)?;
+        row_count += batch.num_rows();
+    }
+
+    Ok((
+        RowGroupInfo {
+            index: rg_idx,
+            num_rows: row_count,
+        },
+        geometries,
+    ))
+}
+
+/// Process geometries from a GeoParquet file with parallel row group reading.
+///
+/// Spawns multiple reader threads that read and decompress row groups in parallel,
+/// sending results through a bounded channel. This provides parallelism in decompression
+/// while the consumer processes results.
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file
+/// * `num_readers` - Number of parallel reader threads
+/// * `callback` - Function called for each row group's geometries
+///
+/// # Returns
+///
+/// Total number of geometries processed
+#[instrument(name = "read_parquet_parallel", skip(callback), fields(path = %path.display(), num_readers))]
+pub fn process_geometries_parallel<F>(
+    path: &Path,
+    num_readers: usize,
+    mut callback: F,
+) -> Result<usize>
+where
+    F: FnMut(RowGroupInfo, Vec<Geometry<f64>>) -> Result<()>,
+{
+    use crossbeam_channel::bounded;
+
+    let num_row_groups = get_row_group_count(path)?;
+
+    if num_row_groups == 0 {
+        return Ok(0);
+    }
+
+    let num_readers = num_readers.max(1).min(num_row_groups);
+
+    // Bounded channel for results - limits memory to ~(num_readers + buffer) row groups
+    let (tx, rx) = bounded::<RowGroupReadResult>(num_readers * 2);
+
+    // Work queue - row group indices to process
+    let (work_tx, work_rx) = bounded::<usize>(num_row_groups);
+
+    // Fill work queue with all row group indices
+    for rg_idx in 0..num_row_groups {
+        work_tx.send(rg_idx).unwrap();
+    }
+    drop(work_tx); // Close work queue so workers know when to stop
+
+    // Spawn reader threads (NOT using rayon - dedicated threads avoid deadlock)
+    let mut reader_handles = Vec::with_capacity(num_readers);
+    for _ in 0..num_readers {
+        let work_rx = work_rx.clone();
+        let tx = tx.clone();
+        let path_owned = path.to_path_buf();
+
+        let handle = std::thread::spawn(move || {
+            // Each thread pulls work from the queue until empty
+            for rg_idx in work_rx {
+                let result = match read_single_row_group(&path_owned, rg_idx) {
+                    Ok((info, geometries)) => RowGroupReadResult::Ok { info, geometries },
+                    Err(e) => RowGroupReadResult::Err(e),
+                };
+                // Stop if receiver disconnected
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        reader_handles.push(handle);
+    }
+
+    // Drop our copy of tx so channel closes when all workers finish
+    drop(tx);
+
+    // Consumer: receive row groups and call callback
+    // Row groups may arrive out of order due to parallel reads
+    let mut total_processed = 0;
+    let mut first_error: Option<Error> = None;
+
+    for result in rx {
+        match result {
+            RowGroupReadResult::Ok { info, geometries } => {
+                let geom_count = geometries.len();
+                if let Err(e) = callback(info, geometries) {
+                    first_error = Some(e);
+                    break;
+                }
+                total_processed += geom_count;
+            }
+            RowGroupReadResult::Err(e) => {
+                first_error = Some(e);
+                break;
+            }
+        }
+    }
+
+    // Wait for all reader threads
+    for handle in reader_handles {
+        let _ = handle.join();
+    }
+
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+
+    Ok(total_processed)
+}
+
 /// Get the number of row groups in a GeoParquet file.
 pub fn get_row_group_count(path: &Path) -> Result<usize> {
     use parquet::file::reader::FileReader;
@@ -793,5 +979,163 @@ mod tests {
             "Should process all row groups"
         );
         assert!(total_rows > 0, "Should have processed some rows");
+    }
+
+    // ==================== Parallel Reader Tests ====================
+
+    /// Test that parallel reader produces the same geometry count as sequential reader.
+    #[test]
+    fn test_parallel_reader_same_count_as_sequential() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Count with sequential reader
+        let mut sequential_count = 0;
+        process_geometries_by_row_group(fixture, |_info, geoms| {
+            sequential_count += geoms.len();
+            Ok(())
+        })
+        .expect("Sequential processing should succeed");
+
+        // Count with parallel reader
+        let mut parallel_count = 0;
+        process_geometries_parallel(fixture, DEFAULT_PARALLEL_READERS, |_info, geoms| {
+            parallel_count += geoms.len();
+            Ok(())
+        })
+        .expect("Parallel processing should succeed");
+
+        assert_eq!(
+            sequential_count, parallel_count,
+            "Parallel reader should produce same geometry count as sequential"
+        );
+    }
+
+    /// Test that parallel reader processes all row groups.
+    #[test]
+    fn test_parallel_reader_processes_all_row_groups() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let expected_count = get_row_group_count(fixture).expect("Should get row group count");
+        let processed_indices = std::sync::Mutex::new(Vec::new());
+
+        process_geometries_parallel(fixture, DEFAULT_PARALLEL_READERS, |info, _geoms| {
+            processed_indices.lock().unwrap().push(info.index);
+            Ok(())
+        })
+        .expect("Parallel processing should succeed");
+
+        let mut indices = processed_indices.into_inner().unwrap();
+        indices.sort(); // Row groups may arrive out of order
+
+        let expected_indices: Vec<usize> = (0..expected_count).collect();
+        assert_eq!(
+            indices, expected_indices,
+            "All row groups should be processed"
+        );
+    }
+
+    /// Test that parallel reader handles single row group files.
+    #[test]
+    fn test_parallel_reader_single_row_group() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let rg_count = get_row_group_count(fixture).expect("Should get row group count");
+        if rg_count != 1 {
+            eprintln!("Skipping: fixture has {} row groups, expected 1", rg_count);
+            return;
+        }
+
+        let mut processed = 0;
+        let result =
+            process_geometries_parallel(fixture, DEFAULT_PARALLEL_READERS, |_info, geoms| {
+                processed += geoms.len();
+                Ok(())
+            });
+
+        assert!(result.is_ok(), "Should handle single row group");
+        assert!(processed > 0, "Should process geometries");
+    }
+
+    /// Test that parallel reader propagates errors from callback.
+    #[test]
+    fn test_parallel_reader_callback_error_propagation() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let result =
+            process_geometries_parallel(fixture, DEFAULT_PARALLEL_READERS, |_info, _geoms| {
+                Err(Error::GeoParquetRead("Test error".to_string()))
+            });
+
+        assert!(result.is_err(), "Should propagate callback error");
+    }
+
+    /// Test that parallel reader works with num_readers = 1 (effectively sequential).
+    #[test]
+    fn test_parallel_reader_single_reader() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let mut count = 0;
+        let result = process_geometries_parallel(fixture, 1, |_info, geoms| {
+            count += geoms.len();
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "Should work with single reader");
+        assert!(count > 0, "Should process geometries");
+    }
+
+    /// Test that parallel reader handles large num_readers gracefully.
+    #[test]
+    fn test_parallel_reader_many_readers() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Request more readers than row groups
+        let mut count = 0;
+        let result = process_geometries_parallel(fixture, 100, |_info, geoms| {
+            count += geoms.len();
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "Should handle more readers than row groups");
+        assert!(count > 0, "Should process geometries");
+    }
+
+    /// Test that read_single_row_group returns error for invalid index.
+    #[test]
+    fn test_read_single_row_group_invalid_index() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let num_rg = get_row_group_count(fixture).expect("Should get count");
+        let result = read_single_row_group(fixture, num_rg + 100);
+
+        assert!(result.is_err(), "Should error on invalid row group index");
     }
 }
