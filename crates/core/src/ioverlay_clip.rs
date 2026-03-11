@@ -117,7 +117,7 @@ fn ioverlay_to_geometry(shapes: IOverlayShapes) -> Option<Geometry<f64>> {
 
     let polygons: Vec<Polygon<f64>> = valid_shapes
         .into_iter()
-        .filter_map(|shape| ioverlay_shape_to_polygon(shape))
+        .filter_map(ioverlay_shape_to_polygon)
         .collect();
 
     match polygons.len() {
@@ -142,7 +142,7 @@ fn ioverlay_shape_to_polygon(shape: IOverlayShape) -> Option<Polygon<f64>> {
     // Convert holes
     let holes: Vec<LineString<f64>> = shape[1..]
         .iter()
-        .filter_map(|contour| contour_to_linestring(contour))
+        .filter_map(contour_to_linestring)
         .collect();
 
     Some(Polygon::new(exterior, holes))
@@ -253,7 +253,7 @@ pub fn clip_multipolygon_ioverlay(
     bounds: &TileBounds,
 ) -> Option<Geometry<f64>> {
     // Convert all polygons to i_overlay format
-    let subj_shapes: Vec<IOverlayShape> = multi.0.iter().map(|p| polygon_to_ioverlay(p)).collect();
+    let subj_shapes: Vec<IOverlayShape> = multi.0.iter().map(polygon_to_ioverlay).collect();
 
     if subj_shapes.is_empty() {
         return None;

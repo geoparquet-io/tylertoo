@@ -7,7 +7,7 @@
 //!
 //! If these tests pass, wagyu may not have been necessary.
 
-use geo::{Coord, Geometry, LineString, Polygon};
+use geo::{Coord, LineString, Polygon};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::overlay::FloatOverlay;
