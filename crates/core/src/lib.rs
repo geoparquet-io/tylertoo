@@ -52,6 +52,7 @@ mod golden;
 pub mod hierarchical_clip;
 #[cfg(test)]
 mod integration_tests;
+pub mod ioverlay_clip;
 pub mod memory;
 pub mod mvt;
 pub mod pipeline;
@@ -63,7 +64,6 @@ pub mod spatial_index;
 pub mod sutherland_hodgman;
 pub mod tile;
 pub mod validate;
-pub mod wagyu_clip;
 pub mod wkb;
 pub mod world_coord;
 

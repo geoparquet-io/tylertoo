@@ -7,7 +7,7 @@
 //!
 //! When first written, these tests FAIL because Sutherland-Hodgman cannot
 //! handle self-intersecting polygons correctly. After implementing the
-//! wagyu fallback (issue #94), they should PASS.
+//! i_overlay fallback (issue #94), they should PASS.
 
 use geo::{Coord, Geometry, LineString, Polygon};
 use gpq_tiles_core::clip::clip_geometry;
@@ -133,7 +133,7 @@ fn cross_product_sign(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>) -> f64 {
 /// When clipped, S-H produces a self-touching polygon where the two "lobes"
 /// meet at a single point. This is geometrically invalid for vector tiles.
 ///
-/// Expected behavior after fix: wagyu fallback produces a valid MultiPolygon
+/// Expected behavior after fix: i_overlay fallback produces a valid MultiPolygon
 /// with the two lobes as separate polygons.
 #[test]
 fn test_self_intersecting_polygon_produces_valid_output() {
@@ -176,7 +176,7 @@ fn test_self_intersecting_polygon_produces_valid_output() {
 /// Test: Polygon with hole that intersects exterior ring
 ///
 /// This is topologically invalid - the hole extends outside the exterior.
-/// S-H doesn't handle this case; wagyu should produce a valid result.
+/// S-H doesn't handle this case; i_overlay should produce a valid result.
 #[test]
 fn test_hole_intersecting_exterior_produces_valid_output() {
     let poly = load_geojson_polygon(
@@ -221,7 +221,7 @@ fn test_hole_intersecting_exterior_produces_valid_output() {
 ///
 /// S-H produces a single polygon that traces along the clip boundary.
 ///
-/// Fixed in wagyu-rs v0.2.1 - the clip operation now correctly produces
+/// Fixed in i_overlay-rs v0.2.1 - the clip operation now correctly produces
 /// two separate polygons for U-shapes that are split by the clip boundary.
 #[test]
 fn test_u_shape_split_produces_multipolygon() {

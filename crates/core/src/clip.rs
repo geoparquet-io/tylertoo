@@ -14,7 +14,7 @@
 //!   tile boundaries (same approach as tippecanoe's clip.cpp). This is O(n) and
 //!   specialized for rectangle clipping. For edge cases where S-H produces invalid
 //!   output (self-intersecting polygons, U-shapes that split), we fall back to
-//!   wagyu's robust Vatti algorithm.
+//!   i_overlay's robust boolean operations.
 //!
 //! # Edge Case Handling (Issue #94)
 //!
@@ -24,7 +24,7 @@
 //! - Polygons with holes that intersect the exterior ring
 //!
 //! When S-H produces output with structural issues (detected via cheap O(n) checks),
-//! we fall back to wagyu which handles these cases correctly.
+//! we fall back to i_overlay which handles these cases correctly.
 //!
 //! See: https://github.com/felt/tippecanoe (clipping documentation)
 
@@ -33,9 +33,9 @@ use geo::{
     Polygon, Rect,
 };
 
+use crate::ioverlay_clip;
 use crate::sutherland_hodgman;
 use crate::tile::TileBounds;
-use crate::wagyu_clip;
 
 /// Default buffer in pixels (matches tippecanoe's common usage)
 /// Tippecanoe default is 5, but CLAUDE.md specifies 8 for this project
@@ -389,20 +389,20 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
     }
 }
 
-/// Clip a polygon to bounds using hybrid S-H + wagyu approach.
+/// Clip a polygon to bounds using hybrid S-H + i_overlay approach.
 ///
 /// Primary: Sutherland-Hodgman for O(n) clipping against axis-aligned tile boundaries.
-/// Fallback: Wagyu Vatti algorithm for edge cases S-H can't handle.
+/// Fallback: i_overlay boolean operations for edge cases S-H can't handle.
 ///
 /// # Algorithm Selection (Issue #94)
 ///
 /// 1. Try Sutherland-Hodgman first (fast, O(n))
 /// 2. Check result for structural issues (cheap O(n) validation)
-/// 3. If issues found, fall back to wagyu (robust, O(n log n))
+/// 3. If issues found, fall back to i_overlay (robust, O(n log n))
 ///
 /// This gives us the best of both worlds:
 /// - 99%+ of polygons use fast S-H path
-/// - Edge cases (self-intersecting, U-shapes) get correct results via wagyu
+/// - Edge cases (self-intersecting, U-shapes) get correct results via i_overlay
 ///
 /// # DIVERGENCE FROM TIPPECANOE: coordinate space
 /// Tippecanoe operates in integer tile coordinates (0-4096).
@@ -419,8 +419,8 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
     }
 
     // Check if input polygon has structural issues (self-intersecting, etc.)
-    // If so, we MUST use wagyu even for "fully inside" polygons because
-    // wagyu will repair the geometry while S-H cannot.
+    // If so, we MUST use i_overlay even for "fully inside" polygons because
+    // i_overlay will repair the geometry while S-H cannot.
     let input_has_issues = has_structural_issues(poly);
 
     // FAST PATH: If polygon is fully inside bounds AND valid, return as-is
@@ -428,10 +428,10 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         return Some(Geometry::Polygon(poly.clone()));
     }
 
-    // If input has structural issues, go directly to wagyu (skip S-H)
-    // Wagyu handles self-intersecting polygons by splitting them into valid parts
+    // If input has structural issues, go directly to i_overlay (skip S-H)
+    // i_overlay handles self-intersecting polygons by splitting them into valid parts
     if input_has_issues {
-        return wagyu_clip::clip_polygon_wagyu(poly, bounds, DEFAULT_EXTENT);
+        return ioverlay_clip::clip_polygon_ioverlay(poly, bounds);
     }
 
     // Primary path: Use Sutherland-Hodgman for O(n) rectangle clipping
@@ -445,7 +445,7 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
             if geometry_has_structural_issues(sh_result.as_ref().unwrap())
                 || has_boundary_connecting_edges(p, bounds)
             {
-                wagyu_clip::clip_polygon_wagyu(poly, bounds, DEFAULT_EXTENT)
+                ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
             } else {
                 sh_result
             }
@@ -456,7 +456,7 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
                 mp.0.iter()
                     .any(|p| has_structural_issues(p) || has_boundary_connecting_edges(p, bounds));
             if has_issues {
-                wagyu_clip::clip_polygon_wagyu(poly, bounds, DEFAULT_EXTENT)
+                ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
             } else {
                 sh_result
             }
@@ -1010,7 +1010,7 @@ mod tests {
     fn test_bbox_prefilter_large_polygon_preclip() {
         // A single large polygon spanning a huge area (-180 to +180 longitude)
         // is clipped to a small 10-degree tile. The pre-clip optimization should
-        // reduce the coordinate count before sending to the expensive wagyu clipper.
+        // reduce the coordinate count before sending to the expensive i_overlay clipper.
         let tile_bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
 
         // Build a large polygon with many coordinates spanning the entire globe.
@@ -1215,10 +1215,9 @@ mod tests {
     fn test_clip_polygon_u_shape() {
         // U-shaped polygon clipped by a horizontal band.
         //
-        // DIVERGENCE FROM WAGYU: Sutherland-Hodgman does not split disconnected
-        // parts into separate polygons. It produces a single (possibly self-touching)
-        // polygon. For tile rendering, this is acceptable and matches tippecanoe's
-        // Sutherland-Hodgman behavior in clip.cpp.
+        // With i_overlay, clipping correctly produces two separate polygons
+        // (the two arms of the U) as a MultiPolygon. This is the geometrically
+        // correct result and avoids the self-touching polygon that S-H produces.
         let bounds = TileBounds::new(0.0, 4.0, 10.0, 6.0); // Horizontal band
 
         // U-shape: two vertical bars connected at the bottom
@@ -1241,10 +1240,32 @@ mod tests {
         let result = clip_polygon(&u_shape, &bounds);
         assert!(result.is_some(), "U-shape should intersect the band");
 
-        // Should produce a Polygon (SH produces a single polygon, not MultiPolygon)
+        // i_overlay correctly produces a MultiPolygon with 2 separate polygons
         match result.unwrap() {
+            Geometry::MultiPolygon(mp) => {
+                assert_eq!(
+                    mp.0.len(),
+                    2,
+                    "U-shape clipped should produce 2 separate polygons"
+                );
+                // Verify all coords within bounds for each polygon
+                for p in mp.0.iter() {
+                    for coord in p.exterior().coords() {
+                        assert!(
+                            coord.x >= 0.0 && coord.x <= 10.0,
+                            "x={} out of bounds",
+                            coord.x
+                        );
+                        assert!(
+                            coord.y >= 4.0 - 1e-10 && coord.y <= 6.0 + 1e-10,
+                            "y={} out of bounds",
+                            coord.y
+                        );
+                    }
+                }
+            }
             Geometry::Polygon(p) => {
-                // Verify all coords within bounds
+                // Also acceptable if i_overlay produces single valid polygon
                 for coord in p.exterior().coords() {
                     assert!(
                         coord.x >= 0.0 && coord.x <= 10.0,
@@ -1258,7 +1279,7 @@ mod tests {
                     );
                 }
             }
-            other => panic!("Expected Polygon, got {:?}", other),
+            other => panic!("Expected Polygon or MultiPolygon, got {:?}", other),
         }
     }
 

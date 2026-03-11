@@ -1,13 +1,13 @@
-//! Performance test for Sutherland-Hodgman vs wagyu on huge polygons.
+//! Performance test for Sutherland-Hodgman vs i_overlay on huge polygons.
 //!
 //! Run: cargo test --release -p gpq-tiles-core --test huge_polygon_clip -- --ignored --nocapture
 //!
-//! The 316k-coord polygon should clip in <0.1s with SH (vs ~10s with wagyu).
+//! The 316k-coord polygon should clip in <0.1s with SH (vs ~1-2s with i_overlay).
 
 use geo::Polygon;
 use gpq_tiles_core::clip;
+use gpq_tiles_core::ioverlay_clip::clip_polygon_ioverlay;
 use gpq_tiles_core::tile::TileBounds;
-use gpq_tiles_core::wagyu_clip::{clip_polygon_wagyu, DEFAULT_EXTENT};
 use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
@@ -29,7 +29,7 @@ fn load_huge_polygon() -> Option<Polygon<f64>> {
 
 #[test]
 #[ignore]
-fn clip_huge_polygon_with_wagyu() {
+fn clip_huge_polygon_with_ioverlay() {
     let poly = match load_huge_polygon() {
         Some(p) => p,
         None => {
@@ -39,7 +39,7 @@ fn clip_huge_polygon_with_wagyu() {
         }
     };
 
-    println!("=== Huge Polygon Clip Test (Wagyu) ===");
+    println!("=== Huge Polygon Clip Test (i_overlay) ===");
     println!("Polygon: {} exterior coords", poly.exterior().0.len());
     println!(
         "Polygon bounds: {:?}",
@@ -49,12 +49,12 @@ fn clip_huge_polygon_with_wagyu() {
     let tile_bounds = TileBounds::new(-67.50, -66.51, -56.25, -61.61);
     println!("\nTile bounds: {:?}", tile_bounds);
 
-    println!("\nClipping with wagyu (this may take a while)...");
+    println!("\nClipping with i_overlay...");
     let start = Instant::now();
-    let result = clip_polygon_wagyu(&poly, &tile_bounds, DEFAULT_EXTENT);
+    let result = clip_polygon_ioverlay(&poly, &tile_bounds);
     let elapsed = start.elapsed();
 
-    println!("Wagyu clip time: {:.3}s", elapsed.as_secs_f64());
+    println!("i_overlay clip time: {:.3}s", elapsed.as_secs_f64());
     println!(
         "Result: {:?}",
         result.as_ref().map(|g| match g {
@@ -66,13 +66,6 @@ fn clip_huge_polygon_with_wagyu() {
             _ => "Other",
         })
     );
-
-    if elapsed.as_secs_f64() > 10.0 {
-        println!("\nCONFIRMED: Wagyu is pathologically slow on this geometry");
-        println!("   Shapely baseline: 0.02s");
-        println!("   Wagyu actual: {:.1}s", elapsed.as_secs_f64());
-        println!("   Slowdown: {:.0}x", elapsed.as_secs_f64() / 0.02);
-    }
 }
 
 #[test]

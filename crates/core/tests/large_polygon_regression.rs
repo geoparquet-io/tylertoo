@@ -1,7 +1,7 @@
 //! Regression test for large polygon conversion performance.
 //!
 //! This test ensures that conversion of files with large/complex polygons
-//! completes in a reasonable time. It catches regressions like the wagyu
+//! completes in a reasonable time. It catches regressions like the i_overlay
 //! pathological slowdown that was fixed by switching to Sutherland-Hodgman.
 //!
 //! Run with: cargo test --release -p gpq-tiles-core --test large_polygon_regression -- --nocapture

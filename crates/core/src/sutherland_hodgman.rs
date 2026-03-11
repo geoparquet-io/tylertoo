@@ -1,7 +1,7 @@
 //! Sutherland-Hodgman polygon clipping for axis-aligned rectangles.
 //!
 //! This module implements the Sutherland-Hodgman algorithm for clipping polygons
-//! against axis-aligned rectangular bounds. Unlike wagyu's Vatti algorithm which
+//! against axis-aligned rectangular bounds. Unlike i_overlay's Vatti algorithm which
 //! handles general polygon boolean operations, Sutherland-Hodgman is specialized
 //! for rectangle clipping and runs in O(n) time per edge (O(4n) = O(n) total).
 //!
@@ -181,7 +181,7 @@ fn clip_ring(ring: &[Coord<f64>], bounds: &TileBounds) -> Vec<Coord<f64>> {
 /// Returns `None` if the polygon doesn't intersect the bounds.
 /// Returns `Geometry::Polygon` for a single polygon result.
 ///
-/// Note: Unlike Vatti/wagyu, Sutherland-Hodgman does NOT split a polygon into
+/// Note: Unlike Vatti/i_overlay, Sutherland-Hodgman does NOT split a polygon into
 /// multiple disconnected parts. A U-shape clipped across its opening will produce
 /// a single (possibly self-intersecting) polygon, not two separate polygons.
 /// For tile rendering purposes, this is acceptable and matches tippecanoe's behavior.
@@ -1084,7 +1084,7 @@ mod tests {
         // but it MUST complete quickly
         assert!(
             elapsed.as_secs_f64() < 0.5,
-            "Clipping {} vertices took {:.3}s (should be <0.5s, wagyu took ~10s)",
+            "Clipping {} vertices took {:.3}s (should be <0.5s, i_overlay took ~10s)",
             n,
             elapsed.as_secs_f64()
         );
