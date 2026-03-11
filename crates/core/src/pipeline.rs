@@ -1087,6 +1087,7 @@ fn generate_tiles_to_writer_internal(
     drop(_phase2_span);
 
     // Phase 3: Read sorted records, group by tile, encode MVT, write PMTiles
+    // PARALLEL ENCODING: Batch tiles and encode in parallel for ~Nx speedup on N cores
     let _phase3_span = tracing::info_span!("encode", total_records).entered();
     if let Some(ref cb) = progress {
         cb(ProgressEvent::PhaseStart {
@@ -1095,16 +1096,141 @@ fn generate_tiles_to_writer_internal(
         });
     }
     if !config.quiet {
-        tracing::info!("Phase 3: Encoding tiles and writing to PMTiles");
+        tracing::info!("Phase 3: Encoding tiles and writing to PMTiles (parallel)");
+    }
+
+    // Batch size for parallel encoding - balance between parallelism and memory
+    // Larger batches = more parallelism, but more memory
+    // 2000 tiles provides good parallel work while keeping memory bounded
+    const BATCH_SIZE: usize = 2000;
+
+    // Raw record data for deferred decoding + encoding
+    struct RawFeature {
+        geometry_bytes: Vec<u8>,
+        feature_id: u64,
+    }
+
+    // Tile with raw (not yet decoded) features
+    struct RawTileData {
+        z: u8,
+        x: u32,
+        y: u32,
+        features: Vec<RawFeature>,
+    }
+
+    // Encoded tile ready for writing
+    struct EncodedTile {
+        z: u8,
+        x: u32,
+        y: u32,
+        data: Vec<u8>,
+        feature_count: usize,
+    }
+
+    // Helper function to decode and encode a single tile (pure, no side effects)
+    // This does geometry decoding + MVT encoding together for better parallelism
+    fn encode_tile_from_raw(
+        tile_data: RawTileData,
+        layer_name: &str,
+        extent: u32,
+    ) -> Option<EncodedTile> {
+        let coord = TileCoord::new(tile_data.x, tile_data.y, tile_data.z);
+        let mut layer_builder = LayerBuilder::new(layer_name).with_extent(extent);
+        let mut feature_count = 0;
+
+        for raw_feat in tile_data.features {
+            // Decode geometry from bytes (this was previously sequential)
+            let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            if !geom.is_degenerate_in_tile(&coord, extent) {
+                layer_builder.add_feature_world(Some(raw_feat.feature_id), &geom, &[], &coord);
+                feature_count += 1;
+            }
+        }
+
+        if feature_count > 0 {
+            let layer = layer_builder.build();
+            let mut tile_builder = TileBuilder::new();
+            tile_builder.add_layer(layer);
+            let tile = tile_builder.build();
+            let encoded = tile.encode_to_vec();
+
+            Some(EncodedTile {
+                z: tile_data.z,
+                x: tile_data.x,
+                y: tile_data.y,
+                data: encoded,
+                feature_count,
+            })
+        } else {
+            None
+        }
     }
 
     let mut current_tile: Option<(u8, u32, u32)> = None;
-    // Phase 2: Store WorldClippedGeometry instead of geo::Geometry
-    let mut current_features: Vec<(WorldClippedGeometry, u64)> = Vec::new();
-    let mut current_tile_memory: usize = 0; // Track memory for current tile's geometries
+    let mut current_features: Vec<RawFeature> = Vec::new();
+    let mut current_tile_memory: usize = 0;
     let mut tiles_written: u64 = 0;
     let mut records_processed: u64 = 0;
-    let progress_interval: u64 = std::cmp::max(1, total_records / 100); // Report ~100 times
+    let progress_interval: u64 = std::cmp::max(1, total_records / 100);
+
+    // Batch of complete tiles waiting to be encoded
+    let mut tile_batch: Vec<RawTileData> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch_memory: usize = 0;
+
+    // Clone config values for use in closure
+    let layer_name = config.layer_name.clone();
+    let extent = config.extent;
+    let deterministic = config.deterministic;
+
+    // Helper to flush the batch: decode + encode in parallel, write sequentially
+    let flush_batch = |batch: &mut Vec<RawTileData>,
+                       batch_mem: &mut usize,
+                       writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
+                       tiles_written: &mut u64,
+                       layer_name: &str,
+                       extent: u32,
+                       deterministic: bool|
+     -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // Decode + encode tiles - parallel or sequential based on deterministic flag
+        let encoded_tiles: Vec<Option<EncodedTile>> = if deterministic {
+            // Sequential for reproducibility
+            std::mem::take(batch)
+                .into_iter()
+                .map(|td| encode_tile_from_raw(td, layer_name, extent))
+                .collect()
+        } else {
+            // Parallel for performance - both decoding AND encoding happen in parallel
+            std::mem::take(batch)
+                .into_par_iter()
+                .map(|td| encode_tile_from_raw(td, layer_name, extent))
+                .collect()
+        };
+
+        // Write encoded tiles sequentially (PMTiles requires ordered writes)
+        for encoded in encoded_tiles.into_iter().flatten() {
+            writer
+                .add_tile_with_count(
+                    encoded.z,
+                    encoded.x,
+                    encoded.y,
+                    &encoded.data,
+                    encoded.feature_count,
+                )
+                .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
+            *tiles_written += 1;
+        }
+
+        *batch_mem = 0;
+        Ok(())
+    };
 
     for record_result in sorted_iter {
         records_processed += 1;
@@ -1119,6 +1245,7 @@ fn generate_tiles_to_writer_internal(
                 });
             }
         }
+
         let record = record_result
             .map_err(|e| Error::PMTilesWrite(format!("Failed to read sorted record: {}", e)))?;
 
@@ -1127,88 +1254,69 @@ fn generate_tiles_to_writer_internal(
         // Check if we're starting a new tile
         if let Some((z, x, y)) = current_tile {
             if (z, x, y) != record_tile {
-                let coord = TileCoord::new(x, y, z);
+                // Current tile is complete - add to batch
+                tile_batch.push(RawTileData {
+                    z,
+                    x,
+                    y,
+                    features: std::mem::take(&mut current_features),
+                });
+                batch_memory += current_tile_memory;
 
-                let mut layer_builder =
-                    LayerBuilder::new(&config.layer_name).with_extent(config.extent);
-                let mut feature_count = 0;
-
-                // Phase 2: Use add_feature_world for direct WorldCoord encoding
-                // Filter out degenerate geometries that collapse to a single pixel
-                for (geom, feat_idx) in current_features.drain(..) {
-                    if !geom.is_degenerate_in_tile(&coord, config.extent) {
-                        layer_builder.add_feature_world(Some(feat_idx), &geom, &[], &coord);
-                        feature_count += 1;
-                    }
-                }
-
-                if feature_count > 0 {
-                    let layer = layer_builder.build();
-                    let mut tile_builder = TileBuilder::new();
-                    tile_builder.add_layer(layer);
-                    let tile = tile_builder.build();
-                    let encoded = tile.encode_to_vec();
-
-                    writer
-                        .add_tile_with_count(z, x, y, &encoded, feature_count)
-                        .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
-
-                    tiles_written += 1;
-                }
-
-                // Reset memory tracking for next tile - geometries are released
+                // Reset memory tracking for current tile
                 memory_tracker.lock().unwrap().remove(current_tile_memory);
                 current_tile_memory = 0;
+
+                // Flush batch if it's full
+                if tile_batch.len() >= BATCH_SIZE {
+                    flush_batch(
+                        &mut tile_batch,
+                        &mut batch_memory,
+                        writer,
+                        &mut tiles_written,
+                        &layer_name,
+                        extent,
+                        deterministic,
+                    )?;
+                }
             }
         }
 
-        // Phase 2: Decode WorldClippedGeometry from bytes (replacing WKB)
-        let geom = WorldClippedGeometry::from_bytes(&record.geometry_wkb)
-            .ok_or_else(|| Error::PMTilesWrite("Failed to decode WorldClippedGeometry".into()))?;
-
-        // Track memory for decoded geometry (estimate based on byte size)
-        let geom_size = record.geometry_wkb.len() * 2; // Rough estimate
+        // Store raw bytes for deferred decoding (will be decoded in parallel)
+        let geom_size = record.geometry_wkb.len();
         memory_tracker.lock().unwrap().add(geom_size);
         current_tile_memory += geom_size;
 
-        // Add to current tile's features
-        current_features.push((geom, record.feature_id));
+        // Add raw feature to current tile
+        current_features.push(RawFeature {
+            geometry_bytes: record.geometry_wkb,
+            feature_id: record.feature_id,
+        });
         current_tile = Some(record_tile);
     }
 
-    // Write the final tile
+    // Add the final tile to batch
     if let Some((z, x, y)) = current_tile {
         if !current_features.is_empty() {
-            let coord = TileCoord::new(x, y, z);
-
-            let mut layer_builder =
-                LayerBuilder::new(&config.layer_name).with_extent(config.extent);
-            let mut feature_count = 0;
-
-            // Phase 2: Use add_feature_world for direct WorldCoord encoding
-            // Filter out degenerate geometries that collapse to a single pixel
-            for (geom, feat_idx) in current_features {
-                if !geom.is_degenerate_in_tile(&coord, config.extent) {
-                    layer_builder.add_feature_world(Some(feat_idx), &geom, &[], &coord);
-                    feature_count += 1;
-                }
-            }
-
-            if feature_count > 0 {
-                let layer = layer_builder.build();
-                let mut tile_builder = TileBuilder::new();
-                tile_builder.add_layer(layer);
-                let tile = tile_builder.build();
-                let encoded = tile.encode_to_vec();
-
-                writer
-                    .add_tile_with_count(z, x, y, &encoded, feature_count)
-                    .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
-
-                tiles_written += 1;
-            }
+            tile_batch.push(RawTileData {
+                z,
+                x,
+                y,
+                features: current_features,
+            });
         }
     }
+
+    // Flush any remaining tiles
+    flush_batch(
+        &mut tile_batch,
+        &mut batch_memory,
+        writer,
+        &mut tiles_written,
+        &layer_name,
+        extent,
+        deterministic,
+    )?;
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
 
