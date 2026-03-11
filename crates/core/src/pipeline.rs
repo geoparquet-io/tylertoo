@@ -3253,7 +3253,7 @@ mod tracing_tests {
 
         let config = TilerConfig::new(0, 4).with_quiet(true);
 
-        let tiles: Result<Vec<GeneratedTile>> = generate_tiles_streaming(&fixture_path, &config);
+        let tiles: Result<Vec<GeneratedTile>> = generate_tiles_streaming(fixture_path, &config);
         assert!(tiles.is_ok());
 
         // Verify the "pipeline" span was entered
@@ -3270,7 +3270,7 @@ mod tracing_tests {
         }
 
         let config = TilerConfig::new(0, 4).with_quiet(true);
-        let _ = generate_tiles_streaming(&fixture_path, &config);
+        let _ = generate_tiles_streaming(fixture_path, &config);
 
         // row_group spans are emitted during row group processing
         assert!(logs_contain("row_group"));
@@ -3286,7 +3286,7 @@ mod tracing_tests {
         }
 
         let config = TilerConfig::new(0, 4).with_quiet(true);
-        let _ = generate_tiles_streaming(&fixture_path, &config);
+        let _ = generate_tiles_streaming(fixture_path, &config);
 
         // read_parquet span is emitted during Phase 1
         assert!(logs_contain("read_parquet"));

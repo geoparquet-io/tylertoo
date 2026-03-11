@@ -6,7 +6,7 @@
 //! - Both flags can be used together
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Get path to the test fixture
@@ -20,6 +20,11 @@ fn cli_binary() -> String {
     env!("CARGO_BIN_EXE_gpq-tiles").to_string()
 }
 
+/// Get a cross-platform temp file path
+fn temp_file(name: &str) -> PathBuf {
+    std::env::temp_dir().join(name)
+}
+
 /// Test that --profile flag produces timing summary output
 #[test]
 fn test_profile_flag_produces_timing_summary() {
@@ -29,15 +34,15 @@ fn test_profile_flag_produces_timing_summary() {
         return;
     }
 
-    let output_file = "/tmp/test_profile_output.pmtiles";
+    let output_file = temp_file("test_profile_output.pmtiles");
 
     // Clean up any existing output
-    let _ = fs::remove_file(output_file);
+    let _ = fs::remove_file(&output_file);
 
     let output = Command::new(cli_binary())
         .args([
             fixture,
-            output_file,
+            output_file.to_str().unwrap(),
             "--profile",
             "--min-zoom",
             "0",
@@ -63,7 +68,7 @@ fn test_profile_flag_produces_timing_summary() {
     );
 
     // Clean up
-    let _ = fs::remove_file(output_file);
+    let _ = fs::remove_file(&output_file);
 }
 
 /// Test that --trace-output flag produces valid JSON file
@@ -75,19 +80,19 @@ fn test_trace_output_produces_valid_json() {
         return;
     }
 
-    let output_file = "/tmp/test_trace_output.pmtiles";
-    let trace_file = "/tmp/test_trace.json";
+    let output_file = temp_file("test_trace_output.pmtiles");
+    let trace_file = temp_file("test_trace.json");
 
     // Clean up any existing files
-    let _ = fs::remove_file(output_file);
-    let _ = fs::remove_file(trace_file);
+    let _ = fs::remove_file(&output_file);
+    let _ = fs::remove_file(&trace_file);
 
     let output = Command::new(cli_binary())
         .args([
             fixture,
-            output_file,
+            output_file.to_str().unwrap(),
             "--trace-output",
-            trace_file,
+            trace_file.to_str().unwrap(),
             "--min-zoom",
             "0",
             "--max-zoom",
@@ -105,13 +110,13 @@ fn test_trace_output_produces_valid_json() {
 
     // Check that trace file was created
     assert!(
-        Path::new(trace_file).exists(),
+        trace_file.exists(),
         "Trace file should be created at {}",
-        trace_file
+        trace_file.display()
     );
 
     // Check that trace file contains valid JSON
-    let trace_content = fs::read_to_string(trace_file).expect("Failed to read trace file");
+    let trace_content = fs::read_to_string(&trace_file).expect("Failed to read trace file");
     assert!(!trace_content.is_empty(), "Trace file should not be empty");
 
     // Chrome trace format should be JSON array or object
@@ -131,8 +136,8 @@ fn test_trace_output_produces_valid_json() {
     );
 
     // Clean up
-    let _ = fs::remove_file(output_file);
-    let _ = fs::remove_file(trace_file);
+    let _ = fs::remove_file(&output_file);
+    let _ = fs::remove_file(&trace_file);
 }
 
 /// Test that both --profile and --trace-output can be used together
@@ -144,20 +149,20 @@ fn test_combined_profile_and_trace_output() {
         return;
     }
 
-    let output_file = "/tmp/test_combined_output.pmtiles";
-    let trace_file = "/tmp/test_combined_trace.json";
+    let output_file = temp_file("test_combined_output.pmtiles");
+    let trace_file = temp_file("test_combined_trace.json");
 
     // Clean up any existing files
-    let _ = fs::remove_file(output_file);
-    let _ = fs::remove_file(trace_file);
+    let _ = fs::remove_file(&output_file);
+    let _ = fs::remove_file(&trace_file);
 
     let output = Command::new(cli_binary())
         .args([
             fixture,
-            output_file,
+            output_file.to_str().unwrap(),
             "--profile",
             "--trace-output",
-            trace_file,
+            trace_file.to_str().unwrap(),
             "--min-zoom",
             "0",
             "--max-zoom",
@@ -182,18 +187,18 @@ fn test_combined_profile_and_trace_output() {
 
     // Check that trace file was created
     assert!(
-        Path::new(trace_file).exists(),
+        trace_file.exists(),
         "Trace file should be created when using --trace-output"
     );
 
     // Check that trace file contains valid JSON
-    let trace_content = fs::read_to_string(trace_file).expect("Failed to read trace file");
+    let trace_content = fs::read_to_string(&trace_file).expect("Failed to read trace file");
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&trace_content);
     assert!(parsed.is_ok(), "Trace file should contain valid JSON");
 
     // Clean up
-    let _ = fs::remove_file(output_file);
-    let _ = fs::remove_file(trace_file);
+    let _ = fs::remove_file(&output_file);
+    let _ = fs::remove_file(&trace_file);
 }
 
 /// Test that trace file contains expected span names
@@ -205,19 +210,19 @@ fn test_trace_contains_expected_spans() {
         return;
     }
 
-    let output_file = "/tmp/test_spans_output.pmtiles";
-    let trace_file = "/tmp/test_spans_trace.json";
+    let output_file = temp_file("test_spans_output.pmtiles");
+    let trace_file = temp_file("test_spans_trace.json");
 
     // Clean up any existing files
-    let _ = fs::remove_file(output_file);
-    let _ = fs::remove_file(trace_file);
+    let _ = fs::remove_file(&output_file);
+    let _ = fs::remove_file(&trace_file);
 
     let output = Command::new(cli_binary())
         .args([
             fixture,
-            output_file,
+            output_file.to_str().unwrap(),
             "--trace-output",
-            trace_file,
+            trace_file.to_str().unwrap(),
             "--min-zoom",
             "0",
             "--max-zoom",
@@ -233,7 +238,7 @@ fn test_trace_contains_expected_spans() {
     );
 
     // Read and parse trace file
-    let trace_content = fs::read_to_string(trace_file).expect("Failed to read trace file");
+    let trace_content = fs::read_to_string(&trace_file).expect("Failed to read trace file");
     let json: serde_json::Value =
         serde_json::from_str(&trace_content).expect("Failed to parse trace JSON");
 
@@ -262,8 +267,8 @@ fn test_trace_contains_expected_spans() {
     }
 
     // Clean up
-    let _ = fs::remove_file(output_file);
-    let _ = fs::remove_file(trace_file);
+    let _ = fs::remove_file(&output_file);
+    let _ = fs::remove_file(&trace_file);
 }
 
 /// Test that CLI runs without profiling flags (baseline)
@@ -275,13 +280,20 @@ fn test_cli_runs_without_profiling() {
         return;
     }
 
-    let output_file = "/tmp/test_no_profile_output.pmtiles";
+    let output_file = temp_file("test_no_profile_output.pmtiles");
 
     // Clean up any existing output
-    let _ = fs::remove_file(output_file);
+    let _ = fs::remove_file(&output_file);
 
     let output = Command::new(cli_binary())
-        .args([fixture, output_file, "--min-zoom", "0", "--max-zoom", "2"])
+        .args([
+            fixture,
+            output_file.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "2",
+        ])
         .output()
         .expect("Failed to execute CLI");
 
@@ -294,7 +306,7 @@ fn test_cli_runs_without_profiling() {
 
     // Check that output file was created
     assert!(
-        Path::new(output_file).exists(),
+        output_file.exists(),
         "Output PMTiles file should be created"
     );
 
@@ -306,5 +318,5 @@ fn test_cli_runs_without_profiling() {
     );
 
     // Clean up
-    let _ = fs::remove_file(output_file);
+    let _ = fs::remove_file(&output_file);
 }

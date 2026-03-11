@@ -211,18 +211,18 @@ mod tests {
 
     #[test]
     fn test_profiling_summary_print() {
-        let mut summary = ProfilingSummary::default();
-        summary.pipeline_duration = std::time::Duration::from_secs(10);
-        summary.phase_timings.insert(
+        let mut phase_timings = HashMap::new();
+        phase_timings.insert(
             "read_parquet".to_string(),
             std::time::Duration::from_secs(3),
         );
-        summary
-            .phase_timings
-            .insert("sort".to_string(), std::time::Duration::from_secs(2));
-        summary
-            .phase_timings
-            .insert("encode".to_string(), std::time::Duration::from_secs(4));
+        phase_timings.insert("sort".to_string(), std::time::Duration::from_secs(2));
+        phase_timings.insert("encode".to_string(), std::time::Duration::from_secs(4));
+
+        let summary = ProfilingSummary {
+            pipeline_duration: std::time::Duration::from_secs(10),
+            phase_timings,
+        };
 
         // This just tests that print doesn't panic
         summary.print();
