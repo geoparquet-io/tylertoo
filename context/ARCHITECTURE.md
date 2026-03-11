@@ -130,6 +130,65 @@ let config = TilerConfig::new(0, 14)
 
 At low zoom levels, many small features (building footprints, parcels) become sub-pixel and would disappear entirely with simple dropping. By accumulating them, we preserve the visual density — a city with 10,000 tiny buildings still shows as a populated area, not empty space.
 
+## Attribute Accumulation (Issue #23)
+
+**MATCHES TIPPECANOE**: When features are merged during tile generation, attributes can be combined using configurable accumulator operations. This matches tippecanoe's `-ac` flag behavior.
+
+**Reference**: tippecanoe command-line options and attribute accumulation
+
+**Supported Operations:**
+
+| Operation | Behavior | Type Handling |
+|-----------|----------|---------------|
+| `sum`     | Add numeric values | Strings → 0.0 |
+| `product` | Multiply numeric values | Strings → 0.0, missing → 1.0 |
+| `mean`    | Running average with count tracking | Stored as Float |
+| `max`     | Keep maximum value | Strings skipped |
+| `min`     | Keep minimum value | Strings skipped |
+| `concat`  | Concatenate strings directly | Numbers → string |
+| `comma`   | Concatenate with comma separator | Numbers → string |
+| `count`   | Count merged features | Increments per accumulation |
+
+**CLI Usage:**
+
+```bash
+gpq-tiles input.parquet output.pmtiles \
+  --accumulate population:sum \
+  --accumulate names:comma \
+  --accumulate max_height:max
+```
+
+**API Usage:**
+
+```rust
+use gpq_tiles_core::accumulator::{AccumulatorConfig, AccumulatorOp};
+use gpq_tiles_core::pipeline::TilerConfig;
+
+let mut acc_config = AccumulatorConfig::new();
+acc_config.set_operation("population", AccumulatorOp::Sum);
+acc_config.set_operation("names", AccumulatorOp::Comma);
+
+let config = TilerConfig::new(0, 14)
+    .with_accumulator(acc_config);
+```
+
+**Key Behaviors (tippecanoe-compatible):**
+
+1. **Unspecified attributes are DROPPED**: Only attributes with configured operations are preserved in the output. This matches tippecanoe's behavior.
+
+2. **Mean requires count tracking**: The accumulator tracks a separate count per mean attribute to compute correct running averages.
+
+3. **Type coercion rules**:
+   - Numeric ops (`sum`, `product`, `mean`): strings treated as 0.0
+   - Comparison ops (`min`, `max`): strings are skipped, numeric value preserved
+   - String ops (`concat`, `comma`): numbers converted to string representation
+
+**Implementation:**
+
+- Module: `crates/core/src/accumulator.rs`
+- `AccumulatorConfig` stores per-attribute operations and mean counts
+- `accumulate()` method modifies target properties in-place
+
 ## Spatial Indexing
 
 **We use space-filling curve sorting, not R-tree.**
@@ -304,6 +363,7 @@ Use `config.with_quiet(true)` to suppress warnings. See `quality.rs` for impleme
 ```
 crates/core/src/
 ├── lib.rs              # Public API
+├── accumulator.rs      # Attribute accumulation for feature merging
 ├── tile.rs             # TileCoord, TileBounds
 ├── clip.rs             # Geometry clipping (dispatcher)
 ├── sutherland_hodgman.rs # O(n) polygon clipping for axis-aligned rectangles

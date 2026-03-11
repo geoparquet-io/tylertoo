@@ -10,7 +10,7 @@ use gpq_tiles_core::pipeline::{
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::validate_wgs84;
-use gpq_tiles_core::PropertyFilter;
+use gpq_tiles_core::{AccumulatorConfig, AccumulatorOp, PropertyFilter};
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,16 @@ struct Args {
     #[arg(short = 'X', long = "exclude-all")]
     exclude_all: bool,
 
+    /// Define attribute accumulation for feature merging.
+    /// Format: ATTRIBUTE:OPERATION (e.g., population:sum, names:comma).
+    /// Matches tippecanoe's -ac flag.
+    ///
+    /// Supported operations: sum, product, mean, max, min, concat, comma, count
+    ///
+    /// Example: --accumulate population:sum --accumulate names:comma
+    #[arg(long = "accumulate", value_name = "ATTR:OP")]
+    accumulate: Vec<String>,
+
     /// Compression algorithm for tiles (gzip, zstd, brotli, none)
     ///
     /// Gzip is the default for maximum compatibility with PMTiles viewers.
@@ -158,6 +168,41 @@ impl Args {
             )
         })
     }
+
+    /// Parse --accumulate arguments into AccumulatorConfig.
+    ///
+    /// Format: ATTRIBUTE:OPERATION (e.g., population:sum)
+    fn parse_accumulator_config(&self) -> Result<Option<AccumulatorConfig>> {
+        if self.accumulate.is_empty() {
+            return Ok(None);
+        }
+
+        let mut config = AccumulatorConfig::new();
+
+        for spec in &self.accumulate {
+            let parts: Vec<&str> = spec.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                anyhow::bail!(
+                    "Invalid accumulate format: '{}'. Expected ATTRIBUTE:OPERATION (e.g., population:sum)",
+                    spec
+                );
+            }
+
+            let attribute = parts[0];
+            let op_str = parts[1];
+
+            let op = AccumulatorOp::parse(op_str).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid accumulator operation: '{}'. Valid operations: sum, product, mean, max, min, concat, comma, count",
+                    op_str
+                )
+            })?;
+
+            config.set_operation(attribute, op);
+        }
+
+        Ok(Some(config))
+    }
 }
 
 fn main() -> Result<()> {
@@ -214,6 +259,9 @@ fn main() -> Result<()> {
     let compression = args
         .parse_compression()
         .context("Failed to parse compression")?;
+    let accumulator_config = args
+        .parse_accumulator_config()
+        .context("Failed to parse accumulator config")?;
 
     // Validate input file uses WGS84 (EPSG:4326) coordinates
     validate_wgs84(&args.input).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -243,6 +291,11 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_drop_densest_as_needed();
     }
 
+    // Add accumulator config if specified
+    if let Some(acc_config) = accumulator_config {
+        tiler_config = tiler_config.with_accumulator(acc_config);
+    }
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -255,6 +308,12 @@ fn main() -> Result<()> {
         }
         if args.deterministic {
             eprintln!("  Processing: deterministic (sequential)");
+        }
+        if let Some(ref acc_config) = tiler_config.accumulator_config {
+            eprintln!("  Accumulators:");
+            for (attr, op) in acc_config.operations() {
+                eprintln!("    {}: {}", attr, op);
+            }
         }
         eprintln!();
     }

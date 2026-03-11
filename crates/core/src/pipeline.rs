@@ -22,6 +22,7 @@ use tracing::instrument;
 
 use geo::Geometry;
 
+use crate::accumulator::AccumulatorConfig;
 use crate::batch_processor::{
     extract_field_metadata, extract_geometries, process_geometries_by_row_group, RowGroupInfo,
 };
@@ -208,6 +209,15 @@ pub struct TilerConfig {
     /// When `gamma` is `Some(value > 0.0)`, gap-based selection is used instead
     /// of grid-based density dropping.
     pub gamma: Option<f64>,
+    /// Accumulator configuration for attribute aggregation during feature merging.
+    ///
+    /// When features are merged (e.g., during coalescing or simplification),
+    /// this configuration determines how attributes are combined. Matches
+    /// tippecanoe's `-ac` flag behavior.
+    ///
+    /// If None, no attribute accumulation is performed (attributes from the
+    /// first feature are kept).
+    pub accumulator_config: Option<AccumulatorConfig>,
 }
 
 impl Default for TilerConfig {
@@ -241,6 +251,8 @@ impl Default for TilerConfig {
             enable_tiny_polygon_accumulation: true,
             // Gap-based dropping disabled by default - use grid-based instead
             gamma: None,
+            // No attribute accumulation by default
+            accumulator_config: None,
         }
     }
 }
@@ -466,6 +478,29 @@ impl TilerConfig {
     /// ```
     pub fn with_drop_densest_as_needed(mut self) -> Self {
         self.gamma = Some(2.0);
+        self
+    }
+
+    /// Set the accumulator configuration for attribute aggregation.
+    ///
+    /// When features are merged during tile generation, this configuration
+    /// determines how attributes are combined. Matches tippecanoe's `-ac` flag.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::accumulator::{AccumulatorConfig, AccumulatorOp};
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// let mut acc_config = AccumulatorConfig::new();
+    /// acc_config.set_operation("population", AccumulatorOp::Sum);
+    /// acc_config.set_operation("names", AccumulatorOp::Comma);
+    ///
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_accumulator(acc_config);
+    /// ```
+    pub fn with_accumulator(mut self, config: AccumulatorConfig) -> Self {
+        self.accumulator_config = Some(config);
         self
     }
 }

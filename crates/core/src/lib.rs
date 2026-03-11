@@ -38,6 +38,7 @@ pub mod vector_tile {
     include!(concat!(env!("OUT_DIR"), "/vector_tile.rs"));
 }
 
+pub mod accumulator;
 pub mod batch_processor;
 pub mod clip;
 pub mod compression;
@@ -65,6 +66,8 @@ pub mod wagyu_clip;
 pub mod wkb;
 pub mod world_coord;
 
+// Re-export accumulator types for CLI usage
+pub use accumulator::{AccumulatorConfig, AccumulatorOp};
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;
 // Re-export Compression from compression module for public API
