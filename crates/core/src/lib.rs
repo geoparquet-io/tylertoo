@@ -161,7 +161,7 @@ impl Converter {
         let input_path = input.as_ref();
         let output_path = output.as_ref();
 
-        log::info!(
+        tracing::info!(
             "Converting {} to {}",
             input_path.display(),
             output_path.display()
@@ -217,12 +217,12 @@ impl Converter {
             tile_count += 1;
         }
 
-        log::info!("Generated {} tiles", tile_count);
+        tracing::info!("Generated {} tiles", tile_count);
 
         // Log deduplication stats
         let dedup_stats = writer.dedup_stats();
         if dedup_stats.duplicates_eliminated > 0 {
-            log::info!(
+            tracing::info!(
                 "Deduplication: {} unique tiles, {} duplicates eliminated ({:.1}% savings)",
                 dedup_stats.unique_tiles,
                 dedup_stats.duplicates_eliminated,
@@ -235,7 +235,7 @@ impl Converter {
             .write_to_file(output_path)
             .map_err(|e| Error::PMTilesWrite(e.to_string()))?;
 
-        log::info!("Wrote PMTiles to {}", output_path.display());
+        tracing::info!("Wrote PMTiles to {}", output_path.display());
 
         Ok(())
     }

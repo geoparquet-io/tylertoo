@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use prost::Message;
 use rayon::prelude::*;
+use tracing::instrument;
 
 use geo::Geometry;
 
@@ -663,6 +664,7 @@ pub fn generate_tiles_streaming(
 ///
 /// writer.finalize(Path::new("output.pmtiles")).unwrap();
 /// ```
+#[instrument(name = "pipeline", skip(writer), fields(min_zoom = config.min_zoom, max_zoom = config.max_zoom))]
 pub fn generate_tiles_to_writer(
     input_path: &Path,
     config: &TilerConfig,
@@ -696,6 +698,7 @@ pub fn generate_tiles_to_writer(
 ///
 /// Same as `generate_tiles_to_writer` but accepts a progress callback for monitoring.
 #[allow(clippy::type_complexity)]
+#[instrument(name = "pipeline", skip(writer, progress), fields(min_zoom = config.min_zoom, max_zoom = config.max_zoom))]
 pub fn generate_tiles_to_writer_with_progress(
     input_path: &Path,
     config: &TilerConfig,
@@ -782,13 +785,23 @@ fn generate_tiles_to_writer_internal(
         });
     }
     if !config.quiet {
-        log::info!("Phase 1: Reading GeoParquet and writing to external sorter");
+        tracing::info!("Phase 1: Reading GeoParquet and writing to external sorter");
     }
 
     let records_written = AtomicU64::new(0);
     let geoms_processed = AtomicU64::new(0);
 
+    // Phase 1 span: Read GeoParquet and clip geometries
+    let _phase1_span = tracing::info_span!("read_parquet", path = %input_path.display()).entered();
+
     process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
+        // Row group span for detailed tracing
+        let _rg_span = tracing::info_span!(
+            "row_group",
+            index = rg_info.index,
+            row_count = rg_info.num_rows
+        )
+        .entered();
         let features_in_group = geometries.len();
 
         if let Some(ref cb) = progress {
@@ -800,7 +813,7 @@ fn generate_tiles_to_writer_internal(
             });
         }
         if !config.quiet {
-            log::info!(
+            tracing::info!(
                 "Processing row group {}/{} with {} features",
                 rg_info.index + 1,
                 total_row_groups,
@@ -1043,19 +1056,23 @@ fn generate_tiles_to_writer_internal(
         });
     }
     if !config.quiet {
-        log::info!(
+        tracing::info!(
             "Phase 1 complete: {} records to sort (peak memory so far: {} bytes)",
             total_records,
             phase1_peak
         );
     }
 
+    // Drop Phase 1 span
+    drop(_phase1_span);
+
     // Phase 2: Sort by tile_id (external merge sort)
+    let _phase2_span = tracing::info_span!("sort").entered();
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Start);
     }
     if !config.quiet {
-        log::info!("Phase 2: External merge sort by tile_id");
+        tracing::info!("Phase 2: External merge sort by tile_id");
     }
 
     let sorted_iter = sorter
@@ -1067,8 +1084,10 @@ fn generate_tiles_to_writer_internal(
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Complete);
     }
+    drop(_phase2_span);
 
     // Phase 3: Read sorted records, group by tile, encode MVT, write PMTiles
+    let _phase3_span = tracing::info_span!("encode", total_records).entered();
     if let Some(ref cb) = progress {
         cb(ProgressEvent::PhaseStart {
             phase: 3,
@@ -1076,7 +1095,7 @@ fn generate_tiles_to_writer_internal(
         });
     }
     if !config.quiet {
-        log::info!("Phase 3: Encoding tiles and writing to PMTiles");
+        tracing::info!("Phase 3: Encoding tiles and writing to PMTiles");
     }
 
     let mut current_tile: Option<(u8, u32, u32)> = None;
@@ -1204,7 +1223,7 @@ fn generate_tiles_to_writer_internal(
         });
     }
     if !config.quiet {
-        log::info!(
+        tracing::info!(
             "External sort streaming complete: {} tiles written, peak memory {}",
             tiles_written,
             stats.peak_formatted()
@@ -1406,7 +1425,7 @@ pub fn generate_tiles_streaming_with_stats(
     let stats = MemoryStats::from_tracker(&memory_tracker);
 
     // Log memory summary
-    log::info!(
+    tracing::info!(
         "Streaming complete: peak memory {}, budget {}",
         stats.peak_formatted(),
         stats
@@ -3212,5 +3231,87 @@ mod tests {
             shift += 7;
         }
         (result, pos)
+    }
+}
+
+/// Tests for tracing span emission
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+    use tracing_test::traced_test;
+
+    /// Test that the pipeline span is emitted during tile generation
+    #[traced_test]
+    #[test]
+    fn test_pipeline_span_emitted() {
+        // Run a minimal tile generation to verify tracing spans are emitted
+        let fixture_path = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture_path.exists() {
+            // Skip test if fixture doesn't exist
+            return;
+        }
+
+        let config = TilerConfig::new(0, 4).with_quiet(true);
+
+        let tiles: Result<Vec<GeneratedTile>> = generate_tiles_streaming(&fixture_path, &config);
+        assert!(tiles.is_ok());
+
+        // Verify the "pipeline" span was entered
+        assert!(logs_contain("pipeline"));
+    }
+
+    /// Test that row_group span is emitted during processing
+    #[traced_test]
+    #[test]
+    fn test_row_group_span_emitted() {
+        let fixture_path = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture_path.exists() {
+            return;
+        }
+
+        let config = TilerConfig::new(0, 4).with_quiet(true);
+        let _ = generate_tiles_streaming(&fixture_path, &config);
+
+        // row_group spans are emitted during row group processing
+        assert!(logs_contain("row_group"));
+    }
+
+    /// Test that read_parquet span is emitted
+    #[traced_test]
+    #[test]
+    fn test_read_parquet_span_emitted() {
+        let fixture_path = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture_path.exists() {
+            return;
+        }
+
+        let config = TilerConfig::new(0, 4).with_quiet(true);
+        let _ = generate_tiles_streaming(&fixture_path, &config);
+
+        // read_parquet span is emitted during Phase 1
+        assert!(logs_contain("read_parquet"));
+    }
+
+    /// Test that streaming writer pipeline runs without panicking when profiling is enabled
+    ///
+    /// This verifies that the tracing spans in generate_tiles_to_writer don't cause issues.
+    /// Full span capture verification should be done via integration tests with Chrome trace output.
+    #[test]
+    fn test_streaming_writer_runs_with_tracing() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+
+        let fixture_path = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture_path.exists() {
+            // Skip test if fixture doesn't exist
+            return;
+        }
+
+        let config = TilerConfig::new(0, 4).with_quiet(true);
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+
+        // Just verify the pipeline runs successfully with tracing spans in place
+        let result = generate_tiles_to_writer(fixture_path, &config, &mut writer);
+        assert!(result.is_ok(), "Tile generation should succeed");
     }
 }

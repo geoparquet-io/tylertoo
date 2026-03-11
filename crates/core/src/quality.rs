@@ -121,7 +121,7 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
     // Look for the "geo" key in key-value metadata
     let Some(kv_metadata) = file_metadata.key_value_metadata() else {
         // No metadata at all - assume WGS84 with warning
-        log::warn!("GeoParquet file has no key-value metadata; assuming WGS84");
+        tracing::warn!("GeoParquet file has no key-value metadata; assuming WGS84");
         return Ok(CrsInfo::wgs84());
     };
 
@@ -132,7 +132,7 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
 
     let Some(geo_json_str) = geo_value else {
         // No geo metadata - assume WGS84 with warning
-        log::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84");
+        tracing::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84");
         return Ok(CrsInfo::wgs84());
     };
 
@@ -148,13 +148,13 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
 
     // Get the columns object
     let Some(columns) = geo_json.get("columns").and_then(Value::as_object) else {
-        log::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84");
+        tracing::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84");
         return Ok(CrsInfo::wgs84());
     };
 
     // Get the primary column's metadata
     let Some(column_meta) = columns.get(primary_column) else {
-        log::warn!(
+        tracing::warn!(
             "GeoParquet 'geo' metadata missing column '{}'; assuming WGS84",
             primary_column
         );
@@ -203,7 +203,7 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
             })
         }
         Some(other) => {
-            log::warn!("Unexpected CRS format in GeoParquet metadata: {:?}", other);
+            tracing::warn!("Unexpected CRS format in GeoParquet metadata: {:?}", other);
             Ok(CrsInfo::unknown())
         }
     }

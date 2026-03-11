@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod profiling;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gpq-tiles",
@@ -82,6 +84,22 @@ struct Args {
     /// compliance workflows. Significantly slower than parallel processing.
     #[arg(long)]
     deterministic: bool,
+
+    /// Enable profiling output with timing summary
+    ///
+    /// Shows phase-level timing breakdown after conversion completes:
+    /// - read_parquet: Time spent reading GeoParquet and clipping
+    /// - sort: Time spent in external merge sort
+    /// - encode: Time spent encoding tiles to MVT format
+    #[arg(long)]
+    profile: bool,
+
+    /// Write Chrome trace JSON to file for visualization
+    ///
+    /// The output can be viewed in Chrome's chrome://tracing or Perfetto.
+    /// This captures detailed span timing for all pipeline phases.
+    #[arg(long, value_name = "FILE")]
+    trace_output: Option<PathBuf>,
 }
 
 impl Args {
@@ -128,8 +146,42 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Initialize profiling if requested (must happen before any tracing calls)
+    // Store guards to keep them alive for the duration of main()
+    let _profiling_guard: Option<profiling::ProfilingGuard>;
+    let _chrome_guard: Option<Box<dyn std::any::Any>>;
+
+    match (&args.profile, &args.trace_output) {
+        (true, Some(trace_path)) => {
+            // Both console profiling and Chrome trace
+            let (pg, cg) = profiling::init_combined_profiling(trace_path);
+            _profiling_guard = Some(pg);
+            _chrome_guard = Some(Box::new(cg));
+        }
+        (true, None) => {
+            // Console profiling only
+            _profiling_guard = Some(profiling::init_profiling());
+            _chrome_guard = None;
+        }
+        (false, Some(trace_path)) => {
+            // Chrome trace only
+            _profiling_guard = None;
+            _chrome_guard = Some(Box::new(profiling::init_chrome_tracing(trace_path)));
+        }
+        (false, None) => {
+            // No profiling
+            _profiling_guard = None;
+            _chrome_guard = None;
+        }
+    }
+
     // Initialize logging - suppress when verbose (we use progress bars instead)
-    let log_level = if args.verbose { "warn" } else { "info" };
+    // Also suppress when profiling (tracing handles output instead)
+    let log_level = if args.verbose || args.profile {
+        "warn"
+    } else {
+        "info"
+    };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     // Parse options

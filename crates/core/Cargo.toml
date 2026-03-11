@@ -32,6 +32,7 @@ rayon = { workspace = true }
 rstar = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+tracing = { workspace = true }
 flate2 = "1"
 brotli = "7"
 zstd = "0.13"
@@ -51,6 +52,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 env_logger = "0.11"
 geojson = "0.24"
 serde_json = "1"
+tracing-subscriber = { workspace = true }
+tracing-test = "0.2"
 
 [[bench]]
 name = "tiling"
