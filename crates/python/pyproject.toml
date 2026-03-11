@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gpq-tiles"
-version = "0.5.0"
+version = "0.6.0"
 description = "Fast GeoParquet to PMTiles converter"
 readme = "README.md"
 license = { text = "Apache-2.0" }
