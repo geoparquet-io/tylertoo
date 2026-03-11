@@ -211,7 +211,7 @@ fn bench_rowgroup_reading(c: &mut Criterion) {
 
     // Parallel with different concurrency levels
     for num_readers in [1, 2, 8] {
-        group.bench_function(&format!("parallel_{}_readers", num_readers), |b| {
+        group.bench_function(format!("parallel_{}_readers", num_readers), |b| {
             b.iter(|| {
                 let total = std::sync::atomic::AtomicUsize::new(0);
                 process_geometries_parallel(fixture_path, num_readers, |_info, geoms| {
