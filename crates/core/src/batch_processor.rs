@@ -137,6 +137,18 @@ where
             let arr = array.as_wkb_view();
             process_typed_array(arr, row_offset, callback)
         }
+        GeoArrowType::Wkt(_) => {
+            let arr = array.as_wkt::<i32>();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::LargeWkt(_) => {
+            let arr = array.as_wkt::<i64>();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::WktView(_) => {
+            let arr = array.as_wkt_view();
+            process_typed_array(arr, row_offset, callback)
+        }
         _ => Err(Error::GeoParquetRead(format!(
             "Unsupported geometry type: {:?}",
             array.data_type()
@@ -407,6 +419,18 @@ fn extract_geometries_from_array(
             let arr = array.as_wkb_view();
             extract_typed_array(arr, output)
         }
+        GeoArrowType::Wkt(_) => {
+            let arr = array.as_wkt::<i32>();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::LargeWkt(_) => {
+            let arr = array.as_wkt::<i64>();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::WktView(_) => {
+            let arr = array.as_wkt_view();
+            extract_typed_array(arr, output)
+        }
         _ => Err(Error::GeoParquetRead(format!(
             "Unsupported geometry type: {:?}",
             array.data_type()
@@ -661,6 +685,54 @@ mod tests {
             batch_geometries.len(),
             "Row-group and batch processing should produce same count"
         );
+    }
+
+    /// Test that WKT-encoded GeoParquet files can be read.
+    /// See: https://github.com/geoparquet-io/gpq-tiles/issues/35
+    ///
+    /// To generate the fixture locally:
+    /// ```bash
+    /// cd tests/fixtures/realdata && uv run python -c "
+    /// import geopandas as gpd
+    /// import pyarrow as pa
+    /// import pyarrow.parquet as pq
+    /// import json
+    /// gdf = gpd.read_parquet('open-buildings.parquet').head(100)
+    /// wkt_strings = gdf.geometry.to_wkt()
+    /// arrays = [pa.array(wkt_strings.tolist(), type=pa.utf8()) if col == 'geometry'
+    ///           else pa.array(gdf[col].tolist()) for col in gdf.columns]
+    /// table = pa.table(dict(zip(gdf.columns, arrays)))
+    /// geo_meta = {'version': '1.1.0', 'primary_column': 'geometry',
+    ///             'columns': {'geometry': {'encoding': 'WKT', 'geometry_types': ['Polygon']}}}
+    /// table = table.replace_schema_metadata({b'geo': json.dumps(geo_meta).encode()})
+    /// pq.write_table(table, 'wkt-encoded.parquet')
+    /// "
+    /// ```
+    #[test]
+    fn test_wkt_encoded_parquet() {
+        let fixture = Path::new("../../tests/fixtures/realdata/wkt-encoded.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: WKT fixture not found (generate locally - see test docstring)");
+            return;
+        }
+
+        let mut count = 0;
+        let result = process_geometries(fixture, |geom, _idx| {
+            // Verify we get valid polygons (the fixture contains building footprints)
+            assert!(
+                matches!(
+                    geom,
+                    geo::Geometry::Polygon(_) | geo::Geometry::MultiPolygon(_)
+                ),
+                "Expected Polygon or MultiPolygon, got {:?}",
+                geom
+            );
+            count += 1;
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "Should read WKT file: {:?}", result.err());
+        assert_eq!(count, 100, "Should have 100 features, got {}", count);
     }
 
     /// Test that row group indices are sequential and correct.

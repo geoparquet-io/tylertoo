@@ -636,4 +636,134 @@ mod tests {
         // Clean up
         let _ = fs::remove_file(&output_path);
     }
+
+    // ========================================================================
+    // WKT Geometry Encoding Tests (Issue #35)
+    // ========================================================================
+
+    /// Test: Full pipeline with WKT-encoded GeoParquet.
+    ///
+    /// Verifies that GeoParquet files using WKT geometry encoding
+    /// (instead of WKB or GeoArrow native) work correctly through
+    /// the entire tile generation pipeline.
+    ///
+    /// See: https://github.com/geoparquet-io/gpq-tiles/issues/35
+    #[test]
+    fn test_e2e_wkt_encoded_geoparquet() {
+        ensure_output_dir();
+
+        let input_path = Path::new(FIXTURE_DIR).join("wkt-encoded.parquet");
+        if !input_path.exists() {
+            eprintln!(
+                "Skipping: WKT fixture not found (generate locally - see batch_processor tests)"
+            );
+            return;
+        }
+
+        let output_path = Path::new(OUTPUT_DIR).join("e2e-wkt-encoded.pmtiles");
+
+        // Configure for zooms 10-12 (small dataset)
+        let config = TilerConfig::new(10, 12).with_layer_name("wkt-buildings");
+
+        // Step 1: Generate tiles from WKT-encoded source
+        let tiles_iter =
+            generate_tiles(&input_path, &config).expect("Should generate tiles from WKT");
+
+        // Step 2: Collect tiles and write to PMTiles
+        let mut writer = PmtilesWriter::new();
+        let mut tile_count = 0;
+
+        for tile_result in tiles_iter {
+            let tile = tile_result.expect("Tile generation should not fail for WKT");
+            writer
+                .add_tile(tile.coord.z, tile.coord.x, tile.coord.y, &tile.data)
+                .expect("Should add tile");
+            tile_count += 1;
+        }
+
+        // Set bounds (Andorra area)
+        writer.set_bounds(&TileBounds::new(1.4, 42.4, 1.8, 42.7));
+
+        // Step 3: Write PMTiles file
+        writer
+            .write_to_file(&output_path)
+            .expect("Should write PMTiles from WKT source");
+
+        // Step 4: Verify the output
+        assert!(output_path.exists(), "PMTiles file should exist");
+
+        let header = read_pmtiles_header(&output_path).expect("Should parse PMTiles header");
+
+        println!("=== WKT E2E Test Results ===");
+        println!("Generated {} tiles from WKT source", tile_count);
+        println!(
+            "Addressed tiles in header: {}",
+            header.addressed_tiles_count
+        );
+
+        // Assertions
+        assert!(
+            tile_count > 0,
+            "Should generate at least one tile from WKT source"
+        );
+        assert_eq!(
+            header.addressed_tiles_count as usize, tile_count,
+            "Header tile count should match"
+        );
+        assert_eq!(header.tile_type, 1, "Tile type should be MVT (1)");
+        assert_eq!(header.tile_compression, 2, "Compression should be gzip (2)");
+
+        // Clean up
+        let _ = fs::remove_file(&output_path);
+    }
+
+    /// Test: Tiles from WKT source decode correctly as MVT.
+    #[test]
+    fn test_e2e_wkt_tiles_decode_as_mvt() {
+        let input_path = Path::new(FIXTURE_DIR).join("wkt-encoded.parquet");
+        if !input_path.exists() {
+            eprintln!(
+                "Skipping: WKT fixture not found (generate locally - see batch_processor tests)"
+            );
+            return;
+        }
+
+        // Generate tiles at z12 only
+        let config = TilerConfig::new(12, 12).with_layer_name("wkt-test");
+        let tiles_iter = generate_tiles(&input_path, &config).expect("Should generate tiles");
+
+        let tiles: Vec<_> = tiles_iter.filter_map(|r| r.ok()).collect();
+
+        assert!(
+            !tiles.is_empty(),
+            "Should generate at least one tile from WKT"
+        );
+
+        // Verify each tile decodes correctly
+        let mut total_features = 0;
+        for tile in &tiles {
+            let decoded = crate::pipeline::decode_tile(&tile.data)
+                .expect("Should decode WKT-sourced MVT tile");
+
+            assert_eq!(decoded.layers.len(), 1, "Should have exactly one layer");
+
+            let layer = &decoded.layers[0];
+            assert_eq!(layer.name, "wkt-test", "Layer name should match config");
+            assert_eq!(layer.version, 2, "MVT version should be 2");
+            assert_eq!(layer.extent, Some(4096), "Extent should be 4096");
+
+            total_features += layer.features.len();
+        }
+
+        println!(
+            "Decoded {} tiles with {} total features from WKT source",
+            tiles.len(),
+            total_features
+        );
+
+        assert!(
+            total_features > 0,
+            "Should have decoded features from WKT source"
+        );
+    }
 }
