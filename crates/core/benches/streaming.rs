@@ -11,6 +11,7 @@
 // - fieldmaps-madagascar-adm4.parquet (17K features) - production scale
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use gpq_tiles_core::batch_processor::process_geometries_by_row_group;
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::pipeline::{generate_tiles_to_writer, TilerConfig};
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
@@ -161,6 +162,34 @@ fn bench_memory_budgets(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark just the row-group reading (file handle reuse optimization)
+/// This isolates the parquet reading from tile generation.
+fn bench_rowgroup_reading(c: &mut Criterion) {
+    if !fixture_exists(FIXTURE_MULTI_RG) {
+        eprintln!("Skipping row-group reading benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_MULTI_RG);
+
+    let mut group = c.benchmark_group("rowgroup_reading");
+    group.sample_size(30);
+
+    group.bench_function("multi_rowgroup_file", |b| {
+        b.iter(|| {
+            let mut total = 0usize;
+            process_geometries_by_row_group(fixture_path, |_info, geoms| {
+                total += geoms.len();
+                Ok(())
+            })
+            .expect("Should read all row groups");
+            black_box(total)
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     name = fast_benchmarks;
     config = Criterion::default().sample_size(50);
@@ -170,7 +199,7 @@ criterion_group!(
 criterion_group!(
     name = medium_benchmarks;
     config = Criterion::default().sample_size(30);
-    targets = bench_multi_rowgroup
+    targets = bench_multi_rowgroup, bench_rowgroup_reading
 );
 
 criterion_group!(

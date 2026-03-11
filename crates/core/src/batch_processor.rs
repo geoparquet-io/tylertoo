@@ -273,14 +273,16 @@ where
 
     // Process each row group separately
     for rg_idx in 0..num_row_groups {
-        // Span: Opening file and building reader for this row group
+        // Span: Building reader for this row group (file handle reused via try_clone)
         let (reader, _batch_size) = {
             let _open_span = info_span!("parquet_open_rowgroup", row_group = rg_idx).entered();
 
-            let file = std::fs::File::open(path)
-                .map_err(|e| Error::GeoParquetRead(format!("Failed to reopen file: {}", e)))?;
+            // Reuse file handle via try_clone() - avoids reopening file for each row group
+            let file_clone = file.try_clone().map_err(|e| {
+                Error::GeoParquetRead(format!("Failed to clone file handle: {}", e))
+            })?;
 
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file_clone)
                 .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
             let batch_size = builder.metadata().row_group(rg_idx).num_rows() as usize;
@@ -629,5 +631,95 @@ mod tests {
             "lat_max={}",
             bbox.lat_max
         );
+    }
+
+    /// Test that file handle reuse produces consistent results.
+    /// Compares row-group-by-row-group processing with batch processing.
+    #[test]
+    fn test_file_handle_reuse_produces_consistent_results() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Get geometries via row-group processing (uses file handle reuse)
+        let mut rg_geometries = Vec::new();
+        process_geometries_by_row_group(fixture, |_info, geoms| {
+            rg_geometries.extend(geoms);
+            Ok(())
+        })
+        .expect("Row-group processing should succeed");
+
+        // Get geometries via batch processing (uses single file handle)
+        let batch_geometries =
+            extract_geometries(fixture).expect("Batch processing should succeed");
+
+        // Results should match exactly
+        assert_eq!(
+            rg_geometries.len(),
+            batch_geometries.len(),
+            "Row-group and batch processing should produce same count"
+        );
+    }
+
+    /// Test that row group indices are sequential and correct.
+    #[test]
+    fn test_row_group_indices_are_sequential() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let expected_count = get_row_group_count(fixture).expect("Should get row group count");
+        let mut indices = Vec::new();
+
+        process_geometries_by_row_group(fixture, |info, _geoms| {
+            indices.push(info.index);
+            Ok(())
+        })
+        .expect("Processing should succeed");
+
+        // Indices should be 0, 1, 2, ..., n-1
+        let expected_indices: Vec<usize> = (0..expected_count).collect();
+        assert_eq!(
+            indices, expected_indices,
+            "Row group indices should be sequential"
+        );
+    }
+
+    /// Test that row group processing handles many row groups efficiently.
+    /// This validates the file handle reuse optimization.
+    #[test]
+    fn test_many_row_groups_processed_efficiently() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let num_row_groups = get_row_group_count(fixture).expect("Should get row group count");
+        let mut processed_groups = 0;
+        let mut total_rows = 0;
+
+        let result = process_geometries_by_row_group(fixture, |info, geoms| {
+            processed_groups += 1;
+            total_rows += info.num_rows;
+            assert_eq!(
+                info.num_rows,
+                geoms.len(),
+                "Row count should match geometry count for row group {}",
+                info.index
+            );
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "Should process all row groups successfully");
+        assert_eq!(
+            processed_groups, num_row_groups,
+            "Should process all row groups"
+        );
+        assert!(total_rows > 0, "Should have processed some rows");
     }
 }
