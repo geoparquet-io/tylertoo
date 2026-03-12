@@ -61,6 +61,7 @@ pub mod property_filter;
 pub mod quality;
 pub mod simplify;
 pub mod spatial_index;
+pub mod streaming_types;
 pub mod sutherland_hodgman;
 pub mod tile;
 pub mod validate;
@@ -81,6 +82,11 @@ pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 pub use pipeline::{ProgressCallback, ProgressEvent};
 // Re-export CRS validation for CLI usage
 pub use quality::{extract_crs, validate_wgs84, CrsInfo};
+// Re-export streaming pipeline types
+pub use streaming_types::{
+    FallbackReason, SortingStrategy, SpoolEntry, SpoolResult, StreamingConfig, StreamingStats,
+    TileFormat,
+};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
