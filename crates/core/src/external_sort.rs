@@ -238,6 +238,62 @@ impl TileFeatureSorter {
 /// 16 shards keeps each shard under 1024 file descriptors for datasets up to ~1.6B records.
 const DEFAULT_NUM_SHARDS: usize = 16;
 
+/// Target segments per shard to stay safely under the 1024 file descriptor limit.
+/// With this target, each shard opens at most ~50 segment files during merge.
+const TARGET_SEGMENTS_PER_SHARD: usize = 50;
+
+/// Minimum buffer size to avoid excessive disk I/O for small datasets.
+const MIN_BUFFER_SIZE: usize = 100_000;
+
+/// Estimated tile replication factor: each source geometry generates multiple
+/// TileFeatureRecords (one per tile it intersects across all zoom levels).
+/// With zoom 0-14, a geometry creates records at EACH level, and may touch
+/// multiple tiles at higher zooms. Conservative estimate: 30x.
+const TILE_REPLICATION_FACTOR: u64 = 30;
+
+/// Calculate optimal sort buffer size based on estimated record count.
+///
+/// The `extsort` crate opens ALL segment files during merge, so we need to ensure
+/// each shard creates at most ~50 segments to stay under the 1024 FD limit.
+///
+/// **Important:** `total_records` is the Parquet row count (source geometries),
+/// but the sorter receives TileFeatureRecords (one per tile a geometry touches).
+/// We apply a replication factor to account for this.
+///
+/// Formula: `buffer_size = max(MIN_BUFFER, total_records * replication / (num_shards * target_segments))`
+///
+/// # Arguments
+///
+/// * `total_records` - Source geometry count from Parquet metadata
+/// * `num_shards` - Number of shards (default: 16)
+///
+/// # Returns
+///
+/// Optimal buffer size that keeps segments per shard under the target.
+pub fn calculate_optimal_sort_buffer(total_records: u64, num_shards: usize) -> usize {
+    if total_records == 0 {
+        return MIN_BUFFER_SIZE;
+    }
+
+    // Account for tile replication: each geometry → multiple TileFeatureRecords
+    let estimated_tile_records = total_records.saturating_mul(TILE_REPLICATION_FACTOR);
+
+    // Records per shard (assuming even distribution)
+    let records_per_shard = estimated_tile_records / num_shards as u64;
+
+    // Required buffer to keep segments under target
+    // buffer = ceil(records_per_shard / target_segments)
+    let required_buffer = if records_per_shard == 0 {
+        MIN_BUFFER_SIZE
+    } else {
+        ((records_per_shard + TARGET_SEGMENTS_PER_SHARD as u64 - 1)
+            / TARGET_SEGMENTS_PER_SHARD as u64) as usize
+    };
+
+    // Never go below minimum
+    required_buffer.max(MIN_BUFFER_SIZE)
+}
+
 /// Sharded external sorter for tile feature records.
 ///
 /// Partitions records by `tile_id % num_shards` to avoid "too many open files" errors.
@@ -310,42 +366,36 @@ impl ShardedTileFeatureSorter {
         self.total_count == 0
     }
 
-    /// Sort all records and return an iterator over them in tile_id order.
+    /// Sort all shards and merge into a single sorted iterator.
     ///
-    /// This consumes the sorter. Each shard is sorted independently, then
-    /// a k-way merge produces the final sorted output.
-    ///
-    /// # Adaptive Consolidation
-    ///
-    /// To avoid exhausting file descriptors on large datasets, this method
-    /// uses adaptive consolidation:
-    ///
-    /// - If a shard has <= `SEGMENT_CONSOLIDATION_THRESHOLD` segments, we use
-    ///   direct iteration (no extra I/O overhead)
-    /// - If a shard has > threshold segments, we consolidate its sorted output
-    ///   to a single intermediate file, then wrap it in `ConsolidatedFileIter`
-    ///
-    /// This ensures we never have more than `threshold + num_shards` file
-    /// descriptors open simultaneously.
+    /// Each shard is sorted independently, then merged via min-heap.
+    /// With dynamic buffer sizing (see `calculate_optimal_sort_buffer`),
+    /// each shard should have ≤50 segments, staying under the FD limit.
     pub fn sort(self) -> std::io::Result<ShardedSortedIterator> {
+        self.sort_with_progress(|_, _, _, _| {})
+    }
+
+    /// Sort all shards with progress reporting.
+    ///
+    /// The callback is invoked after each shard completes sorting:
+    /// `progress(shard_index, total_shards, records_in_shard, duration_secs)`
+    pub fn sort_with_progress<F>(self, progress: F) -> std::io::Result<ShardedSortedIterator>
+    where
+        F: Fn(usize, usize, usize, f64),
+    {
+        use std::time::Instant;
+
         let mut shard_iters: Vec<Box<dyn Iterator<Item = std::io::Result<TileFeatureRecord>>>> =
             Vec::with_capacity(self.num_shards);
 
-        for shard in self.shards {
-            let estimated_segments = shard.estimated_segment_count();
-
-            if estimated_segments > SEGMENT_CONSOLIDATION_THRESHOLD {
-                // Large shard: consolidate to single file to bound open file handles
-                // This adds one write+read pass but keeps fd count bounded
-                let sorted_iter = shard.sort()?;
-                let consolidated_file = consolidate_to_file(sorted_iter)?;
-                let consolidated_iter = ConsolidatedFileIter::new(consolidated_file)?;
-                shard_iters.push(Box::new(consolidated_iter));
-            } else {
-                // Small shard: use direct iteration (no consolidation overhead)
-                let iter = shard.sort()?;
-                shard_iters.push(Box::new(iter));
-            }
+        let total_shards = self.num_shards;
+        for (idx, shard) in self.shards.into_iter().enumerate() {
+            let records_in_shard = shard.len();
+            let start = Instant::now();
+            let iter = shard.sort()?;
+            let duration = start.elapsed().as_secs_f64();
+            shard_iters.push(Box::new(iter));
+            progress(idx + 1, total_shards, records_in_shard, duration);
         }
 
         ShardedSortedIterator::new(shard_iters)

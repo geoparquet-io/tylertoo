@@ -901,6 +901,31 @@ where
     Ok(total_processed.load(Ordering::Relaxed))
 }
 
+/// Get the total number of rows in a GeoParquet file or directory of files.
+///
+/// For directories, returns the sum of rows across all parquet files.
+/// This reads only the Parquet footer metadata, not the actual data.
+pub fn get_total_row_count(path: &Path) -> Result<u64> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    let files = resolve_parquet_files(path)?;
+    let mut total = 0u64;
+
+    for file_path in files {
+        let file = std::fs::File::open(&file_path)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+        let parquet_reader = SerializedFileReader::new(file).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e))
+        })?;
+
+        total += parquet_reader.metadata().file_metadata().num_rows() as u64;
+    }
+
+    Ok(total)
+}
+
 /// Get the total number of row groups in a GeoParquet file or directory.
 ///
 /// For directories, sums the row group count across all parquet files.

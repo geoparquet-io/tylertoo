@@ -64,8 +64,15 @@ pub enum ProgressEvent {
         total_records: u64,
         peak_memory_bytes: usize,
     },
-    /// Phase 2 (sorting) started - no granular progress available
+    /// Phase 2 (sorting) started
     Phase2Start,
+    /// Progress within Phase 2 (sorting shards)
+    Phase2Progress {
+        shard: usize,
+        total_shards: usize,
+        records_in_shard: usize,
+        shard_duration_secs: f64,
+    },
     /// Phase 2 complete
     Phase2Complete,
     /// Progress within Phase 3 (encoding tiles)
@@ -929,8 +936,10 @@ fn generate_tiles_to_writer_internal(
     writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
     progress: Option<ProgressCallback>,
 ) -> Result<crate::memory::MemoryStats> {
-    use crate::batch_processor::get_row_group_count;
-    use crate::external_sort::{ShardedTileFeatureSorter, TileFeatureRecord};
+    use crate::batch_processor::{get_row_group_count, get_total_row_count};
+    use crate::external_sort::{
+        calculate_optimal_sort_buffer, ShardedTileFeatureSorter, TileFeatureRecord,
+    };
     use crate::memory::{MemoryStats, MemoryTracker};
     use crate::mvt::{LayerBuilder, TileBuilder};
     use crate::pmtiles_writer::tile_id;
@@ -953,10 +962,21 @@ fn generate_tiles_to_writer_internal(
     // Get total row group count for progress tracking
     let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
 
+    // Get total row count for dynamic buffer sizing
+    let total_rows = get_total_row_count(input_path).unwrap_or(0);
+
     // Phase 1: Read GeoParquet, clip geometries, write to sorter
-    // Buffer size: 100K records is ~50-100MB depending on geometry complexity
-    // Sharding: 16 shards keeps each shard under 1024 file descriptors for large datasets
-    let sort_buffer_size = 100_000;
+    // Dynamic buffer sizing: ensures each shard creates ≤50 segments to avoid FD exhaustion
+    // Memory: ~180MB per shard for 365K buffer with average 500-byte records
+    const NUM_SHARDS: usize = 16;
+    let sort_buffer_size = calculate_optimal_sort_buffer(total_rows, NUM_SHARDS);
+    if !config.quiet {
+        tracing::debug!(
+            "Sort buffer: {} records (estimated {} total rows)",
+            sort_buffer_size,
+            total_rows
+        );
+    }
     let sorter = Mutex::new(ShardedTileFeatureSorter::new(sort_buffer_size));
 
     // TileFeatureRecord fixed overhead: tile_id(8) + z(1) + x(4) + y(4) + feature_id(8) = 25 bytes
@@ -1286,7 +1306,16 @@ fn generate_tiles_to_writer_internal(
     let sorted_iter = sorter
         .into_inner()
         .unwrap()
-        .sort()
+        .sort_with_progress(|shard, total_shards, records_in_shard, duration| {
+            if let Some(ref cb) = progress {
+                cb(ProgressEvent::Phase2Progress {
+                    shard,
+                    total_shards,
+                    records_in_shard,
+                    shard_duration_secs: duration,
+                });
+            }
+        })
         .map_err(|e| Error::PMTilesWrite(format!("External sort failed: {}", e)))?;
 
     if let Some(ref cb) = progress {
