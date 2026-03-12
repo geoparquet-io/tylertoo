@@ -44,6 +44,18 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
         ProgressEvent::Phase2Start => {
             dict.set_item("phase", "phase2_start")?;
         }
+        ProgressEvent::Phase2Progress {
+            shard,
+            total_shards,
+            records_in_shard,
+            shard_duration_secs,
+        } => {
+            dict.set_item("phase", "phase2_progress")?;
+            dict.set_item("shard", *shard)?;
+            dict.set_item("total_shards", *total_shards)?;
+            dict.set_item("records_in_shard", *records_in_shard)?;
+            dict.set_item("shard_duration_secs", *shard_duration_secs)?;
+        }
         ProgressEvent::Phase2Complete => {
             dict.set_item("phase", "phase2_complete")?;
         }

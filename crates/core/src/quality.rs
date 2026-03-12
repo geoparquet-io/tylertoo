@@ -15,6 +15,7 @@ use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use serde_json::Value;
 
+use crate::batch_processor::resolve_parquet_files;
 use crate::{Error, Result};
 
 /// CRS information extracted from GeoParquet metadata.
@@ -109,7 +110,13 @@ fn is_wgs84_projjson(projjson: &Value) -> bool {
 ///
 /// CRS information, or an error if the file cannot be read.
 pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
-    let file = std::fs::File::open(path)
+    // For directories, use the first file (all files should have the same CRS)
+    let files = resolve_parquet_files(path)?;
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    let file = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
 
     let reader = SerializedFileReader::new(file)
@@ -329,20 +336,47 @@ impl GeoParquetQuality {
     }
 }
 
-/// Assess the quality of a GeoParquet file for streaming processing.
+/// Assess the quality of a GeoParquet file or directory for streaming processing.
+///
+/// For directories, aggregates metrics across all files and checks the first file
+/// for metadata quality (all files should have consistent metadata).
 ///
 /// Performs cheap checks (O(1) metadata reads) first, then more expensive
 /// checks (sampling) only for large files.
 pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
-    let file = std::fs::File::open(path)
+    let files = resolve_parquet_files(path)?;
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    // Aggregate metrics across all files
+    let mut total_file_size_bytes = 0u64;
+    let mut total_row_groups = 0usize;
+    let mut total_rows = 0usize;
+
+    for file_path in &files {
+        let file = std::fs::File::open(file_path)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
+
+        total_file_size_bytes += file
+            .metadata()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to get file metadata: {}", e)))?
+            .len();
+
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e))
+        })?;
+
+        let parquet_metadata = reader.metadata();
+        total_row_groups += parquet_metadata.num_row_groups();
+        total_rows += parquet_metadata.file_metadata().num_rows() as usize;
+    }
+
+    // Use the first file for metadata quality checks
+    let first_file_handle = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
 
-    let file_size_bytes = file
-        .metadata()
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to get file metadata: {}", e)))?
-        .len();
-
-    let reader = SerializedFileReader::new(file)
+    let reader = SerializedFileReader::new(first_file_handle)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
 
     let parquet_metadata = reader.metadata();
@@ -357,10 +391,8 @@ pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
         })
         .unwrap_or(false);
 
-    let row_group_count = parquet_metadata.num_row_groups();
-    let total_rows = parquet_metadata.file_metadata().num_rows() as usize;
-    let avg_rows_per_group = if row_group_count > 0 {
-        total_rows / row_group_count
+    let avg_rows_per_group = if total_row_groups > 0 {
+        total_rows / total_row_groups
     } else {
         0
     };
@@ -370,8 +402,8 @@ pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
     let has_row_group_bboxes = check_row_group_bboxes(&reader);
 
     // For large files (>1GB), sample to check Hilbert sorting
-    let is_hilbert_sorted = if file_size_bytes > 1024 * 1024 * 1024 {
-        Some(check_hilbert_sorted(path)?)
+    let is_hilbert_sorted = if total_file_size_bytes > 1024 * 1024 * 1024 {
+        Some(check_hilbert_sorted(first_file)?)
     } else {
         None // Don't check for small files
     };
@@ -379,10 +411,10 @@ pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
     Ok(GeoParquetQuality {
         has_geo_metadata,
         has_row_group_bboxes,
-        row_group_count,
+        row_group_count: total_row_groups,
         total_rows,
         avg_rows_per_group,
-        file_size_bytes,
+        file_size_bytes: total_file_size_bytes,
         row_group_overlap_pct: None, // TODO: implement bbox overlap check
         is_hilbert_sorted,
     })

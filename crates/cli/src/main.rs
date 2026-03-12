@@ -546,14 +546,34 @@ fn run_with_progress(
             }
 
             ProgressEvent::Phase2Start => {
-                let pb = multi_clone.add(ProgressBar::new_spinner());
+                let pb = multi_clone.add(ProgressBar::new(16)); // 16 shards
                 pb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.cyan} Sorting by tile ID...")
-                        .unwrap(),
+                    ProgressStyle::default_bar()
+                        .template(
+                            "{spinner:.cyan} Sorting [{bar:20.cyan/dim}] {pos}/{len} shards {msg}",
+                        )
+                        .unwrap()
+                        .progress_chars("█▓░"),
                 );
                 pb.enable_steady_tick(Duration::from_millis(100));
                 *phase2_pb_clone.lock().unwrap() = Some(pb);
+            }
+
+            ProgressEvent::Phase2Progress {
+                shard,
+                total_shards,
+                records_in_shard,
+                shard_duration_secs,
+            } => {
+                if let Some(ref pb) = *phase2_pb_clone.lock().unwrap() {
+                    pb.set_length(total_shards as u64);
+                    pb.set_position(shard as u64);
+                    pb.set_message(format!(
+                        "({} records, {:.1}s)",
+                        format_number(records_in_shard as u64),
+                        shard_duration_secs
+                    ));
+                }
             }
 
             ProgressEvent::Phase2Complete => {
