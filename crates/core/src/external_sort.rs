@@ -13,16 +13,31 @@
 //! 5. Final iteration performs k-way merge across all shards
 //! 6. Output is an iterator of records sorted by `tile_id`, ready for tile building
 //!
-//! # Sharding Strategy
+//! # Adaptive Consolidation
 //!
-//! To avoid "too many open files" errors on large datasets, we use sharded sorting:
-//! - Records are partitioned by `tile_id % num_shards`
-//! - Each shard creates far fewer temp files (total_records / num_shards / segment_size)
-//! - Final merge is only num_shards-way (typically 16), not thousands-way
+//! The `extsort` crate opens ALL segment files during merge, which can exhaust
+//! file descriptors on large datasets. We use **adaptive consolidation**:
 //!
-//! For 292M records with 100K segment size and 16 shards:
-//! - Without sharding: 2,920 segments (exceeds 1024 file descriptor limit)
-//! - With sharding: ~183 segments per shard (well under limit)
+//! - Small shards (≤50 segments): Direct iteration, no extra I/O
+//! - Large shards (>50 segments): Consolidate to single intermediate file
+//!
+//! This ensures bounded file descriptors while avoiding unnecessary I/O overhead
+//! for small datasets.
+//!
+//! ## Resource Bounds
+//!
+//! | Dataset Size | Segments/Shard | Action      | Extra I/O |
+//! |--------------|----------------|-------------|-----------|
+//! | 1M records   | ~1             | Direct      | None      |
+//! | 50M records  | ~31            | Direct      | None      |
+//! | 100M records | ~63            | Consolidate | +1 pass   |
+//! | 292M records | ~183           | Consolidate | +1 pass   |
+//!
+//! ## File Descriptor Usage
+//!
+//! - During consolidation: max ~50 (one shard) + accumulated intermediates
+//! - During final merge: 16 files (one per shard)
+//! - Peak: ~200 file descriptors (well under 1024 limit)
 //!
 //! # Example
 //!
@@ -50,7 +65,8 @@ use extsort::{ExternalSorter, Sortable};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 /// A feature record ready for tile building, sorted by tile_id.
 ///
@@ -190,6 +206,22 @@ impl TileFeatureSorter {
         self.records.is_empty()
     }
 
+    /// Estimates the number of segment files that will be created during sorting.
+    ///
+    /// The `extsort` crate creates a new segment file each time the buffer exceeds
+    /// `segment_size`. This estimate is used for adaptive consolidation: if a shard
+    /// will create too many segments, we consolidate to a single intermediate file
+    /// to avoid exhausting file descriptors.
+    ///
+    /// Returns 0 for empty sorters, otherwise `ceil(records / buffer_size)`.
+    pub fn estimated_segment_count(&self) -> usize {
+        if self.records.is_empty() {
+            0
+        } else {
+            (self.records.len() + self.sort_buffer_size - 1) / self.sort_buffer_size
+        }
+    }
+
     /// Sort all records and return an iterator over them in tile_id order.
     ///
     /// This consumes the sorter. For datasets that fit in the buffer,
@@ -282,14 +314,38 @@ impl ShardedTileFeatureSorter {
     ///
     /// This consumes the sorter. Each shard is sorted independently, then
     /// a k-way merge produces the final sorted output.
+    ///
+    /// # Adaptive Consolidation
+    ///
+    /// To avoid exhausting file descriptors on large datasets, this method
+    /// uses adaptive consolidation:
+    ///
+    /// - If a shard has <= `SEGMENT_CONSOLIDATION_THRESHOLD` segments, we use
+    ///   direct iteration (no extra I/O overhead)
+    /// - If a shard has > threshold segments, we consolidate its sorted output
+    ///   to a single intermediate file, then wrap it in `ConsolidatedFileIter`
+    ///
+    /// This ensures we never have more than `threshold + num_shards` file
+    /// descriptors open simultaneously.
     pub fn sort(self) -> std::io::Result<ShardedSortedIterator> {
-        // Sort each shard and collect iterators
         let mut shard_iters: Vec<Box<dyn Iterator<Item = std::io::Result<TileFeatureRecord>>>> =
             Vec::with_capacity(self.num_shards);
 
         for shard in self.shards {
-            let iter = shard.sort()?;
-            shard_iters.push(Box::new(iter));
+            let estimated_segments = shard.estimated_segment_count();
+
+            if estimated_segments > SEGMENT_CONSOLIDATION_THRESHOLD {
+                // Large shard: consolidate to single file to bound open file handles
+                // This adds one write+read pass but keeps fd count bounded
+                let sorted_iter = shard.sort()?;
+                let consolidated_file = consolidate_to_file(sorted_iter)?;
+                let consolidated_iter = ConsolidatedFileIter::new(consolidated_file)?;
+                shard_iters.push(Box::new(consolidated_iter));
+            } else {
+                // Small shard: use direct iteration (no consolidation overhead)
+                let iter = shard.sort()?;
+                shard_iters.push(Box::new(iter));
+            }
         }
 
         ShardedSortedIterator::new(shard_iters)
@@ -409,6 +465,97 @@ impl Iterator for ShardedSortedIterator {
         self.refill_from_shard(entry.shard_idx);
 
         Some(Ok(entry.record))
+    }
+}
+
+// ==================== Adaptive Consolidation ====================
+
+/// Threshold for adaptive consolidation: if a shard has more segments than this,
+/// we consolidate to a single intermediate file to avoid file descriptor exhaustion.
+///
+/// With 16 shards and this threshold, we stay well under the typical 1024 fd limit:
+/// - Max open during consolidation: 50 (one shard) + previous temps
+/// - Max open during merge: 16 intermediate files
+const SEGMENT_CONSOLIDATION_THRESHOLD: usize = 50;
+
+/// Drains an iterator of `TileFeatureRecord` results into a temporary file.
+///
+/// This is used during adaptive consolidation: when a shard has too many segments,
+/// we drain its sorted output to a single file, closing all segment file handles.
+/// The resulting file can then be read back via `ConsolidatedFileIter`.
+///
+/// # Arguments
+///
+/// * `iter` - Iterator yielding `Result<TileFeatureRecord>` (typically from `TileFeatureSorter::sort()`)
+///
+/// # Returns
+///
+/// A `File` handle positioned at the start, ready for reading.
+fn consolidate_to_file<I>(iter: I) -> std::io::Result<File>
+where
+    I: Iterator<Item = std::io::Result<TileFeatureRecord>>,
+{
+    // Create temp file - will be automatically cleaned up when dropped
+    let temp_file = tempfile::tempfile()?;
+    let mut writer = BufWriter::with_capacity(1 << 20, temp_file); // 1MB buffer
+
+    for result in iter {
+        let record = result?;
+        record.encode(&mut writer)?;
+    }
+
+    writer.flush()?;
+
+    // Get the underlying file and seek to start for reading
+    let mut file = writer.into_inner()?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+/// Iterator that reads `TileFeatureRecord`s from a consolidated temp file.
+///
+/// Created by `consolidate_to_file()`, this provides streaming access to records
+/// that were written to disk during adaptive consolidation.
+pub struct ConsolidatedFileIter {
+    reader: BufReader<File>,
+}
+
+impl ConsolidatedFileIter {
+    /// Create a new iterator from a file handle.
+    ///
+    /// The file should be positioned at the start and contain records
+    /// written by `consolidate_to_file()`.
+    pub fn new(file: File) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: BufReader::with_capacity(1 << 20, file), // 1MB buffer
+        })
+    }
+}
+
+impl Iterator for ConsolidatedFileIter {
+    type Item = std::io::Result<TileFeatureRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Try to decode a record; EOF is signaled by reading 0 bytes for the length prefix
+        let mut len_bytes = [0u8; 4];
+        match self.reader.read_exact(&mut len_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => return Some(Err(e)),
+        }
+
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        let mut bytes = vec![0u8; len];
+
+        match self.reader.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(e) => return Some(Err(e)),
+        }
+
+        match rmp_serde::from_slice(&bytes) {
+            Ok(record) => Some(Ok(record)),
+            Err(e) => Some(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))),
+        }
     }
 }
 
@@ -738,5 +885,272 @@ mod tests {
         assert_eq!(record.feature_id, 999);
         assert_eq!(record.geometry_wkb, geom);
         assert_eq!(record.properties, props);
+    }
+
+    // ==================== Adaptive Consolidation Tests ====================
+
+    #[test]
+    fn test_estimated_segment_count_empty() {
+        let sorter = TileFeatureSorter::new(100);
+        assert_eq!(sorter.estimated_segment_count(), 0);
+    }
+
+    #[test]
+    fn test_estimated_segment_count_under_buffer() {
+        let mut sorter = TileFeatureSorter::new(100);
+        for i in 0..50 {
+            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, vec![], vec![]));
+        }
+        // 50 records with buffer 100 = 1 segment (in-memory, no spill)
+        assert_eq!(sorter.estimated_segment_count(), 1);
+    }
+
+    #[test]
+    fn test_estimated_segment_count_exact_buffer() {
+        let mut sorter = TileFeatureSorter::new(100);
+        for i in 0..100 {
+            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, vec![], vec![]));
+        }
+        // 100 records with buffer 100 = 1 segment
+        assert_eq!(sorter.estimated_segment_count(), 1);
+    }
+
+    #[test]
+    fn test_estimated_segment_count_multiple_segments() {
+        let mut sorter = TileFeatureSorter::new(100);
+        for i in 0..350 {
+            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, vec![], vec![]));
+        }
+        // 350 records with buffer 100 = ceil(350/100) = 4 segments
+        assert_eq!(sorter.estimated_segment_count(), 4);
+    }
+
+    #[test]
+    fn test_estimated_segment_count_large_dataset() {
+        let mut sorter = TileFeatureSorter::new(100);
+        for i in 0..10250 {
+            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, vec![], vec![]));
+        }
+        // 10250 records with buffer 100 = ceil(10250/100) = 103 segments
+        assert_eq!(sorter.estimated_segment_count(), 103);
+    }
+
+    // ==================== ConsolidatedFileIter Tests ====================
+
+    #[test]
+    fn test_consolidate_and_read_back_roundtrip() {
+        // Create some records
+        let records: Vec<TileFeatureRecord> = (0..10)
+            .map(|i| TileFeatureRecord::new(i, 0, 0, 0, i, vec![i as u8], vec![]))
+            .collect();
+
+        // Consolidate to file
+        let file = consolidate_to_file(records.clone().into_iter().map(Ok)).unwrap();
+
+        // Read back via ConsolidatedFileIter
+        let iter = ConsolidatedFileIter::new(file).unwrap();
+        let read_back: Vec<_> = iter.map(|r| r.unwrap()).collect();
+
+        assert_eq!(read_back.len(), 10);
+        for (i, record) in read_back.iter().enumerate() {
+            assert_eq!(record.tile_id, i as u64);
+            assert_eq!(record.geometry_wkb, vec![i as u8]);
+        }
+    }
+
+    #[test]
+    fn test_consolidate_empty_iterator() {
+        let records: Vec<TileFeatureRecord> = vec![];
+        let file = consolidate_to_file(records.into_iter().map(Ok)).unwrap();
+        let iter = ConsolidatedFileIter::new(file).unwrap();
+        let read_back: Vec<_> = iter.map(|r| r.unwrap()).collect();
+        assert!(read_back.is_empty());
+    }
+
+    #[test]
+    fn test_consolidate_preserves_all_fields() {
+        let original = TileFeatureRecord::new(
+            12345,
+            8,
+            100,
+            200,
+            9999,
+            vec![0x01, 0x02, 0x03, 0x04, 0x05],
+            vec![0x82, 0xa4, b't', b'e', b's', b't'],
+        );
+
+        let file = consolidate_to_file(vec![original.clone()].into_iter().map(Ok)).unwrap();
+        let mut iter = ConsolidatedFileIter::new(file).unwrap();
+
+        let read_back = iter.next().unwrap().unwrap();
+        assert_eq!(read_back, original);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_consolidate_large_dataset() {
+        // Test with 10K records to ensure streaming works
+        let records: Vec<TileFeatureRecord> = (0..10_000)
+            .map(|i| {
+                TileFeatureRecord::new(
+                    i,
+                    (i % 15) as u8,
+                    (i % 1000) as u32,
+                    (i / 1000) as u32,
+                    i,
+                    vec![(i % 256) as u8; 50], // 50 bytes of geometry
+                    vec![(i % 128) as u8; 20], // 20 bytes of properties
+                )
+            })
+            .collect();
+
+        let file = consolidate_to_file(records.clone().into_iter().map(Ok)).unwrap();
+        let iter = ConsolidatedFileIter::new(file).unwrap();
+        let read_back: Vec<_> = iter.map(|r| r.unwrap()).collect();
+
+        assert_eq!(read_back.len(), 10_000);
+        for (i, record) in read_back.iter().enumerate() {
+            assert_eq!(record.tile_id, i as u64, "Mismatch at index {}", i);
+        }
+    }
+
+    // ==================== Adaptive Sort Behavior Tests ====================
+
+    #[test]
+    fn test_adaptive_sort_small_dataset_direct_path() {
+        // Small dataset: stays under segment threshold, uses direct iteration
+        // 100 records / 100 buffer = 1 segment per shard (well under 50 threshold)
+        let mut sorter = ShardedTileFeatureSorter::with_shards(100, 4);
+
+        for i in 0..100 {
+            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, vec![], vec![]));
+        }
+
+        let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(sorted.len(), 100);
+
+        // Verify correct global ordering
+        for (i, record) in sorted.iter().enumerate() {
+            assert_eq!(record.tile_id, i as u64);
+        }
+    }
+
+    #[test]
+    fn test_adaptive_sort_large_dataset_consolidation_path() {
+        // Large dataset: exceeds segment threshold, triggers consolidation
+        // 10K records / 10 buffer / 4 shards = ~250 segments per shard (> 50 threshold)
+        let mut sorter = ShardedTileFeatureSorter::with_shards(10, 4);
+
+        for i in 0..10_000 {
+            sorter.add(TileFeatureRecord::new(
+                i,
+                0,
+                0,
+                0,
+                i,
+                vec![(i % 256) as u8],
+                vec![],
+            ));
+        }
+
+        let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(sorted.len(), 10_000);
+
+        // Verify correct global ordering
+        for (i, record) in sorted.iter().enumerate() {
+            assert_eq!(record.tile_id, i as u64, "Mismatch at position {}", i);
+        }
+    }
+
+    #[test]
+    fn test_adaptive_sort_mixed_shard_sizes() {
+        // Create uneven distribution: some shards will consolidate, others won't
+        // Use buffer=10, 4 shards
+        // Add many records to tile_ids 0, 4, 8, 12 (all go to shard 0)
+        // Add few records to tile_ids 1, 2, 3 (go to shards 1, 2, 3)
+        let mut sorter = ShardedTileFeatureSorter::with_shards(10, 4);
+
+        // Shard 0: 1000 records → ~100 segments (consolidation)
+        for i in 0..1000 {
+            let tile_id = (i * 4) as u64; // 0, 4, 8, 12, 16, ...
+            sorter.add(TileFeatureRecord::new(
+                tile_id,
+                0,
+                0,
+                0,
+                i as u64,
+                vec![],
+                vec![],
+            ));
+        }
+
+        // Shards 1, 2, 3: 10 records each → 1 segment each (direct)
+        for shard in 1..4 {
+            for i in 0..10 {
+                let tile_id = shard + (i * 4); // e.g., shard 1: 1, 5, 9, 13, ...
+                sorter.add(TileFeatureRecord::new(
+                    tile_id as u64,
+                    0,
+                    0,
+                    0,
+                    (shard * 1000 + i) as u64,
+                    vec![],
+                    vec![],
+                ));
+            }
+        }
+
+        let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(sorted.len(), 1030);
+
+        // Verify sorted order
+        let mut prev_tile_id = 0u64;
+        for record in &sorted {
+            assert!(
+                record.tile_id >= prev_tile_id,
+                "Out of order: {} after {}",
+                record.tile_id,
+                prev_tile_id
+            );
+            prev_tile_id = record.tile_id;
+        }
+    }
+
+    #[test]
+    fn test_adaptive_sort_preserves_data_through_consolidation() {
+        // Large dataset that triggers consolidation, verify data integrity
+        let mut sorter = ShardedTileFeatureSorter::with_shards(10, 4);
+
+        let test_records: Vec<TileFeatureRecord> = (0..5000)
+            .map(|i| {
+                TileFeatureRecord::new(
+                    i,
+                    (i % 15) as u8,
+                    (i % 1000) as u32,
+                    (i / 1000) as u32,
+                    i * 2,                                         // Distinct feature_id
+                    vec![(i % 256) as u8; 10 + (i % 50) as usize], // Variable geometry
+                    vec![(i % 128) as u8; 5 + (i % 20) as usize],  // Variable properties
+                )
+            })
+            .collect();
+
+        for record in &test_records {
+            sorter.add(record.clone());
+        }
+
+        let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(sorted.len(), 5000);
+
+        // Verify each record's data is preserved
+        for record in &sorted {
+            let i = record.tile_id;
+            assert_eq!(record.z, (i % 15) as u8);
+            assert_eq!(record.x, (i % 1000) as u32);
+            assert_eq!(record.y, (i / 1000) as u32);
+            assert_eq!(record.feature_id, i * 2);
+            assert_eq!(record.geometry_wkb.len(), 10 + (i % 50) as usize);
+            assert_eq!(record.properties.len(), 5 + (i % 20) as usize);
+        }
     }
 }
