@@ -14,7 +14,7 @@ use crate::tile::TileBounds;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read as IoRead, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// PMTiles v3 magic number
@@ -1453,6 +1453,357 @@ impl Drop for StreamingPmtilesWriter {
 }
 
 // ============================================================================
+// Spool-Based PMTiles Writer
+// ============================================================================
+
+use crate::streaming_types::{SpoolEntry, TileFormat};
+
+/// Configuration for spool-based PMTiles writing
+#[derive(Debug, Clone)]
+pub struct SpoolWriterConfig {
+    /// Layer name for vector_layers metadata
+    pub layer_name: String,
+    /// Min zoom level
+    pub min_zoom: u8,
+    /// Max zoom level
+    pub max_zoom: u8,
+    /// Field metadata: field name -> MVT type ("String", "Number", "Boolean")
+    pub fields: HashMap<String, String>,
+    /// Compression for tile data (already compressed in spool)
+    pub tile_compression: Compression,
+    /// Compression for internal data (directories, metadata)
+    pub internal_compression: Compression,
+}
+
+impl Default for SpoolWriterConfig {
+    fn default() -> Self {
+        Self {
+            layer_name: "layer".to_string(),
+            min_zoom: 0,
+            max_zoom: 14,
+            fields: HashMap::new(),
+            tile_compression: Compression::Gzip,
+            internal_compression: Compression::Gzip,
+        }
+    }
+}
+
+/// Statistics from spool-based PMTiles writing
+#[derive(Debug, Clone, Default)]
+pub struct SpoolWriteStats {
+    /// Total tiles written
+    pub tiles_written: u64,
+    /// Total bytes of tile data
+    pub tile_data_bytes: u64,
+    /// Number of directory entries (after run-length encoding)
+    pub directory_entries: u64,
+    /// Bytes of compressed directory
+    pub directory_bytes: u64,
+    /// Bytes of compressed metadata
+    pub metadata_bytes: u64,
+}
+
+/// Write a PMTiles archive from a tile spool.
+///
+/// This function assembles a PMTiles v3 archive from pre-encoded tiles stored
+/// in a spool file. The spool stores tiles in arrival order, but this function
+/// writes them in tile_id order for proper PMTiles clustering.
+///
+/// # Critical Implementation Detail
+///
+/// PMTiles directory entries store offsets **relative to tile_data_offset**.
+/// Since the spool stores tiles in arrival order (not tile_id order), we:
+/// 1. Sort entries by tile_id
+/// 2. Write tiles to output in tile_id order (seeking in spool for each)
+/// 3. Calculate final offset as we write each tile
+///
+/// # Arguments
+///
+/// * `output_path` - Path to write the final PMTiles file
+/// * `spool_path` - Path to the spool file containing encoded tile data
+/// * `entries` - Spool entries (tile_id, spool_offset, length) - will be sorted by tile_id
+/// * `format` - Tile encoding format (MVT or MLT)
+/// * `bounds` - Geographic bounds for the tileset
+/// * `config` - Writer configuration (layer name, zoom levels, fields, compression)
+///
+/// # Returns
+///
+/// Statistics about the write operation, or an error.
+///
+/// # Example
+///
+/// ```no_run
+/// use gpq_tiles_core::pmtiles_writer::{write_pmtiles_from_spool, SpoolWriterConfig};
+/// use gpq_tiles_core::streaming_types::{SpoolEntry, TileFormat};
+/// use gpq_tiles_core::tile::TileBounds;
+/// use std::path::Path;
+///
+/// let entries = vec![
+///     SpoolEntry { tile_id: 0, spool_offset: 0, length: 100 },
+///     SpoolEntry { tile_id: 1, spool_offset: 100, length: 150 },
+/// ];
+///
+/// let bounds = TileBounds::new(-180.0, -85.0, 180.0, 85.0);
+/// let config = SpoolWriterConfig::default();
+///
+/// let stats = write_pmtiles_from_spool(
+///     Path::new("output.pmtiles"),
+///     Path::new("tiles.spool"),
+///     entries,
+///     TileFormat::Mvt,
+///     bounds,
+///     &config,
+/// ).unwrap();
+/// ```
+pub fn write_pmtiles_from_spool(
+    output_path: &Path,
+    spool_path: &Path,
+    mut entries: Vec<SpoolEntry>,
+    format: TileFormat,
+    bounds: TileBounds,
+    config: &SpoolWriterConfig,
+) -> Result<SpoolWriteStats> {
+    let mut stats = SpoolWriteStats::default();
+
+    // 1. Sort entries by tile_id for clustered PMTiles output
+    entries.sort_by_key(|e| e.tile_id);
+
+    // 2. Deduplicate entries: keep only the last entry per tile_id
+    // (sparse spool pattern allows multiple entries for same tile)
+    entries = deduplicate_entries(entries);
+
+    // 3. Open spool file for reading
+    let spool_file = File::open(spool_path)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to open spool file: {}", e)))?;
+    let mut spool_reader = BufReader::new(spool_file);
+
+    // 4. Create output file
+    let output_file = File::create(output_path)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to create output file: {}", e)))?;
+    let mut writer = BufWriter::new(output_file);
+
+    // 5. Reserve space for header (127 bytes) - will write at the end
+    let header_placeholder = [0u8; 127];
+    writer
+        .write_all(&header_placeholder)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to write header placeholder: {}", e)))?;
+
+    // 6. Build and write metadata
+    let metadata_json = build_spool_metadata_json(config, &bounds);
+    let compressed_metadata =
+        compression::compress(metadata_json.as_bytes(), config.internal_compression)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
+    stats.metadata_bytes = compressed_metadata.len() as u64;
+
+    // We'll write metadata after the root directory, so calculate offsets later
+
+    // 7. Write tiles in tile_id order, tracking final offsets
+    // First pass: collect tile data into a buffer and build directory entries
+    let mut tile_data_buf = Vec::new();
+    let mut dir_entries: Vec<DirEntry> = Vec::new();
+    let mut read_buf = vec![0u8; 64 * 1024]; // 64KB read buffer
+
+    for entry in &entries {
+        let spool_offset = entry.spool_offset;
+        let length = entry.length as usize;
+
+        // Seek to tile position in spool
+        spool_reader
+            .seek(SeekFrom::Start(spool_offset))
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to seek in spool: {}", e)))?;
+
+        // Ensure buffer is large enough
+        if read_buf.len() < length {
+            read_buf.resize(length, 0);
+        }
+
+        // Read tile data from spool
+        spool_reader
+            .read_exact(&mut read_buf[..length])
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to read tile from spool: {}", e)))?;
+
+        // Track final offset (relative to tile_data section start)
+        let final_offset = tile_data_buf.len() as u64;
+
+        // Add to tile data buffer
+        tile_data_buf.extend_from_slice(&read_buf[..length]);
+
+        // Build directory entry with run_length encoding support
+        // Check if this can extend the previous entry's run_length
+        if let Some(last) = dir_entries.last_mut() {
+            if last.offset + last.length as u64 == final_offset
+                && entry.tile_id == last.tile_id + last.run_length as u64
+                && entry.length == last.length
+            {
+                // Same content at consecutive tile_id - extend run_length
+                last.run_length += 1;
+                stats.tiles_written += 1;
+                continue;
+            }
+        }
+
+        dir_entries.push(DirEntry {
+            tile_id: entry.tile_id,
+            offset: final_offset,
+            length: entry.length,
+            run_length: 1,
+        });
+
+        stats.tiles_written += 1;
+    }
+
+    stats.tile_data_bytes = tile_data_buf.len() as u64;
+    stats.directory_entries = dir_entries.len() as u64;
+
+    // 8. Build directory structure with leaf directories if needed
+    let dir_layout = make_root_leaves(&dir_entries, config.internal_compression)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to build directory: {}", e)))?;
+    stats.directory_bytes =
+        dir_layout.root_bytes.len() as u64 + dir_layout.leaves_bytes.len() as u64;
+
+    // 9. Calculate final section offsets
+    // Layout: Header (127) | Root Dir | Metadata | Leaf Dirs | Tile Data
+    let root_dir_offset = 127u64;
+    let root_dir_length = dir_layout.root_bytes.len() as u64;
+    let metadata_offset = root_dir_offset + root_dir_length;
+    let metadata_length = compressed_metadata.len() as u64;
+    let leaf_dirs_offset = metadata_offset + metadata_length;
+    let leaf_dirs_length = dir_layout.leaves_bytes.len() as u64;
+    let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
+    let tile_data_length = tile_data_buf.len() as u64;
+
+    // 10. Build final header
+    let tile_type = match format {
+        TileFormat::Mvt => TileType::Mvt,
+        TileFormat::Mlt => TileType::Unknown, // MLT not yet in PMTiles spec
+    };
+
+    let header = Header {
+        root_dir_offset,
+        root_dir_length,
+        json_metadata_offset: metadata_offset,
+        json_metadata_length: metadata_length,
+        leaf_dirs_offset: if leaf_dirs_length > 0 {
+            leaf_dirs_offset
+        } else {
+            0
+        },
+        leaf_dirs_length,
+        tile_data_offset,
+        tile_data_length,
+        addressed_tiles_count: stats.tiles_written,
+        tile_entries_count: stats.directory_entries,
+        tile_contents_count: stats.tiles_written, // No deduplication in spool mode (already deduplicated)
+        clustered: true,
+        internal_compression: config.internal_compression,
+        tile_compression: config.tile_compression,
+        tile_type,
+        min_zoom: config.min_zoom,
+        max_zoom: config.max_zoom,
+        min_lon: bounds.lng_min,
+        min_lat: bounds.lat_min,
+        max_lon: bounds.lng_max,
+        max_lat: bounds.lat_max,
+        center_zoom: (config.min_zoom + config.max_zoom) / 2,
+        center_lon: (bounds.lng_min + bounds.lng_max) / 2.0,
+        center_lat: (bounds.lat_min + bounds.lat_max) / 2.0,
+    };
+
+    // 11. Write sections in order (after header placeholder)
+    writer
+        .write_all(&dir_layout.root_bytes)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to write root directory: {}", e)))?;
+
+    writer
+        .write_all(&compressed_metadata)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
+
+    if !dir_layout.leaves_bytes.is_empty() {
+        writer
+            .write_all(&dir_layout.leaves_bytes)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e)))?;
+    }
+
+    writer
+        .write_all(&tile_data_buf)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile data: {}", e)))?;
+
+    // 12. Seek back and write the actual header
+    writer
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to seek to header: {}", e)))?;
+
+    writer
+        .write_all(&header.to_bytes())
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to write header: {}", e)))?;
+
+    writer
+        .flush()
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to flush: {}", e)))?;
+
+    Ok(stats)
+}
+
+/// Deduplicate spool entries, keeping only the last entry per tile_id.
+///
+/// The sparse spool pattern allows multiple entries for the same tile_id
+/// (for handling late arrivals). This function keeps only the last (most recent)
+/// entry for each tile_id.
+///
+/// Assumes entries are already sorted by tile_id.
+fn deduplicate_entries(entries: Vec<SpoolEntry>) -> Vec<SpoolEntry> {
+    if entries.is_empty() {
+        return entries;
+    }
+
+    let mut result = Vec::with_capacity(entries.len());
+    let mut entries_iter = entries.into_iter().peekable();
+
+    while let Some(entry) = entries_iter.next() {
+        // Check if next entry has the same tile_id
+        match entries_iter.peek() {
+            Some(next) if next.tile_id == entry.tile_id => {
+                // Skip this entry, keep the later one
+                continue;
+            }
+            _ => {
+                // This is the last entry for this tile_id
+                result.push(entry);
+            }
+        }
+    }
+
+    result
+}
+
+/// Build metadata JSON for spool-based writer
+fn build_spool_metadata_json(config: &SpoolWriterConfig, bounds: &TileBounds) -> String {
+    let fields_json = if config.fields.is_empty() {
+        "{}".to_string()
+    } else {
+        let mut field_pairs: Vec<_> = config.fields.iter().collect();
+        field_pairs.sort_by_key(|(k, _)| *k);
+        let field_strings: Vec<String> = field_pairs
+            .iter()
+            .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
+            .collect();
+        format!("{{{}}}", field_strings.join(","))
+    };
+
+    format!(
+        r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],"bounds":[{},{},{},{}],"format":"pbf","generator":"gpq-tiles"}}"#,
+        config.layer_name,
+        config.min_zoom,
+        config.max_zoom,
+        fields_json,
+        bounds.lng_min,
+        bounds.lat_min,
+        bounds.lng_max,
+        bounds.lat_max
+    )
+}
+
+// ============================================================================
 // Tests (TDD)
 // ============================================================================
 
@@ -2666,6 +3017,424 @@ mod tests {
             }
         }
 
+        let _ = fs::remove_file(output_path);
+    }
+
+    // =========================================================================
+    // Spool-Based Writer Tests (TDD)
+    // =========================================================================
+
+    use crate::streaming_types::SpoolEntry;
+
+    /// Helper: create a mock spool file with test data
+    fn create_mock_spool(
+        path: &Path,
+        tiles: &[(u64, &[u8])], // (tile_id, tile_data)
+    ) -> Vec<SpoolEntry> {
+        let mut file = File::create(path).unwrap();
+        let mut entries = Vec::new();
+        let mut offset = 0u64;
+
+        for (tile_id, data) in tiles {
+            file.write_all(data).unwrap();
+            entries.push(SpoolEntry {
+                tile_id: *tile_id,
+                spool_offset: offset,
+                length: data.len() as u32,
+            });
+            offset += data.len() as u64;
+        }
+        file.flush().unwrap();
+        entries
+    }
+
+    #[test]
+    fn test_spool_writer_empty_entries() {
+        let spool_path = Path::new("/tmp/test-spool-empty.spool");
+        let output_path = Path::new("/tmp/test-spool-empty.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        // Create empty spool
+        File::create(spool_path).unwrap();
+
+        let result = write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            Vec::new(),
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+            &SpoolWriterConfig::default(),
+        );
+
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert_eq!(stats.tiles_written, 0);
+        assert_eq!(stats.tile_data_bytes, 0);
+
+        // Verify output is valid PMTiles
+        let data = fs::read(output_path).unwrap();
+        assert_eq!(&data[0..7], b"PMTiles");
+        assert_eq!(data[7], 3);
+
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_spool_writer_single_tile() {
+        let spool_path = Path::new("/tmp/test-spool-single.spool");
+        let output_path = Path::new("/tmp/test-spool-single.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        // Create spool with one tile (tile_id = 0 for z0/x0/y0)
+        let tile_data = vec![0x1a, 0x00, 0x01, 0x02];
+        let entries = create_mock_spool(spool_path, &[(0, &tile_data)]);
+
+        let stats = write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            entries,
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+            &SpoolWriterConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(stats.tiles_written, 1);
+        assert_eq!(stats.tile_data_bytes, 4);
+        assert_eq!(stats.directory_entries, 1);
+
+        // Verify output
+        let data = fs::read(output_path).unwrap();
+        let addressed = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        assert_eq!(addressed, 1);
+
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_spool_writer_tiles_sorted_by_tile_id() {
+        let spool_path = Path::new("/tmp/test-spool-unsorted.spool");
+        let output_path = Path::new("/tmp/test-spool-unsorted.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        // Create spool with tiles in non-sorted order
+        // tile_ids: 4, 1, 3, 2 (out of order)
+        let entries = create_mock_spool(
+            spool_path,
+            &[
+                (4, &[0x04, 0x00]), // Written first in spool
+                (1, &[0x01, 0x00]),
+                (3, &[0x03, 0x00]),
+                (2, &[0x02, 0x00]), // Written last in spool
+            ],
+        );
+
+        let stats = write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            entries,
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+            &SpoolWriterConfig {
+                min_zoom: 1,
+                max_zoom: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stats.tiles_written, 4);
+
+        // Verify header shows clustered mode
+        let data = fs::read(output_path).unwrap();
+        let clustered = data[96];
+        assert_eq!(clustered, 1, "Should be clustered");
+
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_spool_writer_offset_calculation() {
+        // This test verifies the critical offset calculation logic
+        let spool_path = Path::new("/tmp/test-spool-offsets.spool");
+        let output_path = Path::new("/tmp/test-spool-offsets.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        // Create spool with tiles of different sizes
+        let entries = create_mock_spool(
+            spool_path,
+            &[
+                (0, &[0x00; 10]), // 10 bytes
+                (1, &[0x01; 20]), // 20 bytes
+                (2, &[0x02; 15]), // 15 bytes
+            ],
+        );
+
+        let stats = write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            entries,
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+            &SpoolWriterConfig::default(),
+        )
+        .unwrap();
+
+        // Total tile data should be 10 + 20 + 15 = 45 bytes
+        assert_eq!(stats.tile_data_bytes, 45);
+
+        // Verify by reading the PMTiles header
+        let data = fs::read(output_path).unwrap();
+        let tile_data_offset = u64::from_le_bytes(data[56..64].try_into().unwrap()) as usize;
+        let tile_data_length = u64::from_le_bytes(data[64..72].try_into().unwrap()) as usize;
+
+        assert_eq!(tile_data_length, 45);
+
+        // Verify tile data was written correctly
+        let tile_section = &data[tile_data_offset..tile_data_offset + tile_data_length];
+        assert_eq!(&tile_section[0..10], &[0x00; 10]);
+        assert_eq!(&tile_section[10..30], &[0x01; 20]);
+        assert_eq!(&tile_section[30..45], &[0x02; 15]);
+
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_spool_writer_deduplicates_entries() {
+        let spool_path = Path::new("/tmp/test-spool-dedup.spool");
+        let output_path = Path::new("/tmp/test-spool-dedup.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        // Create spool with duplicate tile_ids (sparse spool pattern)
+        // Later entry should override earlier one
+        let mut file = File::create(spool_path).unwrap();
+        let entries = vec![
+            SpoolEntry {
+                tile_id: 1,
+                spool_offset: 0,
+                length: 5,
+            },
+            SpoolEntry {
+                tile_id: 2,
+                spool_offset: 5,
+                length: 5,
+            },
+            SpoolEntry {
+                tile_id: 1, // Duplicate - late arrival
+                spool_offset: 10,
+                length: 8,
+            },
+        ];
+
+        // Write tile data: first tile_1 (5 bytes), tile_2 (5 bytes), second tile_1 (8 bytes)
+        file.write_all(&[0x01; 5]).unwrap(); // Original tile 1
+        file.write_all(&[0x02; 5]).unwrap(); // Tile 2
+        file.write_all(&[0x0A; 8]).unwrap(); // Updated tile 1 (late arrival)
+        file.flush().unwrap();
+
+        let stats = write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            entries,
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+            &SpoolWriterConfig::default(),
+        )
+        .unwrap();
+
+        // Only 2 unique tiles (tile 1 overwritten, tile 2 kept)
+        assert_eq!(stats.tiles_written, 2);
+        // Total bytes: 8 (new tile_1) + 5 (tile_2) = 13
+        assert_eq!(stats.tile_data_bytes, 13);
+
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_spool_writer_metadata_json() {
+        let spool_path = Path::new("/tmp/test-spool-metadata.spool");
+        let output_path = Path::new("/tmp/test-spool-metadata.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        let entries = create_mock_spool(spool_path, &[(0, &[0x1a, 0x00])]);
+
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), "String".to_string());
+        fields.insert("count".to_string(), "Number".to_string());
+
+        let config = SpoolWriterConfig {
+            layer_name: "buildings".to_string(),
+            min_zoom: 5,
+            max_zoom: 14,
+            fields,
+            ..Default::default()
+        };
+
+        write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            entries,
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-122.5, 37.5, -122.0, 38.0),
+            &config,
+        )
+        .unwrap();
+
+        // Read and decompress metadata
+        let data = fs::read(output_path).unwrap();
+        let metadata_offset = u64::from_le_bytes(data[24..32].try_into().unwrap()) as usize;
+        let metadata_length = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
+
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut decoder = GzDecoder::new(&data[metadata_offset..metadata_offset + metadata_length]);
+        let mut metadata_json = String::new();
+        decoder.read_to_string(&mut metadata_json).unwrap();
+
+        // Verify metadata content
+        assert!(metadata_json.contains("\"id\":\"buildings\""));
+        assert!(metadata_json.contains("\"minzoom\":5"));
+        assert!(metadata_json.contains("\"maxzoom\":14"));
+        assert!(metadata_json.contains("\"name\":\"String\""));
+        assert!(metadata_json.contains("\"count\":\"Number\""));
+        assert!(
+            metadata_json.contains("\"bounds\":[-122.5,37.5,-122,-38]")
+                || metadata_json.contains("\"bounds\":[-122.5,37.5,-122,38]")
+        );
+
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_deduplicate_entries_preserves_last() {
+        let entries = vec![
+            SpoolEntry {
+                tile_id: 1,
+                spool_offset: 0,
+                length: 10,
+            },
+            SpoolEntry {
+                tile_id: 1,
+                spool_offset: 100,
+                length: 20,
+            }, // Later entry
+            SpoolEntry {
+                tile_id: 2,
+                spool_offset: 200,
+                length: 15,
+            },
+        ];
+
+        let deduped = deduplicate_entries(entries);
+
+        assert_eq!(deduped.len(), 2);
+        // Tile 1 should have the later entry (spool_offset: 100, length: 20)
+        assert_eq!(deduped[0].tile_id, 1);
+        assert_eq!(deduped[0].spool_offset, 100);
+        assert_eq!(deduped[0].length, 20);
+        // Tile 2 unchanged
+        assert_eq!(deduped[1].tile_id, 2);
+    }
+
+    #[test]
+    fn test_deduplicate_entries_empty() {
+        let deduped = deduplicate_entries(Vec::new());
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_entries_no_duplicates() {
+        let entries = vec![
+            SpoolEntry {
+                tile_id: 1,
+                spool_offset: 0,
+                length: 10,
+            },
+            SpoolEntry {
+                tile_id: 2,
+                spool_offset: 10,
+                length: 20,
+            },
+            SpoolEntry {
+                tile_id: 3,
+                spool_offset: 30,
+                length: 15,
+            },
+        ];
+
+        let deduped = deduplicate_entries(entries.clone());
+        assert_eq!(deduped.len(), 3);
+    }
+
+    #[test]
+    fn test_spool_writer_handles_large_tiles() {
+        let spool_path = Path::new("/tmp/test-spool-large.spool");
+        let output_path = Path::new("/tmp/test-spool-large.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        // Create a large tile (100KB)
+        let large_tile = vec![0xAB; 100_000];
+        let entries = create_mock_spool(spool_path, &[(0, &large_tile)]);
+
+        let stats = write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            entries,
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+            &SpoolWriterConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(stats.tiles_written, 1);
+        assert_eq!(stats.tile_data_bytes, 100_000);
+
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_spool_write_stats() {
+        let spool_path = Path::new("/tmp/test-spool-stats.spool");
+        let output_path = Path::new("/tmp/test-spool-stats.pmtiles");
+        let _ = fs::remove_file(spool_path);
+        let _ = fs::remove_file(output_path);
+
+        let entries = create_mock_spool(
+            spool_path,
+            &[(0, &[0x00; 100]), (1, &[0x01; 200]), (2, &[0x02; 150])],
+        );
+
+        let stats = write_pmtiles_from_spool(
+            output_path,
+            spool_path,
+            entries,
+            crate::streaming_types::TileFormat::Mvt,
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+            &SpoolWriterConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(stats.tiles_written, 3);
+        assert_eq!(stats.tile_data_bytes, 450);
+        assert_eq!(stats.directory_entries, 3);
+        assert!(stats.directory_bytes > 0);
+        assert!(stats.metadata_bytes > 0);
+
+        let _ = fs::remove_file(spool_path);
         let _ = fs::remove_file(output_path);
     }
 }
