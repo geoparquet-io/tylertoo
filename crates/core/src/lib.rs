@@ -63,6 +63,7 @@ pub mod property_filter;
 pub mod quality;
 pub mod simplify;
 pub mod spatial_index;
+pub mod streaming_buffer;
 pub mod streaming_types;
 pub mod sutherland_hodgman;
 pub mod tile;
@@ -94,9 +95,11 @@ pub use streaming_types::{
 pub use tile_spool::TileSpool;
 // Re-export parallel encoding types
 pub use parallel_encoding::{
-    encode_tiles_parallel, encode_tiles_smart, EncodedTile, PendingTile, TileFeature,
-    DEFAULT_PARALLEL_THRESHOLD,
+    encode_tiles_parallel, encode_tiles_smart, EncodedTile, PendingTile,
+    TileFeature as ParallelTileFeature, DEFAULT_PARALLEL_THRESHOLD,
 };
+// Re-export streaming buffer types
+pub use streaming_buffer::{HilbertCalibrator, StreamingTileBuffer, TileAccumulator, TileFeature};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
