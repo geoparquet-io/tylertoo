@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::pipeline::{
-    generate_tiles_spool_based, generate_tiles_to_writer_with_progress, ProgressEvent, TilerConfig,
+    generate_tiles_spool_based_with_progress, generate_tiles_to_writer_with_progress,
+    ProgressEvent, TilerConfig,
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::streaming_types::{SortingStrategy, StreamingConfig, TileFormat};
@@ -441,14 +442,13 @@ fn main() -> Result<()> {
     // Choose pipeline based on sorting strategy
     let (write_stats, peak_memory) = match sorting_strategy {
         SortingStrategy::Streaming => {
-            // Use spool-based streaming pipeline
-            let result = generate_tiles_spool_based(
+            // Use spool-based streaming pipeline with progress
+            let result = run_streaming_with_progress(
                 &args.input,
                 &args.output,
                 &tiler_config,
                 &streaming_config,
-            )
-            .map_err(|e| anyhow::anyhow!("Pipeline error: {}", e))?;
+            )?;
 
             // Create compatible write stats
             let write_stats = gpq_tiles_core::pmtiles_writer::StreamingWriteStats {
@@ -682,4 +682,126 @@ fn run_with_progress(
 
     generate_tiles_to_writer_with_progress(input, config, writer, progress_callback)
         .context("Failed to generate tiles")
+}
+
+/// Run the streaming spool-based pipeline with progress bars.
+fn run_streaming_with_progress(
+    input: &Path,
+    output: &Path,
+    config: &TilerConfig,
+    streaming_config: &gpq_tiles_core::streaming_types::StreamingConfig,
+) -> Result<gpq_tiles_core::pipeline::SpoolStreamingResult> {
+    use indicatif::MultiProgress;
+
+    // Multi-progress for managing multiple progress bars
+    let multi = MultiProgress::new();
+
+    // Shared state for progress bars
+    let phase1_pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+    let phase2_pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+    let phase3_pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+
+    let phase1_pb_clone = Arc::clone(&phase1_pb);
+    let phase2_pb_clone = Arc::clone(&phase2_pb);
+    let phase3_pb_clone = Arc::clone(&phase3_pb);
+    let multi_clone = multi.clone();
+
+    let progress_callback = Box::new(move |event: ProgressEvent| {
+        match event {
+            ProgressEvent::PhaseStart { phase, name: _ } => {
+                if phase == 1 {
+                    let pb = multi_clone.add(ProgressBar::new_spinner());
+                    pb.set_style(
+                        ProgressStyle::default_spinner()
+                            .template("{spinner:.cyan} Reading GeoParquet...")
+                            .unwrap(),
+                    );
+                    pb.enable_steady_tick(Duration::from_millis(100));
+                    *phase1_pb_clone.lock().unwrap() = Some(pb);
+                } else if phase == 3 {
+                    let pb = multi_clone.add(ProgressBar::new_spinner());
+                    pb.set_style(
+                        ProgressStyle::default_spinner()
+                            .template("{spinner:.cyan} Writing PMTiles...")
+                            .unwrap(),
+                    );
+                    pb.enable_steady_tick(Duration::from_millis(100));
+                    *phase3_pb_clone.lock().unwrap() = Some(pb);
+                }
+            }
+
+            ProgressEvent::Phase1Progress {
+                row_group,
+                total_row_groups,
+                features_in_group: _,
+                records_written,
+            } => {
+                if let Some(ref pb) = *phase1_pb_clone.lock().unwrap() {
+                    if row_group == 1 {
+                        pb.set_length(total_row_groups as u64);
+                        pb.set_style(
+                            ProgressStyle::default_bar()
+                                .template("{spinner:.cyan} Reading [{bar:40.cyan/blue}] {pos}/{len} row groups | {msg}")
+                                .unwrap()
+                                .progress_chars("█▓▒░  "),
+                        );
+                    }
+                    pb.set_position(row_group as u64);
+                    pb.set_message(format!("{} features", format_number(records_written)));
+                }
+            }
+
+            ProgressEvent::Phase1Complete {
+                total_records,
+                peak_memory_bytes: _,
+            } => {
+                if let Some(ref pb) = *phase1_pb_clone.lock().unwrap() {
+                    pb.finish_with_message(format!("✓ {} features", format_number(total_records)));
+                }
+            }
+
+            ProgressEvent::Phase2Start => {
+                let pb = multi_clone.add(ProgressBar::new_spinner());
+                pb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.cyan} Flushing tiles to spool...")
+                        .unwrap(),
+                );
+                pb.enable_steady_tick(Duration::from_millis(100));
+                *phase2_pb_clone.lock().unwrap() = Some(pb);
+            }
+
+            ProgressEvent::Phase2Complete => {
+                if let Some(ref pb) = *phase2_pb_clone.lock().unwrap() {
+                    pb.finish_with_message("✓ Spool ready");
+                }
+            }
+
+            ProgressEvent::Phase3Progress { .. } => {
+                // No granular progress for PMTiles writing yet
+            }
+
+            ProgressEvent::Complete {
+                total_tiles,
+                peak_memory_bytes: _,
+                duration_secs: _,
+            } => {
+                if let Some(ref pb) = *phase3_pb_clone.lock().unwrap() {
+                    pb.finish_with_message(format!(
+                        "✓ {} tiles written",
+                        format_number(total_tiles)
+                    ));
+                }
+            }
+        }
+    });
+
+    generate_tiles_spool_based_with_progress(
+        input,
+        output,
+        config,
+        streaming_config,
+        progress_callback,
+    )
+    .context("Failed to generate tiles")
 }

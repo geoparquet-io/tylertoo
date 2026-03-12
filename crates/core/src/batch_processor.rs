@@ -98,44 +98,53 @@ pub fn process_geometries<F>(path: &Path, mut callback: F) -> Result<usize>
 where
     F: FnMut(Geometry<f64>, usize) -> Result<()>,
 {
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
-
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
-
-    let reader = builder
-        .build()
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+    // Resolve to files if path is a directory
+    let files = resolve_parquet_files(path)?;
 
     let mut total_processed = 0;
     let mut row_offset = 0;
 
-    for batch_result in reader {
-        let batch = batch_result
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+    for file_path in files {
+        let file = std::fs::File::open(&file_path).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to open {}: {}", file_path.display(), e))
+        })?;
 
-        // Find geometry column by name
-        let schema = batch.schema();
-        let geom_idx = schema
-            .fields()
-            .iter()
-            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
-            .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
-        let geom_col = batch.column(geom_idx);
-        let geom_field = schema.field(geom_idx);
+        let reader = builder
+            .build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
 
-        // Convert Arrow array to GeoArrow geometry array
-        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), geom_field)
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e)))?;
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        // Process each geometry within batch scope using explicit type dispatch
-        // This avoids bulk extraction while leveraging GeoArrow's type system
-        let batch_count = process_geoarrow_array(geom_array.as_ref(), row_offset, &mut callback)?;
+            // Find geometry column by name
+            let schema = batch.schema();
+            let geom_idx = schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+                .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
-        total_processed += batch_count;
-        row_offset += batch.num_rows();
+            let geom_col = batch.column(geom_idx);
+            let geom_field = schema.field(geom_idx);
+
+            // Convert Arrow array to GeoArrow geometry array
+            let geom_array: Arc<dyn GeoArrowArray> =
+                from_arrow_array(geom_col.as_ref(), geom_field).map_err(|e| {
+                    Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
+                })?;
+
+            // Process each geometry within batch scope using explicit type dispatch
+            // This avoids bulk extraction while leveraging GeoArrow's type system
+            let batch_count =
+                process_geoarrow_array(geom_array.as_ref(), row_offset, &mut callback)?;
+
+            total_processed += batch_count;
+            row_offset += batch.num_rows();
+        }
     }
 
     Ok(total_processed)

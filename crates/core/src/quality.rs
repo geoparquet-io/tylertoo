@@ -15,6 +15,7 @@ use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use serde_json::Value;
 
+use crate::batch_processor::resolve_parquet_files;
 use crate::{Error, Result};
 
 /// CRS information extracted from GeoParquet metadata.
@@ -109,7 +110,13 @@ fn is_wgs84_projjson(projjson: &Value) -> bool {
 ///
 /// CRS information, or an error if the file cannot be read.
 pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
-    let file = std::fs::File::open(path)
+    // Resolve to first file if path is a directory
+    let files = resolve_parquet_files(path)?;
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    let file = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
 
     let reader = SerializedFileReader::new(file)
@@ -334,13 +341,21 @@ impl GeoParquetQuality {
 /// Performs cheap checks (O(1) metadata reads) first, then more expensive
 /// checks (sampling) only for large files.
 pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
-    let file = std::fs::File::open(path)
+    // Resolve to files if path is a directory
+    let files = resolve_parquet_files(path)?;
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    let file = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
 
-    let file_size_bytes = file
-        .metadata()
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to get file metadata: {}", e)))?
-        .len();
+    // Sum file sizes across all files
+    let file_size_bytes: u64 = files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum();
 
     let reader = SerializedFileReader::new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
@@ -421,7 +436,13 @@ fn check_hilbert_sorted(path: &Path) -> Result<bool> {
     use crate::spatial_index::{encode_hilbert, lng_lat_to_world_coords};
     use geo::{BoundingRect, Centroid};
 
-    let file = std::fs::File::open(path)
+    // Resolve to first file if path is a directory
+    let files = resolve_parquet_files(path)?;
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    let file = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)

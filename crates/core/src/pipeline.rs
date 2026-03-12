@@ -2158,80 +2158,80 @@ pub fn generate_tiles_spool_based(
             // Assign feature indices
             let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
 
-            // Process each geometry
-            for (geom_idx, geom) in sorted.into_iter().enumerate() {
-                let feat_idx = base_feat_idx + geom_idx as u64;
+            // Process geometries in parallel within row group
+            let (local_features, local_bounds): (Vec<_>, Vec<_>) = sorted
+                .into_par_iter()
+                .enumerate()
+                .filter_map(|(geom_idx, geom)| {
+                    let feat_idx = base_feat_idx + geom_idx as u64;
 
-                // Get bounding box and update global bounds
-                let geom_bbox = match geom.bounding_rect() {
-                    Some(rect) => {
-                        let bounds =
-                            TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                        {
-                            let mut gb = global_bounds.lock().unwrap();
-                            gb.expand(&bounds);
-                        }
-                        bounds
-                    }
-                    None => continue,
-                };
+                    // Get bounding box
+                    let geom_bbox = geom.bounding_rect().map(|rect| {
+                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
+                    })?;
 
-                // Get source Hilbert index for streaming buffer calibration
-                let source_hilbert = geometry_to_hilbert(&geom).unwrap_or(0);
+                    // Get source Hilbert index for streaming buffer calibration
+                    let source_hilbert = geometry_to_hilbert(&geom).unwrap_or(0);
 
-                // Pre-simplify geometry at max zoom tolerance
-                let simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
+                    // Pre-simplify geometry at max zoom tolerance
+                    let simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
 
-                // Hierarchical clipping
-                let (clip_results, _clip_stats) = clip_geometry_hierarchical_world(
-                    &simplified,
-                    &geom_bbox,
-                    config.min_zoom,
-                    config.max_zoom,
-                    config.buffer_pixels,
-                    config.extent,
-                );
+                    // Hierarchical clipping
+                    let (clip_results, _clip_stats) = clip_geometry_hierarchical_world(
+                        &simplified,
+                        &geom_bbox,
+                        config.min_zoom,
+                        config.max_zoom,
+                        config.buffer_pixels,
+                        config.extent,
+                    );
 
-                // Process clip results and add to streaming buffer
-                for (tile_coord, clipped) in clip_results {
-                    // Convert WorldClippedGeometry back to geo::Geometry for WKB encoding
-                    let clipped_geom = match clipped.to_geometry(config.extent, &tile_coord) {
-                        Some(g) => g,
-                        None => continue,
-                    };
+                    // Process clip results
+                    let features: Vec<_> = clip_results
+                        .into_iter()
+                        .filter_map(|(tile_coord, clipped)| {
+                            let clipped_geom = clipped.to_geometry(config.extent, &tile_coord)?;
+                            let validated = filter_valid_geometry(&clipped_geom)?;
+                            let geometry_wkb = crate::wkb::geometry_to_wkb(&validated).ok()?;
 
-                    // Validate geometry
-                    let validated = match filter_valid_geometry(&clipped_geom) {
-                        Some(v) => v,
-                        None => continue,
-                    };
+                            let empty_props: std::collections::HashMap<
+                                String,
+                                crate::wkb::PropertyValue,
+                            > = std::collections::HashMap::new();
+                            let properties =
+                                crate::wkb::serialize_properties(&empty_props).unwrap_or_default();
 
-                    // Serialize to WKB
-                    let geometry_wkb = match crate::wkb::geometry_to_wkb(&validated) {
-                        Ok(wkb) => wkb,
-                        Err(_) => continue, // Skip geometries that fail to encode
-                    };
+                            let tile_feature = TileFeature::new(feat_idx, geometry_wkb, properties);
+                            let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
 
-                    // Empty properties for now (TODO: extract from Arrow batch)
-                    let empty_props: std::collections::HashMap<String, crate::wkb::PropertyValue> =
-                        std::collections::HashMap::new();
-                    let properties = match crate::wkb::serialize_properties(&empty_props) {
-                        Ok(p) => p,
-                        Err(_) => Vec::new(), // Use empty bytes on error
-                    };
+                            Some((tid, tile_coord, tile_feature, source_hilbert))
+                        })
+                        .collect();
 
-                    // Create TileFeature
-                    let tile_feature = TileFeature::new(feat_idx, geometry_wkb, properties);
+                    Some((features, geom_bbox))
+                })
+                .unzip();
 
-                    // Calculate tile_id and add to buffer
-                    let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
+            // Flatten features and merge bounds
+            let local_features: Vec<_> = local_features.into_iter().flatten().collect();
+            let merged_bounds = local_bounds
+                .into_iter()
+                .fold(TileBounds::empty(), |mut acc, b| {
+                    acc.expand(&b);
+                    acc
+                });
 
-                    // Add to streaming buffer (this may flush to spool)
-                    let mut buf = buffer.lock().unwrap();
-                    buf.add_feature(tid, tile_coord, tile_feature, source_hilbert)
-                        .map_err(|e| {
-                            Error::PMTilesWrite(format!("Failed to add feature to buffer: {}", e))
-                        })?;
+            // Lock ONCE per row group and add all features
+            {
+                let mut gb = global_bounds.lock().unwrap();
+                gb.expand(&merged_bounds);
+            }
+            {
+                let mut buf = buffer.lock().unwrap();
+                for (tid, coord, feature, hilbert) in local_features {
+                    buf.add_feature(tid, coord, feature, hilbert).map_err(|e| {
+                        Error::PMTilesWrite(format!("Failed to add feature to buffer: {}", e))
+                    })?;
                 }
             }
 
@@ -2316,6 +2316,253 @@ pub fn generate_tiles_spool_based(
             + write_stats.directory_bytes
             + write_stats.metadata_bytes
             + 127, // +127 for header
+    })
+}
+
+/// Generate tiles using spool-based streaming with progress reporting.
+///
+/// Same as `generate_tiles_spool_based` but with progress callback for UI feedback.
+#[instrument(name = "spool_pipeline_progress", skip_all, fields(min_zoom = config.min_zoom, max_zoom = config.max_zoom))]
+pub fn generate_tiles_spool_based_with_progress(
+    input_path: &Path,
+    output_path: &Path,
+    config: &TilerConfig,
+    streaming_config: &crate::streaming_types::StreamingConfig,
+    progress: ProgressCallback,
+) -> Result<SpoolStreamingResult> {
+    use crate::batch_processor::get_row_group_count;
+    use crate::gap_density::geometry_to_hilbert;
+    use crate::pmtiles_writer::{tile_id, write_pmtiles_from_spool, SpoolWriterConfig};
+    use crate::streaming_buffer::{StreamingTileBuffer, TileFeature};
+    use geo::BoundingRect;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    let start_time = std::time::Instant::now();
+
+    // Validate streaming config
+    if streaming_config.max_active_tiles == 0 {
+        return Err(Error::GeoParquetRead(
+            "max_active_tiles must be > 0".to_string(),
+        ));
+    }
+
+    // Get total row group count for progress
+    let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
+
+    // Extract field metadata for PMTiles header
+    let all_fields = extract_field_metadata(input_path).unwrap_or_default();
+    let fields: std::collections::HashMap<String, String> = if config.property_filter.is_active() {
+        all_fields
+            .into_iter()
+            .filter(|(name, _)| config.property_filter.should_include(name))
+            .collect()
+    } else {
+        all_fields
+    };
+
+    // Initialize streaming buffer
+    let buffer = Mutex::new(
+        StreamingTileBuffer::with_extent(
+            streaming_config.clone(),
+            &config.layer_name,
+            config.extent,
+        )
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to create streaming buffer: {}", e)))?,
+    );
+
+    // Track bounds for PMTiles header
+    let global_bounds = Mutex::new(TileBounds::empty());
+    let global_feature_index = AtomicU64::new(0);
+    let row_groups_completed = AtomicU64::new(0);
+    let features_processed = AtomicU64::new(0);
+
+    // Phase 1: Read GeoParquet and populate streaming buffer
+    progress(ProgressEvent::PhaseStart {
+        phase: 1,
+        name: "Reading GeoParquet",
+    });
+
+    process_geometries_parallel(
+        input_path,
+        DEFAULT_PARALLEL_READERS,
+        |rg_info: RowGroupInfo, geometries| {
+            let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Sort geometries within row group for better Hilbert locality
+            let mut sorted = geometries;
+            sort_geometries(&mut sorted, config.use_hilbert);
+            let num_geoms = sorted.len();
+
+            // Assign feature indices
+            let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
+
+            // Process geometries in parallel within row group
+            let (local_features, local_bounds): (Vec<_>, Vec<_>) = sorted
+                .into_par_iter()
+                .enumerate()
+                .filter_map(|(geom_idx, geom)| {
+                    let feat_idx = base_feat_idx + geom_idx as u64;
+
+                    // Get bounding box
+                    let geom_bbox = geom.bounding_rect().map(|rect| {
+                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
+                    })?;
+
+                    // Get source Hilbert index for streaming buffer calibration
+                    let source_hilbert = geometry_to_hilbert(&geom).unwrap_or(0);
+
+                    // Pre-simplify geometry at max zoom tolerance
+                    let simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
+
+                    // Hierarchical clipping
+                    let (clip_results, _clip_stats) = clip_geometry_hierarchical_world(
+                        &simplified,
+                        &geom_bbox,
+                        config.min_zoom,
+                        config.max_zoom,
+                        config.buffer_pixels,
+                        config.extent,
+                    );
+
+                    // Process clip results
+                    let features: Vec<_> = clip_results
+                        .into_iter()
+                        .filter_map(|(tile_coord, clipped)| {
+                            let clipped_geom = clipped.to_geometry(config.extent, &tile_coord)?;
+                            let validated = filter_valid_geometry(&clipped_geom)?;
+                            let geometry_wkb = crate::wkb::geometry_to_wkb(&validated).ok()?;
+
+                            let empty_props: std::collections::HashMap<
+                                String,
+                                crate::wkb::PropertyValue,
+                            > = std::collections::HashMap::new();
+                            let properties =
+                                crate::wkb::serialize_properties(&empty_props).unwrap_or_default();
+
+                            let tile_feature = TileFeature::new(feat_idx, geometry_wkb, properties);
+                            let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
+
+                            Some((tid, tile_coord, tile_feature, source_hilbert))
+                        })
+                        .collect();
+
+                    Some((features, geom_bbox))
+                })
+                .unzip();
+
+            // Flatten features and merge bounds
+            let local_features: Vec<_> = local_features.into_iter().flatten().collect();
+            let merged_bounds = local_bounds
+                .into_iter()
+                .fold(TileBounds::empty(), |mut acc, b| {
+                    acc.expand(&b);
+                    acc
+                });
+
+            // Lock ONCE per row group and add all features
+            {
+                let mut gb = global_bounds.lock().unwrap();
+                gb.expand(&merged_bounds);
+            }
+            {
+                let mut buf = buffer.lock().unwrap();
+                for (tid, coord, feature, hilbert) in local_features {
+                    buf.add_feature(tid, coord, feature, hilbert).map_err(|e| {
+                        Error::PMTilesWrite(format!("Failed to add feature to buffer: {}", e))
+                    })?;
+                }
+            }
+
+            // Report progress after each row group
+            let total_features = features_processed
+                .fetch_add(rg_info.num_rows as u64, Ordering::Relaxed)
+                + rg_info.num_rows as u64;
+            progress(ProgressEvent::Phase1Progress {
+                row_group: completed as usize,
+                total_row_groups,
+                features_in_group: rg_info.num_rows,
+                records_written: total_features,
+            });
+
+            Ok(())
+        },
+    )?;
+
+    let total_features = features_processed.load(Ordering::Relaxed);
+    progress(ProgressEvent::Phase1Complete {
+        total_records: total_features,
+        peak_memory_bytes: 0,
+    });
+
+    // Phase 2: Finish streaming buffer
+    progress(ProgressEvent::Phase2Start);
+
+    let buffer = buffer
+        .into_inner()
+        .map_err(|_| Error::PMTilesWrite("Buffer lock poisoned".to_string()))?;
+
+    // Check if we should recommend fallback
+    if buffer.should_fallback() {
+        let rate = buffer.stats().late_arrival_rate();
+        tracing::warn!(
+            "High late arrival rate ({:.1}%). Consider using `gpio optimize` on input or --sorting-strategy external",
+            rate * 100.0
+        );
+    }
+
+    let (spool_result, streaming_stats) = buffer
+        .finish()
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to finish buffer: {}", e)))?;
+
+    progress(ProgressEvent::Phase2Complete);
+
+    // Phase 3: Write PMTiles from spool
+    progress(ProgressEvent::PhaseStart {
+        phase: 3,
+        name: "Writing PMTiles",
+    });
+
+    let bounds = global_bounds.lock().unwrap().clone();
+
+    let spool_writer_config = SpoolWriterConfig {
+        layer_name: config.layer_name.clone(),
+        min_zoom: config.min_zoom,
+        max_zoom: config.max_zoom,
+        fields,
+        tile_compression: crate::compression::Compression::Gzip,
+        internal_compression: crate::compression::Compression::Gzip,
+    };
+
+    let write_stats = write_pmtiles_from_spool(
+        output_path,
+        &spool_result.path,
+        spool_result.entries,
+        streaming_config.tile_format,
+        bounds,
+        &spool_writer_config,
+    )?;
+
+    // Clean up spool file
+    if let Err(e) = std::fs::remove_file(&spool_result.path) {
+        tracing::warn!("Failed to remove spool file: {}", e);
+    }
+
+    let duration = start_time.elapsed();
+
+    progress(ProgressEvent::Complete {
+        total_tiles: write_stats.tiles_written,
+        peak_memory_bytes: 0,
+        duration_secs: duration.as_secs_f64(),
+    });
+
+    Ok(SpoolStreamingResult {
+        tiles_written: write_stats.tiles_written,
+        streaming_stats,
+        output_bytes: write_stats.tile_data_bytes
+            + write_stats.directory_bytes
+            + write_stats.metadata_bytes
+            + 127,
     })
 }
 
