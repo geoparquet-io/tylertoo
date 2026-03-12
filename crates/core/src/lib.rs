@@ -64,6 +64,7 @@ pub mod spatial_index;
 pub mod streaming_types;
 pub mod sutherland_hodgman;
 pub mod tile;
+pub mod tile_spool;
 pub mod validate;
 pub mod wkb;
 pub mod world_coord;
@@ -87,6 +88,8 @@ pub use streaming_types::{
     FallbackReason, SortingStrategy, SpoolEntry, SpoolResult, StreamingConfig, StreamingStats,
     TileFormat,
 };
+// Re-export tile spool
+pub use tile_spool::TileSpool;
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
