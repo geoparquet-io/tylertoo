@@ -609,6 +609,7 @@ fn geometry_type_byte(geom: &MltGeometry) -> u8 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_geometry_data(
     geom: &MltGeometry,
     west: f64,
@@ -1209,6 +1210,7 @@ fn write_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(bytes);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_stream_meta(
     out: &mut Vec<u8>,
     physical_stream_type: u8,
@@ -1227,6 +1229,7 @@ fn write_stream_meta(
     write_varint_usize(out, byte_length);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_stream_meta_rle(
     out: &mut Vec<u8>,
     physical_stream_type: u8,

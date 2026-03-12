@@ -930,7 +930,7 @@ fn generate_tiles_to_writer_internal(
     progress: Option<ProgressCallback>,
 ) -> Result<crate::memory::MemoryStats> {
     use crate::batch_processor::get_row_group_count;
-    use crate::external_sort::{TileFeatureRecord, TileFeatureSorter};
+    use crate::external_sort::{ShardedTileFeatureSorter, TileFeatureRecord};
     use crate::memory::{MemoryStats, MemoryTracker};
     use crate::mvt::{LayerBuilder, TileBuilder};
     use crate::pmtiles_writer::tile_id;
@@ -955,8 +955,9 @@ fn generate_tiles_to_writer_internal(
 
     // Phase 1: Read GeoParquet, clip geometries, write to sorter
     // Buffer size: 100K records is ~50-100MB depending on geometry complexity
+    // Sharding: 16 shards keeps each shard under 1024 file descriptors for large datasets
     let sort_buffer_size = 100_000;
-    let sorter = Mutex::new(TileFeatureSorter::new(sort_buffer_size));
+    let sorter = Mutex::new(ShardedTileFeatureSorter::new(sort_buffer_size));
 
     // TileFeatureRecord fixed overhead: tile_id(8) + z(1) + x(4) + y(4) + feature_id(8) = 25 bytes
     const RECORD_FIXED_OVERHEAD: usize = 25;
@@ -2276,7 +2277,7 @@ pub fn generate_tiles_spool_based(
         tracing::info!("Phase 3: Writing PMTiles from spool");
     }
 
-    let bounds = global_bounds.lock().unwrap().clone();
+    let bounds = *global_bounds.lock().unwrap();
 
     let spool_writer_config = SpoolWriterConfig {
         layer_name: config.layer_name.clone(),
@@ -2528,7 +2529,7 @@ pub fn generate_tiles_spool_based_with_progress(
         name: "Writing PMTiles",
     });
 
-    let bounds = global_bounds.lock().unwrap().clone();
+    let bounds = *global_bounds.lock().unwrap();
 
     let spool_writer_config = SpoolWriterConfig {
         layer_name: config.layer_name.clone(),
