@@ -56,6 +56,7 @@ pub mod ioverlay_clip;
 pub mod memory;
 pub mod mlt;
 pub mod mvt;
+pub mod parallel_encoding;
 pub mod pipeline;
 pub mod pmtiles_writer;
 pub mod property_filter;
@@ -91,6 +92,11 @@ pub use streaming_types::{
 };
 // Re-export tile spool
 pub use tile_spool::TileSpool;
+// Re-export parallel encoding types
+pub use parallel_encoding::{
+    encode_tiles_parallel, encode_tiles_smart, EncodedTile, PendingTile, TileFeature,
+    DEFAULT_PARALLEL_THRESHOLD,
+};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
