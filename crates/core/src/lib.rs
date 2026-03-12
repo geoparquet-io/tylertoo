@@ -54,6 +54,7 @@ pub mod hierarchical_clip;
 mod integration_tests;
 pub mod ioverlay_clip;
 pub mod memory;
+pub mod mlt;
 pub mod mvt;
 pub mod pipeline;
 pub mod pmtiles_writer;
