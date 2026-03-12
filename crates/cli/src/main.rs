@@ -598,6 +598,12 @@ fn run_with_progress(
                 }
             }
 
+            ProgressEvent::Phase1ProcessingStart {
+                total_row_groups: _,
+            } => {
+                // Not used in external sort path - sequential callback handles progress
+            }
+
             ProgressEvent::Phase1Progress {
                 row_group,
                 total_row_groups: total_rg,
@@ -730,23 +736,29 @@ fn run_streaming_with_progress(
                 }
             }
 
+            ProgressEvent::Phase1ProcessingStart { total_row_groups } => {
+                // Switch from spinner to progress bar now that we know the total
+                if let Some(ref pb) = *phase1_pb_clone.lock().unwrap() {
+                    pb.set_length(total_row_groups as u64);
+                    pb.set_position(0);
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template("{spinner:.cyan} Processing [{bar:40.cyan/blue}] {pos}/{len} row groups | {msg}")
+                            .unwrap()
+                            .progress_chars("█▓▒░  "),
+                    );
+                }
+            }
+
             ProgressEvent::Phase1Progress {
-                row_group,
-                total_row_groups,
+                row_group: _,
+                total_row_groups: _,
                 features_in_group: _,
                 records_written,
             } => {
                 if let Some(ref pb) = *phase1_pb_clone.lock().unwrap() {
-                    if row_group == 1 {
-                        pb.set_length(total_row_groups as u64);
-                        pb.set_style(
-                            ProgressStyle::default_bar()
-                                .template("{spinner:.cyan} Reading [{bar:40.cyan/blue}] {pos}/{len} row groups | {msg}")
-                                .unwrap()
-                                .progress_chars("█▓▒░  "),
-                        );
-                    }
-                    pb.set_position(row_group as u64);
+                    // Use inc() for thread-safe progress updates
+                    pb.inc(1);
                     pb.set_message(format!("{} features", format_number(records_written)));
                 }
             }

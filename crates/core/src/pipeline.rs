@@ -50,6 +50,8 @@ use crate::{Error, Result};
 pub enum ProgressEvent {
     /// Starting a phase of processing
     PhaseStart { phase: u8, name: &'static str },
+    /// Phase 1 reading complete, processing starting
+    Phase1ProcessingStart { total_row_groups: usize },
     /// Progress within Phase 1 (reading row groups)
     Phase1Progress {
         row_group: usize,
@@ -2132,22 +2134,21 @@ pub fn generate_tiles_spool_based(
     let row_groups_completed = AtomicU64::new(0);
 
     // Phase 1: Read GeoParquet and populate streaming buffer
+    // Uses parallel I/O with sequential row group dispatch, but parallel feature processing within each RG
     if !config.quiet {
-        tracing::info!("Phase 1: Reading GeoParquet and streaming to buffer");
+        tracing::info!(
+            "Phase 1: Processing GeoParquet ({} row groups)",
+            total_row_groups
+        );
     }
 
     process_geometries_parallel(
         input_path,
         DEFAULT_PARALLEL_READERS,
-        |rg_info: RowGroupInfo, geometries| {
+        |_rg_info, geometries| {
             let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
-            if !config.quiet {
-                tracing::debug!(
-                    "Processing row group {}/{} with {} features",
-                    completed,
-                    total_row_groups,
-                    rg_info.num_rows
-                );
+            if !config.quiet && completed % 100 == 0 {
+                tracing::debug!("Processed {}/{} row groups", completed, total_row_groups);
             }
 
             // Sort geometries within row group for better Hilbert locality
@@ -2383,10 +2384,14 @@ pub fn generate_tiles_spool_based_with_progress(
         name: "Reading GeoParquet",
     });
 
+    // Signal processing is starting with total count
+    progress(ProgressEvent::Phase1ProcessingStart { total_row_groups });
+
+    // Process row groups with parallel I/O, sequential dispatch, parallel features within each RG
     process_geometries_parallel(
         input_path,
         DEFAULT_PARALLEL_READERS,
-        |rg_info: RowGroupInfo, geometries| {
+        |rg_info, geometries| {
             let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Sort geometries within row group for better Hilbert locality
@@ -2475,14 +2480,14 @@ pub fn generate_tiles_spool_based_with_progress(
             }
 
             // Report progress after each row group
-            let total_features = features_processed
+            let total_feat = features_processed
                 .fetch_add(rg_info.num_rows as u64, Ordering::Relaxed)
                 + rg_info.num_rows as u64;
             progress(ProgressEvent::Phase1Progress {
                 row_group: completed as usize,
                 total_row_groups,
                 features_in_group: rg_info.num_rows,
-                records_written: total_features,
+                records_written: total_feat,
             });
 
             Ok(())

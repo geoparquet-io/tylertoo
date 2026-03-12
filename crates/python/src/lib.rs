@@ -21,6 +21,10 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
             dict.set_item("phase_num", *phase)?;
             dict.set_item("name", *name)?;
         }
+        ProgressEvent::Phase1ProcessingStart { total_row_groups } => {
+            dict.set_item("phase", "phase1_processing_start")?;
+            dict.set_item("total_row_groups", *total_row_groups)?;
+        }
         ProgressEvent::Phase1Progress {
             row_group,
             total_row_groups,

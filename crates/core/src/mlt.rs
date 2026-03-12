@@ -1459,7 +1459,7 @@ mod tests {
             properties: vec![
                 MltPropertyValue::String("test".to_string()),
                 MltPropertyValue::Int(42),
-                MltPropertyValue::Double(3.14),
+                MltPropertyValue::Double(3.15), // Arbitrary test value
                 MltPropertyValue::Bool(true),
             ],
         }];

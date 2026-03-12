@@ -756,6 +756,151 @@ where
     Ok(total_processed)
 }
 
+/// Process geometries with fully parallel I/O AND parallel callback execution.
+///
+/// Unlike `process_geometries_parallel` which has parallel I/O but sequential callbacks,
+/// this function uses rayon to process row groups in parallel as they arrive from I/O.
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file or directory
+/// * `num_readers` - Number of parallel reader threads
+/// * `callback` - Thread-safe callback for processing each row group
+///
+/// # Returns
+///
+/// Total number of geometries processed
+pub fn process_geometries_fully_parallel<F>(
+    path: &Path,
+    num_readers: usize,
+    callback: F,
+) -> Result<usize>
+where
+    F: Fn(RowGroupInfo, Vec<Geometry<f64>>) -> Result<()> + Send + Sync,
+{
+    use crossbeam_channel::bounded;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Resolve all parquet files (single file or directory)
+    let files = resolve_parquet_files(path)?;
+
+    // Build work items
+    let mut work_items = Vec::new();
+    let mut global_index = 0;
+    for file_path in &files {
+        let file = std::fs::File::open(file_path).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to open {}: {}", file_path.display(), e))
+        })?;
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to read {}: {}", file_path.display(), e))
+        })?;
+        let num_rg = reader.metadata().num_row_groups();
+
+        for rg_idx in 0..num_rg {
+            work_items.push(RowGroupWorkItem {
+                file_path: file_path.clone(),
+                row_group_index: rg_idx,
+                global_index,
+            });
+            global_index += 1;
+        }
+    }
+
+    let num_row_groups = work_items.len();
+    if num_row_groups == 0 {
+        return Ok(0);
+    }
+
+    let num_readers = num_readers.max(1).min(num_row_groups);
+    let total_processed = AtomicUsize::new(0);
+    let first_error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+
+    // Channels
+    let (tx, rx) = bounded::<RowGroupReadResult>(num_readers * 2);
+    let (work_tx, work_rx) = bounded::<RowGroupWorkItem>(num_row_groups);
+
+    // Fill work queue
+    for item in work_items {
+        work_tx.send(item).unwrap();
+    }
+    drop(work_tx);
+
+    // Spawn reader threads
+    let mut reader_handles = Vec::with_capacity(num_readers);
+    for _ in 0..num_readers {
+        let work_rx = work_rx.clone();
+        let tx = tx.clone();
+
+        let handle = std::thread::spawn(move || {
+            for item in work_rx {
+                let result = match read_single_row_group(&item.file_path, item.row_group_index) {
+                    Ok((mut info, geometries)) => {
+                        info.index = item.global_index;
+                        RowGroupReadResult::Ok { info, geometries }
+                    }
+                    Err(e) => RowGroupReadResult::Err(e),
+                };
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        reader_handles.push(handle);
+    }
+    drop(tx);
+
+    // Use rayon::scope to process row groups in parallel as they arrive
+    rayon::scope(|s| {
+        for result in rx {
+            // Check for errors
+            if first_error.lock().unwrap().is_some() {
+                break;
+            }
+
+            match result {
+                RowGroupReadResult::Ok { info, geometries } => {
+                    let geom_count = geometries.len();
+                    let callback_ref = &callback;
+                    let total_ref = &total_processed;
+                    let error_ref = &first_error;
+
+                    s.spawn(move |_| {
+                        if let Err(e) = callback_ref(info, geometries) {
+                            let mut err = error_ref.lock().unwrap();
+                            if err.is_none() {
+                                *err = Some(e);
+                            }
+                        } else {
+                            total_ref.fetch_add(geom_count, Ordering::Relaxed);
+                        }
+                    });
+                }
+                RowGroupReadResult::Err(e) => {
+                    let mut err = first_error.lock().unwrap();
+                    if err.is_none() {
+                        *err = Some(e);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for reader threads
+    for handle in reader_handles {
+        let _ = handle.join();
+    }
+
+    // Check for errors
+    if let Some(e) = first_error.into_inner().unwrap() {
+        return Err(e);
+    }
+
+    Ok(total_processed.load(Ordering::Relaxed))
+}
+
 /// Get the total number of row groups in a GeoParquet file or directory.
 ///
 /// For directories, sums the row group count across all parquet files.
