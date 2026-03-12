@@ -482,6 +482,136 @@ impl WorldClippedGeometry {
                 .all(|(ext, _)| coords_are_degenerate(ext, tile, extent)),
         }
     }
+
+    /// Convert this WorldClippedGeometry to a geo::Geometry in lng/lat coordinates.
+    ///
+    /// This is used when the streaming pipeline needs to serialize the geometry to WKB.
+    ///
+    /// # Arguments
+    /// * `_extent` - Tile extent (unused, kept for API consistency)
+    /// * `_tile` - Tile coordinates (unused, kept for API consistency)
+    ///
+    /// # Returns
+    /// The geometry in lng/lat coordinates, or None if the geometry is invalid.
+    pub fn to_geometry(
+        &self,
+        _extent: u32,
+        _tile: &crate::tile::TileCoord,
+    ) -> Option<geo::Geometry<f64>> {
+        use crate::world_coord::world_to_lng_lat;
+        use geo::{coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
+
+        match self {
+            WorldClippedGeometry::Point(wc) => {
+                let (lng, lat) = world_to_lng_lat(*wc);
+                Some(geo::Geometry::Point(Point::new(lng, lat)))
+            }
+            WorldClippedGeometry::LineString(coords) => {
+                if coords.len() < 2 {
+                    return None;
+                }
+                let line: LineString<f64> = coords
+                    .iter()
+                    .map(|wc| {
+                        let (lng, lat) = world_to_lng_lat(*wc);
+                        coord! { x: lng, y: lat }
+                    })
+                    .collect();
+                Some(geo::Geometry::LineString(line))
+            }
+            WorldClippedGeometry::Polygon {
+                exterior,
+                interiors,
+            } => {
+                if exterior.len() < 3 {
+                    return None;
+                }
+                let ext_ring: LineString<f64> = exterior
+                    .iter()
+                    .map(|wc| {
+                        let (lng, lat) = world_to_lng_lat(*wc);
+                        coord! { x: lng, y: lat }
+                    })
+                    .collect();
+                let int_rings: Vec<LineString<f64>> = interiors
+                    .iter()
+                    .filter(|hole| hole.len() >= 3)
+                    .map(|hole| {
+                        hole.iter()
+                            .map(|wc| {
+                                let (lng, lat) = world_to_lng_lat(*wc);
+                                coord! { x: lng, y: lat }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                Some(geo::Geometry::Polygon(Polygon::new(ext_ring, int_rings)))
+            }
+            WorldClippedGeometry::MultiPoint(points) => {
+                let pts: Vec<Point<f64>> = points
+                    .iter()
+                    .map(|wc| {
+                        let (lng, lat) = world_to_lng_lat(*wc);
+                        Point::new(lng, lat)
+                    })
+                    .collect();
+                if pts.is_empty() {
+                    return None;
+                }
+                Some(geo::Geometry::MultiPoint(MultiPoint::new(pts)))
+            }
+            WorldClippedGeometry::MultiLineString(lines) => {
+                let ls: Vec<LineString<f64>> = lines
+                    .iter()
+                    .filter(|line| line.len() >= 2)
+                    .map(|line| {
+                        line.iter()
+                            .map(|wc| {
+                                let (lng, lat) = world_to_lng_lat(*wc);
+                                coord! { x: lng, y: lat }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                if ls.is_empty() {
+                    return None;
+                }
+                Some(geo::Geometry::MultiLineString(MultiLineString::new(ls)))
+            }
+            WorldClippedGeometry::MultiPolygon(polys) => {
+                let ps: Vec<Polygon<f64>> = polys
+                    .iter()
+                    .filter(|(ext, _)| ext.len() >= 3)
+                    .map(|(exterior, interiors)| {
+                        let ext_ring: LineString<f64> = exterior
+                            .iter()
+                            .map(|wc| {
+                                let (lng, lat) = world_to_lng_lat(*wc);
+                                coord! { x: lng, y: lat }
+                            })
+                            .collect();
+                        let int_rings: Vec<LineString<f64>> = interiors
+                            .iter()
+                            .filter(|hole| hole.len() >= 3)
+                            .map(|hole| {
+                                hole.iter()
+                                    .map(|wc| {
+                                        let (lng, lat) = world_to_lng_lat(*wc);
+                                        coord! { x: lng, y: lat }
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        Polygon::new(ext_ring, int_rings)
+                    })
+                    .collect();
+                if ps.is_empty() {
+                    return None;
+                }
+                Some(geo::Geometry::MultiPolygon(MultiPolygon::new(ps)))
+            }
+        }
+    }
 }
 
 /// Check if all coordinates collapse to the same tile-local pixel.

@@ -2012,6 +2012,313 @@ fn generate_tiles_to_writer_internal(
     Ok(stats)
 }
 
+// ============================================================================
+// Spool-Based Streaming Pipeline (NEW)
+// ============================================================================
+
+/// Result of spool-based streaming tile generation.
+#[derive(Debug)]
+pub struct SpoolStreamingResult {
+    /// Number of tiles written to the final PMTiles
+    pub tiles_written: u64,
+    /// Streaming statistics (late arrivals, evictions, etc.)
+    pub streaming_stats: crate::streaming_types::StreamingStats,
+    /// Final file size in bytes
+    pub output_bytes: u64,
+}
+
+/// Generate tiles using the spool-based streaming pipeline.
+///
+/// This is the optimized pipeline for Hilbert-sorted GeoParquet input (via `gpio optimize`).
+/// It uses minimal temp disk (~1x output size) and memory (~100-500MB).
+///
+/// # Architecture
+///
+/// ```text
+/// GeoParquet → Read batches → Clip features → StreamingTileBuffer
+///     → accumulates features per tile
+///     → flushes completed tiles to TileSpool (MVT or MLT encoded)
+///     → SpoolPmtilesWriter reads spool and writes final PMTiles
+/// ```
+///
+/// # Arguments
+///
+/// * `input_path` - Path to the GeoParquet file or directory
+/// * `output_path` - Path for the output PMTiles file
+/// * `config` - Tiling configuration
+/// * `streaming_config` - Streaming buffer configuration
+///
+/// # Returns
+///
+/// Streaming result with statistics, or an error.
+///
+/// # Example
+///
+/// ```no_run
+/// use gpq_tiles_core::pipeline::{generate_tiles_spool_based, TilerConfig};
+/// use gpq_tiles_core::streaming_types::StreamingConfig;
+/// use std::path::Path;
+///
+/// let config = TilerConfig::new(0, 10);
+/// let streaming_config = StreamingConfig::default();
+///
+/// let result = generate_tiles_spool_based(
+///     Path::new("input.parquet"),
+///     Path::new("output.pmtiles"),
+///     &config,
+///     &streaming_config,
+/// ).unwrap();
+///
+/// println!("Wrote {} tiles", result.tiles_written);
+/// ```
+#[instrument(name = "spool_pipeline", skip_all, fields(min_zoom = config.min_zoom, max_zoom = config.max_zoom))]
+pub fn generate_tiles_spool_based(
+    input_path: &Path,
+    output_path: &Path,
+    config: &TilerConfig,
+    streaming_config: &crate::streaming_types::StreamingConfig,
+) -> Result<SpoolStreamingResult> {
+    use crate::batch_processor::get_row_group_count;
+    use crate::gap_density::geometry_to_hilbert;
+    use crate::pmtiles_writer::{tile_id, write_pmtiles_from_spool, SpoolWriterConfig};
+    use crate::streaming_buffer::{StreamingTileBuffer, TileFeature};
+    use geo::BoundingRect;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    let start_time = std::time::Instant::now();
+
+    // Validate streaming config
+    if streaming_config.max_active_tiles == 0 {
+        return Err(Error::GeoParquetRead(
+            "max_active_tiles must be > 0".to_string(),
+        ));
+    }
+
+    // Get total row group count for progress
+    let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
+    if !config.quiet {
+        tracing::info!(
+            "Spool streaming: processing {} row groups with {} max active tiles",
+            total_row_groups,
+            streaming_config.max_active_tiles
+        );
+    }
+
+    // Extract field metadata for PMTiles header
+    let all_fields = extract_field_metadata(input_path).unwrap_or_default();
+    let fields: std::collections::HashMap<String, String> = if config.property_filter.is_active() {
+        all_fields
+            .into_iter()
+            .filter(|(name, _)| config.property_filter.should_include(name))
+            .collect()
+    } else {
+        all_fields
+    };
+
+    // Initialize streaming buffer
+    let buffer = Mutex::new(
+        StreamingTileBuffer::with_extent(
+            streaming_config.clone(),
+            &config.layer_name,
+            config.extent,
+        )
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to create streaming buffer: {}", e)))?,
+    );
+
+    // Track bounds for PMTiles header
+    let global_bounds = Mutex::new(TileBounds::empty());
+    let global_feature_index = AtomicU64::new(0);
+    let row_groups_completed = AtomicU64::new(0);
+
+    // Phase 1: Read GeoParquet and populate streaming buffer
+    if !config.quiet {
+        tracing::info!("Phase 1: Reading GeoParquet and streaming to buffer");
+    }
+
+    process_geometries_parallel(
+        input_path,
+        DEFAULT_PARALLEL_READERS,
+        |rg_info: RowGroupInfo, geometries| {
+            let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if !config.quiet {
+                tracing::debug!(
+                    "Processing row group {}/{} with {} features",
+                    completed,
+                    total_row_groups,
+                    rg_info.num_rows
+                );
+            }
+
+            // Sort geometries within row group for better Hilbert locality
+            let mut sorted = geometries;
+            sort_geometries(&mut sorted, config.use_hilbert);
+            let num_geoms = sorted.len();
+
+            // Assign feature indices
+            let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
+
+            // Process each geometry
+            for (geom_idx, geom) in sorted.into_iter().enumerate() {
+                let feat_idx = base_feat_idx + geom_idx as u64;
+
+                // Get bounding box and update global bounds
+                let geom_bbox = match geom.bounding_rect() {
+                    Some(rect) => {
+                        let bounds =
+                            TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+                        {
+                            let mut gb = global_bounds.lock().unwrap();
+                            gb.expand(&bounds);
+                        }
+                        bounds
+                    }
+                    None => continue,
+                };
+
+                // Get source Hilbert index for streaming buffer calibration
+                let source_hilbert = geometry_to_hilbert(&geom).unwrap_or(0);
+
+                // Pre-simplify geometry at max zoom tolerance
+                let simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
+
+                // Hierarchical clipping
+                let (clip_results, _clip_stats) = clip_geometry_hierarchical_world(
+                    &simplified,
+                    &geom_bbox,
+                    config.min_zoom,
+                    config.max_zoom,
+                    config.buffer_pixels,
+                    config.extent,
+                );
+
+                // Process clip results and add to streaming buffer
+                for (tile_coord, clipped) in clip_results {
+                    // Convert WorldClippedGeometry back to geo::Geometry for WKB encoding
+                    let clipped_geom = match clipped.to_geometry(config.extent, &tile_coord) {
+                        Some(g) => g,
+                        None => continue,
+                    };
+
+                    // Validate geometry
+                    let validated = match filter_valid_geometry(&clipped_geom) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    // Serialize to WKB
+                    let geometry_wkb = match crate::wkb::geometry_to_wkb(&validated) {
+                        Ok(wkb) => wkb,
+                        Err(_) => continue, // Skip geometries that fail to encode
+                    };
+
+                    // Empty properties for now (TODO: extract from Arrow batch)
+                    let empty_props: std::collections::HashMap<String, crate::wkb::PropertyValue> =
+                        std::collections::HashMap::new();
+                    let properties = match crate::wkb::serialize_properties(&empty_props) {
+                        Ok(p) => p,
+                        Err(_) => Vec::new(), // Use empty bytes on error
+                    };
+
+                    // Create TileFeature
+                    let tile_feature = TileFeature::new(feat_idx, geometry_wkb, properties);
+
+                    // Calculate tile_id and add to buffer
+                    let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
+
+                    // Add to streaming buffer (this may flush to spool)
+                    let mut buf = buffer.lock().unwrap();
+                    buf.add_feature(tid, tile_coord, tile_feature, source_hilbert)
+                        .map_err(|e| {
+                            Error::PMTilesWrite(format!("Failed to add feature to buffer: {}", e))
+                        })?;
+                }
+            }
+
+            Ok(())
+        },
+    )?;
+
+    // Phase 2: Finish streaming buffer and get spool result
+    if !config.quiet {
+        tracing::info!("Phase 2: Finalizing streaming buffer");
+    }
+
+    let buffer = buffer
+        .into_inner()
+        .map_err(|_| Error::PMTilesWrite("Buffer lock poisoned".to_string()))?;
+
+    // Check if we should recommend fallback
+    if buffer.should_fallback() {
+        let rate = buffer.stats().late_arrival_rate();
+        tracing::warn!(
+            "High late arrival rate ({:.1}%). Consider using `gpio optimize` on input or --sorting-strategy external",
+            rate * 100.0
+        );
+    }
+
+    let (spool_result, streaming_stats) = buffer
+        .finish()
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to finish buffer: {}", e)))?;
+
+    if !config.quiet {
+        tracing::info!(
+            "Streaming stats: {} tiles flushed, {} features processed, {:.2}% late arrivals",
+            streaming_stats.tiles_flushed,
+            streaming_stats.features_processed,
+            streaming_stats.late_arrival_rate() * 100.0
+        );
+    }
+
+    // Phase 3: Write PMTiles from spool
+    if !config.quiet {
+        tracing::info!("Phase 3: Writing PMTiles from spool");
+    }
+
+    let bounds = global_bounds.lock().unwrap().clone();
+
+    let spool_writer_config = SpoolWriterConfig {
+        layer_name: config.layer_name.clone(),
+        min_zoom: config.min_zoom,
+        max_zoom: config.max_zoom,
+        fields,
+        tile_compression: crate::compression::Compression::Gzip,
+        internal_compression: crate::compression::Compression::Gzip,
+    };
+
+    let write_stats = write_pmtiles_from_spool(
+        output_path,
+        &spool_result.path,
+        spool_result.entries,
+        streaming_config.tile_format,
+        bounds,
+        &spool_writer_config,
+    )?;
+
+    // Clean up spool file
+    if let Err(e) = std::fs::remove_file(&spool_result.path) {
+        tracing::warn!("Failed to remove spool file: {}", e);
+    }
+
+    let duration = start_time.elapsed();
+    if !config.quiet {
+        tracing::info!(
+            "Spool streaming complete: {} tiles in {:.2}s",
+            write_stats.tiles_written,
+            duration.as_secs_f64()
+        );
+    }
+
+    Ok(SpoolStreamingResult {
+        tiles_written: write_stats.tiles_written,
+        streaming_stats,
+        output_bytes: write_stats.tile_data_bytes
+            + write_stats.directory_bytes
+            + write_stats.metadata_bytes
+            + 127, // +127 for header
+    })
+}
+
 /// Result of streaming tile generation including memory statistics.
 #[derive(Debug)]
 pub struct StreamingResult {

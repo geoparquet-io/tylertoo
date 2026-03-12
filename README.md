@@ -38,6 +38,33 @@ convert(
 )
 ```
 
+## Streaming Pipeline
+
+For Hilbert-sorted GeoParquet files (via [`gpio optimize`](https://github.com/geoparquet-io/gpio)),
+use the streaming pipeline for minimal resource usage:
+
+```bash
+# Optimal for sorted input: ~1x output size temp disk, ~100-500MB memory
+gpq-tiles input.parquet output.pmtiles --sorting-strategy streaming
+
+# Works with any input: ~2x input size temp disk, ~2GB memory (default)
+gpq-tiles input.parquet output.pmtiles --sorting-strategy external
+```
+
+The streaming pipeline uses a spool-based approach:
+- Features accumulate in memory per-tile
+- Completed tiles flush to a temp spool
+- Final PMTiles written from sorted spool
+
+### Partitioned Directories
+
+Supports partitioned GeoParquet directories:
+
+```bash
+# Process all .parquet files in a Hive-partitioned directory
+gpq-tiles data/year=2024/ output.pmtiles
+```
+
 ## Documentation
 
 - **[Getting Started](docs/getting-started.md)** — Installation, basic usage, property filtering

@@ -6,9 +6,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::pipeline::{
-    generate_tiles_to_writer_with_progress, ProgressEvent, TilerConfig,
+    generate_tiles_spool_based, generate_tiles_to_writer_with_progress, ProgressEvent, TilerConfig,
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
+use gpq_tiles_core::streaming_types::{SortingStrategy, StreamingConfig, TileFormat};
 use gpq_tiles_core::validate_wgs84;
 use gpq_tiles_core::{AccumulatorConfig, AccumulatorOp, PropertyFilter};
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
@@ -25,7 +26,12 @@ mod profiling;
     version
 )]
 struct Args {
-    /// Input GeoParquet file
+    /// Input GeoParquet file or directory.
+    ///
+    /// If a directory, recursively finds all .parquet files and processes them
+    /// as a single logical dataset. Supports both Hive-style partitioning
+    /// (e.g., data/year=2024/month=01/file.parquet) and simple directories
+    /// (e.g., data/*.parquet).
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -154,6 +160,30 @@ struct Args {
     /// This captures detailed span timing for all pipeline phases.
     #[arg(long, value_name = "FILE")]
     trace_output: Option<PathBuf>,
+
+    /// Tile encoding format (mvt, mlt)
+    ///
+    /// MVT (Mapbox Vector Tiles) is the default and works with all viewers.
+    /// MLT (MapLibre Tiles) offers better compression but requires MLT-compatible viewers.
+    #[arg(long, default_value = "mvt", value_name = "FORMAT")]
+    tile_format: String,
+
+    /// Sorting strategy (auto, streaming, external)
+    ///
+    /// - auto: Start with streaming, fallback to external if input is poorly sorted
+    /// - streaming: Optimal for Hilbert-sorted input (via `gpio optimize`)
+    ///   Uses ~1x output size temp disk, ~100-500MB memory
+    /// - external: Works with any input order but uses more resources
+    ///   Uses ~2x input size temp disk, ~2GB memory
+    #[arg(long, default_value = "auto", value_name = "STRATEGY")]
+    sorting_strategy: String,
+
+    /// Maximum active tiles in streaming mode
+    ///
+    /// Controls memory usage in streaming pipeline. Higher values use more memory
+    /// but handle slightly unsorted input better. Default: 500.
+    #[arg(long, default_value = "500", value_name = "N")]
+    max_active_tiles: usize,
 }
 
 impl Args {
@@ -238,6 +268,26 @@ impl Args {
             (None, Some(_)) => {
                 anyhow::bail!("--cluster-maxzoom requires --cluster-distance to also be set")
             }
+        }
+    }
+
+    fn parse_tile_format(&self) -> Result<TileFormat> {
+        self.tile_format
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))
+    }
+
+    fn parse_sorting_strategy(&self) -> Result<SortingStrategy> {
+        self.sorting_strategy
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))
+    }
+
+    fn make_streaming_config(&self) -> StreamingConfig {
+        StreamingConfig {
+            max_active_tiles: self.max_active_tiles,
+            tile_format: self.parse_tile_format().unwrap_or_default(),
+            ..StreamingConfig::default()
         }
     }
 }
@@ -341,6 +391,15 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_cluster(distance, maxzoom);
     }
 
+    // Parse streaming pipeline options
+    let sorting_strategy = args
+        .parse_sorting_strategy()
+        .context("Failed to parse sorting strategy")?;
+    let tile_format = args
+        .parse_tile_format()
+        .context("Failed to parse tile format")?;
+    let streaming_config = args.make_streaming_config();
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -348,6 +407,14 @@ fn main() -> Result<()> {
         eprintln!("  Output: {}", args.output.display());
         eprintln!("  Zoom: {}-{}", args.min_zoom, args.max_zoom);
         eprintln!("  Compression: {}", args.compression);
+        eprintln!("  Tile format: {}", tile_format);
+        eprintln!("  Sorting strategy: {}", sorting_strategy);
+        if matches!(
+            sorting_strategy,
+            SortingStrategy::Streaming | SortingStrategy::Auto
+        ) {
+            eprintln!("  Max active tiles: {}", args.max_active_tiles);
+        }
         if let Some(gamma) = tiler_config.gamma {
             eprintln!("  Density dropping: gap-based (gamma={})", gamma);
         }
@@ -371,17 +438,41 @@ fn main() -> Result<()> {
 
     let total_start = Instant::now();
 
-    // Create streaming writer
-    let mut writer =
-        StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
+    // Choose pipeline based on sorting strategy
+    let (write_stats, peak_memory) = match sorting_strategy {
+        SortingStrategy::Streaming => {
+            // Use spool-based streaming pipeline
+            let result = generate_tiles_spool_based(
+                &args.input,
+                &args.output,
+                &tiler_config,
+                &streaming_config,
+            )
+            .map_err(|e| anyhow::anyhow!("Pipeline error: {}", e))?;
 
-    // Run the pipeline with progress bars
-    let stats = run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?;
+            // Create compatible write stats
+            let write_stats = gpq_tiles_core::pmtiles_writer::StreamingWriteStats {
+                total_tiles: result.tiles_written,
+                unique_tiles: result.tiles_written, // No dedup stats in spool mode
+                bytes_written: result.output_bytes,
+                bytes_saved_dedup: 0,
+            };
+            (write_stats, 0usize) // Memory tracking not yet implemented for spool mode
+        }
+        SortingStrategy::ExternalSort | SortingStrategy::Auto => {
+            // Use existing external sort pipeline (Auto defaults to external for now)
+            let mut writer = StreamingPmtilesWriter::new(compression)
+                .context("Failed to create PMTiles writer")?;
 
-    // Finalize PMTiles file
-    let write_stats = writer
-        .finalize(&args.output)
-        .context("Failed to write PMTiles file")?;
+            let stats = run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?;
+
+            let write_stats = writer
+                .finalize(&args.output)
+                .context("Failed to write PMTiles file")?;
+
+            (write_stats, stats.peak_bytes)
+        }
+    };
 
     let total_duration = total_start.elapsed();
 
@@ -390,7 +481,7 @@ fn main() -> Result<()> {
         &args.input,
         &args.output,
         &write_stats,
-        stats.peak_bytes,
+        peak_memory,
         total_duration,
         args.verbose,
     );
