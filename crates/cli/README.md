@@ -7,11 +7,8 @@
 
 Fast GeoParquet → PMTiles converter in Rust.
 
-> **⚠️ Work in Progress**: 
+> **⚠️ Work in Progress**:
 > Code is generated with Claude; take it with a grain of salt.
-> A couple of known issues:
-> 1) We've had a regression since [#63](https://github.com/geoparquet-io/gpq-tiles/pull/63) and the conversion is hanging on large geoms again. I'm investigating.
-> 2) The library is not robust against self-intersections. I'm working on [a port of Wagyu to Rust](https://github.com/nlebovits/wagyu-rs) to address this. In the meantime, this library is definitely not production-ready.
 > --Nissim
 
 ## Install
@@ -26,6 +23,21 @@ pip install gpq-tiles      # Python
 ```bash
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
+
+### Size-Based Feature Dropping
+
+Drop the smallest features first when tiles are dense (tippecanoe parity):
+
+```bash
+gpq-tiles input.parquet output.pmtiles \
+  --drop-smallest-as-needed \
+  --drop-smallest-threshold 4.0  # square pixels (default)
+```
+
+Useful for:
+- Building footprints (drop tiny sheds/outbuildings at high zoom)
+- Dense point data (drop smallest markers)
+- Polygon layers (drop single-pixel features)
 
 ```python
 from gpq_tiles import convert
