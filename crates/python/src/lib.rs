@@ -88,6 +88,12 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     deterministic (bool, optional): Enable deterministic (sequential) processing for reproducible output. Defaults to False.
 ///         When True, disables parallelism to ensure bit-exact reproducibility across runs.
 ///         Useful for debugging, testing, and compliance workflows. Significantly slower.
+///     drop_smallest_as_needed (bool, optional): Enable size-based feature dropping (tippecanoe parity). Defaults to False.
+///         When True, features smaller than ``drop_smallest_threshold`` square pixels are dropped
+///         when tiles are dense. Useful for building footprints, dense point data, and polygon layers.
+///     drop_smallest_threshold (float, optional): Minimum pixel area threshold for smallest-feature dropping. Defaults to 4.0.
+///         Only used when ``drop_smallest_as_needed=True``. Features with pixel area below this
+///         threshold are candidates for dropping.
 ///     progress_callback (callable, optional): A callback function that receives progress events as dicts.
 ///         Each event dict has a "phase" key indicating the event type:
 ///         - "start": Phase started. Keys: phase_num (int), name (str)
@@ -116,13 +122,16 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 ///     >>> # With deterministic (sequential) processing
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", deterministic=True)
+///     >>> # Drop smallest features (tippecanoe parity)
+///     >>> convert("buildings.parquet", "buildings.pmtiles", drop_smallest_as_needed=True)
+///     >>> convert("buildings.parquet", "buildings.pmtiles", drop_smallest_as_needed=True, drop_smallest_threshold=2.0)
 ///     >>> # With progress callback
 ///     >>> def on_progress(event):
 ///     ...     if event["phase"] == "complete":
 ///     ...         print(f"Generated {event['total_tiles']} tiles")
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", progress_callback=on_progress)
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, deterministic=false, progress_callback=None))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, deterministic=false, drop_smallest_as_needed=false, drop_smallest_threshold=4.0, progress_callback=None))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn convert(
     py: Python<'_>,
@@ -137,6 +146,8 @@ fn convert(
     exclude_all: bool,
     layer_name: Option<String>,
     deterministic: bool,
+    drop_smallest_as_needed: bool,
+    drop_smallest_threshold: f64,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     // Validate progress_callback is callable if provided
@@ -200,7 +211,7 @@ fn convert(
     });
 
     // Build TilerConfig
-    let config = TilerConfig::new(min_zoom, max_zoom)
+    let mut config = TilerConfig::new(min_zoom, max_zoom)
         .with_extent(4096)
         .with_layer_name(&layer_name_str)
         .with_density_drop(matches!(
@@ -215,6 +226,12 @@ fn convert(
         .with_property_filter(property_filter)
         .with_quiet(true) // Suppress progress output in Python
         .with_deterministic(deterministic);
+
+    if drop_smallest_as_needed {
+        config = config
+            .with_drop_smallest_as_needed()
+            .with_drop_smallest_threshold(drop_smallest_threshold);
+    }
 
     // Create streaming writer
     let mut writer = StreamingPmtilesWriter::new(compression_config).map_err(|e| {

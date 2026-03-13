@@ -211,6 +211,18 @@ pub struct TilerConfig {
     /// When `gamma` is `Some(value > 0.0)`, gap-based selection is used instead
     /// of grid-based density dropping.
     pub gamma: Option<f64>,
+    /// Enable size-based feature dropping (tippecanoe --drop-smallest-as-needed).
+    ///
+    /// When enabled, features with pixel area below a threshold are dropped first
+    /// when a tile has too many features. Threshold is auto-computed per tile.
+    pub drop_smallest_as_needed: bool,
+
+    /// Minimum pixel area threshold for --drop-smallest-as-needed.
+    ///
+    /// Features smaller than this are candidates for dropping. Default: 4.0 square pixels.
+    /// Only used when drop_smallest_as_needed = true.
+    pub drop_smallest_threshold: f64,
+
     /// Accumulator configuration for attribute aggregation during feature merging.
     ///
     /// When features are merged (e.g., during coalescing or simplification),
@@ -264,6 +276,9 @@ impl Default for TilerConfig {
             enable_tiny_polygon_accumulation: true,
             // Gap-based dropping disabled by default - use grid-based instead
             gamma: None,
+            // Size-based feature dropping disabled by default
+            drop_smallest_as_needed: false,
+            drop_smallest_threshold: 4.0,
             // No attribute accumulation by default
             accumulator_config: None,
             // No point clustering by default
@@ -493,6 +508,22 @@ impl TilerConfig {
     /// ```
     pub fn with_drop_densest_as_needed(mut self) -> Self {
         self.gamma = Some(2.0);
+        self
+    }
+
+    /// Enable dropping of smallest features when tiles are dense.
+    ///
+    /// Equivalent to tippecanoe's --drop-smallest-as-needed.
+    pub fn with_drop_smallest_as_needed(mut self) -> Self {
+        self.drop_smallest_as_needed = true;
+        self
+    }
+
+    /// Set the minimum pixel area threshold for smallest-feature dropping.
+    ///
+    /// Only used when drop_smallest_as_needed = true.
+    pub fn with_drop_smallest_threshold(mut self, threshold: f64) -> Self {
+        self.drop_smallest_threshold = threshold;
         self
     }
 
