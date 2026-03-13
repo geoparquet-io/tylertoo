@@ -172,6 +172,98 @@ impl GeometryStore {
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
+
+    /// Create an independent reader for concurrent access.
+    ///
+    /// Each reader opens its own file handle to the backing store, enabling
+    /// parallel reads from multiple threads (e.g., rayon's par_iter in Phase 3).
+    ///
+    /// # Requirements
+    ///
+    /// Call `flush()` before creating readers to ensure all data is on disk.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// store.flush()?;
+    /// let readers: Vec<_> = (0..rayon::current_num_threads())
+    ///     .map(|_| store.new_reader())
+    ///     .collect::<Result<_, _>>()?;
+    /// ```
+    pub fn new_reader(&self) -> io::Result<GeometryStoreReader> {
+        let file = File::open(&self.path)?;
+        Ok(GeometryStoreReader {
+            file: BufReader::new(file),
+        })
+    }
+
+    /// Return the path to the backing store file.
+    ///
+    /// Useful for diagnostics and debugging.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+/// Independent reader for a `GeometryStore` backing file.
+///
+/// Each reader owns its own file handle and seek position, so multiple readers
+/// can operate concurrently on different threads without contention.
+///
+/// # Thread Safety
+///
+/// `GeometryStoreReader` is `Send` (can be moved to another thread) but not `Sync`
+/// (each thread should have its own reader). This matches the rayon pattern of
+/// giving each thread its own mutable reader.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Create one reader per rayon thread
+/// let readers: Vec<_> = (0..num_threads)
+///     .map(|_| store.new_reader())
+///     .collect::<Result<_, _>>()?;
+///
+/// // Use thread_local! or index by thread for parallel encoding
+/// tiles.par_chunks(batch_size).enumerate().try_for_each(|(i, chunk)| {
+///     let reader = &mut readers[i % readers.len()];
+///     for tile_ref in chunk {
+///         let (geom, props) = reader.read(tile_ref.geometry_handle)?;
+///         // ... encode tile
+///     }
+///     Ok(())
+/// })?;
+/// ```
+pub struct GeometryStoreReader {
+    /// Independent buffered file handle for random-access reads
+    file: BufReader<File>,
+}
+
+impl GeometryStoreReader {
+    /// Read geometry data using a handle.
+    ///
+    /// This has the same behavior as `GeometryStore::read()` but operates on
+    /// an independent file handle, enabling concurrent reads from multiple threads.
+    ///
+    /// # Arguments
+    /// * `handle` - Handle returned from a previous `GeometryStore::append` call
+    ///
+    /// # Returns
+    /// Tuple of (WKB bytes, properties bytes)
+    pub fn read(&mut self, handle: GeometryHandle) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        // Seek to the data portion (skip the length headers)
+        self.file.seek(SeekFrom::Start(handle.offset + 8))?;
+
+        // Read WKB
+        let mut wkb = vec![0u8; handle.wkb_len as usize];
+        self.file.read_exact(&mut wkb)?;
+
+        // Read properties
+        let mut props = vec![0u8; handle.props_len as usize];
+        self.file.read_exact(&mut props)?;
+
+        Ok((wkb, props))
+    }
 }
 
 #[cfg(test)]

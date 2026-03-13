@@ -722,7 +722,10 @@ fn world_geometry_bounds(geom: &WorldClippedGeometry) -> Option<WorldBounds> {
 /// Clip a WorldClippedGeometry to the given WorldBounds.
 ///
 /// Returns the clipped geometry, or None if the geometry doesn't intersect the bounds.
-fn clip_world_geometry(
+///
+/// This is used for lazy clipping in Phase 3 - geometries are stored unclipped in Phase 1,
+/// then clipped on-demand in Phase 3 with containment optimization.
+pub fn clip_world_geometry(
     geom: &WorldClippedGeometry,
     bounds: &WorldBounds,
 ) -> Option<WorldClippedGeometry> {

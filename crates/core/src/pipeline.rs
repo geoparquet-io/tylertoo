@@ -30,12 +30,12 @@ use crate::batch_processor::{
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::clustering::ClusterConfig;
 use crate::feature_drop::{
-    should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_line_world,
-    should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
-    DensityDropConfig, DensityDropper, TinyPolygonAccumulator, DEFAULT_TINY_POLYGON_THRESHOLD,
+    should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_multiline,
+    should_drop_tiny_polygon, should_drop_tiny_polygon_world, DensityDropConfig, DensityDropper,
+    TinyPolygonAccumulator, DEFAULT_TINY_POLYGON_THRESHOLD,
 };
 use crate::gap_density::{scale_for_zoom, GapBasedSelector};
-use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeometry};
+use crate::hierarchical_clip::WorldClippedGeometry;
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
 use crate::simplify::simplify_for_zoom;
@@ -928,11 +928,12 @@ fn generate_tiles_to_writer_internal(
     progress: Option<ProgressCallback>,
 ) -> Result<crate::memory::MemoryStats> {
     use crate::batch_processor::get_row_group_count;
-    use crate::external_sort::{TileFeatureRecord, TileFeatureSorter};
+    use crate::geometry_store::GeometryStore;
+
     use crate::memory::{MemoryStats, MemoryTracker};
     use crate::mvt::{LayerBuilder, TileBuilder};
-    use crate::pmtiles_writer::tile_id;
-    use geo::BoundingRect;
+    use crate::tile_ref::TileRef;
+
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::time::Instant;
@@ -951,13 +952,13 @@ fn generate_tiles_to_writer_internal(
     // Get total row group count for progress tracking
     let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
 
-    // Phase 1: Read GeoParquet, clip geometries, write to sorter
-    // Buffer size: 100K records is ~50-100MB depending on geometry complexity
-    let sort_buffer_size = 100_000;
-    let sorter = Mutex::new(TileFeatureSorter::new(sort_buffer_size));
+    // Phase 1: Read GeoParquet, store geometry once, create TileRefs for intersecting tiles
+    // Buffer size: 100K records is ~5MB with TileRef (48 bytes each) vs ~50-100MB with TileFeatureRecord
+    let _sort_buffer_size = 100_000;
+    let sorter: Mutex<Vec<TileRef>> = Mutex::new(Vec::new());
 
-    // TileFeatureRecord fixed overhead: tile_id(8) + z(1) + x(4) + y(4) + feature_id(8) = 25 bytes
-    const RECORD_FIXED_OVERHEAD: usize = 25;
+    // GeometryStore: disk-backed storage so geometry is written once, read N times
+    let geometry_store = Mutex::new(GeometryStore::new().map_err(Error::Io)?);
 
     if let Some(ref cb) = progress {
         cb(ProgressEvent::PhaseStart {
@@ -1025,223 +1026,56 @@ fn generate_tiles_to_writer_internal(
             // This ensures deterministic feature IDs regardless of parallel execution order
             let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
 
-            // Result type for per-geometry processing stats
-            struct GeomResult {
-                records: Vec<TileFeatureRecord>,
-                time_clip: std::time::Duration,
-                time_simplify: std::time::Duration,
-                time_wkb: std::time::Duration,
-                clip_count: u64,
-                tiles_touched: u64,
-                bounds: Option<TileBounds>,
-            }
+            // LAZY CLIPPING (Phase 1): Store geometry once, create TileRefs for intersecting tiles
+            // This replaces hierarchical clipping - actual clipping happens in Phase 3 with containment optimization
+            let process_start = std::time::Instant::now();
+            let mut local_bounds = TileBounds::empty();
 
-            // Process geometries - either in parallel or sequentially based on config
-            let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
-                let feat_idx = base_feat_idx + geom_idx as u64;
-
-                let mut result = GeomResult {
-                    records: Vec::new(),
-                    time_clip: std::time::Duration::ZERO,
-                    time_simplify: std::time::Duration::ZERO,
-                    time_wkb: std::time::Duration::ZERO,
-                    clip_count: 0,
-                    tiles_touched: 0,
-                    bounds: None,
-                };
-
-                let geom_bbox = match geom.bounding_rect() {
-                    Some(rect) => {
-                        let bounds =
-                            TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                        result.bounds = Some(bounds);
-                        bounds
-                    }
-                    None => return result,
-                };
-
-                // Pre-simplify geometry ONCE at the MAX zoom level tolerance
-                let simplify_start = std::time::Instant::now();
-                let base_simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
-                result.time_simplify = simplify_start.elapsed();
-
-                // Hierarchical clipping in WorldCoord space: clip at min_zoom first,
-                // then clip parent results for child tiles at higher zoom levels.
-                // This avoids re-clipping the full original geometry for every tile.
-                // See issue #38 for rationale.
-                //
-                // Phase 2 change: Use WorldCoord-based clipping for integer precision
-                // throughout the pipeline. This eliminates f64 accumulation errors.
-                let clip_start = std::time::Instant::now();
-                let (clip_results, clip_stats) = clip_geometry_hierarchical_world(
-                    &base_simplified,
-                    &geom_bbox,
+            let tile_refs = {
+                let mut store_guard = geometry_store.lock().unwrap();
+                crate::lazy_clip_pipeline::process_geometry_phase1(
+                    sorted,
+                    base_feat_idx,
                     config.min_zoom,
                     config.max_zoom,
-                    config.buffer_pixels,
                     config.extent,
-                );
-                result.time_clip = clip_start.elapsed();
-                result.clip_count = clip_stats.clip_ops;
-                result.tiles_touched = clip_stats.tiles_processed;
-
-                // Process clip results: validate, drop, serialize to bytes, create records
-                // Collect into a Vec first for deterministic ordering
-                let mut clip_entries: Vec<_> = clip_results.into_iter().collect();
-                clip_entries
-                    .sort_by(|(a, _), (b, _)| tile_id(a.z, a.x, a.y).cmp(&tile_id(b.z, b.x, b.y)));
-
-                for (tile_coord, clipped) in clip_entries {
-                    // Check dropping rules using WorldCoord-based functions
-                    let should_drop = match &clipped {
-                        WorldClippedGeometry::Point(_) => {
-                            // Point dropping uses feature index for density
-                            should_drop_point(
-                                &geo::Point::new(0.0, 0.0),
-                                tile_coord.z,
-                                config.max_zoom,
-                                feat_idx,
-                            )
-                        }
-                        WorldClippedGeometry::MultiPoint(points) => points.is_empty(),
-                        WorldClippedGeometry::LineString(coords) => {
-                            should_drop_tiny_line_world(coords, &tile_coord, config.extent, 1.0)
-                        }
-                        WorldClippedGeometry::MultiLineString(lines) => lines.iter().all(|line| {
-                            should_drop_tiny_line_world(line, &tile_coord, config.extent, 1.0)
-                        }),
-                        WorldClippedGeometry::Polygon {
-                            exterior,
-                            interiors,
-                        } => {
-                            // When accumulation is enabled, don't drop tiny polygons here -
-                            // they'll be accumulated in Phase 3 (encode_tile_from_raw)
-                            if config.enable_tiny_polygon_accumulation {
-                                false // Don't drop - will be handled by accumulator
-                            } else {
-                                should_drop_tiny_polygon_world(
-                                    exterior,
-                                    interiors,
-                                    &tile_coord,
-                                    config.extent,
-                                    DEFAULT_TINY_POLYGON_THRESHOLD,
-                                )
-                            }
-                        }
-                        WorldClippedGeometry::MultiPolygon(polys) => {
-                            // When accumulation is enabled, don't drop tiny polygons here
-                            if config.enable_tiny_polygon_accumulation {
-                                false // Don't drop - will be handled by accumulator
-                            } else {
-                                polys.iter().all(|(ext, ints)| {
-                                    should_drop_tiny_polygon_world(
-                                        ext,
-                                        ints,
-                                        &tile_coord,
-                                        config.extent,
-                                        DEFAULT_TINY_POLYGON_THRESHOLD,
-                                    )
-                                })
-                            }
-                        }
-                    };
-
-                    if should_drop {
-                        continue;
-                    }
-
-                    // Serialize WorldClippedGeometry to bytes (replacing WKB)
-                    let serialize_start = std::time::Instant::now();
-                    let geom_bytes = clipped.to_bytes();
-                    result.time_wkb += serialize_start.elapsed();
-
-                    // Create record with tile_id and coordinates
-                    let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
-                    let record = TileFeatureRecord::new(
-                        tid,
-                        tile_coord.z,
-                        tile_coord.x,
-                        tile_coord.y,
-                        feat_idx,
-                        geom_bytes,
-                        vec![], // Empty properties for now
-                    );
-
-                    result.records.push(record);
-                }
-
-                result
+                    &mut store_guard,
+                    &mut local_bounds,
+                )?
             };
 
-            // Use parallel or sequential geometry processing based on deterministic flag
-            let results: Vec<GeomResult> = if config.deterministic {
-                // SEQUENTIAL: For reproducible output
-                sorted
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, geom)| process_geometry(idx, geom))
-                    .collect()
-            } else {
-                // PARALLEL: For performance (default)
-                sorted
-                    .into_iter()
-                    .enumerate()
-                    .collect::<Vec<_>>()
-                    .into_par_iter()
-                    .map(|(idx, geom)| process_geometry(idx, geom))
-                    .collect()
-            };
+            let process_time = process_start.elapsed();
+            let num_refs = tile_refs.len();
 
-            // Aggregate all results and write to sorter
-            let mut time_clip = std::time::Duration::ZERO;
-            let mut time_simplify = std::time::Duration::ZERO;
-            let mut time_wkb = std::time::Duration::ZERO;
-            let mut time_sorter_add = std::time::Duration::ZERO;
-            let mut clip_count = 0u64;
-            let mut tiles_touched = 0u64;
+            // Update global bounds
+            global_bounds.lock().unwrap().expand(&local_bounds);
 
-            for result in results {
-                time_clip += result.time_clip;
-                time_simplify += result.time_simplify;
-                time_wkb += result.time_wkb;
-                clip_count += result.clip_count;
-                tiles_touched += result.tiles_touched;
-
-                // Update global bounds
-                if let Some(bounds) = result.bounds {
-                    global_bounds.lock().unwrap().expand(&bounds);
+            // Add TileRefs to sorter (lightweight 48-byte records vs 680-byte TileFeatureRecords)
+            let sorter_start = std::time::Instant::now();
+            {
+                let mut sorter_guard = sorter.lock().unwrap();
+                let mut tracker_guard = memory_tracker.lock().unwrap();
+                for tile_ref in tile_refs {
+                    let record_size = std::mem::size_of::<TileRef>(); // 48 bytes
+                    tracker_guard.add(record_size);
+                    sorter_guard.push(tile_ref);
+                    records_written.fetch_add(1, Ordering::Relaxed);
                 }
-
-                // Add records to sorter
-                let sorter_start = std::time::Instant::now();
-                {
-                    let mut sorter_guard = sorter.lock().unwrap();
-                    let mut tracker_guard = memory_tracker.lock().unwrap();
-                    for record in result.records {
-                        let record_size = RECORD_FIXED_OVERHEAD + record.geometry_wkb.len();
-                        tracker_guard.add(record_size);
-                        sorter_guard.add(record);
-                        records_written.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                time_sorter_add += sorter_start.elapsed();
             }
+            let time_sorter_add = sorter_start.elapsed();
 
             geoms_processed.fetch_add(num_geoms as u64, Ordering::Relaxed);
 
             // Log timing at debug level (use RUST_LOG=debug to see)
             log::debug!(
-            "RG {}: {:.2}s | sort={:.2}s clip={:.2}s ({} ops) simplify={:.2}s wkb={:.2}s sorter={:.2}s | tiles={}",
-            rg_info.index,
-            rg_start.elapsed().as_secs_f64(),
-            time_sort.as_secs_f64(),
-            time_clip.as_secs_f64(),
-            clip_count,
-            time_simplify.as_secs_f64(),
-            time_wkb.as_secs_f64(),
-            time_sorter_add.as_secs_f64(),
-            tiles_touched,
-        );
+                "RG {}: {:.2}s | sort={:.2}s process={:.2}s sorter={:.2}s | refs={}",
+                rg_info.index,
+                rg_start.elapsed().as_secs_f64(),
+                time_sort.as_secs_f64(),
+                process_time.as_secs_f64(),
+                time_sorter_add.as_secs_f64(),
+                num_refs,
+            );
 
             Ok(())
         },
@@ -1280,11 +1114,9 @@ fn generate_tiles_to_writer_internal(
         tracing::info!("Phase 2: External merge sort by tile_id");
     }
 
-    let sorted_iter = sorter
-        .into_inner()
-        .unwrap()
-        .sort()
-        .map_err(|e| Error::PMTilesWrite(format!("External sort failed: {}", e)))?;
+    let mut sorted_vec = sorter.into_inner().unwrap();
+    sorted_vec.sort_by_key(|r| r.tile_id);
+    let sorted_iter = sorted_vec.into_iter();
 
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Complete);
@@ -1304,6 +1136,20 @@ fn generate_tiles_to_writer_internal(
         tracing::info!("Phase 3: Encoding tiles and writing to PMTiles (parallel)");
     }
 
+    // Flush geometry store before creating readers
+    geometry_store.lock().unwrap().flush().map_err(Error::Io)?;
+
+    // Create readers for parallel access (one per rayon thread)
+    let num_readers = rayon::current_num_threads();
+    let readers: Arc<Mutex<Vec<crate::geometry_store::GeometryStoreReader>>> = {
+        let store = geometry_store.lock().unwrap();
+        let readers = (0..num_readers)
+            .map(|_| store.new_reader())
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(Error::Io)?;
+        Arc::new(Mutex::new(readers))
+    };
+
     // Batch size for parallel encoding - balance between parallelism and memory
     // Larger batches = more parallelism, but more memory
     // 2000 tiles provides good parallel work while keeping memory bounded
@@ -1311,7 +1157,7 @@ fn generate_tiles_to_writer_internal(
 
     // Raw record data for deferred decoding + encoding
     struct RawFeature {
-        geometry_bytes: Vec<u8>,
+        geometry_handle: crate::geometry_store::GeometryHandle,
         feature_id: u64,
     }
 
@@ -1342,11 +1188,12 @@ fn generate_tiles_to_writer_internal(
     // When cluster_config is Some, point clustering is performed at the appropriate zoom levels.
     fn encode_tile_from_raw(
         tile_data: RawTileData,
+        reader: &mut crate::geometry_store::GeometryStoreReader,
         layer_name: &str,
         extent: u32,
         enable_tiny_polygon_accumulation: bool,
         cluster_config: Option<&ClusterConfig>,
-    ) -> Option<EncodedTile> {
+    ) -> std::io::Result<Option<EncodedTile>> {
         use crate::clustering::{IndexedPoint, PointClusterer};
         use crate::mvt::PropertyValue;
         use crate::world_coord::WorldCoord;
@@ -1382,9 +1229,29 @@ fn generate_tiles_to_writer_internal(
             let mut non_point_features: Vec<(u64, WorldClippedGeometry)> = Vec::new();
 
             for raw_feat in tile_data.features.iter() {
-                let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
+                // Read geometry from store using handle
+                let (geom_wkb, _props) = reader.read(raw_feat.geometry_handle)?;
+                let world_geom = match WorldClippedGeometry::from_bytes(&geom_wkb) {
                     Some(g) => g,
                     None => continue,
+                };
+
+                // LAZY CLIPPING WITH CONTAINMENT OPTIMIZATION (Phase 3)
+                // Check if geometry is fully contained in tile bounds - if so, skip clipping
+                use crate::world_coord::WorldBounds;
+                let tile_bounds = WorldBounds::from_tile_with_buffer(&coord, 8, extent); // 8 pixel buffer
+                let geom_bounds = world_geom.world_bounds();
+
+                let geom = if tile_bounds.contains_bounds(&geom_bounds) {
+                    // Fully contained - skip clipping (80% of building footprints hit this path)
+                    world_geom
+                } else {
+                    // Must clip - geometry extends beyond tile bounds
+                    use crate::hierarchical_clip::clip_world_geometry;
+                    match clip_world_geometry(&world_geom, &tile_bounds) {
+                        Some(clipped) => clipped,
+                        None => continue, // Clipped to nothing
+                    }
                 };
 
                 if geom.is_degenerate_in_tile(&coord, extent) {
@@ -1621,24 +1488,43 @@ fn generate_tiles_to_writer_internal(
                 let tile = tile_builder.build();
                 let encoded = tile.encode_to_vec();
 
-                return Some(EncodedTile {
+                return Ok(Some(EncodedTile {
                     z: tile_data.z,
                     x: tile_data.x,
                     y: tile_data.y,
                     data: encoded,
                     feature_count,
-                });
+                }));
             } else {
-                return None;
+                return Ok(None);
             }
         }
 
         // Non-clustering path: original loop
         for raw_feat in tile_data.features {
-            // Decode geometry from bytes (this was previously sequential)
-            let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
+            // Read geometry from store using handle
+            let (geom_wkb, _props) = reader.read(raw_feat.geometry_handle)?;
+            let world_geom = match WorldClippedGeometry::from_bytes(&geom_wkb) {
                 Some(g) => g,
                 None => continue,
+            };
+
+            // LAZY CLIPPING WITH CONTAINMENT OPTIMIZATION (Phase 3)
+            // Check if geometry is fully contained in tile bounds - if so, skip clipping
+            use crate::world_coord::WorldBounds;
+            let tile_bounds = WorldBounds::from_tile_with_buffer(&coord, 8, extent); // 8 pixel buffer
+            let geom_bounds = world_geom.world_bounds();
+
+            let geom = if tile_bounds.contains_bounds(&geom_bounds) {
+                // Fully contained - skip clipping (80% of building footprints hit this path)
+                world_geom
+            } else {
+                // Must clip - geometry extends beyond tile bounds
+                use crate::hierarchical_clip::clip_world_geometry;
+                match clip_world_geometry(&world_geom, &tile_bounds) {
+                    Some(clipped) => clipped,
+                    None => continue, // Clipped to nothing
+                }
             };
 
             if geom.is_degenerate_in_tile(&coord, extent) {
@@ -1805,15 +1691,15 @@ fn generate_tiles_to_writer_internal(
             let tile = tile_builder.build();
             let encoded = tile.encode_to_vec();
 
-            Some(EncodedTile {
+            Ok(Some(EncodedTile {
                 z: tile_data.z,
                 x: tile_data.x,
                 y: tile_data.y,
                 data: encoded,
                 feature_count,
-            })
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -1844,20 +1730,24 @@ fn generate_tiles_to_writer_internal(
                        extent: u32,
                        deterministic: bool,
                        enable_tiny_polygon_accumulation: bool,
-                       cluster_config: Option<&ClusterConfig>|
+                       cluster_config: Option<&ClusterConfig>,
+                       readers: &Arc<Mutex<Vec<crate::geometry_store::GeometryStoreReader>>>|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
         // Decode + encode tiles - parallel or sequential based on deterministic flag
-        let encoded_tiles: Vec<Option<EncodedTile>> = if deterministic {
+        let encoded_tiles: Vec<std::io::Result<Option<EncodedTile>>> = if deterministic {
             // Sequential for reproducibility
+            let mut readers_guard = readers.lock().unwrap();
+            let reader = &mut readers_guard[0]; // Use first reader for sequential
             std::mem::take(batch)
                 .into_iter()
                 .map(|td| {
                     encode_tile_from_raw(
                         td,
+                        reader,
                         layer_name,
                         extent,
                         enable_tiny_polygon_accumulation,
@@ -1867,11 +1757,19 @@ fn generate_tiles_to_writer_internal(
                 .collect()
         } else {
             // Parallel for performance - both decoding AND encoding happen in parallel
+            // Use thread-safe reader access via atomic counter
+            let reader_counter = std::sync::atomic::AtomicUsize::new(0);
             std::mem::take(batch)
                 .into_par_iter()
                 .map(|td| {
+                    // Get thread-local reader index
+                    let idx = reader_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        % num_readers;
+                    let mut readers_guard = readers.lock().unwrap();
+                    let reader = &mut readers_guard[idx];
                     encode_tile_from_raw(
                         td,
+                        reader,
                         layer_name,
                         extent,
                         enable_tiny_polygon_accumulation,
@@ -1882,24 +1780,27 @@ fn generate_tiles_to_writer_internal(
         };
 
         // Write encoded tiles sequentially (PMTiles requires ordered writes)
-        for encoded in encoded_tiles.into_iter().flatten() {
-            writer
-                .add_tile_with_count(
-                    encoded.z,
-                    encoded.x,
-                    encoded.y,
-                    &encoded.data,
-                    encoded.feature_count,
-                )
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
-            *tiles_written += 1;
+        for result in encoded_tiles.into_iter() {
+            let encoded = result.map_err(Error::Io)?;
+            if let Some(encoded) = encoded {
+                writer
+                    .add_tile_with_count(
+                        encoded.z,
+                        encoded.x,
+                        encoded.y,
+                        &encoded.data,
+                        encoded.feature_count,
+                    )
+                    .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
+                *tiles_written += 1;
+            }
         }
 
         *batch_mem = 0;
         Ok(())
     };
 
-    for record_result in sorted_iter {
+    for record in sorted_iter {
         records_processed += 1;
 
         // Report progress periodically
@@ -1912,9 +1813,6 @@ fn generate_tiles_to_writer_internal(
                 });
             }
         }
-
-        let record = record_result
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to read sorted record: {}", e)))?;
 
         let record_tile = (record.z, record.x, record.y);
 
@@ -1946,19 +1844,21 @@ fn generate_tiles_to_writer_internal(
                         deterministic,
                         enable_tiny_polygon_accumulation,
                         cluster_config.as_ref(),
+                        &readers,
                     )?;
                 }
             }
         }
 
-        // Store raw bytes for deferred decoding (will be decoded in parallel)
-        let geom_size = record.geometry_wkb.len();
-        memory_tracker.lock().unwrap().add(geom_size);
-        current_tile_memory += geom_size;
+        // Store handle for deferred decoding (will be decoded in parallel)
+        // Memory tracking: just the handle size, geometry is on disk
+        let handle_size = std::mem::size_of::<crate::geometry_store::GeometryHandle>();
+        memory_tracker.lock().unwrap().add(handle_size);
+        current_tile_memory += handle_size;
 
         // Add raw feature to current tile
         current_features.push(RawFeature {
-            geometry_bytes: record.geometry_wkb,
+            geometry_handle: record.geometry_handle,
             feature_id: record.feature_id,
         });
         current_tile = Some(record_tile);
@@ -1987,6 +1887,7 @@ fn generate_tiles_to_writer_internal(
         deterministic,
         enable_tiny_polygon_accumulation,
         cluster_config.as_ref(),
+        &readers,
     )?;
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
