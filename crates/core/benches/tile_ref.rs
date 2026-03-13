@@ -81,19 +81,19 @@ fn bench_sorting(c: &mut Criterion) {
     let mut group = c.benchmark_group("tile_record_sorting");
 
     for size in [1_000, 10_000, 100_000] {
-        group.throughput(Throughput::Elements(size as u64));
+        group.throughput(Throughput::Elements(size));
 
         // Create TileFeatureRecords
-        let mut tile_records: Vec<TileFeatureRecord> = (0..size)
+        let tile_records: Vec<TileFeatureRecord> = (0..size)
             .map(|i| {
                 TileFeatureRecord::new(
-                    (i * 7) % size as u64, // Pseudo-random tile_id
+                    (i * 7) % size, // Pseudo-random tile_id
                     10,
                     (i % 1024) as u32,
                     (i / 1024) as u32,
-                    i as u64,
-                    create_test_geometry(i as u64),
-                    create_test_properties(i as u64),
+                    i,
+                    create_test_geometry(i),
+                    create_test_properties(i),
                 )
             })
             .collect();
@@ -112,18 +112,18 @@ fn bench_sorting(c: &mut Criterion) {
 
         // Create TileRefs (with GeometryStore)
         let mut store = GeometryStore::new().expect("Should create store");
-        let mut tile_refs: Vec<TileRef> = (0..size)
+        let tile_refs: Vec<TileRef> = (0..size)
             .map(|i| {
-                let wkb = create_test_geometry(i as u64);
-                let props = create_test_properties(i as u64);
+                let wkb = create_test_geometry(i);
+                let props = create_test_properties(i);
                 let handle = store.append(&wkb, &props).expect("Should append");
 
                 TileRef::new(
-                    (i * 7) % size as u64,
+                    (i * 7) % size,
                     10,
                     (i % 1024) as u32,
                     (i / 1024) as u32,
-                    i as u64,
+                    i,
                     handle,
                 )
             })
