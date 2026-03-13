@@ -24,6 +24,21 @@ pip install gpq-tiles      # Python
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
 
+### Size-Based Feature Dropping
+
+Drop the smallest features first when tiles are dense (tippecanoe parity):
+
+```bash
+gpq-tiles input.parquet output.pmtiles \
+  --drop-smallest-as-needed \
+  --drop-smallest-threshold 4.0  # square pixels (default)
+```
+
+Useful for:
+- Building footprints (drop tiny sheds/outbuildings at high zoom)
+- Dense point data (drop smallest markers)
+- Polygon layers (drop single-pixel features)
+
 ```python
 from gpq_tiles import convert
 

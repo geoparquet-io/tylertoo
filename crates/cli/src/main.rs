@@ -68,6 +68,20 @@ struct Args {
     #[arg(long)]
     gamma: Option<f64>,
 
+    /// Enable size-based feature dropping (tippecanoe parity).
+    ///
+    /// When a tile has more features than can be rendered clearly,
+    /// drops the smallest features (by pixel area) first.
+    /// Equivalent to tippecanoe's --drop-smallest-as-needed.
+    #[arg(long)]
+    drop_smallest_as_needed: bool,
+
+    /// Minimum pixel area for --drop-smallest-as-needed (default: 4.0).
+    ///
+    /// Features with pixel area below this threshold are candidates for dropping.
+    #[arg(long, default_value = "4.0")]
+    drop_smallest_threshold: f64,
+
     /// Layer name for the output tiles (default: derived from input filename)
     #[arg(long)]
     layer_name: Option<String>,
@@ -329,6 +343,13 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_gamma(gamma);
     } else if args.drop_densest_as_needed {
         tiler_config = tiler_config.with_drop_densest_as_needed();
+    }
+
+    // Configure size-based feature dropping if requested
+    if args.drop_smallest_as_needed {
+        tiler_config = tiler_config
+            .with_drop_smallest_as_needed()
+            .with_drop_smallest_threshold(args.drop_smallest_threshold);
     }
 
     // Add accumulator config if specified
