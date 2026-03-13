@@ -28,7 +28,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use tempfile::NamedTempFile;
 
 /// Handle to a stored geometry. Contains offset and lengths for retrieval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GeometryHandle {
     /// Byte offset in the store file
     pub offset: u64,

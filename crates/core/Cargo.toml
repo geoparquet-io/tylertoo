@@ -56,6 +56,7 @@ geojson = "0.24"
 serde_json = "1"
 tracing-subscriber = { workspace = true }
 tracing-test = "0.2"
+bincode = "1"
 
 [[bench]]
 name = "tiling"
@@ -71,4 +72,8 @@ harness = false
 
 [[bench]]
 name = "geometry_store"
+harness = false
+
+[[bench]]
+name = "tile_ref"
 harness = false
