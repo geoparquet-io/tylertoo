@@ -822,6 +822,84 @@ pub fn geometry_pixel_area_world(
     }
 }
 
+/// Calculate pixel area for any geometry type using geographic coordinates.
+///
+/// This is the `geo::Geometry<f64>` equivalent of [`geometry_pixel_area_world`],
+/// used by the streaming pipeline path where geometries remain in geographic
+/// coordinates rather than being converted to [`WorldCoord`].
+///
+/// Dispatches to type-specific calculations:
+/// - **Points/MultiPoints**: 1.0 per point (constant)
+/// - **LineStrings**: circle heuristic pi * (length/2)^2 in tile pixels
+/// - **Polygons**: unsigned area in tile-local pixel coordinates
+///
+/// # Arguments
+/// * `geom` - Geometry in geographic coordinates (lng/lat)
+/// * `tile_bounds` - Geographic bounds of the tile
+/// * `extent` - Tile extent in pixels (typically 4096)
+///
+/// # Returns
+/// Area in square pixels (can be fractional)
+pub fn geometry_pixel_area_geo(
+    geom: &geo::Geometry<f64>,
+    tile_bounds: &TileBounds,
+    extent: u32,
+) -> f64 {
+    use geo::Geometry;
+
+    match geom {
+        Geometry::Point(_) => 1.0,
+
+        Geometry::MultiPoint(mp) => mp.0.len() as f64,
+
+        Geometry::LineString(ls) => linestring_pixel_area_geo(ls, tile_bounds, extent),
+
+        Geometry::MultiLineString(mls) => mls
+            .0
+            .iter()
+            .map(|ls| linestring_pixel_area_geo(ls, tile_bounds, extent))
+            .sum(),
+
+        Geometry::Polygon(poly) => polygon_area_in_tile_coords(poly, tile_bounds, extent),
+
+        Geometry::MultiPolygon(mp) => {
+            mp.0.iter()
+                .map(|poly| polygon_area_in_tile_coords(poly, tile_bounds, extent))
+                .sum()
+        }
+
+        // GeometryCollection and other types: conservative default (keep them)
+        _ => f64::MAX,
+    }
+}
+
+/// Calculate linestring "pixel area" using tippecanoe's circle heuristic.
+///
+/// Converts the linestring to tile-local pixel coordinates, computes total
+/// length, then returns pi * (length/2)^2. This is the `geo::LineString<f64>`
+/// equivalent of [`linestring_pixel_area_world`].
+fn linestring_pixel_area_geo(ls: &LineString<f64>, tile_bounds: &TileBounds, extent: u32) -> f64 {
+    let tile_ls = linestring_to_tile_coords(ls, tile_bounds, extent);
+    let coords: Vec<&Coord<f64>> = tile_ls.coords().collect();
+
+    if coords.len() < 2 {
+        return 0.0;
+    }
+
+    // Sum Euclidean segment lengths in tile-pixel space
+    let pixel_length: f64 = coords
+        .windows(2)
+        .map(|w| {
+            let dx = w[1].x - w[0].x;
+            let dy = w[1].y - w[0].y;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .sum();
+
+    // Tippecanoe: area = pi * (length/2)^2
+    std::f64::consts::PI * (pixel_length / 2.0).powi(2)
+}
+
 /// Check if a polygon is too small to render at the given tile and zoom.
 ///
 /// This is the WorldCoord-native equivalent of `should_drop_tiny_polygon`.

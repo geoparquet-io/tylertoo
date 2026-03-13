@@ -2257,6 +2257,18 @@ pub fn generate_tiles_streaming_with_stats(
                 }
             }
 
+            // Drop features below pixel area threshold (--drop-smallest-as-needed)
+            if config.drop_smallest_as_needed {
+                let pixel_area = crate::feature_drop::geometry_pixel_area_geo(
+                    &validated,
+                    &tile_bounds,
+                    config.extent,
+                );
+                if pixel_area < config.drop_smallest_threshold {
+                    continue;
+                }
+            }
+
             // Add to layer (no properties for now)
             layer_builder.add_feature(Some(feat_idx), &validated, &[], &tile_bounds);
             feature_count += 1;
