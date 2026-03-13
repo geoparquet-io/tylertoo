@@ -482,6 +482,100 @@ impl WorldClippedGeometry {
                 .all(|(ext, _)| coords_are_degenerate(ext, tile, extent)),
         }
     }
+
+    /// Compute the bounding box of this geometry in WorldCoord space.
+    ///
+    /// This is used for the Issue #117 containment optimization: if a geometry's
+    /// bounding box is fully contained within a tile's bounds, we can skip clipping.
+    ///
+    /// # Returns
+    ///
+    /// `WorldBounds` representing the minimum bounding rectangle of the geometry.
+    pub fn world_bounds(&self) -> crate::world_coord::WorldBounds {
+        use crate::world_coord::WorldBounds;
+
+        match self {
+            WorldClippedGeometry::Point(p) => WorldBounds::new(p.x, p.y, p.x, p.y),
+            WorldClippedGeometry::LineString(coords) => bounds_from_coords(coords),
+            WorldClippedGeometry::Polygon {
+                exterior,
+                interiors,
+            } => {
+                let mut bounds = bounds_from_coords(exterior);
+                // Extend bounds to include all interior rings
+                for interior in interiors {
+                    let interior_bounds = bounds_from_coords(interior);
+                    bounds = WorldBounds::new(
+                        bounds.x_min.min(interior_bounds.x_min),
+                        bounds.y_min.min(interior_bounds.y_min),
+                        bounds.x_max.max(interior_bounds.x_max),
+                        bounds.y_max.max(interior_bounds.y_max),
+                    );
+                }
+                bounds
+            }
+            WorldClippedGeometry::MultiPoint(points) => bounds_from_coords(points),
+            WorldClippedGeometry::MultiLineString(lines) => {
+                let mut bounds = WorldBounds::new(u32::MAX, u32::MAX, 0, 0);
+                for line in lines {
+                    let line_bounds = bounds_from_coords(line);
+                    bounds = WorldBounds::new(
+                        bounds.x_min.min(line_bounds.x_min),
+                        bounds.y_min.min(line_bounds.y_min),
+                        bounds.x_max.max(line_bounds.x_max),
+                        bounds.y_max.max(line_bounds.y_max),
+                    );
+                }
+                bounds
+            }
+            WorldClippedGeometry::MultiPolygon(polys) => {
+                let mut bounds = WorldBounds::new(u32::MAX, u32::MAX, 0, 0);
+                for (exterior, interiors) in polys {
+                    let poly_bounds = {
+                        let mut b = bounds_from_coords(exterior);
+                        for interior in interiors {
+                            let interior_bounds = bounds_from_coords(interior);
+                            b = WorldBounds::new(
+                                b.x_min.min(interior_bounds.x_min),
+                                b.y_min.min(interior_bounds.y_min),
+                                b.x_max.max(interior_bounds.x_max),
+                                b.y_max.max(interior_bounds.y_max),
+                            );
+                        }
+                        b
+                    };
+                    bounds = WorldBounds::new(
+                        bounds.x_min.min(poly_bounds.x_min),
+                        bounds.y_min.min(poly_bounds.y_min),
+                        bounds.x_max.max(poly_bounds.x_max),
+                        bounds.y_max.max(poly_bounds.y_max),
+                    );
+                }
+                bounds
+            }
+        }
+    }
+}
+
+/// Helper function to compute bounds from a slice of WorldCoords.
+fn bounds_from_coords(
+    coords: &[crate::world_coord::WorldCoord],
+) -> crate::world_coord::WorldBounds {
+    use crate::world_coord::WorldBounds;
+
+    let mut x_min = u32::MAX;
+    let mut y_min = u32::MAX;
+    let mut x_max = 0u32;
+    let mut y_max = 0u32;
+
+    for coord in coords {
+        x_min = x_min.min(coord.x);
+        y_min = y_min.min(coord.y);
+        x_max = x_max.max(coord.x);
+        y_max = y_max.max(coord.y);
+    }
+
+    WorldBounds::new(x_min, y_min, x_max, y_max)
 }
 
 /// Check if all coordinates collapse to the same tile-local pixel.
@@ -2058,5 +2152,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ========== WorldClippedGeometry::world_bounds() Tests ==========
+
+    #[test]
+    fn test_world_clipped_geometry_bounds_point() {
+        use crate::world_coord::WorldCoord;
+
+        let point = WorldClippedGeometry::Point(WorldCoord { x: 100, y: 200 });
+        let bounds = point.world_bounds();
+
+        assert_eq!(bounds.x_min, 100);
+        assert_eq!(bounds.x_max, 100);
+        assert_eq!(bounds.y_min, 200);
+        assert_eq!(bounds.y_max, 200);
+    }
+
+    #[test]
+    fn test_world_clipped_geometry_bounds_linestring() {
+        use crate::world_coord::WorldCoord;
+
+        let linestring = WorldClippedGeometry::LineString(vec![
+            WorldCoord { x: 100, y: 200 },
+            WorldCoord { x: 300, y: 150 },
+            WorldCoord { x: 200, y: 400 },
+        ]);
+        let bounds = linestring.world_bounds();
+
+        assert_eq!(bounds.x_min, 100);
+        assert_eq!(bounds.x_max, 300);
+        assert_eq!(bounds.y_min, 150);
+        assert_eq!(bounds.y_max, 400);
+    }
+
+    #[test]
+    fn test_world_clipped_geometry_bounds_polygon() {
+        use crate::world_coord::WorldCoord;
+
+        let polygon = WorldClippedGeometry::Polygon {
+            exterior: vec![
+                WorldCoord { x: 100, y: 100 },
+                WorldCoord { x: 400, y: 100 },
+                WorldCoord { x: 400, y: 300 },
+                WorldCoord { x: 100, y: 300 },
+            ],
+            interiors: vec![vec![
+                WorldCoord { x: 150, y: 150 },
+                WorldCoord { x: 200, y: 150 },
+                WorldCoord { x: 200, y: 200 },
+            ]],
+        };
+        let bounds = polygon.world_bounds();
+
+        // Bounds from exterior + interiors
+        assert_eq!(bounds.x_min, 100);
+        assert_eq!(bounds.x_max, 400);
+        assert_eq!(bounds.y_min, 100);
+        assert_eq!(bounds.y_max, 300);
+    }
+
+    #[test]
+    fn test_world_clipped_geometry_bounds_multipoint() {
+        use crate::world_coord::WorldCoord;
+
+        let multipoint = WorldClippedGeometry::MultiPoint(vec![
+            WorldCoord { x: 100, y: 200 },
+            WorldCoord { x: 500, y: 100 },
+            WorldCoord { x: 300, y: 600 },
+        ]);
+        let bounds = multipoint.world_bounds();
+
+        assert_eq!(bounds.x_min, 100);
+        assert_eq!(bounds.x_max, 500);
+        assert_eq!(bounds.y_min, 100);
+        assert_eq!(bounds.y_max, 600);
+    }
+
+    #[test]
+    fn test_world_clipped_geometry_bounds_multilinestring() {
+        use crate::world_coord::WorldCoord;
+
+        let multilinestring = WorldClippedGeometry::MultiLineString(vec![
+            vec![WorldCoord { x: 100, y: 200 }, WorldCoord { x: 200, y: 300 }],
+            vec![WorldCoord { x: 400, y: 100 }, WorldCoord { x: 500, y: 500 }],
+        ]);
+        let bounds = multilinestring.world_bounds();
+
+        assert_eq!(bounds.x_min, 100);
+        assert_eq!(bounds.x_max, 500);
+        assert_eq!(bounds.y_min, 100);
+        assert_eq!(bounds.y_max, 500);
+    }
+
+    #[test]
+    fn test_world_clipped_geometry_bounds_multipolygon() {
+        use crate::world_coord::WorldCoord;
+
+        let multipolygon = WorldClippedGeometry::MultiPolygon(vec![
+            (
+                vec![
+                    WorldCoord { x: 100, y: 100 },
+                    WorldCoord { x: 200, y: 100 },
+                    WorldCoord { x: 200, y: 200 },
+                ],
+                vec![],
+            ),
+            (
+                vec![
+                    WorldCoord { x: 300, y: 300 },
+                    WorldCoord { x: 500, y: 300 },
+                    WorldCoord { x: 500, y: 600 },
+                ],
+                vec![],
+            ),
+        ]);
+        let bounds = multipolygon.world_bounds();
+
+        assert_eq!(bounds.x_min, 100);
+        assert_eq!(bounds.x_max, 500);
+        assert_eq!(bounds.y_min, 100);
+        assert_eq!(bounds.y_max, 600);
     }
 }
