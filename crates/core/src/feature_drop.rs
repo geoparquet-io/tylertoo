@@ -701,6 +701,127 @@ pub fn world_ring_area(coords: &[WorldCoord]) -> i64 {
     sum
 }
 
+/// Calculate polygon pixel area in WorldCoord space.
+///
+/// Converts world-coordinate area to square pixels for the given tile and extent.
+/// Uses Shoelace formula via `world_ring_area`, subtracts holes.
+///
+/// # Arguments
+/// * `exterior` - Outer ring in WorldCoord
+/// * `interiors` - Hole rings in WorldCoord
+/// * `tile` - Tile coordinate for scale calculation
+/// * `extent` - Tile extent in pixels (typically 4096)
+///
+/// # Returns
+/// Area in square pixels (can be fractional)
+pub fn polygon_pixel_area_world(
+    exterior: &[WorldCoord],
+    interiors: &[Vec<WorldCoord>],
+    tile: &TileCoord,
+    extent: u32,
+) -> f64 {
+    // Calculate outer ring area (signed, doubled)
+    let outer_area = world_ring_area(exterior).unsigned_abs();
+
+    // Subtract holes
+    let holes_area: u64 = interiors
+        .iter()
+        .map(|ring| world_ring_area(ring).unsigned_abs())
+        .sum();
+
+    let net_area = outer_area.saturating_sub(holes_area);
+
+    // Convert from world coords to square pixels
+    // World coord range is 0..2^32, tile size is extent px
+    // At zoom z, tile covers (2^32 / 2^z) world units
+    // So 1 world unit = (extent / (2^32 / 2^z)) = extent * 2^z / 2^32 pixels
+    // Area scaling: (pixels/world_unit)^2 = (extent * 2^z / 2^32)^2
+
+    let world_units_per_tile = (1u64 << 32) >> tile.z;
+    let pixels_per_world_unit = (extent as f64) / (world_units_per_tile as f64);
+
+    // net_area is 2x actual area from Shoelace, so divide by 2
+    let world_area = (net_area as f64) / 2.0;
+
+    world_area * pixels_per_world_unit * pixels_per_world_unit
+}
+
+/// Calculate linestring "pixel area" using tippecanoe's circle heuristic.
+///
+/// Tippecanoe treats lines as having area = π × (length/2)² (area of a circle
+/// whose diameter equals the line length). This makes lines comparable to polygons.
+///
+/// # Arguments
+/// * `coords` - Linestring vertices in WorldCoord
+/// * `tile` - Tile coordinate for scale calculation
+/// * `extent` - Tile extent in pixels
+///
+/// # Returns
+/// Pseudo-area in square pixels
+pub fn linestring_pixel_area_world(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> f64 {
+    if coords.len() < 2 {
+        return 0.0;
+    }
+
+    // Calculate total length in world coords
+    let world_length = world_linestring_length(coords);
+
+    // Convert to pixels (same scaling as polygon area)
+    let world_units_per_tile = (1u64 << 32) >> tile.z;
+    let pixels_per_world_unit = (extent as f64) / (world_units_per_tile as f64);
+    let pixel_length = (world_length as f64) * pixels_per_world_unit;
+
+    // Tippecanoe: area = π × (length/2)²
+    std::f64::consts::PI * (pixel_length / 2.0).powi(2)
+}
+
+/// Calculate pixel area for any geometry type in WorldCoord space.
+///
+/// Dispatches to type-specific functions:
+/// - Points/MultiPoints: 1.0 per point
+/// - LineStrings: circle heuristic (π × (length/2)²)
+/// - Polygons: Shoelace formula minus holes
+///
+/// # Arguments
+/// * `geom` - Clipped geometry in WorldCoord
+/// * `tile` - Tile coordinate
+/// * `extent` - Tile extent in pixels
+///
+/// # Returns
+/// Area in square pixels
+pub fn geometry_pixel_area_world(
+    geom: &crate::hierarchical_clip::WorldClippedGeometry,
+    tile: &TileCoord,
+    extent: u32,
+) -> f64 {
+    use crate::hierarchical_clip::WorldClippedGeometry;
+
+    match geom {
+        WorldClippedGeometry::Point(_) => 1.0,
+
+        WorldClippedGeometry::MultiPoint(points) => points.len() as f64,
+
+        WorldClippedGeometry::LineString(coords) => {
+            linestring_pixel_area_world(coords, tile, extent)
+        }
+
+        WorldClippedGeometry::MultiLineString(lines) => lines
+            .iter()
+            .map(|line| linestring_pixel_area_world(line, tile, extent))
+            .sum(),
+
+        WorldClippedGeometry::Polygon {
+            exterior,
+            interiors,
+        } => polygon_pixel_area_world(exterior, interiors, tile, extent),
+
+        WorldClippedGeometry::MultiPolygon(polygons) => polygons
+            .iter()
+            .map(|(ext, ints)| polygon_pixel_area_world(ext, ints, tile, extent))
+            .sum(),
+    }
+}
+
 /// Check if a polygon is too small to render at the given tile and zoom.
 ///
 /// This is the WorldCoord-native equivalent of `should_drop_tiny_polygon`.
@@ -2416,7 +2537,7 @@ mod tests {
     // WORLDCOORD-NATIVE TESTS (Issue #85)
     // =========================================================================
 
-    use crate::world_coord::WorldCoord;
+    use crate::world_coord::{lng_lat_to_world, WorldCoord};
 
     /// Helper to create a square ring of WorldCoords centered at a position.
     /// Returns coordinates in counter-clockwise order (positive area).
@@ -3085,5 +3206,159 @@ mod tests {
             "Should emit multiple times for many tiny polygons, got {} emissions",
             emission_count
         );
+    }
+
+    // =========================================================================
+    // polygon_pixel_area_world tests (drop-smallest-as-needed)
+    // =========================================================================
+
+    #[test]
+    fn test_polygon_pixel_area_world() {
+        // 1x1 degree square at equator, z0, 256px extent
+        // Should be ~256px wide (1/360 of world width)
+        let tile = TileCoord { x: 0, y: 0, z: 0 };
+        let extent = 256;
+
+        // Square from 0,0 to 1,1 degrees
+        let exterior = vec![
+            lng_lat_to_world(0.0, 0.0),
+            lng_lat_to_world(1.0, 0.0),
+            lng_lat_to_world(1.0, 1.0),
+            lng_lat_to_world(0.0, 1.0),
+            lng_lat_to_world(0.0, 0.0),
+        ];
+
+        let pixel_area = polygon_pixel_area_world(&exterior, &[], &tile, extent);
+
+        // 1 degree at z0 = 1/360 of 2^32 world coords
+        // Projected to 256px extent = (256/360)^2 ≈ 0.506 sq px
+        assert!(
+            (pixel_area - 0.506).abs() < 0.1,
+            "Expected ~0.506, got {}",
+            pixel_area
+        );
+    }
+
+    #[test]
+    fn test_polygon_pixel_area_world_with_hole() {
+        let tile = TileCoord { x: 0, y: 0, z: 0 };
+        let extent = 256;
+
+        // Outer ring: 2x2 degrees
+        let exterior = vec![
+            lng_lat_to_world(0.0, 0.0),
+            lng_lat_to_world(2.0, 0.0),
+            lng_lat_to_world(2.0, 2.0),
+            lng_lat_to_world(0.0, 2.0),
+            lng_lat_to_world(0.0, 0.0),
+        ];
+
+        // Inner ring (hole): 1x1 degrees centered
+        let hole = vec![
+            lng_lat_to_world(0.5, 0.5),
+            lng_lat_to_world(1.5, 0.5),
+            lng_lat_to_world(1.5, 1.5),
+            lng_lat_to_world(0.5, 1.5),
+            lng_lat_to_world(0.5, 0.5),
+        ];
+
+        let area_without_hole = polygon_pixel_area_world(&exterior, &[], &tile, extent);
+        let area_with_hole = polygon_pixel_area_world(&exterior, &[hole], &tile, extent);
+
+        // Hole should reduce area by ~25% (1/4 of outer ring)
+        assert!(area_with_hole < area_without_hole);
+        assert!((area_without_hole - area_with_hole) / area_without_hole > 0.2);
+    }
+
+    // =========================================================================
+    // LINESTRING PIXEL AREA TESTS (Task 2: drop-smallest-as-needed)
+    // =========================================================================
+
+    #[test]
+    fn test_linestring_pixel_area_world() {
+        // Horizontal line 1 degree long at equator, z0, 256px extent
+        let tile = TileCoord { x: 0, y: 0, z: 0 };
+        let extent = 256;
+
+        let coords = vec![
+            WorldCoord::from_lng_lat(0.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 0.0),
+        ];
+
+        let pixel_area = linestring_pixel_area_world(&coords, &tile, extent);
+
+        // 1 degree at z0 ≈ 0.711 pixels
+        // Tippecanoe: area = pi * (length/2)^2 = pi * (0.711/2)^2 ≈ 0.397
+        assert!(
+            (pixel_area - 0.397).abs() < 0.1,
+            "Expected ~0.397, got {}",
+            pixel_area
+        );
+    }
+
+    #[test]
+    fn test_linestring_pixel_area_world_multipart() {
+        let tile = TileCoord { x: 0, y: 0, z: 0 };
+        let extent = 256;
+
+        // L-shaped line: 2 segments
+        let coords = vec![
+            WorldCoord::from_lng_lat(0.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 1.0),
+        ];
+
+        let pixel_area = linestring_pixel_area_world(&coords, &tile, extent);
+
+        // Two segments: 1 degree horizontal + 1 degree vertical (Mercator)
+        // Each segment ≈ 0.711 pixels, total length ≈ 1.422 pixels
+        // Area = pi * (1.422/2)^2 ≈ 1.589
+        assert!(
+            (pixel_area - 1.589).abs() < 0.2,
+            "Expected ~1.589, got {}",
+            pixel_area
+        );
+    }
+
+    #[test]
+    fn test_geometry_pixel_area_world_all_types() {
+        use crate::hierarchical_clip::WorldClippedGeometry;
+
+        let tile = TileCoord { x: 0, y: 0, z: 0 };
+        let extent = 256;
+
+        // Point: should return 1.0
+        let point = WorldClippedGeometry::Point(WorldCoord::from_lng_lat(0.0, 0.0));
+        assert_eq!(geometry_pixel_area_world(&point, &tile, extent), 1.0);
+
+        // MultiPoint: should return 1.0 per point
+        let multipoint = WorldClippedGeometry::MultiPoint(vec![
+            WorldCoord::from_lng_lat(0.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 1.0),
+        ]);
+        assert_eq!(geometry_pixel_area_world(&multipoint, &tile, extent), 2.0);
+
+        // LineString: should use circle heuristic
+        let linestring = WorldClippedGeometry::LineString(vec![
+            WorldCoord::from_lng_lat(0.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 0.0),
+        ]);
+        let line_area = geometry_pixel_area_world(&linestring, &tile, extent);
+        assert!(line_area > 0.0 && line_area < 1.0);
+
+        // Polygon: should use Shoelace
+        let exterior = vec![
+            WorldCoord::from_lng_lat(0.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 1.0),
+            WorldCoord::from_lng_lat(0.0, 1.0),
+            WorldCoord::from_lng_lat(0.0, 0.0),
+        ];
+        let polygon = WorldClippedGeometry::Polygon {
+            exterior,
+            interiors: vec![],
+        };
+        let poly_area = geometry_pixel_area_world(&polygon, &tile, extent);
+        assert!(poly_area > 0.0);
     }
 }

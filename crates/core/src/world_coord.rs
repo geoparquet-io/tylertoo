@@ -66,6 +66,14 @@ impl WorldCoord {
         Self { x, y }
     }
 
+    /// Create a WorldCoord from longitude/latitude.
+    ///
+    /// Convenience wrapper around [`lng_lat_to_world`].
+    #[inline]
+    pub fn from_lng_lat(lng: f64, lat: f64) -> Self {
+        lng_lat_to_world(lng, lat)
+    }
+
     /// Get the tile coordinate containing this world coordinate at the given zoom.
     ///
     /// # Arguments
