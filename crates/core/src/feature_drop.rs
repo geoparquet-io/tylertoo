@@ -3439,4 +3439,63 @@ mod tests {
         let poly_area = geometry_pixel_area_world(&polygon, &tile, extent);
         assert!(poly_area > 0.0);
     }
+
+    // =========================================================================
+    // EDGE CASE TESTS (Task 10: drop-smallest-as-needed)
+    // =========================================================================
+
+    #[test]
+    fn test_polygon_pixel_area_world_zero_area() {
+        // Degenerate polygon (collapsed to line)
+        let tile = TileCoord { x: 0, y: 0, z: 0 };
+        let extent = 256;
+
+        let exterior = vec![
+            WorldCoord::from_lng_lat(0.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 0.0),
+            WorldCoord::from_lng_lat(1.0, 0.0), // duplicate
+            WorldCoord::from_lng_lat(0.0, 0.0),
+        ];
+
+        let pixel_area = polygon_pixel_area_world(&exterior, &[], &tile, extent);
+        assert_eq!(pixel_area, 0.0);
+    }
+
+    #[test]
+    fn test_linestring_pixel_area_world_single_point() {
+        // Degenerate line (single point)
+        let tile = TileCoord { x: 0, y: 0, z: 0 };
+        let extent = 256;
+
+        let coords = vec![WorldCoord::from_lng_lat(0.0, 0.0)];
+        let pixel_area = linestring_pixel_area_world(&coords, &tile, extent);
+        assert_eq!(pixel_area, 0.0);
+    }
+
+    #[test]
+    fn test_geometry_pixel_area_world_zoom_scaling() {
+        use crate::hierarchical_clip::WorldClippedGeometry;
+
+        // Same polygon at different zooms should have different pixel areas
+        let extent = 256;
+        let exterior = vec![
+            WorldCoord::from_lng_lat(0.0, 0.0),
+            WorldCoord::from_lng_lat(0.1, 0.0),
+            WorldCoord::from_lng_lat(0.1, 0.1),
+            WorldCoord::from_lng_lat(0.0, 0.1),
+            WorldCoord::from_lng_lat(0.0, 0.0),
+        ];
+        let polygon = WorldClippedGeometry::Polygon {
+            exterior,
+            interiors: vec![],
+        };
+
+        let area_z0 = geometry_pixel_area_world(&polygon, &TileCoord { x: 0, y: 0, z: 0 }, extent);
+        let area_z8 = geometry_pixel_area_world(&polygon, &TileCoord { x: 0, y: 0, z: 8 }, extent);
+
+        // At z8, pixel area should be 2^16 times larger (2^8 per dimension)
+        let expected_ratio = (1u64 << 16) as f64;
+        let actual_ratio = area_z8 / area_z0;
+        assert!((actual_ratio - expected_ratio).abs() / expected_ratio < 0.01);
+    }
 }
