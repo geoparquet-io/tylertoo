@@ -1377,6 +1377,8 @@ fn generate_tiles_to_writer_internal(
         extent: u32,
         enable_tiny_polygon_accumulation: bool,
         cluster_config: Option<&ClusterConfig>,
+        drop_smallest_as_needed: bool,
+        drop_smallest_threshold: f64,
     ) -> Option<EncodedTile> {
         use crate::clustering::{IndexedPoint, PointClusterer};
         use crate::mvt::PropertyValue;
@@ -1420,6 +1422,15 @@ fn generate_tiles_to_writer_internal(
 
                 if geom.is_degenerate_in_tile(&coord, extent) {
                     continue;
+                }
+
+                // Drop features below pixel area threshold (--drop-smallest-as-needed)
+                if drop_smallest_as_needed {
+                    let pixel_area =
+                        crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
+                    if pixel_area < drop_smallest_threshold {
+                        continue;
+                    }
                 }
 
                 match geom {
@@ -1676,6 +1687,15 @@ fn generate_tiles_to_writer_internal(
                 continue;
             }
 
+            // Drop features below pixel area threshold (--drop-smallest-as-needed)
+            if drop_smallest_as_needed {
+                let pixel_area =
+                    crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
+                if pixel_area < drop_smallest_threshold {
+                    continue;
+                }
+            }
+
             // Handle tiny polygon accumulation
             match (&geom, &mut accumulator) {
                 (
@@ -1864,6 +1884,8 @@ fn generate_tiles_to_writer_internal(
     let extent = config.extent;
     let deterministic = config.deterministic;
     let enable_tiny_polygon_accumulation = config.enable_tiny_polygon_accumulation;
+    let drop_smallest_as_needed = config.drop_smallest_as_needed;
+    let drop_smallest_threshold = config.drop_smallest_threshold;
     let cluster_config = config.cluster_config.clone();
 
     // Helper to flush the batch: decode + encode in parallel, write sequentially
@@ -1875,7 +1897,9 @@ fn generate_tiles_to_writer_internal(
                        extent: u32,
                        deterministic: bool,
                        enable_tiny_polygon_accumulation: bool,
-                       cluster_config: Option<&ClusterConfig>|
+                       cluster_config: Option<&ClusterConfig>,
+                       drop_smallest_as_needed: bool,
+                       drop_smallest_threshold: f64|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -1893,6 +1917,8 @@ fn generate_tiles_to_writer_internal(
                         extent,
                         enable_tiny_polygon_accumulation,
                         cluster_config,
+                        drop_smallest_as_needed,
+                        drop_smallest_threshold,
                     )
                 })
                 .collect()
@@ -1907,6 +1933,8 @@ fn generate_tiles_to_writer_internal(
                         extent,
                         enable_tiny_polygon_accumulation,
                         cluster_config,
+                        drop_smallest_as_needed,
+                        drop_smallest_threshold,
                     )
                 })
                 .collect()
@@ -1977,6 +2005,8 @@ fn generate_tiles_to_writer_internal(
                         deterministic,
                         enable_tiny_polygon_accumulation,
                         cluster_config.as_ref(),
+                        drop_smallest_as_needed,
+                        drop_smallest_threshold,
                     )?;
                 }
             }
@@ -2018,6 +2048,8 @@ fn generate_tiles_to_writer_internal(
         deterministic,
         enable_tiny_polygon_accumulation,
         cluster_config.as_ref(),
+        drop_smallest_as_needed,
+        drop_smallest_threshold,
     )?;
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
@@ -4179,6 +4211,71 @@ mod tests {
             enabled_config.enable_tiny_polygon_accumulation,
             "Should be able to explicitly enable tiny polygon accumulation"
         );
+    }
+
+    #[test]
+    fn test_drop_smallest_filters_tiny_features() {
+        // Test that drop_smallest_as_needed filters out features whose pixel area
+        // is below the threshold. At low zoom, building polygons are tiny in pixel
+        // space and should be dropped with a sufficiently large threshold.
+        //
+        // We use zoom 0-10 so the fixture produces multiple tiles. Buildings that
+        // are tiny at low zoom get dropped, which may cause some tiles to become
+        // empty (and thus not emitted), reducing the total tile count.
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Baseline: no drop_smallest_as_needed
+        let config_baseline = TilerConfig::new(0, 10).with_quiet(true);
+        let mut writer_baseline =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+        generate_tiles_to_writer(fixture, &config_baseline, &mut writer_baseline)
+            .expect("Baseline should succeed");
+        let output_baseline = Path::new("/tmp/test-drop-smallest-baseline.pmtiles");
+        let _ = fs::remove_file(output_baseline);
+        let stats_baseline = writer_baseline
+            .finalize(output_baseline)
+            .expect("Baseline finalize");
+
+        // Filtered: with drop_smallest_as_needed and an extremely high threshold
+        // to guarantee dropping at low zoom levels where buildings are sub-pixel
+        let config_filtered = TilerConfig::new(0, 10)
+            .with_quiet(true)
+            .with_drop_smallest_as_needed()
+            .with_drop_smallest_threshold(1_000_000.0); // huge threshold - drops nearly everything
+        let mut writer_filtered =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+        generate_tiles_to_writer(fixture, &config_filtered, &mut writer_filtered)
+            .expect("Filtered should succeed");
+        let output_filtered = Path::new("/tmp/test-drop-smallest-filtered.pmtiles");
+        let _ = fs::remove_file(output_filtered);
+        let stats_filtered = writer_filtered
+            .finalize(output_filtered)
+            .expect("Filtered finalize");
+
+        eprintln!(
+            "Baseline: {} tiles, Filtered: {} tiles",
+            stats_baseline.total_tiles, stats_filtered.total_tiles
+        );
+
+        // With such a huge threshold, the filtered run should produce strictly
+        // fewer tiles than the baseline (many tiles become empty after dropping)
+        assert!(
+            stats_filtered.total_tiles < stats_baseline.total_tiles,
+            "Filtered should produce fewer tiles than baseline: filtered={}, baseline={}",
+            stats_filtered.total_tiles,
+            stats_baseline.total_tiles
+        );
+
+        let _ = fs::remove_file(output_baseline);
+        let _ = fs::remove_file(output_filtered);
     }
 }
 
