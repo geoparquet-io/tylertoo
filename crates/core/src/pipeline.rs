@@ -2436,6 +2436,18 @@ impl TileIterator {
                         }
                     }
 
+                    // Drop features below pixel area threshold (--drop-smallest-as-needed)
+                    if config.drop_smallest_as_needed {
+                        let pixel_area = crate::feature_drop::geometry_pixel_area_geo(
+                            &valid_geom,
+                            &bounds,
+                            config.extent,
+                        );
+                        if pixel_area < config.drop_smallest_threshold {
+                            continue;
+                        }
+                    }
+
                     // Add to layer (no properties for now)
                     layer_builder.add_feature(Some(idx as u64), &valid_geom, &[], &bounds);
                     feature_count += 1;
