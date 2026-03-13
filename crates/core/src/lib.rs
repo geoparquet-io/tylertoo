@@ -54,6 +54,7 @@ pub mod hierarchical_clip;
 #[cfg(test)]
 mod integration_tests;
 pub mod ioverlay_clip;
+pub mod lazy_clip_pipeline;
 pub mod memory;
 pub mod mvt;
 pub mod pipeline;
