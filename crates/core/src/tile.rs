@@ -126,6 +126,46 @@ impl TileBounds {
     pub fn height(&self) -> f64 {
         self.lat_max - self.lat_min
     }
+
+    /// Check if this tile bounds fully contains a geometry's bounding box.
+    ///
+    /// This is the core of Issue #117 optimization: if a geometry is fully
+    /// contained within tile bounds, we can skip clipping entirely.
+    ///
+    /// # Arguments
+    ///
+    /// * `geometry_bbox` - The bounding rectangle of a geometry
+    ///
+    /// # Returns
+    ///
+    /// `true` if the geometry bbox is fully contained within this tile bounds,
+    /// `false` if any part extends outside
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gpq_tiles_core::tile::TileBounds;
+    /// use geo::Rect;
+    /// use geo::Coord;
+    ///
+    /// let tile = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+    /// let small_geom = Rect::new(Coord { x: -5.0, y: -5.0 }, Coord { x: 5.0, y: 5.0 });
+    ///
+    /// assert!(tile.contains(&small_geom)); // Fully inside
+    /// ```
+    pub fn contains(&self, geometry_bbox: &geo::Rect) -> bool {
+        // A geometry is contained if all four corners of its bbox are within tile bounds
+        // geo::Rect stores min and max coords
+        let min = geometry_bbox.min();
+        let max = geometry_bbox.max();
+
+        // Check containment: geometry must be fully inside tile
+        // Note: x = longitude, y = latitude in geo::Coord
+        min.x >= self.lng_min
+            && max.x <= self.lng_max
+            && min.y >= self.lat_min
+            && max.y <= self.lat_max
+    }
 }
 
 /// Convert longitude/latitude to tile coordinates at a given zoom level
@@ -572,5 +612,94 @@ mod tests {
                 max_valid
             );
         }
+    }
+
+    // ========== TileBounds::contains() Tests ==========
+
+    #[test]
+    fn test_tile_bounds_contains_fully_inside() {
+        let tile_bounds = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+        let geometry_bbox = geo::Rect::new(
+            geo::Coord { x: -5.0, y: -5.0 },
+            geo::Coord { x: 5.0, y: 5.0 },
+        );
+
+        assert!(
+            tile_bounds.contains(&geometry_bbox),
+            "Geometry fully inside tile should be contained"
+        );
+    }
+
+    #[test]
+    fn test_tile_bounds_contains_exact_match() {
+        let tile_bounds = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+        let geometry_bbox = geo::Rect::new(
+            geo::Coord { x: -10.0, y: -10.0 },
+            geo::Coord { x: 10.0, y: 10.0 },
+        );
+
+        assert!(
+            tile_bounds.contains(&geometry_bbox),
+            "Geometry with exact same bounds should be contained"
+        );
+    }
+
+    #[test]
+    fn test_tile_bounds_contains_partial_overlap() {
+        let tile_bounds = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+        let geometry_bbox = geo::Rect::new(
+            geo::Coord { x: 5.0, y: 5.0 },
+            geo::Coord { x: 15.0, y: 15.0 },
+        );
+
+        assert!(
+            !tile_bounds.contains(&geometry_bbox),
+            "Geometry partially outside tile should NOT be contained"
+        );
+    }
+
+    #[test]
+    fn test_tile_bounds_contains_completely_outside() {
+        let tile_bounds = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+        let geometry_bbox = geo::Rect::new(
+            geo::Coord { x: 20.0, y: 20.0 },
+            geo::Coord { x: 30.0, y: 30.0 },
+        );
+
+        assert!(
+            !tile_bounds.contains(&geometry_bbox),
+            "Geometry completely outside tile should NOT be contained"
+        );
+    }
+
+    #[test]
+    fn test_tile_bounds_contains_edge_cases() {
+        let tile_bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        // Geometry touching left edge (inside)
+        let bbox_left =
+            geo::Rect::new(geo::Coord { x: 0.0, y: 2.0 }, geo::Coord { x: 5.0, y: 8.0 });
+        assert!(tile_bounds.contains(&bbox_left));
+
+        // Geometry extending beyond right edge
+        let bbox_right = geo::Rect::new(
+            geo::Coord { x: 5.0, y: 2.0 },
+            geo::Coord { x: 11.0, y: 8.0 },
+        );
+        assert!(!tile_bounds.contains(&bbox_right));
+
+        // Geometry extending beyond top edge (lat_max)
+        let bbox_top = geo::Rect::new(
+            geo::Coord { x: 2.0, y: 5.0 },
+            geo::Coord { x: 8.0, y: 11.0 },
+        );
+        assert!(!tile_bounds.contains(&bbox_top));
+
+        // Geometry extending beyond bottom edge (lat_min)
+        let bbox_bottom = geo::Rect::new(
+            geo::Coord { x: 2.0, y: -1.0 },
+            geo::Coord { x: 8.0, y: 5.0 },
+        );
+        assert!(!tile_bounds.contains(&bbox_bottom));
     }
 }
