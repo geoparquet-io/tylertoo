@@ -47,7 +47,7 @@ fn test_lazy_clipping_with_containment_optimization() {
     // Create TileRefs for multiple tiles at zoom 2
     // Tile (2, 2, 2) should contain the polygon (covers 0-90°, -66-0°)
     // Adjacent tiles should be outside or require clipping
-    let tiles = vec![
+    let tiles = [
         TileCoord::new(2, 2, 2), // Should contain the 40-50°, -30--20° polygon
         TileCoord::new(1, 2, 2), // Different tile, geometry outside
         TileCoord::new(2, 1, 2), // Different tile, geometry outside
