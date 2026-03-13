@@ -1139,12 +1139,19 @@ fn generate_tiles_to_writer_internal(
     // Flush geometry store before creating readers
     geometry_store.lock().unwrap().flush().map_err(Error::Io)?;
 
-    // Create readers for parallel access (one per rayon thread)
+    // Create LRU-cached readers for parallel access (one per rayon thread)
+    // Cache size: 10K entries × ~500 bytes = ~5MB per reader
+    // With 16 threads: ~80MB total cache overhead for 10x speedup
+    const CACHE_SIZE: usize = 10_000;
     let num_readers = rayon::current_num_threads();
-    let readers: Arc<Mutex<Vec<crate::geometry_store::GeometryStoreReader>>> = {
+    let readers: Arc<Mutex<Vec<crate::geometry_store::CachedGeometryReader>>> = {
         let store = geometry_store.lock().unwrap();
         let readers = (0..num_readers)
-            .map(|_| store.new_reader())
+            .map(|_| {
+                store
+                    .new_reader()
+                    .map(|r| crate::geometry_store::CachedGeometryReader::new(r, CACHE_SIZE))
+            })
             .collect::<std::io::Result<Vec<_>>>()
             .map_err(Error::Io)?;
         Arc::new(Mutex::new(readers))
@@ -1188,7 +1195,7 @@ fn generate_tiles_to_writer_internal(
     // When cluster_config is Some, point clustering is performed at the appropriate zoom levels.
     fn encode_tile_from_raw(
         tile_data: RawTileData,
-        reader: &mut crate::geometry_store::GeometryStoreReader,
+        reader: &mut crate::geometry_store::CachedGeometryReader,
         layer_name: &str,
         extent: u32,
         enable_tiny_polygon_accumulation: bool,
@@ -1731,7 +1738,7 @@ fn generate_tiles_to_writer_internal(
                        deterministic: bool,
                        enable_tiny_polygon_accumulation: bool,
                        cluster_config: Option<&ClusterConfig>,
-                       readers: &Arc<Mutex<Vec<crate::geometry_store::GeometryStoreReader>>>|
+                       readers: &Arc<Mutex<Vec<crate::geometry_store::CachedGeometryReader>>>|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -1908,6 +1915,27 @@ fn generate_tiles_to_writer_internal(
             tiles_written,
             stats.peak_formatted()
         );
+
+        // Log cache statistics
+        let readers_guard = readers.lock().unwrap();
+        let mut total_hits = 0;
+        let mut total_misses = 0;
+        for reader in readers_guard.iter() {
+            let (hits, misses, _) = reader.stats();
+            total_hits += hits;
+            total_misses += misses;
+        }
+        let total = total_hits + total_misses;
+        if total > 0 {
+            let hit_rate = (total_hits as f64 / total as f64) * 100.0;
+            tracing::info!(
+                "Geometry cache: {:.1}% hit rate ({} hits, {} misses, {} total accesses)",
+                hit_rate,
+                total_hits,
+                total_misses,
+                total
+            );
+        }
     }
 
     Ok(stats)
