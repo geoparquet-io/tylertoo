@@ -526,4 +526,112 @@ mod tests {
             }
         }
     }
+
+    /// Golden test comparing baseline output against drop-smallest-as-needed filtering.
+    ///
+    /// Creates a synthetic dataset with mixed-size polygons (large, medium, tiny)
+    /// and verifies that enabling drop-smallest-as-needed reduces feature count
+    /// by filtering out the smallest features. Prints reduction percentage for
+    /// visual comparison.
+    #[test]
+    fn test_drop_smallest_visual_comparison() {
+        use crate::pipeline::{decode_tile, generate_single_tile, TilerConfig};
+        use crate::tile::TileCoord;
+
+        let features = create_mixed_size_features();
+
+        // z10, tile (512, 511) covers lng [0.0, 0.3516], lat ~[0.0, 0.3516]
+        let coord = TileCoord::new(512, 511, 10);
+
+        // Baseline: no drop-smallest
+        let config_baseline = TilerConfig::new(10, 10).with_layer_name("mixed");
+
+        let tile_baseline = generate_single_tile(&features, coord, &config_baseline)
+            .expect("Baseline should succeed")
+            .expect("Baseline tile should have features");
+        let decoded_baseline =
+            decode_tile(&tile_baseline.data).expect("Should decode baseline tile");
+        let count_baseline = decoded_baseline.layers[0].features.len();
+
+        // Filtered: with drop-smallest-as-needed, threshold = 4.0 sq px
+        let config_filtered = TilerConfig::new(10, 10)
+            .with_layer_name("mixed")
+            .with_drop_smallest_as_needed()
+            .with_drop_smallest_threshold(4.0);
+
+        let tile_filtered = generate_single_tile(&features, coord, &config_filtered)
+            .expect("Filtered should succeed")
+            .expect("Filtered tile should have features");
+        let decoded_filtered =
+            decode_tile(&tile_filtered.data).expect("Should decode filtered tile");
+        let count_filtered = decoded_filtered.layers[0].features.len();
+
+        // Filtered should have fewer features
+        assert!(
+            count_filtered < count_baseline,
+            "Filtered ({}) should have fewer features than baseline ({})",
+            count_filtered,
+            count_baseline
+        );
+
+        // Document the reduction
+        println!("=== Drop-Smallest Visual Comparison (z10) ===");
+        println!("Baseline: {} features", count_baseline);
+        println!("Filtered: {} features", count_filtered);
+        println!(
+            "Reduction: {:.1}%",
+            100.0 * (1.0 - count_filtered as f64 / count_baseline as f64)
+        );
+    }
+
+    /// Create a mixed-size feature set: 20 large, 30 medium, 50 tiny polygons.
+    ///
+    /// All features fall within z10 tile (512, 512) which covers
+    /// lng [0.0, ~0.3516], lat [~0.0, ~0.3516].
+    fn create_mixed_size_features() -> Vec<Geometry<f64>> {
+        use geo::polygon;
+
+        let mut features = Vec::new();
+
+        // Large polygons (0.01 degree squares) - clearly visible at z10
+        for i in 0..20 {
+            let x = (i % 5) as f64 * 0.02 + 0.01;
+            let y = (i / 5) as f64 * 0.02 + 0.01;
+            features.push(Geometry::Polygon(polygon![
+                (x: x,       y: y),
+                (x: x + 0.01, y: y),
+                (x: x + 0.01, y: y + 0.01),
+                (x: x,       y: y + 0.01),
+                (x: x,       y: y),
+            ]));
+        }
+
+        // Medium polygons (0.003 degree squares)
+        for i in 0..30 {
+            let x = (i % 6) as f64 * 0.01 + 0.15;
+            let y = (i / 6) as f64 * 0.01 + 0.01;
+            features.push(Geometry::Polygon(polygon![
+                (x: x,        y: y),
+                (x: x + 0.003, y: y),
+                (x: x + 0.003, y: y + 0.003),
+                (x: x,        y: y + 0.003),
+                (x: x,        y: y),
+            ]));
+        }
+
+        // Tiny polygons (0.0001 degree squares) - should be dropped at z10
+        for i in 0..50 {
+            let x = (i % 10) as f64 * 0.005 + 0.25;
+            let y = (i / 10) as f64 * 0.005 + 0.01;
+            features.push(Geometry::Polygon(polygon![
+                (x: x,         y: y),
+                (x: x + 0.0001, y: y),
+                (x: x + 0.0001, y: y + 0.0001),
+                (x: x,         y: y + 0.0001),
+                (x: x,         y: y),
+            ]));
+        }
+
+        features
+    }
 }
