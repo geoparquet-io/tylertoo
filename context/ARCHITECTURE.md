@@ -20,6 +20,7 @@ Design decisions and tippecanoe divergences.
 | Tiny polygon handling | **Accumulation** | Accumulation | **MATCHES** (Issue #85) |
 | Point clustering | **Hilbert proximity + incremental centroid** | Hilbert proximity + incremental centroid | **MATCHES** (Issue #25) |
 | Attribute accumulation | **Configurable accumulators** | Configurable accumulators | **MATCHES** (Issue #23) |
+| Size-based dropping | **Fixed threshold** | Iterative percentile-based | Fixed threshold v1; iterative planned |
 
 ## Polygon Clipping: Sutherland-Hodgman
 
@@ -91,6 +92,61 @@ let config = TilerConfig::new(0, 14)
 | 128px | 32×32 | 9 |
 
 **Note:** Gap-based selection takes precedence when `gamma` is set.
+
+## Size-Based Feature Dropping (`--drop-smallest-as-needed`)
+
+**Flag:** `--drop-smallest-as-needed`
+
+**Reference:** Tippecanoe's `--drop-smallest-as-needed`
+
+**Algorithm:** Drop features with pixel area below a threshold when tiles are dense.
+
+### Pixel Area Calculation
+
+We implement tippecanoe's area calculation methods for all geometry types:
+
+| Geometry Type | Area Calculation | Implementation |
+|---------------|------------------|----------------|
+| Polygon | Shoelace formula (sum exterior - sum holes) | `polygon_pixel_area_world()` |
+| LineString | π × (length/2)² (circle with line as diameter) | `linestring_pixel_area_world()` |
+| Point/MultiPoint | 1.0 per point (constant) | Direct return |
+
+All areas are converted from world coordinates to square pixels using:
+```
+pixels_per_world_unit = extent / (2^32 / 2^z)
+pixel_area = world_area × pixels_per_world_unit²
+```
+
+### Filtering Logic
+
+**Phase:** Post-clip (features are clipped to tile bounds BEFORE area filtering)
+
+**Location in pipeline:**
+- `encode_tile_from_raw()` - Production path (external sort)
+- `generate_tiles_streaming_with_stats()` - Streaming path
+- `process_tile_static()` - Legacy TileIterator path
+
+**Default threshold:** 4.0 square pixels
+
+Features with `pixel_area < threshold` are dropped from the tile.
+
+### Divergences from Tippecanoe
+
+1. **Fixed threshold (v1):** We start with a fixed threshold per zoom level. Tippecanoe uses iterative threshold adjustment (percentile-based) when tiles exceed size limits.
+
+2. **Point area:** Tippecanoe calculates point area from Hilbert curve gaps (spatial distribution). We use constant area=1.0 per point for simplicity.
+
+3. **Pre-computed areas:** Tippecanoe pre-computes polygon/line areas at serialization time (on unclipped geometry). We compute on-demand during tile encoding (on clipped geometry). This may give slightly different results for features that span tile boundaries.
+
+**Future work:** Implement tippecanoe's iterative threshold adjustment for better tile size control.
+
+### Testing
+
+- `test_polygon_pixel_area_world` - Shoelace formula correctness
+- `test_linestring_pixel_area_world` - Circle heuristic correctness
+- `test_geometry_pixel_area_world_all_types` - Dispatcher correctness
+- `test_drop_smallest_filters_tiny_features` - Integration test
+- `test_drop_smallest_visual_comparison` - Golden test with reduction metrics
 
 ## Tiny Polygon Accumulation (Issue #85)
 
