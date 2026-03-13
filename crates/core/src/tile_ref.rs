@@ -217,7 +217,7 @@ mod tests {
             props_len: 50,
         };
 
-        let mut refs = vec![
+        let mut refs = [
             TileRef::new(300, 10, 1, 1, 1, handle),
             TileRef::new(100, 10, 2, 2, 2, handle),
             TileRef::new(200, 10, 3, 3, 3, handle),
