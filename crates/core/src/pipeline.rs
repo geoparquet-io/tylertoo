@@ -1144,17 +1144,16 @@ fn generate_tiles_to_writer_internal(
     // With 16 threads: ~80MB total cache overhead for 10x speedup
     const CACHE_SIZE: usize = 10_000;
     let num_readers = rayon::current_num_threads();
-    let readers: Arc<Mutex<Vec<crate::geometry_store::CachedGeometryReader>>> = {
+    let mut readers: Vec<crate::geometry_store::CachedGeometryReader> = {
         let store = geometry_store.lock().unwrap();
-        let readers = (0..num_readers)
+        (0..num_readers)
             .map(|_| {
                 store
                     .new_reader()
                     .map(|r| crate::geometry_store::CachedGeometryReader::new(r, CACHE_SIZE))
             })
             .collect::<std::io::Result<Vec<_>>>()
-            .map_err(Error::Io)?;
-        Arc::new(Mutex::new(readers))
+            .map_err(Error::Io)?
     };
 
     // Batch size for parallel encoding - balance between parallelism and memory
@@ -1738,7 +1737,7 @@ fn generate_tiles_to_writer_internal(
                        deterministic: bool,
                        enable_tiny_polygon_accumulation: bool,
                        cluster_config: Option<&ClusterConfig>,
-                       readers: &Arc<Mutex<Vec<crate::geometry_store::CachedGeometryReader>>>|
+                       readers: &mut [crate::geometry_store::CachedGeometryReader]|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -1747,8 +1746,7 @@ fn generate_tiles_to_writer_internal(
         // Decode + encode tiles - parallel or sequential based on deterministic flag
         let encoded_tiles: Vec<std::io::Result<Option<EncodedTile>>> = if deterministic {
             // Sequential for reproducibility
-            let mut readers_guard = readers.lock().unwrap();
-            let reader = &mut readers_guard[0]; // Use first reader for sequential
+            let reader = &mut readers[0]; // Use first reader for sequential
             std::mem::take(batch)
                 .into_iter()
                 .map(|td| {
@@ -1763,25 +1761,29 @@ fn generate_tiles_to_writer_internal(
                 })
                 .collect()
         } else {
-            // Parallel for performance - both decoding AND encoding happen in parallel
-            // Use thread-safe reader access via atomic counter
-            let reader_counter = std::sync::atomic::AtomicUsize::new(0);
+            // Parallel for performance - split batch into chunks, one per reader
+            // Each rayon thread gets exclusive access to one reader (no mutex!)
+            use rayon::prelude::*;
+            let chunk_size = batch.len().div_ceil(num_readers);
+
             std::mem::take(batch)
                 .into_par_iter()
-                .map(|td| {
-                    // Get thread-local reader index
-                    let idx = reader_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        % num_readers;
-                    let mut readers_guard = readers.lock().unwrap();
-                    let reader = &mut readers_guard[idx];
-                    encode_tile_from_raw(
-                        td,
-                        reader,
-                        layer_name,
-                        extent,
-                        enable_tiny_polygon_accumulation,
-                        cluster_config,
-                    )
+                .chunks(chunk_size)
+                .zip(readers.par_iter_mut())
+                .flat_map(|(chunk, reader)| {
+                    chunk
+                        .into_iter()
+                        .map(|td| {
+                            encode_tile_from_raw(
+                                td,
+                                reader,
+                                layer_name,
+                                extent,
+                                enable_tiny_polygon_accumulation,
+                                cluster_config,
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect()
         };
@@ -1851,7 +1853,7 @@ fn generate_tiles_to_writer_internal(
                         deterministic,
                         enable_tiny_polygon_accumulation,
                         cluster_config.as_ref(),
-                        &readers,
+                        &mut readers,
                     )?;
                 }
             }
@@ -1894,7 +1896,7 @@ fn generate_tiles_to_writer_internal(
         deterministic,
         enable_tiny_polygon_accumulation,
         cluster_config.as_ref(),
-        &readers,
+        &mut readers,
     )?;
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
@@ -1917,10 +1919,9 @@ fn generate_tiles_to_writer_internal(
         );
 
         // Log cache statistics
-        let readers_guard = readers.lock().unwrap();
         let mut total_hits = 0;
         let mut total_misses = 0;
-        for reader in readers_guard.iter() {
+        for reader in readers.iter() {
             let (hits, misses, _) = reader.stats();
             total_hits += hits;
             total_misses += misses;
