@@ -32,8 +32,10 @@
 //! ```
 
 use crate::geometry_store::GeometryHandle;
+use extsort::Sortable;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::io::{Read, Write};
 
 /// Lightweight reference to a feature in a tile.
 ///
@@ -101,6 +103,35 @@ impl Ord for TileRef {
     fn cmp(&self, other: &Self) -> Ordering {
         // Sort by tile_id (Hilbert curve order) for spatial locality
         self.tile_id.cmp(&other.tile_id)
+    }
+}
+
+impl Sortable for TileRef {
+    fn encode<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // Use MessagePack for compact binary serialization (same as TileFeatureRecord)
+        let bytes = rmp_serde::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        // Write length prefix (u32) for framing
+        let len = bytes.len() as u32;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
+    fn decode<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        // Read length prefix
+        let mut len_bytes = [0u8; 4];
+        reader.read_exact(&mut len_bytes)?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        // Read payload
+        let mut bytes = vec![0u8; len];
+        reader.read_exact(&mut bytes)?;
+
+        // Deserialize
+        rmp_serde::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -261,6 +292,73 @@ mod tests {
             "Serialized size should be < 60 bytes, got {}",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn test_sortable_encode_decode_roundtrip() {
+        let handle = GeometryHandle {
+            offset: 54321,
+            wkb_len: 750,
+            props_len: 125,
+        };
+        let original = TileRef::new(11111, 14, 8192, 4096, 777, handle);
+
+        // Encode using Sortable trait
+        let mut buffer = Vec::new();
+        original.encode(&mut buffer).expect("Should encode");
+
+        // Decode using Sortable trait
+        let mut cursor = std::io::Cursor::new(buffer);
+        let decoded = TileRef::decode(&mut cursor).expect("Should decode");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_sortable_encoded_size_is_compact() {
+        let handle = GeometryHandle {
+            offset: 1000,
+            wkb_len: 200,
+            props_len: 50,
+        };
+        let tile_ref = TileRef::new(12345, 10, 512, 768, 99, handle);
+
+        let mut buffer = Vec::new();
+        tile_ref.encode(&mut buffer).expect("Should encode");
+
+        // Encoded size = 4 bytes (length prefix) + MessagePack payload
+        // Should be roughly struct size + small overhead
+        assert!(
+            buffer.len() < 70,
+            "Encoded size should be < 70 bytes, got {}",
+            buffer.len()
+        );
+    }
+
+    #[test]
+    fn test_sortable_multiple_records() {
+        let handle = GeometryHandle {
+            offset: 0,
+            wkb_len: 100,
+            props_len: 50,
+        };
+
+        // Encode 3 records sequentially
+        let mut buffer = Vec::new();
+        for i in 0..3u64 {
+            let tile_ref = TileRef::new(i * 100, 5, (i * 10) as u32, (i * 20) as u32, i, handle);
+            tile_ref.encode(&mut buffer).expect("Should encode");
+        }
+
+        // Decode 3 records sequentially
+        let mut cursor = std::io::Cursor::new(buffer);
+        for i in 0..3u64 {
+            let decoded = TileRef::decode(&mut cursor).expect("Should decode");
+            assert_eq!(decoded.tile_id, i * 100);
+            assert_eq!(decoded.x, (i * 10) as u32);
+            assert_eq!(decoded.y, (i * 20) as u32);
+            assert_eq!(decoded.feature_id, i);
+        }
     }
 
     // =============================================================================
