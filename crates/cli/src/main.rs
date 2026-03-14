@@ -134,6 +134,33 @@ struct Args {
     #[arg(long = "cluster-maxzoom", value_name = "ZOOM")]
     cluster_maxzoom: Option<u8>,
 
+    /// Enable automatic per-feature max zoom based on feature area.
+    ///
+    /// Large features (e.g., country polygons) stop at low zoom levels where they
+    /// would otherwise create millions of tiles. Calculates both min zoom (when features
+    /// become visible) and max zoom (when they would explode). This prevents both tile
+    /// explosion and visual clutter.
+    ///
+    /// Example: A 100m² building appears at z8, goes to z14. A 1000km² country appears
+    /// at z0, stops at z7.
+    #[arg(long)]
+    zoom_by_area: bool,
+
+    /// Maximum tiles threshold for --zoom-by-area (default: 400).
+    ///
+    /// Features STOP when they would cover more than this many tiles.
+    /// 400 ≈ 20x20 grid. Higher values = features continue longer (more tiles).
+    /// Typical: 100 (conservative), 400 (balanced), 1000 (aggressive).
+    #[arg(long, default_value = "400")]
+    max_tile_threshold: u32,
+
+    /// Minimum pixel area for --zoom-by-area (default: 4.0 sq pixels).
+    ///
+    /// Features START when they're >= this many square pixels (visible).
+    /// 4.0 = 2x2 pixel square. Higher values = features appear later (less clutter).
+    #[arg(long, default_value = "4.0")]
+    min_pixel_area: f64,
+
     /// Compression algorithm for tiles (gzip, zstd, brotli, none)
     ///
     /// Gzip is the default for maximum compatibility with PMTiles viewers.
@@ -362,6 +389,13 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_cluster(distance, maxzoom);
     }
 
+    // Configure zoom-by-area if requested
+    if args.zoom_by_area {
+        tiler_config.zoom_by_area = true;
+        tiler_config.max_tile_threshold = args.max_tile_threshold;
+        tiler_config.min_pixel_area = args.min_pixel_area;
+    }
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -385,6 +419,12 @@ fn main() -> Result<()> {
             eprintln!(
                 "  Clustering: distance={}, max_zoom={}",
                 cluster.distance, cluster.max_zoom
+            );
+        }
+        if tiler_config.zoom_by_area {
+            eprintln!(
+                "  Zoom by area: enabled (max_tiles={}, min_pixels={:.1})",
+                tiler_config.max_tile_threshold, tiler_config.min_pixel_area
             );
         }
         eprintln!();

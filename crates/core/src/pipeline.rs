@@ -243,6 +243,34 @@ pub struct TilerConfig {
     ///
     /// If None, no point clustering is performed.
     pub cluster_config: Option<ClusterConfig>,
+
+    /// Enable automatic per-feature zoom range calculation based on bbox area (default: false).
+    ///
+    /// When enabled, calculates BOTH min and max zoom for each feature:
+    /// - **Min zoom**: Feature doesn't appear until it's >= min_pixel_area sq pixels (visible)
+    /// - **Max zoom**: Feature stops before it touches > max_tile_threshold tiles (explosion)
+    ///
+    /// Examples:
+    /// - 100m² building: appears at z8 (first visible), goes to z14
+    /// - 1000km² country: appears at z0 (immediately visible), stops at z7 (explosion prevention)
+    ///
+    /// This prevents both tile explosion (large features at high zoom) AND
+    /// visual clutter (tiny features at low zoom).
+    pub zoom_by_area: bool,
+
+    /// Maximum number of tiles a feature should cover before stopping (default: 400).
+    ///
+    /// Only used when `zoom_by_area = true`. Controls when large features STOP appearing.
+    /// Higher values = features continue to higher zooms (more tiles generated).
+    /// 400 ≈ 20x20 tile grid. Typical values: 100 (conservative), 400 (balanced), 1000 (aggressive).
+    pub max_tile_threshold: u32,
+
+    /// Minimum pixel area for a feature to be visible (default: 4.0 sq pixels).
+    ///
+    /// Only used when `zoom_by_area = true`. Controls when small features START appearing.
+    /// 4.0 = 2x2 pixel square (minimum perceptible size).
+    /// Higher values = features appear later (less clutter at low zoom).
+    pub min_pixel_area: f64,
 }
 
 impl Default for TilerConfig {
@@ -283,6 +311,12 @@ impl Default for TilerConfig {
             accumulator_config: None,
             // No point clustering by default
             cluster_config: None,
+            // Zoom-by-area disabled by default - user must opt-in
+            zoom_by_area: false,
+            // Default threshold: ~20x20 tile grid for max zoom
+            max_tile_threshold: 400,
+            // Default: 4 sq pixels (2x2) for min zoom
+            min_pixel_area: 4.0,
         }
     }
 }
@@ -1104,13 +1138,33 @@ fn generate_tiles_to_writer_internal(
                 // Phase 2 change: Use WorldCoord-based clipping for integer precision
                 // throughout the pipeline. This eliminates f64 accumulation errors.
                 let clip_start = std::time::Instant::now();
+
+                // Calculate effective zoom range for this feature
+                let (effective_min_zoom, effective_max_zoom) = if config.zoom_by_area {
+                    let (feature_min_zoom, feature_max_zoom) =
+                        crate::hierarchical_clip::zoom_range_for_bbox(
+                            &geom_bbox,
+                            config.min_pixel_area,
+                            config.max_tile_threshold,
+                        );
+                    // Clamp to configured zoom range
+                    (
+                        feature_min_zoom.max(config.min_zoom),
+                        feature_max_zoom.min(config.max_zoom),
+                    )
+                } else {
+                    (config.min_zoom, config.max_zoom)
+                };
+
                 let (clip_results, clip_stats) = clip_geometry_hierarchical_world(
                     &base_simplified,
                     &geom_bbox,
-                    config.min_zoom,
-                    config.max_zoom,
+                    effective_min_zoom,
+                    effective_max_zoom,
                     config.buffer_pixels,
                     config.extent,
+                    false, // zoom_by_area logic already applied above
+                    0,     // threshold unused when zoom_by_area=false
                 );
                 result.time_clip = clip_start.elapsed();
                 result.clip_count = clip_stats.clip_ops;
