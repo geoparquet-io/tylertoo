@@ -137,20 +137,29 @@ struct Args {
     /// Enable automatic per-feature max zoom based on feature area.
     ///
     /// Large features (e.g., country polygons) stop at low zoom levels where they
-    /// would otherwise create millions of tiles. This prevents performance issues
-    /// and disk thrashing during external sort.
+    /// would otherwise create millions of tiles. Calculates both min zoom (when features
+    /// become visible) and max zoom (when they would explode). This prevents both tile
+    /// explosion and visual clutter.
     ///
-    /// Example: A 1000km² polygon stops at z8, while a 100m² building goes to z14.
+    /// Example: A 100m² building appears at z8, goes to z14. A 1000km² country appears
+    /// at z0, stops at z7.
     #[arg(long)]
-    auto_max_zoom: bool,
+    zoom_by_area: bool,
 
-    /// Minimum tiles threshold for --auto-max-zoom (default: 400).
+    /// Maximum tiles threshold for --zoom-by-area (default: 400).
     ///
-    /// Features stop when they would cover more than this many tiles.
-    /// 400 ≈ 20x20 grid. Higher values = features stop earlier (more aggressive).
+    /// Features STOP when they would cover more than this many tiles.
+    /// 400 ≈ 20x20 grid. Higher values = features continue longer (more tiles).
     /// Typical: 100 (conservative), 400 (balanced), 1000 (aggressive).
     #[arg(long, default_value = "400")]
-    min_tile_threshold: u32,
+    max_tile_threshold: u32,
+
+    /// Minimum pixel area for --zoom-by-area (default: 4.0 sq pixels).
+    ///
+    /// Features START when they're >= this many square pixels (visible).
+    /// 4.0 = 2x2 pixel square. Higher values = features appear later (less clutter).
+    #[arg(long, default_value = "4.0")]
+    min_pixel_area: f64,
 
     /// Compression algorithm for tiles (gzip, zstd, brotli, none)
     ///
@@ -380,10 +389,11 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_cluster(distance, maxzoom);
     }
 
-    // Configure auto max zoom if requested
-    if args.auto_max_zoom {
-        tiler_config.auto_max_zoom = true;
-        tiler_config.min_tile_threshold = args.min_tile_threshold;
+    // Configure zoom-by-area if requested
+    if args.zoom_by_area {
+        tiler_config.zoom_by_area = true;
+        tiler_config.max_tile_threshold = args.max_tile_threshold;
+        tiler_config.min_pixel_area = args.min_pixel_area;
     }
 
     // Print configuration in verbose mode
@@ -411,10 +421,10 @@ fn main() -> Result<()> {
                 cluster.distance, cluster.max_zoom
             );
         }
-        if tiler_config.auto_max_zoom {
+        if tiler_config.zoom_by_area {
             eprintln!(
-                "  Auto max zoom: enabled (threshold={} tiles)",
-                tiler_config.min_tile_threshold
+                "  Zoom by area: enabled (max_tiles={}, min_pixels={:.1})",
+                tiler_config.max_tile_threshold, tiler_config.min_pixel_area
             );
         }
         eprintln!();
