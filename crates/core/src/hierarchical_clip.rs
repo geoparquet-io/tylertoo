@@ -2380,7 +2380,8 @@ mod tests {
 
         // At high zoom levels (e.g., 14+), this tiny polygon will be fully
         // contained within individual tiles and should skip clipping
-        let (results, stats) = clip_geometry_hierarchical_world(&small_poly, &bbox, 0, 16, 8, 4096);
+        let (results, stats) =
+            clip_geometry_hierarchical_world(&small_poly, &bbox, 0, 16, 8, 4096, false, 0);
 
         // Should have results (geometry appears in tiles)
         assert!(
@@ -2422,7 +2423,8 @@ mod tests {
         ]);
         let bbox = TileBounds::new(-20.0, -20.0, 20.0, 20.0);
 
-        let (results, stats) = clip_geometry_hierarchical_world(&large_poly, &bbox, 0, 4, 8, 4096);
+        let (results, stats) =
+            clip_geometry_hierarchical_world(&large_poly, &bbox, 0, 4, 8, 4096, false, 0);
 
         // Large polygon spanning many tiles should require clipping
         // (not fully contained in any tile)
@@ -2478,7 +2480,7 @@ mod tests {
 
         // Clip only at zoom 10 (single zoom level)
         let (results, stats) =
-            clip_geometry_hierarchical_world(&exact_poly, &bbox, 10, 10, 0, 4096); // buffer=0
+            clip_geometry_hierarchical_world(&exact_poly, &bbox, 10, 10, 0, 4096, false, 0); // buffer=0
 
         // Should have result for this tile
         assert!(
@@ -2515,7 +2517,8 @@ mod tests {
         let bbox = TileBounds::new(0.0001, 0.0001, 0.0002, 0.0002);
 
         // At very high zoom (18+), this tiny polygon should be fully contained
-        let (results, stats) = clip_geometry_hierarchical_world(&tiny_poly, &bbox, 15, 20, 8, 4096);
+        let (results, stats) =
+            clip_geometry_hierarchical_world(&tiny_poly, &bbox, 15, 20, 8, 4096, false, 0);
 
         // Should have results
         assert!(!results.is_empty(), "Tiny polygon should appear in tiles");
