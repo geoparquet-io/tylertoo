@@ -77,3 +77,7 @@ harness = false
 [[bench]]
 name = "tile_ref"
 harness = false
+
+[[bench]]
+name = "bbox_containment"
+harness = false
