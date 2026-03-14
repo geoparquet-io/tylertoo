@@ -292,6 +292,14 @@ pub struct RowGroupInfo {
     pub num_rows: usize,
 }
 
+/// Work item for parallel row group processing across multiple files.
+struct RowGroupWorkItem {
+    file_path: PathBuf,
+    row_group_index: usize,
+    /// Global row group index (across all files)
+    global_index: usize,
+}
+
 /// Process geometries in a GeoParquet file row-group by row-group.
 ///
 /// This is the streaming-friendly version that yields geometries grouped by row group.
@@ -584,15 +592,18 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
     ))
 }
 
-/// Process geometries from a GeoParquet file with parallel row group reading.
+/// Process geometries from a GeoParquet file or directory with parallel row group reading.
 ///
 /// Spawns multiple reader threads that read and decompress row groups in parallel,
 /// sending results through a bounded channel. This provides parallelism in decompression
 /// while the consumer processes results.
 ///
+/// Supports partitioned directories: if the input path is a directory, all `.parquet` files
+/// within it (recursively) are processed as a single logical dataset.
+///
 /// # Arguments
 ///
-/// * `path` - Path to the GeoParquet file
+/// * `path` - Path to the GeoParquet file or directory
 /// * `num_readers` - Number of parallel reader threads
 /// * `callback` - Function called for each row group's geometries
 ///
@@ -609,9 +620,35 @@ where
     F: FnMut(RowGroupInfo, Vec<Geometry<f64>>) -> Result<()>,
 {
     use crossbeam_channel::bounded;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
 
-    let num_row_groups = get_row_group_count(path)?;
+    // Resolve all parquet files (single file or directory)
+    let files = resolve_parquet_files(path)?;
 
+    // Build work items: (file_path, row_group_index, global_index) for each row group
+    let mut work_items = Vec::new();
+    let mut global_index = 0;
+    for file_path in &files {
+        let file = std::fs::File::open(file_path).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to open {}: {}", file_path.display(), e))
+        })?;
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to read {}: {}", file_path.display(), e))
+        })?;
+        let num_rg = reader.metadata().num_row_groups();
+
+        for rg_idx in 0..num_rg {
+            work_items.push(RowGroupWorkItem {
+                file_path: file_path.clone(),
+                row_group_index: rg_idx,
+                global_index,
+            });
+            global_index += 1;
+        }
+    }
+
+    let num_row_groups = work_items.len();
     if num_row_groups == 0 {
         return Ok(0);
     }
@@ -621,12 +658,12 @@ where
     // Bounded channel for results - limits memory to ~(num_readers + buffer) row groups
     let (tx, rx) = bounded::<RowGroupReadResult>(num_readers * 2);
 
-    // Work queue - row group indices to process
-    let (work_tx, work_rx) = bounded::<usize>(num_row_groups);
+    // Work queue - work items to process
+    let (work_tx, work_rx) = bounded::<RowGroupWorkItem>(num_row_groups);
 
-    // Fill work queue with all row group indices
-    for rg_idx in 0..num_row_groups {
-        work_tx.send(rg_idx).unwrap();
+    // Fill work queue with all work items
+    for item in work_items {
+        work_tx.send(item).unwrap();
     }
     drop(work_tx); // Close work queue so workers know when to stop
 
@@ -635,13 +672,16 @@ where
     for _ in 0..num_readers {
         let work_rx = work_rx.clone();
         let tx = tx.clone();
-        let path_owned = path.to_path_buf();
 
         let handle = std::thread::spawn(move || {
             // Each thread pulls work from the queue until empty
-            for rg_idx in work_rx {
-                let result = match read_single_row_group(&path_owned, rg_idx) {
-                    Ok((info, geometries)) => RowGroupReadResult::Ok { info, geometries },
+            for item in work_rx {
+                let result = match read_single_row_group(&item.file_path, item.row_group_index) {
+                    Ok((mut info, geometries)) => {
+                        // Update info to use global index for consistent progress reporting
+                        info.index = item.global_index;
+                        RowGroupReadResult::Ok { info, geometries }
+                    }
                     Err(e) => RowGroupReadResult::Err(e),
                 };
                 // Stop if receiver disconnected
