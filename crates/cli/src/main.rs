@@ -134,6 +134,24 @@ struct Args {
     #[arg(long = "cluster-maxzoom", value_name = "ZOOM")]
     cluster_maxzoom: Option<u8>,
 
+    /// Enable automatic per-feature max zoom based on feature area.
+    ///
+    /// Large features (e.g., country polygons) stop at low zoom levels where they
+    /// would otherwise create millions of tiles. This prevents performance issues
+    /// and disk thrashing during external sort.
+    ///
+    /// Example: A 1000km² polygon stops at z8, while a 100m² building goes to z14.
+    #[arg(long)]
+    auto_max_zoom: bool,
+
+    /// Minimum tiles threshold for --auto-max-zoom (default: 400).
+    ///
+    /// Features stop when they would cover more than this many tiles.
+    /// 400 ≈ 20x20 grid. Higher values = features stop earlier (more aggressive).
+    /// Typical: 100 (conservative), 400 (balanced), 1000 (aggressive).
+    #[arg(long, default_value = "400")]
+    min_tile_threshold: u32,
+
     /// Compression algorithm for tiles (gzip, zstd, brotli, none)
     ///
     /// Gzip is the default for maximum compatibility with PMTiles viewers.
@@ -362,6 +380,12 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_cluster(distance, maxzoom);
     }
 
+    // Configure auto max zoom if requested
+    if args.auto_max_zoom {
+        tiler_config.auto_max_zoom = true;
+        tiler_config.min_tile_threshold = args.min_tile_threshold;
+    }
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -385,6 +409,12 @@ fn main() -> Result<()> {
             eprintln!(
                 "  Clustering: distance={}, max_zoom={}",
                 cluster.distance, cluster.max_zoom
+            );
+        }
+        if tiler_config.auto_max_zoom {
+            eprintln!(
+                "  Auto max zoom: enabled (threshold={} tiles)",
+                tiler_config.min_tile_threshold
             );
         }
         eprintln!();

@@ -243,6 +243,24 @@ pub struct TilerConfig {
     ///
     /// If None, no point clustering is performed.
     pub cluster_config: Option<ClusterConfig>,
+
+    /// Enable automatic per-feature max zoom calculation based on feature area (default: false).
+    ///
+    /// When enabled, large features (e.g., country-sized polygons) are NOT clipped to very
+    /// high zoom levels where they would create massive tile explosions. Instead, each feature's
+    /// max zoom is calculated based on its bbox area.
+    ///
+    /// Example: A 1000km² polygon might stop at z8, while a 100m² building goes to z14.
+    ///
+    /// This prevents performance issues where large features generate millions of
+    /// intermediate TileFeatureRecords during external sort.
+    pub auto_max_zoom: bool,
+
+    /// Minimum number of tiles a feature should cover before stopping (default: 400).
+    ///
+    /// Only used when `auto_max_zoom = true`. Higher values = features stop at lower zooms.
+    /// 400 ≈ 20x20 tile grid. Typical values: 100 (conservative), 400 (balanced), 1000 (aggressive).
+    pub min_tile_threshold: u32,
 }
 
 impl Default for TilerConfig {
@@ -283,6 +301,10 @@ impl Default for TilerConfig {
             accumulator_config: None,
             // No point clustering by default
             cluster_config: None,
+            // Auto max zoom disabled by default - user must opt-in
+            auto_max_zoom: false,
+            // Default threshold: ~20x20 tile grid
+            min_tile_threshold: 400,
         }
     }
 }
@@ -1111,6 +1133,8 @@ fn generate_tiles_to_writer_internal(
                     config.max_zoom,
                     config.buffer_pixels,
                     config.extent,
+                    config.auto_max_zoom,
+                    config.min_tile_threshold,
                 );
                 result.time_clip = clip_start.elapsed();
                 result.clip_count = clip_stats.clip_ops;

@@ -29,6 +29,45 @@ use geo::Geometry;
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::tile::{TileBounds, TileCoord};
 
+/// Calculate the maximum useful zoom level for a feature based on its bbox area.
+///
+/// Large features (e.g., country-sized polygons) shouldn't be clipped to very high zoom
+/// levels where they become invisible or create massive tile explosions. This function
+/// calculates the maximum zoom where the feature still covers at least `min_tiles` tiles.
+///
+/// # Arguments
+/// * `bbox` - Geographic bounding box of the feature
+/// * `min_tiles` - Minimum number of tiles the feature should cover (default: 400 = ~20x20 grid)
+///
+/// # Returns
+/// The maximum zoom level where the feature covers >= min_tiles, or 14 if feature is very small.
+pub fn max_zoom_for_bbox(bbox: &TileBounds, min_tiles: u32) -> u8 {
+    // Calculate bbox area in degrees²
+    let width_degrees = bbox.lng_max - bbox.lng_min;
+    let height_degrees = bbox.lat_max - bbox.lat_min;
+    let bbox_area_sq_degrees = width_degrees * height_degrees;
+
+    // At zoom z, the world is divided into 2^z tiles per side
+    // Each tile covers (360° / 2^z) degrees width (simplification, ignoring Web Mercator projection)
+    // Feature touches approximately (feature_area / tile_area) tiles
+    for z in 0..=14u8 {
+        let tiles_per_side = 1u32 << z; // 2^z
+        let degrees_per_tile = 360.0 / tiles_per_side as f64;
+        let tile_area_sq_degrees = degrees_per_tile * degrees_per_tile;
+
+        let tiles_touched = (bbox_area_sq_degrees / tile_area_sq_degrees).ceil() as u32;
+
+        // Stop when feature would touch more than min_tiles
+        if tiles_touched > min_tiles {
+            // Return the previous zoom level (where it was still manageable)
+            return z.saturating_sub(1);
+        }
+    }
+
+    // Feature is very small - allow full zoom
+    14
+}
+
 /// Result of hierarchical clipping for a single geometry across multiple tiles.
 ///
 /// Maps each tile coordinate to the clipped geometry for that tile.
@@ -704,6 +743,8 @@ fn clip_world_geometry(
 /// * `max_zoom` - Maximum zoom level to clip at
 /// * `buffer_pixels` - Buffer in pixels around tile bounds
 /// * `extent` - Tile extent in pixels (typically 4096)
+/// * `auto_max_zoom` - Enable per-feature max zoom optimization
+/// * `min_tile_threshold` - Minimum tiles threshold for auto max zoom (only used if auto_max_zoom=true)
 ///
 /// # Returns
 ///
@@ -713,12 +754,14 @@ fn clip_world_geometry(
 /// # Algorithm
 ///
 /// 1. Convert input geometry to WorldCoord once
-/// 2. At min_zoom: clip geometry to each tile using WorldBounds
-/// 3. At each subsequent zoom level z:
+/// 2. Calculate per-feature max zoom if auto_max_zoom is enabled
+/// 3. At min_zoom: clip geometry to each tile using WorldBounds
+/// 4. At each subsequent zoom level z (up to effective_max_zoom):
 ///    a. For each tile at z, find its parent at z-1
 ///    b. If the parent clip result exists, clip that instead of the original
 ///    c. If no parent result, fall back to original geometry
-/// 4. All operations use integer arithmetic (no f64 conversions per-tile)
+/// 5. All operations use integer arithmetic (no f64 conversions per-tile)
+#[allow(clippy::too_many_arguments)]
 pub fn clip_geometry_hierarchical_world(
     geom: &Geometry<f64>,
     geom_bbox: &TileBounds,
@@ -726,6 +769,8 @@ pub fn clip_geometry_hierarchical_world(
     max_zoom: u8,
     buffer_pixels: u32,
     extent: u32,
+    auto_max_zoom: bool,
+    min_tile_threshold: u32,
 ) -> (WorldClipResults, ClipStats) {
     use crate::tile::tiles_for_bbox;
 
@@ -741,11 +786,18 @@ pub fn clip_geometry_hierarchical_world(
     // Convert geometry bbox to WorldBounds for intersection tests
     let geom_world_bbox = WorldBounds::from_tile_bounds(geom_bbox);
 
+    // Calculate per-feature max zoom if enabled
+    let effective_max_zoom = if auto_max_zoom {
+        max_zoom_for_bbox(geom_bbox, min_tile_threshold).min(max_zoom)
+    } else {
+        max_zoom
+    };
+
     // Cache: stores clipped geometry per tile for parent lookups
     let mut prev_zoom_cache: HashMap<TileCoord, WorldClippedGeometry> = HashMap::new();
     let mut curr_zoom_cache: HashMap<TileCoord, WorldClippedGeometry> = HashMap::new();
 
-    for z in min_zoom..=max_zoom {
+    for z in min_zoom..=effective_max_zoom {
         let tiles: Vec<TileCoord> = tiles_for_bbox(geom_bbox, z).collect();
 
         for tile_coord in tiles {
@@ -808,6 +860,52 @@ pub fn clip_geometry_hierarchical_world(
 mod tests {
     use super::*;
     use geo::{point, polygon};
+
+    // =============================================================================
+    // Tests for max_zoom_for_bbox() - Per-feature max zoom optimization
+    // =============================================================================
+
+    #[test]
+    fn test_max_zoom_large_feature() {
+        // Large country-sized polygon (10° x 10° ~ 1000km x 1000km at equator)
+        let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+        let max_z = max_zoom_for_bbox(&bbox, 400);
+
+        // Large features should stop at low zoom
+        assert!(
+            max_z <= 10,
+            "1000km feature should stop by z10, got z{}",
+            max_z
+        );
+    }
+
+    #[test]
+    fn test_max_zoom_medium_feature() {
+        // Medium feature (1° x 1° ~ 100km x 100km)
+        let bbox = TileBounds::new(-0.5, -0.5, 0.5, 0.5);
+        let max_z = max_zoom_for_bbox(&bbox, 400);
+
+        // Should stop somewhere in middle zooms
+        assert!(
+            (10..=13).contains(&max_z),
+            "100km feature should stop around z10-z13, got z{}",
+            max_z
+        );
+    }
+
+    #[test]
+    fn test_max_zoom_small_feature() {
+        // Small feature (0.001° x 0.001° ~ 100m x 100m)
+        let bbox = TileBounds::new(-0.0005, -0.0005, 0.0005, 0.0005);
+        let max_z = max_zoom_for_bbox(&bbox, 400);
+
+        // Small features should go to max zoom
+        assert_eq!(max_z, 14, "Small feature should reach z14, got z{}", max_z);
+    }
+
+    // =============================================================================
+    // Existing hierarchical clipping tests
+    // =============================================================================
 
     /// Helper to count flat (non-hierarchical) clip operations for comparison.
     fn count_flat_clip_ops(
@@ -1346,7 +1444,8 @@ mod tests {
             let point = Geometry::Point(point!(x: 1.55, y: 42.55));
             let bbox = TileBounds::new(1.55, 42.55, 1.55, 42.55);
 
-            let (results, stats) = clip_geometry_hierarchical_world(&point, &bbox, 0, 4, 8, 4096);
+            let (results, stats) =
+                clip_geometry_hierarchical_world(&point, &bbox, 0, 4, 8, 4096, false, 0);
 
             // Point should be in exactly one tile per zoom level
             for z in 0..=4u8 {
@@ -1385,7 +1484,7 @@ mod tests {
             let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
 
             let (world_results, world_stats) =
-                clip_geometry_hierarchical_world(&poly, &bbox, 0, 3, 8, 4096);
+                clip_geometry_hierarchical_world(&poly, &bbox, 0, 3, 8, 4096, false, 0);
             let (f64_results, f64_stats) = clip_geometry_hierarchical(&poly, &bbox, 0, 3, 8, 4096);
 
             // Should have same number of tiles
@@ -1429,7 +1528,8 @@ mod tests {
             ]);
             let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
 
-            let (results, _) = clip_geometry_hierarchical_world(&poly, &bbox, 0, 2, 8, 4096);
+            let (results, _) =
+                clip_geometry_hierarchical_world(&poly, &bbox, 0, 2, 8, 4096, false, 0);
 
             for (tile, geom) in &results {
                 match geom {
@@ -1458,7 +1558,8 @@ mod tests {
             ]);
             let bbox = TileBounds::new(-20.0, -20.0, 20.0, 20.0);
 
-            let (_results, stats) = clip_geometry_hierarchical_world(&poly, &bbox, 0, 4, 8, 4096);
+            let (_results, stats) =
+                clip_geometry_hierarchical_world(&poly, &bbox, 0, 4, 8, 4096, false, 0);
 
             // Should have cache hits at z>0
             assert!(
@@ -1487,7 +1588,8 @@ mod tests {
             // Using clamped values that match where the point will end up
             let bbox = TileBounds::new(179.0, 85.0, 180.0, 86.0);
 
-            let (results, stats) = clip_geometry_hierarchical_world(&point, &bbox, 0, 2, 8, 4096);
+            let (results, stats) =
+                clip_geometry_hierarchical_world(&point, &bbox, 0, 2, 8, 4096, false, 0);
 
             // WorldCoord clamps coords to valid range, so point IS in valid tiles
             assert!(
@@ -1513,7 +1615,8 @@ mod tests {
             ]);
             let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
 
-            let (_results, stats) = clip_geometry_hierarchical_world(&poly, &bbox, 3, 3, 8, 4096);
+            let (_results, stats) =
+                clip_geometry_hierarchical_world(&poly, &bbox, 3, 3, 8, 4096, false, 0);
 
             // Single zoom level means no parent cache possible
             assert_eq!(stats.cache_hits, 0, "Single zoom should have no cache hits");
@@ -1543,7 +1646,8 @@ mod tests {
             ]));
             let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
 
-            let (results, stats) = clip_geometry_hierarchical_world(&mp, &bbox, 0, 2, 8, 4096);
+            let (results, stats) =
+                clip_geometry_hierarchical_world(&mp, &bbox, 0, 2, 8, 4096, false, 0);
 
             assert!(!results.is_empty(), "Should have results for MultiPolygon");
             assert!(stats.clip_ops > 0, "Should have performed clip operations");
@@ -1878,7 +1982,7 @@ mod tests {
             let bbox = TileBounds::new(10.0, 44.0, 12.0, 46.0);
 
             let (clip_results, _stats) =
-                clip_geometry_hierarchical_world(&poly, &bbox, 5, 5, 8, 4096);
+                clip_geometry_hierarchical_world(&poly, &bbox, 5, 5, 8, 4096, false, 0);
 
             assert!(!clip_results.is_empty(), "Should have at least one tile");
 
@@ -1964,7 +2068,7 @@ mod tests {
             let bbox = TileBounds::new(-0.005, -0.005, 0.005, 0.005);
 
             let (clip_results, _stats) =
-                clip_geometry_hierarchical_world(&poly, &bbox, 0, 0, 8, 4096);
+                clip_geometry_hierarchical_world(&poly, &bbox, 0, 0, 8, 4096, false, 0);
 
             println!("\n=== Small polygon at zoom 0 ===");
 
@@ -2030,7 +2134,7 @@ mod tests {
             let bbox = TileBounds::new(-74.00, 40.74, -73.99, 40.75);
 
             let (clip_results, _stats) =
-                clip_geometry_hierarchical_world(&poly, &bbox, 14, 14, 8, 4096);
+                clip_geometry_hierarchical_world(&poly, &bbox, 14, 14, 8, 4096, false, 0);
 
             println!("\n=== Polygon at zoom 14 near NYC ===");
             assert!(!clip_results.is_empty(), "Should produce tiles at zoom 14");
