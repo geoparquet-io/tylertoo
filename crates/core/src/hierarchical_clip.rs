@@ -29,6 +29,49 @@ use geo::Geometry;
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::tile::{TileBounds, TileCoord};
 
+/// Calculate the minimum zoom level where a feature is visible (≥ threshold sq pixels).
+///
+/// Small features should not appear at low zoom levels where they're too small to see.
+/// This function calculates the minimum zoom where the feature covers at least
+/// `min_pixel_area` square pixels (default: 4.0 = 2x2 pixels).
+///
+/// # Arguments
+/// * `bbox` - Geographic bounding box of the feature
+/// * `min_pixel_area` - Minimum area in square pixels for visibility (default: 4.0)
+///
+/// # Returns
+/// The minimum zoom level where the feature is >= min_pixel_area sq pixels, or 0 if feature is large.
+pub fn min_zoom_for_bbox(bbox: &TileBounds, min_pixel_area: f64) -> u8 {
+    // Calculate bbox area in degrees²
+    let width_degrees = bbox.lng_max - bbox.lng_min;
+    let height_degrees = bbox.lat_max - bbox.lat_min;
+    let bbox_area_sq_degrees = width_degrees * height_degrees;
+
+    // At zoom z:
+    // - Tile covers (360° / 2^z)² degrees
+    // - Tile is 4096 pixels × 4096 pixels
+    // - Feature area in pixels = (feature_area_degrees² / tile_area_degrees²) × (4096² pixels²)
+    const EXTENT: f64 = 4096.0;
+    let extent_sq = EXTENT * EXTENT;
+
+    for z in 0..=14u8 {
+        let tiles_per_side = 1u32 << z; // 2^z
+        let degrees_per_tile = 360.0 / tiles_per_side as f64;
+        let tile_area_sq_degrees = degrees_per_tile * degrees_per_tile;
+
+        // Feature area in pixels at this zoom
+        let feature_area_pixels = (bbox_area_sq_degrees / tile_area_sq_degrees) * extent_sq;
+
+        // If feature is visible (>= min_pixel_area), return this zoom
+        if feature_area_pixels >= min_pixel_area {
+            return z;
+        }
+    }
+
+    // Feature is so small it's not visible even at z14
+    14
+}
+
 /// Calculate the maximum useful zoom level for a feature based on its bbox area.
 ///
 /// Large features (e.g., country-sized polygons) shouldn't be clipped to very high zoom
@@ -901,6 +944,70 @@ mod tests {
 
         // Small features should go to max zoom
         assert_eq!(max_z, 14, "Small feature should reach z14, got z{}", max_z);
+    }
+
+    // =============================================================================
+    // Tests for min_zoom_for_bbox() - Per-feature min zoom optimization
+    // =============================================================================
+
+    #[test]
+    fn test_min_zoom_tiny_feature() {
+        // Tiny feature (100m x 100m ~ 0.001° x 0.001°)
+        // At z8: 8.5 sq pixels (first zoom where it's >= 4 sq pixels)
+        let bbox = TileBounds::new(-0.0005, -0.0005, 0.0005, 0.0005);
+        let min_z = min_zoom_for_bbox(&bbox, 4.0);
+
+        // 100m features first become visible at z8
+        assert_eq!(
+            min_z, 8,
+            "100m feature should first appear at z8 (8.5 px²), got z{}",
+            min_z
+        );
+    }
+
+    #[test]
+    fn test_min_zoom_small_feature() {
+        // Small feature (1km x 1km ~ 0.01° x 0.01°)
+        // At z5: 13.3 sq pixels (first zoom where it's >= 4 sq pixels)
+        let bbox = TileBounds::new(-0.005, -0.005, 0.005, 0.005);
+        let min_z = min_zoom_for_bbox(&bbox, 4.0);
+
+        // 1km features first become visible at z5
+        assert_eq!(
+            min_z, 5,
+            "1km feature should first appear at z5 (13.3 px²), got z{}",
+            min_z
+        );
+    }
+
+    #[test]
+    fn test_min_zoom_medium_feature() {
+        // Medium feature (10km x 10km ~ 0.1° x 0.1°)
+        // At z1: 5.2 sq pixels (first zoom where it's >= 4 sq pixels)
+        let bbox = TileBounds::new(-0.05, -0.05, 0.05, 0.05);
+        let min_z = min_zoom_for_bbox(&bbox, 4.0);
+
+        // 10km features first become visible at z1
+        assert_eq!(
+            min_z, 1,
+            "10km feature should first appear at z1 (5.2 px²), got z{}",
+            min_z
+        );
+    }
+
+    #[test]
+    fn test_min_zoom_large_feature() {
+        // Large feature (1000km x 1000km ~ 10° x 10°)
+        // At z0: 129.5 sq pixels (well above threshold)
+        let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+        let min_z = min_zoom_for_bbox(&bbox, 4.0);
+
+        // Large features should appear immediately
+        assert_eq!(
+            min_z, 0,
+            "1000km feature should appear at z0, got z{}",
+            min_z
+        );
     }
 
     // =============================================================================
