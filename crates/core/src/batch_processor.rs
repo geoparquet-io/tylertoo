@@ -3,7 +3,7 @@
 //! Processes geometries within Arrow RecordBatch lifetime to preserve zero-copy benefits.
 //! DO NOT extract geometries to Vec<Geometry> - that defeats Arrow's purpose.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use geo::Geometry;
@@ -18,6 +18,52 @@ use tracing::instrument;
 use crate::tile::TileBounds;
 use crate::{Error, Result};
 use std::collections::HashMap;
+
+/// Resolve a path to a list of parquet files.
+///
+/// If the path is a file, returns it as a single-element vector.
+/// If the path is a directory, recursively collects all .parquet files.
+pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+
+    if path.is_dir() {
+        let mut files = Vec::new();
+        collect_parquet_files(path, &mut files)?;
+        files.sort(); // Deterministic order
+        if files.is_empty() {
+            return Err(Error::GeoParquetRead(format!(
+                "No .parquet files found in directory: {}",
+                path.display()
+            )));
+        }
+        return Ok(files);
+    }
+
+    Err(Error::GeoParquetRead(format!(
+        "Path does not exist: {}",
+        path.display()
+    )))
+}
+
+/// Recursively collect .parquet files from a directory.
+fn collect_parquet_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        Error::GeoParquetRead(format!("Failed to read directory {}: {}", dir.display(), e))
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::GeoParquetRead(e.to_string()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_parquet_files(&path, files)?;
+        } else if path.extension().is_some_and(|ext| ext == "parquet") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
 
 /// Process geometries in a GeoParquet file batch-by-batch.
 ///
@@ -649,8 +695,15 @@ pub fn get_row_group_count(path: &Path) -> Result<usize> {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+    let file = std::fs::File::open(path).map_err(|e| {
+        Error::GeoParquetRead(format!(
+            "Failed to open {}: {} (is_file: {}, is_dir: {})",
+            path.display(),
+            e,
+            path.is_file(),
+            path.is_dir()
+        ))
+    })?;
 
     let parquet_reader = SerializedFileReader::new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
@@ -669,8 +722,15 @@ pub fn get_row_group_count(path: &Path) -> Result<usize> {
 pub fn extract_field_metadata(path: &Path) -> Result<HashMap<String, String>> {
     use arrow_schema::DataType;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+    // Get the first file (for directories, assumes consistent schemas)
+    let files = resolve_parquet_files(path)?;
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    let file = std::fs::File::open(first_file).map_err(|e| {
+        Error::GeoParquetRead(format!("Failed to open {}: {}", first_file.display(), e))
+    })?;
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;

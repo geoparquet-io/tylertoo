@@ -954,19 +954,19 @@ pub fn generate_tiles_from_partitions_with_progress(
     writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
     progress: ProgressCallback,
 ) -> Result<crate::memory::MemoryStats> {
-    use crate::quality::{assess_quality, emit_quality_warnings};
     use std::sync::Arc;
+
+    use crate::quality::{assess_quality, emit_quality_warnings};
 
     if input_paths.is_empty() {
         return Err(Error::GeoParquetRead("No input files provided".to_string()));
     }
 
-    // Quality assessment on first file only (assume partitions are similar)
+    // Quality assessment and field metadata from first file only
     if let Ok(quality) = assess_quality(&input_paths[0]) {
         emit_quality_warnings(&quality, config.quiet);
     }
 
-    // Extract field metadata from first file
     let all_fields = extract_field_metadata(&input_paths[0]).unwrap_or_default();
     let fields = if config.property_filter.is_active() {
         all_fields
@@ -982,8 +982,6 @@ pub fn generate_tiles_from_partitions_with_progress(
     // Process all files sequentially
     // Each file will use parallel row group reading internally (already saturates I/O)
     let mut peak_bytes = 0usize;
-
-    // Wrap progress callback in Arc so we can share it across files
     let progress_arc = Arc::new(progress);
 
     for (file_idx, input_path) in input_paths.iter().enumerate() {

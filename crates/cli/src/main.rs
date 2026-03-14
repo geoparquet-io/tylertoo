@@ -286,48 +286,6 @@ impl Args {
     }
 }
 
-/// Discover all .parquet files in a path (file or directory)
-fn discover_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
-    if path.is_file() {
-        // Single file
-        return Ok(vec![path.to_path_buf()]);
-    }
-
-    if !path.is_dir() {
-        anyhow::bail!("Input path does not exist: {}", path.display());
-    }
-
-    // Recursively find all .parquet files
-    let mut files = Vec::new();
-    visit_dir(path, &mut files)?;
-
-    if files.is_empty() {
-        anyhow::bail!("No .parquet files found in directory: {}", path.display());
-    }
-
-    // Sort for deterministic ordering
-    files.sort();
-
-    Ok(files)
-}
-
-/// Recursively visit directory and collect .parquet files
-fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("Failed to read directory: {}", dir.display()))?
-    {
-        let entry = entry.context("Failed to read directory entry")?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            visit_dir(&path, files)?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn main() -> Result<()> {
     // Initialize dhat profiler if feature is enabled
     // This must be at the very start of main() - the profiler outputs
@@ -482,7 +440,9 @@ fn main() -> Result<()> {
         StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
 
     // Discover input files (single file or directory)
-    let input_files = discover_parquet_files(&args.input)?;
+    use gpq_tiles_core::batch_processor::resolve_parquet_files;
+    let input_files =
+        resolve_parquet_files(&args.input).context("Failed to resolve input files")?;
 
     if args.verbose && input_files.len() > 1 {
         eprintln!("Found {} partition files", input_files.len());
