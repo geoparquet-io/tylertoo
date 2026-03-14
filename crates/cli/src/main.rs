@@ -25,7 +25,10 @@ mod profiling;
     version
 )]
 struct Args {
-    /// Input GeoParquet file
+    /// Input GeoParquet file or directory
+    ///
+    /// If a directory, recursively finds all .parquet files and processes them
+    /// as a single logical dataset (no schema validation).
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -283,6 +286,48 @@ impl Args {
     }
 }
 
+/// Discover all .parquet files in a path (file or directory)
+fn discover_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if path.is_file() {
+        // Single file
+        return Ok(vec![path.to_path_buf()]);
+    }
+
+    if !path.is_dir() {
+        anyhow::bail!("Input path does not exist: {}", path.display());
+    }
+
+    // Recursively find all .parquet files
+    let mut files = Vec::new();
+    visit_dir(path, &mut files)?;
+
+    if files.is_empty() {
+        anyhow::bail!("No .parquet files found in directory: {}", path.display());
+    }
+
+    // Sort for deterministic ordering
+    files.sort();
+
+    Ok(files)
+}
+
+/// Recursively visit directory and collect .parquet files
+fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("Failed to read directory: {}", dir.display()))?
+    {
+        let entry = entry.context("Failed to read directory entry")?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            visit_dir(&path, files)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Initialize dhat profiler if feature is enabled
     // This must be at the very start of main() - the profiler outputs
@@ -436,8 +481,15 @@ fn main() -> Result<()> {
     let mut writer =
         StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
 
+    // Discover input files (single file or directory)
+    let input_files = discover_parquet_files(&args.input)?;
+
+    if args.verbose && input_files.len() > 1 {
+        eprintln!("Found {} partition files", input_files.len());
+    }
+
     // Run the pipeline with progress bars
-    let stats = run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?;
+    let stats = run_with_progress(&input_files, &tiler_config, &mut writer, args.verbose)?;
 
     // Finalize PMTiles file
     let write_stats = writer
@@ -515,7 +567,7 @@ fn format_number(n: u64) -> String {
 
 /// Run tile generation with progress bars for ExternalSort mode
 fn run_with_progress(
-    input: &Path,
+    input_files: &[PathBuf],
     config: &TilerConfig,
     writer: &mut StreamingPmtilesWriter,
     verbose: bool,
@@ -650,6 +702,14 @@ fn run_with_progress(
 
     let _ = verbose; // Reserved for future use (sub-progress for large geometries)
 
-    generate_tiles_to_writer_with_progress(input, config, writer, progress_callback)
-        .context("Failed to generate tiles")
+    if input_files.len() == 1 {
+        // Single file - use standard pipeline
+        generate_tiles_to_writer_with_progress(&input_files[0], config, writer, progress_callback)
+            .context("Failed to generate tiles")
+    } else {
+        // Multiple files - use partitioned pipeline
+        use gpq_tiles_core::pipeline::generate_tiles_from_partitions_with_progress;
+        generate_tiles_from_partitions_with_progress(input_files, config, writer, progress_callback)
+            .context("Failed to generate tiles from partitions")
+    }
 }
