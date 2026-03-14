@@ -439,17 +439,8 @@ fn main() -> Result<()> {
     let mut writer =
         StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
 
-    // Discover input files (single file or directory)
-    use gpq_tiles_core::batch_processor::resolve_parquet_files;
-    let input_files =
-        resolve_parquet_files(&args.input).context("Failed to resolve input files")?;
-
-    if args.verbose && input_files.len() > 1 {
-        eprintln!("Found {} partition files", input_files.len());
-    }
-
-    // Run the pipeline with progress bars
-    let stats = run_with_progress(&input_files, &tiler_config, &mut writer, args.verbose)?;
+    // Run the pipeline with progress bars (supports both files and directories)
+    let stats = run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?;
 
     // Finalize PMTiles file
     let write_stats = writer
@@ -527,7 +518,7 @@ fn format_number(n: u64) -> String {
 
 /// Run tile generation with progress bars for ExternalSort mode
 fn run_with_progress(
-    input_files: &[PathBuf],
+    input_path: &Path,
     config: &TilerConfig,
     writer: &mut StreamingPmtilesWriter,
     verbose: bool,
@@ -662,14 +653,7 @@ fn run_with_progress(
 
     let _ = verbose; // Reserved for future use (sub-progress for large geometries)
 
-    if input_files.len() == 1 {
-        // Single file - use standard pipeline
-        generate_tiles_to_writer_with_progress(&input_files[0], config, writer, progress_callback)
-            .context("Failed to generate tiles")
-    } else {
-        // Multiple files - use partitioned pipeline
-        use gpq_tiles_core::pipeline::generate_tiles_from_partitions_with_progress;
-        generate_tiles_from_partitions_with_progress(input_files, config, writer, progress_callback)
-            .context("Failed to generate tiles from partitions")
-    }
+    // Standard pipeline handles both files and directories transparently
+    generate_tiles_to_writer_with_progress(input_path, config, writer, progress_callback)
+        .context("Failed to generate tiles")
 }
