@@ -25,7 +25,10 @@ mod profiling;
     version
 )]
 struct Args {
-    /// Input GeoParquet file
+    /// Input GeoParquet file or directory
+    ///
+    /// If a directory, recursively finds all .parquet files and processes them
+    /// as a single logical dataset (no schema validation).
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -436,7 +439,7 @@ fn main() -> Result<()> {
     let mut writer =
         StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
 
-    // Run the pipeline with progress bars
+    // Run the pipeline with progress bars (supports both files and directories)
     let stats = run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?;
 
     // Finalize PMTiles file
@@ -515,7 +518,7 @@ fn format_number(n: u64) -> String {
 
 /// Run tile generation with progress bars for ExternalSort mode
 fn run_with_progress(
-    input: &Path,
+    input_path: &Path,
     config: &TilerConfig,
     writer: &mut StreamingPmtilesWriter,
     verbose: bool,
@@ -650,6 +653,7 @@ fn run_with_progress(
 
     let _ = verbose; // Reserved for future use (sub-progress for large geometries)
 
-    generate_tiles_to_writer_with_progress(input, config, writer, progress_callback)
+    // Standard pipeline handles both files and directories transparently
+    generate_tiles_to_writer_with_progress(input_path, config, writer, progress_callback)
         .context("Failed to generate tiles")
 }
