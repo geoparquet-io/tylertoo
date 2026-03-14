@@ -109,7 +109,15 @@ fn is_wgs84_projjson(projjson: &Value) -> bool {
 ///
 /// CRS information, or an error if the file cannot be read.
 pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
-    let file = std::fs::File::open(path)
+    use crate::batch_processor::resolve_parquet_files;
+
+    // Resolve to first file if path is a directory
+    let files = resolve_parquet_files(path)?;
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    let file = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
 
     let reader = SerializedFileReader::new(file)
