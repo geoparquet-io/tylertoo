@@ -29,6 +29,37 @@ use geo::Geometry;
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::tile::{TileBounds, TileCoord};
 
+/// Calculate the zoom range (min, max) for a feature based on its bbox area.
+///
+/// This is the unified function that combines visibility-based min zoom (when feature
+/// becomes ≥ min_pixel_area sq pixels) with explosion-prevention max zoom (when feature
+/// would touch > max_tile_threshold tiles).
+///
+/// # Arguments
+/// * `bbox` - Geographic bounding box of the feature
+/// * `min_pixel_area` - Minimum area in square pixels for visibility (default: 4.0)
+/// * `max_tile_threshold` - Maximum tiles feature should touch (default: 400)
+///
+/// # Returns
+/// Tuple of (min_zoom, max_zoom) where:
+/// - min_zoom: First zoom where feature is visible (>= min_pixel_area sq pixels)
+/// - max_zoom: Last zoom before tile explosion (< max_tile_threshold tiles)
+pub fn zoom_range_for_bbox(
+    bbox: &TileBounds,
+    min_pixel_area: f64,
+    max_tile_threshold: u32,
+) -> (u8, u8) {
+    let min_z = min_zoom_for_bbox(bbox, min_pixel_area);
+    let max_z = max_zoom_for_bbox(bbox, max_tile_threshold);
+
+    // Ensure min_z <= max_z (shouldn't happen, but guard against edge cases)
+    if min_z > max_z {
+        (max_z, max_z)
+    } else {
+        (min_z, max_z)
+    }
+}
+
 /// Calculate the minimum zoom level where a feature is visible (≥ threshold sq pixels).
 ///
 /// Small features should not appear at low zoom levels where they're too small to see.
@@ -1008,6 +1039,48 @@ mod tests {
             "1000km feature should appear at z0, got z{}",
             min_z
         );
+    }
+
+    // =============================================================================
+    // Tests for zoom_range_for_bbox() - Unified min/max zoom calculation
+    // =============================================================================
+
+    #[test]
+    fn test_zoom_range_tiny_feature() {
+        // Tiny feature (100m) should have narrow zoom range
+        let bbox = TileBounds::new(-0.0005, -0.0005, 0.0005, 0.0005);
+        let (min_z, max_z) = zoom_range_for_bbox(&bbox, 4.0, 400);
+
+        // Should appear at z8 (first visible) and go up to z14
+        assert_eq!(min_z, 8, "100m feature min zoom");
+        assert_eq!(max_z, 14, "100m feature max zoom");
+    }
+
+    #[test]
+    fn test_zoom_range_large_feature() {
+        // Large feature (1000km) should have wide zoom range ending early
+        let bbox = TileBounds::new(-5.0, -5.0, 5.0, 5.0);
+        let (min_z, max_z) = zoom_range_for_bbox(&bbox, 4.0, 400);
+
+        // Should appear at z0 (immediately visible) and stop early to prevent explosion
+        assert_eq!(min_z, 0, "1000km feature min zoom");
+        assert!(
+            max_z <= 10,
+            "1000km feature should stop by z10, got z{}",
+            max_z
+        );
+    }
+
+    #[test]
+    fn test_zoom_range_medium_feature() {
+        // Medium feature should have typical zoom range
+        let bbox = TileBounds::new(-0.05, -0.05, 0.05, 0.05);
+        let (min_z, max_z) = zoom_range_for_bbox(&bbox, 4.0, 400);
+
+        // Should start when visible and end before explosion
+        assert!(min_z < max_z, "min_z should be < max_z");
+        assert!(min_z <= 5, "10km feature should appear by z5");
+        assert!(max_z >= 10, "10km feature should reach at least z10");
     }
 
     // =============================================================================
