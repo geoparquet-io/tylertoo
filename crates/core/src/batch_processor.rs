@@ -1242,4 +1242,73 @@ mod tests {
 
         assert!(result.is_err(), "Should error on invalid row group index");
     }
+
+    /// Test that resolve_parquet_files handles single files correctly.
+    #[test]
+    fn test_resolve_parquet_files_single_file() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let files = resolve_parquet_files(fixture).expect("Should resolve file");
+        assert_eq!(files.len(), 1, "Should return single file");
+        assert_eq!(files[0], fixture, "Should return the input file path");
+    }
+
+    /// Test that resolve_parquet_files returns error for non-existent path.
+    #[test]
+    fn test_resolve_parquet_files_nonexistent() {
+        let nonexistent = Path::new("/nonexistent/path.parquet");
+        let result = resolve_parquet_files(nonexistent);
+        assert!(result.is_err(), "Should error on non-existent path");
+    }
+
+    /// Test that resolve_parquet_files returns error for empty directory.
+    #[test]
+    fn test_resolve_parquet_files_empty_dir() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir().join("gpq_test_empty");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir(&temp_dir).expect("Should create temp dir");
+
+        let result = resolve_parquet_files(&temp_dir);
+        assert!(
+            result.is_err(),
+            "Should error on directory with no parquet files"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Test that get_row_group_count works with directories.
+    #[test]
+    fn test_get_row_group_count_directory() {
+        use std::fs;
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Create temp directory with copy of fixture
+        let temp_dir = std::env::temp_dir().join("gpq_test_multifile");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir(&temp_dir).expect("Should create temp dir");
+
+        let file1 = temp_dir.join("file1.parquet");
+        fs::copy(fixture, &file1).expect("Should copy fixture");
+
+        // Get count from directory
+        let dir_count = get_row_group_count(&temp_dir).expect("Should get count from directory");
+        let file_count = get_row_group_count(fixture).expect("Should get count from file");
+
+        assert_eq!(
+            dir_count, file_count,
+            "Directory count should match file count"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }
