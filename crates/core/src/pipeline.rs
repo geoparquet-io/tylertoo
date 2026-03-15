@@ -1177,6 +1177,10 @@ fn generate_tiles_with_geometry_store_internal(
     let mut refs_vec = tile_refs.into_inner().unwrap();
     refs_vec.sort_unstable(); // In-place sort
 
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase2Complete);
+    }
+
     // Phase 3: Lazy clip and encode
     if let Some(ref cb) = progress {
         cb(ProgressEvent::PhaseStart {
@@ -1200,20 +1204,11 @@ fn generate_tiles_with_geometry_store_internal(
     let mut tiles_encoded = 0u64;
     let mut records_processed = 0u64;
     let mut last_sort_progress = std::time::Instant::now();
-    let mut sort_complete_reported = false;
 
     for tile_ref in refs_vec {
         records_processed += 1;
 
-        // Report Phase 2 complete after first batch of sorted refs
-        if !sort_complete_reported && records_processed >= 10000 {
-            if let Some(ref cb) = progress {
-                cb(ProgressEvent::Phase2Complete);
-            }
-            sort_complete_reported = true;
-        }
-
-        // Log sort progress every 100K refs or 5 seconds
+        // Log progress every 100K refs or 5 seconds
         if !config.quiet && records_processed % 100000 == 0 {
             let elapsed = last_sort_progress.elapsed();
             if elapsed.as_secs() >= 5 {
