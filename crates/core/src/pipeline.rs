@@ -1017,8 +1017,9 @@ fn generate_tiles_with_geometry_store_internal(
             .map_err(|e| Error::PMTilesWrite(format!("Failed to create geometry store: {}", e)))?,
     );
 
-    // TileRefSorter (10× smaller records than TileFeatureRecord)
-    let sort_buffer_size = 1_000_000; // Can use 10× larger buffer with same memory
+    // TileRefSorter - use same buffer size as old pipeline for compatibility
+    // TODO: Investigate why larger buffers cause extsort to hang
+    let sort_buffer_size = 100_000; // Match old pipeline buffer size
     let sorter = Mutex::new(TileRefSorter::new(sort_buffer_size));
 
     const TILE_REF_OVERHEAD: usize = 48; // TileRef size with padding
