@@ -1041,7 +1041,7 @@ fn generate_tiles_with_geometry_store_internal(
     process_geometries_parallel(
         input_path,
         DEFAULT_PARALLEL_READERS,
-        |rg_info, geometries| {
+        |_rg_info, geometries| {
             let features_in_group = geometries.len();
 
             // Track completed row groups (may arrive out of order due to parallel reads)
@@ -1328,8 +1328,10 @@ fn generate_tiles_with_geometry_store_internal(
 /// Phase 3: Read sorted, group by tile, encode MVT, write PMTiles
 ///
 /// Memory usage: O(sort_buffer_size) - configurable, typically 100K-1M records
-/// This is the only tile generation algorithm - geometry-centric with external sort.
-#[allow(dead_code)]
+///
+/// DEPRECATED: Replaced by generate_tiles_with_geometry_store_internal for 7× memory reduction.
+/// Kept for now as fallback but will be removed in future version.
+#[deprecated(note = "Use GeometryStore pipeline for better memory efficiency")]
 fn generate_tiles_to_writer_internal(
     input_path: &Path,
     config: &TilerConfig,
