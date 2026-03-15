@@ -991,7 +991,6 @@ fn generate_tiles_with_geometry_store_internal(
     progress: Option<ProgressCallback>,
 ) -> Result<crate::memory::MemoryStats> {
     use crate::batch_processor::get_row_group_count;
-    use crate::external_sort::TileRefSorter;
     use crate::geometry_store::GeometryStore;
     use crate::memory::MemoryTracker;
     use crate::pmtiles_writer::tile_id;
@@ -1017,10 +1016,9 @@ fn generate_tiles_with_geometry_store_internal(
             .map_err(|e| Error::PMTilesWrite(format!("Failed to create geometry store: {}", e)))?,
     );
 
-    // TileRefSorter - use same buffer size as old pipeline for compatibility
-    // TODO: Investigate why larger buffers cause extsort to hang
-    let sort_buffer_size = 100_000; // Match old pipeline buffer size
-    let sorter = Mutex::new(TileRefSorter::new(sort_buffer_size));
+    // Collect TileRefs in-memory for sorting
+    // With typical datasets: 3-5M refs × 48 bytes = 150-250MB (acceptable)
+    let tile_refs = Mutex::new(Vec::new());
 
     const TILE_REF_OVERHEAD: usize = 48; // TileRef size with padding
 
@@ -1130,10 +1128,9 @@ fn generate_tiles_with_geometry_store_internal(
                         geometry_handle,
                     );
 
-                    let mut sorter_guard = sorter.lock().unwrap();
+                    tile_refs.lock().unwrap().push(tile_ref);
                     let mut tracker_guard = memory_tracker.lock().unwrap();
                     tracker_guard.add(TILE_REF_OVERHEAD);
-                    sorter_guard.add(tile_ref);
                     refs_written.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1184,27 +1181,21 @@ fn generate_tiles_with_geometry_store_internal(
     );
 
     if !config.quiet {
-        tracing::info!(
-            "Phase 2: Sorting {} tile refs (external merge sort)",
-            total_refs
-        );
+        tracing::info!("Phase 2: Sorting {} tile refs (in-memory)", total_refs);
     }
 
     let sort_start = std::time::Instant::now();
-    eprintln!("[DEBUG] Calling sorter.sort()...");
+    eprintln!("[DEBUG] Sorting refs in-memory...");
 
-    let sorted_iter = sorter
-        .into_inner()
-        .unwrap()
-        .sort()
-        .map_err(|e| Error::PMTilesWrite(format!("TileRef sort failed: {}", e)))?;
+    let mut refs_vec = tile_refs.into_inner().unwrap();
+    refs_vec.sort_unstable(); // In-place sort
 
     let sort_elapsed = sort_start.elapsed();
     eprintln!(
-        "[DEBUG] sorter.sort() returned in {:.2}s (iterator created)",
+        "[DEBUG] Sort complete in {:.2}s",
         sort_elapsed.as_secs_f64()
     );
-    eprintln!("[DEBUG] Starting to consume sorted iterator...");
+    eprintln!("[DEBUG] Starting to iterate over sorted refs...");
 
     // Phase 3: Lazy clip and encode
     if let Some(ref cb) = progress {
@@ -1231,13 +1222,16 @@ fn generate_tiles_with_geometry_store_internal(
     let mut last_sort_progress = std::time::Instant::now();
     let mut sort_complete_reported = false;
 
-    eprintln!("[DEBUG] About to enter for loop over sorted_iter");
+    eprintln!(
+        "[DEBUG] About to iterate over {} sorted refs",
+        refs_vec.len()
+    );
     let loop_start = std::time::Instant::now();
 
-    for tile_ref_result in sorted_iter {
+    for tile_ref in refs_vec {
         if records_processed == 0 {
             eprintln!(
-                "[DEBUG] First iteration of for loop started at {:.2}s",
+                "[DEBUG] First iteration started at {:.2}s",
                 loop_start.elapsed().as_secs_f64()
             );
         }
@@ -1284,9 +1278,6 @@ fn generate_tiles_with_geometry_store_internal(
                 last_sort_progress = std::time::Instant::now();
             }
         }
-        let tile_ref = tile_ref_result
-            .map_err(|e| Error::PMTilesWrite(format!("TileRef iteration: {}", e)))?;
-
         // Encode previous tile when tile_id changes
         if let Some((prev_z, prev_x, prev_y)) = current_tile_coords {
             if current_tile_id != Some(tile_ref.tile_id) {
