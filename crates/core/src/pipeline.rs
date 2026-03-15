@@ -1230,7 +1230,16 @@ fn generate_tiles_with_geometry_store_internal(
     let mut last_sort_progress = std::time::Instant::now();
     let mut sort_complete_reported = false;
 
+    eprintln!("[DEBUG] About to enter for loop over sorted_iter");
+    let loop_start = std::time::Instant::now();
+
     for tile_ref_result in sorted_iter {
+        if records_processed == 0 {
+            eprintln!(
+                "[DEBUG] First iteration of for loop started at {:.2}s",
+                loop_start.elapsed().as_secs_f64()
+            );
+        }
         records_processed += 1;
 
         // Debug: First ref
