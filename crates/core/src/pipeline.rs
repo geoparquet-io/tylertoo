@@ -1178,26 +1178,11 @@ fn generate_tiles_with_geometry_store_internal(
         );
     }
 
-    let sort_start = std::time::Instant::now();
     let sorted_iter = sorter
         .into_inner()
         .unwrap()
         .sort()
         .map_err(|e| Error::PMTilesWrite(format!("TileRef sort failed: {}", e)))?;
-    let sort_duration = sort_start.elapsed();
-
-    if !config.quiet {
-        tracing::info!(
-            "Phase 2 complete: Sorted {} refs in {:.1}s ({:.0} refs/sec)",
-            total_refs,
-            sort_duration.as_secs_f64(),
-            total_refs as f64 / sort_duration.as_secs_f64()
-        );
-    }
-
-    if let Some(ref cb) = progress {
-        cb(ProgressEvent::Phase2Complete);
-    }
 
     // Phase 3: Lazy clip and encode
     if let Some(ref cb) = progress {
@@ -1221,8 +1206,33 @@ fn generate_tiles_with_geometry_store_internal(
     let mut current_tile_features: Vec<geo::Geometry<f64>> = Vec::new();
     let mut tiles_encoded = 0u64;
     let mut records_processed = 0u64;
+    let mut last_sort_progress = std::time::Instant::now();
+    let mut sort_complete_reported = false;
 
     for tile_ref_result in sorted_iter {
+        records_processed += 1;
+
+        // Report Phase 2 complete after first batch of sorted refs (sort has started streaming)
+        if !sort_complete_reported && records_processed >= 10000 {
+            if let Some(ref cb) = progress {
+                cb(ProgressEvent::Phase2Complete);
+            }
+            sort_complete_reported = true;
+        }
+
+        // Log sort progress every 100K refs or 5 seconds
+        if !config.quiet && records_processed % 100000 == 0 {
+            let elapsed = last_sort_progress.elapsed();
+            if elapsed.as_secs() >= 5 {
+                tracing::info!(
+                    "Reading sorted refs: {}/{} ({:.1}%)",
+                    records_processed,
+                    total_refs,
+                    (records_processed as f64 / total_refs as f64) * 100.0
+                );
+                last_sort_progress = std::time::Instant::now();
+            }
+        }
         let tile_ref = tile_ref_result
             .map_err(|e| Error::PMTilesWrite(format!("TileRef iteration: {}", e)))?;
 
@@ -1304,7 +1314,6 @@ fn generate_tiles_with_geometry_store_internal(
         let clipped = clip_geometry(&geom, &tile_bounds, buffer_degrees).unwrap_or(geom);
 
         current_tile_features.push(clipped);
-        records_processed += 1;
     }
 
     // Encode final tile
