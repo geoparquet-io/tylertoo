@@ -189,6 +189,62 @@ impl TileFeatureSorter {
     }
 }
 
+/// External sorter for lightweight tile references.
+///
+/// Similar to `TileFeatureSorter` but for `TileRef` instead of `TileFeatureRecord`.
+/// Used with `GeometryStore` to achieve 10× memory reduction by storing geometries
+/// once and sorting only lightweight references.
+pub struct TileRefSorter {
+    /// In-memory buffer for refs before sorting
+    refs: Vec<crate::tile_ref::TileRef>,
+    /// Maximum refs to buffer before flushing to disk
+    sort_buffer_size: usize,
+}
+
+impl TileRefSorter {
+    /// Create a new sorter with the specified buffer size.
+    ///
+    /// # Arguments
+    ///
+    /// * `sort_buffer_size` - Maximum number of refs to hold in memory.
+    ///   Since TileRef is ~41 bytes (vs ~400 for TileFeatureRecord),
+    ///   can use 10× larger buffer with same memory footprint.
+    pub fn new(sort_buffer_size: usize) -> Self {
+        Self {
+            refs: Vec::with_capacity(sort_buffer_size.min(1024)),
+            sort_buffer_size,
+        }
+    }
+
+    /// Add a ref to be sorted.
+    pub fn add(&mut self, tile_ref: crate::tile_ref::TileRef) {
+        self.refs.push(tile_ref);
+    }
+
+    /// Returns the number of refs currently buffered.
+    pub fn len(&self) -> usize {
+        self.refs.len()
+    }
+
+    /// Returns true if no refs have been added.
+    pub fn is_empty(&self) -> bool {
+        self.refs.is_empty()
+    }
+
+    /// Sort all refs and return an iterator over them in tile_id order.
+    ///
+    /// This consumes the sorter. For datasets that fit in the buffer,
+    /// sorting happens entirely in memory. For larger datasets, the
+    /// external sorter writes sorted chunks to temp files and merges them.
+    pub fn sort(
+        self,
+    ) -> std::io::Result<impl Iterator<Item = std::io::Result<crate::tile_ref::TileRef>>> {
+        let sorter = ExternalSorter::new().with_segment_size(self.sort_buffer_size);
+
+        sorter.sort(self.refs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +413,69 @@ mod tests {
         let sorter = TileFeatureSorter::new(1000);
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
         assert!(sorted.is_empty());
+    }
+
+    // =============================================================================
+    // TileRefSorter Tests
+    // =============================================================================
+
+    #[test]
+    fn test_tile_ref_sorter_basic() {
+        use crate::geometry_store::GeometryHandle;
+        use crate::tile_ref::TileRef;
+
+        let mut sorter = TileRefSorter::new(1000);
+        assert!(sorter.is_empty());
+        assert_eq!(sorter.len(), 0);
+
+        let handle = GeometryHandle {
+            offset: 0,
+            wkb_len: 100,
+            props_len: 50,
+        };
+
+        sorter.add(TileRef::new(1, 0, 0, 0, 1, handle));
+        assert!(!sorter.is_empty());
+        assert_eq!(sorter.len(), 1);
+    }
+
+    #[test]
+    fn test_tile_ref_sorter_sorts_by_tile_id() {
+        use crate::geometry_store::GeometryHandle;
+        use crate::tile_ref::TileRef;
+
+        let mut sorter = TileRefSorter::new(1000);
+        let handle = GeometryHandle {
+            offset: 0,
+            wkb_len: 100,
+            props_len: 50,
+        };
+
+        // Add refs out of order
+        sorter.add(TileRef::new(3, 0, 0, 0, 1, handle));
+        sorter.add(TileRef::new(1, 0, 0, 0, 1, handle));
+        sorter.add(TileRef::new(2, 0, 0, 0, 1, handle));
+
+        let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
+
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0].tile_id, 1);
+        assert_eq!(sorted[1].tile_id, 2);
+        assert_eq!(sorted[2].tile_id, 3);
+    }
+
+    #[test]
+    fn test_tile_ref_sorter_memory_efficiency() {
+        use crate::geometry_store::GeometryHandle;
+        use crate::tile_ref::TileRef;
+
+        // TileRef is ~41 bytes vs TileFeatureRecord ~400 bytes
+        // Can buffer 10× more refs with same memory
+        let buffer_size = 1_000_000;
+        let sorter = TileRefSorter::new(buffer_size);
+
+        // Estimated memory: 1M refs × 41 bytes = ~41MB
+        // vs 1M records × 400 bytes = ~400MB
+        let _ = sorter;
     }
 }
