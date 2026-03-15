@@ -1166,21 +1166,34 @@ fn generate_tiles_with_geometry_store_internal(
     }
 
     // Phase 2: Sort TileRefs
+    let total_refs = refs_written.load(Ordering::Relaxed);
+
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Start);
     }
     if !config.quiet {
         tracing::info!(
-            "Phase 2: Sorting {} tile refs",
-            refs_written.load(Ordering::Relaxed)
+            "Phase 2: Sorting {} tile refs (external merge sort)",
+            total_refs
         );
     }
 
+    let sort_start = std::time::Instant::now();
     let sorted_iter = sorter
         .into_inner()
         .unwrap()
         .sort()
         .map_err(|e| Error::PMTilesWrite(format!("TileRef sort failed: {}", e)))?;
+    let sort_duration = sort_start.elapsed();
+
+    if !config.quiet {
+        tracing::info!(
+            "Phase 2 complete: Sorted {} refs in {:.1}s ({:.0} refs/sec)",
+            total_refs,
+            sort_duration.as_secs_f64(),
+            total_refs as f64 / sort_duration.as_secs_f64()
+        );
+    }
 
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Complete);
