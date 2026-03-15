@@ -1229,6 +1229,7 @@ fn generate_tiles_with_geometry_store_internal(
     let loop_start = std::time::Instant::now();
 
     for tile_ref in refs_vec {
+        eprintln!("[DEBUG] Loop iteration {}", records_processed);
         if records_processed == 0 {
             eprintln!(
                 "[DEBUG] First iteration started at {:.2}s",
