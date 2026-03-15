@@ -1341,9 +1341,21 @@ fn generate_tiles_with_geometry_store_internal(
         current_tile_coords = Some((tile_ref.z, tile_ref.x, tile_ref.y));
 
         // Lazy retrieval: read geometry from store
+        if records_processed % 10000 == 0 {
+            eprintln!(
+                "[DEBUG] About to read geometry from GeometryStore (ref #{})",
+                records_processed
+            );
+        }
         let (wkb, _props) = store
             .read(tile_ref.geometry_handle)
             .map_err(|e| Error::PMTilesWrite(format!("GeometryStore read: {}", e)))?;
+        if records_processed % 10000 == 0 {
+            eprintln!(
+                "[DEBUG] GeometryStore read complete (ref #{})",
+                records_processed
+            );
+        }
 
         let geom = wkb_to_geometry(&wkb).map_err(|e| Error::InvalidGeometry {
             feature_id: tile_ref.feature_id as usize,
