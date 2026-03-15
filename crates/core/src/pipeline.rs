@@ -975,6 +975,24 @@ pub fn generate_tiles_to_writer_with_progress(
     generate_tiles_to_writer_internal(input_path, config, writer, Some(progress))
 }
 
+/// GeometryStore-based pipeline: store geometries once, sort lightweight refs, lazy clip.
+///
+/// Memory: O(features * avg_geometry_size) + O(features * tiles_per_feature * 41 bytes)
+/// vs current O(features * tiles_per_feature * avg_clipped_geometry_size)
+fn generate_tiles_with_geometry_store_internal(
+    _input_path: &Path,
+    _config: &TilerConfig,
+    _writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
+    _progress: Option<ProgressCallback>,
+) -> Result<crate::memory::MemoryStats> {
+    // TODO: Implementation
+    Ok(crate::memory::MemoryStats {
+        peak_bytes: 0,
+        budget: None,
+        budget_exceeded_count: 0,
+    })
+}
+
 /// Fast streaming mode: single file pass, stores clipped geometries per tile.
 ///
 /// Memory usage: ~1-2GB for large files (clipped geometries are ~90% smaller than originals)
@@ -4354,6 +4372,38 @@ mod tests {
 
         let _ = fs::remove_file(output_baseline);
         let _ = fs::remove_file(output_filtered);
+    }
+
+    #[test]
+    fn test_generate_tiles_with_geometry_store() {
+        use crate::compression::Compression;
+        use crate::external_sort::TileRefSorter;
+        use crate::geometry_store::GeometryStore;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::path::Path;
+
+        let fixture = "../../tests/fixtures/realdata/open-buildings.parquet";
+        if !Path::new(fixture).exists() {
+            return; // Skip if fixture missing
+        }
+
+        let config = TilerConfig::new(10, 12)
+            .with_layer_name("buildings")
+            .with_deterministic(true);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        // Should not panic and should produce tiles
+        let stats = generate_tiles_with_geometry_store_internal(
+            Path::new(fixture),
+            &config,
+            &mut writer,
+            None,
+        )
+        .expect("Should generate tiles");
+
+        assert!(stats.peak_bytes > 0, "Should track memory");
     }
 }
 
