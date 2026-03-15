@@ -936,8 +936,8 @@ pub fn generate_tiles_to_writer(
     writer.set_fields(fields);
     writer.set_layer_name(&config.layer_name);
 
-    // Always use geometry-centric external sort algorithm (fast + bounded memory)
-    generate_tiles_to_writer_internal(input_path, config, writer, None)
+    // Use GeometryStore-based pipeline for 7× memory reduction
+    generate_tiles_with_geometry_store_internal(input_path, config, writer, None)
 }
 
 /// Generate tiles directly to a streaming PMTiles writer with progress reporting.
@@ -971,8 +971,8 @@ pub fn generate_tiles_to_writer_with_progress(
     writer.set_fields(fields);
     writer.set_layer_name(&config.layer_name);
 
-    // Always use geometry-centric external sort algorithm (fast + bounded memory)
-    generate_tiles_to_writer_internal(input_path, config, writer, Some(progress))
+    // Use GeometryStore-based pipeline for 7× memory reduction
+    generate_tiles_with_geometry_store_internal(input_path, config, writer, Some(progress))
 }
 
 /// GeometryStore-based pipeline: store geometries once, sort lightweight refs, lazy clip.
