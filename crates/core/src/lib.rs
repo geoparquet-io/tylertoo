@@ -47,7 +47,6 @@ pub mod dedup;
 pub mod external_sort;
 pub mod feature_drop;
 pub mod gap_density;
-pub mod geometry_store;
 #[cfg(test)]
 mod golden;
 pub mod hierarchical_clip;
@@ -64,7 +63,6 @@ pub mod simplify;
 pub mod spatial_index;
 pub mod sutherland_hodgman;
 pub mod tile;
-pub mod tile_ref;
 pub mod validate;
 pub mod wkb;
 pub mod world_coord;
@@ -83,8 +81,6 @@ pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 pub use pipeline::{ProgressCallback, ProgressEvent};
 // Re-export CRS validation for CLI usage
 pub use quality::{extract_crs, validate_wgs84, CrsInfo};
-// Re-export TileRef for benchmarks and future use
-pub use tile_ref::TileRef;
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]

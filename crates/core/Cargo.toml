@@ -71,13 +71,5 @@ name = "clipping"
 harness = false
 
 [[bench]]
-name = "geometry_store"
-harness = false
-
-[[bench]]
-name = "tile_ref"
-harness = false
-
-[[bench]]
 name = "bbox_containment"
 harness = false
