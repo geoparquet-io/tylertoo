@@ -1170,32 +1170,12 @@ fn generate_tiles_with_geometry_store_internal(
         cb(ProgressEvent::Phase2Start);
     }
 
-    eprintln!(
-        "[DEBUG] Phase 2 START: About to sort {} tile refs",
-        total_refs
-    );
-    eprintln!(
-        "[DEBUG] TileRef size: {} bytes, Total memory for refs: {:.2} MB",
-        crate::tile_ref::TileRef::SIZE,
-        (total_refs as f64 * crate::tile_ref::TileRef::SIZE as f64) / 1_000_000.0
-    );
-
     if !config.quiet {
         tracing::info!("Phase 2: Sorting {} tile refs (in-memory)", total_refs);
     }
 
-    let sort_start = std::time::Instant::now();
-    eprintln!("[DEBUG] Sorting refs in-memory...");
-
     let mut refs_vec = tile_refs.into_inner().unwrap();
     refs_vec.sort_unstable(); // In-place sort
-
-    let sort_elapsed = sort_start.elapsed();
-    eprintln!(
-        "[DEBUG] Sort complete in {:.2}s",
-        sort_elapsed.as_secs_f64()
-    );
-    eprintln!("[DEBUG] Starting to iterate over sorted refs...");
 
     // Phase 3: Lazy clip and encode
     if let Some(ref cb) = progress {
@@ -1222,48 +1202,15 @@ fn generate_tiles_with_geometry_store_internal(
     let mut last_sort_progress = std::time::Instant::now();
     let mut sort_complete_reported = false;
 
-    eprintln!(
-        "[DEBUG] About to iterate over {} sorted refs",
-        refs_vec.len()
-    );
-    let loop_start = std::time::Instant::now();
-
     for tile_ref in refs_vec {
-        eprintln!("[DEBUG] Loop iteration {}", records_processed);
-        if records_processed == 0 {
-            eprintln!(
-                "[DEBUG] First iteration started at {:.2}s",
-                loop_start.elapsed().as_secs_f64()
-            );
-        }
         records_processed += 1;
 
-        // Debug: First ref
-        if records_processed == 1 {
-            eprintln!(
-                "[DEBUG] First sorted ref retrieved at {:.2}s",
-                last_sort_progress.elapsed().as_secs_f64()
-            );
-        }
-
-        // Report Phase 2 complete after first batch of sorted refs (sort has started streaming)
+        // Report Phase 2 complete after first batch of sorted refs
         if !sort_complete_reported && records_processed >= 10000 {
-            eprintln!("[DEBUG] Retrieved 10K sorted refs, marking Phase 2 complete");
             if let Some(ref cb) = progress {
                 cb(ProgressEvent::Phase2Complete);
             }
             sort_complete_reported = true;
-        }
-
-        // Debug output every 50K refs AND every 5 seconds
-        if records_processed % 50000 == 0 {
-            eprintln!(
-                "[DEBUG] Processed {}/{} sorted refs ({:.1}%) - {:.2}s elapsed",
-                records_processed,
-                total_refs,
-                (records_processed as f64 / total_refs as f64) * 100.0,
-                last_sort_progress.elapsed().as_secs_f64()
-            );
         }
 
         // Log sort progress every 100K refs or 5 seconds
@@ -1333,33 +1280,14 @@ fn generate_tiles_with_geometry_store_internal(
         current_tile_coords = Some((tile_ref.z, tile_ref.x, tile_ref.y));
 
         // Lazy retrieval: read geometry from store
-        if records_processed % 10000 == 0 {
-            eprintln!(
-                "[DEBUG] About to read geometry from GeometryStore (ref #{})",
-                records_processed
-            );
-        }
         let (wkb, _props) = store
             .read(tile_ref.geometry_handle)
             .map_err(|e| Error::PMTilesWrite(format!("GeometryStore read: {}", e)))?;
-        if records_processed % 10000 == 0 {
-            eprintln!(
-                "[DEBUG] GeometryStore read complete (ref #{}), WKB size: {} bytes",
-                records_processed,
-                wkb.len()
-            );
-        }
 
-        if records_processed % 10000 == 0 {
-            eprintln!("[DEBUG] About to decode WKB (ref #{})", records_processed);
-        }
         let geom = wkb_to_geometry(&wkb).map_err(|e| Error::InvalidGeometry {
             feature_id: tile_ref.feature_id as usize,
             reason: format!("WKB decode: {}", e),
         })?;
-        if records_processed % 10000 == 0 {
-            eprintln!("[DEBUG] WKB decode complete (ref #{})", records_processed);
-        }
 
         // Lazy clipping: clip NOW (not stored)
         let tile_coord = crate::tile::TileCoord {
@@ -1374,16 +1302,7 @@ fn generate_tiles_with_geometry_store_internal(
         let buffer_degrees = config.buffer_pixels as f64 / config.extent as f64
             * (tile_bounds.lng_max - tile_bounds.lng_min);
 
-        if records_processed % 10000 == 0 {
-            eprintln!(
-                "[DEBUG] About to clip geometry (ref #{}, tile z={} x={} y={})",
-                records_processed, tile_ref.z, tile_ref.x, tile_ref.y
-            );
-        }
         let clipped = clip_geometry(&geom, &tile_bounds, buffer_degrees).unwrap_or(geom);
-        if records_processed % 10000 == 0 {
-            eprintln!("[DEBUG] Clipping complete (ref #{})", records_processed);
-        }
 
         current_tile_features.push(clipped);
     }
