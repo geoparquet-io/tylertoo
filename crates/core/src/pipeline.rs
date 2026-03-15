@@ -979,18 +979,297 @@ pub fn generate_tiles_to_writer_with_progress(
 ///
 /// Memory: O(features * avg_geometry_size) + O(features * tiles_per_feature * 41 bytes)
 /// vs current O(features * tiles_per_feature * avg_clipped_geometry_size)
+///
+/// This implementation achieves ~10× memory reduction by:
+/// 1. Storing each geometry once in GeometryStore (disk-backed)
+/// 2. Sorting lightweight TileRef pointers (41 bytes vs 400 bytes)
+/// 3. Lazy clipping during Phase 3 encoding
 fn generate_tiles_with_geometry_store_internal(
-    _input_path: &Path,
-    _config: &TilerConfig,
-    _writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
-    _progress: Option<ProgressCallback>,
+    input_path: &Path,
+    config: &TilerConfig,
+    writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
+    progress: Option<ProgressCallback>,
 ) -> Result<crate::memory::MemoryStats> {
-    // TODO: Implementation
-    Ok(crate::memory::MemoryStats {
-        peak_bytes: 0,
-        budget: None,
-        budget_exceeded_count: 0,
-    })
+    use crate::batch_processor::get_row_group_count;
+    use crate::external_sort::TileRefSorter;
+    use crate::geometry_store::GeometryStore;
+    use crate::memory::MemoryTracker;
+    use crate::pmtiles_writer::tile_id;
+    use crate::tile_ref::TileRef;
+    use crate::wkb::geometry_to_wkb;
+    use geo::BoundingRect;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    // Thread-safe state
+    let memory_tracker = Mutex::new(match config.memory_budget {
+        Some(budget) => MemoryTracker::with_budget(budget),
+        None => MemoryTracker::new(),
+    });
+
+    let global_bounds = Mutex::new(TileBounds::empty());
+    let global_feature_index = AtomicU64::new(0);
+    let _total_row_groups = get_row_group_count(input_path).unwrap_or(1);
+
+    // GeometryStore for single-copy storage
+    let geometry_store = Mutex::new(
+        GeometryStore::new()
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to create geometry store: {}", e)))?,
+    );
+
+    // TileRefSorter (10× smaller records than TileFeatureRecord)
+    let sort_buffer_size = 1_000_000; // Can use 10× larger buffer with same memory
+    let sorter = Mutex::new(TileRefSorter::new(sort_buffer_size));
+
+    const TILE_REF_OVERHEAD: usize = 48; // TileRef size with padding
+
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::PhaseStart {
+            phase: 1,
+            name: "Reading GeoParquet (GeometryStore mode)",
+        });
+    }
+    if !config.quiet {
+        tracing::info!("Phase 1: Reading GeoParquet with GeometryStore (memory-efficient)");
+    }
+
+    let refs_written = AtomicU64::new(0);
+    let geoms_stored = AtomicU64::new(0);
+
+    // Phase 1: Read geometries, store once, create TileRefs
+    process_geometries_parallel(
+        input_path,
+        DEFAULT_PARALLEL_READERS,
+        |_rg_info, geometries| {
+            let mut sorted = geometries;
+            sort_geometries(&mut sorted, config.use_hilbert);
+
+            let num_geoms = sorted.len();
+            let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
+
+            for (geom_idx, geom) in sorted.into_iter().enumerate() {
+                let feat_idx = base_feat_idx + geom_idx as u64;
+
+                // Get bounding box
+                let geom_bbox = match geom.bounding_rect() {
+                    Some(rect) => {
+                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
+                    }
+                    None => continue,
+                };
+
+                global_bounds.lock().unwrap().expand(&geom_bbox);
+
+                // Store geometry ONCE (not per tile)
+                let wkb = geometry_to_wkb(&geom)
+                    .map_err(|e| Error::PMTilesWrite(format!("WKB encode: {}", e)))?;
+                let properties = vec![]; // TODO: Extract actual properties
+
+                let geometry_handle = {
+                    let mut store = geometry_store.lock().unwrap();
+                    store
+                        .append(&wkb, &properties)
+                        .map_err(|e| Error::PMTilesWrite(format!("GeometryStore append: {}", e)))?
+                };
+
+                geoms_stored.fetch_add(1, Ordering::Relaxed);
+
+                // Calculate tiles across ALL zoom levels
+                let mut tiles = Vec::new();
+                for z in config.min_zoom..=config.max_zoom {
+                    tiles.extend(crate::tile::tiles_for_bbox(&geom_bbox, z));
+                }
+
+                // Create lightweight TileRef for each tile
+                for tile_coord in tiles {
+                    let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
+
+                    let tile_ref = TileRef::new(
+                        tid,
+                        tile_coord.z,
+                        tile_coord.x,
+                        tile_coord.y,
+                        feat_idx,
+                        geometry_handle,
+                    );
+
+                    let mut sorter_guard = sorter.lock().unwrap();
+                    let mut tracker_guard = memory_tracker.lock().unwrap();
+                    tracker_guard.add(TILE_REF_OVERHEAD);
+                    sorter_guard.add(tile_ref);
+                    refs_written.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            Ok(())
+        },
+    )?;
+
+    // Flush geometry store
+    geometry_store
+        .lock()
+        .unwrap()
+        .flush()
+        .map_err(|e| Error::PMTilesWrite(format!("GeometryStore flush: {}", e)))?;
+
+    if !config.quiet {
+        tracing::info!(
+            "Phase 1 complete: {} geometries stored, {} tile refs created",
+            geoms_stored.load(Ordering::Relaxed),
+            refs_written.load(Ordering::Relaxed)
+        );
+    }
+
+    // Phase 2: Sort TileRefs
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase2Start);
+    }
+    if !config.quiet {
+        tracing::info!(
+            "Phase 2: Sorting {} tile refs",
+            refs_written.load(Ordering::Relaxed)
+        );
+    }
+
+    let sorted_iter = sorter
+        .into_inner()
+        .unwrap()
+        .sort()
+        .map_err(|e| Error::PMTilesWrite(format!("TileRef sort failed: {}", e)))?;
+
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase2Complete);
+    }
+
+    // Phase 3: Lazy clip and encode
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::PhaseStart {
+            phase: 3,
+            name: "Encoding tiles (lazy clipping)",
+        });
+    }
+    if !config.quiet {
+        tracing::info!("Phase 3: Encoding tiles with lazy clipping");
+    }
+
+    use crate::clip::clip_geometry;
+    use crate::mvt::{LayerBuilder, TileBuilder};
+    use crate::wkb::wkb_to_geometry;
+    use prost::Message;
+
+    let mut store = geometry_store.into_inner().unwrap();
+    let mut current_tile_id: Option<u64> = None;
+    let mut current_tile_coords: Option<(u8, u32, u32)> = None; // (z, x, y)
+    let mut current_tile_features: Vec<geo::Geometry<f64>> = Vec::new();
+    let mut tiles_encoded = 0u64;
+
+    for tile_ref_result in sorted_iter {
+        let tile_ref = tile_ref_result
+            .map_err(|e| Error::PMTilesWrite(format!("TileRef iteration: {}", e)))?;
+
+        // Encode previous tile when tile_id changes
+        if let Some((prev_z, prev_x, prev_y)) = current_tile_coords {
+            if current_tile_id != Some(tile_ref.tile_id) {
+                if !current_tile_features.is_empty() {
+                    let tile_coord = crate::tile::TileCoord {
+                        z: prev_z,
+                        x: prev_x,
+                        y: prev_y,
+                    };
+                    let tile_bounds = tile_coord.bounds();
+                    let mut layer =
+                        LayerBuilder::new(&config.layer_name).with_extent(config.extent);
+
+                    for geom in &current_tile_features {
+                        layer.add_feature(
+                            None, // no feature ID
+                            geom,
+                            &[], // no properties
+                            &tile_bounds,
+                        );
+                    }
+
+                    let built_layer = layer.build();
+                    let mut tile_builder = TileBuilder::new();
+                    tile_builder.add_layer(built_layer);
+                    let tile = tile_builder.build();
+                    let encoded = tile.encode_to_vec();
+
+                    writer
+                        .add_tile(prev_z, prev_x, prev_y, &encoded)
+                        .map_err(|e| Error::PMTilesWrite(e.to_string()))?;
+
+                    tiles_encoded += 1;
+                    current_tile_features.clear();
+                }
+            }
+        }
+
+        current_tile_id = Some(tile_ref.tile_id);
+        current_tile_coords = Some((tile_ref.z, tile_ref.x, tile_ref.y));
+
+        // Lazy retrieval: read geometry from store
+        let (wkb, _props) = store
+            .read(tile_ref.geometry_handle)
+            .map_err(|e| Error::PMTilesWrite(format!("GeometryStore read: {}", e)))?;
+
+        let geom = wkb_to_geometry(&wkb).map_err(|e| Error::InvalidGeometry {
+            feature_id: tile_ref.feature_id as usize,
+            reason: format!("WKB decode: {}", e),
+        })?;
+
+        // Lazy clipping: clip NOW (not stored)
+        let tile_coord = crate::tile::TileCoord {
+            z: tile_ref.z,
+            x: tile_ref.x,
+            y: tile_ref.y,
+        };
+        let tile_bounds = tile_coord.bounds();
+
+        // Lazy clipping: always clip (no contains_rect check available yet)
+        // TODO: Add TileBounds::contains_rect for optimization (#117)
+        let buffer_degrees = config.buffer_pixels as f64 / config.extent as f64
+            * (tile_bounds.lng_max - tile_bounds.lng_min);
+        let clipped = clip_geometry(&geom, &tile_bounds, buffer_degrees).unwrap_or(geom);
+
+        current_tile_features.push(clipped);
+    }
+
+    // Encode final tile
+    if let Some((final_z, final_x, final_y)) = current_tile_coords {
+        if !current_tile_features.is_empty() {
+            let tile_coord = crate::tile::TileCoord {
+                z: final_z,
+                x: final_x,
+                y: final_y,
+            };
+            let tile_bounds = tile_coord.bounds();
+            let mut layer = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
+
+            for geom in &current_tile_features {
+                layer.add_feature(None, geom, &[], &tile_bounds);
+            }
+
+            let built_layer = layer.build();
+            let mut tile_builder = TileBuilder::new();
+            tile_builder.add_layer(built_layer);
+            let tile = tile_builder.build();
+            let encoded = tile.encode_to_vec();
+
+            writer
+                .add_tile(final_z, final_x, final_y, &encoded)
+                .map_err(|e| Error::PMTilesWrite(e.to_string()))?;
+
+            tiles_encoded += 1;
+        }
+    }
+
+    if !config.quiet {
+        tracing::info!("Phase 3 complete: {} tiles encoded", tiles_encoded);
+    }
+
+    let tracker = memory_tracker.into_inner().unwrap();
+    Ok(crate::memory::MemoryStats::from_tracker(&tracker))
 }
 
 /// Fast streaming mode: single file pass, stores clipped geometries per tile.
