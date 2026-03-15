@@ -1352,15 +1352,22 @@ fn generate_tiles_with_geometry_store_internal(
             .map_err(|e| Error::PMTilesWrite(format!("GeometryStore read: {}", e)))?;
         if records_processed % 10000 == 0 {
             eprintln!(
-                "[DEBUG] GeometryStore read complete (ref #{})",
-                records_processed
+                "[DEBUG] GeometryStore read complete (ref #{}), WKB size: {} bytes",
+                records_processed,
+                wkb.len()
             );
         }
 
+        if records_processed % 10000 == 0 {
+            eprintln!("[DEBUG] About to decode WKB (ref #{})", records_processed);
+        }
         let geom = wkb_to_geometry(&wkb).map_err(|e| Error::InvalidGeometry {
             feature_id: tile_ref.feature_id as usize,
             reason: format!("WKB decode: {}", e),
         })?;
+        if records_processed % 10000 == 0 {
+            eprintln!("[DEBUG] WKB decode complete (ref #{})", records_processed);
+        }
 
         // Lazy clipping: clip NOW (not stored)
         let tile_coord = crate::tile::TileCoord {
@@ -1374,7 +1381,17 @@ fn generate_tiles_with_geometry_store_internal(
         // TODO: Add TileBounds::contains_rect for optimization (#117)
         let buffer_degrees = config.buffer_pixels as f64 / config.extent as f64
             * (tile_bounds.lng_max - tile_bounds.lng_min);
+
+        if records_processed % 10000 == 0 {
+            eprintln!(
+                "[DEBUG] About to clip geometry (ref #{}, tile z={} x={} y={})",
+                records_processed, tile_ref.z, tile_ref.x, tile_ref.y
+            );
+        }
         let clipped = clip_geometry(&geom, &tile_bounds, buffer_degrees).unwrap_or(geom);
+        if records_processed % 10000 == 0 {
+            eprintln!("[DEBUG] Clipping complete (ref #{})", records_processed);
+        }
 
         current_tile_features.push(clipped);
     }
