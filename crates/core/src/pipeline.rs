@@ -1088,9 +1088,31 @@ fn generate_tiles_with_geometry_store_internal(
 
                 geoms_stored.fetch_add(1, Ordering::Relaxed);
 
-                // Calculate tiles across ALL zoom levels
+                // Calculate effective zoom range for this feature (zoom-by-area)
+                let (effective_min_zoom, effective_max_zoom) = if config.zoom_by_area {
+                    let (feature_min_zoom, feature_max_zoom) =
+                        crate::hierarchical_clip::zoom_range_for_bbox(
+                            &geom_bbox,
+                            config.min_pixel_area,
+                            config.max_tile_threshold,
+                        );
+                    // Clamp to configured zoom range
+                    (
+                        feature_min_zoom.max(config.min_zoom),
+                        feature_max_zoom.min(config.max_zoom),
+                    )
+                } else {
+                    (config.min_zoom, config.max_zoom)
+                };
+
+                // Skip features outside effective zoom range
+                if effective_min_zoom > effective_max_zoom {
+                    continue;
+                }
+
+                // Calculate tiles across EFFECTIVE zoom levels (not all)
                 let mut tiles = Vec::new();
-                for z in config.min_zoom..=config.max_zoom {
+                for z in effective_min_zoom..=effective_max_zoom {
                     tiles.extend(crate::tile::tiles_for_bbox(&geom_bbox, z));
                 }
 
