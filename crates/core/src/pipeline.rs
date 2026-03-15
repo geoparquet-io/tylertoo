@@ -1171,6 +1171,17 @@ fn generate_tiles_with_geometry_store_internal(
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Start);
     }
+
+    eprintln!(
+        "[DEBUG] Phase 2 START: About to sort {} tile refs",
+        total_refs
+    );
+    eprintln!(
+        "[DEBUG] TileRef size: {} bytes, Total memory for refs: {:.2} MB",
+        crate::tile_ref::TileRef::SIZE,
+        (total_refs as f64 * crate::tile_ref::TileRef::SIZE as f64) / 1_000_000.0
+    );
+
     if !config.quiet {
         tracing::info!(
             "Phase 2: Sorting {} tile refs (external merge sort)",
@@ -1178,11 +1189,21 @@ fn generate_tiles_with_geometry_store_internal(
         );
     }
 
+    let sort_start = std::time::Instant::now();
+    eprintln!("[DEBUG] Calling sorter.sort()...");
+
     let sorted_iter = sorter
         .into_inner()
         .unwrap()
         .sort()
         .map_err(|e| Error::PMTilesWrite(format!("TileRef sort failed: {}", e)))?;
+
+    let sort_elapsed = sort_start.elapsed();
+    eprintln!(
+        "[DEBUG] sorter.sort() returned in {:.2}s (iterator created)",
+        sort_elapsed.as_secs_f64()
+    );
+    eprintln!("[DEBUG] Starting to consume sorted iterator...");
 
     // Phase 3: Lazy clip and encode
     if let Some(ref cb) = progress {
@@ -1212,12 +1233,32 @@ fn generate_tiles_with_geometry_store_internal(
     for tile_ref_result in sorted_iter {
         records_processed += 1;
 
+        // Debug: First ref
+        if records_processed == 1 {
+            eprintln!(
+                "[DEBUG] First sorted ref retrieved at {:.2}s",
+                last_sort_progress.elapsed().as_secs_f64()
+            );
+        }
+
         // Report Phase 2 complete after first batch of sorted refs (sort has started streaming)
         if !sort_complete_reported && records_processed >= 10000 {
+            eprintln!("[DEBUG] Retrieved 10K sorted refs, marking Phase 2 complete");
             if let Some(ref cb) = progress {
                 cb(ProgressEvent::Phase2Complete);
             }
             sort_complete_reported = true;
+        }
+
+        // Debug output every 50K refs AND every 5 seconds
+        if records_processed % 50000 == 0 {
+            eprintln!(
+                "[DEBUG] Processed {}/{} sorted refs ({:.1}%) - {:.2}s elapsed",
+                records_processed,
+                total_refs,
+                (records_processed as f64 / total_refs as f64) * 100.0,
+                last_sort_progress.elapsed().as_secs_f64()
+            );
         }
 
         // Log sort progress every 100K refs or 5 seconds
