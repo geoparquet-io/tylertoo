@@ -1035,12 +1035,26 @@ fn generate_tiles_with_geometry_store_internal(
 
     let refs_written = AtomicU64::new(0);
     let geoms_stored = AtomicU64::new(0);
+    let row_groups_completed = AtomicU64::new(0);
 
     // Phase 1: Read geometries, store once, create TileRefs
     process_geometries_parallel(
         input_path,
         DEFAULT_PARALLEL_READERS,
-        |_rg_info, geometries| {
+        |rg_info, geometries| {
+            let features_in_group = geometries.len();
+
+            // Track completed row groups (may arrive out of order due to parallel reads)
+            let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
+
+            if let Some(ref cb) = progress {
+                cb(ProgressEvent::Phase1Progress {
+                    row_group: completed as usize,
+                    total_row_groups: _total_row_groups,
+                    features_in_group,
+                    records_written: geoms_stored.load(Ordering::Relaxed),
+                });
+            }
             let mut sorted = geometries;
             sort_geometries(&mut sorted, config.use_hilbert);
 
@@ -1112,10 +1126,19 @@ fn generate_tiles_with_geometry_store_internal(
         .flush()
         .map_err(|e| Error::PMTilesWrite(format!("GeometryStore flush: {}", e)))?;
 
+    let total_geoms = geoms_stored.load(Ordering::Relaxed);
+    let peak_memory = memory_tracker.lock().unwrap().peak();
+
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase1Complete {
+            total_records: total_geoms,
+            peak_memory_bytes: peak_memory,
+        });
+    }
     if !config.quiet {
         tracing::info!(
             "Phase 1 complete: {} geometries stored, {} tile refs created",
-            geoms_stored.load(Ordering::Relaxed),
+            total_geoms,
             refs_written.load(Ordering::Relaxed)
         );
     }
@@ -1162,6 +1185,7 @@ fn generate_tiles_with_geometry_store_internal(
     let mut current_tile_coords: Option<(u8, u32, u32)> = None; // (z, x, y)
     let mut current_tile_features: Vec<geo::Geometry<f64>> = Vec::new();
     let mut tiles_encoded = 0u64;
+    let mut records_processed = 0u64;
 
     for tile_ref_result in sorted_iter {
         let tile_ref = tile_ref_result
@@ -1200,6 +1224,18 @@ fn generate_tiles_with_geometry_store_internal(
                         .map_err(|e| Error::PMTilesWrite(e.to_string()))?;
 
                     tiles_encoded += 1;
+
+                    // Report progress every 1000 tiles
+                    if let Some(ref cb) = progress {
+                        if tiles_encoded % 1000 == 0 {
+                            cb(ProgressEvent::Phase3Progress {
+                                tiles_written: tiles_encoded,
+                                records_processed,
+                                total_records: total_geoms,
+                            });
+                        }
+                    }
+
                     current_tile_features.clear();
                 }
             }
@@ -1233,6 +1269,7 @@ fn generate_tiles_with_geometry_store_internal(
         let clipped = clip_geometry(&geom, &tile_bounds, buffer_degrees).unwrap_or(geom);
 
         current_tile_features.push(clipped);
+        records_processed += 1;
     }
 
     // Encode final tile
@@ -1268,6 +1305,15 @@ fn generate_tiles_with_geometry_store_internal(
         tracing::info!("Phase 3 complete: {} tiles encoded", tiles_encoded);
     }
 
+    // Final progress update
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase3Progress {
+            tiles_written: tiles_encoded,
+            records_processed,
+            total_records: total_geoms,
+        });
+    }
+
     let tracker = memory_tracker.into_inner().unwrap();
     Ok(crate::memory::MemoryStats::from_tracker(&tracker))
 }
@@ -1283,6 +1329,7 @@ fn generate_tiles_with_geometry_store_internal(
 ///
 /// Memory usage: O(sort_buffer_size) - configurable, typically 100K-1M records
 /// This is the only tile generation algorithm - geometry-centric with external sort.
+#[allow(dead_code)]
 fn generate_tiles_to_writer_internal(
     input_path: &Path,
     config: &TilerConfig,
