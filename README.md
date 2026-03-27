@@ -34,6 +34,23 @@ pip install gpq-tiles      # Python
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
 
+### Recommended Settings
+
+For most datasets, use `--drop-densest-as-needed` to avoid bloated output and improve performance:
+
+```bash
+gpq-tiles input.parquet output.pmtiles \
+  --min-zoom 0 --max-zoom 14 \
+  --drop-densest-as-needed
+```
+
+Without dropping, every feature appears at every zoom level, which:
+- Creates massive output files (often larger than input!)
+- Takes much longer to encode
+- Produces unusable tiles (millions of invisible features at z0)
+
+With dropping, features are intelligently thinned at lower zooms where they'd be too dense to render anyway.
+
 ### Large File Processing (100GB+)
 
 gpq-tiles handles datasets larger than available RAM using disk-backed external sorting and spatial bucketing. For files over 10GB, this kicks in automatically:
