@@ -4735,4 +4735,128 @@ mod tracing_tests {
 
         let _ = fs::remove_file(output_path);
     }
+
+    // ============================================================
+    // Memory-bounded processing tests
+    // ============================================================
+
+    #[test]
+    fn test_processing_mode_default_is_in_memory() {
+        let mode = ProcessingMode::default();
+        assert_eq!(mode, ProcessingMode::InMemory);
+    }
+
+    #[test]
+    fn test_processing_mode_bucketed_equality() {
+        let mode1 = ProcessingMode::Bucketed {
+            num_buckets: Some(16),
+        };
+        let mode2 = ProcessingMode::Bucketed {
+            num_buckets: Some(16),
+        };
+        let mode3 = ProcessingMode::Bucketed {
+            num_buckets: Some(32),
+        };
+        let mode4 = ProcessingMode::Bucketed { num_buckets: None };
+
+        assert_eq!(mode1, mode2);
+        assert_ne!(mode1, mode3);
+        assert_ne!(mode1, mode4);
+    }
+
+    #[test]
+    fn test_auto_bucket_count_small_file() {
+        // 100MB file -> minimum 16 buckets
+        let count = auto_bucket_count(100 * 1024 * 1024);
+        assert_eq!(count, 16, "Small files should use minimum bucket count");
+    }
+
+    #[test]
+    fn test_auto_bucket_count_1gb_file() {
+        // 1GB file -> ~2-3 buckets based on 400MB target, clamped to 16
+        let count = auto_bucket_count(1024 * 1024 * 1024);
+        assert_eq!(count, 16, "1GB file should use minimum bucket count");
+    }
+
+    #[test]
+    fn test_auto_bucket_count_10gb_file() {
+        // 10GB file -> ~25 buckets based on 400MB target, but minimum is 16
+        let count = auto_bucket_count(10 * 1024 * 1024 * 1024);
+        assert_eq!(count, 25, "10GB file should use ~25 buckets");
+    }
+
+    #[test]
+    fn test_auto_bucket_count_100gb_file() {
+        // 100GB file -> ~256 buckets based on 400MB target
+        let count = auto_bucket_count(100 * 1024 * 1024 * 1024);
+        assert_eq!(count, 256, "100GB file should use ~256 buckets");
+    }
+
+    #[test]
+    fn test_auto_bucket_count_1tb_file() {
+        // 1TB file -> capped at 1024 buckets
+        let count = auto_bucket_count(1024 * 1024 * 1024 * 1024);
+        assert_eq!(count, 1024, "Very large files should cap at 1024 buckets");
+    }
+
+    #[test]
+    fn test_auto_processing_mode_small_file() {
+        // 5GB file -> InMemory
+        let mode = auto_processing_mode(5 * 1024 * 1024 * 1024);
+        assert_eq!(mode, ProcessingMode::InMemory);
+    }
+
+    #[test]
+    fn test_auto_processing_mode_at_threshold() {
+        // Exactly 10GB -> Bucketed
+        let mode = auto_processing_mode(10 * 1024 * 1024 * 1024);
+        assert_eq!(mode, ProcessingMode::Bucketed { num_buckets: None });
+    }
+
+    #[test]
+    fn test_auto_processing_mode_large_file() {
+        // 50GB file -> Bucketed
+        let mode = auto_processing_mode(50 * 1024 * 1024 * 1024);
+        assert_eq!(mode, ProcessingMode::Bucketed { num_buckets: None });
+    }
+
+    #[test]
+    fn test_auto_processing_mode_just_under_threshold() {
+        // 9.99GB -> InMemory
+        let mode = auto_processing_mode(10 * 1024 * 1024 * 1024 - 1);
+        assert_eq!(mode, ProcessingMode::InMemory);
+    }
+
+    #[test]
+    fn test_tiler_config_with_processing_mode() {
+        let config = TilerConfig::new(0, 14).with_processing_mode(ProcessingMode::Bucketed {
+            num_buckets: Some(32),
+        });
+
+        assert_eq!(
+            config.processing_mode,
+            ProcessingMode::Bucketed {
+                num_buckets: Some(32)
+            }
+        );
+    }
+
+    #[test]
+    fn test_tiler_config_with_spatial_filter() {
+        use crate::tile::TileBounds;
+
+        let bounds = TileBounds {
+            lng_min: -122.5,
+            lat_min: 37.5,
+            lng_max: -122.0,
+            lat_max: 38.0,
+        };
+
+        let config = TilerConfig::new(0, 14).with_spatial_filter(bounds);
+
+        assert!(config.spatial_filter.is_some());
+        let filter = config.spatial_filter.unwrap();
+        assert_eq!(filter.lng_min, -122.5);
+        assert_eq!(filter.lat_max, 38.0);
+    }
 }
