@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use gpq_tiles_core::batch_processor::total_parquet_size;
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::parse_bounds;
 use gpq_tiles_core::pipeline::{
@@ -431,8 +432,8 @@ fn main() -> Result<()> {
     }
 
     // Configure processing mode (auto-tuned or explicit buckets)
-    // Get file size to determine if bucketing should be auto-enabled
-    let file_size = std::fs::metadata(&args.input).map(|m| m.len()).unwrap_or(0);
+    // Get total parquet size (handles both files and directories)
+    let file_size = total_parquet_size(&args.input);
 
     if let Some(num_buckets) = args.buckets {
         // Explicit bucket count

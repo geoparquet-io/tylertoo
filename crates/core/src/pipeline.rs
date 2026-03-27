@@ -1173,8 +1173,9 @@ fn generate_tiles_to_writer_internal(
     let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
 
     // Phase 1: Read GeoParquet, clip geometries, write to sorter(s)
-    // Buffer size: 100K records is ~50-100MB depending on geometry complexity
-    let sort_buffer_size = 100_000;
+    // Buffer size per bucket: 1M records is ~500MB-1GB depending on geometry complexity
+    // This limits segments to ~50-100 per bucket for billion-record datasets
+    let sort_buffer_size = 1_000_000;
 
     // Determine processing mode and create appropriate sorter structure
     // For bucketed mode, get file size and calculate bucket count
@@ -1191,12 +1192,10 @@ fn generate_tiles_to_writer_internal(
     };
 
     // Create array of sorters (1 for InMemory, N for Bucketed)
+    // Each bucket gets full buffer size - memory is bounded because buckets
+    // flush to disk independently when their buffer fills
     let sorters: Vec<Mutex<TileFeatureSorter>> = (0..num_buckets)
-        .map(|_| {
-            Mutex::new(TileFeatureSorter::new(
-                sort_buffer_size / num_buckets.max(1),
-            ))
-        })
+        .map(|_| Mutex::new(TileFeatureSorter::new(sort_buffer_size)))
         .collect();
 
     if num_buckets > 1 && !config.quiet {

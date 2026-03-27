@@ -20,6 +20,28 @@ use crate::tile::TileBounds;
 use crate::{Error, Result};
 use std::collections::HashMap;
 
+/// Calculate total size of parquet data at a path.
+///
+/// For a single file, returns its size. For a directory, sums all .parquet files.
+/// Used for auto-tuning memory-bounded processing mode.
+pub fn total_parquet_size(path: &Path) -> u64 {
+    if path.is_file() {
+        return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    }
+
+    if path.is_dir() {
+        let mut files = Vec::new();
+        if collect_parquet_files(path, &mut files).is_ok() {
+            return files
+                .iter()
+                .map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+                .sum();
+        }
+    }
+
+    0
+}
+
 /// Resolve a path to a list of parquet files.
 ///
 /// If the path is a file, returns it as a single-element vector.

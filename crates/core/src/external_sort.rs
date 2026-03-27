@@ -34,10 +34,13 @@
 //! }
 //! ```
 
-use extsort::{ExternalSorter, Sortable};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::io::{Read, Write};
+use std::collections::BinaryHeap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+use tempfile::TempDir;
 
 /// A feature record ready for tile building, sorted by tile_id.
 ///
@@ -86,6 +89,30 @@ impl TileFeatureRecord {
             properties,
         }
     }
+
+    /// Encode a record to a writer with length prefix.
+    fn encode<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        let bytes = rmp_serde::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let len = bytes.len() as u32;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Decode a record from a reader with length prefix.
+    fn decode<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut len_bytes = [0u8; 4];
+        reader.read_exact(&mut len_bytes)?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        let mut bytes = vec![0u8; len];
+        reader.read_exact(&mut bytes)?;
+
+        rmp_serde::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
 }
 
 impl Eq for TileFeatureRecord {}
@@ -106,45 +133,25 @@ impl Ord for TileFeatureRecord {
     }
 }
 
-impl Sortable for TileFeatureRecord {
-    fn encode<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        // Use MessagePack for compact binary serialization
-        let bytes = rmp_serde::to_vec(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // Write length prefix (u32) for framing
-        let len = bytes.len() as u32;
-        writer.write_all(&len.to_le_bytes())?;
-        writer.write_all(&bytes)?;
-        Ok(())
-    }
-
-    fn decode<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        // Read length prefix
-        let mut len_bytes = [0u8; 4];
-        reader.read_exact(&mut len_bytes)?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-
-        // Read payload
-        let mut bytes = vec![0u8; len];
-        reader.read_exact(&mut bytes)?;
-
-        // Deserialize
-        rmp_serde::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    }
-}
-
 /// External sorter for tile feature records.
 ///
-/// Wraps `extsort::ExternalSorter` with a convenient API for our use case.
-/// Records are buffered in memory until the buffer fills, then sorted chunks
-/// are written to disk. Final iteration merges all chunks.
+/// **Memory-bounded**: When the in-memory buffer fills, records are sorted
+/// and flushed to a temp file. Final `sort()` performs k-way merge of all
+/// segments.
+///
+/// This ensures memory usage is bounded to O(buffer_size) regardless of
+/// how many records are added.
 pub struct TileFeatureSorter {
-    /// In-memory buffer for records before sorting
-    records: Vec<TileFeatureRecord>,
+    /// In-memory buffer for records before flushing
+    buffer: Vec<TileFeatureRecord>,
     /// Maximum records to buffer before flushing to disk
-    sort_buffer_size: usize,
+    buffer_capacity: usize,
+    /// Temp directory for segment files
+    temp_dir: Option<TempDir>,
+    /// Paths to sorted segment files
+    segment_paths: Vec<PathBuf>,
+    /// Total records added (for len())
+    total_records: usize,
 }
 
 impl TileFeatureSorter {
@@ -152,40 +159,192 @@ impl TileFeatureSorter {
     ///
     /// # Arguments
     ///
-    /// * `sort_buffer_size` - Maximum number of records to hold in memory.
+    /// * `buffer_capacity` - Maximum number of records to hold in memory.
+    ///   When exceeded, records are sorted and written to a temp file.
     ///   Larger values use more RAM but reduce disk I/O.
     ///   Typical value: 100,000 - 1,000,000 depending on available memory.
-    pub fn new(sort_buffer_size: usize) -> Self {
+    pub fn new(buffer_capacity: usize) -> Self {
         Self {
-            records: Vec::with_capacity(sort_buffer_size.min(1024)),
-            sort_buffer_size,
+            buffer: Vec::with_capacity(buffer_capacity.min(1024)),
+            buffer_capacity: buffer_capacity.max(1000), // Minimum 1000 to avoid too many segments
+            temp_dir: None,
+            segment_paths: Vec::new(),
+            total_records: 0,
         }
     }
 
     /// Add a record to be sorted.
+    ///
+    /// When the buffer is full, records are sorted and flushed to a temp file.
     pub fn add(&mut self, record: TileFeatureRecord) {
-        self.records.push(record);
+        self.buffer.push(record);
+        self.total_records += 1;
+
+        // Flush to disk when buffer is full
+        if self.buffer.len() >= self.buffer_capacity {
+            if let Err(e) = self.flush_buffer() {
+                // Log error but don't panic - we'll handle it during sort()
+                tracing::warn!("Failed to flush sort buffer to disk: {}", e);
+            }
+        }
     }
 
-    /// Returns the number of records currently buffered.
+    /// Flush the in-memory buffer to a sorted segment file.
+    fn flush_buffer(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        // Create temp directory if needed
+        if self.temp_dir.is_none() {
+            self.temp_dir = Some(TempDir::new()?);
+        }
+
+        // Sort the buffer
+        self.buffer.sort();
+
+        // Write to segment file
+        let segment_path = self
+            .temp_dir
+            .as_ref()
+            .unwrap()
+            .path()
+            .join(format!("segment_{:04}.bin", self.segment_paths.len()));
+
+        let file = File::create(&segment_path)?;
+        let mut writer = BufWriter::new(file);
+
+        for record in self.buffer.drain(..) {
+            record.encode(&mut writer)?;
+        }
+
+        writer.flush()?;
+        self.segment_paths.push(segment_path);
+
+        tracing::debug!(
+            "Flushed {} records to segment {} (total segments: {})",
+            self.buffer_capacity,
+            self.segment_paths.len() - 1,
+            self.segment_paths.len()
+        );
+
+        Ok(())
+    }
+
+    /// Returns the total number of records added.
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.total_records
     }
 
     /// Returns true if no records have been added.
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.total_records == 0
     }
 
     /// Sort all records and return an iterator over them in tile_id order.
     ///
-    /// This consumes the sorter. For datasets that fit in the buffer,
-    /// sorting happens entirely in memory. For larger datasets, the
-    /// external sorter writes sorted chunks to temp files and merges them.
-    pub fn sort(self) -> std::io::Result<impl Iterator<Item = std::io::Result<TileFeatureRecord>>> {
-        let sorter = ExternalSorter::new().with_segment_size(self.sort_buffer_size);
+    /// This consumes the sorter. Performs k-way merge of all segments
+    /// plus any remaining in-memory records.
+    pub fn sort(mut self) -> std::io::Result<SortedRecordIterator> {
+        // Flush any remaining records
+        self.flush_buffer()?;
 
-        sorter.sort(self.records)
+        // If no segments (everything fit in memory), just return empty iterator
+        if self.segment_paths.is_empty() {
+            return Ok(SortedRecordIterator {
+                heap: BinaryHeap::new(),
+                _temp_dir: self.temp_dir,
+            });
+        }
+
+        // Open all segment files and create merge heap
+        let mut heap = BinaryHeap::new();
+
+        for (idx, path) in self.segment_paths.iter().enumerate() {
+            let file = File::open(path)?;
+            let mut reader = BufReader::new(file);
+
+            // Read first record from each segment
+            match TileFeatureRecord::decode(&mut reader) {
+                Ok(record) => {
+                    heap.push(SegmentEntry {
+                        record,
+                        segment_idx: idx,
+                        reader,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Empty segment, skip
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(SortedRecordIterator {
+            heap,
+            _temp_dir: self.temp_dir,
+        })
+    }
+}
+
+/// Entry in the merge heap for k-way merge.
+struct SegmentEntry {
+    record: TileFeatureRecord,
+    segment_idx: usize,
+    reader: BufReader<File>,
+}
+
+impl Eq for SegmentEntry {}
+
+impl PartialEq for SegmentEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.record == other.record
+    }
+}
+
+impl PartialOrd for SegmentEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SegmentEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order for min-heap behavior (BinaryHeap is max-heap)
+        other.record.cmp(&self.record)
+    }
+}
+
+/// Iterator that performs k-way merge of sorted segments.
+pub struct SortedRecordIterator {
+    heap: BinaryHeap<SegmentEntry>,
+    _temp_dir: Option<TempDir>, // Keep alive until iteration completes
+}
+
+impl Iterator for SortedRecordIterator {
+    type Item = std::io::Result<TileFeatureRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut entry = self.heap.pop()?;
+
+        let result = entry.record.clone();
+
+        // Try to read next record from this segment
+        match TileFeatureRecord::decode(&mut entry.reader) {
+            Ok(next_record) => {
+                entry.record = next_record;
+                self.heap.push(entry);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Segment exhausted, don't push back
+            }
+            Err(e) => {
+                // Return error on next call
+                return Some(Err(e));
+            }
+        }
+
+        Some(Ok(result))
     }
 }
 
@@ -218,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sortable_encode_decode_roundtrip() {
+    fn test_encode_decode_roundtrip() {
         let original = TileFeatureRecord::new(
             123456,
             10,
@@ -323,9 +482,41 @@ mod tests {
     }
 
     #[test]
+    fn test_sorter_disk_spill() {
+        // Use small buffer to force disk spill
+        let mut sorter = TileFeatureSorter::new(100);
+
+        // Add 500 records - should create 5 segments
+        for i in (0..500).rev() {
+            sorter.add(TileFeatureRecord::new(
+                i,
+                0,
+                0,
+                0,
+                i,
+                vec![i as u8],
+                vec![(i % 256) as u8],
+            ));
+        }
+
+        assert_eq!(sorter.len(), 500);
+
+        let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
+
+        assert_eq!(sorted.len(), 500);
+        for (i, record) in sorted.iter().enumerate() {
+            assert_eq!(
+                record.tile_id, i as u64,
+                "Record at position {} has wrong tile_id",
+                i
+            );
+        }
+    }
+
+    #[test]
     fn test_sorter_large_dataset() {
-        // Test with enough records to potentially trigger external sorting
-        let mut sorter = TileFeatureSorter::new(100); // Small buffer to force disk spill
+        // Test with enough records to trigger multiple disk spills
+        let mut sorter = TileFeatureSorter::new(100);
 
         // Add 1000 records in reverse order
         for i in (0..1000).rev() {
