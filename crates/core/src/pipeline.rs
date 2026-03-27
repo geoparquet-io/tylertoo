@@ -1172,10 +1172,40 @@ fn generate_tiles_to_writer_internal(
     // Get total row group count for progress tracking
     let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
 
-    // Phase 1: Read GeoParquet, clip geometries, write to sorter
+    // Phase 1: Read GeoParquet, clip geometries, write to sorter(s)
     // Buffer size: 100K records is ~50-100MB depending on geometry complexity
     let sort_buffer_size = 100_000;
-    let sorter = Mutex::new(TileFeatureSorter::new(sort_buffer_size));
+
+    // Determine processing mode and create appropriate sorter structure
+    // For bucketed mode, get file size and calculate bucket count
+    let file_size = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
+    let (num_buckets, shift_bits) = match &config.processing_mode {
+        ProcessingMode::InMemory => (1, 0u8), // Single bucket = in-memory mode
+        ProcessingMode::Bucketed { num_buckets } => {
+            let n = num_buckets.unwrap_or_else(|| auto_bucket_count(file_size));
+            // Shift bits: we use high bits of tile_id for bucket routing
+            // tile_id is a 64-bit Hilbert index
+            let shift = 64 - (n.next_power_of_two().trailing_zeros() as u8);
+            (n, shift)
+        }
+    };
+
+    // Create array of sorters (1 for InMemory, N for Bucketed)
+    let sorters: Vec<Mutex<TileFeatureSorter>> = (0..num_buckets)
+        .map(|_| {
+            Mutex::new(TileFeatureSorter::new(
+                sort_buffer_size / num_buckets.max(1),
+            ))
+        })
+        .collect();
+
+    if num_buckets > 1 && !config.quiet {
+        tracing::info!(
+            "Using bucketed mode: {} buckets (shift_bits={})",
+            num_buckets,
+            shift_bits
+        );
+    }
 
     // TileFeatureRecord fixed overhead: tile_id(8) + z(1) + x(4) + y(4) + feature_id(8) = 25 bytes
     const RECORD_FIXED_OVERHEAD: usize = 25;
@@ -1455,15 +1485,22 @@ fn generate_tiles_to_writer_internal(
                     global_bounds.lock().unwrap().expand(&bounds);
                 }
 
-                // Add records to sorter
+                // Add records to sorter(s)
+                // For bucketed mode, route by high bits of tile_id
                 let sorter_start = std::time::Instant::now();
                 {
-                    let mut sorter_guard = sorter.lock().unwrap();
                     let mut tracker_guard = memory_tracker.lock().unwrap();
                     for record in result.records {
                         let record_size = RECORD_FIXED_OVERHEAD + record.geometry_wkb.len();
                         tracker_guard.add(record_size);
-                        sorter_guard.add(record);
+
+                        // Route to bucket by tile_id high bits
+                        let bucket_idx = if num_buckets == 1 {
+                            0
+                        } else {
+                            ((record.tile_id >> shift_bits) as usize) % num_buckets
+                        };
+                        sorters[bucket_idx].lock().unwrap().add(record);
                         records_written.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1495,7 +1532,8 @@ fn generate_tiles_to_writer_internal(
     let phase1_peak = memory_tracker.lock().unwrap().peak();
     memory_tracker.lock().unwrap().reset_current();
 
-    let total_records = sorter.lock().unwrap().len() as u64;
+    // Count total records across all buckets
+    let total_records: u64 = sorters.iter().map(|s| s.lock().unwrap().len() as u64).sum();
 
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase1Complete {
@@ -1515,19 +1553,49 @@ fn generate_tiles_to_writer_internal(
     drop(_phase1_span);
 
     // Phase 2: Sort by tile_id (external merge sort)
+    // For bucketed mode, we process each bucket sequentially
     let _phase2_span = tracing::info_span!("sort").entered();
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Start);
     }
     if !config.quiet {
-        tracing::info!("Phase 2: External merge sort by tile_id");
+        if num_buckets > 1 {
+            tracing::info!("Phase 2+3: Processing {} buckets sequentially", num_buckets);
+        } else {
+            tracing::info!("Phase 2: External merge sort by tile_id");
+        }
     }
 
-    let sorted_iter = sorter
-        .into_inner()
-        .unwrap()
-        .sort()
-        .map_err(|e| Error::PMTilesWrite(format!("External sort failed: {}", e)))?;
+    // Convert sorters to owned (we'll consume them one by one)
+    let bucket_sorters: Vec<TileFeatureSorter> = sorters
+        .into_iter()
+        .map(|s| s.into_inner().unwrap())
+        .collect();
+
+    // Create iterators for each bucket (sorted)
+    // We'll chain them together - buckets are processed in order
+    // Since buckets partition by Hilbert high bits, records within a bucket
+    // are already spatially coherent
+    let mut sorted_iters: Vec<_> = Vec::with_capacity(bucket_sorters.len());
+    for (bucket_idx, bucket_sorter) in bucket_sorters.into_iter().enumerate() {
+        let bucket_records = bucket_sorter.len();
+        if bucket_records > 0 && !config.quiet && num_buckets > 1 {
+            tracing::debug!(
+                "Bucket {}/{}: {} records",
+                bucket_idx + 1,
+                num_buckets,
+                bucket_records
+            );
+        }
+        let iter = bucket_sorter.sort().map_err(|e| {
+            Error::PMTilesWrite(format!("Bucket {} sort failed: {}", bucket_idx, e))
+        })?;
+        sorted_iters.push(iter);
+    }
+
+    // Chain all bucket iterators into one sequential iterator
+    // This preserves Hilbert ordering across buckets since buckets are ordered by high bits
+    let sorted_iter = sorted_iters.into_iter().flatten();
 
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase2Complete);
