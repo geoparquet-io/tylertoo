@@ -101,12 +101,18 @@ where
         let batch = batch_result
             .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        // Find geometry column by name
+        // Find geometry column by name (exact "geometry" match first, then fallback to *geom*)
         let schema = batch.schema();
         let geom_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+            .position(|f| f.name() == "geometry")
+            .or_else(|| {
+                schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().contains("geom"))
+            })
             .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
         let geom_col = batch.column(geom_idx);
@@ -374,12 +380,18 @@ where
                     .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?
             };
 
-            // Find geometry column by name
+            // Find geometry column by name (exact "geometry" match first, then fallback to *geom*)
             let schema = batch.schema();
             let geom_idx = schema
                 .fields()
                 .iter()
-                .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+                .position(|f| f.name() == "geometry")
+                .or_else(|| {
+                    schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name().contains("geom"))
+                })
                 .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
             let geom_col = batch.column(geom_idx);
@@ -571,7 +583,13 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
         let geom_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+            .position(|f| f.name() == "geometry")
+            .or_else(|| {
+                schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().contains("geom"))
+            })
             .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
         let geom_col = batch.column(geom_idx);
