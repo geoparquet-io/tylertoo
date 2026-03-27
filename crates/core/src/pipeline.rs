@@ -24,7 +24,7 @@ use geo::Geometry;
 
 use crate::accumulator::AccumulatorConfig;
 use crate::batch_processor::{
-    extract_field_metadata, extract_geometries, process_geometries_parallel, RowGroupInfo,
+    extract_field_metadata, extract_geometries, process_geometries_parallel_filtered, RowGroupInfo,
     DEFAULT_PARALLEL_READERS,
 };
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
@@ -140,6 +140,85 @@ fn should_drop_geometry(
 // NOTE: StreamingMode enum was removed in v0.4.0.
 // The pipeline now always uses the geometry-centric external sort algorithm,
 // which is both fast AND memory-bounded. See ADR-001 for rationale.
+
+/// Processing mode for tile generation.
+///
+/// Controls memory usage vs performance tradeoffs. For files under 10GB,
+/// `InMemory` mode is fast and simple. For larger files (100GB+), `Bucketed`
+/// mode bounds memory usage by partitioning records into spatial buckets.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ProcessingMode {
+    /// Fast in-memory processing (current default).
+    ///
+    /// Uses a single `TileFeatureSorter` that accumulates all records.
+    /// Memory: O(total_records). Best for files under ~10GB.
+    #[default]
+    InMemory,
+
+    /// Memory-bounded spatial bucketing.
+    ///
+    /// Partitions records into N buckets by Hilbert tile_id high bits.
+    /// Each bucket is processed sequentially, limiting peak memory.
+    /// Memory: O(bucket_size) instead of O(total_records).
+    ///
+    /// # Fields
+    ///
+    /// * `num_buckets` - Number of spatial partitions (auto-tuned if None)
+    Bucketed {
+        /// Number of spatial buckets. If None, auto-tuned based on file size.
+        num_buckets: Option<usize>,
+    },
+}
+
+impl ProcessingMode {
+    /// Create a bucketed processing mode with auto-tuned bucket count.
+    pub fn bucketed_auto() -> Self {
+        ProcessingMode::Bucketed { num_buckets: None }
+    }
+
+    /// Create a bucketed processing mode with explicit bucket count.
+    pub fn bucketed(num_buckets: usize) -> Self {
+        ProcessingMode::Bucketed {
+            num_buckets: Some(num_buckets),
+        }
+    }
+
+    /// Check if this mode uses bucketing.
+    pub fn is_bucketed(&self) -> bool {
+        matches!(self, ProcessingMode::Bucketed { .. })
+    }
+}
+
+/// Auto-calculate the number of buckets based on file size.
+///
+/// The formula aims for ~400MB per bucket:
+/// - 1GB file → 8 buckets
+/// - 10GB file → 64 buckets
+/// - 100GB file → 256 buckets
+///
+/// Bucket count is clamped to [16, 1024].
+pub fn auto_bucket_count(file_size_bytes: u64) -> usize {
+    // Target ~400MB per bucket for good memory bounds
+    const TARGET_BUCKET_SIZE: u64 = 400 * 1024 * 1024;
+
+    let size_based = (file_size_bytes / TARGET_BUCKET_SIZE).max(1) as usize;
+
+    // Clamp to reasonable range
+    size_based.clamp(16, 1024)
+}
+
+/// Determine if bucketed mode should be auto-enabled based on file size.
+///
+/// Returns `Bucketed` for files >= 10GB, `InMemory` otherwise.
+pub fn auto_processing_mode(file_size_bytes: u64) -> ProcessingMode {
+    const BUCKETING_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10GB
+
+    if file_size_bytes >= BUCKETING_THRESHOLD {
+        ProcessingMode::Bucketed { num_buckets: None }
+    } else {
+        ProcessingMode::InMemory
+    }
+}
 
 /// Configuration for the tiling pipeline.
 #[derive(Debug, Clone)]
@@ -271,6 +350,23 @@ pub struct TilerConfig {
     /// 4.0 = 2x2 pixel square (minimum perceptible size).
     /// Higher values = features appear later (less clutter at low zoom).
     pub min_pixel_area: f64,
+
+    /// Optional spatial filter for row group filtering.
+    ///
+    /// When set, row groups whose bounding boxes don't intersect this filter
+    /// are skipped entirely. This can dramatically reduce processing time
+    /// for bounded extracts (e.g., extracting a city from a country file).
+    ///
+    /// Accepts both WGS84 bbox (xmin,ymin,xmax,ymax) and tile coordinates (z/x/y).
+    pub spatial_filter: Option<TileBounds>,
+
+    /// Processing mode for memory management (default: auto-tuned).
+    ///
+    /// For files under ~10GB, uses fast in-memory processing.
+    /// For larger files, automatically switches to memory-bounded bucketing.
+    ///
+    /// Can be explicitly set to force a specific mode.
+    pub processing_mode: ProcessingMode,
 }
 
 impl Default for TilerConfig {
@@ -317,6 +413,10 @@ impl Default for TilerConfig {
             max_tile_threshold: 400,
             // Default: 4 sq pixels (2x2) for min zoom
             min_pixel_area: 4.0,
+            // No spatial filter by default - process all row groups
+            spatial_filter: None,
+            // In-memory mode by default (auto-tuning happens at runtime based on file size)
+            processing_mode: ProcessingMode::default(),
         }
     }
 }
@@ -613,6 +713,62 @@ impl TilerConfig {
     pub fn with_cluster_config(mut self, config: ClusterConfig) -> Self {
         self.cluster_config = Some(config);
         self
+    }
+
+    /// Set the spatial filter for row group filtering.
+    ///
+    /// When set, row groups whose bounding boxes don't intersect this filter
+    /// are skipped entirely. This can dramatically reduce processing time
+    /// for bounded extracts (e.g., extracting a city from a country file).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    /// use gpq_tiles_core::tile::TileBounds;
+    ///
+    /// // Filter to San Francisco area
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_spatial_filter(TileBounds {
+    ///         lng_min: -122.5,
+    ///         lat_min: 37.7,
+    ///         lng_max: -122.3,
+    ///         lat_max: 37.9,
+    ///     });
+    /// ```
+    pub fn with_spatial_filter(mut self, bounds: TileBounds) -> Self {
+        self.spatial_filter = Some(bounds);
+        self
+    }
+
+    /// Set the processing mode for memory management.
+    ///
+    /// For files under ~10GB, `ProcessingMode::InMemory` is fast and simple.
+    /// For larger files, `ProcessingMode::Bucketed` bounds memory usage.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::{TilerConfig, ProcessingMode};
+    ///
+    /// // Force bucketed mode with 256 buckets
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_processing_mode(ProcessingMode::bucketed(256));
+    ///
+    /// // Or let auto-tuning decide
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_processing_mode(ProcessingMode::bucketed_auto());
+    /// ```
+    pub fn with_processing_mode(mut self, mode: ProcessingMode) -> Self {
+        self.processing_mode = mode;
+        self
+    }
+
+    /// Enable auto-tuned bucketed processing mode.
+    ///
+    /// This is a convenience method for `.with_processing_mode(ProcessingMode::bucketed_auto())`.
+    pub fn with_bucketed_auto(self) -> Self {
+        self.with_processing_mode(ProcessingMode::bucketed_auto())
     }
 }
 
@@ -1042,9 +1198,11 @@ fn generate_tiles_to_writer_internal(
     // Use parallel row group reader for overlapped I/O and parallel decompression
     let _phase1_span = tracing::info_span!("read_parquet", path = %input_path.display()).entered();
 
-    process_geometries_parallel(
+    // Use spatial filter for row group filtering if configured
+    process_geometries_parallel_filtered(
         input_path,
         DEFAULT_PARALLEL_READERS,
+        config.spatial_filter,
         |rg_info: RowGroupInfo, geometries| {
             // Row group span for detailed tracing
             let _rg_span = tracing::info_span!(
@@ -2178,9 +2336,11 @@ pub fn generate_tiles_streaming_with_stats(
     let config_clone = config.clone();
 
     // Step 4: Process each row group independently with parallel I/O
-    process_geometries_parallel(
+    // Use spatial filter for row group filtering if configured
+    process_geometries_parallel_filtered(
         input_path,
         DEFAULT_PARALLEL_READERS,
+        config.spatial_filter,
         |rg_info: RowGroupInfo, geometries| {
             // Track memory for this row group
             let row_group_mem: usize = geometries.iter().map(estimate_geometry_size).sum();

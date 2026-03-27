@@ -5,8 +5,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use gpq_tiles_core::compression::Compression;
+use gpq_tiles_core::parse_bounds;
 use gpq_tiles_core::pipeline::{
-    generate_tiles_to_writer_with_progress, ProgressEvent, TilerConfig,
+    auto_processing_mode, generate_tiles_to_writer_with_progress, ProcessingMode, ProgressEvent,
+    TilerConfig,
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::validate_wgs84;
@@ -198,6 +200,28 @@ struct Args {
     /// This captures detailed span timing for all pipeline phases.
     #[arg(long, value_name = "FILE")]
     trace_output: Option<PathBuf>,
+
+    /// Spatial filter to skip row groups outside bounding box.
+    ///
+    /// Accepts either tile coordinates (z/x/y) or WGS84 bbox (xmin,ymin,xmax,ymax).
+    /// Row groups whose bounding boxes don't intersect this filter are skipped
+    /// entirely, which can dramatically reduce processing time for bounded extracts.
+    ///
+    /// Examples:
+    ///   --bounds 10/163/395           (tile coordinates for SF area)
+    ///   --bounds -122.5,37.7,-122.3,37.9  (WGS84 bbox)
+    #[arg(long, value_name = "BOUNDS")]
+    bounds: Option<String>,
+
+    /// Number of spatial buckets for memory-bounded processing.
+    ///
+    /// When processing large files (>10GB), the pipeline partitions records
+    /// into spatial buckets to bound memory usage. By default, bucket count
+    /// is auto-tuned based on file size. Use this flag to override.
+    ///
+    /// Typical values: 64 (small), 256 (medium), 1024 (large files).
+    #[arg(long, value_name = "N")]
+    buckets: Option<usize>,
 }
 
 impl Args {
@@ -399,6 +423,26 @@ fn main() -> Result<()> {
         tiler_config.min_pixel_area = args.min_pixel_area;
     }
 
+    // Configure spatial filter (--bounds) if specified
+    if let Some(ref bounds_str) = args.bounds {
+        let spatial_filter = parse_bounds(bounds_str)
+            .map_err(|e| anyhow::anyhow!("Invalid bounds '{}': {}", bounds_str, e))?;
+        tiler_config = tiler_config.with_spatial_filter(spatial_filter);
+    }
+
+    // Configure processing mode (auto-tuned or explicit buckets)
+    // Get file size to determine if bucketing should be auto-enabled
+    let file_size = std::fs::metadata(&args.input).map(|m| m.len()).unwrap_or(0);
+
+    if let Some(num_buckets) = args.buckets {
+        // Explicit bucket count
+        tiler_config = tiler_config.with_processing_mode(ProcessingMode::bucketed(num_buckets));
+    } else {
+        // Auto-tune based on file size (bucketing for files >= 10GB)
+        let mode = auto_processing_mode(file_size);
+        tiler_config = tiler_config.with_processing_mode(mode);
+    }
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -429,6 +473,24 @@ fn main() -> Result<()> {
                 "  Zoom by area: enabled (max_tiles={}, min_pixels={:.1})",
                 tiler_config.max_tile_threshold, tiler_config.min_pixel_area
             );
+        }
+        if let Some(ref filter) = tiler_config.spatial_filter {
+            eprintln!(
+                "  Spatial filter: [{:.4}, {:.4}, {:.4}, {:.4}]",
+                filter.lng_min, filter.lat_min, filter.lng_max, filter.lat_max
+            );
+        }
+        match &tiler_config.processing_mode {
+            ProcessingMode::InMemory => {
+                eprintln!("  Processing mode: in-memory");
+            }
+            ProcessingMode::Bucketed { num_buckets } => {
+                if let Some(n) = num_buckets {
+                    eprintln!("  Processing mode: bucketed ({} buckets)", n);
+                } else {
+                    eprintln!("  Processing mode: bucketed (auto-tuned)");
+                }
+            }
         }
         eprintln!();
     }

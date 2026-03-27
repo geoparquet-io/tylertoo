@@ -43,6 +43,7 @@ pub mod batch_processor;
 pub mod clip;
 pub mod clustering;
 pub mod compression;
+pub mod covering;
 pub mod dedup;
 pub mod external_sort;
 pub mod feature_drop;
@@ -81,6 +82,13 @@ pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 pub use pipeline::{ProgressCallback, ProgressEvent};
 // Re-export CRS validation for CLI usage
 pub use quality::{extract_crs, validate_wgs84, CrsInfo};
+// Re-export covering types for row group filtering
+pub use covering::{
+    extract_row_group_bounds, parse_bounds, parse_covering_metadata, tile_to_bounds, CoveringSpec,
+    RowGroupBounds,
+};
+// Re-export ProcessingMode for memory-bounded processing
+pub use pipeline::{auto_bucket_count, auto_processing_mode, ProcessingMode};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
@@ -96,6 +104,9 @@ pub enum Error {
 
     #[error("MVT encoding failed: {0}")]
     MvtEncoding(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
