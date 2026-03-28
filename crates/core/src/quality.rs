@@ -458,10 +458,17 @@ fn check_hilbert_sorted(path: &Path) -> Result<bool> {
 
         // Use our existing batch processor to extract geometries
         let schema = batch.schema();
+        // Prioritize exact "geometry" match, then fall back to columns containing "geom"
         let geom_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "geometry" || f.name().contains("geom"));
+            .position(|f| f.name() == "geometry")
+            .or_else(|| {
+                schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().contains("geom"))
+            });
 
         if let Some(idx) = geom_idx {
             let geom_col = batch.column(idx);

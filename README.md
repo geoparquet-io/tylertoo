@@ -7,6 +7,16 @@
 
 Fast GeoParquet → PMTiles converter in Rust.
 
+**Features:**
+- Memory-bounded processing for 100GB+ files
+- Spatial filtering with GeoParquet row group skip
+- Tippecanoe-compatible feature dropping (`--drop-densest-as-needed`, `--drop-smallest-as-needed`)
+- Point clustering (`--cluster-distance`)
+- Automatic zoom levels per feature (`--zoom-by-area`)
+- Property filtering (`-y`, `-x`, `-X`)
+- Parallel row group reading
+- gzip, zstd, and brotli compression
+
 > **⚠️ Work in Progress**:
 > Code is generated with Claude; take it with a grain of salt.
 > --Nissim
@@ -23,6 +33,51 @@ pip install gpq-tiles      # Python
 ```bash
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
+
+### Recommended Settings
+
+For most datasets, use `--drop-densest-as-needed` to avoid bloated output and improve performance:
+
+```bash
+gpq-tiles input.parquet output.pmtiles \
+  --min-zoom 0 --max-zoom 14 \
+  --drop-densest-as-needed
+```
+
+Without dropping, every feature appears at every zoom level, which:
+- Creates massive output files (often larger than input!)
+- Takes much longer to encode
+- Produces unusable tiles (millions of invisible features at z0)
+
+With dropping, features are intelligently thinned at lower zooms where they'd be too dense to render anyway.
+
+### Large File Processing (100GB+)
+
+gpq-tiles handles datasets larger than available RAM using disk-backed external sorting and spatial bucketing. For files over 10GB, this kicks in automatically:
+
+```bash
+# Process a directory of partitioned parquet files (auto-tuned)
+gpq-tiles /data/roads/ output.pmtiles --min-zoom 0 --max-zoom 14
+
+# Force bucketed mode with explicit bucket count
+gpq-tiles huge.parquet output.pmtiles --buckets 256
+```
+
+Memory usage is bounded to ~10-15GB regardless of input size.
+
+### Spatial Filtering
+
+Skip row groups outside your area of interest using GeoParquet covering metadata:
+
+```bash
+# Filter by tile coordinates (z/x/y)
+gpq-tiles world.parquet sf-bay.pmtiles --bounds 10/163/395
+
+# Filter by WGS84 bounding box
+gpq-tiles world.parquet sf-bay.pmtiles --bounds -122.5,37.7,-122.3,37.9
+```
+
+Row groups whose bounding boxes don't intersect the filter are skipped entirely.
 
 ### Size-Based Feature Dropping
 

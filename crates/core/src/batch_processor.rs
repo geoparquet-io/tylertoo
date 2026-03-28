@@ -15,9 +15,32 @@ use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::instrument;
 
+use crate::covering::{extract_row_group_bounds, RowGroupBounds};
 use crate::tile::TileBounds;
 use crate::{Error, Result};
 use std::collections::HashMap;
+
+/// Calculate total size of parquet data at a path.
+///
+/// For a single file, returns its size. For a directory, sums all .parquet files.
+/// Used for auto-tuning memory-bounded processing mode.
+pub fn total_parquet_size(path: &Path) -> u64 {
+    if path.is_file() {
+        return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    }
+
+    if path.is_dir() {
+        let mut files = Vec::new();
+        if collect_parquet_files(path, &mut files).is_ok() {
+            return files
+                .iter()
+                .map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+                .sum();
+        }
+    }
+
+    0
+}
 
 /// Resolve a path to a list of parquet files.
 ///
@@ -100,12 +123,18 @@ where
         let batch = batch_result
             .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        // Find geometry column by name
+        // Find geometry column by name (exact "geometry" match first, then fallback to *geom*)
         let schema = batch.schema();
         let geom_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+            .position(|f| f.name() == "geometry")
+            .or_else(|| {
+                schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().contains("geom"))
+            })
             .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
         let geom_col = batch.column(geom_idx);
@@ -373,12 +402,18 @@ where
                     .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?
             };
 
-            // Find geometry column by name
+            // Find geometry column by name (exact "geometry" match first, then fallback to *geom*)
             let schema = batch.schema();
             let geom_idx = schema
                 .fields()
                 .iter()
-                .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+                .position(|f| f.name() == "geometry")
+                .or_else(|| {
+                    schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name().contains("geom"))
+                })
                 .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
             let geom_col = batch.column(geom_idx);
@@ -570,7 +605,13 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
         let geom_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+            .position(|f| f.name() == "geometry")
+            .or_else(|| {
+                schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().contains("geom"))
+            })
             .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
         let geom_col = batch.column(geom_idx);
@@ -611,9 +652,35 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
 ///
 /// Total number of geometries processed
 #[instrument(name = "read_parquet_parallel", skip(callback), fields(path = %path.display(), num_readers))]
-pub fn process_geometries_parallel<F>(
+pub fn process_geometries_parallel<F>(path: &Path, num_readers: usize, callback: F) -> Result<usize>
+where
+    F: FnMut(RowGroupInfo, Vec<Geometry<f64>>) -> Result<()>,
+{
+    // Delegate to filtered version with no filter
+    process_geometries_parallel_filtered(path, num_readers, None, callback)
+}
+
+/// Process geometries row-group by row-group with parallel I/O and optional spatial filtering.
+///
+/// When a spatial filter is provided, row groups whose bounding boxes don't intersect
+/// the filter are skipped entirely. This can dramatically reduce processing time for
+/// bounded extracts (e.g., extracting a city from a country file).
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file or directory
+/// * `num_readers` - Number of parallel reader threads
+/// * `spatial_filter` - Optional bounding box to filter row groups
+/// * `callback` - Function called for each row group's geometries
+///
+/// # Returns
+///
+/// `(total_geometries, skipped_row_groups)` - Number of geometries processed and row groups skipped
+#[instrument(name = "read_parquet_parallel_filtered", skip(callback), fields(path = %path.display(), num_readers, has_filter = spatial_filter.is_some()))]
+pub fn process_geometries_parallel_filtered<F>(
     path: &Path,
     num_readers: usize,
+    spatial_filter: Option<TileBounds>,
     mut callback: F,
 ) -> Result<usize>
 where
@@ -627,8 +694,11 @@ where
     let files = resolve_parquet_files(path)?;
 
     // Build work items: (file_path, row_group_index, global_index) for each row group
+    // With spatial filtering, we skip row groups whose bbox doesn't intersect the filter
     let mut work_items = Vec::new();
     let mut global_index = 0;
+    let mut skipped_row_groups = 0;
+
     for file_path in &files {
         let file = std::fs::File::open(file_path).map_err(|e| {
             Error::GeoParquetRead(format!("Failed to open {}: {}", file_path.display(), e))
@@ -638,7 +708,37 @@ where
         })?;
         let num_rg = reader.metadata().num_row_groups();
 
+        // Extract row group bboxes if filtering is enabled
+        let row_group_bounds: Vec<Option<RowGroupBounds>> = if spatial_filter.is_some() {
+            match extract_row_group_bounds(file_path) {
+                Ok(bounds) => bounds,
+                Err(_) => {
+                    // If we can't extract bounds, include all row groups (safe fallback)
+                    tracing::warn!(
+                        "Could not extract row group bboxes from {}, processing all row groups",
+                        file_path.display()
+                    );
+                    vec![None; num_rg]
+                }
+            }
+        } else {
+            vec![None; num_rg]
+        };
+
         for rg_idx in 0..num_rg {
+            // Check if this row group should be skipped due to spatial filter
+            if let Some(ref filter) = spatial_filter {
+                if let Some(Some(ref rg_bbox)) = row_group_bounds.get(rg_idx) {
+                    if !rg_bbox.intersects(filter) {
+                        // Skip this row group - bbox doesn't intersect filter
+                        skipped_row_groups += 1;
+                        global_index += 1;
+                        continue;
+                    }
+                }
+                // If no bbox available for this row group, include it (safe fallback)
+            }
+
             work_items.push(RowGroupWorkItem {
                 file_path: file_path.clone(),
                 row_group_index: rg_idx,
@@ -646,6 +746,14 @@ where
             });
             global_index += 1;
         }
+    }
+
+    if skipped_row_groups > 0 {
+        tracing::info!(
+            "Spatial filter skipped {} row groups, processing {}",
+            skipped_row_groups,
+            work_items.len()
+        );
     }
 
     let num_row_groups = work_items.len();
