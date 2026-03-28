@@ -260,18 +260,14 @@ impl TileFeatureSorter {
         // Open all segment files and create merge heap
         let mut heap = BinaryHeap::new();
 
-        for (idx, path) in self.segment_paths.iter().enumerate() {
+        for path in self.segment_paths.iter() {
             let file = File::open(path)?;
             let mut reader = BufReader::new(file);
 
             // Read first record from each segment
             match TileFeatureRecord::decode(&mut reader) {
                 Ok(record) => {
-                    heap.push(SegmentEntry {
-                        record,
-                        segment_idx: idx,
-                        reader,
-                    });
+                    heap.push(SegmentEntry { record, reader });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     // Empty segment, skip
@@ -290,7 +286,6 @@ impl TileFeatureSorter {
 /// Entry in the merge heap for k-way merge.
 struct SegmentEntry {
     record: TileFeatureRecord,
-    segment_idx: usize,
     reader: BufReader<File>,
 }
 
