@@ -1099,12 +1099,14 @@ impl StreamingPmtilesWriter {
     pub fn with_temp_dir(compression: Compression, temp_dir: PathBuf) -> std::io::Result<Self> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Generate unique temp file name
+        // Generate unique temp file name with timestamp + process/thread IDs for parallel safety
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let temp_path = temp_dir.join(format!("gpq-tiles-{}.tmp", timestamp));
+        let pid = std::process::id();
+        let tid = std::thread::current().id();
+        let temp_path = temp_dir.join(format!("gpq-tiles-{}-{}-{:?}.tmp", timestamp, pid, tid));
 
         let file = File::create(&temp_path)?;
         let temp_file = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
