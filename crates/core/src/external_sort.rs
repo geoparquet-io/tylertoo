@@ -12,6 +12,14 @@
 //! 4. Final iteration performs k-way merge of all sorted chunks
 //! 5. Output is an iterator of records sorted by `tile_id`, ready for tile building
 //!
+//! # Implementation
+//!
+//! Uses the `extsort` crate which provides:
+//! - **In-memory passthrough**: When data fits in buffer, uses VecDeque directly (zero disk I/O)
+//! - **Peek mode**: For <20 segments, linear scan instead of heap (faster)
+//! - **Heap mode**: For ≥20 segments, binary heap with 20-item batch read-ahead
+//! - **Parallel sort**: Optional rayon support for sorting in-memory segments
+//!
 //! # Example
 //!
 //! ```ignore
@@ -34,13 +42,10 @@
 //! }
 //! ```
 
+use extsort::{ExternalSorter, Sortable};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
-use tempfile::TempDir;
+use std::io::{Read, Write};
 
 /// A feature record ready for tile building, sorted by tile_id.
 ///
@@ -89,30 +94,6 @@ impl TileFeatureRecord {
             properties,
         }
     }
-
-    /// Encode a record to a writer with length prefix.
-    fn encode<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        let bytes = rmp_serde::to_vec(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let len = bytes.len() as u32;
-        writer.write_all(&len.to_le_bytes())?;
-        writer.write_all(&bytes)?;
-        Ok(())
-    }
-
-    /// Decode a record from a reader with length prefix.
-    fn decode<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        let mut len_bytes = [0u8; 4];
-        reader.read_exact(&mut len_bytes)?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-
-        let mut bytes = vec![0u8; len];
-        reader.read_exact(&mut bytes)?;
-
-        rmp_serde::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    }
 }
 
 impl Eq for TileFeatureRecord {}
@@ -133,6 +114,39 @@ impl Ord for TileFeatureRecord {
     }
 }
 
+/// Implement extsort's Sortable trait for disk serialization.
+///
+/// Uses length-prefixed MessagePack encoding for efficient serialization.
+impl Sortable for TileFeatureRecord {
+    fn encode<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        let bytes = rmp_serde::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let len = bytes.len() as u32;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
+    fn decode<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut len_bytes = [0u8; 4];
+        reader.read_exact(&mut len_bytes)?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        let mut bytes = vec![0u8; len];
+        reader.read_exact(&mut bytes)?;
+
+        rmp_serde::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// Comparator function type for TileFeatureRecord.
+type RecordComparator = fn(&TileFeatureRecord, &TileFeatureRecord) -> Ordering;
+
+/// Type alias for the extsort push sorter.
+type InnerPushSorter = extsort::PushExternalSorter<TileFeatureRecord, RecordComparator>;
+
 /// External sorter for tile feature records.
 ///
 /// **Memory-bounded**: When the in-memory buffer fills, records are sorted
@@ -141,17 +155,19 @@ impl Ord for TileFeatureRecord {
 ///
 /// This ensures memory usage is bounded to O(buffer_size) regardless of
 /// how many records are added.
+///
+/// **In-memory fast path**: When all data fits in the buffer, no disk I/O
+/// occurs - the sorted data is returned directly from memory.
 pub struct TileFeatureSorter {
-    /// In-memory buffer for records before flushing
-    buffer: Vec<TileFeatureRecord>,
-    /// Maximum records to buffer before flushing to disk
-    buffer_capacity: usize,
-    /// Temp directory for segment files
-    temp_dir: Option<TempDir>,
-    /// Paths to sorted segment files
-    segment_paths: Vec<PathBuf>,
+    /// The underlying extsort push sorter
+    inner: InnerPushSorter,
     /// Total records added (for len())
     total_records: usize,
+}
+
+/// Comparator function for TileFeatureRecord sorting.
+fn record_cmp(a: &TileFeatureRecord, b: &TileFeatureRecord) -> Ordering {
+    a.cmp(b)
 }
 
 impl TileFeatureSorter {
@@ -164,11 +180,14 @@ impl TileFeatureSorter {
     ///   Larger values use more RAM but reduce disk I/O.
     ///   Typical value: 100,000 - 1,000,000 depending on available memory.
     pub fn new(buffer_capacity: usize) -> Self {
+        // Use parallel sort for better performance on large buffers
+        let sorter = ExternalSorter::new()
+            .with_segment_size(buffer_capacity.max(1000)) // Minimum 1000 to avoid too many segments
+            .with_parallel_sort()
+            .pushed_by(record_cmp as RecordComparator);
+
         Self {
-            buffer: Vec::with_capacity(buffer_capacity.min(1024)),
-            buffer_capacity: buffer_capacity.max(1000), // Minimum 1000 to avoid too many segments
-            temp_dir: None,
-            segment_paths: Vec::new(),
+            inner: sorter,
             total_records: 0,
         }
     }
@@ -177,58 +196,11 @@ impl TileFeatureSorter {
     ///
     /// When the buffer is full, records are sorted and flushed to a temp file.
     pub fn add(&mut self, record: TileFeatureRecord) {
-        self.buffer.push(record);
         self.total_records += 1;
-
-        // Flush to disk when buffer is full
-        if self.buffer.len() >= self.buffer_capacity {
-            if let Err(e) = self.flush_buffer() {
-                // Log error but don't panic - we'll handle it during sort()
-                tracing::warn!("Failed to flush sort buffer to disk: {}", e);
-            }
+        if let Err(e) = self.inner.push(record) {
+            // Log error but don't panic - we'll handle it during sort()
+            tracing::warn!("Failed to add record to sorter: {}", e);
         }
-    }
-
-    /// Flush the in-memory buffer to a sorted segment file.
-    fn flush_buffer(&mut self) -> std::io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        // Create temp directory if needed
-        if self.temp_dir.is_none() {
-            self.temp_dir = Some(TempDir::new()?);
-        }
-
-        // Sort the buffer
-        self.buffer.sort();
-
-        // Write to segment file
-        let segment_path = self
-            .temp_dir
-            .as_ref()
-            .unwrap()
-            .path()
-            .join(format!("segment_{:04}.bin", self.segment_paths.len()));
-
-        let file = File::create(&segment_path)?;
-        let mut writer = BufWriter::new(file);
-
-        for record in self.buffer.drain(..) {
-            record.encode(&mut writer)?;
-        }
-
-        writer.flush()?;
-        self.segment_paths.push(segment_path);
-
-        tracing::debug!(
-            "Flushed {} records to segment {} (total segments: {})",
-            self.buffer_capacity,
-            self.segment_paths.len() - 1,
-            self.segment_paths.len()
-        );
-
-        Ok(())
     }
 
     /// Returns the total number of records added.
@@ -243,103 +215,48 @@ impl TileFeatureSorter {
 
     /// Sort all records and return an iterator over them in tile_id order.
     ///
-    /// This consumes the sorter. Performs k-way merge of all segments
-    /// plus any remaining in-memory records.
-    pub fn sort(mut self) -> std::io::Result<SortedRecordIterator> {
-        // Flush any remaining records
-        self.flush_buffer()?;
-
-        // If no segments (everything fit in memory), just return empty iterator
-        if self.segment_paths.is_empty() {
-            return Ok(SortedRecordIterator {
-                heap: BinaryHeap::new(),
-                _temp_dir: self.temp_dir,
-            });
-        }
-
-        // Open all segment files and create merge heap
-        let mut heap = BinaryHeap::new();
-
-        for path in self.segment_paths.iter() {
-            let file = File::open(path)?;
-            let mut reader = BufReader::new(file);
-
-            // Read first record from each segment
-            match TileFeatureRecord::decode(&mut reader) {
-                Ok(record) => {
-                    heap.push(SegmentEntry { record, reader });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Empty segment, skip
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(SortedRecordIterator {
-            heap,
-            _temp_dir: self.temp_dir,
-        })
+    /// This consumes the sorter. If all data fit in memory, no disk I/O
+    /// occurs (in-memory fast path). Otherwise, performs k-way merge of
+    /// all disk segments.
+    pub fn sort(self) -> std::io::Result<SortedRecordIterator> {
+        let inner = self.inner.done()?;
+        Ok(SortedRecordIterator { inner })
     }
 }
 
-/// Entry in the merge heap for k-way merge.
-struct SegmentEntry {
-    record: TileFeatureRecord,
-    reader: BufReader<File>,
-}
+/// Type alias for the extsort sorted iterator.
+type InnerSortedIterator = extsort::SortedIterator<TileFeatureRecord, RecordComparator>;
 
-impl Eq for SegmentEntry {}
-
-impl PartialEq for SegmentEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.record == other.record
-    }
-}
-
-impl PartialOrd for SegmentEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for SegmentEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse order for min-heap behavior (BinaryHeap is max-heap)
-        other.record.cmp(&self.record)
-    }
-}
-
-/// Iterator that performs k-way merge of sorted segments.
+/// Iterator that returns sorted tile feature records.
+///
+/// Wraps extsort's SortedIterator, which operates in 3 modes:
+/// - **Passthrough**: Data fit in memory → direct VecDeque iteration (zero disk I/O)
+/// - **Peek**: <20 segments → linear scan (faster than heap for few segments)
+/// - **Heap**: ≥20 segments → binary heap with batch read-ahead
 pub struct SortedRecordIterator {
-    heap: BinaryHeap<SegmentEntry>,
-    _temp_dir: Option<TempDir>, // Keep alive until iteration completes
+    inner: InnerSortedIterator,
+}
+
+impl SortedRecordIterator {
+    /// Returns the number of disk segments created during sorting.
+    ///
+    /// Returns 0 if all data fit in the memory buffer (in-memory fast path).
+    /// This is useful for verifying that small datasets don't incur disk I/O.
+    pub fn disk_segment_count(&self) -> usize {
+        self.inner.disk_segment_count()
+    }
+
+    /// Returns the total number of items in the sorted iterator.
+    pub fn sorted_count(&self) -> u64 {
+        self.inner.sorted_count()
+    }
 }
 
 impl Iterator for SortedRecordIterator {
     type Item = std::io::Result<TileFeatureRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut entry = self.heap.pop()?;
-
-        let result = entry.record.clone();
-
-        // Try to read next record from this segment
-        match TileFeatureRecord::decode(&mut entry.reader) {
-            Ok(next_record) => {
-                entry.record = next_record;
-                self.heap.push(entry);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Segment exhausted, don't push back
-            }
-            Err(e) => {
-                // Return error on next call
-                return Some(Err(e));
-            }
-        }
-
-        Some(Ok(result))
+        self.inner.next()
     }
 }
 
@@ -543,5 +460,39 @@ mod tests {
         let sorter = TileFeatureSorter::new(1000);
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
         assert!(sorted.is_empty());
+    }
+
+    #[test]
+    fn test_in_memory_fast_path_no_disk_io() {
+        // This test verifies the critical in-memory fast path:
+        // When data fits in buffer, NO disk I/O should occur.
+        //
+        // BUG IN CURRENT IMPL (issue #147): flush_buffer() is called
+        // unconditionally before checking if segments exist, causing
+        // ALL data to hit disk even when it fits in memory.
+
+        let mut sorter = TileFeatureSorter::new(1000); // Buffer holds 1000
+
+        // Add only 100 records - well under buffer capacity
+        for i in (0..100).rev() {
+            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, vec![], vec![]));
+        }
+
+        let sorted_iter = sorter.sort().unwrap();
+
+        // The key assertion: disk_segment_count() should be 0
+        // when all data fit in memory
+        assert_eq!(
+            sorted_iter.disk_segment_count(),
+            0,
+            "In-memory fast path failed: data was written to disk unnecessarily"
+        );
+
+        // Verify sorting still works correctly
+        let sorted: Vec<_> = sorted_iter.map(|r| r.unwrap()).collect();
+        assert_eq!(sorted.len(), 100);
+        for (i, record) in sorted.iter().enumerate() {
+            assert_eq!(record.tile_id, i as u64);
+        }
     }
 }
