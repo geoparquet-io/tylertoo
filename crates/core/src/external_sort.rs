@@ -48,8 +48,18 @@ use tempfile::TempDir;
 /// - `tile_id`: PMTiles Hilbert-curve ID (determines sort order)
 /// - `z`, `x`, `y`: Tile coordinates (stored to avoid reversing Hilbert curve)
 /// - `feature_id`: Original feature index for debugging/provenance
+/// - `original_hilbert`: Hilbert index of the ORIGINAL (unclipped) geometry centroid
 /// - `geometry_wkb`: WKB-encoded geometry (clipped to tile if needed)
 /// - `properties`: MessagePack-serialized feature properties
+///
+/// # Sorting
+///
+/// Records are sorted by `(tile_id, original_hilbert)`. The `original_hilbert` field
+/// enables correct gap-based density dropping (tippecanoe's `--drop-densest-as-needed`).
+/// Features must be sorted by their original Hilbert index within each tile for the
+/// gap-based algorithm to work correctly.
+///
+/// See: https://github.com/geoparquet-io/gpq-tiles/issues/145
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TileFeatureRecord {
     /// PMTiles tile ID (Hilbert curve order) - primary sort key
@@ -62,6 +72,9 @@ pub struct TileFeatureRecord {
     pub y: u32,
     /// Original feature ID from source data
     pub feature_id: u64,
+    /// Hilbert index of the ORIGINAL geometry centroid (before clipping).
+    /// Used as secondary sort key for correct gap-based density dropping.
+    pub original_hilbert: u64,
     /// WKB-encoded geometry
     pub geometry_wkb: Vec<u8>,
     /// MessagePack-serialized properties
@@ -70,12 +83,22 @@ pub struct TileFeatureRecord {
 
 impl TileFeatureRecord {
     /// Create a new tile feature record.
+    ///
+    /// # Arguments
+    ///
+    /// * `tile_id` - PMTiles tile ID (Hilbert curve order)
+    /// * `z`, `x`, `y` - Tile coordinates
+    /// * `feature_id` - Original feature index for debugging/provenance
+    /// * `original_hilbert` - Hilbert index of the ORIGINAL geometry centroid (before clipping)
+    /// * `geometry_wkb` - Serialized geometry bytes
+    /// * `properties` - MessagePack-serialized properties
     pub fn new(
         tile_id: u64,
         z: u8,
         x: u32,
         y: u32,
         feature_id: u64,
+        original_hilbert: u64,
         geometry_wkb: Vec<u8>,
         properties: Vec<u8>,
     ) -> Self {
@@ -85,6 +108,7 @@ impl TileFeatureRecord {
             x,
             y,
             feature_id,
+            original_hilbert,
             geometry_wkb,
             properties,
         }
@@ -126,10 +150,13 @@ impl PartialOrd for TileFeatureRecord {
 impl Ord for TileFeatureRecord {
     fn cmp(&self, other: &Self) -> Ordering {
         // Primary sort: tile_id (groups features by tile)
-        // Secondary sort: feature_id (stable ordering within tile)
+        // Secondary sort: original_hilbert (enables gap-based density dropping)
+        //
+        // CHANGED in #145: Previously sorted by feature_id, but gap-based dropping
+        // requires features within a tile to be sorted by their original Hilbert index.
         self.tile_id
             .cmp(&other.tile_id)
-            .then_with(|| self.feature_id.cmp(&other.feature_id))
+            .then_with(|| self.original_hilbert.cmp(&other.original_hilbert))
     }
 }
 
@@ -349,25 +376,29 @@ mod tests {
 
     #[test]
     fn test_tile_feature_record_creation() {
-        let record = TileFeatureRecord::new(42, 5, 10, 20, 1, vec![1, 2, 3], vec![4, 5, 6]);
+        let record = TileFeatureRecord::new(42, 5, 10, 20, 1, 5000, vec![1, 2, 3], vec![4, 5, 6]);
         assert_eq!(record.tile_id, 42);
         assert_eq!(record.z, 5);
         assert_eq!(record.x, 10);
         assert_eq!(record.y, 20);
         assert_eq!(record.feature_id, 1);
+        assert_eq!(record.original_hilbert, 5000);
         assert_eq!(record.geometry_wkb, vec![1, 2, 3]);
         assert_eq!(record.properties, vec![4, 5, 6]);
     }
 
     #[test]
     fn test_tile_feature_record_ordering() {
-        let r1 = TileFeatureRecord::new(1, 0, 0, 0, 1, vec![], vec![]);
-        let r2 = TileFeatureRecord::new(2, 0, 0, 0, 1, vec![], vec![]);
-        let r3 = TileFeatureRecord::new(1, 0, 0, 0, 2, vec![], vec![]);
+        // tile_id=1, original_hilbert=100
+        let r1 = TileFeatureRecord::new(1, 0, 0, 0, 1, 100, vec![], vec![]);
+        // tile_id=2, original_hilbert=100
+        let r2 = TileFeatureRecord::new(2, 0, 0, 0, 1, 100, vec![], vec![]);
+        // tile_id=1, original_hilbert=200
+        let r3 = TileFeatureRecord::new(1, 0, 0, 0, 2, 200, vec![], vec![]);
 
         // tile_id is primary sort key
         assert!(r1 < r2);
-        // feature_id is secondary sort key
+        // original_hilbert is secondary sort key (not feature_id!)
         assert!(r1 < r3);
     }
 
@@ -379,6 +410,7 @@ mod tests {
             100,
             200,
             789,
+            999999, // original_hilbert
             vec![0x01, 0x02, 0x03, 0x04],
             vec![0x82, 0xa4, b't', b'e', b's', b't'], // MessagePack map
         );
@@ -396,7 +428,7 @@ mod tests {
         assert!(sorter.is_empty());
         assert_eq!(sorter.len(), 0);
 
-        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, 100, vec![], vec![]));
         assert!(!sorter.is_empty());
         assert_eq!(sorter.len(), 1);
     }
@@ -405,10 +437,10 @@ mod tests {
     fn test_sorter_sorts_by_tile_id() {
         let mut sorter = TileFeatureSorter::new(1000);
 
-        // Add records out of order
-        sorter.add(TileFeatureRecord::new(3, 0, 0, 0, 1, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(2, 0, 0, 0, 1, vec![], vec![]));
+        // Add records out of order (same original_hilbert, different tile_id)
+        sorter.add(TileFeatureRecord::new(3, 0, 0, 0, 1, 100, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, 100, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(2, 0, 0, 0, 1, 100, vec![], vec![]));
 
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
 
@@ -419,21 +451,53 @@ mod tests {
     }
 
     #[test]
-    fn test_sorter_stable_within_tile() {
+    fn test_sorter_stable_within_tile_by_hilbert() {
+        // UPDATED in #145: Now sorts by original_hilbert, not feature_id
         let mut sorter = TileFeatureSorter::new(1000);
 
-        // Multiple features in same tile
-        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 3, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 1, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 2, vec![], vec![]));
+        // Multiple features in same tile with different original_hilbert values
+        // feature_id is intentionally different from hilbert order to prove sorting
+        sorter.add(TileFeatureRecord::new(
+            5,
+            1,
+            0,
+            0,
+            100,
+            3000,
+            vec![],
+            vec![],
+        )); // hilbert=3000
+        sorter.add(TileFeatureRecord::new(
+            5,
+            1,
+            0,
+            0,
+            200,
+            1000,
+            vec![],
+            vec![],
+        )); // hilbert=1000
+        sorter.add(TileFeatureRecord::new(
+            5,
+            1,
+            0,
+            0,
+            300,
+            2000,
+            vec![],
+            vec![],
+        )); // hilbert=2000
 
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
 
         assert_eq!(sorted.len(), 3);
-        // Should be sorted by feature_id within same tile_id
-        assert_eq!(sorted[0].feature_id, 1);
-        assert_eq!(sorted[1].feature_id, 2);
-        assert_eq!(sorted[2].feature_id, 3);
+        // Should be sorted by original_hilbert (1000 < 2000 < 3000), NOT feature_id
+        assert_eq!(sorted[0].original_hilbert, 1000);
+        assert_eq!(sorted[0].feature_id, 200);
+        assert_eq!(sorted[1].original_hilbert, 2000);
+        assert_eq!(sorted[1].feature_id, 300);
+        assert_eq!(sorted[2].original_hilbert, 3000);
+        assert_eq!(sorted[2].feature_id, 100);
     }
 
     #[test]
@@ -452,6 +516,7 @@ mod tests {
             0,
             0,
             1,
+            100, // original_hilbert
             geom2.clone(),
             props2.clone(),
         ));
@@ -461,6 +526,7 @@ mod tests {
             0,
             0,
             1,
+            100, // original_hilbert
             geom1.clone(),
             props1.clone(),
         ));
@@ -482,13 +548,15 @@ mod tests {
         let mut sorter = TileFeatureSorter::new(100);
 
         // Add 500 records - should create 5 segments
+        // Each record has tile_id = i, original_hilbert = i (so sort order is deterministic)
         for i in (0..500).rev() {
             sorter.add(TileFeatureRecord::new(
                 i,
                 0,
                 0,
                 0,
-                i,
+                i, // feature_id
+                i, // original_hilbert
                 vec![i as u8],
                 vec![(i % 256) as u8],
             ));
@@ -520,7 +588,8 @@ mod tests {
                 0,
                 0,
                 0,
-                i,
+                i, // feature_id
+                i, // original_hilbert
                 vec![i as u8],
                 vec![(i % 256) as u8],
             ));

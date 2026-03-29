@@ -34,7 +34,7 @@ use crate::feature_drop::{
     should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
     DensityDropConfig, DensityDropper, TinyPolygonAccumulator, DEFAULT_TINY_POLYGON_THRESHOLD,
 };
-use crate::gap_density::{scale_for_zoom, GapBasedSelector};
+use crate::gap_density::{geometry_to_hilbert, scale_for_zoom, GapBasedSelector};
 use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeometry};
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
@@ -1292,6 +1292,11 @@ fn generate_tiles_to_writer_internal(
             let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
                 let feat_idx = base_feat_idx + geom_idx as u64;
 
+                // Compute Hilbert index from ORIGINAL geometry centroid BEFORE any clipping.
+                // This is critical for gap-based density dropping (--drop-densest-as-needed).
+                // See: https://github.com/geoparquet-io/gpq-tiles/issues/145
+                let original_hilbert = geometry_to_hilbert(&geom).unwrap_or(0);
+
                 let mut result = GeomResult {
                     records: Vec::new(),
                     time_clip: std::time::Duration::ZERO,
@@ -1427,7 +1432,7 @@ fn generate_tiles_to_writer_internal(
                     let geom_bytes = clipped.to_bytes();
                     result.time_wkb += serialize_start.elapsed();
 
-                    // Create record with tile_id and coordinates
+                    // Create record with tile_id, coordinates, and original Hilbert index
                     let tid = tile_id(tile_coord.z, tile_coord.x, tile_coord.y);
                     let record = TileFeatureRecord::new(
                         tid,
@@ -1435,6 +1440,7 @@ fn generate_tiles_to_writer_internal(
                         tile_coord.x,
                         tile_coord.y,
                         feat_idx,
+                        original_hilbert, // From original geometry, enables gap-based dropping
                         geom_bytes,
                         vec![], // Empty properties for now
                     );
@@ -1623,6 +1629,8 @@ fn generate_tiles_to_writer_internal(
     struct RawFeature {
         geometry_bytes: Vec<u8>,
         feature_id: u64,
+        /// Original Hilbert index for gap-based density dropping (#145)
+        original_hilbert: u64,
     }
 
     // Tile with raw (not yet decoded) features
@@ -1650,6 +1658,10 @@ fn generate_tiles_to_writer_internal(
     // This matches tippecanoe's behavior (clip.cpp:1048-1097).
     //
     // When cluster_config is Some, point clustering is performed at the appropriate zoom levels.
+    //
+    // When gamma is Some and > 0, gap-based density dropping is applied using the
+    // original_hilbert index from each feature. Features are already sorted by
+    // (tile_id, original_hilbert) via external sort, enabling correct gap-based selection.
     fn encode_tile_from_raw(
         tile_data: RawTileData,
         layer_name: &str,
@@ -1658,6 +1670,7 @@ fn generate_tiles_to_writer_internal(
         cluster_config: Option<&ClusterConfig>,
         drop_smallest_as_needed: bool,
         drop_smallest_threshold: f64,
+        gamma: Option<f64>,
     ) -> Option<EncodedTile> {
         use crate::clustering::{IndexedPoint, PointClusterer};
         use crate::mvt::PropertyValue;
@@ -1666,6 +1679,14 @@ fn generate_tiles_to_writer_internal(
         let coord = TileCoord::new(tile_data.x, tile_data.y, tile_data.z);
         let mut layer_builder = LayerBuilder::new(layer_name).with_extent(extent);
         let mut feature_count = 0;
+
+        // Gap-based density dropping (--drop-densest-as-needed)
+        // Uses original_hilbert from records, which is computed from ORIGINAL geometry
+        // before clipping. Features are already sorted by original_hilbert within each tile.
+        // See: https://github.com/geoparquet-io/gpq-tiles/issues/145
+        let mut gap_selector = gamma
+            .filter(|&g| g > 0.0)
+            .map(|g| GapBasedSelector::new(g).with_scale(scale_for_zoom(tile_data.z)));
 
         // Create accumulator for tiny polygons if enabled
         let mut accumulator = if enable_tiny_polygon_accumulation {
@@ -1956,6 +1977,16 @@ fn generate_tiles_to_writer_internal(
 
         // Non-clustering path: original loop
         for raw_feat in tile_data.features {
+            // Gap-based density dropping (--drop-densest-as-needed)
+            // Applied BEFORE geometry decoding for efficiency - we can skip
+            // expensive decode if the feature will be dropped anyway.
+            // Features are already sorted by original_hilbert within each tile.
+            if let Some(ref mut selector) = gap_selector {
+                if selector.should_drop(raw_feat.original_hilbert) {
+                    continue;
+                }
+            }
+
             // Decode geometry from bytes (this was previously sequential)
             let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
                 Some(g) => g,
@@ -2166,6 +2197,7 @@ fn generate_tiles_to_writer_internal(
     let drop_smallest_as_needed = config.drop_smallest_as_needed;
     let drop_smallest_threshold = config.drop_smallest_threshold;
     let cluster_config = config.cluster_config.clone();
+    let gamma = config.gamma;
 
     // Helper to flush the batch: decode + encode in parallel, write sequentially
     let flush_batch = |batch: &mut Vec<RawTileData>,
@@ -2178,7 +2210,8 @@ fn generate_tiles_to_writer_internal(
                        enable_tiny_polygon_accumulation: bool,
                        cluster_config: Option<&ClusterConfig>,
                        drop_smallest_as_needed: bool,
-                       drop_smallest_threshold: f64|
+                       drop_smallest_threshold: f64,
+                       gamma: Option<f64>|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -2198,6 +2231,7 @@ fn generate_tiles_to_writer_internal(
                         cluster_config,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
+                        gamma,
                     )
                 })
                 .collect()
@@ -2214,6 +2248,7 @@ fn generate_tiles_to_writer_internal(
                         cluster_config,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
+                        gamma,
                     )
                 })
                 .collect()
@@ -2286,6 +2321,7 @@ fn generate_tiles_to_writer_internal(
                         cluster_config.as_ref(),
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
+                        gamma,
                     )?;
                 }
             }
@@ -2300,6 +2336,7 @@ fn generate_tiles_to_writer_internal(
         current_features.push(RawFeature {
             geometry_bytes: record.geometry_wkb,
             feature_id: record.feature_id,
+            original_hilbert: record.original_hilbert,
         });
         current_tile = Some(record_tile);
     }
@@ -2329,6 +2366,7 @@ fn generate_tiles_to_writer_internal(
         cluster_config.as_ref(),
         drop_smallest_as_needed,
         drop_smallest_threshold,
+        gamma,
     )?;
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
