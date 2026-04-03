@@ -1173,9 +1173,25 @@ fn generate_tiles_to_writer_internal(
     let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
 
     // Phase 1: Read GeoParquet, clip geometries, write to sorter(s)
-    // Buffer size per bucket: 1M records is ~500MB-1GB depending on geometry complexity
-    // This limits segments to ~50-100 per bucket for billion-record datasets
-    let sort_buffer_size = 1_000_000;
+    // Buffer size per bucket determines how many temp files are created during external sort.
+    // Too small = too many files = EMFILE (too many open files) error during k-way merge.
+    // Too large = OOM if memory_budget isn't respected.
+    //
+    // TileFeatureRecord is ~200 bytes average (25 fixed + geometry).
+    // Default 1M records = ~200MB per bucket segment.
+    // With memory_budget, scale up to reduce temp file count.
+    let sort_buffer_size = match config.memory_budget {
+        Some(budget) => {
+            // Estimate ~200 bytes per TileFeatureRecord
+            // Target: few segments per bucket to avoid EMFILE
+            // Divide budget by num_buckets (calculated below), but we don't know it yet.
+            // Use conservative estimate: budget / 8 buckets / 200 bytes
+            // Cap at 50M records to avoid huge in-memory sorts
+            let records_per_bucket = budget / 8 / 200;
+            records_per_bucket.min(50_000_000).max(1_000_000)
+        }
+        None => 1_000_000, // Default: 1M records (~200MB per segment)
+    };
 
     // Determine processing mode and create appropriate sorter structure
     // For bucketed mode, get file size and calculate bucket count
