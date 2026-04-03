@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use serde_json::Value;
@@ -432,6 +433,20 @@ fn check_row_group_bboxes(reader: &SerializedFileReader<std::fs::File>) -> bool 
     false
 }
 
+/// Find geometry column index in an Arrow schema.
+fn find_geometry_column_index(schema: &arrow_schema::Schema) -> Option<usize> {
+    schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "geometry")
+        .or_else(|| {
+            schema
+                .fields()
+                .iter()
+                .position(|f| f.name().contains("geom"))
+        })
+}
+
 /// Sample the first N features to check if they're Hilbert-sorted.
 fn check_hilbert_sorted(path: &Path) -> Result<bool> {
     use crate::spatial_index::{encode_hilbert, lng_lat_to_world_coords};
@@ -443,11 +458,26 @@ fn check_hilbert_sorted(path: &Path) -> Result<bool> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
-    // Only read first batch for sampling
-    let reader = builder
-        .with_batch_size(1000)
-        .build()
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+    // Find geometry column and project only that for I/O efficiency
+    let schema = builder.schema().clone();
+    let geom_idx = find_geometry_column_index(&schema);
+
+    let (reader, geom_field) = if let Some(idx) = geom_idx {
+        let geom_field = schema.field(idx).clone();
+        let mask = ProjectionMask::roots(builder.metadata().file_metadata().schema_descr(), [idx]);
+        let reader = builder
+            .with_batch_size(1000)
+            .with_projection(mask)
+            .build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+        (reader, Some(geom_field))
+    } else {
+        let reader = builder
+            .with_batch_size(1000)
+            .build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+        (reader, None)
+    };
 
     let mut hilbert_indices: Vec<u64> = Vec::new();
 
@@ -456,27 +486,13 @@ fn check_hilbert_sorted(path: &Path) -> Result<bool> {
         let batch = batch_result
             .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        // Use our existing batch processor to extract geometries
-        let schema = batch.schema();
-        // Prioritize exact "geometry" match, then fall back to columns containing "geom"
-        let geom_idx = schema
-            .fields()
-            .iter()
-            .position(|f| f.name() == "geometry")
-            .or_else(|| {
-                schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name().contains("geom"))
-            });
-
-        if let Some(idx) = geom_idx {
-            let geom_col = batch.column(idx);
-            let geom_field = schema.field(idx);
+        if let Some(ref field) = geom_field {
+            // After projection, geometry is at column 0
+            let geom_col = batch.column(0);
 
             // Convert to GeoArrow and extract centroids
-            let geom_array = geoarrow::array::from_arrow_array(geom_col.as_ref(), geom_field)
-                .map_err(|e| {
+            let geom_array =
+                geoarrow::array::from_arrow_array(geom_col.as_ref(), field).map_err(|e| {
                     Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
                 })?;
 

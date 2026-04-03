@@ -13,6 +13,7 @@ use geoarrow::datatypes::GeoArrowType;
 use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
 use tracing::instrument;
 
 use crate::covering::{extract_row_group_bounds, RowGroupBounds};
@@ -88,6 +89,22 @@ fn collect_parquet_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Find geometry column index in an Arrow schema.
+///
+/// Looks for "geometry" first (exact match), then falls back to any field containing "geom".
+fn find_geometry_column_index(schema: &arrow_schema::Schema) -> Option<usize> {
+    schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "geometry")
+        .or_else(|| {
+            schema
+                .fields()
+                .iter()
+                .position(|f| f.name().contains("geom"))
+        })
+}
+
 /// Process geometries in a GeoParquet file batch-by-batch.
 ///
 /// The callback receives each geometry converted to geo::Geometry for processing.
@@ -112,7 +129,21 @@ where
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
+    // Find geometry column and project only that column for I/O efficiency.
+    // This avoids reading/decompressing property columns we don't need during geometry processing.
+    let schema = builder.schema().clone();
+    let geom_idx = find_geometry_column_index(&schema)
+        .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+
+    // Cache the geometry field metadata for GeoArrow conversion (before moving builder)
+    let geom_field = schema.field(geom_idx).clone();
+
+    let mask = ProjectionMask::roots(
+        builder.metadata().file_metadata().schema_descr(),
+        [geom_idx],
+    );
     let reader = builder
+        .with_projection(mask)
         .build()
         .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
 
@@ -123,26 +154,14 @@ where
         let batch = batch_result
             .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        // Find geometry column by name (exact "geometry" match first, then fallback to *geom*)
-        let schema = batch.schema();
-        let geom_idx = schema
-            .fields()
-            .iter()
-            .position(|f| f.name() == "geometry")
-            .or_else(|| {
-                schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name().contains("geom"))
-            })
-            .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
-
-        let geom_col = batch.column(geom_idx);
-        let geom_field = schema.field(geom_idx);
+        // After projection, geometry is at column 0 (it's the only column)
+        let geom_col = batch.column(0);
 
         // Convert Arrow array to GeoArrow geometry array
-        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), geom_field)
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e)))?;
+        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), &geom_field)
+            .map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
+        })?;
 
         // Process each geometry within batch scope using explicit type dispatch
         // This avoids bulk extraction while leveraging GeoArrow's type system
@@ -355,7 +374,7 @@ where
     let file = std::fs::File::open(path)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
 
-    // Get row group count using the lower-level API
+    // Get row group count and geometry column info using the lower-level API
     let parquet_reader = SerializedFileReader::new(
         file.try_clone()
             .map_err(|e| Error::GeoParquetRead(format!("Failed to clone file handle: {}", e)))?,
@@ -364,12 +383,28 @@ where
 
     let num_row_groups = parquet_reader.metadata().num_row_groups();
 
+    // Find geometry column once before the loop - for column projection
+    let initial_builder = ParquetRecordBatchReaderBuilder::try_new(
+        file.try_clone()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to clone file handle: {}", e)))?,
+    )
+    .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+    let schema = initial_builder.schema();
+    let geom_idx = find_geometry_column_index(&schema)
+        .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+    let geom_field = schema.field(geom_idx).clone();
+    let schema_descr = initial_builder
+        .metadata()
+        .file_metadata()
+        .schema_descr_ptr();
+
     let mut total_processed = 0;
 
     // Process each row group separately
     for rg_idx in 0..num_row_groups {
         // Span: Building reader for this row group (file handle reused via try_clone)
-        let (reader, _batch_size) = {
+        let reader = {
             let _open_span = info_span!("parquet_open_rowgroup", row_group = rg_idx).entered();
 
             // Reuse file handle via try_clone() - avoids reopening file for each row group
@@ -380,15 +415,15 @@ where
             let builder = ParquetRecordBatchReaderBuilder::try_new(file_clone)
                 .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
-            let batch_size = builder.metadata().row_group(rg_idx).num_rows() as usize;
+            // Project only the geometry column for I/O efficiency
+            let mask = ProjectionMask::roots(&schema_descr, [geom_idx]);
 
-            // Select only the current row group
-            let reader = builder
+            // Select only the current row group with column projection
+            builder
                 .with_row_groups(vec![rg_idx])
+                .with_projection(mask)
                 .build()
-                .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
-
-            (reader, batch_size)
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?
         };
 
         let mut row_group_geometries = Vec::new();
@@ -402,22 +437,8 @@ where
                     .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?
             };
 
-            // Find geometry column by name (exact "geometry" match first, then fallback to *geom*)
-            let schema = batch.schema();
-            let geom_idx = schema
-                .fields()
-                .iter()
-                .position(|f| f.name() == "geometry")
-                .or_else(|| {
-                    schema
-                        .fields()
-                        .iter()
-                        .position(|f| f.name().contains("geom"))
-                })
-                .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
-
-            let geom_col = batch.column(geom_idx);
-            let geom_field = schema.field(geom_idx);
+            // After projection, geometry is at column 0 (it's the only column)
+            let geom_col = batch.column(0);
 
             // Span: Converting Arrow array to GeoArrow geometry array
             let geom_array: Arc<dyn GeoArrowArray> = {
@@ -427,7 +448,7 @@ where
                     rows = batch.num_rows()
                 )
                 .entered();
-                from_arrow_array(geom_col.as_ref(), geom_field).map_err(|e| {
+                from_arrow_array(geom_col.as_ref(), &geom_field).map_err(|e| {
                     Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
                 })?
             };
@@ -589,8 +610,19 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
+    // Find geometry column and project only that column for I/O efficiency
+    let schema = builder.schema();
+    let geom_idx = find_geometry_column_index(&schema)
+        .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+    let geom_field = schema.field(geom_idx).clone();
+    let mask = ProjectionMask::roots(
+        builder.metadata().file_metadata().schema_descr(),
+        [geom_idx],
+    );
+
     let reader = builder
         .with_row_groups(vec![rg_idx])
+        .with_projection(mask)
         .build()
         .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
 
@@ -601,24 +633,13 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
         let batch = batch_result
             .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        let schema = batch.schema();
-        let geom_idx = schema
-            .fields()
-            .iter()
-            .position(|f| f.name() == "geometry")
-            .or_else(|| {
-                schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name().contains("geom"))
-            })
-            .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+        // After projection, geometry is at column 0 (it's the only column)
+        let geom_col = batch.column(0);
 
-        let geom_col = batch.column(geom_idx);
-        let geom_field = schema.field(geom_idx);
-
-        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), geom_field)
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e)))?;
+        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), &geom_field)
+            .map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
+        })?;
 
         extract_geometries_from_array(geom_array.as_ref(), &mut geometries)?;
         row_count += batch.num_rows();
