@@ -24,6 +24,7 @@ geo-traits = { workspace = true }
 geoparquet = { workspace = true }
 parquet = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
 geo = { workspace = true }
 pmtiles = { workspace = true }
 geozero = { workspace = true }

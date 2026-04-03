@@ -6,17 +6,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::Float64Type;
+use arrow_array::BooleanArray;
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
 use geoarrow::array::from_arrow_array;
 use geoarrow::datatypes::GeoArrowType;
 use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter};
 use parquet::arrow::ProjectionMask;
 use tracing::instrument;
 
-use crate::covering::{extract_row_group_bounds, RowGroupBounds};
+use crate::covering::{
+    extract_row_group_bounds, find_bbox_column_indices, parse_covering_metadata, BboxColumnIndices,
+    RowGroupBounds,
+};
 use crate::tile::TileBounds;
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -583,10 +589,95 @@ enum RowGroupReadResult {
     Err(Error),
 }
 
+/// Spatial filter configuration for row-level predicate pushdown.
+#[derive(Clone)]
+pub struct SpatialFilterConfig {
+    /// The bounding box to filter against
+    pub bounds: TileBounds,
+    /// Column indices for bbox fields (xmin, ymin, xmax, ymax)
+    pub bbox_indices: BboxColumnIndices,
+}
+
+/// Extract bbox column configuration from the first parquet file for predicate pushdown.
+///
+/// Returns None if bbox columns aren't available (falls back to geometry-only filtering).
+fn extract_bbox_column_config(
+    files: &[PathBuf],
+    bounds: TileBounds,
+) -> Result<Option<Arc<SpatialFilterConfig>>> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    let first_file = files
+        .first()
+        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+
+    let file = std::fs::File::open(first_file).map_err(|e| {
+        Error::GeoParquetRead(format!("Failed to open {}: {}", first_file.display(), e))
+    })?;
+
+    let reader = SerializedFileReader::new(file).map_err(|e| {
+        Error::GeoParquetRead(format!("Failed to read {}: {}", first_file.display(), e))
+    })?;
+
+    let metadata = reader.metadata();
+
+    // Get geo metadata and parse covering spec
+    let kv = metadata.file_metadata().key_value_metadata();
+    let geo_json = kv.and_then(|kv| {
+        kv.iter()
+            .find(|pair| pair.key.to_lowercase() == "geo")
+            .and_then(|pair| pair.value.clone())
+    });
+
+    let Some(geo_json) = geo_json else {
+        tracing::debug!("No geo metadata found, skipping row-level predicate pushdown");
+        return Ok(None);
+    };
+
+    let covering = match parse_covering_metadata(&geo_json)? {
+        Some(c) => c,
+        None => {
+            tracing::debug!("No covering metadata found, skipping row-level predicate pushdown");
+            return Ok(None);
+        }
+    };
+
+    let bbox_indices = match find_bbox_column_indices(metadata, &covering) {
+        Some(indices) => indices,
+        None => {
+            tracing::debug!("Could not find bbox columns, skipping row-level predicate pushdown");
+            return Ok(None);
+        }
+    };
+
+    tracing::info!(
+        "Enabling row-level predicate pushdown with bbox columns: xmin={}, ymin={}, xmax={}, ymax={}",
+        bbox_indices.xmin, bbox_indices.ymin, bbox_indices.xmax, bbox_indices.ymax
+    );
+
+    Ok(Some(Arc::new(SpatialFilterConfig {
+        bounds,
+        bbox_indices,
+    })))
+}
+
 /// Read a single row group from a GeoParquet file.
 ///
 /// This function opens its own file handle, making it safe for parallel use.
 fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Vec<Geometry<f64>>)> {
+    read_single_row_group_filtered(path, rg_idx, None)
+}
+
+/// Read a single row group with optional row-level spatial filtering (predicate pushdown).
+///
+/// When a spatial filter is provided, rows whose bboxes don't intersect the filter
+/// are skipped at the Parquet decode level, avoiding geometry deserialization entirely.
+fn read_single_row_group_filtered(
+    path: &Path,
+    rg_idx: usize,
+    spatial_filter: Option<&SpatialFilterConfig>,
+) -> Result<(RowGroupInfo, Vec<Geometry<f64>>)> {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
 
@@ -610,21 +701,78 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
-    // Find geometry column and project only that column for I/O efficiency
+    // Find geometry column
     let schema = builder.schema();
+    let schema_descr = builder.metadata().file_metadata().schema_descr();
     let geom_idx = find_geometry_column_index(&schema)
         .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
     let geom_field = schema.field(geom_idx).clone();
-    let mask = ProjectionMask::roots(
-        builder.metadata().file_metadata().schema_descr(),
-        [geom_idx],
-    );
 
-    let reader = builder
-        .with_row_groups(vec![rg_idx])
-        .with_projection(mask)
-        .build()
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+    // Build projection mask and optional row filter
+    let (reader, geom_col_position) = if let Some(filter_config) = spatial_filter {
+        // Project geometry + bbox columns for filtering
+        let bbox = &filter_config.bbox_indices;
+        let projected_cols = [geom_idx, bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax];
+        let mask = ProjectionMask::roots(schema_descr, projected_cols);
+
+        // Create spatial predicate: keep rows where bbox intersects filter
+        // After projection, columns are at positions 0-4: geom, xmin, ymin, xmax, ymax
+        let filter_bounds = filter_config.bounds;
+        let predicate_mask =
+            ProjectionMask::roots(schema_descr, [bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax]);
+
+        let predicate =
+            ArrowPredicateFn::new(predicate_mask, move |batch: arrow_array::RecordBatch| {
+                // bbox columns are at positions 0-3 in the predicate batch
+                let xmin_col = batch.column(0).as_primitive::<Float64Type>();
+                let ymin_col = batch.column(1).as_primitive::<Float64Type>();
+                let xmax_col = batch.column(2).as_primitive::<Float64Type>();
+                let ymax_col = batch.column(3).as_primitive::<Float64Type>();
+
+                // AABB intersection test: !(xmax < filter.xmin || xmin > filter.xmax || ymax < filter.ymin || ymin > filter.ymax)
+                let result: BooleanArray = (0..batch.num_rows())
+                    .map(|i| {
+                        let xmin = xmin_col.value(i);
+                        let ymin = ymin_col.value(i);
+                        let xmax = xmax_col.value(i);
+                        let ymax = ymax_col.value(i);
+
+                        // Intersection test
+                        let intersects = xmin <= filter_bounds.lng_max
+                            && xmax >= filter_bounds.lng_min
+                            && ymin <= filter_bounds.lat_max
+                            && ymax >= filter_bounds.lat_min;
+
+                        Some(intersects)
+                    })
+                    .collect();
+
+                Ok(result)
+            });
+
+        let row_filter = RowFilter::new(vec![Box::new(predicate)]);
+
+        let reader = builder
+            .with_row_groups(vec![rg_idx])
+            .with_projection(mask)
+            .with_row_filter(row_filter)
+            .build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+        // Geometry is at position 0 in projected output
+        (reader, 0)
+    } else {
+        // No filtering - project only geometry column
+        let mask = ProjectionMask::roots(schema_descr, [geom_idx]);
+
+        let reader = builder
+            .with_row_groups(vec![rg_idx])
+            .with_projection(mask)
+            .build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+        (reader, 0)
+    };
 
     let mut geometries = Vec::new();
     let mut row_count = 0;
@@ -633,8 +781,8 @@ fn read_single_row_group(path: &Path, rg_idx: usize) -> Result<(RowGroupInfo, Ve
         let batch = batch_result
             .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        // After projection, geometry is at column 0 (it's the only column)
-        let geom_col = batch.column(0);
+        // Geometry column is at geom_col_position
+        let geom_col = batch.column(geom_col_position);
 
         let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), &geom_field)
             .map_err(|e| {
@@ -713,6 +861,14 @@ where
 
     // Resolve all parquet files (single file or directory)
     let files = resolve_parquet_files(path)?;
+
+    // Extract bbox column indices for row-level predicate pushdown
+    // We use the first file to get the schema - all files in a partitioned dataset should have the same schema
+    let row_filter_config: Option<Arc<SpatialFilterConfig>> = if let Some(bounds) = spatial_filter {
+        extract_bbox_column_config(&files, bounds)?
+    } else {
+        None
+    };
 
     // Build work items: (file_path, row_group_index, global_index) for each row group
     // With spatial filtering, we skip row groups whose bbox doesn't intersect the filter
@@ -801,11 +957,23 @@ where
     for _ in 0..num_readers {
         let work_rx = work_rx.clone();
         let tx = tx.clone();
+        let filter_config = row_filter_config.clone();
 
         let handle = std::thread::spawn(move || {
             // Each thread pulls work from the queue until empty
             for item in work_rx {
-                let result = match read_single_row_group(&item.file_path, item.row_group_index) {
+                // Use filtered reader when predicate pushdown is available
+                let read_result = if let Some(ref config) = filter_config {
+                    read_single_row_group_filtered(
+                        &item.file_path,
+                        item.row_group_index,
+                        Some(config.as_ref()),
+                    )
+                } else {
+                    read_single_row_group(&item.file_path, item.row_group_index)
+                };
+
+                let result = match read_result {
                     Ok((mut info, geometries)) => {
                         // Update info to use global index for consistent progress reporting
                         info.index = item.global_index;
