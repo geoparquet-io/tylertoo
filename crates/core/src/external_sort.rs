@@ -499,6 +499,109 @@ mod tests {
         assert!(sorted.is_empty());
     }
 
+    /// Critical test for GitHub issue #145: Verify Hilbert ordering within tiles
+    /// is preserved after disk spill.
+    ///
+    /// This tests the SECONDARY sort key (original_hilbert) which is critical
+    /// for gap-based density dropping to work correctly.
+    #[test]
+    fn test_disk_spill_preserves_hilbert_ordering_within_tiles() {
+        // Use small buffer to force multiple disk spills
+        let mut sorter = TileFeatureSorter::new(100);
+
+        // Create 5 tiles with 50 features each = 250 records
+        // Features within each tile have varying Hilbert indices
+        for tile_id in 0..5u64 {
+            // Add features in REVERSE Hilbert order to test sorting
+            for hilbert in (0..50u64).rev() {
+                sorter.add(TileFeatureRecord::new(
+                    tile_id,                  // tile_id
+                    (tile_id % 16) as u8,     // z
+                    tile_id as u32,           // x
+                    0,                        // y
+                    tile_id * 100 + hilbert,  // feature_id (unique)
+                    hilbert * 1000 + tile_id, // original_hilbert (varying within tile)
+                    vec![tile_id as u8],      // geometry
+                    vec![hilbert as u8],      // properties
+                ));
+            }
+        }
+
+        // Shuffle by adding interleaved records
+        // This ensures records from different tiles are mixed
+        for tile_id in 0..5u64 {
+            for hilbert in 50..100u64 {
+                sorter.add(TileFeatureRecord::new(
+                    tile_id,
+                    (tile_id % 16) as u8,
+                    tile_id as u32,
+                    0,
+                    tile_id * 100 + hilbert,
+                    hilbert * 1000 + tile_id, // original_hilbert
+                    vec![tile_id as u8],
+                    vec![hilbert as u8],
+                ));
+            }
+        }
+
+        assert_eq!(sorter.len(), 500); // 5 tiles * 100 features
+
+        let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(sorted.len(), 500);
+
+        // Verify records are sorted by (tile_id, original_hilbert)
+        let mut prev_tile_id = 0u64;
+        let mut prev_hilbert = 0u64;
+
+        for (i, record) in sorted.iter().enumerate() {
+            if record.tile_id == prev_tile_id {
+                // Same tile - Hilbert should be >= previous
+                assert!(
+                    record.original_hilbert >= prev_hilbert,
+                    "Record {} has wrong Hilbert order within tile {}: {} < {} (prev)",
+                    i,
+                    record.tile_id,
+                    record.original_hilbert,
+                    prev_hilbert
+                );
+            } else {
+                // New tile - should be > previous tile
+                assert!(
+                    record.tile_id > prev_tile_id,
+                    "Record {} has wrong tile order: {} <= {} (prev)",
+                    i,
+                    record.tile_id,
+                    prev_tile_id
+                );
+            }
+            prev_tile_id = record.tile_id;
+            prev_hilbert = record.original_hilbert;
+        }
+
+        // Verify each tile has features in correct Hilbert order
+        for tile_id in 0..5u64 {
+            let tile_features: Vec<_> = sorted.iter().filter(|r| r.tile_id == tile_id).collect();
+
+            assert_eq!(
+                tile_features.len(),
+                100,
+                "Tile {} should have 100 features",
+                tile_id
+            );
+
+            // Check Hilbert ordering within tile
+            let hilberts: Vec<u64> = tile_features.iter().map(|r| r.original_hilbert).collect();
+            let mut sorted_hilberts = hilberts.clone();
+            sorted_hilberts.sort();
+
+            assert_eq!(
+                hilberts, sorted_hilberts,
+                "Tile {} features should be sorted by original_hilbert",
+                tile_id
+            );
+        }
+    }
+
     #[test]
     fn test_in_memory_fast_path_no_disk_io() {
         // This test verifies the critical in-memory fast path:
