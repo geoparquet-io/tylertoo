@@ -97,6 +97,7 @@ impl TileFeatureRecord {
     /// * `original_hilbert` - Hilbert index of the ORIGINAL geometry centroid (before clipping)
     /// * `geometry_wkb` - Serialized geometry bytes
     /// * `properties` - MessagePack-serialized properties
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tile_id: u64,
         z: u8,

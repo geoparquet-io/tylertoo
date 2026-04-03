@@ -397,7 +397,7 @@ where
     .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
     let schema = initial_builder.schema();
-    let geom_idx = find_geometry_column_index(&schema)
+    let geom_idx = find_geometry_column_index(schema)
         .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
     let geom_field = schema.field(geom_idx).clone();
     let schema_descr = initial_builder
@@ -704,7 +704,7 @@ fn read_single_row_group_filtered(
     // Find geometry column
     let schema = builder.schema();
     let schema_descr = builder.metadata().file_metadata().schema_descr();
-    let geom_idx = find_geometry_column_index(&schema)
+    let geom_idx = find_geometry_column_index(schema)
         .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
     let geom_field = schema.field(geom_idx).clone();
 

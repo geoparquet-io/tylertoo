@@ -1188,7 +1188,7 @@ fn generate_tiles_to_writer_internal(
             // Use conservative estimate: budget / 8 buckets / 200 bytes
             // Cap at 50M records to avoid huge in-memory sorts
             let records_per_bucket = budget / 8 / 200;
-            records_per_bucket.min(50_000_000).max(1_000_000)
+            records_per_bucket.clamp(1_000_000, 50_000_000)
         }
         None => 1_000_000, // Default: 1M records (~200MB per segment)
     };
@@ -1678,6 +1678,7 @@ fn generate_tiles_to_writer_internal(
     // When gamma is Some and > 0, gap-based density dropping is applied using the
     // original_hilbert index from each feature. Features are already sorted by
     // (tile_id, original_hilbert) via external sort, enabling correct gap-based selection.
+    #[allow(clippy::too_many_arguments)]
     fn encode_tile_from_raw(
         tile_data: RawTileData,
         layer_name: &str,
