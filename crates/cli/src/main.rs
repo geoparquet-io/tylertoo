@@ -21,6 +21,35 @@ use std::time::{Duration, Instant};
 
 mod profiling;
 
+/// Parse human-readable memory size (e.g., "8G", "16G", "512M") to bytes.
+fn parse_memory_size(s: &str) -> Result<usize, String> {
+    let s = s.trim().to_uppercase();
+    let (num_str, multiplier) = if s.ends_with("G") || s.ends_with("GB") {
+        (
+            s.trim_end_matches("GB").trim_end_matches("G"),
+            1024 * 1024 * 1024,
+        )
+    } else if s.ends_with("M") || s.ends_with("MB") {
+        (s.trim_end_matches("MB").trim_end_matches("M"), 1024 * 1024)
+    } else if s.ends_with("K") || s.ends_with("KB") {
+        (s.trim_end_matches("KB").trim_end_matches("K"), 1024)
+    } else {
+        // Assume bytes if no suffix
+        (s.as_str(), 1)
+    };
+
+    num_str
+        .trim()
+        .parse::<usize>()
+        .map(|n| n * multiplier)
+        .map_err(|_| {
+            format!(
+                "Invalid memory size: '{}'. Use format like '8G', '16G', '512M'",
+                s
+            )
+        })
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gpq-tiles",
@@ -223,6 +252,17 @@ struct Args {
     /// Typical values: 64 (small), 256 (medium), 1024 (large files).
     #[arg(long, value_name = "N")]
     buckets: Option<usize>,
+
+    /// Memory budget for sorting (e.g., "8G", "16G", "40G").
+    ///
+    /// Controls how much RAM the external sort can use per bucket.
+    /// Larger values = fewer temp files = faster sorting and avoids
+    /// "too many open files" errors on large datasets.
+    ///
+    /// Default: conservative (creates many small temp files).
+    /// Recommended: 50-75% of available RAM for large datasets.
+    #[arg(long, value_name = "SIZE", value_parser = parse_memory_size)]
+    memory_budget: Option<usize>,
 }
 
 impl Args {
@@ -444,6 +484,11 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_processing_mode(mode);
     }
 
+    // Configure memory budget if specified
+    if let Some(budget) = args.memory_budget {
+        tiler_config = tiler_config.with_memory_budget(budget);
+    }
+
     // Print configuration in verbose mode
     if args.verbose {
         eprintln!("Configuration:");
@@ -492,6 +537,9 @@ fn main() -> Result<()> {
                     eprintln!("  Processing mode: bucketed (auto-tuned)");
                 }
             }
+        }
+        if let Some(budget) = tiler_config.memory_budget {
+            eprintln!("  Memory budget: {}", HumanBytes(budget as u64));
         }
         eprintln!();
     }

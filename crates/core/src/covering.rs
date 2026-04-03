@@ -219,16 +219,16 @@ pub fn parse_covering_metadata(geo_json: &str) -> Result<Option<CoveringSpec>, E
 // ============================================================================
 
 /// Column indices for bbox fields within a Parquet file.
-#[derive(Debug)]
-struct BboxColumnIndices {
-    xmin: usize,
-    ymin: usize,
-    xmax: usize,
-    ymax: usize,
+#[derive(Debug, Clone, Copy)]
+pub struct BboxColumnIndices {
+    pub xmin: usize,
+    pub ymin: usize,
+    pub xmax: usize,
+    pub ymax: usize,
 }
 
 /// Find the column indices for bbox fields in the Parquet schema.
-fn find_bbox_column_indices(
+pub fn find_bbox_column_indices(
     metadata: &ParquetMetaData,
     covering: &CoveringSpec,
 ) -> Option<BboxColumnIndices> {

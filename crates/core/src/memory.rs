@@ -273,4 +273,100 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
         assert_eq!(format_bytes(4 * 1024 * 1024 * 1024), "4.00 GB");
     }
+
+    // ============================================================
+    // BUG VERIFICATION TESTS
+    // ============================================================
+
+    /// Demonstrates that MemoryTracker counts THROUGHPUT, not RESIDENT memory.
+    ///
+    /// When used with an external sorter that spills to disk, the tracker
+    /// will add() for each record but never remove() when records are flushed.
+    /// This causes peak to reflect cumulative bytes processed, not actual RAM.
+    #[test]
+    fn test_bug_tracker_counts_throughput_not_resident() {
+        let mut tracker = MemoryTracker::with_budget(1000);
+
+        // Simulate external sorter behavior:
+        // - Add 500 bytes (record 1)
+        // - Add 500 bytes (record 2)
+        // - Sorter flushes to disk (but tracker has no remove() call!)
+        // - Add 500 bytes (record 3)
+        // - etc.
+
+        // In the real pipeline, records are added but never removed
+        // because the external sorter handles its own memory management
+
+        tracker.add(500);
+        tracker.add(500);
+        // At this point, actual memory might be flushed to disk
+        // But tracker still shows 1000 bytes
+
+        assert_eq!(tracker.current(), 1000);
+        assert_eq!(tracker.peak(), 1000);
+
+        // More records come in, old ones are on disk
+        tracker.add(500);
+        tracker.add(500);
+
+        // Tracker shows 2000 bytes, but actual RAM might be only 1000
+        // (if sorter flushed the first batch)
+        assert_eq!(tracker.current(), 2000);
+        assert_eq!(tracker.peak(), 2000);
+
+        // After reset_current(), peak is preserved
+        tracker.reset_current();
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.peak(), 2000); // Peak never decreases!
+
+        println!("This demonstrates the bug:");
+        println!("- Tracker peak: {} bytes", tracker.peak());
+        println!("- Actual RAM could be much lower if sorter spilled to disk");
+        println!("- Peak represents THROUGHPUT, not RESIDENT memory");
+    }
+
+    /// Shows that the pipeline's memory tracking pattern leads to overcounting.
+    ///
+    /// The pipeline does:
+    /// 1. Phase 1: add(record_size) for EVERY record going to sorter
+    /// 2. Sorter spills to disk (no remove() called)
+    /// 3. reset_current() after Phase 1
+    /// 4. Phase 3: add(geom_size) again when reading back
+    ///
+    /// This means records are counted TWICE in peak if Phase 3 adds exceed Phase 1.
+    #[test]
+    fn test_bug_pipeline_double_counting_pattern() {
+        let mut tracker = MemoryTracker::new();
+
+        // Phase 1: Add records to sorter
+        for _ in 0..100 {
+            tracker.add(100); // 100 bytes per record
+        }
+        let phase1_peak = tracker.peak();
+        println!("After Phase 1: peak = {} bytes", phase1_peak);
+        assert_eq!(phase1_peak, 10_000);
+
+        // Reset current (but peak is preserved!)
+        tracker.reset_current();
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.peak(), 10_000);
+
+        // Phase 3: Read records back and add again
+        for _ in 0..100 {
+            tracker.add(100);
+        }
+
+        // Peak is now max(phase1_peak, phase3_current)
+        // If Phase 3 had more records, peak would be higher
+        println!("After Phase 3: peak = {} bytes", tracker.peak());
+
+        // The issue: If Phase 1 adds 97GB worth of throughput,
+        // peak stays at 97GB even though:
+        // 1. Records were written to disk
+        // 2. reset_current() was called
+        // 3. Actual RAM never exceeded buffer size
+
+        println!("\nThis is why the pipeline reports 97GB 'peak memory'");
+        println!("when actual RAM usage was ~40GB or less.");
+    }
 }

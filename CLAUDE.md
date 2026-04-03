@@ -68,6 +68,32 @@ let geom: geo::Geometry = geozero::wkb::Wkb(wkb.to_vec()).to_geo();
 
 Document all divergences in `context/ARCHITECTURE.md`.
 
+### 4. Test Execution: Targeted Tests Only
+
+**Tests are SLOW.** The full suite runs integration tests with real parquet I/O, full pipeline execution, and nested parallelism (cargo test threads × Rayon threads × I/O threads).
+
+**NEVER run the full test suite.** Always run targeted tests:
+
+```bash
+# GOOD: Run specific test
+cargo test --package gpq-tiles-core batch_processor::tests::test_specific_thing -- --nocapture
+
+# GOOD: Run tests in a specific module
+cargo test --package gpq-tiles-core covering:: -- --nocapture
+
+# BAD: Runs everything, takes forever
+cargo test
+cargo test --package gpq-tiles-core
+```
+
+**When to skip tests entirely:**
+- Formatting fixes (`cargo fmt`)
+- Import cleanup
+- Documentation changes
+- Changes already verified by `cargo check` or `cargo build`
+
+**Use `cargo check` liberally** — it's fast and catches most errors without running tests.
+
 ## Architecture
 
 ```
@@ -90,11 +116,16 @@ TilerConfig { min_zoom, max_zoom, ... }       // Pipeline configuration
 ## Commands
 
 ```bash
-cargo build                   # Build
-cargo test                    # Run all tests
-cargo bench                   # Run all benchmarks
-cargo bench -- "single_tile"  # Run specific benchmark group
+cargo check                   # Fast compile check (use liberally)
+cargo build                   # Build debug
+cargo build --release         # Build release
 cargo fmt --all               # Format (required before commit)
+
+# Tests - ALWAYS targeted (see Critical Constraint #4)
+cargo test --package gpq-tiles-core <module>::<test> -- --nocapture
+
+# Benchmarks (slow - only run when needed)
+cargo bench --package gpq-tiles-core --bench <name> -- "<filter>"
 
 # Run the CLI
 cargo run --package gpq-tiles -- input.parquet output.pmtiles

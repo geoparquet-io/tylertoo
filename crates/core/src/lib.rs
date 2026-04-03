@@ -84,8 +84,8 @@ pub use pipeline::{ProgressCallback, ProgressEvent};
 pub use quality::{extract_crs, validate_wgs84, CrsInfo};
 // Re-export covering types for row group filtering
 pub use covering::{
-    extract_row_group_bounds, parse_bounds, parse_covering_metadata, tile_to_bounds, CoveringSpec,
-    RowGroupBounds,
+    extract_row_group_bounds, find_bbox_column_indices, parse_bounds, parse_covering_metadata,
+    tile_to_bounds, BboxColumnIndices, CoveringSpec, RowGroupBounds,
 };
 // Re-export ProcessingMode for memory-bounded processing
 pub use pipeline::{auto_bucket_count, auto_processing_mode, ProcessingMode};

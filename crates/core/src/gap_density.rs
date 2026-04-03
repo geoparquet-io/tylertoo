@@ -201,6 +201,8 @@ impl GapBasedSelector {
 
                 if gap == 0.0 || gap < 1.0 {
                     // Zero gap or very small gap - drop
+                    // CRITICAL: Retain gap for accumulation (tippecanoe compatibility)
+                    self.gap_accumulator = gap;
                     return true;
                 }
 
@@ -736,5 +738,127 @@ mod tests {
         let mut selector = GapBasedSelector::new(1.0);
         selector.set_gamma(3.0);
         assert_eq!(selector.gamma(), 3.0);
+    }
+
+    // ============================================================
+    // BUG VERIFICATION TESTS (Issue #???)
+    // These tests verify the gap_accumulator bug hypothesis
+    // ============================================================
+
+    /// Test showing that gap_accumulator is never set when dropping in else branch.
+    ///
+    /// With scale=100 and uniform spacing of 10:
+    /// - gap = 10/100 = 0.1 < 1.0 for features after first
+    /// - prev_index only updates when KEEPING
+    /// - So we only keep at multiples of 100 (where gap >= 1.0)
+    #[test]
+    fn test_bug_gap_accumulator_never_positive() {
+        let mut selector = GapBasedSelector::new(2.0).with_scale(100.0);
+
+        // Process features at 0, 10, 20, ..., 990
+        let indices: Vec<u64> = (0..100).map(|i| i * 10).collect();
+
+        let mut keep_indices = Vec::new();
+        for &idx in &indices {
+            if !selector.should_drop(idx) {
+                keep_indices.push(idx);
+            }
+        }
+
+        println!("Kept features at indices: {:?}", keep_indices);
+
+        // With CORRECT tippecanoe behavior (after fix):
+        // Gap accumulates when dropping, allowing features through sooner
+        // when threshold >= accumulated_gap
+
+        // The exact kept indices depend on the accumulation math:
+        // - More features kept than the buggy "multiples of 100" pattern
+        // - Features are kept when threshold = (distance/scale)^gamma >= gap_accumulator
+
+        // After fix: should keep MORE features due to accumulation
+        assert!(
+            keep_indices.len() > 10,
+            "Fixed: Should keep more than 10 features due to gap accumulation (got {})",
+            keep_indices.len()
+        );
+        println!(
+            "After fix: kept {} features (vs 10 with buggy code)",
+            keep_indices.len()
+        );
+    }
+
+    /// Compare actual vs expected tippecanoe behavior.
+    ///
+    /// This test documents the expected tippecanoe behavior and shows
+    /// where our implementation diverges.
+    #[test]
+    fn test_bug_tippecanoe_behavior_comparison() {
+        let mut selector = GapBasedSelector::new(2.0).with_scale(100.0);
+
+        // Carefully chosen sequence to demonstrate accumulation
+        let indices = [0u64, 30, 60, 150, 160, 300];
+
+        // EXPECTED tippecanoe behavior (with working accumulation):
+        // idx=0:   KEEP (first)
+        // idx=30:  gap=30/100=0.3 < 1.0, DROP, gap_acc=0.3
+        // idx=60:  threshold=(60/100)^2=0.36 >= gap_acc=0.3, KEEP, gap_acc=0
+        // idx=150: gap=(150-60)/100=0.9 < 1.0, DROP, gap_acc=0.9
+        // idx=160: threshold=((160-60)/100)^2=1.0 >= gap_acc=0.9, KEEP
+        // idx=300: gap=(300-160)/100=1.4 >= 1.0, KEEP
+
+        let expected_keeps_tippecanoe = vec![0, 60, 160, 300];
+
+        // ACTUAL buggy behavior (no accumulation):
+        // idx=0:   KEEP (first), prev=0
+        // idx=30:  gap=30/100=0.3 < 1.0, DROP, prev stays 0
+        // idx=60:  gap=60/100=0.6 < 1.0, DROP, prev stays 0
+        // idx=150: gap=150/100=1.5 >= 1.0, KEEP, prev=150
+        // idx=160: gap=(160-150)/100=0.1 < 1.0, DROP
+        // idx=300: gap=(300-150)/100=1.5 >= 1.0, KEEP
+
+        let expected_keeps_buggy = vec![0, 150, 300];
+
+        let mut actual_keeps = Vec::new();
+        for &idx in &indices {
+            if !selector.should_drop(idx) {
+                actual_keeps.push(idx);
+            }
+        }
+
+        println!("Expected (tippecanoe): {:?}", expected_keeps_tippecanoe);
+        println!("Expected (buggy):      {:?}", expected_keeps_buggy);
+        println!("Actual:                {:?}", actual_keeps);
+
+        // After fix: actual should match tippecanoe behavior
+        assert_eq!(
+            actual_keeps, expected_keeps_tippecanoe,
+            "Fixed: Now matches tippecanoe behavior with gap accumulation"
+        );
+    }
+
+    /// Test demonstrating that features 60 and 160 should be kept with proper accumulation
+    /// but are dropped with the buggy implementation.
+    #[test]
+    fn test_bug_missed_keeps_due_to_no_accumulation() {
+        let mut selector = GapBasedSelector::new(2.0).with_scale(100.0);
+
+        // Feature 0: KEEP
+        assert!(!selector.should_drop(0));
+
+        // Feature 30: DROP (gap=0.3 < 1.0)
+        assert!(selector.should_drop(30));
+
+        // Feature 60: With buggy code, gap=(60-0)/100=0.6 < 1.0, so DROP
+        // With correct code: threshold=0.36 >= gap_acc=0.3, so KEEP
+        let drop_60 = selector.should_drop(60);
+
+        println!("Feature 60: drop={}", drop_60);
+        println!("After fix: KEEP (threshold=0.36 >= gap_acc=0.3)");
+
+        // After fix: feature 60 should be KEPT because threshold >= accumulated gap
+        assert!(
+            !drop_60,
+            "Fixed: Feature 60 should be KEPT with proper gap accumulation"
+        );
     }
 }
