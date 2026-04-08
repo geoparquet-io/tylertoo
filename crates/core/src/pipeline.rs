@@ -2047,20 +2047,172 @@ fn generate_tiles_to_writer_internal(
             }
         }
 
-        // TODO(#26): Implement geometry coalescing here when coalesce_config.is_some()
-        // The infrastructure is ready (CoalesceConfig passed through pipeline).
-        // Implementation needs to:
-        // 1. Collect all features into a Vec (like clustering path does)
-        // 2. Create SpatialGrid for tile bounds
-        // 3. Group features by cell using assign_cell()
-        // 4. Apply coalesce_geometries() within each cell
-        // 5. Add coalesced features to LayerBuilder
-        //
-        // This is complex because WorldClippedGeometry needs conversion to geo::Geometry
-        // for coalescing, then back. Consider row-group pre-coalesce as alternative.
-        let _ = coalesce_config; // Silence unused warning until implemented
+        // Coalescing path: merge features by geometry type to reduce tile complexity
+        let should_coalesce = coalesce_config
+            .map(|cc| tile_data.features.len() >= cc.min_density_trigger as usize)
+            .unwrap_or(false);
 
-        // Non-clustering path: original loop
+        if should_coalesce {
+            use crate::coalesce::SpatialGrid;
+            use crate::world_coord::WorldCoord;
+
+            // Get tile bounds for spatial grid
+            let tile_bounds = coord.bounds();
+            let grid_config = coalesce_config
+                .map(|cc| cc.grid_size.clone())
+                .unwrap_or_default();
+            let grid = SpatialGrid::new(tile_data.features.len() as f64, tile_bounds, &grid_config);
+
+            // Collect and decode all features, grouping by grid cell
+            let mut cells: std::collections::HashMap<
+                (usize, usize),
+                Vec<(u64, WorldClippedGeometry)>,
+            > = std::collections::HashMap::new();
+
+            for raw_feat in tile_data.features.iter() {
+                // Apply gap-based density dropping
+                if let Some(ref mut selector) = gap_selector {
+                    if selector.should_drop(raw_feat.original_hilbert) {
+                        continue;
+                    }
+                }
+
+                let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
+                    Some(g) => g,
+                    None => continue,
+                };
+
+                if geom.is_degenerate_in_tile(&coord, extent) {
+                    continue;
+                }
+
+                if drop_smallest_as_needed {
+                    let pixel_area =
+                        crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
+                    if pixel_area < drop_smallest_threshold {
+                        continue;
+                    }
+                }
+
+                // Assign to grid cell based on first point (fast approximation of centroid)
+                let first_point = match &geom {
+                    WorldClippedGeometry::Point(p) => Some(*p),
+                    WorldClippedGeometry::MultiPoint(mp) => mp.first().copied(),
+                    WorldClippedGeometry::LineString(ls) => ls.first().copied(),
+                    WorldClippedGeometry::MultiLineString(mls) => {
+                        mls.first().and_then(|ls| ls.first().copied())
+                    }
+                    WorldClippedGeometry::Polygon { exterior, .. } => exterior.first().copied(),
+                    WorldClippedGeometry::MultiPolygon(mp) => {
+                        mp.first().and_then(|(ext, _)| ext.first().copied())
+                    }
+                };
+
+                let cell = if let Some(p) = first_point {
+                    // Convert WorldCoord to lng/lat for grid assignment
+                    let lng = (p.x as f64 / (1u64 << 32) as f64) * 360.0 - 180.0;
+                    let lat_rad =
+                        std::f64::consts::PI * (1.0 - 2.0 * p.y as f64 / (1u64 << 32) as f64);
+                    let lat = lat_rad.sinh().atan().to_degrees();
+                    let pt = geo::Point::new(lng, lat);
+                    grid.assign_cell(&geo::Geometry::Point(pt))
+                        .unwrap_or((0, 0))
+                } else {
+                    (0, 0) // Fallback cell for empty geometries
+                };
+
+                cells
+                    .entry(cell)
+                    .or_default()
+                    .push((raw_feat.feature_id, geom));
+            }
+
+            // Coalesce features within each cell by geometry type
+            for ((_cx, _cy), cell_features) in cells {
+                // Group by geometry type family
+                let mut points: Vec<WorldCoord> = Vec::new();
+                let mut linestrings: Vec<Vec<WorldCoord>> = Vec::new();
+                let mut polygons: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = Vec::new();
+                let mut first_feature_id: Option<u64> = None;
+
+                for (feat_id, geom) in cell_features {
+                    if first_feature_id.is_none() {
+                        first_feature_id = Some(feat_id);
+                    }
+                    match geom {
+                        WorldClippedGeometry::Point(p) => points.push(p),
+                        WorldClippedGeometry::MultiPoint(mp) => points.extend(mp),
+                        WorldClippedGeometry::LineString(ls) => linestrings.push(ls),
+                        WorldClippedGeometry::MultiLineString(mls) => linestrings.extend(mls),
+                        WorldClippedGeometry::Polygon {
+                            exterior,
+                            interiors,
+                        } => {
+                            polygons.push((exterior, interiors));
+                        }
+                        WorldClippedGeometry::MultiPolygon(mp) => polygons.extend(mp),
+                    }
+                }
+
+                let feat_id = first_feature_id.unwrap_or(synthetic_feature_id);
+
+                // Emit coalesced geometries
+                if !points.is_empty() {
+                    let coalesced = if points.len() == 1 {
+                        WorldClippedGeometry::Point(points.into_iter().next().unwrap())
+                    } else {
+                        WorldClippedGeometry::MultiPoint(points)
+                    };
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &[], &coord);
+                    feature_count += 1;
+                }
+
+                if !linestrings.is_empty() {
+                    let coalesced = if linestrings.len() == 1 {
+                        WorldClippedGeometry::LineString(linestrings.into_iter().next().unwrap())
+                    } else {
+                        WorldClippedGeometry::MultiLineString(linestrings)
+                    };
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &[], &coord);
+                    feature_count += 1;
+                }
+
+                if !polygons.is_empty() {
+                    let coalesced = if polygons.len() == 1 {
+                        let (ext, ints) = polygons.into_iter().next().unwrap();
+                        WorldClippedGeometry::Polygon {
+                            exterior: ext,
+                            interiors: ints,
+                        }
+                    } else {
+                        WorldClippedGeometry::MultiPolygon(polygons)
+                    };
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &[], &coord);
+                    feature_count += 1;
+                }
+            }
+
+            // Build and return tile
+            if feature_count > 0 {
+                let layer = layer_builder.build();
+                let mut tile_builder = TileBuilder::new();
+                tile_builder.add_layer(layer);
+                let tile = tile_builder.build();
+                let encoded = tile.encode_to_vec();
+
+                return Some(EncodedTile {
+                    z: tile_data.z,
+                    x: tile_data.x,
+                    y: tile_data.y,
+                    data: encoded,
+                    feature_count,
+                });
+            } else {
+                return None;
+            }
+        }
+
+        // Non-clustering, non-coalescing path: original loop
         for raw_feat in tile_data.features {
             // Gap-based density dropping (--drop-densest-as-needed)
             // Applied BEFORE geometry decoding for efficiency - we can skip
