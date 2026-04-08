@@ -169,6 +169,50 @@ struct Args {
     #[arg(long = "cluster-maxzoom", value_name = "ZOOM")]
     cluster_maxzoom: Option<u8>,
 
+    /// Enable geometry coalescing for dense tiles.
+    ///
+    /// Merges features into Multi* geometries to reduce tile complexity while
+    /// preserving all coordinate data. Uses GeoParquet metadata to predict dense
+    /// tiles upfront (no retry loops like tippecanoe).
+    ///
+    /// Only the densest row groups (top 10% by default) are coalesced.
+    #[arg(long = "coalesce-densest-as-needed")]
+    coalesce_densest: bool,
+
+    /// Set the percentile threshold for coalescing (default: 90).
+    ///
+    /// Only row groups in the top (100 - percentile)% densest are coalesced.
+    /// Example: 90 means top 10% densest, 75 means top 25% densest.
+    /// Requires --coalesce-densest-as-needed.
+    #[arg(
+        long = "coalesce-percentile",
+        value_name = "PERCENTILE",
+        default_value = "90"
+    )]
+    coalesce_percentile: u8,
+
+    /// Minimum features per tile to trigger coalescing (default: 100).
+    ///
+    /// Even if a tile exceeds the percentile threshold, coalescing is
+    /// skipped if the feature count is below this value.
+    /// Requires --coalesce-densest-as-needed.
+    #[arg(
+        long = "coalesce-min-density",
+        value_name = "FEATURES",
+        default_value = "100"
+    )]
+    coalesce_min_density: f64,
+
+    /// Attribute handling mode during coalescing (default: drop).
+    ///
+    /// Controls how feature attributes are handled when geometries are merged:
+    /// - drop: Discard all attributes (tippecanoe-compatible default)
+    /// - keep-first: Keep the first feature's attributes
+    ///
+    /// Requires --coalesce-densest-as-needed.
+    #[arg(long = "coalesce-attrs", value_name = "MODE", default_value = "drop")]
+    coalesce_attrs: String,
+
     /// Enable automatic per-feature max zoom based on feature area.
     ///
     /// Large features (e.g., country polygons) stop at low zoom levels where they
@@ -455,6 +499,27 @@ fn main() -> Result<()> {
     // Add cluster config if specified
     if let Some((distance, maxzoom)) = cluster_config {
         tiler_config = tiler_config.with_cluster(distance, maxzoom);
+    }
+
+    // Add coalesce config if specified
+    if args.coalesce_densest {
+        tiler_config = tiler_config
+            .with_coalesce_percentile(args.coalesce_percentile)
+            .with_coalesce_min_density(args.coalesce_min_density);
+
+        // Parse attribute handling mode
+        let attr_mode = match args.coalesce_attrs.to_lowercase().as_str() {
+            "drop" => gpq_tiles_core::coalesce::AttributeMode::Drop,
+            "keep-first" | "keepfirst" => gpq_tiles_core::coalesce::AttributeMode::KeepFirst,
+            "strict" => gpq_tiles_core::coalesce::AttributeMode::Strict,
+            other => {
+                anyhow::bail!(
+                    "Invalid --coalesce-attrs value: '{}'. Valid options: drop, keep-first, strict",
+                    other
+                );
+            }
+        };
+        tiler_config = tiler_config.with_coalesce_attribute_mode(attr_mode);
     }
 
     // Configure zoom-by-area if requested

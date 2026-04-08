@@ -379,6 +379,26 @@ pub fn sort_geometries(geometries: &mut [Geometry<f64>], use_hilbert: bool) {
     });
 }
 
+/// Sort feature records by their spatial index for efficient tile generation.
+///
+/// This is a version of `sort_geometries` that works with `FeatureRecord` structs,
+/// preserving the association between geometries and their properties.
+///
+/// # Arguments
+///
+/// * `features` - Mutable slice of feature records to sort in place
+/// * `use_hilbert` - If true, use Hilbert curve (better locality). If false, use Z-order.
+pub fn sort_features(features: &mut [crate::batch_processor::FeatureRecord], use_hilbert: bool) {
+    features.sort_by_cached_key(|feat| {
+        let (wx, wy) = geometry_world_coords(&feat.geometry).unwrap_or((0, 0));
+        if use_hilbert {
+            encode_hilbert(wx, wy)
+        } else {
+            encode_zorder(wx, wy)
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

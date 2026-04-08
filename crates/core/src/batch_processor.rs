@@ -23,9 +23,41 @@ use crate::covering::{
     extract_row_group_bounds, find_bbox_column_indices, parse_covering_metadata, BboxColumnIndices,
     RowGroupBounds,
 };
+use crate::property_filter::PropertyFilter;
 use crate::tile::TileBounds;
+use crate::wkb::{serialize_properties, PropertyValue};
 use crate::{Error, Result};
 use std::collections::HashMap;
+
+/// A feature record containing geometry and serialized properties.
+///
+/// This struct is returned by `process_features_parallel_filtered()` and contains
+/// both the geometry and MessagePack-serialized properties for each feature.
+#[derive(Debug, Clone)]
+pub struct FeatureRecord {
+    /// The feature's geometry
+    pub geometry: Geometry<f64>,
+    /// MessagePack-serialized properties (may be empty if property extraction is disabled)
+    pub properties: Vec<u8>,
+}
+
+impl FeatureRecord {
+    /// Create a new feature record with geometry and serialized properties.
+    pub fn new(geometry: Geometry<f64>, properties: Vec<u8>) -> Self {
+        Self {
+            geometry,
+            properties,
+        }
+    }
+
+    /// Create a feature record with geometry and no properties.
+    pub fn geometry_only(geometry: Geometry<f64>) -> Self {
+        Self {
+            geometry,
+            properties: Vec::new(),
+        }
+    }
+}
 
 /// Calculate total size of parquet data at a path.
 ///
@@ -1110,6 +1142,437 @@ pub fn extract_field_metadata(path: &Path) -> Result<HashMap<String, String>> {
     }
 
     Ok(fields)
+}
+
+/// Read features (geometry + properties) from a single row group with property filtering.
+///
+/// This function extends `read_single_row_group_filtered` to also extract properties
+/// from the record batch. Properties are serialized to MessagePack format.
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file
+/// * `rg_idx` - Row group index to read
+/// * `property_filter` - Filter for which properties to include
+///
+/// # Returns
+///
+/// `(RowGroupInfo, Vec<FeatureRecord>)` containing the row group metadata and features
+pub fn read_features_from_row_group(
+    path: &Path,
+    rg_idx: usize,
+    property_filter: &PropertyFilter,
+) -> Result<(RowGroupInfo, Vec<FeatureRecord>)> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+    let parquet_reader = SerializedFileReader::new(
+        file.try_clone()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to clone file handle: {}", e)))?,
+    )
+    .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
+
+    let num_row_groups = parquet_reader.metadata().num_row_groups();
+    if rg_idx >= num_row_groups {
+        return Err(Error::GeoParquetRead(format!(
+            "Row group {} out of range (file has {})",
+            rg_idx, num_row_groups
+        )));
+    }
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+    let schema = builder.schema().clone();
+    let schema_descr = builder.metadata().file_metadata().schema_descr();
+    let geom_idx = find_geometry_column_index(&schema)
+        .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+    let geom_field = schema.field(geom_idx).clone();
+
+    // Build list of columns to project based on property filter
+    let mut projected_cols: Vec<usize> = vec![geom_idx];
+    let mut property_col_indices: Vec<(usize, String)> = Vec::new(); // (projected_index, field_name)
+
+    // If not ExcludeAll, include property columns
+    if !matches!(property_filter, PropertyFilter::ExcludeAll) {
+        for (field_idx, field) in schema.fields().iter().enumerate() {
+            // Skip geometry column
+            if field_idx == geom_idx {
+                continue;
+            }
+            // Skip unsupported types (binary, complex structures)
+            if !is_supported_property_type(field.data_type()) {
+                continue;
+            }
+            // Apply property filter
+            if property_filter.should_include(field.name()) {
+                property_col_indices.push((projected_cols.len(), field.name().clone()));
+                projected_cols.push(field_idx);
+            }
+        }
+    }
+
+    let mask = ProjectionMask::roots(schema_descr, projected_cols);
+    let reader = builder
+        .with_row_groups(vec![rg_idx])
+        .with_projection(mask)
+        .build()
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+    let mut features = Vec::new();
+    let mut row_count = 0;
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+
+        // Geometry column is at position 0 after projection
+        let geom_col = batch.column(0);
+        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), &geom_field)
+            .map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
+        })?;
+
+        // Extract geometries for this batch
+        let mut batch_geometries: Vec<Geometry<f64>> = Vec::new();
+        extract_geometries_from_array(geom_array.as_ref(), &mut batch_geometries)?;
+
+        // Extract properties for each row
+        for (row_idx, geom) in batch_geometries.into_iter().enumerate() {
+            let properties = if property_col_indices.is_empty() {
+                Vec::new()
+            } else {
+                extract_row_properties(&batch, row_idx, &property_col_indices)?
+            };
+
+            features.push(FeatureRecord::new(geom, properties));
+        }
+
+        row_count += batch.num_rows();
+    }
+
+    Ok((
+        RowGroupInfo {
+            index: rg_idx,
+            num_rows: row_count,
+        },
+        features,
+    ))
+}
+
+/// Check if an Arrow data type is supported for property extraction.
+fn is_supported_property_type(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+/// Extract properties from a single row of a record batch.
+///
+/// # Arguments
+///
+/// * `batch` - The Arrow record batch
+/// * `row_idx` - Row index within the batch
+/// * `property_cols` - List of (projected_column_index, field_name) pairs
+///
+/// # Returns
+///
+/// MessagePack-serialized properties
+fn extract_row_properties(
+    batch: &arrow_array::RecordBatch,
+    row_idx: usize,
+    property_cols: &[(usize, String)],
+) -> Result<Vec<u8>> {
+    use arrow_array::Array;
+    use arrow_schema::DataType;
+
+    let mut props: HashMap<String, PropertyValue> = HashMap::new();
+
+    for (col_idx, field_name) in property_cols {
+        let col = batch.column(*col_idx);
+
+        // Skip null values
+        if col.is_null(row_idx) {
+            continue;
+        }
+
+        let value = match col.data_type() {
+            DataType::Utf8 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::StringArray>();
+                arr.map(|a| PropertyValue::String(a.value(row_idx).to_string()))
+            }
+            DataType::LargeUtf8 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::LargeStringArray>();
+                arr.map(|a| PropertyValue::String(a.value(row_idx).to_string()))
+            }
+            DataType::Boolean => {
+                let arr = col.as_any().downcast_ref::<arrow_array::BooleanArray>();
+                arr.map(|a| PropertyValue::Bool(a.value(row_idx)))
+            }
+            DataType::Int8 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::Int8Array>();
+                arr.map(|a| PropertyValue::Int(a.value(row_idx) as i64))
+            }
+            DataType::Int16 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::Int16Array>();
+                arr.map(|a| PropertyValue::Int(a.value(row_idx) as i64))
+            }
+            DataType::Int32 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::Int32Array>();
+                arr.map(|a| PropertyValue::Int(a.value(row_idx) as i64))
+            }
+            DataType::Int64 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::Int64Array>();
+                arr.map(|a| PropertyValue::Int(a.value(row_idx)))
+            }
+            DataType::UInt8 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::UInt8Array>();
+                arr.map(|a| PropertyValue::UInt(a.value(row_idx) as u64))
+            }
+            DataType::UInt16 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::UInt16Array>();
+                arr.map(|a| PropertyValue::UInt(a.value(row_idx) as u64))
+            }
+            DataType::UInt32 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::UInt32Array>();
+                arr.map(|a| PropertyValue::UInt(a.value(row_idx) as u64))
+            }
+            DataType::UInt64 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::UInt64Array>();
+                arr.map(|a| PropertyValue::UInt(a.value(row_idx)))
+            }
+            DataType::Float16 => {
+                // half::f16 needs special handling - skip for now
+                None
+            }
+            DataType::Float32 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::Float32Array>();
+                arr.map(|a| PropertyValue::Float(a.value(row_idx) as f64))
+            }
+            DataType::Float64 => {
+                let arr = col.as_any().downcast_ref::<arrow_array::Float64Array>();
+                arr.map(|a| PropertyValue::Float(a.value(row_idx)))
+            }
+            _ => None,
+        };
+
+        if let Some(v) = value {
+            props.insert(field_name.clone(), v);
+        }
+    }
+
+    if props.is_empty() {
+        Ok(Vec::new())
+    } else {
+        serialize_properties(&props).map_err(|e| Error::GeoParquetRead(e.to_string()))
+    }
+}
+
+/// Result type for parallel row group reading with features.
+enum FeatureRowGroupReadResult {
+    Ok {
+        info: RowGroupInfo,
+        features: Vec<FeatureRecord>,
+    },
+    Err(Error),
+}
+
+/// Process features (geometry + properties) from a GeoParquet file with parallel row group reading.
+///
+/// This extends `process_geometries_parallel_filtered` to also extract properties.
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file or directory
+/// * `num_readers` - Number of parallel reader threads
+/// * `spatial_filter` - Optional bounding box to filter row groups
+/// * `property_filter` - Filter for which properties to include
+/// * `callback` - Function called for each row group's features
+///
+/// # Returns
+///
+/// Total number of features processed
+#[instrument(name = "read_features_parallel", skip(callback), fields(path = %path.display(), num_readers, has_filter = spatial_filter.is_some()))]
+pub fn process_features_parallel_filtered<F>(
+    path: &Path,
+    num_readers: usize,
+    spatial_filter: Option<TileBounds>,
+    property_filter: &PropertyFilter,
+    mut callback: F,
+) -> Result<usize>
+where
+    F: FnMut(RowGroupInfo, Vec<FeatureRecord>) -> Result<()>,
+{
+    use crossbeam_channel::bounded;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    // Resolve all parquet files (single file or directory)
+    let files = resolve_parquet_files(path)?;
+
+    // Build work items: (file_path, row_group_index, global_index) for each row group
+    // With spatial filtering, we skip row groups whose bbox doesn't intersect the filter
+    let mut work_items = Vec::new();
+    let mut global_index = 0;
+    let mut skipped_row_groups = 0;
+
+    for file_path in &files {
+        let file = std::fs::File::open(file_path).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to open {}: {}", file_path.display(), e))
+        })?;
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to read {}: {}", file_path.display(), e))
+        })?;
+        let num_rg = reader.metadata().num_row_groups();
+
+        // Extract row group bboxes if filtering is enabled
+        let row_group_bounds: Vec<Option<RowGroupBounds>> = if spatial_filter.is_some() {
+            match extract_row_group_bounds(file_path) {
+                Ok(bounds) => bounds,
+                Err(_) => {
+                    tracing::warn!(
+                        "Could not extract row group bboxes from {}, processing all row groups",
+                        file_path.display()
+                    );
+                    vec![None; num_rg]
+                }
+            }
+        } else {
+            vec![None; num_rg]
+        };
+
+        for rg_idx in 0..num_rg {
+            // Check if this row group should be skipped due to spatial filter
+            if let Some(ref filter) = spatial_filter {
+                if let Some(Some(ref rg_bbox)) = row_group_bounds.get(rg_idx) {
+                    if !rg_bbox.intersects(filter) {
+                        skipped_row_groups += 1;
+                        global_index += 1;
+                        continue;
+                    }
+                }
+            }
+
+            work_items.push(RowGroupWorkItem {
+                file_path: file_path.clone(),
+                row_group_index: rg_idx,
+                global_index,
+            });
+            global_index += 1;
+        }
+    }
+
+    if skipped_row_groups > 0 {
+        tracing::info!(
+            "Spatial filter skipped {} row groups, processing {}",
+            skipped_row_groups,
+            work_items.len()
+        );
+    }
+
+    let num_row_groups = work_items.len();
+    if num_row_groups == 0 {
+        return Ok(0);
+    }
+
+    let num_readers = num_readers.max(1).min(num_row_groups);
+
+    // Bounded channel for results
+    let (tx, rx) = bounded::<FeatureRowGroupReadResult>(num_readers * 2);
+
+    // Work queue
+    let (work_tx, work_rx) = bounded::<RowGroupWorkItem>(num_row_groups);
+
+    // Fill work queue
+    for item in work_items {
+        work_tx.send(item).unwrap();
+    }
+    drop(work_tx);
+
+    // Clone property filter for threads (using Arc for shared access)
+    let property_filter = Arc::new(property_filter.clone());
+
+    // Spawn reader threads
+    let mut reader_handles = Vec::with_capacity(num_readers);
+    for _ in 0..num_readers {
+        let work_rx = work_rx.clone();
+        let tx = tx.clone();
+        let prop_filter = Arc::clone(&property_filter);
+
+        let handle = std::thread::spawn(move || {
+            for item in work_rx {
+                let read_result = read_features_from_row_group(
+                    &item.file_path,
+                    item.row_group_index,
+                    &prop_filter,
+                );
+
+                let result = match read_result {
+                    Ok((mut info, features)) => {
+                        info.index = item.global_index;
+                        FeatureRowGroupReadResult::Ok { info, features }
+                    }
+                    Err(e) => FeatureRowGroupReadResult::Err(e),
+                };
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        reader_handles.push(handle);
+    }
+
+    drop(tx);
+
+    // Consumer: receive row groups and call callback
+    let mut total_processed = 0;
+    let mut first_error: Option<Error> = None;
+
+    for result in rx {
+        match result {
+            FeatureRowGroupReadResult::Ok { info, features } => {
+                let feat_count = features.len();
+                if let Err(e) = callback(info, features) {
+                    first_error = Some(e);
+                    break;
+                }
+                total_processed += feat_count;
+            }
+            FeatureRowGroupReadResult::Err(e) => {
+                first_error = Some(e);
+                break;
+            }
+        }
+    }
+
+    // Wait for all reader threads
+    for handle in reader_handles {
+        let _ = handle.join();
+    }
+
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+
+    Ok(total_processed)
 }
 
 #[cfg(test)]

@@ -294,6 +294,42 @@ pub fn choose_mingap(gaps: &mut [u64], fraction: f64, existing_gap: u64) -> u64 
     gaps[ix]
 }
 
+/// Calculate the p-th percentile of a slice of f64 values.
+///
+/// Uses the "nearest rank" method: returns the value at position `ceil(p * n) - 1`.
+///
+/// # Arguments
+///
+/// * `values` - Slice of f64 values (will be cloned and sorted)
+/// * `p` - Percentile in range [0.0, 1.0] (e.g., 0.90 for 90th percentile)
+///
+/// # Returns
+///
+/// The percentile value, or 0.0 if the slice is empty.
+///
+/// # Example
+///
+/// ```
+/// use gpq_tiles_core::gap_density::percentile;
+///
+/// let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+/// let p90 = percentile(&values, 0.90);
+/// assert!((p90 - 9.0).abs() < 0.01);
+/// ```
+pub fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let p = p.clamp(0.0, 1.0);
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+
+    sorted[idx.min(sorted.len() - 1)]
+}
+
 /// Select features by gap-based density filtering.
 ///
 /// Sorts features by Hilbert index and applies gap-based selection to reduce density.
@@ -860,5 +896,55 @@ mod tests {
             !drop_60,
             "Fixed: Feature 60 should be KEPT with proper gap accumulation"
         );
+    }
+
+    // ============================================================
+    // UNIT TESTS: percentile calculation for coalescing
+    // ============================================================
+
+    #[test]
+    fn test_percentile_90th() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let p90 = percentile(&values, 0.90);
+        // 90th percentile of [1..10] should be 9.0
+        assert!((p90 - 9.0).abs() < 0.01, "Expected ~9.0, got {}", p90);
+    }
+
+    #[test]
+    fn test_percentile_50th_median() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let median = percentile(&values, 0.50);
+        // Median of [1,2,3,4,5] = 3.0
+        assert!((median - 3.0).abs() < 0.01, "Expected ~3.0, got {}", median);
+    }
+
+    #[test]
+    fn test_percentile_empty_returns_zero() {
+        let values: Vec<f64> = vec![];
+        let result = percentile(&values, 0.50);
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn test_percentile_single_element() {
+        let values = vec![42.0];
+        let result = percentile(&values, 0.90);
+        assert_eq!(result, 42.0);
+    }
+
+    #[test]
+    fn test_percentile_boundary_0() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let result = percentile(&values, 0.0);
+        // 0th percentile = minimum
+        assert_eq!(result, 1.0);
+    }
+
+    #[test]
+    fn test_percentile_boundary_100() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let result = percentile(&values, 1.0);
+        // 100th percentile = maximum
+        assert_eq!(result, 5.0);
     }
 }

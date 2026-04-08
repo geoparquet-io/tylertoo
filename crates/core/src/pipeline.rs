@@ -24,11 +24,12 @@ use geo::Geometry;
 
 use crate::accumulator::AccumulatorConfig;
 use crate::batch_processor::{
-    extract_field_metadata, extract_geometries, process_geometries_parallel_filtered, RowGroupInfo,
-    DEFAULT_PARALLEL_READERS,
+    extract_field_metadata, extract_geometries, process_features_parallel_filtered,
+    process_geometries_parallel_filtered, FeatureRecord, RowGroupInfo, DEFAULT_PARALLEL_READERS,
 };
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::clustering::ClusterConfig;
+use crate::coalesce::{CoalesceConfig, CoalesceTargets};
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_line_world,
     should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
@@ -39,7 +40,7 @@ use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeo
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
 use crate::simplify::simplify_for_zoom;
-use crate::spatial_index::sort_geometries;
+use crate::spatial_index::{sort_features, sort_geometries};
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
 use crate::validate::filter_valid_geometry;
 use crate::vector_tile::Tile;
@@ -323,6 +324,17 @@ pub struct TilerConfig {
     /// If None, no point clustering is performed.
     pub cluster_config: Option<ClusterConfig>,
 
+    /// Geometry coalescing configuration for dense tiles.
+    ///
+    /// When enabled, merges geometries into Multi* types to reduce tile complexity
+    /// while preserving all coordinate data. Uses GeoParquet metadata to predict
+    /// dense tiles upfront rather than reactive retry loops.
+    ///
+    /// Activated via `--coalesce-densest-as-needed` CLI flag.
+    ///
+    /// If None, no coalescing is performed.
+    pub coalesce_config: Option<CoalesceConfig>,
+
     /// Enable automatic per-feature zoom range calculation based on bbox area (default: false).
     ///
     /// When enabled, calculates BOTH min and max zoom for each feature:
@@ -407,6 +419,8 @@ impl Default for TilerConfig {
             accumulator_config: None,
             // No point clustering by default
             cluster_config: None,
+            // Coalescing disabled by default - user must opt-in
+            coalesce_config: None,
             // Zoom-by-area disabled by default - user must opt-in
             zoom_by_area: false,
             // Default threshold: ~20x20 tile grid for max zoom
@@ -712,6 +726,59 @@ impl TilerConfig {
     /// Alternative to `with_cluster()` when you have a pre-built config.
     pub fn with_cluster_config(mut self, config: ClusterConfig) -> Self {
         self.cluster_config = Some(config);
+        self
+    }
+
+    /// Enable geometry coalescing with default settings.
+    ///
+    /// Coalescing merges dense features into Multi* geometries to reduce
+    /// tile complexity while preserving all coordinate data. Uses GeoParquet
+    /// metadata to predict dense tiles upfront.
+    pub fn with_coalesce_densest(mut self) -> Self {
+        self.coalesce_config = Some(CoalesceConfig::default());
+        self
+    }
+
+    /// Enable geometry coalescing with custom percentile threshold.
+    ///
+    /// Only the top (100 - percentile)% densest row groups are coalesced.
+    /// Example: percentile=90 means only the top 10% densest are coalesced.
+    pub fn with_coalesce_percentile(mut self, percentile: u8) -> Self {
+        self.coalesce_config = Some(
+            self.coalesce_config
+                .unwrap_or_default()
+                .with_percentile(percentile),
+        );
+        self
+    }
+
+    /// Enable geometry coalescing with a CoalesceConfig.
+    ///
+    /// Set minimum density trigger for coalescing.
+    ///
+    /// Tiles with fewer features than this threshold skip coalescing.
+    pub fn with_coalesce_min_density(mut self, min_density: f64) -> Self {
+        self.coalesce_config = Some(
+            self.coalesce_config
+                .unwrap_or_default()
+                .with_min_density(min_density),
+        );
+        self
+    }
+
+    /// Set attribute handling mode for coalescing.
+    pub fn with_coalesce_attribute_mode(mut self, mode: crate::coalesce::AttributeMode) -> Self {
+        self.coalesce_config = Some(
+            self.coalesce_config
+                .unwrap_or_default()
+                .with_attribute_mode(mode),
+        );
+        self
+    }
+
+    /// Alternative to `with_coalesce_densest()` when you have a pre-built config.
+    pub fn with_coalesce_config(mut self, config: CoalesceConfig) -> Self {
+        self.coalesce_config = Some(config);
         self
     }
 
@@ -1239,16 +1306,36 @@ fn generate_tiles_to_writer_internal(
     let geoms_processed = AtomicU64::new(0);
     let row_groups_completed = AtomicU64::new(0);
 
+    // Determine if we need to extract properties for coalescing
+    // Properties are needed when coalesce_config.attribute_mode != Drop
+    use crate::coalesce::AttributeMode;
+    let need_properties = config
+        .coalesce_config
+        .as_ref()
+        .map(|cc| cc.attribute_mode != AttributeMode::Drop)
+        .unwrap_or(false);
+
+    // Property filter for Phase 1: ExcludeAll when properties not needed (efficient),
+    // otherwise use the configured filter (or None for all properties)
+    let phase1_property_filter = if need_properties {
+        // Use configured filter, defaulting to None (all properties) for coalescing
+        config.property_filter.clone()
+    } else {
+        PropertyFilter::ExcludeAll
+    };
+
     // Phase 1 span: Read GeoParquet and clip geometries
     // Use parallel row group reader for overlapped I/O and parallel decompression
     let _phase1_span = tracing::info_span!("read_parquet", path = %input_path.display()).entered();
 
-    // Use spatial filter for row group filtering if configured
-    process_geometries_parallel_filtered(
+    // Use feature extraction with property filter
+    // When properties not needed, ExcludeAll ensures only geometry column is projected (efficient)
+    process_features_parallel_filtered(
         input_path,
         DEFAULT_PARALLEL_READERS,
         config.spatial_filter,
-        |rg_info: RowGroupInfo, geometries| {
+        &phase1_property_filter,
+        |rg_info: RowGroupInfo, features| {
             // Row group span for detailed tracing
             let _rg_span = tracing::info_span!(
                 "row_group",
@@ -1256,7 +1343,7 @@ fn generate_tiles_to_writer_internal(
                 row_count = rg_info.num_rows
             )
             .entered();
-            let features_in_group = geometries.len();
+            let features_in_group = features.len();
 
             // Track completed row groups (may arrive out of order due to parallel reads)
             let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1281,10 +1368,10 @@ fn generate_tiles_to_writer_internal(
             // PROFILING: Track time spent in each phase
             let rg_start = std::time::Instant::now();
 
-            // Sort geometries within row group for better locality
+            // Sort features within row group for better locality
             let sort_start = std::time::Instant::now();
-            let mut sorted = geometries;
-            sort_geometries(&mut sorted, config.use_hilbert);
+            let mut sorted = features;
+            sort_features(&mut sorted, config.use_hilbert);
             let time_sort = sort_start.elapsed();
 
             let num_geoms = sorted.len();
@@ -1304,9 +1391,13 @@ fn generate_tiles_to_writer_internal(
                 bounds: Option<TileBounds>,
             }
 
-            // Process geometries - either in parallel or sequentially based on config
-            let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
-                let feat_idx = base_feat_idx + geom_idx as u64;
+            // Process features - either in parallel or sequentially based on config
+            let process_feature = |feat_idx_local: usize, feature: FeatureRecord| -> GeomResult {
+                let feat_idx = base_feat_idx + feat_idx_local as u64;
+
+                // Extract geometry and properties from feature record
+                let geom = feature.geometry;
+                let properties = feature.properties;
 
                 // Compute Hilbert index from ORIGINAL geometry centroid BEFORE any clipping.
                 // This is critical for gap-based density dropping (--drop-densest-as-needed).
@@ -1457,8 +1548,9 @@ fn generate_tiles_to_writer_internal(
                         tile_coord.y,
                         feat_idx,
                         original_hilbert, // From original geometry, enables gap-based dropping
+                        rg_info.index,    // Row group index for predictive coalescing
                         geom_bytes,
-                        vec![], // Empty properties for now
+                        properties.clone(), // Pass through properties for coalescing
                     );
 
                     result.records.push(record);
@@ -1467,13 +1559,13 @@ fn generate_tiles_to_writer_internal(
                 result
             };
 
-            // Use parallel or sequential geometry processing based on deterministic flag
+            // Use parallel or sequential feature processing based on deterministic flag
             let results: Vec<GeomResult> = if config.deterministic {
                 // SEQUENTIAL: For reproducible output
                 sorted
                     .into_iter()
                     .enumerate()
-                    .map(|(idx, geom)| process_geometry(idx, geom))
+                    .map(|(idx, feature)| process_feature(idx, feature))
                     .collect()
             } else {
                 // PARALLEL: For performance (default)
@@ -1482,7 +1574,7 @@ fn generate_tiles_to_writer_internal(
                     .enumerate()
                     .collect::<Vec<_>>()
                     .into_par_iter()
-                    .map(|(idx, geom)| process_geometry(idx, geom))
+                    .map(|(idx, feature)| process_feature(idx, feature))
                     .collect()
             };
 
@@ -1647,6 +1739,10 @@ fn generate_tiles_to_writer_internal(
         feature_id: u64,
         /// Original Hilbert index for gap-based density dropping (#145)
         original_hilbert: u64,
+        /// Row group index (for predictive coalescing)
+        row_group_idx: usize,
+        /// MessagePack-serialized properties (may be empty)
+        property_bytes: Vec<u8>,
     }
 
     // Tile with raw (not yet decoded) features
@@ -1685,13 +1781,39 @@ fn generate_tiles_to_writer_internal(
         extent: u32,
         enable_tiny_polygon_accumulation: bool,
         cluster_config: Option<&ClusterConfig>,
+        coalesce_config: Option<&CoalesceConfig>,
+        coalesce_targets: Option<&CoalesceTargets>,
         drop_smallest_as_needed: bool,
         drop_smallest_threshold: f64,
         gamma: Option<f64>,
     ) -> Option<EncodedTile> {
         use crate::clustering::{IndexedPoint, PointClusterer};
         use crate::mvt::PropertyValue;
+        use crate::wkb::deserialize_properties;
         use crate::world_coord::WorldCoord;
+
+        // Helper to deserialize MessagePack properties and convert to MVT format
+        fn decode_properties(bytes: &[u8]) -> Vec<(String, PropertyValue)> {
+            if bytes.is_empty() {
+                return Vec::new();
+            }
+            match deserialize_properties(bytes) {
+                Ok(props) => props
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let mvt_value = match v {
+                            crate::wkb::PropertyValue::String(s) => PropertyValue::String(s),
+                            crate::wkb::PropertyValue::Int(i) => PropertyValue::Int(i),
+                            crate::wkb::PropertyValue::UInt(u) => PropertyValue::UInt(u),
+                            crate::wkb::PropertyValue::Float(f) => PropertyValue::Double(f),
+                            crate::wkb::PropertyValue::Bool(b) => PropertyValue::Bool(b),
+                        };
+                        (k, mvt_value)
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
 
         let coord = TileCoord::new(tile_data.x, tile_data.y, tile_data.z);
         let mut layer_builder = LayerBuilder::new(layer_name).with_extent(extent);
@@ -2001,7 +2123,200 @@ fn generate_tiles_to_writer_internal(
             }
         }
 
-        // Non-clustering path: original loop
+        // Coalescing path: merge features by geometry type to reduce tile complexity
+        // Use hybrid approach: coalesce if EITHER:
+        // 1. Feature count exceeds min_density_trigger (reactive), OR
+        // 2. Any feature came from a row group marked as dense at this zoom (predictive)
+        let should_coalesce = coalesce_config
+            .map(|cc| {
+                // Reactive: feature count check
+                let reactive_trigger = tile_data.features.len() >= cc.min_density_trigger as usize;
+
+                // Predictive: check if any feature's row group is marked as dense
+                let predictive_trigger = coalesce_targets
+                    .map(|targets| {
+                        tile_data
+                            .features
+                            .iter()
+                            .any(|f| targets.should_coalesce(f.row_group_idx, tile_data.z))
+                    })
+                    .unwrap_or(false);
+
+                reactive_trigger || predictive_trigger
+            })
+            .unwrap_or(false);
+
+        if should_coalesce {
+            use crate::coalesce::SpatialGrid;
+            use crate::world_coord::WorldCoord;
+
+            // Get tile bounds for spatial grid
+            let tile_bounds = coord.bounds();
+            let grid_config = coalesce_config
+                .map(|cc| cc.grid_size.clone())
+                .unwrap_or_default();
+            let grid = SpatialGrid::new(tile_data.features.len() as f64, tile_bounds, &grid_config);
+
+            // Collect and decode all features, grouping by grid cell
+            // Store (feature_id, geometry, property_bytes) for KeepFirst property mode
+            #[allow(clippy::type_complexity)]
+            let mut cells: std::collections::HashMap<
+                (usize, usize),
+                Vec<(u64, WorldClippedGeometry, Vec<u8>)>,
+            > = std::collections::HashMap::new();
+
+            for raw_feat in tile_data.features.iter() {
+                // Apply gap-based density dropping
+                if let Some(ref mut selector) = gap_selector {
+                    if selector.should_drop(raw_feat.original_hilbert) {
+                        continue;
+                    }
+                }
+
+                let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
+                    Some(g) => g,
+                    None => continue,
+                };
+
+                if geom.is_degenerate_in_tile(&coord, extent) {
+                    continue;
+                }
+
+                if drop_smallest_as_needed {
+                    let pixel_area =
+                        crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
+                    if pixel_area < drop_smallest_threshold {
+                        continue;
+                    }
+                }
+
+                // Assign to grid cell based on first point (fast approximation of centroid)
+                let first_point = match &geom {
+                    WorldClippedGeometry::Point(p) => Some(*p),
+                    WorldClippedGeometry::MultiPoint(mp) => mp.first().copied(),
+                    WorldClippedGeometry::LineString(ls) => ls.first().copied(),
+                    WorldClippedGeometry::MultiLineString(mls) => {
+                        mls.first().and_then(|ls| ls.first().copied())
+                    }
+                    WorldClippedGeometry::Polygon { exterior, .. } => exterior.first().copied(),
+                    WorldClippedGeometry::MultiPolygon(mp) => {
+                        mp.first().and_then(|(ext, _)| ext.first().copied())
+                    }
+                };
+
+                let cell = if let Some(p) = first_point {
+                    // Convert WorldCoord to lng/lat for grid assignment
+                    let lng = (p.x as f64 / (1u64 << 32) as f64) * 360.0 - 180.0;
+                    let lat_rad =
+                        std::f64::consts::PI * (1.0 - 2.0 * p.y as f64 / (1u64 << 32) as f64);
+                    let lat = lat_rad.sinh().atan().to_degrees();
+                    let pt = geo::Point::new(lng, lat);
+                    grid.assign_cell(&geo::Geometry::Point(pt))
+                        .unwrap_or((0, 0))
+                } else {
+                    (0, 0) // Fallback cell for empty geometries
+                };
+
+                cells.entry(cell).or_default().push((
+                    raw_feat.feature_id,
+                    geom,
+                    raw_feat.property_bytes.clone(),
+                ));
+            }
+
+            // Coalesce features within each cell by geometry type
+            for ((_cx, _cy), cell_features) in cells {
+                // Group by geometry type family
+                let mut points: Vec<WorldCoord> = Vec::new();
+                let mut linestrings: Vec<Vec<WorldCoord>> = Vec::new();
+                let mut polygons: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = Vec::new();
+                let mut first_feature_id: Option<u64> = None;
+                let mut first_property_bytes: Option<Vec<u8>> = None;
+
+                for (feat_id, geom, prop_bytes) in cell_features {
+                    if first_feature_id.is_none() {
+                        first_feature_id = Some(feat_id);
+                        first_property_bytes = Some(prop_bytes);
+                    }
+                    match geom {
+                        WorldClippedGeometry::Point(p) => points.push(p),
+                        WorldClippedGeometry::MultiPoint(mp) => points.extend(mp),
+                        WorldClippedGeometry::LineString(ls) => linestrings.push(ls),
+                        WorldClippedGeometry::MultiLineString(mls) => linestrings.extend(mls),
+                        WorldClippedGeometry::Polygon {
+                            exterior,
+                            interiors,
+                        } => {
+                            polygons.push((exterior, interiors));
+                        }
+                        WorldClippedGeometry::MultiPolygon(mp) => polygons.extend(mp),
+                    }
+                }
+
+                let feat_id = first_feature_id.unwrap_or(synthetic_feature_id);
+                // For KeepFirst mode, use properties from the first feature in each cell
+                let props = first_property_bytes
+                    .as_ref()
+                    .map(|bytes| decode_properties(bytes))
+                    .unwrap_or_default();
+
+                // Emit coalesced geometries with properties from first feature
+                if !points.is_empty() {
+                    let coalesced = if points.len() == 1 {
+                        WorldClippedGeometry::Point(points.into_iter().next().unwrap())
+                    } else {
+                        WorldClippedGeometry::MultiPoint(points)
+                    };
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
+                    feature_count += 1;
+                }
+
+                if !linestrings.is_empty() {
+                    let coalesced = if linestrings.len() == 1 {
+                        WorldClippedGeometry::LineString(linestrings.into_iter().next().unwrap())
+                    } else {
+                        WorldClippedGeometry::MultiLineString(linestrings)
+                    };
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
+                    feature_count += 1;
+                }
+
+                if !polygons.is_empty() {
+                    let coalesced = if polygons.len() == 1 {
+                        let (ext, ints) = polygons.into_iter().next().unwrap();
+                        WorldClippedGeometry::Polygon {
+                            exterior: ext,
+                            interiors: ints,
+                        }
+                    } else {
+                        WorldClippedGeometry::MultiPolygon(polygons)
+                    };
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
+                    feature_count += 1;
+                }
+            }
+
+            // Build and return tile
+            if feature_count > 0 {
+                let layer = layer_builder.build();
+                let mut tile_builder = TileBuilder::new();
+                tile_builder.add_layer(layer);
+                let tile = tile_builder.build();
+                let encoded = tile.encode_to_vec();
+
+                return Some(EncodedTile {
+                    z: tile_data.z,
+                    x: tile_data.x,
+                    y: tile_data.y,
+                    data: encoded,
+                    feature_count,
+                });
+            } else {
+                return None;
+            }
+        }
+
+        // Non-clustering, non-coalescing path: original loop
         for raw_feat in tile_data.features {
             // Gap-based density dropping (--drop-densest-as-needed)
             // Applied BEFORE geometry decoding for efficiency - we can skip
@@ -2032,6 +2347,9 @@ fn generate_tiles_to_writer_internal(
                 }
             }
 
+            // Decode properties for this feature
+            let props = decode_properties(&raw_feat.property_bytes);
+
             // Handle tiny polygon accumulation
             match (&geom, &mut accumulator) {
                 (
@@ -2053,6 +2371,7 @@ fn generate_tiles_to_writer_internal(
                         acc.accumulate(exterior, interiors);
 
                         // Emit synthetic square if threshold exceeded
+                        // Note: synthetic features have no properties
                         while acc.should_emit() {
                             if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
                                 let synthetic_geom = WorldClippedGeometry::Polygon {
@@ -2072,11 +2391,11 @@ fn generate_tiles_to_writer_internal(
                             }
                         }
                     } else {
-                        // Normal-sized polygon - add directly
+                        // Normal-sized polygon - add directly with properties
                         layer_builder.add_feature_world(
                             Some(raw_feat.feature_id),
                             &geom,
-                            &[],
+                            &props,
                             &coord,
                         );
                         feature_count += 1;
@@ -2102,6 +2421,7 @@ fn generate_tiles_to_writer_internal(
                             acc.accumulate(ext, ints);
 
                             // Emit synthetic square if threshold exceeded
+                            // Note: synthetic features have no properties
                             while acc.should_emit() {
                                 if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
                                     let synthetic_geom = WorldClippedGeometry::Polygon {
@@ -2127,7 +2447,7 @@ fn generate_tiles_to_writer_internal(
                         }
                     }
 
-                    // If there are any normal-sized polygons, add them
+                    // If there are any normal-sized polygons, add them with properties
                     if has_normal_polygons {
                         if normal_polygons.len() == 1 {
                             // Single polygon remaining - emit as Polygon
@@ -2139,7 +2459,7 @@ fn generate_tiles_to_writer_internal(
                             layer_builder.add_feature_world(
                                 Some(raw_feat.feature_id),
                                 &poly_geom,
-                                &[],
+                                &props,
                                 &coord,
                             );
                         } else {
@@ -2148,7 +2468,7 @@ fn generate_tiles_to_writer_internal(
                             layer_builder.add_feature_world(
                                 Some(raw_feat.feature_id),
                                 &multi_geom,
-                                &[],
+                                &props,
                                 &coord,
                             );
                         }
@@ -2156,8 +2476,13 @@ fn generate_tiles_to_writer_internal(
                     }
                 }
                 _ => {
-                    // Non-polygon geometry - add directly
-                    layer_builder.add_feature_world(Some(raw_feat.feature_id), &geom, &[], &coord);
+                    // Non-polygon geometry - add directly with properties
+                    layer_builder.add_feature_world(
+                        Some(raw_feat.feature_id),
+                        &geom,
+                        &props,
+                        &coord,
+                    );
                     feature_count += 1;
                 }
             }
@@ -2223,7 +2548,19 @@ fn generate_tiles_to_writer_internal(
     let drop_smallest_as_needed = config.drop_smallest_as_needed;
     let drop_smallest_threshold = config.drop_smallest_threshold;
     let cluster_config = config.cluster_config.clone();
+    let coalesce_config = config.coalesce_config.clone();
     let gamma = config.gamma;
+
+    // Calculate predictive coalesce targets from Parquet metadata (if coalescing enabled)
+    let coalesce_targets: Option<CoalesceTargets> = coalesce_config.as_ref().and_then(|cc| {
+        crate::coalesce::calculate_coalesce_targets(
+            input_path,
+            config.min_zoom,
+            config.max_zoom,
+            cc.percentile,
+            cc.min_density_trigger,
+        )
+    });
 
     // Helper to flush the batch: decode + encode in parallel, write sequentially
     let flush_batch = |batch: &mut Vec<RawTileData>,
@@ -2235,6 +2572,8 @@ fn generate_tiles_to_writer_internal(
                        deterministic: bool,
                        enable_tiny_polygon_accumulation: bool,
                        cluster_config: Option<&ClusterConfig>,
+                       coalesce_config: Option<&CoalesceConfig>,
+                       coalesce_targets: Option<&CoalesceTargets>,
                        drop_smallest_as_needed: bool,
                        drop_smallest_threshold: f64,
                        gamma: Option<f64>|
@@ -2255,6 +2594,8 @@ fn generate_tiles_to_writer_internal(
                         extent,
                         enable_tiny_polygon_accumulation,
                         cluster_config,
+                        coalesce_config,
+                        coalesce_targets,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2272,6 +2613,8 @@ fn generate_tiles_to_writer_internal(
                         extent,
                         enable_tiny_polygon_accumulation,
                         cluster_config,
+                        coalesce_config,
+                        coalesce_targets,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2345,6 +2688,8 @@ fn generate_tiles_to_writer_internal(
                         deterministic,
                         enable_tiny_polygon_accumulation,
                         cluster_config.as_ref(),
+                        coalesce_config.as_ref(),
+                        coalesce_targets.as_ref(),
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2363,6 +2708,8 @@ fn generate_tiles_to_writer_internal(
             geometry_bytes: record.geometry_wkb,
             feature_id: record.feature_id,
             original_hilbert: record.original_hilbert,
+            row_group_idx: record.row_group_idx,
+            property_bytes: record.properties,
         });
         current_tile = Some(record_tile);
     }
@@ -2390,6 +2737,8 @@ fn generate_tiles_to_writer_internal(
         deterministic,
         enable_tiny_polygon_accumulation,
         cluster_config.as_ref(),
+        coalesce_config.as_ref(),
+        coalesce_targets.as_ref(),
         drop_smallest_as_needed,
         drop_smallest_threshold,
         gamma,

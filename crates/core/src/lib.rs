@@ -42,6 +42,7 @@ pub mod accumulator;
 pub mod batch_processor;
 pub mod clip;
 pub mod clustering;
+pub mod coalesce;
 pub mod compression;
 pub mod covering;
 pub mod dedup;
@@ -72,6 +73,10 @@ pub mod world_coord;
 pub use accumulator::{AccumulatorConfig, AccumulatorOp};
 // Re-export clustering types for CLI usage
 pub use clustering::{ClusterConfig, IndexedPoint, PointClusterer};
+// Re-export coalescing types for CLI usage
+pub use coalesce::{
+    calculate_coalesce_targets, AttributeMode, CoalesceConfig, CoalesceTargets, GridSize,
+};
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;
 // Re-export Compression from compression module for public API
