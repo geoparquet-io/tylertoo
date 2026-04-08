@@ -2,13 +2,10 @@
 
 **Issue:** #26  
 **Date:** 2026-04-08  
-**Status:** Implemented (Simplified)  
+**Status:** Implemented  
 **Updated:** 2026-04-08
 
 ## Implementation Status
-
-> **Note:** The current implementation uses a **simplified reactive approach** rather than the 
-> full predictive architecture described below. This section documents what was actually implemented.
 
 ### What's Implemented ✅
 
@@ -18,29 +15,38 @@
 - **Adaptive grid sizing**: 4×4 (low density) or 8×8 (high density)
 - **CLI flags**: `--coalesce-densest-as-needed`, `--coalesce-percentile`, `--coalesce-min-density`, `--coalesce-attrs`
 - **Edge case handling**: Zero-width bounds, negative coordinates, empty geometries
+- **Predictive coalescing**: Full GeoParquet-native architecture:
+  - `calculate_coalesce_targets()` scans row group metadata at pipeline start
+  - `row_group_idx` propagated through `TileFeatureRecord` and `RawFeature`
+  - Hybrid trigger: coalesce if EITHER feature count exceeds threshold (reactive) OR row group marked dense (predictive)
+- **Property passthrough**: Full support for `--coalesce-attrs=keep-first|strict`:
+  - `process_features_parallel_filtered()` extracts properties when needed
+  - `PropertyFilter::ExcludeAll` used when properties not needed (efficient I/O)
+  - Properties flow through external sort → tile encoding
 
-### What's NOT Implemented (Future Work) ⏳
+### What Remains (Future Work) ⏳
 
-- **Predictive coalescing wiring**: The `calculate_coalesce_targets()` function is now implemented and exported,
-  but the pipeline still uses tile-level feature count check. To fully enable predictive coalescing:
-  1. Add `row_group_idx` to `TileFeatureRecord` in external_sort.rs
-  2. Pass `CoalesceTargets` to `encode_tile_from_raw()`
-  3. Replace `tile_data.features.len() >= min_density_trigger` with `targets.should_coalesce(rg_idx, zoom)`
-- **Attribute passthrough**: Pipeline doesn't pass properties through encoding (pre-existing limitation)
+- **Benchmark tile sizes**: before/after coalescing comparison on real datasets
+- **Integration test**: with gpio-optimized dense GeoParquet file
+- **Tippecanoe comparison**: output quality verification
 
 ### Current Behavior
 
 ```
 When --coalesce-densest-as-needed is enabled:
-  For each tile:
-    IF tile.feature_count >= min_density_trigger (default: 100):
-      → Apply coalescing (spatial grid + Multi* merging)
-    ELSE:
-      → Standard encoding
+  Phase 0 (metadata scan):
+    For each zoom level:
+      Calculate tile density for each row group from bbox + num_rows
+      Mark top 10% densest row groups as "dense" at that zoom
+  
+  Phase 3 (tile encoding):
+    For each tile:
+      IF feature_count >= min_density_trigger (reactive) 
+         OR any feature's row_group is marked dense at this zoom (predictive):
+        → Apply coalescing (spatial grid + Multi* merging)
+      ELSE:
+        → Standard encoding
 ```
-
-This is simpler but less efficient than the predictive approach—all tiles are checked rather than 
-only those from dense row groups.
 
 ---
 
