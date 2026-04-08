@@ -1162,7 +1162,7 @@ mod tests {
 
         // Should be ~1000 features/tile since bounds fits in ~1 tile
         assert!(
-            density >= 500.0 && density <= 1500.0,
+            (500.0..=1500.0).contains(&density),
             "Expected ~1000, got {}",
             density
         );

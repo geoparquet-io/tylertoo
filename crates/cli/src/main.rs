@@ -510,29 +510,8 @@ fn main() -> Result<()> {
         // Parse attribute handling mode
         let attr_mode = match args.coalesce_attrs.to_lowercase().as_str() {
             "drop" => gpq_tiles_core::coalesce::AttributeMode::Drop,
-            "keep-first" | "keepfirst" => {
-                // Note: KeepFirst is accepted but currently has same effect as Drop
-                // because the encoding pipeline doesn't pass properties through yet.
-                // This is a known limitation to be addressed in a future release.
-                if args.verbose {
-                    eprintln!(
-                        "Warning: --coalesce-attrs=keep-first has same effect as 'drop' \
-                         until property passthrough is implemented in the encoding pipeline"
-                    );
-                }
-                gpq_tiles_core::coalesce::AttributeMode::KeepFirst
-            }
-            "strict" => {
-                // Strict mode would error on any properties, but since we don't pass
-                // properties through the pipeline yet, it effectively does nothing.
-                if args.verbose {
-                    eprintln!(
-                        "Warning: --coalesce-attrs=strict currently has no effect \
-                         because properties are not yet passed through the encoding pipeline"
-                    );
-                }
-                gpq_tiles_core::coalesce::AttributeMode::Strict
-            }
+            "keep-first" | "keepfirst" => gpq_tiles_core::coalesce::AttributeMode::KeepFirst,
+            "strict" => gpq_tiles_core::coalesce::AttributeMode::Strict,
             other => {
                 anyhow::bail!(
                     "Invalid --coalesce-attrs value: '{}'. Valid options: drop, keep-first, strict",

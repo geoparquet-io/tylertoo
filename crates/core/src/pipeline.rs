@@ -24,8 +24,8 @@ use geo::Geometry;
 
 use crate::accumulator::AccumulatorConfig;
 use crate::batch_processor::{
-    extract_field_metadata, extract_geometries, process_geometries_parallel_filtered, RowGroupInfo,
-    DEFAULT_PARALLEL_READERS,
+    extract_field_metadata, extract_geometries, process_features_parallel_filtered,
+    process_geometries_parallel_filtered, FeatureRecord, RowGroupInfo, DEFAULT_PARALLEL_READERS,
 };
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::clustering::ClusterConfig;
@@ -40,7 +40,7 @@ use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeo
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
 use crate::simplify::simplify_for_zoom;
-use crate::spatial_index::sort_geometries;
+use crate::spatial_index::{sort_features, sort_geometries};
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
 use crate::validate::filter_valid_geometry;
 use crate::vector_tile::Tile;
@@ -1306,16 +1306,36 @@ fn generate_tiles_to_writer_internal(
     let geoms_processed = AtomicU64::new(0);
     let row_groups_completed = AtomicU64::new(0);
 
+    // Determine if we need to extract properties for coalescing
+    // Properties are needed when coalesce_config.attribute_mode != Drop
+    use crate::coalesce::AttributeMode;
+    let need_properties = config
+        .coalesce_config
+        .as_ref()
+        .map(|cc| cc.attribute_mode != AttributeMode::Drop)
+        .unwrap_or(false);
+
+    // Property filter for Phase 1: ExcludeAll when properties not needed (efficient),
+    // otherwise use the configured filter (or None for all properties)
+    let phase1_property_filter = if need_properties {
+        // Use configured filter, defaulting to None (all properties) for coalescing
+        config.property_filter.clone()
+    } else {
+        PropertyFilter::ExcludeAll
+    };
+
     // Phase 1 span: Read GeoParquet and clip geometries
     // Use parallel row group reader for overlapped I/O and parallel decompression
     let _phase1_span = tracing::info_span!("read_parquet", path = %input_path.display()).entered();
 
-    // Use spatial filter for row group filtering if configured
-    process_geometries_parallel_filtered(
+    // Use feature extraction with property filter
+    // When properties not needed, ExcludeAll ensures only geometry column is projected (efficient)
+    process_features_parallel_filtered(
         input_path,
         DEFAULT_PARALLEL_READERS,
         config.spatial_filter,
-        |rg_info: RowGroupInfo, geometries| {
+        &phase1_property_filter,
+        |rg_info: RowGroupInfo, features| {
             // Row group span for detailed tracing
             let _rg_span = tracing::info_span!(
                 "row_group",
@@ -1323,7 +1343,7 @@ fn generate_tiles_to_writer_internal(
                 row_count = rg_info.num_rows
             )
             .entered();
-            let features_in_group = geometries.len();
+            let features_in_group = features.len();
 
             // Track completed row groups (may arrive out of order due to parallel reads)
             let completed = row_groups_completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1348,10 +1368,10 @@ fn generate_tiles_to_writer_internal(
             // PROFILING: Track time spent in each phase
             let rg_start = std::time::Instant::now();
 
-            // Sort geometries within row group for better locality
+            // Sort features within row group for better locality
             let sort_start = std::time::Instant::now();
-            let mut sorted = geometries;
-            sort_geometries(&mut sorted, config.use_hilbert);
+            let mut sorted = features;
+            sort_features(&mut sorted, config.use_hilbert);
             let time_sort = sort_start.elapsed();
 
             let num_geoms = sorted.len();
@@ -1371,9 +1391,13 @@ fn generate_tiles_to_writer_internal(
                 bounds: Option<TileBounds>,
             }
 
-            // Process geometries - either in parallel or sequentially based on config
-            let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
-                let feat_idx = base_feat_idx + geom_idx as u64;
+            // Process features - either in parallel or sequentially based on config
+            let process_feature = |feat_idx_local: usize, feature: FeatureRecord| -> GeomResult {
+                let feat_idx = base_feat_idx + feat_idx_local as u64;
+
+                // Extract geometry and properties from feature record
+                let geom = feature.geometry;
+                let properties = feature.properties;
 
                 // Compute Hilbert index from ORIGINAL geometry centroid BEFORE any clipping.
                 // This is critical for gap-based density dropping (--drop-densest-as-needed).
@@ -1526,7 +1550,7 @@ fn generate_tiles_to_writer_internal(
                         original_hilbert, // From original geometry, enables gap-based dropping
                         rg_info.index,    // Row group index for predictive coalescing
                         geom_bytes,
-                        vec![], // Empty properties for now
+                        properties.clone(), // Pass through properties for coalescing
                     );
 
                     result.records.push(record);
@@ -1535,13 +1559,13 @@ fn generate_tiles_to_writer_internal(
                 result
             };
 
-            // Use parallel or sequential geometry processing based on deterministic flag
+            // Use parallel or sequential feature processing based on deterministic flag
             let results: Vec<GeomResult> = if config.deterministic {
                 // SEQUENTIAL: For reproducible output
                 sorted
                     .into_iter()
                     .enumerate()
-                    .map(|(idx, geom)| process_geometry(idx, geom))
+                    .map(|(idx, feature)| process_feature(idx, feature))
                     .collect()
             } else {
                 // PARALLEL: For performance (default)
@@ -1550,7 +1574,7 @@ fn generate_tiles_to_writer_internal(
                     .enumerate()
                     .collect::<Vec<_>>()
                     .into_par_iter()
-                    .map(|(idx, geom)| process_geometry(idx, geom))
+                    .map(|(idx, feature)| process_feature(idx, feature))
                     .collect()
             };
 
@@ -2135,6 +2159,7 @@ fn generate_tiles_to_writer_internal(
 
             // Collect and decode all features, grouping by grid cell
             // Store (feature_id, geometry, property_bytes) for KeepFirst property mode
+            #[allow(clippy::type_complexity)]
             let mut cells: std::collections::HashMap<
                 (usize, usize),
                 Vec<(u64, WorldClippedGeometry, Vec<u8>)>,
