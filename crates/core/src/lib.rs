@@ -42,6 +42,7 @@ pub mod accumulator;
 pub mod batch_processor;
 pub mod clip;
 pub mod clustering;
+pub mod coalesce;
 pub mod compression;
 pub mod covering;
 pub mod dedup;
