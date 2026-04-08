@@ -2,7 +2,8 @@
 
 **Issue:** #26  
 **Date:** 2026-04-08  
-**Status:** Draft
+**Status:** Draft  
+**Updated:** 2026-04-08 (post-research)
 
 ## Context
 
@@ -10,7 +11,21 @@ When tiles contain too many features, we need to reduce complexity without losin
 
 We're taking a **GeoParquet-native predictive approach** that leverages row group metadata to estimate density upfront, enabling selective coalescing only where needed.
 
-## Why GeoParquet-Native
+## Why GeoParquet-Native (vs Tippecanoe)
+
+**Research finding:** Tippecanoe's coalescing is reactive and uses linear scan (see `tile.cpp:1512-1567`):
+1. Encode entire tile to MVT
+2. Measure compressed size (default limit: 500KB)
+3. If oversized: adjust mingap/minextent thresholds, retry
+4. Repeat 1-10+ times per dense tile
+
+| Aspect | Tippecanoe | gpq-tiles (this design) |
+|--------|------------|-------------------------|
+| **Trigger** | Post-encode size check | Pre-compute from metadata |
+| **Lookup** | Linear scan O(n) | Spatial grid O(1) |
+| **Grouping** | "Most recent same-type feature" | Hilbert-clustered spatial cells |
+| **Passes per tile** | 1-10+ (retry loop) | 1 (single pass) |
+| **Attribute ops** | sum/mean/max/min/concat | Same (reuse accumulator.rs) |
 
 Traditional tile generators treat input as opaque features. They must read all geometries before knowing which tiles will be dense.
 
@@ -192,10 +207,19 @@ impl SpatialGrid {
     }
     
     /// Assign geometry to cell. Returns None if centroid cannot be computed.
+    /// 
+    /// Edge cases handled:
+    /// - Empty geometries → None (caller should filter)
+    /// - Zero-area polygons → falls back to bounding_rect().center()
+    /// - Degenerate linestrings → falls back to first coordinate
     pub fn assign_cell(&self, geom: &Geometry) -> Option<(usize, usize)> {
-        let centroid = geom.centroid()?;
-        let x = ((centroid.x() - self.bounds.min_x) / self.bounds.width() * self.size as f64) as usize;
-        let y = ((centroid.y() - self.bounds.min_y) / self.bounds.height() * self.size as f64) as usize;
+        // Primary: use centroid
+        // Fallback: bounding rect center (handles degenerate cases)
+        let center = geom.centroid()
+            .or_else(|| geom.bounding_rect().map(|r| r.center()))?;
+        
+        let x = ((center.x() - self.bounds.min_x) / self.bounds.width() * self.size as f64) as usize;
+        let y = ((center.y() - self.bounds.min_y) / self.bounds.height() * self.size as f64) as usize;
         Some((x.min(self.size - 1), y.min(self.size - 1)))
     }
 }
@@ -358,22 +382,24 @@ gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-a
 
 ### Reuse Existing Infrastructure
 
-| Module | Function | Usage |
-|--------|----------|-------|
-| `accumulator.rs` | `AccumulatorConfig::accumulate()` | Attribute merging |
-| `covering.rs` | `extract_row_group_bounds()` | Row group bbox extraction |
-| `covering.rs` | `covering_tiles()` | Count tiles for bbox at zoom |
-| `gap_density.rs` | `geometry_to_hilbert()` | Centroid calculation (fallback) |
+| Module | Function | Status | Usage |
+|--------|----------|--------|-------|
+| `accumulator.rs` | `AccumulatorConfig::accumulate()` | ✅ EXISTS | Attribute merging |
+| `covering.rs` | `extract_row_group_bounds()` | ✅ EXISTS | Row group bbox extraction |
+| `covering.rs` | `tile_to_bounds()` | ✅ EXISTS | Tile coord → WGS84 bounds |
+| `gap_density.rs` | `choose_mingap()` | ✅ EXISTS | Percentile-like calculation |
+| `spatial_index.rs` | `encode_hilbert()` | ✅ EXISTS | Hilbert encoding |
 
 ### Functions to Implement
 
-| Function | Location | Complexity |
-|----------|----------|------------|
-| `percentile(values: &[f64], p: f64) -> f64` | `gap_density.rs` | ~10 lines |
-| `estimate_tile_density()` | `coalesce.rs` | ~5 lines |
-| `CoalesceTargets` struct + methods | `coalesce.rs` | ~50 lines |
-| `SpatialGrid` struct + methods | `coalesce.rs` | ~80 lines |
-| `coalesce_geometries()` | `coalesce.rs` | ~100 lines |
+| Function | Location | Complexity | Notes |
+|----------|----------|------------|-------|
+| `covering_tiles(bounds, zoom) -> impl Iterator<TileCoord>` | `covering.rs` | ~20 lines | **NEW** - iterate tiles covering bbox |
+| `percentile(values: &[f64], p: f64) -> f64` | `gap_density.rs` | ~10 lines | Simple nth-element |
+| `estimate_tile_density()` | `coalesce.rs` | ~5 lines | Uses `covering_tiles().count()` |
+| `CoalesceTargets` struct + methods | `coalesce.rs` | ~50 lines | Zoom-aware tracking |
+| `SpatialGrid` struct + methods | `coalesce.rs` | ~80 lines | With centroid fallback |
+| `coalesce_geometries()` | `coalesce.rs` | ~100 lines | All type pairs + edge cases |
 
 ## API
 
@@ -484,15 +510,22 @@ gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-a
 
 ## Tasks
 
-- [ ] Add `percentile()` function to `gap_density.rs`
-- [ ] Create `crates/core/src/coalesce.rs` with core types
-- [ ] Implement `estimate_tile_density()` 
-- [ ] Implement `CoalesceTargets` with zoom-aware tracking
-- [ ] Implement `SpatialGrid` with adaptive sizing
-- [ ] Implement `coalesce_geometries()` for all type pairs
+### Phase 1: Foundation (TDD)
+- [ ] Add `covering_tiles()` to `covering.rs` + tests
+- [ ] Add `percentile()` to `gap_density.rs` + tests
+
+### Phase 2: Core Types (TDD)
+- [ ] Create `crates/core/src/coalesce.rs`
+- [ ] Implement `coalesce_geometries()` + exhaustive type tests
+- [ ] Implement `SpatialGrid` with centroid fallback + tests
+- [ ] Implement `CoalesceTargets` + tests
+
+### Phase 3: Integration
 - [ ] Add `CoalesceConfig` to `TilerConfig`
 - [ ] Integrate with `pipeline.rs` tile encoding
 - [ ] Add CLI flags to `main.rs`
-- [ ] Write unit tests for all new functions
-- [ ] Write integration test with dense dataset
+
+### Phase 4: Validation
+- [ ] Integration test with gpio-optimized dense dataset
 - [ ] Benchmark tile sizes before/after coalescing
+- [ ] Compare output quality vs tippecanoe on same input
