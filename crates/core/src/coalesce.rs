@@ -174,6 +174,90 @@ impl CoalesceTargets {
 }
 
 // ============================================================================
+// CoalesceConfig - configuration for predictive coalescing
+// ============================================================================
+
+/// Attribute handling mode during geometry coalescing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AttributeMode {
+    /// Drop attributes without configured accumulators (tippecanoe-compatible default)
+    #[default]
+    Drop,
+    /// Keep first feature's value for unconfigured attributes
+    KeepFirst,
+    /// Error if any attribute lacks an accumulator config
+    Strict,
+}
+
+/// Configuration for geometry coalescing.
+///
+/// Coalescing merges features into Multi* geometries to reduce tile complexity
+/// while preserving all coordinate data. This is triggered predictively based
+/// on GeoParquet row group metadata rather than reactively after tile encoding.
+#[derive(Debug, Clone)]
+pub struct CoalesceConfig {
+    /// Percentile threshold for density-based coalescing (default: 90).
+    ///
+    /// Only the top (100 - percentile)% densest row groups are coalesced.
+    /// 90 means only the top 10% densest row groups are coalesced.
+    pub percentile: u8,
+
+    /// Minimum features/tile to trigger coalescing (default: 100).
+    ///
+    /// Even if a row group exceeds the percentile threshold, coalescing is
+    /// skipped if the estimated density is below this value.
+    pub min_density_trigger: f64,
+
+    /// Grid size configuration for spatial grouping.
+    pub grid_size: GridSize,
+
+    /// Attribute handling mode during coalescing.
+    pub attribute_mode: AttributeMode,
+}
+
+impl Default for CoalesceConfig {
+    fn default() -> Self {
+        Self {
+            percentile: 90,
+            min_density_trigger: 100.0,
+            grid_size: GridSize::default(),
+            attribute_mode: AttributeMode::default(),
+        }
+    }
+}
+
+impl CoalesceConfig {
+    /// Create a new config with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the density percentile threshold.
+    pub fn with_percentile(mut self, percentile: u8) -> Self {
+        self.percentile = percentile.min(100);
+        self
+    }
+
+    /// Set the minimum density trigger.
+    pub fn with_min_density(mut self, min_density: f64) -> Self {
+        self.min_density_trigger = min_density;
+        self
+    }
+
+    /// Set the grid size configuration.
+    pub fn with_grid_size(mut self, grid_size: GridSize) -> Self {
+        self.grid_size = grid_size;
+        self
+    }
+
+    /// Set the attribute handling mode.
+    pub fn with_attribute_mode(mut self, mode: AttributeMode) -> Self {
+        self.attribute_mode = mode;
+        self
+    }
+}
+
+// ============================================================================
 // Coalescing result types
 // ============================================================================
 

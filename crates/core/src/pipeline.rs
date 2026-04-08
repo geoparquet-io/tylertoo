@@ -29,6 +29,7 @@ use crate::batch_processor::{
 };
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::clustering::ClusterConfig;
+use crate::coalesce::CoalesceConfig;
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_line_world,
     should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
@@ -323,6 +324,17 @@ pub struct TilerConfig {
     /// If None, no point clustering is performed.
     pub cluster_config: Option<ClusterConfig>,
 
+    /// Geometry coalescing configuration for dense tiles.
+    ///
+    /// When enabled, merges geometries into Multi* types to reduce tile complexity
+    /// while preserving all coordinate data. Uses GeoParquet metadata to predict
+    /// dense tiles upfront rather than reactive retry loops.
+    ///
+    /// Activated via `--coalesce-densest-as-needed` CLI flag.
+    ///
+    /// If None, no coalescing is performed.
+    pub coalesce_config: Option<CoalesceConfig>,
+
     /// Enable automatic per-feature zoom range calculation based on bbox area (default: false).
     ///
     /// When enabled, calculates BOTH min and max zoom for each feature:
@@ -407,6 +419,8 @@ impl Default for TilerConfig {
             accumulator_config: None,
             // No point clustering by default
             cluster_config: None,
+            // Coalescing disabled by default - user must opt-in
+            coalesce_config: None,
             // Zoom-by-area disabled by default - user must opt-in
             zoom_by_area: false,
             // Default threshold: ~20x20 tile grid for max zoom
@@ -712,6 +726,37 @@ impl TilerConfig {
     /// Alternative to `with_cluster()` when you have a pre-built config.
     pub fn with_cluster_config(mut self, config: ClusterConfig) -> Self {
         self.cluster_config = Some(config);
+        self
+    }
+
+    /// Enable geometry coalescing with default settings.
+    ///
+    /// Coalescing merges dense features into Multi* geometries to reduce
+    /// tile complexity while preserving all coordinate data. Uses GeoParquet
+    /// metadata to predict dense tiles upfront.
+    pub fn with_coalesce_densest(mut self) -> Self {
+        self.coalesce_config = Some(CoalesceConfig::default());
+        self
+    }
+
+    /// Enable geometry coalescing with custom percentile threshold.
+    ///
+    /// Only the top (100 - percentile)% densest row groups are coalesced.
+    /// Example: percentile=90 means only the top 10% densest are coalesced.
+    pub fn with_coalesce_percentile(mut self, percentile: u8) -> Self {
+        self.coalesce_config = Some(
+            self.coalesce_config
+                .unwrap_or_default()
+                .with_percentile(percentile),
+        );
+        self
+    }
+
+    /// Enable geometry coalescing with a CoalesceConfig.
+    ///
+    /// Alternative to `with_coalesce_densest()` when you have a pre-built config.
+    pub fn with_coalesce_config(mut self, config: CoalesceConfig) -> Self {
+        self.coalesce_config = Some(config);
         self
     }
 
