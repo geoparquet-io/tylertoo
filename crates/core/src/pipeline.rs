@@ -754,6 +754,28 @@ impl TilerConfig {
 
     /// Enable geometry coalescing with a CoalesceConfig.
     ///
+    /// Set minimum density trigger for coalescing.
+    ///
+    /// Tiles with fewer features than this threshold skip coalescing.
+    pub fn with_coalesce_min_density(mut self, min_density: f64) -> Self {
+        self.coalesce_config = Some(
+            self.coalesce_config
+                .unwrap_or_default()
+                .with_min_density(min_density),
+        );
+        self
+    }
+
+    /// Set attribute handling mode for coalescing.
+    pub fn with_coalesce_attribute_mode(mut self, mode: crate::coalesce::AttributeMode) -> Self {
+        self.coalesce_config = Some(
+            self.coalesce_config
+                .unwrap_or_default()
+                .with_attribute_mode(mode),
+        );
+        self
+    }
+
     /// Alternative to `with_coalesce_densest()` when you have a pre-built config.
     pub fn with_coalesce_config(mut self, config: CoalesceConfig) -> Self {
         self.coalesce_config = Some(config);

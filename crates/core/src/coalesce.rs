@@ -87,7 +87,18 @@ impl SpatialGrid {
     ///
     /// Returns `None` if the centroid cannot be computed (e.g., empty geometry).
     /// Uses bounding rect center as fallback for degenerate cases.
+    ///
+    /// # Edge cases
+    /// - Zero-width/height bounds: all features go to cell (0, 0)
+    /// - Coordinates outside bounds: clamped to valid cell range
     pub fn assign_cell(&self, geom: &Geometry) -> Option<(usize, usize)> {
+        // Guard against degenerate bounds (would cause division by zero)
+        let width = self.bounds.width();
+        let height = self.bounds.height();
+        if width <= 0.0 || height <= 0.0 {
+            return Some((0, 0)); // All features go to cell 0
+        }
+
         // Primary: use centroid
         // Fallback: bounding rect center (handles degenerate cases)
         let center = geom
@@ -97,13 +108,24 @@ impl SpatialGrid {
 
         let (cx, cy) = center;
 
-        let x =
-            ((cx - self.bounds.lng_min) / self.bounds.width() * self.size as f64).floor() as usize;
-        let y =
-            ((cy - self.bounds.lat_min) / self.bounds.height() * self.size as f64).floor() as usize;
+        // Calculate cell coordinates with safe conversion
+        // Handles negative results (coords outside bounds) by clamping to 0
+        let x_raw = ((cx - self.bounds.lng_min) / width * self.size as f64).floor();
+        let y_raw = ((cy - self.bounds.lat_min) / height * self.size as f64).floor();
 
-        // Clamp to valid cell indices
-        Some((x.min(self.size - 1), y.min(self.size - 1)))
+        // Clamp to valid cell indices (handles both negative and overflow cases)
+        let x = if x_raw < 0.0 {
+            0
+        } else {
+            (x_raw as usize).min(self.size - 1)
+        };
+        let y = if y_raw < 0.0 {
+            0
+        } else {
+            (y_raw as usize).min(self.size - 1)
+        };
+
+        Some((x, y))
     }
 }
 
@@ -290,7 +312,22 @@ pub enum CoalesceResult {
 pub fn coalesce_geometries(target: &mut Geometry, source: Geometry) -> CoalesceResult {
     use Geometry::*;
 
-    // Handle convertible types first (before the main match)
+    // Convert target from Line/Rect/Triangle to their canonical forms
+    // This must happen BEFORE matching so patterns work correctly
+    match target {
+        Line(l) => {
+            *target = LineString((*l).into());
+        }
+        Rect(r) => {
+            *target = Polygon(r.to_polygon());
+        }
+        Triangle(t) => {
+            *target = Polygon(t.to_polygon());
+        }
+        _ => {}
+    }
+
+    // Handle convertible source types
     let source = match source {
         Line(l) => LineString(l.into()),
         Rect(r) => Polygon(r.to_polygon()),
@@ -837,5 +874,163 @@ mod tests {
         assert!(dense_at_5.contains(&0));
         assert!(dense_at_5.contains(&2));
         assert!(dense_at_5.contains(&5));
+    }
+
+    // =========================================================================
+    // Edge case tests (bug fixes)
+    // =========================================================================
+
+    #[test]
+    fn test_spatial_grid_zero_width_bounds() {
+        // Degenerate bounds with zero width (single longitude line)
+        let bounds = crate::tile::TileBounds::new(5.0, 0.0, 5.0, 10.0);
+        let grid = SpatialGrid::new(100.0, bounds, &GridSize::Fixed(4));
+
+        // Should not panic, all features go to cell (0, 0)
+        let point = Geometry::Point(point!(x: 5.0, y: 5.0));
+        let cell = grid.assign_cell(&point);
+        assert_eq!(cell, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_spatial_grid_zero_height_bounds() {
+        // Degenerate bounds with zero height (single latitude line)
+        let bounds = crate::tile::TileBounds::new(0.0, 5.0, 10.0, 5.0);
+        let grid = SpatialGrid::new(100.0, bounds, &GridSize::Fixed(4));
+
+        // Should not panic, all features go to cell (0, 0)
+        let point = Geometry::Point(point!(x: 5.0, y: 5.0));
+        let cell = grid.assign_cell(&point);
+        assert_eq!(cell, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_spatial_grid_point_outside_bounds_negative() {
+        let bounds = crate::tile::TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let grid = SpatialGrid::new(100.0, bounds, &GridSize::Fixed(4));
+
+        // Point with negative coordinates (outside bounds to the left/bottom)
+        let point = Geometry::Point(point!(x: -5.0, y: -3.0));
+        let cell = grid.assign_cell(&point);
+
+        // Should clamp to (0, 0), not overflow
+        assert_eq!(cell, Some((0, 0)));
+    }
+
+    #[test]
+    fn test_spatial_grid_point_far_outside_bounds() {
+        let bounds = crate::tile::TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let grid = SpatialGrid::new(100.0, bounds, &GridSize::Fixed(4));
+
+        // Point way outside bounds
+        let point = Geometry::Point(point!(x: 1000.0, y: 1000.0));
+        let cell = grid.assign_cell(&point);
+
+        // Should clamp to max cell (3, 3)
+        assert_eq!(cell, Some((3, 3)));
+    }
+
+    #[test]
+    fn test_point_plus_multipoint_coalesces() {
+        // Test case: Point (target) + MultiPoint (source)
+        let mut target = Geometry::Point(point!(x: 0.0, y: 0.0));
+        let source = Geometry::MultiPoint(MultiPoint::new(vec![
+            point!(x: 1.0, y: 1.0),
+            point!(x: 2.0, y: 2.0),
+        ]));
+
+        let result = coalesce_geometries(&mut target, source);
+
+        assert!(matches!(result, CoalesceResult::Merged));
+        match &target {
+            Geometry::MultiPoint(mp) => {
+                assert_eq!(mp.0.len(), 3, "Should have original point + 2 from source");
+            }
+            _ => panic!("Expected MultiPoint"),
+        }
+    }
+
+    #[test]
+    fn test_line_as_target_coalesces_with_linestring() {
+        // Test case: Line (target) + LineString (source)
+        // This verifies the target conversion fix
+        let mut target = Geometry::Line(Line::new(coord!(x: 0.0, y: 0.0), coord!(x: 1.0, y: 1.0)));
+        let source = Geometry::LineString(LineString::new(vec![
+            coord!(x: 2.0, y: 2.0),
+            coord!(x: 3.0, y: 3.0),
+        ]));
+
+        let result = coalesce_geometries(&mut target, source);
+
+        assert!(matches!(result, CoalesceResult::Merged));
+        match &target {
+            Geometry::MultiLineString(mls) => {
+                assert_eq!(mls.0.len(), 2);
+            }
+            _ => panic!("Expected MultiLineString, got {:?}", target),
+        }
+    }
+
+    #[test]
+    fn test_rect_as_target_coalesces_with_polygon() {
+        // Test case: Rect (target) + Polygon (source)
+        let mut target = Geometry::Rect(Rect::new(coord!(x: 0.0, y: 0.0), coord!(x: 1.0, y: 1.0)));
+        let source = Geometry::Polygon(polygon![
+            (x: 2.0, y: 2.0),
+            (x: 3.0, y: 2.0),
+            (x: 3.0, y: 3.0),
+            (x: 2.0, y: 3.0),
+            (x: 2.0, y: 2.0),
+        ]);
+
+        let result = coalesce_geometries(&mut target, source);
+
+        assert!(matches!(result, CoalesceResult::Merged));
+        match &target {
+            Geometry::MultiPolygon(mp) => {
+                assert_eq!(mp.0.len(), 2);
+            }
+            _ => panic!("Expected MultiPolygon, got {:?}", target),
+        }
+    }
+
+    #[test]
+    fn test_triangle_as_target_coalesces_with_polygon() {
+        // Test case: Triangle (target) + Polygon (source)
+        let mut target = Geometry::Triangle(Triangle::new(
+            coord!(x: 0.0, y: 0.0),
+            coord!(x: 1.0, y: 0.0),
+            coord!(x: 0.5, y: 1.0),
+        ));
+        let source = Geometry::Polygon(polygon![
+            (x: 2.0, y: 2.0),
+            (x: 3.0, y: 2.0),
+            (x: 3.0, y: 3.0),
+            (x: 2.0, y: 3.0),
+            (x: 2.0, y: 2.0),
+        ]);
+
+        let result = coalesce_geometries(&mut target, source);
+
+        assert!(matches!(result, CoalesceResult::Merged));
+        match &target {
+            Geometry::MultiPolygon(mp) => {
+                assert_eq!(mp.0.len(), 2);
+            }
+            _ => panic!("Expected MultiPolygon, got {:?}", target),
+        }
+    }
+
+    #[test]
+    fn test_empty_multipoint_returns_none_for_cell() {
+        let bounds = crate::tile::TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let grid = SpatialGrid::new(100.0, bounds, &GridSize::Fixed(4));
+
+        // Empty MultiPoint has no centroid or bounding rect
+        let empty_mp = Geometry::MultiPoint(MultiPoint::new(vec![]));
+        let cell = grid.assign_cell(&empty_mp);
+
+        // Should return None (no cell assignable)
+        assert!(cell.is_none());
     }
 }

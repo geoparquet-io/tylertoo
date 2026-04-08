@@ -2,8 +2,44 @@
 
 **Issue:** #26  
 **Date:** 2026-04-08  
-**Status:** Draft  
-**Updated:** 2026-04-08 (post-research)
+**Status:** Implemented (Simplified)  
+**Updated:** 2026-04-08
+
+## Implementation Status
+
+> **Note:** The current implementation uses a **simplified reactive approach** rather than the 
+> full predictive architecture described below. This section documents what was actually implemented.
+
+### What's Implemented ✅
+
+- **SpatialGrid**: O(1) cell assignment using centroid/bounding rect
+- **Geometry coalescing**: All geometry type combinations (Point→MultiPoint, etc.)
+- **Target geometry conversion**: Line/Rect/Triangle normalized to canonical forms
+- **Adaptive grid sizing**: 4×4 (low density) or 8×8 (high density)
+- **CLI flags**: `--coalesce-densest-as-needed`, `--coalesce-percentile`, `--coalesce-min-density`, `--coalesce-attrs`
+- **Edge case handling**: Zero-width bounds, negative coordinates, empty geometries
+
+### What's NOT Implemented (Future Work) ⏳
+
+- **Predictive metadata scan**: The `CoalesceTargets` infrastructure exists but is not wired into the pipeline
+- **Per-zoom thresholds from percentile**: Currently uses a fixed `min_density_trigger` per tile
+- **Attribute passthrough**: Pipeline doesn't pass properties through encoding (pre-existing limitation)
+
+### Current Behavior
+
+```
+When --coalesce-densest-as-needed is enabled:
+  For each tile:
+    IF tile.feature_count >= min_density_trigger (default: 100):
+      → Apply coalescing (spatial grid + Multi* merging)
+    ELSE:
+      → Standard encoding
+```
+
+This is simpler but less efficient than the predictive approach—all tiles are checked rather than 
+only those from dense row groups.
+
+---
 
 ## Context
 

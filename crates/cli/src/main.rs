@@ -191,6 +191,28 @@ struct Args {
     )]
     coalesce_percentile: u8,
 
+    /// Minimum features per tile to trigger coalescing (default: 100).
+    ///
+    /// Even if a tile exceeds the percentile threshold, coalescing is
+    /// skipped if the feature count is below this value.
+    /// Requires --coalesce-densest-as-needed.
+    #[arg(
+        long = "coalesce-min-density",
+        value_name = "FEATURES",
+        default_value = "100"
+    )]
+    coalesce_min_density: f64,
+
+    /// Attribute handling mode during coalescing (default: drop).
+    ///
+    /// Controls how feature attributes are handled when geometries are merged:
+    /// - drop: Discard all attributes (tippecanoe-compatible default)
+    /// - keep-first: Keep the first feature's attributes
+    ///
+    /// Requires --coalesce-densest-as-needed.
+    #[arg(long = "coalesce-attrs", value_name = "MODE", default_value = "drop")]
+    coalesce_attrs: String,
+
     /// Enable automatic per-feature max zoom based on feature area.
     ///
     /// Large features (e.g., country polygons) stop at low zoom levels where they
@@ -481,7 +503,44 @@ fn main() -> Result<()> {
 
     // Add coalesce config if specified
     if args.coalesce_densest {
-        tiler_config = tiler_config.with_coalesce_percentile(args.coalesce_percentile);
+        tiler_config = tiler_config
+            .with_coalesce_percentile(args.coalesce_percentile)
+            .with_coalesce_min_density(args.coalesce_min_density);
+
+        // Parse attribute handling mode
+        let attr_mode = match args.coalesce_attrs.to_lowercase().as_str() {
+            "drop" => gpq_tiles_core::coalesce::AttributeMode::Drop,
+            "keep-first" | "keepfirst" => {
+                // Note: KeepFirst is accepted but currently has same effect as Drop
+                // because the encoding pipeline doesn't pass properties through yet.
+                // This is a known limitation to be addressed in a future release.
+                if args.verbose {
+                    eprintln!(
+                        "Warning: --coalesce-attrs=keep-first has same effect as 'drop' \
+                         until property passthrough is implemented in the encoding pipeline"
+                    );
+                }
+                gpq_tiles_core::coalesce::AttributeMode::KeepFirst
+            }
+            "strict" => {
+                // Strict mode would error on any properties, but since we don't pass
+                // properties through the pipeline yet, it effectively does nothing.
+                if args.verbose {
+                    eprintln!(
+                        "Warning: --coalesce-attrs=strict currently has no effect \
+                         because properties are not yet passed through the encoding pipeline"
+                    );
+                }
+                gpq_tiles_core::coalesce::AttributeMode::Strict
+            }
+            other => {
+                anyhow::bail!(
+                    "Invalid --coalesce-attrs value: '{}'. Valid options: drop, keep-first, strict",
+                    other
+                );
+            }
+        };
+        tiler_config = tiler_config.with_coalesce_attribute_mode(attr_mode);
     }
 
     // Configure zoom-by-area if requested
