@@ -115,6 +115,8 @@ pub struct RowGroupBounds {
     pub xmax: f64,
     /// Maximum latitude
     pub ymax: f64,
+    /// Number of rows in this row group (for density estimation)
+    pub num_rows: usize,
 }
 
 impl RowGroupBounds {
@@ -379,6 +381,7 @@ pub fn extract_row_group_bounds_from_reader(
                     ymin,
                     xmax,
                     ymax,
+                    num_rows: rg.num_rows() as usize,
                 }));
             }
             _ => bounds.push(None),
@@ -616,6 +619,7 @@ mod tests {
             ymin: -10.0,
             xmax: 10.0,
             ymax: 10.0,
+            num_rows: 1000,
         };
 
         // Overlapping filter
@@ -663,6 +667,7 @@ mod tests {
             ymin: 37.7,
             xmax: -122.3,
             ymax: 37.9,
+            num_rows: 500,
         };
 
         let tile_bounds = rg_bounds.to_tile_bounds();

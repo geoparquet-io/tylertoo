@@ -74,7 +74,9 @@ pub use accumulator::{AccumulatorConfig, AccumulatorOp};
 // Re-export clustering types for CLI usage
 pub use clustering::{ClusterConfig, IndexedPoint, PointClusterer};
 // Re-export coalescing types for CLI usage
-pub use coalesce::{AttributeMode, CoalesceConfig, GridSize};
+pub use coalesce::{
+    calculate_coalesce_targets, AttributeMode, CoalesceConfig, CoalesceTargets, GridSize,
+};
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;
 // Re-export Compression from compression module for public API

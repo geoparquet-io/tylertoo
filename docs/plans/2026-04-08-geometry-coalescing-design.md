@@ -21,8 +21,11 @@
 
 ### What's NOT Implemented (Future Work) ⏳
 
-- **Predictive metadata scan**: The `CoalesceTargets` infrastructure exists but is not wired into the pipeline
-- **Per-zoom thresholds from percentile**: Currently uses a fixed `min_density_trigger` per tile
+- **Predictive coalescing wiring**: The `calculate_coalesce_targets()` function is now implemented and exported,
+  but the pipeline still uses tile-level feature count check. To fully enable predictive coalescing:
+  1. Add `row_group_idx` to `TileFeatureRecord` in external_sort.rs
+  2. Pass `CoalesceTargets` to `encode_tile_from_raw()`
+  3. Replace `tile_data.features.len() >= min_density_trigger` with `targets.should_coalesce(rg_idx, zoom)`
 - **Attribute passthrough**: Pipeline doesn't pass properties through encoding (pre-existing limitation)
 
 ### Current Behavior

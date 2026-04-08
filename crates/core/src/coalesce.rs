@@ -280,6 +280,122 @@ impl CoalesceConfig {
 }
 
 // ============================================================================
+// Predictive coalescing: calculate targets from Parquet metadata
+// ============================================================================
+
+use crate::covering::{covering_tiles, extract_row_group_bounds};
+use crate::gap_density::percentile;
+use std::path::Path;
+
+/// Estimate features-per-tile for a row group at a given zoom level.
+///
+/// # Arguments
+///
+/// * `bounds` - Geographic bounding box of the row group
+/// * `num_rows` - Number of rows (features) in the row group
+/// * `zoom` - Target zoom level
+///
+/// # Returns
+///
+/// Estimated number of features per tile at the given zoom level.
+fn estimate_tile_density(bounds: &TileBounds, num_rows: usize, zoom: u8) -> f64 {
+    let tile_count = covering_tiles(bounds, zoom).count().max(1);
+    num_rows as f64 / tile_count as f64
+}
+
+/// Calculate coalesce targets from Parquet row group metadata.
+///
+/// This is the core of the predictive coalescing approach:
+/// 1. Extract bounding boxes from each row group (no decompression)
+/// 2. Estimate features-per-tile at each zoom level
+/// 3. Find the percentile density threshold at each zoom
+/// 4. Mark row groups exceeding that threshold as "dense"
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file
+/// * `min_zoom` - Minimum zoom level to analyze
+/// * `max_zoom` - Maximum zoom level to analyze
+/// * `percentile_threshold` - Percentile (0-100) above which row groups are marked dense
+/// * `min_density_trigger` - Minimum features/tile to trigger coalescing
+///
+/// # Returns
+///
+/// `Some(CoalesceTargets)` if the file has row group bbox metadata (gpio-optimized),
+/// `None` if the file lacks covering metadata and predictive coalescing isn't possible.
+///
+/// # Example
+///
+/// ```ignore
+/// use gpq_tiles_core::coalesce::calculate_coalesce_targets;
+///
+/// let targets = calculate_coalesce_targets(
+///     Path::new("data.parquet"),
+///     0,   // min_zoom
+///     14,  // max_zoom
+///     90,  // percentile (top 10% densest)
+///     100.0, // min features/tile
+/// );
+///
+/// if let Some(targets) = targets {
+///     // Check if row group 5 should be coalesced at zoom 8
+///     if targets.should_coalesce(5, 8) {
+///         // Apply coalescing...
+///     }
+/// }
+/// ```
+pub fn calculate_coalesce_targets(
+    path: &Path,
+    min_zoom: u8,
+    max_zoom: u8,
+    percentile_threshold: u8,
+    min_density_trigger: f64,
+) -> Option<CoalesceTargets> {
+    // Extract row group bounds from Parquet metadata
+    let row_group_bounds = extract_row_group_bounds(path).ok()?;
+
+    // If no row groups have bounds metadata, we can't do predictive coalescing
+    let has_any_bounds = row_group_bounds.iter().any(|b| b.is_some());
+    if !has_any_bounds {
+        return None;
+    }
+
+    let mut targets = CoalesceTargets::new();
+
+    for zoom in min_zoom..=max_zoom {
+        // Calculate density for each row group at this zoom
+        let densities: Vec<(usize, f64)> = row_group_bounds
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, bounds)| {
+                let rgb = bounds.as_ref()?;
+                let tile_bounds = TileBounds::new(rgb.xmin, rgb.ymin, rgb.xmax, rgb.ymax);
+                let density = estimate_tile_density(&tile_bounds, rgb.num_rows, zoom);
+                Some((idx, density))
+            })
+            .collect();
+
+        // Need at least 5 row groups for stable percentile calculation
+        if densities.len() < 5 {
+            continue;
+        }
+
+        // Calculate threshold as specified percentile
+        let density_values: Vec<f64> = densities.iter().map(|(_, d)| *d).collect();
+        let threshold = percentile(&density_values, percentile_threshold as f64 / 100.0);
+
+        // Mark row groups exceeding threshold (and min_density_trigger)
+        for (rg_idx, density) in &densities {
+            if *density > threshold && *density >= min_density_trigger {
+                targets.mark_dense(*rg_idx, zoom, *density);
+            }
+        }
+    }
+
+    Some(targets)
+}
+
+// ============================================================================
 // Coalescing result types
 // ============================================================================
 
@@ -1032,5 +1148,53 @@ mod tests {
 
         // Should return None (no cell assignable)
         assert!(cell.is_none());
+    }
+
+    // =========================================================================
+    // Predictive coalescing: density estimation tests
+    // =========================================================================
+
+    #[test]
+    fn test_estimate_tile_density_single_tile() {
+        // Bounds that fit in a single tile at z10
+        let bounds = TileBounds::new(-122.42, 37.78, -122.40, 37.80);
+        let density = estimate_tile_density(&bounds, 1000, 10);
+
+        // Should be ~1000 features/tile since bounds fits in ~1 tile
+        assert!(
+            density >= 500.0 && density <= 1500.0,
+            "Expected ~1000, got {}",
+            density
+        );
+    }
+
+    #[test]
+    fn test_estimate_tile_density_multiple_tiles() {
+        // Bounds spanning multiple tiles at z10
+        let bounds = TileBounds::new(-122.5, 37.5, -122.0, 38.0);
+        let density = estimate_tile_density(&bounds, 1000, 10);
+
+        // Should be lower since features spread across multiple tiles
+        assert!(
+            density < 500.0,
+            "Expected density < 500 (spread across tiles), got {}",
+            density
+        );
+    }
+
+    #[test]
+    fn test_estimate_tile_density_zoom_scaling() {
+        let bounds = TileBounds::new(-122.5, 37.5, -122.0, 38.0);
+
+        let density_z8 = estimate_tile_density(&bounds, 1000, 8);
+        let density_z12 = estimate_tile_density(&bounds, 1000, 12);
+
+        // Higher zoom = more tiles = lower density per tile
+        assert!(
+            density_z8 > density_z12,
+            "Expected z8 density ({}) > z12 density ({})",
+            density_z8,
+            density_z12
+        );
     }
 }

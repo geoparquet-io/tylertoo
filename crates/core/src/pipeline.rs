@@ -29,7 +29,7 @@ use crate::batch_processor::{
 };
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::clustering::ClusterConfig;
-use crate::coalesce::CoalesceConfig;
+use crate::coalesce::{CoalesceConfig, CoalesceTargets};
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_line_world,
     should_drop_tiny_multiline, should_drop_tiny_polygon, should_drop_tiny_polygon_world,
@@ -1524,6 +1524,7 @@ fn generate_tiles_to_writer_internal(
                         tile_coord.y,
                         feat_idx,
                         original_hilbert, // From original geometry, enables gap-based dropping
+                        rg_info.index,    // Row group index for predictive coalescing
                         geom_bytes,
                         vec![], // Empty properties for now
                     );
@@ -1714,6 +1715,10 @@ fn generate_tiles_to_writer_internal(
         feature_id: u64,
         /// Original Hilbert index for gap-based density dropping (#145)
         original_hilbert: u64,
+        /// Row group index (for predictive coalescing)
+        row_group_idx: usize,
+        /// MessagePack-serialized properties (may be empty)
+        property_bytes: Vec<u8>,
     }
 
     // Tile with raw (not yet decoded) features
@@ -1753,13 +1758,38 @@ fn generate_tiles_to_writer_internal(
         enable_tiny_polygon_accumulation: bool,
         cluster_config: Option<&ClusterConfig>,
         coalesce_config: Option<&CoalesceConfig>,
+        coalesce_targets: Option<&CoalesceTargets>,
         drop_smallest_as_needed: bool,
         drop_smallest_threshold: f64,
         gamma: Option<f64>,
     ) -> Option<EncodedTile> {
         use crate::clustering::{IndexedPoint, PointClusterer};
         use crate::mvt::PropertyValue;
+        use crate::wkb::deserialize_properties;
         use crate::world_coord::WorldCoord;
+
+        // Helper to deserialize MessagePack properties and convert to MVT format
+        fn decode_properties(bytes: &[u8]) -> Vec<(String, PropertyValue)> {
+            if bytes.is_empty() {
+                return Vec::new();
+            }
+            match deserialize_properties(bytes) {
+                Ok(props) => props
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let mvt_value = match v {
+                            crate::wkb::PropertyValue::String(s) => PropertyValue::String(s),
+                            crate::wkb::PropertyValue::Int(i) => PropertyValue::Int(i),
+                            crate::wkb::PropertyValue::UInt(u) => PropertyValue::UInt(u),
+                            crate::wkb::PropertyValue::Float(f) => PropertyValue::Double(f),
+                            crate::wkb::PropertyValue::Bool(b) => PropertyValue::Bool(b),
+                        };
+                        (k, mvt_value)
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
 
         let coord = TileCoord::new(tile_data.x, tile_data.y, tile_data.z);
         let mut layer_builder = LayerBuilder::new(layer_name).with_extent(extent);
@@ -2070,8 +2100,26 @@ fn generate_tiles_to_writer_internal(
         }
 
         // Coalescing path: merge features by geometry type to reduce tile complexity
+        // Use hybrid approach: coalesce if EITHER:
+        // 1. Feature count exceeds min_density_trigger (reactive), OR
+        // 2. Any feature came from a row group marked as dense at this zoom (predictive)
         let should_coalesce = coalesce_config
-            .map(|cc| tile_data.features.len() >= cc.min_density_trigger as usize)
+            .map(|cc| {
+                // Reactive: feature count check
+                let reactive_trigger = tile_data.features.len() >= cc.min_density_trigger as usize;
+
+                // Predictive: check if any feature's row group is marked as dense
+                let predictive_trigger = coalesce_targets
+                    .map(|targets| {
+                        tile_data
+                            .features
+                            .iter()
+                            .any(|f| targets.should_coalesce(f.row_group_idx, tile_data.z))
+                    })
+                    .unwrap_or(false);
+
+                reactive_trigger || predictive_trigger
+            })
             .unwrap_or(false);
 
         if should_coalesce {
@@ -2086,9 +2134,10 @@ fn generate_tiles_to_writer_internal(
             let grid = SpatialGrid::new(tile_data.features.len() as f64, tile_bounds, &grid_config);
 
             // Collect and decode all features, grouping by grid cell
+            // Store (feature_id, geometry, property_bytes) for KeepFirst property mode
             let mut cells: std::collections::HashMap<
                 (usize, usize),
-                Vec<(u64, WorldClippedGeometry)>,
+                Vec<(u64, WorldClippedGeometry, Vec<u8>)>,
             > = std::collections::HashMap::new();
 
             for raw_feat in tile_data.features.iter() {
@@ -2143,10 +2192,11 @@ fn generate_tiles_to_writer_internal(
                     (0, 0) // Fallback cell for empty geometries
                 };
 
-                cells
-                    .entry(cell)
-                    .or_default()
-                    .push((raw_feat.feature_id, geom));
+                cells.entry(cell).or_default().push((
+                    raw_feat.feature_id,
+                    geom,
+                    raw_feat.property_bytes.clone(),
+                ));
             }
 
             // Coalesce features within each cell by geometry type
@@ -2156,10 +2206,12 @@ fn generate_tiles_to_writer_internal(
                 let mut linestrings: Vec<Vec<WorldCoord>> = Vec::new();
                 let mut polygons: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = Vec::new();
                 let mut first_feature_id: Option<u64> = None;
+                let mut first_property_bytes: Option<Vec<u8>> = None;
 
-                for (feat_id, geom) in cell_features {
+                for (feat_id, geom, prop_bytes) in cell_features {
                     if first_feature_id.is_none() {
                         first_feature_id = Some(feat_id);
+                        first_property_bytes = Some(prop_bytes);
                     }
                     match geom {
                         WorldClippedGeometry::Point(p) => points.push(p),
@@ -2177,15 +2229,20 @@ fn generate_tiles_to_writer_internal(
                 }
 
                 let feat_id = first_feature_id.unwrap_or(synthetic_feature_id);
+                // For KeepFirst mode, use properties from the first feature in each cell
+                let props = first_property_bytes
+                    .as_ref()
+                    .map(|bytes| decode_properties(bytes))
+                    .unwrap_or_default();
 
-                // Emit coalesced geometries
+                // Emit coalesced geometries with properties from first feature
                 if !points.is_empty() {
                     let coalesced = if points.len() == 1 {
                         WorldClippedGeometry::Point(points.into_iter().next().unwrap())
                     } else {
                         WorldClippedGeometry::MultiPoint(points)
                     };
-                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &[], &coord);
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
                     feature_count += 1;
                 }
 
@@ -2195,7 +2252,7 @@ fn generate_tiles_to_writer_internal(
                     } else {
                         WorldClippedGeometry::MultiLineString(linestrings)
                     };
-                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &[], &coord);
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
                     feature_count += 1;
                 }
 
@@ -2209,7 +2266,7 @@ fn generate_tiles_to_writer_internal(
                     } else {
                         WorldClippedGeometry::MultiPolygon(polygons)
                     };
-                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &[], &coord);
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
                     feature_count += 1;
                 }
             }
@@ -2265,6 +2322,9 @@ fn generate_tiles_to_writer_internal(
                 }
             }
 
+            // Decode properties for this feature
+            let props = decode_properties(&raw_feat.property_bytes);
+
             // Handle tiny polygon accumulation
             match (&geom, &mut accumulator) {
                 (
@@ -2286,6 +2346,7 @@ fn generate_tiles_to_writer_internal(
                         acc.accumulate(exterior, interiors);
 
                         // Emit synthetic square if threshold exceeded
+                        // Note: synthetic features have no properties
                         while acc.should_emit() {
                             if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
                                 let synthetic_geom = WorldClippedGeometry::Polygon {
@@ -2305,11 +2366,11 @@ fn generate_tiles_to_writer_internal(
                             }
                         }
                     } else {
-                        // Normal-sized polygon - add directly
+                        // Normal-sized polygon - add directly with properties
                         layer_builder.add_feature_world(
                             Some(raw_feat.feature_id),
                             &geom,
-                            &[],
+                            &props,
                             &coord,
                         );
                         feature_count += 1;
@@ -2335,6 +2396,7 @@ fn generate_tiles_to_writer_internal(
                             acc.accumulate(ext, ints);
 
                             // Emit synthetic square if threshold exceeded
+                            // Note: synthetic features have no properties
                             while acc.should_emit() {
                                 if let Some((syn_ext, syn_int)) = acc.emit_synthetic_square() {
                                     let synthetic_geom = WorldClippedGeometry::Polygon {
@@ -2360,7 +2422,7 @@ fn generate_tiles_to_writer_internal(
                         }
                     }
 
-                    // If there are any normal-sized polygons, add them
+                    // If there are any normal-sized polygons, add them with properties
                     if has_normal_polygons {
                         if normal_polygons.len() == 1 {
                             // Single polygon remaining - emit as Polygon
@@ -2372,7 +2434,7 @@ fn generate_tiles_to_writer_internal(
                             layer_builder.add_feature_world(
                                 Some(raw_feat.feature_id),
                                 &poly_geom,
-                                &[],
+                                &props,
                                 &coord,
                             );
                         } else {
@@ -2381,7 +2443,7 @@ fn generate_tiles_to_writer_internal(
                             layer_builder.add_feature_world(
                                 Some(raw_feat.feature_id),
                                 &multi_geom,
-                                &[],
+                                &props,
                                 &coord,
                             );
                         }
@@ -2389,8 +2451,13 @@ fn generate_tiles_to_writer_internal(
                     }
                 }
                 _ => {
-                    // Non-polygon geometry - add directly
-                    layer_builder.add_feature_world(Some(raw_feat.feature_id), &geom, &[], &coord);
+                    // Non-polygon geometry - add directly with properties
+                    layer_builder.add_feature_world(
+                        Some(raw_feat.feature_id),
+                        &geom,
+                        &props,
+                        &coord,
+                    );
                     feature_count += 1;
                 }
             }
@@ -2459,6 +2526,17 @@ fn generate_tiles_to_writer_internal(
     let coalesce_config = config.coalesce_config.clone();
     let gamma = config.gamma;
 
+    // Calculate predictive coalesce targets from Parquet metadata (if coalescing enabled)
+    let coalesce_targets: Option<CoalesceTargets> = coalesce_config.as_ref().and_then(|cc| {
+        crate::coalesce::calculate_coalesce_targets(
+            input_path,
+            config.min_zoom,
+            config.max_zoom,
+            cc.percentile,
+            cc.min_density_trigger,
+        )
+    });
+
     // Helper to flush the batch: decode + encode in parallel, write sequentially
     let flush_batch = |batch: &mut Vec<RawTileData>,
                        batch_mem: &mut usize,
@@ -2470,6 +2548,7 @@ fn generate_tiles_to_writer_internal(
                        enable_tiny_polygon_accumulation: bool,
                        cluster_config: Option<&ClusterConfig>,
                        coalesce_config: Option<&CoalesceConfig>,
+                       coalesce_targets: Option<&CoalesceTargets>,
                        drop_smallest_as_needed: bool,
                        drop_smallest_threshold: f64,
                        gamma: Option<f64>|
@@ -2491,6 +2570,7 @@ fn generate_tiles_to_writer_internal(
                         enable_tiny_polygon_accumulation,
                         cluster_config,
                         coalesce_config,
+                        coalesce_targets,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2509,6 +2589,7 @@ fn generate_tiles_to_writer_internal(
                         enable_tiny_polygon_accumulation,
                         cluster_config,
                         coalesce_config,
+                        coalesce_targets,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2583,6 +2664,7 @@ fn generate_tiles_to_writer_internal(
                         enable_tiny_polygon_accumulation,
                         cluster_config.as_ref(),
                         coalesce_config.as_ref(),
+                        coalesce_targets.as_ref(),
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2601,6 +2683,8 @@ fn generate_tiles_to_writer_internal(
             geometry_bytes: record.geometry_wkb,
             feature_id: record.feature_id,
             original_hilbert: record.original_hilbert,
+            row_group_idx: record.row_group_idx,
+            property_bytes: record.properties,
         });
         current_tile = Some(record_tile);
     }
@@ -2629,6 +2713,7 @@ fn generate_tiles_to_writer_internal(
         enable_tiny_polygon_accumulation,
         cluster_config.as_ref(),
         coalesce_config.as_ref(),
+        coalesce_targets.as_ref(),
         drop_smallest_as_needed,
         drop_smallest_threshold,
         gamma,

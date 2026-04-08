@@ -80,6 +80,8 @@ pub struct TileFeatureRecord {
     /// Hilbert index of the ORIGINAL geometry centroid (before clipping).
     /// Used as secondary sort key for correct gap-based density dropping.
     pub original_hilbert: u64,
+    /// Row group index (for predictive coalescing)
+    pub row_group_idx: usize,
     /// WKB-encoded geometry
     pub geometry_wkb: Vec<u8>,
     /// MessagePack-serialized properties
@@ -95,6 +97,7 @@ impl TileFeatureRecord {
     /// * `z`, `x`, `y` - Tile coordinates
     /// * `feature_id` - Original feature index for debugging/provenance
     /// * `original_hilbert` - Hilbert index of the ORIGINAL geometry centroid (before clipping)
+    /// * `row_group_idx` - Row group index (for predictive coalescing)
     /// * `geometry_wkb` - Serialized geometry bytes
     /// * `properties` - MessagePack-serialized properties
     #[allow(clippy::too_many_arguments)]
@@ -105,6 +108,7 @@ impl TileFeatureRecord {
         y: u32,
         feature_id: u64,
         original_hilbert: u64,
+        row_group_idx: usize,
         geometry_wkb: Vec<u8>,
         properties: Vec<u8>,
     ) -> Self {
@@ -115,6 +119,7 @@ impl TileFeatureRecord {
             y,
             feature_id,
             original_hilbert,
+            row_group_idx,
             geometry_wkb,
             properties,
         }
@@ -294,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_tile_feature_record_creation() {
-        let record = TileFeatureRecord::new(42, 5, 10, 20, 1, 999, vec![1, 2, 3], vec![4, 5, 6]);
+        let record = TileFeatureRecord::new(42, 5, 10, 20, 1, 999, 0, vec![1, 2, 3], vec![4, 5, 6]);
         assert_eq!(record.tile_id, 42);
         assert_eq!(record.z, 5);
         assert_eq!(record.x, 10);
@@ -307,9 +312,9 @@ mod tests {
 
     #[test]
     fn test_tile_feature_record_ordering() {
-        let r1 = TileFeatureRecord::new(1, 0, 0, 0, 1, 100, vec![], vec![]);
-        let r2 = TileFeatureRecord::new(2, 0, 0, 0, 1, 100, vec![], vec![]);
-        let r3 = TileFeatureRecord::new(1, 0, 0, 0, 2, 200, vec![], vec![]);
+        let r1 = TileFeatureRecord::new(1, 0, 0, 0, 1, 100, 0, vec![], vec![]);
+        let r2 = TileFeatureRecord::new(2, 0, 0, 0, 1, 100, 0, vec![], vec![]);
+        let r3 = TileFeatureRecord::new(1, 0, 0, 0, 2, 200, 0, vec![], vec![]);
 
         // tile_id is primary sort key
         assert!(r1 < r2);
@@ -326,6 +331,7 @@ mod tests {
             200,
             789,
             555, // original_hilbert
+            0,   // row_group_idx
             vec![0x01, 0x02, 0x03, 0x04],
             vec![0x82, 0xa4, b't', b'e', b's', b't'], // MessagePack map
         );
@@ -343,7 +349,7 @@ mod tests {
         assert!(sorter.is_empty());
         assert_eq!(sorter.len(), 0);
 
-        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, 0, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, 0, 0, vec![], vec![]));
         assert!(!sorter.is_empty());
         assert_eq!(sorter.len(), 1);
     }
@@ -353,9 +359,9 @@ mod tests {
         let mut sorter = TileFeatureSorter::new(1000);
 
         // Add records out of order
-        sorter.add(TileFeatureRecord::new(3, 0, 0, 0, 1, 0, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, 0, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(2, 0, 0, 0, 1, 0, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(3, 0, 0, 0, 1, 0, 0, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, 0, 0, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(2, 0, 0, 0, 1, 0, 0, vec![], vec![]));
 
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
 
@@ -371,9 +377,39 @@ mod tests {
 
         // Multiple features in same tile with different Hilbert indices
         // feature_id is intentionally out of order to prove we sort by original_hilbert, not feature_id
-        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 99, 300, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 77, 100, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 88, 200, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(
+            5,
+            1,
+            0,
+            0,
+            99,
+            300,
+            0,
+            vec![],
+            vec![],
+        ));
+        sorter.add(TileFeatureRecord::new(
+            5,
+            1,
+            0,
+            0,
+            77,
+            100,
+            0,
+            vec![],
+            vec![],
+        ));
+        sorter.add(TileFeatureRecord::new(
+            5,
+            1,
+            0,
+            0,
+            88,
+            200,
+            0,
+            vec![],
+            vec![],
+        ));
 
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
 
@@ -404,6 +440,7 @@ mod tests {
             0,
             1,
             200, // original_hilbert
+            0,   // row_group_idx
             geom2.clone(),
             props2.clone(),
         ));
@@ -414,6 +451,7 @@ mod tests {
             0,
             1,
             100, // original_hilbert
+            0,   // row_group_idx
             geom1.clone(),
             props1.clone(),
         ));
@@ -443,6 +481,7 @@ mod tests {
                 0,
                 i,
                 i, // original_hilbert = same as tile_id for simplicity
+                0, // row_group_idx
                 vec![i as u8],
                 vec![(i % 256) as u8],
             ));
@@ -476,6 +515,7 @@ mod tests {
                 0,
                 i,
                 i, // original_hilbert = same as tile_id for simplicity
+                0, // row_group_idx
                 vec![i as u8],
                 vec![(i % 256) as u8],
             ));
@@ -522,6 +562,7 @@ mod tests {
                     0,                        // y
                     tile_id * 100 + hilbert,  // feature_id (unique)
                     hilbert * 1000 + tile_id, // original_hilbert (varying within tile)
+                    0,                        // row_group_idx
                     vec![tile_id as u8],      // geometry
                     vec![hilbert as u8],      // properties
                 ));
@@ -539,6 +580,7 @@ mod tests {
                     0,
                     tile_id * 100 + hilbert,
                     hilbert * 1000 + tile_id, // original_hilbert
+                    0,                        // row_group_idx
                     vec![tile_id as u8],
                     vec![hilbert as u8],
                 ));
@@ -614,7 +656,7 @@ mod tests {
 
         // Add only 100 records - well under buffer capacity
         for i in (0..100).rev() {
-            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, i, vec![], vec![]));
+            sorter.add(TileFeatureRecord::new(i, 0, 0, 0, i, i, 0, vec![], vec![]));
         }
 
         let sorted_iter = sorter.sort().unwrap();
