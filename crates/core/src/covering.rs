@@ -38,7 +38,7 @@
 //! This approach has ~4% overhead compared to baseline metadata reads, and is
 //! 370x faster than scanning column values.
 
-use crate::tile::TileBounds;
+use crate::tile::{lng_lat_to_tile, TileBounds, TileCoord};
 use crate::Error;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -459,6 +459,28 @@ pub fn tile_to_bounds(z: u8, x: u32, y: u32) -> TileBounds {
     }
 }
 
+/// Iterator over tiles covering a geographic bounding box at a given zoom level.
+///
+/// Used for coalescing density estimation: count tiles to estimate features-per-tile.
+///
+/// # Arguments
+///
+/// * `bounds` - Geographic bounding box (lng/lat, WGS84)
+/// * `zoom` - Target zoom level
+///
+/// # Returns
+///
+/// Iterator yielding `TileCoord` for each tile that intersects the bounding box.
+pub fn covering_tiles(bounds: &TileBounds, zoom: u8) -> impl Iterator<Item = TileCoord> {
+    // Convert corner coordinates to tile coordinates
+    let min_tile = lng_lat_to_tile(bounds.lng_min, bounds.lat_max, zoom); // NW corner
+    let max_tile = lng_lat_to_tile(bounds.lng_max, bounds.lat_min, zoom); // SE corner
+
+    // Generate all tiles in the bounding rectangle
+    (min_tile.x..=max_tile.x)
+        .flat_map(move |x| (min_tile.y..=max_tile.y).map(move |y| TileCoord::new(x, y, zoom)))
+}
+
 /// Parse bbox in xmin,ymin,xmax,ymax format.
 fn parse_bbox(input: &str) -> Result<TileBounds, Error> {
     let parts: Vec<&str> = input.split(',').collect();
@@ -511,6 +533,7 @@ fn parse_bbox(input: &str) -> Result<TileBounds, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tile::TileCoord;
 
     // -------------------------------------------------------------------------
     // Covering Metadata Parsing Tests
@@ -780,6 +803,67 @@ mod tests {
             "Extracted bounds for {}/{} row groups",
             with_bounds,
             bounds.len()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Tile Coverage Tests (for coalescing density estimation)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_covering_tiles_single_tile() {
+        // Bounds that fit entirely within a single z10 tile
+        // San Francisco downtown area
+        let bounds = TileBounds::new(-122.42, 37.78, -122.40, 37.80);
+        let tiles: Vec<_> = covering_tiles(&bounds, 10).collect();
+
+        assert_eq!(tiles.len(), 1, "Expected single tile coverage");
+        assert_eq!(tiles[0].z, 10);
+    }
+
+    #[test]
+    fn test_covering_tiles_multiple_tiles() {
+        // Bounds spanning multiple tiles at z10
+        // Larger SF Bay area
+        let bounds = TileBounds::new(-122.5, 37.7, -122.3, 37.9);
+        let tiles: Vec<_> = covering_tiles(&bounds, 10).collect();
+
+        assert!(tiles.len() > 1, "Expected multiple tiles");
+        // All tiles should be at z10
+        assert!(tiles.iter().all(|t| t.z == 10));
+    }
+
+    #[test]
+    fn test_covering_tiles_world_at_z0() {
+        // World bounds at z0 = exactly one tile
+        let bounds = TileBounds::new(-180.0, -85.0, 180.0, 85.0);
+        let tiles: Vec<_> = covering_tiles(&bounds, 0).collect();
+
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0], TileCoord::new(0, 0, 0));
+    }
+
+    #[test]
+    fn test_covering_tiles_world_at_z1() {
+        // World bounds at z1 = four tiles (2x2)
+        let bounds = TileBounds::new(-180.0, -85.0, 180.0, 85.0);
+        let tiles: Vec<_> = covering_tiles(&bounds, 1).collect();
+
+        assert_eq!(tiles.len(), 4);
+    }
+
+    #[test]
+    fn test_covering_tiles_count_matches_expected() {
+        // A bbox covering roughly 2x3 tiles at z12
+        let bounds = TileBounds::new(-122.5, 37.7, -122.35, 37.85);
+        let tiles: Vec<_> = covering_tiles(&bounds, 12).collect();
+
+        // Calculate expected: tiles spanning this bbox
+        // We don't need exact count, just verify reasonable range
+        assert!(
+            tiles.len() >= 4 && tiles.len() <= 12,
+            "Expected 4-12 tiles, got {}",
+            tiles.len()
         );
     }
 }
