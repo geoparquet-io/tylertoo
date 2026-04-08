@@ -323,7 +323,7 @@ pub fn coalesce_geometries(target: &mut Geometry, source: Geometry) -> CoalesceR
             *target = MultiPoint(geo::MultiPoint::new(vec![*p1, p2]));
             CoalesceResult::Merged
         }
-        (MultiPoint(mp), Point(p)) => {
+        (MultiPoint(_), Point(p)) => {
             if let MultiPoint(mp) = target {
                 mp.0.push(p);
             }

@@ -1730,6 +1730,7 @@ fn generate_tiles_to_writer_internal(
         extent: u32,
         enable_tiny_polygon_accumulation: bool,
         cluster_config: Option<&ClusterConfig>,
+        coalesce_config: Option<&CoalesceConfig>,
         drop_smallest_as_needed: bool,
         drop_smallest_threshold: f64,
         gamma: Option<f64>,
@@ -2046,6 +2047,19 @@ fn generate_tiles_to_writer_internal(
             }
         }
 
+        // TODO(#26): Implement geometry coalescing here when coalesce_config.is_some()
+        // The infrastructure is ready (CoalesceConfig passed through pipeline).
+        // Implementation needs to:
+        // 1. Collect all features into a Vec (like clustering path does)
+        // 2. Create SpatialGrid for tile bounds
+        // 3. Group features by cell using assign_cell()
+        // 4. Apply coalesce_geometries() within each cell
+        // 5. Add coalesced features to LayerBuilder
+        //
+        // This is complex because WorldClippedGeometry needs conversion to geo::Geometry
+        // for coalescing, then back. Consider row-group pre-coalesce as alternative.
+        let _ = coalesce_config; // Silence unused warning until implemented
+
         // Non-clustering path: original loop
         for raw_feat in tile_data.features {
             // Gap-based density dropping (--drop-densest-as-needed)
@@ -2268,6 +2282,7 @@ fn generate_tiles_to_writer_internal(
     let drop_smallest_as_needed = config.drop_smallest_as_needed;
     let drop_smallest_threshold = config.drop_smallest_threshold;
     let cluster_config = config.cluster_config.clone();
+    let coalesce_config = config.coalesce_config.clone();
     let gamma = config.gamma;
 
     // Helper to flush the batch: decode + encode in parallel, write sequentially
@@ -2280,6 +2295,7 @@ fn generate_tiles_to_writer_internal(
                        deterministic: bool,
                        enable_tiny_polygon_accumulation: bool,
                        cluster_config: Option<&ClusterConfig>,
+                       coalesce_config: Option<&CoalesceConfig>,
                        drop_smallest_as_needed: bool,
                        drop_smallest_threshold: f64,
                        gamma: Option<f64>|
@@ -2300,6 +2316,7 @@ fn generate_tiles_to_writer_internal(
                         extent,
                         enable_tiny_polygon_accumulation,
                         cluster_config,
+                        coalesce_config,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2317,6 +2334,7 @@ fn generate_tiles_to_writer_internal(
                         extent,
                         enable_tiny_polygon_accumulation,
                         cluster_config,
+                        coalesce_config,
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2390,6 +2408,7 @@ fn generate_tiles_to_writer_internal(
                         deterministic,
                         enable_tiny_polygon_accumulation,
                         cluster_config.as_ref(),
+                        coalesce_config.as_ref(),
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
@@ -2435,6 +2454,7 @@ fn generate_tiles_to_writer_internal(
         deterministic,
         enable_tiny_polygon_accumulation,
         cluster_config.as_ref(),
+        coalesce_config.as_ref(),
         drop_smallest_as_needed,
         drop_smallest_threshold,
         gamma,
