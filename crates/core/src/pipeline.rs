@@ -39,6 +39,7 @@ use crate::gap_density::{geometry_to_hilbert, scale_for_zoom, GapBasedSelector};
 use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeometry};
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
+use crate::sampling::{ExtentSampler, GapSampler};
 use crate::simplify::simplify_for_zoom;
 use crate::spatial_index::{sort_features, sort_geometries};
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
@@ -1857,6 +1858,9 @@ fn generate_tiles_to_writer_internal(
         drop_smallest_as_needed: bool,
         drop_smallest_threshold: f64,
         gamma: Option<f64>,
+        // Samplers for adaptive threshold iteration (Wave 2)
+        _gap_sampler: Option<&mut GapSampler>,
+        _extent_sampler: Option<&mut ExtentSampler>,
     ) -> Option<EncodedTile> {
         use crate::clustering::{IndexedPoint, PointClusterer};
         use crate::mvt::PropertyValue;
@@ -1897,6 +1901,15 @@ fn generate_tiles_to_writer_internal(
         let mut gap_selector = gamma
             .filter(|&g| g > 0.0)
             .map(|g| GapBasedSelector::new(g).with_scale(scale_for_zoom(tile_data.z)));
+
+        // TODO(Wave 3): Record samples for adaptive threshold iteration
+        // During the sampling pass, collect gap values and feature extents:
+        // if let Some(sampler) = _gap_sampler {
+        //     sampler.record(gap_value);
+        // }
+        // if let Some(sampler) = _extent_sampler {
+        //     sampler.record(extent_value);
+        // }
 
         // Create accumulator for tiny polygons if enabled
         let mut accumulator = if enable_tiny_polygon_accumulation {
@@ -2670,6 +2683,8 @@ fn generate_tiles_to_writer_internal(
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
+                        None, // gap_sampler - Wave 3 will wire up
+                        None, // extent_sampler - Wave 3 will wire up
                     )
                 })
                 .collect()
@@ -2689,6 +2704,8 @@ fn generate_tiles_to_writer_internal(
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
+                        None, // gap_sampler - Wave 3 will wire up
+                        None, // extent_sampler - Wave 3 will wire up
                     )
                 })
                 .collect()

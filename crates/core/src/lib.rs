@@ -117,6 +117,13 @@ pub enum Error {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Cannot reduce tile further: tile {tile} has {size} bytes and {features} features after maximum threshold adjustment")]
+    CannotReduceFurther {
+        tile: String,
+        size: usize,
+        features: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
