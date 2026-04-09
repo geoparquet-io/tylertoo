@@ -561,7 +561,7 @@ mod tests {
         for i in 0..8 {
             sampler.record(i);
         }
-        assert!(sampler.len() > 0);
+        assert!(!sampler.is_empty());
         assert!(sampler.increment() > 1);
         assert!(sampler.seq() > 0);
 
