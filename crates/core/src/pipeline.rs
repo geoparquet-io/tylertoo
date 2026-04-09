@@ -1217,7 +1217,7 @@ fn generate_tiles_to_writer_internal(
 ) -> Result<crate::memory::MemoryStats> {
     use crate::batch_processor::get_row_group_count;
     use crate::external_sort::{TileFeatureRecord, TileFeatureSorter};
-    use crate::memory::{MemoryStats, MemoryTracker};
+    use crate::memory::{MemoryStats, MemoryTracker, RssTracker};
     use crate::mvt::{LayerBuilder, TileBuilder};
     use crate::pmtiles_writer::tile_id;
     use geo::BoundingRect;
@@ -1228,10 +1228,13 @@ fn generate_tiles_to_writer_internal(
     let start_time = Instant::now();
 
     // Thread-safe state for parallel geometry processing
+    // MemoryTracker: accumulates bytes for budget estimation
+    // RssTracker: samples actual RSS for accurate reporting (issue #152)
     let memory_tracker = Mutex::new(match config.memory_budget {
         Some(budget) => MemoryTracker::with_budget(budget),
         None => MemoryTracker::new(),
     });
+    let rss_tracker = Mutex::new(RssTracker::new());
 
     let global_bounds = Mutex::new(TileBounds::empty());
     let global_feature_index = AtomicU64::new(0);
@@ -1645,19 +1648,24 @@ fn generate_tiles_to_writer_internal(
     let phase1_peak = memory_tracker.lock().unwrap().peak();
     memory_tracker.lock().unwrap().reset_current();
 
+    // Sample actual RSS at phase boundary (issue #152)
+    rss_tracker.lock().unwrap().sample();
+    let phase1_rss = rss_tracker.lock().unwrap().peak_rss();
+
     // Count total records across all buckets
     let total_records: u64 = sorters.iter().map(|s| s.lock().unwrap().len() as u64).sum();
 
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase1Complete {
             total_records,
-            peak_memory_bytes: phase1_peak,
+            peak_memory_bytes: phase1_rss as usize, // Report actual RSS, not throughput
         });
     }
     if !config.quiet {
         tracing::info!(
-            "Phase 1 complete: {} records to sort (peak memory so far: {} bytes)",
+            "Phase 1 complete: {} records to sort (peak RSS: {}, throughput: {} bytes)",
             total_records,
+            crate::memory::format_bytes(phase1_rss as usize),
             phase1_peak
         );
     }
@@ -2746,7 +2754,13 @@ fn generate_tiles_to_writer_internal(
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
 
-    let stats = MemoryStats::from_tracker(&memory_tracker.into_inner().unwrap());
+    // Final RSS sample at completion
+    rss_tracker.lock().unwrap().sample();
+
+    // Create stats from both trackers (issue #152: use actual RSS for peak_bytes)
+    let mem_tracker = memory_tracker.into_inner().unwrap();
+    let rss = rss_tracker.into_inner().unwrap();
+    let stats = MemoryStats::from_trackers(&mem_tracker, &rss);
     let duration = start_time.elapsed();
 
     if let Some(ref cb) = progress {
@@ -2758,9 +2772,10 @@ fn generate_tiles_to_writer_internal(
     }
     if !config.quiet {
         tracing::info!(
-            "External sort streaming complete: {} tiles written, peak memory {}",
+            "External sort streaming complete: {} tiles written, peak RSS {} (throughput: {})",
             tiles_written,
-            stats.peak_formatted()
+            stats.peak_formatted(),
+            stats.throughput_formatted()
         );
     }
 
@@ -2794,15 +2809,18 @@ pub fn generate_tiles_streaming_with_stats(
     input_path: &Path,
     config: &TilerConfig,
 ) -> Result<(Vec<GeneratedTile>, crate::memory::MemoryStats)> {
-    use crate::memory::{estimate_geometry_size, MemoryStats, MemoryTracker};
+    use crate::memory::{estimate_geometry_size, MemoryStats, MemoryTracker, RssTracker};
     use geo::BoundingRect;
     use std::collections::HashMap;
 
-    // Step 1: Initialize memory tracker
+    // Step 1: Initialize memory trackers
+    // MemoryTracker: accumulates bytes for budget estimation
+    // RssTracker: samples actual RSS for accurate reporting (issue #152)
     let mut memory_tracker = match config.memory_budget {
         Some(budget) => MemoryTracker::with_budget(budget),
         None => MemoryTracker::new(),
     };
+    let mut rss_tracker = RssTracker::new();
 
     // Step 2: Extract field metadata
     let _all_fields = extract_field_metadata(input_path).unwrap_or_default();
@@ -2986,13 +3004,17 @@ pub fn generate_tiles_streaming_with_stats(
     // Sort tiles by (z, x, y) for deterministic output
     tiles.sort_by(|a, b| (a.coord.z, a.coord.x, a.coord.y).cmp(&(b.coord.z, b.coord.x, b.coord.y)));
 
-    // Collect memory stats
-    let stats = MemoryStats::from_tracker(&memory_tracker);
+    // Final RSS sample at completion
+    rss_tracker.sample();
+
+    // Collect memory stats (issue #152: use actual RSS for peak_bytes)
+    let stats = MemoryStats::from_trackers(&memory_tracker, &rss_tracker);
 
     // Log memory summary
     tracing::info!(
-        "Streaming complete: peak memory {}, budget {}",
+        "Streaming complete: peak RSS {} (throughput: {}), budget {}",
         stats.peak_formatted(),
+        stats.throughput_formatted(),
         stats
             .budget_formatted()
             .unwrap_or_else(|| "none".to_string())
