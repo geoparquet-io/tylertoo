@@ -2807,8 +2807,10 @@ fn generate_tiles_to_writer_internal(
                         );
                         return Err(Error::CannotReduceFurther {
                             tile: format!("{}/{}/{}", z, x, y),
+                            zoom: z,
                             size: data_len,
                             features: feature_count,
+                            max_tile_size: max_size.unwrap_or(500_000) as usize,
                         });
                     }
 
@@ -2874,8 +2876,10 @@ fn generate_tiles_to_writer_internal(
                         );
                         return Err(Error::CannotReduceFurther {
                             tile: format!("{}/{}/{}", z, x, y),
+                            zoom: z,
                             size: data_len,
                             features: feature_count,
+                            max_tile_size: max_size.unwrap_or(500_000) as usize,
                         });
                     }
 

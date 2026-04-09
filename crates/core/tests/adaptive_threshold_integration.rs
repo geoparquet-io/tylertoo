@@ -247,8 +247,10 @@ fn test_cannot_reduce_further_error_format() {
     // Create the error to verify its format
     let err = Error::CannotReduceFurther {
         tile: "5/10/12".to_string(),
+        zoom: 5,
         size: 1_000_000,
         features: 50_000,
+        max_tile_size: 500_000,
     };
 
     let msg = err.to_string();
@@ -258,11 +260,14 @@ fn test_cannot_reduce_further_error_format() {
         msg.contains("5/10/12"),
         "Error should contain tile coordinate"
     );
-    assert!(msg.contains("1000000"), "Error should contain size");
-    assert!(msg.contains("50000"), "Error should contain feature count");
     assert!(
         msg.contains("Cannot reduce"),
         "Error should mention reduction failure"
+    );
+    // Should contain helpful suggestions
+    assert!(
+        msg.contains("Suggestions") || msg.contains("--"),
+        "Error should contain actionable suggestions"
     );
 
     // Verify Debug formatting works
@@ -310,6 +315,7 @@ fn test_cannot_reduce_further_pathological_input() {
             tile,
             size,
             features,
+            ..
         }) => {
             println!(
                 "Got expected CannotReduceFurther for tile {} (size: {}, features: {})",

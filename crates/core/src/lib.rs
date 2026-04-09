@@ -97,6 +97,58 @@ pub use covering::{
 // Re-export ProcessingMode for memory-bounded processing
 pub use pipeline::{auto_bucket_count, auto_processing_mode, ProcessingMode};
 
+/// Format a helpful error message for CannotReduceFurther errors
+fn format_cannot_reduce_error(
+    zoom: u8,
+    tile: &str,
+    size: usize,
+    features: usize,
+    max_tile_size: usize,
+) -> String {
+    let bytes_per_feature = if features > 0 { size / features } else { size };
+    let size_kb = size / 1024;
+    let max_kb = max_tile_size / 1024;
+
+    let mut msg = format!(
+        "Cannot reduce tile {tile} (zoom {zoom}): {size_kb}KB with {features} features exceeds {max_kb}KB limit"
+    );
+
+    // Diagnose the problem and suggest solutions
+    if features <= 20 && bytes_per_feature > 50_000 {
+        // Few features but huge size = geometry complexity issue
+        msg.push_str(&format!(
+            "\n\nDiagnosis: Each feature averages {}KB - geometries are too complex at this zoom level.",
+            bytes_per_feature / 1024
+        ));
+        msg.push_str("\n\nSuggestions:");
+        msg.push_str(&format!(
+            "\n  • Increase --min-zoom to {} or higher to skip problematic low-zoom tiles",
+            zoom + 2
+        ));
+        msg.push_str(&format!(
+            "\n  • Increase --max-tile-size to {}M to allow larger tiles at low zoom",
+            (size / 1_000_000) + 1
+        ));
+        msg.push_str("\n  • Pre-simplify geometries with `gpio simplify` before tiling");
+    } else if features > max_tile_size / 100 {
+        // Too many features
+        msg.push_str("\n\nDiagnosis: Too many features for tile size limit.");
+        msg.push_str("\n\nSuggestions:");
+        msg.push_str("\n  • Increase --max-tile-features to allow more features");
+        msg.push_str("\n  • Use --drop-densest-as-needed with higher --gamma (e.g., --gamma 3)");
+        msg.push_str("\n  • Use --cluster-distance to merge nearby points");
+    } else {
+        msg.push_str("\n\nSuggestions:");
+        msg.push_str(&format!(
+            "\n  • Increase --max-tile-size (current: {}KB)",
+            max_kb
+        ));
+        msg.push_str(&format!("\n  • Increase --min-zoom above {}", zoom));
+    }
+
+    msg
+}
+
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
 pub enum Error {
@@ -118,11 +170,13 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Cannot reduce tile further: tile {tile} has {size} bytes and {features} features after maximum threshold adjustment")]
+    #[error("{}", format_cannot_reduce_error(*.zoom, tile, *.size, *.features, *.max_tile_size))]
     CannotReduceFurther {
         tile: String,
+        zoom: u8,
         size: usize,
         features: usize,
+        max_tile_size: usize,
     },
 }
 
