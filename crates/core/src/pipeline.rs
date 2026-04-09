@@ -3068,61 +3068,62 @@ fn generate_tiles_to_writer_internal(
 
                 // Check if we're transitioning to a new zoom level
                 let new_zoom = record_tile.0;
-                if adaptive_enabled && last_zoom.is_some() && last_zoom != Some(new_zoom) {
-                    // Flush any pending tiles from the previous zoom before propagating
-                    flush_batch(
-                        &mut tile_batch,
-                        &mut batch_memory,
-                        writer,
-                        &mut tiles_written,
-                        &layer_name,
-                        extent,
-                        deterministic,
-                        enable_tiny_polygon_accumulation,
-                        cluster_config.as_ref(),
-                        coalesce_config.as_ref(),
-                        coalesce_targets.as_ref(),
-                        drop_smallest_as_needed,
-                        drop_smallest_threshold,
-                        gamma,
-                        config,
-                        &adaptive,
-                    )?;
+                if let Some(completed_zoom) = last_zoom {
+                    if adaptive_enabled && completed_zoom != new_zoom {
+                        // Flush any pending tiles from the previous zoom before propagating
+                        flush_batch(
+                            &mut tile_batch,
+                            &mut batch_memory,
+                            writer,
+                            &mut tiles_written,
+                            &layer_name,
+                            extent,
+                            deterministic,
+                            enable_tiny_polygon_accumulation,
+                            cluster_config.as_ref(),
+                            coalesce_config.as_ref(),
+                            coalesce_targets.as_ref(),
+                            drop_smallest_as_needed,
+                            drop_smallest_threshold,
+                            gamma,
+                            config,
+                            &adaptive,
+                        )?;
 
-                    // Check if any tile at the completed zoom level triggered a retry flag
-                    // This means at least one tile required a higher threshold than initially set
-                    let completed_zoom = last_zoom.unwrap();
-                    if adaptive.needs_retry(completed_zoom) {
-                        // In tippecanoe's full implementation, we would re-encode all tiles
-                        // at this zoom level with the updated thresholds. However, with our
-                        // streaming architecture, tiles have already been written.
-                        //
-                        // The per-tile retry loop handles most cases by increasing thresholds
-                        // until tiles fit within limits. The threshold is then propagated
-                        // to subsequent zoom levels, so they start with better initial values.
-                        //
-                        // For pathological cases where zoom-level retry would help, users can
-                        // increase max_retries or use more aggressive initial thresholds.
-                        tracing::info!(
-                            "Zoom {} thresholds increased during encoding (mingap: {}, minextent: {}). \
-                             Thresholds will be propagated to zoom {}.",
+                        // Check if any tile at the completed zoom level triggered a retry flag
+                        // This means at least one tile required a higher threshold than initially set
+                        if adaptive.needs_retry(completed_zoom) {
+                            // In tippecanoe's full implementation, we would re-encode all tiles
+                            // at this zoom level with the updated thresholds. However, with our
+                            // streaming architecture, tiles have already been written.
+                            //
+                            // The per-tile retry loop handles most cases by increasing thresholds
+                            // until tiles fit within limits. The threshold is then propagated
+                            // to subsequent zoom levels, so they start with better initial values.
+                            //
+                            // For pathological cases where zoom-level retry would help, users can
+                            // increase max_retries or use more aggressive initial thresholds.
+                            tracing::info!(
+                                "Zoom {} thresholds increased during encoding (mingap: {}, minextent: {}). \
+                                 Thresholds will be propagated to zoom {}.",
+                                completed_zoom,
+                                adaptive.get_mingap(completed_zoom),
+                                adaptive.get_minextent(completed_zoom),
+                                completed_zoom + 1
+                            );
+                            adaptive.clear_retry_flag(completed_zoom);
+                        }
+
+                        // Propagate thresholds from completed zoom to next zoom level
+                        adaptive.propagate_to_next_zoom(completed_zoom);
+                        tracing::debug!(
+                            "Propagated adaptive thresholds from zoom {} to zoom {} (mingap: {}, minextent: {})",
                             completed_zoom,
-                            adaptive.get_mingap(completed_zoom),
-                            adaptive.get_minextent(completed_zoom),
-                            completed_zoom + 1
+                            completed_zoom + 1,
+                            adaptive.get_mingap(completed_zoom + 1),
+                            adaptive.get_minextent(completed_zoom + 1)
                         );
-                        adaptive.clear_retry_flag(completed_zoom);
                     }
-
-                    // Propagate thresholds from completed zoom to next zoom level
-                    adaptive.propagate_to_next_zoom(completed_zoom);
-                    tracing::debug!(
-                        "Propagated adaptive thresholds from zoom {} to zoom {} (mingap: {}, minextent: {})",
-                        completed_zoom,
-                        completed_zoom + 1,
-                        adaptive.get_mingap(completed_zoom + 1),
-                        adaptive.get_minextent(completed_zoom + 1)
-                    );
                 }
                 last_zoom = Some(z);
 

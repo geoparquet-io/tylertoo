@@ -114,8 +114,8 @@ fn format_cannot_reduce_error(
     );
 
     // Diagnose the problem and suggest solutions
-    if features <= 20 && bytes_per_feature > 50_000 {
-        // Few features but huge size = geometry complexity issue
+    if bytes_per_feature > 50_000 {
+        // Large average feature size = geometry complexity issue (regardless of count)
         msg.push_str(&format!(
             "\n\nDiagnosis: Each feature averages {}KB - geometries are too complex at this zoom level.",
             bytes_per_feature / 1024
