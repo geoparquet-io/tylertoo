@@ -50,6 +50,12 @@ fn parse_memory_size(s: &str) -> Result<usize, String> {
         })
 }
 
+/// Parse human-readable size (e.g., "500K", "1M", "2G") to bytes as u32.
+fn parse_size_bytes(s: &str) -> Result<u32, String> {
+    let bytes = parse_memory_size(s)?;
+    u32::try_from(bytes).map_err(|_| format!("Size {} too large for u32", s))
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "gpq-tiles",
@@ -116,6 +122,22 @@ struct Args {
     /// Features with pixel area below this threshold are candidates for dropping.
     #[arg(long, default_value = "4.0")]
     drop_smallest_threshold: f64,
+
+    /// Maximum tile size in bytes (e.g., "500K", "1M").
+    ///
+    /// When a tile exceeds this limit, adaptive thresholds increase
+    /// to drop more features until the tile fits. Equivalent to
+    /// tippecanoe's --maximum-tile-bytes.
+    #[arg(long, value_parser = parse_size_bytes)]
+    max_tile_size: Option<u32>,
+
+    /// Maximum features per tile.
+    ///
+    /// When a tile exceeds this limit, adaptive thresholds increase
+    /// to drop more features until the tile fits. Equivalent to
+    /// tippecanoe's --maximum-tile-features.
+    #[arg(long)]
+    max_tile_features: Option<u32>,
 
     /// Layer name for the output tiles (default: derived from input filename)
     #[arg(long)]
@@ -489,6 +511,14 @@ fn main() -> Result<()> {
         tiler_config = tiler_config
             .with_drop_smallest_as_needed()
             .with_drop_smallest_threshold(args.drop_smallest_threshold);
+    }
+
+    // Configure adaptive threshold limits if specified
+    if let Some(max_size) = args.max_tile_size {
+        tiler_config = tiler_config.with_max_tile_size(max_size);
+    }
+    if let Some(max_features) = args.max_tile_features {
+        tiler_config = tiler_config.with_max_tile_features(max_features);
     }
 
     // Add accumulator config if specified

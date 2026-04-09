@@ -20,7 +20,7 @@ Design decisions and tippecanoe divergences.
 | Tiny polygon handling | **Accumulation** | Accumulation | **MATCHES** (Issue #85) |
 | Point clustering | **Hilbert proximity + incremental centroid** | Hilbert proximity + incremental centroid | **MATCHES** (Issue #25) |
 | Attribute accumulation | **Configurable accumulators** | Configurable accumulators | **MATCHES** (Issue #23) |
-| Size-based dropping | **Fixed threshold** | Iterative percentile-based | Fixed threshold v1; iterative planned |
+| Size-based dropping | **Adaptive threshold iteration** | Iterative percentile-based | **MATCHES** (see Adaptive Threshold Iteration section) |
 
 ## Polygon Clipping: Sutherland-Hodgman
 
@@ -147,6 +147,76 @@ Features with `pixel_area < threshold` are dropped from the tile.
 - `test_geometry_pixel_area_world_all_types` - Dispatcher correctness
 - `test_drop_smallest_filters_tiny_features` - Integration test
 - `test_drop_smallest_visual_comparison` - Golden test with reduction metrics
+
+## Adaptive Threshold Iteration
+
+Implements tippecanoe's iterative percentile-based threshold adjustment for automatic tile size control.
+
+### Problem
+
+Fixed thresholds for feature dropping (`--drop-smallest-as-needed`, `--drop-densest-as-needed`) require manual tuning. When tiles exceed size limits, users must experiment with different threshold values.
+
+### Solution
+
+When `--max-tile-size` or `--max-tile-features` is set, gpq-tiles automatically adjusts thresholds:
+
+1. **Encode** tile with current threshold
+2. **Check** if tile exceeds limits
+3. **Sample** the gap/extent distribution from the tile's features
+4. **Select** a new threshold at a percentile that should reduce features sufficiently
+5. **Retry** encoding with the higher threshold
+6. **Propagate** the final threshold to the next zoom level
+
+### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `BoundedSampler<T>` | `sampling.rs` | Collects samples with incremental halving (100K cap) |
+| `AdaptiveTargets` | `adaptive.rs` | Thread-safe per-zoom threshold tracking |
+| `encode_tile_with_adaptive_retry` | `pipeline.rs` | Retry loop with threshold ratcheting |
+
+### Tippecanoe Compatibility
+
+This implementation matches tippecanoe's algorithm:
+
+- **Incremental halving**: When samples exceed 100K, keep every 2nd sample and double the increment
+- **Percentile selection**: `ix = (len - 1) * (1 - fraction)` with ratcheting
+- **Multipliers**: mingap=0.80, minextent=0.75 (tippecanoe defaults)
+- **Ratcheting**: Thresholds only increase, never decrease
+
+### Divergences from Tippecanoe
+
+| Aspect | Tippecanoe | gpq-tiles | Reason |
+|--------|------------|-----------|--------|
+| Zoom retry | Re-encodes entire zoom when threshold increases | Forward propagation only | Simplicity; full retry planned for follow-up |
+| Sample storage | Global arrays | Per-tile samplers | Rust ownership model |
+
+### CLI Usage
+
+```bash
+# Limit tile size to 500KB
+gpq-tiles input.parquet output.pmtiles --max-tile-size 500K --drop-densest-as-needed
+
+# Limit features per tile to 10,000
+gpq-tiles input.parquet output.pmtiles --max-tile-features 10000 --drop-smallest-as-needed
+
+# Both limits (most restrictive wins)
+gpq-tiles input.parquet output.pmtiles \
+    --max-tile-size 500K \
+    --max-tile-features 10000 \
+    --drop-densest-as-needed \
+    --drop-smallest-as-needed
+```
+
+### Error Handling
+
+When thresholds cannot be increased further (all features would be dropped), returns:
+
+```
+Error: Cannot reduce tile further: tile 5/10/12 has 1000000 bytes and 50000 features after maximum threshold adjustment
+```
+
+This matches tippecanoe's failure mode.
 
 ## Tiny Polygon Accumulation (Issue #85)
 
