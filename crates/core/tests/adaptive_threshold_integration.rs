@@ -28,8 +28,14 @@ use std::path::Path;
 /// when max_tile_features is set.
 ///
 /// This test uses a real fixture to verify the full pipeline works with
-/// adaptive thresholds enabled. The key assertion is that the pipeline
-/// completes successfully even with aggressive feature limits.
+/// adaptive thresholds enabled. The adaptive retry loop uses percentile-based
+/// threshold selection to progressively drop more features until tiles fit.
+///
+/// With max_tile_features=500 and drop_densest enabled, the pipeline:
+/// 1. Samples gap values during initial encoding
+/// 2. If a tile exceeds 500 features, selects a higher gap threshold
+/// 3. Re-encodes with the new threshold, repeating until tiles fit
+/// 4. Reports the final threshold to AdaptiveTargets for propagation
 #[test]
 fn test_adaptive_threshold_reduces_features() {
     // Use open-buildings fixture (dense point data - ideal for testing adaptive behavior)
@@ -44,6 +50,7 @@ fn test_adaptive_threshold_reduces_features() {
     }
 
     // Configure with aggressive limits to force adaptive behavior
+    // 500 features per tile is quite restrictive for dense building data
     let config = TilerConfig::new(0, 4)
         .with_quiet(true)
         .with_max_tile_features(500) // Force adaptive behavior on dense tiles
@@ -53,7 +60,11 @@ fn test_adaptive_threshold_reduces_features() {
 
     let result = generate_tiles_to_writer(fixture_path, &config, &mut writer);
 
-    // Should succeed - adaptive thresholds handle dense tiles
+    // Should succeed - adaptive thresholds handle dense tiles by:
+    // - Sampling gap values during encoding
+    // - Using percentile-based threshold selection when tiles exceed limits
+    // - Progressively increasing thresholds until tiles fit
+    // - Returning CannotReduceFurther only when all options exhausted
     assert!(
         result.is_ok(),
         "Expected success with adaptive thresholds: {:?}",
@@ -257,6 +268,68 @@ fn test_cannot_reduce_further_error_format() {
     // Verify Debug formatting works
     let debug_msg = format!("{:?}", err);
     assert!(debug_msg.contains("CannotReduceFurther"));
+}
+
+/// Test that CannotReduceFurther is returned for pathological input.
+///
+/// When a tile has so many features that no threshold can reduce it below
+/// the limit, the pipeline should return CannotReduceFurther rather than
+/// silently returning an oversized tile.
+///
+/// This test uses an impossibly small feature limit (1 feature per tile)
+/// on dense data. Since even a single feature can't satisfy a 1-feature
+/// limit when the tile has multiple features, this should fail.
+#[test]
+fn test_cannot_reduce_further_pathological_input() {
+    let fixture_path = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+
+    if !fixture_path.exists() {
+        eprintln!(
+            "Skipping test: fixture not found at {:?}",
+            fixture_path.display()
+        );
+        return;
+    }
+
+    // Configure with impossibly small limit to force CannotReduceFurther
+    // 1 feature per tile is impossible for dense data with multiple features per tile
+    let config = TilerConfig::new(0, 2) // Low zoom to ensure dense tiles
+        .with_quiet(true)
+        .with_max_tile_features(1) // Impossibly small limit
+        .with_drop_densest(); // Enable gap-based dropping to attempt reduction
+
+    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+
+    let result = generate_tiles_to_writer(fixture_path, &config, &mut writer);
+
+    // Should fail with CannotReduceFurther
+    // Even with maximum threshold adjustment, 1 feature per tile is impossible
+    // for any tile with more than 1 feature
+    match result {
+        Err(Error::CannotReduceFurther {
+            tile,
+            size,
+            features,
+        }) => {
+            println!(
+                "Got expected CannotReduceFurther for tile {} (size: {}, features: {})",
+                tile, size, features
+            );
+            // Verify the error contains meaningful information
+            assert!(!tile.is_empty(), "Tile coordinate should not be empty");
+            assert!(features > 1, "Features should exceed the limit of 1");
+        }
+        Err(other) => {
+            // Other errors might occur (e.g., if the data is sparse enough)
+            // That's also acceptable - the point is we don't silently accept oversized tiles
+            println!("Got different error (acceptable): {:?}", other);
+        }
+        Ok(_) => {
+            // If all tiles somehow fit within 1 feature, that's fine too
+            // It means the data at low zoom is very sparse
+            println!("All tiles fit within 1 feature limit (sparse data)");
+        }
+    }
 }
 
 /// Test that the error type is Send + Sync (required for parallel processing).

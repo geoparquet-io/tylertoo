@@ -40,7 +40,7 @@ use crate::gap_density::{geometry_to_hilbert, scale_for_zoom, GapBasedSelector};
 use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeometry};
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
-use crate::sampling::{ExtentSampler, GapSampler};
+use crate::sampling::{BoundedSampler, ExtentSampler, GapSampler};
 use crate::simplify::simplify_for_zoom;
 use crate::spatial_index::{sort_features, sort_geometries};
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
@@ -1861,8 +1861,8 @@ fn generate_tiles_to_writer_internal(
         drop_smallest_threshold: f64,
         gamma: Option<f64>,
         // Samplers for adaptive threshold iteration (Wave 2)
-        _gap_sampler: Option<&mut GapSampler>,
-        _extent_sampler: Option<&mut ExtentSampler>,
+        mut gap_sampler: Option<&mut GapSampler>,
+        mut extent_sampler: Option<&mut ExtentSampler>,
     ) -> Option<EncodedTile> {
         use crate::clustering::{IndexedPoint, PointClusterer};
         use crate::mvt::PropertyValue;
@@ -1904,14 +1904,8 @@ fn generate_tiles_to_writer_internal(
             .filter(|&g| g > 0.0)
             .map(|g| GapBasedSelector::new(g).with_scale(scale_for_zoom(tile_data.z)));
 
-        // TODO(Wave 3): Record samples for adaptive threshold iteration
-        // During the sampling pass, collect gap values and feature extents:
-        // if let Some(sampler) = _gap_sampler {
-        //     sampler.record(gap_value);
-        // }
-        // if let Some(sampler) = _extent_sampler {
-        //     sampler.record(extent_value);
-        // }
+        // Track previous Hilbert index for gap sampling
+        let mut prev_hilbert: Option<u64> = None;
 
         // Create accumulator for tiny polygons if enabled
         let mut accumulator = if enable_tiny_polygon_accumulation {
@@ -1958,13 +1952,29 @@ fn generate_tiles_to_writer_internal(
                     continue;
                 }
 
+                // Compute pixel area for potential dropping and sampling
+                let pixel_area =
+                    crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
+
                 // Drop features below pixel area threshold (--drop-smallest-as-needed)
-                if drop_smallest_as_needed {
-                    let pixel_area =
-                        crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
-                    if pixel_area < drop_smallest_threshold {
-                        continue;
+                if drop_smallest_as_needed && pixel_area < drop_smallest_threshold {
+                    continue;
+                }
+
+                // Record samples for adaptive threshold iteration (clustering path)
+                if let Some(ref mut sampler) = gap_sampler {
+                    if let Some(prev) = prev_hilbert {
+                        if raw_feat.original_hilbert > prev {
+                            let gap = raw_feat.original_hilbert - prev;
+                            sampler.record(gap);
+                        }
                     }
+                }
+                prev_hilbert = Some(raw_feat.original_hilbert);
+
+                if let Some(ref mut sampler) = extent_sampler {
+                    let extent_val = (pixel_area * 1000.0) as i64;
+                    sampler.record(extent_val);
                 }
 
                 match geom {
@@ -2268,12 +2278,28 @@ fn generate_tiles_to_writer_internal(
                     continue;
                 }
 
-                if drop_smallest_as_needed {
-                    let pixel_area =
-                        crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
-                    if pixel_area < drop_smallest_threshold {
-                        continue;
+                // Compute pixel area for potential dropping and sampling
+                let pixel_area =
+                    crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
+
+                if drop_smallest_as_needed && pixel_area < drop_smallest_threshold {
+                    continue;
+                }
+
+                // Record samples for adaptive threshold iteration (coalescing path)
+                if let Some(ref mut sampler) = gap_sampler {
+                    if let Some(prev) = prev_hilbert {
+                        if raw_feat.original_hilbert > prev {
+                            let gap = raw_feat.original_hilbert - prev;
+                            sampler.record(gap);
+                        }
                     }
+                }
+                prev_hilbert = Some(raw_feat.original_hilbert);
+
+                if let Some(ref mut sampler) = extent_sampler {
+                    let extent_val = (pixel_area * 1000.0) as i64;
+                    sampler.record(extent_val);
                 }
 
                 // Assign to grid cell based on first point (fast approximation of centroid)
@@ -2424,13 +2450,32 @@ fn generate_tiles_to_writer_internal(
                 continue;
             }
 
+            // Compute pixel area for potential dropping and sampling
+            let pixel_area = crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
+
             // Drop features below pixel area threshold (--drop-smallest-as-needed)
-            if drop_smallest_as_needed {
-                let pixel_area =
-                    crate::feature_drop::geometry_pixel_area_world(&geom, &coord, extent);
-                if pixel_area < drop_smallest_threshold {
-                    continue;
+            if drop_smallest_as_needed && pixel_area < drop_smallest_threshold {
+                continue;
+            }
+
+            // Record samples for adaptive threshold iteration
+            // Gap: Hilbert index difference from previous feature
+            if let Some(ref mut sampler) = gap_sampler {
+                if let Some(prev) = prev_hilbert {
+                    if raw_feat.original_hilbert > prev {
+                        let gap = raw_feat.original_hilbert - prev;
+                        sampler.record(gap);
+                    }
                 }
+            }
+            prev_hilbert = Some(raw_feat.original_hilbert);
+
+            // Extent: pixel area (converted to i64 for threshold comparison)
+            if let Some(ref mut sampler) = extent_sampler {
+                // Scale pixel area to i64 range for consistent thresholding
+                // Multiply by 1000 to preserve some decimal precision
+                let extent_val = (pixel_area * 1000.0) as i64;
+                sampler.record(extent_val);
             }
 
             // Decode properties for this feature
@@ -2619,11 +2664,18 @@ fn generate_tiles_to_writer_internal(
     ///
     /// When max_tile_size or max_tile_features is configured, this function:
     /// 1. Encodes the tile with current thresholds from AdaptiveTargets
-    /// 2. Checks if the result exceeds limits
-    /// 3. If exceeded, increases gamma threshold and retries (up to max_retries)
+    /// 2. Samples gap and extent values during encoding
+    /// 3. If result exceeds limits, selects new thresholds using percentile-based algorithm
     /// 4. Reports the final threshold used to AdaptiveTargets for propagation
     ///
-    /// This implements tippecanoe's adaptive threshold iteration approach.
+    /// This implements tippecanoe's adaptive threshold iteration approach using
+    /// percentile-based threshold selection (not arbitrary gamma increments).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(tile))` if encoding succeeds within limits
+    /// - `Ok(None)` if the tile is empty (no features)
+    /// - `Err(CannotReduceFurther)` if thresholds are exhausted and tile still exceeds limits
     #[allow(clippy::too_many_arguments)]
     fn encode_tile_with_adaptive_retry(
         tile_data: RawTileData,
@@ -2638,9 +2690,8 @@ fn generate_tiles_to_writer_internal(
         gamma: Option<f64>,
         config: &TilerConfig,
         adaptive: &AdaptiveTargets,
-    ) -> Option<EncodedTile> {
-        const MAX_RETRIES: u32 = 5;
-        const GAMMA_INCREMENT: f64 = 0.5;
+    ) -> std::result::Result<Option<EncodedTile>, Error> {
+        const MAX_RETRIES: u32 = 10;
 
         let zoom = tile_data.z;
 
@@ -2651,7 +2702,7 @@ fn generate_tiles_to_writer_internal(
 
         if !adaptive_enabled {
             // No adaptive limits - use standard encoding
-            return encode_tile_from_raw(
+            return Ok(encode_tile_from_raw(
                 tile_data,
                 layer_name,
                 extent,
@@ -2664,28 +2715,55 @@ fn generate_tiles_to_writer_internal(
                 gamma,
                 None,
                 None,
-            );
+            ));
         }
 
-        // Start with current threshold from AdaptiveTargets (may have been propagated from lower zoom)
-        let base_gamma = gamma.unwrap_or(0.0);
-        let initial_gamma_offset = adaptive.get_mingap(zoom) as f64 * 0.001; // Convert to gamma-like scale
-        let mut current_gamma = base_gamma + initial_gamma_offset;
-        let mut retries = 0;
+        // Start with current thresholds from AdaptiveTargets (may have been propagated from lower zoom)
+        let mut current_mingap = adaptive.get_mingap(zoom);
+        let mut current_minextent = adaptive.get_minextent(zoom);
 
-        // Clone tile_data for potential retries (features are Arc-wrapped internally)
-        // Since RawTileData owns the features Vec, we need to handle this carefully
+        // Clone tile_data for potential retries
         let features_clone = tile_data.features.clone();
         let z = tile_data.z;
         let x = tile_data.x;
         let y = tile_data.y;
 
+        // Create samplers for this tile's retry loop
+        let mut gap_sampler: GapSampler = BoundedSampler::new(config.max_samples);
+        let mut extent_sampler: ExtentSampler = BoundedSampler::new(config.max_samples);
+
+        let mut retries = 0;
+
         loop {
+            // Clear samplers for this iteration
+            gap_sampler.clear();
+            extent_sampler.clear();
+
             let tile_to_encode = RawTileData {
                 z,
                 x,
                 y,
                 features: features_clone.clone(),
+            };
+
+            // Convert mingap threshold to gamma for gap-based dropping
+            // Higher mingap = more aggressive dropping = higher gamma
+            let effective_gamma = if config.drop_densest_as_needed && current_mingap > 0 {
+                // Scale mingap to gamma: mingap is in Hilbert index units
+                // Use logarithmic scaling for reasonable gamma values
+                let gamma_from_mingap = (current_mingap as f64).log2() / 10.0;
+                Some(gamma.unwrap_or(0.0) + gamma_from_mingap.max(0.0))
+            } else {
+                gamma
+            };
+
+            // Convert minextent threshold to drop_smallest_threshold
+            let effective_drop_threshold = if drop_smallest_as_needed && current_minextent > 0 {
+                // minextent is in scaled pixel area units (x1000)
+                // Convert back to pixel area
+                (current_minextent as f64 / 1000.0).max(drop_smallest_threshold)
+            } else {
+                drop_smallest_threshold
             };
 
             let result = encode_tile_from_raw(
@@ -2697,61 +2775,119 @@ fn generate_tiles_to_writer_internal(
                 coalesce_config,
                 coalesce_targets,
                 drop_smallest_as_needed,
-                drop_smallest_threshold,
-                if current_gamma > 0.0 {
-                    Some(current_gamma)
-                } else {
-                    gamma
-                },
-                None,
-                None,
+                effective_drop_threshold,
+                effective_gamma,
+                Some(&mut gap_sampler),
+                Some(&mut extent_sampler),
             );
 
-            match &result {
+            match result {
                 Some(encoded) => {
                     let size_ok = max_size.map_or(true, |max| encoded.data.len() <= max as usize);
                     let features_ok =
                         max_features.map_or(true, |max| encoded.feature_count <= max as usize);
 
                     if size_ok && features_ok {
-                        // Success! Report threshold used for propagation
-                        if current_gamma > base_gamma {
-                            let gamma_as_mingap = ((current_gamma - base_gamma) * 1000.0) as u64;
-                            adaptive.report_mingap(zoom, gamma_as_mingap);
-                        }
-                        return result;
+                        // Success! Report thresholds used for propagation
+                        adaptive.report_mingap(zoom, current_mingap);
+                        adaptive.report_minextent(zoom, current_minextent);
+                        return Ok(Some(encoded));
                     }
 
-                    // Tile exceeded limits
+                    // Store metrics for potential error reporting
+                    let feature_count = encoded.feature_count;
+                    let data_len = encoded.data.len();
+
+                    // Tile exceeded limits - try to increase thresholds
                     if retries >= MAX_RETRIES {
-                        // Max retries reached - return best effort
+                        // Cannot reduce further - return error
                         tracing::warn!(
                             "Tile z{}/x{}/y{}: exceeded limits after {} retries (size: {}, features: {})",
-                            z, x, y, MAX_RETRIES, encoded.data.len(), encoded.feature_count
+                            z, x, y, MAX_RETRIES, data_len, feature_count
                         );
-                        // Still report the threshold we used
-                        let gamma_as_mingap = ((current_gamma - base_gamma) * 1000.0) as u64;
-                        adaptive.report_mingap(zoom, gamma_as_mingap);
-                        return result;
+                        return Err(Error::CannotReduceFurther {
+                            tile: format!("{}/{}/{}", z, x, y),
+                            size: data_len,
+                            features: feature_count,
+                        });
                     }
 
-                    // Increase threshold and retry
-                    current_gamma += GAMMA_INCREMENT;
+                    // Calculate new fraction based on overage (tippecanoe algorithm)
+                    let target = max_features.unwrap_or(u32::MAX) as f64;
+                    let actual = feature_count as f64;
+                    let overage_ratio = target / actual;
+
+                    let mut threshold_increased = false;
+
+                    // Try increasing mingap threshold using percentile selection
+                    if config.drop_densest_as_needed && !gap_sampler.is_empty() {
+                        // fraction = mingap_fraction * (target/actual) * 0.80
+                        // This decreases as overage increases
+                        let new_fraction =
+                            (config.mingap_fraction * overage_ratio * 0.80).min(0.80);
+
+                        if let Some(new_threshold) =
+                            gap_sampler.select_threshold(new_fraction, current_mingap)
+                        {
+                            tracing::debug!(
+                                "Tile z{}/x{}/y{}: mingap {} -> {} (fraction={:.3})",
+                                z,
+                                x,
+                                y,
+                                current_mingap,
+                                new_threshold,
+                                new_fraction
+                            );
+                            current_mingap = new_threshold;
+                            threshold_increased = true;
+                        }
+                    }
+
+                    // Try increasing minextent threshold using percentile selection
+                    if drop_smallest_as_needed && !extent_sampler.is_empty() {
+                        // fraction = minextent_fraction * (target/actual) * 0.75
+                        let new_fraction =
+                            (config.minextent_fraction * overage_ratio * 0.75).min(0.80);
+
+                        if let Some(new_threshold) =
+                            extent_sampler.select_threshold(new_fraction, current_minextent)
+                        {
+                            tracing::debug!(
+                                "Tile z{}/x{}/y{}: minextent {} -> {} (fraction={:.3})",
+                                z,
+                                x,
+                                y,
+                                current_minextent,
+                                new_threshold,
+                                new_fraction
+                            );
+                            current_minextent = new_threshold;
+                            threshold_increased = true;
+                        }
+                    }
+
+                    if !threshold_increased {
+                        // Cannot increase thresholds further - return error
+                        tracing::warn!(
+                            "Tile z{}/x{}/y{}: cannot increase thresholds further (size: {}, features: {})",
+                            z, x, y, data_len, feature_count
+                        );
+                        return Err(Error::CannotReduceFurther {
+                            tile: format!("{}/{}/{}", z, x, y),
+                            size: data_len,
+                            features: feature_count,
+                        });
+                    }
+
                     retries += 1;
                     tracing::debug!(
-                        "Tile z{}/x{}/y{}: retry {} with gamma={:.2} (size: {}, features: {})",
-                        z,
-                        x,
-                        y,
-                        retries,
-                        current_gamma,
-                        encoded.data.len(),
-                        encoded.feature_count
+                        "Tile z{}/x{}/y{}: retry {} (mingap={}, minextent={}, size={}, features={})",
+                        z, x, y, retries, current_mingap, current_minextent, data_len, feature_count
                     );
                 }
                 None => {
                     // Empty tile - nothing to retry
-                    return None;
+                    return Ok(None);
                 }
             }
         }
@@ -2823,7 +2959,8 @@ fn generate_tiles_to_writer_internal(
 
         // Decode + encode tiles - parallel or sequential based on deterministic flag
         // Uses adaptive retry when max_tile_size or max_tile_features is configured
-        let encoded_tiles: Vec<Option<EncodedTile>> = if deterministic {
+        let encoded_results: Vec<std::result::Result<Option<EncodedTile>, Error>> = if deterministic
+        {
             // Sequential for reproducibility
             std::mem::take(batch)
                 .into_iter()
@@ -2868,7 +3005,12 @@ fn generate_tiles_to_writer_internal(
         };
 
         // Write encoded tiles sequentially (PMTiles requires ordered writes)
-        for encoded in encoded_tiles.into_iter().flatten() {
+        // Propagate CannotReduceFurther errors
+        for result in encoded_results {
+            let encoded = result?;
+            let Some(encoded) = encoded else {
+                continue;
+            };
             writer
                 .add_tile_with_count(
                     encoded.z,
@@ -2943,8 +3085,32 @@ fn generate_tiles_to_writer_internal(
                         &adaptive,
                     )?;
 
-                    // Propagate thresholds from completed zoom to next zoom level
+                    // Check if any tile at the completed zoom level triggered a retry flag
+                    // This means at least one tile required a higher threshold than initially set
                     let completed_zoom = last_zoom.unwrap();
+                    if adaptive.needs_retry(completed_zoom) {
+                        // In tippecanoe's full implementation, we would re-encode all tiles
+                        // at this zoom level with the updated thresholds. However, with our
+                        // streaming architecture, tiles have already been written.
+                        //
+                        // The per-tile retry loop handles most cases by increasing thresholds
+                        // until tiles fit within limits. The threshold is then propagated
+                        // to subsequent zoom levels, so they start with better initial values.
+                        //
+                        // For pathological cases where zoom-level retry would help, users can
+                        // increase max_retries or use more aggressive initial thresholds.
+                        tracing::info!(
+                            "Zoom {} thresholds increased during encoding (mingap: {}, minextent: {}). \
+                             Thresholds will be propagated to zoom {}.",
+                            completed_zoom,
+                            adaptive.get_mingap(completed_zoom),
+                            adaptive.get_minextent(completed_zoom),
+                            completed_zoom + 1
+                        );
+                        adaptive.clear_retry_flag(completed_zoom);
+                    }
+
+                    // Propagate thresholds from completed zoom to next zoom level
                     adaptive.propagate_to_next_zoom(completed_zoom);
                     tracing::debug!(
                         "Propagated adaptive thresholds from zoom {} to zoom {} (mingap: {}, minextent: {})",
@@ -3032,9 +3198,22 @@ fn generate_tiles_to_writer_internal(
         &adaptive,
     )?;
 
-    // TODO: If adaptive.needs_retry(zoom), re-encode entire zoom level
-    // For now, we just propagate thresholds forward to the next zoom level
-    // Full zoom-level retry can be added in a follow-up PR
+    // Final zoom level retry check
+    // The per-tile retry loop handles threshold adjustment for each tile.
+    // Thresholds are propagated between zoom levels during transitions.
+    // Full zoom-level re-encoding is not implemented due to streaming architecture
+    // constraints - it would require buffering all tiles at each zoom level.
+    if let Some(final_zoom) = last_zoom {
+        if adaptive.needs_retry(final_zoom) {
+            tracing::info!(
+                "Final zoom {} had increased thresholds (mingap: {}, minextent: {})",
+                final_zoom,
+                adaptive.get_mingap(final_zoom),
+                adaptive.get_minextent(final_zoom)
+            );
+            adaptive.clear_retry_flag(final_zoom);
+        }
+    }
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
 
