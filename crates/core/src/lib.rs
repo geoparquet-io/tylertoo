@@ -39,6 +39,7 @@ pub mod vector_tile {
 }
 
 pub mod accumulator;
+pub mod adaptive;
 pub mod batch_processor;
 pub mod clip;
 pub mod clustering;
@@ -61,6 +62,7 @@ pub mod pipeline;
 pub mod pmtiles_writer;
 pub mod property_filter;
 pub mod quality;
+pub mod sampling;
 pub mod simplify;
 pub mod spatial_index;
 pub mod sutherland_hodgman;

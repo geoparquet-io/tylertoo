@@ -264,6 +264,32 @@ pub struct TilerConfig {
     /// Useful for debugging, testing, and compliance workflows.
     /// Default: false (parallel processing enabled for performance).
     pub deterministic: bool,
+
+    // === Adaptive Threshold Fields ===
+    /// Maximum tile size in bytes. When exceeded, thresholds are increased.
+    /// Default: None (disabled)
+    pub max_tile_size: Option<u32>,
+
+    /// Maximum features per tile. When exceeded, thresholds are increased.
+    /// Default: None (disabled)
+    pub max_tile_features: Option<u32>,
+
+    /// Maximum samples for adaptive threshold calculation.
+    /// Default: 100_000 (tippecanoe default)
+    pub max_samples: usize,
+
+    /// Fraction multiplier for mingap threshold selection.
+    /// Default: 0.80 (tippecanoe value)
+    pub mingap_fraction: f64,
+
+    /// Fraction multiplier for minextent threshold selection.
+    /// Default: 0.75 (tippecanoe value)
+    pub minextent_fraction: f64,
+
+    /// Enable drop-densest-as-needed (gap-based dropping).
+    /// Default: false
+    pub drop_densest_as_needed: bool,
+
     /// Enable tiny polygon accumulation (default: true).
     ///
     /// When enabled, tiny polygons that would be individually invisible are
@@ -407,6 +433,13 @@ impl Default for TilerConfig {
             quiet: false,
             // Parallel processing by default for performance
             deterministic: false,
+            // Adaptive threshold defaults
+            max_tile_size: None,
+            max_tile_features: None,
+            max_samples: 100_000,
+            mingap_fraction: 0.80,
+            minextent_fraction: 0.75,
+            drop_densest_as_needed: false,
             // Tiny polygon accumulation is enabled by default (matches tippecanoe)
             // This preserves visual density by emitting synthetic squares
             enable_tiny_polygon_accumulation: true,
@@ -672,6 +705,36 @@ impl TilerConfig {
     /// Only used when drop_smallest_as_needed = true.
     pub fn with_drop_smallest_threshold(mut self, threshold: f64) -> Self {
         self.drop_smallest_threshold = threshold;
+        self
+    }
+
+    /// Set maximum tile size in bytes
+    pub fn with_max_tile_size(mut self, bytes: u32) -> Self {
+        self.max_tile_size = Some(bytes);
+        self
+    }
+
+    /// Set maximum features per tile
+    pub fn with_max_tile_features(mut self, count: u32) -> Self {
+        self.max_tile_features = Some(count);
+        self
+    }
+
+    /// Set maximum samples for adaptive threshold
+    pub fn with_max_samples(mut self, samples: usize) -> Self {
+        self.max_samples = samples;
+        self
+    }
+
+    /// Enable drop-densest-as-needed
+    pub fn with_drop_densest(mut self) -> Self {
+        self.drop_densest_as_needed = true;
+        self
+    }
+
+    /// Enable drop-smallest-as-needed
+    pub fn with_drop_smallest(mut self) -> Self {
+        self.drop_smallest_as_needed = true;
         self
     }
 
