@@ -23,6 +23,7 @@ use tracing::instrument;
 use geo::Geometry;
 
 use crate::accumulator::AccumulatorConfig;
+use crate::adaptive::AdaptiveTargets;
 use crate::batch_processor::{
     extract_field_metadata, extract_geometries, process_features_parallel_filtered,
     process_geometries_parallel_filtered, FeatureRecord, RowGroupInfo, DEFAULT_PARALLEL_READERS,
@@ -1806,6 +1807,7 @@ fn generate_tiles_to_writer_internal(
     const BATCH_SIZE: usize = 2000;
 
     // Raw record data for deferred decoding + encoding
+    #[derive(Clone)]
     struct RawFeature {
         geometry_bytes: Vec<u8>,
         feature_id: u64,
@@ -2613,12 +2615,158 @@ fn generate_tiles_to_writer_internal(
         }
     }
 
+    /// Encode a tile with adaptive retry for size/feature limits.
+    ///
+    /// When max_tile_size or max_tile_features is configured, this function:
+    /// 1. Encodes the tile with current thresholds from AdaptiveTargets
+    /// 2. Checks if the result exceeds limits
+    /// 3. If exceeded, increases gamma threshold and retries (up to max_retries)
+    /// 4. Reports the final threshold used to AdaptiveTargets for propagation
+    ///
+    /// This implements tippecanoe's adaptive threshold iteration approach.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_tile_with_adaptive_retry(
+        tile_data: RawTileData,
+        layer_name: &str,
+        extent: u32,
+        enable_tiny_polygon_accumulation: bool,
+        cluster_config: Option<&ClusterConfig>,
+        coalesce_config: Option<&CoalesceConfig>,
+        coalesce_targets: Option<&CoalesceTargets>,
+        drop_smallest_as_needed: bool,
+        drop_smallest_threshold: f64,
+        gamma: Option<f64>,
+        config: &TilerConfig,
+        adaptive: &AdaptiveTargets,
+    ) -> Option<EncodedTile> {
+        const MAX_RETRIES: u32 = 5;
+        const GAMMA_INCREMENT: f64 = 0.5;
+
+        let zoom = tile_data.z;
+
+        // Check if adaptive limits are enabled
+        let max_size = config.max_tile_size;
+        let max_features = config.max_tile_features;
+        let adaptive_enabled = max_size.is_some() || max_features.is_some();
+
+        if !adaptive_enabled {
+            // No adaptive limits - use standard encoding
+            return encode_tile_from_raw(
+                tile_data,
+                layer_name,
+                extent,
+                enable_tiny_polygon_accumulation,
+                cluster_config,
+                coalesce_config,
+                coalesce_targets,
+                drop_smallest_as_needed,
+                drop_smallest_threshold,
+                gamma,
+                None,
+                None,
+            );
+        }
+
+        // Start with current threshold from AdaptiveTargets (may have been propagated from lower zoom)
+        let base_gamma = gamma.unwrap_or(0.0);
+        let initial_gamma_offset = adaptive.get_mingap(zoom) as f64 * 0.001; // Convert to gamma-like scale
+        let mut current_gamma = base_gamma + initial_gamma_offset;
+        let mut retries = 0;
+
+        // Clone tile_data for potential retries (features are Arc-wrapped internally)
+        // Since RawTileData owns the features Vec, we need to handle this carefully
+        let features_clone = tile_data.features.clone();
+        let z = tile_data.z;
+        let x = tile_data.x;
+        let y = tile_data.y;
+
+        loop {
+            let tile_to_encode = RawTileData {
+                z,
+                x,
+                y,
+                features: features_clone.clone(),
+            };
+
+            let result = encode_tile_from_raw(
+                tile_to_encode,
+                layer_name,
+                extent,
+                enable_tiny_polygon_accumulation,
+                cluster_config,
+                coalesce_config,
+                coalesce_targets,
+                drop_smallest_as_needed,
+                drop_smallest_threshold,
+                if current_gamma > 0.0 {
+                    Some(current_gamma)
+                } else {
+                    gamma
+                },
+                None,
+                None,
+            );
+
+            match &result {
+                Some(encoded) => {
+                    let size_ok = max_size.map_or(true, |max| encoded.data.len() <= max as usize);
+                    let features_ok =
+                        max_features.map_or(true, |max| encoded.feature_count <= max as usize);
+
+                    if size_ok && features_ok {
+                        // Success! Report threshold used for propagation
+                        if current_gamma > base_gamma {
+                            let gamma_as_mingap = ((current_gamma - base_gamma) * 1000.0) as u64;
+                            adaptive.report_mingap(zoom, gamma_as_mingap);
+                        }
+                        return result;
+                    }
+
+                    // Tile exceeded limits
+                    if retries >= MAX_RETRIES {
+                        // Max retries reached - return best effort
+                        tracing::warn!(
+                            "Tile z{}/x{}/y{}: exceeded limits after {} retries (size: {}, features: {})",
+                            z, x, y, MAX_RETRIES, encoded.data.len(), encoded.feature_count
+                        );
+                        // Still report the threshold we used
+                        let gamma_as_mingap = ((current_gamma - base_gamma) * 1000.0) as u64;
+                        adaptive.report_mingap(zoom, gamma_as_mingap);
+                        return result;
+                    }
+
+                    // Increase threshold and retry
+                    current_gamma += GAMMA_INCREMENT;
+                    retries += 1;
+                    tracing::debug!(
+                        "Tile z{}/x{}/y{}: retry {} with gamma={:.2} (size: {}, features: {})",
+                        z,
+                        x,
+                        y,
+                        retries,
+                        current_gamma,
+                        encoded.data.len(),
+                        encoded.feature_count
+                    );
+                }
+                None => {
+                    // Empty tile - nothing to retry
+                    return None;
+                }
+            }
+        }
+    }
+
     let mut current_tile: Option<(u8, u32, u32)> = None;
     let mut current_features: Vec<RawFeature> = Vec::new();
     let mut current_tile_memory: usize = 0;
     let mut tiles_written: u64 = 0;
     let mut records_processed: u64 = 0;
     let progress_interval: u64 = std::cmp::max(1, total_records / 100);
+
+    // Track last completed zoom level for threshold propagation
+    let mut last_zoom: Option<u8> = None;
+    let adaptive_enabled = config.max_tile_size.is_some() || config.max_tile_features.is_some();
 
     // Batch of complete tiles waiting to be encoded
     let mut tile_batch: Vec<RawTileData> = Vec::with_capacity(BATCH_SIZE);
@@ -2646,7 +2794,12 @@ fn generate_tiles_to_writer_internal(
         )
     });
 
+    // Create adaptive targets for threshold tracking across zoom levels
+    // Used when max_tile_size or max_tile_features is configured
+    let adaptive = AdaptiveTargets::new();
+
     // Helper to flush the batch: decode + encode in parallel, write sequentially
+    // Uses encode_tile_with_adaptive_retry when max_tile_size/max_tile_features is configured
     let flush_batch = |batch: &mut Vec<RawTileData>,
                        batch_mem: &mut usize,
                        writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
@@ -2660,19 +2813,22 @@ fn generate_tiles_to_writer_internal(
                        coalesce_targets: Option<&CoalesceTargets>,
                        drop_smallest_as_needed: bool,
                        drop_smallest_threshold: f64,
-                       gamma: Option<f64>|
+                       gamma: Option<f64>,
+                       config: &TilerConfig,
+                       adaptive: &AdaptiveTargets|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
         // Decode + encode tiles - parallel or sequential based on deterministic flag
+        // Uses adaptive retry when max_tile_size or max_tile_features is configured
         let encoded_tiles: Vec<Option<EncodedTile>> = if deterministic {
             // Sequential for reproducibility
             std::mem::take(batch)
                 .into_iter()
                 .map(|td| {
-                    encode_tile_from_raw(
+                    encode_tile_with_adaptive_retry(
                         td,
                         layer_name,
                         extent,
@@ -2683,8 +2839,8 @@ fn generate_tiles_to_writer_internal(
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
-                        None, // gap_sampler - Wave 3 will wire up
-                        None, // extent_sampler - Wave 3 will wire up
+                        config,
+                        adaptive,
                     )
                 })
                 .collect()
@@ -2693,7 +2849,7 @@ fn generate_tiles_to_writer_internal(
             std::mem::take(batch)
                 .into_par_iter()
                 .map(|td| {
-                    encode_tile_from_raw(
+                    encode_tile_with_adaptive_retry(
                         td,
                         layer_name,
                         extent,
@@ -2704,8 +2860,8 @@ fn generate_tiles_to_writer_internal(
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
-                        None, // gap_sampler - Wave 3 will wire up
-                        None, // extent_sampler - Wave 3 will wire up
+                        config,
+                        adaptive,
                     )
                 })
                 .collect()
@@ -2764,6 +2920,42 @@ fn generate_tiles_to_writer_internal(
                 memory_tracker.lock().unwrap().remove(current_tile_memory);
                 current_tile_memory = 0;
 
+                // Check if we're transitioning to a new zoom level
+                let new_zoom = record_tile.0;
+                if adaptive_enabled && last_zoom.is_some() && last_zoom != Some(new_zoom) {
+                    // Flush any pending tiles from the previous zoom before propagating
+                    flush_batch(
+                        &mut tile_batch,
+                        &mut batch_memory,
+                        writer,
+                        &mut tiles_written,
+                        &layer_name,
+                        extent,
+                        deterministic,
+                        enable_tiny_polygon_accumulation,
+                        cluster_config.as_ref(),
+                        coalesce_config.as_ref(),
+                        coalesce_targets.as_ref(),
+                        drop_smallest_as_needed,
+                        drop_smallest_threshold,
+                        gamma,
+                        config,
+                        &adaptive,
+                    )?;
+
+                    // Propagate thresholds from completed zoom to next zoom level
+                    let completed_zoom = last_zoom.unwrap();
+                    adaptive.propagate_to_next_zoom(completed_zoom);
+                    tracing::debug!(
+                        "Propagated adaptive thresholds from zoom {} to zoom {} (mingap: {}, minextent: {})",
+                        completed_zoom,
+                        completed_zoom + 1,
+                        adaptive.get_mingap(completed_zoom + 1),
+                        adaptive.get_minextent(completed_zoom + 1)
+                    );
+                }
+                last_zoom = Some(z);
+
                 // Flush batch if it's full
                 if tile_batch.len() >= BATCH_SIZE {
                     flush_batch(
@@ -2781,6 +2973,8 @@ fn generate_tiles_to_writer_internal(
                         drop_smallest_as_needed,
                         drop_smallest_threshold,
                         gamma,
+                        config,
+                        &adaptive,
                     )?;
                 }
             }
@@ -2800,6 +2994,10 @@ fn generate_tiles_to_writer_internal(
             property_bytes: record.properties,
         });
         current_tile = Some(record_tile);
+        // Initialize last_zoom on first tile
+        if last_zoom.is_none() {
+            last_zoom = Some(record_tile.0);
+        }
     }
 
     // Add the final tile to batch
@@ -2830,7 +3028,13 @@ fn generate_tiles_to_writer_internal(
         drop_smallest_as_needed,
         drop_smallest_threshold,
         gamma,
+        config,
+        &adaptive,
     )?;
+
+    // TODO: If adaptive.needs_retry(zoom), re-encode entire zoom level
+    // For now, we just propagate thresholds forward to the next zoom level
+    // Full zoom-level retry can be added in a follow-up PR
 
     writer.set_bounds(&global_bounds.into_inner().unwrap());
 
