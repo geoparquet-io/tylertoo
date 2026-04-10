@@ -41,7 +41,7 @@ use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeo
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
 use crate::sampling::{BoundedSampler, ExtentSampler, GapSampler};
-use crate::simplify::simplify_for_zoom;
+use crate::simplify::{simplify_for_zoom, simplify_geometry_for_tile};
 use crate::spatial_index::{sort_features, sort_geometries};
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
 use crate::validate::filter_valid_geometry;
@@ -1910,6 +1910,8 @@ fn generate_tiles_to_writer_internal(
         drop_smallest_as_needed: bool,
         drop_smallest_threshold: f64,
         gamma: Option<f64>,
+        // Zoom-dependent simplification factor (None = no simplification)
+        simplify_factor: Option<f64>,
         // Samplers for adaptive threshold iteration (Wave 2)
         mut gap_sampler: Option<&mut GapSampler>,
         mut extent_sampler: Option<&mut ExtentSampler>,
@@ -1996,6 +1998,13 @@ fn generate_tiles_to_writer_internal(
                 let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
                     Some(g) => g,
                     None => continue,
+                };
+
+                // Apply zoom-dependent simplification if enabled
+                let geom = if let Some(factor) = simplify_factor {
+                    simplify_geometry_for_tile(&geom, &coord, extent, factor)
+                } else {
+                    geom
                 };
 
                 if geom.is_degenerate_in_tile(&coord, extent) {
@@ -2324,6 +2333,13 @@ fn generate_tiles_to_writer_internal(
                     None => continue,
                 };
 
+                // Apply zoom-dependent simplification if enabled
+                let geom = if let Some(factor) = simplify_factor {
+                    simplify_geometry_for_tile(&geom, &coord, extent, factor)
+                } else {
+                    geom
+                };
+
                 if geom.is_degenerate_in_tile(&coord, extent) {
                     continue;
                 }
@@ -2494,6 +2510,13 @@ fn generate_tiles_to_writer_internal(
             let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
                 Some(g) => g,
                 None => continue,
+            };
+
+            // Apply zoom-dependent simplification if enabled
+            let geom = if let Some(factor) = simplify_factor {
+                simplify_geometry_for_tile(&geom, &coord, extent, factor)
+            } else {
+                geom
             };
 
             if geom.is_degenerate_in_tile(&coord, extent) {
@@ -2763,6 +2786,7 @@ fn generate_tiles_to_writer_internal(
                 drop_smallest_as_needed,
                 drop_smallest_threshold,
                 gamma,
+                config.simplify_factor,
                 None,
                 None,
             ));
@@ -2827,6 +2851,7 @@ fn generate_tiles_to_writer_internal(
                 drop_smallest_as_needed,
                 effective_drop_threshold,
                 effective_gamma,
+                config.simplify_factor,
                 Some(&mut gap_sampler),
                 Some(&mut extent_sampler),
             );
