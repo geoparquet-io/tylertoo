@@ -235,6 +235,21 @@ struct Args {
     #[arg(long = "coalesce-attrs", value_name = "MODE", default_value = "drop")]
     coalesce_attrs: String,
 
+    /// Enable zoom-dependent geometry simplification.
+    ///
+    /// Applies Douglas-Peucker simplification with tolerance scaling by zoom level.
+    /// Dramatically reduces tile sizes for linear features (roads, rivers, boundaries).
+    /// At lower zoom levels (zoomed out), more aggressive simplification is applied.
+    #[arg(long)]
+    simplify: bool,
+
+    /// Simplification factor (default: 1.0 = 1 pixel tolerance).
+    ///
+    /// Controls aggressiveness: 0.5 = more detail, 1.0 = standard, 2.0 = aggressive.
+    /// Only used when --simplify is enabled.
+    #[arg(long, default_value = "1.0")]
+    simplify_factor: f64,
+
     /// Enable automatic per-feature max zoom based on feature area.
     ///
     /// Large features (e.g., country polygons) stop at low zoom levels where they
@@ -552,6 +567,11 @@ fn main() -> Result<()> {
         tiler_config = tiler_config.with_coalesce_attribute_mode(attr_mode);
     }
 
+    // Configure simplification if requested
+    if args.simplify {
+        tiler_config = tiler_config.with_simplify(args.simplify_factor);
+    }
+
     // Configure zoom-by-area if requested
     if args.zoom_by_area {
         tiler_config.zoom_by_area = true;
@@ -608,6 +628,9 @@ fn main() -> Result<()> {
                 "  Clustering: distance={}, max_zoom={}",
                 cluster.distance, cluster.max_zoom
             );
+        }
+        if let Some(factor) = tiler_config.simplify_factor {
+            eprintln!("  Simplification: enabled (factor={})", factor);
         }
         if tiler_config.zoom_by_area {
             eprintln!(
