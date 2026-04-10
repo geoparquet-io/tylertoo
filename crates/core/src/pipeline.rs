@@ -407,6 +407,23 @@ pub struct TilerConfig {
     ///
     /// Can be explicitly set to force a specific mode.
     pub processing_mode: ProcessingMode,
+
+    /// Simplification factor for zoom-dependent geometry simplification.
+    ///
+    /// When set, Douglas-Peucker simplification is applied to geometries per-tile
+    /// with tolerance scaling by zoom level. The tolerance at each zoom is:
+    ///
+    /// ```text
+    /// tolerance = simplify_factor / (extent * 2^zoom)
+    /// ```
+    ///
+    /// - `None` (default): No simplification applied
+    /// - `Some(1.0)`: Standard simplification (1 pixel tolerance at max zoom)
+    /// - `Some(0.5)`: Less aggressive simplification
+    /// - `Some(2.0)`: More aggressive simplification
+    ///
+    /// This matches tippecanoe's `-S` / `--simplification` flag behavior.
+    pub simplify_factor: Option<f64>,
 }
 
 impl Default for TilerConfig {
@@ -466,6 +483,8 @@ impl Default for TilerConfig {
             spatial_filter: None,
             // In-memory mode by default (auto-tuning happens at runtime based on file size)
             processing_mode: ProcessingMode::default(),
+            // No simplification by default - exact geometry preservation
+            simplify_factor: None,
         }
     }
 }
@@ -901,6 +920,37 @@ impl TilerConfig {
     /// This is a convenience method for `.with_processing_mode(ProcessingMode::bucketed_auto())`.
     pub fn with_bucketed_auto(self) -> Self {
         self.with_processing_mode(ProcessingMode::bucketed_auto())
+    }
+
+    /// Enable zoom-dependent geometry simplification.
+    ///
+    /// Applies Douglas-Peucker simplification to geometries per-tile with
+    /// tolerance scaling by zoom level. The tolerance at each zoom is:
+    ///
+    /// ```text
+    /// tolerance = factor / (extent * 2^zoom)
+    /// ```
+    ///
+    /// This matches tippecanoe's `-S` / `--simplification` flag.
+    ///
+    /// # Arguments
+    ///
+    /// * `factor` - Simplification factor. Common values:
+    ///   - `1.0` - Standard (1 pixel tolerance at max zoom)
+    ///   - `0.5` - Less aggressive (preserves more detail)
+    ///   - `2.0` - More aggressive (reduces file size)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_simplify(1.0);  // Standard simplification
+    /// ```
+    pub fn with_simplify(mut self, factor: f64) -> Self {
+        self.simplify_factor = Some(factor);
+        self
     }
 }
 
@@ -3783,6 +3833,21 @@ mod tests {
         assert_eq!(config.extent, 512);
         assert_eq!(config.buffer_pixels, 16);
         assert_eq!(config.layer_name, "buildings");
+    }
+
+    #[test]
+    fn test_tiler_config_simplify_factor() {
+        // Default should be None (no simplification)
+        let config = TilerConfig::default();
+        assert_eq!(config.simplify_factor, None);
+
+        // Builder should enable simplification with factor
+        let config_enabled = TilerConfig::default().with_simplify(1.0);
+        assert_eq!(config_enabled.simplify_factor, Some(1.0));
+
+        // Should work with different factor values
+        let config_custom = TilerConfig::default().with_simplify(0.5);
+        assert_eq!(config_custom.simplify_factor, Some(0.5));
     }
 
     // ========== GeneratedTile Tests ==========
