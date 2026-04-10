@@ -19,6 +19,7 @@
 //! Geographic Coords → Transform to tile coords → Simplify (pixels) → Encode
 //! ```
 
+use crate::hierarchical_clip::WorldClippedGeometry;
 use crate::tile::{TileBounds, TileCoord};
 use crate::world_coord::{WorldCoord, WORLD_SCALE};
 use geo::{Coord, Geometry, LineString, MultiLineString, MultiPolygon, Point, Polygon, Simplify};
@@ -609,6 +610,125 @@ pub fn simplify_world_ring_preserve_boundaries(
     simplified
 }
 
+/// Simplify a WorldClippedGeometry for a specific tile.
+///
+/// This is the main entry point for tile-level simplification in the encoding
+/// pipeline. It applies boundary-preserving Douglas-Peucker simplification
+/// with zoom-appropriate tolerance.
+///
+/// # Arguments
+/// * `geom` - The clipped geometry to simplify
+/// * `tile` - The tile being encoded (for boundary detection and tolerance)
+/// * `extent` - Tile extent (typically 4096)
+/// * `simplify_factor` - Multiplier for pixel tolerance (typically 1.0)
+///
+/// # Returns
+/// Simplified geometry with boundary points preserved.
+pub fn simplify_geometry_for_tile(
+    geom: &WorldClippedGeometry,
+    tile: &TileCoord,
+    extent: u32,
+    simplify_factor: f64,
+) -> WorldClippedGeometry {
+    // Tolerance in pixels, scaled by factor
+    let pixel_tolerance = simplify_factor;
+
+    match geom {
+        // Points cannot be simplified
+        WorldClippedGeometry::Point(p) => WorldClippedGeometry::Point(*p),
+        WorldClippedGeometry::MultiPoint(points) => {
+            WorldClippedGeometry::MultiPoint(points.clone())
+        }
+
+        // Linestrings: use boundary-preserving simplification
+        WorldClippedGeometry::LineString(coords) => {
+            let simplified = simplify_world_linestring_preserve_boundaries(
+                coords,
+                tile,
+                extent,
+                pixel_tolerance,
+            );
+            WorldClippedGeometry::LineString(simplified)
+        }
+
+        WorldClippedGeometry::MultiLineString(lines) => {
+            let simplified_lines: Vec<Vec<WorldCoord>> = lines
+                .iter()
+                .map(|line| {
+                    simplify_world_linestring_preserve_boundaries(
+                        line,
+                        tile,
+                        extent,
+                        pixel_tolerance,
+                    )
+                })
+                .filter(|line| line.len() >= 2) // Filter degenerate lines
+                .collect();
+            WorldClippedGeometry::MultiLineString(simplified_lines)
+        }
+
+        // Polygons: use boundary-preserving ring simplification
+        WorldClippedGeometry::Polygon {
+            exterior,
+            interiors,
+        } => {
+            let simplified_exterior =
+                simplify_world_ring_preserve_boundaries(exterior, tile, extent, pixel_tolerance);
+
+            // Only keep interior rings that remain valid after simplification
+            let simplified_interiors: Vec<Vec<WorldCoord>> = interiors
+                .iter()
+                .map(|ring| {
+                    simplify_world_ring_preserve_boundaries(ring, tile, extent, pixel_tolerance)
+                })
+                .filter(|ring| ring.len() >= 4) // Filter degenerate rings
+                .collect();
+
+            // If exterior becomes degenerate, return original
+            if simplified_exterior.len() < 4 {
+                return geom.clone();
+            }
+
+            WorldClippedGeometry::Polygon {
+                exterior: simplified_exterior,
+                interiors: simplified_interiors,
+            }
+        }
+
+        WorldClippedGeometry::MultiPolygon(polys) => {
+            let simplified_polys: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = polys
+                .iter()
+                .map(|(exterior, interiors)| {
+                    let simplified_exterior = simplify_world_ring_preserve_boundaries(
+                        exterior,
+                        tile,
+                        extent,
+                        pixel_tolerance,
+                    );
+
+                    let simplified_interiors: Vec<Vec<WorldCoord>> = interiors
+                        .iter()
+                        .map(|ring| {
+                            simplify_world_ring_preserve_boundaries(
+                                ring,
+                                tile,
+                                extent,
+                                pixel_tolerance,
+                            )
+                        })
+                        .filter(|ring| ring.len() >= 4)
+                        .collect();
+
+                    (simplified_exterior, simplified_interiors)
+                })
+                .filter(|(ext, _)| ext.len() >= 4) // Filter degenerate polygons
+                .collect();
+
+            WorldClippedGeometry::MultiPolygon(simplified_polys)
+        }
+    }
+}
+
 /// Get the simplified vertex count for a WorldCoord polyline without
 /// materializing the result. Useful for feature dropping decisions.
 ///
@@ -1122,6 +1242,39 @@ mod tests {
 
         // Ring must have at least 4 points (3 unique + closing)
         assert!(simplified.len() >= 4, "Ring must have at least 4 points");
+    }
+
+    #[test]
+    fn test_simplify_geometry_for_tile() {
+        use crate::hierarchical_clip::WorldClippedGeometry;
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 5);
+        let extent = 4096u32;
+        let factor = 1.0;
+
+        // Test with a linestring
+        let line = WorldClippedGeometry::LineString(vec![
+            WorldCoord::new(1 << 26, 1 << 26),
+            WorldCoord::new((1 << 26) + 1, (1 << 26) + 1), // tiny deviation
+            WorldCoord::new(1 << 27, 1 << 27),
+        ]);
+
+        let simplified = simplify_geometry_for_tile(&line, &tile, extent, factor);
+
+        // Should have fewer or equal points
+        if let WorldClippedGeometry::LineString(coords) = simplified {
+            assert!(coords.len() <= 3);
+            assert!(coords.len() >= 2); // Minimum for valid linestring
+        } else {
+            panic!("Expected LineString");
+        }
+
+        // Test that points pass through unchanged
+        let point = WorldClippedGeometry::Point(WorldCoord::new(1 << 26, 1 << 26));
+        let simplified_point = simplify_geometry_for_tile(&point, &tile, extent, factor);
+        assert!(matches!(simplified_point, WorldClippedGeometry::Point(_)));
     }
 
     // ========================================================================
