@@ -571,6 +571,44 @@ pub fn simplify_world_linestring_preserve_boundaries(
     result
 }
 
+/// Simplify a polygon ring while preserving points on tile boundaries.
+///
+/// Same as [`simplify_world_linestring_preserve_boundaries`] but ensures the ring
+/// remains closed and has at least 4 points (3 unique + closing).
+pub fn simplify_world_ring_preserve_boundaries(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> Vec<WorldCoord> {
+    if coords.len() < 4 {
+        return coords.to_vec();
+    }
+
+    // Simplify as a linestring (excluding the closing point to avoid duplication)
+    let open_coords = if coords.first() == coords.last() && coords.len() > 1 {
+        &coords[..coords.len() - 1]
+    } else {
+        coords
+    };
+
+    let mut simplified =
+        simplify_world_linestring_preserve_boundaries(open_coords, tile, extent, pixel_tolerance);
+
+    // Ensure minimum ring size (3 unique points)
+    // Douglas-Peucker might reduce below this; if so, return original
+    if simplified.len() < 3 {
+        return coords.to_vec();
+    }
+
+    // Close the ring
+    if simplified.first() != simplified.last() {
+        simplified.push(simplified[0]);
+    }
+
+    simplified
+}
+
 /// Get the simplified vertex count for a WorldCoord polyline without
 /// materializing the result. Useful for feature dropping decisions.
 ///
@@ -1047,6 +1085,43 @@ mod tests {
         // First and last points are always preserved by Douglas-Peucker
         assert_eq!(simplified.first(), Some(&coords[0]));
         assert_eq!(simplified.last(), Some(&coords[4]));
+    }
+
+    #[test]
+    fn test_simplify_world_ring_preserve_boundaries() {
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 1);
+        let extent = 4096u32;
+
+        // Create a ring that crosses the tile boundary
+        // Square with one edge on the tile boundary
+        let ring = vec![
+            WorldCoord::new(1 << 30, 1 << 30),               // inside corner
+            WorldCoord::new(1 << 31, 1 << 30),               // ON RIGHT BOUNDARY
+            WorldCoord::new(1 << 31, (1 << 30) + (1 << 28)), // ON RIGHT BOUNDARY
+            WorldCoord::new(1 << 30, (1 << 30) + (1 << 28)), // inside corner
+            WorldCoord::new(1 << 30, 1 << 30),               // close ring
+        ];
+
+        let simplified = simplify_world_ring_preserve_boundaries(&ring, &tile, extent, 10.0);
+
+        // Boundary points must be preserved
+        assert!(
+            simplified.contains(&ring[1]),
+            "First boundary point must be preserved"
+        );
+        assert!(
+            simplified.contains(&ring[2]),
+            "Second boundary point must be preserved"
+        );
+
+        // Ring must remain closed
+        assert_eq!(simplified.first(), simplified.last(), "Ring must be closed");
+
+        // Ring must have at least 4 points (3 unique + closing)
+        assert!(simplified.len() >= 4, "Ring must have at least 4 points");
     }
 
     // ========================================================================
