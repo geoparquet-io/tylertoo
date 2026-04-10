@@ -94,6 +94,10 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     drop_smallest_threshold (float, optional): Minimum pixel area threshold for smallest-feature dropping. Defaults to 4.0.
 ///         Only used when ``drop_smallest_as_needed=True``. Features with pixel area below this
 ///         threshold are candidates for dropping.
+///     simplify_factor (float, optional): Geometry simplification factor. Defaults to None (disabled).
+///         When set, applies zoom-dependent simplification using Visvalingam-Whyatt algorithm.
+///         Value is relative to tile pixel tolerance (e.g., 1.0 = 1 pixel tolerance at each zoom).
+///         Higher values = more aggressive simplification. Typical range: 0.5-2.0.
 ///     progress_callback (callable, optional): A callback function that receives progress events as dicts.
 ///         Each event dict has a "phase" key indicating the event type:
 ///         - "start": Phase started. Keys: phase_num (int), name (str)
@@ -125,13 +129,15 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     >>> # Drop smallest features (tippecanoe parity)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", drop_smallest_as_needed=True)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", drop_smallest_as_needed=True, drop_smallest_threshold=2.0)
+///     >>> # Zoom-dependent simplification
+///     >>> convert("buildings.parquet", "buildings.pmtiles", simplify_factor=1.0)
 ///     >>> # With progress callback
 ///     >>> def on_progress(event):
 ///     ...     if event["phase"] == "complete":
 ///     ...         print(f"Generated {event['total_tiles']} tiles")
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", progress_callback=on_progress)
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, deterministic=false, drop_smallest_as_needed=false, drop_smallest_threshold=4.0, progress_callback=None))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, deterministic=false, drop_smallest_as_needed=false, drop_smallest_threshold=4.0, simplify_factor=None, progress_callback=None))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn convert(
     py: Python<'_>,
@@ -148,6 +154,7 @@ fn convert(
     deterministic: bool,
     drop_smallest_as_needed: bool,
     drop_smallest_threshold: f64,
+    simplify_factor: Option<f64>,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     // Validate progress_callback is callable if provided
@@ -231,6 +238,10 @@ fn convert(
         config = config
             .with_drop_smallest_as_needed()
             .with_drop_smallest_threshold(drop_smallest_threshold);
+    }
+
+    if let Some(factor) = simplify_factor {
+        config = config.with_simplify(factor);
     }
 
     // Create streaming writer
