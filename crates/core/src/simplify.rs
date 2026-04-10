@@ -399,6 +399,36 @@ fn tile_linestring_to_world_coords(
         .collect()
 }
 
+/// Check if a WorldCoord lies on or near a tile boundary.
+///
+/// Points on tile boundaries must be preserved during simplification to prevent
+/// visible seams between adjacent tiles. This matches tippecanoe's approach of
+/// marking boundary-crossing points as "necessary".
+///
+/// # Arguments
+/// * `coord` - The world coordinate to check
+/// * `tile` - The tile to check boundaries against
+/// * `extent` - Tile extent (typically 4096)
+/// * `pixel_tolerance` - Distance in pixels to consider "on boundary"
+///
+/// # Returns
+/// `true` if the point is within `pixel_tolerance` pixels of any tile edge.
+pub fn is_on_tile_boundary(
+    coord: &WorldCoord,
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> bool {
+    let (x, y) = world_to_tile_local_f64(*coord, tile, extent);
+    let extent_f = extent as f64;
+
+    // Check if within tolerance of any edge (0, extent)
+    x < pixel_tolerance
+        || x > extent_f - pixel_tolerance
+        || y < pixel_tolerance
+        || y > extent_f - pixel_tolerance
+}
+
 /// Simplify a polyline given as WorldCoords using Douglas-Peucker in tile-local space.
 ///
 /// This is the primary WorldCoord simplification function. It:
@@ -871,6 +901,39 @@ mod tests {
             matches!(simplified, Geometry::LineString(_)),
             "Should return a LineString geometry"
         );
+    }
+
+    // ========================================================================
+    // Boundary-Preserving Simplification Tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_on_tile_boundary() {
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 1); // zoom 1, tile (0,0)
+        let extent = 4096u32;
+
+        // Point clearly inside tile - not on boundary
+        let inside = WorldCoord::new(1 << 30, 1 << 30); // middle of tile
+        assert!(!is_on_tile_boundary(&inside, &tile, extent, 1.0));
+
+        // Point on left edge (x = tile_min_x)
+        let on_left = WorldCoord::new(0, 1 << 30);
+        assert!(is_on_tile_boundary(&on_left, &tile, extent, 1.0));
+
+        // Point on right edge (x = tile_max_x)
+        let on_right = WorldCoord::new(1 << 31, 1 << 30);
+        assert!(is_on_tile_boundary(&on_right, &tile, extent, 1.0));
+
+        // Point on top edge (y = tile_min_y)
+        let on_top = WorldCoord::new(1 << 30, 0);
+        assert!(is_on_tile_boundary(&on_top, &tile, extent, 1.0));
+
+        // Point on bottom edge (y = tile_max_y)
+        let on_bottom = WorldCoord::new(1 << 30, 1 << 31);
+        assert!(is_on_tile_boundary(&on_bottom, &tile, extent, 1.0));
     }
 
     // ========================================================================
