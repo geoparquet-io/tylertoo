@@ -19,6 +19,7 @@
 //! Geographic Coords → Transform to tile coords → Simplify (pixels) → Encode
 //! ```
 
+use crate::hierarchical_clip::WorldClippedGeometry;
 use crate::tile::{TileBounds, TileCoord};
 use crate::world_coord::{WorldCoord, WORLD_SCALE};
 use geo::{Coord, Geometry, LineString, MultiLineString, MultiPolygon, Point, Polygon, Simplify};
@@ -399,6 +400,36 @@ fn tile_linestring_to_world_coords(
         .collect()
 }
 
+/// Check if a WorldCoord lies on or near a tile boundary.
+///
+/// Points on tile boundaries must be preserved during simplification to prevent
+/// visible seams between adjacent tiles. This matches tippecanoe's approach of
+/// marking boundary-crossing points as "necessary".
+///
+/// # Arguments
+/// * `coord` - The world coordinate to check
+/// * `tile` - The tile to check boundaries against
+/// * `extent` - Tile extent (typically 4096)
+/// * `pixel_tolerance` - Distance in pixels to consider "on boundary"
+///
+/// # Returns
+/// `true` if the point is within `pixel_tolerance` pixels of any tile edge.
+pub fn is_on_tile_boundary(
+    coord: &WorldCoord,
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> bool {
+    let (x, y) = world_to_tile_local_f64(*coord, tile, extent);
+    let extent_f = extent as f64;
+
+    // Check if within tolerance of any edge (0, extent)
+    x < pixel_tolerance
+        || x > extent_f - pixel_tolerance
+        || y < pixel_tolerance
+        || y > extent_f - pixel_tolerance
+}
+
 /// Simplify a polyline given as WorldCoords using Douglas-Peucker in tile-local space.
 ///
 /// This is the primary WorldCoord simplification function. It:
@@ -460,6 +491,242 @@ pub fn simplify_world_ring(
     }
 
     result
+}
+
+/// Simplify a linestring while preserving points on tile boundaries.
+///
+/// This is the production simplification function that prevents tile-edge seams.
+/// Points within 1 pixel of tile boundaries are never removed, matching
+/// tippecanoe's behavior of marking boundary-crossing points as "necessary".
+///
+/// # Algorithm
+/// 1. Identify which points are on tile boundaries
+/// 2. Split the linestring at boundary points
+/// 3. Simplify each segment independently
+/// 4. Rejoin segments, preserving boundary points
+///
+/// # Arguments
+/// * `coords` - Polyline vertices in world coordinates
+/// * `tile` - The tile context for boundary detection and coordinate transformation
+/// * `extent` - Tile extent (typically 4096)
+/// * `pixel_tolerance` - Simplification tolerance in pixels
+///
+/// # Returns
+/// Simplified polyline with boundary points preserved.
+pub fn simplify_world_linestring_preserve_boundaries(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> Vec<WorldCoord> {
+    if coords.len() < 2 {
+        return coords.to_vec();
+    }
+
+    // Find indices of boundary points (these must be preserved)
+    let boundary_indices: Vec<usize> = coords
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| is_on_tile_boundary(c, tile, extent, 1.0))
+        .map(|(i, _)| i)
+        .collect();
+
+    // If no boundary points, use standard simplification
+    if boundary_indices.is_empty() {
+        return simplify_world_linestring(coords, tile, extent, pixel_tolerance);
+    }
+
+    // Split at boundary points and simplify each segment
+    let mut result = Vec::new();
+    let mut segment_start = 0;
+
+    for &boundary_idx in &boundary_indices {
+        if boundary_idx > segment_start {
+            // Simplify segment from segment_start to boundary_idx (inclusive)
+            let segment = &coords[segment_start..=boundary_idx];
+            let simplified_segment =
+                simplify_world_linestring(segment, tile, extent, pixel_tolerance);
+
+            // Add all but the last point (boundary point will be added next)
+            if result.is_empty() {
+                result.extend_from_slice(&simplified_segment[..simplified_segment.len() - 1]);
+            } else {
+                // Skip first point (duplicate of previous boundary)
+                result.extend_from_slice(&simplified_segment[1..simplified_segment.len() - 1]);
+            }
+        }
+
+        // Always add the boundary point
+        result.push(coords[boundary_idx]);
+        segment_start = boundary_idx;
+    }
+
+    // Handle final segment (from last boundary to end)
+    if segment_start < coords.len() - 1 {
+        let segment = &coords[segment_start..];
+        let simplified_segment = simplify_world_linestring(segment, tile, extent, pixel_tolerance);
+        // Skip first point (duplicate of boundary)
+        result.extend_from_slice(&simplified_segment[1..]);
+    }
+
+    result
+}
+
+/// Simplify a polygon ring while preserving points on tile boundaries.
+///
+/// Same as [`simplify_world_linestring_preserve_boundaries`] but ensures the ring
+/// remains closed and has at least 4 points (3 unique + closing).
+pub fn simplify_world_ring_preserve_boundaries(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> Vec<WorldCoord> {
+    if coords.len() < 4 {
+        return coords.to_vec();
+    }
+
+    // Simplify as a linestring (excluding the closing point to avoid duplication)
+    let open_coords = if coords.first() == coords.last() && coords.len() > 1 {
+        &coords[..coords.len() - 1]
+    } else {
+        coords
+    };
+
+    let mut simplified =
+        simplify_world_linestring_preserve_boundaries(open_coords, tile, extent, pixel_tolerance);
+
+    // Ensure minimum ring size (3 unique points)
+    // Douglas-Peucker might reduce below this; if so, return original
+    if simplified.len() < 3 {
+        return coords.to_vec();
+    }
+
+    // Close the ring
+    if simplified.first() != simplified.last() {
+        simplified.push(simplified[0]);
+    }
+
+    simplified
+}
+
+/// Simplify a WorldClippedGeometry for a specific tile.
+///
+/// This is the main entry point for tile-level simplification in the encoding
+/// pipeline. It applies boundary-preserving Douglas-Peucker simplification
+/// with zoom-appropriate tolerance.
+///
+/// # Arguments
+/// * `geom` - The clipped geometry to simplify
+/// * `tile` - The tile being encoded (for boundary detection and tolerance)
+/// * `extent` - Tile extent (typically 4096)
+/// * `simplify_factor` - Multiplier for pixel tolerance (typically 1.0)
+///
+/// # Returns
+/// Simplified geometry with boundary points preserved.
+pub fn simplify_geometry_for_tile(
+    geom: &WorldClippedGeometry,
+    tile: &TileCoord,
+    extent: u32,
+    simplify_factor: f64,
+) -> WorldClippedGeometry {
+    // Tolerance in pixels, scaled by factor
+    let pixel_tolerance = simplify_factor;
+
+    match geom {
+        // Points cannot be simplified
+        WorldClippedGeometry::Point(p) => WorldClippedGeometry::Point(*p),
+        WorldClippedGeometry::MultiPoint(points) => {
+            WorldClippedGeometry::MultiPoint(points.clone())
+        }
+
+        // Linestrings: use boundary-preserving simplification
+        WorldClippedGeometry::LineString(coords) => {
+            let simplified = simplify_world_linestring_preserve_boundaries(
+                coords,
+                tile,
+                extent,
+                pixel_tolerance,
+            );
+            WorldClippedGeometry::LineString(simplified)
+        }
+
+        WorldClippedGeometry::MultiLineString(lines) => {
+            let simplified_lines: Vec<Vec<WorldCoord>> = lines
+                .iter()
+                .map(|line| {
+                    simplify_world_linestring_preserve_boundaries(
+                        line,
+                        tile,
+                        extent,
+                        pixel_tolerance,
+                    )
+                })
+                .filter(|line| line.len() >= 2) // Filter degenerate lines
+                .collect();
+            WorldClippedGeometry::MultiLineString(simplified_lines)
+        }
+
+        // Polygons: use boundary-preserving ring simplification
+        WorldClippedGeometry::Polygon {
+            exterior,
+            interiors,
+        } => {
+            let simplified_exterior =
+                simplify_world_ring_preserve_boundaries(exterior, tile, extent, pixel_tolerance);
+
+            // Only keep interior rings that remain valid after simplification
+            let simplified_interiors: Vec<Vec<WorldCoord>> = interiors
+                .iter()
+                .map(|ring| {
+                    simplify_world_ring_preserve_boundaries(ring, tile, extent, pixel_tolerance)
+                })
+                .filter(|ring| ring.len() >= 4) // Filter degenerate rings
+                .collect();
+
+            // If exterior becomes degenerate, return original
+            if simplified_exterior.len() < 4 {
+                return geom.clone();
+            }
+
+            WorldClippedGeometry::Polygon {
+                exterior: simplified_exterior,
+                interiors: simplified_interiors,
+            }
+        }
+
+        WorldClippedGeometry::MultiPolygon(polys) => {
+            let simplified_polys: Vec<(Vec<WorldCoord>, Vec<Vec<WorldCoord>>)> = polys
+                .iter()
+                .map(|(exterior, interiors)| {
+                    let simplified_exterior = simplify_world_ring_preserve_boundaries(
+                        exterior,
+                        tile,
+                        extent,
+                        pixel_tolerance,
+                    );
+
+                    let simplified_interiors: Vec<Vec<WorldCoord>> = interiors
+                        .iter()
+                        .map(|ring| {
+                            simplify_world_ring_preserve_boundaries(
+                                ring,
+                                tile,
+                                extent,
+                                pixel_tolerance,
+                            )
+                        })
+                        .filter(|ring| ring.len() >= 4)
+                        .collect();
+
+                    (simplified_exterior, simplified_interiors)
+                })
+                .filter(|(ext, _)| ext.len() >= 4) // Filter degenerate polygons
+                .collect();
+
+            WorldClippedGeometry::MultiPolygon(simplified_polys)
+        }
+    }
 }
 
 /// Get the simplified vertex count for a WorldCoord polyline without
@@ -871,6 +1138,143 @@ mod tests {
             matches!(simplified, Geometry::LineString(_)),
             "Should return a LineString geometry"
         );
+    }
+
+    // ========================================================================
+    // Boundary-Preserving Simplification Tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_on_tile_boundary() {
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 1); // zoom 1, tile (0,0)
+        let extent = 4096u32;
+
+        // Point clearly inside tile - not on boundary
+        let inside = WorldCoord::new(1 << 30, 1 << 30); // middle of tile
+        assert!(!is_on_tile_boundary(&inside, &tile, extent, 1.0));
+
+        // Point on left edge (x = tile_min_x)
+        let on_left = WorldCoord::new(0, 1 << 30);
+        assert!(is_on_tile_boundary(&on_left, &tile, extent, 1.0));
+
+        // Point on right edge (x = tile_max_x)
+        let on_right = WorldCoord::new(1 << 31, 1 << 30);
+        assert!(is_on_tile_boundary(&on_right, &tile, extent, 1.0));
+
+        // Point on top edge (y = tile_min_y)
+        let on_top = WorldCoord::new(1 << 30, 0);
+        assert!(is_on_tile_boundary(&on_top, &tile, extent, 1.0));
+
+        // Point on bottom edge (y = tile_max_y)
+        let on_bottom = WorldCoord::new(1 << 30, 1 << 31);
+        assert!(is_on_tile_boundary(&on_bottom, &tile, extent, 1.0));
+    }
+
+    #[test]
+    fn test_simplify_world_linestring_preserve_boundaries() {
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 1);
+        let extent = 4096u32;
+
+        // Create a linestring that crosses the tile boundary
+        // Points: start inside, cross boundary, end inside
+        let coords = vec![
+            WorldCoord::new(1 << 30, 1 << 30),               // inside
+            WorldCoord::new(1 << 30, (1 << 30) + 100), // small deviation (should be simplified away normally)
+            WorldCoord::new(1 << 31, 1 << 30),         // ON RIGHT BOUNDARY - must be preserved
+            WorldCoord::new(1 << 31, (1 << 30) + 100), // small deviation on boundary
+            WorldCoord::new((1 << 30) + (1 << 29), 1 << 30), // inside
+        ];
+
+        // Simplify with boundary preservation
+        let simplified = simplify_world_linestring_preserve_boundaries(
+            &coords, &tile, extent, 10.0, // aggressive tolerance to trigger simplification
+        );
+
+        // The boundary point (index 2) must be preserved
+        assert!(
+            simplified.contains(&coords[2]),
+            "Boundary point must be preserved"
+        );
+
+        // First and last points are always preserved by Douglas-Peucker
+        assert_eq!(simplified.first(), Some(&coords[0]));
+        assert_eq!(simplified.last(), Some(&coords[4]));
+    }
+
+    #[test]
+    fn test_simplify_world_ring_preserve_boundaries() {
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 1);
+        let extent = 4096u32;
+
+        // Create a ring that crosses the tile boundary
+        // Square with one edge on the tile boundary
+        let ring = vec![
+            WorldCoord::new(1 << 30, 1 << 30),               // inside corner
+            WorldCoord::new(1 << 31, 1 << 30),               // ON RIGHT BOUNDARY
+            WorldCoord::new(1 << 31, (1 << 30) + (1 << 28)), // ON RIGHT BOUNDARY
+            WorldCoord::new(1 << 30, (1 << 30) + (1 << 28)), // inside corner
+            WorldCoord::new(1 << 30, 1 << 30),               // close ring
+        ];
+
+        let simplified = simplify_world_ring_preserve_boundaries(&ring, &tile, extent, 10.0);
+
+        // Boundary points must be preserved
+        assert!(
+            simplified.contains(&ring[1]),
+            "First boundary point must be preserved"
+        );
+        assert!(
+            simplified.contains(&ring[2]),
+            "Second boundary point must be preserved"
+        );
+
+        // Ring must remain closed
+        assert_eq!(simplified.first(), simplified.last(), "Ring must be closed");
+
+        // Ring must have at least 4 points (3 unique + closing)
+        assert!(simplified.len() >= 4, "Ring must have at least 4 points");
+    }
+
+    #[test]
+    fn test_simplify_geometry_for_tile() {
+        use crate::hierarchical_clip::WorldClippedGeometry;
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 5);
+        let extent = 4096u32;
+        let factor = 1.0;
+
+        // Test with a linestring
+        let line = WorldClippedGeometry::LineString(vec![
+            WorldCoord::new(1 << 26, 1 << 26),
+            WorldCoord::new((1 << 26) + 1, (1 << 26) + 1), // tiny deviation
+            WorldCoord::new(1 << 27, 1 << 27),
+        ]);
+
+        let simplified = simplify_geometry_for_tile(&line, &tile, extent, factor);
+
+        // Should have fewer or equal points
+        if let WorldClippedGeometry::LineString(coords) = simplified {
+            assert!(coords.len() <= 3);
+            assert!(coords.len() >= 2); // Minimum for valid linestring
+        } else {
+            panic!("Expected LineString");
+        }
+
+        // Test that points pass through unchanged
+        let point = WorldClippedGeometry::Point(WorldCoord::new(1 << 26, 1 << 26));
+        let simplified_point = simplify_geometry_for_tile(&point, &tile, extent, factor);
+        assert!(matches!(simplified_point, WorldClippedGeometry::Point(_)));
     }
 
     // ========================================================================
