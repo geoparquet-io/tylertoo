@@ -132,6 +132,81 @@ Best for: Base layers, heatmaps, or cases where attributes aren't needed.
 
 ---
 
+## Geometry Simplification
+
+Simplification reduces vertex counts in complex geometries, dramatically shrinking tile sizes—especially for linear features like roads, rivers, and boundaries.
+
+### Basic Usage
+
+```bash
+# Enable simplification with default tolerance (1 pixel)
+gpq-tiles input.parquet output.pmtiles --simplify
+
+# More aggressive simplification (2 pixel tolerance)
+gpq-tiles input.parquet output.pmtiles --simplify --simplify-factor 2.0
+
+# Less aggressive (preserve more detail)
+gpq-tiles input.parquet output.pmtiles --simplify --simplify-factor 0.5
+```
+
+### How It Works
+
+gpq-tiles uses the **Douglas-Peucker algorithm** with zoom-dependent tolerance:
+
+```
+tolerance = simplify_factor / (extent × 2^zoom)
+```
+
+This means:
+- **Low zoom** (zoomed out): Aggressive simplification—roads become smooth arcs
+- **High zoom** (zoomed in): Gentle simplification—full detail preserved
+
+The default `simplify_factor` of `1.0` means "1 pixel tolerance"—vertices closer than 1 pixel are collapsed.
+
+### Tile Boundary Preservation
+
+To prevent visible seams between adjacent tiles, gpq-tiles marks vertices on tile boundaries as "necessary"—they're never removed during simplification.
+
+This matches tippecanoe's shared-node approach: clipping happens first, then simplification, ensuring adjacent tiles share identical boundary vertices.
+
+### When to Use Simplification
+
+**Best for:**
+- **Linear features**: Roads, rivers, rail lines, coastlines, boundaries
+- **Low zoom levels**: Where vertex-dense features create oversized tiles
+- **CannotReduceFurther errors**: When dropping features isn't enough
+
+**Less useful for:**
+- **Point features**: Already minimal geometry
+- **Polygons with few vertices**: Not much to simplify
+- **High zoom only**: Detail is already appropriate
+
+### Combining with Other Options
+
+Simplification works alongside feature dropping for maximum tile size reduction:
+
+```bash
+# Simplify geometry AND drop small features
+gpq-tiles roads.parquet roads.pmtiles \
+  --simplify \
+  --drop-smallest-as-needed \
+  --max-tile-size 500K
+
+# Simplify + density dropping (typical for dense road networks)
+gpq-tiles roads.parquet roads.pmtiles \
+  --simplify \
+  --drop-density high
+```
+
+**How they differ:**
+- `--simplify` reduces **vertex count** within each feature
+- `--drop-smallest-as-needed` removes **entire features** (smallest first)
+- `--drop-density` limits **features per grid cell**
+
+Use all three together for datasets with many complex linear features.
+
+---
+
 ## Feature Dropping
 
 Control how aggressively features are dropped at low zoom levels:
