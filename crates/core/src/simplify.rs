@@ -492,6 +492,85 @@ pub fn simplify_world_ring(
     result
 }
 
+/// Simplify a linestring while preserving points on tile boundaries.
+///
+/// This is the production simplification function that prevents tile-edge seams.
+/// Points within 1 pixel of tile boundaries are never removed, matching
+/// tippecanoe's behavior of marking boundary-crossing points as "necessary".
+///
+/// # Algorithm
+/// 1. Identify which points are on tile boundaries
+/// 2. Split the linestring at boundary points
+/// 3. Simplify each segment independently
+/// 4. Rejoin segments, preserving boundary points
+///
+/// # Arguments
+/// * `coords` - Polyline vertices in world coordinates
+/// * `tile` - The tile context for boundary detection and coordinate transformation
+/// * `extent` - Tile extent (typically 4096)
+/// * `pixel_tolerance` - Simplification tolerance in pixels
+///
+/// # Returns
+/// Simplified polyline with boundary points preserved.
+pub fn simplify_world_linestring_preserve_boundaries(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> Vec<WorldCoord> {
+    if coords.len() < 2 {
+        return coords.to_vec();
+    }
+
+    // Find indices of boundary points (these must be preserved)
+    let boundary_indices: Vec<usize> = coords
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| is_on_tile_boundary(c, tile, extent, 1.0))
+        .map(|(i, _)| i)
+        .collect();
+
+    // If no boundary points, use standard simplification
+    if boundary_indices.is_empty() {
+        return simplify_world_linestring(coords, tile, extent, pixel_tolerance);
+    }
+
+    // Split at boundary points and simplify each segment
+    let mut result = Vec::new();
+    let mut segment_start = 0;
+
+    for &boundary_idx in &boundary_indices {
+        if boundary_idx > segment_start {
+            // Simplify segment from segment_start to boundary_idx (inclusive)
+            let segment = &coords[segment_start..=boundary_idx];
+            let simplified_segment =
+                simplify_world_linestring(segment, tile, extent, pixel_tolerance);
+
+            // Add all but the last point (boundary point will be added next)
+            if result.is_empty() {
+                result.extend_from_slice(&simplified_segment[..simplified_segment.len() - 1]);
+            } else {
+                // Skip first point (duplicate of previous boundary)
+                result.extend_from_slice(&simplified_segment[1..simplified_segment.len() - 1]);
+            }
+        }
+
+        // Always add the boundary point
+        result.push(coords[boundary_idx]);
+        segment_start = boundary_idx;
+    }
+
+    // Handle final segment (from last boundary to end)
+    if segment_start < coords.len() - 1 {
+        let segment = &coords[segment_start..];
+        let simplified_segment = simplify_world_linestring(segment, tile, extent, pixel_tolerance);
+        // Skip first point (duplicate of boundary)
+        result.extend_from_slice(&simplified_segment[1..]);
+    }
+
+    result
+}
+
 /// Get the simplified vertex count for a WorldCoord polyline without
 /// materializing the result. Useful for feature dropping decisions.
 ///
@@ -934,6 +1013,40 @@ mod tests {
         // Point on bottom edge (y = tile_max_y)
         let on_bottom = WorldCoord::new(1 << 30, 1 << 31);
         assert!(is_on_tile_boundary(&on_bottom, &tile, extent, 1.0));
+    }
+
+    #[test]
+    fn test_simplify_world_linestring_preserve_boundaries() {
+        use crate::tile::TileCoord;
+        use crate::world_coord::WorldCoord;
+
+        let tile = TileCoord::new(0, 0, 1);
+        let extent = 4096u32;
+
+        // Create a linestring that crosses the tile boundary
+        // Points: start inside, cross boundary, end inside
+        let coords = vec![
+            WorldCoord::new(1 << 30, 1 << 30),               // inside
+            WorldCoord::new(1 << 30, (1 << 30) + 100), // small deviation (should be simplified away normally)
+            WorldCoord::new(1 << 31, 1 << 30),         // ON RIGHT BOUNDARY - must be preserved
+            WorldCoord::new(1 << 31, (1 << 30) + 100), // small deviation on boundary
+            WorldCoord::new((1 << 30) + (1 << 29), 1 << 30), // inside
+        ];
+
+        // Simplify with boundary preservation
+        let simplified = simplify_world_linestring_preserve_boundaries(
+            &coords, &tile, extent, 10.0, // aggressive tolerance to trigger simplification
+        );
+
+        // The boundary point (index 2) must be preserved
+        assert!(
+            simplified.contains(&coords[2]),
+            "Boundary point must be preserved"
+        );
+
+        // First and last points are always preserved by Douglas-Peucker
+        assert_eq!(simplified.first(), Some(&coords[0]));
+        assert_eq!(simplified.last(), Some(&coords[4]));
     }
 
     // ========================================================================
