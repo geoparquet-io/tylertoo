@@ -22,7 +22,7 @@ categories = ["science", "data-structures", "encoding"]
 gpq-tiles-core = { path = "crates/core", version = "0.6.0" }
 
 # Core geospatial dependencies
-geoarrow = "0.4"
+geoarrow = "0.8"
 geoarrow-array = "0.4"
 geo-traits = "0.3"
 geoparquet = "0.4"
