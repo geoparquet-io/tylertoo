@@ -37,14 +37,14 @@ thiserror = { workspace = true }
 log = { workspace = true }
 tracing = { workspace = true }
 flate2 = "1"
-brotli = "7"
+brotli = "8"
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 extsort = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
-i_overlay = "4"
+i_overlay = "5"
 tempfile = "3"
 memory-stats = { workspace = true }
 
@@ -53,13 +53,13 @@ prost-build = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 env_logger = "0.11"
-geojson = "0.24"
+geojson = "1.0"
 serde_json = "1"
 tracing-subscriber = { workspace = true }
 tracing-test = "0.2"
-bincode = "1"
+bincode = "3"
 
 [[bench]]
 name = "tiling"
