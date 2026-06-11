@@ -193,7 +193,7 @@ jobs:
         run: cargo tarpaulin --out xml --all-features --workspace --exclude gpq-tiles-python
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: ./cobertura.xml
           token: ${{ secrets.CODECOV_TOKEN }}
