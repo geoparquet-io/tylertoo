@@ -3,7 +3,7 @@
 //! This is a thin wrapper around the gpq-tiles-core library.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use gpq_tiles_core::batch_processor::total_parquet_size;
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::parse_bounds;
@@ -56,13 +56,117 @@ fn parse_size_bytes(s: &str) -> Result<u32, String> {
     u32::try_from(bytes).map_err(|_| format!("Size {} too large for u32", s))
 }
 
+/// Top-level CLI: a default (bare) tile pipeline plus subcommands.
+///
+/// `gpq-tiles input.parquet output.pmtiles` still works (bare tile pipeline);
+/// `gpq-tiles tiles ...` is the explicit form, and `overview` / `validate`
+/// are the GeoParquet-overview subcommands.
 #[derive(Parser, Debug)]
 #[command(
     name = "gpq-tiles",
-    about = "Convert GeoParquet to PMTiles vector tiles",
+    about = "Convert GeoParquet to PMTiles vector tiles and multi-resolution overviews",
     version
 )]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Generate PMTiles vector tiles (the default pipeline).
+    Tiles(TilesArgs),
+    /// Build a multi-resolution overview GeoParquet file.
+    Overview(OverviewArgs),
+    /// Validate a GeoParquet overview file against the spec (§6.2).
+    Validate(ValidateArgs),
+}
+
+/// Arguments for `gpq-tiles overview`.
+#[derive(Parser, Debug)]
+struct OverviewArgs {
+    /// Input GeoParquet file (EPSG:4326 or EPSG:3857).
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Output overview GeoParquet file.
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+
+    /// Level materialization mode.
+    #[arg(long, default_value = "duplicating", value_parser = ["duplicating", "partitioning"])]
+    mode: String,
+
+    /// Minimum (coarsest) Web Mercator zoom for the level range.
+    #[arg(long, default_value = "0")]
+    min_zoom: u8,
+
+    /// Maximum (finest / canonical) Web Mercator zoom for the level range.
+    #[arg(long, default_value = "6")]
+    max_zoom: u8,
+
+    /// Explicit comma-separated GSD list (meters, strictly decreasing).
+    /// Overrides --min-zoom/--max-zoom when set.
+    #[arg(long, value_name = "GSDS")]
+    gsd: Option<String>,
+
+    /// Column name used as the cell-winner priority (sort) key.
+    #[arg(long, value_name = "COL")]
+    sort_key: Option<String>,
+
+    /// Simplification tolerance factor (tolerance = factor * gsd). Duplicating
+    /// mode only.
+    #[arg(long, default_value = "1.0")]
+    simplify_factor: f64,
+
+    /// Collapse below-visibility polygons to a representative point instead of
+    /// dropping them (spec Q4 opt-in).
+    #[arg(long)]
+    collapse: bool,
+
+    /// Emit the optional COGP compatibility footer key (partitioning mode).
+    #[arg(long)]
+    cogp_compat: bool,
+
+    /// Point thinning factor (grid-cell multiplier).
+    #[arg(long, default_value = "4.0")]
+    point_thinning: f64,
+
+    /// Line thinning factor (grid-cell multiplier).
+    #[arg(long, default_value = "2.0")]
+    line_thinning: f64,
+
+    /// Polygon thinning factor (grid-cell multiplier).
+    #[arg(long, default_value = "1.0")]
+    polygon_thinning: f64,
+
+    /// Line visibility gate (min bbox-diagonal in GSD multiples).
+    #[arg(long, default_value = "2.0")]
+    line_visibility: f64,
+
+    /// Polygon visibility gate (min bbox-diagonal in GSD multiples).
+    #[arg(long, default_value = "4.0")]
+    polygon_visibility: f64,
+
+    /// Maximum output row-group size in rows.
+    #[arg(long, default_value = "10000")]
+    row_group_size: usize,
+
+    /// Write the JSON conversion report to this path.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+}
+
+/// Arguments for `gpq-tiles validate`.
+#[derive(Parser, Debug)]
+struct ValidateArgs {
+    /// GeoParquet overview file to validate.
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct TilesArgs {
     /// Input GeoParquet file or directory
     ///
     /// If a directory, recursively finds all .parquet files and processes them
@@ -346,7 +450,7 @@ struct Args {
     memory_budget: Option<usize>,
 }
 
-impl Args {
+impl TilesArgs {
     fn parse_property_filter(&self) -> Result<PropertyFilter> {
         // Check for conflicting options
         let has_include = !self.include.is_empty();
@@ -439,8 +543,63 @@ fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    let args = Args::parse();
+    // Backward-compatible bare invocation: `gpq-tiles input.parquet out.pmtiles`
+    // is rewritten to `gpq-tiles tiles input.parquet out.pmtiles` when the first
+    // positional token is not a known subcommand (and not --help/--version).
+    let cli = Cli::parse_from(rewrite_bare_args(std::env::args_os()));
 
+    match cli.command {
+        Command::Overview(args) => run_overview(args),
+        Command::Validate(args) => run_validate(args),
+        Command::Tiles(args) => run_tiles(args),
+    }
+}
+
+/// Insert an implicit `tiles` subcommand for the backward-compatible bare form.
+///
+/// If the first non-flag token is already a subcommand (`tiles`/`overview`/
+/// `validate`/`help`) or the invocation is a help/version query, the arguments
+/// are returned unchanged.
+fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    const SUBCOMMANDS: [&str; 4] = ["tiles", "overview", "validate", "help"];
+    let argv: Vec<std::ffi::OsString> = args.into_iter().collect();
+
+    // Nothing to rewrite for a bare `gpq-tiles` (clap prints help/usage).
+    if argv.len() <= 1 {
+        return argv;
+    }
+
+    let first_positional = argv
+        .iter()
+        .skip(1)
+        .find(|a| !a.to_string_lossy().starts_with('-'));
+    let is_subcommand = first_positional
+        .map(|a| SUBCOMMANDS.contains(&a.to_string_lossy().as_ref()))
+        .unwrap_or(false);
+    let is_help_or_version = argv.iter().skip(1).any(|a| {
+        matches!(
+            a.to_string_lossy().as_ref(),
+            "-h" | "--help" | "-V" | "--version"
+        )
+    });
+
+    if is_subcommand || is_help_or_version {
+        return argv;
+    }
+
+    let mut rewritten = Vec::with_capacity(argv.len() + 1);
+    rewritten.push(argv[0].clone());
+    rewritten.push(std::ffi::OsString::from("tiles"));
+    rewritten.extend(argv.into_iter().skip(1));
+    rewritten
+}
+
+/// Run the PMTiles tile-generation pipeline (verbatim from the pre-subcommand
+/// CLI; every flag preserved).
+fn run_tiles(args: TilesArgs) -> Result<()> {
     // Initialize profiling if requested (must happen before any tracing calls)
     // Store guards to keep them alive for the duration of main()
     let _profiling_guard: Option<profiling::ProfilingGuard>;
@@ -689,6 +848,130 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Run `gpq-tiles overview`: build a multi-resolution overview GeoParquet file.
+fn run_overview(args: OverviewArgs) -> Result<()> {
+    use gpq_tiles_core::overview::assign::{AssignConfig, SortDirection};
+    use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+    use gpq_tiles_core::overview::level::Mode;
+    use gpq_tiles_core::overview::simplify::SimplifyOptions;
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let mode = match args.mode.as_str() {
+        "duplicating" => Mode::Duplicating,
+        "partitioning" => Mode::Partitioning,
+        other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
+    };
+
+    // Explicit --gsd list overrides the zoom range.
+    let levels = if let Some(gsd_str) = &args.gsd {
+        let gsds = gsd_str
+            .split(',')
+            .map(|s| s.trim().parse::<f64>())
+            .collect::<std::result::Result<Vec<f64>, _>>()
+            .map_err(|e| anyhow::anyhow!("invalid --gsd list '{}': {}", gsd_str, e))?;
+        LevelPlan::Gsds(gsds)
+    } else {
+        LevelPlan::ZoomRange {
+            min_zoom: args.min_zoom,
+            max_zoom: args.max_zoom,
+        }
+    };
+
+    let assign = AssignConfig {
+        point_thinning: args.point_thinning,
+        line_thinning: args.line_thinning,
+        polygon_thinning: args.polygon_thinning,
+        line_visibility: args.line_visibility,
+        polygon_visibility: args.polygon_visibility,
+        sort_direction: SortDirection::Desc,
+    };
+
+    let options = ConvertOptions {
+        mode,
+        levels,
+        assign,
+        sort_key: args.sort_key.clone(),
+        simplify: SimplifyOptions {
+            factor: args.simplify_factor,
+            collapse: args.collapse,
+        },
+        cogp_compat_key: args.cogp_compat,
+        max_row_group_size: args.row_group_size,
+    };
+
+    let report = convert_to_overviews(&args.input, &args.output, &options)
+        .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))?;
+
+    // Human-readable summary.
+    println!();
+    println!(
+        "✓ Overview {} → {}  ({:?} mode)",
+        args.input.file_name().unwrap_or_default().to_string_lossy(),
+        args.output
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        report.mode
+    );
+    println!(
+        "  {} input features → {} rows across {} levels in {:.2}s",
+        format_number(report.input_features as u64),
+        format_number(report.total_rows as u64),
+        report.levels.len(),
+        report.duration_secs
+    );
+    println!(
+        "  {:>3}  {:>12}  {:>10}  {:>10}  {:>12}",
+        "lvl", "gsd(m)", "features", "vertices", "bytes"
+    );
+    for lvl in &report.levels {
+        println!(
+            "  {:>3}  {:>12.2}  {:>10}  {:>10}  {:>12}",
+            lvl.level,
+            lvl.gsd,
+            format_number(lvl.feature_count as u64),
+            format_number(lvl.vertex_count as u64),
+            HumanBytes(lvl.compressed_bytes.max(0) as u64)
+        );
+    }
+
+    if let Some(report_path) = &args.report {
+        let json =
+            serde_json::to_string_pretty(&report).context("failed to serialize overview report")?;
+        std::fs::write(report_path, json)
+            .with_context(|| format!("failed to write report to {}", report_path.display()))?;
+        println!("  report written to {}", report_path.display());
+    }
+
+    Ok(())
+}
+
+/// Run `gpq-tiles validate`: check a GeoParquet overview file (spec §6.2).
+fn run_validate(args: ValidateArgs) -> Result<()> {
+    use gpq_tiles_core::overview::check::validate_file;
+
+    let report = validate_file(&args.file)
+        .map_err(|e| anyhow::anyhow!("could not open '{}': {e}", args.file.display()))?;
+
+    println!("Validating {}", args.file.display());
+    for check in &report.checks {
+        let mark = if check.passed { "PASS" } else { "FAIL" };
+        println!("  [{mark}] {}: {}", check.name, check.message);
+    }
+
+    if report.is_valid() {
+        println!(
+            "\n✓ valid overview file ({} checks passed)",
+            report.checks.len()
+        );
+        Ok(())
+    } else {
+        let failed = report.failures().count();
+        anyhow::bail!("{failed} check(s) failed");
+    }
 }
 
 /// Print a succinct summary of the conversion

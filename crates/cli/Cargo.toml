@@ -27,6 +27,7 @@ anyhow = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 indicatif = { workspace = true }
+serde_json = "1"
 dhat = { version = "0.3", optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
