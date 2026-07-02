@@ -180,18 +180,23 @@
       }
     },
     {
-      "id": "polygons-eurocrops-parcels",
+      "id": "polygons-ftw-moldova-large",
       "class": "polygon",
       "tier": "large",
-      "profile": "manual",
-      "source": "source-coop",
-      "url": "https://source.coop/cholmes/eurocrops",
-      "region": "EuroCrops agricultural field boundaries (parcels-like)",
-      "expected_features": null,
-      "verified_count": false,
-      "expected_size_mb": null,
-      "license": "varies per country (mostly CC-BY / open); CONFIRM before use",
-      "note": "HUMAN-CONFIRM: exact GeoParquet object path on Source Cooperative not verified. Candidate public parcels/field-boundary dataset. A US county parcels GeoParquet was not located as a stable public source during corpus build; EuroCrops is the closest verified-exists candidate. Not auto-fetched."
+      "profile": "default",
+      "source": "http-parquet",
+      "url": "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin/admin:country_code=MD/Moldova.parquet",
+      "region": "Moldova agricultural field boundaries (Fields of the World, alpha predictions)",
+      "expected_features": 631910,
+      "verified_count": true,
+      "expected_size_mb": 104,
+      "license": "see source.coop/ftw/global-data (FTW alpha predictions)",
+      "note": "Row count and schema verified 2026-07-02 via remote parquet footer (631,910 rows, 6 row groups, WKB geometry + bbox struct). Dense small adjacent polygons: parcels-like generalization stress test.",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 14,
+        "flags": "--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed"
+      }
     }
   ]
 }

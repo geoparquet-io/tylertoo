@@ -103,6 +103,17 @@ fetch_natural_earth() {
   echo "   wrote $out ($(du -h "$out" | cut -f1))"
 }
 
+# ---- fetch one direct-URL parquet ------------------------------
+fetch_http_parquet() {
+  local id="$1" url="$2"
+  local out="$RAW/$id.parquet"
+
+  echo ">> [$id] direct parquet $url"
+  curl -sL --fail --max-time 900 \
+    -o "$out" "$url"
+  echo "   wrote $out ($(du -h "$out" | cut -f1))"
+}
+
 # ---- iterate manifest ------------------------------------------
 COUNT=0
 while read -r ds; do
@@ -146,6 +157,10 @@ skip (use --force)"
       url="$(jq -r '.url' <<<"$ds")"
       shp="$(jq -r '.shapefile' <<<"$ds")"
       fetch_natural_earth "$id" "$url" "$shp"
+      ;;
+    http-parquet)
+      url="$(jq -r '.url' <<<"$ds")"
+      fetch_http_parquet "$id" "$url"
       ;;
     *)
       echo "-- skip [$id] (source=$source \
