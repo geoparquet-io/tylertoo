@@ -159,6 +159,10 @@ pub struct OverviewWriter<W: Write + Send> {
     /// must have).
     augmented_schema: SchemaRef,
     options: OverviewWriterOptions,
+    /// Source-batch column indices to drop before encoding: pre-existing
+    /// bbox-covering struct columns whose name collides with the covering the
+    /// encoder will generate (§4.4). See [`Self::try_new`].
+    drop_indices: Vec<usize>,
     /// `row_group_end` recorded for each completed level.
     level_row_group_ends: Vec<i64>,
     /// Index of the next level expected by [`Self::write_level`].
@@ -201,8 +205,36 @@ impl<W: Write + Send> OverviewWriter<W> {
             return Err(WriterError::NoGeometryColumn);
         }
 
-        // Augment schema: source fields + NOT NULL Int32 `level` column (§4.1).
-        let mut fields: Vec<Arc<Field>> = source_schema.fields().iter().cloned().collect();
+        // Drop any pre-existing bbox-covering struct column whose name collides
+        // with the covering the geoparquet encoder will *generate* for a
+        // geometry column (§4.4). gpio-optimized inputs (the documented input
+        // contract, §4.3) always carry such a `bbox` covering; passing it
+        // through would (a) duplicate the column and (b) — because the `geo`
+        // covering metadata resolves the name to the *first* physical match —
+        // point the covering at the stale, pre-generalization input bbox
+        // instead of the encoder's freshly computed one. We drop it so the
+        // encoder's authoritative covering is the only one present.
+        let covering_names: std::collections::HashSet<String> = geometry_columns
+            .iter()
+            .map(|g| covering_name_for(g))
+            .collect();
+        let drop_indices: Vec<usize> = source_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| covering_names.contains(f.name()) && is_bbox_covering_struct(f))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Augment schema: retained source fields + NOT NULL Int32 `level`
+        // column (§4.1).
+        let mut fields: Vec<Arc<Field>> = source_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !drop_indices.contains(i))
+            .map(|(_, f)| f.clone())
+            .collect();
         fields.push(Arc::new(Field::new(LEVEL_COLUMN, DataType::Int32, false)));
         let augmented_schema = Arc::new(Schema::new_with_metadata(
             fields,
@@ -228,6 +260,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             encoder,
             augmented_schema,
             options,
+            drop_indices,
             level_row_group_ends: Vec::new(),
             next_level_idx: 0,
         })
@@ -263,7 +296,14 @@ impl<W: Write + Send> OverviewWriter<W> {
             let num_rows = batch.num_rows();
             let level_array = Int32Array::from(vec![level_idx as i32; num_rows]);
 
-            let mut columns = batch.columns().to_vec();
+            // Drop the colliding covering column(s) (§4.4), then append `level`.
+            let mut columns: Vec<_> = batch
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !self.drop_indices.contains(i))
+                .map(|(_, c)| c.clone())
+                .collect();
             columns.push(Arc::new(level_array));
             let augmented = RecordBatch::try_new(self.augmented_schema.clone(), columns)?;
 
@@ -367,6 +407,25 @@ fn geometry_columns(schema: &Schema) -> Vec<String> {
         })
         .map(|f| f.name().clone())
         .collect()
+}
+
+/// Whether `field` is a bbox-covering struct: a `Struct` whose child field
+/// names are exactly `{xmin, ymin, xmax, ymax}` (case-insensitive). Used to
+/// recognise (and drop) a pre-existing covering column that would collide with
+/// the encoder's generated one (§4.4), without touching unrelated struct
+/// attributes that merely share the covering's *name*.
+fn is_bbox_covering_struct(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::Struct(children) => {
+            if children.len() != 4 {
+                return false;
+            }
+            let mut names: Vec<String> = children.iter().map(|c| c.name().to_lowercase()).collect();
+            names.sort();
+            names == ["xmax", "xmin", "ymax", "ymin"]
+        }
+        _ => false,
+    }
 }
 
 /// Covering column name the encoder will produce for a geometry column, per its
@@ -536,6 +595,115 @@ mod tests {
                 got: 1
             }
         ));
+    }
+
+    #[test]
+    fn preexisting_bbox_covering_is_not_duplicated() {
+        use arrow_array::{Float64Array, StructArray};
+        use arrow_schema::Fields;
+
+        // is_bbox_covering_struct recognises the covering shape.
+        let bbox_children = Fields::from(vec![
+            Field::new("xmin", DataType::Float64, false),
+            Field::new("ymin", DataType::Float64, false),
+            Field::new("xmax", DataType::Float64, false),
+            Field::new("ymax", DataType::Float64, false),
+        ]);
+        assert!(is_bbox_covering_struct(&Field::new(
+            "bbox",
+            DataType::Struct(bbox_children.clone()),
+            false
+        )));
+        assert!(!is_bbox_covering_struct(&Field::new(
+            "name",
+            DataType::Utf8,
+            false
+        )));
+
+        // Source schema mirrors a gpio-optimized input: it already carries a
+        // `bbox` covering struct that collides with the encoder's generated one.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geometry_field(),
+            Field::new("bbox", DataType::Struct(bbox_children.clone()), false),
+        ]));
+
+        let make_batch = |ids: &[i64]| {
+            let id_array = Int64Array::from(ids.to_vec());
+            let geom_array = build_geometry_array(ids);
+            // Deliberately STALE covering sentinels (-999/999): if the writer
+            // passed this column through instead of dropping it, these values
+            // would surface in the covering stats.
+            let col = |v: f64| Arc::new(Float64Array::from(vec![v; ids.len()])) as _;
+            let bbox = StructArray::new(
+                bbox_children.clone(),
+                vec![col(-999.0), col(-999.0), col(999.0), col(999.0)],
+                None,
+            );
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(geom_array.to_array_ref()),
+                    Arc::new(bbox),
+                ],
+            )
+            .unwrap()
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer =
+                OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
+            writer
+                .write_level(0, std::iter::once(make_batch(&[0, 3])))
+                .unwrap();
+            writer
+                .write_level(1, std::iter::once(make_batch(&[0, 1, 3])))
+                .unwrap();
+            writer
+                .write_level(2, std::iter::once(make_batch(&[0, 1, 2, 3])))
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let file = File::open(tmp.path()).unwrap();
+        let parquet_meta = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+
+        // Exactly ONE physical `bbox.xmin` column — no `bbox`/`bbox_1`
+        // duplication from passing the input covering through.
+        let n_bbox_xmin = parquet_meta
+            .row_group(0)
+            .columns()
+            .iter()
+            .filter(|c| c.column_path().string() == "bbox.xmin")
+            .count();
+        assert_eq!(n_bbox_xmin, 1, "duplicate bbox covering column present");
+
+        // The covering carries the encoder's FRESH geometry bounds, not the
+        // stale -999/999 sentinels from the input column.
+        for row_group in parquet_meta.row_groups() {
+            for child in ["xmin", "ymin", "xmax", "ymax"] {
+                let path = format!("bbox.{child}");
+                let chunk = row_group
+                    .columns()
+                    .iter()
+                    .find(|c| c.column_path().string() == path)
+                    .unwrap_or_else(|| panic!("missing covering column {path}"));
+                match chunk.statistics().expect("covering stats") {
+                    Statistics::Double(s) => {
+                        assert!(
+                            *s.min_opt().unwrap() > -100.0 && *s.max_opt().unwrap() < 100.0,
+                            "covering {path} carries stale input bbox values"
+                        );
+                    }
+                    other => panic!("unexpected covering stats type: {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]
