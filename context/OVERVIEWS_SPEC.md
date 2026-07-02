@@ -2,7 +2,9 @@
 
 Version: `0.1.0` (DRAFT — for human review)
 Status: Draft, 2026-07-02
-License intent: CC BY 4.0 (matching COGP)
+License intent: CC BY 4.0
+Standardization target: candidate official GeoParquet extension via
+the opengeospatial/geoparquet process (the `covering` path into 1.1)
 
 This document specifies **COG-style multi-resolution overviews** embedded
 in a GeoParquet file. It defines a physical layout, a footer metadata
@@ -10,12 +12,13 @@ schema, and read/write protocols that let a client fetch only the
 resolution band it needs over HTTP range requests, while the file remains
 a fully valid GeoParquet 1.1 file readable by any existing tool.
 
-It is designed as a **superset of the Cloud Optimized GeoParquet Profile
-(COGP)** v0.1.0 (Kanahiro). A file written in `partitioning` mode (§2.3)
-is intended to be a valid COGP file, readable by existing COGP readers
-with no changes. A file written in `duplicating` mode (§2.2) adds
-COG-style self-contained overview levels that COGP does not define; such
-files remain valid GeoParquet 1.1 but are *not* valid COGP.
+It is designed for standardization through the **official GeoParquet
+spec process** (opengeospatial/geoparquet): the metadata is structured
+so it can be merged into the `geo` file metadata as a spec-level
+extension (as `covering` was in 1.1), and it incubates under its own
+footer key until then. The layout concepts of `partitioning` mode
+(§2.3) are shared with the third-party COGP draft (Kanahiro); COGP
+interop is an optional courtesy (§3.1), not a design constraint.
 
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY, and
 OPTIONAL are to be interpreted as in RFC 2119.
@@ -58,9 +61,10 @@ with a single predicate.
 
 ### 1.3 Relationship to prior art
 
-- **COGP** (feature-level, no simplification, prefix reads): this spec's
-  `partitioning` mode is a COGP profile. We reuse its `gsd`, its
-  `row_group_end` semantics, and its layout constraints verbatim.
+- **COGP** (third-party draft; feature-level, no simplification,
+  prefix reads): this spec's `partitioning` mode shares its concepts;
+  we deliberately keep its `gsd` and `row_group_end` field semantics
+  so a compatibility key is cheap to emit (§3.1).
 - **Cloud Optimized GeoTIFF / COPC**: the `duplicating` mode borrows the
   COG read model — one level band is a complete, self-contained rendering
   of the whole dataset; a reader fetches exactly one band.
@@ -100,11 +104,11 @@ Constraints:
   MUST NOT assume a feature at level `k` corresponds 1:1 to a feature at
   level `k+1`. (Cross-level joins are a non-goal; see §10.)
 
-This mode is a superset of COGP and is NOT itself a valid COGP file,
-because features are duplicated across levels (COGP requires each feature
+Features are duplicated across levels in this mode; it has no
+counterpart in the third-party COGP draft (which requires each feature
 in exactly one row group).
 
-### 2.3 `partitioning` mode (COGP-compatible)
+### 2.3 `partitioning` mode
 
 Each feature appears **exactly once**, placed at its **coarsest** level —
 the coarsest level at which it is still meaningful under that level's GSD.
@@ -121,9 +125,10 @@ Constraints:
   canonical level row-band; the canonical level pointer (§3.4) MUST be
   `null` in this mode, signalling "all rows, no filter" (§6.2).
 
-A `partitioning`-mode file MUST additionally satisfy all COGP v0.1.0
-requirements so that it is a valid COGP file (§3.1 documents how the
-metadata keys mirror each other).
+A `partitioning`-mode file's layout is concept-compatible with the
+third-party COGP draft; a writer MAY additionally emit the `cogp`
+compatibility key (§3.1) to make it consumable by COGP readers. COGP
+validity is NOT a conformance requirement of this spec.
 
 ### 2.4 Canonical fidelity (normative)
 
@@ -146,38 +151,46 @@ differ.
 
 ## 3. Footer metadata
 
-### 3.1 Key strategy (RECOMMENDATION)
+### 3.1 Key strategy (REVISED 2026-07-02)
 
-**Recommendation: write a single `cogp` key, extended with optional
-additive fields**, rather than defining a separate `gpq_overviews` key.
+**Decision: incubate under our own footer key, designed for merger
+into the official `geo` metadata as a GeoParquet spec extension.**
 
-Rationale:
+- **Key name**: `geo:overviews` (UTF-8 string), value is a UTF-8 JSON
+  object with the schema in §3.2. The `geo:`-prefixed sibling key
+  signals spec-track intent while keeping the incubating structure
+  out of the `geo` object itself (so no reader can mistake it for
+  ratified 1.1/2.0 metadata). Upon standardization, the object moves
+  verbatim to an `overviews` member of the `geo` metadata and the
+  sibling key is dropped — the JSON schema is designed so this is a
+  key rename only.
 
-1. COGP mandates that readers MUST ignore unrecognized fields (§6 of
-   COGP). Adding optional fields (`mode`, `canonical_level`, per-level
-   `zoom`, `generalization`) is spec-legal under COGP's minor-version
-   rules and keeps `partitioning`-mode files readable by existing COGP
-   readers with zero changes.
-2. A single source of truth avoids the two-keys-can-disagree failure mode.
-3. It positions this work as a COGP extension proposal (plan task L1),
-   not a competing format.
+Rationale: this spec's standardization path runs through the official
+opengeospatial/geoparquet process (the same path `covering` took into
+1.1), not through third-party drafts. Structuring the metadata for
+`geo`-merger from day one is what makes the eventual extension
+proposal a rename rather than a redesign.
 
-The `duplicating` mode is expressed entirely through additive fields on
-the `cogp` object; a COGP reader that ignores them sees a coarse→fine
-ordered set of levels and will still fetch a **prefix** — which, in
-`duplicating` mode, over-fetches (it reads levels `0..z` when band `z`
-alone would do) but is never *wrong* (level `z` is self-contained, so the
-prefix is a superset). This graceful degradation is the reason for the
-single-key choice.
+**COGP interop (optional, informative).** The `partitioning`-mode
+layout is concept-compatible with the third-party COGP draft
+(Kanahiro), and our `levels` schema deliberately keeps COGP's
+`row_group_end`/`gsd` field semantics. A writer MAY additionally emit
+a `cogp` footer key containing the COGP-subset fields
+(`version`, `levels[].{row_group_end, gsd}`) for `partitioning`-mode
+files so existing COGP readers can consume them. When both keys are
+present the `geo:overviews` key is authoritative; a validator MUST
+flag disagreement between them as an error. A COGP prefix-reader that
+encounters a `duplicating`-mode file (via a MAY-emitted `cogp` key)
+over-fetches — levels are self-contained, so a prefix is a superset —
+but is never wrong; writers SHOULD nonetheless omit the `cogp` key in
+`duplicating` mode to avoid advertising semantics COGP does not
+define.
 
-Therefore, in this spec the footer key is:
-
-- **Key name**: `cogp` (UTF-8 string), value is a UTF-8 JSON object.
-
-> OPEN QUESTION Q2: Should we ALSO emit an aliased `gpq_overviews` key with
-> the identical JSON, to reserve the name and let non-COGP tooling key off
-> a clearer name? Recommendation: NO for v0.1 (avoid divergence risk); keep
-> a single `cogp` key. Revisit if COGP outreach (L1) stalls. See §11.
+> OPEN QUESTION Q2 (revised): Is `geo:overviews` the right incubation
+> key name, and should the MAY-emit `cogp` compatibility key exist at
+> all? Recommendation: `geo:overviews`; emit `cogp` only behind an
+> explicit writer flag, default off. To be settled with the GeoParquet
+> spec maintainers directly. See §11.
 
 ### 3.2 JSON schema
 
@@ -197,8 +210,9 @@ Level := {
 }
 ```
 
-Fields required by COGP: `version`, `levels`, `levels[].row_group_end`,
-`levels[].gsd`. All other fields are additive extensions defined here.
+All fields are defined by this spec. (`version`, `levels`,
+`levels[].row_group_end`, and `levels[].gsd` also form the
+COGP-compatible subset used by the optional `cogp` key, §3.1.)
 
 ### 3.3 `levels` constraints (normative)
 
@@ -219,8 +233,10 @@ Fields required by COGP: `version`, `levels`, `levels[].row_group_end`,
 
 ### 3.4 `mode` and `canonical_level`
 
-- `mode` SHOULD be present. If absent, readers MUST assume `partitioning`
-  (the COGP default), preserving COGP-reader behavior.
+- `mode` SHOULD be present. If absent, readers MUST assume
+  `partitioning` (the non-duplicating default: safest assumption for a
+  reader, since treating a partitioning file as duplicating would
+  drop data).
 - `canonical_level`:
   - In `duplicating` mode it MUST be present and MUST equal
     `len(levels) - 1` (the finest level). A reader/analyst uses it to
@@ -272,7 +288,7 @@ Provenance := {
 }
 ```
 
-### 3.7 Example — `partitioning` mode (also a valid COGP file)
+### 3.7 Example — `partitioning` mode
 
 ```json
 {
@@ -287,8 +303,9 @@ Provenance := {
 }
 ```
 
-A COGP v0.1.0 reader ignores `mode`, `canonical_level`, and `zoom` and
-sees exactly the COGP example structure.
+If the writer also emits the optional `cogp` compatibility key
+(§3.1), it contains the `version` and `levels[].{row_group_end, gsd}`
+subset of the above.
 
 ### 3.8 Versioning
 
@@ -464,13 +481,14 @@ layer.
 3. Write levels coarse→fine, each ending on a row-group boundary (§4.2).
 4. Write a NOT NULL `INT32` `level` column consistent with the footer
    (§4.1).
-5. Write the `cogp` footer key with valid JSON per §3, including strictly
-   increasing `row_group_end` (final = `num_row_groups-1`) and strictly
-   decreasing `gsd`.
+5. Write the `geo:overviews` footer key with valid JSON per §3,
+   including strictly increasing `row_group_end` (final =
+   `num_row_groups-1`) and strictly decreasing `gsd`.
 6. In `duplicating` mode: set `mode`, set `canonical_level = L-1`, and
    guarantee canonical-level value-identity to source (§2.4).
-7. In `partitioning` mode: satisfy all COGP v0.1.0 requirements
-   (feature-once, geometry verbatim), set `canonical_level = null`.
+7. In `partitioning` mode: place each feature exactly once with
+   geometry verbatim, set `canonical_level = null`. (Optionally emit
+   the `cogp` compatibility key per §3.1.)
 8. Use ZSTD; no dictionary on geometry/bbox columns (§4.5).
 
 ### 6.2 Validation checklist (feeds `validate` subcommand, task P4)
@@ -479,8 +497,11 @@ A validator MUST check:
 
 - [ ] File opens as valid GeoParquet 1.1 (geo metadata present, primary
       column declared).
-- [ ] `cogp` footer key present, parses as UTF-8 JSON, `version` is
-      semver, MAJOR is supported.
+- [ ] `geo:overviews` footer key present, parses as UTF-8 JSON,
+      `version` is semver, MAJOR is supported.
+- [ ] If a `cogp` compatibility key is also present, its
+      `levels[].{row_group_end, gsd}` agree exactly with
+      `geo:overviews` (disagreement is an error, §3.1).
 - [ ] `levels` non-empty; `row_group_end` strictly increasing, 0-based,
       final == `num_row_groups - 1`.
 - [ ] `gsd` strictly decreasing, all > 0.
@@ -548,7 +569,8 @@ structure, not cartographic quality.
 ### 7.4 Single-level degenerate files
 
 - A file with `len(levels) == 1` is conformant. It is an ordinary
-  GeoParquet file plus a `cogp` key and a constant `level = 0` column. In
+  GeoParquet file plus a `geo:overviews` key and a constant
+  `level = 0` column. In
   `duplicating` mode `canonical_level = 0`. This is the degenerate "no
   overviews" case and is explicitly allowed.
 
@@ -600,7 +622,7 @@ This spec explicitly does NOT address:
 A tiny buildings dataset, generalized into 3 levels at z2/z4/z6, written
 `duplicating`. 15 row groups total.
 
-### 9.1 Footer `cogp` JSON
+### 9.1 Footer `geo:overviews` JSON
 
 ```json
 {
@@ -672,9 +694,11 @@ Migration plan:
    All spatial-pruning language in §5.1 applies unchanged, sourcing min/max
    from the native geometry column's Parquet statistics instead of the
    covering column. Producers targeting 2.0 SHOULD omit the covering column.
-2. **Footer key unchanged.** The `cogp` key and its JSON schema (§3) are
-   encoding-agnostic and carry over verbatim (`row_group_end`, `gsd`,
-   `mode`, `canonical_level`, `zoom`).
+2. **Footer key unchanged.** The `geo:overviews` key and its JSON
+   schema (§3) are encoding-agnostic and carry over verbatim
+   (`row_group_end`, `gsd`, `mode`, `canonical_level`, `zoom`) —
+   until/unless the object is merged into the `geo` metadata by the
+   official spec process, at which point it is a key rename only.
 3. **`level` column unchanged.** Still an INT32 NOT NULL column.
 4. **Version bump.** A 2.0 overview file uses `version` MINOR/MAJOR bump
    and declares GeoParquet 2.0 in its `geo` metadata; validators MUST
@@ -695,8 +719,13 @@ Migration plan:
 - **Q1 (§2.4)** Canonical fidelity: require row-order preservation, or only
   set/value equality? *Recommendation: set/value equality only* (Hilbert
   sort reorders rows; strict source order conflicts with §4.3).
-- **Q2 (§3.1)** Footer key: single `cogp` key vs. also emitting an aliased
-  `gpq_overviews` key? *Recommendation: single `cogp` key for v0.1.*
+- **Q2 (§3.1, REVISED 2026-07-02)** Incubation key is `geo:overviews`,
+  designed for verbatim merger into the `geo` metadata via the
+  official GeoParquet spec process. Remaining sub-questions: is
+  `geo:overviews` the right incubation name, and should the optional
+  `cogp` compatibility key exist (recommend: behind a writer flag,
+  default off)? *To be settled directly with the GeoParquet spec
+  maintainers (Chris Holmes / Javier de la Torre).*
 - **Q3 (§7.1)** CRS: restrict to EPSG:3857/4326, or allow arbitrary
   projected-meter CRS? *Recommendation: 3857 + 4326 for v0.1.*
 - **Q4 (§7.5)** Geometry-type collapse: default-on or opt-in? *Recommendation:

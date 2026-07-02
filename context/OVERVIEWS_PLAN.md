@@ -32,7 +32,7 @@ Phase 2 (validate):    V1 correctness -> V2 quality [HUMAN GATE]
                        V4 streaming refactor (after V1)
 Phase 3 (ecosystem):   E1 serve-MVT   E2 TS loader/demo   E3 python
                        (all after format freeze at V1/V2)
-Phase 4 (launch):      L1 spec repo / COGP outreach [HUMAN]
+Phase 4 (launch):      L1 spec via official GeoParquet channel [HUMAN]
                        L2 blog + hosted demo
                        L3 GeoParquet community discussion
 ```
@@ -158,7 +158,8 @@ DuckDB `WHERE level = canonical` row count == input row count.
 - File validity: GDAL ogrinfo, DuckDB spatial, QGIS open, pyarrow.
 - Canonical-level fidelity: geometry + attributes byte/value-equal
   to input.
-- Partitioning mode: valid COGP (run cogp validate if feasible).
+- Partitioning mode with `cogp` compat key enabled: readable by
+  cogp-rs (run cogp validate if feasible; optional interop check).
 - Determinism: same input → same output.
 FORMAT FREEZE after V1 passes + G1 checkpoint feedback applied.
 
@@ -218,10 +219,15 @@ recipes; user docs page.
 
 ## Phase 4 — Launch
 
-### L1. Spec publication / COGP outreach  (deps: V3)   [HUMAN]
-Preferred: approach Kanahiro with benchmarks + working code;
-propose duplicating-levels mode as COGP extension. Fallback:
-publish standalone spec repo (README + SPEC.md, CC-BY, versioned).
+### L1. Spec publication via official channel  (deps: V3)   [HUMAN]
+(REVISED 2026-07-02: Nissim works directly with the GeoParquet spec
+maintainers — Chris Holmes, Javier de la Torre — and co-maintains
+gpio. The official spec process IS the channel.)
+Take the spec + benchmarks + working code directly to the GeoParquet
+maintainers; propose `geo:overviews` as an official extension
+(the `covering` path into 1.1). Integrate writer tooling into the
+gpio ecosystem. Courtesy heads-up to Kanahiro (COGP) is optional;
+the MAY-emit `cogp` compatibility key covers interop.
 This step is yours, not an agent's.
 
 ### L2. Blog post + demo  (deps: V3, E2)
