@@ -1,7 +1,8 @@
 # GeoParquet Overviews Specification
 
-Version: `0.1.0` (DRAFT — for human review)
-Status: Draft, 2026-07-02
+Version: `0.1.0`
+Status: Draft — §11 design decisions APPROVED by maintainer
+2026-07-02; implementation may proceed against this document.
 License intent: CC BY 4.0
 Standardization target: candidate official GeoParquet extension via
 the opengeospatial/geoparquet process (the `covering` path into 1.1)
@@ -714,24 +715,22 @@ Migration plan:
 
 ---
 
-## 11. Open questions (for human reviewer)
+## 11. Open questions — ALL RESOLVED (human review 2026-07-02)
 
-- **Q1 (§2.4)** Canonical fidelity: require row-order preservation, or only
-  set/value equality? *Recommendation: set/value equality only* (Hilbert
-  sort reorders rows; strict source order conflicts with §4.3).
-- **Q2 (§3.1, REVISED 2026-07-02)** Incubation key is `geo:overviews`,
+- **Q1 (§2.4) APPROVED:** canonical fidelity is **set/value equality
+  only**, not row order (Hilbert sort reorders rows within levels).
+- **Q2 (§3.1) APPROVED:** incubation key is **`geo:overviews`**,
   designed for verbatim merger into the `geo` metadata via the
-  official GeoParquet spec process. Remaining sub-questions: is
-  `geo:overviews` the right incubation name, and should the optional
-  `cogp` compatibility key exist (recommend: behind a writer flag,
-  default off)? *To be settled directly with the GeoParquet spec
-  maintainers (Chris Holmes / Javier de la Torre).*
-- **Q3 (§7.1)** CRS: restrict to EPSG:3857/4326, or allow arbitrary
-  projected-meter CRS? *Recommendation: 3857 + 4326 for v0.1.*
-- **Q4 (§7.5)** Geometry-type collapse: default-on or opt-in? *Recommendation:
-  opt-in; default preserve-type-or-drop.*
-- **Q5 (§10)** GeoParquet 2.0: dual-emit covering + native stats during
-  transition, or hard-switch? *Recommendation: dual-emit during transition.*
+  official GeoParquet spec process; optional `cogp` compatibility key
+  emitted only behind an explicit writer flag, **default off**. Key
+  name may still be refined with the GeoParquet spec maintainers —
+  implementations MUST keep it a single named constant.
+- **Q3 (§7.1) APPROVED:** v0.1 restricts CRS to **EPSG:4326 and
+  EPSG:3857**; arbitrary projected-meter CRS deferred.
+- **Q4 (§7.5) APPROVED:** geometry-type collapse is **opt-in,
+  default off** (default: preserve-type-or-drop).
+- **Q5 (§10) APPROVED:** GeoParquet 2.0 files **dual-emit** the bbox
+  covering column alongside native geometry stats during transition.
 - **Q6 (new)** ~~`gsd(z)` uses the constant `1024`; confirm this matches the
   cogp-rs reference exactly.~~ **RESOLVED (verified against cogp-rs
   src/convert.rs, 2026-07-02):** cogp-rs auto-derives
@@ -739,9 +738,6 @@ Migration plan:
   (chosen as ~4× a 256-px tile so sub-pixel features drop; the base is
   a CLI-configurable knob, and `--gsd` overrides derivation entirely).
   §5.2 table is correct as written.
-- **Q7 (new)** Should `mode` be REQUIRED rather than SHOULD, accepting that
-  omitting it defaults to `partitioning`? Making it required removes
-  ambiguity but slightly diverges from "additive optional field" framing
-  toward COGP readers (which ignore it anyway). *Recommendation: keep
-  SHOULD + documented default.*
+- **Q7 APPROVED:** `mode` stays **SHOULD with documented
+  `partitioning` default** (the safe reader assumption), not REQUIRED.
 ```
