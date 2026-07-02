@@ -38,6 +38,32 @@ pub const GSD_TILE_BASE: f64 = 1024.0;
 /// Equatorial meters-per-degree factor for geographic (degree) CRS inputs (§7.1).
 pub const METERS_PER_DEGREE: f64 = 111_320.0;
 
+/// Coordinate reference system of the overview file (spec Q3 / §7.1).
+///
+/// v0.1 restricts overviews to these two CRSs. The variant governs how a
+/// meters-denominated GSD tolerance is expressed in the geometry's
+/// coordinate units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Crs {
+    /// Geographic lon/lat degrees. Meters are divided by
+    /// [`METERS_PER_DEGREE`] (equatorial approximation; high-latitude
+    /// datasets see GSD/scale skew, acceptable per §7.1).
+    Epsg4326,
+    /// Web Mercator meters. Meters are used verbatim.
+    Epsg3857,
+}
+
+impl Crs {
+    /// Convert a distance in meters into this CRS's coordinate units.
+    #[inline]
+    pub fn meters_to_units(self, meters: f64) -> f64 {
+        match self {
+            Crs::Epsg3857 => meters,
+            Crs::Epsg4326 => meters / METERS_PER_DEGREE,
+        }
+    }
+}
+
 /// Ground sample distance (meters) for a Web Mercator zoom level (§5.2).
 ///
 /// `gsd(z) = 40_075_016.69 / 1024 / 2^z` — matches the cogp-rs convention.

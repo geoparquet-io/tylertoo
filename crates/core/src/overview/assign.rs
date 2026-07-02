@@ -58,24 +58,7 @@
 
 use std::collections::HashMap;
 
-/// Equatorial meters per degree of longitude (spec §5.2 / §7.1).
-///
-/// Used to convert a meter-denominated GSD into degree-space grid units when
-/// the file CRS is geographic (EPSG:4326).
-pub const METERS_PER_DEGREE: f64 = 111_320.0;
-
-/// Coordinate reference system of the input geometry coordinates.
-///
-/// GSD is *always* meters (spec §7.1); this enum tells the engine how to
-/// convert a meter GSD into the coordinate units of the input bboxes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Crs {
-    /// Web Mercator — coordinates are already meters.
-    Epsg3857,
-    /// Geographic lon/lat — coordinates are degrees; convert via
-    /// [`METERS_PER_DEGREE`].
-    Epsg4326,
-}
+pub use super::level::{Crs, METERS_PER_DEGREE};
 
 /// Geometry kind, for per-kind thinning and visibility gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,10 +227,7 @@ impl Assignment {
 /// Convert a meter-denominated GSD into input-coordinate units for the CRS.
 #[inline]
 pub fn gsd_to_coord_units(gsd_meters: f64, crs: Crs) -> f64 {
-    match crs {
-        Crs::Epsg3857 => gsd_meters,
-        Crs::Epsg4326 => gsd_meters / METERS_PER_DEGREE,
-    }
+    crs.meters_to_units(gsd_meters)
 }
 
 /// Murmur3 finalizer — a deterministic mix used as a priority tiebreaker.

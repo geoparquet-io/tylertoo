@@ -59,13 +59,7 @@ use geo::{
     Polygon, Rect, Simplify, Validation,
 };
 
-/// Equatorial meters per degree of longitude/latitude (spec §7.1).
-///
-/// Used to convert a meters-denominated GSD tolerance into the degree units
-/// of an EPSG:4326 dataset. This is an equatorial approximation; high-latitude
-/// datasets see GSD/scale skew (acceptable for a coarse level-selection
-/// heuristic — spec §7.1).
-pub const METERS_PER_DEGREE: f64 = 111_320.0;
+pub use super::level::{Crs, METERS_PER_DEGREE};
 
 /// Default simplification factor: `tolerance = factor * gsd`.
 ///
@@ -82,31 +76,6 @@ const MIN_POLYGON_RING_POINTS: usize = 4;
 
 /// Minimum number of coordinates for a non-degenerate line.
 const MIN_LINESTRING_POINTS: usize = 2;
-
-/// Coordinate reference system of the overview file (spec Q3 / §7.1).
-///
-/// v0.1 restricts overviews to these two CRSs. The variant governs how a
-/// meters-denominated GSD tolerance is expressed in the geometry's coordinate
-/// units.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Crs {
-    /// Geographic lon/lat degrees. Tolerance meters are divided by
-    /// [`METERS_PER_DEGREE`].
-    Epsg4326,
-    /// Web Mercator meters. Tolerance meters are used verbatim.
-    Epsg3857,
-}
-
-impl Crs {
-    /// Convert a distance in meters into this CRS's coordinate units.
-    #[inline]
-    pub fn meters_to_units(self, meters: f64) -> f64 {
-        match self {
-            Crs::Epsg3857 => meters,
-            Crs::Epsg4326 => meters / METERS_PER_DEGREE,
-        }
-    }
-}
 
 /// Options controlling per-level simplification.
 #[derive(Debug, Clone, Copy, PartialEq)]
