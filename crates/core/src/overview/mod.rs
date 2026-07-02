@@ -4,8 +4,11 @@
 //! `context/OVERVIEWS_SPEC.md`: read gpio-sorted GeoParquet → per-level
 //! grid cell-winner thinning (`assign`) → per-level **world-space**
 //! geometry simplification with tolerance derived from level GSD, not
-//! tile pixels (`simplify`) → level-banded GeoParquet writer. No tile
-//! clipping, no MVT, no PMTiles.
+//! tile pixels (`simplify`) → level-banded GeoParquet writer (`writer`),
+//! with the shared metadata model in `level`. No tile clipping, no MVT,
+//! no PMTiles.
 
 pub mod assign;
+pub mod level;
 pub mod simplify;
+pub mod writer;
