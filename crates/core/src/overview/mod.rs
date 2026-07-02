@@ -1,9 +1,11 @@
-//! GeoParquet multi-resolution overviews.
+//! GeoParquet multi-resolution overviews (COG-style vector overviews).
 //!
-//! See `context/OVERVIEWS_SPEC.md` for the authoritative format spec.
-//!
-//! This module is assembled from several sibling submodules (level
-//! assignment, per-level simplification, writer, reader). Only the pure
-//! level-assignment engine lives here so far.
+//! This subtree implements the overview generalization pipeline defined in
+//! `context/OVERVIEWS_SPEC.md`: read gpio-sorted GeoParquet → per-level
+//! grid cell-winner thinning (`assign`) → per-level **world-space**
+//! geometry simplification with tolerance derived from level GSD, not
+//! tile pixels (`simplify`) → level-banded GeoParquet writer. No tile
+//! clipping, no MVT, no PMTiles.
 
 pub mod assign;
+pub mod simplify;
