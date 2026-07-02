@@ -335,7 +335,19 @@ pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds
 pub fn extract_row_group_bounds_from_reader(
     reader: &SerializedFileReader<File>,
 ) -> Result<Vec<Option<RowGroupBounds>>, Error> {
-    let metadata = reader.metadata();
+    extract_row_group_bounds_from_metadata(reader.metadata())
+}
+
+/// Extract per-row-group bounding boxes directly from parsed Parquet metadata.
+///
+/// This is the metadata-only variant of [`extract_row_group_bounds_from_reader`]:
+/// callers that already hold a [`ParquetMetaData`] (e.g. from a
+/// `ParquetRecordBatchReaderBuilder`) can prune without re-opening the file.
+/// Returns `None` for row groups whose covering statistics are unavailable, and
+/// `vec![None; n]` when the file lacks geo/covering metadata entirely.
+pub fn extract_row_group_bounds_from_metadata(
+    metadata: &ParquetMetaData,
+) -> Result<Vec<Option<RowGroupBounds>>, Error> {
     let num_row_groups = metadata.num_row_groups();
 
     // Parse geo metadata to get covering spec
@@ -392,7 +404,7 @@ pub fn extract_row_group_bounds_from_reader(
 }
 
 /// Get the "geo" metadata JSON string from Parquet file metadata.
-fn get_geo_metadata(metadata: &ParquetMetaData) -> Result<Option<String>, Error> {
+pub fn get_geo_metadata(metadata: &ParquetMetaData) -> Result<Option<String>, Error> {
     let kv = metadata.file_metadata().key_value_metadata();
     let Some(kv) = kv else {
         return Ok(None);

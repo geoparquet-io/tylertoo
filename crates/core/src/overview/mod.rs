@@ -9,6 +9,8 @@
 //! no PMTiles.
 
 pub mod assign;
+pub mod check;
 pub mod level;
+pub mod reader;
 pub mod simplify;
 pub mod writer;
