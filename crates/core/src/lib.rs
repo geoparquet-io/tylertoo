@@ -58,6 +58,7 @@ mod integration_tests;
 pub mod ioverlay_clip;
 pub mod memory;
 pub mod mvt;
+pub mod overview;
 pub mod pipeline;
 pub mod pmtiles_writer;
 pub mod property_filter;
