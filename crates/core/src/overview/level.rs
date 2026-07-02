@@ -108,6 +108,38 @@ pub struct Generalization {
     pub engine: String,
     /// Parallel to the top-level `levels` array.
     pub levels: Vec<GeneralizationLevel>,
+    /// OPTIONAL cell-winner ranking provenance (§3.5, additive; informative).
+    ///
+    /// Records how the assignment engine broke ties for which feature wins a
+    /// grid cell (class-aware priority, Q1). Absent on files written before
+    /// this field existed; readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<RankingProvenance>,
+}
+
+/// How the cell-winner priority (sort) key was chosen for a conversion (Q1).
+///
+/// Additive, OPTIONAL, informative provenance embedded in [`Generalization`]
+/// (§3.5). Records the ranking *tier* that produced the per-feature sort key,
+/// so a reviewer can see whether a coarse render was ranked by class, by a
+/// numeric column, or fell back to size.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RankingProvenance {
+    /// One of: `explicit-sort-key`, `class-ranking`, `auto-overture-roads`,
+    /// `auto-confidence`, `size-fallback`.
+    pub mode: String,
+    /// Source column the ranking read, when one applies (`size-fallback` has
+    /// none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// The categorical value→priority map, when small enough to be useful
+    /// (class-ranking tiers only). Higher priority wins the cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranks: Option<Vec<(String, f64)>>,
+    /// Priority assigned to a present-but-unrecognized categorical value
+    /// (class-ranking tiers only). Loses to every named rank, beats a null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_rank: Option<f64>,
 }
 
 /// One entry of the [`Generalization`] provenance block (§3.5).
@@ -676,6 +708,55 @@ mod tests {
             meta.validate(13).unwrap_err(),
             OverviewValidationError::CanonicalLevelNotNull { .. }
         ));
+    }
+
+    #[test]
+    fn ranking_provenance_roundtrip_class_ranking() {
+        // A class-ranking generalization block survives JSON round-trip and
+        // preserves mode / column / ranks / unknown_rank (§3.5, additive).
+        let mut meta = duplicating_example();
+        meta.generalization = Some(Generalization {
+            engine: "gpq-tiles test".to_string(),
+            levels: vec![],
+            ranking: Some(RankingProvenance {
+                mode: "auto-overture-roads".to_string(),
+                column: Some("road_class".to_string()),
+                ranks: Some(vec![
+                    ("motorway".to_string(), 18.0),
+                    ("service".to_string(), 11.0),
+                ]),
+                unknown_rank: Some(0.0),
+            }),
+        });
+        let json = meta.to_json().unwrap();
+        let parsed = OverviewsMeta::from_json(&json).unwrap();
+        assert_eq!(meta, parsed);
+        let r = parsed.generalization.unwrap().ranking.unwrap();
+        assert_eq!(r.mode, "auto-overture-roads");
+        assert_eq!(r.column.as_deref(), Some("road_class"));
+        assert_eq!(r.unknown_rank, Some(0.0));
+        assert_eq!(r.ranks.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ranking_provenance_absent_field_tolerated() {
+        // A generalization block written before `ranking` existed (no key)
+        // deserializes with `ranking == None`.
+        let src = r#"{
+            "version": "0.1.0",
+            "mode": "duplicating",
+            "canonical_level": 0,
+            "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
+            "generalization": {
+                "engine": "gpq-tiles 0.1.0",
+                "levels": [
+                    { "simplify_tolerance_m": 0, "thinning_factor": 1.0,
+                      "visibility_gate_m": 0, "geometry_types": [] }
+                ]
+            }
+        }"#;
+        let meta = OverviewsMeta::from_json(src).unwrap();
+        assert!(meta.generalization.unwrap().ranking.is_none());
     }
 
     #[test]

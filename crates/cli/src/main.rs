@@ -110,9 +110,23 @@ struct OverviewArgs {
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
-    /// Column name used as the cell-winner priority (sort) key.
+    /// Column name used as the cell-winner priority (sort) key. Mutually
+    /// exclusive with --class-rank.
     #[arg(long, value_name = "COL")]
     sort_key: Option<String>,
+
+    /// Categorical class ranking (higher priority wins a cell). Format:
+    /// `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g.
+    /// `--class-rank road_class:motorway=5,primary=4,residential=2`.
+    /// Present-but-unlisted values rank below every listed value (but above
+    /// nulls). Mutually exclusive with --sort-key.
+    #[arg(long, value_name = "SPEC")]
+    class_rank: Option<String>,
+
+    /// Disable auto-detection of well-known schemas (Overture roads `class`/
+    /// `road_class`, Overture places `confidence`).
+    #[arg(long)]
+    no_auto_rank: bool,
 
     /// Simplification tolerance factor (tolerance = factor * gsd). Duplicating
     /// mode only.
@@ -889,11 +903,22 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         sort_direction: SortDirection::Desc,
     };
 
+    // --class-rank and --sort-key are mutually exclusive (also enforced in core).
+    if args.class_rank.is_some() && args.sort_key.is_some() {
+        anyhow::bail!("--class-rank and --sort-key are mutually exclusive");
+    }
+    let class_ranking = match &args.class_rank {
+        Some(spec) => Some(parse_class_rank(spec)?),
+        None => None,
+    };
+
     let options = ConvertOptions {
         mode,
         levels,
         assign,
         sort_key: args.sort_key.clone(),
+        class_ranking,
+        no_auto_rank: args.no_auto_rank,
         simplify: SimplifyOptions {
             factor: args.simplify_factor,
             collapse: args.collapse,
@@ -947,6 +972,56 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse a `--class-rank` spec: `COLUMN:VALUE=RANK,VALUE=RANK,...`.
+///
+/// `unknown_rank` (the priority for present-but-unlisted values) is derived as
+/// `min(listed ranks) - 1.0`, so unknown classes always lose to every listed
+/// value while still beating null/missing values (which lose to any rank).
+fn parse_class_rank(spec: &str) -> Result<gpq_tiles_core::overview::convert::ClassRanking> {
+    use gpq_tiles_core::overview::convert::ClassRanking;
+
+    let (column, rest) = spec.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid --class-rank '{spec}': expected COLUMN:VALUE=RANK,... (missing ':')"
+        )
+    })?;
+    let column = column.trim();
+    if column.is_empty() {
+        anyhow::bail!("invalid --class-rank '{spec}': empty column name");
+    }
+
+    let mut ranks: Vec<(String, f64)> = Vec::new();
+    for pair in rest.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (value, rank) = pair.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid --class-rank entry '{pair}': expected VALUE=RANK")
+        })?;
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!("invalid --class-rank entry '{pair}': empty value");
+        }
+        let rank: f64 = rank
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid rank in '{pair}': {e}"))?;
+        ranks.push((value.to_string(), rank));
+    }
+    if ranks.is_empty() {
+        anyhow::bail!("invalid --class-rank '{spec}': no VALUE=RANK entries");
+    }
+
+    // Unknown values must lose to every named class but beat nulls.
+    let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
+    Ok(ClassRanking {
+        column: column.to_string(),
+        ranks,
+        unknown_rank: min_rank - 1.0,
+    })
 }
 
 /// Run `gpq-tiles validate`: check a GeoParquet overview file (spec §6.2).

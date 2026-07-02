@@ -24,12 +24,14 @@
 //! This is the correctness-first, in-memory implementation. Memory is
 //! `O(dataset)`; the bounded-memory streaming pipeline is a later task.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
 use geo::{BoundingRect, Geometry};
@@ -42,7 +44,9 @@ use serde::Serialize;
 use crate::batch_processor::extract_geometries_from_array;
 
 use super::assign::{assign_levels, AssignConfig, AssignFeature, FeatureKind};
-use super::level::{gsd as gsd_for_zoom, Crs, Generalization, GeneralizationLevel, Mode};
+use super::level::{
+    gsd as gsd_for_zoom, Crs, Generalization, GeneralizationLevel, Mode, RankingProvenance,
+};
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, WriterError, LEVEL_COLUMN};
 
@@ -104,6 +108,113 @@ impl LevelPlan {
     }
 }
 
+/// A categorical (class-aware) cell-winner ranking (Q1, tier 1 / tier 3).
+///
+/// Maps the string values of a column to numeric priorities. Higher priority
+/// **wins** a grid cell — matching [`assign`](super::assign)'s default
+/// `SortDirection::Desc` (larger `sort_key` wins). A feature whose column value
+/// is present but not in [`ranks`](ClassRanking::ranks) is assigned
+/// [`unknown_rank`](ClassRanking::unknown_rank), which — as long as it is below
+/// every named rank — **loses to all named classes but still beats a
+/// null/missing value** (nulls encode as `None`, which loses to any `Some` in
+/// the priority order).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassRanking {
+    /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
+    pub column: String,
+    /// `(value, priority)` pairs; higher priority wins the cell. Order is
+    /// irrelevant (looked up by value).
+    pub ranks: Vec<(String, f64)>,
+    /// Priority for a present-but-unranked value. Set below every named rank so
+    /// unknown classes lose to known ones but beat nulls.
+    pub unknown_rank: f64,
+}
+
+/// Upper bound on how many `(value, priority)` pairs are echoed into the
+/// footer provenance block (§3.5). Larger maps record only the mode + column.
+const MAX_PROVENANCE_RANKS: usize = 64;
+
+/// Built-in Overture transportation `class` ranking (Q1, tier 3 auto-detect).
+///
+/// Spine (highest→lowest, always holds): motorway > trunk > primary >
+/// secondary > tertiary > residential > unclassified > service. Below service
+/// come the remaining pedestrian/minor classes, then everything unrecognized
+/// (rail classes, the literal `unknown`, driveways, …) falls to
+/// [`unknown_rank`](ClassRanking::unknown_rank).
+pub fn overture_road_ranking(column: String) -> ClassRanking {
+    // Descending priorities; spine first (see doc comment), then the tail.
+    let ordered = [
+        "motorway", // spine
+        "trunk",
+        "primary",
+        "secondary",
+        "tertiary",
+        "residential",
+        "unclassified",
+        "service",
+        "living_street", // tail (all below service)
+        "pedestrian",
+        "track",
+        "cycleway",
+        "bridleway",
+        "footway",
+        "steps",
+        "path",
+        "driveway",
+        "parking_aisle",
+    ];
+    let n = ordered.len();
+    let ranks = ordered
+        .iter()
+        .enumerate()
+        // Highest priority for the first entry; all strictly positive so every
+        // named class beats unknown_rank (0.0).
+        .map(|(i, &c)| (c.to_string(), (n - i) as f64))
+        .collect();
+    ClassRanking {
+        column,
+        ranks,
+        unknown_rank: 0.0,
+    }
+}
+
+/// Known Overture transportation `class` / `road_class` vocabulary, used only to
+/// decide whether an auto-detected `class`/`road_class` column is *actually* a
+/// road-class column (overlap gate). Includes rail/pedestrian values that the
+/// ranking itself leaves at `unknown_rank`.
+const KNOWN_ROAD_CLASSES: &[&str] = &[
+    "motorway",
+    "trunk",
+    "primary",
+    "secondary",
+    "tertiary",
+    "residential",
+    "unclassified",
+    "service",
+    "living_street",
+    "pedestrian",
+    "track",
+    "cycleway",
+    "bridleway",
+    "footway",
+    "steps",
+    "path",
+    "driveway",
+    "parking_aisle",
+    "unknown",
+    // rail subtype classes (present in Overture transportation extracts)
+    "standard_gauge",
+    "light_rail",
+    "tram",
+    "subway",
+    "monorail",
+    "funicular",
+];
+
+/// Minimum number of *distinct* known road classes a candidate column must
+/// contain before auto-detection treats it as Overture roads.
+const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
+
 /// Options for [`convert_to_overviews`].
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
@@ -113,8 +224,15 @@ pub struct ConvertOptions {
     pub levels: LevelPlan,
     /// Thinning / visibility / sort configuration for level assignment.
     pub assign: AssignConfig,
-    /// Optional column name whose value is used as the cell-winner sort key.
+    /// Optional column name whose (numeric) value is used as the cell-winner
+    /// sort key. Mutually exclusive with [`class_ranking`](Self::class_ranking).
     pub sort_key: Option<String>,
+    /// Optional explicit categorical class ranking (Q1 tier 1). Mutually
+    /// exclusive with [`sort_key`](Self::sort_key).
+    pub class_ranking: Option<ClassRanking>,
+    /// Disable tier-3 auto-detection of well-known schemas (Overture roads /
+    /// places confidence). No effect when `sort_key` or `class_ranking` is set.
+    pub no_auto_rank: bool,
     /// Per-level simplification options (duplicating mode only).
     pub simplify: SimplifyOptions,
     /// Emit the optional COGP compatibility footer key (§3.1). Default `false`.
@@ -133,6 +251,8 @@ impl Default for ConvertOptions {
             },
             assign: AssignConfig::default(),
             sort_key: None,
+            class_ranking: None,
+            no_auto_rank: false,
             simplify: SimplifyOptions::default(),
             cogp_compat_key: false,
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
@@ -214,6 +334,23 @@ pub enum ConvertError {
         /// The requested column name.
         name: String,
     },
+    /// Both a numeric sort key and a categorical class ranking were supplied.
+    #[error("--sort-key and --class-rank are mutually exclusive; supply at most one")]
+    RankingConflict,
+    /// The `--class-rank` column is not present in the input schema.
+    #[error("class-rank column {name:?} not found in input schema")]
+    ClassRankColumnMissing {
+        /// The requested column name.
+        name: String,
+    },
+    /// The `--class-rank` column is not a string (Utf8/LargeUtf8) column.
+    #[error("class-rank column {name:?} is {data_type} but must be a string column")]
+    ClassRankColumnNotString {
+        /// The requested column name.
+        name: String,
+        /// The actual Arrow data type found.
+        data_type: String,
+    },
     /// The level plan is invalid (empty / non-monotonic / bad zoom range).
     #[error("invalid level specification: {0}")]
     InvalidLevels(String),
@@ -234,6 +371,12 @@ pub fn convert_to_overviews(
     let start = Instant::now();
     let input_path = input_path.as_ref();
     let output_path = output_path.as_ref();
+
+    // A numeric sort key and a categorical class ranking are mutually
+    // exclusive (Q1): they would both drive `AssignFeature::sort_key`.
+    if options.sort_key.is_some() && options.class_ranking.is_some() {
+        return Err(ConvertError::RankingConflict);
+    }
 
     // --- CRS detection + rejection (spec Q3). --------------------------------
     let crs = detect_crs(input_path)?;
@@ -273,16 +416,11 @@ pub fn convert_to_overviews(
     let mut geometries: Vec<Geometry<f64>> = Vec::with_capacity(num_features);
     extract_geometries_from_array(geom_array.as_ref(), &mut geometries)?;
 
-    // Optional sort-key column.
-    let sort_keys: Vec<Option<f64>> = match &options.sort_key {
-        None => vec![None; num_features],
-        Some(name) => {
-            let idx = input_schema
-                .index_of(name)
-                .map_err(|_| ConvertError::SortKeyColumnMissing { name: name.clone() })?;
-            extract_sort_keys(full.column(idx))
-        }
-    };
+    // Resolve the cell-winner ranking (Q1): explicit sort key / explicit class
+    // ranking / auto-detected well-known schema / size fallback. Returns the
+    // per-feature sort keys and the provenance recorded in the footer (§3.5).
+    let (sort_keys, ranking_provenance) =
+        resolve_ranking(&input_schema, &full, &geometries, options)?;
 
     // --- Level assignment. ---------------------------------------------------
     let level_specs = options.levels.resolve()?;
@@ -381,7 +519,12 @@ pub fn convert_to_overviews(
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
     writer_opts.cogp_compat_key = options.cogp_compat_key;
-    writer_opts.generalization = Some(build_generalization(&emitted_gsds, crs, options));
+    writer_opts.generalization = Some(build_generalization(
+        &emitted_gsds,
+        crs,
+        options,
+        ranking_provenance,
+    ));
 
     let mut writer = OverviewWriter::create(output_path, &source_schema, writer_opts)?;
 
@@ -601,7 +744,12 @@ fn build_level_batch(
 }
 
 /// Build informative generalization provenance (§3.5) from the emitted gsds.
-fn build_generalization(gsds: &[f64], _crs: Crs, options: &ConvertOptions) -> Generalization {
+fn build_generalization(
+    gsds: &[f64],
+    _crs: Crs,
+    options: &ConvertOptions,
+    ranking: RankingProvenance,
+) -> Generalization {
     let levels = gsds
         .iter()
         .map(|&gsd_m| GeneralizationLevel {
@@ -617,7 +765,246 @@ fn build_generalization(gsds: &[f64], _crs: Crs, options: &ConvertOptions) -> Ge
     Generalization {
         engine: format!("gpq-tiles {}", env!("CARGO_PKG_VERSION")),
         levels,
+        ranking: Some(ranking),
     }
+}
+
+/// Resolve the cell-winner ranking for a conversion (Q1). Returns per-feature
+/// sort keys (parallel to `full`'s rows / `geometries`) plus the provenance
+/// block (§3.5). Tiers, in priority order:
+///
+/// 1. explicit numeric `--sort-key`;
+/// 2. explicit categorical `class_ranking`;
+/// 3. auto-detected Overture roads (`road_class`/`class`) or places
+///    (`confidence`, points only) — unless `no_auto_rank`;
+/// 4. `size-fallback` (no keys; assignment ranks by bbox diagonal + hash).
+///
+/// The chosen tier is logged (`log::info!`) so corpus runs show what happened.
+fn resolve_ranking(
+    input_schema: &Schema,
+    full: &RecordBatch,
+    geometries: &[Geometry<f64>],
+    options: &ConvertOptions,
+) -> Result<(Vec<Option<f64>>, RankingProvenance), ConvertError> {
+    let n = full.num_rows();
+
+    // Tier 1a: explicit numeric --sort-key.
+    if let Some(name) = &options.sort_key {
+        let idx = input_schema
+            .index_of(name)
+            .map_err(|_| ConvertError::SortKeyColumnMissing { name: name.clone() })?;
+        let keys = extract_sort_keys(full.column(idx));
+        log::info!("overview ranking: explicit numeric sort-key column {name:?}");
+        return Ok((
+            keys,
+            RankingProvenance {
+                mode: "explicit-sort-key".to_string(),
+                column: Some(name.clone()),
+                ranks: None,
+                unknown_rank: None,
+            },
+        ));
+    }
+
+    // Tier 1b: explicit categorical class ranking.
+    if let Some(cr) = &options.class_ranking {
+        let idx = input_schema.index_of(&cr.column).map_err(|_| {
+            ConvertError::ClassRankColumnMissing {
+                name: cr.column.clone(),
+            }
+        })?;
+        let keys = extract_class_ranks(full.column(idx), cr)?;
+        log::info!(
+            "overview ranking: explicit class-ranking on column {:?} ({} named classes, unknown_rank={})",
+            cr.column,
+            cr.ranks.len(),
+            cr.unknown_rank
+        );
+        return Ok((keys, class_ranking_provenance("class-ranking", cr)));
+    }
+
+    // Tier 3: auto-detection of well-known schemas.
+    if !options.no_auto_rank {
+        // Overture transportation road classes.
+        if let Some((idx, col_name)) = find_road_class_column(input_schema, full) {
+            let cr = overture_road_ranking(col_name.clone());
+            let keys = extract_class_ranks(full.column(idx), &cr)?;
+            log::info!(
+                "overview ranking: auto-detected Overture road classes in column {col_name:?}; \
+                 applying built-in ranking (motorway > … > service > tail)"
+            );
+            return Ok((keys, class_ranking_provenance("auto-overture-roads", &cr)));
+        }
+        // Overture places confidence (numeric, point datasets only).
+        if let Some((idx, col_name)) = find_confidence_column(input_schema, geometries) {
+            let keys = extract_sort_keys(full.column(idx));
+            log::info!(
+                "overview ranking: auto-detected Overture places confidence column {col_name:?} \
+                 (numeric point ranking)"
+            );
+            return Ok((
+                keys,
+                RankingProvenance {
+                    mode: "auto-confidence".to_string(),
+                    column: Some(col_name),
+                    ranks: None,
+                    unknown_rank: None,
+                },
+            ));
+        }
+    }
+
+    // Fallback: size (bbox diagonal) + deterministic hash (existing behavior).
+    log::info!(
+        "overview ranking: no sort key specified or auto-detected; using size + \
+         deterministic-hash fallback"
+    );
+    Ok((
+        vec![None; n],
+        RankingProvenance {
+            mode: "size-fallback".to_string(),
+            column: None,
+            ranks: None,
+            unknown_rank: None,
+        },
+    ))
+}
+
+/// Provenance for a categorical class ranking, echoing the map when small.
+fn class_ranking_provenance(mode: &str, cr: &ClassRanking) -> RankingProvenance {
+    let ranks = if cr.ranks.len() <= MAX_PROVENANCE_RANKS {
+        Some(cr.ranks.clone())
+    } else {
+        None
+    };
+    RankingProvenance {
+        mode: mode.to_string(),
+        column: Some(cr.column.clone()),
+        ranks,
+        unknown_rank: Some(cr.unknown_rank),
+    }
+}
+
+/// Map each row's string value to its class priority. Null values → `None`
+/// (they lose to every ranked feature). A present-but-unranked value maps to
+/// [`ClassRanking::unknown_rank`].
+fn extract_class_ranks(
+    col: &dyn Array,
+    ranking: &ClassRanking,
+) -> Result<Vec<Option<f64>>, ConvertError> {
+    use arrow_array::cast::AsArray;
+
+    let map: HashMap<&str, f64> = ranking
+        .ranks
+        .iter()
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+    let n = col.len();
+
+    macro_rules! collect_str {
+        ($arr:expr) => {{
+            let a = $arr;
+            (0..n)
+                .map(|i| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(*map.get(a.value(i)).unwrap_or(&ranking.unknown_rank))
+                    }
+                })
+                .collect()
+        }};
+    }
+
+    match col.data_type() {
+        DataType::Utf8 => Ok(collect_str!(col.as_string::<i32>())),
+        DataType::LargeUtf8 => Ok(collect_str!(col.as_string::<i64>())),
+        other => Err(ConvertError::ClassRankColumnNotString {
+            name: ranking.column.clone(),
+            data_type: format!("{other:?}"),
+        }),
+    }
+}
+
+/// Auto-detect an Overture road-class column: a Utf8/LargeUtf8 column named
+/// `road_class` or `class` (case-insensitive) whose values overlap the known
+/// transportation vocabulary by at least [`ROAD_VOCAB_MIN_DISTINCT`] distinct
+/// classes. Returns `(column index, column name)`.
+fn find_road_class_column(schema: &Schema, full: &RecordBatch) -> Option<(usize, String)> {
+    for (idx, f) in schema.fields().iter().enumerate() {
+        let lname = f.name().to_ascii_lowercase();
+        if lname != "road_class" && lname != "class" {
+            continue;
+        }
+        if !matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            continue;
+        }
+        if column_overlaps_road_vocab(full.column(idx)) {
+            return Some((idx, f.name().clone()));
+        }
+    }
+    None
+}
+
+/// True if the string column contains at least [`ROAD_VOCAB_MIN_DISTINCT`]
+/// distinct values from [`KNOWN_ROAD_CLASSES`].
+fn column_overlaps_road_vocab(col: &dyn Array) -> bool {
+    use arrow_array::cast::AsArray;
+
+    let vocab: HashSet<&str> = KNOWN_ROAD_CLASSES.iter().copied().collect();
+    let mut found: HashSet<&str> = HashSet::new();
+
+    macro_rules! scan {
+        ($arr:expr) => {{
+            let a = $arr;
+            for i in 0..a.len() {
+                if a.is_null(i) {
+                    continue;
+                }
+                if let Some(&hit) = vocab.get(a.value(i)) {
+                    found.insert(hit);
+                    if found.len() >= ROAD_VOCAB_MIN_DISTINCT {
+                        return true;
+                    }
+                }
+            }
+        }};
+    }
+
+    match col.data_type() {
+        DataType::Utf8 => scan!(col.as_string::<i32>()),
+        DataType::LargeUtf8 => scan!(col.as_string::<i64>()),
+        _ => return false,
+    }
+    found.len() >= ROAD_VOCAB_MIN_DISTINCT
+}
+
+/// Auto-detect an Overture places `confidence` column: a Float32/Float64 column
+/// named `confidence` (case-insensitive), applied only when the dataset is
+/// predominantly points. Returns `(column index, column name)`.
+fn find_confidence_column(
+    schema: &Schema,
+    geometries: &[Geometry<f64>],
+) -> Option<(usize, String)> {
+    if geometries.is_empty() {
+        return None;
+    }
+    let points = geometries
+        .iter()
+        .filter(|g| matches!(feature_kind(g), FeatureKind::Point))
+        .count();
+    // Require a point majority; confidence ranking is a points convention.
+    if points * 2 < geometries.len() {
+        return None;
+    }
+    for (idx, f) in schema.fields().iter().enumerate() {
+        if f.name().eq_ignore_ascii_case("confidence")
+            && matches!(f.data_type(), DataType::Float32 | DataType::Float64)
+        {
+            return Some((idx, f.name().clone()));
+        }
+    }
+    None
 }
 
 /// Fill each level report's byte sizes by summing its row-group band from the
@@ -1011,6 +1398,346 @@ mod tests {
             matches!(err, ConvertError::LevelColumnPresent),
             "expected LevelColumnPresent, got {err:?}"
         );
+    }
+
+    /// Write a GeoParquet file with `id` (Int64) + `road_class` (Utf8) +
+    /// geometry, for the class-ranking tests. Uses the default (WGS84) CRS.
+    fn write_class_input(path: &Path, geoms: &[Geometry<f64>], classes: &[Option<&str>]) {
+        let n = geoms.len();
+        assert_eq!(n, classes.len());
+        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+        let class = StringArray::from(classes.to_vec());
+        let geom_arr = build_geometry_array(geoms);
+        let geom_field = geom_arr.data_type().to_field("geometry", true);
+
+        let fields = vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(Field::new("road_class", DataType::Utf8, true)),
+            Arc::new(geom_field),
+        ];
+        let columns: Vec<Arc<dyn Array>> =
+            vec![Arc::new(id), Arc::new(class), geom_arr.to_array_ref()];
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+        let gpq_options = GeoParquetWriterOptionsBuilder::default()
+            .set_encoding(GeoParquetWriterEncoding::WKB)
+            .set_generate_covering(true)
+            .build();
+        let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+        let target_schema = encoder.target_schema();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, target_schema, None).unwrap();
+        let mut encoder = encoder;
+        let encoded = encoder.encode_record_batch(&batch).unwrap();
+        writer.write(&encoded).unwrap();
+        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+        writer.close().unwrap();
+    }
+
+    /// Coarsest (min) level each `id` appears at, scanned across all levels.
+    fn min_level_by_id(reader: &OverviewReader) -> std::collections::HashMap<i64, usize> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        let mut out: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for level in 0..reader.num_levels() {
+            let rdr = reader.read_level(level, None).unwrap();
+            for batch in rdr {
+                let batch = batch.unwrap();
+                let ids = batch
+                    .column(batch.schema().index_of("id").unwrap())
+                    .as_primitive::<Int64Type>()
+                    .clone();
+                for i in 0..batch.num_rows() {
+                    let id = ids.value(i);
+                    out.entry(id)
+                        .and_modify(|l| *l = (*l).min(level))
+                        .or_insert(level);
+                }
+            }
+        }
+        out
+    }
+
+    // --- Q1 class-ranking unit tests ----------------------------------------
+
+    #[test]
+    fn class_rank_maps_named_unknown_null() {
+        // named → its rank; present-but-unlisted → unknown_rank; null → None.
+        let col = StringArray::from(vec![
+            Some("motorway"),
+            Some("driveway"), // unlisted → unknown_rank
+            None,             // null → None
+        ]);
+        let ranking = ClassRanking {
+            column: "road_class".to_string(),
+            ranks: vec![("motorway".to_string(), 5.0)],
+            unknown_rank: 0.0,
+        };
+        let keys = extract_class_ranks(&col, &ranking).unwrap();
+        assert_eq!(keys, vec![Some(5.0), Some(0.0), None]);
+    }
+
+    #[test]
+    fn class_rank_rejects_non_string_column() {
+        let col = Float64Array::from(vec![1.0, 2.0]);
+        let ranking = ClassRanking {
+            column: "road_class".to_string(),
+            ranks: vec![("x".to_string(), 1.0)],
+            unknown_rank: 0.0,
+        };
+        let err = extract_class_ranks(&col, &ranking).unwrap_err();
+        assert!(matches!(err, ConvertError::ClassRankColumnNotString { .. }));
+    }
+
+    #[test]
+    fn overture_road_ranking_spine_is_ordered() {
+        let cr = overture_road_ranking("road_class".to_string());
+        let rank = |v: &str| -> f64 {
+            cr.ranks
+                .iter()
+                .find(|(k, _)| k == v)
+                .map(|(_, r)| *r)
+                .unwrap()
+        };
+        // Spine strictly descending.
+        let spine = [
+            "motorway",
+            "trunk",
+            "primary",
+            "secondary",
+            "tertiary",
+            "residential",
+            "unclassified",
+            "service",
+        ];
+        for w in spine.windows(2) {
+            assert!(rank(w[0]) > rank(w[1]), "{} !> {}", w[0], w[1]);
+        }
+        // Tail classes all rank below service, above unknown_rank.
+        for tail in ["living_street", "footway", "path", "cycleway", "track"] {
+            assert!(rank(tail) < rank("service"), "{tail} !< service");
+            assert!(rank(tail) > cr.unknown_rank, "{tail} !> unknown");
+        }
+        // Rail / literal-unknown are not named → fall to unknown_rank.
+        assert!(cr.ranks.iter().all(|(k, _)| k != "standard_gauge"));
+    }
+
+    // --- Q1 mutual-exclusion + auto-detection tests -------------------------
+
+    #[test]
+    fn sort_key_and_class_ranking_conflict() {
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            sort_key: Some("rank".to_string()),
+            class_ranking: Some(ClassRanking {
+                column: "road_class".to_string(),
+                ranks: vec![("motorway".to_string(), 1.0)],
+                unknown_rank: 0.0,
+            }),
+            ..Default::default()
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+        assert!(matches!(err, ConvertError::RankingConflict));
+    }
+
+    /// Lines with 5+ distinct Overture road classes, spread apart so each wins
+    /// its own coarse cell — used to exercise auto-detection provenance.
+    fn overture_line_geoms() -> (Vec<Geometry<f64>>, Vec<Option<&'static str>>) {
+        let classes = [
+            "motorway",
+            "trunk",
+            "primary",
+            "residential",
+            "footway",
+            "service",
+        ];
+        let mut geoms = Vec::new();
+        let mut cls = Vec::new();
+        for (i, c) in classes.iter().enumerate() {
+            let base = i as f64 * 2.0; // far apart → distinct cells
+            let ls = LineString::from(vec![(base, 0.0), (base + 0.5, 0.3)]);
+            geoms.push(Geometry::LineString(ls));
+            cls.push(Some(*c));
+        }
+        (geoms, cls)
+    }
+
+    fn ranking_mode_of(path: &Path) -> String {
+        let reader = OverviewReader::open(path).unwrap();
+        reader
+            .meta()
+            .generalization
+            .as_ref()
+            .unwrap()
+            .ranking
+            .as_ref()
+            .unwrap()
+            .mode
+            .clone()
+    }
+
+    #[test]
+    fn auto_detect_overture_roads_triggers() {
+        let (geoms, classes) = overture_line_geoms();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_class_input(tin.path(), &geoms, &classes);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(ranking_mode_of(tout.path()), "auto-overture-roads");
+    }
+
+    #[test]
+    fn auto_detect_disabled_falls_back_to_size() {
+        let (geoms, classes) = overture_line_geoms();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_class_input(tin.path(), &geoms, &classes);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            no_auto_rank: true,
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(ranking_mode_of(tout.path()), "size-fallback");
+    }
+
+    #[test]
+    fn auto_detect_non_trigger_without_class_column() {
+        // synthetic_geometries has no road_class column → size fallback.
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions::default();
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(ranking_mode_of(tout.path()), "size-fallback");
+    }
+
+    #[test]
+    fn class_rank_provenance_recorded() {
+        let (geoms, classes) = overture_line_geoms();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_class_input(tin.path(), &geoms, &classes);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            class_ranking: Some(ClassRanking {
+                column: "road_class".to_string(),
+                ranks: vec![("motorway".to_string(), 5.0), ("footway".to_string(), 1.0)],
+                unknown_rank: 0.0,
+            }),
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let r = reader
+            .meta()
+            .generalization
+            .as_ref()
+            .unwrap()
+            .ranking
+            .clone()
+            .unwrap();
+        assert_eq!(r.mode, "class-ranking");
+        assert_eq!(r.column.as_deref(), Some("road_class"));
+        assert_eq!(r.ranks.unwrap().len(), 2);
+        assert_eq!(r.unknown_rank, Some(0.0));
+    }
+
+    // --- Q1 regression: high class beats larger low class in a shared cell ---
+
+    #[test]
+    fn high_class_small_feature_wins_coarse_cell() {
+        // Two lines sharing one coarse cell. The high-class line is SMALLER
+        // (shorter bbox diagonal) than the low-class line. Under size-only
+        // ranking the big low-class line would win the coarse level; with class
+        // ranking the small high-class line must win it (coarser min_level).
+        // Both clear the level-0 line visibility gate.
+        //
+        // 4326 units. gsd(4) ≈ 2445.98 m ⇒ 0.02197°; line gate = 2·gsd ⇒
+        // 0.04394°; cell size = 2·gsd ⇒ 0.04394°. Both bboxes centered at
+        // (0.02, 0.01) ⇒ same cell (0,0).
+        let big_low = Geometry::LineString(LineString::from(vec![
+            (-0.03, -0.04),
+            (0.07, 0.06), // diag ≈ 0.1414° (well over gate), larger
+        ]));
+        let small_high = Geometry::LineString(LineString::from(vec![
+            (0.0, 0.0),
+            (0.04, 0.02), // diag ≈ 0.0447° (just over gate), smaller
+        ]));
+        let geoms = vec![big_low, small_high];
+        let classes = vec![Some("footway"), Some("motorway")];
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+
+        // Baseline: size-fallback → the BIG low-class line (id 0) wins coarse.
+        {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_class_input(tin.path(), &geoms, &classes);
+            let opts = ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 4,
+                    max_zoom: 10,
+                },
+                no_auto_rank: true, // force size fallback
+                ..Default::default()
+            };
+            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            let ml = min_level_by_id(&reader);
+            assert!(
+                ml[&0] < ml[&1],
+                "size fallback: big low-class (id0) should win coarse, got {ml:?}"
+            );
+        }
+
+        // Class ranking: the SMALL high-class line (id 1) wins the coarse cell.
+        {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_class_input(tin.path(), &geoms, &classes);
+            let opts = ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 4,
+                    max_zoom: 10,
+                },
+                class_ranking: Some(ClassRanking {
+                    column: "road_class".to_string(),
+                    ranks: vec![("motorway".to_string(), 5.0), ("footway".to_string(), 1.0)],
+                    unknown_rank: 0.0,
+                }),
+                ..Default::default()
+            };
+            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            let ml = min_level_by_id(&reader);
+            assert!(
+                ml[&1] < ml[&0],
+                "class ranking: small high-class (id1) must win coarse, got {ml:?}"
+            );
+            assert_eq!(ml[&1], 0, "high-class line should reach the coarsest level");
+        }
     }
 
     #[test]
