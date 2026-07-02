@@ -81,7 +81,7 @@ cell_size = thinning_factor * gsd(level)          (in the CRS's units)
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
 | `--point-thinning` | `4.0` | × GSD (cell size) | **bigger = sparser** |
-| `--line-thinning` | `2.0` | × GSD (cell size) | **bigger = sparser** |
+| `--line-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
 | `--polygon-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
 
 Bigger factor ⇒ bigger cells ⇒ fewer cells ⇒ fewer survivors ⇒ **sparser**
@@ -93,8 +93,10 @@ This is the opposite of "turn it up to get more." If your coarse roads look too
 empty, **lower** `--line-thinning`, don't raise it.
 
 The defaults are class-aware: points thin hardest (4.0, they clutter fastest),
-lines moderately (2.0), polygons least (1.0, they tile space rather than
-cluster). The factor multiplies the GSD, so it stacks with `--gsd-base`: doubling
+lines and polygons least (1.0). The line default was retuned 2.0 → 1.0 after
+the 2026-07-02 Portland roads sweep (`corpus/SWEEP_NOTES.md`): at 1.0, road
+networks stay visibly more continuous at coarse zooms, and the true-scale
+renders showed the extra density costs little legibility. The factor multiplies the GSD, so it stacks with `--gsd-base`: doubling
 `--gsd-base` halves the GSD, which halves the cell size for the same factor.
 
 ---

@@ -128,8 +128,12 @@ impl AssignFeature {
 
 /// Thinning / visibility / sort configuration.
 ///
-/// Defaults match the spec/cogp-rs reference: point thinning 4, line 2,
-/// polygon 1; line visibility 2, polygon 4; sort descending.
+/// Defaults: point thinning 4, line 1, polygon 1; line visibility 2,
+/// polygon 4; sort descending. Point/polygon match the cogp-rs
+/// reference; line thinning was retuned 2.0 → 1.0 after the 2026-07-02
+/// Portland-roads parameter sweep (corpus/SWEEP_NOTES.md): lt=1 keeps
+/// road networks visibly more continuous at coarse zooms, chosen by
+/// maintainer review of the true-scale sweep renders.
 #[derive(Debug, Clone, Copy)]
 pub struct AssignConfig {
     /// Grid-cell multiplier for points (coarser grid ⇒ more aggressive thin).
@@ -151,7 +155,7 @@ impl Default for AssignConfig {
     fn default() -> Self {
         Self {
             point_thinning: 4.0,
-            line_thinning: 2.0,
+            line_thinning: 1.0,
             polygon_thinning: 1.0,
             line_visibility: 2.0,
             polygon_visibility: 4.0,

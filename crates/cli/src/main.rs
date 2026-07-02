@@ -180,11 +180,13 @@ struct OverviewArgs {
     #[arg(long, default_value = "4.0")]
     point_thinning: f64,
 
-    /// Line thinning factor: grid cell size = factor * gsd (default 2.0).
+    /// Line thinning factor: grid cell size = factor * gsd (default 1.0).
     ///
     /// BIGGER = SPARSER (fewer lines survive per level), SMALLER = denser.
-    /// See --point-thinning; this is the roads/line knob.
-    #[arg(long, default_value = "2.0")]
+    /// See --point-thinning; this is the roads/line knob. Default retuned
+    /// 2.0 -> 1.0 after the Portland sweep (corpus/SWEEP_NOTES.md): 1.0
+    /// keeps road networks visibly more continuous at coarse zooms.
+    #[arg(long, default_value = "1.0")]
     line_thinning: f64,
 
     /// Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
