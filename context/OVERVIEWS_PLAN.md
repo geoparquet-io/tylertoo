@@ -192,10 +192,46 @@ item stays under budget (dhat/heaptrack test).
 12m04s / 5.5 GB peak RSS in the in-memory v1. Also revisit wall
 time — likely dominated by per-level decode/rebuild.)
 
-### (V5. Quality ladder — post-launch unless V2 fails)
-Point clustering at coarse levels (clustering.rs), polygon
-coalescing (issue #27/#22 semantics, tippecanoe accumulate-attribute
-conventions), attribute aggregation rules into spec v0.2.
+### V5. Quality ladder (REVISED 2026-07-02 after early V2 renders:
+mid/fine zooms good; coarse-zoom line networks fragment. Waves
+below; each ends with partial re-render + human eyeball gate.)
+
+Dependency graph:
+```
+Q1 class priority ──┬─→ Q2 density budgets ──┐
+                    └─→ Q3 line coalescing   ├─→ Q5 polygon coalescing
+Q6 aggregation semantics ─→ Q4 point clustering ┘
+```
+
+- **Q1 (Wave 1, NOW): class-aware priority.** Ranking tiers:
+  (1) user-named rank column / categorical mapping;
+  (2) fallback: size (bbox diag), then deterministic hash
+  (fair random — tippecanoe-like) — already implemented;
+  (3) auto-detect well-known schemas (Overture roads `class`,
+  Overture places `confidence`). Record ranking used in the
+  footer `generalization` provenance block. Gate: Portland/Boise
+  roads coarse renders.
+- **Q2 (Wave 2): density-based budgets** — per-level feature
+  budgets / drop-rates varying with local density (dense areas
+  drop harder), consuming Q1's ranking. Reuse gap_density.rs /
+  sampling.rs concepts. Gate: NYC 458k POIs at z4–z8.
+  ∥ **Q6: aggregation semantics decision** (paper): attributes of
+  merged features — tippecanoe accumulate-attribute conventions,
+  accumulator.rs; spec v0.2 note. Prereq for Q4/Q5.
+- **Q3 (Wave 3): line network coalescing** — glue touching
+  same-class segments into strokes pre-assignment; feeds the
+  existing simplify_coalesced_linestring path. Gate: roads become
+  continuous lines at coarse zooms.
+  ∥ **Q4: point clustering** (clustering.rs; needs Q6). Gate: NYC
+  as graduated dots.
+- **Q5 (Wave 4): polygon coalescing** — merge adjacent small
+  polygons (unary union) when density demands; needs Q6, benefits
+  from Q2; heaviest compute (pairs with V4 streaming). Gate:
+  Moldova coarse levels. May prove unnecessary if Q2 suffices.
+
+V3 benchmarks + E0 export-pmtiles do NOT depend on this ladder —
+start them after Wave 1 passes the eyeball gate; they improve
+automatically as waves land.
 
 ---
 
