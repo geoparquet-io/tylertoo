@@ -308,10 +308,106 @@ def area_km2(extent):
     return max(abs(w * hgt), 1e-6)
 
 
-def run(only=None):
+# ---------------- true-scale (actual on-screen size) ----------------
+#
+# A level with declared Web Mercator zoom z is meant to be *displayed* at that
+# zoom. Our normal renders blow the dataset extent up to a fixed 1600px-wide
+# figure, magnifying coarse levels ~50x beyond their intended display scale —
+# which makes real sparsity indistinguishable from microscope artifacts. The
+# true-scale mode renders the extent at the pixel size it would actually occupy
+# on screen at zoom z: extent_fraction_of_world * 256px * 2^z (capped 1600px).
+
+TRUESCALE_CAP_PX = 1600  # never render larger than this on a side
+TRUESCALE_TINY_PX = 24   # below this, also emit a 4x supersample for legibility
+TRUESCALE_SS = 4         # supersample factor for tiny levels
+
+
+def _merc_world_px(z):
+    return 256.0 * (2.0 ** z)
+
+
+def _merc_project_fn(z):
+    """Return a coord-array transform: (lon,lat) -> Web Mercator pixel at zoom z
+    (world origin top-left, y increasing south). For shapely.transform."""
+    world = _merc_world_px(z)
+
+    def fn(coords):
+        lon = coords[:, 0]
+        lat = np.clip(coords[:, 1], -85.05112878, 85.05112878)
+        x = (lon + 180.0) / 360.0 * world
+        siny = np.sin(np.radians(lat))
+        siny = np.clip(siny, -0.9999, 0.9999)
+        y = (0.5 - np.log((1.0 + siny) / (1.0 - siny)) / (4.0 * math.pi)) * world
+        return np.column_stack([x, y])
+
+    return fn
+
+
+def truescale_px(extent, z):
+    """On-screen (width_px, height_px) of the extent at zoom z, uncapped."""
+    xmin, ymin, xmax, ymax = extent
+    fn = _merc_project_fn(z)
+    corners = fn(np.array([[xmin, ymin], [xmax, ymax]]))
+    w = abs(corners[1, 0] - corners[0, 0])
+    # y grows south, so ymin(lat) -> larger y; height is the span.
+    h = abs(corners[0, 1] - corners[1, 1])
+    return max(w, 1.0), max(h, 1.0)
+
+
+def render_truescale(geoms, kind, extent, z, out_png, supersample=1):
+    """Render `geoms` (lon/lat shapely) at true on-screen scale for zoom z.
+
+    Returns (out_w_px, out_h_px, tiny) where `tiny` is True when the natural
+    size is below TRUESCALE_TINY_PX on both sides (caller emits a supersample).
+    Coordinates are projected to Web Mercator pixels so shapes are correct and
+    the figure's pixel dimensions equal the true display size (× supersample).
+    """
+    w_px, h_px = truescale_px(extent, z)
+    tiny = max(w_px, h_px) < TRUESCALE_TINY_PX
+    # Cap the long side at TRUESCALE_CAP_PX, preserving aspect.
+    scale = min(1.0, TRUESCALE_CAP_PX / max(w_px, h_px))
+    out_w = max(w_px * scale, 1.0)
+    out_h = max(h_px * scale, 1.0)
+
+    fn = _merc_project_fn(z)
+    proj = shapely.transform(geoms, fn) if len(geoms) else geoms
+    xmin, ymin, xmax, ymax = extent
+    c = fn(np.array([[xmin, ymin], [xmax, ymax]]))
+    x0, x1 = min(c[0, 0], c[1, 0]), max(c[0, 0], c[1, 0])
+    y_bottom, y_top = max(c[0, 1], c[1, 1]), min(c[0, 1], c[1, 1])
+
+    dpi = DPI * supersample
+    fig, ax = plt.subplots(figsize=(out_w / DPI, out_h / DPI), dpi=dpi)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y_bottom, y_top)  # y_bottom > y_top => north up
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    drawn = plot_geoms(ax, proj, kind)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.savefig(out_png, dpi=dpi, facecolor="white")
+    plt.close(fig)
+    return int(round(out_w * supersample)), int(round(out_h * supersample)), tiny, drawn
+
+
+def _truescale_pair(geoms, kind, extent, z, out_base):
+    """Render one true-scale PNG (and, when the natural size is tiny, a 4x
+    supersampled companion). Returns (png_relpath, ss_relpath_or_None, w, h)."""
+    png = f"{out_base}.png"
+    w, h, tiny, _ = render_truescale(geoms, kind, extent, z, png, supersample=1)
+    ss_rel = None
+    if tiny:
+        ss = f"{out_base}.4x.png"
+        render_truescale(geoms, kind, extent, z, ss, supersample=TRUESCALE_SS)
+        ss_rel = os.path.relpath(ss, RENDER)
+    return os.path.relpath(png, RENDER), ss_rel, w, h
+
+
+def run(only=None, true_scale=False):
     os.makedirs(RENDER, exist_ok=True)
     metrics = {}  # dataset -> list of level rows
     contact = {}  # dataset -> list of (level, zoom, our_png, tippe_png, fcount, tippe_fcount, drawn)
+    tcontact = {}  # dataset -> list of true-scale rows
 
     dupfiles = sorted(glob.glob(os.path.join(OVR, "*.dup.parquet")))
     for path in dupfiles:
@@ -339,10 +435,14 @@ def run(only=None):
             for (tz, tx, ty) in tiles:
                 tiles_by_z.setdefault(tz, []).append((tx, ty))
             tippe_range = (h["min_zoom"], h["max_zoom"])
-        tippe_cache = {}  # zoom -> (png_path, fcount)
+        # zoom -> dict(mag_png, fcount, skip, ts_png, ts_ss, ts_w, ts_h).
+        # One decode per zoom feeds BOTH the magnified and true-scale panels, so
+        # true-scale never decodes a tippecanoe zoom that magnified mode didn't.
+        tippe_cache = {}
 
         rows = []
         crows = []
+        tcrows = []
         canon_feat = report["levels"][-1]["feature_count"]
         for lv in report["levels"]:
             k = lv["level"]
@@ -351,7 +451,7 @@ def run(only=None):
             vcount = lv["vertex_count"]
             cbytes = lv.get("compressed_bytes", 0)
 
-            # our render
+            # our render (magnified)
             our_png = os.path.join(RENDER, mid, f"level_{k}.png")
             geoms = read_level_geoms(path, geomcol, k)
             fig, ax = make_axes(extent)
@@ -359,19 +459,35 @@ def run(only=None):
             save(fig, our_png)
             print(f"   level {k} z{z}: {fcount} feats (drew {drawn})")
 
+            # our render (true scale)
+            ts_our_png = ts_our_ss = None
+            ts_w = ts_h = None
+            if true_scale:
+                ts_our_png, ts_our_ss, ts_w, ts_h = _truescale_pair(
+                    geoms, kind, extent,
+                    z, os.path.join(RENDER, mid, f"ts_level_{k}"))
+                print(f"      true-scale level {k}: {ts_w}x{ts_h}px"
+                      f"{' (+4x)' if ts_our_ss else ''}")
+
             # tippecanoe render at matching zoom
             tippe_png = None
             tippe_fcount = None
             tippe_skip = None
+            ts_tippe_png = ts_tippe_ss = None
             if have_golden and tippe_range[0] <= z <= tippe_range[1]:
                 if z in tippe_cache:
-                    tippe_png, tippe_fcount, tippe_skip = tippe_cache[z]
+                    c = tippe_cache[z]
+                    tippe_png, tippe_fcount, tippe_skip = (
+                        c["mag_png"], c["fcount"], c["skip"])
+                    ts_tippe_png, ts_tippe_ss = c["ts_png"], c["ts_ss"]
                 else:
                     ntiles = len(tiles_by_z.get(z, []))
                     if ntiles > TILE_CAP:
                         tippe_skip = ntiles
                         print(f"      tippe z{z}: SKIP ({ntiles} tiles > cap)")
-                        tippe_cache[z] = (None, None, ntiles)
+                        tippe_cache[z] = dict(mag_png=None, fcount=None,
+                                              skip=ntiles, ts_png=None,
+                                              ts_ss=None)
                     else:
                         tgeoms, tcnt = decode_zoom(tiles_by_z, h, r, z)
                         tpng = os.path.join(
@@ -380,9 +496,23 @@ def run(only=None):
                         plot_geoms(ax, tgeoms, kind)
                         save(fig, tpng)
                         tippe_png, tippe_fcount = tpng, tcnt
-                        tippe_cache[z] = (tpng, tcnt, None)
+                        if true_scale:
+                            ts_tippe_png, ts_tippe_ss, _, _ = _truescale_pair(
+                                tgeoms, kind, extent, z,
+                                os.path.join(RENDER, mid, f"ts_tippecanoe_z{z}"))
+                        tippe_cache[z] = dict(
+                            mag_png=tpng, fcount=tcnt, skip=None,
+                            ts_png=ts_tippe_png, ts_ss=ts_tippe_ss)
                         print(f"      tippe z{z}: {tcnt} distinct feats "
                               f"({ntiles} tiles)")
+
+            if true_scale:
+                tcrows.append(dict(
+                    level=k, zoom=z, features=fcount, tippe_feat=tippe_fcount,
+                    our_png=ts_our_png, our_ss=ts_our_ss,
+                    tippe_png=ts_tippe_png, tippe_ss=ts_tippe_ss,
+                    w=ts_w, h=ts_h,
+                ))
 
             ratio = None
             if tippe_fcount:
@@ -413,10 +543,14 @@ def run(only=None):
                             have_golden=have_golden, kind=kind,
                             canon_feat=canon_feat)
         contact[mid] = crows
+        if true_scale:
+            tcontact[mid] = tcrows
 
     if not only:
         write_metrics(metrics)
         write_index(contact, metrics)
+        if true_scale:
+            write_truescale(tcontact, metrics)
     return metrics, contact
 
 
@@ -558,8 +692,82 @@ def write_index(contact, metrics):
     print(f"wrote {out}")
 
 
+def write_truescale(tcontact, metrics):
+    """Contact sheet at TRUE display scale: each panel is the size the level
+    would occupy on screen at its zoom (capped 1600px). Tiny panels link to a
+    4x supersample."""
+    out = os.path.join(RENDER, "truescale.html")
+    h = []
+    h.append("<!doctype html><html><head><meta charset='utf-8'>")
+    h.append("<title>gpq-tiles true-scale contact sheet</title>")
+    h.append(
+        "<style>body{font-family:system-ui,sans-serif;margin:24px;"
+        "background:#f7f7f8;color:#111}h1{font-size:22px}"
+        "h2{margin-top:40px;border-bottom:2px solid #ccc;padding-bottom:4px}"
+        ".row{display:flex;gap:24px;align-items:flex-start;margin:14px 0;"
+        "padding:10px;background:#fff;border:1px solid #e0e0e0;border-radius:8px}"
+        ".cell{min-width:120px}.cell img{image-rendering:crisp-edges;"
+        "border:1px solid #ddd;background:#fff}.cap{font-size:12px;color:#444;"
+        "margin:4px 0}.lab{font-weight:600;font-size:13px}"
+        ".meta{font-size:13px;color:#555}.miss{color:#999;font-style:italic;"
+        "padding:20px;text-align:center;border:1px dashed #ccc}"
+        "</style></head><body>"
+    )
+    h.append("<h1>gpq-tiles overviews — true-scale contact sheet</h1>")
+    h.append(
+        "<p class='meta'>Each image is rendered at the pixel size the dataset "
+        "extent actually occupies on screen at that level's Web Mercator zoom "
+        "(<code>extent_fraction_of_world × 256px × 2^z</code>, capped "
+        f"{TRUESCALE_CAP_PX}px). This is the intended display scale — no "
+        "magnification. Left = our level; right = tippecanoe at the matching "
+        "zoom (reusing cached decodes; skipped where not decoded). Panels below "
+        f"{TRUESCALE_TINY_PX}px link to a 4x supersample.</p>"
+    )
+    h.append("<p class='meta'>Datasets: " + " · ".join(
+        f"<a href='#{mid}'>{mid}</a>" for mid in tcontact) + "</p>")
+
+    def panel(lab, png, ss):
+        if not png:
+            return (f"<div class='cell'><div class='lab'>{lab}</div>"
+                    "<div class='miss'>not decoded</div></div>")
+        link_open = f"<a href='{ss}'>" if ss else ""
+        link_close = "</a>" if ss else ""
+        note = " · <a href='%s'>4x</a>" % ss if ss else ""
+        return (f"<div class='cell'><div class='lab'>{lab}</div>"
+                f"{link_open}<img src='{png}' loading='lazy'>{link_close}"
+                f"<div class='cap'>true scale{note}</div></div>")
+
+    for mid, rows in tcontact.items():
+        m = metrics[mid]
+        h.append(f"<h2 id='{mid}'>{mid}</h2>")
+        h.append(
+            f"<p class='meta'>kind: {m['kind']} · extent "
+            f"{m['area_km2']:.0f} km&sup2; · canonical {m['canon_feat']} "
+            f"features · golden: {'yes' if m['have_golden'] else 'MISSING'}</p>"
+        )
+        for cr in rows:
+            dim = (f"{cr['w']}x{cr['h']}px" if cr["w"] else "")
+            h.append("<div class='row'>")
+            h.append(
+                f"<div><div class='lab'>level {cr['level']} (z{cr['zoom']}) "
+                f"· {dim}</div><div class='cap'>{cr['features']:,} features</div>"
+                "</div>")
+            h.append(panel(f"ours z{cr['zoom']}", cr["our_png"], cr["our_ss"]))
+            tlab = (f"tippecanoe z{cr['zoom']}"
+                    + (f" · {cr['tippe_feat']:,} feats"
+                       if cr["tippe_feat"] else ""))
+            h.append(panel(tlab, cr["tippe_png"], cr["tippe_ss"]))
+            h.append("</div>")
+    h.append("</body></html>")
+    open(out, "w").write("\n".join(h))
+    print(f"wrote {out}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", help="render a single dataset id")
+    ap.add_argument("--true-scale", action="store_true",
+                    help="also render each level at true on-screen display "
+                         "scale and write truescale.html")
     args = ap.parse_args()
-    run(only=args.only)
+    run(only=args.only, true_scale=args.true_scale)

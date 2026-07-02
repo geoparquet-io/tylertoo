@@ -45,7 +45,7 @@ use crate::batch_processor::extract_geometries_from_array;
 
 use super::assign::{assign_levels, AssignConfig, AssignFeature, FeatureKind};
 use super::level::{
-    gsd as gsd_for_zoom, Crs, Generalization, GeneralizationLevel, Mode, RankingProvenance,
+    gsd_with_base, Crs, Generalization, GeneralizationLevel, Mode, RankingProvenance, GSD_TILE_BASE,
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, WriterError, LEVEL_COLUMN};
@@ -68,7 +68,12 @@ pub enum LevelPlan {
 
 impl LevelPlan {
     /// Resolve to the coarse→fine list of `(gsd_meters, zoom?)` level specs.
-    fn resolve(&self) -> Result<Vec<(f64, Option<u8>)>, ConvertError> {
+    ///
+    /// `gsd_base` is the GSD tile-band base (spec §5.2 / Q6); it scales the
+    /// per-zoom GSDs of a [`ZoomRange`](LevelPlan::ZoomRange) plan and has no
+    /// effect on an explicit [`Gsds`](LevelPlan::Gsds) plan (those GSDs are
+    /// already in meters).
+    fn resolve(&self, gsd_base: f64) -> Result<Vec<(f64, Option<u8>)>, ConvertError> {
         match self {
             LevelPlan::ZoomRange { min_zoom, max_zoom } => {
                 if min_zoom > max_zoom {
@@ -77,7 +82,7 @@ impl LevelPlan {
                     )));
                 }
                 Ok((*min_zoom..=*max_zoom)
-                    .map(|z| (gsd_for_zoom(z), Some(z)))
+                    .map(|z| (gsd_with_base(z, gsd_base), Some(z)))
                     .collect())
             }
             LevelPlan::Gsds(gsds) => {
@@ -235,6 +240,11 @@ pub struct ConvertOptions {
     pub no_auto_rank: bool,
     /// Per-level simplification options (duplicating mode only).
     pub simplify: SimplifyOptions,
+    /// GSD tile-band base for zoom→GSD derivation (spec §5.2 / Q6; the cogp-rs
+    /// `base` knob). Default [`GSD_TILE_BASE`] (1024). Larger ⇒ smaller GSDs
+    /// (finer detail / less thinning); smaller ⇒ larger GSDs (coarser / more
+    /// thinning). No effect on an explicit [`LevelPlan::Gsds`] plan.
+    pub gsd_base: f64,
     /// Emit the optional COGP compatibility footer key (§3.1). Default `false`.
     pub cogp_compat_key: bool,
     /// Maximum row-group size in rows for the output writer.
@@ -254,6 +264,7 @@ impl Default for ConvertOptions {
             class_ranking: None,
             no_auto_rank: false,
             simplify: SimplifyOptions::default(),
+            gsd_base: GSD_TILE_BASE,
             cogp_compat_key: false,
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
         }
@@ -423,7 +434,7 @@ pub fn convert_to_overviews(
         resolve_ranking(&input_schema, &full, &geometries, options)?;
 
     // --- Level assignment. ---------------------------------------------------
-    let level_specs = options.levels.resolve()?;
+    let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
 
     let features: Vec<AssignFeature> = geometries
@@ -764,6 +775,14 @@ fn build_generalization(
         .collect();
     Generalization {
         engine: format!("gpq-tiles {}", env!("CARGO_PKG_VERSION")),
+        // Only record the base when it deviates from the default: a default run
+        // then produces a byte-identical footer to before this knob existed
+        // (the levels[].gsd already imply the default base, §5.2 / Q6).
+        gsd_base: if options.gsd_base == GSD_TILE_BASE {
+            None
+        } else {
+            Some(options.gsd_base)
+        },
         levels,
         ranking: Some(ranking),
     }
@@ -1356,6 +1375,85 @@ mod tests {
             assert!(w[0].gsd > w[1].gsd);
         }
         assert_eq!(report.levels.last().unwrap().feature_count, geoms.len());
+    }
+
+    #[test]
+    fn default_gsd_base_footer_gsds_match_const() {
+        // Regression: a default-flag (gsd_base == GSD_TILE_BASE) conversion must
+        // produce footer GSDs byte-identical to the constant-base `gsd(z)` —
+        // i.e. this knob is inert at its default, so default output is unchanged.
+        use crate::overview::level::gsd;
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            opts.gsd_base, GSD_TILE_BASE,
+            "default must be the const base"
+        );
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        // Footer GSDs equal the const-base gsd(z) for each level's zoom, exactly.
+        for level in &reader.meta().levels {
+            let z = level.zoom.expect("zoom-range plan records zooms");
+            assert_eq!(level.gsd, gsd(z), "footer gsd must match const gsd(z={z})");
+        }
+        // Default base is NOT echoed into provenance (implied by the GSDs).
+        assert_eq!(
+            reader.meta().generalization.as_ref().unwrap().gsd_base,
+            None,
+            "default gsd_base must be absent from provenance"
+        );
+    }
+
+    #[test]
+    fn nondefault_gsd_base_scales_footer_gsds() {
+        // Footer GSDs scale with `--gsd-base`: doubling the base halves every
+        // level GSD, and the non-default base is recorded in provenance.
+        use crate::overview::level::{gsd_with_base, GSD_TILE_BASE};
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = GSD_TILE_BASE * 2.0;
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            gsd_base: base,
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        assert!(validate_file(tout.path()).unwrap().is_valid());
+        for level in &reader.meta().levels {
+            let z = level.zoom.unwrap();
+            assert_eq!(
+                level.gsd,
+                gsd_with_base(z, base),
+                "scaled footer gsd (z={z})"
+            );
+        }
+        // Non-default base recorded in provenance.
+        assert_eq!(
+            reader.meta().generalization.as_ref().unwrap().gsd_base,
+            Some(base),
+            "non-default gsd_base must be recorded"
+        );
     }
 
     #[test]

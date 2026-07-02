@@ -110,6 +110,23 @@ struct OverviewArgs {
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
+    /// GSD tile-band base for the zoom→GSD mapping: gsd(z) = 40075016.69 /
+    /// base / 2^z (spec §5.2, cogp-rs default 1024).
+    ///
+    /// This is the master detail knob for a zoom-range plan. A LARGER base
+    /// makes every level's GSD SMALLER, so less is thinned and simplified at a
+    /// given zoom (denser, more detailed, larger coarse levels). A SMALLER
+    /// base makes GSDs LARGER (sparser, cruder, cheaper coarse levels). It
+    /// scales the whole ladder at once, whereas --simplify-factor and the
+    /// --*-thinning knobs act relative to each level's GSD. No effect when
+    /// --gsd is given (those GSDs are already absolute meters).
+    ///
+    /// Cheat sheet: coarse levels too sparse → RAISE --gsd-base (or lower the
+    /// thinning factors); too crude → lower --simplify-factor. See
+    /// docs/OVERVIEW_TUNING.md.
+    #[arg(long, value_name = "F", default_value = "1024.0")]
+    gsd_base: f64,
+
     /// Column name used as the cell-winner priority (sort) key. Mutually
     /// exclusive with --class-rank.
     #[arg(long, value_name = "COL")]
@@ -128,8 +145,18 @@ struct OverviewArgs {
     #[arg(long)]
     no_auto_rank: bool,
 
-    /// Simplification tolerance factor (tolerance = factor * gsd). Duplicating
-    /// mode only.
+    /// Simplification tolerance factor: RDP tolerance = factor * gsd (meters),
+    /// duplicating mode only (default 1.0).
+    ///
+    /// Controls how much per-feature vertex detail each coarse level sheds.
+    /// LOWER = smoother/less aggressive = more vertices kept = crisper but
+    /// heavier levels; HIGHER = cruder = fewer vertices = lighter levels. The
+    /// canonical (finest) level is always verbatim regardless. A line/polygon
+    /// whose bbox diagonal is below the tolerance is dropped entirely, so a
+    /// very high factor also thins features, not just vertices.
+    ///
+    /// Cheat sheet: coarse levels look too crude/blocky → LOWER
+    /// --simplify-factor. See docs/OVERVIEW_TUNING.md.
     #[arg(long, default_value = "1.0")]
     simplify_factor: f64,
 
@@ -142,23 +169,45 @@ struct OverviewArgs {
     #[arg(long)]
     cogp_compat: bool,
 
-    /// Point thinning factor (grid-cell multiplier).
+    /// Point thinning factor: grid cell size = factor * gsd (default 4.0).
+    ///
+    /// One feature survives per grid cell per level, so BIGGER factor = BIGGER
+    /// cells = FEWER survivors = SPARSER map; SMALLER = denser. Points thin
+    /// hardest by default (4.0) since they clutter fastest. This multiplies the
+    /// GSD cell size, so it interacts with --gsd-base (which sets the GSD).
+    ///
+    /// Cheat sheet: coarse levels too sparse → LOWER the thinning factors.
     #[arg(long, default_value = "4.0")]
     point_thinning: f64,
 
-    /// Line thinning factor (grid-cell multiplier).
+    /// Line thinning factor: grid cell size = factor * gsd (default 2.0).
+    ///
+    /// BIGGER = SPARSER (fewer lines survive per level), SMALLER = denser.
+    /// See --point-thinning; this is the roads/line knob.
     #[arg(long, default_value = "2.0")]
     line_thinning: f64,
 
-    /// Polygon thinning factor (grid-cell multiplier).
+    /// Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
+    ///
+    /// BIGGER = SPARSER, SMALLER = denser. Polygons thin least by default
+    /// (1.0) since they tile space rather than cluster.
     #[arg(long, default_value = "1.0")]
     polygon_thinning: f64,
 
-    /// Line visibility gate (min bbox-diagonal in GSD multiples).
+    /// Line visibility gate in GSD multiples: a line is eligible at a level
+    /// only if its bbox diagonal >= factor * gsd (default 2.0).
+    ///
+    /// This is a hard drop, not a thin: BIGGER = more small lines dropped at
+    /// coarse levels (sparser); SMALLER = more small lines kept. The gate is
+    /// multiplied by the level GSD, so --gsd-base moves it too.
     #[arg(long, default_value = "2.0")]
     line_visibility: f64,
 
-    /// Polygon visibility gate (min bbox-diagonal in GSD multiples).
+    /// Polygon visibility gate in GSD multiples: a polygon is eligible only if
+    /// its bbox diagonal >= factor * gsd (default 4.0).
+    ///
+    /// BIGGER = more small polygons dropped at coarse levels (sparser);
+    /// SMALLER = more kept. See --line-visibility.
     #[arg(long, default_value = "4.0")]
     polygon_visibility: f64,
 
@@ -923,6 +972,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             factor: args.simplify_factor,
             collapse: args.collapse,
         },
+        gsd_base: args.gsd_base,
         cogp_compat_key: args.cogp_compat,
         max_row_group_size: args.row_group_size,
     };

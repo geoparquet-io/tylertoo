@@ -64,11 +64,23 @@ impl Crs {
     }
 }
 
+/// Ground sample distance (meters) for a Web Mercator zoom level (§5.2), using
+/// an explicit tile-band `base` instead of the [`GSD_TILE_BASE`] default.
+///
+/// `gsd(z, base) = 40_075_016.69 / base / 2^z`. The `base` is the cogp-rs
+/// CLI-configurable knob (spec Q6): a larger base yields smaller GSDs at every
+/// zoom (finer detail retained / less thinning), a smaller base yields larger
+/// GSDs (coarser / more thinning). See `docs/OVERVIEW_TUNING.md`.
+pub fn gsd_with_base(z: u8, base: f64) -> f64 {
+    WEBMERC_CIRCUMFERENCE_M / base / 2f64.powi(z as i32)
+}
+
 /// Ground sample distance (meters) for a Web Mercator zoom level (§5.2).
 ///
 /// `gsd(z) = 40_075_016.69 / 1024 / 2^z` — matches the cogp-rs convention.
+/// Thin wrapper over [`gsd_with_base`] with the default [`GSD_TILE_BASE`].
 pub fn gsd(z: u8) -> f64 {
-    WEBMERC_CIRCUMFERENCE_M / GSD_TILE_BASE / 2f64.powi(z as i32)
+    gsd_with_base(z, GSD_TILE_BASE)
 }
 
 /// Inverse of [`gsd`]: the (fractional) Web Mercator zoom for a target GSD.
@@ -106,6 +118,13 @@ pub enum Mode {
 pub struct Generalization {
     /// Engine identifier, e.g. `"gpq-tiles 0.6.0"`.
     pub engine: String,
+    /// OPTIONAL GSD tile-band base used to derive per-level GSDs from zooms
+    /// (spec §5.2 / Q6; the cogp-rs `base` knob). Absent when the default
+    /// [`GSD_TILE_BASE`] (1024) was used — the footer `levels[].gsd` already
+    /// imply it — and present (a single named provenance value) only when a
+    /// non-default `--gsd-base` was chosen. Readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gsd_base: Option<f64>,
     /// Parallel to the top-level `levels` array.
     pub levels: Vec<GeneralizationLevel>,
     /// OPTIONAL cell-winner ranking provenance (§3.5, additive; informative).
@@ -497,6 +516,25 @@ mod tests {
     }
 
     #[test]
+    fn gsd_with_base_default_matches_const_gsd() {
+        // The parameterized variant with the default base is identical to the
+        // constant-base `gsd` (byte-for-byte f64), for every zoom.
+        for z in 0u8..=16 {
+            assert_eq!(gsd_with_base(z, GSD_TILE_BASE), gsd(z), "z={z}");
+        }
+    }
+
+    #[test]
+    fn gsd_with_base_scales_inversely_with_base() {
+        // Doubling the base halves the GSD at every zoom; halving doubles it.
+        for z in 0u8..=12 {
+            let d = gsd(z);
+            assert!((gsd_with_base(z, GSD_TILE_BASE * 2.0) - d / 2.0).abs() < 1e-9);
+            assert!((gsd_with_base(z, GSD_TILE_BASE / 2.0) - d * 2.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn zoom_for_gsd_inverts_gsd() {
         for z in 0u8..=16 {
             let back = zoom_for_gsd(gsd(z));
@@ -717,6 +755,7 @@ mod tests {
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
             engine: "gpq-tiles test".to_string(),
+            gsd_base: None,
             levels: vec![],
             ranking: Some(RankingProvenance {
                 mode: "auto-overture-roads".to_string(),
