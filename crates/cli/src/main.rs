@@ -213,6 +213,53 @@ struct OverviewArgs {
     #[arg(long, default_value = "4.0")]
     polygon_visibility: f64,
 
+    /// Per-level density drop rate: each coarser level keeps 1/rate of the
+    /// next finer level's feature budget (default 1.65).
+    ///
+    /// This is the Q2 knob that stops mid-zoom counts plateauing at ~everything.
+    /// Cell-winner thinning stops binding once its grid cell is smaller than the
+    /// typical feature spacing, so from ~z9 up every feature survives and coarse
+    /// levels over-retain (Portland roads: ours/tippecanoe ≈ 2–3x at z9–z11).
+    /// After cell-winner thinning, each level is capped at a budget that decays
+    /// geometrically toward coarse zooms — budget(L) = N / rate^(finest−L),
+    /// where N is the input feature count — and the lowest-priority survivors
+    /// (same class-rank → size → hash order as the cell-winner, spec Q1) are
+    /// dropped until the level meets its budget. Levels already sparser than
+    /// their budget (the coarse zooms) are untouched, so this only bites the
+    /// mid-zoom plateau. BIGGER rate = coarser levels shed harder (sparser mid
+    /// zooms, smaller files); SMALLER = gentler. The default 1.65 is smaller than
+    /// tippecanoe's nominal 2.5 because our budget anchors on the full canonical
+    /// count N (every feature appears at the finest level), not a per-tile
+    /// basezoom count. The canonical (finest) level is never dropped. See
+    /// docs/OVERVIEW_TUNING.md and corpus/SWEEP_NOTES.md.
+    #[arg(long, value_name = "F", default_value = "1.65")]
+    drop_rate: f64,
+
+    /// Spatial-fairness strength for the density budget (default 1.5).
+    ///
+    /// The budget is shared across coarse super-cells (neighborhoods) so a
+    /// global rank-ordered cut cannot empty sparse rural areas to keep dense
+    /// cities under budget. Each super-cell keeps its top-priority features up
+    /// to an allocation proportional to population^(1/gamma): gamma=1 is a
+    /// proportional cut (every neighborhood keeps the same fraction); gamma>1 is
+    /// SUBLINEAR — dense neighborhoods keep proportionally fewer, sparse ones
+    /// proportionally more (they are protected). This is tippecanoe's gamma
+    /// dot-dropping ("reduce dots to the 1/gamma power in dense areas") applied
+    /// per super-cell. BIGGER = more protection for sparse areas / harder
+    /// relative thinning of dense areas. Does not change per-level totals (it
+    /// only redistributes which features survive spatially), so it is
+    /// independent of --drop-rate. No effect when --no-density-drop is set.
+    #[arg(long, value_name = "F", default_value = "1.5")]
+    drop_gamma: f64,
+
+    /// Disable the Q2 per-level density budget entirely (off switch).
+    ///
+    /// Reverts to pure cell-winner thinning — the pre-Q2 behavior — and emits a
+    /// byte-identical footer (no density_drop provenance). Use this to compare
+    /// before/after, or when the cell-winner thinning already meets your needs.
+    #[arg(long)]
+    no_density_drop: bool,
+
     /// Maximum output row-group size in rows.
     #[arg(long, default_value = "10000")]
     row_group_size: usize,
@@ -917,7 +964,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
 /// Run `gpq-tiles overview`: build a multi-resolution overview GeoParquet file.
 fn run_overview(args: OverviewArgs) -> Result<()> {
-    use gpq_tiles_core::overview::assign::{AssignConfig, SortDirection};
+    use gpq_tiles_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
     use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
     use gpq_tiles_core::overview::level::Mode;
     use gpq_tiles_core::overview::simplify::SimplifyOptions;
@@ -973,6 +1020,11 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         simplify: SimplifyOptions {
             factor: args.simplify_factor,
             collapse: args.collapse,
+        },
+        density: DensityBudgetConfig {
+            enabled: !args.no_density_drop,
+            drop_rate: args.drop_rate,
+            gamma: args.drop_gamma,
         },
         gsd_base: args.gsd_base,
         cogp_compat_key: args.cogp_compat,

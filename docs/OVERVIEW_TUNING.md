@@ -27,6 +27,11 @@ interact.
 >   over-smoothed)** → LOWER `--simplify-factor`.
 > - **Coarse levels are too *heavy / dense / large*** → RAISE the thinning
 >   factors and/or `--simplify-factor`; or LOWER `--gsd-base`.
+> - **Mid zooms (≈z9–z12) over-retained (way more features than tippecanoe,
+>   large duplicating files)** → RAISE `--drop-rate` (the density budget); to
+>   disable it entirely use `--no-density-drop`.
+> - **A rank-ordered cut is emptying sparse rural areas** → RAISE `--drop-gamma`
+>   (protects sparse neighborhoods).
 
 ---
 
@@ -183,6 +188,81 @@ used is recorded in the footer `generalization.ranking` provenance.
 
 ---
 
+## Density budget: `--drop-rate`, `--drop-gamma`, `--no-density-drop`
+
+Cell-winner thinning (above) stops binding once its grid cell is smaller than
+the typical feature spacing: from roughly z9 up, *every* feature wins its own
+cell, so per-level counts plateau at ~the whole dataset. On Portland roads that
+plateau is 2–3× tippecanoe's feature count at z9–z11 (see
+`corpus/SWEEP_NOTES.md`) — visual clutter, and the main driver of duplicating
+mode's storage overhead.
+
+The **density budget** fixes this the way tippecanoe does: after cell-winner
+thinning, each level is capped at a feature **budget** that decays geometrically
+toward coarse zooms, and the lowest-priority survivors (same
+[ranking](#ranking-which-feature-wins-a-cell) order) are dropped until the level
+meets its budget.
+
+```
+budget(level) = N / drop_rate ^ (finest_level − level)      (N = input features)
+keep(level)   = min(cell_winner_survivors(level), budget(level))
+```
+
+The finest (canonical) level keeps everything (never dropped, spec §2.4). The
+cut is a *ceiling*: a level already sparser than its budget — every coarse zoom,
+where cell-winner did the thinning — is untouched, so the budget only bites the
+mid-zoom plateau.
+
+| Knob | Default | Units | Direction |
+|------|---------|-------|-----------|
+| `--drop-rate F` | `1.65` | ratio (>1) | **bigger = sparser mid zooms** |
+| `--drop-gamma F` | `1.5` | exponent (≥1) | **bigger = more sparse-area protection** |
+| `--no-density-drop` | off | flag | disables the budget (pre-Q2 behavior) |
+
+**`--drop-rate`** is the strength knob. Each coarser level keeps `1/rate` of the
+next finer one. BIGGER ⇒ coarse levels shed harder (sparser mid zooms, smaller
+files); SMALLER ⇒ gentler. The default `1.65` was calibrated on Portland roads
+(`corpus/SWEEP_NOTES.md`): it brings z9 to 1.21× and z10 to 1.03× tippecanoe
+(z11 lands at 0.67×, a storage win) and leaves z8 and the coarse zooms
+essentially at their cell-winner counts.
+
+> **Why 1.65, not tippecanoe's 2.5?** Our budget anchors on the *full canonical
+> count* `N` (every feature appears at the finest level), whereas tippecanoe's
+> `-rate` is relative to a per-tile basezoom count. So an equivalent per-level
+> thinning lands at a smaller numeric rate. `2.5` here over-thins hard (Portland
+> z9–z13 all drop below tippecanoe).
+
+**Spatial fairness (`--drop-gamma`).** A global rank-ordered cut would empty
+sparse rural areas to keep dense cities under budget. Instead the per-level
+budget is shared across coarse **super-cells** (`128 × GSD` neighborhoods): each
+super-cell keeps its top-priority features up to an allocation
+`∝ population^(1/gamma)`, water-filled so no cell gets more than it has.
+`gamma = 1` is a proportional cut (every neighborhood keeps the same fraction);
+`gamma > 1` is **sublinear** — dense neighborhoods keep proportionally fewer,
+sparse ones proportionally more (protected). This is exactly tippecanoe's
+`-g`/gamma dot-dropping ("reduce dots to the `1/gamma` power in dense areas")
+applied per super-cell. `--drop-gamma` does **not** change per-level totals (it
+only redistributes *which* features survive spatially), so it is independent of
+`--drop-rate`.
+
+⚠️ **Interaction — points may not feel the budget.** The budget applies to
+points, lines and polygons alike, but points are already thinned hard by
+`--point-thinning` (default 4). On a large point dataset (e.g. NYC POIs) the
+cell-winner point counts often sit *below* the N-anchored budget at every zoom,
+so `--drop-rate` rarely binds; point over-retention is better addressed with
+point clustering (spec Q4). Lines and polygons (thinning factor 1) are where the
+budget does the most work.
+
+**`--no-density-drop`** turns the budget off entirely, reverting to pure
+cell-winner thinning (the pre-Q2 behavior) and a byte-identical footer.
+
+Only the mid-zoom plateau is affected. The chosen drop mechanism + parameters
+are recorded in the footer `geo:overviews` → `generalization.density_drop`
+provenance (`drop_rate`, `gamma`, `supercell_gsd_factor`); a disabled run omits
+the block.
+
+---
+
 ## Worked scenarios
 
 | Symptom | Fix |
@@ -193,6 +273,9 @@ used is recorded in the footer `generalization.ranking` provenance.
 | Coarse level files are too large / slow | RAISE the thinning factors and/or `--simplify-factor`; or LOWER `--gsd-base` |
 | Small buildings vanish too early | LOWER `--polygon-visibility`; or `--collapse` to keep them as points |
 | Whole map uniformly too sparse or too dense | move `--gsd-base` (up = denser, down = sparser) instead of tuning each family |
+| Mid zooms have far more features than tippecanoe / duplicating files too large | RAISE `--drop-rate` (density budget); or `--no-density-drop` to turn it off |
+| Density cut is stripping sparse rural areas to keep cities | RAISE `--drop-gamma` (sparse-area protection) |
 
 See `corpus/SWEEP_NOTES.md` for an empirical `--line-thinning` ×
-`--simplify-factor` sweep on Portland roads.
+`--simplify-factor` sweep on Portland roads, and the Q2 section there for the
+`--drop-rate` calibration (before/after ratios vs tippecanoe).

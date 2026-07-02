@@ -43,9 +43,13 @@ use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_from_array;
 
-use super::assign::{assign_levels, AssignConfig, AssignFeature, FeatureKind};
+use super::assign::{
+    apply_density_budget, assign_levels, AssignConfig, AssignFeature, DensityBudgetConfig,
+    FeatureKind, SUPERCELL_GSD_FACTOR,
+};
 use super::level::{
-    gsd_with_base, Crs, Generalization, GeneralizationLevel, Mode, RankingProvenance, GSD_TILE_BASE,
+    gsd_with_base, Crs, DensityProvenance, Generalization, GeneralizationLevel, Mode,
+    RankingProvenance, GSD_TILE_BASE,
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, WriterError, LEVEL_COLUMN};
@@ -240,6 +244,9 @@ pub struct ConvertOptions {
     pub no_auto_rank: bool,
     /// Per-level simplification options (duplicating mode only).
     pub simplify: SimplifyOptions,
+    /// Per-level density budget applied after cell-winner thinning (Q2). Default
+    /// enabled; disable via `--no-density-drop` to reproduce pre-Q2 behavior.
+    pub density: DensityBudgetConfig,
     /// GSD tile-band base for zoom→GSD derivation (spec §5.2 / Q6; the cogp-rs
     /// `base` knob). Default [`GSD_TILE_BASE`] (1024). Larger ⇒ smaller GSDs
     /// (finer detail / less thinning); smaller ⇒ larger GSDs (coarser / more
@@ -264,6 +271,7 @@ impl Default for ConvertOptions {
             class_ranking: None,
             no_auto_rank: false,
             simplify: SimplifyOptions::default(),
+            density: DensityBudgetConfig::default(),
             gsd_base: GSD_TILE_BASE,
             cogp_compat_key: false,
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
@@ -448,6 +456,22 @@ pub fn convert_to_overviews(
         })
         .collect();
     let assignment = assign_levels(&features, &level_gsds, &options.assign, crs);
+    // Q2: layer the per-level density budget on top of cell-winner thinning.
+    // When disabled this is an identity, so `--no-density-drop` reproduces the
+    // pre-Q2 assignment (and, since no density_drop provenance is emitted, a
+    // byte-identical footer).
+    let assignment = if options.density.enabled {
+        apply_density_budget(
+            &assignment,
+            &features,
+            &level_gsds,
+            &options.assign,
+            &options.density,
+            crs,
+        )
+    } else {
+        assignment
+    };
     let num_levels = level_gsds.len();
     let finest = num_levels.saturating_sub(1);
 
@@ -785,6 +809,17 @@ fn build_generalization(
         },
         levels,
         ranking: Some(ranking),
+        // Record the density budget only when it was applied; a disabled run
+        // omits the block so its footer matches pre-Q2 output.
+        density_drop: if options.density.enabled {
+            Some(DensityProvenance {
+                drop_rate: options.density.drop_rate,
+                gamma: options.density.gamma,
+                supercell_gsd_factor: SUPERCELL_GSD_FACTOR,
+            })
+        } else {
+            None
+        },
     }
 }
 
@@ -1835,6 +1870,128 @@ mod tests {
                 "class ranking: small high-class (id1) must win coarse, got {ml:?}"
             );
             assert_eq!(ml[&1], 0, "high-class line should reach the coarsest level");
+        }
+    }
+
+    // --- Q2 density budget --------------------------------------------------
+
+    fn density_provenance_of(path: &Path) -> Option<crate::overview::level::DensityProvenance> {
+        let reader = OverviewReader::open(path).unwrap();
+        reader
+            .meta()
+            .generalization
+            .as_ref()
+            .unwrap()
+            .density_drop
+            .clone()
+    }
+
+    /// Many points on a grid, spread so cell-winner keeps them all at fine
+    /// levels — enough features that the density budget binds at a mid level.
+    fn grid_points(n: usize) -> Vec<Geometry<f64>> {
+        (0..n)
+            .map(|i| {
+                let x = (i % 40) as f64 * 0.3 - 6.0;
+                let y = (i / 40) as f64 * 0.3 - 6.0;
+                Geometry::Point(Point::new(x, y))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn density_provenance_recorded_by_default() {
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        let d = density_provenance_of(tout.path()).expect("default run records density_drop");
+        assert_eq!(d.drop_rate, DensityBudgetConfig::default().drop_rate);
+        assert_eq!(d.gamma, DensityBudgetConfig::default().gamma);
+        assert_eq!(d.supercell_gsd_factor, SUPERCELL_GSD_FACTOR);
+    }
+
+    #[test]
+    fn density_disabled_omits_provenance_and_keeps_canonical() {
+        let geoms = grid_points(600);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            density: DensityBudgetConfig {
+                enabled: false,
+                ..DensityBudgetConfig::default()
+            },
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        // Off switch: no density_drop provenance (footer matches pre-Q2).
+        assert!(
+            density_provenance_of(tout.path()).is_none(),
+            "disabled budget must not emit provenance"
+        );
+        assert!(validate_file(tout.path()).unwrap().is_valid());
+        assert_eq!(report.levels.last().unwrap().feature_count, geoms.len());
+    }
+
+    #[test]
+    fn density_thins_midlevels_keeps_canonical() {
+        let geoms = grid_points(600);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout_on = tempfile::NamedTempFile::new().unwrap();
+        let tout_off = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            ..Default::default()
+        };
+        let on = convert_to_overviews(tin.path(), tout_on.path(), &base).unwrap();
+        let off = convert_to_overviews(
+            tin.path(),
+            tout_off.path(),
+            &ConvertOptions {
+                density: DensityBudgetConfig {
+                    enabled: false,
+                    ..DensityBudgetConfig::default()
+                },
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        // Canonical fidelity: both keep every feature at the finest level.
+        assert_eq!(on.levels.last().unwrap().feature_count, geoms.len());
+        assert_eq!(off.levels.last().unwrap().feature_count, geoms.len());
+        assert!(validate_file(tout_on.path()).unwrap().is_valid());
+
+        // The budget removes mid-level features that cell-winner alone retained:
+        // the on-budget run writes strictly fewer total rows than the off run.
+        assert!(
+            on.total_rows < off.total_rows,
+            "density budget should thin mid levels: on={} off={}",
+            on.total_rows,
+            off.total_rows
+        );
+        // Counts remain monotone non-decreasing coarse→fine under the budget.
+        for w in on.levels.windows(2) {
+            assert!(w[0].feature_count <= w[1].feature_count);
         }
     }
 

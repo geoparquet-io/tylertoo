@@ -134,6 +134,32 @@ pub struct Generalization {
     /// this field existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ranking: Option<RankingProvenance>,
+    /// OPTIONAL density-budget provenance (§3.5, additive; informative).
+    ///
+    /// Records the per-level density budget applied after cell-winner thinning
+    /// (Q2): the geometric drop-rate and the spatial-fairness gamma. Absent when
+    /// the budget was disabled (`--no-density-drop`) or on files written before
+    /// this field existed; readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density_drop: Option<DensityProvenance>,
+}
+
+/// How the per-level density budget was applied for a conversion (Q2).
+///
+/// Additive, OPTIONAL, informative provenance embedded in [`Generalization`]
+/// (§3.5). Records the tippecanoe-style drop-rate budget and the spatial
+/// fairness (gamma) used to decide which cell-winner survivors were dropped to
+/// meet each level's budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DensityProvenance {
+    /// Per-level geometric drop rate: each coarser level keeps `1/drop_rate` of
+    /// the next finer level's feature budget.
+    pub drop_rate: f64,
+    /// Spatial-fairness strength: `1.0` = proportional cut; larger = sublinear
+    /// (dense neighborhoods kept to the `1/gamma` power of their population).
+    pub gamma: f64,
+    /// Super-cell edge length used for fairness, as a multiple of the level GSD.
+    pub supercell_gsd_factor: f64,
 }
 
 /// How the cell-winner priority (sort) key was chosen for a conversion (Q1).
@@ -766,6 +792,7 @@ mod tests {
                 ]),
                 unknown_rank: Some(0.0),
             }),
+            density_drop: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
@@ -775,6 +802,43 @@ mod tests {
         assert_eq!(r.column.as_deref(), Some("road_class"));
         assert_eq!(r.unknown_rank, Some(0.0));
         assert_eq!(r.ranks.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn density_provenance_roundtrip_and_absent_tolerated() {
+        // A density_drop block survives JSON round-trip preserving its fields,
+        // and a generalization block without the key deserializes to None.
+        let mut meta = duplicating_example();
+        meta.generalization = Some(Generalization {
+            engine: "gpq-tiles test".to_string(),
+            gsd_base: None,
+            levels: vec![],
+            ranking: None,
+            density_drop: Some(DensityProvenance {
+                drop_rate: 1.8,
+                gamma: 1.5,
+                supercell_gsd_factor: 128.0,
+            }),
+        });
+        let json = meta.to_json().unwrap();
+        let parsed = OverviewsMeta::from_json(&json).unwrap();
+        assert_eq!(meta, parsed);
+        let d = parsed.generalization.unwrap().density_drop.unwrap();
+        assert_eq!(d.drop_rate, 1.8);
+        assert_eq!(d.gamma, 1.5);
+        assert_eq!(d.supercell_gsd_factor, 128.0);
+
+        // Absent key → None (additive-field tolerance).
+        let src = r#"{
+            "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
+            "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
+            "generalization": {
+                "engine": "gpq-tiles 0.1.0",
+                "levels": []
+            }
+        }"#;
+        let m = OverviewsMeta::from_json(src).unwrap();
+        assert!(m.generalization.unwrap().density_drop.is_none());
     }
 
     #[test]

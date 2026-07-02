@@ -409,6 +409,345 @@ pub fn assign_levels(
     }
 }
 
+// ============================================================================
+// Density-based budgets (Q2)
+// ============================================================================
+//
+// Cell-winner thinning (above) stops binding once the grid cell is smaller than
+// the typical feature spacing: at mid zooms *every* feature wins its own cell,
+// so counts plateau at ~the whole dataset (Portland roads: ours/tippecanoe ≈
+// 2–3x at z9–z11; see `corpus/SWEEP_NOTES.md`). Tippecanoe instead applies a
+// rank-ordered drop-rate per zoom. This stage layers that on top of the
+// cell-winner assignment: it imposes a per-level feature **budget** that decays
+// geometrically toward coarse zooms and drops the lowest-priority survivors
+// (by the same Q1 [`Priority`] order) until each level meets its budget.
+//
+// # Budget shape (tippecanoe drop-rate analog)
+//
+// The finest (canonical) level keeps everything. Each coarser level keeps a
+// `1/drop_rate` fraction of the finer one, so the budget at level `L` is
+// `budget(L) = N · (1/drop_rate)^(finest − L)` where `N` is the input feature
+// count. The cut is a *ceiling*: a level whose cell-winner survivor count is
+// already below its budget is left untouched (coarse zooms are cell-winner
+// limited, not density limited). A floor ([`MIN_DENSITY_LEVEL_FEATURES`]) leaves
+// already-sparse levels alone entirely.
+//
+// # Spatial fairness (tippecanoe gamma analog)
+//
+// A global rank-ordered cut would empty sparse rural neighborhoods to keep dense
+// cities under budget. Instead the per-level budget is shared across coarse
+// **super-cells** ([`SUPERCELL_GSD_FACTOR`] × GSD): each super-cell keeps its
+// top-priority features up to an allocation `∝ population^(1/gamma)`,
+// water-filled so no cell is allocated more than it has and the surplus flows to
+// cells still under their cap. With `gamma = 1` the allocation is proportional
+// (every neighborhood keeps the same fraction); `gamma > 1` is **sublinear** —
+// dense neighborhoods keep proportionally fewer, sparse ones proportionally
+// more. This is exactly tippecanoe's `-g`/gamma dot-dropping ("reduces dots to
+// the `1/gamma` power of the original count in dense areas"; see
+// `gap_density.rs`), applied per super-cell instead of globally.
+//
+// # Monotonicity / correctness
+//
+// Admission is greedy coarse→fine and a feature, once admitted, is never
+// dropped at a finer level (its `min_level` is the level it was admitted at).
+// This preserves duplicating monotonicity and — because the finest level admits
+// every remaining feature — the canonical level is never thinned (spec §2.4).
+
+use std::cmp::Ordering;
+
+/// Super-cell edge length for spatial-fairness budget allocation, as a multiple
+/// of the level GSD (in coordinate units). A super-cell is the neighborhood over
+/// which the per-level budget is shared; `128 × GSD` is roughly a tile-scale
+/// patch at the level's nominal display scale — coarse enough to hold many
+/// features (so the budget can bind) yet fine enough that a city spans many
+/// cells (so rural areas are not starved to feed it).
+pub const SUPERCELL_GSD_FACTOR: f64 = 128.0;
+
+/// Levels with fewer surviving features than this are exempt from the density
+/// budget. Such levels are already grid-thinning-limited (sparse) rather than
+/// density-limited, so a budget would only fight the cell-winner stage. This is
+/// what keeps coarse zooms essentially unchanged under the default budget.
+pub const MIN_DENSITY_LEVEL_FEATURES: usize = 256;
+
+/// Configuration for the Q2 density budget (see the module section above).
+#[derive(Debug, Clone, Copy)]
+pub struct DensityBudgetConfig {
+    /// Master switch. When `false`, [`apply_density_budget`] is an identity and
+    /// the pipeline reproduces the pre-Q2 cell-winner behavior byte-for-byte.
+    pub enabled: bool,
+    /// Per-level drop rate: each coarser level keeps `1/drop_rate` of the next
+    /// finer level. Must be `> 1` (values `<= 1` disable the budget). Larger ⇒
+    /// coarser levels shed harder.
+    pub drop_rate: f64,
+    /// Spatial-fairness strength (`>= 1`). `1.0` = proportional cut; larger =
+    /// sublinear, protecting sparse neighborhoods (dense areas kept to the
+    /// `1/gamma` power of their population).
+    pub gamma: f64,
+}
+
+impl Default for DensityBudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Calibrated on lines-portland-medium (duplicating, auto-rank): this
+            // brings z9 (1.21x) and z10 (1.03x) into the 1.0–1.3x tippecanoe band
+            // and z8 to ~1.0x, while the coarse zooms stay cell-winner-limited.
+            // See `corpus/SWEEP_NOTES.md`. Smaller than tippecanoe's nominal 2.5
+            // because our budget anchors on the full canonical count N (every
+            // feature is present at the finest level), not a per-tile basezoom
+            // count.
+            drop_rate: 1.65,
+            gamma: 1.5,
+        }
+    }
+}
+
+/// Apply the Q2 per-level density budget on top of a cell-winner [`Assignment`].
+///
+/// `features`, `level_gsds`, `config` (for the [`SortDirection`]) and `crs` must
+/// be the exact inputs passed to [`assign_levels`] that produced `assignment`;
+/// the returned assignment is parallel to `features` in the same way. When the
+/// budget is disabled (or degenerate) the input assignment is returned unchanged.
+pub fn apply_density_budget(
+    assignment: &Assignment,
+    features: &[AssignFeature],
+    level_gsds: &[f64],
+    config: &AssignConfig,
+    budget: &DensityBudgetConfig,
+    crs: Crs,
+) -> Assignment {
+    let num_levels = assignment.num_levels as usize;
+    // Off-switch / degenerate: return the cell-winner assignment untouched.
+    if !budget.enabled || !(budget.drop_rate > 1.0) || features.is_empty() || num_levels < 2 {
+        return assignment.clone();
+    }
+
+    let n = features.len();
+    let finest = num_levels - 1;
+
+    // The coarsest level cell-winner permits each feature to appear at.
+    let cw_min: Vec<usize> = assignment
+        .assignments
+        .iter()
+        .map(|a| a.min_level as usize)
+        .collect();
+
+    // Q1 priority per feature — identical ordering to the cell-winner stage.
+    let prio: Vec<Priority> = features
+        .iter()
+        .map(|f| Priority::new(f, config.sort_direction))
+        .collect();
+
+    let keep_frac = 1.0 / budget.drop_rate;
+    let total = n as f64;
+    let effective_budget = |level: usize| -> usize {
+        if level >= finest {
+            return n; // canonical keeps everything
+        }
+        let raw = total * keep_frac.powi((finest - level) as i32);
+        (raw.round() as usize).max(MIN_DENSITY_LEVEL_FEATURES)
+    };
+
+    // Greedy admission, coarse→fine. `admitted_at[pos]` becomes the feature's
+    // final (budgeted) min_level. Features not admitted at a level are deferred
+    // to a finer one; the finest level admits all remaining (canonical fidelity).
+    let mut admitted = vec![false; n];
+    let mut admitted_at = vec![finest as u8; n];
+    let mut kept_count = 0usize;
+
+    for level in 0..num_levels {
+        let cands: Vec<usize> = (0..n)
+            .filter(|&i| !admitted[i] && cw_min[i] <= level)
+            .collect();
+        if cands.is_empty() {
+            continue;
+        }
+        let budget_l = effective_budget(level);
+
+        if level == finest || kept_count + cands.len() <= budget_l {
+            // Everything fits (or this is the canonical level): admit all.
+            for &i in &cands {
+                admitted[i] = true;
+                admitted_at[i] = level as u8;
+            }
+            kept_count += cands.len();
+            continue;
+        }
+
+        let available = budget_l.saturating_sub(kept_count);
+        if available == 0 {
+            // Grandfathered survivors already fill the budget; defer newcomers.
+            continue;
+        }
+
+        // Budget binds: keep the top `available` candidates, fairly distributed
+        // across super-cells, by Q1 priority within each cell.
+        let chosen = select_budget_survivors(
+            &cands,
+            available,
+            features,
+            &prio,
+            level_gsds[level],
+            crs,
+            budget.gamma,
+        );
+        for &i in &chosen {
+            admitted[i] = true;
+            admitted_at[i] = level as u8;
+        }
+        kept_count += chosen.len();
+    }
+
+    Assignment {
+        assignments: features
+            .iter()
+            .zip(admitted_at)
+            .map(|(f, min_level)| FeatureAssignment {
+                index: f.index,
+                min_level,
+            })
+            .collect(),
+        num_levels: assignment.num_levels,
+    }
+}
+
+/// Order two candidates best-first by Q1 [`Priority`] (a strict total order).
+#[inline]
+fn priority_order(prio: &[Priority], a: usize, b: usize) -> Ordering {
+    if a == b {
+        Ordering::Equal
+    } else if prio[a].beats(&prio[b]) {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
+}
+
+/// Choose `available` survivors from `cands` for one level: partition into
+/// super-cells, fair-allocate the budget across them ([`water_fill`]) and keep
+/// each cell's top-priority members. Deterministic (cells iterated in sorted
+/// key order; ties broken by [`Priority`]'s index tiebreak).
+fn select_budget_survivors(
+    cands: &[usize],
+    available: usize,
+    features: &[AssignFeature],
+    prio: &[Priority],
+    gsd_m: f64,
+    crs: Crs,
+    gamma: f64,
+) -> Vec<usize> {
+    let gsd_units = gsd_to_coord_units(gsd_m, crs);
+    let super_size = gsd_units * SUPERCELL_GSD_FACTOR;
+
+    // Degenerate super-cell size: fall back to a global priority cut.
+    if !(super_size > 0.0) {
+        let mut all = cands.to_vec();
+        all.sort_by(|&a, &b| priority_order(prio, a, b));
+        all.truncate(available);
+        return all;
+    }
+
+    let mut cells: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for &i in cands {
+        let (cx, cy) = features[i].center();
+        let key = (
+            (cx / super_size).floor() as i64,
+            (cy / super_size).floor() as i64,
+        );
+        cells.entry(key).or_default().push(i);
+    }
+    for members in cells.values_mut() {
+        members.sort_by(|&a, &b| priority_order(prio, a, b));
+    }
+
+    // Deterministic cell order for the water-fill + output.
+    let mut keys: Vec<(i64, i64)> = cells.keys().copied().collect();
+    keys.sort_unstable();
+    let pops: Vec<usize> = keys.iter().map(|k| cells[k].len()).collect();
+
+    let alpha = 1.0 / gamma.max(1.0);
+    let allocs = water_fill(&pops, available, alpha);
+
+    let mut chosen = Vec::with_capacity(available);
+    for (k, a) in keys.iter().zip(allocs) {
+        chosen.extend(cells[k].iter().take(a).copied());
+    }
+    chosen
+}
+
+/// Water-filling allocation of `budget` units across cells of the given
+/// populations, weighting each cell by `population^alpha`, never exceeding a
+/// cell's population, and redistributing any surplus to cells still under their
+/// cap. Returns per-cell allocations summing to `min(budget, Σ pops)`.
+fn water_fill(pops: &[usize], budget: usize, alpha: f64) -> Vec<usize> {
+    let n = pops.len();
+    let total_pop: usize = pops.iter().sum();
+    if budget >= total_pop {
+        return pops.to_vec();
+    }
+    let mut alloc = vec![0usize; n];
+    let mut capped = vec![false; n];
+    let mut remaining = budget;
+
+    // Round 1..: cap any cell whose weighted share exceeds its population, then
+    // redistribute the freed budget across the rest. Terminates because each
+    // round with a cap removes at least one cell.
+    loop {
+        let sum_w: f64 = (0..n)
+            .filter(|&i| !capped[i])
+            .map(|i| (pops[i] as f64).powf(alpha))
+            .sum();
+        if sum_w <= 0.0 || remaining == 0 {
+            break;
+        }
+        let mut newly_capped = false;
+        for i in 0..n {
+            if capped[i] {
+                continue;
+            }
+            let raw = remaining as f64 * (pops[i] as f64).powf(alpha) / sum_w;
+            if raw >= pops[i] as f64 {
+                alloc[i] = pops[i];
+                capped[i] = true;
+                newly_capped = true;
+            }
+        }
+        if newly_capped {
+            let capped_sum: usize = (0..n).filter(|&i| capped[i]).map(|i| alloc[i]).sum();
+            remaining = budget.saturating_sub(capped_sum);
+            continue;
+        }
+
+        // No cell caps this round: hand out floors, then the leftover by largest
+        // fractional part (a single pass suffices — leftover ≤ #fractional cells).
+        let sum_w2 = sum_w;
+        let mut leftover = remaining;
+        let mut fracs: Vec<(usize, f64)> = Vec::new();
+        for i in 0..n {
+            if capped[i] {
+                continue;
+            }
+            let raw = remaining as f64 * (pops[i] as f64).powf(alpha) / sum_w2;
+            let floor = raw.floor();
+            alloc[i] = floor as usize;
+            leftover = leftover.saturating_sub(floor as usize);
+            fracs.push((i, raw - floor));
+        }
+        fracs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        for &(i, _) in &fracs {
+            if leftover == 0 {
+                break;
+            }
+            if alloc[i] < pops[i] {
+                alloc[i] += 1;
+                leftover -= 1;
+            }
+        }
+        break;
+    }
+    alloc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +1044,212 @@ mod tests {
     fn gsd_to_coord_units_conversion() {
         assert_eq!(gsd_to_coord_units(1000.0, Crs::Epsg3857), 1000.0);
         assert!((gsd_to_coord_units(111_320.0, Crs::Epsg4326) - 1.0).abs() < 1e-9);
+    }
+
+    // ---- Q2 density budget --------------------------------------------------
+
+    /// Build an assignment with every feature at `min_level = 0` (cell-winner
+    /// keeps all features at every level) so the *budget* alone drives counts.
+    fn all_at_level_zero(n: usize, num_levels: u8) -> Assignment {
+        Assignment {
+            assignments: (0..n)
+                .map(|i| FeatureAssignment {
+                    index: i,
+                    min_level: 0,
+                })
+                .collect(),
+            num_levels,
+        }
+    }
+
+    fn budget_cfg(enabled: bool, drop_rate: f64, gamma: f64) -> DensityBudgetConfig {
+        DensityBudgetConfig {
+            enabled,
+            drop_rate,
+            gamma,
+        }
+    }
+
+    #[test]
+    fn budget_geometric_decay_shape() {
+        // With every feature present at every level (cell-winner non-binding),
+        // per-level counts must follow the geometric budget N/rate^(finest-L).
+        let n = 16_384usize;
+        let num_levels = 6u8;
+        let finest = (num_levels - 1) as usize;
+        // Coords spread across several super-cells; counts are coord-independent.
+        let feats: Vec<AssignFeature> = (0..n)
+            .map(|i| {
+                let x = (i % 128) as f64 * 5000.0;
+                let y = (i / 128) as f64 * 5000.0;
+                point(i, x, y)
+            })
+            .collect();
+        let gsds: Vec<f64> = (0..num_levels).map(|z| gsd(z as u32)).collect();
+        let base = all_at_level_zero(n, num_levels);
+
+        let out = apply_density_budget(
+            &base,
+            &feats,
+            &gsds,
+            &AssignConfig::default(),
+            &budget_cfg(true, 2.0, 1.0),
+            Crs::Epsg3857,
+        );
+
+        let counts: Vec<usize> = (0..num_levels)
+            .map(|l| out.duplicating_at_level(l).len())
+            .collect();
+        // Canonical keeps everything.
+        assert_eq!(counts[finest], n, "canonical must keep all features");
+        // Each finer level ~doubles the coarser one (rate = 2.0), within 6%.
+        for w in counts.windows(2) {
+            let ratio = w[1] as f64 / w[0] as f64;
+            assert!(
+                (ratio - 2.0).abs() < 0.12,
+                "geometric decay violated: counts={counts:?} ratio={ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn budget_keeps_high_priority_survivors() {
+        // 1024 features in a single super-cell; the first 256 carry a high sort
+        // key. The level-0 budget keeps 512, and every high-key feature (which
+        // out-ranks the keyless ones) must survive the cut.
+        let n = 1024usize;
+        let high = 256usize;
+        let feats: Vec<AssignFeature> = (0..n)
+            .map(|i| {
+                let mut f = point(i, i as f64 * 100.0, 0.0); // all within one super-cell
+                if i < high {
+                    f.sort_key = Some(100.0);
+                }
+                f
+            })
+            .collect();
+        let gsds = [gsd(0), gsd(2)];
+        let base = all_at_level_zero(n, 2);
+
+        let out = apply_density_budget(
+            &base,
+            &feats,
+            &gsds,
+            &AssignConfig::default(),
+            &budget_cfg(true, 2.0, 1.5),
+            Crs::Epsg3857,
+        );
+
+        // Budget(0) = 1024/2 = 512 < 1024 → binds.
+        assert_eq!(out.duplicating_at_level(0).len(), 512, "level-0 budget");
+        // All high-key features present at the coarsest level.
+        let high_at_0 = out
+            .assignments
+            .iter()
+            .filter(|a| a.index < high && a.min_level == 0)
+            .count();
+        assert_eq!(
+            high_at_0, high,
+            "all high-priority features survive the cut"
+        );
+    }
+
+    #[test]
+    fn budget_spatial_fairness_protects_sparse() {
+        // Two clusters far apart: A (sparse, 64 features) and B (dense, 576).
+        // Under gamma>1 the sparse cluster keeps a larger share than a global
+        // rank-ordered cut would give it.
+        let a_n = 64usize;
+        let b_n = 576usize;
+        let n = a_n + b_n;
+        let mut feats: Vec<AssignFeature> = Vec::with_capacity(n);
+        for i in 0..a_n {
+            feats.push(point(i, i as f64 * 1000.0, 0.0)); // near origin
+        }
+        for j in 0..b_n {
+            feats.push(point(a_n + j, 10_000_000.0 + j as f64 * 1000.0, 0.0)); // far cluster
+        }
+        let gsds = [gsd(0), gsd(2)];
+        let base = all_at_level_zero(n, 2);
+
+        let out = apply_density_budget(
+            &base,
+            &feats,
+            &gsds,
+            &AssignConfig::default(),
+            &budget_cfg(true, 2.0, 2.0),
+            Crs::Epsg3857,
+        );
+
+        // Budget(0) = 640/2 = 320 → binds.
+        let a_kept = out
+            .assignments
+            .iter()
+            .filter(|a| a.index < a_n && a.min_level == 0)
+            .count();
+
+        // A global priority cut (top 320 across everything) keeps far fewer A.
+        let mut order: Vec<usize> = (0..n).collect();
+        let prio: Vec<Priority> = feats
+            .iter()
+            .map(|f| Priority::new(f, SortDirection::Desc))
+            .collect();
+        order.sort_by(|&a, &b| priority_order(&prio, a, b));
+        let global_a = order.iter().take(320).filter(|&&i| i < a_n).count();
+
+        assert_eq!(a_kept, a_n, "fairness keeps the entire sparse cluster");
+        assert!(
+            a_kept > global_a,
+            "sparse cluster retains more than a global cut: fair={a_kept} global={global_a}"
+        );
+    }
+
+    #[test]
+    fn budget_canonical_never_dropped() {
+        // Whatever the budget does at coarse levels, the finest level keeps every
+        // feature (spec §2.4 canonical fidelity).
+        let n = 4000usize;
+        let num_levels = 5u8;
+        let finest = num_levels - 1;
+        let feats: Vec<AssignFeature> = (0..n)
+            .map(|i| point(i, (i % 64) as f64 * 200.0, (i / 64) as f64 * 200.0))
+            .collect();
+        let gsds: Vec<f64> = (0..num_levels).map(|z| gsd(z as u32)).collect();
+        let base = all_at_level_zero(n, num_levels);
+        let out = apply_density_budget(
+            &base,
+            &feats,
+            &gsds,
+            &AssignConfig::default(),
+            &DensityBudgetConfig::default(),
+            Crs::Epsg3857,
+        );
+        assert_eq!(
+            out.duplicating_at_level(finest).len(),
+            n,
+            "canonical level must contain every feature"
+        );
+    }
+
+    #[test]
+    fn budget_disabled_is_identity() {
+        // The off switch reproduces the cell-winner assignment exactly.
+        let feats: Vec<AssignFeature> = (0..500)
+            .map(|i| point(i, (i % 20) as f64 * 100.0, (i / 20) as f64 * 100.0))
+            .collect();
+        let gsds = [gsd(2), gsd(4), gsd(6)];
+        let cw = assign_levels(&feats, &gsds, &AssignConfig::default(), Crs::Epsg3857);
+        let out = apply_density_budget(
+            &cw,
+            &feats,
+            &gsds,
+            &AssignConfig::default(),
+            &budget_cfg(false, 2.0, 1.5),
+            Crs::Epsg3857,
+        );
+        assert_eq!(
+            cw.assignments, out.assignments,
+            "disabled budget must be an identity"
+        );
     }
 }
