@@ -1916,4 +1916,139 @@ mod tests {
             ring2_first_y
         );
     }
+
+    // ------------------------------------------------------------------------
+    // MVT Encoding Overhead Tests
+    // ------------------------------------------------------------------------
+
+    /// Test to measure MVT encoding overhead for MultiLineString vs single LineString.
+    ///
+    /// Hypothesis: A MultiLineString with many short linestrings is MUCH larger than
+    /// a single LineString with the same total points due to MoveTo command overhead.
+    ///
+    /// Each linestring in a MultiLineString requires:
+    /// - MoveTo(1) command: 1 u32
+    /// - First point coordinates: 2 u32 (zigzag encoded dx, dy)
+    /// - LineTo(n-1) command: 1 u32
+    /// - Remaining points: 2*(n-1) u32
+    ///
+    /// For a 2-point linestring, that's: 1 + 2 + 1 + 2 = 6 u32 per linestring
+    /// For 100 2-point linestrings: 600 u32
+    ///
+    /// A single 200-point linestring:
+    /// - MoveTo(1) command: 1 u32
+    /// - First point: 2 u32
+    /// - LineTo(199): 1 u32
+    /// - Remaining 199 points: 398 u32
+    /// Total: 402 u32
+    ///
+    /// Expected overhead ratio: ~1.5x for geometry commands alone,
+    /// but protobuf varint encoding may amplify this.
+    #[test]
+    fn test_mvt_encoding_overhead_multilinestring_vs_linestring() {
+        use geo::coord;
+        use prost::Message;
+
+        let bounds = TileBounds {
+            lng_min: -180.0,
+            lat_min: -85.0,
+            lng_max: 180.0,
+            lat_max: 85.0,
+        };
+        let extent = DEFAULT_EXTENT;
+
+        // Create 100 separate 2-point linestrings (200 total points)
+        let mut lines: Vec<LineString> = Vec::with_capacity(100);
+        for i in 0..100 {
+            // Each linestring spans a small portion of the tile
+            let x1 = -180.0 + (i as f64 * 3.6); // spread across longitude
+            let x2 = x1 + 1.0;
+            let y = (i as f64) * 0.8 - 40.0; // spread across latitude
+            let line = LineString::new(vec![coord! { x: x1, y: y }, coord! { x: x2, y: y }]);
+            lines.push(line);
+        }
+        let multi_linestring = MultiLineString::new(lines);
+
+        // Create a single linestring with 200 points
+        let mut single_coords: Vec<geo::Coord<f64>> = Vec::with_capacity(200);
+        for i in 0..200 {
+            let x = -180.0 + (i as f64 * 1.8);
+            let y = (i as f64) * 0.4 - 40.0;
+            single_coords.push(coord! { x: x, y: y });
+        }
+        let single_linestring = LineString::new(single_coords);
+
+        // Encode MultiLineString
+        let multi_cmds = encode_multi_linestring(&multi_linestring, &bounds, extent);
+
+        // Encode single LineString
+        let single_cmds = encode_linestring(&single_linestring, &bounds, extent);
+
+        println!("\n=== MVT Encoding Overhead Test ===");
+        println!("MultiLineString: 100 linestrings x 2 points each = 200 total points");
+        println!("Single LineString: 200 points");
+        println!();
+        println!("Geometry command counts:");
+        println!("  MultiLineString: {} u32 values", multi_cmds.len());
+        println!("  Single LineString: {} u32 values", single_cmds.len());
+        println!(
+            "  Command overhead ratio: {:.2}x",
+            multi_cmds.len() as f64 / single_cmds.len() as f64
+        );
+
+        // Now encode to full MVT tiles and compare byte sizes
+        let mut multi_layer = LayerBuilder::new("test");
+        multi_layer.add_feature(
+            Some(1),
+            &Geometry::MultiLineString(multi_linestring.clone()),
+            &[],
+            &bounds,
+        );
+        let multi_tile = TileBuilder::new();
+        let mut multi_builder = multi_tile;
+        multi_builder.add_layer(multi_layer.build());
+        let multi_tile_proto = multi_builder.build();
+        let multi_bytes = multi_tile_proto.encode_to_vec();
+
+        let mut single_layer = LayerBuilder::new("test");
+        single_layer.add_feature(
+            Some(1),
+            &Geometry::LineString(single_linestring.clone()),
+            &[],
+            &bounds,
+        );
+        let single_tile = TileBuilder::new();
+        let mut single_builder = single_tile;
+        single_builder.add_layer(single_layer.build());
+        let single_tile_proto = single_builder.build();
+        let single_bytes = single_tile_proto.encode_to_vec();
+
+        println!();
+        println!("MVT protobuf byte sizes:");
+        println!("  MultiLineString tile: {} bytes", multi_bytes.len());
+        println!("  Single LineString tile: {} bytes", single_bytes.len());
+        println!(
+            "  Byte overhead ratio: {:.2}x",
+            multi_bytes.len() as f64 / single_bytes.len() as f64
+        );
+        println!();
+        println!(
+            "Overhead per linestring: {} extra bytes",
+            (multi_bytes.len() - single_bytes.len()) / 100
+        );
+
+        // Verify the hypothesis: MultiLineString should be significantly larger
+        assert!(
+            multi_cmds.len() > single_cmds.len(),
+            "MultiLineString should have more command values than single LineString"
+        );
+
+        // The ratio should be around 1.5x for 2-point linestrings
+        let cmd_ratio = multi_cmds.len() as f64 / single_cmds.len() as f64;
+        assert!(
+            cmd_ratio > 1.2,
+            "Command overhead ratio should be >1.2x, got {:.2}x",
+            cmd_ratio
+        );
+    }
 }

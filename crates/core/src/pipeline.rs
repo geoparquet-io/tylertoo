@@ -2450,13 +2450,45 @@ fn generate_tiles_to_writer_internal(
                 }
 
                 if !linestrings.is_empty() {
-                    let coalesced = if linestrings.len() == 1 {
-                        WorldClippedGeometry::LineString(linestrings.into_iter().next().unwrap())
+                    // Aggressively simplify coalesced linestrings WITHOUT boundary preservation.
+                    // For coalesced features, we want maximum simplification since feature
+                    // boundaries no longer matter after merging.
+                    let simplified_linestrings: Vec<Vec<WorldCoord>> = if let Some(factor) =
+                        simplify_factor
+                    {
+                        let pixel_tolerance =
+                            factor * (1u32 << 14u8.saturating_sub(coord.z)) as f64;
+                        let after_simplify: Vec<Vec<WorldCoord>> = linestrings
+                            .into_iter()
+                            .map(|ls| {
+                                crate::simplify::simplify_coalesced_linestring(
+                                    &ls,
+                                    &coord,
+                                    extent,
+                                    pixel_tolerance,
+                                )
+                            })
+                            .filter(|ls| ls.len() >= 2)
+                            .collect();
+
+                        // Apply tippecanoe-style remove_noop ACROSS all linestrings.
+                        // This drops linestrings that start where others end (same pixel).
+                        crate::simplify::remove_noop_multilinestring(after_simplify, &coord, extent)
                     } else {
-                        WorldClippedGeometry::MultiLineString(linestrings)
+                        linestrings
                     };
-                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
-                    feature_count += 1;
+
+                    if !simplified_linestrings.is_empty() {
+                        let coalesced = if simplified_linestrings.len() == 1 {
+                            WorldClippedGeometry::LineString(
+                                simplified_linestrings.into_iter().next().unwrap(),
+                            )
+                        } else {
+                            WorldClippedGeometry::MultiLineString(simplified_linestrings)
+                        };
+                        layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
+                        feature_count += 1;
+                    }
                 }
 
                 if !polygons.is_empty() {
@@ -2468,6 +2500,12 @@ fn generate_tiles_to_writer_internal(
                         }
                     } else {
                         WorldClippedGeometry::MultiPolygon(polygons)
+                    };
+                    // Re-simplify coalesced geometry for aggressive reduction at low zoom
+                    let coalesced = if let Some(factor) = simplify_factor {
+                        simplify_geometry_for_tile(&coalesced, &coord, extent, factor)
+                    } else {
+                        coalesced
                     };
                     layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
                     feature_count += 1;

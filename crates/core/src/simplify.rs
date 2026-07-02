@@ -23,6 +23,7 @@ use crate::hierarchical_clip::WorldClippedGeometry;
 use crate::tile::{TileBounds, TileCoord};
 use crate::world_coord::{WorldCoord, WORLD_SCALE};
 use geo::{Coord, Geometry, LineString, MultiLineString, MultiPolygon, Point, Polygon, Simplify};
+use tracing::debug;
 
 /// Default pixel tolerance for simplification (matches tippecanoe)
 pub const DEFAULT_PIXEL_TOLERANCE: f64 = 1.0;
@@ -407,6 +408,181 @@ fn tile_linestring_to_world_coords(
 /// marking boundary-crossing points as "necessary".
 ///
 /// # Arguments
+/// Aggressively simplify a coalesced linestring without boundary preservation.
+///
+/// For coalesced geometries, we don't want to preserve feature boundaries since
+/// features have been merged. This allows much more aggressive simplification.
+/// Matches tippecanoe's approach: simplify the entire coalesced geometry as one unit.
+pub fn simplify_coalesced_linestring(
+    coords: &[WorldCoord],
+    tile: &TileCoord,
+    extent: u32,
+    pixel_tolerance: f64,
+) -> Vec<WorldCoord> {
+    if coords.len() < 2 {
+        return Vec::new(); // Drop degenerate linestrings
+    }
+
+    // Calculate minimum pixel extent threshold based on zoom level.
+    // At low zoom levels, we need to be VERY aggressive about dropping tiny segments
+    // because there are so MANY of them (road networks have millions of segments).
+    //
+    // The key insight: at low zoom, the visual contribution of a tiny road segment
+    // is negligible, but it still costs ~20-40 bytes in the tile. With millions of
+    // segments, this adds up fast.
+    //
+    // Threshold scales with zoom to maintain visual quality while controlling size:
+    // z0-4 = 16px (very aggressive - only major roads visible)
+    // z5-7 = 8px  (moderate - regional roads)
+    // z8-10 = 4px (less aggressive - local roads start appearing)
+    // z11+ = 2px  (minimal - all detail preserved)
+    let min_extent_px = if tile.z <= 4 {
+        16.0
+    } else if tile.z <= 7 {
+        8.0
+    } else if tile.z <= 10 {
+        4.0
+    } else {
+        2.0
+    };
+
+    let extent_pixels = linestring_extent_pixels(coords, tile, extent);
+    if extent_pixels < min_extent_px {
+        return Vec::new(); // Drop sub-threshold linestring entirely
+    }
+
+    // Aggressive simplification without boundary preservation
+    let simplified = simplify_world_linestring(coords, tile, extent, pixel_tolerance);
+
+    // Then remove consecutive same-pixel points
+    remove_noop_linestring(&simplified, tile, extent)
+}
+
+/// Calculate the maximum extent (width or height) of a linestring in tile pixels.
+fn linestring_extent_pixels(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> f64 {
+    if coords.is_empty() {
+        return 0.0;
+    }
+
+    let mut min_x = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut min_y = f64::MAX;
+    let mut max_y = f64::MIN;
+
+    for coord in coords {
+        let (x, y) = world_to_tile_local_f64(*coord, tile, extent);
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    // Return the larger of width or height
+    (max_x - min_x).max(max_y - min_y)
+}
+
+/// Remove consecutive duplicate points when rounded to tile pixel coordinates.
+///
+/// This mirrors tippecanoe's `remove_noop` function (clip.cpp:532-604).
+/// After simplification, points may land on the same pixel - this removes those
+/// duplicates. If all points collapse to the same pixel, the result will have
+/// length < 2 and the linestring should be dropped.
+fn remove_noop_linestring(coords: &[WorldCoord], tile: &TileCoord, extent: u32) -> Vec<WorldCoord> {
+    if coords.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(coords.len());
+    let mut prev_px: Option<(i32, i32)> = None;
+
+    for coord in coords {
+        let (x, y) = world_to_tile_local_f64(*coord, tile, extent);
+        let px = (x.round() as i32, y.round() as i32);
+
+        // Keep point if it's on a different pixel than the previous
+        if prev_px.map_or(true, |prev| prev != px) {
+            result.push(*coord);
+            prev_px = Some(px);
+        }
+    }
+
+    result
+}
+
+/// Tippecanoe-style remove_noop for MultiLineString.
+///
+/// Unlike `remove_noop_linestring` which processes each linestring independently,
+/// this function works ACROSS linestrings like tippecanoe does. Key behaviors:
+///
+/// 1. **LINETO dedup**: Consecutive LINETOs on same pixel are dropped (within each linestring)
+/// 2. **MOVETO-after-LINETO**: If a new linestring starts on the same pixel where the
+///    previous linestring ended, the new linestring is dropped entirely
+/// 3. **Empty linestrings**: Linestrings with < 2 unique pixel positions are dropped
+///
+/// This is critical for coalesced road networks where many tiny segments end where
+/// others begin - they should merge into the visual line, not create separate features.
+pub fn remove_noop_multilinestring(
+    linestrings: Vec<Vec<WorldCoord>>,
+    tile: &TileCoord,
+    extent: u32,
+) -> Vec<Vec<WorldCoord>> {
+    let mut result = Vec::with_capacity(linestrings.len());
+
+    // Track the last pixel position ACROSS all linestrings
+    let mut last_lineto_px: Option<(i32, i32)> = None;
+
+    for coords in linestrings {
+        if coords.is_empty() {
+            continue;
+        }
+
+        // Check if this linestring's MOVETO lands on the same pixel as the previous LINETO
+        // (tippecanoe's third pass for VT_LINE)
+        let first_coord = coords[0];
+        let (fx, fy) = world_to_tile_local_f64(first_coord, tile, extent);
+        let first_px = (fx.round() as i32, fy.round() as i32);
+
+        if let Some(last_px) = last_lineto_px {
+            if first_px == last_px {
+                // MOVETO lands on same pixel as previous LINETO - skip entire linestring
+                // But update last_lineto_px to this linestring's end in case it extends further
+                if coords.len() >= 2 {
+                    let last_coord = coords[coords.len() - 1];
+                    let (lx, ly) = world_to_tile_local_f64(last_coord, tile, extent);
+                    last_lineto_px = Some((lx.round() as i32, ly.round() as i32));
+                }
+                continue;
+            }
+        }
+
+        // Process this linestring with within-linestring dedup
+        let mut deduped = Vec::with_capacity(coords.len());
+        let mut prev_px: Option<(i32, i32)> = None;
+
+        for coord in &coords {
+            let (x, y) = world_to_tile_local_f64(*coord, tile, extent);
+            let px = (x.round() as i32, y.round() as i32);
+
+            if prev_px.map_or(true, |prev| prev != px) {
+                deduped.push(*coord);
+                prev_px = Some(px);
+            }
+        }
+
+        // Only keep linestrings with at least 2 unique pixel positions
+        if deduped.len() >= 2 {
+            // Update last_lineto_px to this linestring's end
+            let last_coord = deduped[deduped.len() - 1];
+            let (lx, ly) = world_to_tile_local_f64(last_coord, tile, extent);
+            last_lineto_px = Some((lx.round() as i32, ly.round() as i32));
+
+            result.push(deduped);
+        }
+    }
+
+    result
+}
+
 /// * `coord` - The world coordinate to check
 /// * `tile` - The tile to check boundaries against
 /// * `extent` - Tile extent (typically 4096)
@@ -630,8 +806,10 @@ pub fn simplify_geometry_for_tile(
     extent: u32,
     simplify_factor: f64,
 ) -> WorldClippedGeometry {
-    // Tolerance in pixels, scaled by factor
-    let pixel_tolerance = simplify_factor;
+    // Tolerance in pixels, scaled by zoom level (doubles for each zoom below z=14)
+    // At z=14: 1 pixel tolerance. At z=2: 4096 pixel tolerance (very aggressive).
+    // Matches tippecanoe's approach: res = 1 << (32 - detail - z) with detail=12.
+    let pixel_tolerance = simplify_factor * (1u32 << 14u8.saturating_sub(tile.z)) as f64;
 
     match geom {
         // Points cannot be simplified
@@ -640,7 +818,7 @@ pub fn simplify_geometry_for_tile(
             WorldClippedGeometry::MultiPoint(points.clone())
         }
 
-        // Linestrings: use boundary-preserving simplification
+        // Linestrings: use boundary-preserving simplification, then remove pixel duplicates
         WorldClippedGeometry::LineString(coords) => {
             let simplified = simplify_world_linestring_preserve_boundaries(
                 coords,
@@ -648,11 +826,18 @@ pub fn simplify_geometry_for_tile(
                 extent,
                 pixel_tolerance,
             );
-            WorldClippedGeometry::LineString(simplified)
+            // Remove consecutive points on same pixel (tippecanoe's remove_noop)
+            let deduped = remove_noop_linestring(&simplified, tile, extent);
+            WorldClippedGeometry::LineString(deduped)
         }
 
         WorldClippedGeometry::MultiLineString(lines) => {
-            let simplified_lines: Vec<Vec<WorldCoord>> = lines
+            // Count points BEFORE remove_noop (for debug logging at low zoom)
+            let before_linestrings = lines.len();
+            let before_points: usize = lines.iter().map(|l| l.len()).sum();
+
+            // First, apply boundary-preserving simplification
+            let after_simplify: Vec<Vec<WorldCoord>> = lines
                 .iter()
                 .map(|line| {
                     simplify_world_linestring_preserve_boundaries(
@@ -662,8 +847,38 @@ pub fn simplify_geometry_for_tile(
                         pixel_tolerance,
                     )
                 })
-                .filter(|line| line.len() >= 2) // Filter degenerate lines
                 .collect();
+
+            let after_simplify_linestrings = after_simplify.len();
+            let after_simplify_points: usize = after_simplify.iter().map(|l| l.len()).sum();
+
+            // Now apply remove_noop to each linestring
+            let simplified_lines: Vec<Vec<WorldCoord>> = after_simplify
+                .into_iter()
+                .map(|line| remove_noop_linestring(&line, tile, extent))
+                .filter(|line| line.len() >= 2) // Drop degenerate/collapsed lines
+                .collect();
+
+            // Count points AFTER remove_noop
+            let after_linestrings = simplified_lines.len();
+            let after_points: usize = simplified_lines.iter().map(|l| l.len()).sum();
+
+            // Debug log only for low zoom levels (z <= 4)
+            if tile.z <= 4 {
+                debug!(
+                    "simplify z={} MultiLineString: BEFORE remove_noop: {} linestrings, {} points",
+                    tile.z, after_simplify_linestrings, after_simplify_points
+                );
+                debug!(
+                    "simplify z={} MultiLineString: AFTER remove_noop: {} linestrings, {} points",
+                    tile.z, after_linestrings, after_points
+                );
+                debug!(
+                    "simplify z={} MultiLineString: TOTAL reduction: {} -> {} linestrings, {} -> {} points",
+                    tile.z, before_linestrings, after_linestrings, before_points, after_points
+                );
+            }
+
             WorldClippedGeometry::MultiLineString(simplified_lines)
         }
 
@@ -1754,6 +1969,447 @@ mod tests {
                     i32_y
                 );
             }
+        }
+
+        /// BUG REPRODUCTION: When coalescing MANY small features, each keeps 2+ points.
+        ///
+        /// ROOT CAUSE: `simplify_geometry_for_tile` simplifies WITHIN each sub-linestring
+        /// but doesn't merge ACROSS sub-linestrings. At low zoom where tolerance equals
+        /// the tile extent (4096 pixels), this creates massive output.
+        ///
+        /// OBSERVED: At zoom 2, coalesced features are 61KB each despite simplification.
+        ///
+        /// REPRODUCTION: 500 tiny linestrings (each 2 points) coalesced together.
+        /// Even with 4096px tolerance, we get 500 * 2 = 1000 points output.
+        /// The linestrings should be merged/dropped since they're sub-pixel at this zoom.
+        #[test]
+        fn test_simplify_multilinestring_at_low_zoom() {
+            use crate::hierarchical_clip::WorldClippedGeometry;
+            use crate::tile::TileCoord;
+
+            // Zoom 2: tolerance = 4096 pixels (entire tile extent!)
+            let tile = TileCoord::new(1, 1, 2);
+            let extent = 4096u32;
+            let simplify_factor = 1.0;
+
+            let shift = 32 - tile.z as u32;
+            let tile_origin_x = (tile.x as u64) << shift;
+            let tile_origin_y = (tile.y as u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            // Create 500 tiny linestrings, each just 2 points
+            // These simulate coalesced road segments
+            let mut all_lines: Vec<Vec<WorldCoord>> = Vec::new();
+
+            for i in 0..500 {
+                // Spread across the tile in a grid pattern
+                let row = i / 25;
+                let col = i % 25;
+                let base_x = tile_origin_x + tile_size / 10 + (col as u64) * tile_size * 8 / 250;
+                let base_y = tile_origin_y + tile_size / 10 + (row as u64) * tile_size * 8 / 200;
+
+                // Each linestring is sub-pixel at z2 (tile_size/20000 << tile_size/4096)
+                let line = vec![
+                    WorldCoord::new(base_x as u32, base_y as u32),
+                    WorldCoord::new((base_x + tile_size / 20000) as u32, base_y as u32),
+                ];
+                all_lines.push(line);
+            }
+
+            let input_points: usize = all_lines.iter().map(|l| l.len()).sum();
+            let input_linestrings = all_lines.len();
+            println!(
+                "Input: {} linestrings, {} total points",
+                input_linestrings, input_points
+            );
+
+            // Create and simplify
+            let geom = WorldClippedGeometry::MultiLineString(all_lines);
+            let simplified = simplify_geometry_for_tile(&geom, &tile, extent, simplify_factor);
+
+            // Count output
+            let (output_linestrings, output_points) = match &simplified {
+                WorldClippedGeometry::MultiLineString(lines) => {
+                    let total: usize = lines.iter().map(|l| l.len()).sum();
+                    (lines.len(), total)
+                }
+                _ => panic!("Expected MultiLineString"),
+            };
+
+            let pixel_tolerance = simplify_factor * (1u32 << 14u8.saturating_sub(tile.z)) as f64;
+            println!(
+                "Output: {} linestrings, {} total points (tolerance: {} pixels)",
+                output_linestrings, output_points, pixel_tolerance
+            );
+
+            // After tippecanoe-style remove_noop: sub-pixel linestrings collapse because
+            // both points round to the same pixel and the duplicate is removed.
+            // Some linestrings may straddle pixel boundaries and remain as 2-point lines.
+            // We expect significant reduction (> 50%) from the original 1000 points.
+            assert!(
+                output_points < input_points / 2,
+                "Expected > 50% reduction from remove_noop. Input: {} points, Output: {} points.\n\
+                 Linestrings where both points round to same pixel should be dropped.",
+                input_points,
+                output_points
+            );
+        }
+
+        /// Test: remove_noop_multilinestring drops linestrings that START
+        /// on the same pixel where the previous linestring ENDED.
+        ///
+        /// Tippecanoe behavior: If linestring A ends at pixel (10, 20) and
+        /// linestring B starts at pixel (10, 20), linestring B should be dropped
+        /// entirely because it visually continues from the same pixel.
+        #[test]
+        fn test_remove_noop_drops_linestring_starting_at_previous_end() {
+            use crate::tile::TileCoord;
+
+            // Use zoom 10 with standard extent for pixel-level control
+            let tile = TileCoord::new(500, 500, 10);
+            let extent = 4096u32;
+
+            // Calculate world coordinate spacing for 1 pixel at this zoom
+            let shift = 32 - tile.z as u32;
+            let tile_size = 1u64 << shift;
+            let world_per_pixel = tile_size / extent as u64;
+
+            // Tile origin in world coordinates
+            let tile_origin_x = (tile.x as u64) << shift;
+            let tile_origin_y = (tile.y as u64) << shift;
+
+            // Create 3 linestrings:
+            // - Linestring 1: pixels (10, 20) -> (100, 20) -- visually significant
+            // - Linestring 2: pixels (100, 20) -> (200, 20) -- STARTS at same pixel as LS1 ends!
+            // - Linestring 3: pixels (300, 20) -> (400, 20) -- starts at a different pixel
+
+            // Linestring 1: (10, 20) -> (100, 20)
+            let ls1 = vec![
+                WorldCoord::new(
+                    (tile_origin_x + 10 * world_per_pixel) as u32,
+                    (tile_origin_y + 20 * world_per_pixel) as u32,
+                ),
+                WorldCoord::new(
+                    (tile_origin_x + 100 * world_per_pixel) as u32,
+                    (tile_origin_y + 20 * world_per_pixel) as u32,
+                ),
+            ];
+
+            // Linestring 2: STARTS at pixel (100, 20) -- same as where LS1 ends!
+            // Ends at pixel (200, 20)
+            let ls2 = vec![
+                WorldCoord::new(
+                    (tile_origin_x + 100 * world_per_pixel) as u32,
+                    (tile_origin_y + 20 * world_per_pixel) as u32,
+                ),
+                WorldCoord::new(
+                    (tile_origin_x + 200 * world_per_pixel) as u32,
+                    (tile_origin_y + 20 * world_per_pixel) as u32,
+                ),
+            ];
+
+            // Linestring 3: (300, 20) -> (400, 20) -- starts at DIFFERENT pixel
+            let ls3 = vec![
+                WorldCoord::new(
+                    (tile_origin_x + 300 * world_per_pixel) as u32,
+                    (tile_origin_y + 20 * world_per_pixel) as u32,
+                ),
+                WorldCoord::new(
+                    (tile_origin_x + 400 * world_per_pixel) as u32,
+                    (tile_origin_y + 20 * world_per_pixel) as u32,
+                ),
+            ];
+
+            let input = vec![ls1.clone(), ls2.clone(), ls3.clone()];
+            let result = remove_noop_multilinestring(input, &tile, extent);
+
+            println!("Input: 3 linestrings");
+            println!("Output: {} linestrings", result.len());
+
+            // Expected behavior (tippecanoe-style):
+            // - LS1 kept (starts at distinct pixel)
+            // - LS2 DROPPED (starts at same pixel where LS1 ends)
+            // - LS3 kept (starts at distinct pixel from where LS2 ended)
+            //
+            // So we expect 2 linestrings in the output
+            assert_eq!(
+                result.len(),
+                2,
+                "Expected 2 linestrings (LS2 should be dropped because it starts \
+                 at the same pixel where LS1 ends).\n\
+                 Got {} linestrings instead.",
+                result.len()
+            );
+
+            // Verify the first output is LS1
+            assert_eq!(
+                result[0].len(),
+                ls1.len(),
+                "First output linestring should match LS1"
+            );
+
+            // Verify the second output is LS3
+            assert_eq!(
+                result[1].len(),
+                ls3.len(),
+                "Second output linestring should match LS3"
+            );
+        }
+
+        /// Test that 2-point linestrings spanning exactly 1 pixel are dropped at low zoom.
+        ///
+        /// This tests the hypothesis: after coalescing, gpq-tiles has thousands of 2-point
+        /// linestrings that can't be simplified further because RDP can't simplify below
+        /// 2 points, but these linestrings are visually insignificant (only 1 pixel long).
+        ///
+        /// At zoom 2, a 1-pixel linestring is visually negligible and should be dropped
+        /// to reduce tile size.
+        #[test]
+        fn test_single_pixel_linestrings_should_be_dropped_at_low_zoom() {
+            use crate::tile::TileCoord;
+
+            // Zoom 2: entire tile is 4096 pixels
+            let tile = TileCoord::new(1, 1, 2);
+            let extent = 4096u32;
+            let simplify_factor = 1.0;
+
+            // Calculate world coordinate scale
+            let shift = 32 - tile.z as u32;
+            let tile_origin_x = (tile.x as u64) << shift;
+            let tile_origin_y = (tile.y as u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            // World units per pixel: tile_size / extent
+            let world_per_pixel = tile_size / extent as u64;
+
+            // Create 100 linestrings, each spanning exactly 1 pixel (both points on adjacent pixels)
+            let mut count_surviving = 0;
+
+            for i in 0..100 {
+                // Spread across the tile
+                let base_x = tile_origin_x + (i as u64 * tile_size / 120);
+                let base_y = tile_origin_y + tile_size / 2;
+
+                // Each linestring spans exactly 1 pixel (2 pixels apart = 1 pixel length)
+                // Point A at pixel N, Point B at pixel N+1
+                let coords = vec![
+                    WorldCoord::new(base_x as u32, base_y as u32),
+                    WorldCoord::new((base_x + world_per_pixel) as u32, base_y as u32),
+                ];
+
+                let simplified =
+                    simplify_coalesced_linestring(&coords, &tile, extent, simplify_factor);
+
+                if simplified.len() >= 2 {
+                    count_surviving += 1;
+                }
+            }
+
+            println!(
+                "1-pixel linestrings surviving at z2: {}/100 (should be 0)",
+                count_surviving
+            );
+
+            // At zoom 2, a 1-pixel linestring is visually insignificant.
+            // The min_extent_px threshold at z<=4 is 16px.
+            // These 1-pixel linestrings should be dropped because they're < 16px extent.
+            assert_eq!(
+                count_surviving, 0,
+                "Expected ALL 1-pixel linestrings to be dropped at z2.\n\
+                 Got {} surviving linestrings.\n\
+                 At zoom 2, min_extent_px=16, so linestrings < 16px should be dropped.",
+                count_surviving
+            );
+        }
+
+        /// Test that 2-point linestrings at the threshold boundary (16 pixels at z2) survive.
+        ///
+        /// This is the counterpart to the above test - linestrings at or above the
+        /// threshold should survive simplification.
+        #[test]
+        fn test_threshold_pixel_linestrings_survive_at_low_zoom() {
+            use crate::tile::TileCoord;
+
+            // Zoom 2: min_extent_px = 16
+            let tile = TileCoord::new(1, 1, 2);
+            let extent = 4096u32;
+            let simplify_factor = 1.0;
+
+            let shift = 32 - tile.z as u32;
+            let tile_origin_x = (tile.x as u64) << shift;
+            let tile_origin_y = (tile.y as u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            let world_per_pixel = tile_size / extent as u64;
+
+            // Create 100 linestrings, each spanning exactly 16 pixels (at threshold)
+            let mut count_surviving = 0;
+
+            for i in 0..100 {
+                let base_x = tile_origin_x + (i as u64 * tile_size / 120);
+                let base_y = tile_origin_y + tile_size / 2;
+
+                // 16 pixels extent (at threshold)
+                let coords = vec![
+                    WorldCoord::new(base_x as u32, base_y as u32),
+                    WorldCoord::new((base_x + 16 * world_per_pixel) as u32, base_y as u32),
+                ];
+
+                let simplified =
+                    simplify_coalesced_linestring(&coords, &tile, extent, simplify_factor);
+
+                if simplified.len() >= 2 {
+                    count_surviving += 1;
+                }
+            }
+
+            println!(
+                "16-pixel linestrings surviving at z2: {}/100 (should be 100)",
+                count_surviving
+            );
+
+            // At threshold, linestrings should survive
+            assert_eq!(
+                count_surviving, 100,
+                "Expected ALL 16-pixel linestrings to survive at z2.\n\
+                 Got {} surviving. min_extent_px=16, so linestrings >= 16px should survive.",
+                count_surviving
+            );
+        }
+
+        /// Test that many tiny 2-point linestrings are kept at HIGH zoom levels.
+        ///
+        /// At zoom 12+, even tiny linestrings matter for visual detail.
+        /// This tests that the zoom-dependent thresholding works correctly
+        /// and doesn't over-aggressively drop features at high zoom.
+        #[test]
+        fn test_tiny_linestrings_survive_at_high_zoom() {
+            use crate::tile::TileCoord;
+
+            // Zoom 12: min_extent_px = 2
+            let tile = TileCoord::new(1000, 1000, 12);
+            let extent = 4096u32;
+            let simplify_factor = 1.0;
+
+            let shift = 32 - tile.z as u32;
+            let tile_origin_x = (tile.x as u64) << shift;
+            let tile_origin_y = (tile.y as u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            let world_per_pixel = tile_size / extent as u64;
+
+            // Create 100 linestrings, each spanning exactly 3 pixels (above z12 threshold)
+            let mut count_surviving = 0;
+
+            for i in 0..100 {
+                let base_x = tile_origin_x + (i as u64 * tile_size / 120);
+                let base_y = tile_origin_y + tile_size / 2;
+
+                // 3 pixels extent (above z12 threshold of 2px)
+                let coords = vec![
+                    WorldCoord::new(base_x as u32, base_y as u32),
+                    WorldCoord::new((base_x + 3 * world_per_pixel) as u32, base_y as u32),
+                ];
+
+                let simplified =
+                    simplify_coalesced_linestring(&coords, &tile, extent, simplify_factor);
+
+                if simplified.len() >= 2 {
+                    count_surviving += 1;
+                }
+            }
+
+            println!(
+                "3-pixel linestrings surviving at z12: {}/100 (should be 100)",
+                count_surviving
+            );
+
+            assert_eq!(
+                count_surviving, 100,
+                "Expected ALL 3-pixel linestrings to survive at z12.\n\
+                 Got {} surviving. At z12 min_extent_px=2, so 3px linestrings should survive.",
+                count_surviving
+            );
+        }
+
+        /// FAILING TEST: Non-coalesced 2-point linestrings via simplify_geometry_for_tile
+        ///
+        /// This tests the hypothesis: simplify_geometry_for_tile does NOT drop tiny
+        /// 2-point linestrings even at low zoom, because it uses the boundary-preserving
+        /// simplification path which only removes pixel-duplicate points.
+        ///
+        /// The current implementation keeps all 2-point linestrings where points are
+        /// on different pixels, regardless of how far apart those pixels are.
+        /// This leads to thousands of tiny 2-point linestrings that can't be simplified
+        /// further by RDP but are visually insignificant.
+        #[test]
+        fn test_non_coalesced_tiny_linestrings_should_be_dropped() {
+            use crate::hierarchical_clip::WorldClippedGeometry;
+            use crate::tile::TileCoord;
+
+            // Zoom 2: tolerance = 4096 pixels (entire tile extent!)
+            let tile = TileCoord::new(1, 1, 2);
+            let extent = 4096u32;
+            let simplify_factor = 1.0;
+
+            let shift = 32 - tile.z as u32;
+            let tile_origin_x = (tile.x as u64) << shift;
+            let tile_origin_y = (tile.y as u64) << shift;
+            let tile_size = 1u64 << shift;
+
+            let world_per_pixel = tile_size / extent as u64;
+
+            // Create 100 linestrings, each spanning exactly 1 pixel (both points on adjacent pixels)
+            let mut all_lines: Vec<Vec<WorldCoord>> = Vec::new();
+
+            for i in 0..100 {
+                let base_x = tile_origin_x + (i as u64 * tile_size / 120);
+                let base_y = tile_origin_y + tile_size / 2;
+
+                // Each linestring spans exactly 1 pixel
+                let line = vec![
+                    WorldCoord::new(base_x as u32, base_y as u32),
+                    WorldCoord::new((base_x + world_per_pixel) as u32, base_y as u32),
+                ];
+                all_lines.push(line);
+            }
+
+            let input_linestrings = all_lines.len();
+            let input_points: usize = all_lines.iter().map(|l| l.len()).sum();
+            println!(
+                "Input (non-coalesced): {} linestrings, {} total points",
+                input_linestrings, input_points
+            );
+
+            // Use simplify_geometry_for_tile (the NON-coalesced path)
+            let geom = WorldClippedGeometry::MultiLineString(all_lines);
+            let simplified = simplify_geometry_for_tile(&geom, &tile, extent, simplify_factor);
+
+            let (output_linestrings, output_points) = match &simplified {
+                WorldClippedGeometry::MultiLineString(lines) => {
+                    let total: usize = lines.iter().map(|l| l.len()).sum();
+                    (lines.len(), total)
+                }
+                _ => panic!("Expected MultiLineString"),
+            };
+
+            println!(
+                "Output (non-coalesced): {} linestrings, {} total points",
+                output_linestrings, output_points
+            );
+
+            // This assertion SHOULD fail with current implementation!
+            // At zoom 2, 1-pixel linestrings are visually insignificant.
+            // They should be dropped, but simplify_geometry_for_tile doesn't have
+            // the extent-based filtering that simplify_coalesced_linestring has.
+            assert_eq!(
+                output_linestrings, 0,
+                "Expected ALL 1-pixel linestrings to be dropped at z2.\n\
+                 Got {} surviving linestrings (with {} points).\n\
+                 BUG: simplify_geometry_for_tile does not drop sub-threshold linestrings\n\
+                 like simplify_coalesced_linestring does (min_extent_px=16 at z2).",
+                output_linestrings, output_points
+            );
         }
     }
 }
