@@ -188,6 +188,9 @@ pass 0 stats (optional) → pass 1 build cell-winner tables →
 pass 2 per-level stream-simplify-write. Memory target:
 O(row group + winner tables). Verify peak RSS on the large corpus
 item stays under budget (dhat/heaptrack test).
+(PRIORITY UP per V1 results 2026-07-02: Moldova 632k polygons =
+12m04s / 5.5 GB peak RSS in the in-memory v1. Also revisit wall
+time — likely dominated by per-level decode/rebuild.)
 
 ### (V5. Quality ladder — post-launch unless V2 fails)
 Point clustering at coarse levels (clustering.rs), polygon
@@ -198,9 +201,22 @@ conventions), attribute aggregation rules into spec v0.2.
 
 ## Phase 3 — Ecosystem (parallel, after format freeze)
 
+### E0. `gpq-tiles export-pmtiles`  (deps: P4, V2 quality gate;
+reuses shelved mvt.rs/pmtiles_writer.rs/clip.rs)
+(ADDED 2026-07-02.) Batch PMTiles export FROM an overview file —
+the replacement for the stuck tile pipeline, not a revival of it.
+Per zoom: read the matching level band (already thinned/simplified/
+Hilbert-ordered), windowed sweep groups features into tiles, clip at
+tile bounds, MVT-encode, write PMTiles. No global external sort, no
+per-tile budget retry loop (generalization is precomputed); optional
+light per-tile safety valve for pathological density. This gives the
+immediate-adoption artifact (PMTiles works everywhere today) as a
+cheap derived export of the canonical overview file — no drift.
+
 ### E1. `gpq-tiles serve`  (deps: P4; reuses shelved mvt.rs/clip.rs)
 z/x/y MVT endpoint reading an overview file: level = zoom,
-bbox = tile bounds, clip + encode precomputed features.
+bbox = tile bounds, clip + encode precomputed features. Shares the
+tile-window/clip/encode core with E0.
 Gives every MapLibre map a zero-client-change path.
 Stretch: static-deployable variant (Cloudflare Worker) later.
 

@@ -328,6 +328,12 @@ Every overview file MUST contain a physical column:
 - **Nullability**: NOT NULL. Every row MUST have a level value.
 - **Domain**: `0 .. len(levels)-1`.
 
+Writers MUST reject source data whose schema contains a column named
+`level` under **case-insensitive** comparison (e.g. `LEVEL`, `Level`):
+SQL engines commonly resolve identifiers case-insensitively, so a
+case-colliding source column would silently shadow the overview
+column in reader predicates. (V1 finding F2, 2026-07-02.)
+
 Conformance requires **column↔footer consistency**: for every row group
 `r` and every row in `r`, the row's `level` value MUST equal the level
 `k` whose RG span (§3.3) contains `r`. Equivalently, all rows of a given

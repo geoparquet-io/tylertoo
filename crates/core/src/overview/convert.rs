@@ -244,10 +244,13 @@ pub fn convert_to_overviews(
     let input_schema = builder.schema().clone();
 
     // Reject an input that already carries a `level` column (§4.1).
+    // Case-insensitive: DuckDB resolves identifiers case-insensitively,
+    // so a source `LEVEL` column would silently shadow ours in
+    // `WHERE level = k` (V1 finding F2).
     if input_schema
         .fields()
         .iter()
-        .any(|f| f.name() == LEVEL_COLUMN)
+        .any(|f| f.name().eq_ignore_ascii_case(LEVEL_COLUMN))
     {
         return Err(ConvertError::LevelColumnPresent);
     }

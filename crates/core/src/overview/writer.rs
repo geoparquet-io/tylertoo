@@ -121,7 +121,10 @@ pub enum WriterError {
     #[error("geoparquet encoder error: {0}")]
     GeoParquet(String),
     /// The source schema already contains a `level` column.
-    #[error("source schema already contains a '{LEVEL_COLUMN}' column")]
+    #[error(
+        "source schema already contains a '{LEVEL_COLUMN}' column \
+         (matched case-insensitively; rename the source column first)"
+    )]
     LevelColumnExists,
     /// The source schema has no geometry column (no geoarrow-extension field).
     #[error("source schema has no geometry column")]
@@ -192,10 +195,13 @@ impl<W: Write + Send> OverviewWriter<W> {
         source_schema: &Schema,
         options: OverviewWriterOptions,
     ) -> Result<Self, WriterError> {
+        // Case-insensitive: SQL engines (DuckDB) resolve identifiers
+        // case-insensitively, so a source `LEVEL` column would silently
+        // shadow ours in `WHERE level = k` (V1 finding F2).
         if source_schema
             .fields()
             .iter()
-            .any(|f| f.name() == LEVEL_COLUMN)
+            .any(|f| f.name().eq_ignore_ascii_case(LEVEL_COLUMN))
         {
             return Err(WriterError::LevelColumnExists);
         }
@@ -571,6 +577,21 @@ mod tests {
     fn schema_with_level_column_is_rejected() {
         let schema = Schema::new(vec![
             Field::new("level", DataType::Int32, false),
+            geometry_field(),
+        ]);
+        let opts = OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(100.0, None)]);
+        let sink: Vec<u8> = Vec::new();
+        let result = OverviewWriter::try_new(sink, &schema, opts);
+        assert!(matches!(result, Err(WriterError::LevelColumnExists)));
+    }
+
+    #[test]
+    fn schema_with_case_colliding_level_column_is_rejected() {
+        // V1 finding F2: Natural Earth admin data carries a `LEVEL`
+        // attribute; DuckDB resolves identifiers case-insensitively,
+        // so this must be rejected like an exact match.
+        let schema = Schema::new(vec![
+            Field::new("LEVEL", DataType::Int32, false),
             geometry_field(),
         ]);
         let opts = OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(100.0, None)]);
