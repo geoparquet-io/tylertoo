@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "description": "gpq-tiles overview test corpus. Datasets per geometry class (point/line/polygon/monster) at small/medium/large scale tiers. Scripts only; data never committed.",
+  "overture": {
+    "release": "2026-06-17.0",
+    "bucket": "s3://overturemaps-us-west-2/release",
+    "region": "us-west-2",
+    "release_note": "Pinned release verified 2026-07-02. To use latest, override GPQ_OVERTURE_RELEASE env var or query the STAC catalog at https://stac.overturemaps.org/catalog.json (SET VARIABLE latest = (SELECT latest FROM 'https://stac.overturemaps.org/catalog.json'))."
+  },
+  "profiles": {
+    "default": "small + medium tiers, target < 2-3 GB total (fetch.sh)",
+    "large": "adds large tier state/country datasets (fetch.sh --large)",
+    "manual": "documented candidate, not auto-fetched (needs human confirmation)"
+  },
+  "datasets": [
+    {
+      "id": "points-boise-small",
+      "class": "point",
+      "tier": "small",
+      "profile": "default",
+      "source": "overture",
+      "theme": "places",
+      "type": "place",
+      "region": "Boise, ID metro",
+      "bbox": [-116.7, 43.4, -115.9, 43.8],
+      "select": "id, names.primary AS name, confidence, geometry",
+      "expected_features": 37000,
+      "verified_count": true,
+      "expected_size_mb": 2,
+      "license": "CDLA-Permissive-2.0 (Overture places)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 14,
+        "flags": "--drop-densest-as-needed --extend-zooms-if-still-dropping"
+      }
+    },
+    {
+      "id": "points-nyc-medium",
+      "class": "point",
+      "tier": "medium",
+      "profile": "default",
+      "source": "overture",
+      "theme": "places",
+      "type": "place",
+      "region": "New York City (5 boroughs)",
+      "bbox": [-74.3, 40.5, -73.7, 40.9],
+      "select": "id, names.primary AS name, confidence, geometry",
+      "expected_features": 458000,
+      "verified_count": true,
+      "expected_size_mb": 22,
+      "license": "CDLA-Permissive-2.0 (Overture places)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 14,
+        "flags": "--drop-densest-as-needed --extend-zooms-if-still-dropping"
+      }
+    },
+    {
+      "id": "lines-boise-small",
+      "class": "line",
+      "tier": "small",
+      "profile": "default",
+      "source": "overture",
+      "theme": "transportation",
+      "type": "segment",
+      "region": "Boise, ID metro",
+      "bbox": [-116.7, 43.4, -115.9, 43.8],
+      "select": "id, class AS road_class, subtype, geometry",
+      "expected_features": 152000,
+      "verified_count": true,
+      "expected_size_mb": 30,
+      "license": "ODbL-1.0 (Overture transportation, contains OpenStreetMap)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 14,
+        "flags": "--simplification=10 --drop-densest-as-needed"
+      }
+    },
+    {
+      "id": "lines-portland-medium",
+      "class": "line",
+      "tier": "medium",
+      "profile": "default",
+      "source": "overture",
+      "theme": "transportation",
+      "type": "segment",
+      "region": "Portland, OR metro",
+      "bbox": [-123.0, 45.3, -122.3, 45.7],
+      "select": "id, class AS road_class, subtype, geometry",
+      "expected_features": 280000,
+      "verified_count": false,
+      "expected_size_mb": 55,
+      "license": "ODbL-1.0 (Overture transportation, contains OpenStreetMap)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 14,
+        "flags": "--simplification=10 --drop-densest-as-needed"
+      }
+    },
+    {
+      "id": "polygons-portland-medium",
+      "class": "polygon",
+      "tier": "medium",
+      "profile": "default",
+      "source": "overture",
+      "theme": "buildings",
+      "type": "building",
+      "region": "Portland, OR metro",
+      "bbox": [-123.0, 45.3, -122.3, 45.7],
+      "select": "id, class AS building_class, height, geometry",
+      "expected_features": 650000,
+      "verified_count": false,
+      "expected_size_mb": 160,
+      "license": "ODbL-1.0 (Overture buildings, contains OpenStreetMap)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 14,
+        "flags": "--simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed"
+      }
+    },
+    {
+      "id": "monster-coastline",
+      "class": "monster",
+      "tier": "world",
+      "profile": "default",
+      "source": "natural-earth",
+      "url": "https://naciscdn.org/naturalearth/10m/physical/ne_10m_coastline.zip",
+      "shapefile": "ne_10m_coastline.shp",
+      "region": "Global coastline (10m)",
+      "geometry_kind": "line",
+      "expected_features": 4200,
+      "verified_count": false,
+      "expected_size_mb": 6,
+      "license": "Public Domain (Natural Earth)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 10,
+        "flags": "--simplification=10"
+      }
+    },
+    {
+      "id": "monster-admin",
+      "class": "monster",
+      "tier": "world",
+      "profile": "default",
+      "source": "natural-earth",
+      "url": "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_countries.zip",
+      "shapefile": "ne_10m_admin_0_countries.shp",
+      "region": "Global admin-0 country boundaries (10m)",
+      "geometry_kind": "polygon",
+      "expected_features": 258,
+      "verified_count": false,
+      "expected_size_mb": 12,
+      "license": "Public Domain (Natural Earth)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 10,
+        "flags": "--simplification=10 --coalesce-densest-as-needed"
+      }
+    },
+    {
+      "id": "lines-oregon-large",
+      "class": "line",
+      "tier": "large",
+      "profile": "large",
+      "source": "overture",
+      "theme": "transportation",
+      "type": "segment",
+      "region": "State of Oregon, USA",
+      "bbox": [-124.6, 41.9, -116.4, 46.3],
+      "select": "id, class AS road_class, subtype, geometry",
+      "expected_features": 5000000,
+      "verified_count": false,
+      "expected_size_mb": 900,
+      "license": "ODbL-1.0 (Overture transportation, contains OpenStreetMap)",
+      "tippecanoe": {
+        "minzoom": 0,
+        "maxzoom": 14,
+        "flags": "--simplification=10 --drop-densest-as-needed"
+      }
+    },
+    {
+      "id": "polygons-eurocrops-parcels",
+      "class": "polygon",
+      "tier": "large",
+      "profile": "manual",
+      "source": "source-coop",
+      "url": "https://source.coop/cholmes/eurocrops",
+      "region": "EuroCrops agricultural field boundaries (parcels-like)",
+      "expected_features": null,
+      "verified_count": false,
+      "expected_size_mb": null,
+      "license": "varies per country (mostly CC-BY / open); CONFIRM before use",
+      "note": "HUMAN-CONFIRM: exact GeoParquet object path on Source Cooperative not verified. Candidate public parcels/field-boundary dataset. A US county parcels GeoParquet was not located as a stable public source during corpus build; EuroCrops is the closest verified-exists candidate. Not auto-fetched."
+    }
+  ]
+}

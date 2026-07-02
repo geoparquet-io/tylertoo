@@ -47,6 +47,9 @@ target/criterion/
 # Large benchmark fixtures (download manually, not tracked in repo)
 tests/fixtures/realdata/adm2_polygons.parquet
 
+# Overview test corpus data (rebuilt from corpus/*.sh recipes)
+corpus/data/
+
 # Mutation testing
 mutants.out/
 
