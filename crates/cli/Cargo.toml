@@ -25,7 +25,6 @@ gpq-tiles-core = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
-log = { workspace = true }
 indicatif = { workspace = true }
 serde_json = "1"
 tempfile = "3"
@@ -34,3 +33,6 @@ dhat = { version = "0.3", optional = true }
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
+
+[lints]
+workspace = true
