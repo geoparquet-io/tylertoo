@@ -236,6 +236,24 @@ impl OverviewReader {
             .build()?;
         Ok(reader)
     }
+
+    /// [`Self::read_level`] with an explicit Arrow batch size (the builder
+    /// default is 1024 rows). Larger batches amortize per-batch overhead for
+    /// consumers that do parallel per-row work on each batch (PMTiles export).
+    pub fn read_level_with_batch_size(
+        &self,
+        level_idx: usize,
+        bbox: Option<[f64; 4]>,
+        batch_size: usize,
+    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+        let selected = self.selected_row_groups(level_idx, bbox)?;
+        let file = File::open(&self.path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_row_groups(selected)
+            .with_batch_size(batch_size)
+            .build()?;
+        Ok(reader)
+    }
 }
 
 #[cfg(test)]
