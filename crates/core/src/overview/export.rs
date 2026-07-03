@@ -353,7 +353,16 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
         for tc in tiles_for_bbox(&bbox, zoom) {
             let tb = tc.bounds();
             let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
-            if let Some(clipped) = clip_geometry(&feat.geom, &tb, buffer_deg) {
+            // Fast path (H3(c) lever 4): a feature whose bbox lies entirely
+            // within the buffered tile bounds is unaffected by clipping —
+            // skip the BooleanOps intersection and emit the geometry as-is.
+            // At z14 ~80% of features are interior to a single tile.
+            if bbox_within_buffered(&bbox, &tb, buffer_deg) {
+                grouped
+                    .entry((tc.x, tc.y))
+                    .or_default()
+                    .push((feat.geom.clone(), fi));
+            } else if let Some(clipped) = clip_geometry(&feat.geom, &tb, buffer_deg) {
                 grouped.entry((tc.x, tc.y)).or_default().push((clipped, fi));
             }
         }
@@ -383,6 +392,17 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
         t_mvt.elapsed().as_secs_f64(),
     );
     out
+}
+
+/// `true` when `bbox` lies entirely within `tb` expanded by `buffer` on every
+/// side. Clipping such a feature to the buffered tile is a geometric no-op, so
+/// the clip can be skipped (and BooleanOps ring normalization avoided).
+#[inline]
+fn bbox_within_buffered(bbox: &TileBounds, tb: &TileBounds, buffer: f64) -> bool {
+    bbox.lng_min >= tb.lng_min - buffer
+        && bbox.lat_min >= tb.lat_min - buffer
+        && bbox.lng_max <= tb.lng_max + buffer
+        && bbox.lat_max <= tb.lat_max + buffer
 }
 
 /// Encode a single tile's members to MVT bytes, applying the oversized valve.
@@ -939,6 +959,67 @@ mod tests {
                     assert!(
                         y >= -slack - extent && y <= extent + slack + extent,
                         "y {y} outside buffered tile bounds"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bbox_contained_feature_bypasses_clip_with_identical_output() {
+        // A concave polygon fully inside one z4 tile (z4 tile width 22.5°; the
+        // tile containing lng -100..., lat ~40 spans well past this 2° shape).
+        // The fast path must emit the geometry as-is: the encoded tile bytes
+        // must equal an MVT built from the *unclipped* geometry.
+        let poly = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-100.0, 25.0),
+                (-98.0, 25.0),
+                (-98.0, 27.0),
+                (-99.0, 25.5), // concavity: BooleanOps clip normalizes rings
+                (-100.0, 27.0),
+                (-100.0, 25.0),
+            ]),
+            vec![],
+        ));
+        let feats = vec![Feature {
+            geom: poly.clone(),
+            props: vec![],
+        }];
+        let opts = ExportOptions::default();
+        let tiles = encode_level_tiles(&feats, 4, &opts);
+        assert_eq!(tiles.len(), 1, "fully-contained feature => exactly 1 tile");
+        assert_eq!(tiles[0].feature_count, 1);
+
+        let tc = TileCoord::new(tiles[0].x, tiles[0].y, 4);
+        let expected = build_mvt(&[(poly.clone(), 0)], &feats, &tc.bounds(), &opts);
+        assert_eq!(
+            tiles[0].data, expected,
+            "contained feature must bypass the clip (geometry emitted as-is)"
+        );
+    }
+
+    #[test]
+    fn seam_crossing_feature_still_clips() {
+        // A line spanning several z4 tiles must still be clipped per tile:
+        // it lands in >= 2 tiles and no tile carries the full-extent geometry.
+        let line = Geometry::LineString(LineString::from(vec![(-100.0, 10.0), (-40.0, 11.0)]));
+        let feats = vec![Feature {
+            geom: line,
+            props: vec![],
+        }];
+        let opts = ExportOptions::default();
+        let tiles = encode_level_tiles(&feats, 4, &opts);
+        assert!(tiles.len() >= 2, "seam-crossing line must span tiles");
+        let extent = opts.extent as i32;
+        let slack = (opts.tile_buffer as i32) + 4;
+        for t in &tiles {
+            let decoded = decode_tile(&t.data);
+            for f in &decoded.layers[0].features {
+                for (x, y) in decode_coords(&f.geometry) {
+                    assert!(
+                        x >= -slack && x <= extent + slack && y >= -slack && y <= extent + slack,
+                        "({x},{y}) outside buffered tile: geometry was not clipped"
                     );
                 }
             }
