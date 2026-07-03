@@ -311,6 +311,57 @@ you trade a bigger footer for that pushdown.
 
 ---
 
+## Memory / streaming knobs: `--no-streaming`, `--read-batch-size`
+
+Like the [file layout knobs](#file-layout-knobs---row-group-size---full-column-stats),
+these never change the output's content: level assignments, geometry,
+attributes, and footer metadata are equivalent either way. They control **how
+much memory the conversion itself uses**.
+
+By default the converter runs a **two-pass streaming pipeline** (H3):
+
+1. **Pass 1** streams the input once and keeps only a tiny record per feature
+   (bbox, geometry kind, ranking key — no geometry). The level-assignment
+   engine and density budget run over those records to build the **winner
+   table**: one byte per feature saying which levels it survives at.
+2. **Pass 2** re-reads the input once per level (Parquet is seekable, so
+   re-reads are cheap), filters each read batch against the winner table,
+   simplifies only the selected rows, and writes batch-by-batch.
+
+Peak memory is `O(read batch + winner tables)` instead of `O(dataset)`: on the
+Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
+(in-memory) to well under 1 GB, with equivalent output.
+
+| Knob | Default | Units | Direction |
+|------|---------|-------|-----------|
+| `--read-batch-size N` | `8192` | rows per read batch | **bigger = faster-ish, more memory** |
+| `--no-streaming` | off | flag | revert to the one-pass in-memory pipeline |
+
+**`--read-batch-size`** bounds the transient working set of both passes: each
+batch is decoded, filtered, simplified, and written before the next is read.
+LARGER batches amortize per-batch overhead (marginally faster) at the cost of
+proportionally more peak memory; SMALLER batches bound memory tighter. The
+default 8192 keeps per-batch transients in the tens of MB even for
+vertex-heavy polygon data; you rarely need to change it. LOWER it (e.g. 1024)
+on very memory-constrained machines or for monster geometries (a single batch
+of coastline-sized multipolygons can be large); RAISE it (e.g. 65536) only if
+profiling shows per-batch overhead dominating on a machine with RAM to spare.
+
+**`--no-streaming`** runs the original in-memory pipeline: the whole table and
+every decoded geometry are held at once (`O(dataset)` memory). It reads the
+input exactly once instead of once per level, so it can be marginally faster
+on *small* inputs that comfortably fit in RAM; on large inputs it is both
+slower and enormously more memory-hungry. It is kept as the reference
+implementation — the two paths are equivalence-tested against each other —
+and as an escape hatch; there is no output-quality reason to use it.
+
+Residual per-feature memory in streaming mode (the "winner tables") is ~50–80
+bytes per input feature during pass 1 and 1 byte per feature during pass 2 —
+about 40 MB / 0.6 MB for a 632k-feature file — so even planet-tier inputs
+stay laptop-sized.
+
+---
+
 ## Worked scenarios
 
 | Symptom | Fix |
@@ -326,6 +377,7 @@ you trade a bigger footer for that pushdown.
 | Every remote query fetches a huge footer before any data | default already suppresses string/geometry stats; do NOT pass `--full-column-stats` |
 | Need server-side row-group skipping on a property predicate | pass `--full-column-stats` (bigger footer, gains column pruning) |
 | Tiny viewports over high-latency storage fetch too much | LOWER `--row-group-size` for tighter bbox pruning |
+| Conversion runs out of memory / swaps on a big file | streaming is already the default; LOWER `--read-batch-size`; make sure `--no-streaming` is NOT set |
 
 See `corpus/SWEEP_NOTES.md` for an empirical `--line-thinning` ×
 `--simplify-factor` sweep on Portland roads, and the Q2 section there for the
