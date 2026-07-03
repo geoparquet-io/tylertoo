@@ -1,13 +1,15 @@
-//! In-memory overview conversion pipeline (task P5).
+//! Overview conversion pipeline (task P5; streaming since H3).
 //!
 //! [`convert_to_overviews`] wires the existing overview modules into a single
-//! GeoParquet → GeoParquet overview build:
+//! GeoParquet → GeoParquet overview build. By default
+//! ([`ConvertOptions::streaming`]) it dispatches to the two-pass
+//! bounded-memory pipeline in [`super::stream`]; the in-memory reference
+//! implementation below (`streaming: false`) proceeds as:
 //!
 //! 1. **read** the whole input GeoParquet preserving the full property schema
-//!    (in-memory v1: the entire table is concatenated into one batch; the
-//!    streaming refactor is task V4). The CRS is detected from the `geo`
-//!    metadata and mapped to [`Crs`]; non-4326/3857 inputs and inputs that
-//!    already carry a `level` column are rejected (spec Q3, §4.1).
+//!    (the entire table is concatenated into one batch). The CRS is detected
+//!    from the `geo` metadata and mapped to [`Crs`]; non-4326/3857 inputs and
+//!    inputs that already carry a `level` column are rejected (spec Q3, §4.1).
 //! 2. **assign** every feature a coarsest level via [`assign::assign_levels`]
 //!    over per-feature bbox + [`FeatureKind`] + an optional sort key.
 //! 3. **generalize + write**, coarse→fine, feeding [`OverviewWriter`]:
@@ -22,8 +24,10 @@
 //!    totals, duration) is returned and is `serde` `Serialize` for the later
 //!    benchmark tasks.
 //!
-//! This is the correctness-first, in-memory implementation. Memory is
-//! `O(dataset)`; the bounded-memory streaming pipeline is a later task.
+//! The in-memory path is the correctness-first reference: memory is
+//! `O(dataset)`. The default streaming path ([`super::stream`]) produces
+//! equivalent output in `O(read batch + winner tables)` memory; equivalence
+//! is asserted by the `streaming_matches_*` tests below.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -78,7 +82,7 @@ impl LevelPlan {
     /// per-zoom GSDs of a [`ZoomRange`](LevelPlan::ZoomRange) plan and has no
     /// effect on an explicit [`Gsds`](LevelPlan::Gsds) plan (those GSDs are
     /// already in meters).
-    fn resolve(&self, gsd_base: f64) -> Result<Vec<(f64, Option<u8>)>, ConvertError> {
+    pub(super) fn resolve(&self, gsd_base: f64) -> Result<Vec<(f64, Option<u8>)>, ConvertError> {
         match self {
             LevelPlan::ZoomRange { min_zoom, max_zoom } => {
                 if min_zoom > max_zoom {
@@ -192,7 +196,7 @@ pub fn overture_road_ranking(column: String) -> ClassRanking {
 /// decide whether an auto-detected `class`/`road_class` column is *actually* a
 /// road-class column (overlap gate). Includes rail/pedestrian values that the
 /// ranking itself leaves at `unknown_rank`.
-const KNOWN_ROAD_CLASSES: &[&str] = &[
+pub(super) const KNOWN_ROAD_CLASSES: &[&str] = &[
     "motorway",
     "trunk",
     "primary",
@@ -223,7 +227,7 @@ const KNOWN_ROAD_CLASSES: &[&str] = &[
 
 /// Minimum number of *distinct* known road classes a candidate column must
 /// contain before auto-detection treats it as Overture roads.
-const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
+pub(super) const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
 
 /// Options for [`convert_to_overviews`].
 #[derive(Debug, Clone)]
@@ -263,7 +267,24 @@ pub struct ConvertOptions {
     /// bbox covering and `level` column always keep their pruning stats. Set
     /// `true` for clients that push property predicates to the remote file.
     pub full_column_stats: bool,
+    /// Use the two-pass bounded-memory streaming pipeline (H3). Default `true`.
+    ///
+    /// Pass 1 streams the input once to build the per-feature winner tables
+    /// (level assignment + Q2 density budget); pass 2 streams the input again
+    /// per level, simplifying and writing batch-by-batch. Peak memory is
+    /// `O(read batch + winner tables)` instead of `O(dataset)`. Set `false`
+    /// to use the original in-memory pipeline (kept for comparison; produces
+    /// equivalent output).
+    pub streaming: bool,
+    /// Rows per Arrow read batch in the streaming pipeline (both passes).
+    /// Default [`DEFAULT_READ_BATCH_SIZE`]. Larger batches amortize per-batch
+    /// overhead at the cost of proportionally more peak memory; smaller
+    /// batches bound memory tighter. No effect when `streaming` is `false`.
+    pub read_batch_size: usize,
 }
+
+/// Default rows per read batch for the streaming pipeline (H3).
+pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
 
 impl Default for ConvertOptions {
     fn default() -> Self {
@@ -283,6 +304,8 @@ impl Default for ConvertOptions {
             cogp_compat_key: false,
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
             full_column_stats: false,
+            streaming: true,
+            read_batch_size: DEFAULT_READ_BATCH_SIZE,
         }
     }
 }
@@ -395,6 +418,16 @@ pub fn convert_to_overviews(
     output_path: impl AsRef<Path>,
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
+    // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
+    // is kept as the reference implementation (`streaming: false`).
+    if options.streaming {
+        return super::stream::convert_streaming(
+            input_path.as_ref(),
+            output_path.as_ref(),
+            options,
+        );
+    }
+
     let start = Instant::now();
     let input_path = input_path.as_ref();
     let output_path = output_path.as_ref();
@@ -624,7 +657,7 @@ pub fn convert_to_overviews(
 
 /// Detect the input CRS and map it to [`Crs`], rejecting anything that is not
 /// EPSG:4326 or EPSG:3857 (spec Q3).
-fn detect_crs(path: &Path) -> Result<Crs, ConvertError> {
+pub(super) fn detect_crs(path: &Path) -> Result<Crs, ConvertError> {
     let info = crate::quality::extract_crs(path)?;
     if info.is_wgs84 {
         return Ok(Crs::Epsg4326);
@@ -645,7 +678,7 @@ fn detect_crs(path: &Path) -> Result<Crs, ConvertError> {
 }
 
 /// Find the primary geometry column index (name `geometry`, else first `geom*`).
-fn find_geometry_column(schema: &Schema) -> Option<usize> {
+pub(super) fn find_geometry_column(schema: &Schema) -> Option<usize> {
     schema
         .fields()
         .iter()
@@ -659,7 +692,7 @@ fn find_geometry_column(schema: &Schema) -> Option<usize> {
 }
 
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when the bbox is undefined).
-fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
+pub(super) fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
     match g.bounding_rect() {
         Some(r) => [r.min().x, r.min().y, r.max().x, r.max().y],
         None => [0.0, 0.0, 0.0, 0.0],
@@ -667,7 +700,7 @@ fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
 }
 
 /// Map a geometry to the [`FeatureKind`] used for thinning / visibility.
-fn feature_kind(g: &Geometry<f64>) -> FeatureKind {
+pub(super) fn feature_kind(g: &Geometry<f64>) -> FeatureKind {
     match g {
         Geometry::Point(_) | Geometry::MultiPoint(_) => FeatureKind::Point,
         Geometry::LineString(_) | Geometry::MultiLineString(_) | Geometry::Line(_) => {
@@ -678,14 +711,14 @@ fn feature_kind(g: &Geometry<f64>) -> FeatureKind {
 }
 
 /// Count coordinates (vertices) in a geometry.
-fn count_vertices(g: &Geometry<f64>) -> usize {
+pub(super) fn count_vertices(g: &Geometry<f64>) -> usize {
     use geo::coords_iter::CoordsIter;
     g.coords_count()
 }
 
 /// Extract an optional f64 sort key per row from a numeric Arrow column.
 /// Non-numeric columns and null values yield `None`.
-fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
+pub(super) fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
         Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
@@ -724,7 +757,7 @@ fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
 }
 
 /// A mixed-`Geometry` GeoArrow field carrying the geoarrow extension metadata.
-fn mixed_geometry_field(name: &str) -> Arc<Field> {
+pub(super) fn mixed_geometry_field(name: &str) -> Arc<Field> {
     use geoarrow_array::GeoArrowArray;
     let typ = GeometryType::new(Default::default());
     let empty = GeometryBuilder::new(typ).with_prefer_multi(false).finish();
@@ -733,7 +766,7 @@ fn mixed_geometry_field(name: &str) -> Arc<Field> {
 
 /// Build the writer source schema: original fields, geometry field replaced by
 /// the geoarrow-typed field, no file-level metadata (the encoder regenerates it).
-fn build_source_schema(
+pub(super) fn build_source_schema(
     input_schema: &Schema,
     geom_idx: usize,
     geom_out_field: Arc<Field>,
@@ -755,7 +788,7 @@ fn build_source_schema(
 
 /// Assemble one level's record batch: non-geometry columns via `take` on the
 /// selected indices (preserving input order), geometry rebuilt from `geoms`.
-fn build_level_batch(
+pub(super) fn build_level_batch(
     source_schema: &Schema,
     full: &RecordBatch,
     non_geom_cols: &[usize],
@@ -787,7 +820,7 @@ fn build_level_batch(
 }
 
 /// Build informative generalization provenance (§3.5) from the emitted gsds.
-fn build_generalization(
+pub(super) fn build_generalization(
     gsds: &[f64],
     _crs: Crs,
     options: &ConvertOptions,
@@ -933,7 +966,7 @@ fn resolve_ranking(
 }
 
 /// Provenance for a categorical class ranking, echoing the map when small.
-fn class_ranking_provenance(mode: &str, cr: &ClassRanking) -> RankingProvenance {
+pub(super) fn class_ranking_provenance(mode: &str, cr: &ClassRanking) -> RankingProvenance {
     let ranks = if cr.ranks.len() <= MAX_PROVENANCE_RANKS {
         Some(cr.ranks.clone())
     } else {
@@ -950,7 +983,7 @@ fn class_ranking_provenance(mode: &str, cr: &ClassRanking) -> RankingProvenance 
 /// Map each row's string value to its class priority. Null values → `None`
 /// (they lose to every ranked feature). A present-but-unranked value maps to
 /// [`ClassRanking::unknown_rank`].
-fn extract_class_ranks(
+pub(super) fn extract_class_ranks(
     col: &dyn Array,
     ranking: &ClassRanking,
 ) -> Result<Vec<Option<f64>>, ConvertError> {
@@ -1071,7 +1104,7 @@ fn find_confidence_column(
 
 /// Fill each level report's byte sizes by summing its row-group band from the
 /// output file's Parquet footer.
-fn fill_level_bytes(
+pub(super) fn fill_level_bytes(
     output_path: &Path,
     meta: &super::level::OverviewsMeta,
     reports: &mut [LevelReport],
@@ -2001,6 +2034,197 @@ mod tests {
         for w in on.levels.windows(2) {
             assert!(w[0].feature_count <= w[1].feature_count);
         }
+    }
+
+    // --- H3 streaming / in-memory equivalence -------------------------------
+
+    /// Raw `geo:overviews` footer JSON of an overview file.
+    fn overviews_footer_json(path: &Path) -> String {
+        let file = std::fs::File::open(path).unwrap();
+        let b = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        b.metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == crate::overview::level::OVERVIEWS_KEY)
+            .expect("geo:overviews key")
+            .value
+            .clone()
+            .unwrap()
+    }
+
+    /// Convert the same input through the in-memory and streaming paths and
+    /// assert equivalent outputs: per-level feature/vertex counts, footer
+    /// metadata (byte-identical JSON), and row values in order at every level.
+    /// Assumes a `write_input`-shaped file (id/name/rank/geometry columns).
+    fn assert_streaming_equivalent(input: &Path, base: &ConvertOptions) {
+        let mem_out = tempfile::NamedTempFile::new().unwrap();
+        let stream_out = tempfile::NamedTempFile::new().unwrap();
+
+        let mem_opts = ConvertOptions {
+            streaming: false,
+            ..base.clone()
+        };
+        let stream_opts = ConvertOptions {
+            streaming: true,
+            ..base.clone()
+        };
+        let mem = convert_to_overviews(input, mem_out.path(), &mem_opts).unwrap();
+        let strm = convert_to_overviews(input, stream_out.path(), &stream_opts).unwrap();
+
+        // Reports agree on everything but duration.
+        assert_eq!(mem.mode, strm.mode);
+        assert_eq!(mem.input_features, strm.input_features);
+        assert_eq!(mem.total_rows, strm.total_rows);
+        assert_eq!(mem.total_vertices, strm.total_vertices);
+        assert_eq!(mem.levels.len(), strm.levels.len());
+        for (a, b) in mem.levels.iter().zip(&strm.levels) {
+            assert_eq!(a.level, b.level);
+            assert_eq!(a.gsd, b.gsd, "level {} gsd", a.level);
+            assert_eq!(a.zoom, b.zoom, "level {} zoom", a.level);
+            assert_eq!(
+                a.feature_count, b.feature_count,
+                "level {} feature count",
+                a.level
+            );
+            assert_eq!(
+                a.vertex_count, b.vertex_count,
+                "level {} vertex count",
+                a.level
+            );
+        }
+
+        // Footer metadata byte-identical; both files validate.
+        assert_eq!(
+            overviews_footer_json(mem_out.path()),
+            overviews_footer_json(stream_out.path()),
+            "geo:overviews footers differ"
+        );
+        assert!(validate_file(mem_out.path()).unwrap().is_valid());
+        assert!(validate_file(stream_out.path()).unwrap().is_valid());
+
+        // Row-level equality per level (ids, attributes, geometry, order).
+        let mr = OverviewReader::open(mem_out.path()).unwrap();
+        let sr = OverviewReader::open(stream_out.path()).unwrap();
+        assert_eq!(mr.num_levels(), sr.num_levels());
+        for level in 0..mr.num_levels() {
+            assert_eq!(
+                read_level_rows(&mr, level),
+                read_level_rows(&sr, level),
+                "level {level} rows differ"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_matches_in_memory_duplicating() {
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 10,
+            },
+            ..Default::default()
+        };
+        assert_streaming_equivalent(tin.path(), &base);
+    }
+
+    #[test]
+    fn streaming_matches_in_memory_partitioning() {
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            mode: Mode::Partitioning,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            ..Default::default()
+        };
+        assert_streaming_equivalent(tin.path(), &base);
+    }
+
+    #[test]
+    fn streaming_matches_with_small_read_batches_and_density_budget() {
+        // Many features + a tiny read batch: exercises batch-boundary handling
+        // in both passes AND the Q2 density-budget cuts in the winner tables.
+        let geoms = grid_points(600);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            read_batch_size: 7,
+            ..Default::default()
+        };
+        assert_streaming_equivalent(tin.path(), &base);
+    }
+
+    #[test]
+    fn streaming_matches_with_explicit_sort_key() {
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            sort_key: Some("rank".to_string()),
+            ..Default::default()
+        };
+        assert_streaming_equivalent(tin.path(), &base);
+    }
+
+    #[test]
+    fn streaming_auto_rank_matches_in_memory() {
+        // Auto-detected Overture road-class ranking must resolve identically in
+        // the streaming pass-1 (incremental vocab scan) and in-memory paths.
+        let (geoms, classes) = overture_line_geoms();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_class_input(tin.path(), &geoms, &classes);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            read_batch_size: 2,
+            ..Default::default()
+        };
+        let mem_out = tempfile::NamedTempFile::new().unwrap();
+        let stream_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(
+            tin.path(),
+            mem_out.path(),
+            &ConvertOptions {
+                streaming: false,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
+
+        assert_eq!(ranking_mode_of(mem_out.path()), "auto-overture-roads");
+        assert_eq!(ranking_mode_of(stream_out.path()), "auto-overture-roads");
+        assert_eq!(
+            overviews_footer_json(mem_out.path()),
+            overviews_footer_json(stream_out.path())
+        );
+        let mr = OverviewReader::open(mem_out.path()).unwrap();
+        let sr = OverviewReader::open(stream_out.path()).unwrap();
+        assert_eq!(min_level_by_id(&mr), min_level_by_id(&sr));
     }
 
     #[test]
