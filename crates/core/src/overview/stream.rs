@@ -48,7 +48,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -115,14 +115,20 @@ pub(super) fn convert_streaming(
     let geom_field = input_schema.field(geom_idx).clone();
 
     // --- Pass 1: stream → AssignFeatures + resolved ranking. -----------------
+    let t_pass1 = Instant::now();
     let (mut features, ranking_provenance) =
         run_pass1(input_path, &input_schema, geom_idx, options)?;
     let num_features = features.len();
+    log::debug!(
+        "[profile] pass1 stream+scan: {:.2}s",
+        t_pass1.elapsed().as_secs_f64()
+    );
 
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
 
+    let t_assign = Instant::now();
     let assignment = assign_levels(&features, &level_gsds, &options.assign, crs);
     let assignment = if options.density.enabled {
         apply_density_budget(
@@ -136,6 +142,10 @@ pub(super) fn convert_streaming(
     } else {
         assignment
     };
+    log::debug!(
+        "[profile] assignment+budget: {:.2}s",
+        t_assign.elapsed().as_secs_f64()
+    );
 
     // The winner table: per input row, the coarsest level it appears at.
     // 1 byte per feature — the only O(N) state carried into pass 2.
@@ -208,6 +218,7 @@ pub(super) fn convert_streaming(
         .collect();
 
     // --- Pass 2: per level, stream → filter → simplify → write. --------------
+    let t_pass2 = Instant::now();
     let mut level_reports = Vec::with_capacity(emitted.len());
     for (level_idx, e) in emitted.iter().enumerate() {
         // Verbatim path: partitioning at every level (§2.3), and duplicating at
@@ -244,7 +255,17 @@ pub(super) fn convert_streaming(
         });
     }
 
+    log::debug!(
+        "[profile] pass2 total: {:.2}s",
+        t_pass2.elapsed().as_secs_f64()
+    );
+
+    let t_finish = Instant::now();
     let meta = writer.finish()?;
+    log::debug!(
+        "[profile] writer.finish: {:.2}s",
+        t_finish.elapsed().as_secs_f64()
+    );
     fill_level_bytes(output_path, &meta, &mut level_reports)?;
 
     let total_rows: usize = level_reports.iter().map(|l| l.feature_count).sum();
@@ -576,6 +597,25 @@ fn run_pass1(
 // Pass 2: per-level streaming filter → simplify → write
 // ============================================================================
 
+/// Wall-time accumulators for one level's pass-2 stream ([profile] logging).
+#[derive(Default)]
+struct Pass2Timers {
+    /// Parquet read + Arrow decode of the raw batch (`reader.next()`).
+    read: Cell<Duration>,
+    /// Winner selection + geometry take/decode to `geo::Geometry`.
+    decode: Cell<Duration>,
+    /// Simplification (or verbatim vertex counting at the canonical level).
+    simplify: Cell<Duration>,
+    /// Output batch assembly (`build_level_batch`).
+    build: Cell<Duration>,
+}
+
+impl Pass2Timers {
+    fn add(cell: &Cell<Duration>, start: Instant) {
+        cell.set(cell.get() + start.elapsed());
+    }
+}
+
 /// Immutable context for one level's pass-2 stream.
 struct LevelStreamCtx<'a> {
     source_schema: &'a Schema,
@@ -614,8 +654,11 @@ fn write_level_streaming(
     let rows = Cell::new(0usize);
     let vertices = Cell::new(0usize);
     let mut row_offset = 0usize;
+    let timers = Pass2Timers::default();
+    let t_level = Instant::now();
 
     let batches = std::iter::from_fn(|| loop {
+        let t_read = Instant::now();
         let batch = match reader.next() {
             None => return None,
             Some(Err(e)) => {
@@ -624,9 +667,10 @@ fn write_level_streaming(
             }
             Some(Ok(b)) => b,
         };
+        Pass2Timers::add(&timers.read, t_read);
         let offset = row_offset;
         row_offset += batch.num_rows();
-        match process_level_batch(&batch, offset, ctx) {
+        match process_level_batch(&batch, offset, ctx, &timers) {
             Ok(None) => continue, // no members of this level in the batch
             Ok(Some((out, verts))) => {
                 rows.set(rows.get() + out.num_rows());
@@ -645,6 +689,22 @@ fn write_level_streaming(
         return Err(e); // stream error takes precedence over the writer's
     }
     res?;
+    let total = t_level.elapsed();
+    let accounted =
+        timers.read.get() + timers.decode.get() + timers.simplify.get() + timers.build.get();
+    log::debug!(
+        "[profile] level {} ({}, {} rows): total={:.2}s read={:.2}s decode={:.2}s \
+         simplify={:.2}s build={:.2}s write={:.2}s",
+        level_idx,
+        if ctx.verbatim { "verbatim" } else { "simplify" },
+        rows.get(),
+        total.as_secs_f64(),
+        timers.read.get().as_secs_f64(),
+        timers.decode.get().as_secs_f64(),
+        timers.simplify.get().as_secs_f64(),
+        timers.build.get().as_secs_f64(),
+        total.saturating_sub(accounted).as_secs_f64(),
+    );
     Ok((rows.get(), vertices.get()))
 }
 
@@ -655,8 +715,10 @@ fn process_level_batch(
     batch: &RecordBatch,
     row_offset: usize,
     ctx: &LevelStreamCtx<'_>,
+    timers: &Pass2Timers,
 ) -> Result<Option<(RecordBatch, usize)>, ConvertError> {
     let n = batch.num_rows();
+    let t_decode = Instant::now();
     let selected: Vec<usize> = (0..n)
         .filter(|&i| {
             let ml = ctx.min_levels[row_offset + i];
@@ -681,7 +743,9 @@ fn process_level_batch(
         .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(selected.len());
     extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
+    Pass2Timers::add(&timers.decode, t_decode);
 
+    let t_simplify = Instant::now();
     let mut kept_idx: Vec<usize> = Vec::with_capacity(selected.len());
     let mut verts = 0usize;
 
@@ -704,11 +768,14 @@ fn process_level_batch(
             }
         }
         if out.is_empty() {
+            Pass2Timers::add(&timers.simplify, t_simplify);
             return Ok(None);
         }
         out
     };
+    Pass2Timers::add(&timers.simplify, t_simplify);
 
+    let t_build = Instant::now();
     let out_batch = build_level_batch(
         ctx.source_schema,
         batch,
@@ -717,5 +784,6 @@ fn process_level_batch(
         &kept_idx,
         &kept_geoms,
     )?;
+    Pass2Timers::add(&timers.build, t_build);
     Ok(Some((out_batch, verts)))
 }

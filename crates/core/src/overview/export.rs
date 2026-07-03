@@ -252,7 +252,9 @@ pub fn export_pmtiles(
 
         // Read the whole level band into memory (v1). The reader already applies
         // duplicating (single band) vs partitioning (prefix) semantics.
+        let t_read = Instant::now();
         let features = read_level_features(&reader, level_idx, crs)?;
+        let read_secs = t_read.elapsed().as_secs_f64();
         let level_feature_count = features.len();
 
         // Expand the overall geographic bounds from feature bboxes.
@@ -266,8 +268,11 @@ pub fn export_pmtiles(
             }
         }
 
+        let t_encode = Instant::now();
         let tiles = encode_level_tiles(&features, zoom, options);
+        let encode_secs = t_encode.elapsed().as_secs_f64();
 
+        let t_write = Instant::now();
         let mut tile_feature_count = 0usize;
         let mut oversized = 0usize;
         for t in &tiles {
@@ -277,6 +282,12 @@ pub fn export_pmtiles(
             }
             writer.add_tile_with_count(zoom, t.x, t.y, &t.data, t.feature_count)?;
         }
+        log::debug!(
+            "[profile] z{zoom} (level {level_idx}, {level_feature_count} feats, {} tiles): \
+             read={read_secs:.2}s clip+encode={encode_secs:.2}s write(gzip)={:.2}s",
+            tiles.len(),
+            t_write.elapsed().as_secs_f64(),
+        );
 
         zooms.push(ZoomReport {
             zoom,
@@ -291,7 +302,12 @@ pub fn export_pmtiles(
     if let Some(b) = &overall_bounds {
         writer.set_bounds(b);
     }
+    let t_finalize = Instant::now();
     writer.finalize(output_path.as_ref())?;
+    log::debug!(
+        "[profile] pmtiles finalize: {:.2}s",
+        t_finalize.elapsed().as_secs_f64()
+    );
 
     let total_tiles = zooms.iter().map(|z| z.tile_count).sum();
     let total_tile_features = zooms.iter().map(|z| z.tile_feature_count).sum();
@@ -328,6 +344,7 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
     // tile (x,y) -> list of (clipped geometry, property index into `features`).
     let mut grouped: GroupedTileGeoms = BTreeMap::new();
 
+    let t_clip = Instant::now();
     for (fi, feat) in features.iter().enumerate() {
         let Some(rect) = feat.geom.bounding_rect() else {
             continue;
@@ -342,6 +359,9 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
         }
     }
 
+    let clip_secs = t_clip.elapsed().as_secs_f64();
+
+    let t_mvt = Instant::now();
     let mut out = Vec::with_capacity(grouped.len());
     for ((x, y), members) in grouped {
         let tc = TileCoord::new(x, y, zoom);
@@ -358,6 +378,10 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
             oversized,
         });
     }
+    log::debug!(
+        "[profile]   z{zoom} clip+group={clip_secs:.2}s mvt-encode={:.2}s",
+        t_mvt.elapsed().as_secs_f64(),
+    );
     out
 }
 

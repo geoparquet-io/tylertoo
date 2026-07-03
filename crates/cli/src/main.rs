@@ -1209,6 +1209,8 @@ fn run_validate(args: ValidateArgs) -> Result<()> {
 fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
 
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let opts = ExportOptions {
         layer_name: args.layer_name,
         tile_buffer: args.tile_buffer,
