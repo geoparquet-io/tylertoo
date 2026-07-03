@@ -189,3 +189,71 @@ RUST_LOG=gpq_tiles_core::overview=debug \
 Phase lines are logged as `[profile] …` at debug level. This run: convert
 726.8 s / 335 MB peak RSS; export 271.8 s / 2.06 GB peak RSS (matches the
 uninstrumented H3 baselines within noise).
+
+## 7. Results after levers 1–4 (2026-07-03)
+
+Same dataset, same commands, same machine (16 cores), release build, after
+implementing the four ranked levers (§6 items 1–4; the cascade, §6 item 5,
+remains open):
+
+- **Lever 3 — validation cuts in `overview::simplify`**: skip candidate
+  `is_valid()` when RDP removed no vertices; never re-validate the original
+  on the fallback path; **fallback bug fixed** — an invalid RDP candidate now
+  retries at `eps/2, eps/4, eps/8` and only keeps the original geometry when
+  every retry self-intersects (counted, logged at debug level).
+- **Lever 1 — rayon in convert pass 2**: per-feature simplify parallelized
+  within each read batch (order-preserving collect; writer single-threaded).
+- **Lever 4 — export bbox fast path**: features whose bbox lies inside the
+  buffered tile bounds skip the BooleanOps clip entirely.
+- **Lever 2 — rayon in export**: per-feature clip and per-tile MVT encode
+  parallelized (order-preserving; grouping merge and write loop serial).
+
+### Wall / memory (Moldova, duplicating z0–14)
+
+Baselines are the H3 artifacts in `corpus/data/bench/h3/` (same commands).
+
+| Command | Wall before | Wall after | Speedup | RSS before | RSS after |
+|---|---:|---:|---:|---:|---:|
+| `overview` (convert) | 706.1 s | **55.3 s** | **12.8×** | 305.7 MB | 320.2 MB |
+| `export-pmtiles` | 288.5 s | **58.8 s** | **4.9×** | 2.16 GB | 2.38 GB |
+
+CPU utilization: convert 557 %, export 828 % (of 1600 %). Output validation:
+all 9 `gpq-tiles validate` checks pass; export reports **0 oversized tiles**
+(17,372 tiles in both runs).
+
+### Output size drop (the fallback fix, intended)
+
+Coarse/mid levels no longer quietly carry 3–9 % of features at full
+resolution. Features kept at full resolution (all epsilon retries
+self-intersecting): **3,664 total** — level 1: 7, level 2: 120, level 3: 633,
+level 4: 1,401, level 5: 1,502, level 6: 1, levels 7–10: 0 — versus the old
+behaviour where *every* invalid first candidate (e.g. ~9 % of a coarse-level
+sample, §4) fell back.
+
+| | Before | After | Δ |
+|---|---:|---:|---:|
+| Overview parquet | 360.7 MB | 293.6 MB | **−18.6 %** |
+| Total vertices | 118.3 M | 87.7 M | −25.9 % |
+| Level 6 vertices | 8.45 M | 1.35 M | −84 % |
+| Level 7 vertices | 9.76 M | 2.18 M | −78 % |
+| PMTiles archive | 130.7 MB | 123.3 MB | −5.7 % |
+
+Row-count deltas are tiny: 1,583,053 → 1,583,041 (−12 rows; retry candidates
+whose shoelace area collapsed below the sliver gate are now dropped instead
+of being kept at full resolution) and 1,807,912 → 1,807,901 exported tile
+features (−11, downstream of the same rows).
+
+### Where the remaining time goes (vs the Amdahl ceilings)
+
+- Convert (ceiling ~10.6× from lever 1 alone; achieved 12.8× because lever 3
+  multiplies): level 10 is now the bottleneck (26.1 s of the 53.6 s pass 2 —
+  candidate `is_valid()` on 383 k nearly-full-resolution polygons, imperfectly
+  load-balanced across the per-batch parallel sections). Read+decode+write
+  floor is ~12 s serial.
+- Export (ceiling ~8.4×; achieved 4.9×): z14 clip+group fell 168.2 s → 42.2 s
+  (4×, not the naive 16×·5×): the bbox fast path replaces most clips with a
+  geometry clone + regroup that is allocation-bound, and the per-zoom merge
+  into the `BTreeMap` stays serial. Export RSS rose ~10 % (per-feature clip
+  results are staged before the serial merge).
+- The §5 cascade (simplify level k from level k+1) remains the next lever for
+  convert level 10.
