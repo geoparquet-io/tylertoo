@@ -46,6 +46,13 @@ pub enum ReaderError {
     /// The `geo:overviews` footer key is present but is not valid JSON per §3.
     #[error("invalid 'geo:overviews' JSON: {0}")]
     InvalidOverviewsJson(serde_json::Error),
+    /// The `geo:overviews` metadata parses but violates a §3.3/§3.4
+    /// structural invariant against the file's actual row groups (level band
+    /// out of range / non-monotonic / footer-data mismatch): the level bands
+    /// cannot be trusted, so the file is rejected at open (H4 hardening — a
+    /// hostile `row_group_end` would otherwise drive band arithmetic).
+    #[error("invalid 'geo:overviews' metadata: {0}")]
+    InvalidMetadata(#[from] super::level::OverviewValidationError),
     /// A level index was requested that does not exist in the file.
     #[error("level {level} out of range (file has {num_levels} levels)")]
     LevelOutOfRange {
@@ -89,6 +96,13 @@ impl OverviewReader {
             .ok_or(ReaderError::MissingOverviewsKey)?;
 
         let meta = OverviewsMeta::from_json(&json).map_err(ReaderError::InvalidOverviewsJson)?;
+
+        // Structural validation against the file's ACTUAL row groups (§3.3 /
+        // §3.4): every subsequent band computation trusts the footer's
+        // row_group_end values, so a corrupt or tampered footer must be
+        // rejected here rather than driving out-of-range (or, for negative
+        // values, usize-wrapped) row-group reads.
+        meta.validate(metadata.num_row_groups() as i64)?;
 
         Ok(Self {
             path,
