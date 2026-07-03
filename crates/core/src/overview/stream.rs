@@ -62,12 +62,14 @@ use rayon::prelude::*;
 use crate::batch_processor::extract_geometries_from_array;
 
 use super::assign::{apply_density_budget, assign_levels, AssignFeature, FeatureKind};
+use super::cluster::{build_cluster_tables, ClusterEntry, ClusterTables};
 use super::convert::{
-    build_generalization, build_level_batch, build_source_schema, class_ranking_provenance,
-    count_vertices, detect_crs, extract_class_ranks, extract_sort_keys, feature_kind,
-    fill_level_bytes, find_geometry_column, geometry_bbox, mixed_geometry_field,
-    overture_road_ranking, ClassRanking, ConvertError, ConvertOptions, ConvertReport, LevelReport,
-    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    append_point_count_field, apply_cluster_columns, build_generalization, build_level_batch,
+    build_source_schema, class_ranking_provenance, count_vertices, detect_crs, extract_class_ranks,
+    extract_sort_keys, feature_kind, fill_level_bytes, find_geometry_column, geometry_bbox,
+    mixed_geometry_field, overture_road_ranking, validate_cluster_schema, ClassRanking,
+    ConvertError, ConvertOptions, ConvertReport, LevelReport, KNOWN_ROAD_CLASSES,
+    ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::simplify::{
@@ -117,10 +119,13 @@ pub(super) fn convert_streaming(
     let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
     let geom_field = input_schema.field(geom_idx).clone();
 
+    // Clustering schema checks + accumulate column resolution (Q4).
+    let acc_cols = validate_cluster_schema(&input_schema, options)?;
+
     // --- Pass 1: stream → AssignFeatures + resolved ranking. -----------------
     let t_pass1 = Instant::now();
-    let (mut features, ranking_provenance) =
-        run_pass1(input_path, &input_schema, geom_idx, options)?;
+    let (mut features, ranking_provenance, acc_values) =
+        run_pass1(input_path, &input_schema, geom_idx, options, &acc_cols)?;
     let num_features = features.len();
     log::debug!(
         "[profile] pass1 stream+scan: {:.2}s",
@@ -154,6 +159,25 @@ pub(super) fn convert_streaming(
     // 1 byte per feature — the only O(N) state carried into pass 2.
     let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
     drop(assignment);
+
+    // Cluster tables (Q4): built from the pass-1 features + final winner
+    // table, before the O(N) scratch is freed. Memory afterwards is
+    // O(non-singleton clusters), carried into pass 2 alongside `min_levels`.
+    let cluster_tables: Option<ClusterTables> = if options.cluster {
+        let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
+        Some(build_cluster_tables(
+            &features,
+            &min_levels,
+            &level_gsds,
+            &options.assign,
+            crs,
+            &acc_values,
+            &ops,
+        ))
+    } else {
+        None
+    };
+    drop(acc_values);
     features.clear();
     features.shrink_to_fit(); // free the pass-1 O(N)·48B scratch before pass 2
 
@@ -197,6 +221,12 @@ pub(super) fn convert_streaming(
     let geom_name = geom_field.name().clone();
     let geom_out_field = mixed_geometry_field(&geom_name);
     let source_schema = build_source_schema(&input_schema, geom_idx, geom_out_field);
+    // Writer schema: base + point_count when clustering (Q4).
+    let out_schema = if options.cluster {
+        append_point_count_field(&source_schema)
+    } else {
+        source_schema.clone()
+    };
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()
@@ -214,7 +244,7 @@ pub(super) fn convert_streaming(
         ranking_provenance,
     ));
 
-    let mut writer = OverviewWriter::create(output_path, &source_schema, writer_opts)?;
+    let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
     let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
         .filter(|&c| c != geom_idx)
@@ -229,6 +259,7 @@ pub(super) fn convert_streaming(
         let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
         let ctx = LevelStreamCtx {
             source_schema: &source_schema,
+            out_schema: &out_schema,
             non_geom_cols: &non_geom_cols,
             geom_idx,
             min_levels: &min_levels,
@@ -238,6 +269,13 @@ pub(super) fn convert_streaming(
             gsd_m: e.gsd,
             crs,
             simplify: &options.simplify,
+            cluster_enabled: options.cluster,
+            // Canonical level: singleton clusters, columns verbatim (§2.4).
+            cluster_table: cluster_tables
+                .as_ref()
+                .filter(|_| e.orig as usize != finest)
+                .map(|t| &t[e.orig as usize]),
+            acc_cols: &acc_cols,
         };
         let (rows, vertices) = write_level_streaming(
             &mut writer,
@@ -420,19 +458,26 @@ fn scan_road_vocab(col: &dyn Array, found: &mut HashSet<&'static str>) {
     }
 }
 
-/// Pass 1: stream the input (geometry + ranking columns only) and produce the
-/// per-feature [`AssignFeature`]s (with resolved sort keys) plus the ranking
-/// provenance block (§3.5). Memory: `O(read batch)` transient +
-/// `O(N)` small per-feature records.
+/// Result of [`run_pass1`]: the per-feature [`AssignFeature`]s, the resolved
+/// ranking provenance, and the per-accumulate-spec source values.
+type Pass1Output = (Vec<AssignFeature>, RankingProvenance, Vec<Vec<Option<f64>>>);
+
+/// Pass 1: stream the input (geometry + ranking/accumulate columns only) and
+/// produce the per-feature [`AssignFeature`]s (with resolved sort keys), the
+/// ranking provenance block (§3.5), and — when clustering with aggregation —
+/// the per-spec source values (parallel to `acc_cols`). Memory: `O(read
+/// batch)` transient + `O(N)` small per-feature records.
 fn run_pass1(
     input_path: &Path,
     input_schema: &Schema,
     geom_idx: usize,
     options: &ConvertOptions,
-) -> Result<(Vec<AssignFeature>, RankingProvenance), ConvertError> {
+    acc_cols: &[usize],
+) -> Result<Pass1Output, ConvertError> {
     let mut plan = build_rank_plan(input_schema, options)?;
 
-    // Project only the columns pass 1 needs: geometry + ranking candidates.
+    // Project only the columns pass 1 needs: geometry + ranking candidates +
+    // accumulate columns (Q4).
     let mut cols: Vec<usize> = vec![geom_idx];
     match &plan {
         RankPlan::ExplicitSort { idx, .. } | RankPlan::ExplicitClass { idx, .. } => cols.push(*idx),
@@ -444,6 +489,7 @@ fn run_pass1(
         }
         RankPlan::SizeFallback => {}
     }
+    cols.extend(acc_cols.iter().copied());
     cols.sort_unstable();
     cols.dedup();
     // Original schema index → projected batch column index.
@@ -461,6 +507,7 @@ fn run_pass1(
     let mut point_count = 0usize;
     let mut explicit_keys: Vec<Option<f64>> = Vec::new();
     let mut confidence_keys: Vec<Option<f64>> = Vec::new();
+    let mut acc_values: Vec<Vec<Option<f64>>> = vec![Vec::new(); acc_cols.len()];
     let mut geoms_buf: Vec<Geometry<f64>> = Vec::new();
 
     for batch in reader {
@@ -509,6 +556,11 @@ fn run_pass1(
                 }
             }
             RankPlan::SizeFallback => {}
+        }
+
+        // Accumulate columns (Q4): per-spec source values, in row order.
+        for (s, &idx) in acc_cols.iter().enumerate() {
+            acc_values[s].extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
         }
     }
 
@@ -593,7 +645,7 @@ fn run_pass1(
         }
     }
 
-    Ok((features, provenance))
+    Ok((features, provenance, acc_values))
 }
 
 // ============================================================================
@@ -622,6 +674,9 @@ impl Pass2Timers {
 /// Immutable context for one level's pass-2 stream.
 struct LevelStreamCtx<'a> {
     source_schema: &'a Schema,
+    /// Output schema: `source_schema` + trailing `point_count` when
+    /// clustering, otherwise identical.
+    out_schema: &'a Schema,
     non_geom_cols: &'a [usize],
     geom_idx: usize,
     /// Winner table: per input row, its coarsest level.
@@ -634,6 +689,13 @@ struct LevelStreamCtx<'a> {
     gsd_m: f64,
     crs: Crs,
     simplify: &'a SimplifyOptions,
+    /// Clustering (Q4): append `point_count` + rewrite accumulate columns.
+    cluster_enabled: bool,
+    /// This level's cluster table; `None` at the canonical level (singletons)
+    /// or when clustering is off.
+    cluster_table: Option<&'a std::collections::HashMap<usize, ClusterEntry>>,
+    /// Schema indices of the accumulate columns.
+    acc_cols: &'a [usize],
 }
 
 /// Stream one level from the input file into the writer. Returns
@@ -796,7 +858,7 @@ fn process_level_batch(
     Pass2Timers::add(&timers.simplify, t_simplify);
 
     let t_build = Instant::now();
-    let out_batch = build_level_batch(
+    let mut out_batch = build_level_batch(
         ctx.source_schema,
         batch,
         ctx.non_geom_cols,
@@ -804,6 +866,17 @@ fn process_level_batch(
         &kept_idx,
         &kept_geoms,
     )?;
+    if ctx.cluster_enabled {
+        // Cluster-table keys are global row indices; kept_idx is batch-local.
+        let globals: Vec<usize> = kept_idx.iter().map(|&i| row_offset + i).collect();
+        out_batch = apply_cluster_columns(
+            out_batch,
+            ctx.out_schema,
+            &globals,
+            ctx.cluster_table,
+            ctx.acc_cols,
+        )?;
+    }
     Pass2Timers::add(&timers.build, t_build);
     Ok(Some((out_batch, verts)))
 }

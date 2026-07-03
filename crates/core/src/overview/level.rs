@@ -142,6 +142,41 @@ pub struct Generalization {
     /// this field existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub density_drop: Option<DensityProvenance>,
+    /// OPTIONAL point-clustering provenance (§3.5, additive; spec §12 draft).
+    ///
+    /// Records that clustering was enabled (Q4): the name of the cluster-size
+    /// column (`point_count`) and any accumulated attribute columns. Absent
+    /// when clustering was off (`--cluster` not passed) or on files written
+    /// before this field existed; readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clustering: Option<ClusteringProvenance>,
+}
+
+/// How point clustering was applied for a conversion (Q4, spec §12 draft).
+///
+/// Additive, OPTIONAL provenance embedded in [`Generalization`] (§3.5).
+/// When present with `enabled: true`, the file carries the named
+/// `point_count` column (INT64 NOT NULL) and the listed accumulated columns;
+/// the validator checks those structural facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClusteringProvenance {
+    /// Whether clustering was applied. Always `true` when the block is
+    /// emitted; present for forward compatibility.
+    pub enabled: bool,
+    /// Name of the cluster-size column (this implementation: `point_count`).
+    pub point_count_column: String,
+    /// Columns whose values were aggregated across clustered points.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accumulated: Vec<AccumulatedColumn>,
+}
+
+/// One accumulated attribute column in [`ClusteringProvenance`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccumulatedColumn {
+    /// Source column name.
+    pub column: String,
+    /// Aggregation operator: `sum`, `max`, `min`, or `mean`.
+    pub op: String,
 }
 
 /// How the per-level density budget was applied for a conversion (Q2).
@@ -793,6 +828,7 @@ mod tests {
                 unknown_rank: Some(0.0),
             }),
             density_drop: None,
+            clustering: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
@@ -819,6 +855,7 @@ mod tests {
                 gamma: 1.5,
                 supercell_gsd_factor: 128.0,
             }),
+            clustering: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
@@ -839,6 +876,46 @@ mod tests {
         }"#;
         let m = OverviewsMeta::from_json(src).unwrap();
         assert!(m.generalization.unwrap().density_drop.is_none());
+    }
+
+    #[test]
+    fn clustering_provenance_roundtrip_and_absent_tolerated() {
+        // A clustering block survives JSON round-trip; absent key → None.
+        let mut meta = duplicating_example();
+        meta.generalization = Some(Generalization {
+            engine: "gpq-tiles test".to_string(),
+            gsd_base: None,
+            levels: vec![],
+            ranking: None,
+            density_drop: None,
+            clustering: Some(ClusteringProvenance {
+                enabled: true,
+                point_count_column: "point_count".to_string(),
+                accumulated: vec![AccumulatedColumn {
+                    column: "confidence".to_string(),
+                    op: "mean".to_string(),
+                }],
+            }),
+        });
+        let json = meta.to_json().unwrap();
+        let parsed = OverviewsMeta::from_json(&json).unwrap();
+        assert_eq!(meta, parsed);
+        let c = parsed.generalization.unwrap().clustering.unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.point_count_column, "point_count");
+        assert_eq!(c.accumulated.len(), 1);
+        assert_eq!(c.accumulated[0].column, "confidence");
+        assert_eq!(c.accumulated[0].op, "mean");
+
+        // Absent key → None (additive-field tolerance); empty accumulated
+        // list is omitted from serialization.
+        let src = r#"{
+            "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
+            "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
+            "generalization": { "engine": "gpq-tiles 0.1.0", "levels": [] }
+        }"#;
+        let m = OverviewsMeta::from_json(src).unwrap();
+        assert!(m.generalization.unwrap().clustering.is_none());
     }
 
     #[test]

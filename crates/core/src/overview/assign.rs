@@ -110,7 +110,7 @@ pub struct AssignFeature {
 impl AssignFeature {
     /// Bbox center — the representative point used for grid placement.
     #[inline]
-    fn center(&self) -> (f64, f64) {
+    pub(super) fn center(&self) -> (f64, f64) {
         let [xmin, ymin, xmax, ymax] = self.bbox;
         ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5)
     }
@@ -150,6 +150,19 @@ pub struct AssignConfig {
     /// Whether larger or smaller `sort_key` wins.
     pub sort_direction: SortDirection,
 }
+
+/// Default `point_thinning` when point clustering is enabled.
+///
+/// With clustering, absorbed points are *summarized* (`point_count` +
+/// accumulated attributes) rather than dropped, so a much coarser grid is
+/// pure win: one dot per ~16 display pixels approaches the supercluster
+/// look (radius 40 px) while the non-clustered default (4.0) preserves
+/// density for thin-only output. Chosen by maintainer review of the
+/// 2026-07-03 NYC pt={4,16,48} sweep (corpus/data/bench/q4/).
+///
+/// Callers that expose a user-facing `point_thinning` knob should apply
+/// this default only when the user did not set the knob explicitly.
+pub const CLUSTER_POINT_THINNING_DEFAULT: f64 = 16.0;
 
 impl Default for AssignConfig {
     fn default() -> Self {
@@ -253,8 +266,10 @@ type CellKey = (u8, i64, i64);
 
 /// Priority of a feature within a cell. Higher is better. Compared
 /// lexicographically to yield a strict total order (see [`Priority::cmp`]).
+/// `pub(super)` so the clustering stage (`super::cluster`) can rank present
+/// features with the exact order the cell-winner stage used.
 #[derive(Debug, Clone, Copy)]
-struct Priority {
+pub(super) struct Priority {
     /// Encoded sort key: `Some` sorts above `None`; direction already applied
     /// so that "larger `sort_bits` wins".
     sort_rank: Option<f64>,
@@ -265,7 +280,7 @@ struct Priority {
 }
 
 impl Priority {
-    fn new(feat: &AssignFeature, dir: SortDirection) -> Self {
+    pub(super) fn new(feat: &AssignFeature, dir: SortDirection) -> Self {
         // Apply direction so a plain "larger wins" comparison is correct.
         let sort_rank = feat.sort_key.map(|k| match dir {
             SortDirection::Desc => k,
@@ -280,7 +295,7 @@ impl Priority {
     }
 
     /// Returns `true` if `self` is strictly better (should win) than `other`.
-    fn beats(&self, other: &Priority) -> bool {
+    pub(super) fn beats(&self, other: &Priority) -> bool {
         // 1. sort_rank: Some beats None; both Some compares larger-wins.
         match (self.sort_rank, other.sort_rank) {
             (Some(a), Some(b)) => {

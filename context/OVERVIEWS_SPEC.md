@@ -619,8 +619,9 @@ This spec explicitly does NOT address:
 - **Mandating a specific thinning/simplification algorithm.** The spec
   constrains layout and metadata; the generalization engine is
   implementation-defined (gpq-tiles supplies one).
-- **Attribute aggregation** (summing/averaging attributes of dropped
-  features). Deferred to a later `generalization` v0.2.
+- ~~**Attribute aggregation** (summing/averaging attributes of dropped
+  features). Deferred to a later `generalization` v0.2.~~ Now specified as
+  the opt-in point-clustering extension, §12 (v0.2.0-draft).
 
 ---
 
@@ -747,3 +748,112 @@ Migration plan:
 - **Q7 APPROVED:** `mode` stays **SHOULD with documented
   `partitioning` default** (the safe reader assumption), not REQUIRED.
 ```
+
+---
+
+## 12. Point clustering extension (v0.2.0-draft)
+
+Status: draft addition targeted at spec v0.2.0; implemented by gpq-tiles
+behind the opt-in `--cluster` flag (2026-07-03). Additive: files written
+with clustering remain valid v0.1.0 overview files (an extra optional
+column + an optional provenance block that v0.1 readers MUST ignore per
+§3.8); the section is versioned v0.2.0-draft because it introduces new
+normative requirements for files that opt in.
+
+### 12.1 Model
+
+Clustering applies to **point features only** (Point/MultiPoint rows;
+lines and polygons are unaffected) and to **`duplicating` mode only**
+(§12.5). It is **opt-in, default off** (consistent with §11 Q4's
+opt-in-collapse posture).
+
+At each level, the generalization engine's per-cell survivor **absorbs**
+the point features that were thinned out of its cell at that level's
+grid, instead of them simply vanishing:
+
+- Every source point feature is represented by exactly one row at every
+  level: itself if present, else an absorbing winner. Consequently, at
+  each level, the sum of `point_count` over the level's point rows
+  equals the total source point-feature count.
+- Absorption is **per level**: a feature absorbed at level `k` may
+  itself be a row (with its own, smaller cluster) at level `k+1`.
+- The winner keeps its **own geometry** and its own values for every
+  non-accumulated column. (DIVERGENCE from supercluster, which
+  re-centers a cluster at its members' centroid: keeping the winner's
+  geometry is deterministic and anchors the cluster at a real feature.)
+
+### 12.2 `point_count` column (normative when clustering)
+
+A clustered file MUST contain a physical column:
+
+- **Name**: `point_count` (recorded in metadata, §12.4, so readers need
+  not hard-code it).
+- **Type**: Parquet `INT64`. **Nullability**: NOT NULL.
+- **Domain**: `>= 1`. Non-point rows and unclustered (singleton) point
+  rows carry `1`.
+- At the **canonical level** every value MUST be `1` (clusters would
+  violate canonical value-identity, §2.4 — the canonical band remains
+  verbatim source data plus the constant `point_count = 1`).
+
+Writers MUST reject source data whose schema already contains a column
+named `point_count` under case-insensitive comparison (same rationale
+as the `level` column rule, §4.1).
+
+### 12.3 Attribute accumulation (optional)
+
+A writer MAY additionally aggregate **numeric** columns across each
+cluster (tippecanoe `--accumulate-attribute` convention): the winner's
+value of the column becomes `sum` | `max` | `min` | `mean` over itself
+plus the absorbed features at that level.
+
+- Aggregates MUST be computed per level **from source values** (never
+  from a coarser level's already-aggregated values), so `mean` is exact
+  at every level.
+- Null member values do not contribute; a cluster with no non-null
+  member keeps the winner's null.
+- Canonical-level values remain verbatim (§2.4; every canonical cluster
+  is a singleton).
+- The aggregated column keeps its declared type; producers SHOULD
+  prefer floating-point columns for `mean`.
+
+### 12.4 Metadata
+
+Clustering is recorded in the `generalization` provenance block (§3.5):
+
+```
+Generalization += {
+  "clustering": {                       // OPTIONAL
+    "enabled":            true,
+    "point_count_column": "point_count",
+    "accumulated": [ { "column": string, "op": "sum"|"max"|"min"|"mean" } ]
+  }
+}
+```
+
+Unlike the rest of §3.5, when `clustering.enabled` is true a validator
+MUST enforce §12.2 structurally: the named column exists as INT64 NOT
+NULL, all values are `>= 1` (checkable via row-group statistics), and
+the canonical band's values are exactly `1`.
+
+### 12.5 Partitioning mode is excluded (normative)
+
+`--cluster` MUST be rejected for `partitioning`-mode files. Rationale:
+a partitioning feature has exactly **one** row but is *displayed* at
+every zoom `z >= min_level` (prefix reads, §2.3). A single stored
+`point_count` can only describe one level's grid, so it would be wrong
+at every other display zoom; worse, a feature absorbed at a coarse
+level reappears as its own row in a finer band while remaining counted
+in the coarse winner, so `Σ point_count` over any prefix double-counts.
+There is no non-contorted single-column encoding of per-level counts in
+a feature-once layout; producers who need clustering use `duplicating`
+mode.
+
+---
+
+## 13. Changelog
+
+- **v0.2.0-draft (2026-07-03)**: added §12 point clustering extension
+  (`point_count` column, numeric attribute accumulation,
+  `generalization.clustering` metadata, duplicating-mode-only rule);
+  struck attribute aggregation from the §8 non-goals.
+- **v0.1.0 (2026-07-02)**: initial draft; §11 design decisions approved.
