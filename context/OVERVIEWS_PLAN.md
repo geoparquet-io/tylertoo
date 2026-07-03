@@ -239,6 +239,12 @@ automatically as waves land.
 
 ### E0. `gpq-tiles export-pmtiles`  (deps: P4, V2 quality gate;
 reuses shelved mvt.rs/pmtiles_writer.rs/clip.rs)
+DONE 2026-07-03: `overview/export.rs` + CLI subcommand; single-pass per-zoom
+tiling (no external sort / budget retry), optional one-pass oversized valve.
+Portland lines (z2–z14, 295k feats) → 46 MB PMTiles, 1325 tiles, 5.05s, 244 MB
+RSS; tiles decode (tippecanoe-decode) with per-zoom totals matching the overview
+report up to expected tile-border duplication (0%→7.2% z14). See
+`benchmarks/overview/EXPORT_NOTES.md`.
 (ADDED 2026-07-02.) Batch PMTiles export FROM an overview file —
 the replacement for the stuck tile pipeline, not a revival of it.
 Per zoom: read the matching level band (already thinned/simplified/

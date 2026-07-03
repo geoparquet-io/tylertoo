@@ -80,6 +80,38 @@ enum Command {
     Overview(OverviewArgs),
     /// Validate a GeoParquet overview file against the spec (§6.2).
     Validate(ValidateArgs),
+    /// Export a PMTiles archive from an overview GeoParquet file (Plan E0).
+    ExportPmtiles(ExportPmtilesArgs),
+}
+
+/// Arguments for `gpq-tiles export-pmtiles`.
+#[derive(Parser, Debug)]
+struct ExportPmtilesArgs {
+    /// Input overview GeoParquet file (produced by `gpq-tiles overview`).
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Output PMTiles archive.
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+
+    /// MVT layer name written into every tile.
+    #[arg(long, default_value = "overview")]
+    layer_name: String,
+
+    /// Per-tile edge buffer, in tile pixels (feature seam continuity).
+    #[arg(long, default_value = "8")]
+    tile_buffer: u32,
+
+    /// Optional per-tile MVT size limit in BYTES. When a tile exceeds it, a
+    /// single non-iterative drop pass sheds the lowest-priority (smallest)
+    /// features for that tile only. Omit to enforce no limit.
+    #[arg(long, value_name = "BYTES")]
+    tile_size_limit: Option<usize>,
+
+    /// Write the JSON export report to this path.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
 }
 
 /// Arguments for `gpq-tiles overview`.
@@ -663,6 +695,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Overview(args) => run_overview(args),
         Command::Validate(args) => run_validate(args),
+        Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Tiles(args) => run_tiles(args),
     }
 }
@@ -676,7 +709,7 @@ fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    const SUBCOMMANDS: [&str; 4] = ["tiles", "overview", "validate", "help"];
+    const SUBCOMMANDS: [&str; 5] = ["tiles", "overview", "validate", "export-pmtiles", "help"];
     let argv: Vec<std::ffi::OsString> = args.into_iter().collect();
 
     // Nothing to rewrite for a bare `gpq-tiles` (clap prints help/usage).
@@ -1151,6 +1184,60 @@ fn run_validate(args: ValidateArgs) -> Result<()> {
         let failed = report.failures().count();
         anyhow::bail!("{failed} check(s) failed");
     }
+}
+
+fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
+    use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
+
+    let opts = ExportOptions {
+        layer_name: args.layer_name,
+        tile_buffer: args.tile_buffer,
+        extent: 4096,
+        tile_size_limit: args.tile_size_limit,
+    };
+
+    println!(
+        "Exporting {} → {}",
+        args.input.display(),
+        args.output.display()
+    );
+    let report = export_pmtiles(&args.input, &args.output, &opts)
+        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+
+    println!(
+        "  mode={} zooms z{}..z{}",
+        report.mode, report.min_zoom, report.max_zoom
+    );
+    for z in &report.zooms {
+        println!(
+            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}",
+            z.zoom,
+            z.level,
+            z.tile_count,
+            z.tile_feature_count,
+            if z.oversized_tiles > 0 {
+                format!(", {} oversized", z.oversized_tiles)
+            } else {
+                String::new()
+            }
+        );
+    }
+    println!(
+        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s",
+        report.total_tiles,
+        report.total_tile_features,
+        report.oversized_tiles,
+        report.duration_secs
+    );
+
+    if let Some(path) = &args.report {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
+        println!("  report → {}", path.display());
+    }
+    Ok(())
 }
 
 /// Print a succinct summary of the conversion
