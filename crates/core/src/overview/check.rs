@@ -1053,6 +1053,8 @@ mod tests {
             coalescing: Some(CoalescingProvenance {
                 enabled: true,
                 snap_tolerance_gsd_factor: 1.0,
+                junction_angle: Some(0.0),
+                max_level_rows: Some(2_000_000),
                 coalesced_count_column: "coalesced_count".to_string(),
             }),
         });

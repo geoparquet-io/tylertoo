@@ -10,7 +10,9 @@
 //! files, behind an explicit writer flag — an optional COGP-compatible subset
 //! under [`COGP_KEY`].
 
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Footer metadata key under which the overviews JSON object is stored.
 ///
@@ -175,6 +177,19 @@ pub struct CoalescingProvenance {
     /// Endpoint snap tolerance in GSD multiples (per level, the snap
     /// distance is `snap_tolerance_gsd_factor × gsd`).
     pub snap_tolerance_gsd_factor: f64,
+    /// Junction continuation threshold, degrees (`0` = strict degree-2
+    /// chaining; §13.4). REQUIRED on v0.2.0 writers; `None` only when
+    /// reading a file written before the member existed — readers MUST
+    /// treat absence as *unknown*, never as an implied default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junction_angle: Option<f64>,
+    /// Per-level candidate-line ceiling (§13.4): levels whose candidate
+    /// line count exceeded it were written uncoalesced (memory guard).
+    /// REQUIRED on v0.2.0 writers; `None` only when reading a file written
+    /// before the member existed — readers MUST treat absence as
+    /// *unknown*, never as an implied default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_level_rows: Option<u64>,
     /// Name of the merged-segment-count column (this implementation:
     /// `coalesced_count`).
     pub coalesced_count_column: String,
@@ -242,12 +257,44 @@ pub struct RankingProvenance {
     pub column: Option<String>,
     /// The categorical value→priority map, when small enough to be useful
     /// (class-ranking tiers only). Higher priority wins the cell.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ranks: Option<Vec<(String, f64)>>,
+    ///
+    /// Serialized as a JSON object map (spec §3.5 v0.2.0), e.g.
+    /// `{"motorway": 5, "primary": 4}`. Deserialization additionally
+    /// accepts the legacy array-of-pairs shape (`[["motorway", 5.0], …]`)
+    /// emitted by gpq-tiles ≤ the 0.1.0/interim footers, so older files
+    /// keep reading; only the map shape is ever written.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_ranks"
+    )]
+    pub ranks: Option<BTreeMap<String, f64>>,
     /// Priority assigned to a present-but-unrecognized categorical value
     /// (class-ranking tiers only). Loses to every named rank, beats a null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unknown_rank: Option<f64>,
+}
+
+/// Deserialize [`RankingProvenance::ranks`], accepting both the v0.2.0
+/// object-map shape (`{"motorway": 5.0}`) and the legacy array-of-pairs
+/// shape (`[["motorway", 5.0]]`) that pre-alignment gpq-tiles footers
+/// carry. Only the map shape is ever serialized.
+fn deserialize_ranks<'de, D>(deserializer: D) -> Result<Option<BTreeMap<String, f64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RanksShape {
+        Map(BTreeMap<String, f64>),
+        LegacyPairs(Vec<(String, f64)>),
+    }
+    Ok(
+        Option::<RanksShape>::deserialize(deserializer)?.map(|s| match s {
+            RanksShape::Map(m) => m,
+            RanksShape::LegacyPairs(pairs) => pairs.into_iter().collect(),
+        }),
+    )
 }
 
 /// One entry of the [`Generalization`] provenance block (§3.5).
@@ -849,10 +896,10 @@ mod tests {
             ranking: Some(RankingProvenance {
                 mode: "auto-overture-roads".to_string(),
                 column: Some("road_class".to_string()),
-                ranks: Some(vec![
+                ranks: Some(BTreeMap::from([
                     ("motorway".to_string(), 18.0),
                     ("service".to_string(), 11.0),
-                ]),
+                ])),
                 unknown_rank: Some(0.0),
             }),
             density_drop: None,
@@ -860,6 +907,11 @@ mod tests {
             coalescing: None,
         });
         let json = meta.to_json().unwrap();
+        // v0.2.0 (§3.5): ranks serialize as a JSON object map, NOT pairs.
+        assert!(
+            json.contains(r#""ranks":{"motorway":18.0,"service":11.0}"#),
+            "ranks must serialize as an object map, got {json}"
+        );
         let parsed = OverviewsMeta::from_json(&json).unwrap();
         assert_eq!(meta, parsed);
         let r = parsed.generalization.unwrap().ranking.unwrap();
@@ -867,6 +919,38 @@ mod tests {
         assert_eq!(r.column.as_deref(), Some("road_class"));
         assert_eq!(r.unknown_rank, Some(0.0));
         assert_eq!(r.ranks.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ranking_ranks_legacy_array_of_pairs_still_reads() {
+        // Files written before the v0.2.0 alignment carry ranks as an array
+        // of [value, priority] pairs; readers accept both shapes but only
+        // ever emit the map.
+        let src = r#"{
+            "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
+            "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
+            "generalization": {
+                "engine": "gpq-tiles 0.5.0",
+                "levels": [],
+                "ranking": {
+                    "mode": "class-ranking",
+                    "column": "road_class",
+                    "ranks": [["motorway", 5.0], ["primary", 4.0]],
+                    "unknown_rank": 0.0
+                }
+            }
+        }"#;
+        let meta = OverviewsMeta::from_json(src).unwrap();
+        let r = meta.generalization.clone().unwrap().ranking.unwrap();
+        let ranks = r.ranks.unwrap();
+        assert_eq!(ranks.get("motorway"), Some(&5.0));
+        assert_eq!(ranks.get("primary"), Some(&4.0));
+        // Re-serialization normalizes to the object-map shape.
+        let json = meta.to_json().unwrap();
+        assert!(
+            json.contains(r#""ranks":{"motorway":5.0,"primary":4.0}"#),
+            "re-emit must use the map shape, got {json}"
+        );
     }
 
     #[test]
@@ -922,15 +1006,29 @@ mod tests {
             coalescing: Some(CoalescingProvenance {
                 enabled: true,
                 snap_tolerance_gsd_factor: 1.0,
+                junction_angle: Some(0.0),
+                max_level_rows: Some(2_000_000),
                 coalesced_count_column: "coalesced_count".to_string(),
             }),
         });
         let json = meta.to_json().unwrap();
+        // §13.4 (v0.2.0): all five members present when emitted.
+        for key in [
+            r#""enabled":true"#,
+            r#""snap_tolerance_gsd_factor":1.0"#,
+            r#""junction_angle":0.0"#,
+            r#""max_level_rows":2000000"#,
+            r#""coalesced_count_column":"coalesced_count""#,
+        ] {
+            assert!(json.contains(key), "missing {key} in {json}");
+        }
         let parsed = OverviewsMeta::from_json(&json).unwrap();
         assert_eq!(meta, parsed);
         let c = parsed.generalization.unwrap().coalescing.unwrap();
         assert!(c.enabled);
         assert_eq!(c.snap_tolerance_gsd_factor, 1.0);
+        assert_eq!(c.junction_angle, Some(0.0));
+        assert_eq!(c.max_level_rows, Some(2_000_000));
         assert_eq!(c.coalesced_count_column, "coalesced_count");
 
         // Absent key → None (additive-field tolerance).
@@ -941,6 +1039,33 @@ mod tests {
         }"#;
         let m = OverviewsMeta::from_json(src).unwrap();
         assert!(m.generalization.unwrap().coalescing.is_none());
+    }
+
+    #[test]
+    fn coalescing_provenance_older_file_missing_new_members_reads_as_unknown() {
+        // A pre-v0.2.0-alignment footer records only the snap factor; the
+        // two new members MUST deserialize as None (unknown), never as an
+        // implied default (§13.4 read-compat).
+        let src = r#"{
+            "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
+            "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
+            "generalization": {
+                "engine": "gpq-tiles 0.5.0", "levels": [],
+                "coalescing": {
+                    "enabled": true,
+                    "snap_tolerance_gsd_factor": 1.0,
+                    "coalesced_count_column": "coalesced_count"
+                }
+            }
+        }"#;
+        let m = OverviewsMeta::from_json(src).unwrap();
+        let c = m.generalization.unwrap().coalescing.unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.junction_angle, None, "absent means unknown, not 0");
+        assert_eq!(
+            c.max_level_rows, None,
+            "absent means unknown, not a default"
+        );
     }
 
     #[test]

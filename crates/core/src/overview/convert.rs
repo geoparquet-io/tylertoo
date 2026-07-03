@@ -1614,6 +1614,11 @@ pub(super) fn build_generalization(
             Some(CoalescingProvenance {
                 enabled: true,
                 snap_tolerance_gsd_factor: options.coalesce_snap,
+                // §13.4 (v0.2.0): the junction-continuation threshold and the
+                // per-level candidate ceiling are REQUIRED provenance so the
+                // generalization is reproducible from the file alone.
+                junction_angle: Some(options.coalesce_junction_angle),
+                max_level_rows: Some(options.coalesce_max_level_rows as u64),
                 coalesced_count_column: COALESCED_COUNT_COLUMN.to_string(),
             })
         } else {
@@ -1742,9 +1747,11 @@ fn resolve_ranking(
 }
 
 /// Provenance for a categorical class ranking, echoing the map when small.
+/// The footer shape is a JSON object map (spec §3.5 v0.2.0), so the ordered
+/// pair list collapses into a `BTreeMap` here.
 pub(super) fn class_ranking_provenance(mode: &str, cr: &ClassRanking) -> RankingProvenance {
     let ranks = if cr.ranks.len() <= MAX_PROVENANCE_RANKS {
-        Some(cr.ranks.clone())
+        Some(cr.ranks.iter().cloned().collect())
     } else {
         None
     };
@@ -2614,8 +2621,19 @@ mod tests {
             .unwrap();
         assert_eq!(r.mode, "class-ranking");
         assert_eq!(r.column.as_deref(), Some("road_class"));
-        assert_eq!(r.ranks.unwrap().len(), 2);
+        let ranks = r.ranks.unwrap();
+        assert_eq!(ranks.len(), 2);
+        assert_eq!(ranks.get("motorway"), Some(&5.0));
+        assert_eq!(ranks.get("footway"), Some(&1.0));
         assert_eq!(r.unknown_rank, Some(0.0));
+
+        // §3.5 (v0.2.0): the footer JSON carries ranks as an object map, not
+        // an array of pairs.
+        let json = overviews_footer_json(tout.path());
+        assert!(
+            json.contains(r#""ranks":{"footway":1.0,"motorway":5.0}"#),
+            "footer must serialize ranks as an object map, got {json}"
+        );
     }
 
     // --- Q1 regression: high class beats larger low class in a shared cell ---
@@ -3661,6 +3679,8 @@ mod tests {
         let opts = ConvertOptions {
             coalesce_lines: true,
             coalesce_snap: 1.5,
+            coalesce_junction_angle: 30.0,
+            coalesce_max_level_rows: 123_456,
             ..Default::default()
         };
         convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
@@ -3675,6 +3695,10 @@ mod tests {
             .expect("coalescing provenance recorded");
         assert!(c.enabled);
         assert_eq!(c.snap_tolerance_gsd_factor, 1.5);
+        // §13.4 (v0.2.0): junction angle + memory-guard ceiling recorded so
+        // the generalization is reproducible from the file alone.
+        assert_eq!(c.junction_angle, Some(30.0));
+        assert_eq!(c.max_level_rows, Some(123_456));
         assert_eq!(c.coalesced_count_column, "coalesced_count");
 
         // Opt-out (`--no-coalesce-lines`): no coalescing block recorded.
