@@ -253,7 +253,7 @@ fn convert(
             Box::new(move |event: ProgressEvent| {
                 let callback = Arc::clone(&callback_arc);
 
-                // Acquire the GIL to call into Python (PyO3 0.28 uses Python::attach)
+                // Acquire the GIL to call into Python (PyO3 0.29 uses Python::attach)
                 Python::attach(|py| {
                     // Convert event to Python dict
                     match progress_event_to_dict(py, &event) {
@@ -271,7 +271,7 @@ fn convert(
                 });
             });
 
-        // Release the GIL while running the Rust code (PyO3 0.28 uses py.detach())
+        // Release the GIL while running the Rust code (PyO3 0.29 uses py.detach())
         py.detach(|| {
             generate_tiles_to_writer_with_progress(
                 input_path,

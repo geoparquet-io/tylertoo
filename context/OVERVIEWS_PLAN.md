@@ -342,10 +342,12 @@ Human part: the merge buttons. Agent part: triage + fixes.
   overview path; the CI failure was its aspirational red test. Removal commit
   `d897110`; see `context/TILE_SIMPLIFY_POSTMORTEM.md`. The `tiles` subcommand
   now behaves exactly as `main`.
-- Security Audit: reproduced — 2 `pyo3 0.28.2` vulns (RUSTSEC-2026-0176/0177).
-  PRE-EXISTING on `main` (same `pyo3="0.28"` pin; lockfile gitignored). Fix =
-  breaking pyo3 0.29 bump + bindings migration → DEFERRED (ties into E3). No
-  ignore added (a fix exists).
+- Security Audit: **FIXED** — 2 `pyo3 0.28.2` vulns (RUSTSEC-2026-0176/0177)
+  cleared by bumping the workspace pin to `pyo3 = "0.29"`. Turned out to be a
+  pure pin bump: none of the 0.29 breaking changes touch the binding's API
+  surface, so no `crates/python/src` changes were needed. `cargo audit` now
+  exits 0 (0 vulns; 7 warning-level advisories remain, non-failing). See
+  CI_TRIAGE.md Job 3 Resolution.
 - Coverage: not run locally; expected to heal once tests pass.
 - Still human: merge/close #158, retarget #168 → main, CI re-run.
 

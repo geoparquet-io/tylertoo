@@ -96,11 +96,17 @@ feature's unit + integration tests are gone). The overview path, E0 export, and
 
 ---
 
-## Job 3 — Security Audit  →  REPRODUCED (network restored), FIX DEFERRED (pre-existing on main)
+## Job 3 — Security Audit  →  FIXED (pyo3 0.28 → 0.29 on `feat/geoparquet-overviews`)
 
-**Reproduced:** yes. With connectivity restored, `cargo audit` fetched the fresh
-advisory-db (1149 advisories) and reports **`error: 2 vulnerabilities found!`**
-(the failing condition) plus **7 warnings**.
+**Status: RESOLVED.** The two failing `pyo3 0.28.2` vulnerabilities were cleared
+by bumping the workspace pin to `pyo3 = "0.29"` and migrating the Python bindings
+(commit `chore(deps): migrate pyo3 0.28 -> 0.29`). Post-fix `cargo audit` exits
+`0` with **0 vulnerabilities** and only the 7 warning-level advisories remaining
+(unmaintained/unsound; non-failing). See "Resolution" below.
+
+**Originally reproduced:** yes. With connectivity restored, `cargo audit` fetched
+the fresh advisory-db (1149 advisories) and reported **`error: 2 vulnerabilities
+found!`** (the failing condition) plus **7 warnings**.
 
 **The 2 vulnerabilities (both `pyo3 0.28.2`):**
 
@@ -117,16 +123,24 @@ branches — meaning this Security-Audit failure occurs on `main` too, as of the
 2026-04 pyo3 advisories. It is **not** a regression from the overview or
 (now-excised) simplify work.
 
-**Why not fixed here:** a semver-compatible `cargo update -p pyo3` only reaches
-`0.28.3`, which does **not** clear the advisory (fix is in `0.29.0`). Moving to
-`0.29` is a breaking pyo3 minor bump (0.x minor = breaking) that changes the
-`extension-module` binding surface and requires migrating + rebuilding +
-retesting `crates/python/src/lib.rs`. That is a scoped dependency-upgrade change
-(fits with the E3 Python-bindings work in the plan), out of scope for the H2
-CI-reckoning + excision task, and carries binding-regression risk. **Deferred:
-bump `pyo3` to `>= 0.29.0` and migrate the Python bindings in a dedicated
-change.** No `audit.toml` ignore was added — a fix exists, so silencing would be
-unjustified per the task rules.
+**Resolution (this branch):** bumped the workspace pin to `pyo3 = "0.29"` (in
+`Cargo.toml [workspace.dependencies]`). A semver-compatible `cargo update -p
+pyo3` only reaches `0.28.3`, which does **not** clear the advisory (fix is in
+`0.29.0`), so the minor bump was required. Per the PyO3 0.29 CHANGELOG, none of
+the breaking changes touch this crate's API surface: the binding uses only
+`Python::attach` / `py.detach` / `PyDict::new` / `set_item` / `call1` /
+`wrap_pyfunction!` / `#[pymodule]` / `Bound<'_, PyModule>`, all unchanged in
+0.29 (the `downcast`→`cast` and `TYPE_INFO`→`TYPE_HINT` reworks were 0.27/0.28).
+The migration was therefore a **pure version bump** — no source changes beyond
+updating two stale "PyO3 0.28" code comments. `maturin`/`pyproject.toml` needed
+no change (`maturin>=1.0,<2.0` supports pyo3 0.29; no `pyo3-build-config` pin).
+Verified: `cargo check -p gpq-tiles-python` ✓, `cargo clippy -p
+gpq-tiles-python --all-targets --all-features -- -D warnings` ✓, `uv run maturin
+develop` ✓ (built cp311 wheel against pyo3 0.29), `uv run pytest` 31 passed (the
+11 failures are pre-existing `streaming_mode`/`parallel_tiles`/`parallel_geoms`
+kwarg-mismatch tests unrelated to pyo3 — those kwargs are not in the `convert()`
+signature). No `audit.toml` ignore was needed — the vulnerability is fixed, not
+silenced.
 
 **The 7 warnings (unmaintained/unsound, non-failing; deep transitive deps):**
 RUSTSEC-2023-0089 atomic-polyfill, RUSTSEC-2025-0141 bincode,
@@ -163,12 +177,14 @@ token cannot fail the job. **Assumption: Coverage passes once tests pass.**
 4. `docs: record tile-simplify postmortem + CI triage` — this file, the
    postmortem, and the CARRYOVER/plan cross-links.
 
-(No deps commit: `Cargo.lock` is gitignored; dependency resolution is fresh on
-CI. The pyo3 vulnerability fix is deferred — see Job 3.)
+(`Cargo.lock` is gitignored; dependency resolution is fresh on CI. The pyo3
+vulnerability fix landed as a `Cargo.toml` pin bump `0.28` → `0.29` — see Job 3
+Resolution.)
 
 ## Still requires human / separate work (out of H2 agent scope)
 
 - Merge/close #158, retarget #168 → `main` (human merge buttons).
 - Actual CI re-run on `main`'s workflows.
-- **pyo3 0.28 → 0.29 breaking bump + Python-bindings migration** to clear
-  RUSTSEC-2026-0176/0177 (pre-existing on main; ties into E3).
+- ~~pyo3 0.28 → 0.29 breaking bump + Python-bindings migration to clear
+  RUSTSEC-2026-0176/0177~~ **DONE** on `feat/geoparquet-overviews` — turned out
+  to be a pure pin bump (no binding API changes needed); see Job 3 Resolution.

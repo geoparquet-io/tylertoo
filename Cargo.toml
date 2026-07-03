@@ -48,7 +48,7 @@ dashmap = "6"
 clap = { version = "4", features = ["derive"] }
 
 # Python bindings
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
 
 # Error handling
 anyhow = "1.0"
