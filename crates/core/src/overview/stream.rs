@@ -59,7 +59,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use rayon::prelude::*;
 
-use crate::batch_processor::extract_geometries_from_array;
+use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
 
 use super::assign::{apply_density_budget, assign_levels, AssignFeature, FeatureKind};
 use super::cluster::{build_cluster_tables, ClusterEntry, ClusterTables};
@@ -70,15 +70,21 @@ use super::convert::{
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
     count_vertices, detect_crs, extract_class_ranks, extract_sort_keys, feature_kind,
     fill_level_bytes, find_geometry_column, geometry_bbox, mixed_geometry_field,
-    overture_road_ranking, validate_cluster_schema, validate_coalesce_schema, ClassRanking,
-    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
-    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    overture_road_ranking, usable_geometry, validate_cluster_schema, validate_coalesce_schema,
+    ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
+    LevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::simplify::{
     full_resolution_fallback_count, simplify_for_level, Simplified, SimplifyOptions,
 };
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, LEVEL_COLUMN};
+
+/// Row-indexed winner-table sentinel for rows with no feature (null, empty,
+/// or non-finite geometry — skipped in pass 1). It matches no level in either
+/// mode: [`super::convert::MAX_LEVELS`] caps the plan at 255 levels, so the
+/// finest level index is at most 254.
+const UNASSIGNED_LEVEL: u8 = u8::MAX;
 
 /// A level actually emitted to the output (levels with zero winners are
 /// omitted and renumbered, spec §7.3, matching the in-memory path).
@@ -134,7 +140,15 @@ pub(super) fn convert_streaming(
         provenance: ranking_provenance,
         acc_values,
         coalesce: coalesce_scratch,
+        num_rows,
+        skipped_rows,
     } = run_pass1(input_path, &input_schema, geom_idx, options, &acc_cols)?;
+    if skipped_rows > 0 {
+        log::warn!(
+            "skipping {skipped_rows} of {num_rows} input rows with a null, \
+             empty, or non-finite geometry"
+        );
+    }
     let num_features = features.len();
     log::debug!(
         "[profile] pass1 stream+scan: {:.2}s",
@@ -164,23 +178,29 @@ pub(super) fn convert_streaming(
         t_assign.elapsed().as_secs_f64()
     );
 
-    // The winner table: per input row, the coarsest level it appears at.
-    // 1 byte per feature — the only O(N) state carried into pass 2.
-    let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+    // The feature-parallel winner table (coarsest level per FEATURE, in
+    // `features` order) feeds the cluster stage and the per-level counts.
+    let feat_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
     drop(assignment);
 
     // Cluster tables (Q4): built from the pass-1 features + final winner
     // table, before the O(N) scratch is freed. Memory afterwards is
     // O(non-singleton clusters), carried into pass 2 alongside `min_levels`.
+    // Accumulate values are extracted per ROW; the cluster stage indexes them
+    // by feature position, so remap through each feature's row index.
     let cluster_tables: Option<ClusterTables> = if options.cluster {
         let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
+        let acc_feat: Vec<Vec<Option<f64>>> = acc_values
+            .iter()
+            .map(|vals| features.iter().map(|f| vals[f.index]).collect())
+            .collect();
         Some(build_cluster_tables(
             &features,
-            &min_levels,
+            &feat_min_levels,
             &level_gsds,
             &options.assign,
             crs,
-            &acc_values,
+            &acc_feat,
             &ops,
         ))
     } else {
@@ -188,23 +208,34 @@ pub(super) fn convert_streaming(
     };
     drop(acc_values);
 
-    // Coalescing (Q3): keep the per-row kinds (1 byte/feature — line rows
-    // bypass the winner table at coalesced levels) and the pass-1 line
+    // Coalescing (Q3): keep the per-row kinds (1 byte/row — line rows bypass
+    // the winner table at coalesced levels; skipped-geometry rows default to
+    // Point, which never matches the Line bypass) and the pass-1 line
     // scratch; apply the memory guard.
     let coalesce_on = coalesce_effective(
         options,
         coalesce_scratch.as_ref().map_or(0, |s| s.rows.len()),
     );
-    let kinds: Option<Vec<FeatureKind>> = options
-        .coalesce_lines
-        .then(|| features.iter().map(|f| f.kind).collect());
+    let kinds: Option<Vec<FeatureKind>> = options.coalesce_lines.then(|| {
+        let mut k = vec![FeatureKind::Point; num_rows];
+        for f in &features {
+            k[f.index] = f.kind;
+        }
+        k
+    });
     let coalesce_scratch = coalesce_scratch.filter(|_| coalesce_on);
-
-    features.clear();
-    features.shrink_to_fit(); // free the pass-1 O(N)·48B scratch before pass 2
 
     let num_levels = level_gsds.len();
     let finest = num_levels.saturating_sub(1);
+
+    // The ROW-indexed winner table pass 2 addresses (`row_offset + i`), one
+    // byte per input row. Skipped-geometry rows keep the UNASSIGNED sentinel,
+    // which matches no level in either mode (the level plan is capped at
+    // [`super::convert::MAX_LEVELS`] levels, so `finest < u8::MAX`).
+    let mut min_levels = vec![UNASSIGNED_LEVEL; num_rows];
+    for (f, &ml) in features.iter().zip(&feat_min_levels) {
+        min_levels[f.index] = ml;
+    }
 
     // Per-level winner counts (exact row counts in partitioning mode; in
     // duplicating mode exact up to simplification drops — used as the writer's
@@ -215,13 +246,15 @@ pub(super) fn convert_streaming(
     // rebuilt, with simplification, per level in pass 2 rather than held for
     // every level at once).
     let mut hist = vec![0usize; num_levels];
-    for (pos, &ml) in min_levels.iter().enumerate() {
-        if coalesce_scratch.is_some() && kinds.as_ref().is_some_and(|k| k[pos] == FeatureKind::Line)
-        {
+    for (f, &ml) in features.iter().zip(&feat_min_levels) {
+        if coalesce_scratch.is_some() && f.kind == FeatureKind::Line {
             continue; // counted via the per-level chain stage below
         }
         hist[(ml as usize).min(finest)] += 1;
     }
+    drop(feat_min_levels);
+    features.clear();
+    features.shrink_to_fit(); // free the pass-1 O(N)·48B scratch before pass 2
     let mut counts: Vec<usize> = match options.mode {
         Mode::Duplicating => hist
             .iter()
@@ -580,6 +613,11 @@ struct Pass1Output {
     acc_values: Vec<Vec<Option<f64>>>,
     /// Line geometries + groups for coalescing (Q3); `None` unless enabled.
     coalesce: Option<CoalesceScratch>,
+    /// Total input rows streamed (INCLUDING skipped-geometry rows): the
+    /// domain of every row-indexed table pass 2 addresses.
+    num_rows: usize,
+    /// Rows skipped for a null, empty, or non-finite geometry (H4).
+    skipped_rows: usize,
 }
 
 /// Pass 1: stream the input (geometry + ranking/accumulate columns only) and
@@ -624,15 +662,20 @@ fn run_pass1(
         .build()?;
 
     let mut features: Vec<AssignFeature> = Vec::new();
+    let mut num_rows = 0usize;
+    let mut skipped_rows = 0usize;
     let mut point_count = 0usize;
     let mut explicit_keys: Vec<Option<f64>> = Vec::new();
     let mut confidence_keys: Vec<Option<f64>> = Vec::new();
     let mut acc_values: Vec<Vec<Option<f64>>> = vec![Vec::new(); acc_cols.len()];
-    let mut geoms_buf: Vec<Geometry<f64>> = Vec::new();
+    let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::new();
     // Coalescing (Q3): line rows + geometries, and — for an explicit class
-    // ranking — the interned per-row class groups.
+    // ranking — the interned per-row class groups. `line_feat_pos` holds each
+    // line's position in `features` (NOT its row index: skipped-geometry rows
+    // make the two diverge).
     let collect_lines = options.coalesce_lines;
     let mut line_rows: Vec<usize> = Vec::new();
+    let mut line_feat_pos: Vec<usize> = Vec::new();
     let mut line_geoms: Vec<Geometry<f64>> = Vec::new();
     let mut explicit_groups: Vec<u32> = Vec::new();
     let mut explicit_interner = GroupInterner::default();
@@ -645,16 +688,26 @@ fn run_pass1(
         let garr = from_arrow_array(batch.column(gcol_idx).as_ref(), gfield)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
         geoms_buf.clear();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms_buf)?;
+        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)?;
 
-        let base = features.len();
-        for (i, g) in geoms_buf.iter().enumerate() {
+        // `AssignFeature::index` is the GLOBAL ROW index: pass 2 addresses the
+        // winner tables by raw row position. Rows with a null, empty, or
+        // non-finite geometry produce no feature but still advance the row
+        // index, so every row-keyed table stays aligned (H4 hardening; a
+        // skipped row must never shift attributes onto a neighbor's geometry).
+        let base = num_rows;
+        for (i, gopt) in geoms_buf.iter().enumerate() {
+            let Some(g) = gopt.as_ref().filter(|g| usable_geometry(g)) else {
+                skipped_rows += 1;
+                continue;
+            };
             let kind = feature_kind(g);
             if matches!(kind, FeatureKind::Point) {
                 point_count += 1;
             }
             if collect_lines && matches!(kind, FeatureKind::Line) {
                 line_rows.push(base + i);
+                line_feat_pos.push(features.len());
                 line_geoms.push(g.clone());
             }
             features.push(AssignFeature {
@@ -664,6 +717,7 @@ fn run_pass1(
                 sort_key: None, // filled below once the ranking tier resolves
             });
         }
+        num_rows += geoms_buf.len();
 
         match &mut plan {
             RankPlan::ExplicitSort { idx, .. } => {
@@ -784,15 +838,22 @@ fn run_pass1(
     };
 
     if let Some(keys) = keys {
-        debug_assert_eq!(keys.len(), features.len());
-        for (f, k) in features.iter_mut().zip(keys) {
-            f.sort_key = k;
+        // Keys are extracted per ROW (including skipped-geometry rows), so
+        // they are looked up by each feature's row index, not zipped
+        // positionally.
+        debug_assert_eq!(keys.len(), num_rows);
+        for f in features.iter_mut() {
+            f.sort_key = keys[f.index];
         }
     }
 
-    // Coalescing scratch (Q3): line sort keys + per-line groups.
+    // Coalescing scratch (Q3): line sort keys + per-line groups. `rows` and
+    // `groups` are row-indexed; sort keys live on the features.
     let coalesce = collect_lines.then(|| CoalesceScratch {
-        sort_keys: line_rows.iter().map(|&r| features[r].sort_key).collect(),
+        sort_keys: line_feat_pos
+            .iter()
+            .map(|&p| features[p].sort_key)
+            .collect(),
         groups: all_groups.map(|g| line_rows.iter().map(|&r| g[r]).collect()),
         rows: line_rows,
         geoms: line_geoms,
@@ -803,6 +864,8 @@ fn run_pass1(
         provenance,
         acc_values,
         coalesce,
+        num_rows,
+        skipped_rows,
     })
 }
 

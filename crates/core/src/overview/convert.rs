@@ -46,7 +46,7 @@ use geoarrow_array::GeoArrowArray;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Serialize;
 
-use crate::batch_processor::extract_geometries_from_array;
+use crate::batch_processor::extract_geometries_opt_from_array;
 
 use super::assign::{
     apply_density_budget, assign_levels, AssignConfig, AssignFeature, DensityBudgetConfig,
@@ -80,6 +80,12 @@ pub enum LevelPlan {
     Gsds(Vec<f64>),
 }
 
+/// Maximum number of levels a plan may resolve to. The per-feature winner
+/// tables store level indices as `u8` (with `u8::MAX` reserved as the
+/// streaming pipeline's "no feature on this row" sentinel), so plans beyond
+/// 255 levels are rejected instead of silently wrapping.
+pub(super) const MAX_LEVELS: usize = 255;
+
 impl LevelPlan {
     /// Resolve to the coarse→fine list of `(gsd_meters, zoom?)` level specs.
     ///
@@ -88,6 +94,14 @@ impl LevelPlan {
     /// effect on an explicit [`Gsds`](LevelPlan::Gsds) plan (those GSDs are
     /// already in meters).
     pub(super) fn resolve(&self, gsd_base: f64) -> Result<Vec<(f64, Option<u8>)>, ConvertError> {
+        let check_len = |n: usize| {
+            if n > MAX_LEVELS {
+                return Err(ConvertError::InvalidLevels(format!(
+                    "{n} levels requested; at most {MAX_LEVELS} levels are supported"
+                )));
+            }
+            Ok(())
+        };
         match self {
             LevelPlan::ZoomRange { min_zoom, max_zoom } => {
                 if min_zoom > max_zoom {
@@ -95,6 +109,7 @@ impl LevelPlan {
                         "min_zoom {min_zoom} must be <= max_zoom {max_zoom}"
                     )));
                 }
+                check_len(*max_zoom as usize - *min_zoom as usize + 1)?;
                 Ok((*min_zoom..=*max_zoom)
                     .map(|z| (gsd_with_base(z, gsd_base), Some(z)))
                     .collect())
@@ -105,6 +120,7 @@ impl LevelPlan {
                         "explicit gsd list must be non-empty".to_string(),
                     ));
                 }
+                check_len(gsds.len())?;
                 let mut prev: Option<f64> = None;
                 for (i, &g) in gsds.iter().enumerate() {
                     if g <= 0.0 || g.is_nan() {
@@ -463,6 +479,10 @@ pub enum ConvertError {
     /// The level plan is invalid (empty / non-monotonic / bad zoom range).
     #[error("invalid level specification: {0}")]
     InvalidLevels(String),
+    /// A conversion knob carries a nonsensical value (non-finite or
+    /// non-positive where a positive finite value is required).
+    #[error("invalid option: {0}")]
+    InvalidConfig(String),
     /// `--cluster` was requested in partitioning mode. A partitioning row is
     /// read at MANY display zooms (prefix reads, §2.3) but exists at exactly
     /// one level, so a single stored `point_count` cannot reflect "that
@@ -608,14 +628,41 @@ pub fn convert_to_overviews(
         batches.push(batch?);
     }
     let full = concat_batches(&input_schema, &batches)?;
-    let num_features = full.num_rows();
 
-    // Decode geometries once (in-memory v1).
+    // Decode geometries once (in-memory v1), row-aligned. Rows with a null,
+    // empty, or non-finite geometry cannot participate in level assignment:
+    // they are dropped HERE, from the batch and the geometry vec together, so
+    // every downstream index stays aligned (H4: an interleaved null geometry
+    // must never shift attributes onto a neighboring row's geometry).
     let geom_array: Arc<dyn GeoArrowArray> =
         from_arrow_array(full.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-    let mut geometries: Vec<Geometry<f64>> = Vec::with_capacity(num_features);
-    extract_geometries_from_array(geom_array.as_ref(), &mut geometries)?;
+    let mut geom_opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(full.num_rows());
+    extract_geometries_opt_from_array(geom_array.as_ref(), &mut geom_opts)?;
+    let keep: Vec<bool> = geom_opts
+        .iter()
+        .map(|g| g.as_ref().is_some_and(usable_geometry))
+        .collect();
+    let skipped = keep.iter().filter(|k| !**k).count();
+    let (full, geometries): (RecordBatch, Vec<Geometry<f64>>) = if skipped > 0 {
+        log::warn!(
+            "skipping {skipped} of {} input rows with a null, empty, or \
+             non-finite geometry",
+            full.num_rows()
+        );
+        let mask = arrow_array::BooleanArray::from(keep.clone());
+        let filtered = arrow_select::filter::filter_record_batch(&full, &mask)?;
+        let geoms = geom_opts
+            .into_iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(g, _)| g.expect("kept rows are Some"))
+            .collect();
+        (filtered, geoms)
+    } else {
+        (full, geom_opts.into_iter().flatten().collect())
+    };
+    let num_features = full.num_rows();
 
     // Resolve the cell-winner ranking (Q1): explicit sort key / explicit class
     // ranking / auto-detected well-known schema / size fallback. Returns the
@@ -944,6 +991,25 @@ pub(super) fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
         Some(r) => [r.min().x, r.min().y, r.max().x, r.max().y],
         None => [0.0, 0.0, 0.0, 0.0],
     }
+}
+
+/// Whether a decoded geometry can participate in level assignment: it must
+/// carry at least one coordinate and every coordinate must be finite.
+///
+/// Rows failing this check (alongside null-geometry rows) are **skipped with
+/// a warning** rather than converted: an empty geometry has no location to
+/// thin against, and a NaN/infinite coordinate would silently collapse into
+/// grid cell `(0, 0)` (H4 hostile-input hardening).
+pub(super) fn usable_geometry(g: &Geometry<f64>) -> bool {
+    use geo::coords_iter::CoordsIter;
+    let mut any = false;
+    for c in g.coords_iter() {
+        if !c.x.is_finite() || !c.y.is_finite() {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// Map a geometry to the [`FeatureKind`] used for thinning / visibility.
@@ -1810,6 +1876,8 @@ mod tests {
         GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
     };
     use parquet::arrow::ArrowWriter;
+
+    use crate::batch_processor::extract_geometries_from_array;
 
     // --- synthetic GeoParquet input builders --------------------------------
 
