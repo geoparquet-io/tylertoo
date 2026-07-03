@@ -57,6 +57,7 @@ use geo::Geometry;
 use geoarrow::array::from_arrow_array;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
+use rayon::prelude::*;
 
 use crate::batch_processor::extract_geometries_from_array;
 
@@ -766,9 +767,18 @@ fn process_level_batch(
         }
         geoms
     } else {
+        // Simplification is >95% of pass-2 wall time (H3(c) profile) and
+        // embarrassingly parallel per feature. `par_iter().map().collect()`
+        // preserves within-batch order, so the output stays byte-identical to
+        // the serial path; the writer (our single caller) remains
+        // single-threaded, and memory stays bounded by one read batch.
+        let simplified: Vec<Simplified> = geoms
+            .par_iter()
+            .map(|g| simplify_for_level(g, ctx.gsd_m, ctx.crs, ctx.simplify))
+            .collect();
         let mut out = Vec::with_capacity(selected.len());
-        for (g, &i) in geoms.iter().zip(&selected) {
-            match simplify_for_level(g, ctx.gsd_m, ctx.crs, ctx.simplify) {
+        for (s, &i) in simplified.into_iter().zip(&selected) {
+            match s {
                 Simplified::Keep(s) => {
                     verts += count_vertices(&s);
                     kept_idx.push(i);
