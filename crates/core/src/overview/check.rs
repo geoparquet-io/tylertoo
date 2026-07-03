@@ -260,6 +260,16 @@ pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
         check_level_footer_consistency(metadata, meta, idx, &mut report);
     }
 
+    // --- clustering metadata (Q4): point_count column + canonical values. ----
+    if let Some(cl) = meta
+        .as_ref()
+        .and_then(|m| m.generalization.as_ref())
+        .and_then(|g| g.clustering.as_ref())
+        .filter(|c| c.enabled)
+    {
+        check_clustering(metadata, meta.as_ref().unwrap(), cl, &mut report);
+    }
+
     // --- covering column per-RG min/max stats present (§4.4). ----------------
     match &covering {
         None => { /* already failed geoparquet_covering_declared */ }
@@ -336,6 +346,111 @@ fn check_mode_canonical(meta: &OverviewsMeta, report: &mut ValidationReport) {
                 );
             }
         }
+    }
+}
+
+/// Clustering conformance (Q4, spec §12 draft): when the footer's
+/// `generalization.clustering` block is present and enabled,
+/// - the mode must be `duplicating` (clustering cannot be represented in
+///   partitioning mode without double counting);
+/// - the named point-count column must exist as INT64 NOT NULL;
+/// - every row group's point_count stats must have `min >= 1`, and the
+///   canonical level band's must be exactly `min == max == 1` (every
+///   canonical cluster is a singleton).
+fn check_clustering(
+    metadata: &ParquetMetaData,
+    meta: &OverviewsMeta,
+    clustering: &crate::overview::level::ClusteringProvenance,
+    report: &mut ValidationReport,
+) {
+    // Mode: duplicating only.
+    match meta.mode {
+        Some(Mode::Duplicating) => report.pass(
+            "cluster_mode",
+            "clustering metadata on a duplicating-mode file",
+        ),
+        other => {
+            report.fail(
+                "cluster_mode",
+                format!(
+                    "clustering metadata requires duplicating mode, found {other:?} \
+                     (a partitioning row is read across many zoom prefixes; a \
+                     per-level point_count would double count)"
+                ),
+            );
+            return;
+        }
+    }
+
+    // Column exists, INT64, NOT NULL.
+    let name = clustering.point_count_column.as_str();
+    let descr = metadata.file_metadata().schema_descr();
+    let col_idx = (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name);
+    let col_idx = match col_idx {
+        None => {
+            report.fail(
+                "cluster_point_count_column",
+                format!("clustering metadata names column {name:?} but it is absent"),
+            );
+            return;
+        }
+        Some(idx) => {
+            let col = descr.column(idx);
+            let phys_ok = col.physical_type() == PhysicalType::INT64;
+            let required = col.max_def_level() == 0;
+            if phys_ok && required {
+                report.pass(
+                    "cluster_point_count_column",
+                    format!("{name:?} is INT64 NOT NULL"),
+                );
+                idx
+            } else {
+                report.fail(
+                    "cluster_point_count_column",
+                    format!(
+                        "{name:?} must be INT64 NOT NULL (physical={:?}, max_def_level={})",
+                        col.physical_type(),
+                        col.max_def_level()
+                    ),
+                );
+                return;
+            }
+        }
+    };
+
+    // Values: min >= 1 everywhere; canonical band exactly 1 (via RG stats).
+    let canonical = meta.canonical_level;
+    let mut problems: Vec<String> = Vec::new();
+    for rg in 0..metadata.num_row_groups() {
+        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == canonical;
+        let chunk = metadata.row_group(rg).column(col_idx);
+        match chunk.statistics() {
+            Some(Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
+                (Some(&min), Some(&max)) => {
+                    if min < 1 {
+                        problems.push(format!("RG {rg}: point_count min={min} < 1"));
+                    }
+                    if is_canonical && (min != 1 || max != 1) {
+                        problems.push(format!(
+                            "RG {rg} (canonical): point_count min={min} max={max}, expected 1"
+                        ));
+                    }
+                }
+                _ => problems.push(format!("RG {rg}: point_count has no min/max stats")),
+            },
+            Some(other) => {
+                problems.push(format!("RG {rg}: point_count stats not Int64 ({other:?})"))
+            }
+            None => problems.push(format!("RG {rg}: point_count column has no statistics")),
+        }
+    }
+    if problems.is_empty() {
+        report.pass(
+            "cluster_point_count_values",
+            "point_count >= 1 everywhere; canonical level all 1",
+        );
+    } else {
+        report.fail("cluster_point_count_values", problems.join("; "));
     }
 }
 
@@ -637,6 +752,161 @@ mod tests {
         assert_eq!(report.check_passed("overviews_key_present"), Some(false));
         assert_eq!(report.check_passed("geoparquet_geo_metadata"), Some(false));
         assert_eq!(report.check_passed("level_column"), Some(false));
+    }
+
+    // --- Q4 clustering checks -------------------------------------------------
+
+    /// Write a 2-level duplicating fixture whose footer carries clustering
+    /// provenance. `point_counts` supplies per-level `point_count` values
+    /// (parallel to `level_ids`); `None` omits the column entirely.
+    fn write_cluster_fixture(
+        path: &std::path::Path,
+        level_ids: &[Vec<i64>],
+        point_counts: Option<&[Vec<i64>]>,
+    ) {
+        use crate::overview::level::{AccumulatedColumn, ClusteringProvenance, Generalization};
+        use arrow_array::Int64Array as I64;
+
+        let mut fields = vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(Field::new("name", DataType::Utf8, false)),
+            Arc::new(geometry_field()),
+        ];
+        if point_counts.is_some() {
+            fields.push(Arc::new(Field::new("point_count", DataType::Int64, false)));
+        }
+        let schema = Arc::new(Schema::new(fields));
+
+        let specs: Vec<LevelSpec> = (0..level_ids.len())
+            .map(|k| {
+                let z = (2 + 2 * k) as u8;
+                LevelSpec::new(gsd(z), Some(z))
+            })
+            .collect();
+        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
+        opts.generalization = Some(Generalization {
+            engine: "gpq-tiles test".to_string(),
+            gsd_base: None,
+            levels: vec![],
+            ranking: None,
+            density_drop: None,
+            clustering: Some(ClusteringProvenance {
+                enabled: true,
+                point_count_column: "point_count".to_string(),
+                accumulated: vec![AccumulatedColumn {
+                    column: "id".to_string(),
+                    op: "sum".to_string(),
+                }],
+            }),
+        });
+
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        for (k, ids) in level_ids.iter().enumerate() {
+            let id_array = I64::from(ids.to_vec());
+            let name_array =
+                StringArray::from(ids.iter().map(|id| format!("f{id}")).collect::<Vec<_>>());
+            let geom_array = build_geometry_array(ids);
+            let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(geom_array.to_array_ref()),
+            ];
+            if let Some(counts) = point_counts {
+                columns.push(Arc::new(I64::from(counts[k].clone())));
+            }
+            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            writer
+                .write_level(k, Some(ids.len()), std::iter::once(batch))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn clustering_good_file_passes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_cluster_fixture(
+            tmp.path(),
+            &[vec![0], vec![0, 1, 2]],
+            Some(&[vec![3], vec![1, 1, 1]]),
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(
+            report.is_valid(),
+            "unexpected failures: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        assert_eq!(report.check_passed("cluster_mode"), Some(true));
+        assert_eq!(
+            report.check_passed("cluster_point_count_column"),
+            Some(true)
+        );
+        assert_eq!(
+            report.check_passed("cluster_point_count_values"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn clustering_metadata_without_column_fails() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_cluster_fixture(tmp.path(), &[vec![0], vec![0, 1, 2]], None);
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
+        assert_eq!(
+            report.check_passed("cluster_point_count_column"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn clustering_canonical_count_not_one_fails() {
+        // Canonical level carries a point_count of 2 → conformance failure.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_cluster_fixture(
+            tmp.path(),
+            &[vec![0], vec![0, 1, 2]],
+            Some(&[vec![3], vec![1, 2, 1]]),
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
+        assert_eq!(
+            report.check_passed("cluster_point_count_values"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn clustering_zero_count_fails() {
+        // A point_count of 0 anywhere violates the >= 1 invariant.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_cluster_fixture(
+            tmp.path(),
+            &[vec![0], vec![0, 1, 2]],
+            Some(&[vec![0], vec![1, 1, 1]]),
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
+        assert_eq!(
+            report.check_passed("cluster_point_count_values"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn no_clustering_metadata_skips_checks() {
+        // A plain duplicating fixture never runs the cluster_* checks.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tmp.path(),
+            Mode::Duplicating,
+            &[vec![0, 2], vec![0, 1, 2, 3]],
+            false,
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(report.is_valid());
+        assert_eq!(report.check_passed("cluster_mode"), None);
+        assert_eq!(report.check_passed("cluster_point_count_column"), None);
     }
 
     #[test]
