@@ -47,26 +47,18 @@ pub mod ioverlay_clip;
 pub mod mvt;
 pub mod overview;
 pub mod pmtiles_writer;
-pub mod property_filter;
 pub mod quality;
 pub mod sutherland_hodgman;
 pub mod tile;
 pub mod wkb;
 pub mod world_coord;
 
-// Re-export PropertyFilter for convenience
-pub use property_filter::PropertyFilter;
 // Re-export Compression from compression module for public API
 pub use compression::Compression;
 // Re-export StreamingPmtilesWriter and related types
 pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
-// Re-export CRS validation for CLI usage
+// Re-export CRS validation for public API
 pub use quality::{extract_crs, validate_wgs84, CrsInfo};
-// Re-export covering types for row group filtering
-pub use covering::{
-    extract_row_group_bounds, find_bbox_column_indices, parse_bounds, parse_covering_metadata,
-    tile_to_bounds, BboxColumnIndices, CoveringSpec, RowGroupBounds,
-};
 
 /// Errors that can occur while reading GeoParquet or writing PMTiles.
 #[derive(Error, Debug)]

@@ -63,7 +63,7 @@ enum Command {
     /// Generate PMTiles vector tiles (the default pipeline).
     Tiles(TilesArgs),
     /// Build a multi-resolution overview GeoParquet file.
-    Overview(OverviewArgs),
+    Overview(Box<OverviewArgs>),
     /// Validate a GeoParquet overview file against the spec (§6.2).
     Validate(ValidateArgs),
     /// Export a PMTiles archive from an overview GeoParquet file (Plan E0).
@@ -478,7 +478,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse_from(rewrite_bare_args(std::env::args_os()));
 
     match cli.command {
-        Command::Overview(args) => run_overview(args),
+        Command::Overview(args) => run_overview(*args),
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Tiles(args) => run_tiles(args),

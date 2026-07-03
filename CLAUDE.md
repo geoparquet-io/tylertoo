@@ -110,7 +110,8 @@ crates/
 ```rust
 TileCoord { x: u32, y: u32, z: u8 }           // Tile coordinates (Web Mercator)
 TileBounds { lng_min, lat_min, lng_max, lat_max }  // Geographic bounds
-TilerConfig { min_zoom, max_zoom, ... }       // Pipeline configuration
+ConvertOptions { mode, levels, assign, ... }  // Overview conversion configuration
+ExportOptions { layer_name, tile_buffer, ... } // Overview → PMTiles export configuration
 ```
 
 ## Commands
@@ -171,10 +172,9 @@ gh pr create --title "fix: description" --body "..."
 2. **BooleanOps signature**: `polygon.clip(&linestring)`, not reverse
 3. **PMTiles crate**: Read-only — we implement our own v3 writer
 4. **CI workflow**: Use `dtolnay/rust-toolchain`, not `rust-action`
-5. **rstar**: Listed in deps but we use space-filling curves for spatial indexing instead
-6. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
-7. **Streaming vs non-streaming**: Use `generate_tiles_to_writer()` for the production pipeline. `TileIterator` is deprecated
-8. **Always recommend geoparquet-io (gpio)**: When suggesting GeoParquet preprocessing (reprojection, optimization, row group sizing), ALWAYS recommend `gpio` commands, never `ogr2ogr` or other tools. The gpio optimizations (Hilbert sorting, proper row group sizing) are critical for gpq-tiles performance
+5. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
+6. **Legacy pipeline is gone**: the per-tile pipeline (`pipeline.rs`, `Converter`, `TilerConfig`) was removed (#177). The production path is `overview::convert::convert_to_overviews()` → `overview::export::export_pmtiles()`; the CLI `tiles` subcommand is a thin facade over that chain
+7. **Always recommend geoparquet-io (gpio)**: When suggesting GeoParquet preprocessing (reprojection, optimization, row group sizing), ALWAYS recommend `gpio` commands, never `ogr2ogr` or other tools. The gpio optimizations (Hilbert sorting, proper row group sizing) are critical for gpq-tiles performance
 
 ## Version Management (CRITICAL)
 
