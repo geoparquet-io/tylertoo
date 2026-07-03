@@ -537,11 +537,57 @@ pub enum ConvertError {
 ///
 /// See the module documentation for the pipeline. Returns a [`ConvertReport`]
 /// describing the levels written.
+/// Validate the numeric conversion knobs (H4 hostile-input hardening).
+///
+/// A NaN, infinite, or non-positive thinning factor (or GSD base) silently
+/// degenerates the assignment grid — every cell-winner pass would skip every
+/// feature — so nonsensical values are rejected up front with a clear error
+/// instead of producing an "everything at the canonical level" file.
+fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
+    let positive = |name: &str, v: f64| {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(ConvertError::InvalidConfig(format!(
+                "{name} = {v} must be a finite value > 0"
+            )));
+        }
+        Ok(())
+    };
+    let non_negative = |name: &str, v: f64| {
+        if !v.is_finite() || v < 0.0 {
+            return Err(ConvertError::InvalidConfig(format!(
+                "{name} = {v} must be a finite value >= 0"
+            )));
+        }
+        Ok(())
+    };
+    positive("gsd-base", options.gsd_base)?;
+    positive("point-thinning", options.assign.point_thinning)?;
+    positive("line-thinning", options.assign.line_thinning)?;
+    positive("polygon-thinning", options.assign.polygon_thinning)?;
+    non_negative("line-visibility", options.assign.line_visibility)?;
+    non_negative("polygon-visibility", options.assign.polygon_visibility)?;
+    // Negative snap / junction-angle values are documented OFF switches; only
+    // NaN is meaningless.
+    if options.coalesce_snap.is_nan() {
+        return Err(ConvertError::InvalidConfig(
+            "coalesce-snap must not be NaN (use <= 0 to disable snapping)".to_string(),
+        ));
+    }
+    if options.coalesce_junction_angle.is_nan() {
+        return Err(ConvertError::InvalidConfig(
+            "coalesce-junction-angle must not be NaN (use 0 to disable)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn convert_to_overviews(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
+    // Knob sanity (H4), shared by both pipelines.
+    validate_options(options)?;
     // Clustering option sanity (Q4), shared by both pipelines: partitioning
     // mode cannot represent per-level counts (see the error's rationale), and
     // aggregation is meaningless without clustering.
