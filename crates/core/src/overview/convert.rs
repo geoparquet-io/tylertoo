@@ -53,9 +53,13 @@ use super::assign::{
     FeatureKind, SUPERCELL_GSD_FACTOR,
 };
 use super::cluster::{build_cluster_tables, AccumulateSpec, ClusterEntry, POINT_COUNT_COLUMN};
+use super::coalesce::{
+    coalesce_level_lines, CoalesceInput, COALESCED_COUNT_COLUMN, DEFAULT_COALESCE_MAX_LEVEL_ROWS,
+    DEFAULT_SNAP_GSD_FACTOR,
+};
 use super::level::{
-    gsd_with_base, AccumulatedColumn, ClusteringProvenance, Crs, DensityProvenance, Generalization,
-    GeneralizationLevel, Mode, RankingProvenance, GSD_TILE_BASE,
+    gsd_with_base, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance, Crs,
+    DensityProvenance, Generalization, GeneralizationLevel, Mode, RankingProvenance, GSD_TILE_BASE,
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, WriterError, LEVEL_COLUMN};
@@ -294,6 +298,26 @@ pub struct ConvertOptions {
     /// absorbed features at that level. Requires [`cluster`](Self::cluster).
     /// Empty by default.
     pub accumulate: Vec<AccumulateSpec>,
+    /// Enable line network coalescing (plan Q3; opt-in). Duplicating mode
+    /// only. At each non-canonical level, touching same-class line segments
+    /// are chained into single "stroke" LineStrings BEFORE the visibility
+    /// gate and thinning run (see [`super::coalesce`]), so fragmented
+    /// networks read as connected arteries at coarse zooms. The output
+    /// gains a `coalesced_count` INT32 NOT NULL column (source segments
+    /// merged per row; 1 for unmerged rows and at the canonical level).
+    /// Points and polygons are unaffected. Default `false`.
+    pub coalesce_lines: bool,
+    /// Endpoint snap tolerance for coalescing, in GSD multiples (default
+    /// [`DEFAULT_SNAP_GSD_FACTOR`] = 1.0): after exact-endpoint chaining,
+    /// chain ends within `factor × gsd` of each other are joined. `<= 0`
+    /// disables the snap pass (exact coordinate matching only).
+    pub coalesce_snap: f64,
+    /// Per-level candidate ceiling for coalescing (default
+    /// [`DEFAULT_COALESCE_MAX_LEVEL_ROWS`]): chaining holds the level's
+    /// candidate line geometries in memory at once, so levels with more
+    /// candidate lines than this skip coalescing (with a log) instead of
+    /// breaking the streaming pipeline's memory bound.
+    pub coalesce_max_level_rows: usize,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -321,6 +345,9 @@ impl Default for ConvertOptions {
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             cluster: false,
             accumulate: Vec::new(),
+            coalesce_lines: false,
+            coalesce_snap: DEFAULT_SNAP_GSD_FACTOR,
+            coalesce_max_level_rows: DEFAULT_COALESCE_MAX_LEVEL_ROWS,
         }
     }
 }
@@ -457,6 +484,26 @@ pub enum ConvertError {
          converting with --cluster"
     )]
     PointCountColumnPresent,
+    /// `--coalesce-lines` was requested in partitioning mode. Partitioning
+    /// requires every source feature to appear exactly once with its
+    /// geometry verbatim (§2.3); a merged chain is a new geometry replacing
+    /// several source rows, so coalescing has no sound construction in a
+    /// feature-once layout (it also breaks the prefix-read semantics:
+    /// segments merged at a coarse level would have to vanish from every
+    /// finer band they belong to).
+    #[error(
+        "--coalesce-lines requires duplicating mode: partitioning places each \
+         feature exactly once with geometry verbatim, which a merged chain \
+         cannot satisfy"
+    )]
+    CoalescePartitioningUnsupported,
+    /// The input already contains a `coalesced_count` column (coalescing
+    /// enabled).
+    #[error(
+        "input already contains a '{COALESCED_COUNT_COLUMN}' column; rename it \
+         before converting with --coalesce-lines"
+    )]
+    CoalescedCountColumnPresent,
     /// The input has no features, or every feature was dropped from every level.
     #[error("no output rows produced (empty input or all features dropped)")]
     NoData,
@@ -479,6 +526,11 @@ pub fn convert_to_overviews(
     }
     if !options.accumulate.is_empty() && !options.cluster {
         return Err(ConvertError::AccumulateWithoutCluster);
+    }
+    // Coalescing option sanity (Q3): partitioning mode cannot represent
+    // merged chains (see the error's rationale).
+    if options.coalesce_lines && matches!(options.mode, Mode::Partitioning) {
+        return Err(ConvertError::CoalescePartitioningUnsupported);
     }
 
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
@@ -526,6 +578,8 @@ pub fn convert_to_overviews(
 
     // Clustering schema checks + accumulate column resolution (Q4).
     let acc_cols = validate_cluster_schema(&input_schema, options)?;
+    // Coalescing schema check (Q3).
+    validate_coalesce_schema(&input_schema, options)?;
 
     let reader = builder.build()?;
     let mut batches: Vec<RecordBatch> = Vec::new();
@@ -547,6 +601,24 @@ pub fn convert_to_overviews(
     // per-feature sort keys and the provenance recorded in the footer (§3.5).
     let (sort_keys, ranking_provenance) =
         resolve_ranking(&input_schema, &full, &geometries, options)?;
+
+    // --- Coalescing groups (Q3): interned class values, when class-ranked. ---
+    let num_lines = geometries
+        .iter()
+        .filter(|g| feature_kind(g) == FeatureKind::Line)
+        .count();
+    let coalesce_on = coalesce_effective(options, num_lines);
+    let line_groups: Option<Vec<u32>> = if coalesce_on {
+        coalesce_group_column(&ranking_provenance).map(|col| {
+            let idx = input_schema.index_of(col).expect("ranking column exists");
+            let mut interner = GroupInterner::default();
+            let mut groups = Vec::with_capacity(full.num_rows());
+            interner.extend(full.column(idx).as_ref(), &mut groups);
+            groups
+        })
+    } else {
+        None
+    };
 
     // --- Level assignment. ---------------------------------------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
@@ -611,6 +683,9 @@ pub fn convert_to_overviews(
         indices: Vec<usize>,
         geoms: Vec<Geometry<f64>>,
         vertex_count: usize,
+        /// Coalescing (Q3): this level's chain table (rep row → merged
+        /// geometry + member count). `None` at non-coalesced levels.
+        coalesce: Option<CoalesceTable>,
     }
     let mut emitted: Vec<EmittedLevel> = Vec::new();
 
@@ -623,6 +698,38 @@ pub fn convert_to_overviews(
         // Verbatim path: partitioning at every level (§2.3), and duplicating at
         // the canonical (finest) level (§2.4). Otherwise simplify per feature.
         let verbatim = matches!(options.mode, Mode::Partitioning) || level == finest;
+
+        // Coalescing (Q3): at non-canonical duplicating levels, ALL line rows
+        // enter the per-level chain stage (pre-gate, pre-thinning — chains of
+        // sub-visibility fragments must be reclaimable) and the winner-table
+        // path handles only the non-line rows. The chain table's rep rows are
+        // added back below with their merged, pre-simplified geometry.
+        let coalesce: Option<CoalesceTable> = if coalesce_on && !verbatim {
+            let inputs: Vec<CoalesceInput<'_>> = features
+                .iter()
+                .filter(|f| f.kind == FeatureKind::Line)
+                .map(|f| CoalesceInput {
+                    index: f.index,
+                    geom: &geometries[f.index],
+                    sort_key: f.sort_key,
+                    group: line_groups.as_ref().map_or(0, |g| g[f.index]),
+                })
+                .collect();
+            Some(build_level_coalesce_table(&inputs, gsd_m, crs, options))
+        } else {
+            None
+        };
+        let member_indices: Vec<usize> = if let Some(table) = &coalesce {
+            let mut v: Vec<usize> = member_indices
+                .into_iter()
+                .filter(|&i| features[i].kind != FeatureKind::Line)
+                .collect();
+            v.extend(table.keys().copied());
+            v.sort_unstable();
+            v
+        } else {
+            member_indices
+        };
 
         let mut indices = Vec::with_capacity(member_indices.len());
         let mut geoms = Vec::with_capacity(member_indices.len());
@@ -637,6 +744,13 @@ pub fn convert_to_overviews(
             }
         } else {
             for i in member_indices {
+                // Chain reps carry their merged, already-simplified geometry.
+                if let Some((g, _)) = coalesce.as_ref().and_then(|t| t.get(&i)) {
+                    vertex_count += count_vertices(g);
+                    indices.push(i);
+                    geoms.push(g.clone());
+                    continue;
+                }
                 match simplify_for_level(&geometries[i], gsd_m, crs, &options.simplify) {
                     Simplified::Keep(g) => {
                         vertex_count += count_vertices(&g);
@@ -659,6 +773,7 @@ pub fn convert_to_overviews(
             indices,
             geoms,
             vertex_count,
+            coalesce,
         });
     }
 
@@ -673,11 +788,17 @@ pub fn convert_to_overviews(
     // same type so RecordBatch assembly matches.
     let geom_out_field = mixed_geometry_field(&geom_name);
     let source_schema = build_source_schema(&input_schema, geom_idx, geom_out_field.clone());
-    // Writer schema: base + point_count when clustering (Q4).
-    let out_schema = if options.cluster {
+    // Writer schema: base + point_count when clustering (Q4) + coalesced_count
+    // when coalescing (Q3).
+    let cluster_schema = if options.cluster {
         append_point_count_field(&source_schema)
     } else {
         source_schema.clone()
+    };
+    let out_schema = if options.coalesce_lines {
+        append_coalesced_count_field(&cluster_schema)
+    } else {
+        cluster_schema.clone()
     };
 
     let writer_levels: Vec<LevelSpec> = emitted
@@ -716,7 +837,11 @@ pub fn convert_to_overviews(
         if let Some(tables) = &cluster_tables {
             // Canonical level: singleton clusters, columns verbatim (§2.4).
             let table = (e.orig != finest).then(|| &tables[e.orig]);
-            batch = apply_cluster_columns(batch, &out_schema, &e.indices, table, &acc_cols)?;
+            batch = apply_cluster_columns(batch, &cluster_schema, &e.indices, table, &acc_cols)?;
+        }
+        if options.coalesce_lines {
+            // Canonical level (and guard-skipped runs): table is None ⇒ all 1.
+            batch = apply_coalesced_count(batch, &out_schema, &e.indices, e.coalesce.as_ref())?;
         }
         writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
         level_reports.push(LevelReport {
@@ -1105,6 +1230,165 @@ fn overwrite_numeric_column(
     }
 }
 
+// ============================================================================
+// Coalescing helpers (Q3) — shared by the in-memory and streaming pipelines
+// ============================================================================
+
+/// One level's coalescing result: rep source row → (simplified merged
+/// geometry, number of source segments merged).
+pub(super) type CoalesceTable = HashMap<usize, (Geometry<f64>, i32)>;
+
+/// Validate the coalescing-related schema constraint: the input must not
+/// already carry a `coalesced_count` column (case-insensitive, mirroring the
+/// `level` / `point_count` rules).
+pub(super) fn validate_coalesce_schema(
+    schema: &Schema,
+    options: &ConvertOptions,
+) -> Result<(), ConvertError> {
+    if !options.coalesce_lines {
+        return Ok(());
+    }
+    if schema
+        .fields()
+        .iter()
+        .any(|f| f.name().eq_ignore_ascii_case(COALESCED_COUNT_COLUMN))
+    {
+        return Err(ConvertError::CoalescedCountColumnPresent);
+    }
+    Ok(())
+}
+
+/// The writer schema with the trailing `coalesced_count` INT32 NOT NULL
+/// column appended (coalescing enabled).
+pub(super) fn append_coalesced_count_field(schema: &Schema) -> Schema {
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(
+        COALESCED_COUNT_COLUMN,
+        DataType::Int32,
+        false,
+    )));
+    Schema::new(fields)
+}
+
+/// Append the `coalesced_count` column to a level batch: chain reps take
+/// their member count from `table`; every other row (non-lines, unmerged
+/// lines, canonical rows — `table` is `None` there) carries `1`.
+pub(super) fn apply_coalesced_count(
+    batch: RecordBatch,
+    out_schema: &Schema,
+    global_indices: &[usize],
+    table: Option<&CoalesceTable>,
+) -> Result<RecordBatch, ConvertError> {
+    use arrow_array::Int32Array;
+
+    debug_assert_eq!(batch.num_rows(), global_indices.len());
+    let mut columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
+    let counts: Vec<i32> = global_indices
+        .iter()
+        .map(|g| table.and_then(|t| t.get(g)).map_or(1, |(_, c)| *c))
+        .collect();
+    columns.push(Arc::new(Int32Array::from(counts)));
+    Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
+}
+
+/// The class column driving coalescing compatibility groups, when the Q1
+/// ranking is class-based (explicit `--class-rank` or auto-detected Overture
+/// roads). Numeric rankings (`--sort-key`, auto-confidence) and the size
+/// fallback have no class semantics: all lines are compatible.
+pub(super) fn coalesce_group_column(ranking: &RankingProvenance) -> Option<&str> {
+    match ranking.mode.as_str() {
+        "class-ranking" | "auto-overture-roads" => ranking.column.as_deref(),
+        _ => None,
+    }
+}
+
+/// Incremental string→id interner for coalescing compatibility groups.
+/// Null values map to [`GroupInterner::NULL_GROUP`] (all nulls compatible
+/// with each other, never with a named class).
+#[derive(Debug, Default)]
+pub(super) struct GroupInterner {
+    map: HashMap<String, u32>,
+}
+
+impl GroupInterner {
+    /// Group id assigned to null/missing class values.
+    pub(super) const NULL_GROUP: u32 = u32::MAX;
+
+    /// Intern one column's values, appending a group id per row to `out`.
+    /// Non-string columns intern every row as [`Self::NULL_GROUP`] (callers
+    /// only pass validated class-ranking columns, which are strings).
+    pub(super) fn extend(&mut self, col: &dyn Array, out: &mut Vec<u32>) {
+        use arrow_array::cast::AsArray;
+
+        macro_rules! intern {
+            ($arr:expr) => {{
+                let a = $arr;
+                for i in 0..a.len() {
+                    if a.is_null(i) {
+                        out.push(Self::NULL_GROUP);
+                    } else {
+                        let next = self.map.len() as u32;
+                        let id = *self.map.entry(a.value(i).to_string()).or_insert(next);
+                        out.push(id);
+                    }
+                }
+            }};
+        }
+        match col.data_type() {
+            DataType::Utf8 => intern!(col.as_string::<i32>()),
+            DataType::LargeUtf8 => intern!(col.as_string::<i64>()),
+            _ => out.extend(std::iter::repeat(Self::NULL_GROUP).take(col.len())),
+        }
+    }
+}
+
+/// Build one level's [`CoalesceTable`]: chain + gate + thin the candidate
+/// lines ([`coalesce_level_lines`]), then simplify each surviving chain for
+/// the level. Chains that degenerate during simplification are dropped
+/// (default knobs never hit this: the 2×GSD gate is stricter than the 1×GSD
+/// simplify drop gate). Deterministic; shared verbatim by both pipelines so
+/// their outputs stay identical.
+pub(super) fn build_level_coalesce_table(
+    inputs: &[CoalesceInput<'_>],
+    gsd_m: f64,
+    crs: Crs,
+    options: &ConvertOptions,
+) -> CoalesceTable {
+    let chains = coalesce_level_lines(inputs, gsd_m, crs, &options.assign, options.coalesce_snap);
+    let mut table = CoalesceTable::with_capacity(chains.len());
+    for chain in chains {
+        match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify) {
+            Simplified::Keep(g) => {
+                table.insert(chain.rep, (g, chain.count));
+            }
+            Simplified::Dropped => {}
+        }
+    }
+    table
+}
+
+/// Whether coalescing is effectively active for this conversion: enabled,
+/// and the candidate line count fits the per-level memory guard. Logs when
+/// the guard trips (the file still carries the `coalesced_count` column,
+/// all 1, and the coalescing provenance).
+pub(super) fn coalesce_effective(options: &ConvertOptions, num_lines: usize) -> bool {
+    if !options.coalesce_lines {
+        return false;
+    }
+    if num_lines > options.coalesce_max_level_rows {
+        log::warn!(
+            "coalescing skipped: {num_lines} candidate lines exceed \
+             --coalesce-max-level-rows {} (chaining holds a level's line \
+             geometries in memory; near-canonical levels this large need \
+             coalescing least). Output keeps the coalesced_count column \
+             (all 1).",
+            options.coalesce_max_level_rows
+        );
+        return false;
+    }
+    true
+}
+
 /// Build informative generalization provenance (§3.5) from the emitted gsds.
 pub(super) fn build_generalization(
     gsds: &[f64],
@@ -1143,6 +1427,17 @@ pub(super) fn build_generalization(
                 drop_rate: options.density.drop_rate,
                 gamma: options.density.gamma,
                 supercell_gsd_factor: SUPERCELL_GSD_FACTOR,
+            })
+        } else {
+            None
+        },
+        // Recorded only when coalescing was requested; a non-coalesced run
+        // emits a byte-identical footer to before this feature existed.
+        coalescing: if options.coalesce_lines {
+            Some(CoalescingProvenance {
+                enabled: true,
+                snap_tolerance_gsd_factor: options.coalesce_snap,
+                coalesced_count_column: COALESCED_COUNT_COLUMN.to_string(),
             })
         } else {
             None
@@ -2914,6 +3209,414 @@ mod tests {
                 read_point_counts(&mr, level),
                 read_point_counts(&sr, level),
                 "level {level} point_count differs"
+            );
+        }
+    }
+
+    // --- Q3 line coalescing ---------------------------------------------------
+
+    /// Read the `coalesced_count` column for one level, in row order.
+    fn read_coalesced_counts(reader: &OverviewReader, level: usize) -> Vec<i32> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        let rdr = reader.read_level(level, None).unwrap();
+        let mut out = Vec::new();
+        for batch in rdr {
+            let batch = batch.unwrap();
+            let idx = batch.schema().index_of("coalesced_count").unwrap();
+            let col = batch.column(idx).as_primitive::<Int32Type>().clone();
+            assert_eq!(col.null_count(), 0, "coalesced_count must be NOT NULL");
+            out.extend(col.values().iter().copied());
+        }
+        out
+    }
+
+    /// A chain of `n` touching collinear segments (each 0.01° long) starting
+    /// at (0,0), plus one far-away point. Each segment alone is below the
+    /// coarse-level line visibility gate; the chain is well above it.
+    fn fragment_chain_geoms(n: usize) -> Vec<Geometry<f64>> {
+        let mut geoms: Vec<Geometry<f64>> = (0..n)
+            .map(|i| {
+                let x0 = i as f64 * 0.01;
+                Geometry::LineString(LineString::from(vec![(x0, 0.0), (x0 + 0.01, 0.0)]))
+            })
+            .collect();
+        geoms.push(Geometry::Point(Point::new(5.0, 5.0)));
+        geoms
+    }
+
+    #[test]
+    fn coalesce_reclaims_sub_visibility_fragments_and_keeps_canonical() {
+        // z4 gsd ≈ 2446 m ⇒ gate 2·gsd ≈ 0.0439°. Segments are 0.01° (fail
+        // alone); the 6-segment chain is 0.06° (passes). Without coalescing
+        // the coarse level holds only the point; with it, point + one artery.
+        let geoms = fragment_chain_geoms(6);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            no_auto_rank: true,
+            ..Default::default()
+        };
+
+        // Baseline: fragments vanish from the coarse level.
+        let tout_off = tempfile::NamedTempFile::new().unwrap();
+        let off = convert_to_overviews(tin.path(), tout_off.path(), &base).unwrap();
+        assert_eq!(
+            off.levels[0].feature_count, 1,
+            "without coalescing only the point survives level 0: {:?}",
+            off.levels
+        );
+
+        // Coalescing: the chain survives as ONE feature with count 6.
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ConvertOptions {
+            coalesce_lines: true,
+            ..base
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(
+            report.levels[0].feature_count, 2,
+            "chain + point at level 0: {:?}",
+            report.levels
+        );
+
+        let vr = validate_file(tout.path()).unwrap();
+        assert!(
+            vr.is_valid(),
+            "failures: {:?}",
+            vr.failures().collect::<Vec<_>>()
+        );
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let counts0 = read_coalesced_counts(&reader, 0);
+        let mut sorted = counts0.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 6], "point=1, merged chain=6: {counts0:?}");
+
+        // Canonical level: every source row verbatim, all counts 1.
+        let canonical = reader.num_levels() - 1;
+        let rows = read_level_rows(&reader, canonical);
+        assert_eq!(rows.len(), geoms.len());
+        for (id, _, _, geom) in &rows {
+            assert_eq!(
+                geom, &geoms[*id as usize],
+                "canonical geometry verbatim (never coalesced)"
+            );
+        }
+        assert!(read_coalesced_counts(&reader, canonical)
+            .iter()
+            .all(|&c| c == 1));
+    }
+
+    #[test]
+    fn coalesce_groups_by_auto_detected_class() {
+        // Two touching motorway segments merge; the footway touching the
+        // same chain end does not (class mismatch). Extra far-away classed
+        // lines trigger the Overture auto-detection vocab gate.
+        let mut geoms = vec![
+            Geometry::LineString(LineString::from(vec![(0.0, 0.0), (0.1, 0.0)])),
+            Geometry::LineString(LineString::from(vec![(0.1, 0.0), (0.2, 0.0)])),
+            Geometry::LineString(LineString::from(vec![(0.2, 0.0), (0.2, 0.1)])),
+        ];
+        let mut classes = vec![Some("motorway"), Some("motorway"), Some("footway")];
+        for (i, c) in ["primary", "service", "residential"].iter().enumerate() {
+            geoms.push(Geometry::LineString(LineString::from(vec![
+                (3.0 + i as f64, 3.0),
+                (3.1 + i as f64, 3.05),
+            ])));
+            classes.push(Some(*c));
+        }
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_class_input(tin.path(), &geoms, &classes);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            coalesce_lines: true,
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(ranking_mode_of(tout.path()), "auto-overture-roads");
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let counts0 = read_coalesced_counts(&reader, 0);
+        assert_eq!(
+            counts0.iter().filter(|&&c| c == 2).count(),
+            1,
+            "exactly one 2-segment motorway chain: {counts0:?}"
+        );
+        assert!(
+            counts0.iter().all(|&c| c <= 2),
+            "footway never merges into the motorway chain: {counts0:?}"
+        );
+    }
+
+    #[test]
+    fn coalesce_rejects_partitioning() {
+        let geoms = fragment_chain_geoms(3);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        for streaming in [true, false] {
+            let err = convert_to_overviews(
+                tin.path(),
+                tout.path(),
+                &ConvertOptions {
+                    mode: Mode::Partitioning,
+                    coalesce_lines: true,
+                    streaming,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ConvertError::CoalescePartitioningUnsupported),
+                "streaming={streaming}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coalesce_rejects_existing_coalesced_count_column() {
+        // An input already carrying a `coalesced_count` column is rejected
+        // when coalescing (case-insensitively), accepted when off.
+        let geoms = fragment_chain_geoms(2);
+        let n = geoms.len();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        {
+            let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+            let cc = arrow_array::Int32Array::from(vec![7i32; n]);
+            let geom_arr = build_geometry_array(&geoms);
+            let geom_field = geom_arr.data_type().to_field("geometry", true);
+            let fields = vec![
+                Arc::new(Field::new("id", DataType::Int64, false)),
+                Arc::new(Field::new("Coalesced_Count", DataType::Int32, false)),
+                Arc::new(geom_field),
+            ];
+            let columns: Vec<Arc<dyn Array>> =
+                vec![Arc::new(id), Arc::new(cc), geom_arr.to_array_ref()];
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            let gpq_options = GeoParquetWriterOptionsBuilder::default()
+                .set_encoding(GeoParquetWriterEncoding::WKB)
+                .set_generate_covering(true)
+                .build();
+            let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+            let target_schema = encoder.target_schema();
+            let file = std::fs::File::create(tin.path()).unwrap();
+            let mut writer = ArrowWriter::try_new(file, target_schema, None).unwrap();
+            writer
+                .write(&encoder.encode_record_batch(&batch).unwrap())
+                .unwrap();
+            writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+            writer.close().unwrap();
+        }
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        for streaming in [true, false] {
+            let err = convert_to_overviews(
+                tin.path(),
+                tout.path(),
+                &ConvertOptions {
+                    coalesce_lines: true,
+                    streaming,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ConvertError::CoalescedCountColumnPresent),
+                "streaming={streaming}: got {err:?}"
+            );
+        }
+        // Without coalescing the column is an ordinary property.
+        convert_to_overviews(tin.path(), tout.path(), &ConvertOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn coalesce_footer_provenance_recorded() {
+        let geoms = fragment_chain_geoms(3);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            coalesce_lines: true,
+            coalesce_snap: 1.5,
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let c = reader
+            .meta()
+            .generalization
+            .as_ref()
+            .unwrap()
+            .coalescing
+            .clone()
+            .expect("coalescing provenance recorded");
+        assert!(c.enabled);
+        assert_eq!(c.snap_tolerance_gsd_factor, 1.5);
+        assert_eq!(c.coalesced_count_column, "coalesced_count");
+
+        // Off by default: no coalescing block, no coalesced_count column.
+        let tout_off = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(tin.path(), tout_off.path(), &ConvertOptions::default()).unwrap();
+        let r_off = OverviewReader::open(tout_off.path()).unwrap();
+        assert!(r_off
+            .meta()
+            .generalization
+            .as_ref()
+            .unwrap()
+            .coalescing
+            .is_none());
+    }
+
+    #[test]
+    fn coalesce_guard_skips_chaining_but_keeps_column() {
+        // A max-level-rows guard smaller than the line count: no chaining
+        // happens (fragments still vanish at coarse levels) but the schema
+        // and provenance stay stable (coalesced_count all 1).
+        let geoms = fragment_chain_geoms(6);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            no_auto_rank: true,
+            coalesce_lines: true,
+            coalesce_max_level_rows: 2, // < 6 lines → guard trips
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(
+            report.levels[0].feature_count, 1,
+            "guard-skipped run behaves like non-coalesced: {:?}",
+            report.levels
+        );
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        for level in 0..reader.num_levels() {
+            assert!(read_coalesced_counts(&reader, level)
+                .iter()
+                .all(|&c| c == 1));
+        }
+        assert!(validate_file(tout.path()).unwrap().is_valid());
+    }
+
+    #[test]
+    fn streaming_matches_in_memory_coalescing() {
+        // Coalescing must be byte-equivalent between the streaming and
+        // in-memory pipelines, including with tiny read batches (chain reps
+        // scattered across batch boundaries).
+        let geoms = fragment_chain_geoms(6);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            no_auto_rank: true,
+            coalesce_lines: true,
+            read_batch_size: 2,
+            ..Default::default()
+        };
+        assert_streaming_equivalent(tin.path(), &base);
+
+        // Explicitly compare coalesced_count per level too.
+        let mem_out = tempfile::NamedTempFile::new().unwrap();
+        let stream_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(
+            tin.path(),
+            mem_out.path(),
+            &ConvertOptions {
+                streaming: false,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
+        let mr = OverviewReader::open(mem_out.path()).unwrap();
+        let sr = OverviewReader::open(stream_out.path()).unwrap();
+        for level in 0..mr.num_levels() {
+            assert_eq!(
+                read_coalesced_counts(&mr, level),
+                read_coalesced_counts(&sr, level),
+                "level {level} coalesced_count differs"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_matches_in_memory_coalescing_with_class_groups() {
+        // Same equivalence with the auto-detected class ranking driving the
+        // compatibility groups (interner parity across batch boundaries).
+        let mut geoms = vec![
+            Geometry::LineString(LineString::from(vec![(0.0, 0.0), (0.1, 0.0)])),
+            Geometry::LineString(LineString::from(vec![(0.1, 0.0), (0.2, 0.0)])),
+            Geometry::LineString(LineString::from(vec![(0.2, 0.0), (0.2, 0.1)])),
+        ];
+        let mut classes = vec![Some("motorway"), Some("motorway"), Some("footway")];
+        for (i, c) in ["primary", "service", "residential", "trunk"]
+            .iter()
+            .enumerate()
+        {
+            geoms.push(Geometry::LineString(LineString::from(vec![
+                (3.0 + i as f64, 3.0),
+                (3.1 + i as f64, 3.05),
+            ])));
+            classes.push(Some(*c));
+        }
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_class_input(tin.path(), &geoms, &classes);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            coalesce_lines: true,
+            read_batch_size: 2,
+            ..Default::default()
+        };
+        let mem_out = tempfile::NamedTempFile::new().unwrap();
+        let stream_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(
+            tin.path(),
+            mem_out.path(),
+            &ConvertOptions {
+                streaming: false,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
+        assert_eq!(
+            overviews_footer_json(mem_out.path()),
+            overviews_footer_json(stream_out.path())
+        );
+        let mr = OverviewReader::open(mem_out.path()).unwrap();
+        let sr = OverviewReader::open(stream_out.path()).unwrap();
+        assert_eq!(mr.num_levels(), sr.num_levels());
+        for level in 0..mr.num_levels() {
+            assert_eq!(
+                read_coalesced_counts(&mr, level),
+                read_coalesced_counts(&sr, level),
+                "level {level} coalesced_count differs"
             );
         }
     }
