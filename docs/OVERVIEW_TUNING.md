@@ -335,6 +335,87 @@ exists as INT64 NOT NULL and that canonical-level values are all 1.
 
 ---
 
+## Line coalescing: `--coalesce-lines`, `--coalesce-snap`, `--coalesce-max-level-rows`
+
+At coarse levels a line network (roads, rivers) can degrade into scattered
+dashes: a segment whose bbox diagonal is below the visibility gate
+(`--line-visibility × gsd`) is dropped outright, and cell-winner thinning
+keeps disconnected fragments of what remains. Selection is smart;
+*continuity* is destroyed.
+
+**`--coalesce-lines`** (opt-in, duplicating mode only) chains touching
+compatible segments into single "stroke" LineStrings at each non-canonical
+level, **before** the gate and thinning run:
+
+- A chain of individually sub-visibility segments survives as **one long
+  visible artery** — the gate evaluates the chain's extent, not each
+  fragment's. This ordering is the entire payoff.
+- Chains never merge **across class values** (when a class ranking is
+  active — explicit `--class-rank` or auto-detected Overture
+  `class`/`road_class`) and never merge **through junctions** where 3+
+  compatible endpoints meet (degree-2 nodes only; network topology is
+  preserved). With no class ranking, all lines are compatible.
+- The merged feature keeps the **attributes of its highest-priority
+  member** (same class-rank → size → hash order as the cell-winner stage)
+  and the output gains a **`coalesced_count`** INT32 NOT NULL column
+  (source segments merged per row; 1 for unmerged rows and everywhere at
+  the canonical level, which is never coalesced).
+- Points and polygons are untouched. MultiLineString rows pass through
+  unmerged.
+
+```bash
+gpq-tiles overview roads.parquet roads_overview.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --coalesce-lines        # auto class ranking groups by road class
+```
+
+### `--coalesce-snap` (default 1.0, GSD multiples)
+
+Exactly-touching endpoints always chain (Overture/OSM segments share exact
+node coordinates). The snap pass additionally joins chain ends within
+`factor × gsd` of each other — two endpoints closer than one ground sample
+are indistinguishable at that level. BIGGER bridges larger digitization
+gaps but risks fusing the ends of nearby parallel lines; `0` disables the
+snap pass (exact matches only).
+
+### `--coalesce-max-level-rows` (default 2,000,000): memory guard
+
+Chaining needs a level's candidate line geometries in memory at once, and
+the candidate set at every non-canonical level is **all** lines (dropped
+fragments must be reclaimable, so no winner-table pre-filter applies).
+Datasets with more lines than this ceiling skip coalescing with a warning
+— the file still carries the `coalesced_count` column (all 1) and the
+provenance block, so the schema is stable. Levels that large are
+near-canonical anyway, where segments are individually visible and
+coalescing matters least. This is the streaming pipeline's one deliberate
+`O(lines)` residual allocation.
+
+### Interactions
+
+- **`--line-visibility` / `--line-thinning`** now act on *chains*: the
+  gate tests the merged extent, and one **chain** (not one segment)
+  survives per thinning cell. Expect coarse levels to show **fewer rows
+  but much more retained line length** than a non-coalesced run.
+- **Class ranking** does double duty: it both prioritizes which chain wins
+  a cell and defines the compatibility groups. `--no-auto-rank` (or a
+  numeric `--sort-key`) makes all lines compatible — fine for
+  single-class datasets (rivers), usually wrong for mixed road networks.
+- **Density budget (Q2)**: line rows leave the winner table at coalesced
+  levels, so the drop-rate budget does not apply to them there (chaining
+  already collapses line counts far harder); points and polygons keep the
+  budget as usual.
+- **Partitioning mode is rejected.** Partitioning places each feature
+  exactly once with geometry verbatim; a merged chain is a new geometry
+  replacing several source rows, which that contract cannot represent.
+
+Coalescing is recorded in the footer `geo:overviews` →
+`generalization.coalescing` provenance (`enabled`,
+`snap_tolerance_gsd_factor`, `coalesced_count_column`); `gpq-tiles
+validate` checks that the column exists as INT32 NOT NULL, all values are
+>= 1, and canonical-level values are all 1.
+
+---
+
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
 These do not change *which* features or vertices survive — geometry and
