@@ -72,6 +72,9 @@ serde = { version = "1.0", features = ["derive"] }
 # Memory profiling (actual RSS measurement)
 memory-stats = "1.2"
 
+# Property-based testing (dev only)
+proptest = "1"
+
 # Note: Install these separately with cargo install:
 # - cargo-tarpaulin (coverage)
 # - cargo-mutants (mutation testing)
