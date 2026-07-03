@@ -90,3 +90,94 @@ Documented in `docs/OVERVIEW_TUNING.md` § "Memory / streaming knobs".
 - H3(b) (export: flush finished tiles instead of holding a zoom map)
   is **not** part of this change; export still holds one zoom in
   memory.
+
+# H3(b) — Bounded-memory export + serial-merge removal
+
+Date: 2026-07-03. Branch: `fix/export-memory-flush` (on top of the
+H3(c) levers, base b8a1635).
+
+Restructures `crates/core/src/overview/export.rs` from per-zoom
+whole-band materialization (level `Vec<Feature>` + staged per-feature
+clip results + a **serial** `BTreeMap` grouping merge + all encoded
+tiles held until written) to a partitioned streaming pipeline:
+
+1. **Scan pass** per level: stream the band once (geometry decode
+   only) → per-tile member counts, band row count, overall bounds.
+   O(#tiles) state.
+2. **Partition**: split the zoom's tiles into contiguous ascending
+   `(x, y)` ranges of ~`DEFAULT_PARTITION_TARGET` = 32,768
+   (feature × tile) members.
+3. **Partition pass**: partitions run in parallel waves of
+   `PARTITION_WAVE` = 6 (order-preserving collect, serial in-order
+   write). Each partition re-reads a row-group-pruned subset of the
+   band (conservative bbox pruning via the covering stats; skipped for
+   EPSG:3857 inputs), clips features in parallel per 8k-row batch
+   (`OverviewReader::read_level_with_batch_size`, new), groups by a
+   **parallel `(tile key, band order)` sort** — the serial per-zoom
+   `BTreeMap` merge is gone — and MVT-encodes tiles in parallel.
+   Finished partitions stream straight to the PMTiles writer.
+
+Parallel: per-batch clip, member grouping sort, per-tile MVT encode,
+and up to 6 concurrent partitions. Serial: band scan, per-batch
+decode/property extraction (within each partition), and the in-order
+gzip/write loop (unchanged).
+
+## Byte-identity
+
+Tiles are still added zoom-ascending and `(x, y)`-ascending within a
+zoom (the packed tile key sorts exactly like the old `BTreeMap<(x, y)>`
+iteration), and within-tile members keep band order, so tile bytes,
+dedup offsets, directory, and metadata are unchanged. Verified three
+ways:
+
+- `overview::export::tests::export_archive_matches_pre_refactor_reference`:
+  whole-archive xxh3 pinned from the pre-refactor implementation
+  (captured at b8a1635 before the rewrite) on a mixed-geometry
+  2-level fixture — green after the rewrite.
+- `overview::export::tests::partitioned_export_is_partition_invariant`:
+  `partition_target = 1` (max partitions, max band re-reads) vs the
+  default produce byte-identical archives and identical reports.
+- Moldova: `cmp` of the full 123 MB archive, pre- vs post-refactor
+  build — **byte-identical**; reports identical modulo
+  `duration_secs`. 17,372 tiles, 1,807,912 tile features, 0 oversized
+  in both.
+
+## Moldova before / after
+
+Input `corpus/data/bench/h3/moldova.dup.stream.parquet` (632k
+polygons, duplicating z0–14), command:
+
+```bash
+/usr/bin/time -v target/release/gpq-tiles \
+  export-pmtiles \
+  corpus/data/bench/h3/moldova.dup.stream.parquet \
+  out.pmtiles --layer-name fields
+```
+
+Caveat: the machine was heavily loaded by unrelated jobs (load avg
+13–30 of 16 cores) throughout these runs, so absolute walls are
+inflated vs the idle-machine H3(c) figures (58.8 s / 2.38 GB).
+Before/after pairs were therefore run back-to-back under the same
+load; best-of-pairs shown:
+
+| build | wall (paired, loaded) | CPU | Max RSS |
+|---|---:|---:|---:|
+| pre-refactor (b8a1635 + anchor test) | 75.5 s | 717 % | **2.41 GB** |
+| **partitioned streaming** | **73.9 s** | 688 % | **0.89 GB** |
+
+- **Peak RSS 2.4 GB → 0.89 GB (−63 %), under the 1 GB target.** The
+  bound is now O(wave × partition): ~6 × (32k members + one 8k-row
+  batch transient), independent of the zoom band size.
+- Wall: parity with the pre-refactor build under identical load
+  (73.9 vs 75.5 s; run-to-run noise under this contention was ±25 %,
+  e.g. ref itself ranged 75.5–103.5 s). The serial `BTreeMap` merge is
+  eliminated (per-partition sort+encode is 0.2–0.6 s at z14), but the
+  per-partition band re-reads add ~3.5× row-read redundancy at z14
+  (row groups pruned per partition; Hilbert row groups vs `(x, y)`
+  stripe partitions overlap imperfectly), and wave scheduling absorbs
+  most of the freed serial time. The 8.4× Amdahl ceiling (~32 s) was
+  not demonstrable under this load; on the paired evidence the
+  restructure is wall-neutral and memory is the win.
+- Debug-level `[profile]` instrumentation now also logs per-partition
+  `rows_read / members / collect / sort+encode` (kept, like the H3(c)
+  instrumentation, behind `RUST_LOG=gpq_tiles_core::overview=debug`).
