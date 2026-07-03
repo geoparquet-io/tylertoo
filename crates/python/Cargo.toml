@@ -17,3 +17,6 @@ crate-type = ["cdylib"]
 gpq-tiles-core = { workspace = true }
 pyo3 = { workspace = true }
 tempfile = "3"
+
+[lints]
+workspace = true

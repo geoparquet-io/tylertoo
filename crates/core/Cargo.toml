@@ -27,7 +27,6 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-select = { workspace = true }
 geo = { workspace = true }
-pmtiles = { workspace = true }
 geozero = { workspace = true }
 prost = { workspace = true }
 rayon = { workspace = true }
@@ -58,3 +57,6 @@ harness = false
 [[bench]]
 name = "bbox_containment"
 harness = false
+
+[lints]
+workspace = true
