@@ -61,6 +61,7 @@ use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
 use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArray;
 use prost::Message;
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_from_array;
@@ -329,9 +330,15 @@ pub fn export_pmtiles(
 // Tiling + encoding
 // ============================================================================
 
-/// Per-tile working map: tile `(x, y)` -> list of `(clipped geometry, property
-/// index into the level's `features`)`.
-type GroupedTileGeoms = BTreeMap<(u32, u32), Vec<(Geometry<f64>, usize)>>;
+/// One tile's members: list of `(clipped geometry, property index into the
+/// level's `features`)`.
+type TileMembers = Vec<(Geometry<f64>, usize)>;
+
+/// Per-tile working map: tile `(x, y)` -> members.
+type GroupedTileGeoms = BTreeMap<(u32, u32), TileMembers>;
+
+/// Per-feature clip results: list of `(tile (x, y), clipped geometry)`.
+type FeatureTileGeoms = Vec<((u32, u32), Geometry<f64>)>;
 
 /// Group a level's features into tiles at `zoom`, clip each to its tile bounds
 /// plus the pixel buffer, and MVT-encode. Applies the optional oversized valve.
@@ -341,52 +348,70 @@ type GroupedTileGeoms = BTreeMap<(u32, u32), Vec<(Geometry<f64>, usize)>>;
 /// load-bearing — the `BTreeMap` is used for deterministic, locality-friendly
 /// grouping and a bounded per-zoom working set).
 fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> Vec<EncodedTile> {
+    // Clip in parallel per feature (H3(c) lever 2: clipping is 94% of export
+    // wall and independent per feature). `par_iter().map().collect()`
+    // preserves feature order, so the sequential merge below pushes members
+    // into each tile's vector in exactly the serial order — grouping, and
+    // therefore the encoded tile bytes, are unchanged.
+    let t_clip = Instant::now();
+    let per_feature: Vec<FeatureTileGeoms> = features
+        .par_iter()
+        .map(|feat| {
+            let Some(rect) = feat.geom.bounding_rect() else {
+                return Vec::new();
+            };
+            let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+            let mut out = Vec::new();
+            for tc in tiles_for_bbox(&bbox, zoom) {
+                let tb = tc.bounds();
+                let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
+                // Fast path (H3(c) lever 4): a feature whose bbox lies entirely
+                // within the buffered tile bounds is unaffected by clipping —
+                // skip the BooleanOps intersection and emit the geometry as-is.
+                // At z14 ~80% of features are interior to a single tile.
+                if bbox_within_buffered(&bbox, &tb, buffer_deg) {
+                    out.push(((tc.x, tc.y), feat.geom.clone()));
+                } else if let Some(clipped) = clip_geometry(&feat.geom, &tb, buffer_deg) {
+                    out.push(((tc.x, tc.y), clipped));
+                }
+            }
+            out
+        })
+        .collect();
+
     // tile (x,y) -> list of (clipped geometry, property index into `features`).
     let mut grouped: GroupedTileGeoms = BTreeMap::new();
-
-    let t_clip = Instant::now();
-    for (fi, feat) in features.iter().enumerate() {
-        let Some(rect) = feat.geom.bounding_rect() else {
-            continue;
-        };
-        let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-        for tc in tiles_for_bbox(&bbox, zoom) {
-            let tb = tc.bounds();
-            let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
-            // Fast path (H3(c) lever 4): a feature whose bbox lies entirely
-            // within the buffered tile bounds is unaffected by clipping —
-            // skip the BooleanOps intersection and emit the geometry as-is.
-            // At z14 ~80% of features are interior to a single tile.
-            if bbox_within_buffered(&bbox, &tb, buffer_deg) {
-                grouped
-                    .entry((tc.x, tc.y))
-                    .or_default()
-                    .push((feat.geom.clone(), fi));
-            } else if let Some(clipped) = clip_geometry(&feat.geom, &tb, buffer_deg) {
-                grouped.entry((tc.x, tc.y)).or_default().push((clipped, fi));
-            }
+    for (fi, items) in per_feature.into_iter().enumerate() {
+        for (key, geom) in items {
+            grouped.entry(key).or_default().push((geom, fi));
         }
     }
 
     let clip_secs = t_clip.elapsed().as_secs_f64();
 
+    // Encode tiles in parallel; the indexed collect preserves the BTreeMap's
+    // (x, y) order, and the caller's serial write loop consumes `out` in that
+    // order, so PMTiles tile ordering and bytes are unchanged.
     let t_mvt = Instant::now();
-    let mut out = Vec::with_capacity(grouped.len());
-    for ((x, y), members) in grouped {
-        let tc = TileCoord::new(x, y, zoom);
-        let tb = tc.bounds();
-        let (data, count, oversized) = encode_tile(&members, features, &tb, opts);
-        if count == 0 {
-            continue;
-        }
-        out.push(EncodedTile {
-            x,
-            y,
-            data,
-            feature_count: count,
-            oversized,
-        });
-    }
+    let entries: Vec<((u32, u32), TileMembers)> = grouped.into_iter().collect();
+    let out: Vec<EncodedTile> = entries
+        .into_par_iter()
+        .filter_map(|((x, y), members)| {
+            let tc = TileCoord::new(x, y, zoom);
+            let tb = tc.bounds();
+            let (data, count, oversized) = encode_tile(&members, features, &tb, opts);
+            if count == 0 {
+                return None;
+            }
+            Some(EncodedTile {
+                x,
+                y,
+                data,
+                feature_count: count,
+                oversized,
+            })
+        })
+        .collect();
     log::debug!(
         "[profile]   z{zoom} clip+group={clip_secs:.2}s mvt-encode={:.2}s",
         t_mvt.elapsed().as_secs_f64(),
