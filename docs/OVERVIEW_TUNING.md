@@ -263,6 +263,69 @@ the block.
 
 ---
 
+## Clustering: `--cluster`, `--accumulate-attribute`
+
+By default a point that loses its thinning-grid cell simply does not appear at
+that level — the survivor says nothing about how many features it stands for.
+**`--cluster`** (opt-in, duplicating mode only) makes the survivor **absorb**
+its cell's losers instead:
+
+- Every output row gains a **`point_count`** INT64 NOT NULL column — the
+  number of source features the row represents at its level (the tippecanoe /
+  supercluster convention). At the canonical (finest) level every value is 1;
+  lines and polygons always carry 1 (clustering only applies to points).
+- The winner keeps its **own geometry and attribute values** — clusters are
+  anchored on a real feature, not moved to a centroid (a deliberate divergence
+  from supercluster's re-centering: deterministic, and the anchor stays a real
+  place).
+- Absorption is **per level**: a point absorbed at z4 may itself be a winner
+  at z6 with its own (smaller) cluster. At each level,
+  `sum(point_count) == total source point count` — the clusters partition the
+  dataset at every level's grid.
+
+Use it for graduated-dot rendering of dense point data (POIs, addresses): the
+client scales the symbol by `point_count` instead of drawing a misleadingly
+sparse constant-size dot field.
+
+**`--accumulate-attribute COL:OP`** (repeatable; requires `--cluster`)
+aggregates a numeric column across each cluster: the winner's value of `COL`
+becomes the `OP` over itself + everything it absorbed at that level. Ops:
+`sum`, `max`, `min`, `mean`. Examples:
+
+```bash
+gpq-tiles overview places.parquet places_overview.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --cluster \
+  --accumulate-attribute population:sum \
+  --accumulate-attribute confidence:mean
+```
+
+Notes:
+
+- Aggregates are computed **per level from source values** (never from
+  already-aggregated coarser values), so `mean` is exact at every level.
+- Null values don't contribute; a cluster whose members are all null keeps
+  the winner's null. Non-accumulated columns keep the winner's own values.
+- Aggregation is computed in `f64` and written back in the column's original
+  type; a `mean` over an integer column rounds to the nearest integer
+  (prefer float columns for `mean`).
+- The column must exist and be numeric — the conversion fails early otherwise.
+- Interaction with the density budget: a budget-deferred cell winner leaves
+  its cell without a representative; those features attach to the **nearest
+  surviving point** at that level, so counts still sum correctly.
+- **Partitioning mode is rejected.** A partitioning row is read at many zooms
+  (prefix reads) but exists at exactly one level, so a single stored
+  `point_count` cannot reflect every zoom's grid — and absorbed features
+  reappear as their own rows at finer levels while remaining counted in
+  coarser winners, double-counting every prefix sum.
+
+Clustering is recorded in the footer `geo:overviews` →
+`generalization.clustering` provenance (`enabled`, `point_count_column`,
+`accumulated: [{column, op}]`); `gpq-tiles validate` checks that the column
+exists as INT64 NOT NULL and that canonical-level values are all 1.
+
+---
+
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
 These do not change *which* features or vertices survive — geometry and
@@ -374,6 +437,8 @@ stay laptop-sized.
 | Whole map uniformly too sparse or too dense | move `--gsd-base` (up = denser, down = sparser) instead of tuning each family |
 | Mid zooms have far more features than tippecanoe / duplicating files too large | RAISE `--drop-rate` (density budget); or `--no-density-drop` to turn it off |
 | Density cut is stripping sparse rural areas to keep cities | RAISE `--drop-gamma` (sparse-area protection) |
+| Dense point data renders as a misleadingly sparse dot field at coarse zooms | `--cluster` and style the symbol size by `point_count` |
+| Need per-cluster totals/averages of a numeric column | `--accumulate-attribute col:sum` / `col:mean` (with `--cluster`) |
 | Every remote query fetches a huge footer before any data | default already suppresses string/geometry stats; do NOT pass `--full-column-stats` |
 | Need server-side row-group skipping on a property predicate | pass `--full-column-stats` (bigger footer, gains column pruning) |
 | Tiny viewports over high-latency storage fetch too much | LOWER `--row-group-size` for tighter bbox pruning |
