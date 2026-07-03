@@ -69,7 +69,9 @@ use super::convert::{
     KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
-use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
+use super::simplify::{
+    full_resolution_fallback_count, simplify_for_level, Simplified, SimplifyOptions,
+};
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, LEVEL_COLUMN};
 
 /// A level actually emitted to the output (levels with zero winners are
@@ -655,6 +657,7 @@ fn write_level_streaming(
     let vertices = Cell::new(0usize);
     let mut row_offset = 0usize;
     let timers = Pass2Timers::default();
+    let fallbacks_before = full_resolution_fallback_count();
     let t_level = Instant::now();
 
     let batches = std::iter::from_fn(|| loop {
@@ -705,6 +708,13 @@ fn write_level_streaming(
         timers.build.get().as_secs_f64(),
         total.saturating_sub(accounted).as_secs_f64(),
     );
+    let fallbacks = full_resolution_fallback_count() - fallbacks_before;
+    if fallbacks > 0 {
+        log::debug!(
+            "[profile] level {level_idx}: {fallbacks} feature(s) kept at full \
+             resolution (invalid RDP candidate after all epsilon retries)"
+        );
+    }
     Ok((rows.get(), vertices.get()))
 }
 

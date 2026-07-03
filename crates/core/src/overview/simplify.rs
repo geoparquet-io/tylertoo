@@ -54,12 +54,27 @@
 //! [`simplify_for_level`] with no simplification, gating, or dropping — an
 //! explicit, tested identity path rather than an emergent one.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use geo::{
     Area, BoundingRect, Centroid, Geometry, LineString, MultiLineString, MultiPolygon, Point,
     Polygon, Rect, Simplify, Validation,
 };
 
 pub use super::level::{Crs, METERS_PER_DEGREE};
+
+/// Process-wide count of polygons that exhausted every epsilon-backoff retry
+/// (see [`simplify_polygon_impl`]) and were kept at full resolution.
+///
+/// Callers (e.g. the streaming convert loop) log deltas of
+/// [`full_resolution_fallback_count`] at debug level to expose how often the
+/// last-resort path fires.
+static FULL_RES_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-wide full-resolution fallback counter.
+pub fn full_resolution_fallback_count() -> u64 {
+    FULL_RES_FALLBACKS.load(Ordering::Relaxed)
+}
 
 /// Default simplification factor: `tolerance = factor * gsd`.
 ///
@@ -262,6 +277,27 @@ fn simplify_linestring_impl(ls: &LineString<f64>, tol: f64) -> Option<LineString
     Some(simplified)
 }
 
+/// Number of epsilon halvings tried when RDP produces an invalid
+/// (self-intersecting) candidate before giving up and keeping the original
+/// geometry. Attempts run at `tol, tol/2, tol/4, tol/8`.
+const INVALID_RETRY_HALVINGS: u32 = 3;
+
+/// `true` when RDP removed nothing: the candidate has the same ring count and
+/// per-ring vertex counts as the original. RDP output vertices are always an
+/// ordered subset of the input (endpoints included), so equal counts imply an
+/// identical geometry — validation of the candidate is then redundant (the
+/// input is assumed valid, and re-checking it is exactly the H3(c) profile's
+/// dominant cost at fine GSDs).
+fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool {
+    candidate.exterior().0.len() == original.exterior().0.len()
+        && candidate.interiors().len() == original.interiors().len()
+        && candidate
+            .interiors()
+            .iter()
+            .zip(original.interiors())
+            .all(|(a, b)| a.0.len() == b.0.len())
+}
+
 /// Simplify a Polygon in world space with ring-validity guards.
 ///
 /// - Below the visibility gate ⇒ collapse (drop, or representative point when
@@ -271,44 +307,67 @@ fn simplify_linestring_impl(ls: &LineString<f64>, tol: f64) -> Option<LineString
 ///   fall below the gate are dropped.
 /// - If the exterior collapses (too few points or sub-tolerance area) ⇒
 ///   collapse.
-/// - If RDP introduces an invalid (self-intersecting) polygon, fall back to
-///   the original geometry (boundary-preserving: never emit an invalid ring).
+/// - If RDP introduces an invalid (self-intersecting) polygon, retry with a
+///   progressively halved epsilon ([`INVALID_RETRY_HALVINGS`] retries): a
+///   smaller tolerance keeps more vertices and usually restores validity while
+///   still shedding sub-tolerance detail. Only when every retry fails is the
+///   original geometry kept verbatim (boundary-preserving last resort, counted
+///   in [`full_resolution_fallback_count`]).
+///
+/// Validation-cost notes (H3(c) profile, lever 3): the candidate skips
+/// `is_valid()` entirely when RDP removed no vertices (identical to the
+/// assumed-valid input), and the original is **never** re-validated — the old
+/// code ran a full-resolution `is_valid()` on the fallback path, which was
+/// ~96% of coarse-level simplification cost. A consequence: an *invalid
+/// source* polygon whose candidates all fail validation is now kept verbatim
+/// (like the canonical level does) instead of being collapsed/dropped.
 fn simplify_polygon_impl(poly: &Polygon<f64>, tol: f64, collapse: bool) -> Simplified {
     if polygon_diag(poly) < tol {
         return collapse_polygon(poly, collapse);
     }
 
-    let simplified = poly.simplify(tol);
-
-    // Drop interior rings that collapsed below the gate.
-    let interiors: Vec<LineString<f64>> = simplified
-        .interiors()
-        .iter()
-        .filter(|ring| linestring_diag(ring) >= tol)
-        .cloned()
-        .collect();
-
-    let exterior = simplified.exterior().clone();
-    let candidate = Polygon::new(exterior, interiors);
-
-    // Exterior collapse: too few points, or area smaller than a
-    // tolerance-sized cell (catches slivers / zero-area rings).
+    // Gates are level properties, so they stay at `tol` even when the RDP
+    // epsilon backs off below it.
     let min_area = tol * tol;
-    if candidate.exterior().0.len() < MIN_POLYGON_RING_POINTS
-        || candidate.unsigned_area() < min_area
-    {
-        return collapse_polygon(poly, collapse);
+
+    let mut eps = tol;
+    for _ in 0..=INVALID_RETRY_HALVINGS {
+        let simplified = poly.simplify(eps);
+
+        // Drop interior rings that collapsed below the gate.
+        let interiors: Vec<LineString<f64>> = simplified
+            .interiors()
+            .iter()
+            .filter(|ring| linestring_diag(ring) >= tol)
+            .cloned()
+            .collect();
+
+        let exterior = simplified.exterior().clone();
+        let candidate = Polygon::new(exterior, interiors);
+
+        // Exterior collapse: too few points, or area smaller than a
+        // tolerance-sized cell (catches slivers / zero-area rings).
+        if candidate.exterior().0.len() < MIN_POLYGON_RING_POINTS
+            || candidate.unsigned_area() < min_area
+        {
+            return collapse_polygon(poly, collapse);
+        }
+
+        if polygon_unchanged(&candidate, poly) || candidate.is_valid() {
+            return Simplified::Keep(Geometry::Polygon(candidate));
+        }
+        eps *= 0.5;
     }
 
-    if candidate.is_valid() {
-        Simplified::Keep(Geometry::Polygon(candidate))
-    } else if poly.is_valid() {
-        // Boundary-preserving fallback: RDP made it self-intersect; keep the
-        // original valid geometry rather than emit an invalid ring.
-        Simplified::Keep(Geometry::Polygon(poly.clone()))
-    } else {
-        collapse_polygon(poly, collapse)
-    }
+    // Every retry self-intersected: keep the original geometry rather than
+    // emit an invalid ring.
+    FULL_RES_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    log::trace!(
+        "overview simplify: RDP candidate invalid after {} epsilon retries; \
+         keeping full-resolution geometry",
+        INVALID_RETRY_HALVINGS + 1
+    );
+    Simplified::Keep(Geometry::Polygon(poly.clone()))
 }
 
 /// Resolve a collapsed polygon: drop by default, or (opt-in) a representative
@@ -663,6 +722,70 @@ mod tests {
             simplify_for_level(&Geometry::Polygon(sliver), 100.0, Crs::Epsg3857, &opts),
             Simplified::Dropped
         );
+    }
+
+    // ---- invalid-candidate progressive retry -------------------------------
+
+    /// A polygon whose RDP output at `tol = 4` self-intersects: a square with
+    /// a shallow downward notch in the bottom edge and a thin finger from the
+    /// top descending into the notch pocket. RDP at 4 removes the sub-tolerance
+    /// notch, leaving the finger tip below the straightened bottom edge (the
+    /// finger edges then cross it). At `tol = 2` the notch survives and the
+    /// ring is valid again. The sub-tolerance wobble vertices on the right and
+    /// left edges are removed at *both* tolerances, so the epsilon-backoff
+    /// retry still yields a genuinely simplified (not full-resolution) result.
+    fn notch_finger_polygon() -> Polygon<f64> {
+        let c = |x: f64, y: f64| Coord { x, y };
+        Polygon::new(
+            LineString::new(vec![
+                c(0.0, 0.0),
+                c(45.0, 0.0),
+                c(50.0, -3.0),
+                c(55.0, 0.0),
+                c(100.0, 0.0),
+                c(100.1, 30.0), // sub-tolerance wobble (removed at tol >= ~0.1)
+                c(100.0, 60.0),
+                c(99.9, 80.0), // sub-tolerance wobble
+                c(100.0, 100.0),
+                c(52.0, 100.0),
+                c(50.0, -1.0),
+                c(48.0, 100.0),
+                c(0.0, 100.0),
+                c(0.1, 50.0), // sub-tolerance wobble
+                c(0.0, 0.0),
+            ]),
+            vec![],
+        )
+    }
+
+    #[test]
+    fn test_invalid_rdp_candidate_retries_to_simplified_valid() {
+        let poly = notch_finger_polygon();
+        let orig_len = poly.exterior().0.len();
+        assert!(poly.is_valid(), "fixture must start valid");
+        assert!(
+            !poly.simplify(4.0).is_valid(),
+            "fixture must self-intersect at the full tolerance (precondition)"
+        );
+
+        // gsd 4 m in EPSG:3857 (meters) with factor 1.0 => tol = 4.0.
+        let opts = SimplifyOptions::default();
+        match simplify_for_level(&Geometry::Polygon(poly), 4.0, Crs::Epsg3857, &opts) {
+            Simplified::Keep(Geometry::Polygon(p)) => {
+                assert!(
+                    p.is_valid(),
+                    "retry output must be valid, got {:?}",
+                    p.exterior()
+                );
+                assert!(
+                    p.exterior().0.len() < orig_len,
+                    "retry output must be simplified, not the full-resolution \
+                     fallback ({} !< {orig_len})",
+                    p.exterior().0.len()
+                );
+            }
+            other => panic!("expected Keep(Polygon), got {other:?}"),
+        }
     }
 
     // ---- multi-geometry part dropping -------------------------------------
