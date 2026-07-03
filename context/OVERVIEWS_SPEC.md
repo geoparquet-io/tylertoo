@@ -879,13 +879,13 @@ segments into single "stroke" LineStrings:
 - **Chaining**: endpoints are matched exactly first, then chain ends
   within a snap tolerance of `snap_tolerance_gsd_factor × gsd` (two
   endpoints closer than one ground sample are indistinguishable at the
-  level). Nodes of **degree 2** always continue a chain. At junctions
-  (three or more compatible endpoints), an implementation MAY continue
-  the pair(s) of lines that best continue each other within a bounded
-  angular deviation from straight (stroke building; gpq-tiles:
-  `--coalesce-junction-angle`, default 30°, `0` = strict degree-2
-  chaining); all other incident lines terminate there, preserving
-  network topology.
+  level). Nodes of **degree 2** always continue a chain; junctions
+  (three or more compatible endpoints) terminate chains by default,
+  preserving network topology. An implementation MAY optionally
+  continue the pair(s) of lines that best continue each other within a
+  bounded angular deviation from straight (stroke building; gpq-tiles:
+  `--coalesce-junction-angle`, default `0` = off per maintainer render
+  review 2026-07-03).
 - **Attributes**: the merged row carries the attribute values of its
   highest-priority member (the same priority order the cell-winner
   stage uses), plus the member count (§13.2).
@@ -963,9 +963,11 @@ no `coalescing` provenance) rather than fail; it SHOULD reject an
 
 - **v0.2.0-draft (2026-07-03, later still)**: §13 revised per
   maintainer review — junction continuation (angle-bounded stroke
-  building at degree >= 3 nodes) added to the chaining model; the
-  gpq-tiles engine default flipped to ON (opt-out); §13.5 reworded
-  for default-on tools (inert in partitioning, reject only explicit
+  building at degree >= 3 nodes) added to the chaining model as an
+  OPTIONAL mechanism (gpq-tiles default OFF: the Portland sweep found
+  strict degree-2 chaining renders better); the gpq-tiles engine
+  coalescing default flipped to ON (opt-out); §13.5 reworded for
+  default-on tools (inert in partitioning, reject only explicit
   requests).
 - **v0.2.0-draft (2026-07-03, later)**: added §13 line coalescing
   extension (`coalesced_count` column, degree-2 endpoint chaining

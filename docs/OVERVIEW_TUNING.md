@@ -356,10 +356,9 @@ run:
 - Chains never merge **across class values** (when a class ranking is
   active — explicit `--class-rank` or auto-detected Overture
   `class`/`road_class`). With no class ranking, all lines are compatible.
-- At **junctions** (3+ compatible endpoints meeting), chains continue only
-  through the pair of lines that best continue each other within
-  `--coalesce-junction-angle` of straight (see below); everything else
-  terminates there, preserving network topology.
+- **Junctions** (3+ compatible endpoints meeting) terminate chains by
+  default, preserving network topology. `--coalesce-junction-angle` (see
+  below) can optionally continue the best-aligned pair through them.
 - The merged feature keeps the **attributes of its highest-priority
   member** (same class-rank → size → hash order as the cell-winner stage)
   and the output gains a **`coalesced_count`** INT32 NOT NULL column
@@ -378,18 +377,18 @@ gpq-tiles overview roads.parquet roads_overview.parquet \
   --min-zoom 0 --max-zoom 14 --no-coalesce-lines
 ```
 
-### `--coalesce-junction-angle` (default 30, degrees)
+### `--coalesce-junction-angle` (default 0 = off, degrees)
 
-Chains would otherwise break at every same-class crossing — on a road
-network that is almost every block, so strokes stay short exactly where
-the maintainer wants long arteries. At each junction the best-continuing
-pair of lines merges when its deviation from a straight continuation is
-at most this angle, best pair first (a 4-way crossing continues **both**
-through-streets). BIGGER = chains bend further through junctions (fewer,
-longer strokes; a genuine turn may get absorbed); `0` = never merge
-through junctions (strict degree-2 chaining, the original Q3 behavior).
-The Portland sweep for picking the default lives at
-`corpus/data/bench/q3/portland-roads-junction{00,30,60}.pmtiles`.
+By default chains stop at junctions (strict degree-2 chaining) — the
+Portland sweep (`corpus/data/bench/q3/portland-roads-junction{00,30}.pmtiles`,
+maintainer review 2026-07-03) found this renders better than junction
+continuation, which over-merges. Set an angle to opt in: at each junction
+the best-continuing pair of lines merges when its deviation from a
+straight continuation is at most this angle, best pair first (a 4-way
+crossing continues **both** through-streets). BIGGER = chains bend
+further through junctions (fewer, longer strokes; z0–z1 gain giant
+arterial strokes on Portland at 30°) at the cost of merging through
+genuine turns and smearing attributes across crossings.
 
 ### `--coalesce-snap` (default 1.0, GSD multiples)
 

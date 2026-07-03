@@ -327,11 +327,12 @@ pub struct ConvertOptions {
     /// breaking the streaming pipeline's memory bound.
     pub coalesce_max_level_rows: usize,
     /// Junction continuation threshold for coalescing, in degrees (default
-    /// [`DEFAULT_JUNCTION_ANGLE_DEG`]): at junction nodes (degree >= 3),
-    /// compatible incident lines that continue each other within this
-    /// deviation from straight merge best-pair-first, so arterials chain
-    /// THROUGH the same-class crossings that otherwise terminate every
-    /// stroke. `0` restores strict degree-2-only chaining.
+    /// [`DEFAULT_JUNCTION_ANGLE_DEG`] = `0` = OFF, per maintainer render
+    /// review — strict degree-2 chaining looks better on road networks).
+    /// When `> 0`: at junction nodes (degree >= 3), compatible incident
+    /// lines that continue each other within this deviation from straight
+    /// merge best-pair-first, so arterials chain THROUGH same-class
+    /// crossings (fewer, longer strokes at the cost of over-merging).
     pub coalesce_junction_angle: f64,
 }
 

@@ -24,12 +24,12 @@
 //!    coordinates), then a **snap** pass that joins the resulting chains'
 //!    free endpoints quantized to `snap_gsd_factor × GSD` grid cells
 //!    (closing sub-resolution digitization gaps). Both phases join nodes
-//!    of **degree 2** unconditionally; at junctions (degree >= 3) the
-//!    incident pairs that continue each other within
-//!    [`CoalesceParams::junction_angle_deg`] of straight merge best-pair
-//!    first (stroke building — arterials chain THROUGH same-class
-//!    crossings; a sharp turn stays a chain boundary; `0` restores strict
-//!    degree-2-only chaining).
+//!    of **degree 2** unconditionally — junctions (degree >= 3) terminate
+//!    chains by default, preserving network topology. Optionally
+//!    ([`CoalesceParams::junction_angle_deg`] > 0, default OFF per
+//!    maintainer render review), the incident pairs at a junction that
+//!    continue each other within that deviation of straight merge
+//!    best-pair first (stroke building).
 //! 3. The merged feature takes the attributes of its **highest-priority
 //!    member** (the same [`Priority`] order the cell-winner stage uses),
 //!    and records the number of merged source segments
@@ -82,15 +82,15 @@ pub const COALESCED_COUNT_COLUMN: &str = "coalesced_count";
 /// one ground sample distance are indistinguishable at the level.
 pub const DEFAULT_SNAP_GSD_FACTOR: f64 = 1.0;
 
-/// Default junction continuation threshold, in degrees: at a junction
-/// (node degree >= 3), the pair of incident lines that best continue each
-/// other merge when their deviation from a straight continuation is at
-/// most this angle. `30°` keeps arterials chaining through the frequent
-/// same-class crossings that otherwise break every stroke, while a sharp
-/// turn onto a side street stays a chain boundary. Provisional default
-/// pending the maintainer's Portland junction-angle sweep
-/// (`corpus/data/bench/q3/portland-roads-junction{00,30,60}.pmtiles`).
-pub const DEFAULT_JUNCTION_ANGLE_DEG: f64 = 30.0;
+/// Default junction continuation threshold, in degrees. **`0` = OFF**
+/// (strict degree-2 chaining): the maintainer's Portland junction-angle
+/// sweep (`corpus/data/bench/q3/portland-roads-junction{00,30}.pmtiles`,
+/// reviewed 2026-07-03) found strict degree-2 chaining renders better —
+/// junction continuation over-merges. The knob remains available
+/// (`--coalesce-junction-angle DEG`): at a junction (node degree >= 3)
+/// the pair of incident lines that best continue each other merge when
+/// their deviation from a straight continuation is at most the angle.
+pub const DEFAULT_JUNCTION_ANGLE_DEG: f64 = 0.0;
 
 /// Default per-level candidate-row ceiling above which coalescing is
 /// skipped (bounded-memory guard; see `docs/OVERVIEW_TUNING.md`). Chaining

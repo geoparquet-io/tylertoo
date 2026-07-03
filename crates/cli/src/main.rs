@@ -248,17 +248,18 @@ struct OverviewArgs {
     coalesce_lines: bool,
 
     /// Junction continuation angle for line coalescing, in degrees
-    /// (default 30).
+    /// (default 0 = OFF: junctions terminate chains, preserving network
+    /// topology — chosen from the Portland junction-angle sweep in
+    /// corpus/data/bench/q3/, where strict degree-2 chaining rendered
+    /// better).
     ///
-    /// At a junction (3+ same-class segment endpoints meeting), the pair of
-    /// lines that best continue each other merge when their deviation from
-    /// a straight continuation is at most this angle — best pair first, so
-    /// a 4-way crossing continues BOTH through-streets. BIGGER = chains
-    /// bend further through junctions (longer, fewer strokes; risk of
-    /// merging through genuine turns); 0 = never merge through junctions
-    /// (strict degree-2 chaining). See the Portland junction-angle sweep in
-    /// corpus/data/bench/q3/.
-    #[arg(long, value_name = "DEG", default_value = "30.0")]
+    /// When > 0: at a junction (3+ same-class segment endpoints meeting),
+    /// the pair of lines that best continue each other merge when their
+    /// deviation from a straight continuation is at most this angle — best
+    /// pair first, so a 4-way crossing continues BOTH through-streets.
+    /// BIGGER = chains bend further through junctions (longer, fewer
+    /// strokes; risk of merging through genuine turns).
+    #[arg(long, value_name = "DEG", default_value = "0.0")]
     coalesce_junction_angle: f64,
 
     /// Endpoint snap tolerance for line coalescing, in GSD multiples
