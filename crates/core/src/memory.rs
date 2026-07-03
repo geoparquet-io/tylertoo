@@ -555,6 +555,13 @@ mod tests {
     /// 3. Independent of add() calls - only reflects actual allocations
     #[test]
     fn test_rss_tracker_samples_actual_memory() {
+        // The OS query itself can be unavailable (some CI runners/sandboxes);
+        // that is an environment limitation, not the property under test.
+        if memory_stats::memory_stats().is_none() {
+            eprintln!("skipping: memory_stats unavailable in this environment");
+            return;
+        }
+
         let mut tracker = RssTracker::new();
 
         // Sample initial RSS
