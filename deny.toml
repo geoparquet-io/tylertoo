@@ -1,0 +1,52 @@
+# cargo-deny configuration — supply-chain policy for the workspace.
+# Run locally with: cargo deny check
+# CI: Security Audit job (every PR) + weekly scheduled security workflow.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # number_prefix is unmaintained; pulled in transitively by indicatif.
+    # Blocked on indicatif swapping it out upstream. Re-evaluate on bump.
+    { id = "RUSTSEC-2025-0119", reason = "transitive via indicatif; no fix released" },
+    # paste is unmaintained; pulled in transitively by parquet (arrow-rs).
+    # Blocked on arrow-rs migrating off it. Re-evaluate on arrow/parquet bump.
+    { id = "RUSTSEC-2024-0436", reason = "transitive via parquet/arrow-rs; no fix released" },
+]
+
+[licenses]
+version = 2
+# Allowlist derived from the actual dependency tree (2026-07). Everything here
+# is permissive / weak-copyleft-free. Notably absent on purpose: GPL/LGPL/AGPL,
+# MPL, SSPL, BUSL. (r-efi is triple-licensed MIT OR Apache-2.0 OR
+# LGPL-2.1-or-later; cargo-deny satisfies it via MIT.)
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate crate versions are common in the arrow ecosystem; keep as warning.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

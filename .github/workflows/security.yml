@@ -1,0 +1,140 @@
+# Scheduled Security Audit — weekly, off the PR path.
+#
+# Purpose: new RUSTSEC/PyPA advisories land between PRs; this catches them
+# without anyone remembering to check. Runs cargo-audit, cargo-deny
+# (advisories, licenses, bans, sources — policy in deny.toml) and pip-audit
+# (against crates/python/uv.lock).
+#
+# On failure it does NOT fail silently: it opens (or updates) a pinned issue
+# labelled `security-audit` with the failing output, so the advisory has a
+# visible, assignable home.
+
+name: Scheduled Security Audit
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security:
+    name: Security Audit (scheduled)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+      - name: Run audits
+        id: audits
+        # Run every audit even if an earlier one fails, collecting output so
+        # the issue we open contains the full picture.
+        run: |
+          set +e
+          FAILED=0
+          REPORT=""
+
+          run_audit() {
+            local name="$1"; shift
+            local out
+            out=$("$@" 2>&1)
+            local status=$?
+            if [ $status -ne 0 ]; then
+              FAILED=1
+              REPORT="${REPORT}
+          ### ${name} FAILED
+
+          \`\`\`
+          $(echo "$out" | tail -60)
+          \`\`\`
+          "
+              echo "::error::${name} failed"
+            else
+              echo "${name}: ok"
+            fi
+          }
+
+          cargo generate-lockfile
+
+          run_audit "cargo audit" cargo audit
+          run_audit "cargo deny" cargo deny check
+
+          (cd crates/python && uv export --no-emit-project --format requirements-txt -o /tmp/requirements.txt)
+          run_audit "pip-audit" uvx pip-audit -r /tmp/requirements.txt --disable-pip
+
+          {
+            echo "failed=$FAILED"
+            echo "report<<AUDIT_EOF"
+            echo "$REPORT"
+            echo "AUDIT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          exit $FAILED
+
+      - name: Open or update the security-audit issue
+        if: failure() && steps.audits.outputs.failed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REPORT: ${{ steps.audits.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Make sure the label exists (no-op if it already does).
+          gh label create security-audit \
+            --description "Automated weekly security audit failures" \
+            --color B60205 2>/dev/null || true
+
+          TITLE="Weekly security audit is failing"
+          BODY="The scheduled security audit found problems.
+
+          Run: $RUN_URL
+
+          $REPORT
+
+          ---
+          _This issue is managed by .github/workflows/security.yml. It is
+          updated (not duplicated) on every failing weekly run; close it once
+          the advisories are resolved or explicitly ignored in deny.toml with
+          a reason._"
+
+          EXISTING=$(gh issue list --label security-audit --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING"
+            gh issue edit "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL"
+          else
+            echo "Opening new issue"
+            NEW_URL=$(gh issue create --title "$TITLE" --label security-audit --body "$BODY")
+            # Pin it so it stays visible (best effort; needs no extra scope).
+            NUM=${NEW_URL##*/}
+            ISSUE_ID=$(gh api "repos/$GH_REPO/issues/$NUM" --jq .node_id)
+            # shellcheck disable=SC2016  # $id is a GraphQL variable, not shell
+            gh api graphql -f query='
+              mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { number } } }' \
+              -f id="$ISSUE_ID" || true
+          fi

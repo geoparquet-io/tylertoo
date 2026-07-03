@@ -1,0 +1,8 @@
+# Clippy configuration (workspace-wide).
+#
+# cognitive_complexity is enabled as a hard gate via [workspace.lints.clippy]
+# in Cargo.toml. Clippy's default threshold is 25; as of 2026-07 the two most
+# complex functions in the workspace score 26 and 27, so the threshold is set
+# to 30 to make the gate pass on current code. RATCHET: lower this toward 25
+# as those functions get refactored — never raise it.
+cognitive-complexity-threshold = 30

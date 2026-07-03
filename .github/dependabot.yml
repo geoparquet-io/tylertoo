@@ -1,31 +1,65 @@
+# Dependabot — automated dependency updates for all three ecosystems.
+#
+# Patch/minor updates are auto-merged on green CI by
+# .github/workflows/dependabot-automerge.yml; majors wait for a human
+# (reviewers below). Grouping keeps the PR count down: the arrow-rs family
+# must move in lockstep, and everything else can land as one weekly PR per
+# ecosystem.
+
 version: 2
 updates:
-  # GitHub Actions dependencies
+  # GitHub Actions dependencies (commit-SHA pins in .github/workflows)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
     labels:
       - "dependencies"
       - "github-actions"
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 2
     groups:
       all-actions:
         patterns:
           - "*"
 
-  # Rust/Cargo dependencies
+  # Rust/Cargo dependencies (workspace)
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 1
+      day: "monday"
+    open-pull-requests-limit: 4
     reviewers:
       - "nlebovits"
     labels:
       - "dependencies"
       - "rust"
     groups:
+      # arrow-rs and the geoarrow stack version together; a partial bump
+      # never compiles — keep them in one PR.
+      arrow-parquet:
+        patterns:
+          - "arrow-*"
+          - "parquet"
+          - "geoparquet"
+          - "geoarrow*"
       all-cargo-deps:
+        patterns:
+          - "*"
+
+  # Python dev tooling (crates/python: pyproject.toml + uv.lock; the shipped
+  # wheel has no Python runtime deps, so this is all dev/lint tooling)
+  - package-ecosystem: "pip"
+    directory: "/crates/python"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    labels:
+      - "dependencies"
+      - "python"
+    groups:
+      python-dev:
         patterns:
           - "*"

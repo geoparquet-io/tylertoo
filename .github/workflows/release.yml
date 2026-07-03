@@ -15,6 +15,9 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'  # Matches v0.1.0, v1.0.0, etc.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   release-rust:
     name: Release to crates.io
@@ -22,12 +25,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      # Credentials stay persisted here on purpose: this job pushes the
+      # release tag back to the repo in the manual-dispatch recovery path.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6 # zizmor: ignore[artipacked]
         with:
           fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
 
       - name: Install protoc
         run: |
@@ -38,39 +45,40 @@ jobs:
         id: version
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected version: $VERSION (tag: v$VERSION)"
 
       - name: Check release status
         id: release_check
+        env:
+          TAG: v${{ steps.version.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ steps.version.outputs.version }}"
-
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists, nothing to do"
-            echo "release_exists=true" >> $GITHUB_OUTPUT
-            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "release_exists=false" >> $GITHUB_OUTPUT
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
             if git rev-parse "$TAG" >/dev/null 2>&1; then
               echo "Tag $TAG exists but no release - recovery mode"
-              echo "tag_exists=true" >> $GITHUB_OUTPUT
+              echo "tag_exists=true" >> "$GITHUB_OUTPUT"
             else
               echo "Tag $TAG does not exist, full release"
-              echo "tag_exists=false" >> $GITHUB_OUTPUT
+              echo "tag_exists=false" >> "$GITHUB_OUTPUT"
             fi
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create git tag
         if: steps.release_check.outputs.tag_exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
 
       - name: Publish gpq-tiles-core to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
@@ -89,12 +97,14 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.release_check.outputs.release_exists == 'false'
-        run: |
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --title "${{ steps.version.outputs.tag }}" \
-            --notes "See [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details."
         env:
+          TAG: ${{ steps.version.outputs.tag }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "See [CHANGELOG](https://github.com/$REPO/blob/main/CHANGELOG.md) for details."
 
   build-wheels:
     name: Build wheels (${{ matrix.os }})
@@ -103,10 +113,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -123,13 +137,13 @@ jobs:
         run: choco install protoc
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.11'
 
       - name: Build wheels (Linux)
         if: runner.os == 'Linux'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           target: x86_64
           manylinux: auto
@@ -142,18 +156,18 @@ jobs:
 
       - name: Build wheels (macOS)
         if: runner.os == 'macOS'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           args: --release --out dist -m crates/python/Cargo.toml
 
       - name: Build wheels (Windows)
         if: runner.os == 'Windows'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           args: --release --out dist -m crates/python/Cargo.toml
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wheels-${{ matrix.os }}
           path: dist
@@ -162,16 +176,18 @@ jobs:
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
           args: --out dist -m crates/python/Cargo.toml
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wheels-sdist
           path: dist
@@ -184,14 +200,14 @@ jobs:
       id-token: write  # Required for trusted publishing
     steps:
       - name: Download all wheels
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           print-hash: true
           # Uses trusted publishing (OIDC) by default

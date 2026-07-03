@@ -10,8 +10,9 @@ end-to-end output validity, and temp-file cleanup.
 import tempfile
 from pathlib import Path
 
-import gpq_tiles
 import pytest
+
+import gpq_tiles
 
 # Path to test fixtures (relative to workspace root)
 FIXTURES_DIR = Path(__file__).parent.parent.parent.parent / "tests" / "fixtures"
@@ -37,6 +38,7 @@ class TestConvertFunction:
     def test_convert_docstring_mentions_facade(self):
         """The docstring must direct users to overview()/export_pmtiles()."""
         doc = gpq_tiles.convert.__doc__
+        assert doc is not None
         assert "overview" in doc
         assert "export_pmtiles" in doc
 
@@ -44,7 +46,7 @@ class TestConvertFunction:
         """Test that convert() has expected default parameters."""
         # This will fail with TypeError if required args are missing
         with pytest.raises(TypeError) as exc_info:
-            gpq_tiles.convert()
+            gpq_tiles.convert()  # type: ignore[call-arg]
 
         # Should complain about missing input/output, not other params
         error_msg = str(exc_info.value)
@@ -92,7 +94,7 @@ class TestConvertErrors:
             {"deterministic": True},
             {"drop_smallest_as_needed": True},
             {"drop_smallest_threshold": 4.0},
-            {"progress_callback": lambda e: None},
+            {"progress_callback": lambda _e: None},
         ],
     )
     def test_convert_rejects_removed_legacy_kwargs(self, removed_kwarg):
@@ -202,9 +204,7 @@ class TestConvertIntegration:
                 max_zoom=6,
             )
 
-            leftovers = [
-                p for p in Path(tmpdir).iterdir() if "overview" in p.name
-            ]
+            leftovers = [p for p in Path(tmpdir).iterdir() if "overview" in p.name]
             assert leftovers == [], f"temp overview leaked: {leftovers}"
 
     def test_convert_cleans_up_temp_overview_on_failure(self):
@@ -223,7 +223,5 @@ class TestConvertIntegration:
                     output=str(output),
                 )
 
-            leftovers = [
-                p for p in Path(tmpdir).iterdir() if "overview" in p.name
-            ]
+            leftovers = [p for p in Path(tmpdir).iterdir() if "overview" in p.name]
             assert leftovers == [], f"temp overview leaked: {leftovers}"
