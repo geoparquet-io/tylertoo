@@ -1,0 +1,54 @@
+{
+  "points-nyc-medium": {
+    "features": 458135,
+    "gpio_bytes": 30841137,
+    "dup_bytes": 78788227,
+    "par_bytes": 33678527,
+    "pmtiles_bytes": 77337192,
+    "cogp_bytes": 32996342,
+    "statusquo_bytes": 108178329,
+    "dup_overhead_pct": 155.5,
+    "par_overhead_pct": 9.2,
+    "dup_vs_statusquo_pct": -27.2,
+    "dup_bytes_per_feature": 172.0
+  },
+  "lines-portland-medium": {
+    "features": 295881,
+    "gpio_bytes": 36757077,
+    "dup_bytes": 71435503,
+    "par_bytes": 41895489,
+    "pmtiles_bytes": 43390874,
+    "cogp_bytes": 42717171,
+    "statusquo_bytes": 80147951,
+    "dup_overhead_pct": 94.3,
+    "par_overhead_pct": 14.0,
+    "dup_vs_statusquo_pct": -10.9,
+    "dup_bytes_per_feature": 241.4
+  },
+  "polygons-portland-medium": {
+    "features": 812435,
+    "gpio_bytes": 114547673,
+    "dup_bytes": 187284299,
+    "par_bytes": 119320611,
+    "pmtiles_bytes": 78622300,
+    "cogp_bytes": 117337728,
+    "statusquo_bytes": 193169973,
+    "dup_overhead_pct": 63.5,
+    "par_overhead_pct": 4.2,
+    "dup_vs_statusquo_pct": -3.0,
+    "dup_bytes_per_feature": 230.5
+  },
+  "polygons-ftw-moldova-large": {
+    "features": 631910,
+    "gpio_bytes": 96974077,
+    "dup_bytes": 359834644,
+    "par_bytes": 129532720,
+    "pmtiles_bytes": 154449463,
+    "cogp_bytes": 130556247,
+    "statusquo_bytes": 251423540,
+    "dup_overhead_pct": 271.1,
+    "par_overhead_pct": 33.6,
+    "dup_vs_statusquo_pct": 43.1,
+    "dup_bytes_per_feature": 569.4
+  }
+}

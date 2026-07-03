@@ -3,7 +3,7 @@
 //! This is a thin wrapper around the gpq-tiles-core library.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use gpq_tiles_core::batch_processor::total_parquet_size;
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::parse_bounds;
@@ -56,13 +56,278 @@ fn parse_size_bytes(s: &str) -> Result<u32, String> {
     u32::try_from(bytes).map_err(|_| format!("Size {} too large for u32", s))
 }
 
+/// Top-level CLI: a default (bare) tile pipeline plus subcommands.
+///
+/// `gpq-tiles input.parquet output.pmtiles` still works (bare tile pipeline);
+/// `gpq-tiles tiles ...` is the explicit form, and `overview` / `validate`
+/// are the GeoParquet-overview subcommands.
 #[derive(Parser, Debug)]
 #[command(
     name = "gpq-tiles",
-    about = "Convert GeoParquet to PMTiles vector tiles",
+    about = "Convert GeoParquet to PMTiles vector tiles and multi-resolution overviews",
     version
 )]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Generate PMTiles vector tiles (the default pipeline).
+    Tiles(TilesArgs),
+    /// Build a multi-resolution overview GeoParquet file.
+    Overview(OverviewArgs),
+    /// Validate a GeoParquet overview file against the spec (§6.2).
+    Validate(ValidateArgs),
+    /// Export a PMTiles archive from an overview GeoParquet file (Plan E0).
+    ExportPmtiles(ExportPmtilesArgs),
+}
+
+/// Arguments for `gpq-tiles export-pmtiles`.
+#[derive(Parser, Debug)]
+struct ExportPmtilesArgs {
+    /// Input overview GeoParquet file (produced by `gpq-tiles overview`).
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Output PMTiles archive.
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+
+    /// MVT layer name written into every tile.
+    #[arg(long, default_value = "overview")]
+    layer_name: String,
+
+    /// Per-tile edge buffer, in tile pixels (feature seam continuity).
+    #[arg(long, default_value = "8")]
+    tile_buffer: u32,
+
+    /// Optional per-tile MVT size limit in BYTES. When a tile exceeds it, a
+    /// single non-iterative drop pass sheds the lowest-priority (smallest)
+    /// features for that tile only. Omit to enforce no limit.
+    #[arg(long, value_name = "BYTES")]
+    tile_size_limit: Option<usize>,
+
+    /// Write the JSON export report to this path.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+}
+
+/// Arguments for `gpq-tiles overview`.
+#[derive(Parser, Debug)]
+struct OverviewArgs {
+    /// Input GeoParquet file (EPSG:4326 or EPSG:3857).
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Output overview GeoParquet file.
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+
+    /// Level materialization mode.
+    #[arg(long, default_value = "duplicating", value_parser = ["duplicating", "partitioning"])]
+    mode: String,
+
+    /// Minimum (coarsest) Web Mercator zoom for the level range.
+    #[arg(long, default_value = "0")]
+    min_zoom: u8,
+
+    /// Maximum (finest / canonical) Web Mercator zoom for the level range.
+    #[arg(long, default_value = "6")]
+    max_zoom: u8,
+
+    /// Explicit comma-separated GSD list (meters, strictly decreasing).
+    /// Overrides --min-zoom/--max-zoom when set.
+    #[arg(long, value_name = "GSDS")]
+    gsd: Option<String>,
+
+    /// GSD tile-band base for the zoom→GSD mapping: gsd(z) = 40075016.69 /
+    /// base / 2^z (spec §5.2, cogp-rs default 1024).
+    ///
+    /// This is the master detail knob for a zoom-range plan. A LARGER base
+    /// makes every level's GSD SMALLER, so less is thinned and simplified at a
+    /// given zoom (denser, more detailed, larger coarse levels). A SMALLER
+    /// base makes GSDs LARGER (sparser, cruder, cheaper coarse levels). It
+    /// scales the whole ladder at once, whereas --simplify-factor and the
+    /// --*-thinning knobs act relative to each level's GSD. No effect when
+    /// --gsd is given (those GSDs are already absolute meters).
+    ///
+    /// Cheat sheet: coarse levels too sparse → RAISE --gsd-base (or lower the
+    /// thinning factors); too crude → lower --simplify-factor. See
+    /// docs/OVERVIEW_TUNING.md.
+    #[arg(long, value_name = "F", default_value = "1024.0")]
+    gsd_base: f64,
+
+    /// Column name used as the cell-winner priority (sort) key. Mutually
+    /// exclusive with --class-rank.
+    #[arg(long, value_name = "COL")]
+    sort_key: Option<String>,
+
+    /// Categorical class ranking (higher priority wins a cell). Format:
+    /// `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g.
+    /// `--class-rank road_class:motorway=5,primary=4,residential=2`.
+    /// Present-but-unlisted values rank below every listed value (but above
+    /// nulls). Mutually exclusive with --sort-key.
+    #[arg(long, value_name = "SPEC")]
+    class_rank: Option<String>,
+
+    /// Disable auto-detection of well-known schemas (Overture roads `class`/
+    /// `road_class`, Overture places `confidence`).
+    #[arg(long)]
+    no_auto_rank: bool,
+
+    /// Simplification tolerance factor: RDP tolerance = factor * gsd (meters),
+    /// duplicating mode only (default 1.0).
+    ///
+    /// Controls how much per-feature vertex detail each coarse level sheds.
+    /// LOWER = smoother/less aggressive = more vertices kept = crisper but
+    /// heavier levels; HIGHER = cruder = fewer vertices = lighter levels. The
+    /// canonical (finest) level is always verbatim regardless. A line/polygon
+    /// whose bbox diagonal is below the tolerance is dropped entirely, so a
+    /// very high factor also thins features, not just vertices.
+    ///
+    /// Cheat sheet: coarse levels look too crude/blocky → LOWER
+    /// --simplify-factor. See docs/OVERVIEW_TUNING.md.
+    #[arg(long, default_value = "1.0")]
+    simplify_factor: f64,
+
+    /// Collapse below-visibility polygons to a representative point instead of
+    /// dropping them (spec Q4 opt-in).
+    #[arg(long)]
+    collapse: bool,
+
+    /// Emit the optional COGP compatibility footer key (partitioning mode).
+    #[arg(long)]
+    cogp_compat: bool,
+
+    /// Point thinning factor: grid cell size = factor * gsd (default 4.0).
+    ///
+    /// One feature survives per grid cell per level, so BIGGER factor = BIGGER
+    /// cells = FEWER survivors = SPARSER map; SMALLER = denser. Points thin
+    /// hardest by default (4.0) since they clutter fastest. This multiplies the
+    /// GSD cell size, so it interacts with --gsd-base (which sets the GSD).
+    ///
+    /// Cheat sheet: coarse levels too sparse → LOWER the thinning factors.
+    #[arg(long, default_value = "4.0")]
+    point_thinning: f64,
+
+    /// Line thinning factor: grid cell size = factor * gsd (default 1.0).
+    ///
+    /// BIGGER = SPARSER (fewer lines survive per level), SMALLER = denser.
+    /// See --point-thinning; this is the roads/line knob. Default retuned
+    /// 2.0 -> 1.0 after the Portland sweep (corpus/SWEEP_NOTES.md): 1.0
+    /// keeps road networks visibly more continuous at coarse zooms.
+    #[arg(long, default_value = "1.0")]
+    line_thinning: f64,
+
+    /// Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
+    ///
+    /// BIGGER = SPARSER, SMALLER = denser. Polygons thin least by default
+    /// (1.0) since they tile space rather than cluster.
+    #[arg(long, default_value = "1.0")]
+    polygon_thinning: f64,
+
+    /// Line visibility gate in GSD multiples: a line is eligible at a level
+    /// only if its bbox diagonal >= factor * gsd (default 2.0).
+    ///
+    /// This is a hard drop, not a thin: BIGGER = more small lines dropped at
+    /// coarse levels (sparser); SMALLER = more small lines kept. The gate is
+    /// multiplied by the level GSD, so --gsd-base moves it too.
+    #[arg(long, default_value = "2.0")]
+    line_visibility: f64,
+
+    /// Polygon visibility gate in GSD multiples: a polygon is eligible only if
+    /// its bbox diagonal >= factor * gsd (default 4.0).
+    ///
+    /// BIGGER = more small polygons dropped at coarse levels (sparser);
+    /// SMALLER = more kept. See --line-visibility.
+    #[arg(long, default_value = "4.0")]
+    polygon_visibility: f64,
+
+    /// Per-level density drop rate: each coarser level keeps 1/rate of the
+    /// next finer level's feature budget (default 1.65).
+    ///
+    /// This is the Q2 knob that stops mid-zoom counts plateauing at ~everything.
+    /// Cell-winner thinning stops binding once its grid cell is smaller than the
+    /// typical feature spacing, so from ~z9 up every feature survives and coarse
+    /// levels over-retain (Portland roads: ours/tippecanoe ≈ 2–3x at z9–z11).
+    /// After cell-winner thinning, each level is capped at a budget that decays
+    /// geometrically toward coarse zooms — budget(L) = N / rate^(finest−L),
+    /// where N is the input feature count — and the lowest-priority survivors
+    /// (same class-rank → size → hash order as the cell-winner, spec Q1) are
+    /// dropped until the level meets its budget. Levels already sparser than
+    /// their budget (the coarse zooms) are untouched, so this only bites the
+    /// mid-zoom plateau. BIGGER rate = coarser levels shed harder (sparser mid
+    /// zooms, smaller files); SMALLER = gentler. The default 1.65 is smaller than
+    /// tippecanoe's nominal 2.5 because our budget anchors on the full canonical
+    /// count N (every feature appears at the finest level), not a per-tile
+    /// basezoom count. The canonical (finest) level is never dropped. See
+    /// docs/OVERVIEW_TUNING.md and corpus/SWEEP_NOTES.md.
+    #[arg(long, value_name = "F", default_value = "1.65")]
+    drop_rate: f64,
+
+    /// Spatial-fairness strength for the density budget (default 1.5).
+    ///
+    /// The budget is shared across coarse super-cells (neighborhoods) so a
+    /// global rank-ordered cut cannot empty sparse rural areas to keep dense
+    /// cities under budget. Each super-cell keeps its top-priority features up
+    /// to an allocation proportional to population^(1/gamma): gamma=1 is a
+    /// proportional cut (every neighborhood keeps the same fraction); gamma>1 is
+    /// SUBLINEAR — dense neighborhoods keep proportionally fewer, sparse ones
+    /// proportionally more (they are protected). This is tippecanoe's gamma
+    /// dot-dropping ("reduce dots to the 1/gamma power in dense areas") applied
+    /// per super-cell. BIGGER = more protection for sparse areas / harder
+    /// relative thinning of dense areas. Does not change per-level totals (it
+    /// only redistributes which features survive spatially), so it is
+    /// independent of --drop-rate. No effect when --no-density-drop is set.
+    #[arg(long, value_name = "F", default_value = "1.5")]
+    drop_gamma: f64,
+
+    /// Disable the Q2 per-level density budget entirely (off switch).
+    ///
+    /// Reverts to pure cell-winner thinning — the pre-Q2 behavior — and emits a
+    /// byte-identical footer (no density_drop provenance). Use this to compare
+    /// before/after, or when the cell-winner thinning already meets your needs.
+    #[arg(long)]
+    no_density_drop: bool,
+
+    /// Maximum output row-group size in rows.
+    ///
+    /// Interpreted per level: a level with at most this many rows is written as
+    /// a single row group; a larger level is split into roughly uniform row
+    /// groups of at most this size. Coarse bands (few features) therefore become
+    /// one broad row group; fine bands keep tight per-row-group bbox statistics.
+    #[arg(long, default_value = "10000")]
+    row_group_size: usize,
+
+    /// Keep full Parquet statistics on every column, including high-cardinality
+    /// string/binary property columns and the WKB geometry column.
+    ///
+    /// By default those columns' per-row-group min/max stats are suppressed to
+    /// keep the footer small (a 26-char ULID `id` over hundreds of row groups
+    /// otherwise bloats the footer to megabytes, paid on every remote query).
+    /// The bbox covering and `level` column always keep their pruning stats.
+    /// Enable this if remote clients push predicates on property columns and
+    /// want row-group skipping on them.
+    #[arg(long)]
+    full_column_stats: bool,
+
+    /// Write the JSON conversion report to this path.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+}
+
+/// Arguments for `gpq-tiles validate`.
+#[derive(Parser, Debug)]
+struct ValidateArgs {
+    /// GeoParquet overview file to validate.
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct TilesArgs {
     /// Input GeoParquet file or directory
     ///
     /// If a directory, recursively finds all .parquet files and processes them
@@ -331,7 +596,7 @@ struct Args {
     memory_budget: Option<usize>,
 }
 
-impl Args {
+impl TilesArgs {
     fn parse_property_filter(&self) -> Result<PropertyFilter> {
         // Check for conflicting options
         let has_include = !self.include.is_empty();
@@ -424,8 +689,64 @@ fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    let args = Args::parse();
+    // Backward-compatible bare invocation: `gpq-tiles input.parquet out.pmtiles`
+    // is rewritten to `gpq-tiles tiles input.parquet out.pmtiles` when the first
+    // positional token is not a known subcommand (and not --help/--version).
+    let cli = Cli::parse_from(rewrite_bare_args(std::env::args_os()));
 
+    match cli.command {
+        Command::Overview(args) => run_overview(args),
+        Command::Validate(args) => run_validate(args),
+        Command::ExportPmtiles(args) => run_export_pmtiles(args),
+        Command::Tiles(args) => run_tiles(args),
+    }
+}
+
+/// Insert an implicit `tiles` subcommand for the backward-compatible bare form.
+///
+/// If the first non-flag token is already a subcommand (`tiles`/`overview`/
+/// `validate`/`help`) or the invocation is a help/version query, the arguments
+/// are returned unchanged.
+fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    const SUBCOMMANDS: [&str; 5] = ["tiles", "overview", "validate", "export-pmtiles", "help"];
+    let argv: Vec<std::ffi::OsString> = args.into_iter().collect();
+
+    // Nothing to rewrite for a bare `gpq-tiles` (clap prints help/usage).
+    if argv.len() <= 1 {
+        return argv;
+    }
+
+    let first_positional = argv
+        .iter()
+        .skip(1)
+        .find(|a| !a.to_string_lossy().starts_with('-'));
+    let is_subcommand = first_positional
+        .map(|a| SUBCOMMANDS.contains(&a.to_string_lossy().as_ref()))
+        .unwrap_or(false);
+    let is_help_or_version = argv.iter().skip(1).any(|a| {
+        matches!(
+            a.to_string_lossy().as_ref(),
+            "-h" | "--help" | "-V" | "--version"
+        )
+    });
+
+    if is_subcommand || is_help_or_version {
+        return argv;
+    }
+
+    let mut rewritten = Vec::with_capacity(argv.len() + 1);
+    rewritten.push(argv[0].clone());
+    rewritten.push(std::ffi::OsString::from("tiles"));
+    rewritten.extend(argv.into_iter().skip(1));
+    rewritten
+}
+
+/// Run the PMTiles tile-generation pipeline (verbatim from the pre-subcommand
+/// CLI; every flag preserved).
+fn run_tiles(args: TilesArgs) -> Result<()> {
     // Initialize profiling if requested (must happen before any tracing calls)
     // Store guards to keep them alive for the duration of main()
     let _profiling_guard: Option<profiling::ProfilingGuard>;
@@ -665,6 +986,252 @@ fn main() -> Result<()> {
         args.verbose,
     );
 
+    Ok(())
+}
+
+/// Run `gpq-tiles overview`: build a multi-resolution overview GeoParquet file.
+fn run_overview(args: OverviewArgs) -> Result<()> {
+    use gpq_tiles_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
+    use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+    use gpq_tiles_core::overview::level::Mode;
+    use gpq_tiles_core::overview::simplify::SimplifyOptions;
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let mode = match args.mode.as_str() {
+        "duplicating" => Mode::Duplicating,
+        "partitioning" => Mode::Partitioning,
+        other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
+    };
+
+    // Explicit --gsd list overrides the zoom range.
+    let levels = if let Some(gsd_str) = &args.gsd {
+        let gsds = gsd_str
+            .split(',')
+            .map(|s| s.trim().parse::<f64>())
+            .collect::<std::result::Result<Vec<f64>, _>>()
+            .map_err(|e| anyhow::anyhow!("invalid --gsd list '{}': {}", gsd_str, e))?;
+        LevelPlan::Gsds(gsds)
+    } else {
+        LevelPlan::ZoomRange {
+            min_zoom: args.min_zoom,
+            max_zoom: args.max_zoom,
+        }
+    };
+
+    let assign = AssignConfig {
+        point_thinning: args.point_thinning,
+        line_thinning: args.line_thinning,
+        polygon_thinning: args.polygon_thinning,
+        line_visibility: args.line_visibility,
+        polygon_visibility: args.polygon_visibility,
+        sort_direction: SortDirection::Desc,
+    };
+
+    // --class-rank and --sort-key are mutually exclusive (also enforced in core).
+    if args.class_rank.is_some() && args.sort_key.is_some() {
+        anyhow::bail!("--class-rank and --sort-key are mutually exclusive");
+    }
+    let class_ranking = match &args.class_rank {
+        Some(spec) => Some(parse_class_rank(spec)?),
+        None => None,
+    };
+
+    let options = ConvertOptions {
+        mode,
+        levels,
+        assign,
+        sort_key: args.sort_key.clone(),
+        class_ranking,
+        no_auto_rank: args.no_auto_rank,
+        simplify: SimplifyOptions {
+            factor: args.simplify_factor,
+            collapse: args.collapse,
+        },
+        density: DensityBudgetConfig {
+            enabled: !args.no_density_drop,
+            drop_rate: args.drop_rate,
+            gamma: args.drop_gamma,
+        },
+        gsd_base: args.gsd_base,
+        cogp_compat_key: args.cogp_compat,
+        max_row_group_size: args.row_group_size,
+        full_column_stats: args.full_column_stats,
+    };
+
+    let report = convert_to_overviews(&args.input, &args.output, &options)
+        .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))?;
+
+    // Human-readable summary.
+    println!();
+    println!(
+        "✓ Overview {} → {}  ({:?} mode)",
+        args.input.file_name().unwrap_or_default().to_string_lossy(),
+        args.output
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        report.mode
+    );
+    println!(
+        "  {} input features → {} rows across {} levels in {:.2}s",
+        format_number(report.input_features as u64),
+        format_number(report.total_rows as u64),
+        report.levels.len(),
+        report.duration_secs
+    );
+    println!(
+        "  {:>3}  {:>12}  {:>10}  {:>10}  {:>12}",
+        "lvl", "gsd(m)", "features", "vertices", "bytes"
+    );
+    for lvl in &report.levels {
+        println!(
+            "  {:>3}  {:>12.2}  {:>10}  {:>10}  {:>12}",
+            lvl.level,
+            lvl.gsd,
+            format_number(lvl.feature_count as u64),
+            format_number(lvl.vertex_count as u64),
+            HumanBytes(lvl.compressed_bytes.max(0) as u64)
+        );
+    }
+
+    if let Some(report_path) = &args.report {
+        let json =
+            serde_json::to_string_pretty(&report).context("failed to serialize overview report")?;
+        std::fs::write(report_path, json)
+            .with_context(|| format!("failed to write report to {}", report_path.display()))?;
+        println!("  report written to {}", report_path.display());
+    }
+
+    Ok(())
+}
+
+/// Parse a `--class-rank` spec: `COLUMN:VALUE=RANK,VALUE=RANK,...`.
+///
+/// `unknown_rank` (the priority for present-but-unlisted values) is derived as
+/// `min(listed ranks) - 1.0`, so unknown classes always lose to every listed
+/// value while still beating null/missing values (which lose to any rank).
+fn parse_class_rank(spec: &str) -> Result<gpq_tiles_core::overview::convert::ClassRanking> {
+    use gpq_tiles_core::overview::convert::ClassRanking;
+
+    let (column, rest) = spec.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid --class-rank '{spec}': expected COLUMN:VALUE=RANK,... (missing ':')"
+        )
+    })?;
+    let column = column.trim();
+    if column.is_empty() {
+        anyhow::bail!("invalid --class-rank '{spec}': empty column name");
+    }
+
+    let mut ranks: Vec<(String, f64)> = Vec::new();
+    for pair in rest.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (value, rank) = pair.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid --class-rank entry '{pair}': expected VALUE=RANK")
+        })?;
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!("invalid --class-rank entry '{pair}': empty value");
+        }
+        let rank: f64 = rank
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid rank in '{pair}': {e}"))?;
+        ranks.push((value.to_string(), rank));
+    }
+    if ranks.is_empty() {
+        anyhow::bail!("invalid --class-rank '{spec}': no VALUE=RANK entries");
+    }
+
+    // Unknown values must lose to every named class but beat nulls.
+    let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
+    Ok(ClassRanking {
+        column: column.to_string(),
+        ranks,
+        unknown_rank: min_rank - 1.0,
+    })
+}
+
+/// Run `gpq-tiles validate`: check a GeoParquet overview file (spec §6.2).
+fn run_validate(args: ValidateArgs) -> Result<()> {
+    use gpq_tiles_core::overview::check::validate_file;
+
+    let report = validate_file(&args.file)
+        .map_err(|e| anyhow::anyhow!("could not open '{}': {e}", args.file.display()))?;
+
+    println!("Validating {}", args.file.display());
+    for check in &report.checks {
+        let mark = if check.passed { "PASS" } else { "FAIL" };
+        println!("  [{mark}] {}: {}", check.name, check.message);
+    }
+
+    if report.is_valid() {
+        println!(
+            "\n✓ valid overview file ({} checks passed)",
+            report.checks.len()
+        );
+        Ok(())
+    } else {
+        let failed = report.failures().count();
+        anyhow::bail!("{failed} check(s) failed");
+    }
+}
+
+fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
+    use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
+
+    let opts = ExportOptions {
+        layer_name: args.layer_name,
+        tile_buffer: args.tile_buffer,
+        extent: 4096,
+        tile_size_limit: args.tile_size_limit,
+    };
+
+    println!(
+        "Exporting {} → {}",
+        args.input.display(),
+        args.output.display()
+    );
+    let report = export_pmtiles(&args.input, &args.output, &opts)
+        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+
+    println!(
+        "  mode={} zooms z{}..z{}",
+        report.mode, report.min_zoom, report.max_zoom
+    );
+    for z in &report.zooms {
+        println!(
+            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}",
+            z.zoom,
+            z.level,
+            z.tile_count,
+            z.tile_feature_count,
+            if z.oversized_tiles > 0 {
+                format!(", {} oversized", z.oversized_tiles)
+            } else {
+                String::new()
+            }
+        );
+    }
+    println!(
+        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s",
+        report.total_tiles,
+        report.total_tile_features,
+        report.oversized_tiles,
+        report.duration_secs
+    );
+
+    if let Some(path) = &args.report {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
+        println!("  report → {}", path.display());
+    }
     Ok(())
 }
 

@@ -518,7 +518,7 @@ where
 }
 
 /// Extract geometries from a GeoArrow array into a Vec.
-fn extract_geometries_from_array(
+pub fn extract_geometries_from_array(
     array: &dyn GeoArrowArray,
     output: &mut Vec<Geometry<f64>>,
 ) -> Result<()> {

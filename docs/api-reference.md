@@ -26,6 +26,8 @@ gpq-tiles [OPTIONS] <INPUT> <OUTPUT>
 | `-y, --include <FIELD>` | (all) | Include property (repeatable) |
 | `-x, --exclude <FIELD>` | (none) | Exclude property (repeatable) |
 | `-X, --exclude-all` | false | Exclude all properties (geometry only) |
+| `--simplify` | false | Enable zoom-dependent geometry simplification |
+| `--simplify-factor <F>` | `1.0` | Simplification factor (pixel tolerance) |
 | `--no-parallel` | false | Disable parallel tile processing |
 | `--no-parallel-geoms` | false | Disable parallel geometry processing |
 | `-v, --verbose` | false | Show progress bars |
@@ -70,6 +72,7 @@ convert(
     streaming_mode: str = "fast",
     parallel_tiles: bool = True,
     parallel_geoms: bool = True,
+    simplify_factor: float | None = None,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> None
 ```
@@ -91,6 +94,7 @@ convert(
 | `streaming_mode` | `str` | `"fast"` | Memory mode: `"fast"` or `"low-memory"` |
 | `parallel_tiles` | `bool` | `True` | Enable parallel tile generation |
 | `parallel_geoms` | `bool` | `True` | Enable parallel geometry processing |
+| `simplify_factor` | `float` | `None` | Simplification factor (None = disabled, 1.0 = 1 pixel tolerance) |
 | `progress_callback` | `Callable` | `None` | Callback for progress events |
 
 **Raises:**
@@ -124,6 +128,10 @@ convert("data.parquet", "out.pmtiles", exclude_all=True)  # geometry only
 
 # Large file handling
 convert("huge.parquet", "out.pmtiles", streaming_mode="low-memory")
+
+# Simplification for linear features
+convert("roads.parquet", "roads.pmtiles", simplify_factor=1.0)  # 1 pixel tolerance
+convert("roads.parquet", "roads.pmtiles", simplify_factor=0.5)  # More detail preserved
 
 # Progress callback
 def on_progress(event):
@@ -233,6 +241,11 @@ let config = TilerConfig::new(0, 14)
     .with_property_filter(PropertyFilter::Include(vec!["name".into()]))
     .with_layer_name("buildings");
 
+// With simplification for linear features
+let config_simplified = TilerConfig::new(0, 14)
+    .with_simplify(1.0)  // 1 pixel tolerance
+    .with_layer_name("roads");
+
 let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
 
 for tile_result in tiles {
@@ -255,6 +268,7 @@ TilerConfig::new(min_zoom: u8, max_zoom: u8)
     .with_density_max_per_cell(max: usize)              // Default: 1
     .with_hilbert_sorting(enabled: bool)                // Default: true
     .with_property_filter(filter: PropertyFilter)       // Default: None
+    .with_simplify(factor: f64)                         // Default: None (disabled)
     .with_parallel_tiles(enabled: bool)                 // Default: true
     .with_parallel_geoms(enabled: bool)                 // Default: true
     .with_quiet(enabled: bool)                          // Default: false

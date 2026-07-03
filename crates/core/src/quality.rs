@@ -376,11 +376,7 @@ pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
 
     let row_group_count = parquet_metadata.num_row_groups();
     let total_rows = parquet_metadata.file_metadata().num_rows() as usize;
-    let avg_rows_per_group = if row_group_count > 0 {
-        total_rows / row_group_count
-    } else {
-        0
-    };
+    let avg_rows_per_group = total_rows.checked_div(row_group_count).unwrap_or(0);
 
     // Check for row group bboxes (would be in column statistics or custom metadata)
     // For now, we check if row groups have statistics on geometry-like columns

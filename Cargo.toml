@@ -29,6 +29,7 @@ geoparquet = "0.4"
 parquet = "55"
 arrow-schema = "55"
 arrow-array = "55"
+arrow-select = "55"
 geo = "0.32"
 pmtiles = "0.12"
 geozero = { version = "0.14", features = ["with-wkb", "with-geo"] }
@@ -47,7 +48,7 @@ dashmap = "6"
 clap = { version = "4", features = ["derive"] }
 
 # Python bindings
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
 
 # Error handling
 anyhow = "1.0"

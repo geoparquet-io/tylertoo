@@ -1,0 +1,346 @@
+{
+  "points-nyc-medium": {
+    "world": {
+      "zoom": 8,
+      "bbox": [
+        -74.299992,
+        40.50005907,
+        -73.69999261,
+        40.9000036
+      ],
+      "overview": {
+        "bytes": 577787,
+        "requests": 7,
+        "get_requests": 6,
+        "head_requests": 1,
+        "wall_ms": 120.32880302285776,
+        "features": 5772,
+        "level": 8,
+        "wall_ms_p95": 122.84160201670602
+      },
+      "pmtiles": {
+        "bytes": 96910,
+        "requests": 4,
+        "get_requests": 4,
+        "wall_ms": 6.67463697027415,
+        "tiles_requested": 1,
+        "tiles_present": 1,
+        "wall_ms_p95": 7.626410981174558
+      }
+    },
+    "regional": {
+      "zoom": 11,
+      "bbox": [
+        -74.07499222875,
+        40.650038268749995,
+        -73.92499238125001,
+        40.75002440125
+      ],
+      "overview": {
+        "bytes": 4359431,
+        "requests": 32,
+        "get_requests": 31,
+        "head_requests": 1,
+        "wall_ms": 89.93670396739617,
+        "features": 14321,
+        "level": 11,
+        "wall_ms_p95": 89.97946500312537
+      },
+      "pmtiles": {
+        "bytes": 961237,
+        "requests": 16,
+        "get_requests": 16,
+        "wall_ms": 27.732033981010318,
+        "tiles_requested": 4,
+        "tiles_present": 4,
+        "wall_ms_p95": 29.16189399547875
+      }
+    },
+    "street": {
+      "zoom": 14,
+      "bbox": [
+        -73.99000000000001,
+        40.75,
+        -73.97,
+        40.769999999999996
+      ],
+      "overview": {
+        "bytes": 5185687,
+        "requests": 39,
+        "get_requests": 38,
+        "head_requests": 1,
+        "wall_ms": 297.0087089925073,
+        "features": 33865,
+        "level": 14,
+        "wall_ms_p95": 1075.7314909715205
+      },
+      "pmtiles": {
+        "bytes": 1249498,
+        "requests": 16,
+        "get_requests": 16,
+        "wall_ms": 26.677859015762806,
+        "tiles_requested": 4,
+        "tiles_present": 4,
+        "wall_ms_p95": 29.103775043040514
+      }
+    }
+  },
+  "lines-portland-medium": {
+    "world": {
+      "zoom": 8,
+      "bbox": [
+        -122.9999916,
+        45.3000099,
+        -122.2169605,
+        45.7765525
+      ],
+      "overview": {
+        "bytes": 1256602,
+        "requests": 12,
+        "get_requests": 11,
+        "head_requests": 1,
+        "wall_ms": 125.48983504530042,
+        "features": 14663,
+        "level": 6,
+        "wall_ms_p95": 166.65998997632414
+      },
+      "pmtiles": {
+        "bytes": 484492,
+        "requests": 6,
+        "get_requests": 6,
+        "wall_ms": 5.86768495850265,
+        "tiles_requested": 2,
+        "tiles_present": 2,
+        "wall_ms_p95": 6.099620019085705
+      }
+    },
+    "regional": {
+      "zoom": 11,
+      "bbox": [
+        -122.70635493750001,
+        45.478713375,
+        -122.5105971625,
+        45.597849025
+      ],
+      "overview": {
+        "bytes": 3567830,
+        "requests": 27,
+        "get_requests": 26,
+        "head_requests": 1,
+        "wall_ms": 127.36024998594075,
+        "features": 9261,
+        "level": 9,
+        "wall_ms_p95": 128.92506102798507
+      },
+      "pmtiles": {
+        "bytes": 1883578,
+        "requests": 18,
+        "get_requests": 18,
+        "wall_ms": 17.999427975155413,
+        "tiles_requested": 6,
+        "tiles_present": 6,
+        "wall_ms_p95": 18.10629799729213
+      }
+    },
+    "street": {
+      "zoom": 14,
+      "bbox": [
+        -122.69000000000001,
+        45.510000000000005,
+        -122.67,
+        45.53
+      ],
+      "overview": {
+        "bytes": 4631438,
+        "requests": 23,
+        "get_requests": 22,
+        "head_requests": 1,
+        "wall_ms": 131.993021001108,
+        "features": 3701,
+        "level": 12,
+        "wall_ms_p95": 212.74253900628537
+      },
+      "pmtiles": {
+        "bytes": 361693,
+        "requests": 12,
+        "get_requests": 12,
+        "wall_ms": 10.941943037323654,
+        "tiles_requested": 4,
+        "tiles_present": 4,
+        "wall_ms_p95": 12.027488031890243
+      }
+    }
+  },
+  "polygons-portland-medium": {
+    "world": {
+      "zoom": 8,
+      "bbox": [
+        -122.9999994,
+        45.3000049,
+        -122.2996302,
+        45.7002644
+      ],
+      "overview": {
+        "bytes": 264721,
+        "requests": 7,
+        "get_requests": 6,
+        "head_requests": 1,
+        "wall_ms": 200.04685001913458,
+        "features": 15,
+        "level": 0,
+        "wall_ms_p95": 201.52172399684787
+      },
+      "pmtiles": {
+        "bytes": 501421,
+        "requests": 6,
+        "get_requests": 6,
+        "wall_ms": 6.3958640093915164,
+        "tiles_requested": 2,
+        "tiles_present": 2,
+        "wall_ms_p95": 6.421722995582968
+      }
+    },
+    "regional": {
+      "zoom": 11,
+      "bbox": [
+        -122.73736095,
+        45.4501022125,
+        -122.56226865000001,
+        45.5501670875
+      ],
+      "overview": {
+        "bytes": 1864038,
+        "requests": 12,
+        "get_requests": 11,
+        "head_requests": 1,
+        "wall_ms": 125.1810560352169,
+        "features": 2026,
+        "level": 3,
+        "wall_ms_p95": 164.489111979492
+      },
+      "pmtiles": {
+        "bytes": 1636088,
+        "requests": 12,
+        "get_requests": 12,
+        "wall_ms": 11.73621095949784,
+        "tiles_requested": 4,
+        "tiles_present": 4,
+        "wall_ms_p95": 12.036144034937024
+      }
+    },
+    "street": {
+      "zoom": 14,
+      "bbox": [
+        -122.65,
+        45.550000000000004,
+        -122.63,
+        45.57
+      ],
+      "overview": {
+        "bytes": 6762443,
+        "requests": 28,
+        "get_requests": 27,
+        "head_requests": 1,
+        "wall_ms": 131.53747702017426,
+        "features": 7219,
+        "level": 6,
+        "wall_ms_p95": 169.73799699917436
+      },
+      "pmtiles": {
+        "bytes": 566845,
+        "requests": 9,
+        "get_requests": 9,
+        "wall_ms": 8.04516498465091,
+        "tiles_requested": 3,
+        "tiles_present": 3,
+        "wall_ms_p95": 8.432981965597719
+      }
+    }
+  },
+  "polygons-ftw-moldova-large": {
+    "world": {
+      "zoom": 6,
+      "bbox": [
+        26.592531983585204,
+        45.4719002653674,
+        30.15892038332341,
+        48.4902285248874
+      ],
+      "overview": {
+        "bytes": 8803432,
+        "requests": 11,
+        "get_requests": 10,
+        "head_requests": 1,
+        "wall_ms": 440.61253499239683,
+        "features": 7804,
+        "level": 3,
+        "wall_ms_p95": 446.2905840482563
+      },
+      "pmtiles": {
+        "bytes": 740455,
+        "requests": 8,
+        "get_requests": 8,
+        "wall_ms": 12.325346004217863,
+        "tiles_requested": 2,
+        "tiles_present": 2,
+        "wall_ms_p95": 12.365080008748919
+      }
+    },
+    "regional": {
+      "zoom": 9,
+      "bbox": [
+        27.92992763348703,
+        46.603773362687406,
+        28.82152473342158,
+        47.3583554275674
+      ],
+      "overview": {
+        "bytes": 21799726,
+        "requests": 47,
+        "get_requests": 46,
+        "head_requests": 1,
+        "wall_ms": 375.5973690422252,
+        "features": 8008,
+        "level": 6,
+        "wall_ms_p95": 377.76742602000013
+      },
+      "pmtiles": {
+        "bytes": 1237858,
+        "requests": 16,
+        "get_requests": 16,
+        "wall_ms": 30.477760010398924,
+        "tiles_requested": 4,
+        "tiles_present": 4,
+        "wall_ms_p95": 33.44429802382365
+      }
+    },
+    "street": {
+      "zoom": 14,
+      "bbox": [
+        28.11,
+        47.150000000000006,
+        28.130000000000003,
+        47.17
+      ],
+      "overview": {
+        "bytes": 2018567,
+        "requests": 23,
+        "get_requests": 22,
+        "head_requests": 1,
+        "wall_ms": 297.73225396638736,
+        "features": 1527,
+        "level": 11,
+        "wall_ms_p95": 299.4149770238437
+      },
+      "pmtiles": {
+        "bytes": 133982,
+        "requests": 16,
+        "get_requests": 16,
+        "wall_ms": 24.080292030703276,
+        "tiles_requested": 4,
+        "tiles_present": 4,
+        "wall_ms_p95": 24.342293036170304
+      }
+    }
+  }
+}
