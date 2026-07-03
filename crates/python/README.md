@@ -53,6 +53,61 @@ convert(
 )
 ```
 
+### Multi-Resolution Overviews (Python)
+
+The overview pipeline builds COG-style vector overviews: a single
+level-banded GeoParquet file with progressively generalized copies of the
+data, plus a PMTiles exporter and a spec validator. All CLI knobs are
+exposed with identical defaults.
+
+```python
+from gpq_tiles import overview, validate, export_pmtiles
+
+# Polygon workflow (e.g. Moldova buildings/admin areas):
+# thin + simplify across z0-z10, then export tiles.
+report = overview(
+    "moldova.parquet", "moldova-overviews.parquet",
+    min_zoom=0, max_zoom=10,
+    simplify_factor=1.0,        # RDP tolerance = factor * level GSD
+    polygon_visibility=4.0,     # drop polygons smaller than 4 GSDs
+    drop_rate=1.65,             # per-level density budget
+)
+for lvl in report["levels"]:
+    print(lvl["level"], lvl["gsd"], lvl["feature_count"])
+
+result = validate("moldova-overviews.parquet")
+assert result["valid"], [c for c in result["checks"] if not c["passed"]]
+
+export_pmtiles(
+    "moldova-overviews.parquet", "moldova.pmtiles",
+    layer_name="buildings",
+)
+
+# Clustered point workflow (e.g. NYC trees): each level's surviving
+# point absorbs its grid-cell neighbors (point_count column), and
+# numeric attributes aggregate across each cluster.
+overview(
+    "nyc-trees.parquet", "nyc-trees-overviews.parquet",
+    min_zoom=8, max_zoom=14,
+    cluster=True,                                  # point_thinning defaults to 16.0
+    accumulate_attributes={"health_score": "mean"},
+    sort_key="diameter", sort_direction="desc",    # biggest tree wins the cell
+)
+export_pmtiles("nyc-trees-overviews.parquet", "nyc-trees.pmtiles",
+               layer_name="trees")
+```
+
+Every knob of `gpq-tiles overview` is available: `mode`
+("duplicating"/"partitioning"), `gsds`/`gsd_base`, `sort_key`/`sort_direction`,
+`class_rank_column`/`class_ranks`/`class_rank_unknown`, `no_auto_rank`,
+`simplify_factor`/`collapse`, per-kind `*_thinning` and `*_visibility`
+factors, density budget (`density_drop`, `drop_rate`, `drop_gamma`),
+clustering (`cluster`, `accumulate_attributes`), line coalescing
+(`coalesce_lines`, `coalesce_snap`, `coalesce_junction_angle`,
+`coalesce_max_level_rows`), writer options (`row_group_size`,
+`full_column_stats`, `cogp_compat`), and streaming controls (`streaming`,
+`read_batch_size`). See `help(gpq_tiles.overview)`.
+
 ## Documentation
 
 - **[Getting Started](docs/getting-started.md)** — Installation, basic usage, property filtering
