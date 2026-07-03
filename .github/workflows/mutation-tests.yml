@@ -1,3 +1,9 @@
+# Weekly Mutation Tests — cargo-mutants on the core crate.
+#
+# Purpose: mutation testing is far too slow for the PR path, so it runs on a
+# weekly schedule (plus manual dispatch) and publishes its report as an
+# artifact + job summary. It is advisory, not a PR gate.
+
 name: Weekly Mutation Tests
 
 on:
@@ -5,6 +11,9 @@ on:
     # Run every Sunday at 2 AM UTC
     - cron: '0 2 * * 0'
   workflow_dispatch:  # Allow manual triggering
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,10 +24,28 @@ jobs:
     name: Mutation Testing
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
 
       - name: Install protoc
         run: |
@@ -26,35 +53,41 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        with:
+          tool: cargo-mutants
 
       - name: Run mutation tests on core
-        run: cargo mutants --package gpq2tiles-core --output mutants.out
+        # NB: package name is gpq-tiles-core (the old gpq2tiles-core spelling
+        # made every scheduled run fail at startup).
+        run: cargo mutants --package gpq-tiles-core --output mutants.out
 
       - name: Upload mutation report
-        uses: actions/upload-artifact@v7
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mutation-report
           path: mutants.out/
 
       - name: Post summary
+        if: always()
         run: |
-          echo "## Mutation Testing Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Mutation Testing Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ -f mutants.out/outcomes.txt ]; then
-            cat mutants.out/outcomes.txt >> $GITHUB_STEP_SUMMARY
+            cat mutants.out/outcomes.txt >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No mutation results found" >> $GITHUB_STEP_SUMMARY
+            echo "No mutation results found" >> "$GITHUB_STEP_SUMMARY"
           fi

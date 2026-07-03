@@ -1,0 +1,46 @@
+# Dependabot auto-merge — zero-touch dependency updates.
+#
+# Purpose: enable auto-merge (squash) on Dependabot PRs for patch and minor
+# updates. GitHub then merges the PR only once every required branch-
+# protection check is green, so this never bypasses the quality gates.
+# Major version bumps are left for a human to review and merge.
+#
+# Requires: branch protection on main with the CI jobs as required checks
+# (see the PR that introduced this file for the exact gh commands).
+
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    permissions:
+      # Least privilege: contents:write to enable auto-merge,
+      # pull-requests:write to comment/approve-free enablement.
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for patch/minor updates
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Leave majors for a human
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        run: echo "Major update — waiting for human review."
