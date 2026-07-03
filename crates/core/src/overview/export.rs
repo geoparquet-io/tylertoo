@@ -813,6 +813,67 @@ mod tests {
 
     // --- tests ---------------------------------------------------------------
 
+    /// Rich 2-level fixture used by the byte-equivalence tests: points, a
+    /// seam-crossing line, a concave polygon and a many-vertex line, with
+    /// id/name properties, at zooms 2 and 4.
+    fn equivalence_fixture(path: &Path) {
+        let pa = Geometry::Point(Point::new(-120.0, 40.0));
+        let pb = Geometry::Point(Point::new(120.0, -40.0));
+        let wide = Geometry::LineString(LineString::from(vec![
+            (-100.0, 10.0),
+            (-80.0, 12.0),
+            (-60.0, 8.0),
+            (-40.0, 11.0),
+        ]));
+        let concave = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-100.0, 25.0),
+                (-98.0, 25.0),
+                (-98.0, 27.0),
+                (-99.0, 25.5),
+                (-100.0, 27.0),
+                (-100.0, 25.0),
+            ]),
+            vec![],
+        ));
+        let mut coords = Vec::new();
+        for k in 0..200 {
+            coords.push((30.0 + k as f64 * 0.3, -20.0 + (k as f64 * 0.1).sin()));
+        }
+        let wiggly = Geometry::LineString(LineString::from(coords));
+        write_fixture(
+            path,
+            &[
+                (vec![0, 1], vec![pa.clone(), pb.clone()]),
+                (vec![0, 1, 2, 3, 4], vec![pa, pb, wide, concave, wiggly]),
+            ],
+        );
+    }
+
+    /// Byte-level anchor for the H3(b) export restructure: the whole archive
+    /// (header + directory + metadata + tile data) must hash to the value
+    /// produced by the pre-refactor per-zoom BTreeMap implementation. The
+    /// reference hash was captured from that implementation (commit b8a1635)
+    /// on this exact fixture before the partitioned-streaming rewrite.
+    #[test]
+    fn export_archive_matches_pre_refactor_reference() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(tin.path());
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            ..Default::default()
+        };
+        let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(report.total_tiles, 12);
+        let bytes = std::fs::read(tout.path()).unwrap();
+        assert_eq!(
+            format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
+            "58d90ae6c69d16f6",
+            "archive bytes diverged from the pre-refactor reference"
+        );
+    }
+
     #[test]
     fn zoom_mapping_uses_explicit_zoom() {
         let meta = OverviewsMeta {
