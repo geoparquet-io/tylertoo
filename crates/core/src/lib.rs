@@ -97,8 +97,6 @@ pub use covering::{
 };
 // Re-export ProcessingMode for memory-bounded processing
 pub use pipeline::{auto_bucket_count, auto_processing_mode, ProcessingMode};
-// Re-export simplify functions for external use
-pub use simplify::simplify_geometry_for_tile;
 
 /// Format a helpful error message for CannotReduceFurther errors
 fn format_cannot_reduce_error(
