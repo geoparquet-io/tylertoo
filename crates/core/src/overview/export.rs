@@ -377,7 +377,7 @@ fn encode_tile(
             // (coordinate count) descending — the biggest features carry the
             // tile's visual signal — and keep a proportional prefix.
             let mut ranked: Vec<&(Geometry<f64>, usize)> = members.iter().collect();
-            ranked.sort_by(|a, b| b.0.coords_count().cmp(&a.0.coords_count()));
+            ranked.sort_by_key(|m| std::cmp::Reverse(m.0.coords_count()));
             let keep_frac = limit as f64 / data.len() as f64;
             let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
             let kept: Vec<(Geometry<f64>, usize)> =

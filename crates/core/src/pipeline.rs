@@ -1540,8 +1540,7 @@ fn generate_tiles_to_writer_internal(
                 // Process clip results: validate, drop, serialize to bytes, create records
                 // Collect into a Vec first for deterministic ordering
                 let mut clip_entries: Vec<_> = clip_results.into_iter().collect();
-                clip_entries
-                    .sort_by(|(a, _), (b, _)| tile_id(a.z, a.x, a.y).cmp(&tile_id(b.z, b.x, b.y)));
+                clip_entries.sort_by_key(|(a, _)| tile_id(a.z, a.x, a.y));
 
                 for (tile_coord, clipped) in clip_entries {
                     // Check dropping rules using WorldCoord-based functions
@@ -3470,7 +3469,7 @@ pub fn generate_tiles_streaming_with_stats(
     }
 
     // Sort tiles by (z, x, y) for deterministic output
-    tiles.sort_by(|a, b| (a.coord.z, a.coord.x, a.coord.y).cmp(&(b.coord.z, b.coord.x, b.coord.y)));
+    tiles.sort_by_key(|t| (t.coord.z, t.coord.x, t.coord.y));
 
     // Final RSS sample at completion
     rss_tracker.sample();

@@ -106,7 +106,7 @@ fn format_cannot_reduce_error(
     features: usize,
     max_tile_size: usize,
 ) -> String {
-    let bytes_per_feature = if features > 0 { size / features } else { size };
+    let bytes_per_feature = size.checked_div(features).unwrap_or(size);
     let size_kb = size / 1024;
     let max_kb = max_tile_size / 1024;
 
