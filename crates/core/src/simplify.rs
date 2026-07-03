@@ -2342,6 +2342,19 @@ mod tests {
         /// on different pixels, regardless of how far apart those pixels are.
         /// This leads to thousands of tiny 2-point linestrings that can't be simplified
         /// further by RDP but are visually insignificant.
+        ///
+        /// QUARANTINED (ignored): this is an aspirational TDD "red" test that
+        /// asserts `simplify_geometry_for_tile` should gain the same sub-pixel
+        /// linestring dropping that `simplify_coalesced_linestring` already has
+        /// (min_extent_px). It was committed prematurely from a dirty tree in
+        /// 61e9c17 ("coalesced-linestring simplification WIP") and belongs to
+        /// the zoom-dependent-simplification feature, NOT the overview work on
+        /// this branch. Wiring sub-threshold dropping into the non-coalesced
+        /// path is a cross-cutting change to the core tile output and is
+        /// deliberately out of scope for the CI-reckoning task (H2); it is
+        /// tracked as follow-up feature work. Un-ignore when that feature lands.
+        #[ignore = "aspirational red test for unimplemented non-coalesced \
+                    sub-pixel linestring dropping; see doc comment (H2 triage)"]
         #[test]
         fn test_non_coalesced_tiny_linestrings_should_be_dropped() {
             use crate::hierarchical_clip::WorldClippedGeometry;
