@@ -300,6 +300,94 @@ gpio/portolan integration announcements. Decide on repo rename
 
 ---
 
+## Phase 5 — Hardening & parity roadmap (ADDED 2026-07-03)
+
+Status snapshot at time of writing: Phases 0–1 done; V1 done; V2
+resolved (magnification artifact + tuned defaults); V3 done; Q1/Q2
+done; E0 done. What remains between "working prototype with
+published numbers" and "production tool at tippecanoe parity on big
+files", in proposed execution order:
+
+### H1. Writer row-group pathology  (cheap; do first)
+V3 root cause on Moldova: 8.84 MB Thrift footer (167 RGs × per-column
+stats incl. ULID id strings, paid on every remote query) and 10k-row
+RGs at coarse bands that defeat bbox pruning (regional viewport
+overlaps ~all of them).
+Fix: (a) per-level row-group sizing — coarse bands get few, large
+RGs (target: band ≤ N rows ⇒ single RG, else size by band share);
+(b) disable statistics on high-cardinality string columns (id-like),
+keep stats on bbox/level; (c) re-run bench_storage/bench_access for
+Moldova and update RESULTS.md.
+Acceptance: Moldova footer < 1 MB; regional-viewport bytes visibly
+down; all validate checks still pass.
+
+### H2. CI reckoning  [HUMAN + agent]
+CI has NEVER run on this branch (workflows target main). Steps:
+merge #158, retarget #168 to main, triage the full-suite results —
+including the tile-pipeline integration tests avoided locally all
+along. Expect pre-existing flakiness noise; separate "broken by us"
+(fix) from "was already broken" (document/issue).
+Human part: the merge buttons. Agent part: triage + fixes.
+
+### H3. V4 streaming — the big-files unlock  (the big ticket)
+Baseline to beat: Moldova 632k = 10m57s / 5.44 GB RSS (convert),
+and export holds one full zoom in memory (canonical zoom = whole
+dataset ⇒ same ceiling).
+(a) Convert: pass 1 stream → winner tables (+ Q2 budget cuts);
+pass 2 per level stream → simplify → write batch-by-batch. Memory
+target O(row group + winner tables). The assign engine was built
+for this (O(occupied-cells) state).
+(b) Export: Hilbert order ⇒ tiles complete in sequence; flush
+finished tiles instead of holding the zoom map.
+(c) Wall-time profile while in there: Moldova is 3.6× slower than
+tippecanoe — suspect per-level decode→rebuild churn (geometry
+decoded/re-encoded once per level). Cache encoded WKB or cascade
+simplification level-to-level.
+Acceptance: Moldova convert < 1 GB RSS; planet-tier dataset
+(--large Oregon roads, 5M feats) converts on a laptop; dhat/RSS
+regression test.
+
+### H4. Hostile-inputs wave  (correctness debt)
+Known-unverified today:
+- Hilbert-sorted input contract is ASSUMED, never checked — unsorted
+  input silently produces terrible pruning. Add cheap sortedness
+  sniff + loud warning (fallback sort = later, optional).
+- Antimeridian: spec prohibits (§7.3) but converter likely does NOT
+  reject — probable silent garbage bboxes. Enforce with clear error.
+- High latitude: METERS_PER_DEGREE equatorial approximation ⇒
+  thinning grids ~2.5× off in northern Norway. Decide: latitude-
+  scaled factor or documented limitation; add a Norway/Svalbard
+  corpus dataset either way.
+- Empty/null geometries, mixed geometry-type columns, poles.
+- GeoParquet 2.0 native-geometry inputs (spec §10 forward-compat is
+  unimplemented in code).
+Acceptance: each case either works with a test or fails with a
+clear, documented error. Corpus grows hostile fixtures.
+
+### H5. Quality ladder continuation (see Phase 2 §V5)
+Order: Q6 aggregation semantics [HUMAN design decision] → Q4 point
+clustering (owns remaining point storage overhead — NYC dup-mode is
++156% vs source; budget can't touch it, clustering can) → Q3 line
+coalescing (coarse-zoom strokes; biggest remaining visual parity
+gap) → Q5 polygon coalescing only if Moldova true-scale renders
+demand it.
+
+### H6. Parity & ecosystem tail
+- Multi-layer support (issue #16): several inputs → one overview
+  file / one tileset. Spec v0.2 design decision (layer column? per-
+  layer level bands?). Real tippecanoe parity gap.
+- E3 Python bindings for overview/validate/export-pmtiles.
+- E1 serve; E2 TS loader + hosted demo (unblocks L2 blog).
+- Remote-storage leg of V3 benchmarks (needs an R2/S3 bucket)
+  before numbers go external.
+
+Proposed sequence: H1 → H2 → H3 → H4 → (H5 ∥ H6), with L1 (the
+one-pager to the GeoParquet maintainers) drafted after H1 fixes the
+worst published number and sent whenever the human is ready — it
+does not need to wait for H3+.
+
+---
+
 ## Agent execution notes
 
 - Parallelism: Phase 0 = 3 agents; Phase 1 = P1/P2/P3 in parallel
