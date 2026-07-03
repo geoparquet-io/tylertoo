@@ -22,14 +22,14 @@ categories = ["science", "data-structures", "encoding"]
 gpq-tiles-core = { path = "crates/core", version = "0.6.0" }
 
 # Core geospatial dependencies
-geoarrow = "0.4"
-geoarrow-array = "0.4"
+geoarrow = "0.8"
+geoarrow-array = "0.8"
 geo-traits = "0.3"
-geoparquet = "0.4"
-parquet = "55"
-arrow-schema = "55"
-arrow-array = "55"
-arrow-select = "55"
+geoparquet = "0.8"
+parquet = "59"
+arrow-schema = "59"
+arrow-array = "59"
+arrow-select = "59"
 geo = "0.32"
 geozero = { version = "0.14", features = ["with-wkb", "with-geo"] }
 
