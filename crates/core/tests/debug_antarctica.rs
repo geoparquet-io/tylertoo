@@ -109,7 +109,7 @@ fn find_problematic_tiles() {
 
     if !slow_tiles.is_empty() {
         println!("\nSlowest tiles:");
-        slow_tiles.sort_by(|a, b| b.2.cmp(&a.2));
+        slow_tiles.sort_by_key(|t| std::cmp::Reverse(t.2));
         for (x, y, elapsed) in slow_tiles.iter().take(10) {
             let bounds = tile_to_bounds(*x, *y, zoom);
             println!(
