@@ -67,11 +67,12 @@ use super::coalesce::CoalesceInput;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
-    build_source_schema, class_ranking_provenance, coalesce_effective, count_vertices, detect_crs,
-    extract_class_ranks, extract_sort_keys, feature_kind, fill_level_bytes, find_geometry_column,
-    geometry_bbox, mixed_geometry_field, overture_road_ranking, validate_cluster_schema,
-    validate_coalesce_schema, ClassRanking, CoalesceTable, ConvertError, ConvertOptions,
-    ConvertReport, GroupInterner, LevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
+    count_vertices, detect_crs, extract_class_ranks, extract_sort_keys, feature_kind,
+    fill_level_bytes, find_geometry_column, geometry_bbox, mixed_geometry_field,
+    overture_road_ranking, validate_cluster_schema, validate_coalesce_schema, ClassRanking,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
+    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::simplify::{
@@ -239,14 +240,9 @@ pub(super) fn convert_streaming(
             if level == finest {
                 counts[level] += scratch.rows.len(); // canonical: verbatim
             } else {
-                counts[level] += super::coalesce::coalesce_level_lines(
-                    &inputs,
-                    level_gsds[level],
-                    crs,
-                    &options.assign,
-                    options.coalesce_snap,
-                )
-                .len();
+                counts[level] +=
+                    coalesce_level_chains(&inputs, level, finest, level_gsds[level], crs, options)
+                        .len();
             }
         }
     }
@@ -318,7 +314,16 @@ pub(super) fn convert_streaming(
         let coalesce_table: Option<CoalesceTable> = coalesce_scratch
             .as_ref()
             .filter(|_| !verbatim)
-            .map(|scratch| build_level_coalesce_table(&scratch.inputs(), e.gsd, crs, options));
+            .map(|scratch| {
+                build_level_coalesce_table(
+                    &scratch.inputs(),
+                    e.orig as usize,
+                    finest,
+                    e.gsd,
+                    crs,
+                    options,
+                )
+            });
         let ctx = LevelStreamCtx {
             source_schema: &source_schema,
             cluster_schema: &cluster_schema,

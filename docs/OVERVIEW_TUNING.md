@@ -335,7 +335,7 @@ exists as INT64 NOT NULL and that canonical-level values are all 1.
 
 ---
 
-## Line coalescing: `--coalesce-lines`, `--coalesce-snap`, `--coalesce-max-level-rows`
+## Line coalescing: `--no-coalesce-lines`, `--coalesce-junction-angle`, `--coalesce-snap`, `--coalesce-max-level-rows`
 
 At coarse levels a line network (roads, rivers) can degrade into scattered
 dashes: a segment whose bbox diagonal is below the visibility gate
@@ -343,18 +343,23 @@ dashes: a segment whose bbox diagonal is below the visibility gate
 keeps disconnected fragments of what remains. Selection is smart;
 *continuity* is destroyed.
 
-**`--coalesce-lines`** (opt-in, duplicating mode only) chains touching
-compatible segments into single "stroke" LineStrings at each non-canonical
-level, **before** the gate and thinning run:
+Line coalescing is therefore **ON by default** (maintainer render review
+2026-07-03 — like `--line-thinning 1.0` and the clustered point grid,
+defaults should look right; pass **`--no-coalesce-lines`** to opt out). It
+chains touching compatible segments into single "stroke" LineStrings at
+each non-canonical duplicating level, **before** the gate and thinning
+run:
 
 - A chain of individually sub-visibility segments survives as **one long
   visible artery** — the gate evaluates the chain's extent, not each
   fragment's. This ordering is the entire payoff.
 - Chains never merge **across class values** (when a class ranking is
   active — explicit `--class-rank` or auto-detected Overture
-  `class`/`road_class`) and never merge **through junctions** where 3+
-  compatible endpoints meet (degree-2 nodes only; network topology is
-  preserved). With no class ranking, all lines are compatible.
+  `class`/`road_class`). With no class ranking, all lines are compatible.
+- At **junctions** (3+ compatible endpoints meeting), chains continue only
+  through the pair of lines that best continue each other within
+  `--coalesce-junction-angle` of straight (see below); everything else
+  terminates there, preserving network topology.
 - The merged feature keeps the **attributes of its highest-priority
   member** (same class-rank → size → hash order as the cell-winner stage)
   and the output gains a **`coalesced_count`** INT32 NOT NULL column
@@ -364,10 +369,27 @@ level, **before** the gate and thinning run:
   unmerged.
 
 ```bash
+# Coalescing is on by default (auto class ranking groups by road class):
 gpq-tiles overview roads.parquet roads_overview.parquet \
-  --min-zoom 0 --max-zoom 14 \
-  --coalesce-lines        # auto class ranking groups by road class
+  --min-zoom 0 --max-zoom 14
+
+# Opt out (pre-Q3 behavior, no coalesced_count column):
+gpq-tiles overview roads.parquet roads_overview.parquet \
+  --min-zoom 0 --max-zoom 14 --no-coalesce-lines
 ```
+
+### `--coalesce-junction-angle` (default 30, degrees)
+
+Chains would otherwise break at every same-class crossing — on a road
+network that is almost every block, so strokes stay short exactly where
+the maintainer wants long arteries. At each junction the best-continuing
+pair of lines merges when its deviation from a straight continuation is
+at most this angle, best pair first (a 4-way crossing continues **both**
+through-streets). BIGGER = chains bend further through junctions (fewer,
+longer strokes; a genuine turn may get absorbed); `0` = never merge
+through junctions (strict degree-2 chaining, the original Q3 behavior).
+The Portland sweep for picking the default lives at
+`corpus/data/bench/q3/portland-roads-junction{00,30,60}.pmtiles`.
 
 ### `--coalesce-snap` (default 1.0, GSD multiples)
 
@@ -400,13 +422,20 @@ coalescing matters least. This is the streaming pipeline's one deliberate
   a cell and defines the compatibility groups. `--no-auto-rank` (or a
   numeric `--sort-key`) makes all lines compatible — fine for
   single-class datasets (rivers), usually wrong for mixed road networks.
-- **Density budget (Q2)**: line rows leave the winner table at coalesced
-  levels, so the drop-rate budget does not apply to them there (chaining
-  already collapses line counts far harder); points and polygons keep the
-  budget as usual.
-- **Partitioning mode is rejected.** Partitioning places each feature
-  exactly once with geometry verbatim; a merged chain is a new geometry
-  replacing several source rows, which that contract cannot represent.
+- **Density budget (Q2)** applies to **chains**: after gate + thinning,
+  each level keeps at most `num_lines / drop_rate^(finest − level)` chains
+  (same geometric ladder, floor, and spatial-fairness gamma as the
+  point/polygon budget), cutting the lowest-priority chains first. Without
+  this the reclaimed fragments would re-inflate exactly the mid-zoom
+  counts the budget was calibrated to cap. `--no-density-drop` disables
+  the chain budget too. Points and polygons keep the row-level budget as
+  usual.
+- **Partitioning mode: inert.** Partitioning places each feature exactly
+  once with geometry verbatim; a merged chain is a new geometry replacing
+  several source rows, which that contract cannot represent. Since
+  coalescing is on by default, partitioning conversions simply proceed
+  without it (no `coalesced_count` column, no provenance, info log); an
+  explicit `--coalesce-lines` with `--mode partitioning` is rejected.
 
 Coalescing is recorded in the footer `geo:overviews` →
 `generalization.coalescing` provenance (`enabled`,

@@ -54,8 +54,8 @@ use super::assign::{
 };
 use super::cluster::{build_cluster_tables, AccumulateSpec, ClusterEntry, POINT_COUNT_COLUMN};
 use super::coalesce::{
-    coalesce_level_lines, CoalesceInput, COALESCED_COUNT_COLUMN, DEFAULT_COALESCE_MAX_LEVEL_ROWS,
-    DEFAULT_SNAP_GSD_FACTOR,
+    coalesce_level_lines, CoalesceInput, CoalesceParams, COALESCED_COUNT_COLUMN,
+    DEFAULT_COALESCE_MAX_LEVEL_ROWS, DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
 };
 use super::level::{
     gsd_with_base, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance, Crs,
@@ -298,14 +298,22 @@ pub struct ConvertOptions {
     /// absorbed features at that level. Requires [`cluster`](Self::cluster).
     /// Empty by default.
     pub accumulate: Vec<AccumulateSpec>,
-    /// Enable line network coalescing (plan Q3; opt-in). Duplicating mode
-    /// only. At each non-canonical level, touching same-class line segments
+    /// Enable line network coalescing (plan Q3). **Default `true`** (like
+    /// `line_thinning = 1.0` and the clustering point grid, chosen by
+    /// maintainer render review: defaults should look right). At each
+    /// non-canonical duplicating level, touching same-class line segments
     /// are chained into single "stroke" LineStrings BEFORE the visibility
     /// gate and thinning run (see [`super::coalesce`]), so fragmented
     /// networks read as connected arteries at coarse zooms. The output
     /// gains a `coalesced_count` INT32 NOT NULL column (source segments
     /// merged per row; 1 for unmerged rows and at the canonical level).
-    /// Points and polygons are unaffected. Default `false`.
+    /// Points and polygons are unaffected.
+    ///
+    /// **Partitioning mode**: coalescing cannot be represented there (a
+    /// merged chain violates §2.3's feature-once/verbatim contract), so
+    /// this option is treated as INERT for partitioning conversions — the
+    /// output has no `coalesced_count` column and no coalescing provenance.
+    /// (The CLI additionally rejects an *explicit* request.)
     pub coalesce_lines: bool,
     /// Endpoint snap tolerance for coalescing, in GSD multiples (default
     /// [`DEFAULT_SNAP_GSD_FACTOR`] = 1.0): after exact-endpoint chaining,
@@ -318,6 +326,13 @@ pub struct ConvertOptions {
     /// candidate lines than this skip coalescing (with a log) instead of
     /// breaking the streaming pipeline's memory bound.
     pub coalesce_max_level_rows: usize,
+    /// Junction continuation threshold for coalescing, in degrees (default
+    /// [`DEFAULT_JUNCTION_ANGLE_DEG`]): at junction nodes (degree >= 3),
+    /// compatible incident lines that continue each other within this
+    /// deviation from straight merge best-pair-first, so arterials chain
+    /// THROUGH the same-class crossings that otherwise terminate every
+    /// stroke. `0` restores strict degree-2-only chaining.
+    pub coalesce_junction_angle: f64,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -345,9 +360,10 @@ impl Default for ConvertOptions {
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             cluster: false,
             accumulate: Vec::new(),
-            coalesce_lines: false,
+            coalesce_lines: true,
             coalesce_snap: DEFAULT_SNAP_GSD_FACTOR,
             coalesce_max_level_rows: DEFAULT_COALESCE_MAX_LEVEL_ROWS,
+            coalesce_junction_angle: DEFAULT_JUNCTION_ANGLE_DEG,
         }
     }
 }
@@ -484,19 +500,6 @@ pub enum ConvertError {
          converting with --cluster"
     )]
     PointCountColumnPresent,
-    /// `--coalesce-lines` was requested in partitioning mode. Partitioning
-    /// requires every source feature to appear exactly once with its
-    /// geometry verbatim (§2.3); a merged chain is a new geometry replacing
-    /// several source rows, so coalescing has no sound construction in a
-    /// feature-once layout (it also breaks the prefix-read semantics:
-    /// segments merged at a coarse level would have to vanish from every
-    /// finer band they belong to).
-    #[error(
-        "--coalesce-lines requires duplicating mode: partitioning places each \
-         feature exactly once with geometry verbatim, which a merged chain \
-         cannot satisfy"
-    )]
-    CoalescePartitioningUnsupported,
     /// The input already contains a `coalesced_count` column (coalescing
     /// enabled).
     #[error(
@@ -527,11 +530,28 @@ pub fn convert_to_overviews(
     if !options.accumulate.is_empty() && !options.cluster {
         return Err(ConvertError::AccumulateWithoutCluster);
     }
-    // Coalescing option sanity (Q3): partitioning mode cannot represent
-    // merged chains (see the error's rationale).
-    if options.coalesce_lines && matches!(options.mode, Mode::Partitioning) {
-        return Err(ConvertError::CoalescePartitioningUnsupported);
-    }
+    // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
+    // chain is a new geometry replacing several source rows, which the
+    // feature-once/verbatim contract of §2.3 cannot represent, and removing
+    // merged members from finer bands would break prefix reads. Coalescing
+    // is on by default, so partitioning conversions silently proceed
+    // without it (no column, no provenance); the CLI rejects an EXPLICIT
+    // request instead.
+    let inert_options: ConvertOptions;
+    let options: &ConvertOptions =
+        if options.coalesce_lines && matches!(options.mode, Mode::Partitioning) {
+            log::info!(
+                "line coalescing is inert in partitioning mode (feature-once / \
+                 geometry-verbatim contract); converting without it"
+            );
+            inert_options = ConvertOptions {
+                coalesce_lines: false,
+                ..options.clone()
+            };
+            &inert_options
+        } else {
+            options
+        };
 
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
@@ -715,7 +735,9 @@ pub fn convert_to_overviews(
                     group: line_groups.as_ref().map_or(0, |g| g[f.index]),
                 })
                 .collect();
-            Some(build_level_coalesce_table(&inputs, gsd_m, crs, options))
+            Some(build_level_coalesce_table(
+                &inputs, level, finest, gsd_m, crs, options,
+            ))
         } else {
             None
         };
@@ -1342,19 +1364,61 @@ impl GroupInterner {
     }
 }
 
-/// Build one level's [`CoalesceTable`]: chain + gate + thin the candidate
-/// lines ([`coalesce_level_lines`]), then simplify each surviving chain for
-/// the level. Chains that degenerate during simplification are dropped
-/// (default knobs never hit this: the 2×GSD gate is stricter than the 1×GSD
-/// simplify drop gate). Deterministic; shared verbatim by both pipelines so
-/// their outputs stay identical.
+/// Run the chain stage for one level: chain + gate + thin + per-level
+/// density budget. The budget mirrors the Q2 geometric ladder over the LINE
+/// candidate count — `budget(L) = num_lines / drop_rate^(finest − L)`, with
+/// the same [`MIN_DENSITY_LEVEL_FEATURES`](super::assign) floor and
+/// spatial-fairness gamma — so coalescing does not bypass the mid-zoom cap
+/// the budget was calibrated for. Deterministic; shared verbatim by both
+/// pipelines (and the streaming counting pass) so their outputs and hints
+/// stay identical.
+pub(super) fn coalesce_level_chains(
+    inputs: &[CoalesceInput<'_>],
+    level: usize,
+    finest: usize,
+    gsd_m: f64,
+    crs: Crs,
+    options: &ConvertOptions,
+) -> Vec<super::coalesce::CoalescedLine> {
+    let budget = if options.density.enabled
+        && options.density.drop_rate > 1.0
+        && !options.density.drop_rate.is_nan()
+        && level < finest
+    {
+        let keep = 1.0 / options.density.drop_rate;
+        let raw = inputs.len() as f64 * keep.powi((finest - level) as i32);
+        let max_chains = (raw.round() as usize).max(super::assign::MIN_DENSITY_LEVEL_FEATURES);
+        Some((max_chains, options.density.gamma))
+    } else {
+        None
+    };
+    coalesce_level_lines(
+        inputs,
+        gsd_m,
+        crs,
+        &options.assign,
+        &CoalesceParams {
+            snap_gsd_factor: options.coalesce_snap,
+            junction_angle_deg: options.coalesce_junction_angle,
+            budget,
+        },
+    )
+}
+
+/// Build one level's [`CoalesceTable`]: run the chain stage
+/// ([`coalesce_level_chains`]), then simplify each surviving chain for the
+/// level. Chains that degenerate during simplification are dropped (default
+/// knobs never hit this: the 2×GSD gate is stricter than the 1×GSD simplify
+/// drop gate).
 pub(super) fn build_level_coalesce_table(
     inputs: &[CoalesceInput<'_>],
+    level: usize,
+    finest: usize,
     gsd_m: f64,
     crs: Crs,
     options: &ConvertOptions,
 ) -> CoalesceTable {
-    let chains = coalesce_level_lines(inputs, gsd_m, crs, &options.assign, options.coalesce_snap);
+    let chains = coalesce_level_chains(inputs, level, finest, gsd_m, crs, options);
     let mut table = CoalesceTable::with_capacity(chains.len());
     for chain in chains {
         match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify) {
@@ -3254,30 +3318,34 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_input(tin.path(), &geoms, false, None);
 
-        let base = ConvertOptions {
+        let opts = ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 4,
                 max_zoom: 10,
             },
             no_auto_rank: true,
-            ..Default::default()
+            ..Default::default() // coalescing is ON by default
         };
 
-        // Baseline: fragments vanish from the coarse level.
+        // Baseline (opt-out): fragments vanish from the coarse level.
         let tout_off = tempfile::NamedTempFile::new().unwrap();
-        let off = convert_to_overviews(tin.path(), tout_off.path(), &base).unwrap();
+        let off = convert_to_overviews(
+            tin.path(),
+            tout_off.path(),
+            &ConvertOptions {
+                coalesce_lines: false,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         assert_eq!(
             off.levels[0].feature_count, 1,
             "without coalescing only the point survives level 0: {:?}",
             off.levels
         );
 
-        // Coalescing: the chain survives as ONE feature with count 6.
+        // Coalescing (default): the chain survives as ONE feature, count 6.
         let tout = tempfile::NamedTempFile::new().unwrap();
-        let opts = ConvertOptions {
-            coalesce_lines: true,
-            ..base
-        };
         let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
         assert_eq!(
             report.levels[0].feature_count, 2,
@@ -3360,28 +3428,46 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_rejects_partitioning() {
+    fn coalesce_inert_in_partitioning() {
+        // Partitioning cannot represent merged chains (§13.5); with
+        // coalescing on by default, partitioning conversions proceed
+        // WITHOUT it: no coalesced_count column, no coalescing provenance.
         let geoms = fragment_chain_geoms(3);
         let tin = tempfile::NamedTempFile::new().unwrap();
-        let tout = tempfile::NamedTempFile::new().unwrap();
         write_input(tin.path(), &geoms, false, None);
 
         for streaming in [true, false] {
-            let err = convert_to_overviews(
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let report = convert_to_overviews(
                 tin.path(),
                 tout.path(),
                 &ConvertOptions {
                     mode: Mode::Partitioning,
-                    coalesce_lines: true,
+                    coalesce_lines: true, // the default; explicit for clarity
                     streaming,
                     ..Default::default()
                 },
             )
-            .unwrap_err();
+            .unwrap();
+            // Feature-once: total rows == input rows, no merging happened.
+            assert_eq!(report.total_rows, geoms.len(), "streaming={streaming}");
+            let reader = OverviewReader::open(tout.path()).unwrap();
             assert!(
-                matches!(err, ConvertError::CoalescePartitioningUnsupported),
-                "streaming={streaming}: got {err:?}"
+                reader
+                    .meta()
+                    .generalization
+                    .as_ref()
+                    .unwrap()
+                    .coalescing
+                    .is_none(),
+                "no coalescing provenance in partitioning mode"
             );
+            let batch_schema = reader.read_level(0, None).unwrap().next().unwrap().unwrap();
+            assert!(
+                batch_schema.schema().index_of("coalesced_count").is_err(),
+                "no coalesced_count column in partitioning mode"
+            );
+            assert!(validate_file(tout.path()).unwrap().is_valid());
         }
     }
 
@@ -3438,8 +3524,16 @@ mod tests {
                 "streaming={streaming}: got {err:?}"
             );
         }
-        // Without coalescing the column is an ordinary property.
-        convert_to_overviews(tin.path(), tout.path(), &ConvertOptions::default()).unwrap();
+        // With coalescing disabled the column is an ordinary property.
+        convert_to_overviews(
+            tin.path(),
+            tout.path(),
+            &ConvertOptions {
+                coalesce_lines: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3468,9 +3562,17 @@ mod tests {
         assert_eq!(c.snap_tolerance_gsd_factor, 1.5);
         assert_eq!(c.coalesced_count_column, "coalesced_count");
 
-        // Off by default: no coalescing block, no coalesced_count column.
+        // Opt-out (`--no-coalesce-lines`): no coalescing block recorded.
         let tout_off = tempfile::NamedTempFile::new().unwrap();
-        convert_to_overviews(tin.path(), tout_off.path(), &ConvertOptions::default()).unwrap();
+        convert_to_overviews(
+            tin.path(),
+            tout_off.path(),
+            &ConvertOptions {
+                coalesce_lines: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let r_off = OverviewReader::open(tout_off.path()).unwrap();
         assert!(r_off
             .meta()

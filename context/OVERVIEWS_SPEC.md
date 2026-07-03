@@ -863,8 +863,10 @@ introduces new normative requirements for files that opt in.
 
 Coalescing applies to **line features only** (LineString rows; points
 and polygons are unaffected, and MultiLineString rows pass through
-unmerged) and to **`duplicating` mode only** (§13.5). It is **opt-in,
-default off**.
+unmerged) and to **`duplicating` mode only** (§13.5). It is an OPTIONAL
+extension of this spec; whether a producer enables it by default is an
+implementation choice (gpq-tiles: **on by default** since 2026-07-03
+per maintainer render review, opt-out via `--no-coalesce-lines`).
 
 At each non-canonical level, BEFORE the visibility gate and cell-winner
 thinning run, the generalization engine chains touching compatible line
@@ -877,9 +879,13 @@ segments into single "stroke" LineStrings:
 - **Chaining**: endpoints are matched exactly first, then chain ends
   within a snap tolerance of `snap_tolerance_gsd_factor × gsd` (two
   endpoints closer than one ground sample are indistinguishable at the
-  level). Chains extend only through nodes of **degree 2**: junctions
-  where three or more compatible endpoints meet terminate every chain,
-  preserving network topology.
+  level). Nodes of **degree 2** always continue a chain. At junctions
+  (three or more compatible endpoints), an implementation MAY continue
+  the pair(s) of lines that best continue each other within a bounded
+  angular deviation from straight (stroke building; gpq-tiles:
+  `--coalesce-junction-angle`, default 30°, `0` = strict degree-2
+  chaining); all other incident lines terminate there, preserving
+  network topology.
 - **Attributes**: the merged row carries the attribute values of its
   highest-priority member (the same priority order the cell-winner
   stage uses), plus the member count (§13.2).
@@ -937,20 +943,30 @@ values are exactly `1`.
 
 ### 13.5 Partitioning mode is excluded (normative)
 
-`--coalesce-lines` MUST be rejected for `partitioning`-mode files.
-Rationale: partitioning requires every source feature to appear
-**exactly once with its geometry verbatim** (§2.3). A merged chain is a
-new geometry replacing several source rows — it cannot satisfy
-geometry-verbatim, and removing the merged members from the finer bands
-they belong to would break the prefix-read contract (a prefix would no
-longer be a complete coarse rendering plus refinements). No sound
-construction was found; producers who need coalescing use `duplicating`
-mode.
+Coalescing MUST NOT be applied to `partitioning`-mode files. Rationale:
+partitioning requires every source feature to appear **exactly once
+with its geometry verbatim** (§2.3). A merged chain is a new geometry
+replacing several source rows — it cannot satisfy geometry-verbatim,
+and removing the merged members from the finer bands they belong to
+would break the prefix-read contract (a prefix would no longer be a
+complete coarse rendering plus refinements). No sound construction was
+found; producers who need coalescing use `duplicating` mode.
+
+A tool whose coalescing option is enabled **by default** MUST treat a
+partitioning conversion as non-coalesced (no `coalesced_count` column,
+no `coalescing` provenance) rather than fail; it SHOULD reject an
+*explicit* request to coalesce a partitioning conversion.
 
 ---
 
 ## 14. Changelog
 
+- **v0.2.0-draft (2026-07-03, later still)**: §13 revised per
+  maintainer review — junction continuation (angle-bounded stroke
+  building at degree >= 3 nodes) added to the chaining model; the
+  gpq-tiles engine default flipped to ON (opt-out); §13.5 reworded
+  for default-on tools (inert in partitioning, reject only explicit
+  requests).
 - **v0.2.0-draft (2026-07-03, later)**: added §13 line coalescing
   extension (`coalesced_count` column, degree-2 endpoint chaining
   model, `generalization.coalescing` metadata,

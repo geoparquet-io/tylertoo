@@ -23,9 +23,13 @@
 //!    dominant case, since OSM/Overture segments share exact node
 //!    coordinates), then a **snap** pass that joins the resulting chains'
 //!    free endpoints quantized to `snap_gsd_factor × GSD` grid cells
-//!    (closing sub-resolution digitization gaps). Both phases join only
-//!    through nodes of **degree 2** — junctions where three or more
-//!    endpoints meet terminate every chain, preserving network topology.
+//!    (closing sub-resolution digitization gaps). Both phases join nodes
+//!    of **degree 2** unconditionally; at junctions (degree >= 3) the
+//!    incident pairs that continue each other within
+//!    [`CoalesceParams::junction_angle_deg`] of straight merge best-pair
+//!    first (stroke building — arterials chain THROUGH same-class
+//!    crossings; a sharp turn stays a chain boundary; `0` restores strict
+//!    degree-2-only chaining).
 //! 3. The merged feature takes the attributes of its **highest-priority
 //!    member** (the same [`Priority`] order the cell-winner stage uses),
 //!    and records the number of merged source segments
@@ -35,9 +39,10 @@
 //!    `line_thinning × GSD` grid cell, best [`Priority`] wins).
 //!
 //! The canonical level is NEVER coalesced (spec §2.4 value fidelity), and
-//! partitioning mode rejects coalescing outright (merged geometries violate
-//! §2.3's feature-once / geometry-verbatim contract; see
-//! `ConvertError::CoalescePartitioningUnsupported`).
+//! coalescing is INERT in partitioning mode (merged geometries violate
+//! §2.3's feature-once / geometry-verbatim contract; spec §13.5).
+//! Coalescing is ON by default in the conversion options (maintainer
+//! render review 2026-07-03: defaults should look right), with an opt-out.
 //!
 //! # DIVERGENCE FROM TIPPECANOE
 //!
@@ -45,11 +50,12 @@
 //! into multi-geometries without topological chaining (tile.cpp, coalesce
 //! path); its shared-node machinery protects junction vertices during
 //! simplification rather than building strokes. Our endpoint chaining
-//! through degree-2 nodes matches planetiler's `mergeLineStrings`
-//! behavior (the standard cartographic stroke-building operation), while
-//! keeping tippecanoe's *philosophy*: never merge across attribute
-//! (class) boundaries, never merge through junctions, deterministic
-//! output. We also merge with a snap tolerance of one GSD — two endpoints
+//! through degree-2 nodes (plus angle-limited junction continuation)
+//! matches planetiler's `mergeLineStrings` behavior (the standard
+//! cartographic stroke-building operation), while keeping tippecanoe's
+//! *philosophy*: never merge across attribute (class) boundaries,
+//! deterministic output. We also merge with a snap tolerance of one GSD —
+//! two endpoints
 //! closer than one ground sample are indistinguishable at the level — where
 //! planetiler uses exact matches after tile-grid quantization (an
 //! equivalent idea in tile space).
@@ -75,6 +81,16 @@ pub const COALESCED_COUNT_COLUMN: &str = "coalesced_count";
 /// Default endpoint snap tolerance, in GSD multiples: two endpoints within
 /// one ground sample distance are indistinguishable at the level.
 pub const DEFAULT_SNAP_GSD_FACTOR: f64 = 1.0;
+
+/// Default junction continuation threshold, in degrees: at a junction
+/// (node degree >= 3), the pair of incident lines that best continue each
+/// other merge when their deviation from a straight continuation is at
+/// most this angle. `30°` keeps arterials chaining through the frequent
+/// same-class crossings that otherwise break every stroke, while a sharp
+/// turn onto a side street stays a chain boundary. Provisional default
+/// pending the maintainer's Portland junction-angle sweep
+/// (`corpus/data/bench/q3/portland-roads-junction{00,30,60}.pmtiles`).
+pub const DEFAULT_JUNCTION_ANGLE_DEG: f64 = 30.0;
 
 /// Default per-level candidate-row ceiling above which coalescing is
 /// skipped (bounded-memory guard; see `docs/OVERVIEW_TUNING.md`). Chaining
@@ -118,37 +134,68 @@ type End = u8;
 /// Quantized endpoint node key, namespaced by compatibility group.
 type NodeKey = (u32, i64, i64);
 
+/// Per-level chaining parameters for [`coalesce_level_lines`].
+#[derive(Debug, Clone, Copy)]
+pub struct CoalesceParams {
+    /// Endpoint snap tolerance in GSD multiples. `<= 0` means exact
+    /// coordinate matching only.
+    pub snap_gsd_factor: f64,
+    /// Junction continuation threshold in degrees
+    /// ([`DEFAULT_JUNCTION_ANGLE_DEG`]): at nodes of degree >= 3, incident
+    /// pairs that continue each other within this deviation from straight
+    /// are joined (best pair first, repeatedly — a 4-way crossing continues
+    /// both through-streets). `<= 0` restores strict degree-2-only chaining.
+    pub junction_angle_deg: f64,
+    /// OPTIONAL per-level `(max_chains, gamma)` density budget (Q2 applied
+    /// to CHAINS): when more chains than `max_chains` survive the gate +
+    /// thinning, the lowest-priority ones are dropped with the same
+    /// super-cell spatial fairness the point/polygon budget uses. Without
+    /// this, coalescing would bypass the Q2 budget entirely and re-inflate
+    /// the mid-zoom counts the budget was calibrated to cap.
+    pub budget: Option<(usize, f64)>,
+}
+
+impl Default for CoalesceParams {
+    fn default() -> Self {
+        Self {
+            snap_gsd_factor: DEFAULT_SNAP_GSD_FACTOR,
+            junction_angle_deg: DEFAULT_JUNCTION_ANGLE_DEG,
+            budget: None,
+        }
+    }
+}
+
 /// Coalesce one level's candidate lines: chain within compatibility groups
-/// through degree-2 endpoint nodes, then apply the visibility gate and
-/// cell-winner thinning to the merged chains. Returns the surviving chains
-/// ordered by ascending `rep` index.
+/// through endpoint nodes (degree-2 always; junction continuation per
+/// [`CoalesceParams::junction_angle_deg`]), then apply the visibility gate,
+/// cell-winner thinning, and the optional chain budget. Returns the
+/// surviving chains ordered by ascending `rep` index.
 ///
 /// - `gsd_m`: the level's GSD in meters (governs snap tolerance, gate, and
 ///   thinning grid). Non-positive GSD returns every input as an ungated
 ///   singleton (degenerate; callers pass canonical levels elsewhere).
 /// - `config`: the assignment configuration; `line_visibility`,
 ///   `line_thinning`, and `sort_direction` are used.
-/// - `snap_gsd_factor`: endpoint snap tolerance in GSD multiples. `<= 0`
-///   means exact coordinate matching only.
 pub fn coalesce_level_lines(
     lines: &[CoalesceInput<'_>],
     gsd_m: f64,
     crs: Crs,
     config: &AssignConfig,
-    snap_gsd_factor: f64,
+    params: &CoalesceParams,
 ) -> Vec<CoalescedLine> {
     if lines.is_empty() {
         return Vec::new();
     }
+    let budget = params.budget;
     let gsd_units = crs.meters_to_units(gsd_m);
     let snap_tol = if gsd_units > 0.0 {
-        snap_gsd_factor * gsd_units
+        params.snap_gsd_factor * gsd_units
     } else {
         0.0
     };
 
-    // --- 1+2. Build chains (grouped, degree-2 endpoint joins). --------------
-    let chains = build_chains(lines, snap_tol);
+    // --- 1+2. Build chains (grouped endpoint joins + junction continuation).
+    let chains = build_chains(lines, snap_tol, params.junction_angle_deg);
 
     // --- Priorities + sort keys of the members (the cell-winner order, Q1). --
     let mut prio: HashMap<usize, Priority> = HashMap::with_capacity(lines.len());
@@ -210,43 +257,107 @@ pub fn coalesce_level_lines(
 
     // --- 4b. Cell-winner thinning among the surviving chains. ----------------
     let cell_size = gsd_units * config.line_thinning;
-    let survivors: Vec<CoalescedLine> = if cell_size > 0.0 && !cell_size.is_nan() {
-        let chain_prio: Vec<Priority> = gated
-            .iter()
-            .map(|(_, f)| Priority::new(f, config.sort_direction))
-            .collect();
-        // cell -> position of the best chain so far in `gated`.
-        let mut grid: HashMap<(i64, i64), usize> = HashMap::new();
-        for (pos, (_, feat)) in gated.iter().enumerate() {
-            let (cx, cy) = feat.center();
-            let key = (
-                (cx / cell_size).floor() as i64,
-                (cy / cell_size).floor() as i64,
-            );
-            grid.entry(key)
-                .and_modify(|best| {
-                    if chain_prio[pos].beats(&chain_prio[*best]) {
-                        *best = pos;
-                    }
-                })
-                .or_insert(pos);
-        }
-        let mut keep: Vec<usize> = grid.into_values().collect();
-        keep.sort_unstable();
-        let mut out = Vec::with_capacity(keep.len());
-        let mut gated = gated;
-        // Drain winners in ascending position order (stable, deterministic).
-        for (offset, pos) in keep.into_iter().enumerate() {
-            out.push(gated.remove(pos - offset).0);
-        }
-        out
-    } else {
-        gated.into_iter().map(|(l, _)| l).collect()
-    };
+    let mut survivors: Vec<(CoalescedLine, AssignFeature)> =
+        if cell_size > 0.0 && !cell_size.is_nan() {
+            let chain_prio: Vec<Priority> = gated
+                .iter()
+                .map(|(_, f)| Priority::new(f, config.sort_direction))
+                .collect();
+            // cell -> position of the best chain so far in `gated`.
+            let mut grid: HashMap<(i64, i64), usize> = HashMap::new();
+            for (pos, (_, feat)) in gated.iter().enumerate() {
+                let (cx, cy) = feat.center();
+                let key = (
+                    (cx / cell_size).floor() as i64,
+                    (cy / cell_size).floor() as i64,
+                );
+                grid.entry(key)
+                    .and_modify(|best| {
+                        if chain_prio[pos].beats(&chain_prio[*best]) {
+                            *best = pos;
+                        }
+                    })
+                    .or_insert(pos);
+            }
+            // Keep winners in ascending position order (stable, deterministic;
+            // O(n) — a per-winner `Vec::remove` here is quadratic on real data).
+            let mut keep = vec![false; gated.len()];
+            for pos in grid.into_values() {
+                keep[pos] = true;
+            }
+            gated
+                .into_iter()
+                .zip(&keep)
+                .filter(|(_, &k)| k)
+                .map(|(pair, _)| pair)
+                .collect()
+        } else {
+            gated
+        };
 
-    let mut survivors = survivors;
+    // --- 4c. Per-level density budget on chains (Q2 analog). -----------------
+    if let Some((max_chains, gamma)) = budget {
+        if survivors.len() > max_chains {
+            let feats: Vec<AssignFeature> = survivors
+                .iter()
+                .enumerate()
+                .map(|(pos, (_, f))| AssignFeature { index: pos, ..*f })
+                .collect();
+            let prio: Vec<Priority> = feats
+                .iter()
+                .map(|f| Priority::new(f, config.sort_direction))
+                .collect();
+            let cands: Vec<usize> = (0..survivors.len()).collect();
+            let mut chosen = super::assign::select_budget_survivors(
+                &cands, max_chains, &feats, &prio, gsd_m, crs, gamma,
+            );
+            chosen.sort_unstable();
+            let mut keep = vec![false; survivors.len()];
+            for pos in chosen {
+                keep[pos] = true;
+            }
+            survivors = survivors
+                .into_iter()
+                .zip(&keep)
+                .filter(|(_, &k)| k)
+                .map(|(pair, _)| pair)
+                .collect();
+        }
+    }
+
+    let mut survivors: Vec<CoalescedLine> = survivors.into_iter().map(|(l, _)| l).collect();
     survivors.sort_by_key(|c| c.rep);
     survivors
+}
+
+/// Unit direction of `p` at its `end`, pointing INTO the line away from
+/// the endpoint (toward the first distinct vertex). `None` when every
+/// vertex coincides (degenerate).
+fn piece_direction(p: &Piece, end: End) -> Option<(f64, f64)> {
+    let c = &p.coords;
+    let (anchor, inward) = if end == 0 {
+        (c[0], c.iter().skip(1).find(|&&q| q != c[0]).copied())
+    } else {
+        let last = c[c.len() - 1];
+        (last, c.iter().rev().skip(1).find(|&&q| q != last).copied())
+    };
+    let q = inward?;
+    let (dx, dy) = (q.x - anchor.x, q.y - anchor.y);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len > 0.0 {
+        Some((dx / len, dy / len))
+    } else {
+        None
+    }
+}
+
+/// Angular deviation (degrees) of continuing from a line with inward
+/// direction `a` onto a line with inward direction `b` at a shared node:
+/// `0°` = perfectly straight (the directions are opposite), `90°` = a
+/// right-angle turn.
+fn continuation_deviation_deg(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dot = (a.0 * b.0 + a.1 * b.1).clamp(-1.0, 1.0);
+    180.0 - dot.acos().to_degrees()
 }
 
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when undefined).
@@ -297,11 +408,20 @@ fn snap_key(group: u32, c: geo::Coord<f64>, tol: f64) -> NodeKey {
 ///    segments are far shorter than the snap tolerance (the coarse-zoom
 ///    norm, where a one-phase snapped graph would collapse a short
 ///    segment's own two endpoints into a single node and never join it).
-/// 2. **Snap pass**: re-run the same degree-2 join over the *resulting
-///    chains'* free endpoints, quantized to `snap_tol` grid cells —
-///    closing small digitization gaps at the level's resolution. Skipped
-///    when `snap_tol <= 0` (exact matching only).
-fn build_chains(lines: &[CoalesceInput<'_>], snap_tol: f64) -> Vec<RawChain> {
+/// 2. **Snap pass**: re-run the same join over the *resulting chains'*
+///    free endpoints, quantized to `snap_tol` grid cells — closing small
+///    digitization gaps at the level's resolution. Skipped when
+///    `snap_tol <= 0` (exact matching only).
+///
+/// Both phases join degree-2 nodes unconditionally and, when
+/// `junction_angle_deg > 0`, continue through junctions (degree >= 3) by
+/// repeatedly pairing the incident lines that best continue each other
+/// within that angular deviation (stroke building).
+fn build_chains(
+    lines: &[CoalesceInput<'_>],
+    snap_tol: f64,
+    junction_angle_deg: f64,
+) -> Vec<RawChain> {
     // Chainable = plain LineString with >= 2 coordinates. Everything else
     // (MultiLineString, Line, degenerate) is an unmerged singleton.
     let mut pieces: Vec<Piece> = Vec::new();
@@ -318,9 +438,9 @@ fn build_chains(lines: &[CoalesceInput<'_>], snap_tol: f64) -> Vec<RawChain> {
     }
 
     // Phase 1: exact endpoint matching; phase 2: snapped matching.
-    let pieces = join_pieces(pieces, exact_key);
+    let pieces = join_pieces(pieces, exact_key, junction_angle_deg);
     let pieces = if snap_tol > 0.0 {
-        join_pieces(pieces, |g, c| snap_key(g, c, snap_tol))
+        join_pieces(pieces, |g, c| snap_key(g, c, snap_tol), junction_angle_deg)
     } else {
         pieces
     };
@@ -343,13 +463,26 @@ fn build_chains(lines: &[CoalesceInput<'_>], snap_tol: f64) -> Vec<RawChain> {
     chains
 }
 
-/// One round of degree-2 endpoint joining over `pieces`, with node keys
-/// produced by `key(group, endpoint)`. Nodes with exactly two incident
-/// endpoints from two DISTINCT pieces join; junctions (degree >= 3) and
-/// self-loops never do. Deterministic: components are walked in ascending
-/// piece index, starting from a free end (or the lowest-index piece of a
-/// cycle).
-fn join_pieces(pieces: Vec<Piece>, key: impl Fn(u32, geo::Coord<f64>) -> NodeKey) -> Vec<Piece> {
+/// One round of endpoint joining over `pieces`, with node keys produced by
+/// `key(group, endpoint)`.
+///
+/// - Nodes with exactly two incident endpoints from two DISTINCT pieces
+///   join unconditionally (a degree-2 node is an unambiguous continuation).
+/// - Junctions (degree >= 3): when `junction_angle_deg > 0`, incident pairs
+///   from distinct pieces whose directions continue each other within that
+///   deviation from straight are joined best-pair-first (so a 4-way
+///   crossing continues BOTH through-streets); remaining incidents
+///   terminate. `<= 0` restores strict degree-2-only behavior.
+/// - Self-loops never join.
+///
+/// Deterministic: components are walked in ascending piece index, starting
+/// from a free end (or the lowest-index piece of a cycle); junction pairs
+/// are ordered by (deviation, incident order).
+fn join_pieces(
+    pieces: Vec<Piece>,
+    key: impl Fn(u32, geo::Coord<f64>) -> NodeKey,
+    junction_angle_deg: f64,
+) -> Vec<Piece> {
     // Endpoint node map: node -> incident (piece idx, end).
     let mut nodes: HashMap<NodeKey, Vec<(usize, End)>> = HashMap::new();
     for (pi, p) in pieces.iter().enumerate() {
@@ -362,11 +495,49 @@ fn join_pieces(pieces: Vec<Piece>, key: impl Fn(u32, geo::Coord<f64>) -> NodeKey
     // Joins: per piece, the (other piece, other end) connected at each end.
     let mut joins: Vec<[Option<(usize, End)>; 2]> = vec![[None, None]; pieces.len()];
     for incidents in nodes.values() {
-        if incidents.len() == 2 && incidents[0].0 != incidents[1].0 {
+        let d = incidents.len();
+        if d == 2 && incidents[0].0 != incidents[1].0 {
             let (a, a_end) = incidents[0];
             let (b, b_end) = incidents[1];
             joins[a][a_end as usize] = Some((b, b_end));
             joins[b][b_end as usize] = Some((a, a_end));
+        } else if d >= 3 && junction_angle_deg > 0.0 {
+            // Junction continuation (stroke building): pair up incidents
+            // that continue each other within the angular threshold,
+            // straightest pair first. Each node's pairing is independent of
+            // every other node's (an end belongs to exactly one node), so
+            // map iteration order cannot affect the result.
+            let dirs: Vec<Option<(f64, f64)>> = incidents
+                .iter()
+                .map(|&(pi, e)| piece_direction(&pieces[pi], e))
+                .collect();
+            let mut cands: Vec<(f64, usize, usize)> = Vec::new();
+            for i in 0..d {
+                for j in (i + 1)..d {
+                    if incidents[i].0 == incidents[j].0 {
+                        continue; // self-loops never join
+                    }
+                    if let (Some(a), Some(b)) = (dirs[i], dirs[j]) {
+                        let dev = continuation_deviation_deg(a, b);
+                        if dev <= junction_angle_deg {
+                            cands.push((dev, i, j));
+                        }
+                    }
+                }
+            }
+            cands.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            let mut used = vec![false; d];
+            for (_, i, j) in cands {
+                if used[i] || used[j] {
+                    continue;
+                }
+                used[i] = true;
+                used[j] = true;
+                let (a, a_end) = incidents[i];
+                let (b, b_end) = incidents[j];
+                joins[a][a_end as usize] = Some((b, b_end));
+                joins[b][b_end as usize] = Some((a, a_end));
+            }
         }
     }
 
@@ -479,8 +650,25 @@ mod tests {
         AssignConfig::default()
     }
 
+    fn params(snap: f64, junction: f64, budget: Option<(usize, f64)>) -> CoalesceParams {
+        CoalesceParams {
+            snap_gsd_factor: snap,
+            junction_angle_deg: junction,
+            budget,
+        }
+    }
+
     fn run<'a>(lines: &[CoalesceInput<'a>], gsd_m: f64) -> Vec<CoalescedLine> {
-        coalesce_level_lines(lines, gsd_m, Crs::Epsg3857, &cfg(), DEFAULT_SNAP_GSD_FACTOR)
+        coalesce_level_lines(
+            lines,
+            gsd_m,
+            Crs::Epsg3857,
+            &cfg(),
+            &CoalesceParams {
+                junction_angle_deg: 0.0, // strict degree-2 (junction tests are explicit)
+                ..CoalesceParams::default()
+            },
+        )
     }
 
     fn coords_of(g: &Geometry<f64>) -> Vec<(f64, f64)> {
@@ -548,6 +736,108 @@ mod tests {
         assert!(out.iter().all(|l| l.count == 1));
     }
 
+    // --- junction continuation (stroke building) ------------------------------
+
+    /// T-junction with the junction knob on: the collinear pair chains
+    /// straight through; the perpendicular branch stays separate.
+    #[test]
+    fn junction_continuation_merges_straight_pair_at_t() {
+        let a = ls(&[(0.0, 0.0), (100.0, 0.0)]);
+        let b = ls(&[(100.0, 0.0), (200.0, 0.0)]);
+        let c = ls(&[(100.0, 0.0), (100.0, 100.0)]);
+        let lines = [input(0, &a), input(1, &b), input(2, &c)];
+        let out = coalesce_level_lines(
+            &lines,
+            TINY_GSD,
+            Crs::Epsg3857,
+            &cfg(),
+            &params(1.0, 30.0, None),
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "straight pair merges, branch survives: {out:?}"
+        );
+        let merged = out.iter().find(|l| l.count == 2).expect("merged pair");
+        assert_eq!(coords_of(&merged.geom).len(), 3);
+        assert_eq!(out.iter().find(|l| l.count == 1).map(|l| l.rep), Some(2));
+    }
+
+    /// Four-way crossing: BOTH through-streets continue (two pairs merge).
+    /// The crossing is asymmetric so the two merged chains land in
+    /// different thinning cells (equal bbox centers would thin to one).
+    #[test]
+    fn junction_continuation_pairs_both_streets_at_crossing() {
+        let e = ls(&[(0.0, 0.0), (100.0, 0.0)]);
+        let w = ls(&[(100.0, 0.0), (300.0, 0.0)]);
+        let n = ls(&[(100.0, 0.0), (100.0, 100.0)]);
+        let s = ls(&[(100.0, -300.0), (100.0, 0.0)]);
+        let lines = [input(0, &e), input(1, &w), input(2, &n), input(3, &s)];
+        let out = coalesce_level_lines(
+            &lines,
+            TINY_GSD,
+            Crs::Epsg3857,
+            &cfg(),
+            &params(1.0, 30.0, None),
+        );
+        assert_eq!(out.len(), 2, "both through-streets continue: {out:?}");
+        assert!(out.iter().all(|l| l.count == 2));
+    }
+
+    /// A bend sharper than the threshold does not merge through a junction.
+    #[test]
+    fn junction_continuation_respects_angle_threshold() {
+        let a = ls(&[(0.0, 0.0), (100.0, 0.0)]);
+        let bent = ls(&[(100.0, 0.0), (170.0, 70.0)]); // 45° off straight
+        let branch = ls(&[(100.0, 0.0), (100.0, 100.0)]); // 90° off
+        let lines = [input(0, &a), input(1, &bent), input(2, &branch)];
+        // 30° threshold: nothing continues (45° and 90° both exceed it).
+        let strict = coalesce_level_lines(
+            &lines,
+            TINY_GSD,
+            Crs::Epsg3857,
+            &cfg(),
+            &params(1.0, 30.0, None),
+        );
+        assert_eq!(strict.len(), 3, "45° bend exceeds 30°: {strict:?}");
+        // 60° threshold: the 45° pair merges; the 90° branch still doesn't.
+        let loose = coalesce_level_lines(
+            &lines,
+            TINY_GSD,
+            Crs::Epsg3857,
+            &cfg(),
+            &params(1.0, 60.0, None),
+        );
+        assert_eq!(loose.len(), 2, "45° bend within 60°: {loose:?}");
+        assert_eq!(loose.iter().map(|l| l.count).max(), Some(2));
+    }
+
+    /// Junction continuation still never crosses class groups.
+    #[test]
+    fn junction_continuation_respects_groups() {
+        let a = ls(&[(0.0, 0.0), (100.0, 0.0)]);
+        let b = ls(&[(100.0, 0.0), (200.0, 0.0)]); // straight, WRONG class
+        let c = ls(&[(100.0, 0.0), (100.0, 100.0)]); // same class, 90° off
+        let mut ia = input(0, &a);
+        let mut ib = input(1, &b);
+        let mut ic = input(2, &c);
+        ia.group = 1;
+        ib.group = 2;
+        ic.group = 1;
+        let out = coalesce_level_lines(
+            &[ia, ib, ic],
+            TINY_GSD,
+            Crs::Epsg3857,
+            &cfg(),
+            &params(1.0, 30.0, None),
+        );
+        // Within group 1 the node is degree 2 (a + c) — but they meet at
+        // 90°... degree-2 joins are unconditional, so a + c chain; b stays.
+        assert_eq!(out.len(), 2, "no cross-group merge: {out:?}");
+        let merged = out.iter().find(|l| l.count == 2).expect("a+c chain");
+        assert!(merged.rep == 0 || merged.rep == 2);
+    }
+
     #[test]
     fn snap_tolerance_joins_near_endpoints() {
         // gsd = 1 m, snap 1.0 => endpoints quantized to 1 m cells. Endpoints
@@ -569,7 +859,7 @@ mod tests {
         let b = ls(&[(100.0, 0.0), (200.0, 0.0)]); // exact match
         let c = ls(&[(200.0000001, 0.0), (300.0, 0.0)]); // near, not exact
         let lines = [input(0, &a), input(1, &b), input(2, &c)];
-        let out = coalesce_level_lines(&lines, 1.0, Crs::Epsg3857, &cfg(), 0.0);
+        let out = coalesce_level_lines(&lines, 1.0, Crs::Epsg3857, &cfg(), &params(0.0, 0.0, None));
         assert_eq!(out.len(), 2);
         assert_eq!(out.iter().map(|l| l.count).max(), Some(2));
     }
@@ -695,7 +985,8 @@ mod tests {
             line_visibility: 0.5, // gate 500 m < 900 m diag
             ..AssignConfig::default()
         };
-        let out = coalesce_level_lines(&lines, 1000.0, Crs::Epsg3857, &cfg, 1.0);
+        let out =
+            coalesce_level_lines(&lines, 1000.0, Crs::Epsg3857, &cfg, &params(1.0, 0.0, None));
         assert_eq!(out.len(), 1, "one chain per thinning cell: {out:?}");
     }
 
@@ -709,7 +1000,8 @@ mod tests {
             line_visibility: 0.1,
             ..AssignConfig::default()
         };
-        let out = coalesce_level_lines(&lines, 1000.0, Crs::Epsg3857, &cfg, 1.0);
+        let out =
+            coalesce_level_lines(&lines, 1000.0, Crs::Epsg3857, &cfg, &params(1.0, 0.0, None));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].rep, 0, "longer chain out-ranks in its cell");
     }
@@ -728,6 +1020,33 @@ mod tests {
         o1.sort_by_key(|l| l.rep);
         o2.sort_by_key(|l| l.rep);
         assert_eq!(o1, o2, "results independent of input order");
+    }
+
+    #[test]
+    fn chain_budget_caps_survivors_by_priority() {
+        // Three disjoint chains in separate thinning cells; a budget of 2
+        // keeps the two highest-priority (longest) ones.
+        let long = ls(&[(0.0, 0.0), (5000.0, 0.0)]);
+        let mid = ls(&[(0.0, 20_000.0), (3000.0, 20_000.0)]);
+        let short = ls(&[(0.0, 40_000.0), (1000.0, 40_000.0)]);
+        let lines = [input(0, &long), input(1, &mid), input(2, &short)];
+        let cfg = AssignConfig {
+            line_visibility: 0.1,
+            ..AssignConfig::default()
+        };
+        let all =
+            coalesce_level_lines(&lines, 1000.0, Crs::Epsg3857, &cfg, &params(1.0, 0.0, None));
+        assert_eq!(all.len(), 3, "no budget keeps all: {all:?}");
+        let cut = coalesce_level_lines(
+            &lines,
+            1000.0,
+            Crs::Epsg3857,
+            &cfg,
+            &params(1.0, 0.0, Some((2, 1.0))),
+        );
+        assert_eq!(cut.len(), 2, "budget of 2 binds: {cut:?}");
+        let reps: Vec<usize> = cut.iter().map(|c| c.rep).collect();
+        assert_eq!(reps, vec![0, 1], "lowest-priority (shortest) chain drops");
     }
 
     #[test]

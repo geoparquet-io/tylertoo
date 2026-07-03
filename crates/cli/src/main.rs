@@ -222,23 +222,46 @@ struct OverviewArgs {
     #[arg(long = "accumulate-attribute", value_name = "COL:OP")]
     accumulate_attribute: Vec<String>,
 
-    /// Enable line network coalescing (duplicating mode only; opt-in).
+    /// Disable line network coalescing (ON by default; duplicating mode).
     ///
-    /// At each non-canonical level, touching same-class line segments are
-    /// chained into single "stroke" LineStrings BEFORE the visibility gate
-    /// and thinning run, so a chain of individually sub-visibility fragments
-    /// survives as one long, connected artery — road/river networks read as
-    /// continuous lines at coarse zooms instead of scattered dashes. Chains
-    /// never merge across class values (when a class ranking is active) or
-    /// through junctions where 3+ segments meet. The merged feature keeps
-    /// the attributes of its highest-priority member, and the output gains
-    /// a `coalesced_count` INT32 NOT NULL column (source segments merged
-    /// per row; 1 for unmerged rows and everywhere at the canonical level).
-    /// Points and polygons are unaffected. See docs/OVERVIEW_TUNING.md.
+    /// By default, at each non-canonical level touching same-class line
+    /// segments are chained into single "stroke" LineStrings BEFORE the
+    /// visibility gate and thinning run, so a chain of individually
+    /// sub-visibility fragments survives as one long, connected artery —
+    /// road/river networks read as continuous lines at coarse zooms instead
+    /// of scattered dashes. Chains never merge across class values (when a
+    /// class ranking is active); junctions continue only within
+    /// --coalesce-junction-angle of straight. The merged feature keeps the
+    /// attributes of its highest-priority member, and the output gains a
+    /// `coalesced_count` INT32 NOT NULL column (source segments merged per
+    /// row; 1 for unmerged rows and everywhere at the canonical level).
+    /// Points and polygons are unaffected. In partitioning mode coalescing
+    /// is inert (a merged chain cannot satisfy the feature-once/verbatim
+    /// contract). See docs/OVERVIEW_TUNING.md.
     #[arg(long)]
+    no_coalesce_lines: bool,
+
+    /// Deprecated no-op: coalescing is now the default. Kept so existing
+    /// invocations keep working; rejected with partitioning mode (where the
+    /// default silently disables instead).
+    #[arg(long, hide = true, conflicts_with = "no_coalesce_lines")]
     coalesce_lines: bool,
 
-    /// Endpoint snap tolerance for --coalesce-lines, in GSD multiples
+    /// Junction continuation angle for line coalescing, in degrees
+    /// (default 30).
+    ///
+    /// At a junction (3+ same-class segment endpoints meeting), the pair of
+    /// lines that best continue each other merge when their deviation from
+    /// a straight continuation is at most this angle — best pair first, so
+    /// a 4-way crossing continues BOTH through-streets. BIGGER = chains
+    /// bend further through junctions (longer, fewer strokes; risk of
+    /// merging through genuine turns); 0 = never merge through junctions
+    /// (strict degree-2 chaining). See the Portland junction-angle sweep in
+    /// corpus/data/bench/q3/.
+    #[arg(long, value_name = "DEG", default_value = "30.0")]
+    coalesce_junction_angle: f64,
+
+    /// Endpoint snap tolerance for line coalescing, in GSD multiples
     /// (default 1.0).
     ///
     /// Exactly-touching endpoints always chain; this knob additionally joins
@@ -249,7 +272,7 @@ struct OverviewArgs {
     #[arg(long, value_name = "F", default_value = "1.0")]
     coalesce_snap: f64,
 
-    /// Per-level candidate-line ceiling for --coalesce-lines (memory guard).
+    /// Per-level candidate-line ceiling for line coalescing (memory guard).
     ///
     /// Chaining holds the level's candidate line geometries in memory at
     /// once (every line is a candidate at every non-canonical level, since
@@ -1152,7 +1175,10 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         .map(|s| parse_accumulate(s))
         .collect::<Result<Vec<_>>>()?;
 
-    // Coalescing flags (Q3; also enforced in core).
+    // Coalescing flags (Q3). Coalescing is ON by default (opt out with
+    // --no-coalesce-lines); with partitioning mode the default is silently
+    // inert (core logs it), but an EXPLICIT --coalesce-lines request is an
+    // error the user should hear about.
     if args.coalesce_lines && mode == Mode::Partitioning {
         anyhow::bail!(
             "--coalesce-lines requires --mode duplicating: partitioning places \
@@ -1160,6 +1186,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
              chain cannot satisfy"
         );
     }
+    let coalesce_lines = !args.no_coalesce_lines;
 
     let options = ConvertOptions {
         mode,
@@ -1185,9 +1212,10 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         read_batch_size: args.read_batch_size,
         cluster: args.cluster,
         accumulate,
-        coalesce_lines: args.coalesce_lines,
+        coalesce_lines,
         coalesce_snap: args.coalesce_snap,
         coalesce_max_level_rows: args.coalesce_max_level_rows,
+        coalesce_junction_angle: args.coalesce_junction_angle,
     };
 
     let report = convert_to_overviews(&args.input, &args.output, &options)
