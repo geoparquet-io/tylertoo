@@ -850,8 +850,129 @@ mode.
 
 ---
 
-## 13. Changelog
+## 13. Line coalescing extension (v0.2.0-draft)
 
+Status: draft addition targeted at spec v0.2.0; implemented by gpq-tiles
+behind the opt-in `--coalesce-lines` flag (2026-07-03). Additive: files
+written with coalescing remain valid v0.1.0 overview files (an extra
+optional column + an optional provenance block that v0.1 readers MUST
+ignore per §3.8); the section is versioned v0.2.0-draft because it
+introduces new normative requirements for files that opt in.
+
+### 13.1 Model
+
+Coalescing applies to **line features only** (LineString rows; points
+and polygons are unaffected, and MultiLineString rows pass through
+unmerged) and to **`duplicating` mode only** (§13.5). It is an OPTIONAL
+extension of this spec; whether a producer enables it by default is an
+implementation choice (gpq-tiles: **on by default** since 2026-07-03
+per maintainer render review, opt-out via `--no-coalesce-lines`).
+
+At each non-canonical level, BEFORE the visibility gate and cell-winner
+thinning run, the generalization engine chains touching compatible line
+segments into single "stroke" LineStrings:
+
+- **Compatibility**: segments chain only within the same class value of
+  the active class-ranking column (when one is active); with no class
+  ranking, all lines are compatible. Null class values are compatible
+  with each other only.
+- **Chaining**: endpoints are matched exactly first, then chain ends
+  within a snap tolerance of `snap_tolerance_gsd_factor × gsd` (two
+  endpoints closer than one ground sample are indistinguishable at the
+  level). Nodes of **degree 2** always continue a chain; junctions
+  (three or more compatible endpoints) terminate chains by default,
+  preserving network topology. An implementation MAY optionally
+  continue the pair(s) of lines that best continue each other within a
+  bounded angular deviation from straight (stroke building; gpq-tiles:
+  `--coalesce-junction-angle`, default `0` = off per maintainer render
+  review 2026-07-03).
+- **Attributes**: the merged row carries the attribute values of its
+  highest-priority member (the same priority order the cell-winner
+  stage uses), plus the member count (§13.2).
+- The visibility gate and thinning then evaluate the **merged chains**,
+  so a chain of individually sub-visibility fragments survives as one
+  visible artery. This ordering is the point of the extension.
+
+The **canonical level is never coalesced** (§2.4 value fidelity: the
+canonical band remains verbatim source rows plus the constant
+`coalesced_count = 1`).
+
+Feature identity across levels is already NOT guaranteed (§2.2), so a
+merged chain at a coarse level needs no correspondence machinery.
+
+### 13.2 `coalesced_count` column (normative when coalescing)
+
+A coalesced file MUST contain a physical column:
+
+- **Name**: `coalesced_count` (recorded in metadata, §13.4).
+- **Type**: Parquet `INT32`. **Nullability**: NOT NULL.
+- **Domain**: `>= 1`. Non-line rows and unmerged line rows carry `1`.
+- At the **canonical level** every value MUST be `1`.
+
+Writers MUST reject source data whose schema already contains a column
+named `coalesced_count` under case-insensitive comparison (same
+rationale as the `level` column rule, §4.1).
+
+### 13.3 Snap tolerance
+
+The snap tolerance is expressed in GSD multiples so it scales with each
+level's resolution. `1.0` (one ground sample) is the natural default;
+`0` restricts chaining to exact endpoint matches. Implementations MAY
+realize the snap by grid quantization of endpoints (deterministic,
+O(n)); the effective join distance then lies between 0 and √2 × the
+tolerance.
+
+### 13.4 Metadata
+
+Coalescing is recorded in the `generalization` provenance block (§3.5):
+
+```
+Generalization += {
+  "coalescing": {                          // OPTIONAL
+    "enabled":                   true,
+    "snap_tolerance_gsd_factor": number,
+    "coalesced_count_column":    "coalesced_count"
+  }
+}
+```
+
+When `coalescing.enabled` is true a validator MUST enforce §13.2
+structurally: the named column exists as INT32 NOT NULL, all values are
+`>= 1` (checkable via row-group statistics), and the canonical band's
+values are exactly `1`.
+
+### 13.5 Partitioning mode is excluded (normative)
+
+Coalescing MUST NOT be applied to `partitioning`-mode files. Rationale:
+partitioning requires every source feature to appear **exactly once
+with its geometry verbatim** (§2.3). A merged chain is a new geometry
+replacing several source rows — it cannot satisfy geometry-verbatim,
+and removing the merged members from the finer bands they belong to
+would break the prefix-read contract (a prefix would no longer be a
+complete coarse rendering plus refinements). No sound construction was
+found; producers who need coalescing use `duplicating` mode.
+
+A tool whose coalescing option is enabled **by default** MUST treat a
+partitioning conversion as non-coalesced (no `coalesced_count` column,
+no `coalescing` provenance) rather than fail; it SHOULD reject an
+*explicit* request to coalesce a partitioning conversion.
+
+---
+
+## 14. Changelog
+
+- **v0.2.0-draft (2026-07-03, later still)**: §13 revised per
+  maintainer review — junction continuation (angle-bounded stroke
+  building at degree >= 3 nodes) added to the chaining model as an
+  OPTIONAL mechanism (gpq-tiles default OFF: the Portland sweep found
+  strict degree-2 chaining renders better); the gpq-tiles engine
+  coalescing default flipped to ON (opt-out); §13.5 reworded for
+  default-on tools (inert in partitioning, reject only explicit
+  requests).
+- **v0.2.0-draft (2026-07-03, later)**: added §13 line coalescing
+  extension (`coalesced_count` column, degree-2 endpoint chaining
+  model, `generalization.coalescing` metadata,
+  duplicating-mode-only rule).
 - **v0.2.0-draft (2026-07-03)**: added §12 point clustering extension
   (`point_count` column, numeric attribute accumulation,
   `generalization.clustering` metadata, duplicating-mode-only rule);

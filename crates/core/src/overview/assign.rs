@@ -651,7 +651,9 @@ fn priority_order(prio: &[Priority], a: usize, b: usize) -> Ordering {
 /// super-cells, fair-allocate the budget across them ([`water_fill`]) and keep
 /// each cell's top-priority members. Deterministic (cells iterated in sorted
 /// key order; ties broken by [`Priority`]'s index tiebreak).
-fn select_budget_survivors(
+/// `pub(super)` so the coalescing stage (`super::coalesce`) can apply the
+/// same per-level budget + spatial fairness to merged chains.
+pub(super) fn select_budget_survivors(
     cands: &[usize],
     available: usize,
     features: &[AssignFeature],

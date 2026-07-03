@@ -11,6 +11,7 @@
 pub mod assign;
 pub mod check;
 pub mod cluster;
+pub mod coalesce;
 pub mod convert;
 pub mod export;
 pub mod level;

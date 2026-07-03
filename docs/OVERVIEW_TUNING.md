@@ -335,6 +335,115 @@ exists as INT64 NOT NULL and that canonical-level values are all 1.
 
 ---
 
+## Line coalescing: `--no-coalesce-lines`, `--coalesce-junction-angle`, `--coalesce-snap`, `--coalesce-max-level-rows`
+
+At coarse levels a line network (roads, rivers) can degrade into scattered
+dashes: a segment whose bbox diagonal is below the visibility gate
+(`--line-visibility × gsd`) is dropped outright, and cell-winner thinning
+keeps disconnected fragments of what remains. Selection is smart;
+*continuity* is destroyed.
+
+Line coalescing is therefore **ON by default** (maintainer render review
+2026-07-03 — like `--line-thinning 1.0` and the clustered point grid,
+defaults should look right; pass **`--no-coalesce-lines`** to opt out). It
+chains touching compatible segments into single "stroke" LineStrings at
+each non-canonical duplicating level, **before** the gate and thinning
+run:
+
+- A chain of individually sub-visibility segments survives as **one long
+  visible artery** — the gate evaluates the chain's extent, not each
+  fragment's. This ordering is the entire payoff.
+- Chains never merge **across class values** (when a class ranking is
+  active — explicit `--class-rank` or auto-detected Overture
+  `class`/`road_class`). With no class ranking, all lines are compatible.
+- **Junctions** (3+ compatible endpoints meeting) terminate chains by
+  default, preserving network topology. `--coalesce-junction-angle` (see
+  below) can optionally continue the best-aligned pair through them.
+- The merged feature keeps the **attributes of its highest-priority
+  member** (same class-rank → size → hash order as the cell-winner stage)
+  and the output gains a **`coalesced_count`** INT32 NOT NULL column
+  (source segments merged per row; 1 for unmerged rows and everywhere at
+  the canonical level, which is never coalesced).
+- Points and polygons are untouched. MultiLineString rows pass through
+  unmerged.
+
+```bash
+# Coalescing is on by default (auto class ranking groups by road class):
+gpq-tiles overview roads.parquet roads_overview.parquet \
+  --min-zoom 0 --max-zoom 14
+
+# Opt out (pre-Q3 behavior, no coalesced_count column):
+gpq-tiles overview roads.parquet roads_overview.parquet \
+  --min-zoom 0 --max-zoom 14 --no-coalesce-lines
+```
+
+### `--coalesce-junction-angle` (default 0 = off, degrees)
+
+By default chains stop at junctions (strict degree-2 chaining) — the
+Portland sweep (`corpus/data/bench/q3/portland-roads-junction{00,30}.pmtiles`,
+maintainer review 2026-07-03) found this renders better than junction
+continuation, which over-merges. Set an angle to opt in: at each junction
+the best-continuing pair of lines merges when its deviation from a
+straight continuation is at most this angle, best pair first (a 4-way
+crossing continues **both** through-streets). BIGGER = chains bend
+further through junctions (fewer, longer strokes; z0–z1 gain giant
+arterial strokes on Portland at 30°) at the cost of merging through
+genuine turns and smearing attributes across crossings.
+
+### `--coalesce-snap` (default 1.0, GSD multiples)
+
+Exactly-touching endpoints always chain (Overture/OSM segments share exact
+node coordinates). The snap pass additionally joins chain ends within
+`factor × gsd` of each other — two endpoints closer than one ground sample
+are indistinguishable at that level. BIGGER bridges larger digitization
+gaps but risks fusing the ends of nearby parallel lines; `0` disables the
+snap pass (exact matches only).
+
+### `--coalesce-max-level-rows` (default 2,000,000): memory guard
+
+Chaining needs a level's candidate line geometries in memory at once, and
+the candidate set at every non-canonical level is **all** lines (dropped
+fragments must be reclaimable, so no winner-table pre-filter applies).
+Datasets with more lines than this ceiling skip coalescing with a warning
+— the file still carries the `coalesced_count` column (all 1) and the
+provenance block, so the schema is stable. Levels that large are
+near-canonical anyway, where segments are individually visible and
+coalescing matters least. This is the streaming pipeline's one deliberate
+`O(lines)` residual allocation.
+
+### Interactions
+
+- **`--line-visibility` / `--line-thinning`** now act on *chains*: the
+  gate tests the merged extent, and one **chain** (not one segment)
+  survives per thinning cell. Expect coarse levels to show **fewer rows
+  but much more retained line length** than a non-coalesced run.
+- **Class ranking** does double duty: it both prioritizes which chain wins
+  a cell and defines the compatibility groups. `--no-auto-rank` (or a
+  numeric `--sort-key`) makes all lines compatible — fine for
+  single-class datasets (rivers), usually wrong for mixed road networks.
+- **Density budget (Q2)** applies to **chains**: after gate + thinning,
+  each level keeps at most `num_lines / drop_rate^(finest − level)` chains
+  (same geometric ladder, floor, and spatial-fairness gamma as the
+  point/polygon budget), cutting the lowest-priority chains first. Without
+  this the reclaimed fragments would re-inflate exactly the mid-zoom
+  counts the budget was calibrated to cap. `--no-density-drop` disables
+  the chain budget too. Points and polygons keep the row-level budget as
+  usual.
+- **Partitioning mode: inert.** Partitioning places each feature exactly
+  once with geometry verbatim; a merged chain is a new geometry replacing
+  several source rows, which that contract cannot represent. Since
+  coalescing is on by default, partitioning conversions simply proceed
+  without it (no `coalesced_count` column, no provenance, info log); an
+  explicit `--coalesce-lines` with `--mode partitioning` is rejected.
+
+Coalescing is recorded in the footer `geo:overviews` →
+`generalization.coalescing` provenance (`enabled`,
+`snap_tolerance_gsd_factor`, `coalesced_count_column`); `gpq-tiles
+validate` checks that the column exists as INT32 NOT NULL, all values are
+>= 1, and canonical-level values are all 1.
+
+---
+
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
 These do not change *which* features or vertices survive — geometry and

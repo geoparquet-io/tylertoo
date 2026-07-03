@@ -150,6 +150,34 @@ pub struct Generalization {
     /// before this field existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clustering: Option<ClusteringProvenance>,
+    /// OPTIONAL line-coalescing provenance (§3.5, additive; spec §13 draft).
+    ///
+    /// Records that line network coalescing was enabled (Q3): the endpoint
+    /// snap tolerance (in GSD multiples) and the name of the
+    /// merged-segment-count column (`coalesced_count`). Absent when
+    /// coalescing was off (`--coalesce-lines` not passed) or on files
+    /// written before this field existed; readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalescing: Option<CoalescingProvenance>,
+}
+
+/// How line coalescing was applied for a conversion (Q3, spec §13 draft).
+///
+/// Additive, OPTIONAL provenance embedded in [`Generalization`] (§3.5).
+/// When present with `enabled: true`, the file carries the named
+/// `coalesced_count` column (INT32 NOT NULL, all 1 at the canonical level);
+/// the validator checks those structural facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoalescingProvenance {
+    /// Whether coalescing was applied. Always `true` when the block is
+    /// emitted; present for forward compatibility.
+    pub enabled: bool,
+    /// Endpoint snap tolerance in GSD multiples (per level, the snap
+    /// distance is `snap_tolerance_gsd_factor × gsd`).
+    pub snap_tolerance_gsd_factor: f64,
+    /// Name of the merged-segment-count column (this implementation:
+    /// `coalesced_count`).
+    pub coalesced_count_column: String,
 }
 
 /// How point clustering was applied for a conversion (Q4, spec §12 draft).
@@ -829,6 +857,7 @@ mod tests {
             }),
             density_drop: None,
             clustering: None,
+            coalescing: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
@@ -856,6 +885,7 @@ mod tests {
                 supercell_gsd_factor: 128.0,
             }),
             clustering: None,
+            coalescing: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
@@ -879,6 +909,41 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_provenance_roundtrip_and_absent_tolerated() {
+        // A coalescing block survives JSON round-trip; absent key → None.
+        let mut meta = duplicating_example();
+        meta.generalization = Some(Generalization {
+            engine: "gpq-tiles test".to_string(),
+            gsd_base: None,
+            levels: vec![],
+            ranking: None,
+            density_drop: None,
+            clustering: None,
+            coalescing: Some(CoalescingProvenance {
+                enabled: true,
+                snap_tolerance_gsd_factor: 1.0,
+                coalesced_count_column: "coalesced_count".to_string(),
+            }),
+        });
+        let json = meta.to_json().unwrap();
+        let parsed = OverviewsMeta::from_json(&json).unwrap();
+        assert_eq!(meta, parsed);
+        let c = parsed.generalization.unwrap().coalescing.unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.snap_tolerance_gsd_factor, 1.0);
+        assert_eq!(c.coalesced_count_column, "coalesced_count");
+
+        // Absent key → None (additive-field tolerance).
+        let src = r#"{
+            "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
+            "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
+            "generalization": { "engine": "gpq-tiles 0.1.0", "levels": [] }
+        }"#;
+        let m = OverviewsMeta::from_json(src).unwrap();
+        assert!(m.generalization.unwrap().coalescing.is_none());
+    }
+
+    #[test]
     fn clustering_provenance_roundtrip_and_absent_tolerated() {
         // A clustering block survives JSON round-trip; absent key → None.
         let mut meta = duplicating_example();
@@ -896,6 +961,7 @@ mod tests {
                     op: "mean".to_string(),
                 }],
             }),
+            coalescing: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();

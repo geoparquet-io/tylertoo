@@ -63,13 +63,16 @@ use crate::batch_processor::extract_geometries_from_array;
 
 use super::assign::{apply_density_budget, assign_levels, AssignFeature, FeatureKind};
 use super::cluster::{build_cluster_tables, ClusterEntry, ClusterTables};
+use super::coalesce::CoalesceInput;
 use super::convert::{
-    append_point_count_field, apply_cluster_columns, build_generalization, build_level_batch,
-    build_source_schema, class_ranking_provenance, count_vertices, detect_crs, extract_class_ranks,
-    extract_sort_keys, feature_kind, fill_level_bytes, find_geometry_column, geometry_bbox,
-    mixed_geometry_field, overture_road_ranking, validate_cluster_schema, ClassRanking,
-    ConvertError, ConvertOptions, ConvertReport, LevelReport, KNOWN_ROAD_CLASSES,
-    ROAD_VOCAB_MIN_DISTINCT,
+    append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
+    apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
+    build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
+    count_vertices, detect_crs, extract_class_ranks, extract_sort_keys, feature_kind,
+    fill_level_bytes, find_geometry_column, geometry_bbox, mixed_geometry_field,
+    overture_road_ranking, validate_cluster_schema, validate_coalesce_schema, ClassRanking,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
+    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::simplify::{
@@ -121,11 +124,17 @@ pub(super) fn convert_streaming(
 
     // Clustering schema checks + accumulate column resolution (Q4).
     let acc_cols = validate_cluster_schema(&input_schema, options)?;
+    // Coalescing schema check (Q3).
+    validate_coalesce_schema(&input_schema, options)?;
 
     // --- Pass 1: stream → AssignFeatures + resolved ranking. -----------------
     let t_pass1 = Instant::now();
-    let (mut features, ranking_provenance, acc_values) =
-        run_pass1(input_path, &input_schema, geom_idx, options, &acc_cols)?;
+    let Pass1Output {
+        mut features,
+        provenance: ranking_provenance,
+        acc_values,
+        coalesce: coalesce_scratch,
+    } = run_pass1(input_path, &input_schema, geom_idx, options, &acc_cols)?;
     let num_features = features.len();
     log::debug!(
         "[profile] pass1 stream+scan: {:.2}s",
@@ -178,6 +187,19 @@ pub(super) fn convert_streaming(
         None
     };
     drop(acc_values);
+
+    // Coalescing (Q3): keep the per-row kinds (1 byte/feature — line rows
+    // bypass the winner table at coalesced levels) and the pass-1 line
+    // scratch; apply the memory guard.
+    let coalesce_on = coalesce_effective(
+        options,
+        coalesce_scratch.as_ref().map_or(0, |s| s.rows.len()),
+    );
+    let kinds: Option<Vec<FeatureKind>> = options
+        .coalesce_lines
+        .then(|| features.iter().map(|f| f.kind).collect());
+    let coalesce_scratch = coalesce_scratch.filter(|_| coalesce_on);
+
     features.clear();
     features.shrink_to_fit(); // free the pass-1 O(N)·48B scratch before pass 2
 
@@ -186,12 +208,21 @@ pub(super) fn convert_streaming(
 
     // Per-level winner counts (exact row counts in partitioning mode; in
     // duplicating mode exact up to simplification drops — used as the writer's
-    // row-group sizing hint and for empty-level omission).
+    // row-group sizing hint and for empty-level omission). With coalescing,
+    // line rows leave the winner table at non-canonical levels: their count
+    // is the level's surviving chain count instead (computed by running the
+    // chain stage per level — cheap relative to decode; the tables are
+    // rebuilt, with simplification, per level in pass 2 rather than held for
+    // every level at once).
     let mut hist = vec![0usize; num_levels];
-    for &ml in &min_levels {
+    for (pos, &ml) in min_levels.iter().enumerate() {
+        if coalesce_scratch.is_some() && kinds.as_ref().is_some_and(|k| k[pos] == FeatureKind::Line)
+        {
+            continue; // counted via the per-level chain stage below
+        }
         hist[(ml as usize).min(finest)] += 1;
     }
-    let counts: Vec<usize> = match options.mode {
+    let mut counts: Vec<usize> = match options.mode {
         Mode::Duplicating => hist
             .iter()
             .scan(0usize, |acc, &c| {
@@ -201,6 +232,20 @@ pub(super) fn convert_streaming(
             .collect(),
         Mode::Partitioning => hist,
     };
+    if let Some(scratch) = &coalesce_scratch {
+        // Duplicating only (partitioning + coalescing is rejected upstream).
+        let inputs = scratch.inputs();
+        #[allow(clippy::needless_range_loop)]
+        for level in 0..num_levels {
+            if level == finest {
+                counts[level] += scratch.rows.len(); // canonical: verbatim
+            } else {
+                counts[level] +=
+                    coalesce_level_chains(&inputs, level, finest, level_gsds[level], crs, options)
+                        .len();
+            }
+        }
+    }
 
     let emitted: Vec<EmitLevel> = level_specs
         .iter()
@@ -221,11 +266,17 @@ pub(super) fn convert_streaming(
     let geom_name = geom_field.name().clone();
     let geom_out_field = mixed_geometry_field(&geom_name);
     let source_schema = build_source_schema(&input_schema, geom_idx, geom_out_field);
-    // Writer schema: base + point_count when clustering (Q4).
-    let out_schema = if options.cluster {
+    // Writer schema: base + point_count when clustering (Q4) + coalesced_count
+    // when coalescing (Q3).
+    let cluster_schema = if options.cluster {
         append_point_count_field(&source_schema)
     } else {
         source_schema.clone()
+    };
+    let out_schema = if options.coalesce_lines {
+        append_coalesced_count_field(&cluster_schema)
+    } else {
+        cluster_schema.clone()
     };
 
     let writer_levels: Vec<LevelSpec> = emitted
@@ -257,8 +308,25 @@ pub(super) fn convert_streaming(
         // Verbatim path: partitioning at every level (§2.3), and duplicating at
         // the canonical (finest) level (§2.4).
         let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
+        // Coalescing (Q3): rebuild this level's chain table (chains + gate +
+        // thin + simplify) from the pass-1 line scratch. Canonical level is
+        // never coalesced (§2.4). Memory: one level's surviving chains.
+        let coalesce_table: Option<CoalesceTable> = coalesce_scratch
+            .as_ref()
+            .filter(|_| !verbatim)
+            .map(|scratch| {
+                build_level_coalesce_table(
+                    &scratch.inputs(),
+                    e.orig as usize,
+                    finest,
+                    e.gsd,
+                    crs,
+                    options,
+                )
+            });
         let ctx = LevelStreamCtx {
             source_schema: &source_schema,
+            cluster_schema: &cluster_schema,
             out_schema: &out_schema,
             non_geom_cols: &non_geom_cols,
             geom_idx,
@@ -276,6 +344,9 @@ pub(super) fn convert_streaming(
                 .filter(|_| e.orig as usize != finest)
                 .map(|t| &t[e.orig as usize]),
             acc_cols: &acc_cols,
+            coalesce_enabled: options.coalesce_lines,
+            kinds: kinds.as_deref(),
+            coalesce_table: coalesce_table.as_ref(),
         };
         let (rows, vertices) = write_level_streaming(
             &mut writer,
@@ -336,6 +407,10 @@ struct RoadCandidate {
     found: HashSet<&'static str>,
     /// Per-row class-rank keys, extracted as we stream.
     keys: Vec<Option<f64>>,
+    /// Per-row interned class values (coalescing groups, Q3). Populated
+    /// only when coalescing is enabled.
+    groups: Vec<u32>,
+    interner: GroupInterner,
 }
 
 /// The ranking tier resolved from the options + schema *before* reading data
@@ -405,6 +480,8 @@ fn build_rank_plan(schema: &Schema, options: &ConvertOptions) -> Result<RankPlan
                 ranking: overture_road_ranking(f.name().clone()),
                 found: HashSet::new(),
                 keys: Vec::new(),
+                groups: Vec::new(),
+                interner: GroupInterner::default(),
             })
             .collect();
         // Candidate Overture places confidence column (point-majority gate is
@@ -458,9 +535,52 @@ fn scan_road_vocab(col: &dyn Array, found: &mut HashSet<&'static str>) {
     }
 }
 
-/// Result of [`run_pass1`]: the per-feature [`AssignFeature`]s, the resolved
-/// ranking provenance, and the per-accumulate-spec source values.
-type Pass1Output = (Vec<AssignFeature>, RankingProvenance, Vec<Vec<Option<f64>>>);
+/// Line geometries (+ compatibility groups) collected during pass 1 for the
+/// coalescing stage (Q3). This is the streaming pipeline's one deliberate
+/// residual `O(lines)` allocation: chaining needs a level's candidate line
+/// geometries together, and the candidate set at every non-canonical
+/// duplicating level is ALL lines (chains of sub-visibility fragments must
+/// be reclaimable, so no winner-table pre-filter applies). Bounded by
+/// [`ConvertOptions::coalesce_max_level_rows`]; beyond it coalescing is
+/// skipped and this scratch is never built.
+struct CoalesceScratch {
+    /// Source row index per collected line, ascending input order.
+    rows: Vec<usize>,
+    /// The lines' decoded geometries, parallel to `rows`.
+    geoms: Vec<Geometry<f64>>,
+    /// Sort key per line (Q1 ranking), parallel to `rows`; filled after the
+    /// ranking tier resolves.
+    sort_keys: Vec<Option<f64>>,
+    /// Interned class group per line, parallel to `rows`; `None` = no class
+    /// ranking active (all lines compatible).
+    groups: Option<Vec<u32>>,
+}
+
+impl CoalesceScratch {
+    /// The per-level chaining inputs (borrowing the collected geometries).
+    fn inputs(&self) -> Vec<CoalesceInput<'_>> {
+        (0..self.rows.len())
+            .map(|i| CoalesceInput {
+                index: self.rows[i],
+                geom: &self.geoms[i],
+                sort_key: self.sort_keys[i],
+                group: self.groups.as_ref().map_or(0, |g| g[i]),
+            })
+            .collect()
+    }
+}
+
+/// Result of [`run_pass1`].
+struct Pass1Output {
+    /// Per-feature assignment inputs (bbox, kind, resolved sort key).
+    features: Vec<AssignFeature>,
+    /// Resolved ranking provenance (§3.5).
+    provenance: RankingProvenance,
+    /// Per-accumulate-spec source values (Q4), parallel to `acc_cols`.
+    acc_values: Vec<Vec<Option<f64>>>,
+    /// Line geometries + groups for coalescing (Q3); `None` unless enabled.
+    coalesce: Option<CoalesceScratch>,
+}
 
 /// Pass 1: stream the input (geometry + ranking/accumulate columns only) and
 /// produce the per-feature [`AssignFeature`]s (with resolved sort keys), the
@@ -509,6 +629,13 @@ fn run_pass1(
     let mut confidence_keys: Vec<Option<f64>> = Vec::new();
     let mut acc_values: Vec<Vec<Option<f64>>> = vec![Vec::new(); acc_cols.len()];
     let mut geoms_buf: Vec<Geometry<f64>> = Vec::new();
+    // Coalescing (Q3): line rows + geometries, and — for an explicit class
+    // ranking — the interned per-row class groups.
+    let collect_lines = options.coalesce_lines;
+    let mut line_rows: Vec<usize> = Vec::new();
+    let mut line_geoms: Vec<Geometry<f64>> = Vec::new();
+    let mut explicit_groups: Vec<u32> = Vec::new();
+    let mut explicit_interner = GroupInterner::default();
 
     for batch in reader {
         let batch = batch?;
@@ -526,6 +653,10 @@ fn run_pass1(
             if matches!(kind, FeatureKind::Point) {
                 point_count += 1;
             }
+            if collect_lines && matches!(kind, FeatureKind::Line) {
+                line_rows.push(base + i);
+                line_geoms.push(g.clone());
+            }
             features.push(AssignFeature {
                 index: base + i,
                 bbox: geometry_bbox(g),
@@ -539,10 +670,11 @@ fn run_pass1(
                 explicit_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
             }
             RankPlan::ExplicitClass { idx, ranking } => {
-                explicit_keys.extend(extract_class_ranks(
-                    batch.column(proj(*idx)).as_ref(),
-                    ranking,
-                )?);
+                let col = batch.column(proj(*idx));
+                explicit_keys.extend(extract_class_ranks(col.as_ref(), ranking)?);
+                if collect_lines {
+                    explicit_interner.extend(col.as_ref(), &mut explicit_groups);
+                }
             }
             RankPlan::Auto { roads, confidence } => {
                 for cand in roads.iter_mut() {
@@ -550,6 +682,9 @@ fn run_pass1(
                     scan_road_vocab(col.as_ref(), &mut cand.found);
                     cand.keys
                         .extend(extract_class_ranks(col.as_ref(), &cand.ranking)?);
+                    if collect_lines {
+                        cand.interner.extend(col.as_ref(), &mut cand.groups);
+                    }
                 }
                 if let Some((idx, _)) = confidence {
                     confidence_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
@@ -578,8 +713,15 @@ fn run_pass1(
         }
     };
 
-    // Resolve the tier (same order + logging as the in-memory path).
-    let (keys, provenance): (Option<Vec<Option<f64>>>, RankingProvenance) = match plan {
+    // Resolve the tier (same order + logging as the in-memory path). The
+    // third element is the all-row class-group vector for coalescing, present
+    // only for the class-based tiers (matches `coalesce_group_column`).
+    type Resolved = (
+        Option<Vec<Option<f64>>>,
+        RankingProvenance,
+        Option<Vec<u32>>,
+    );
+    let (keys, provenance, all_groups): Resolved = match plan {
         RankPlan::ExplicitSort { name, .. } => {
             log::info!("overview ranking: explicit numeric sort-key column {name:?}");
             (
@@ -590,6 +732,7 @@ fn run_pass1(
                     ranks: None,
                     unknown_rank: None,
                 },
+                None,
             )
         }
         RankPlan::ExplicitClass { ranking, .. } => {
@@ -602,6 +745,7 @@ fn run_pass1(
             (
                 Some(explicit_keys),
                 class_ranking_provenance("class-ranking", &ranking),
+                collect_lines.then_some(explicit_groups),
             )
         }
         RankPlan::Auto { roads, confidence } => {
@@ -615,7 +759,7 @@ fn run_pass1(
                     cand.ranking.column
                 );
                 let prov = class_ranking_provenance("auto-overture-roads", &cand.ranking);
-                (Some(cand.keys), prov)
+                (Some(cand.keys), prov, collect_lines.then_some(cand.groups))
             } else if let Some((_, col_name)) = confidence.filter(|_| n > 0 && point_count * 2 >= n)
             {
                 log::info!(
@@ -630,12 +774,13 @@ fn run_pass1(
                         ranks: None,
                         unknown_rank: None,
                     },
+                    None,
                 )
             } else {
-                (None, size_fallback())
+                (None, size_fallback(), None)
             }
         }
-        RankPlan::SizeFallback => (None, size_fallback()),
+        RankPlan::SizeFallback => (None, size_fallback(), None),
     };
 
     if let Some(keys) = keys {
@@ -645,7 +790,20 @@ fn run_pass1(
         }
     }
 
-    Ok((features, provenance, acc_values))
+    // Coalescing scratch (Q3): line sort keys + per-line groups.
+    let coalesce = collect_lines.then(|| CoalesceScratch {
+        sort_keys: line_rows.iter().map(|&r| features[r].sort_key).collect(),
+        groups: all_groups.map(|g| line_rows.iter().map(|&r| g[r]).collect()),
+        rows: line_rows,
+        geoms: line_geoms,
+    });
+
+    Ok(Pass1Output {
+        features,
+        provenance,
+        acc_values,
+        coalesce,
+    })
 }
 
 // ============================================================================
@@ -674,8 +832,11 @@ impl Pass2Timers {
 /// Immutable context for one level's pass-2 stream.
 struct LevelStreamCtx<'a> {
     source_schema: &'a Schema,
-    /// Output schema: `source_schema` + trailing `point_count` when
-    /// clustering, otherwise identical.
+    /// `source_schema` + trailing `point_count` when clustering, otherwise
+    /// identical (the schema [`apply_cluster_columns`] produces).
+    cluster_schema: &'a Schema,
+    /// Final writer schema: `cluster_schema` + trailing `coalesced_count`
+    /// when coalescing, otherwise identical.
     out_schema: &'a Schema,
     non_geom_cols: &'a [usize],
     geom_idx: usize,
@@ -696,6 +857,15 @@ struct LevelStreamCtx<'a> {
     cluster_table: Option<&'a std::collections::HashMap<usize, ClusterEntry>>,
     /// Schema indices of the accumulate columns.
     acc_cols: &'a [usize],
+    /// Coalescing (Q3): append `coalesced_count` at every level.
+    coalesce_enabled: bool,
+    /// Per-row geometry kinds (line rows bypass the winner table at
+    /// coalesced levels); `Some` iff coalescing is enabled.
+    kinds: Option<&'a [FeatureKind]>,
+    /// This level's chain table (rep row → merged simplified geometry +
+    /// member count); `None` at verbatim levels or when coalescing is
+    /// off/guard-skipped.
+    coalesce_table: Option<&'a CoalesceTable>,
 }
 
 /// Stream one level from the input file into the writer. Returns
@@ -794,7 +964,15 @@ fn process_level_batch(
     let t_decode = Instant::now();
     let selected: Vec<usize> = (0..n)
         .filter(|&i| {
-            let ml = ctx.min_levels[row_offset + i];
+            let g = row_offset + i;
+            // Coalesced level: line rows bypass the winner table entirely —
+            // only surviving chain reps are emitted (with merged geometry).
+            if let Some(table) = ctx.coalesce_table {
+                if ctx.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line {
+                    return table.contains_key(&g);
+                }
+            }
+            let ml = ctx.min_levels[g];
             if ctx.duplicating {
                 ml <= ctx.orig_level
             } else {
@@ -834,9 +1012,20 @@ fn process_level_batch(
         // preserves within-batch order, so the output stays byte-identical to
         // the serial path; the writer (our single caller) remains
         // single-threaded, and memory stays bounded by one read batch.
+        // Chain reps substitute their merged, already-simplified geometry
+        // (simplified once in `build_level_coalesce_table`, identically to
+        // the in-memory path).
         let simplified: Vec<Simplified> = geoms
             .par_iter()
-            .map(|g| simplify_for_level(g, ctx.gsd_m, ctx.crs, ctx.simplify))
+            .zip(&selected)
+            .map(|(g, &i)| {
+                if let Some((merged, _)) = ctx.coalesce_table.and_then(|t| t.get(&(row_offset + i)))
+                {
+                    Simplified::Keep(merged.clone())
+                } else {
+                    simplify_for_level(g, ctx.gsd_m, ctx.crs, ctx.simplify)
+                }
+            })
             .collect();
         let mut out = Vec::with_capacity(selected.len());
         for (s, &i) in simplified.into_iter().zip(&selected) {
@@ -866,16 +1055,23 @@ fn process_level_batch(
         &kept_idx,
         &kept_geoms,
     )?;
-    if ctx.cluster_enabled {
-        // Cluster-table keys are global row indices; kept_idx is batch-local.
+    if ctx.cluster_enabled || ctx.coalesce_enabled {
+        // Cluster/coalesce-table keys are global row indices; kept_idx is
+        // batch-local.
         let globals: Vec<usize> = kept_idx.iter().map(|&i| row_offset + i).collect();
-        out_batch = apply_cluster_columns(
-            out_batch,
-            ctx.out_schema,
-            &globals,
-            ctx.cluster_table,
-            ctx.acc_cols,
-        )?;
+        if ctx.cluster_enabled {
+            out_batch = apply_cluster_columns(
+                out_batch,
+                ctx.cluster_schema,
+                &globals,
+                ctx.cluster_table,
+                ctx.acc_cols,
+            )?;
+        }
+        if ctx.coalesce_enabled {
+            out_batch =
+                apply_coalesced_count(out_batch, ctx.out_schema, &globals, ctx.coalesce_table)?;
+        }
     }
     Pass2Timers::add(&timers.build, t_build);
     Ok(Some((out_batch, verts)))
