@@ -1,8 +1,10 @@
 # GeoParquet Overviews Specification
 
-Version: `0.1.0`
-Status: Draft — §11 design decisions APPROVED by maintainer
-2026-07-02; implementation may proceed against this document.
+Version: `0.2.0`
+Status: Draft — v0.1.0 design decisions (§11) APPROVED by maintainer
+2026-07-02; the point-clustering (§12) and line-coalescing (§13)
+extensions consolidated into this version 2026-07-03. Implementation
+may proceed against this document.
 License intent: CC BY 4.0
 Standardization target: candidate official GeoParquet extension via
 the opengeospatial/geoparquet process (the `covering` path into 1.1)
@@ -21,10 +23,20 @@ footer key until then. The layout concepts of `partitioning` mode
 (§2.3) are shared with the third-party COGP draft (Kanahiro); COGP
 interop is an optional courtesy (§3.1), not a design constraint.
 
-The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY, and
-OPTIONAL are to be interpreted as in RFC 2119.
+Two opt-in extensions are part of this version: point clustering
+(§12) and line coalescing (§13). Both are additive: a file that does
+not opt in is unaffected, and a file that does opt in remains a valid
+baseline overview file for readers that ignore the extension columns
+and metadata (§3.8).
 
-Open questions raised inline are collected in §11.
+The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY, and
+OPTIONAL are to be interpreted as in RFC 2119. Sections and blocks
+labeled **(informative)** carry no conformance requirements; RFC 2119
+key words appearing inside informative text describe requirements
+stated normatively elsewhere.
+
+The v0.1.0 open questions were all resolved by maintainer review;
+the resolution record is kept in §11 (informative).
 
 ---
 
@@ -103,7 +115,7 @@ Constraints:
   and MAY contain simplified or collapsed geometries.
 - Feature identity across levels is NOT required to be stable, and readers
   MUST NOT assume a feature at level `k` corresponds 1:1 to a feature at
-  level `k+1`. (Cross-level joins are a non-goal; see §10.)
+  level `k+1`. (Cross-level joins are a non-goal; see §8.)
 
 Features are duplicated across levels in this mode; it has no
 counterpart in the third-party COGP draft (which requires each feature
@@ -141,12 +153,25 @@ no reprojection, no coordinate rounding beyond what the source already
 contained). Physical encoding (compression, dictionary, page layout) MAY
 differ.
 
-> OPEN QUESTION Q1: Do we require **row-order** preservation within the
-> canonical level (i.e. canonical rows in source order), or only set
-> equality? Hilbert sorting within the level (§4.3) reorders rows, so
-> strict source-order preservation conflicts with the spatial-sort SHOULD.
-> Recommendation: require **set/value** equality only, NOT row order, and
-> state that explicitly. See §11.
+Canonical fidelity is **set/value equality only**: row order within
+the canonical level is NOT required to match source order (the
+intra-level spatial sort, §4.3, reorders rows). Readers MUST NOT rely
+on canonical row order. (Resolved Q1, §11.)
+
+### 2.5 Mode × mechanism applicability (informative)
+
+The generalization mechanisms defined or referenced by this spec do
+not all apply in both modes. Normative rules live in the referenced
+sections; this table is the one-place summary:
+
+| Mechanism | `duplicating` | `partitioning` |
+|---|---|---|
+| Feature thinning / visibility gating (§1.2) | yes (rows dropped per level) | yes (governs *assignment* to a level; nothing is dropped, §2.3) |
+| Ranking (which feature wins a cell / is assigned coarser) | yes | yes |
+| Density budget (informative provenance, §3.5) | yes | yes |
+| Geometry simplification / type collapse (§7.5) | yes (non-canonical levels only, §2.4) | no — geometry is verbatim (§2.3) |
+| Point clustering (§12) | yes (opt-in) | no — MUST be rejected (§12.5) |
+| Line coalescing (§13) | yes (opt-in) | no — inert or rejected per §13.5 |
 
 ---
 
@@ -187,11 +212,11 @@ but is never wrong; writers SHOULD nonetheless omit the `cogp` key in
 `duplicating` mode to avoid advertising semantics COGP does not
 define.
 
-> OPEN QUESTION Q2 (revised): Is `geo:overviews` the right incubation
-> key name, and should the MAY-emit `cogp` compatibility key exist at
-> all? Recommendation: `geo:overviews`; emit `cogp` only behind an
-> explicit writer flag, default off. To be settled with the GeoParquet
-> spec maintainers directly. See §11.
+The `cogp` key MUST only be emitted behind an explicit writer option,
+default off. The `geo:overviews` key name may still be refined with
+the GeoParquet spec maintainers; implementations MUST therefore keep
+it a single named constant so a rename is a one-line change.
+(Resolved Q2, §11.)
 
 ### 3.2 JSON schema
 
@@ -201,7 +226,8 @@ define.
   "levels":          [Level],  // REQUIRED, non-empty, coarse→fine
   "mode":            string,   // OPTIONAL: "duplicating" | "partitioning"
   "canonical_level": integer | null,  // OPTIONAL (see §3.4)
-  "generalization":  Provenance        // OPTIONAL, informative (§3.5)
+  "generalization":  Provenance        // OPTIONAL, informative (§3.5;
+                                       // two exceptions, §12.4/§13.4)
 }
 
 Level := {
@@ -241,33 +267,78 @@ COGP-compatible subset used by the optional `cogp` key, §3.1.)
 - `canonical_level`:
   - In `duplicating` mode it MUST be present and MUST equal
     `len(levels) - 1` (the finest level). A reader/analyst uses it to
-    build the canonical predicate (§5.2, §6.2).
+    build the canonical predicate (§5.3, §6.2).
   - In `partitioning` mode it MUST be `null` (or absent), meaning
     "the whole table is canonical; no level filter needed."
 
-### 3.5 `generalization` provenance (informative)
+### 3.5 `generalization` provenance (informative, two exceptions)
 
 An OPTIONAL object recording how each level was generalized, for
-reproducibility and debugging. Informative only; readers MUST NOT rely on
-it for correctness.
+reproducibility and debugging. Every member except `engine` and
+`levels` is OPTIONAL; readers MUST tolerate the absence of any
+OPTIONAL member and MUST ignore unrecognized members (§3.8).
+
+The block is informative — readers MUST NOT rely on it for
+correctness — with exactly **two exceptions**: a `clustering` member
+with `enabled: true` (§12.4) and a `coalescing` member with
+`enabled: true` (§13.4) each assert normative structural facts about
+the file that a validator MUST enforce.
 
 ```
 Provenance := {
-  "engine":  string,           // e.g. "gpq-tiles 0.4.0"
-  "levels":  [ {               // parallel to top-level "levels"
+  "engine":       string,      // e.g. "gpq-tiles 0.6.0"
+  "gsd_base":     number,      // OPTIONAL: non-default tile-band base
+                               // used to derive levels[].gsd (§5.2);
+                               // absent when the default 1024 was used
+  "levels":       [ {          // parallel to top-level "levels"
       "simplify_tolerance_m": number,   // world-space tolerance, meters
       "thinning_factor":      number,   // cell-winner factor
       "visibility_gate_m":    number,   // min bbox-diagonal kept, meters
       "geometry_types":       [string]  // union of kinds at this level
-  } ]
+  } ],
+  "ranking":      Ranking,     // OPTIONAL: cell-winner priority source
+  "density_drop": DensityDrop, // OPTIONAL: per-level feature budget
+  "clustering":   Clustering,  // OPTIONAL: point clustering (§12.4)
+  "coalescing":   Coalescing   // OPTIONAL: line coalescing (§13.4)
+}
+
+Ranking := {
+  "mode":         string,      // e.g. "explicit-sort-key",
+                               // "class-ranking", "size-fallback"
+  "column":       string,      // OPTIONAL: source column read
+  "ranks":        { string: number, ... },
+                               // OPTIONAL: JSON object map of class
+                               // value → priority; higher priority
+                               // wins, e.g. {"motorway": 5,
+                               // "primary": 4, "residential": 2}
+  "unknown_rank": number       // OPTIONAL: priority of unlisted values
+}
+
+DensityDrop := {
+  "drop_rate":            number,  // each coarser level keeps 1/rate
+  "gamma":                number,  // spatial-fairness exponent (>= 1)
+  "supercell_gsd_factor": number   // fairness neighborhood, × GSD
 }
 ```
+
+`Ranking` and `DensityDrop` record which mechanism a producer used
+(FYI, never a contract); `Clustering` and `Coalescing` are defined in
+§12.4 and §13.4. Producer-side default values for these mechanisms
+are an implementation concern, not fixed by this spec (for gpq-tiles
+they are documented in `docs/OVERVIEW_TUNING.md`, with the code
+constants as the source of truth).
+
+Writers conforming to v0.2.0 MUST serialize `ranks` as a JSON object
+map as shown above (not an array of pairs). (Implementation note,
+informative: gpq-tiles emits the object map as of PR #190; its reader
+additionally accepts the legacy array-of-pairs shape written by
+earlier versions.)
 
 ### 3.6 Example — `duplicating` mode
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "mode": "duplicating",
   "canonical_level": 2,
   "levels": [
@@ -276,7 +347,7 @@ Provenance := {
     { "row_group_end": 14, "gsd": 611.50,  "zoom": 6 }
   ],
   "generalization": {
-    "engine": "gpq-tiles 0.4.0",
+    "engine": "gpq-tiles 0.6.0",
     "levels": [
       { "simplify_tolerance_m": 4000, "thinning_factor": 4.0,
         "visibility_gate_m": 9784, "geometry_types": ["Point","Polygon"] },
@@ -284,7 +355,10 @@ Provenance := {
         "visibility_gate_m": 2446, "geometry_types": ["Polygon"] },
       { "simplify_tolerance_m": 0,    "thinning_factor": 1.0,
         "visibility_gate_m": 0,    "geometry_types": ["Polygon"] }
-    ]
+    ],
+    "ranking": { "mode": "size-fallback" },
+    "density_drop": { "drop_rate": 1.65, "gamma": 1.5,
+                      "supercell_gsd_factor": 128.0 }
   }
 }
 ```
@@ -293,7 +367,7 @@ Provenance := {
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "mode": "partitioning",
   "canonical_level": null,
   "levels": [
@@ -339,7 +413,7 @@ Conformance requires **column↔footer consistency**: for every row group
 `k` whose RG span (§3.3) contains `r`. Equivalently, all rows of a given
 row group MUST share one `level` value, and that value MUST match the
 footer's level assignment for that RG index. A validator MUST check this
-(§6, §8).
+(§6.2).
 
 Rationale: the footer key serves footer-only readers (range-request
 clients); the visible `level` column serves naive SQL readers (DuckDB,
@@ -520,6 +594,13 @@ A validator MUST check:
 - [ ] Covering `bbox` struct column present with per-RG min/max stats.
 - [ ] `mode` valid; if `duplicating`, `canonical_level == L-1`; if
       `partitioning`, `canonical_level` is null/absent.
+- [ ] If `generalization.clustering.enabled` is true: mode is
+      `duplicating`, and the named `point_count` column satisfies
+      §12.2 (INT64 NOT NULL, all values >= 1, canonical band all 1)
+      (§12.4).
+- [ ] If `generalization.coalescing.enabled` is true: the named
+      `coalesced_count` column satisfies §13.2 (INT32 NOT NULL, all
+      values >= 1, canonical band all 1) (§13.4).
 - [ ] No dictionary encoding on geometry/bbox columns (SHOULD warn, not
       fail).
 - [ ] Antimeridian: no geometry bbox spans the full lng range in a way
@@ -551,11 +632,9 @@ structure, not cartographic quality.
   heuristic) but producers SHOULD document that high-latitude datasets see
   GSD/scale skew.
 
-> OPEN QUESTION Q3: Should we mandate that overview files be in a single,
-> known CRS (recommend EPSG:3857 or EPSG:4326) to make GSD unambiguous, or
-> allow arbitrary projected CRS with meter units? Recommendation: allow
-> EPSG:4326 and EPSG:3857 for v0.1 (the two COGP handles), defer arbitrary
-> projected CRS. See §11.
+Overview files MUST use **EPSG:4326 or EPSG:3857** (the two CRSs
+COGP handles); arbitrary projected-meter CRSs are deferred to a
+future version. (Resolved Q3, §11.)
 
 ### 7.2 Antimeridian
 
@@ -595,14 +674,16 @@ structure, not cartographic quality.
   record the per-level union for tooling that wants to pick a renderer per
   band.
 
-> OPEN QUESTION Q4: Should type collapse be opt-in (default: preserve type,
-> drop-below-gate instead of collapse) to avoid surprising renderers that
-> switch geometry type mid-zoom? Recommendation: opt-in collapse, default
-> preserve-or-drop; document via `generalization`. See §11.
+Geometry-type collapse MUST be opt-in for producers, default off
+(default behavior: preserve type, drop below the gate instead of
+collapsing) — renderers should not be surprised by a geometry type
+switching mid-zoom unless the producer asked for it. When enabled it
+SHOULD be documented via the `generalization` provenance (§3.5).
+(Resolved Q4, §11.)
 
 ---
 
-## 8. Non-goals (v0.1)
+## 8. Non-goals
 
 This spec explicitly does NOT address:
 
@@ -619,13 +700,16 @@ This spec explicitly does NOT address:
 - **Mandating a specific thinning/simplification algorithm.** The spec
   constrains layout and metadata; the generalization engine is
   implementation-defined (gpq-tiles supplies one).
-- ~~**Attribute aggregation** (summing/averaging attributes of dropped
-  features). Deferred to a later `generalization` v0.2.~~ Now specified as
-  the opt-in point-clustering extension, §12 (v0.2.0-draft).
+- **Topology-aware network merging beyond §13.** Line coalescing (§13)
+  chains touching segments; it does not build a routable graph or
+  guarantee planarity.
+
+Attribute aggregation of dropped features — a v0.1.0 non-goal — is
+now specified as the opt-in point-clustering extension (§12).
 
 ---
 
-## 9. Worked example (3-level `duplicating` file)
+## 9. Worked example (3-level `duplicating` file) (informative)
 
 A tiny buildings dataset, generalized into 3 levels at z2/z4/z6, written
 `duplicating`. 15 row groups total.
@@ -634,7 +718,7 @@ A tiny buildings dataset, generalized into 3 levels at z2/z4/z6, written
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "mode": "duplicating",
   "canonical_level": 2,
   "levels": [
@@ -715,14 +799,19 @@ Migration plan:
 5. **Dual-target period.** During transition, a producer MAY emit BOTH the
    covering column AND native stats (redundant but maximally compatible).
 
-> OPEN QUESTION Q5: For 2.0, do we keep emitting the covering column for a
-> deprecation window, or hard-switch? Recommendation: emit both during
-> transition (belt and suspenders), drop covering once 2.0 reader support
-> is widespread. See §11.
+During the transition, GeoParquet 2.0 overview files **dual-emit**
+the bbox covering column alongside native geometry stats (item 5
+above); the covering column is dropped once 2.0 reader support is
+widespread. (Resolved Q5, §11.)
 
 ---
 
-## 11. Open questions — ALL RESOLVED (human review 2026-07-02)
+## 11. v0.1.0 open questions — resolution record (informative)
+
+All v0.1.0 open questions were resolved by maintainer review
+2026-07-02. The resolutions below are folded into the normative text
+of the sections they cite; this section is kept as the decision
+record.
 
 - **Q1 (§2.4) APPROVED:** canonical fidelity is **set/value equality
   only**, not row order (Hilbert sort reorders rows within levels).
@@ -747,40 +836,50 @@ Migration plan:
   §5.2 table is correct as written.
 - **Q7 APPROVED:** `mode` stays **SHOULD with documented
   `partitioning` default** (the safe reader assumption), not REQUIRED.
-```
 
 ---
 
-## 12. Point clustering extension (v0.2.0-draft)
+## 12. Point clustering extension
 
-Status: draft addition targeted at spec v0.2.0; implemented by gpq-tiles
-behind the opt-in `--cluster` flag (2026-07-03). Additive: files written
-with clustering remain valid v0.1.0 overview files (an extra optional
-column + an optional provenance block that v0.1 readers MUST ignore per
-§3.8); the section is versioned v0.2.0-draft because it introduces new
-normative requirements for files that opt in.
+An OPTIONAL, additive extension. A file written with clustering
+remains a valid baseline overview file: the extension adds one column
+(§12.2) and one provenance member (§12.4) that readers unaware of
+this section ignore per §3.8. The normative requirements below apply
+only to files that opt in (i.e. files whose footer carries a
+`generalization.clustering` member with `enabled: true`).
 
-### 12.1 Model
+### 12.1 Model (normative)
 
 Clustering applies to **point features only** (Point/MultiPoint rows;
 lines and polygons are unaffected) and to **`duplicating` mode only**
-(§12.5). It is **opt-in, default off** (consistent with §11 Q4's
-opt-in-collapse posture).
+(§12.5). It MUST be opt-in for producers, default off (consistent
+with the opt-in-collapse posture of §7.5 / Q4).
 
-At each level, the generalization engine's per-cell survivor **absorbs**
-the point features that were thinned out of its cell at that level's
-grid, instead of them simply vanishing:
+At each level, the generalization engine's per-cell survivor
+**absorbs** the point features that were thinned out of its cell at
+that level's grid, instead of them simply vanishing:
 
-- Every source point feature is represented by exactly one row at every
-  level: itself if present, else an absorbing winner. Consequently, at
-  each level, the sum of `point_count` over the level's point rows
-  equals the total source point-feature count.
-- Absorption is **per level**: a feature absorbed at level `k` may
+- **Accounting (strict).** At every level, every source point feature
+  MUST be counted in the `point_count` of exactly one point row of
+  that level: its own row if it survives the level, otherwise the row
+  of the winner that absorbed it. A feature whose cell winner is
+  itself removed after absorption (e.g. by a density budget) MUST be
+  re-assigned to a surviving point row of the same level — which
+  survivor is implementation-defined (gpq-tiles: the nearest) — so no
+  feature is ever dropped from the count or counted twice.
+- **Sum invariant (normative).** Consequently, at every level, the
+  sum of `point_count` over the level's point rows MUST equal the
+  total source point-feature count exactly, including when a density
+  budget or any other post-thinning drop mechanism is active. The
+  clusters of a level partition the source point set at that level's
+  grid.
+- Absorption is **per level**: a feature absorbed at level `k` MAY
   itself be a row (with its own, smaller cluster) at level `k+1`.
 - The winner keeps its **own geometry** and its own values for every
   non-accumulated column. (DIVERGENCE from supercluster, which
   re-centers a cluster at its members' centroid: keeping the winner's
-  geometry is deterministic and anchors the cluster at a real feature.)
+  geometry is deterministic and anchors the cluster at a real
+  feature.)
 
 ### 12.2 `point_count` column (normative when clustering)
 
@@ -799,12 +898,13 @@ Writers MUST reject source data whose schema already contains a column
 named `point_count` under case-insensitive comparison (same rationale
 as the `level` column rule, §4.1).
 
-### 12.3 Attribute accumulation (optional)
+### 12.3 Attribute accumulation (normative when used)
 
 A writer MAY additionally aggregate **numeric** columns across each
-cluster (tippecanoe `--accumulate-attribute` convention): the winner's
-value of the column becomes `sum` | `max` | `min` | `mean` over itself
-plus the absorbed features at that level.
+cluster (the tippecanoe `--accumulate-attribute` convention): the
+winner's value of the column becomes `sum` | `max` | `min` | `mean`
+over itself plus the absorbed features at that level. A writer that
+does so MUST observe the following:
 
 - Aggregates MUST be computed per level **from source values** (never
   from a coarser level's already-aggregated values), so `mean` is exact
@@ -816,85 +916,97 @@ plus the absorbed features at that level.
 - The aggregated column keeps its declared type; producers SHOULD
   prefer floating-point columns for `mean`.
 
-### 12.4 Metadata
+### 12.4 Metadata (normative when clustering)
 
-Clustering is recorded in the `generalization` provenance block (§3.5):
+Clustering is recorded in the `generalization` provenance block
+(§3.5) as its `Clustering` member:
 
 ```
-Generalization += {
-  "clustering": {                       // OPTIONAL
-    "enabled":            true,
-    "point_count_column": "point_count",
-    "accumulated": [ { "column": string, "op": "sum"|"max"|"min"|"mean" } ]
-  }
+Clustering := {
+  "enabled":            true,
+  "point_count_column": string,   // e.g. "point_count"
+  "accumulated": [ { "column": string,
+                     "op": "sum"|"max"|"min"|"mean" } ]  // OPTIONAL
 }
 ```
 
-Unlike the rest of §3.5, when `clustering.enabled` is true a validator
-MUST enforce §12.2 structurally: the named column exists as INT64 NOT
-NULL, all values are `>= 1` (checkable via row-group statistics), and
-the canonical band's values are exactly `1`.
+This member is one of the two exceptions to §3.5's informative rule:
+when `clustering.enabled` is true a validator MUST enforce §12.2
+structurally — the file's `mode` is `duplicating` (§12.5), the named
+column exists as INT64 NOT NULL, all values are `>= 1` (checkable via
+row-group statistics), and the canonical band's values are exactly
+`1`.
 
 ### 12.5 Partitioning mode is excluded (normative)
 
-`--cluster` MUST be rejected for `partitioning`-mode files. Rationale:
-a partitioning feature has exactly **one** row but is *displayed* at
-every zoom `z >= min_level` (prefix reads, §2.3). A single stored
-`point_count` can only describe one level's grid, so it would be wrong
-at every other display zoom; worse, a feature absorbed at a coarse
-level reappears as its own row in a finer band while remaining counted
-in the coarse winner, so `Σ point_count` over any prefix double-counts.
-There is no non-contorted single-column encoding of per-level counts in
-a feature-once layout; producers who need clustering use `duplicating`
+A producer MUST reject a request to cluster a `partitioning`-mode
+file. Rationale: a partitioning feature has exactly **one** row but
+is *displayed* at every zoom from its level onward (prefix reads,
+§2.3). A single stored `point_count` can only describe one level's
+grid, so it would be wrong at every other display zoom; worse, a
+feature absorbed at a coarse level reappears as its own row in a
+finer band while remaining counted in the coarse winner, so
+`Σ point_count` over any prefix double-counts. There is no
+non-contorted single-column encoding of per-level counts in a
+feature-once layout; producers who need clustering use `duplicating`
 mode.
+
+### 12.6 Implementation note (informative)
+
+gpq-tiles implements this extension behind the opt-in `--cluster`
+flag, with optional accumulation via `--accumulate-attribute COL:OP`;
+enabling clustering also changes the engine's point-thinning default
+(a sparser grid is harmless when losers are summarized rather than
+discarded). Engine defaults and tuning guidance live in
+`docs/OVERVIEW_TUNING.md`; they are implementation choices, not
+requirements of this spec.
 
 ---
 
-## 13. Line coalescing extension (v0.2.0-draft)
+## 13. Line coalescing extension
 
-Status: draft addition targeted at spec v0.2.0; implemented by gpq-tiles
-behind the opt-in `--coalesce-lines` flag (2026-07-03). Additive: files
-written with coalescing remain valid v0.1.0 overview files (an extra
-optional column + an optional provenance block that v0.1 readers MUST
-ignore per §3.8); the section is versioned v0.2.0-draft because it
-introduces new normative requirements for files that opt in.
+An OPTIONAL, additive extension. A file written with coalescing
+remains a valid baseline overview file: the extension adds one column
+(§13.2) and one provenance member (§13.4) that readers unaware of
+this section ignore per §3.8. The normative requirements below apply
+only to files that opt in (i.e. files whose footer carries a
+`generalization.coalescing` member with `enabled: true`).
 
-### 13.1 Model
+### 13.1 Model (normative)
 
 Coalescing applies to **line features only** (LineString rows; points
 and polygons are unaffected, and MultiLineString rows pass through
-unmerged) and to **`duplicating` mode only** (§13.5). It is an OPTIONAL
-extension of this spec; whether a producer enables it by default is an
-implementation choice (gpq-tiles: **on by default** since 2026-07-03
-per maintainer render review, opt-out via `--no-coalesce-lines`).
+unmerged) and to **`duplicating` mode only** (§13.5). Whether a
+producer enables it by default is an implementation choice (§13.6);
+the partitioning-mode behavior of a default-on producer is
+constrained by §13.5.
 
-At each non-canonical level, BEFORE the visibility gate and cell-winner
-thinning run, the generalization engine chains touching compatible line
-segments into single "stroke" LineStrings:
+At each non-canonical level, BEFORE the visibility gate and
+cell-winner thinning run, the generalization engine chains touching
+compatible line segments into single "stroke" LineStrings:
 
-- **Compatibility**: segments chain only within the same class value of
-  the active class-ranking column (when one is active); with no class
-  ranking, all lines are compatible. Null class values are compatible
-  with each other only.
+- **Compatibility**: segments MUST chain only within the same class
+  value of the active class-ranking column (when one is active); with
+  no class ranking, all lines are compatible. Null class values are
+  compatible with each other only.
 - **Chaining**: endpoints are matched exactly first, then chain ends
-  within a snap tolerance of `snap_tolerance_gsd_factor × gsd` (two
-  endpoints closer than one ground sample are indistinguishable at the
-  level). Nodes of **degree 2** always continue a chain; junctions
-  (three or more compatible endpoints) terminate chains by default,
-  preserving network topology. An implementation MAY optionally
-  continue the pair(s) of lines that best continue each other within a
-  bounded angular deviation from straight (stroke building; gpq-tiles:
-  `--coalesce-junction-angle`, default `0` = off per maintainer render
-  review 2026-07-03).
+  within a snap tolerance of `snap_tolerance_gsd_factor × gsd`
+  (§13.3). Nodes of **degree 2** always continue a chain; junctions
+  (three or more compatible endpoints) MUST terminate chains by
+  default, preserving network topology. An implementation MAY
+  optionally continue, through a junction, the pair(s) of lines that
+  best continue each other within a bounded angular deviation from
+  straight (stroke building).
 - **Attributes**: the merged row carries the attribute values of its
   highest-priority member (the same priority order the cell-winner
   stage uses), plus the member count (§13.2).
-- The visibility gate and thinning then evaluate the **merged chains**,
-  so a chain of individually sub-visibility fragments survives as one
-  visible artery. This ordering is the point of the extension.
+- The visibility gate and thinning then evaluate the **merged
+  chains**, so a chain of individually sub-visibility fragments
+  survives as one visible artery. This ordering is the point of the
+  extension.
 
-The **canonical level is never coalesced** (§2.4 value fidelity: the
-canonical band remains verbatim source rows plus the constant
+The **canonical level MUST NOT be coalesced** (§2.4 value fidelity:
+the canonical band remains verbatim source rows plus the constant
 `coalesced_count = 1`).
 
 Feature identity across levels is already NOT guaranteed (§2.2), so a
@@ -913,33 +1025,52 @@ Writers MUST reject source data whose schema already contains a column
 named `coalesced_count` under case-insensitive comparison (same
 rationale as the `level` column rule, §4.1).
 
-### 13.3 Snap tolerance
+### 13.3 Snap tolerance (normative)
 
-The snap tolerance is expressed in GSD multiples so it scales with each
-level's resolution. `1.0` (one ground sample) is the natural default;
+The snap tolerance is expressed in GSD multiples so it scales with
+each level's resolution: two endpoints closer than one ground sample
+are indistinguishable at the level, so `1.0` is the natural default.
 `0` restricts chaining to exact endpoint matches. Implementations MAY
 realize the snap by grid quantization of endpoints (deterministic,
 O(n)); the effective join distance then lies between 0 and √2 × the
 tolerance.
 
-### 13.4 Metadata
+### 13.4 Metadata (normative when coalescing)
 
-Coalescing is recorded in the `generalization` provenance block (§3.5):
+Coalescing is recorded in the `generalization` provenance block
+(§3.5) as its `Coalescing` member:
 
 ```
-Generalization += {
-  "coalescing": {                          // OPTIONAL
-    "enabled":                   true,
-    "snap_tolerance_gsd_factor": number,
-    "coalesced_count_column":    "coalesced_count"
-  }
+Coalescing := {
+  "enabled":                   true,
+  "snap_tolerance_gsd_factor": number,   // snap tolerance, × GSD (§13.3)
+  "junction_angle":            number,   // degrees; 0 = strict degree-2
+                                         // chaining (junction
+                                         // continuation off, §13.1)
+  "max_level_rows":            integer,  // per-level candidate-line
+                                         // ceiling; levels with more
+                                         // candidate lines were written
+                                         // uncoalesced (counts all 1)
+  "coalesced_count_column":    string    // e.g. "coalesced_count"
 }
 ```
 
-When `coalescing.enabled` is true a validator MUST enforce §13.2
-structurally: the named column exists as INT32 NOT NULL, all values are
-`>= 1` (checkable via row-group statistics), and the canonical band's
-values are exactly `1`.
+All four parameter members carry the same weight: a writer conforming
+to v0.2.0 that emits the `coalescing` block MUST include
+`snap_tolerance_gsd_factor`, `junction_angle`, `max_level_rows`, and
+`coalesced_count_column`, so the coalescing generalization is
+reproducible from the file alone. Readers MUST tolerate the absence
+of `junction_angle` and `max_level_rows` on files written before
+these members existed (treating them as unknown, not as any default).
+
+This member is one of the two exceptions to §3.5's informative rule:
+when `coalescing.enabled` is true a validator MUST enforce §13.2
+structurally — the named column exists as INT32 NOT NULL, all values
+are `>= 1` (checkable via row-group statistics), and the canonical
+band's values are exactly `1`.
+
+(Implementation note, informative: gpq-tiles emits all four
+parameter members as of PR #190.)
 
 ### 13.5 Partitioning mode is excluded (normative)
 
@@ -957,24 +1088,47 @@ partitioning conversion as non-coalesced (no `coalesced_count` column,
 no `coalescing` provenance) rather than fail; it SHOULD reject an
 *explicit* request to coalesce a partitioning conversion.
 
+### 13.6 Implementation note (informative)
+
+gpq-tiles enables coalescing by default (opt-out via
+`--no-coalesce-lines`) with junction continuation off (strict
+degree-2 chaining, per maintainer render review) and a snap tolerance
+of `1.0` GSD. To bound memory, levels whose candidate line count
+exceeds a ceiling skip coalescing while still emitting the
+`coalesced_count` column (all `1`) and the provenance block, keeping
+the schema stable — such a file is conformant, since §13.2 permits
+all-`1` values, and the ceiling itself is recorded as
+`max_level_rows` (§13.4). Engine defaults and tuning guidance live in
+`docs/OVERVIEW_TUNING.md`; they are implementation choices, not
+requirements of this spec.
+
 ---
 
 ## 14. Changelog
 
-- **v0.2.0-draft (2026-07-03, later still)**: §13 revised per
-  maintainer review — junction continuation (angle-bounded stroke
-  building at degree >= 3 nodes) added to the chaining model as an
-  OPTIONAL mechanism (gpq-tiles default OFF: the Portland sweep found
-  strict degree-2 chaining renders better); the gpq-tiles engine
-  coalescing default flipped to ON (opt-out); §13.5 reworded for
-  default-on tools (inert in partitioning, reject only explicit
-  requests).
-- **v0.2.0-draft (2026-07-03, later)**: added §13 line coalescing
-  extension (`coalesced_count` column, degree-2 endpoint chaining
-  model, `generalization.coalescing` metadata,
-  duplicating-mode-only rule).
-- **v0.2.0-draft (2026-07-03)**: added §12 point clustering extension
-  (`point_count` column, numeric attribute accumulation,
-  `generalization.clustering` metadata, duplicating-mode-only rule);
-  struck attribute aggregation from the §8 non-goals.
+- **v0.2.0 (2026-07-03)**: added the point clustering extension (§12:
+  `point_count` column, numeric attribute accumulation,
+  `generalization.clustering` metadata, duplicating-mode-only rule)
+  and the line coalescing extension (§13: `coalesced_count` column,
+  degree-2 endpoint chaining with OPTIONAL angle-bounded junction
+  continuation, `generalization.coalescing` metadata,
+  duplicating-mode-only rule with default-on-tool behavior);
+  documented the post-v0.1.0 provenance members in §3.5 (`gsd_base`,
+  `ranking`, `density_drop`, `clustering`, `coalescing`) and updated
+  the examples (§3.6, §3.7, §9.1) to match; added the mode ×
+  mechanism table (§2.5) and the extension items in the validation
+  checklist (§6.2); moved attribute aggregation out of the §8
+  non-goals (now §12); folded the approved Q1–Q5 resolutions into the
+  normative text of §2.4, §3.1, §7.1, §7.5 and §10, converting §11
+  into an informative resolution record; fixed broken
+  cross-references (§2.2, §3.4, §4.1). Per maintainer review of the
+  consolidation: the `coalescing` provenance object gains REQUIRED
+  `junction_angle` and `max_level_rows` members so coalescing is
+  reproducible from the file alone (§13.4); `ranking.ranks` is
+  specified as a JSON object map, not an array of pairs (§3.5); and
+  the §12.1 cluster accounting / `Σ point_count` sum invariant is
+  strict-normative at every level, including under density-budget
+  drops. Backward compatible: v0.1.0 files
+  remain conforming, and extension files remain readable by baseline
+  readers (§3.8).
 - **v0.1.0 (2026-07-02)**: initial draft; §11 design decisions approved.
