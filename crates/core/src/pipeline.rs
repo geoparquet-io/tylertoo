@@ -41,7 +41,7 @@ use crate::hierarchical_clip::{clip_geometry_hierarchical_world, WorldClippedGeo
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::property_filter::PropertyFilter;
 use crate::sampling::{BoundedSampler, ExtentSampler, GapSampler};
-use crate::simplify::{simplify_for_zoom, simplify_geometry_for_tile};
+use crate::simplify::simplify_for_zoom;
 use crate::spatial_index::{sort_features, sort_geometries};
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
 use crate::validate::filter_valid_geometry;
@@ -407,23 +407,6 @@ pub struct TilerConfig {
     ///
     /// Can be explicitly set to force a specific mode.
     pub processing_mode: ProcessingMode,
-
-    /// Simplification factor for zoom-dependent geometry simplification.
-    ///
-    /// When set, Douglas-Peucker simplification is applied to geometries per-tile
-    /// with tolerance scaling by zoom level. The tolerance at each zoom is:
-    ///
-    /// ```text
-    /// tolerance = simplify_factor / (extent * 2^zoom)
-    /// ```
-    ///
-    /// - `None` (default): No simplification applied
-    /// - `Some(1.0)`: Standard simplification (1 pixel tolerance at max zoom)
-    /// - `Some(0.5)`: Less aggressive simplification
-    /// - `Some(2.0)`: More aggressive simplification
-    ///
-    /// This matches tippecanoe's `-S` / `--simplification` flag behavior.
-    pub simplify_factor: Option<f64>,
 }
 
 impl Default for TilerConfig {
@@ -483,8 +466,6 @@ impl Default for TilerConfig {
             spatial_filter: None,
             // In-memory mode by default (auto-tuning happens at runtime based on file size)
             processing_mode: ProcessingMode::default(),
-            // No simplification by default - exact geometry preservation
-            simplify_factor: None,
         }
     }
 }
@@ -920,37 +901,6 @@ impl TilerConfig {
     /// This is a convenience method for `.with_processing_mode(ProcessingMode::bucketed_auto())`.
     pub fn with_bucketed_auto(self) -> Self {
         self.with_processing_mode(ProcessingMode::bucketed_auto())
-    }
-
-    /// Enable zoom-dependent geometry simplification.
-    ///
-    /// Applies Douglas-Peucker simplification to geometries per-tile with
-    /// tolerance scaling by zoom level. The tolerance at each zoom is:
-    ///
-    /// ```text
-    /// tolerance = factor / (extent * 2^zoom)
-    /// ```
-    ///
-    /// This matches tippecanoe's `-S` / `--simplification` flag.
-    ///
-    /// # Arguments
-    ///
-    /// * `factor` - Simplification factor. Common values:
-    ///   - `1.0` - Standard (1 pixel tolerance at max zoom)
-    ///   - `0.5` - Less aggressive (preserves more detail)
-    ///   - `2.0` - More aggressive (reduces file size)
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use gpq_tiles_core::pipeline::TilerConfig;
-    ///
-    /// let config = TilerConfig::new(0, 14)
-    ///     .with_simplify(1.0);  // Standard simplification
-    /// ```
-    pub fn with_simplify(mut self, factor: f64) -> Self {
-        self.simplify_factor = Some(factor);
-        self
     }
 }
 
@@ -1910,8 +1860,6 @@ fn generate_tiles_to_writer_internal(
         drop_smallest_as_needed: bool,
         drop_smallest_threshold: f64,
         gamma: Option<f64>,
-        // Zoom-dependent simplification factor (None = no simplification)
-        simplify_factor: Option<f64>,
         // Samplers for adaptive threshold iteration (Wave 2)
         mut gap_sampler: Option<&mut GapSampler>,
         mut extent_sampler: Option<&mut ExtentSampler>,
@@ -1998,13 +1946,6 @@ fn generate_tiles_to_writer_internal(
                 let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
                     Some(g) => g,
                     None => continue,
-                };
-
-                // Apply zoom-dependent simplification if enabled
-                let geom = if let Some(factor) = simplify_factor {
-                    simplify_geometry_for_tile(&geom, &coord, extent, factor)
-                } else {
-                    geom
                 };
 
                 if geom.is_degenerate_in_tile(&coord, extent) {
@@ -2333,13 +2274,6 @@ fn generate_tiles_to_writer_internal(
                     None => continue,
                 };
 
-                // Apply zoom-dependent simplification if enabled
-                let geom = if let Some(factor) = simplify_factor {
-                    simplify_geometry_for_tile(&geom, &coord, extent, factor)
-                } else {
-                    geom
-                };
-
                 if geom.is_degenerate_in_tile(&coord, extent) {
                     continue;
                 }
@@ -2450,45 +2384,13 @@ fn generate_tiles_to_writer_internal(
                 }
 
                 if !linestrings.is_empty() {
-                    // Aggressively simplify coalesced linestrings WITHOUT boundary preservation.
-                    // For coalesced features, we want maximum simplification since feature
-                    // boundaries no longer matter after merging.
-                    let simplified_linestrings: Vec<Vec<WorldCoord>> = if let Some(factor) =
-                        simplify_factor
-                    {
-                        let pixel_tolerance =
-                            factor * (1u32 << 14u8.saturating_sub(coord.z)) as f64;
-                        let after_simplify: Vec<Vec<WorldCoord>> = linestrings
-                            .into_iter()
-                            .map(|ls| {
-                                crate::simplify::simplify_coalesced_linestring(
-                                    &ls,
-                                    &coord,
-                                    extent,
-                                    pixel_tolerance,
-                                )
-                            })
-                            .filter(|ls| ls.len() >= 2)
-                            .collect();
-
-                        // Apply tippecanoe-style remove_noop ACROSS all linestrings.
-                        // This drops linestrings that start where others end (same pixel).
-                        crate::simplify::remove_noop_multilinestring(after_simplify, &coord, extent)
+                    let coalesced = if linestrings.len() == 1 {
+                        WorldClippedGeometry::LineString(linestrings.into_iter().next().unwrap())
                     } else {
-                        linestrings
+                        WorldClippedGeometry::MultiLineString(linestrings)
                     };
-
-                    if !simplified_linestrings.is_empty() {
-                        let coalesced = if simplified_linestrings.len() == 1 {
-                            WorldClippedGeometry::LineString(
-                                simplified_linestrings.into_iter().next().unwrap(),
-                            )
-                        } else {
-                            WorldClippedGeometry::MultiLineString(simplified_linestrings)
-                        };
-                        layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
-                        feature_count += 1;
-                    }
+                    layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
+                    feature_count += 1;
                 }
 
                 if !polygons.is_empty() {
@@ -2500,12 +2402,6 @@ fn generate_tiles_to_writer_internal(
                         }
                     } else {
                         WorldClippedGeometry::MultiPolygon(polygons)
-                    };
-                    // Re-simplify coalesced geometry for aggressive reduction at low zoom
-                    let coalesced = if let Some(factor) = simplify_factor {
-                        simplify_geometry_for_tile(&coalesced, &coord, extent, factor)
-                    } else {
-                        coalesced
                     };
                     layer_builder.add_feature_world(Some(feat_id), &coalesced, &props, &coord);
                     feature_count += 1;
@@ -2548,13 +2444,6 @@ fn generate_tiles_to_writer_internal(
             let geom = match WorldClippedGeometry::from_bytes(&raw_feat.geometry_bytes) {
                 Some(g) => g,
                 None => continue,
-            };
-
-            // Apply zoom-dependent simplification if enabled
-            let geom = if let Some(factor) = simplify_factor {
-                simplify_geometry_for_tile(&geom, &coord, extent, factor)
-            } else {
-                geom
             };
 
             if geom.is_degenerate_in_tile(&coord, extent) {
@@ -2824,7 +2713,6 @@ fn generate_tiles_to_writer_internal(
                 drop_smallest_as_needed,
                 drop_smallest_threshold,
                 gamma,
-                config.simplify_factor,
                 None,
                 None,
             ));
@@ -2889,7 +2777,6 @@ fn generate_tiles_to_writer_internal(
                 drop_smallest_as_needed,
                 effective_drop_threshold,
                 effective_gamma,
-                config.simplify_factor,
                 Some(&mut gap_sampler),
                 Some(&mut extent_sampler),
             );
@@ -3896,21 +3783,6 @@ mod tests {
         assert_eq!(config.extent, 512);
         assert_eq!(config.buffer_pixels, 16);
         assert_eq!(config.layer_name, "buildings");
-    }
-
-    #[test]
-    fn test_tiler_config_simplify_factor() {
-        // Default should be None (no simplification)
-        let config = TilerConfig::default();
-        assert_eq!(config.simplify_factor, None);
-
-        // Builder should enable simplification with factor
-        let config_enabled = TilerConfig::default().with_simplify(1.0);
-        assert_eq!(config_enabled.simplify_factor, Some(1.0));
-
-        // Should work with different factor values
-        let config_custom = TilerConfig::default().with_simplify(0.5);
-        assert_eq!(config_custom.simplify_factor, Some(0.5));
     }
 
     // ========== GeneratedTile Tests ==========
