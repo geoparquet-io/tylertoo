@@ -101,11 +101,18 @@ struct GeoDoc {
 }
 
 /// Validate an overview file at `path` against the §6.2 conformance checklist.
+///
+/// Runs every metadata-only check of [`validate_metadata`], plus the
+/// data-reading §12.1 cluster sum-invariant check (which needs the column
+/// values, not just row-group statistics).
 pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckError> {
+    let path = path.as_ref();
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let metadata = builder.metadata().clone();
-    Ok(validate_metadata(&metadata))
+    let mut report = validate_metadata(&metadata);
+    check_cluster_sum_invariant(path, &metadata, &mut report);
+    Ok(report)
 }
 
 /// Run the §6.2 checklist against already-parsed Parquet metadata.
@@ -569,6 +576,171 @@ fn check_coalescing(
     }
 }
 
+/// §12.1 strict cluster sum invariant (data-reading check, `validate_file`
+/// only): when clustering provenance is present and enabled on a structurally
+/// sound duplicating file, every level's `Σ point_count` over its **point**
+/// rows must equal the source point count exactly — taken as the number of
+/// point rows in the canonical band, which is the source data verbatim
+/// (§2.4). Implies the derived producer obligation: no clustered level may
+/// thin its points to zero while the source contains points.
+///
+/// Skipped (no report entry) when the prerequisites are missing — the
+/// structural checks of [`validate_metadata`] already fail those files.
+fn check_cluster_sum_invariant(
+    path: &Path,
+    metadata: &ParquetMetaData,
+    report: &mut ValidationReport,
+) {
+    // Prerequisites: parseable footer, enabled clustering, duplicating mode
+    // with a valid canonical level, the named INT64 count column, the level
+    // column, and a geometry column (needed to tell point rows apart).
+    let Some(meta) =
+        footer_value(metadata, OVERVIEWS_KEY).and_then(|j| OverviewsMeta::from_json(&j).ok())
+    else {
+        return;
+    };
+    let Some(clustering) = meta
+        .generalization
+        .as_ref()
+        .and_then(|g| g.clustering.as_ref())
+        .filter(|c| c.enabled)
+    else {
+        return;
+    };
+    if meta.mode != Some(Mode::Duplicating) {
+        return; // cluster_mode already failed
+    }
+    let Some(canonical) = meta.canonical_level.filter(|&c| c >= 0) else {
+        return; // mode_canonical already failed
+    };
+
+    match cluster_sum_by_level(path, &meta, clustering) {
+        Err(e) => report.fail(
+            "cluster_sum_invariant",
+            format!("could not read cluster columns: {e}"),
+        ),
+        Ok(None) => { /* prerequisite column absent: already failed elsewhere */ }
+        Ok(Some(per_level)) => {
+            let Some(&(_, expected)) = per_level.get(canonical as usize) else {
+                return; // canonical band outside levels: structure failed
+            };
+            let mut problems: Vec<String> = Vec::new();
+            for (level, &(point_rows, sum)) in per_level.iter().enumerate() {
+                if expected > 0 && point_rows == 0 {
+                    problems.push(format!(
+                        "level {level} has no point row to absorb {expected} \
+                         source points"
+                    ));
+                } else if sum != expected {
+                    problems.push(format!(
+                        "level {level}: sum(point_count) over point rows = \
+                         {sum}, expected source point count {expected}"
+                    ));
+                }
+            }
+            if problems.is_empty() {
+                report.pass(
+                    "cluster_sum_invariant",
+                    format!(
+                        "every level's point_count sums to the source point \
+                         count ({expected}) (§12.1)"
+                    ),
+                );
+            } else {
+                report.fail("cluster_sum_invariant", problems.join("; "));
+            }
+        }
+    }
+}
+
+/// Per level: `(point-row count, Σ point_count over point rows)`, read from
+/// the file with a projection over the geometry / `level` / count columns.
+/// `Ok(None)` when a prerequisite column is missing from the schema.
+#[allow(clippy::type_complexity)]
+fn cluster_sum_by_level(
+    path: &Path,
+    meta: &OverviewsMeta,
+    clustering: &crate::overview::level::ClusteringProvenance,
+) -> Result<Option<Vec<(usize, i64)>>, String> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, Int64Type};
+    use geoarrow::array::from_arrow_array;
+    use parquet::arrow::ProjectionMask;
+
+    use super::convert::{feature_kind, find_geometry_column};
+    use crate::batch_processor::extract_geometries_opt_from_array;
+
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| e.to_string())?;
+    let schema = builder.schema().clone();
+
+    let Some(geom_idx) = find_geometry_column(&schema) else {
+        return Ok(None);
+    };
+    let Ok(pc_idx) = schema.index_of(&clustering.point_count_column) else {
+        return Ok(None);
+    };
+    let Ok(level_idx) = schema.index_of(LEVEL_COLUMN) else {
+        return Ok(None);
+    };
+    let geom_field = schema.field(geom_idx).clone();
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [geom_idx, pc_idx, level_idx]);
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut per_level: Vec<(usize, i64)> = vec![(0, 0); meta.levels.len()];
+    let mut geoms: Vec<Option<geo::Geometry<f64>>> = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| e.to_string())?;
+        let bschema = batch.schema();
+        let g = batch.column(
+            bschema
+                .index_of(geom_field.name())
+                .map_err(|e| e.to_string())?,
+        );
+        let levels = batch
+            .column(bschema.index_of(LEVEL_COLUMN).map_err(|e| e.to_string())?)
+            .as_primitive::<Int32Type>()
+            .clone();
+        let counts = batch
+            .column(
+                bschema
+                    .index_of(&clustering.point_count_column)
+                    .map_err(|e| e.to_string())?,
+            )
+            .as_primitive::<Int64Type>()
+            .clone();
+
+        let garr = from_arrow_array(g.as_ref(), &geom_field)
+            .map_err(|e| format!("geometry decode: {e}"))?;
+        geoms.clear();
+        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms)
+            .map_err(|e| format!("geometry decode: {e}"))?;
+
+        for (i, geom) in geoms.iter().enumerate() {
+            // Only point rows participate in the sum (§12.1); null geometry
+            // rows (foreign writers) cannot be classified and are skipped.
+            let is_point = geom
+                .as_ref()
+                .is_some_and(|g| feature_kind(g) == super::assign::FeatureKind::Point);
+            if !is_point {
+                continue;
+            }
+            let level = levels.value(i);
+            if level < 0 || level as usize >= per_level.len() {
+                return Err(format!("row carries out-of-range level {level}"));
+            }
+            let entry = &mut per_level[level as usize];
+            entry.0 += 1;
+            entry.1 += counts.value(i);
+        }
+    }
+    Ok(Some(per_level))
+}
+
 /// Per-RG `level` column statistics must be `min == max ==` the footer-implied
 /// level for that RG index (§4.1). Records one summarizing entry.
 fn check_level_footer_consistency(
@@ -940,11 +1112,14 @@ mod tests {
 
     #[test]
     fn clustering_good_file_passes() {
+        // Fixture geometry: even ids are points, odd ids polygons. Canonical
+        // level [0, 1, 2] has 2 source points (0, 2); the level-0 point row
+        // (id 0) must carry point_count 2 (§12.1 sum invariant).
         let tmp = tempfile::NamedTempFile::new().unwrap();
         write_cluster_fixture(
             tmp.path(),
             &[vec![0], vec![0, 1, 2]],
-            Some(&[vec![3], vec![1, 1, 1]]),
+            Some(&[vec![2], vec![1, 1, 1]]),
         );
         let report = validate_file(tmp.path()).unwrap();
         assert!(
@@ -960,6 +1135,53 @@ mod tests {
         assert_eq!(
             report.check_passed("cluster_point_count_values"),
             Some(true)
+        );
+        assert_eq!(report.check_passed("cluster_sum_invariant"), Some(true));
+    }
+
+    #[test]
+    fn clustering_sum_invariant_violation_fails() {
+        // Row-group statistics are conformant (min >= 1, canonical all 1),
+        // but the level-0 point sums to 3 while the source holds 2 points:
+        // an absorbed point was double counted (§12.1). Only the sum check
+        // catches this.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_cluster_fixture(
+            tmp.path(),
+            &[vec![0], vec![0, 1, 2]],
+            Some(&[vec![3], vec![1, 1, 1]]),
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
+        assert_eq!(
+            report.check_passed("cluster_point_count_values"),
+            Some(true),
+            "stats-level checks must stay green (the violation is data-level)"
+        );
+        assert_eq!(report.check_passed("cluster_sum_invariant"), Some(false));
+    }
+
+    #[test]
+    fn clustering_level_without_point_row_fails() {
+        // Level 0 holds only a polygon (id 1) while the source has 2 points:
+        // the derived producer obligation (§12.1) requires a surviving point
+        // row per clustered level to absorb the counts.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_cluster_fixture(
+            tmp.path(),
+            &[vec![1], vec![0, 1, 2]],
+            Some(&[vec![1], vec![1, 1, 1]]),
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
+        let failed = report
+            .failures()
+            .find(|c| c.name == "cluster_sum_invariant")
+            .expect("cluster_sum_invariant must fail");
+        assert!(
+            failed.message.contains("no point row"),
+            "unexpected message: {}",
+            failed.message
         );
     }
 

@@ -324,6 +324,60 @@ pub fn build_cluster_tables(
     tables
 }
 
+/// Verify the strict §12.1 accounting / sum invariant over freshly built
+/// cluster tables: at every level, every source point feature is counted in
+/// exactly one point row of that level, so `Σ point_count` over a level's
+/// point rows equals the total source point count exactly — under any drop
+/// mechanism (cell-winner thinning, density budget, their interactions).
+///
+/// Also asserts the derived producer obligation: a clustered level MUST NOT
+/// thin its points to zero while the source contains points — there must be
+/// a surviving point row to absorb the re-assignments.
+///
+/// Inputs are the exact arguments/results of [`build_cluster_tables`]
+/// (`min_levels` parallel to `features`). Returns a human-readable violation
+/// description; callers surface it as a conversion error.
+pub fn verify_sum_invariant(
+    features: &[AssignFeature],
+    min_levels: &[u8],
+    tables: &ClusterTables,
+) -> Result<(), String> {
+    debug_assert_eq!(features.len(), min_levels.len());
+    let total: i64 = features
+        .iter()
+        .filter(|f| f.kind == FeatureKind::Point)
+        .count() as i64;
+    if total == 0 {
+        return Ok(()); // no source points: nothing to account for
+    }
+    for (level, table) in tables.iter().enumerate() {
+        let mut sum = 0i64;
+        let mut point_rows = 0usize;
+        for (f, &ml) in features.iter().zip(min_levels) {
+            if f.kind != FeatureKind::Point || ml as usize > level {
+                continue;
+            }
+            point_rows += 1;
+            sum += table.get(&f.index).map_or(1, |e| e.point_count);
+        }
+        if point_rows == 0 {
+            return Err(format!(
+                "clustered level {level} has no surviving point row to absorb \
+                 {total} source points (spec §12.1: a clustered level cannot \
+                 thin points to zero while the source contains points)"
+            ));
+        }
+        if sum != total {
+            return Err(format!(
+                "clustered level {level}: sum(point_count) over point rows = \
+                 {sum}, expected the source point count {total} (spec §12.1 \
+                 sum invariant)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Deterministic nearest present point feature to the center of `cell_key`,
 /// searched over expanding Chebyshev rings of the level grid. Among the
 /// candidates of the first non-empty ring, the one with the smallest squared
@@ -739,6 +793,65 @@ mod tests {
         };
         let t = build_cluster_tables(&[poly], &[0], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
         assert!(t.iter().all(|m| m.is_empty()));
+    }
+
+    /// §12.1 verifier: a healthy table set (including a simulated
+    /// density-budget orphan) passes; the pathological zero-survivor level
+    /// (every point deferred past a level) is rejected with the derived
+    /// producer obligation, and a doctored table is rejected by the sum rule.
+    #[test]
+    fn verify_sum_invariant_pass_orphan_and_zero_survivor() {
+        let cell = 4.0 * gsd(2);
+        let feats = vec![
+            point(0, 0.5 * cell, 0.0),
+            point(1, 1.5 * cell, 0.0), // orphan cell (deferred winner)
+            point(2, 4.5 * cell, 0.0),
+        ];
+        let gsds = [gsd(2), gsd(10)];
+        let cfg = AssignConfig::default();
+
+        // Orphan absorbed by nearest survivor: invariant holds.
+        let min_levels = vec![0u8, 1, 0];
+        let tables =
+            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        verify_sum_invariant(&feats, &min_levels, &tables).unwrap();
+
+        // Zero survivors at level 0 (every point deferred): build silently
+        // skips the level, the verifier MUST reject it (spec §12.1).
+        let all_deferred = vec![1u8, 1, 1];
+        let tables =
+            build_cluster_tables(&feats, &all_deferred, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let err = verify_sum_invariant(&feats, &all_deferred, &tables).unwrap_err();
+        assert!(
+            err.contains("no surviving point row"),
+            "unexpected message: {err}"
+        );
+
+        // Doctored table (a lost absorption): sum rule rejects.
+        let min_levels = vec![0u8, 1, 0];
+        let mut tables =
+            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        tables[0].clear(); // drop the 2-point cluster entry → sum 2, not 3
+        let err = verify_sum_invariant(&feats, &min_levels, &tables).unwrap_err();
+        assert!(err.contains("sum invariant"), "unexpected message: {err}");
+    }
+
+    /// The verifier is a no-op for point-free inputs (lines/polygons only).
+    #[test]
+    fn verify_sum_invariant_no_points_is_ok() {
+        let poly = AssignFeature {
+            index: 0,
+            bbox: [0.0, 0.0, 50_000.0, 50_000.0],
+            kind: FeatureKind::Polygon,
+            sort_key: None,
+        };
+        let gsds = [gsd(2), gsd(6)];
+        let cfg = AssignConfig::default();
+        let feats = vec![poly];
+        let min_levels = vec![0u8];
+        let tables =
+            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        verify_sum_invariant(&feats, &min_levels, &tables).unwrap();
     }
 
     #[test]

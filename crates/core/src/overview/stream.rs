@@ -62,7 +62,7 @@ use rayon::prelude::*;
 use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
 
 use super::assign::{apply_density_budget, assign_levels, AssignFeature, FeatureKind};
-use super::cluster::{build_cluster_tables, ClusterEntry, ClusterTables};
+use super::cluster::{build_cluster_tables, verify_sum_invariant, ClusterEntry, ClusterTables};
 use super::coalesce::CoalesceInput;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
@@ -194,7 +194,7 @@ pub(super) fn convert_streaming(
             .iter()
             .map(|vals| features.iter().map(|f| vals[f.index]).collect())
             .collect();
-        Some(build_cluster_tables(
+        let tables = build_cluster_tables(
             &features,
             &feat_min_levels,
             &level_gsds,
@@ -202,7 +202,12 @@ pub(super) fn convert_streaming(
             crs,
             &acc_feat,
             &ops,
-        ))
+        );
+        // Strict §12.1 accounting: Σ point_count per level == source point
+        // count, and no clustered level thins its points to zero.
+        verify_sum_invariant(&features, &feat_min_levels, &tables)
+            .map_err(ConvertError::ClusterInvariant)?;
+        Some(tables)
     } else {
         None
     };

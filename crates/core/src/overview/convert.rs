@@ -52,7 +52,9 @@ use super::assign::{
     apply_density_budget, assign_levels, AssignConfig, AssignFeature, DensityBudgetConfig,
     FeatureKind, SUPERCELL_GSD_FACTOR,
 };
-use super::cluster::{build_cluster_tables, AccumulateSpec, ClusterEntry, POINT_COUNT_COLUMN};
+use super::cluster::{
+    build_cluster_tables, verify_sum_invariant, AccumulateSpec, ClusterEntry, POINT_COUNT_COLUMN,
+};
 use super::coalesce::{
     coalesce_level_lines, CoalesceInput, CoalesceParams, COALESCED_COUNT_COLUMN,
     DEFAULT_COALESCE_MAX_LEVEL_ROWS, DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
@@ -531,6 +533,14 @@ pub enum ConvertError {
     /// The input has no features, or every feature was dropped from every level.
     #[error("no output rows produced (empty input or all features dropped)")]
     NoData,
+    /// The strict cluster accounting / sum invariant (spec §12.1) was
+    /// violated while building the per-level cluster tables: a level's
+    /// `point_count` values would not partition the source point set (or a
+    /// clustered level thinned its points to zero with source points left
+    /// to absorb). This is a producer bug guard — a conforming conversion
+    /// can never trip it.
+    #[error("cluster invariant violated (spec §12.1): {0}")]
+    ClusterInvariant(String),
 }
 
 /// Convert a GeoParquet file into a multi-resolution overview GeoParquet file.
@@ -773,7 +783,7 @@ pub fn convert_to_overviews(
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
         let acc_values = extract_accumulate_values(&full, &acc_cols);
         let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
-        Some(build_cluster_tables(
+        let tables = build_cluster_tables(
             &features,
             &min_levels,
             &level_gsds,
@@ -781,7 +791,12 @@ pub fn convert_to_overviews(
             crs,
             &acc_values,
             &ops,
-        ))
+        );
+        // Strict §12.1 accounting: Σ point_count per level == source point
+        // count, and no clustered level thins its points to zero.
+        verify_sum_invariant(&features, &min_levels, &tables)
+            .map_err(ConvertError::ClusterInvariant)?;
+        Some(tables)
     } else {
         None
     };
@@ -3108,6 +3123,76 @@ mod tests {
         assert!(coarse.iter().any(|&c| c > 1), "no clustering happened");
         assert!(coarse.len() < geoms.len());
         assert_eq!(report.levels.last().unwrap().feature_count, geoms.len());
+    }
+
+    /// §12.1 sum-invariant property across knob combinations: clustering
+    /// crossed with the density budget (on/off), point-thinning grid sizes,
+    /// and both pipelines (streaming / in-memory) — every produced file must
+    /// partition the source point set at every level, pass the
+    /// `cluster_sum_invariant` validator rule, and keep a singleton-only
+    /// canonical band. Coalescing stays at its default (on): it only touches
+    /// lines and must not interact with point accounting.
+    #[test]
+    fn cluster_sum_invariant_across_knob_combinations() {
+        let geoms = grid_points(300);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        for streaming in [true, false] {
+            for density in [true, false] {
+                for thinning in [2.0, 8.0] {
+                    let tout = tempfile::NamedTempFile::new().unwrap();
+                    let mut opts = ConvertOptions {
+                        levels: LevelPlan::ZoomRange {
+                            min_zoom: 0,
+                            max_zoom: 6,
+                        },
+                        cluster: true,
+                        streaming,
+                        ..Default::default()
+                    };
+                    opts.density.enabled = density;
+                    opts.assign.point_thinning = thinning;
+                    let label =
+                        format!("streaming={streaming} density={density} thinning={thinning}");
+                    convert_to_overviews(tin.path(), tout.path(), &opts)
+                        .unwrap_or_else(|e| panic!("{label}: {e}"));
+
+                    let vr = validate_file(tout.path()).unwrap();
+                    assert!(
+                        vr.is_valid(),
+                        "{label}: failures: {:?}",
+                        vr.failures().collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        vr.check_passed("cluster_sum_invariant"),
+                        Some(true),
+                        "{label}"
+                    );
+
+                    let reader = OverviewReader::open(tout.path()).unwrap();
+                    let canonical = reader.num_levels() - 1;
+                    for level in 0..reader.num_levels() {
+                        let counts = read_point_counts(&reader, level);
+                        assert!(
+                            !counts.is_empty(),
+                            "{label}: level {level} thinned points to zero"
+                        );
+                        assert_eq!(
+                            counts.iter().sum::<i64>(),
+                            geoms.len() as i64,
+                            "{label}: level {level} must partition the source set"
+                        );
+                    }
+                    assert!(
+                        read_point_counts(&reader, canonical)
+                            .iter()
+                            .all(|&c| c == 1),
+                        "{label}: canonical band must be singleton-only"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
