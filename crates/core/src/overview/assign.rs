@@ -110,7 +110,7 @@ pub struct AssignFeature {
 impl AssignFeature {
     /// Bbox center — the representative point used for grid placement.
     #[inline]
-    fn center(&self) -> (f64, f64) {
+    pub(super) fn center(&self) -> (f64, f64) {
         let [xmin, ymin, xmax, ymax] = self.bbox;
         ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5)
     }
@@ -253,8 +253,10 @@ type CellKey = (u8, i64, i64);
 
 /// Priority of a feature within a cell. Higher is better. Compared
 /// lexicographically to yield a strict total order (see [`Priority::cmp`]).
+/// `pub(super)` so the clustering stage (`super::cluster`) can rank present
+/// features with the exact order the cell-winner stage used.
 #[derive(Debug, Clone, Copy)]
-struct Priority {
+pub(super) struct Priority {
     /// Encoded sort key: `Some` sorts above `None`; direction already applied
     /// so that "larger `sort_bits` wins".
     sort_rank: Option<f64>,
@@ -265,7 +267,7 @@ struct Priority {
 }
 
 impl Priority {
-    fn new(feat: &AssignFeature, dir: SortDirection) -> Self {
+    pub(super) fn new(feat: &AssignFeature, dir: SortDirection) -> Self {
         // Apply direction so a plain "larger wins" comparison is correct.
         let sort_rank = feat.sort_key.map(|k| match dir {
             SortDirection::Desc => k,
@@ -280,7 +282,7 @@ impl Priority {
     }
 
     /// Returns `true` if `self` is strictly better (should win) than `other`.
-    fn beats(&self, other: &Priority) -> bool {
+    pub(super) fn beats(&self, other: &Priority) -> bool {
         // 1. sort_rank: Some beats None; both Some compares larger-wins.
         match (self.sort_rank, other.sort_rank) {
             (Some(a), Some(b)) => {

@@ -52,9 +52,10 @@ use super::assign::{
     apply_density_budget, assign_levels, AssignConfig, AssignFeature, DensityBudgetConfig,
     FeatureKind, SUPERCELL_GSD_FACTOR,
 };
+use super::cluster::{build_cluster_tables, AccumulateSpec, ClusterEntry, POINT_COUNT_COLUMN};
 use super::level::{
-    gsd_with_base, Crs, DensityProvenance, Generalization, GeneralizationLevel, Mode,
-    RankingProvenance, GSD_TILE_BASE,
+    gsd_with_base, AccumulatedColumn, ClusteringProvenance, Crs, DensityProvenance, Generalization,
+    GeneralizationLevel, Mode, RankingProvenance, GSD_TILE_BASE,
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, WriterError, LEVEL_COLUMN};
@@ -281,6 +282,18 @@ pub struct ConvertOptions {
     /// overhead at the cost of proportionally more peak memory; smaller
     /// batches bound memory tighter. No effect when `streaming` is `false`.
     pub read_batch_size: usize,
+    /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
+    /// mode only. When enabled, each level's point cell-winners absorb the
+    /// other point features in their cell: the output gains a `point_count`
+    /// INT64 NOT NULL column (1 at the canonical level) and the winner keeps
+    /// its own geometry and attributes (see [`super::cluster`]). Lines and
+    /// polygons are unaffected. Default `false`.
+    pub cluster: bool,
+    /// Numeric per-cluster attribute aggregation (Q6): for each spec, the
+    /// winner's value of the column becomes the aggregate over itself + the
+    /// absorbed features at that level. Requires [`cluster`](Self::cluster).
+    /// Empty by default.
+    pub accumulate: Vec<AccumulateSpec>,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -306,6 +319,8 @@ impl Default for ConvertOptions {
             full_column_stats: false,
             streaming: true,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
+            cluster: false,
+            accumulate: Vec::new(),
         }
     }
 }
@@ -404,6 +419,44 @@ pub enum ConvertError {
     /// The level plan is invalid (empty / non-monotonic / bad zoom range).
     #[error("invalid level specification: {0}")]
     InvalidLevels(String),
+    /// `--cluster` was requested in partitioning mode. A partitioning row is
+    /// read at MANY display zooms (prefix reads, §2.3) but exists at exactly
+    /// one level, so a single stored `point_count` cannot reflect "that
+    /// level's grid" for every zoom it is displayed at — and absorbed
+    /// features reappear as their own rows at finer levels while remaining
+    /// counted in coarser winners, double-counting every prefix sum.
+    #[error(
+        "--cluster requires duplicating mode: a partitioning-mode feature has one \
+         row read across many zoom prefixes, so a per-level point_count cannot be \
+         represented without double counting"
+    )]
+    ClusterPartitioningUnsupported,
+    /// `--accumulate-attribute` was supplied without `--cluster`.
+    #[error("--accumulate-attribute requires --cluster")]
+    AccumulateWithoutCluster,
+    /// An `--accumulate-attribute` column is not present in the input schema.
+    #[error("accumulate-attribute column {name:?} not found in input schema")]
+    AccumulateColumnMissing {
+        /// The requested column name.
+        name: String,
+    },
+    /// An `--accumulate-attribute` column is not numeric.
+    #[error(
+        "accumulate-attribute column {name:?} is {data_type} but must be numeric \
+         (int/uint/float)"
+    )]
+    AccumulateColumnNotNumeric {
+        /// The requested column name.
+        name: String,
+        /// The actual Arrow data type found.
+        data_type: String,
+    },
+    /// The input already contains a `point_count` column (clustering enabled).
+    #[error(
+        "input already contains a '{POINT_COUNT_COLUMN}' column; rename it before \
+         converting with --cluster"
+    )]
+    PointCountColumnPresent,
     /// The input has no features, or every feature was dropped from every level.
     #[error("no output rows produced (empty input or all features dropped)")]
     NoData,
@@ -418,6 +471,16 @@ pub fn convert_to_overviews(
     output_path: impl AsRef<Path>,
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
+    // Clustering option sanity (Q4), shared by both pipelines: partitioning
+    // mode cannot represent per-level counts (see the error's rationale), and
+    // aggregation is meaningless without clustering.
+    if options.cluster && matches!(options.mode, Mode::Partitioning) {
+        return Err(ConvertError::ClusterPartitioningUnsupported);
+    }
+    if !options.accumulate.is_empty() && !options.cluster {
+        return Err(ConvertError::AccumulateWithoutCluster);
+    }
+
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
     if options.streaming {
@@ -460,6 +523,9 @@ pub fn convert_to_overviews(
 
     let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
     let geom_field = input_schema.field(geom_idx).clone();
+
+    // Clustering schema checks + accumulate column resolution (Q4).
+    let acc_cols = validate_cluster_schema(&input_schema, options)?;
 
     let reader = builder.build()?;
     let mut batches: Vec<RecordBatch> = Vec::new();
@@ -516,9 +582,30 @@ pub fn convert_to_overviews(
     let num_levels = level_gsds.len();
     let finest = num_levels.saturating_sub(1);
 
+    // --- Cluster tables (Q4): per level, winner → point_count + aggregates. --
+    let cluster_tables = if options.cluster {
+        let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+        let acc_values = extract_accumulate_values(&full, &acc_cols);
+        let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
+        Some(build_cluster_tables(
+            &features,
+            &min_levels,
+            &level_gsds,
+            &options.assign,
+            crs,
+            &acc_values,
+            &ops,
+        ))
+    } else {
+        None
+    };
+
     // --- Build per-level generalized selections (coarse→fine). ---------------
     // Each emitted entry: (spec, feature indices, geometries, vertex_count).
     struct EmittedLevel {
+        /// Index in the resolved level plan (cluster-table key; may differ
+        /// from the emitted index when empty levels are omitted, §7.3).
+        orig: usize,
         gsd: f64,
         zoom: Option<u8>,
         indices: Vec<usize>,
@@ -566,6 +653,7 @@ pub fn convert_to_overviews(
             continue;
         }
         emitted.push(EmittedLevel {
+            orig: level,
             gsd: gsd_m,
             zoom,
             indices,
@@ -585,6 +673,12 @@ pub fn convert_to_overviews(
     // same type so RecordBatch assembly matches.
     let geom_out_field = mixed_geometry_field(&geom_name);
     let source_schema = build_source_schema(&input_schema, geom_idx, geom_out_field.clone());
+    // Writer schema: base + point_count when clustering (Q4).
+    let out_schema = if options.cluster {
+        append_point_count_field(&source_schema)
+    } else {
+        source_schema.clone()
+    };
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()
@@ -602,7 +696,7 @@ pub fn convert_to_overviews(
         ranking_provenance,
     ));
 
-    let mut writer = OverviewWriter::create(output_path, &source_schema, writer_opts)?;
+    let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
     // Column indices of the non-geometry source columns (preserve original order).
     let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
@@ -611,7 +705,7 @@ pub fn convert_to_overviews(
 
     let mut level_reports = Vec::with_capacity(emitted.len());
     for (level_idx, e) in emitted.iter().enumerate() {
-        let batch = build_level_batch(
+        let mut batch = build_level_batch(
             &source_schema,
             &full,
             &non_geom_cols,
@@ -619,6 +713,11 @@ pub fn convert_to_overviews(
             &e.indices,
             &e.geoms,
         )?;
+        if let Some(tables) = &cluster_tables {
+            // Canonical level: singleton clusters, columns verbatim (§2.4).
+            let table = (e.orig != finest).then(|| &tables[e.orig]);
+            batch = apply_cluster_columns(batch, &out_schema, &e.indices, table, &acc_cols)?;
+        }
         writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
         level_reports.push(LevelReport {
             level: level_idx,
@@ -819,6 +918,193 @@ pub(super) fn build_level_batch(
     )?)
 }
 
+// ============================================================================
+// Clustering helpers (Q4) — shared by the in-memory and streaming pipelines
+// ============================================================================
+
+/// Validate the clustering-related schema constraints and resolve the
+/// accumulate columns to schema indices (parallel to `options.accumulate`).
+///
+/// Checks (clustering enabled only):
+/// - the input does not already carry a `point_count` column
+///   (case-insensitive, mirroring the `level` column rule §4.1);
+/// - every accumulate column exists and is numeric.
+pub(super) fn validate_cluster_schema(
+    schema: &Schema,
+    options: &ConvertOptions,
+) -> Result<Vec<usize>, ConvertError> {
+    if !options.cluster {
+        return Ok(Vec::new());
+    }
+    if schema
+        .fields()
+        .iter()
+        .any(|f| f.name().eq_ignore_ascii_case(POINT_COUNT_COLUMN))
+    {
+        return Err(ConvertError::PointCountColumnPresent);
+    }
+    let mut indices = Vec::with_capacity(options.accumulate.len());
+    for spec in &options.accumulate {
+        let idx =
+            schema
+                .index_of(&spec.column)
+                .map_err(|_| ConvertError::AccumulateColumnMissing {
+                    name: spec.column.clone(),
+                })?;
+        let dt = schema.field(idx).data_type();
+        if !is_numeric_type(dt) {
+            return Err(ConvertError::AccumulateColumnNotNumeric {
+                name: spec.column.clone(),
+                data_type: format!("{dt:?}"),
+            });
+        }
+        indices.push(idx);
+    }
+    Ok(indices)
+}
+
+/// Whether an Arrow type is accepted by `--accumulate-attribute`.
+fn is_numeric_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+/// The writer source schema with the trailing `point_count` INT64 NOT NULL
+/// column appended (clustering enabled).
+pub(super) fn append_point_count_field(schema: &Schema) -> Schema {
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(
+        POINT_COUNT_COLUMN,
+        DataType::Int64,
+        false,
+    )));
+    Schema::new(fields)
+}
+
+/// Per-feature accumulate values (one vector per spec, parallel to the rows),
+/// extracted from the resolved column indices of a batch-shaped table.
+pub(super) fn extract_accumulate_values(
+    batch: &RecordBatch,
+    acc_col_indices: &[usize],
+) -> Vec<Vec<Option<f64>>> {
+    acc_col_indices
+        .iter()
+        .map(|&idx| extract_sort_keys(batch.column(idx).as_ref()))
+        .collect()
+}
+
+/// Append the `point_count` column to a level batch and overwrite the
+/// accumulate columns for clustered rows (Q4).
+///
+/// - `batch`: the level batch built by [`build_level_batch`] (base schema).
+/// - `out_schema`: base schema + trailing `point_count` field.
+/// - `global_indices`: per batch row, the source-row index used as the
+///   cluster-table key.
+/// - `table`: the level's cluster table; `None` at the canonical level (all
+///   singletons — every column passes through verbatim, count = 1).
+/// - `acc_cols`: schema indices of the accumulate columns (parallel to the
+///   aggregates in each [`ClusterEntry`]).
+///
+/// Singleton rows (absent from the table) keep every source value; only
+/// non-singleton winners have `point_count > 1` and rewritten aggregates.
+/// Aggregates are computed in `f64`; written back in the column's original
+/// type (integer columns round to nearest — relevant for `mean`).
+pub(super) fn apply_cluster_columns(
+    batch: RecordBatch,
+    out_schema: &Schema,
+    global_indices: &[usize],
+    table: Option<&HashMap<usize, ClusterEntry>>,
+    acc_cols: &[usize],
+) -> Result<RecordBatch, ConvertError> {
+    use arrow_array::Int64Array;
+
+    debug_assert_eq!(batch.num_rows(), global_indices.len());
+    let mut columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
+
+    // Overwrite accumulate columns for clustered rows.
+    if let Some(table) = table {
+        for (s, &col_idx) in acc_cols.iter().enumerate() {
+            let overrides: Vec<Option<f64>> = global_indices
+                .iter()
+                .map(|g| table.get(g).and_then(|e| e.aggregates[s]))
+                .collect();
+            if overrides.iter().any(|o| o.is_some()) {
+                columns[col_idx] = overwrite_numeric_column(&columns[col_idx], &overrides)?;
+            }
+        }
+    }
+
+    // Append point_count (1 for singletons / non-points / canonical rows).
+    let counts: Vec<i64> = global_indices
+        .iter()
+        .map(|g| table.and_then(|t| t.get(g)).map_or(1, |e| e.point_count))
+        .collect();
+    columns.push(Arc::new(Int64Array::from(counts)));
+
+    Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
+}
+
+/// Rebuild a numeric column with per-row override values (`None` keeps the
+/// original value, including its nullness). Aggregates arrive as `f64`;
+/// integer columns round to nearest.
+fn overwrite_numeric_column(
+    col: &Arc<dyn Array>,
+    overrides: &[Option<f64>],
+) -> Result<Arc<dyn Array>, ConvertError> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+        UInt32Type, UInt64Type, UInt8Type,
+    };
+    use arrow_array::PrimitiveArray;
+
+    macro_rules! rebuild {
+        ($ty:ty, $cast:expr) => {{
+            let a = col.as_primitive::<$ty>();
+            let rebuilt: PrimitiveArray<$ty> = (0..a.len())
+                .map(|i| match overrides[i] {
+                    Some(v) => Some($cast(v)),
+                    None => {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i))
+                        }
+                    }
+                })
+                .collect();
+            Ok(Arc::new(rebuilt))
+        }};
+    }
+    match col.data_type() {
+        DataType::Int8 => rebuild!(Int8Type, |v: f64| v.round() as i8),
+        DataType::Int16 => rebuild!(Int16Type, |v: f64| v.round() as i16),
+        DataType::Int32 => rebuild!(Int32Type, |v: f64| v.round() as i32),
+        DataType::Int64 => rebuild!(Int64Type, |v: f64| v.round() as i64),
+        DataType::UInt8 => rebuild!(UInt8Type, |v: f64| v.round() as u8),
+        DataType::UInt16 => rebuild!(UInt16Type, |v: f64| v.round() as u16),
+        DataType::UInt32 => rebuild!(UInt32Type, |v: f64| v.round() as u32),
+        DataType::UInt64 => rebuild!(UInt64Type, |v: f64| v.round() as u64),
+        DataType::Float32 => rebuild!(Float32Type, |v: f64| v as f32),
+        DataType::Float64 => rebuild!(Float64Type, |v: f64| v),
+        other => Err(ConvertError::AccumulateColumnNotNumeric {
+            name: "<accumulate column>".to_string(),
+            data_type: format!("{other:?}"),
+        }),
+    }
+}
+
 /// Build informative generalization provenance (§3.5) from the emitted gsds.
 pub(super) fn build_generalization(
     gsds: &[f64],
@@ -857,6 +1143,24 @@ pub(super) fn build_generalization(
                 drop_rate: options.density.drop_rate,
                 gamma: options.density.gamma,
                 supercell_gsd_factor: SUPERCELL_GSD_FACTOR,
+            })
+        } else {
+            None
+        },
+        // Recorded only when clustering was applied; a non-clustered run emits
+        // a byte-identical footer to before this feature existed.
+        clustering: if options.cluster {
+            Some(ClusteringProvenance {
+                enabled: true,
+                point_count_column: POINT_COUNT_COLUMN.to_string(),
+                accumulated: options
+                    .accumulate
+                    .iter()
+                    .map(|s| AccumulatedColumn {
+                        column: s.column.clone(),
+                        op: s.op.as_str().to_string(),
+                    })
+                    .collect(),
             })
         } else {
             None
@@ -2225,6 +2529,393 @@ mod tests {
         let mr = OverviewReader::open(mem_out.path()).unwrap();
         let sr = OverviewReader::open(stream_out.path()).unwrap();
         assert_eq!(min_level_by_id(&mr), min_level_by_id(&sr));
+    }
+
+    // --- Q4 point clustering -------------------------------------------------
+
+    /// Read the `point_count` column for one level, in row order.
+    fn read_point_counts(reader: &OverviewReader, level: usize) -> Vec<i64> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        let rdr = reader.read_level(level, None).unwrap();
+        let mut out = Vec::new();
+        for batch in rdr {
+            let batch = batch.unwrap();
+            let idx = batch.schema().index_of("point_count").unwrap();
+            let col = batch.column(idx).as_primitive::<Int64Type>().clone();
+            assert_eq!(col.null_count(), 0, "point_count must be NOT NULL");
+            out.extend(col.values().iter().copied());
+        }
+        out
+    }
+
+    /// Read a Float64 column for one level, in row order (None = null).
+    fn read_f64_column(reader: &OverviewReader, level: usize, name: &str) -> Vec<Option<f64>> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Float64Type;
+        let rdr = reader.read_level(level, None).unwrap();
+        let mut out = Vec::new();
+        for batch in rdr {
+            let batch = batch.unwrap();
+            let idx = batch.schema().index_of(name).unwrap();
+            let col = batch.column(idx).as_primitive::<Float64Type>().clone();
+            for i in 0..col.len() {
+                out.push(if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i))
+                });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cluster_duplicating_end_to_end_counts_partition_every_level() {
+        // 600 grid points, clustering on: every level's point_count sums to
+        // the source count, canonical counts are all 1, file validates.
+        let geoms = grid_points(600);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            cluster: true,
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        let vr = validate_file(tout.path()).unwrap();
+        assert!(
+            vr.is_valid(),
+            "failures: {:?}",
+            vr.failures().collect::<Vec<_>>()
+        );
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let canonical = reader.num_levels() - 1;
+        for level in 0..reader.num_levels() {
+            let counts = read_point_counts(&reader, level);
+            assert!(counts.iter().all(|&c| c >= 1), "level {level} counts >= 1");
+            assert_eq!(
+                counts.iter().sum::<i64>(),
+                geoms.len() as i64,
+                "level {level}: sum(point_count) must equal source count"
+            );
+        }
+        // Canonical: every cluster is a singleton.
+        assert!(read_point_counts(&reader, canonical)
+            .iter()
+            .all(|&c| c == 1));
+        // Density budget bites mid-levels: some coarse level must actually
+        // cluster (a count > 1), or this test tests nothing.
+        let coarse = read_point_counts(&reader, 0);
+        assert!(coarse.iter().any(|&c| c > 1), "no clustering happened");
+        assert!(coarse.len() < geoms.len());
+        assert_eq!(report.levels.last().unwrap().feature_count, geoms.len());
+    }
+
+    #[test]
+    fn cluster_accumulate_sum_and_mean_consistent() {
+        // The `rank` column (Float64, values n..1) accumulated as sum: every
+        // level's Σ rank over rows must equal the source Σ (clusters
+        // partition the source set and sum is additive). Canonical stays
+        // verbatim.
+        let geoms = grid_points(400);
+        let n = geoms.len();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+        let source_sum: f64 = (1..=n).map(|v| v as f64).sum();
+
+        // sum
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            cluster: true,
+            accumulate: vec![AccumulateSpec {
+                column: "rank".to_string(),
+                op: super::super::cluster::AccumulateOp::Sum,
+            }],
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        for level in 0..reader.num_levels() {
+            let ranks = read_f64_column(&reader, level, "rank");
+            let total: f64 = ranks.iter().flatten().sum();
+            assert!(
+                (total - source_sum).abs() < 1e-6,
+                "level {level}: rank sum {total} != source {source_sum}"
+            );
+        }
+        // Canonical: verbatim source values (id i has rank n - i).
+        let canonical = reader.num_levels() - 1;
+        let rows = read_level_rows(&reader, canonical);
+        for (id, _, rank, _) in rows {
+            assert_eq!(rank, (n as i64 - id) as f64, "canonical rank verbatim");
+        }
+
+        // mean: Σ (mean_i × point_count_i) must reproduce the source sum at
+        // every level (mean computed from source values, not mean-of-means).
+        let tout2 = tempfile::NamedTempFile::new().unwrap();
+        let opts_mean = ConvertOptions {
+            accumulate: vec![AccumulateSpec {
+                column: "rank".to_string(),
+                op: super::super::cluster::AccumulateOp::Mean,
+            }],
+            ..opts.clone()
+        };
+        convert_to_overviews(tin.path(), tout2.path(), &opts_mean).unwrap();
+        let reader2 = OverviewReader::open(tout2.path()).unwrap();
+        for level in 0..reader2.num_levels() {
+            let means = read_f64_column(&reader2, level, "rank");
+            let counts = read_point_counts(&reader2, level);
+            let total: f64 = means
+                .iter()
+                .zip(&counts)
+                .map(|(m, &c)| m.unwrap() * c as f64)
+                .sum();
+            assert!(
+                (total - source_sum).abs() < 1e-6,
+                "level {level}: Σ mean×count {total} != source {source_sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_footer_provenance_recorded() {
+        let geoms = grid_points(100);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            cluster: true,
+            accumulate: vec![AccumulateSpec {
+                column: "rank".to_string(),
+                op: super::super::cluster::AccumulateOp::Mean,
+            }],
+            ..Default::default()
+        };
+        convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let c = reader
+            .meta()
+            .generalization
+            .as_ref()
+            .unwrap()
+            .clustering
+            .clone()
+            .expect("clustering provenance recorded");
+        assert!(c.enabled);
+        assert_eq!(c.point_count_column, "point_count");
+        assert_eq!(c.accumulated.len(), 1);
+        assert_eq!(c.accumulated[0].column, "rank");
+        assert_eq!(c.accumulated[0].op, "mean");
+
+        // Off by default: no clustering block, no point_count column.
+        let tout_off = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(tin.path(), tout_off.path(), &ConvertOptions::default()).unwrap();
+        let r_off = OverviewReader::open(tout_off.path()).unwrap();
+        assert!(r_off
+            .meta()
+            .generalization
+            .as_ref()
+            .unwrap()
+            .clustering
+            .is_none());
+    }
+
+    #[test]
+    fn cluster_option_errors() {
+        let geoms = grid_points(20);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        // Partitioning + cluster is rejected.
+        let err = convert_to_overviews(
+            tin.path(),
+            tout.path(),
+            &ConvertOptions {
+                mode: Mode::Partitioning,
+                cluster: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::ClusterPartitioningUnsupported));
+
+        // Accumulate without cluster is rejected.
+        let err = convert_to_overviews(
+            tin.path(),
+            tout.path(),
+            &ConvertOptions {
+                accumulate: vec![AccumulateSpec {
+                    column: "rank".to_string(),
+                    op: super::super::cluster::AccumulateOp::Sum,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::AccumulateWithoutCluster));
+
+        // Missing accumulate column is rejected (both pipelines).
+        for streaming in [true, false] {
+            let err = convert_to_overviews(
+                tin.path(),
+                tout.path(),
+                &ConvertOptions {
+                    cluster: true,
+                    streaming,
+                    accumulate: vec![AccumulateSpec {
+                        column: "nonexistent".to_string(),
+                        op: super::super::cluster::AccumulateOp::Sum,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ConvertError::AccumulateColumnMissing { .. }),
+                "streaming={streaming}: got {err:?}"
+            );
+        }
+
+        // Non-numeric accumulate column is rejected.
+        let err = convert_to_overviews(
+            tin.path(),
+            tout.path(),
+            &ConvertOptions {
+                cluster: true,
+                accumulate: vec![AccumulateSpec {
+                    column: "name".to_string(),
+                    op: super::super::cluster::AccumulateOp::Max,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::AccumulateColumnNotNumeric { .. }
+        ));
+    }
+
+    #[test]
+    fn cluster_rejects_existing_point_count_column() {
+        // An input already carrying a `point_count` column is rejected when
+        // clustering (case-insensitively), but accepted when clustering is off.
+        let geoms = grid_points(10);
+        let n = geoms.len();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        {
+            let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+            let pc = Int64Array::from(vec![7i64; n]);
+            let geom_arr = build_geometry_array(&geoms);
+            let geom_field = geom_arr.data_type().to_field("geometry", true);
+            let fields = vec![
+                Arc::new(Field::new("id", DataType::Int64, false)),
+                Arc::new(Field::new("Point_Count", DataType::Int64, false)),
+                Arc::new(geom_field),
+            ];
+            let columns: Vec<Arc<dyn Array>> =
+                vec![Arc::new(id), Arc::new(pc), geom_arr.to_array_ref()];
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            let gpq_options = GeoParquetWriterOptionsBuilder::default()
+                .set_encoding(GeoParquetWriterEncoding::WKB)
+                .set_generate_covering(true)
+                .build();
+            let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+            let target_schema = encoder.target_schema();
+            let file = std::fs::File::create(tin.path()).unwrap();
+            let mut writer = ArrowWriter::try_new(file, target_schema, None).unwrap();
+            writer
+                .write(&encoder.encode_record_batch(&batch).unwrap())
+                .unwrap();
+            writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+            writer.close().unwrap();
+        }
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let err = convert_to_overviews(
+            tin.path(),
+            tout.path(),
+            &ConvertOptions {
+                cluster: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::PointCountColumnPresent));
+
+        // Without clustering the column is an ordinary property.
+        convert_to_overviews(tin.path(), tout.path(), &ConvertOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn streaming_matches_in_memory_clustering() {
+        // Clustering + accumulation must be byte-equivalent between the
+        // streaming and in-memory pipelines, including with tiny read batches
+        // and the density budget's orphan-cell handling.
+        let geoms = grid_points(600);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            read_batch_size: 7,
+            cluster: true,
+            accumulate: vec![
+                AccumulateSpec {
+                    column: "rank".to_string(),
+                    op: super::super::cluster::AccumulateOp::Sum,
+                },
+                AccumulateSpec {
+                    column: "rank".to_string(),
+                    op: super::super::cluster::AccumulateOp::Mean,
+                },
+            ],
+            ..Default::default()
+        };
+        // NOTE: two specs on one column — the LAST rewrite wins per column;
+        // exercised here purely for pipeline equivalence.
+        assert_streaming_equivalent(tin.path(), &base);
+
+        // Explicitly compare point_count per level too (read_level_rows in
+        // the shared helper does not include it).
+        let mem_out = tempfile::NamedTempFile::new().unwrap();
+        let stream_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(
+            tin.path(),
+            mem_out.path(),
+            &ConvertOptions {
+                streaming: false,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        convert_to_overviews(tin.path(), stream_out.path(), &base).unwrap();
+        let mr = OverviewReader::open(mem_out.path()).unwrap();
+        let sr = OverviewReader::open(stream_out.path()).unwrap();
+        for level in 0..mr.num_levels() {
+            assert_eq!(
+                read_point_counts(&mr, level),
+                read_point_counts(&sr, level),
+                "level {level} point_count differs"
+            );
+        }
     }
 
     #[test]
