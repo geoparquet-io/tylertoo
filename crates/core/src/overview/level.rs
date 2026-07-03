@@ -27,7 +27,7 @@ pub const OVERVIEWS_KEY: &str = "geo:overviews";
 pub const COGP_KEY: &str = "cogp";
 
 /// The spec version emitted by this implementation (semver MAJOR.MINOR.PATCH).
-pub const SPEC_VERSION: &str = "0.1.0";
+pub const SPEC_VERSION: &str = "0.2.0";
 
 /// Web Mercator equatorial circumference in meters (§5.2).
 pub const WEBMERC_CIRCUMFERENCE_M: f64 = 40_075_016.69;

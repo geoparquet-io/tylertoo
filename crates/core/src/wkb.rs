@@ -27,7 +27,6 @@
 use geo::Geometry;
 use geozero::wkb::Wkb;
 use geozero::{CoordDimensions, ToGeo, ToWkb};
-use std::collections::HashMap;
 
 /// Errors that can occur during WKB serialization/deserialization.
 #[derive(Debug, thiserror::Error)]
@@ -37,12 +36,6 @@ pub enum WkbError {
 
     #[error("WKB decode error: {0}")]
     DecodeError(String),
-
-    #[error("Property serialization error: {0}")]
-    PropertySerializeError(String),
-
-    #[error("Property deserialization error: {0}")]
-    PropertyDeserializeError(String),
 }
 
 pub type Result<T> = std::result::Result<T, WkbError>;
@@ -94,43 +87,6 @@ pub fn wkb_to_geometry(wkb: &[u8]) -> Result<Geometry> {
     Wkb(wkb.to_vec())
         .to_geo()
         .map_err(|e| WkbError::DecodeError(e.to_string()))
-}
-
-/// Property value type for feature attributes.
-///
-/// Matches the MVT property types supported by the tile format.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum PropertyValue {
-    String(String),
-    Int(i64),
-    UInt(u64),
-    Float(f64),
-    Bool(bool),
-}
-
-/// Serialize feature properties to MessagePack bytes.
-///
-/// MessagePack is more compact than JSON (~30% smaller) and faster to
-/// serialize/deserialize, making it ideal for temp file storage.
-///
-/// # Arguments
-/// * `props` - Map of property names to values
-///
-/// # Returns
-/// MessagePack-encoded bytes on success, or an error if serialization fails.
-pub fn serialize_properties(props: &HashMap<String, PropertyValue>) -> Result<Vec<u8>> {
-    rmp_serde::to_vec(props).map_err(|e| WkbError::PropertySerializeError(e.to_string()))
-}
-
-/// Deserialize MessagePack bytes back to feature properties.
-///
-/// # Arguments
-/// * `data` - The MessagePack-encoded bytes
-///
-/// # Returns
-/// The property map on success, or an error if deserialization fails.
-pub fn deserialize_properties(data: &[u8]) -> Result<HashMap<String, PropertyValue>> {
-    rmp_serde::from_slice(data).map_err(|e| WkbError::PropertyDeserializeError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -351,106 +307,5 @@ mod tests {
     fn test_decode_empty_bytes() {
         let result = wkb_to_geometry(&[]);
         assert!(result.is_err());
-    }
-
-    // ========================================================================
-    // Property Serialization Tests
-    // ========================================================================
-
-    #[test]
-    fn test_properties_round_trip_string() {
-        let mut props = HashMap::new();
-        props.insert(
-            "name".to_string(),
-            PropertyValue::String("Test".to_string()),
-        );
-        props.insert(
-            "description".to_string(),
-            PropertyValue::String("A test feature".to_string()),
-        );
-
-        let bytes = serialize_properties(&props).expect("serialize should succeed");
-        let restored = deserialize_properties(&bytes).expect("deserialize should succeed");
-
-        assert_eq!(props, restored);
-    }
-
-    #[test]
-    fn test_properties_round_trip_numbers() {
-        let mut props = HashMap::new();
-        props.insert("int_val".to_string(), PropertyValue::Int(-42));
-        props.insert("uint_val".to_string(), PropertyValue::UInt(42));
-        props.insert("float_val".to_string(), PropertyValue::Float(3.14158));
-
-        let bytes = serialize_properties(&props).expect("serialize should succeed");
-        let restored = deserialize_properties(&bytes).expect("deserialize should succeed");
-
-        assert_eq!(props, restored);
-    }
-
-    #[test]
-    fn test_properties_round_trip_bool() {
-        let mut props = HashMap::new();
-        props.insert("active".to_string(), PropertyValue::Bool(true));
-        props.insert("deleted".to_string(), PropertyValue::Bool(false));
-
-        let bytes = serialize_properties(&props).expect("serialize should succeed");
-        let restored = deserialize_properties(&bytes).expect("deserialize should succeed");
-
-        assert_eq!(props, restored);
-    }
-
-    #[test]
-    fn test_properties_round_trip_mixed() {
-        let mut props = HashMap::new();
-        props.insert(
-            "name".to_string(),
-            PropertyValue::String("Building".to_string()),
-        );
-        props.insert("floors".to_string(), PropertyValue::Int(5));
-        props.insert("area".to_string(), PropertyValue::Float(1234.56));
-        props.insert("commercial".to_string(), PropertyValue::Bool(true));
-        props.insert("id".to_string(), PropertyValue::UInt(999));
-
-        let bytes = serialize_properties(&props).expect("serialize should succeed");
-        let restored = deserialize_properties(&bytes).expect("deserialize should succeed");
-
-        assert_eq!(props, restored);
-    }
-
-    #[test]
-    fn test_properties_empty() {
-        let props: HashMap<String, PropertyValue> = HashMap::new();
-
-        let bytes = serialize_properties(&props).expect("serialize should succeed");
-        let restored = deserialize_properties(&bytes).expect("deserialize should succeed");
-
-        assert!(restored.is_empty());
-    }
-
-    #[test]
-    fn test_properties_unicode() {
-        let mut props = HashMap::new();
-        props.insert(
-            "name".to_string(),
-            PropertyValue::String("東京タワー".to_string()),
-        );
-        props.insert(
-            "emoji".to_string(),
-            PropertyValue::String("🗼🌏".to_string()),
-        );
-
-        let bytes = serialize_properties(&props).expect("serialize should succeed");
-        let restored = deserialize_properties(&bytes).expect("deserialize should succeed");
-
-        assert_eq!(props, restored);
-    }
-
-    #[test]
-    fn test_deserialize_invalid_msgpack() {
-        let invalid_bytes = vec![0xFF, 0xFF, 0xFF];
-        let result = deserialize_properties(&invalid_bytes);
-        assert!(result.is_err());
-        assert!(matches!(result, Err(WkbError::PropertyDeserializeError(_))));
     }
 }

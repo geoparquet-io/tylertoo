@@ -2,6 +2,35 @@
 
 Design decisions and tippecanoe divergences.
 
+## Decision Record: Legacy Tiles Pipeline Removed (#177, 2026-07-03)
+
+The legacy per-tile pipeline (`pipeline.rs`, `Converter`, the streaming
+external-sort/bucketed tiler and its quality features) was **removed**. The
+overview pipeline (`overview convert` → `export-pmtiles`) supersedes it for
+the project's core workflow: it is faster (Moldova full pipeline < 2 min),
+memory-bounded (convert ~306 MB / export ~0.89 GB), and carries the quality
+ladder (ranking, density budget, clustering, coalescing) the tile path never
+got. See `context/TILE_SIMPLIFY_POSTMORTEM.md` for why the tile-path quality
+work had already been excised.
+
+What survives:
+
+- **The `tiles` CLI subcommand** (and the bare `gpq-tiles in.parquet
+  out.pmtiles` form) as a ~50-line facade: overview convert into a temporary
+  GeoParquet file → export-pmtiles to the requested output. One-shot
+  "GeoParquet in, PMTiles out" UX is preserved; the legacy tuning flags are
+  gone (use `overview` + `export-pmtiles` directly for knobs).
+- **The Python `convert()` binding**, re-pointed at the same facade path with
+  a deprecation note steering users to `overview()` / `export_pmtiles()`.
+- **Shared infrastructure** the overview pipeline builds on (tile math,
+  clipping, MVT encoding, the PMTiles v3 writer, GeoArrow batch decoding).
+
+Consequences: #102 (row-group bbox filtering for the tiles pipeline) loses
+its remaining scope; sections of this document describing legacy-pipeline
+internals (density dropping, adaptive thresholds, accumulation, clustering
+at tile encode time, golden comparisons) are **historical** and kept only as
+reference for behavior the overview quality ladder replaces.
+
 ## Design Principles
 
 1. **Arrow-First**: Process geometries within Arrow batch scope for zero-copy benefits
@@ -553,29 +582,42 @@ Use `config.with_quiet(true)` to suppress warnings. See `quality.rs` for impleme
 
 ## Module Structure
 
+The overview pipeline is the product; the remaining top-level modules are
+the shared infrastructure it builds on.
+
 ```
 crates/core/src/
-├── lib.rs              # Public API
-├── accumulator.rs      # Attribute accumulation for feature merging
-├── tile.rs             # TileCoord, TileBounds
+├── lib.rs              # Public API surface + Error type
+├── overview/           # THE PRODUCT: GeoParquet multi-resolution overviews
+│   ├── mod.rs          #   Subtree docs
+│   ├── assign.rs       #   Per-level cell-winner thinning + density budget
+│   ├── check.rs        #   Spec §6.2 validation (gpq-tiles validate)
+│   ├── cluster.rs      #   Point clustering + attribute accumulation (§12)
+│   ├── coalesce.rs     #   Line network coalescing (§13)
+│   ├── convert.rs      #   convert_to_overviews() orchestration
+│   ├── export.rs       #   Overview GeoParquet → PMTiles export
+│   ├── hostile.rs      #   Hostile-input hardening tests
+│   ├── level.rs        #   Footer metadata model, SPEC_VERSION
+│   ├── reader.rs       #   Overview file reader (level-banded row groups)
+│   ├── simplify.rs     #   World-space RDP simplification (GSD tolerance)
+│   ├── stream.rs       #   Two-pass bounded-memory streaming pipeline
+│   └── writer.rs       #   Level-banded GeoParquet writer
+├── batch_processor.rs  # GeoArrow batch → geo::Geometry decoding
 ├── clip.rs             # Geometry clipping (dispatcher)
+├── ioverlay_clip.rs    # i_overlay-based robust polygon clipping
 ├── sutherland_hodgman.rs # O(n) polygon clipping for axis-aligned rectangles
-├── wagyu_clip.rs       # Wagyu/Vatti clipping (retained for complex boolean ops)
-├── simplify.rs         # RDP simplification
-├── validate.rs         # Geometry validation
+├── covering.rs         # bbox covering metadata, row-group bounds
+├── tile.rs             # TileCoord, TileBounds
+├── world_coord.rs      # Integer world-coordinate space
 ├── mvt.rs              # MVT encoding
-├── pmtiles_writer.rs   # PMTiles v3 writer (PmtilesWriter + StreamingPmtilesWriter)
-├── feature_drop.rs     # Dropping algorithms
-├── spatial_index.rs    # Hilbert/Z-order curves
-├── pipeline.rs         # Tile generation (streaming + non-streaming)
-├── batch_processor.rs  # GeoArrow iteration (row group support)
-├── memory.rs           # Memory tracking and estimation
-├── quality.rs          # File quality assessment
-├── dedup.rs            # Tile deduplication (XXH3)
+├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)
 ├── compression.rs      # gzip/brotli/zstd compression
-├── property_filter.rs  # Include/exclude field filtering
-└── golden.rs           # Golden tests
+├── dedup.rs            # Tile deduplication (XXH3)
+├── quality.rs          # CRS extraction + WGS84 validation
+└── wkb.rs              # WKB round-trip helpers
 
-crates/core/examples/
-└── test_large_file.rs  # Large file streaming test
+crates/cli/src/main.rs  # Subcommands: tiles (facade), overview, validate,
+                        # export-pmtiles
+crates/python/src/lib.rs # pyo3 bindings: convert (facade), overview,
+                        # export_pmtiles, validate
 ```
