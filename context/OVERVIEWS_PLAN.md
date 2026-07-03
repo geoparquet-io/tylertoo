@@ -352,6 +352,14 @@ Human part: the merge buttons. Agent part: triage + fixes.
 - Still human: merge/close #158, retarget #168 → main, CI re-run.
 
 ### H3. V4 streaming — the big-files unlock  (the big ticket)
+(a) DONE 2026-07-03: two-pass streaming convert (`overview/stream.rs`),
+default on (`--no-streaming` keeps the in-memory reference path;
+`--read-batch-size`, default 8192). Moldova dup z0–14: 5.30 GB →
+305.7 MB peak RSS (−94 %), wall time unchanged (11:50 → 11:46),
+byte-identical `geo`/`geo:overviews` footers + identical per-level
+counts vs in-memory, all validate checks pass. See
+`benchmarks/overview/H3_NOTES.md`. (b) export and (c) wall-time
+profile remain open.
 Baseline to beat: Moldova 632k = 10m57s / 5.44 GB RSS (convert),
 and export holds one full zoom in memory (canonical zoom = whole
 dataset ⇒ same ceiling).
