@@ -108,17 +108,10 @@ pub fn simplify_for_zoom(geom: &Geometry<f64>, zoom: u8, extent: u32) -> Geometr
 /// (x, y) in tile-local coordinates as f64 for precision during simplification
 #[inline]
 fn geo_to_tile_coords_f64(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) -> (f64, f64) {
-    let extent_f = extent as f64;
-
-    // Normalize to 0-1 within tile bounds
-    let x_ratio = (lng - bounds.lng_min) / (bounds.lng_max - bounds.lng_min);
-    let y_ratio = (lat - bounds.lat_min) / (bounds.lat_max - bounds.lat_min);
-
-    // Scale to extent and flip Y (tile coords have Y increasing downward)
-    let x = x_ratio * extent_f;
-    let y = (1.0 - y_ratio) * extent_f;
-
-    (x, y)
+    // Delegates to the shared MVT transform (linear X, Web Mercator Y) so
+    // simplification tolerances are measured in the same tile pixels that
+    // MVT encoding will produce.
+    crate::mvt::geo_to_tile_coords_unrounded(lng, lat, bounds, extent)
 }
 
 /// Transform a tile-local coordinate back to geographic coordinates.
@@ -126,16 +119,7 @@ fn geo_to_tile_coords_f64(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 /// This is the inverse of [`geo_to_tile_coords_f64`].
 #[inline]
 fn tile_coords_to_geo(x: f64, y: f64, bounds: &TileBounds, extent: u32) -> (f64, f64) {
-    let extent_f = extent as f64;
-
-    // Unflip Y and denormalize
-    let x_ratio = x / extent_f;
-    let y_ratio = 1.0 - (y / extent_f);
-
-    let lng = bounds.lng_min + x_ratio * (bounds.lng_max - bounds.lng_min);
-    let lat = bounds.lat_min + y_ratio * (bounds.lat_max - bounds.lat_min);
-
-    (lng, lat)
+    crate::mvt::tile_coords_to_geo_f64(x, y, bounds, extent)
 }
 
 /// Transform a LineString from geographic to tile-local coordinates.
