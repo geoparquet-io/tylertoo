@@ -197,6 +197,31 @@ struct OverviewArgs {
     #[arg(long)]
     collapse: bool,
 
+    /// Enable point clustering (duplicating mode only; opt-in).
+    ///
+    /// At each overview level, the surviving point in each thinning grid cell
+    /// ABSORBS the other points in its cell instead of them simply vanishing:
+    /// the output gains a `point_count` INT64 NOT NULL column recording how
+    /// many source features each row represents at its level (tippecanoe /
+    /// supercluster convention; always 1 at the canonical level). The winner
+    /// keeps its own geometry and attribute values. Lines and polygons are
+    /// unaffected (their rows carry point_count = 1). Use for graduated-dot
+    /// rendering of dense point data. See docs/OVERVIEW_TUNING.md.
+    #[arg(long)]
+    cluster: bool,
+
+    /// Aggregate a numeric column across clustered points: COL:OP where OP is
+    /// sum, max, min, or mean. Repeatable. Requires --cluster.
+    ///
+    /// At each level the winner's value of COL becomes the aggregate over
+    /// itself + the points it absorbed at that level (computed per level from
+    /// SOURCE values — mean is exact, never a mean of means). All other
+    /// columns keep the winner's own values. Example:
+    /// --accumulate-attribute population:sum
+    /// --accumulate-attribute confidence:mean
+    #[arg(long = "accumulate-attribute", value_name = "COL:OP")]
+    accumulate_attribute: Vec<String>,
+
     /// Emit the optional COGP compatibility footer key (partitioning mode).
     #[arg(long)]
     cogp_compat: bool,
@@ -1060,6 +1085,23 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         None => None,
     };
 
+    // Clustering flags (Q4; also enforced in core).
+    if !args.accumulate_attribute.is_empty() && !args.cluster {
+        anyhow::bail!("--accumulate-attribute requires --cluster");
+    }
+    if args.cluster && mode == Mode::Partitioning {
+        anyhow::bail!(
+            "--cluster requires --mode duplicating: a partitioning-mode feature has \
+             one row read across many zoom prefixes, so a per-level point_count \
+             cannot be represented without double counting"
+        );
+    }
+    let accumulate = args
+        .accumulate_attribute
+        .iter()
+        .map(|s| parse_accumulate(s))
+        .collect::<Result<Vec<_>>>()?;
+
     let options = ConvertOptions {
         mode,
         levels,
@@ -1082,6 +1124,8 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         full_column_stats: args.full_column_stats,
         streaming: !args.no_streaming,
         read_batch_size: args.read_batch_size,
+        cluster: args.cluster,
+        accumulate,
     };
 
     let report = convert_to_overviews(&args.input, &args.output, &options)
@@ -1178,6 +1222,31 @@ fn parse_class_rank(spec: &str) -> Result<gpq_tiles_core::overview::convert::Cla
         column: column.to_string(),
         ranks,
         unknown_rank: min_rank - 1.0,
+    })
+}
+
+/// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
+/// `sum`, `max`, `min`, `mean` (case-insensitive).
+fn parse_accumulate(spec: &str) -> Result<gpq_tiles_core::overview::cluster::AccumulateSpec> {
+    use gpq_tiles_core::overview::cluster::{AccumulateOp, AccumulateSpec};
+
+    let (column, op) = spec.rsplit_once(':').ok_or_else(|| {
+        anyhow::anyhow!("invalid --accumulate-attribute '{spec}': expected COL:OP (missing ':')")
+    })?;
+    let column = column.trim();
+    if column.is_empty() {
+        anyhow::bail!("invalid --accumulate-attribute '{spec}': empty column name");
+    }
+    let op = AccumulateOp::parse(op.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid --accumulate-attribute '{spec}': unknown op {:?} \
+             (expected sum, max, min, or mean)",
+            op.trim()
+        )
+    })?;
+    Ok(AccumulateSpec {
+        column: column.to_string(),
+        op,
     })
 }
 
@@ -1456,4 +1525,35 @@ fn run_with_progress(
     // Standard pipeline handles both files and directories transparently
     generate_tiles_to_writer_with_progress(input_path, config, writer, progress_callback)
         .context("Failed to generate tiles")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpq_tiles_core::overview::cluster::AccumulateOp;
+
+    #[test]
+    fn parse_accumulate_valid_specs() {
+        let s = parse_accumulate("population:sum").unwrap();
+        assert_eq!(s.column, "population");
+        assert_eq!(s.op, AccumulateOp::Sum);
+
+        // Case-insensitive op, trimmed parts.
+        let s = parse_accumulate(" confidence : MEAN ").unwrap();
+        assert_eq!(s.column, "confidence");
+        assert_eq!(s.op, AccumulateOp::Mean);
+
+        let s = parse_accumulate("x:min").unwrap();
+        assert_eq!(s.op, AccumulateOp::Min);
+        let s = parse_accumulate("x:max").unwrap();
+        assert_eq!(s.op, AccumulateOp::Max);
+    }
+
+    #[test]
+    fn parse_accumulate_rejects_bad_specs() {
+        assert!(parse_accumulate("population").is_err(), "missing op");
+        assert!(parse_accumulate(":sum").is_err(), "empty column");
+        assert!(parse_accumulate("pop:median").is_err(), "unknown op");
+        assert!(parse_accumulate("pop:").is_err(), "empty op");
+    }
 }
