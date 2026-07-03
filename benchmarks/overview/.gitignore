@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# run_all.sh byproducts (RESULTS.md is canonical)
+storage_table.md
+conversion_table.md
+access_table.md
