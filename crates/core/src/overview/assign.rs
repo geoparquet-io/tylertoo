@@ -151,6 +151,19 @@ pub struct AssignConfig {
     pub sort_direction: SortDirection,
 }
 
+/// Default `point_thinning` when point clustering is enabled.
+///
+/// With clustering, absorbed points are *summarized* (`point_count` +
+/// accumulated attributes) rather than dropped, so a much coarser grid is
+/// pure win: one dot per ~16 display pixels approaches the supercluster
+/// look (radius 40 px) while the non-clustered default (4.0) preserves
+/// density for thin-only output. Chosen by maintainer review of the
+/// 2026-07-03 NYC pt={4,16,48} sweep (corpus/data/bench/q4/).
+///
+/// Callers that expose a user-facing `point_thinning` knob should apply
+/// this default only when the user did not set the knob explicitly.
+pub const CLUSTER_POINT_THINNING_DEFAULT: f64 = 16.0;
+
 impl Default for AssignConfig {
     fn default() -> Self {
         Self {

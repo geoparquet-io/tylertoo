@@ -226,16 +226,20 @@ struct OverviewArgs {
     #[arg(long)]
     cogp_compat: bool,
 
-    /// Point thinning factor: grid cell size = factor * gsd (default 4.0).
+    /// Point thinning factor: grid cell size = factor * gsd.
+    ///
+    /// Default 4.0, or 16.0 when --cluster is enabled (absorbed points are
+    /// summarized via point_count rather than dropped, so a coarser grid
+    /// gives the familiar graduated-cluster look; chosen from the NYC
+    /// pt={4,16,48} sweep).
     ///
     /// One feature survives per grid cell per level, so BIGGER factor = BIGGER
-    /// cells = FEWER survivors = SPARSER map; SMALLER = denser. Points thin
-    /// hardest by default (4.0) since they clutter fastest. This multiplies the
-    /// GSD cell size, so it interacts with --gsd-base (which sets the GSD).
+    /// cells = FEWER survivors = SPARSER map; SMALLER = denser. This multiplies
+    /// the GSD cell size, so it interacts with --gsd-base (which sets the GSD).
     ///
     /// Cheat sheet: coarse levels too sparse → LOWER the thinning factors.
-    #[arg(long, default_value = "4.0")]
-    point_thinning: f64,
+    #[arg(long)]
+    point_thinning: Option<f64>,
 
     /// Line thinning factor: grid cell size = factor * gsd (default 1.0).
     ///
@@ -1067,8 +1071,16 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         }
     };
 
+    // Cluster-conditional default: with --cluster, absorbed points are
+    // summarized (point_count), so the sparser 16.0 grid is the better look.
+    let point_thinning = args.point_thinning.unwrap_or(if args.cluster {
+        gpq_tiles_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
+    } else {
+        AssignConfig::default().point_thinning
+    });
+
     let assign = AssignConfig {
-        point_thinning: args.point_thinning,
+        point_thinning,
         line_thinning: args.line_thinning,
         polygon_thinning: args.polygon_thinning,
         line_visibility: args.line_visibility,

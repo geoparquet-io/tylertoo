@@ -85,7 +85,7 @@ cell_size = thinning_factor * gsd(level)          (in the CRS's units)
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
-| `--point-thinning` | `4.0` | × GSD (cell size) | **bigger = sparser** |
+| `--point-thinning` | `4.0` (`16.0` with `--cluster`) | × GSD (cell size) | **bigger = sparser** |
 | `--line-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
 | `--polygon-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
 
@@ -286,6 +286,15 @@ its cell's losers instead:
 Use it for graduated-dot rendering of dense point data (POIs, addresses): the
 client scales the symbol by `point_count` instead of drawing a misleadingly
 sparse constant-size dot field.
+
+**Clustering changes the `--point-thinning` default from 4.0 to 16.0.** With
+thin-only output a coarse grid *discards* data, so the default stays dense;
+with clustering the losers are summarized into `point_count`, so a sparser
+grid is pure win and gives the familiar graduated-cluster look (supercluster's
+default radius is ~40 px; 16 × GSD ≈ one dot per ~16 display pixels). Chosen
+from the NYC pt={4,16,48} sweep — each 4× step in the factor shifts the whole
+density ladder two zooms. Pass `--point-thinning` explicitly to override in
+either mode.
 
 **`--accumulate-attribute COL:OP`** (repeatable; requires `--cluster`)
 aggregates a numeric column across each cluster: the winner's value of `COL`
