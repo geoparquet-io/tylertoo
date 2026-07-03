@@ -518,9 +518,31 @@ where
 }
 
 /// Extract geometries from a GeoArrow array into a Vec.
+///
+/// Null slots and slots that cannot convert to a `geo::Geometry` are
+/// **silently skipped**, so `output` may end up shorter than the array.
+/// Callers that must keep row indices aligned with other columns should use
+/// [`extract_geometries_opt_from_array`] instead.
 pub fn extract_geometries_from_array(
     array: &dyn GeoArrowArray,
     output: &mut Vec<Geometry<f64>>,
+) -> Result<()> {
+    let mut opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(array.len());
+    extract_geometries_opt_from_array(array, &mut opts)?;
+    output.extend(opts.into_iter().flatten());
+    Ok(())
+}
+
+/// Extract geometries from a GeoArrow array into a **row-aligned** Vec of
+/// `Option`s: exactly one entry per array slot, `None` for null slots (and
+/// for the rare slot that decodes but has no `geo::Geometry` conversion).
+///
+/// Structurally invalid geometry payloads (e.g. an empty or corrupt WKB
+/// value) still return a hard [`Error::GeoParquetRead`]; only *absent*
+/// geometry maps to `None`.
+pub fn extract_geometries_opt_from_array(
+    array: &dyn GeoArrowArray,
+    output: &mut Vec<Option<Geometry<f64>>>,
 ) -> Result<()> {
     match array.data_type() {
         GeoArrowType::Point(_) => {
@@ -586,21 +608,25 @@ pub fn extract_geometries_from_array(
     }
 }
 
-/// Extract geometries from a typed GeoArrow array into a Vec.
-fn extract_typed_array<'a, A>(accessor: &'a A, output: &mut Vec<Geometry<f64>>) -> Result<()>
+/// Extract geometries from a typed GeoArrow array into a row-aligned Vec of
+/// `Option`s (one entry per slot; see [`extract_geometries_opt_from_array`]).
+fn extract_typed_array<'a, A>(
+    accessor: &'a A,
+    output: &mut Vec<Option<Geometry<f64>>>,
+) -> Result<()>
 where
     A: GeoArrowArrayAccessor<'a>,
     A::Item: ToGeoGeometry<f64>,
 {
     for (i, item) in accessor.iter().enumerate() {
-        if let Some(geom_result) = item {
-            let geom_trait = geom_result.map_err(|e| {
-                Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
-            })?;
-
-            if let Some(geo_geom) = geom_trait.try_to_geometry() {
-                output.push(geo_geom);
+        match item {
+            Some(geom_result) => {
+                let geom_trait = geom_result.map_err(|e| {
+                    Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
+                })?;
+                output.push(geom_trait.try_to_geometry());
             }
+            None => output.push(None),
         }
     }
     Ok(())
