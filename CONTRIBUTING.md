@@ -6,10 +6,11 @@
 git clone https://github.com/geoparquet-io/gpq-tiles.git
 cd gpq-tiles
 git config core.hooksPath .githooks
-cargo build && cargo test
+cargo build && cargo check
 ```
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for Python setup.
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the day-to-day workflow,
+Python setup, and how to run every CI gate locally.
 
 ## Commit Convention
 
@@ -27,9 +28,15 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for Python setup.
 
 ## Pull Request Process
 
-1. Branch from `main`
-2. `cargo test && cargo fmt --all && cargo clippy`
-3. Submit PR
+1. Branch from `main` (it is protected — no direct pushes).
+2. Run the gates locally — CI enforces all of them as required checks:
+   `cargo fmt --all --check`, `cargo clippy --all-targets
+   --all-features -- -D warnings`, `cargo machete`, targeted tests,
+   and (for Python changes) the ruff/mypy/stubtest/vulture/xenon/pytest
+   suite via `uv run`. The full list with commands:
+   [DEVELOPMENT.md → CI Gates](DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
+3. Submit the PR; never bypass the pre-commit hooks (`--no-verify` is
+   forbidden).
 
 ## Releasing (Maintainers)
 
@@ -48,7 +55,7 @@ git checkout main && git pull
 git checkout -b release/vX.Y.Z
 
 # 2. Bump version (from repo root, NOT crates/python)
-cz bump --increment MINOR --changelog   # or PATCH/MAJOR
+uv run cz bump --increment MINOR --changelog   # or PATCH/MAJOR
 
 # 3. Verify build works
 cargo check
@@ -62,13 +69,18 @@ gh pr create --title "Release vX.Y.Z" --body "Automated release"
 
 ### What Commitizen Updates
 
-The config in `crates/python/pyproject.toml` updates these files:
+The config lives in `.cz.toml` at the repo root (the single source of
+truth for `version_files`). A bump updates:
 
 | File | Pattern |
 |------|---------|
 | `Cargo.toml` | `version = "X.Y.Z"` (workspace) |
+| `Cargo.toml` | `gpq-tiles-core = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
 | `crates/python/pyproject.toml` | `version = "X.Y.Z"` |
-| `crates/cli/Cargo.toml` | `gpq-tiles-core = { ..., version = "X.Y.Z" }` |
+| `.cz.toml` | its own `version` field |
+
+The pre-commit hook and the CI Version Consistency job both fail if
+these drift.
 
 ### Recovery
 
@@ -84,6 +96,6 @@ gh workflow run release.yml --ref main
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `failed to select version for gpq-tiles-core` | CLI dependency not updated | Ensure `crates/cli/Cargo.toml` has correct version |
+| `failed to select version for gpq-tiles-core` | workspace dependency version not updated | Ensure the `[workspace.dependencies]` entry in `Cargo.toml` moved with the bump |
 | `cz: command not found` | Commitizen not installed | `uv tool install commitizen` |
-| CI timeout on benchmarks | Large benchmarks running | Check regex excludes `large_*` |
+| Version Consistency job fails | Manual edit to one version file | Re-run `uv run cz bump` from the repo root |

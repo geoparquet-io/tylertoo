@@ -99,7 +99,7 @@ empty, **lower** `--line-thinning`, don't raise it.
 
 The defaults are class-aware: points thin hardest (4.0, they clutter fastest),
 lines and polygons least (1.0). The line default was retuned 2.0 → 1.0 after
-the 2026-07-02 Portland roads sweep (`corpus/SWEEP_NOTES.md`): at 1.0, road
+the 2026-07-02 Portland roads sweep (`corpus/SWEEPS.md`): at 1.0, road
 networks stay visibly more continuous at coarse zooms, and the true-scale
 renders showed the extra density costs little legibility. The factor multiplies the GSD, so it stacks with `--gsd-base`: doubling
 `--gsd-base` halves the GSD, which halves the cell size for the same factor.
@@ -194,7 +194,7 @@ Cell-winner thinning (above) stops binding once its grid cell is smaller than
 the typical feature spacing: from roughly z9 up, *every* feature wins its own
 cell, so per-level counts plateau at ~the whole dataset. On Portland roads that
 plateau is 2–3× tippecanoe's feature count at z9–z11 (see
-`corpus/SWEEP_NOTES.md`) — visual clutter, and the main driver of duplicating
+`corpus/SWEEPS.md`) — visual clutter, and the main driver of duplicating
 mode's storage overhead.
 
 The **density budget** fixes this the way tippecanoe does: after cell-winner
@@ -222,7 +222,7 @@ mid-zoom plateau.
 **`--drop-rate`** is the strength knob. Each coarser level keeps `1/rate` of the
 next finer one. BIGGER ⇒ coarse levels shed harder (sparser mid zooms, smaller
 files); SMALLER ⇒ gentler. The default `1.65` was calibrated on Portland roads
-(`corpus/SWEEP_NOTES.md`): it brings z9 to 1.21× and z10 to 1.03× tippecanoe
+(`corpus/SWEEPS.md`): it brings z9 to 1.21× and z10 to 1.03× tippecanoe
 (z11 lands at 0.67×, a storage win) and leaves z8 and the coarse zooms
 essentially at their cell-winner counts.
 
@@ -438,7 +438,8 @@ coalescing matters least. This is the streaming pipeline's one deliberate
 
 Coalescing is recorded in the footer `geo:overviews` →
 `generalization.coalescing` provenance (`enabled`,
-`snap_tolerance_gsd_factor`, `coalesced_count_column`); `gpq-tiles
+`snap_tolerance_gsd_factor`, `junction_angle`, `max_level_rows`,
+`coalesced_count_column` — the complete knob set, spec §13.4); `gpq-tiles
 validate` checks that the column exists as INT32 NOT NULL, all values are
 >= 1, and canonical-level values are all 1.
 
@@ -562,6 +563,6 @@ stay laptop-sized.
 | Tiny viewports over high-latency storage fetch too much | LOWER `--row-group-size` for tighter bbox pruning |
 | Conversion runs out of memory / swaps on a big file | streaming is already the default; LOWER `--read-batch-size`; make sure `--no-streaming` is NOT set |
 
-See `corpus/SWEEP_NOTES.md` for an empirical `--line-thinning` ×
+See `corpus/SWEEPS.md` for an empirical `--line-thinning` ×
 `--simplify-factor` sweep on Portland roads, and the Q2 section there for the
 `--drop-rate` calibration (before/after ratios vs tippecanoe).

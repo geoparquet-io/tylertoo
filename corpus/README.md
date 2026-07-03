@@ -1,8 +1,9 @@
 # gpq-tiles overview test corpus
 
 Reproducible test datasets + golden references for evaluating
-GeoParquet-embedded multi-resolution **overviews** (task V2 quality
-evaluation and task V3 benchmarks in `context/OVERVIEWS_PLAN.md`).
+GeoParquet-embedded multi-resolution **overviews** (quality metrics in
+`corpus/METRICS.md`, sweep decisions in `corpus/SWEEPS.md`, access/storage
+benchmarks in `benchmarks/overview/`).
 
 **This directory contains scripts and manifests only. No data files
 are committed.** Everything under `corpus/data/` is gitignored and

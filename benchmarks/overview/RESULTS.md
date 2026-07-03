@@ -218,6 +218,12 @@ are chosen so the full extent fits one screenful at `world` and an overview
 
 ## 3. Conversion cost (wall time + peak RSS)
 
+> **Stale — kept for the record.** These numbers predate the streaming
+> converter (H3) and the parallel/validation optimization levers: the
+> Moldova row below is the old in-memory pipeline. Current numbers
+> (convert ~55 s / ~320 MB peak RSS on the same file) and the change
+> history are in [`PROFILE.md`](./PROFILE.md).
+
 `gpq-tiles overview` (duplicating, default knobs, z0..14, reads GeoParquet
 natively) vs the golden tippecanoe workflow `gpio convert geojson <src> |
 tippecanoe -P <recorded flags>`. Both wrapped in `/usr/bin/time -v`. The
@@ -236,8 +242,9 @@ comparable or lower memory. On the large dense Moldova set it is **3.6×
 slower and 4.7× heavier** than tippecanoe: the v1 overview pipeline is
 fully in-memory and rebuilds/decodes geometry per level, so 631 k polygons
 with 38 M vertices duplicated across 12 levels blow memory to 5.4 GB. This
-is the exact motivation for the planned V4 streaming refactor
-(`context/OVERVIEWS_PLAN.md`, memory target O(row group + winner tables)).
+was the exact motivation for the V4/H3 streaming refactor — since
+shipped as the default pipeline (see `PROFILE.md`; the plan is archived
+at `context/archive/OVERVIEWS_PLAN.md`).
 
 ---
 

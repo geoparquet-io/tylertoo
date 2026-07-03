@@ -217,16 +217,20 @@ We use [Conventional Commits](https://www.conventionalcommits.org/). See `CONTRI
 feat: add WKT geometry encoding support
 fix: guard against degenerate linestrings in simplify
 perf(core): parallelize geometry processing
-feat(cli): add --streaming-mode flag
+feat(cli): add --report flag to export-pmtiles
 ```
 
 ## Key Documents
 
 | Document | Purpose |
 |----------|---------|
-| `context/ARCHITECTURE.md` | Design decisions, tippecanoe divergences |
-| `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup |
+| `context/ARCHITECTURE.md` | Design decisions, module map, tippecanoe divergences |
+| `context/OVERVIEWS_SPEC.md` | The `geo:overviews` format spec (draft — single source of truth for the format) |
+| `docs/OVERVIEW_TUNING.md` | Every generalization knob, default, and interaction |
+| `corpus/SWEEPS.md` | The sweep-derived default-value decisions |
+| `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup, running CI gates locally |
 | `CONTRIBUTING.md` | How to contribute, commit conventions, releases |
+| `context/archive/` | Frozen historical docs (plans, session artifacts, legacy-pipeline notes) |
 
 ## Setup
 

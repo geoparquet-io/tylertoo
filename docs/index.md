@@ -1,43 +1,46 @@
 # gpq-tiles
 
-Fast GeoParquet → PMTiles converter in Rust.
+Multi-resolution **overviews for GeoParquet**, plus PMTiles export — in Rust.
 
-## Why gpq-tiles?
+## What it does
 
-- **Fast** — Parallel tile generation with Rayon, space-filling curve sorting
-- **Correct** — MVT spec compliance, golden tests against tippecanoe v2.49.0
-- **Smart** — Density-based feature dropping, tiny polygon removal, point thinning
-- **Flexible** — Property filtering, compression options (gzip/brotli/zstd)
-- **Efficient** — Tile deduplication via XXH3 hashing
+- **`gpq-tiles overview`** — embed COG-style multi-resolution levels in a
+  GeoParquet file (thinning, ranking, density budget, clustering, line
+  coalescing, world-space simplification). The file stays valid GeoParquet:
+  exact, SQL-queryable, single-artifact.
+- **`gpq-tiles export-pmtiles`** — export a PMTiles vector-tile archive from
+  an overview file.
+- **`gpq-tiles tiles`** (or the bare form) — one-shot GeoParquet → PMTiles,
+  a thin facade over the two steps above.
+- **`gpq-tiles validate`** — check an overview file against the spec.
 
 ## Quick Example
 
 ```bash
-# CLI
+# One-shot: GeoParquet in, PMTiles out
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 
-# With property filtering
-gpq-tiles input.parquet output.pmtiles --include name --include population
+# Or keep the intermediate overview file (the interesting artifact)
+gpq-tiles overview input.parquet overviews.parquet \
+  --min-zoom 0 --max-zoom 14
+gpq-tiles export-pmtiles overviews.parquet output.pmtiles
+gpq-tiles validate overviews.parquet
 ```
 
 ```python
 # Python
-from gpq_tiles import convert
-convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
-```
+from gpq_tiles import overview, export_pmtiles
 
-```rust
-// Rust
-use gpq_tiles_core::pipeline::{generate_tiles, TilerConfig};
-let config = TilerConfig::new(0, 14);
-let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
+overview("input.parquet", "overviews.parquet", min_zoom=0, max_zoom=14)
+export_pmtiles("overviews.parquet", "output.pmtiles")
 ```
 
 ## Next Steps
 
 - [Getting Started](getting-started.md) — Installation and basic usage
-- [Advanced Usage](advanced-usage.md) — Performance tuning, streaming, CI/CD
-- [API Reference](api-reference.md) — CLI flags, Rust API, Python API
+- [Overview Tuning](OVERVIEW_TUNING.md) — Every generalization knob explained
+- [API Reference](api-reference.md) — CLI flags, Python API, Rust API
+- [Advanced Usage](advanced-usage.md) — Input optimization, memory, export
 - [Architecture](architecture.md) — Design decisions and internals
 
 ## License
