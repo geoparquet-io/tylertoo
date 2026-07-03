@@ -133,17 +133,82 @@ pub fn orient_multi_polygon_for_mvt(multi: &MultiPolygon) -> MultiPolygon {
 /// # Returns
 /// (x, y) in tile-local coordinates, where (0,0) is top-left
 pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) -> (i32, i32) {
+    let (x, y) = geo_to_tile_coords_unrounded(lng, lat, bounds, extent);
+    (x.round() as i32, y.round() as i32)
+}
+
+/// Web Mercator Y fraction of a latitude: 0.0 at the top of the Mercator
+/// world (+85.0511°), 0.5 at the equator, 1.0 at the bottom (−85.0511°).
+///
+/// Latitude is clamped to ±89.9° only to keep `tan` finite; callers passing
+/// buffered coordinates slightly outside the Mercator range still get
+/// monotonic (out-of-range) fractions rather than infinities.
+#[inline]
+pub(crate) fn mercator_y_fraction(lat: f64) -> f64 {
+    let lat = lat.clamp(-89.9, 89.9);
+    (1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0
+}
+
+/// Inverse of [`mercator_y_fraction`]: Mercator Y fraction back to latitude
+/// in degrees.
+#[inline]
+pub(crate) fn lat_from_mercator_y_fraction(y: f64) -> f64 {
+    (std::f64::consts::PI * (1.0 - 2.0 * y))
+        .sinh()
+        .atan()
+        .to_degrees()
+}
+
+/// f64 (unrounded) core of [`geo_to_tile_coords`], shared with the
+/// simplification and feature-drop paths so filtering/simplification sees the
+/// exact coordinates MVT encoding will produce.
+///
+/// Longitude is linear in Web Mercator X, so X interpolates linearly between
+/// the tile's degree bounds. Latitude is NOT linear in Web Mercator Y: tile
+/// bounds are Mercator-derived (see `TileCoord::bounds`), so Y must
+/// interpolate in Mercator fraction space. Linear latitude interpolation
+/// displaces features toward the poles — ~470/4096 units at z0 for 40.7°N —
+/// shrinking below one unit only around z12.
+#[inline]
+pub(crate) fn geo_to_tile_coords_unrounded(
+    lng: f64,
+    lat: f64,
+    bounds: &TileBounds,
+    extent: u32,
+) -> (f64, f64) {
     let extent_f = extent as f64;
 
-    // Normalize to 0-1 within tile bounds
+    // X: linear in longitude.
     let x_ratio = (lng - bounds.lng_min) / (bounds.lng_max - bounds.lng_min);
-    let y_ratio = (lat - bounds.lat_min) / (bounds.lat_max - bounds.lat_min);
 
-    // Scale to extent and flip Y (tile coords have Y increasing downward)
-    let x = (x_ratio * extent_f).round() as i32;
-    let y = ((1.0 - y_ratio) * extent_f).round() as i32;
+    // Y: linear in Mercator fraction, top-down (tile Y increases downward).
+    let merc_top = mercator_y_fraction(bounds.lat_max);
+    let merc_bottom = mercator_y_fraction(bounds.lat_min);
+    let y_ratio = (mercator_y_fraction(lat) - merc_top) / (merc_bottom - merc_top);
 
-    (x, y)
+    (x_ratio * extent_f, y_ratio * extent_f)
+}
+
+/// Inverse of [`geo_to_tile_coords_unrounded`]: tile-local coordinates back to
+/// geographic degrees.
+#[inline]
+pub(crate) fn tile_coords_to_geo_f64(
+    x: f64,
+    y: f64,
+    bounds: &TileBounds,
+    extent: u32,
+) -> (f64, f64) {
+    let extent_f = extent as f64;
+
+    let x_ratio = x / extent_f;
+    let lng = bounds.lng_min + x_ratio * (bounds.lng_max - bounds.lng_min);
+
+    let merc_top = mercator_y_fraction(bounds.lat_max);
+    let merc_bottom = mercator_y_fraction(bounds.lat_min);
+    let merc = merc_top + (y / extent_f) * (merc_bottom - merc_top);
+    let lat = lat_from_mercator_y_fraction(merc);
+
+    (lng, lat)
 }
 
 // ============================================================================
@@ -1099,6 +1164,93 @@ mod tests {
         assert_eq!(y, 0);
     }
 
+    /// Web-Mercator-correct expected tile-local Y for a latitude at a zoom,
+    /// computed independently of production code:
+    /// merc fraction y = (1 - ln(tan(φ) + 1/cos(φ)) / π) / 2,
+    /// tile-local = (y * 2^z - tile_y) * extent.
+    fn expected_mercator_tile_y(lat: f64, zoom: u8, tile_y: u32, extent: u32) -> i32 {
+        let phi = lat.to_radians();
+        let merc = (1.0 - (phi.tan() + 1.0 / phi.cos()).ln() / std::f64::consts::PI) / 2.0;
+        ((merc * (1u32 << zoom) as f64 - tile_y as f64) * extent as f64).round() as i32
+    }
+
+    #[test]
+    fn test_geo_to_tile_coords_mercator_y_z0() {
+        // NYC (40.7128°N, -74.0060°W) in the single z0 tile. Latitude must be
+        // placed with Web Mercator Y, not linear interpolation between the
+        // tile's degree bounds. Linear interpolation puts this ~472 units too
+        // far north (y≈1068 instead of 1540), i.e. renders NYC at ~65°N.
+        let (lng, lat) = (-74.0060, 40.7128);
+        let tile = TileCoord::new(0, 0, 0);
+        let bounds = tile.bounds();
+        let extent = 4096;
+
+        let expected_y = expected_mercator_tile_y(lat, 0, 0, extent);
+        let expected_x = (((lng + 180.0) / 360.0) * extent as f64).round() as i32;
+
+        let (x, y) = geo_to_tile_coords(lng, lat, &bounds, extent);
+        assert!(
+            (x - expected_x).abs() <= 1,
+            "z0 X: got {x}, expected {expected_x}"
+        );
+        assert!(
+            (y - expected_y).abs() <= 1,
+            "z0 Y must be Web Mercator: got {y}, expected {expected_y}"
+        );
+    }
+
+    #[test]
+    fn test_geo_to_tile_coords_mercator_y_z2() {
+        // Same point in its z2 tile (x=1, y=1). Linear interpolation still
+        // misplaces latitude by tens of units at z2.
+        let (lng, lat) = (-74.0060, 40.7128);
+        let tile = TileCoord::new(1, 1, 2);
+        let bounds = tile.bounds();
+        let extent = 4096;
+
+        let expected_y = expected_mercator_tile_y(lat, 2, 1, extent);
+        let (_, y) = geo_to_tile_coords(lng, lat, &bounds, extent);
+        assert!(
+            (y - expected_y).abs() <= 1,
+            "z2 Y must be Web Mercator: got {y}, expected {expected_y}"
+        );
+    }
+
+    #[test]
+    fn test_geo_to_tile_coords_mercator_y_z12_regression() {
+        // Fine-zoom regression pin: at z12 a tile spans so few degrees that
+        // mercator and linear agree to sub-unit precision — fine zooms were
+        // visually correct before the mercator fix and must not shift.
+        let (lng, lat) = (-74.0060_f64, 40.7128_f64);
+        let zoom = 12u8;
+        let n = 1u32 << zoom;
+        let tx = (((lng + 180.0) / 360.0) * n as f64).floor() as u32;
+        let phi = lat.to_radians();
+        let merc = (1.0 - (phi.tan() + 1.0 / phi.cos()).ln() / std::f64::consts::PI) / 2.0;
+        let ty = (merc * n as f64).floor() as u32;
+        let tile = TileCoord::new(tx, ty, zoom);
+        let bounds = tile.bounds();
+        let extent = 4096;
+
+        let expected_y = expected_mercator_tile_y(lat, zoom, ty, extent);
+        // The pre-fix linear-interpolation value, pinned so the fix provably
+        // does not move fine-zoom output by more than 1 unit.
+        let linear_y = (((bounds.lat_max - lat) / (bounds.lat_max - bounds.lat_min))
+            * extent as f64)
+            .round() as i32;
+        assert!(
+            (expected_y - linear_y).abs() <= 1,
+            "test premise: mercator and linear must agree at z12 \
+             (mercator {expected_y} vs linear {linear_y})"
+        );
+
+        let (_, y) = geo_to_tile_coords(lng, lat, &bounds, extent);
+        assert!(
+            (y - expected_y).abs() <= 1,
+            "z12 Y: got {y}, expected {expected_y} (pre-fix {linear_y})"
+        );
+    }
+
     // ------------------------------------------------------------------------
     // Point Encoding Tests
     // ------------------------------------------------------------------------
@@ -1549,13 +1701,11 @@ mod tests {
 
     #[test]
     fn test_world_to_tile_local_x_matches_f64_path() {
-        // X coordinates should match between f64 and WorldCoord paths
-        // because longitude is linearly mapped in both cases.
-        //
-        // DIVERGENCE FROM F64 PATH:
-        // Y coordinates differ because geo_to_tile_coords linearly interpolates
-        // latitude within TileBounds, while WorldCoord uses the correct Mercator
-        // projection. The WorldCoord path is more accurate for Y coordinates.
+        // Both X and Y must match between the f64 and WorldCoord paths: both
+        // are linear in longitude for X and use the Web Mercator projection
+        // for Y. (The f64 path used to linearly interpolate latitude within
+        // TileBounds, which misplaced features toward the poles at coarse
+        // zooms — fixed to Mercator.)
         let tile = TileCoord::new(0, 0, 1);
         let bounds = tile.bounds();
         let extent = 4096;
@@ -1565,23 +1715,24 @@ mod tests {
         let lat = (bounds.lat_min + bounds.lat_max) / 2.0;
 
         // f64 path
-        let (f64_x, _f64_y) = geo_to_tile_coords(lng, lat, &bounds, extent);
+        let (f64_x, f64_y) = geo_to_tile_coords(lng, lat, &bounds, extent);
 
         // WorldCoord path
         let world = lng_lat_to_world(lng, lat);
-        let (wc_x, _wc_y) = world_to_tile_local(&world, &tile, extent);
+        let (wc_x, wc_y) = world_to_tile_local(&world, &tile, extent);
 
-        // X should match closely (both linear in longitude)
         assert!(
             (f64_x - wc_x).abs() <= 1,
             "X mismatch: f64={} vs WorldCoord={}",
             f64_x,
             wc_x
         );
-
-        // Y values differ because f64 path linearly interpolates latitude
-        // while WorldCoord uses Mercator projection. This is expected and
-        // WorldCoord is the more correct approach.
+        assert!(
+            (f64_y - wc_y).abs() <= 1,
+            "Y mismatch: f64={} vs WorldCoord={}",
+            f64_y,
+            wc_y
+        );
     }
 
     #[test]
@@ -1804,13 +1955,9 @@ mod tests {
 
     #[test]
     fn test_world_coord_linestring_consistency_with_f64() {
-        // Test that encoding a linestring through both paths gives similar structure.
-        //
-        // DIVERGENCE FROM F64 PATH:
-        // The f64 path (geo_to_tile_coords) linearly interpolates latitude in TileBounds,
-        // while WorldCoord uses the Mercator projection. X coordinates (longitude) match
-        // closely, but Y coordinates differ because Mercator is non-linear in latitude.
-        // The WorldCoord path is more accurate.
+        // Test that encoding a linestring through both paths gives the same
+        // structure and coordinates: both paths are linear in longitude for X
+        // and use the Web Mercator projection for Y.
         let tile = TileCoord::new(10, 10, 5);
         let bounds = tile.bounds();
         let extent = 4096;
@@ -1849,16 +1996,16 @@ mod tests {
             );
         }
 
-        // Y coordinates (indices 2, 5) may differ due to Mercator vs linear interpolation
-        // Just verify they are within valid tile extent range
+        // Y coordinates (indices 2, 5) must also be close: both paths project
+        // latitude with Web Mercator.
         for i in [2, 5] {
+            let f64_val = zigzag_decode(f64_commands[i]);
             let wc_val = zigzag_decode(wc_commands[i]);
-            // For the first Y it's absolute, for delta it can be negative
-            // Just verify the values are reasonable (not overflowing)
             assert!(
-                wc_val.abs() <= extent as i32 * 2,
-                "Y command[{}] out of range: {}",
+                (f64_val - wc_val).abs() <= 2,
+                "Y command[{}] mismatch: f64={} vs WorldCoord={}",
                 i,
+                f64_val,
                 wc_val
             );
         }

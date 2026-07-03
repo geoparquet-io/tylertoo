@@ -241,19 +241,11 @@ pub fn polygon_area_in_tile_coords(
 /// See issue #85 for tracking full tippecanoe parity.
 #[inline]
 fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) -> (f64, f64) {
-    let extent_f = extent as f64;
-
-    // Normalize to 0-1 within tile bounds
-    let x_ratio = (lng - bounds.lng_min) / (bounds.lng_max - bounds.lng_min);
-    let y_ratio = (lat - bounds.lat_min) / (bounds.lat_max - bounds.lat_min);
-
-    // Scale to extent and flip Y (tile coords have Y increasing downward)
-    // IMPORTANT: Round to match MVT encoding precision (mvt.rs uses .round() as i32)
-    // This ensures filtering decisions align with actual MVT output coordinates.
-    let x = (x_ratio * extent_f).round();
-    let y = ((1.0 - y_ratio) * extent_f).round();
-
-    (x, y)
+    // Delegate to the shared MVT transform (linear X, Web Mercator Y) so drop
+    // decisions use the same projection as the encoder, then round to match
+    // MVT encoding precision (mvt.rs uses .round() as i32).
+    let (x, y) = crate::mvt::geo_to_tile_coords_unrounded(lng, lat, bounds, extent);
+    (x.round(), y.round())
 }
 
 /// Transform a LineString from geographic to tile-local coordinates.
