@@ -263,6 +263,54 @@ the block.
 
 ---
 
+## File layout knobs: `--row-group-size`, `--full-column-stats`
+
+These do not change *which* features or vertices survive — geometry and
+attributes are byte-identical regardless — but they control the **physical
+Parquet layout**, which drives remote read cost (footer size + bbox pruning).
+
+### `--row-group-size` (default 10000): per-level row-group sizing
+
+The value is a per-level **cap**, not a global row-group size:
+
+- A level whose feature count is `<= row-group-size` is written as a **single**
+  row group. Coarse bands (a handful of features) therefore become one broad
+  row group — which is what a reader fetches whole anyway (the coarse overview
+  is the "quick look").
+- A larger level is split into `ceil(features / row-group-size)` row groups of
+  **roughly uniform** size. Fine bands keep many small row groups, so their
+  per-row-group bbox statistics prune tightly against a viewport.
+
+Each level always ends exactly on a row-group boundary and no row group ever
+mixes two levels (spec §4.2) — this is invariant and independent of the knob.
+
+Smaller values → tighter bbox pruning (fetch fewer features for a small
+viewport) but more row groups → a larger footer. Larger values → the reverse.
+The default 10000 balances the two; because string/geometry stats are
+suppressed by default (below), even hundreds of row groups keep the footer
+small, so there is rarely a reason to raise it. LOWER it if you serve tiny
+viewports over a high-latency store and want tighter pruning.
+
+### `--full-column-stats` (default off): statistics suppression
+
+By default the writer **suppresses** Parquet per-row-group min/max statistics
+on the WKB geometry column and on every string/binary property column (e.g. an
+Overture 26-character ULID `id`). These stats are never used by the overview
+read protocol — spatial pruning uses the **bbox covering** struct, and level
+selection uses the **`level`** column, both of which *always* keep full stats
+(spec §4.4). But on high-cardinality data they dominate the Thrift footer,
+which is read in full on *every* remote query regardless of viewport. On the
+Moldova polygon set (631k features, ULID ids) the footer was **8.84 MB** with
+full stats — larger than most viewports' actual data — and drops below **1 MB**
+with suppression.
+
+Pass `--full-column-stats` to keep stats on all columns. Do this only if remote
+clients push predicates on property columns (e.g. `WHERE id = …` or
+`WHERE class = 'motorway'` server-side) and want row-group skipping on them —
+you trade a bigger footer for that pushdown.
+
+---
+
 ## Worked scenarios
 
 | Symptom | Fix |
@@ -275,6 +323,9 @@ the block.
 | Whole map uniformly too sparse or too dense | move `--gsd-base` (up = denser, down = sparser) instead of tuning each family |
 | Mid zooms have far more features than tippecanoe / duplicating files too large | RAISE `--drop-rate` (density budget); or `--no-density-drop` to turn it off |
 | Density cut is stripping sparse rural areas to keep cities | RAISE `--drop-gamma` (sparse-area protection) |
+| Every remote query fetches a huge footer before any data | default already suppresses string/geometry stats; do NOT pass `--full-column-stats` |
+| Need server-side row-group skipping on a property predicate | pass `--full-column-stats` (bigger footer, gains column pruning) |
+| Tiny viewports over high-latency storage fetch too much | LOWER `--row-group-size` for tighter bbox pruning |
 
 See `corpus/SWEEP_NOTES.md` for an empirical `--line-thinning` ×
 `--simplify-factor` sweep on Portland roads, and the Q2 section there for the

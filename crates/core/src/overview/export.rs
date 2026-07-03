@@ -701,7 +701,11 @@ mod tests {
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         for (k, (ids, geoms)) in level_geoms.iter().enumerate() {
             writer
-                .write_level(k, std::iter::once(batch(&schema, ids, geoms)))
+                .write_level(
+                    k,
+                    Some(ids.len()),
+                    std::iter::once(batch(&schema, ids, geoms)),
+                )
                 .unwrap();
         }
         writer.finish().unwrap()
@@ -800,6 +804,7 @@ mod tests {
         let mut w = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
         w.write_level(
             0,
+            Some(1),
             std::iter::once(batch(
                 &schema,
                 &[0],
@@ -809,6 +814,7 @@ mod tests {
         .unwrap();
         w.write_level(
             1,
+            Some(1),
             std::iter::once(batch(
                 &schema,
                 &[1],

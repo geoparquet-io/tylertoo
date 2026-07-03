@@ -256,6 +256,12 @@ pub struct ConvertOptions {
     pub cogp_compat_key: bool,
     /// Maximum row-group size in rows for the output writer.
     pub max_row_group_size: usize,
+    /// Keep full Parquet statistics on every column (including high-cardinality
+    /// string/binary property columns and the WKB geometry column). Default
+    /// `false`: those stats are suppressed to keep the footer small (H1); the
+    /// bbox covering and `level` column always keep their pruning stats. Set
+    /// `true` for clients that push property predicates to the remote file.
+    pub full_column_stats: bool,
 }
 
 impl Default for ConvertOptions {
@@ -275,6 +281,7 @@ impl Default for ConvertOptions {
             gsd_base: GSD_TILE_BASE,
             cogp_compat_key: false,
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
+            full_column_stats: false,
         }
     }
 }
@@ -553,6 +560,7 @@ pub fn convert_to_overviews(
     let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
+    writer_opts.full_column_stats = options.full_column_stats;
     writer_opts.cogp_compat_key = options.cogp_compat_key;
     writer_opts.generalization = Some(build_generalization(
         &emitted_gsds,
@@ -578,7 +586,7 @@ pub fn convert_to_overviews(
             &e.indices,
             &e.geoms,
         )?;
-        writer.write_level(level_idx, std::iter::once(batch))?;
+        writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
         level_reports.push(LevelReport {
             level: level_idx,
             gsd: e.gsd,

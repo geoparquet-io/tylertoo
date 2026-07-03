@@ -556,7 +556,11 @@ mod tests {
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         for (k, ids) in level_ids.iter().enumerate() {
             writer
-                .write_level(k, std::iter::once(source_batch(&schema, ids)))
+                .write_level(
+                    k,
+                    Some(ids.len()),
+                    std::iter::once(source_batch(&schema, ids)),
+                )
                 .unwrap();
         }
         writer.finish().unwrap()

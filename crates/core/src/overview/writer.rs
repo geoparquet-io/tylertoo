@@ -73,8 +73,22 @@ pub struct OverviewWriterOptions {
     pub levels: Vec<LevelSpec>,
     /// ZSTD compression level.
     pub zstd_level: i32,
-    /// Maximum row-group size in rows.
+    /// Row-group **cap** in rows (§4.5). Interpreted per level (H1): a level
+    /// whose row count is `<= max_row_group_size` is written as a SINGLE row
+    /// group; a larger level is split into `ceil(rows / max_row_group_size)`
+    /// row groups of roughly uniform size. Small coarse bands therefore become
+    /// one broad row group (read whole anyway) while fine bands keep tight
+    /// per-row-group bbox statistics for pruning.
     pub max_row_group_size: usize,
+    /// Keep full Parquet statistics on **every** column, including
+    /// high-cardinality string/binary property columns and the WKB geometry
+    /// column (H1). Default `false`: those columns' per-row-group min/max are
+    /// suppressed because no reader uses them and they dominate the footer
+    /// (Moldova: a 26-char ULID `id` × 167 row groups ⇒ 8.84 MB footer). The
+    /// bbox covering and `level` column always keep their stats (the pruning
+    /// index, §4.4). Set `true` for clients that push property predicates to the
+    /// remote file and want row-group skipping on those columns.
+    pub full_column_stats: bool,
     /// Emit the optional COGP-compatibility footer key (§3.1). Default `false`.
     pub cogp_compat_key: bool,
     /// Spec version string written to the footer.
@@ -92,6 +106,7 @@ impl OverviewWriterOptions {
             levels,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             max_row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
+            full_column_stats: false,
             cogp_compat_key: false,
             version: SPEC_VERSION.to_string(),
             generalization: None,
@@ -258,7 +273,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
         let target_schema = encoder.target_schema();
 
-        let props = build_writer_properties(&options, &geometry_columns)?;
+        let props = build_writer_properties(&options, &geometry_columns, &augmented_schema)?;
         let writer = ArrowWriter::try_new(sink, target_schema, Some(props))?;
 
         Ok(Self {
@@ -284,9 +299,19 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// source schema (no `level` column); this method appends the `level`
     /// column set to `level_idx`, GeoParquet-encodes the batch, and writes it.
     /// The level ends exactly on a row-group boundary (§4.2).
+    ///
+    /// `level_row_hint` is the total number of rows this level will contribute
+    /// (H1). When supplied, the writer sizes this level's row groups from it:
+    /// a level with `hint <= max_row_group_size` rows is written as a **single**
+    /// row group; a larger level is split into `ceil(hint / max_row_group_size)`
+    /// row groups of roughly uniform size. When `None`, the writer falls back to
+    /// splitting every `max_row_group_size` rows. Either way the level ends
+    /// exactly on a row-group boundary and never shares a row group with another
+    /// level (§4.2) — the RG-boundary-per-level invariant is exact.
     pub fn write_level(
         &mut self,
         level_idx: usize,
+        level_row_hint: Option<usize>,
         batches: impl Iterator<Item = RecordBatch>,
     ) -> Result<(), WriterError> {
         if level_idx != self.next_level_idx {
@@ -297,6 +322,15 @@ impl<W: Write + Send> OverviewWriter<W> {
         }
 
         let rg_before = self.writer.flushed_row_groups().len();
+
+        // Rows per row group for THIS level (§4.2, §4.5). The underlying
+        // `ArrowWriter` never splits on its own (its `max_row_group_size` is set
+        // to `usize::MAX` in `build_writer_properties`); we drive every row-group
+        // boundary here by slicing each encoded batch to `target` and flushing.
+        let target = rg_row_target(self.options.max_row_group_size, level_row_hint);
+
+        // Rows accumulated into the current (not-yet-flushed) row group.
+        let mut in_rg: usize = 0;
 
         for batch in batches {
             let num_rows = batch.num_rows();
@@ -317,11 +351,29 @@ impl<W: Write + Send> OverviewWriter<W> {
                 .encoder
                 .encode_record_batch(&augmented)
                 .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
-            self.writer.write(&encoded)?;
+
+            // Slice the encoded batch so row-group boundaries fall exactly on
+            // `target`-row multiples (carrying `in_rg` across batches).
+            let n = encoded.num_rows();
+            let mut offset = 0usize;
+            while offset < n {
+                let take = (target - in_rg).min(n - offset);
+                self.writer.write(&encoded.slice(offset, take))?;
+                in_rg += take;
+                offset += take;
+                if in_rg >= target {
+                    self.writer.flush()?;
+                    in_rg = 0;
+                }
+            }
         }
 
-        // Force a row-group boundary so the level ends exactly on one (§4.2).
-        self.writer.flush()?;
+        // Close the final partial row group so the level ends exactly on a
+        // boundary (§4.2). If `in_rg == 0` the boundary already fell on the last
+        // flush, so a trailing flush would create a spurious empty row group.
+        if in_rg > 0 {
+            self.writer.flush()?;
+        }
 
         let rg_after = self.writer.flushed_row_groups().len();
         if rg_after <= rg_before {
@@ -444,18 +496,53 @@ fn covering_name_for(column_name: &str) -> String {
     }
 }
 
+/// Rows per row group for a level (H1). With a known `level_row_hint`:
+/// a level that fits in `cap` rows becomes a **single** row group; a larger
+/// level is split into `ceil(hint / cap)` row groups of roughly uniform size.
+/// With `None`, fall back to the cap (split every `cap` rows).
+fn rg_row_target(max_row_group_size: usize, level_row_hint: Option<usize>) -> usize {
+    let cap = max_row_group_size.max(1);
+    match level_row_hint {
+        Some(n) if n > 0 => {
+            if n <= cap {
+                n
+            } else {
+                let num_rgs = n.div_ceil(cap);
+                n.div_ceil(num_rgs)
+            }
+        }
+        _ => cap,
+    }
+}
+
 /// Build [`WriterProperties`]: ZSTD, no dictionary on geometry + bbox columns
-/// (§4.5), tunable row-group size, per-RG statistics for spatial pruning.
+/// (§4.5), manual per-level row-group control, and statistics tuned so the
+/// footer stays small (H1) while the pruning index survives.
+///
+/// - `set_max_row_group_size(usize::MAX)`: the writer never splits row groups on
+///   its own; [`OverviewWriter::write_level`] drives every boundary so each
+///   level is sized independently and ends on a row-group boundary (§4.2).
+/// - Statistics: the bbox covering children and `level` column keep full stats
+///   (the spatial-pruning index, §4.4). Unless `full_column_stats` is set, the
+///   WKB geometry column and every Utf8/Binary property column have their stats
+///   suppressed — their per-row-group min/max are never used by a reader but
+///   dominate the footer on high-cardinality data (e.g. Overture ULID `id`).
 fn build_writer_properties(
     options: &OverviewWriterOptions,
     geometry_columns: &[String],
+    augmented_schema: &Schema,
 ) -> Result<WriterProperties, WriterError> {
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(options.zstd_level)?))
-        .set_max_row_group_size(options.max_row_group_size)
+        // Manual per-level row-group control (see write_level): disable the
+        // writer's own row-count splitting.
+        .set_max_row_group_size(usize::MAX)
         // Per-row-group (chunk) statistics are the spatial-pruning index (§4.4);
         // Page-level also carries chunk-level min/max.
         .set_statistics_enabled(EnabledStatistics::Page);
+
+    let geom_set: std::collections::HashSet<&str> =
+        geometry_columns.iter().map(|s| s.as_str()).collect();
 
     for geom in geometry_columns {
         // Geometry (WKB) column: no dictionary (§4.5).
@@ -466,6 +553,32 @@ fn build_writer_properties(
         for child in ["xmin", "ymin", "xmax", "ymax"] {
             let path = ColumnPath::from(vec![covering.clone(), child.to_string()]);
             builder = builder.set_column_dictionary_enabled(path, false);
+        }
+    }
+
+    // Statistics suppression on high-cardinality columns (H1). Suppress the WKB
+    // geometry column and every string/binary property column; keep everything
+    // else (covering children — a generated `bbox` struct not present in this
+    // schema — and the `level` column both keep the default Page stats).
+    if !options.full_column_stats {
+        for field in augmented_schema.fields() {
+            let name = field.name();
+            let is_geometry = geom_set.contains(name.as_str());
+            let is_string_or_binary = matches!(
+                field.data_type(),
+                DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
+                    | DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+            );
+            if is_geometry || is_string_or_binary {
+                builder = builder.set_column_statistics_enabled(
+                    ColumnPath::from(name.clone()),
+                    EnabledStatistics::None,
+                );
+            }
         }
     }
 
@@ -608,7 +721,9 @@ mod tests {
             OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
         // Skip level 0 -> should error.
         let batch = source_batch(&schema, &[0, 1]);
-        let err = writer.write_level(1, std::iter::once(batch)).unwrap_err();
+        let err = writer
+            .write_level(1, None, std::iter::once(batch))
+            .unwrap_err();
         assert!(matches!(
             err,
             WriterError::LevelOutOfOrder {
@@ -677,13 +792,13 @@ mod tests {
             let mut writer =
                 OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
             writer
-                .write_level(0, std::iter::once(make_batch(&[0, 3])))
+                .write_level(0, None, std::iter::once(make_batch(&[0, 3])))
                 .unwrap();
             writer
-                .write_level(1, std::iter::once(make_batch(&[0, 1, 3])))
+                .write_level(1, None, std::iter::once(make_batch(&[0, 1, 3])))
                 .unwrap();
             writer
-                .write_level(2, std::iter::once(make_batch(&[0, 1, 2, 3])))
+                .write_level(2, None, std::iter::once(make_batch(&[0, 1, 2, 3])))
                 .unwrap();
             writer.finish().unwrap();
         }
@@ -741,13 +856,17 @@ mod tests {
             let mut writer =
                 OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
             writer
-                .write_level(0, std::iter::once(source_batch(&schema, &level0_ids)))
+                .write_level(0, None, std::iter::once(source_batch(&schema, &level0_ids)))
                 .unwrap();
             writer
-                .write_level(1, std::iter::once(source_batch(&schema, &level1_ids)))
+                .write_level(1, None, std::iter::once(source_batch(&schema, &level1_ids)))
                 .unwrap();
             writer
-                .write_level(2, std::iter::once(source_batch(&schema, &canonical_ids)))
+                .write_level(
+                    2,
+                    None,
+                    std::iter::once(source_batch(&schema, &canonical_ids)),
+                )
                 .unwrap();
             writer.finish().unwrap()
         };
@@ -912,10 +1031,10 @@ mod tests {
         let written_meta = {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
             writer
-                .write_level(0, std::iter::once(source_batch(&schema, &[0, 2])))
+                .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 2])))
                 .unwrap();
             writer
-                .write_level(1, std::iter::once(source_batch(&schema, &[1, 3, 5])))
+                .write_level(1, None, std::iter::once(source_batch(&schema, &[1, 3, 5])))
                 .unwrap();
             writer.finish().unwrap()
         };
@@ -959,7 +1078,7 @@ mod tests {
         let mut writer =
             OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
         writer
-            .write_level(0, std::iter::once(source_batch(&schema, &[0, 3])))
+            .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 3])))
             .unwrap();
         let err = writer.finish().unwrap_err();
         assert!(matches!(
@@ -969,5 +1088,174 @@ mod tests {
                 expected: 3
             }
         ));
+    }
+
+    #[test]
+    fn rg_row_target_sizes_levels() {
+        // Small level (<= cap): one row group of exactly the level's rows.
+        assert_eq!(rg_row_target(10_000, Some(3)), 3);
+        assert_eq!(rg_row_target(10_000, Some(10_000)), 10_000);
+        // Large level: ceil(n/cap) uniform row groups.
+        // 10 rows, cap 4 -> ceil(10/4)=3 groups -> ceil(10/3)=4 rows/group.
+        assert_eq!(rg_row_target(4, Some(10)), 4);
+        // 9 rows, cap 4 -> 3 groups -> 3 rows/group (more uniform than 4,4,1).
+        assert_eq!(rg_row_target(4, Some(9)), 3);
+        // Unknown hint falls back to the cap.
+        assert_eq!(rg_row_target(4, None), 4);
+        assert_eq!(rg_row_target(4, Some(0)), 4);
+    }
+
+    #[test]
+    fn per_level_row_group_sizing() {
+        // A small coarse band becomes ONE row group; a larger fine band splits
+        // into several roughly uniform row groups. Footer row_group_end values
+        // stay exact and the file validates.
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut opts = OverviewWriterOptions::new(
+            Mode::Duplicating,
+            vec![
+                LevelSpec::new(gsd(2), Some(2)),
+                LevelSpec::new(gsd(4), Some(4)),
+            ],
+        );
+        opts.max_row_group_size = 4;
+
+        let meta = {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            // Level 0: 3 rows (<= cap 4) -> single row group.
+            writer
+                .write_level(
+                    0,
+                    Some(3),
+                    std::iter::once(source_batch(&schema, &[0, 1, 2])),
+                )
+                .unwrap();
+            // Level 1: 10 rows (> cap 4) -> ceil(10/4)=3 uniform row groups.
+            let ids: Vec<i64> = (0..10).collect();
+            writer
+                .write_level(
+                    1,
+                    Some(ids.len()),
+                    std::iter::once(source_batch(&schema, &ids)),
+                )
+                .unwrap();
+            writer.finish().unwrap()
+        };
+
+        // Footer bands: level 0 = RG 0; level 1 = RGs 1..=3.
+        assert_eq!(meta.levels[0].row_group_end, 0);
+        assert_eq!(meta.levels[1].row_group_end, 3);
+
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert_eq!(pm.num_row_groups(), 4);
+        // Level 0 is a single row group of all 3 rows.
+        assert_eq!(pm.row_group(0).num_rows(), 3);
+        // Level 1's three row groups sum to 10 and none exceeds the cap.
+        let l1: Vec<i64> = (1..=3).map(|r| pm.row_group(r).num_rows()).collect();
+        assert_eq!(l1.iter().sum::<i64>(), 10);
+        assert!(l1.iter().all(|&r| r <= 4), "row groups exceed cap: {l1:?}");
+
+        // Every row group is single-level (invariant §4.2) and validates.
+        assert!(crate::overview::check::validate_file(tmp.path())
+            .unwrap()
+            .is_valid());
+    }
+
+    /// Does the row group at index `rg` have statistics for the column at
+    /// `path`? Helper for the stats-suppression tests.
+    fn rg_has_stats(path: &std::path::Path, rg: usize, col_path: &str) -> bool {
+        let file = File::open(path).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        pm.row_group(rg)
+            .columns()
+            .iter()
+            .find(|c| c.column_path().string() == col_path)
+            .unwrap_or_else(|| panic!("column {col_path} not found"))
+            .statistics()
+            .is_some()
+    }
+
+    fn write_three_level_file(path: &std::path::Path, full_column_stats: bool) {
+        let schema = Arc::new(source_schema());
+        let mut opts = duplicating_options();
+        opts.full_column_stats = full_column_stats;
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        writer
+            .write_level(0, Some(2), std::iter::once(source_batch(&schema, &[0, 3])))
+            .unwrap();
+        writer
+            .write_level(
+                1,
+                Some(3),
+                std::iter::once(source_batch(&schema, &[0, 1, 3])),
+            )
+            .unwrap();
+        writer
+            .write_level(
+                2,
+                Some(4),
+                std::iter::once(source_batch(&schema, &[0, 1, 2, 3])),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn string_and_geometry_stats_suppressed_by_default() {
+        // Default: the bbox covering + level column keep their pruning stats;
+        // the Utf8 `name` and WKB `geometry` columns have their stats suppressed
+        // (the H1 footer fix). The numeric `id` column keeps its (cheap) stats.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_three_level_file(tmp.path(), false);
+
+        // Pruning index: MUST be present.
+        assert!(rg_has_stats(tmp.path(), 0, "level"), "level stats missing");
+        for child in ["xmin", "ymin", "xmax", "ymax"] {
+            assert!(
+                rg_has_stats(tmp.path(), 0, &format!("bbox.{child}")),
+                "covering bbox.{child} stats missing"
+            );
+        }
+        // High-cardinality string + WKB geometry: MUST be suppressed.
+        assert!(
+            !rg_has_stats(tmp.path(), 0, "name"),
+            "string property stats not suppressed"
+        );
+        assert!(
+            !rg_has_stats(tmp.path(), 0, "geometry"),
+            "geometry WKB stats not suppressed"
+        );
+        // Numeric property keeps stats (cheap, occasionally useful).
+        assert!(
+            rg_has_stats(tmp.path(), 0, "id"),
+            "numeric id stats missing"
+        );
+    }
+
+    #[test]
+    fn full_column_stats_flag_keeps_all_stats() {
+        // With --full-column-stats every column keeps stats, including the
+        // string `name` and WKB `geometry` columns.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_three_level_file(tmp.path(), true);
+
+        assert!(rg_has_stats(tmp.path(), 0, "level"));
+        assert!(rg_has_stats(tmp.path(), 0, "bbox.xmin"));
+        assert!(
+            rg_has_stats(tmp.path(), 0, "name"),
+            "string stats should be kept under full_column_stats"
+        );
+        assert!(
+            rg_has_stats(tmp.path(), 0, "geometry"),
+            "geometry stats should be kept under full_column_stats"
+        );
     }
 }

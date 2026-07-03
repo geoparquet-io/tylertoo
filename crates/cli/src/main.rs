@@ -293,8 +293,25 @@ struct OverviewArgs {
     no_density_drop: bool,
 
     /// Maximum output row-group size in rows.
+    ///
+    /// Interpreted per level: a level with at most this many rows is written as
+    /// a single row group; a larger level is split into roughly uniform row
+    /// groups of at most this size. Coarse bands (few features) therefore become
+    /// one broad row group; fine bands keep tight per-row-group bbox statistics.
     #[arg(long, default_value = "10000")]
     row_group_size: usize,
+
+    /// Keep full Parquet statistics on every column, including high-cardinality
+    /// string/binary property columns and the WKB geometry column.
+    ///
+    /// By default those columns' per-row-group min/max stats are suppressed to
+    /// keep the footer small (a 26-char ULID `id` over hundreds of row groups
+    /// otherwise bloats the footer to megabytes, paid on every remote query).
+    /// The bbox covering and `level` column always keep their pruning stats.
+    /// Enable this if remote clients push predicates on property columns and
+    /// want row-group skipping on them.
+    #[arg(long)]
+    full_column_stats: bool,
 
     /// Write the JSON conversion report to this path.
     #[arg(long, value_name = "PATH")]
@@ -1062,6 +1079,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         gsd_base: args.gsd_base,
         cogp_compat_key: args.cogp_compat,
         max_row_group_size: args.row_group_size,
+        full_column_stats: args.full_column_stats,
     };
 
     let report = convert_to_overviews(&args.input, &args.output, &options)
