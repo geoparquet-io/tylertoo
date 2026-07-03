@@ -61,6 +61,7 @@ use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
 use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArray;
 use prost::Message;
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_from_array;
@@ -252,7 +253,9 @@ pub fn export_pmtiles(
 
         // Read the whole level band into memory (v1). The reader already applies
         // duplicating (single band) vs partitioning (prefix) semantics.
+        let t_read = Instant::now();
         let features = read_level_features(&reader, level_idx, crs)?;
+        let read_secs = t_read.elapsed().as_secs_f64();
         let level_feature_count = features.len();
 
         // Expand the overall geographic bounds from feature bboxes.
@@ -266,8 +269,11 @@ pub fn export_pmtiles(
             }
         }
 
+        let t_encode = Instant::now();
         let tiles = encode_level_tiles(&features, zoom, options);
+        let encode_secs = t_encode.elapsed().as_secs_f64();
 
+        let t_write = Instant::now();
         let mut tile_feature_count = 0usize;
         let mut oversized = 0usize;
         for t in &tiles {
@@ -277,6 +283,12 @@ pub fn export_pmtiles(
             }
             writer.add_tile_with_count(zoom, t.x, t.y, &t.data, t.feature_count)?;
         }
+        log::debug!(
+            "[profile] z{zoom} (level {level_idx}, {level_feature_count} feats, {} tiles): \
+             read={read_secs:.2}s clip+encode={encode_secs:.2}s write(gzip)={:.2}s",
+            tiles.len(),
+            t_write.elapsed().as_secs_f64(),
+        );
 
         zooms.push(ZoomReport {
             zoom,
@@ -291,7 +303,12 @@ pub fn export_pmtiles(
     if let Some(b) = &overall_bounds {
         writer.set_bounds(b);
     }
+    let t_finalize = Instant::now();
     writer.finalize(output_path.as_ref())?;
+    log::debug!(
+        "[profile] pmtiles finalize: {:.2}s",
+        t_finalize.elapsed().as_secs_f64()
+    );
 
     let total_tiles = zooms.iter().map(|z| z.tile_count).sum();
     let total_tile_features = zooms.iter().map(|z| z.tile_feature_count).sum();
@@ -313,9 +330,15 @@ pub fn export_pmtiles(
 // Tiling + encoding
 // ============================================================================
 
-/// Per-tile working map: tile `(x, y)` -> list of `(clipped geometry, property
-/// index into the level's `features`)`.
-type GroupedTileGeoms = BTreeMap<(u32, u32), Vec<(Geometry<f64>, usize)>>;
+/// One tile's members: list of `(clipped geometry, property index into the
+/// level's `features`)`.
+type TileMembers = Vec<(Geometry<f64>, usize)>;
+
+/// Per-tile working map: tile `(x, y)` -> members.
+type GroupedTileGeoms = BTreeMap<(u32, u32), TileMembers>;
+
+/// Per-feature clip results: list of `(tile (x, y), clipped geometry)`.
+type FeatureTileGeoms = Vec<((u32, u32), Geometry<f64>)>;
 
 /// Group a level's features into tiles at `zoom`, clip each to its tile bounds
 /// plus the pixel buffer, and MVT-encode. Applies the optional oversized valve.
@@ -325,40 +348,86 @@ type GroupedTileGeoms = BTreeMap<(u32, u32), Vec<(Geometry<f64>, usize)>>;
 /// load-bearing — the `BTreeMap` is used for deterministic, locality-friendly
 /// grouping and a bounded per-zoom working set).
 fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> Vec<EncodedTile> {
+    // Clip in parallel per feature (H3(c) lever 2: clipping is 94% of export
+    // wall and independent per feature). `par_iter().map().collect()`
+    // preserves feature order, so the sequential merge below pushes members
+    // into each tile's vector in exactly the serial order — grouping, and
+    // therefore the encoded tile bytes, are unchanged.
+    let t_clip = Instant::now();
+    let per_feature: Vec<FeatureTileGeoms> = features
+        .par_iter()
+        .map(|feat| {
+            let Some(rect) = feat.geom.bounding_rect() else {
+                return Vec::new();
+            };
+            let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+            let mut out = Vec::new();
+            for tc in tiles_for_bbox(&bbox, zoom) {
+                let tb = tc.bounds();
+                let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
+                // Fast path (H3(c) lever 4): a feature whose bbox lies entirely
+                // within the buffered tile bounds is unaffected by clipping —
+                // skip the BooleanOps intersection and emit the geometry as-is.
+                // At z14 ~80% of features are interior to a single tile.
+                if bbox_within_buffered(&bbox, &tb, buffer_deg) {
+                    out.push(((tc.x, tc.y), feat.geom.clone()));
+                } else if let Some(clipped) = clip_geometry(&feat.geom, &tb, buffer_deg) {
+                    out.push(((tc.x, tc.y), clipped));
+                }
+            }
+            out
+        })
+        .collect();
+
     // tile (x,y) -> list of (clipped geometry, property index into `features`).
     let mut grouped: GroupedTileGeoms = BTreeMap::new();
+    for (fi, items) in per_feature.into_iter().enumerate() {
+        for (key, geom) in items {
+            grouped.entry(key).or_default().push((geom, fi));
+        }
+    }
 
-    for (fi, feat) in features.iter().enumerate() {
-        let Some(rect) = feat.geom.bounding_rect() else {
-            continue;
-        };
-        let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-        for tc in tiles_for_bbox(&bbox, zoom) {
+    let clip_secs = t_clip.elapsed().as_secs_f64();
+
+    // Encode tiles in parallel; the indexed collect preserves the BTreeMap's
+    // (x, y) order, and the caller's serial write loop consumes `out` in that
+    // order, so PMTiles tile ordering and bytes are unchanged.
+    let t_mvt = Instant::now();
+    let entries: Vec<((u32, u32), TileMembers)> = grouped.into_iter().collect();
+    let out: Vec<EncodedTile> = entries
+        .into_par_iter()
+        .filter_map(|((x, y), members)| {
+            let tc = TileCoord::new(x, y, zoom);
             let tb = tc.bounds();
-            let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
-            if let Some(clipped) = clip_geometry(&feat.geom, &tb, buffer_deg) {
-                grouped.entry((tc.x, tc.y)).or_default().push((clipped, fi));
+            let (data, count, oversized) = encode_tile(&members, features, &tb, opts);
+            if count == 0 {
+                return None;
             }
-        }
-    }
-
-    let mut out = Vec::with_capacity(grouped.len());
-    for ((x, y), members) in grouped {
-        let tc = TileCoord::new(x, y, zoom);
-        let tb = tc.bounds();
-        let (data, count, oversized) = encode_tile(&members, features, &tb, opts);
-        if count == 0 {
-            continue;
-        }
-        out.push(EncodedTile {
-            x,
-            y,
-            data,
-            feature_count: count,
-            oversized,
-        });
-    }
+            Some(EncodedTile {
+                x,
+                y,
+                data,
+                feature_count: count,
+                oversized,
+            })
+        })
+        .collect();
+    log::debug!(
+        "[profile]   z{zoom} clip+group={clip_secs:.2}s mvt-encode={:.2}s",
+        t_mvt.elapsed().as_secs_f64(),
+    );
     out
+}
+
+/// `true` when `bbox` lies entirely within `tb` expanded by `buffer` on every
+/// side. Clipping such a feature to the buffered tile is a geometric no-op, so
+/// the clip can be skipped (and BooleanOps ring normalization avoided).
+#[inline]
+fn bbox_within_buffered(bbox: &TileBounds, tb: &TileBounds, buffer: f64) -> bool {
+    bbox.lng_min >= tb.lng_min - buffer
+        && bbox.lat_min >= tb.lat_min - buffer
+        && bbox.lng_max <= tb.lng_max + buffer
+        && bbox.lat_max <= tb.lat_max + buffer
 }
 
 /// Encode a single tile's members to MVT bytes, applying the oversized valve.
@@ -915,6 +984,67 @@ mod tests {
                     assert!(
                         y >= -slack - extent && y <= extent + slack + extent,
                         "y {y} outside buffered tile bounds"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bbox_contained_feature_bypasses_clip_with_identical_output() {
+        // A concave polygon fully inside one z4 tile (z4 tile width 22.5°; the
+        // tile containing lng -100..., lat ~40 spans well past this 2° shape).
+        // The fast path must emit the geometry as-is: the encoded tile bytes
+        // must equal an MVT built from the *unclipped* geometry.
+        let poly = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-100.0, 25.0),
+                (-98.0, 25.0),
+                (-98.0, 27.0),
+                (-99.0, 25.5), // concavity: BooleanOps clip normalizes rings
+                (-100.0, 27.0),
+                (-100.0, 25.0),
+            ]),
+            vec![],
+        ));
+        let feats = vec![Feature {
+            geom: poly.clone(),
+            props: vec![],
+        }];
+        let opts = ExportOptions::default();
+        let tiles = encode_level_tiles(&feats, 4, &opts);
+        assert_eq!(tiles.len(), 1, "fully-contained feature => exactly 1 tile");
+        assert_eq!(tiles[0].feature_count, 1);
+
+        let tc = TileCoord::new(tiles[0].x, tiles[0].y, 4);
+        let expected = build_mvt(&[(poly.clone(), 0)], &feats, &tc.bounds(), &opts);
+        assert_eq!(
+            tiles[0].data, expected,
+            "contained feature must bypass the clip (geometry emitted as-is)"
+        );
+    }
+
+    #[test]
+    fn seam_crossing_feature_still_clips() {
+        // A line spanning several z4 tiles must still be clipped per tile:
+        // it lands in >= 2 tiles and no tile carries the full-extent geometry.
+        let line = Geometry::LineString(LineString::from(vec![(-100.0, 10.0), (-40.0, 11.0)]));
+        let feats = vec![Feature {
+            geom: line,
+            props: vec![],
+        }];
+        let opts = ExportOptions::default();
+        let tiles = encode_level_tiles(&feats, 4, &opts);
+        assert!(tiles.len() >= 2, "seam-crossing line must span tiles");
+        let extent = opts.extent as i32;
+        let slack = (opts.tile_buffer as i32) + 4;
+        for t in &tiles {
+            let decoded = decode_tile(&t.data);
+            for f in &decoded.layers[0].features {
+                for (x, y) in decode_coords(&f.geometry) {
+                    assert!(
+                        x >= -slack && x <= extent + slack && y >= -slack && y <= extent + slack,
+                        "({x},{y}) outside buffered tile: geometry was not clipped"
                     );
                 }
             }

@@ -15,4 +15,5 @@ pub mod export;
 pub mod level;
 pub mod reader;
 pub mod simplify;
+mod stream;
 pub mod writer;

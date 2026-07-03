@@ -313,6 +313,29 @@ struct OverviewArgs {
     #[arg(long)]
     full_column_stats: bool,
 
+    /// Disable the two-pass bounded-memory streaming pipeline (H3).
+    ///
+    /// By default the converter streams the input twice: pass 1 builds the
+    /// per-feature winner tables (level assignment + density budget) holding
+    /// only bboxes/kinds/sort-keys; pass 2 re-reads the input per level and
+    /// simplifies + writes batch-by-batch. Peak memory is O(read batch +
+    /// winner tables) instead of O(dataset) — e.g. Moldova (632k polygons)
+    /// drops from ~5.4 GB to well under 1 GB peak RSS. Output is equivalent
+    /// (same level assignments, rows, and footer). This flag reverts to the
+    /// original in-memory pipeline, which decodes the whole dataset once and
+    /// may be marginally faster on small inputs that comfortably fit in RAM.
+    #[arg(long)]
+    no_streaming: bool,
+
+    /// Rows per Arrow read batch in the streaming pipeline (both passes).
+    ///
+    /// LARGER batches amortize per-batch overhead (slightly faster) at the
+    /// cost of proportionally more peak memory; SMALLER batches bound memory
+    /// tighter. The default (8192) keeps per-batch transients in the tens of
+    /// MB even for vertex-heavy polygon data. No effect with --no-streaming.
+    #[arg(long, value_name = "ROWS", default_value = "8192")]
+    read_batch_size: usize,
+
     /// Write the JSON conversion report to this path.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
@@ -1057,6 +1080,8 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         cogp_compat_key: args.cogp_compat,
         max_row_group_size: args.row_group_size,
         full_column_stats: args.full_column_stats,
+        streaming: !args.no_streaming,
+        read_batch_size: args.read_batch_size,
     };
 
     let report = convert_to_overviews(&args.input, &args.output, &options)
@@ -1183,6 +1208,8 @@ fn run_validate(args: ValidateArgs) -> Result<()> {
 
 fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let opts = ExportOptions {
         layer_name: args.layer_name,
