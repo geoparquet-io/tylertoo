@@ -313,6 +313,10 @@ pub fn export_pmtiles(
 // Tiling + encoding
 // ============================================================================
 
+/// Per-tile working map: tile `(x, y)` -> list of `(clipped geometry, property
+/// index into the level's `features`)`.
+type GroupedTileGeoms = BTreeMap<(u32, u32), Vec<(Geometry<f64>, usize)>>;
+
 /// Group a level's features into tiles at `zoom`, clip each to its tile bounds
 /// plus the pixel buffer, and MVT-encode. Applies the optional oversized valve.
 ///
@@ -322,7 +326,7 @@ pub fn export_pmtiles(
 /// grouping and a bounded per-zoom working set).
 fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> Vec<EncodedTile> {
     // tile (x,y) -> list of (clipped geometry, property index into `features`).
-    let mut grouped: BTreeMap<(u32, u32), Vec<(Geometry<f64>, usize)>> = BTreeMap::new();
+    let mut grouped: GroupedTileGeoms = BTreeMap::new();
 
     for (fi, feat) in features.iter().enumerate() {
         let Some(rect) = feat.geom.bounding_rect() else {

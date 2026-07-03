@@ -1940,6 +1940,7 @@ mod tests {
     /// - First point: 2 u32
     /// - LineTo(199): 1 u32
     /// - Remaining 199 points: 398 u32
+    ///
     /// Total: 402 u32
     ///
     /// Expected overhead ratio: ~1.5x for geometry commands alone,

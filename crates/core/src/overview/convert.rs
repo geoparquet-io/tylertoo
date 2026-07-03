@@ -16,7 +16,8 @@
 //!    - `duplicating` canonical (finest) level: original geometry **untouched**
 //!      (spec §2.4, value-identity — no simplify round-trip);
 //!    - `partitioning` (all levels): original geometry **verbatim** (§2.3).
-//!    Input (Hilbert) order is preserved within each level (no re-sort).
+//!
+//! Input (Hilbert) order is preserved within each level (no re-sort).
 //! 4. **report**: a [`ConvertReport`] (per-level feature/vertex/byte counts,
 //!    totals, duration) is returned and is `serde` `Serialize` for the later
 //!    benchmark tasks.
@@ -97,7 +98,7 @@ impl LevelPlan {
                 }
                 let mut prev: Option<f64> = None;
                 for (i, &g) in gsds.iter().enumerate() {
-                    if !(g > 0.0) {
+                    if g <= 0.0 || g.is_nan() {
                         return Err(ConvertError::InvalidLevels(format!(
                             "gsd[{i}] = {g} must be > 0"
                         )));
@@ -493,8 +494,7 @@ pub fn convert_to_overviews(
     }
     let mut emitted: Vec<EmittedLevel> = Vec::new();
 
-    for level in 0..num_levels {
-        let (gsd_m, zoom) = level_specs[level];
+    for (level, &(gsd_m, zoom)) in level_specs.iter().enumerate() {
         let member_indices: Vec<usize> = match options.mode {
             Mode::Duplicating => assignment.duplicating_at_level(level as u8),
             Mode::Partitioning => assignment.partitioning_at_level(level as u8),
@@ -1256,12 +1256,12 @@ mod tests {
             .unwrap();
             let mut gvec = Vec::new();
             extract_geometries_from_array(garr.as_ref(), &mut gvec).unwrap();
-            for i in 0..batch.num_rows() {
+            for (i, g) in gvec.iter().enumerate() {
                 out.push((
                     ids.value(i),
                     names.value(i).to_string(),
                     ranks.value(i),
-                    gvec[i].clone(),
+                    g.clone(),
                 ));
             }
         }

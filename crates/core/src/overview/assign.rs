@@ -364,8 +364,9 @@ pub fn assign_levels(
             }
 
             let cell_size = gsd_units * config.thinning_factor(feat.kind);
-            // Guard against a zero/negative cell size (bad GSD input).
-            if !(cell_size > 0.0) {
+            // Guard against a zero/negative cell size (bad GSD input); also
+            // reject NaN.
+            if cell_size <= 0.0 || cell_size.is_nan() {
                 continue;
             }
             let (cx, cy) = feat.center();
@@ -518,7 +519,12 @@ pub fn apply_density_budget(
 ) -> Assignment {
     let num_levels = assignment.num_levels as usize;
     // Off-switch / degenerate: return the cell-winner assignment untouched.
-    if !budget.enabled || !(budget.drop_rate > 1.0) || features.is_empty() || num_levels < 2 {
+    if !budget.enabled
+        || budget.drop_rate <= 1.0
+        || budget.drop_rate.is_nan()
+        || features.is_empty()
+        || num_levels < 2
+    {
         return assignment.clone();
     }
 
@@ -555,6 +561,9 @@ pub fn apply_density_budget(
     let mut admitted_at = vec![finest as u8; n];
     let mut kept_count = 0usize;
 
+    // `level` is a scalar used in arithmetic/comparisons throughout the body
+    // (not merely an index), so a range loop is the clearest form here.
+    #[allow(clippy::needless_range_loop)]
     for level in 0..num_levels {
         let cands: Vec<usize> = (0..n)
             .filter(|&i| !admitted[i] && cw_min[i] <= level)
@@ -639,8 +648,9 @@ fn select_budget_survivors(
     let gsd_units = gsd_to_coord_units(gsd_m, crs);
     let super_size = gsd_units * SUPERCELL_GSD_FACTOR;
 
-    // Degenerate super-cell size: fall back to a global priority cut.
-    if !(super_size > 0.0) {
+    // Degenerate super-cell size (non-positive or NaN): fall back to a global
+    // priority cut.
+    if super_size <= 0.0 || super_size.is_nan() {
         let mut all = cands.to_vec();
         all.sort_by(|&a, &b| priority_order(prio, a, b));
         all.truncate(available);

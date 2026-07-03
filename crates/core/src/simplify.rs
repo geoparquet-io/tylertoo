@@ -500,7 +500,7 @@ fn remove_noop_linestring(coords: &[WorldCoord], tile: &TileCoord, extent: u32) 
         let px = (x.round() as i32, y.round() as i32);
 
         // Keep point if it's on a different pixel than the previous
-        if prev_px.map_or(true, |prev| prev != px) {
+        if prev_px != Some(px) {
             result.push(*coord);
             prev_px = Some(px);
         }
@@ -563,7 +563,7 @@ pub fn remove_noop_multilinestring(
             let (x, y) = world_to_tile_local_f64(*coord, tile, extent);
             let px = (x.round() as i32, y.round() as i32);
 
-            if prev_px.map_or(true, |prev| prev != px) {
+            if prev_px != Some(px) {
                 deduped.push(*coord);
                 prev_px = Some(px);
             }
