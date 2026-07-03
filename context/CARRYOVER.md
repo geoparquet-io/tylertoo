@@ -3,6 +3,15 @@
 Status: draft, 2026-07-02. Branch `feat/geoparquet-overviews`.
 Companion to `context/OVERVIEWS_PLAN.md` and `context/OVERVIEWS_SPEC.md` (G1).
 
+> **Update 2026-07-03 (H2):** the per-tile zoom-dependent simplification
+> feature (PR #158) has been **excised** — `pipeline.rs`, `simplify.rs`, and the
+> Python bindings were reverted to `origin/main`, and the `tiles`
+> `--simplify`/`--simplify-factor` surface removed. The simplify.rs function
+> inventory below (`simplify_geometry_for_tile`, `simplify_coalesced_linestring`,
+> `remove_noop_multilinestring`, the `*_preserve_boundaries` helpers) reflects
+> the pre-excision state and no longer exists on the branch; `simplify.rs` now
+> holds only main's 6 functions. See `context/TILE_SIMPLIFY_POSTMORTEM.md`.
+
 This document audits every module in `crates/core/src/` and maps each to a
 **fate** for the new GeoParquet multi-resolution overviews pipeline:
 

@@ -326,13 +326,28 @@ Moldova and update RESULTS.md.
 Acceptance: Moldova footer < 1 MB; regional-viewport bytes visibly
 down; all validate checks still pass.
 
-### H2. CI reckoning  [HUMAN + agent]
+### H2. CI reckoning  [HUMAN + agent]  — agent part DONE 2026-07-03
 CI has NEVER run on this branch (workflows target main). Steps:
 merge #158, retarget #168 to main, triage the full-suite results —
 including the tile-pipeline integration tests avoided locally all
 along. Expect pre-existing flakiness noise; separate "broken by us"
 (fix) from "was already broken" (document/issue).
 Human part: the merge buttons. Agent part: triage + fixes.
+
+**Agent progress (see `context/CI_TRIAGE.md`):**
+- Clippy (`Check`): FIXED — 12 `-D warnings` errors in overview + simplify
+  (`932b233`).
+- Test (`ubuntu, stable`): FIXED by **excising** the per-tile zoom-dependent
+  simplification feature (PR #158) — it was unproven and superseded by the
+  overview path; the CI failure was its aspirational red test. Removal commit
+  `d897110`; see `context/TILE_SIMPLIFY_POSTMORTEM.md`. The `tiles` subcommand
+  now behaves exactly as `main`.
+- Security Audit: reproduced — 2 `pyo3 0.28.2` vulns (RUSTSEC-2026-0176/0177).
+  PRE-EXISTING on `main` (same `pyo3="0.28"` pin; lockfile gitignored). Fix =
+  breaking pyo3 0.29 bump + bindings migration → DEFERRED (ties into E3). No
+  ignore added (a fix exists).
+- Coverage: not run locally; expected to heal once tests pass.
+- Still human: merge/close #158, retarget #168 → main, CI re-run.
 
 ### H3. V4 streaming — the big-files unlock  (the big ticket)
 Baseline to beat: Moldova 632k = 10m57s / 5.44 GB RSS (convert),
