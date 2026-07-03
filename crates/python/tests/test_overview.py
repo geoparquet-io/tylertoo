@@ -8,8 +8,9 @@ output-file validity via the validate() checklist.
 import tempfile
 from pathlib import Path
 
-import gpq_tiles
 import pytest
+
+import gpq_tiles
 
 FIXTURES_DIR = Path(__file__).parent.parent.parent.parent / "tests" / "fixtures"
 REALDATA_DIR = FIXTURES_DIR / "realdata"
@@ -40,13 +41,11 @@ class TestOverviewApi:
 
     def test_overview_requires_input_output(self):
         with pytest.raises(TypeError):
-            gpq_tiles.overview()
+            gpq_tiles.overview()  # type: ignore[call-arg]
 
     def test_overview_invalid_mode(self):
-        with pytest.raises(ValueError, match="[Ii]nvalid mode"):
-            gpq_tiles.overview(
-                "/nonexistent.parquet", "/tmp/out.parquet", mode="bogus"
-            )
+        with pytest.raises(ValueError, match=r"[Ii]nvalid mode"):
+            gpq_tiles.overview("/nonexistent.parquet", "/tmp/out.parquet", mode="bogus")
 
     def test_overview_invalid_sort_direction(self):
         with pytest.raises(ValueError, match="sort_direction"):
@@ -211,9 +210,7 @@ class TestOverviewIntegration:
 
     def test_overview_explicit_gsds(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            _, report = self._overview(
-                tmpdir, gsds=[8.0, 2.0], polygon_visibility=0.0
-            )
+            _, report = self._overview(tmpdir, gsds=[8.0, 2.0], polygon_visibility=0.0)
             assert len(report["levels"]) == 2
             assert report["levels"][0]["gsd"] == pytest.approx(8.0)
             # Explicit-GSD levels carry no zoom.
@@ -268,9 +265,7 @@ class TestOverviewIntegration:
 
     def test_overview_sort_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            out, _ = self._overview(
-                tmpdir, max_zoom=4, sort_key="area_in_meters"
-            )
+            out, _ = self._overview(tmpdir, max_zoom=4, sort_key="area_in_meters")
             assert gpq_tiles.validate(str(out))["valid"] is True
 
     def test_overview_sort_key_ascending(self):
@@ -287,9 +282,7 @@ class TestOverviewIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "overview.parquet"
             with pytest.raises(ValueError, match="not found"):
-                gpq_tiles.overview(
-                    str(BUILDINGS), str(out), sort_key="no_such_column"
-                )
+                gpq_tiles.overview(str(BUILDINGS), str(out), sort_key="no_such_column")
 
     def test_overview_no_auto_rank(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -300,9 +293,7 @@ class TestOverviewIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             _, budget_off = self._overview(tmpdir, max_zoom=4, density_drop=False)
         with tempfile.TemporaryDirectory() as tmpdir:
-            _, hard = self._overview(
-                tmpdir, max_zoom=4, drop_rate=4.0, drop_gamma=2.0
-            )
+            _, hard = self._overview(tmpdir, max_zoom=4, drop_rate=4.0, drop_gamma=2.0)
         assert hard["total_rows"] <= budget_off["total_rows"]
 
     def test_overview_cluster_and_accumulate(self):
@@ -423,9 +414,7 @@ class TestExportPmtilesIntegration:
         # polygon_visibility=0 keeps every level populated for the tiny
         # building footprints, so the export covers the full zoom range.
         kwargs.setdefault("polygon_visibility", 0.0)
-        gpq_tiles.overview(
-            str(BUILDINGS), str(out), min_zoom=11, max_zoom=14, **kwargs
-        )
+        gpq_tiles.overview(str(BUILDINGS), str(out), min_zoom=11, max_zoom=14, **kwargs)
         return out
 
     def test_export_defaults_and_report(self):
