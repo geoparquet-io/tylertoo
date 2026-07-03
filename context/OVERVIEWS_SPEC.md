@@ -330,9 +330,9 @@ constants as the source of truth).
 
 Writers conforming to v0.2.0 MUST serialize `ranks` as a JSON object
 map as shown above (not an array of pairs). (Implementation note,
-informative: gpq-tiles currently emits an array of `[value,
-priority]` pairs; alignment to the object-map shape is tracked for
-the code-alignment PR following #181.)
+informative: gpq-tiles emits the object map as of PR #190; its reader
+additionally accepts the legacy array-of-pairs shape written by
+earlier versions.)
 
 ### 3.6 Example — `duplicating` mode
 
@@ -1069,9 +1069,8 @@ structurally — the named column exists as INT32 NOT NULL, all values
 are `>= 1` (checkable via row-group statistics), and the canonical
 band's values are exactly `1`.
 
-(Implementation note, informative: gpq-tiles does not yet emit
-`junction_angle` and `max_level_rows`; alignment is tracked for the
-code-alignment PR following #181.)
+(Implementation note, informative: gpq-tiles emits all four
+parameter members as of PR #190.)
 
 ### 13.5 Partitioning mode is excluded (normative)
 
