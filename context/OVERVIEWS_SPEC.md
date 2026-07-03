@@ -306,7 +306,11 @@ Ranking := {
   "mode":         string,      // e.g. "explicit-sort-key",
                                // "class-ranking", "size-fallback"
   "column":       string,      // OPTIONAL: source column read
-  "ranks":        [[string, number]],  // OPTIONAL: value→priority map
+  "ranks":        { string: number, ... },
+                               // OPTIONAL: JSON object map of class
+                               // value → priority; higher priority
+                               // wins, e.g. {"motorway": 5,
+                               // "primary": 4, "residential": 2}
   "unknown_rank": number       // OPTIONAL: priority of unlisted values
 }
 
@@ -323,6 +327,12 @@ DensityDrop := {
 are an implementation concern, not fixed by this spec (for gpq-tiles
 they are documented in `docs/OVERVIEW_TUNING.md`, with the code
 constants as the source of truth).
+
+Writers conforming to v0.2.0 MUST serialize `ranks` as a JSON object
+map as shown above (not an array of pairs). (Implementation note,
+informative: gpq-tiles currently emits an array of `[value,
+priority]` pairs; alignment to the object-map shape is tracked for
+the code-alignment PR following #181.)
 
 ### 3.6 Example — `duplicating` mode
 
@@ -849,10 +859,20 @@ At each level, the generalization engine's per-cell survivor
 **absorbs** the point features that were thinned out of its cell at
 that level's grid, instead of them simply vanishing:
 
-- Every source point feature MUST be represented by exactly one row
-  at every level: itself if present, else an absorbing winner.
-  Consequently, at each level, the sum of `point_count` over the
-  level's point rows equals the total source point-feature count.
+- **Accounting (strict).** At every level, every source point feature
+  MUST be counted in the `point_count` of exactly one point row of
+  that level: its own row if it survives the level, otherwise the row
+  of the winner that absorbed it. A feature whose cell winner is
+  itself removed after absorption (e.g. by a density budget) MUST be
+  re-assigned to a surviving point row of the same level — which
+  survivor is implementation-defined (gpq-tiles: the nearest) — so no
+  feature is ever dropped from the count or counted twice.
+- **Sum invariant (normative).** Consequently, at every level, the
+  sum of `point_count` over the level's point rows MUST equal the
+  total source point-feature count exactly, including when a density
+  budget or any other post-thinning drop mechanism is active. The
+  clusters of a level partition the source point set at that level's
+  grid.
 - Absorption is **per level**: a feature absorbed at level `k` MAY
   itself be a row (with its own, smaller cluster) at level `k+1`.
 - The winner keeps its **own geometry** and its own values for every
@@ -1023,16 +1043,35 @@ Coalescing is recorded in the `generalization` provenance block
 ```
 Coalescing := {
   "enabled":                   true,
-  "snap_tolerance_gsd_factor": number,
-  "coalesced_count_column":    string   // e.g. "coalesced_count"
+  "snap_tolerance_gsd_factor": number,   // snap tolerance, × GSD (§13.3)
+  "junction_angle":            number,   // degrees; 0 = strict degree-2
+                                         // chaining (junction
+                                         // continuation off, §13.1)
+  "max_level_rows":            integer,  // per-level candidate-line
+                                         // ceiling; levels with more
+                                         // candidate lines were written
+                                         // uncoalesced (counts all 1)
+  "coalesced_count_column":    string    // e.g. "coalesced_count"
 }
 ```
+
+All four parameter members carry the same weight: a writer conforming
+to v0.2.0 that emits the `coalescing` block MUST include
+`snap_tolerance_gsd_factor`, `junction_angle`, `max_level_rows`, and
+`coalesced_count_column`, so the coalescing generalization is
+reproducible from the file alone. Readers MUST tolerate the absence
+of `junction_angle` and `max_level_rows` on files written before
+these members existed (treating them as unknown, not as any default).
 
 This member is one of the two exceptions to §3.5's informative rule:
 when `coalescing.enabled` is true a validator MUST enforce §13.2
 structurally — the named column exists as INT32 NOT NULL, all values
 are `>= 1` (checkable via row-group statistics), and the canonical
 band's values are exactly `1`.
+
+(Implementation note, informative: gpq-tiles does not yet emit
+`junction_angle` and `max_level_rows`; alignment is tracked for the
+code-alignment PR following #181.)
 
 ### 13.5 Partitioning mode is excluded (normative)
 
@@ -1059,7 +1098,8 @@ of `1.0` GSD. To bound memory, levels whose candidate line count
 exceeds a ceiling skip coalescing while still emitting the
 `coalesced_count` column (all `1`) and the provenance block, keeping
 the schema stable — such a file is conformant, since §13.2 permits
-all-`1` values. Engine defaults and tuning guidance live in
+all-`1` values, and the ceiling itself is recorded as
+`max_level_rows` (§13.4). Engine defaults and tuning guidance live in
 `docs/OVERVIEW_TUNING.md`; they are implementation choices, not
 requirements of this spec.
 
@@ -1082,7 +1122,14 @@ requirements of this spec.
   non-goals (now §12); folded the approved Q1–Q5 resolutions into the
   normative text of §2.4, §3.1, §7.1, §7.5 and §10, converting §11
   into an informative resolution record; fixed broken
-  cross-references (§2.2, §3.4, §4.1). Backward compatible: v0.1.0 files
+  cross-references (§2.2, §3.4, §4.1). Per maintainer review of the
+  consolidation: the `coalescing` provenance object gains REQUIRED
+  `junction_angle` and `max_level_rows` members so coalescing is
+  reproducible from the file alone (§13.4); `ranking.ranks` is
+  specified as a JSON object map, not an array of pairs (§3.5); and
+  the §12.1 cluster accounting / `Σ point_count` sum invariant is
+  strict-normative at every level, including under density-budget
+  drops. Backward compatible: v0.1.0 files
   remain conforming, and extension files remain readable by baseline
   readers (§3.8).
 - **v0.1.0 (2026-07-02)**: initial draft; §11 design decisions approved.
