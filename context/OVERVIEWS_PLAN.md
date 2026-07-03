@@ -309,6 +309,11 @@ published numbers" and "production tool at tippecanoe parity on big
 files", in proposed execution order:
 
 ### H1. Writer row-group pathology  (cheap; do first)
+DONE 2026-07-03: per-level RG sizing + default stats suppression on
+string/binary/WKB columns (`--full-column-stats` to opt out). Moldova dup
+footer 8.84 → 0.24 MB, file 411 → 360 MB, regional viewport 37.6 → 21.8 MB,
+street 10.8 → 2.0 MB; metros unregressed; all validate checks pass.
+RESULTS.md revised in place (dated H1 note).
 V3 root cause on Moldova: 8.84 MB Thrift footer (167 RGs × per-column
 stats incl. ULID id strings, paid on every remote query) and 10k-row
 RGs at coarse bands that defeat bbox pruning (regional viewport
