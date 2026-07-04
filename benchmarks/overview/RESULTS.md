@@ -216,6 +216,96 @@ are chosen so the full extent fits one screenful at `world` and an overview
 
 ---
 
+## 2b. Remote access — real S3 range requests (issue #176)
+
+The localhost numbers above establish *bytes coalesced*; this section
+establishes the strategic claim on real object storage: **a coarse-zoom
+viewport touches a small sliver of a large remote file**. Same four
+datasets, same viewport rectangles and zooms as §2, but the artifacts
+live in S3 (`us-east-2`, bucket parameterized) and every request crosses
+the real network.
+
+![% of the S3 object fetched per viewport](./remote_access_chart.svg)
+
+- **Overview path**: a fresh `duckdb` CLI process reads
+  `s3://<bucket>/overviews/<ds>.dup.parquet` directly (httpfs,
+  credential_chain). Request and byte counts are DuckDB's own HTTPFS
+  HTTP Stats (`EXPLAIN ANALYZE`); wall time is the query's Total Time.
+- **PMTiles path**: the python `pmtiles` reader over a presigned HTTPS
+  URL with a keep-alive `requests.Session`; requests/bytes counted in
+  the `get_bytes` hook.
+- **cold** = first access in a fresh client (pays TLS + header/footer +
+  metadata + data). **warm** = the same viewport repeated in the same
+  client: DuckDB's parquet-metadata cache is on but its external file
+  (data) cache is **off**, so both paths re-fetch data — symmetric with
+  the cacheless python pmtiles reader. Median of 3 runs.
+
+### Cold (fresh client) — the headline table
+
+`% of file` = bytes fetched ÷ size of that path's own S3 object
+(overview GeoParquet 68–343 MB; PMTiles 41–147 MB).
+
+| dataset | viewport | z | ov bytes | ov req | ov ms | ov feats | % of file | pm bytes | pm req | pm ms | % of file |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| points-nyc-medium | world | 8 | 564 KB | 7 | 2010 | 5,772 | 0.73% | 95 KB | 4 | 910 | 0.13% |
+| points-nyc-medium | regional | 11 | 4.10 MB | 32 | 2080 | 14,321 | 5.46% | 939 KB | 16 | 2462 | 1.24% |
+| points-nyc-medium | street | 14 | 4.90 MB | 39 | 2120 | 33,865 | 6.52% | 1.19 MB | 16 | 2602 | 1.62% |
+| lines-portland-medium | world | 8 | 1.10 MB | 12 | 2280 | 14,663 | 1.61% | 473 KB | 6 | 1381 | 1.12% |
+| lines-portland-medium | regional | 11 | 3.40 MB | 27 | 2110 | 9,261 | 4.99% | 1.80 MB | 18 | 2816 | 4.34% |
+| lines-portland-medium | street | 14 | 4.40 MB | 23 | 2200 | 3,701 | 6.46% | 353 KB | 12 | 1916 | 0.83% |
+| polygons-portland-medium | world | 8 | 258 KB | 7 | 1750 | 15 | 0.14% | 490 KB | 6 | 1438 | 0.64% |
+| polygons-portland-medium | regional | 11 | 1.70 MB | 12 | 2180 | 2,026 | 0.95% | 1.56 MB | 12 | 2014 | 2.08% |
+| polygons-portland-medium | street | 14 | 6.40 MB | 28 | 2240 | 7,219 | 3.58% | 554 KB | 9 | 1609 | 0.72% |
+| polygons-ftw-moldova-large | world | 6 | 8.30 MB | 11 | 3200 | 7,804 | 2.42% | 723 KB | 8 | 1591 | 0.48% |
+| polygons-ftw-moldova-large | regional | 9 | 20.70 MB | 47 | 2990 | 8,008 | 6.03% | 1.18 MB | 16 | 2616 | 0.80% |
+| polygons-ftw-moldova-large | street | 14 | 1.90 MB | 23 | 2710 | 1,527 | 0.55% | 131 KB | 16 | 2379 | 0.09% |
+
+### Warm (same client, repeat viewport)
+
+| dataset | viewport | ov warm ms | ov warm req | pm warm ms | pm warm req |
+|---|---|---|---|---|---|
+| points-nyc-medium | world | 1810 | 6 | 518 | 4 |
+| points-nyc-medium | regional | 1960 | 31 | 1959 | 16 |
+| points-nyc-medium | street | 2010 | 38 | 2005 | 16 |
+| lines-portland-medium | world | 2030 | 11 | 724 | 6 |
+| lines-portland-medium | regional | 1960 | 26 | 2178 | 18 |
+| lines-portland-medium | street | 2060 | 22 | 1506 | 12 |
+| polygons-portland-medium | world | 1660 | 6 | 804 | 6 |
+| polygons-portland-medium | regional | 2090 | 11 | 1456 | 12 |
+| polygons-portland-medium | street | 2210 | 27 | 1090 | 9 |
+| polygons-ftw-moldova-large | world | 2950 | 10 | 986 | 8 |
+| polygons-ftw-moldova-large | regional | 3070 | 46 | 1982 | 16 |
+| polygons-ftw-moldova-large | street | 2590 | 22 | 2021 | 16 |
+
+### Reading the remote numbers
+
+- **The strategic claim holds.** Every viewport in the sweep is
+  satisfied from **0.14–6.52 %** of the overview file; every *world*
+  viewport from **≤ 2.42 %**. On the 343 MB Moldova file a world pan is
+  8.3 MB in 11 requests; the worst cell in the whole sweep (Moldova
+  regional) is 20.7 MB / 47 requests of a 343 MB object. Bytes scale
+  with viewport content, not file size — the local §2 coalescing
+  result survives contact with real object storage.
+- **Wall times converge on the network, not the format.** Cold walls
+  are 1.8–3.2 s for the overview path vs 0.9–2.8 s for PMTiles —
+  the byte gap (§2's 2–18×) mostly disappears into request round
+  trips. PMTiles keeps a real edge on world views (fewer, smaller
+  requests); at regional/street the two paths are within ~±25 % of
+  each other in most cells. Warm repeats save ~5–15 % (overview,
+  metadata cached) and ~20–45 % (PMTiles, TLS reuse dominates).
+- The §2 fairness rules and the **Caveats** below apply verbatim: the
+  comparison is deliberately not apples-to-apples (overview returns
+  exact geometry + all attributes; MVT is lossy, quantized, and
+  property-pruned), and bytes remain the story — wall times include
+  one specific client (`duckdb` CLI vs python reader) on one
+  residential connection to `us-east-2`.
+
+Harness: `bench_access_remote.py` (bucket/region/profile via
+`BENCH_BUCKET` / `BENCH_REGION` / `BENCH_AWS_PROFILE`); tables + chart
+regenerate via `format_remote.py` from `remote_access_results.json`.
+
+---
+
 ## 3. Conversion cost (wall time + peak RSS)
 
 > **Stale — kept for the record.** These numbers predate the streaming

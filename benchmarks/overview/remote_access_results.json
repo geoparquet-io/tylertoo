@@ -1,0 +1,599 @@
+{
+  "bucket": "gpq-tiles-bench",
+  "region": "us-east-2",
+  "runs": 3,
+  "datasets": {
+    "points-nyc-medium": {
+      "world": {
+        "zoom": 8,
+        "bbox": [
+          -74.299992,
+          40.50005907,
+          -73.69999261,
+          40.9000036
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 577740.8,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 2009.9999999999998,
+            "level": 8,
+            "features": 5772,
+            "proc_ms": 3748.8572279689834,
+            "wall_ms_max": 2050.0
+          },
+          "warm": {
+            "bytes": 577740.8,
+            "head": 0,
+            "get": 6,
+            "wall_ms": 1810.0,
+            "level": 8,
+            "features": 5772,
+            "wall_ms_max": 1980.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 96910,
+            "requests": 4,
+            "wall_ms": 910.0672579952516,
+            "tiles_requested": 1,
+            "tiles_present": 1,
+            "wall_ms_max": 932.0417629787698
+          },
+          "warm": {
+            "bytes": 96910,
+            "requests": 4,
+            "wall_ms": 517.8912369883619,
+            "tiles_requested": 1,
+            "tiles_present": 1,
+            "wall_ms_max": 604.5062150224112
+          }
+        }
+      },
+      "regional": {
+        "zoom": 11,
+        "bbox": [
+          -74.07499222875,
+          40.650038268749995,
+          -73.92499238125001,
+          40.75002440125
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 4299161.6,
+            "head": 1,
+            "get": 31,
+            "wall_ms": 2080.0,
+            "level": 11,
+            "features": 14321,
+            "proc_ms": 4263.7632910045795,
+            "wall_ms_max": 2090.0
+          },
+          "warm": {
+            "bytes": 4299161.6,
+            "head": 0,
+            "get": 31,
+            "wall_ms": 1960.0,
+            "level": 11,
+            "features": 14321,
+            "wall_ms_max": 2120.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 961237,
+            "requests": 16,
+            "wall_ms": 2461.9987240293995,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2661.3279270241037
+          },
+          "warm": {
+            "bytes": 961237,
+            "requests": 16,
+            "wall_ms": 1959.345233044587,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2134.3093820032664
+          }
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          -73.99000000000001,
+          40.75,
+          -73.97,
+          40.769999999999996
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 5138022.4,
+            "head": 1,
+            "get": 38,
+            "wall_ms": 2120.0,
+            "level": 14,
+            "features": 33865,
+            "proc_ms": 4286.845707974862,
+            "wall_ms_max": 2180.0
+          },
+          "warm": {
+            "bytes": 5138022.4,
+            "head": 0,
+            "get": 38,
+            "wall_ms": 2009.9999999999998,
+            "level": 14,
+            "features": 33865,
+            "wall_ms_max": 2120.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 1249498,
+            "requests": 16,
+            "wall_ms": 2601.546656980645,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2652.4657830013894
+          },
+          "warm": {
+            "bytes": 1249498,
+            "requests": 16,
+            "wall_ms": 2005.2955410210416,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2107.2913220268674
+          }
+        }
+      },
+      "overview_file_bytes": 78788227,
+      "pmtiles_file_bytes": 77337192
+    },
+    "lines-portland-medium": {
+      "world": {
+        "zoom": 8,
+        "bbox": [
+          -122.9999916,
+          45.3000099,
+          -122.2169605,
+          45.7765525
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 1153433.6,
+            "head": 1,
+            "get": 11,
+            "wall_ms": 2280.0,
+            "level": 6,
+            "features": 14663,
+            "proc_ms": 4554.2255610344,
+            "wall_ms_max": 2330.0
+          },
+          "warm": {
+            "bytes": 1153433.6,
+            "head": 0,
+            "get": 11,
+            "wall_ms": 2029.9999999999998,
+            "level": 6,
+            "features": 14663,
+            "wall_ms_max": 2170.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 484492,
+            "requests": 6,
+            "wall_ms": 1380.9398399898782,
+            "tiles_requested": 2,
+            "tiles_present": 2,
+            "wall_ms_max": 1392.5231829634868
+          },
+          "warm": {
+            "bytes": 484492,
+            "requests": 6,
+            "wall_ms": 723.5817380133085,
+            "tiles_requested": 2,
+            "tiles_present": 2,
+            "wall_ms_max": 761.7900210316293
+          }
+        }
+      },
+      "regional": {
+        "zoom": 11,
+        "bbox": [
+          -122.70635493750001,
+          45.478713375,
+          -122.5105971625,
+          45.597849025
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 3565158.4,
+            "head": 1,
+            "get": 26,
+            "wall_ms": 2110.0,
+            "level": 9,
+            "features": 9261,
+            "proc_ms": 4124.451651005074,
+            "wall_ms_max": 2200.0
+          },
+          "warm": {
+            "bytes": 3565158.4,
+            "head": 0,
+            "get": 26,
+            "wall_ms": 1960.0,
+            "level": 9,
+            "features": 9261,
+            "wall_ms_max": 2170.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 1883578,
+            "requests": 18,
+            "wall_ms": 2816.0124159767292,
+            "tiles_requested": 6,
+            "tiles_present": 6,
+            "wall_ms_max": 2909.9254150060005
+          },
+          "warm": {
+            "bytes": 1883578,
+            "requests": 18,
+            "wall_ms": 2178.4945190302096,
+            "tiles_requested": 6,
+            "tiles_present": 6,
+            "wall_ms_max": 2187.6531509915367
+          }
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          -122.69000000000001,
+          45.510000000000005,
+          -122.67,
+          45.53
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 4613734.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 2200.0,
+            "level": 12,
+            "features": 3701,
+            "proc_ms": 4245.973913988564,
+            "wall_ms_max": 2210.0
+          },
+          "warm": {
+            "bytes": 4613734.4,
+            "head": 0,
+            "get": 22,
+            "wall_ms": 2060.0,
+            "level": 12,
+            "features": 3701,
+            "wall_ms_max": 2070.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 361693,
+            "requests": 12,
+            "wall_ms": 1915.8300290000625,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2060.19352999283
+          },
+          "warm": {
+            "bytes": 361693,
+            "requests": 12,
+            "wall_ms": 1506.1220559873618,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 1536.438346025534
+          }
+        }
+      },
+      "overview_file_bytes": 71435503,
+      "pmtiles_file_bytes": 43390874
+    },
+    "polygons-portland-medium": {
+      "world": {
+        "zoom": 8,
+        "bbox": [
+          -122.9999994,
+          45.3000049,
+          -122.2996302,
+          45.7002644
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 264704.0,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 1750.0,
+            "level": 0,
+            "features": 15,
+            "proc_ms": 3685.541024955455,
+            "wall_ms_max": 1960.0
+          },
+          "warm": {
+            "bytes": 264704.0,
+            "head": 0,
+            "get": 6,
+            "wall_ms": 1660.0,
+            "level": 0,
+            "features": 15,
+            "wall_ms_max": 1680.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 501421,
+            "requests": 6,
+            "wall_ms": 1437.8331640036777,
+            "tiles_requested": 2,
+            "tiles_present": 2,
+            "wall_ms_max": 1537.9639369784854
+          },
+          "warm": {
+            "bytes": 501421,
+            "requests": 6,
+            "wall_ms": 804.1399419889785,
+            "tiles_requested": 2,
+            "tiles_present": 2,
+            "wall_ms_max": 897.7780689601786
+          }
+        }
+      },
+      "regional": {
+        "zoom": 11,
+        "bbox": [
+          -122.73736095,
+          45.4501022125,
+          -122.56226865000001,
+          45.5501670875
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 1782579.2,
+            "head": 1,
+            "get": 11,
+            "wall_ms": 2180.0,
+            "level": 3,
+            "features": 2026,
+            "proc_ms": 4413.138387026265,
+            "wall_ms_max": 2260.0
+          },
+          "warm": {
+            "bytes": 1782579.2,
+            "head": 0,
+            "get": 11,
+            "wall_ms": 2090.0,
+            "level": 3,
+            "features": 2026,
+            "wall_ms_max": 2100.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 1636088,
+            "requests": 12,
+            "wall_ms": 2013.5351350181736,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2197.2698479657993
+          },
+          "warm": {
+            "bytes": 1636088,
+            "requests": 12,
+            "wall_ms": 1456.0402099741623,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 1688.7741920072585
+          }
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          -122.65,
+          45.550000000000004,
+          -122.63,
+          45.57
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 6710886.4,
+            "head": 1,
+            "get": 27,
+            "wall_ms": 2240.0,
+            "level": 6,
+            "features": 7219,
+            "proc_ms": 4511.253741045948,
+            "wall_ms_max": 2360.0
+          },
+          "warm": {
+            "bytes": 6710886.4,
+            "head": 0,
+            "get": 27,
+            "wall_ms": 2210.0,
+            "level": 6,
+            "features": 7219,
+            "wall_ms_max": 2210.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 566845,
+            "requests": 9,
+            "wall_ms": 1609.341620001942,
+            "tiles_requested": 3,
+            "tiles_present": 3,
+            "wall_ms_max": 1681.8587490124628
+          },
+          "warm": {
+            "bytes": 566845,
+            "requests": 9,
+            "wall_ms": 1090.1657189824618,
+            "tiles_requested": 3,
+            "tiles_present": 3,
+            "wall_ms_max": 1155.364565027412
+          }
+        }
+      },
+      "overview_file_bytes": 187284299,
+      "pmtiles_file_bytes": 78622300
+    },
+    "polygons-ftw-moldova-large": {
+      "world": {
+        "zoom": 6,
+        "bbox": [
+          26.592531983585204,
+          45.4719002653674,
+          30.15892038332341,
+          48.4902285248874
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 8703180.8,
+            "head": 1,
+            "get": 10,
+            "wall_ms": 3200.0,
+            "level": 3,
+            "features": 7804,
+            "proc_ms": 6400.609165022615,
+            "wall_ms_max": 3350.0
+          },
+          "warm": {
+            "bytes": 8703180.8,
+            "head": 0,
+            "get": 10,
+            "wall_ms": 2950.0,
+            "level": 3,
+            "features": 7804,
+            "wall_ms_max": 2990.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 740455,
+            "requests": 8,
+            "wall_ms": 1590.5836070305668,
+            "tiles_requested": 2,
+            "tiles_present": 2,
+            "wall_ms_max": 1674.4034470175393
+          },
+          "warm": {
+            "bytes": 740455,
+            "requests": 8,
+            "wall_ms": 985.5733949807473,
+            "tiles_requested": 2,
+            "tiles_present": 2,
+            "wall_ms_max": 1025.905042013619
+          }
+        }
+      },
+      "regional": {
+        "zoom": 9,
+        "bbox": [
+          27.92992763348703,
+          46.603773362687406,
+          28.82152473342158,
+          47.3583554275674
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 21705523.2,
+            "head": 1,
+            "get": 46,
+            "wall_ms": 2990.0,
+            "level": 6,
+            "features": 8008,
+            "proc_ms": 6402.409339963924,
+            "wall_ms_max": 3270.0
+          },
+          "warm": {
+            "bytes": 21705523.2,
+            "head": 0,
+            "get": 46,
+            "wall_ms": 3070.0,
+            "level": 6,
+            "features": 8008,
+            "wall_ms_max": 3120.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 1237858,
+            "requests": 16,
+            "wall_ms": 2615.768083021976,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2618.6319509870373
+          },
+          "warm": {
+            "bytes": 1237858,
+            "requests": 16,
+            "wall_ms": 1981.5721639897674,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2003.0472269863822
+          }
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          28.11,
+          47.150000000000006,
+          28.130000000000003,
+          47.17
+        ],
+        "overview": {
+          "cold": {
+            "bytes": 1992294.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 2710.0,
+            "level": 11,
+            "features": 1527,
+            "proc_ms": 5384.224818029907,
+            "wall_ms_max": 2730.0
+          },
+          "warm": {
+            "bytes": 1992294.4,
+            "head": 0,
+            "get": 22,
+            "wall_ms": 2590.0,
+            "level": 11,
+            "features": 1527,
+            "wall_ms_max": 2730.0
+          }
+        },
+        "pmtiles": {
+          "cold": {
+            "bytes": 133982,
+            "requests": 16,
+            "wall_ms": 2378.7473990232684,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2496.0289430455305
+          },
+          "warm": {
+            "bytes": 133982,
+            "requests": 16,
+            "wall_ms": 2020.652582985349,
+            "tiles_requested": 4,
+            "tiles_present": 4,
+            "wall_ms_max": 2073.8554429844953
+          }
+        }
+      },
+      "overview_file_bytes": 359834644,
+      "pmtiles_file_bytes": 154449463
+    }
+  }
+}
