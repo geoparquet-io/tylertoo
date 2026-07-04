@@ -22,16 +22,16 @@ categories = ["science", "data-structures", "encoding"]
 gpq-tiles-core = { path = "crates/core", version = "0.6.0" }
 
 # Core geospatial dependencies
-geoarrow = "0.4"
-geoarrow-array = "0.4"
+geoarrow = "0.8"
+geoarrow-array = "0.8"
 geo-traits = "0.3"
-geoparquet = "0.4"
-parquet = "55"
-arrow-schema = "55"
-arrow-array = "55"
-arrow-select = "55"
-geo = "0.33"
-geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
+geoparquet = "0.8"
+parquet = "58"
+arrow-schema = "58"
+arrow-array = "58"
+arrow-select = "58"
+geo = "0.32"
+geozero = { version = "0.14", features = ["with-wkb", "with-geo"] }
 
 # Protobuf for MVT encoding
 prost = "0.14"

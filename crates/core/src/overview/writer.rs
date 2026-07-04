@@ -26,8 +26,8 @@ use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use parquet::format::KeyValue;
 use parquet::schema::types::ColumnPath;
 
 use geoparquet::writer::{
@@ -519,7 +519,7 @@ fn rg_row_target(max_row_group_size: usize, level_row_hint: Option<usize>) -> us
 /// (§4.5), manual per-level row-group control, and statistics tuned so the
 /// footer stays small (H1) while the pruning index survives.
 ///
-/// - `set_max_row_group_size(usize::MAX)`: the writer never splits row groups on
+/// - `set_max_row_group_row_count(Some(usize::MAX))`: the writer never splits row groups on
 ///   its own; [`OverviewWriter::write_level`] drives every boundary so each
 ///   level is sized independently and ends on a row-group boundary (§4.2).
 /// - Statistics: the bbox covering children and `level` column keep full stats
@@ -536,7 +536,7 @@ fn build_writer_properties(
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(options.zstd_level)?))
         // Manual per-level row-group control (see write_level): disable the
         // writer's own row-count splitting.
-        .set_max_row_group_size(usize::MAX)
+        .set_max_row_group_row_count(Some(usize::MAX))
         // Per-row-group (chunk) statistics are the spatial-pruning index (§4.4);
         // Page-level also carries chunk-level min/max.
         .set_statistics_enabled(EnabledStatistics::Page);
