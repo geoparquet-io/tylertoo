@@ -378,6 +378,20 @@ struct OverviewArgs {
     #[arg(long, default_value = "10000")]
     row_group_size: usize,
 
+    /// Per-level row-group sizing policy (#202).
+    ///
+    /// `constant`: every level uses --row-group-size as its cap (default).
+    /// `zoom-scaled`: the cap doubles per zoom step below the finest level
+    /// (cap = row_group_size << (max_zoom - level_zoom)) — coarse bands, which
+    /// wide viewports read mostly whole anyway, become fewer/larger row groups
+    /// (fewer remote requests) while the finest level keeps tight bbox pruning.
+    #[arg(
+        long,
+        default_value = "constant",
+        value_parser = ["constant", "zoom-scaled"]
+    )]
+    row_group_size_policy: String,
+
     /// Keep full Parquet statistics on every column, including high-cardinality
     /// string/binary property columns and the WKB geometry column.
     ///
@@ -626,6 +640,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
     use gpq_tiles_core::overview::level::Mode;
     use gpq_tiles_core::overview::simplify::SimplifyOptions;
+    use gpq_tiles_core::overview::writer::RowGroupSizePolicy;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -725,6 +740,13 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         gsd_base: args.gsd_base,
         cogp_compat_key: args.cogp_compat,
         max_row_group_size: args.row_group_size,
+        row_group_size_policy: match args.row_group_size_policy.as_str() {
+            "constant" => RowGroupSizePolicy::Constant,
+            "zoom-scaled" => RowGroupSizePolicy::ZoomScaled,
+            other => {
+                anyhow::bail!("invalid --row-group-size-policy '{other}' (constant|zoom-scaled)")
+            }
+        },
         full_column_stats: args.full_column_stats,
         streaming: !args.no_streaming,
         read_batch_size: args.read_batch_size,

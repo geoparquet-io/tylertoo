@@ -332,6 +332,7 @@ pub(super) fn convert_streaming(
     let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
+    writer_opts.row_group_size_policy = options.row_group_size_policy;
     writer_opts.full_column_stats = options.full_column_stats;
     writer_opts.cogp_compat_key = options.cogp_compat_key;
     writer_opts.generalization = Some(build_generalization(

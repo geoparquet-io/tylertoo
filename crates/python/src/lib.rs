@@ -485,6 +485,7 @@ fn overview(
         gsd_base,
         cogp_compat_key: cogp_compat,
         max_row_group_size: row_group_size,
+        row_group_size_policy: Default::default(),
         full_column_stats,
         streaming,
         read_batch_size,
