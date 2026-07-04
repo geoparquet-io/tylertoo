@@ -49,6 +49,21 @@ impl Compression {
         *self as u8
     }
 
+    /// Parse a PMTiles spec byte code back into a compression type.
+    ///
+    /// Inverse of [`Compression::code`]. Returns `None` for codes outside the
+    /// PMTiles v3 spec (0-4).
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Compression::Unknown),
+            1 => Some(Compression::None),
+            2 => Some(Compression::Gzip),
+            3 => Some(Compression::Brotli),
+            4 => Some(Compression::Zstd),
+            _ => Option::None,
+        }
+    }
+
     /// Get a human-readable name for this compression type.
     pub fn name(&self) -> &'static str {
         match self {
@@ -80,6 +95,52 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
         Compression::Brotli => compress_brotli(data),
         Compression::Zstd => compress_zstd(data),
     }
+}
+
+/// Decompress data using the specified algorithm.
+///
+/// Inverse of [`compress`]: the read side of the PMTiles pipeline (issue
+/// #112) uses this for directories, JSON metadata, and tile data, honoring
+/// the compression codes declared in the archive header.
+///
+/// # Arguments
+/// * `data` - Compressed input data
+/// * `compression` - Compression algorithm the data was compressed with
+///
+/// # Returns
+/// Decompressed data, or a copy of the input if compression is None.
+pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
+    match compression {
+        Compression::Unknown => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Cannot decompress with unknown compression type",
+        )),
+        Compression::None => Ok(data.to_vec()),
+        Compression::Gzip => decompress_gzip(data),
+        Compression::Brotli => decompress_brotli(data),
+        Compression::Zstd => decompress_zstd(data),
+    }
+}
+
+/// Decompress gzip data.
+fn decompress_gzip(data: &[u8]) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Decompress brotli data.
+fn decompress_brotli(data: &[u8]) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    brotli::Decompressor::new(data, 4096).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Decompress zstd data.
+fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::decode_all(data)
 }
 
 /// Compress data with gzip.
@@ -305,5 +366,71 @@ mod tests {
                 compression.name()
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Decompression (read side, issue #112)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_from_code_inverts_code() {
+        for compression in [
+            Compression::Unknown,
+            Compression::None,
+            Compression::Gzip,
+            Compression::Brotli,
+            Compression::Zstd,
+        ] {
+            assert_eq!(
+                Compression::from_code(compression.code()),
+                Some(compression)
+            );
+        }
+        assert_eq!(Compression::from_code(5), None);
+        assert_eq!(Compression::from_code(255), None);
+    }
+
+    #[test]
+    fn test_decompress_roundtrips_every_codec() {
+        let original = b"PMTiles round-trip payload \x00\x01\x02 with some repetition repetition";
+        for compression in [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Brotli,
+            Compression::Zstd,
+        ] {
+            let compressed = compress(original, compression).unwrap();
+            let decompressed = decompress(&compressed, compression).unwrap();
+            assert_eq!(
+                decompressed,
+                original.to_vec(),
+                "{} round-trip",
+                compression.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_decompress_empty_payload() {
+        for compression in [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Brotli,
+            Compression::Zstd,
+        ] {
+            let compressed = compress(&[], compression).unwrap();
+            let decompressed = decompress(&compressed, compression).unwrap();
+            assert!(decompressed.is_empty(), "{}", compression.name());
+        }
+    }
+
+    #[test]
+    fn test_decompress_unknown_is_error() {
+        assert!(decompress(b"anything", Compression::Unknown).is_err());
+    }
+
+    #[test]
+    fn test_decompress_corrupt_gzip_is_error() {
+        assert!(decompress(b"not gzip at all", Compression::Gzip).is_err());
     }
 }

@@ -80,17 +80,23 @@ pub fn command_decode(command: u32) -> (u32, u32) {
 
 /// Orient a polygon for MVT encoding.
 ///
-/// MVT specification requires:
-/// - Exterior rings: clockwise in screen/tile coordinates (positive area)
-/// - Interior rings: counter-clockwise in screen/tile coordinates (negative area)
+/// MVT spec 4.3.3.3 defines ring roles by the sign of the surveyor's-formula
+/// (shoelace) area computed on the stored tile coordinates:
+/// - Exterior rings: POSITIVE area (appears clockwise with Y pointing down)
+/// - Interior rings: NEGATIVE area (appears counter-clockwise with Y down)
 ///
-/// Since tile coordinates have Y increasing downward (opposite to geographic coords),
-/// and our coordinate transform flips Y, we need polygons in geographic coordinates
-/// to have:
-/// - Exterior rings: counter-clockwise (becomes CW after Y-flip)
-/// - Interior rings: clockwise (becomes CCW after Y-flip)
+/// Our coordinate transform flips Y (geographic latitude up → tile Y down),
+/// and a Y-flip NEGATES the shoelace sign. So to end up positive in tile
+/// coordinates, exterior rings must be NEGATIVE (clockwise) in geographic
+/// coordinates — geo's `Direction::Reversed` convention:
+/// - Exterior rings: clockwise in geo coords (positive area after Y-flip)
+/// - Interior rings: counter-clockwise in geo coords (negative after Y-flip)
 ///
-/// This matches geo's `Direction::Default` convention.
+/// (An earlier version used `Direction::Default`, reasoning visually that
+/// "geographic CCW appears CW after the Y-flip" — true on screen, but the
+/// spec's definition is the algebraic sign on the stored coordinates, which
+/// the flip negates. That emitted spec-inverted windings; fixed as part of
+/// issue #112, whose decoder follows the spec sign.)
 ///
 /// # Arguments
 /// * `polygon` - The polygon to orient
@@ -98,7 +104,7 @@ pub fn command_decode(command: u32) -> (u32, u32) {
 /// # Returns
 /// A new polygon with correctly oriented rings for MVT encoding
 pub fn orient_polygon_for_mvt(polygon: &Polygon) -> Polygon {
-    polygon.orient(Direction::Default)
+    polygon.orient(Direction::Reversed)
 }
 
 /// Orient a multi-polygon for MVT encoding.
@@ -111,7 +117,7 @@ pub fn orient_polygon_for_mvt(polygon: &Polygon) -> Polygon {
 /// # Returns
 /// A new multi-polygon with correctly oriented rings for MVT encoding
 pub fn orient_multi_polygon_for_mvt(multi: &MultiPolygon) -> MultiPolygon {
-    multi.orient(Direction::Default)
+    multi.orient(Direction::Reversed)
 }
 
 // ============================================================================
@@ -1121,18 +1127,17 @@ mod tests {
 
     #[test]
     fn test_polygon_correct_winding_unchanged() {
-        // A polygon with correct MVT winding (CCW exterior in geographic coords,
-        // which becomes CW exterior in tile coords after Y-flip) should pass through unchanged.
-        //
-        // MVT requires: exterior rings CW, interior rings CCW (in tile/screen coords)
-        // Geographic CCW -> Tile CW (after Y-flip), so geo::Direction::Default is correct.
+        // A polygon with correct MVT winding (CW exterior in geographic
+        // coords: the Y-flip negates the shoelace sign, yielding the
+        // POSITIVE tile-space area the spec requires for exterior rings)
+        // should pass through unchanged.
 
-        // CCW polygon in geographic coords (correct for MVT after Y-flip)
+        // CW polygon in geographic coords (correct for MVT after Y-flip)
         let poly = polygon![
             (x: 0.0, y: 0.0),
-            (x: 1.0, y: 0.0),
-            (x: 1.0, y: 1.0),
             (x: 0.0, y: 1.0),
+            (x: 1.0, y: 1.0),
+            (x: 1.0, y: 0.0),
             (x: 0.0, y: 0.0),
         ];
 
@@ -1144,47 +1149,119 @@ mod tests {
 
     #[test]
     fn test_polygon_incorrect_winding_gets_corrected() {
-        // A polygon with incorrect winding (CW exterior in geographic coords)
-        // should be corrected to CCW exterior.
+        // A polygon with incorrect winding (CCW exterior in geographic
+        // coords, which would flip to NEGATIVE tile-space area) should be
+        // corrected to CW exterior.
 
-        // CW polygon in geographic coords (incorrect - needs correction)
+        // CCW polygon in geographic coords (incorrect - needs correction)
         let poly = polygon![
             (x: 0.0, y: 0.0),
-            (x: 0.0, y: 1.0),
-            (x: 1.0, y: 1.0),
             (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0),
         ];
 
         let oriented = orient_polygon_for_mvt(&poly);
 
-        // Should now be CCW (reversed from input)
+        // Should now be CW (reversed from input)
         // The first and last points stay the same, but the middle points should be reversed
         assert_ne!(poly.exterior().0[1], oriented.exterior().0[1]);
     }
 
     #[test]
+    fn test_encoded_exterior_ring_has_positive_tile_area() {
+        // MVT spec 4.3.3.3: exterior rings must have POSITIVE area by the
+        // surveyor's formula on tile coordinates; interior rings NEGATIVE.
+        // This pins the winding fix (issue #112) at the command-stream level.
+        let bounds = test_bounds();
+        let poly = polygon![
+            exterior: [
+                (x: 0.1, y: 0.1),
+                (x: 0.9, y: 0.1),
+                (x: 0.9, y: 0.9),
+                (x: 0.1, y: 0.9),
+                (x: 0.1, y: 0.1),
+            ],
+            interiors: [
+                [
+                    (x: 0.4, y: 0.4),
+                    (x: 0.6, y: 0.4),
+                    (x: 0.6, y: 0.6),
+                    (x: 0.4, y: 0.6),
+                    (x: 0.4, y: 0.4),
+                ],
+            ],
+        ];
+        let commands = encode_polygon(&poly, &bounds, 4096);
+
+        // Decode the command stream into rings of absolute tile coords.
+        let mut rings: Vec<Vec<(i64, i64)>> = Vec::new();
+        let mut cur: Vec<(i64, i64)> = Vec::new();
+        let (mut cx, mut cy) = (0i64, 0i64);
+        let mut i = 0;
+        while i < commands.len() {
+            let (cmd, count) = command_decode(commands[i]);
+            i += 1;
+            match cmd {
+                CMD_MOVE_TO | CMD_LINE_TO => {
+                    for _ in 0..count {
+                        cx += i64::from(zigzag_decode(commands[i]));
+                        cy += i64::from(zigzag_decode(commands[i + 1]));
+                        i += 2;
+                        cur.push((cx, cy));
+                    }
+                }
+                CMD_CLOSE_PATH => rings.push(std::mem::take(&mut cur)),
+                _ => panic!("unexpected command"),
+            }
+        }
+        assert_eq!(rings.len(), 2, "exterior + hole");
+
+        let area2 = |ring: &[(i64, i64)]| -> i64 {
+            let n = ring.len();
+            (0..n)
+                .map(|j| {
+                    let (x0, y0) = ring[j];
+                    let (x1, y1) = ring[(j + 1) % n];
+                    x0 * y1 - x1 * y0
+                })
+                .sum()
+        };
+        assert!(
+            area2(&rings[0]) > 0,
+            "exterior ring must have positive tile-space area, got {}",
+            area2(&rings[0])
+        );
+        assert!(
+            area2(&rings[1]) < 0,
+            "interior ring must have negative tile-space area, got {}",
+            area2(&rings[1])
+        );
+    }
+
+    #[test]
     fn test_polygon_with_hole_correct_winding() {
         // A polygon with a hole should have:
-        // - CCW exterior in geographic coords (becomes CW in tile coords)
-        // - CW interior in geographic coords (becomes CCW in tile coords)
+        // - CW exterior in geographic coords (positive tile-space area)
+        // - CCW interior in geographic coords (negative tile-space area)
 
-        // Exterior: CCW in geo coords
-        // Interior: CW in geo coords (correct for a hole)
+        // Exterior: CW in geo coords (correct)
+        // Interior: CCW in geo coords (correct for a hole)
         let poly = polygon![
             exterior: [
                 (x: 0.0, y: 0.0),
-                (x: 10.0, y: 0.0),
-                (x: 10.0, y: 10.0),
                 (x: 0.0, y: 10.0),
+                (x: 10.0, y: 10.0),
+                (x: 10.0, y: 0.0),
                 (x: 0.0, y: 0.0),
             ],
             interiors: [
                 [
                     (x: 2.0, y: 2.0),
-                    (x: 2.0, y: 8.0),
-                    (x: 8.0, y: 8.0),
                     (x: 8.0, y: 2.0),
+                    (x: 8.0, y: 8.0),
+                    (x: 2.0, y: 8.0),
                     (x: 2.0, y: 2.0),
                 ],
             ],
@@ -1192,31 +1269,33 @@ mod tests {
 
         let oriented = orient_polygon_for_mvt(&poly);
 
-        // After orientation, exterior should be CCW and interior should be CW
-        // (in geographic coordinates, which becomes CW exterior / CCW interior in tile coords)
+        // After orientation, exterior stays CW and interior stays CCW
+        // (in geographic coordinates: positive/negative tile-space area).
         assert_eq!(oriented.interiors().len(), 1);
+        assert_eq!(poly.exterior().0, oriented.exterior().0);
+        assert_eq!(poly.interiors()[0].0, oriented.interiors()[0].0);
     }
 
     #[test]
     fn test_polygon_with_hole_incorrect_winding_gets_corrected() {
         // A polygon where both exterior and interior have wrong winding
 
-        // Exterior: CW in geo coords (wrong)
-        // Interior: CCW in geo coords (wrong for a hole)
+        // Exterior: CCW in geo coords (wrong)
+        // Interior: CW in geo coords (wrong for a hole)
         let poly = polygon![
             exterior: [
                 (x: 0.0, y: 0.0),
-                (x: 0.0, y: 10.0),
-                (x: 10.0, y: 10.0),
                 (x: 10.0, y: 0.0),
+                (x: 10.0, y: 10.0),
+                (x: 0.0, y: 10.0),
                 (x: 0.0, y: 0.0),
             ],
             interiors: [
                 [
                     (x: 2.0, y: 2.0),
-                    (x: 8.0, y: 2.0),
-                    (x: 8.0, y: 8.0),
                     (x: 2.0, y: 8.0),
+                    (x: 8.0, y: 8.0),
+                    (x: 8.0, y: 2.0),
                     (x: 2.0, y: 2.0),
                 ],
             ],

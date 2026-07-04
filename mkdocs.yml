@@ -53,6 +53,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Decoding PMTiles: decode.md
   - API Reference: api-reference.md
   - Advanced Usage: advanced-usage.md
   - Architecture: architecture.md
