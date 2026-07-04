@@ -42,6 +42,7 @@ pub mod batch_processor;
 pub mod clip;
 pub mod compression;
 pub mod covering;
+pub mod decode;
 pub mod dedup;
 pub mod ioverlay_clip;
 pub mod mvt;

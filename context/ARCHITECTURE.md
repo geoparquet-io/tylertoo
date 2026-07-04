@@ -125,6 +125,28 @@ banding/row-group alignment, canonical fidelity, monotonicity, cluster
 | Tile-size control (export) | Single non-iterative drop pass (`--tile-size-limit`) | Iterative threshold retry loop | Overview levels are already budgeted; the valve is a backstop, not the mechanism |
 | Polygon clipping (export) | Sutherland–Hodgman f64 + i_overlay fallback | Sutherland–Hodgman integer tile coords | Same algorithm family, different coordinate space (below) |
 
+## Decision Record: MVT Winding Fix + PMTiles Decode (#112, 2026-07-04)
+
+While building the PMTiles → GeoParquet decoder (`decode.rs`), its
+spec-strict ring classifier exposed an encoder bug: `orient_polygon_for_mvt`
+used geo's `Direction::Default` (exterior CCW in geographic coordinates),
+reasoning visually that "geographic CCW appears clockwise after the Y-flip".
+Visually true — but MVT spec 4.3.3.3 defines exterior rings by a POSITIVE
+surveyor's-formula area on the stored tile coordinates, and a Y-flip NEGATES
+that sign. Our exteriors therefore carried negative area (holes positive) —
+inverted relative to the spec and to tippecanoe. Fixed to
+`Direction::Reversed`; `mvt::tests::test_encoded_exterior_ring_has_positive_tile_area`
+pins the convention at the command-stream level. Archives written by older
+releases have inverted windings; winding-agnostic renderers (even-odd fill)
+draw them correctly, but spec-strict consumers (including our own decoder)
+classify their holes as exteriors — re-export to fix.
+
+The decoder itself follows tippecanoe-decode's model: no deduplication
+(every feature from every selected tile, with `zoom`/`layer`/`mvt_id`
+provenance columns for filtering), coordinates lifted through tippecanoe's
+32-bit world-coordinate transform (write_json.cpp), degenerate MVT content
+(zero-area rings, one-point linestrings, leading interior rings) dropped.
+
 ## Polygon Clipping: Sutherland-Hodgman
 
 **DIVERGENCE**: Tippecanoe uses Sutherland-Hodgman in integer tile
@@ -203,6 +225,7 @@ crates/core/src/
 ├── tile.rs             # TileCoord, TileBounds
 ├── world_coord.rs      # Integer world-coordinate space
 ├── mvt.rs              # MVT encoding
+├── decode.rs           # PMTiles → GeoParquet decoding (#112)
 ├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)
 ├── compression.rs      # gzip/brotli/zstd compression
 ├── dedup.rs            # Tile deduplication (XXH3)
