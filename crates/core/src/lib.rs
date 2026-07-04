@@ -42,6 +42,7 @@ pub mod batch_processor;
 pub mod clip;
 pub mod compression;
 pub mod covering;
+pub mod decode;
 pub mod dedup;
 pub mod ioverlay_clip;
 pub mod mvt;
@@ -68,6 +69,9 @@ pub enum Error {
 
     #[error("Failed to write PMTiles: {0}")]
     PMTilesWrite(String),
+
+    #[error("Failed to read PMTiles: {0}")]
+    PMTilesRead(String),
 
     #[error("Invalid geometry at feature {feature_id}: {reason}")]
     InvalidGeometry { feature_id: usize, reason: String },

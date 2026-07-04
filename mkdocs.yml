@@ -53,8 +53,10 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Decoding PMTiles: decode.md
   - API Reference: api-reference.md
   - Advanced Usage: advanced-usage.md
+  - Remote Reads: remote-reads.md
   - Architecture: architecture.md
   - Overview Tuning: OVERVIEW_TUNING.md
   - Development: development.md

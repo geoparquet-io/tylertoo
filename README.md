@@ -14,6 +14,8 @@ Fast GeoParquet → PMTiles converter in Rust.
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
 - Memory-bounded streaming conversion (632k-polygon / 38M-vertex file: ~55 s, ~320 MB peak RSS)
 - Spec validation (`gpq-tiles validate`)
+- PMTiles → GeoParquet decoding (`gpq-tiles decode`) — tippecanoe-decode
+  semantics, any PMTiles v3 MVT archive
 
 > **⚠️ Work in Progress**:
 > Code is generated with Claude; take it with a grain of salt.
@@ -53,6 +55,18 @@ All tuning knobs live on `overview` / `export-pmtiles` — see
 [Overview Tuning](docs/OVERVIEW_TUNING.md). Defaults are calibrated on
 rendered corpus sweeps and are meant to look right out of the box.
 
+### Decoding PMTiles back to GeoParquet
+
+```bash
+# Extract one zoom of any PMTiles v3 vector archive as GeoParquet
+gpq-tiles decode input.pmtiles output.parquet --zoom 14
+```
+
+The output is the **tiled representation** (simplified, clipped, duplicated
+across tiles and zooms — no round-trip guarantee), with `zoom`/`layer`/
+`mvt_id` provenance columns for filtering. See
+[Decoding PMTiles](docs/decode.md).
+
 ### Input Preparation
 
 Inputs must be WGS84 (EPSG:4326), and should be Hilbert-sorted with sane
@@ -81,8 +95,10 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 
 - **[Getting Started](docs/getting-started.md)** — Installation, basic usage, the two-step workflow
 - **[Overview Tuning](docs/OVERVIEW_TUNING.md)** — Every generalization knob explained
+- **[Decoding PMTiles](docs/decode.md)** — PMTiles → GeoParquet, limitations included
 - **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API
 - **[Advanced Usage](docs/advanced-usage.md)** — Input optimization, memory, remote reads, CI/CD
+- **[Remote Reads](docs/remote-reads.md)** — Querying overview files on object storage with DuckDB
 - **[Format Spec (draft)](context/OVERVIEWS_SPEC.md)** — The `geo:overviews` format contract
 
 ## Development

@@ -103,3 +103,77 @@ arterial strokes at z0–z1 but over-merges through genuine turns and
 smears attributes across crossings. Line coalescing itself remains
 **ON by default** (same review: defaults should look right); opt out
 with `--no-coalesce-lines`.
+
+## Decision 5: `--row-group-size-policy zoom-scaled` (issue #202)
+
+**Sweep:** `--row-group-size` ∈ {10k, 25k, 50k, 100k} and the new
+`--row-group-size-policy zoom-scaled` on all four benchmark datasets
+(points-nyc, lines-portland, polygons-portland, polygons-ftw-moldova),
+duplicating mode, z0–14, default knobs. Measured against real S3
+(us-east-2) with the #200 harness: DuckDB cold requests/bytes/wall
+per viewport.
+
+**Request counts (cold, median of 3):**
+
+| dataset | viewport | z | rg10k | rg25k | rg50k | rg100k | zoom-scaled |
+|---|---|---|---|---|---|---|---|
+| points-nyc-medium | regional | 11 | 38 | 22 | 20 | 14 | **14** |
+| points-nyc-medium | street | 14 | 46 | 32 | 22 | 16 | **46** |
+| lines-portland-medium | regional | 11 | 32 | 20 | 14 | 8 | **8** |
+| lines-portland-medium | street | 14 | 27 | 21 | 15 | 15 | **27** |
+| polygons-portland-medium | street | 14 | 33 | 33 | 33 | 21 | **33** |
+| polygons-ftw-moldova-large | regional | 9 | **52** | 32 | 22 | 12 | **12** |
+| polygons-ftw-moldova-large | street | 14 | 25 | 24 | 23 | 13 | **25** |
+
+**Bytes fetched (cold, median of 3):**
+
+| dataset | viewport | z | rg10k | rg25k | rg50k | rg100k | zoom-scaled |
+|---|---|---|---|---|---|---|---|
+| points-nyc-medium | street | 14 | **5.1 MB** | 8.0 MB | 11.0 MB | 15.9 MB | **5.1 MB** |
+| lines-portland-medium | street | 14 | **4.5 MB** | 9.2 MB | 13.2 MB | 27.0 MB | **4.5 MB** |
+| polygons-portland-medium | street | 14 | **6.7 MB** | 16.7 MB | 34.2 MB | 39.3 MB | **6.7 MB** |
+| polygons-ftw-moldova-large | regional | 9 | 7.1 MB | 8.5 MB | 8.5 MB | 8.5 MB | 8.5 MB |
+| polygons-ftw-moldova-large | street | 14 | **2.0 MB** | 4.3 MB | 12.3 MB | 12.6 MB | **2.0 MB** |
+
+World viewports: all policies identical (row count < any cap).
+
+**Storage (local, file / footer / RGs):**
+
+| dataset | rg10k | rg100k | zoom-scaled |
+|---|---|---|---|
+| points-nyc-medium | 78.95 MB / 121 KB / 116 | 73.92 MB / 28 KB / 23 | 76.98 MB / 82 KB / 77 |
+| lines-portland-medium | 73.21 MB / 81 KB / 81 | 71.28 MB / 21 KB / 17 | 72.39 MB / 54 KB / 52 |
+| polygons-portland-medium | 186.68 MB / 156 KB / 148 | 180.75 MB / 24 KB / 20 | 184.78 MB / 121 KB / 114 |
+| polygons-ftw-moldova-large | 293.65 MB / 248 KB / 167 | 292.23 MB / 40 KB / 24 | 292.52 MB / 151 KB / 100 |
+
+File size: negligible (2–6% variation). Footer: linear in RG count but
+small either way (<250 KB on the 294 MB Moldova file).
+
+**Decision (2026-07-04, #202):** ship `zoom-scaled` as **opt-in**; keep
+`constant 10k` as the default for now. `zoom-scaled` doubles the
+row-group cap per zoom step below the finest level, so coarse bands —
+read mostly whole by wide viewports anyway — become fewer, larger row
+groups, while the finest level keeps tight bbox pruning:
+
+- Coarse/regional: matches rg100k request counts (Moldova regional
+  52 → 12 requests, 77% reduction).
+- Fine/street: maintains rg10k byte counts (Portland polygons 6.7 MB
+  vs rg100k's 39.3 MB, 6× less).
+- Best of both: the lowest wall times across the sweep on street
+  viewports (fewer bytes trumps fewer requests at the canonical level).
+
+The constant policies are a tradeoff: rg100k cuts requests but pulls
+3–6× more bytes at fine zoom (wider row groups mean coarser pruning);
+rg10k keeps bytes tight but pays 2–4× more round trips on coarse/mid
+viewports. `zoom-scaled` gets both — request efficiency at coarse zoom,
+byte efficiency at fine zoom.
+
+**Why opt-in (for now):** the sweep confirms the win, but the policy is
+new; shipping it as the default would be a behavior change to all users
+without a bake-in period. The option is there, documented, and proven;
+it can be promoted to the default in a subsequent release once real-world
+usage confirms no edge-case surprises.
+
+Raw data: `corpus/data/bench/sweep202/{rg10k,rg25k,rg50k,rg100k,zoom-scaled}/`
+(local), `s3://gpq-tiles-bench/sweep202/` (remote, can be deleted after
+this decision is final).

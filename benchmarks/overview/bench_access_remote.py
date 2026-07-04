@@ -31,6 +31,13 @@ Env:
   BENCH_AWS_PROFILE (default nissim-admin)
   BENCH_RUNS        (default 3; medians reported)
   BENCH_DATASETS    (comma list; default all four)
+  BENCH_OVERVIEW_PREFIX (default "overviews"; e.g. "sweep202/rg50k" to
+                    point the overview path at a sweep variant prefix)
+  BENCH_REPORT_DIR  (default corpus/data/bench/overviews; local dir with
+                    <ds>.dup.report.json for the zoom->level mapping)
+  BENCH_RESULTS     (default remote_access_results.json; output path)
+  BENCH_SKIP_PMTILES=1  (overview path only -- for sweeps where the
+                    PMTiles side is unchanged)
 """
 import json
 import math
@@ -49,6 +56,14 @@ BUCKET = os.environ.get("BENCH_BUCKET", "gpq-tiles-bench")
 REGION = os.environ.get("BENCH_REGION", "us-east-2")
 PROFILE = os.environ.get("BENCH_AWS_PROFILE", "nissim-admin")
 N_RUNS = int(os.environ.get("BENCH_RUNS", "3"))
+OV_PREFIX = os.environ.get("BENCH_OVERVIEW_PREFIX", "overviews")
+REPORT_DIR = os.environ.get(
+    "BENCH_REPORT_DIR", os.path.join(DATA_ROOT, "bench", "overviews")
+)
+RESULTS_PATH = os.environ.get(
+    "BENCH_RESULTS", os.path.join(HERE, "remote_access_results.json")
+)
+SKIP_PMTILES = os.environ.get("BENCH_SKIP_PMTILES") == "1"
 
 DATASETS = os.environ.get(
     "BENCH_DATASETS",
@@ -79,9 +94,7 @@ def tiles_for_bbox(bbox, z):
 
 
 def zoom_to_level(ds):
-    rep = os.path.join(
-        DATA_ROOT, "bench", "overviews", ds + ".dup.report.json"
-    )
+    rep = os.path.join(REPORT_DIR, ds + ".dup.report.json")
     with open(rep) as f:
         r = json.load(f)
     return {lvl["zoom"]: lvl["level"] for lvl in r["levels"]}
@@ -126,7 +139,7 @@ def parse_duckdb_output(out):
 def overview_run(ds, bbox, zoom, z2l):
     """One fresh DuckDB process: cold query then warm repeat."""
     level = z2l.get(zoom)
-    url = f"s3://{BUCKET}/overviews/{ds}.dup.parquet"
+    url = f"s3://{BUCKET}/{OV_PREFIX}/{ds}.dup.parquet"
     xmin, ymin, xmax, ymax = bbox
     where = (
         f"WHERE level={level} "
@@ -252,16 +265,19 @@ def main():
         viewports = json.load(f)
 
     results = {"bucket": BUCKET, "region": REGION, "runs": N_RUNS,
-               "datasets": {}}
+               "overview_prefix": OV_PREFIX, "datasets": {}}
     for ds in DATASETS:
         z2l = zoom_to_level(ds)
-        pm_url = presign(f"pmtiles/{ds}.pmtiles")
         results["datasets"][ds] = {
             "overview_file_bytes": object_size(
-                f"overviews/{ds}.dup.parquet"
+                f"{OV_PREFIX}/{ds}.dup.parquet"
             ),
-            "pmtiles_file_bytes": object_size(f"pmtiles/{ds}.pmtiles"),
         }
+        if not SKIP_PMTILES:
+            pm_url = presign(f"pmtiles/{ds}.pmtiles")
+            results["datasets"][ds]["pmtiles_file_bytes"] = object_size(
+                f"pmtiles/{ds}.pmtiles"
+            )
         for vp in ("world", "regional", "street"):
             cfg = viewports[ds]["viewports"][vp]
             bbox, zoom = cfg["bbox"], cfg["zoom"]
@@ -271,32 +287,37 @@ def main():
                 c, w = overview_run(ds, bbox, zoom, z2l)
                 ov_cold.append(c)
                 ov_warm.append(w)
-                c, w = pmtiles_run(ds, bbox, zoom, pm_url)
-                pm_cold.append(c)
-                pm_warm.append(w)
+                if not SKIP_PMTILES:
+                    c, w = pmtiles_run(ds, bbox, zoom, pm_url)
+                    pm_cold.append(c)
+                    pm_warm.append(w)
 
             entry = {
                 "zoom": zoom, "bbox": bbox,
                 "overview": {"cold": median_of(ov_cold),
                              "warm": median_of(ov_warm)},
-                "pmtiles": {"cold": median_of(pm_cold),
-                            "warm": median_of(pm_warm)},
             }
+            if not SKIP_PMTILES:
+                entry["pmtiles"] = {"cold": median_of(pm_cold),
+                                    "warm": median_of(pm_warm)}
             results["datasets"][ds][vp] = entry
             oc = entry["overview"]["cold"]
-            pc = entry["pmtiles"]["cold"]
-            print(
+            line = (
                 f"{ds:28s} {vp:9s} z{zoom:<2d} | "
                 f"ov {oc['bytes']:>11,.0f}B "
                 f"{oc['head'] + oc['get']:>3d}req "
-                f"{oc['wall_ms']:>8.1f}ms {oc['features']:>7d}f | "
-                f"pm {pc['bytes']:>11,}B {pc['requests']:>3d}req "
-                f"{pc['wall_ms']:>8.1f}ms "
-                f"{pc['tiles_present']}/{pc['tiles_requested']}t",
-                flush=True,
+                f"{oc['wall_ms']:>8.1f}ms {oc['features']:>7d}f"
             )
+            if not SKIP_PMTILES:
+                pc = entry["pmtiles"]["cold"]
+                line += (
+                    f" | pm {pc['bytes']:>11,}B {pc['requests']:>3d}req "
+                    f"{pc['wall_ms']:>8.1f}ms "
+                    f"{pc['tiles_present']}/{pc['tiles_requested']}t"
+                )
+            print(line, flush=True)
 
-    out = os.path.join(HERE, "remote_access_results.json")
+    out = RESULTS_PATH
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nwrote {out}")

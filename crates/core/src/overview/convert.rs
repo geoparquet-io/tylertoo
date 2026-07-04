@@ -65,7 +65,9 @@ use super::level::{
     METERS_PER_DEGREE,
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
-use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, WriterError, LEVEL_COLUMN};
+use super::writer::{
+    LevelSpec, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy, WriterError, LEVEL_COLUMN,
+};
 
 /// How the caller specifies the overview levels.
 #[derive(Debug, Clone, PartialEq)]
@@ -285,6 +287,11 @@ pub struct ConvertOptions {
     pub cogp_compat_key: bool,
     /// Maximum row-group size in rows for the output writer.
     pub max_row_group_size: usize,
+    /// How the per-level row-group cap is derived from `max_row_group_size`
+    /// (#202). Default [`RowGroupSizePolicy::Constant`]; `ZoomScaled` doubles
+    /// the cap per zoom step below the finest level (fewer requests on coarse
+    /// bands that wide viewports read mostly whole anyway).
+    pub row_group_size_policy: RowGroupSizePolicy,
     /// Keep full Parquet statistics on every column (including high-cardinality
     /// string/binary property columns and the WKB geometry column). Default
     /// `false`: those stats are suppressed to keep the footer small (H1); the
@@ -387,6 +394,7 @@ impl Default for ConvertOptions {
             gsd_base: GSD_TILE_BASE,
             cogp_compat_key: false,
             max_row_group_size: super::writer::DEFAULT_MAX_ROW_GROUP_SIZE,
+            row_group_size_policy: RowGroupSizePolicy::default(),
             full_column_stats: false,
             streaming: true,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
@@ -1014,6 +1022,7 @@ pub fn convert_to_overviews(
     let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
+    writer_opts.row_group_size_policy = options.row_group_size_policy;
     writer_opts.full_column_stats = options.full_column_stats;
     writer_opts.cogp_compat_key = options.cogp_compat_key;
     writer_opts.generalization = Some(build_generalization(

@@ -159,6 +159,92 @@ impl Header {
     }
 }
 
+impl TileType {
+    /// Parse a PMTiles spec byte code back into a tile type (byte 99).
+    ///
+    /// Returns `None` for codes outside the PMTiles v3 spec (0-5).
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(TileType::Unknown),
+            1 => Some(TileType::Mvt),
+            2 => Some(TileType::Png),
+            3 => Some(TileType::Jpeg),
+            4 => Some(TileType::Webp),
+            5 => Some(TileType::Avif),
+            _ => None,
+        }
+    }
+}
+
+impl Header {
+    /// Parse a PMTiles v3 header from the first 127 bytes of an archive.
+    ///
+    /// Inverse of [`Header::to_bytes`]; the read side of the pipeline (issue
+    /// #112) uses this to locate directories and tile data. Fails on short
+    /// input, bad magic, unsupported version, or out-of-spec compression /
+    /// tile-type codes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Header> {
+        let err = |msg: String| Error::PMTilesRead(msg);
+        if bytes.len() < 127 {
+            return Err(err(format!(
+                "file too short for PMTiles header: {} bytes (need 127)",
+                bytes.len()
+            )));
+        }
+        if &bytes[0..7] != PMTILES_MAGIC {
+            return Err(err("bad magic: not a PMTiles archive".to_string()));
+        }
+        if bytes[7] != PMTILES_VERSION {
+            return Err(err(format!(
+                "unsupported PMTiles version {} (only v3 is supported)",
+                bytes[7]
+            )));
+        }
+
+        let read_u64 =
+            |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8-byte slice"));
+        let read_coord = |at: usize| {
+            f64::from(i32::from_le_bytes(
+                bytes[at..at + 4].try_into().expect("4-byte slice"),
+            )) / 10_000_000.0
+        };
+
+        let internal_compression = Compression::from_code(bytes[97])
+            .ok_or_else(|| err(format!("invalid internal compression code {}", bytes[97])))?;
+        let tile_compression = Compression::from_code(bytes[98])
+            .ok_or_else(|| err(format!("invalid tile compression code {}", bytes[98])))?;
+        let tile_type = TileType::from_code(bytes[99])
+            .ok_or_else(|| err(format!("invalid tile type code {}", bytes[99])))?;
+
+        Ok(Header {
+            root_dir_offset: read_u64(8),
+            root_dir_length: read_u64(16),
+            json_metadata_offset: read_u64(24),
+            json_metadata_length: read_u64(32),
+            leaf_dirs_offset: read_u64(40),
+            leaf_dirs_length: read_u64(48),
+            tile_data_offset: read_u64(56),
+            tile_data_length: read_u64(64),
+            addressed_tiles_count: read_u64(72),
+            tile_entries_count: read_u64(80),
+            tile_contents_count: read_u64(88),
+            clustered: bytes[96] == 1,
+            internal_compression,
+            tile_compression,
+            tile_type,
+            min_zoom: bytes[100],
+            max_zoom: bytes[101],
+            min_lon: read_coord(102),
+            min_lat: read_coord(106),
+            max_lon: read_coord(110),
+            max_lat: read_coord(114),
+            center_zoom: bytes[118],
+            center_lon: read_coord(119),
+            center_lat: read_coord(123),
+        })
+    }
+}
+
 /// Convert tile coordinates (z, x, y) to a TileID for PMTiles
 ///
 /// Uses Hilbert curve ordering for spatial locality. The tile ID is a cumulative
@@ -213,6 +299,54 @@ fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
         s /= 2;
     }
     d
+}
+
+/// Convert a PMTiles TileID back to tile coordinates (z, x, y).
+///
+/// Inverse of [`tile_id`]. Supports zoom levels 0-31 (the range a u64
+/// cumulative Hilbert ID can address); returns an error for IDs beyond z31.
+pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
+    let mut acc: u64 = 0;
+    for z in 0u8..=31 {
+        let num = 1u64 << (2 * u64::from(z));
+        if id - acc < num {
+            let (x, y) = hilbert_d2xy(z, id - acc);
+            return Ok((z, x, y));
+        }
+        acc += num;
+    }
+    Err(Error::PMTilesRead(format!(
+        "tile id {id} exceeds the zoom 31 address space"
+    )))
+}
+
+/// Convert a Hilbert curve index back to x,y coordinates at zoom level z
+///
+/// Standard inverse Hilbert algorithm (d2xy), mirroring [`xy_to_hilbert`]:
+/// https://en.wikipedia.org/wiki/Hilbert_curve
+fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
+    let n = 1u64 << z;
+    let (mut x, mut y) = (0u64, 0u64);
+    let mut t = d;
+    let mut s = 1u64;
+    while s < n {
+        let rx = 1 & (t / 2);
+        let ry = 1 & (t ^ rx);
+        // Rotate quadrant - the inverse uses s-1 (current block size - 1),
+        // where the forward transform uses n-1 (see xy_to_hilbert).
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        x += s * rx;
+        y += s * ry;
+        t /= 4;
+        s *= 2;
+    }
+    (x as u32, y as u32)
 }
 
 // ============================================================================
@@ -1563,6 +1697,134 @@ mod tests {
                 z
             );
         }
+    }
+
+    #[test]
+    fn test_tile_id_to_zxy_matches_spec_examples() {
+        assert_eq!(tile_id_to_zxy(0).unwrap(), (0, 0, 0));
+        assert_eq!(tile_id_to_zxy(1).unwrap(), (1, 0, 0));
+        assert_eq!(tile_id_to_zxy(2).unwrap(), (1, 0, 1));
+        assert_eq!(tile_id_to_zxy(3).unwrap(), (1, 1, 1));
+        assert_eq!(tile_id_to_zxy(4).unwrap(), (1, 1, 0));
+        assert_eq!(tile_id_to_zxy(5).unwrap(), (2, 0, 0));
+    }
+
+    #[test]
+    fn test_tile_id_to_zxy_inverts_tile_id_exhaustively() {
+        // Exhaustive round-trip at low zooms...
+        for z in 0..=5u8 {
+            let n = 1u32 << z;
+            for y in 0..n {
+                for x in 0..n {
+                    assert_eq!(
+                        tile_id_to_zxy(tile_id(z, x, y)).unwrap(),
+                        (z, x, y),
+                        "round-trip z={z} x={x} y={y}"
+                    );
+                }
+            }
+        }
+        // ...and spot checks at high zooms, including corners.
+        for (z, x, y) in [
+            (14u8, 4823u32, 6160u32),
+            (14, 0, 0),
+            (14, (1 << 14) - 1, (1 << 14) - 1),
+            (20, 123_456, 654_321),
+            (31, (1u32 << 31) - 1, 0),
+        ] {
+            assert_eq!(tile_id_to_zxy(tile_id(z, x, y)).unwrap(), (z, x, y));
+        }
+    }
+
+    #[test]
+    fn test_tile_id_to_zxy_rejects_out_of_range() {
+        // One past the last z31 ID must error rather than wrap.
+        let past_z31 = (0..=31u8).map(|z| 1u64 << (2 * u64::from(z))).sum::<u64>();
+        assert!(tile_id_to_zxy(past_z31).is_err());
+        assert!(tile_id_to_zxy(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn test_header_from_bytes_roundtrips_to_bytes() {
+        let header = Header {
+            root_dir_offset: 127,
+            root_dir_length: 421,
+            json_metadata_offset: 548,
+            json_metadata_length: 33,
+            leaf_dirs_offset: 581,
+            leaf_dirs_length: 1290,
+            tile_data_offset: 1871,
+            tile_data_length: 999_999,
+            addressed_tiles_count: 42,
+            tile_entries_count: 40,
+            tile_contents_count: 39,
+            clustered: true,
+            internal_compression: Compression::Gzip,
+            tile_compression: Compression::Zstd,
+            tile_type: TileType::Mvt,
+            min_zoom: 3,
+            max_zoom: 14,
+            min_lon: -75.1652,
+            min_lat: -33.8688,
+            max_lon: 151.2093,
+            max_lat: 48.8566,
+            center_zoom: 8,
+            center_lon: 2.3522,
+            center_lat: 39.9526,
+        };
+        let parsed = Header::from_bytes(&header.to_bytes()).unwrap();
+
+        assert_eq!(parsed.root_dir_offset, header.root_dir_offset);
+        assert_eq!(parsed.root_dir_length, header.root_dir_length);
+        assert_eq!(parsed.json_metadata_offset, header.json_metadata_offset);
+        assert_eq!(parsed.json_metadata_length, header.json_metadata_length);
+        assert_eq!(parsed.leaf_dirs_offset, header.leaf_dirs_offset);
+        assert_eq!(parsed.leaf_dirs_length, header.leaf_dirs_length);
+        assert_eq!(parsed.tile_data_offset, header.tile_data_offset);
+        assert_eq!(parsed.tile_data_length, header.tile_data_length);
+        assert_eq!(parsed.addressed_tiles_count, header.addressed_tiles_count);
+        assert_eq!(parsed.tile_entries_count, header.tile_entries_count);
+        assert_eq!(parsed.tile_contents_count, header.tile_contents_count);
+        assert_eq!(parsed.clustered, header.clustered);
+        assert_eq!(parsed.internal_compression, header.internal_compression);
+        assert_eq!(parsed.tile_compression, header.tile_compression);
+        assert_eq!(parsed.tile_type, header.tile_type);
+        assert_eq!(parsed.min_zoom, header.min_zoom);
+        assert_eq!(parsed.max_zoom, header.max_zoom);
+        // Coordinates go through the i32 * 1e7 spec encoding: 1e-7 precision.
+        for (got, want) in [
+            (parsed.min_lon, header.min_lon),
+            (parsed.min_lat, header.min_lat),
+            (parsed.max_lon, header.max_lon),
+            (parsed.max_lat, header.max_lat),
+            (parsed.center_lon, header.center_lon),
+            (parsed.center_lat, header.center_lat),
+        ] {
+            assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+        }
+        assert_eq!(parsed.center_zoom, header.center_zoom);
+    }
+
+    #[test]
+    fn test_header_from_bytes_rejects_garbage() {
+        // Too short.
+        assert!(Header::from_bytes(&[0u8; 50]).is_err());
+        // Bad magic.
+        let mut bytes = Header::default().to_bytes();
+        bytes[0] = b'X';
+        assert!(Header::from_bytes(&bytes).is_err());
+        // Bad version.
+        let mut bytes = Header::default().to_bytes();
+        bytes[7] = 2;
+        assert!(Header::from_bytes(&bytes).is_err());
+        // Out-of-spec compression code.
+        let mut bytes = Header::default().to_bytes();
+        bytes[97] = 9;
+        assert!(Header::from_bytes(&bytes).is_err());
+        // Out-of-spec tile type code.
+        let mut bytes = Header::default().to_bytes();
+        bytes[99] = 9;
+        assert!(Header::from_bytes(&bytes).is_err());
     }
 
     #[test]

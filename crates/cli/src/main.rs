@@ -89,6 +89,60 @@ enum Command {
     Validate(ValidateArgs),
     /// Export a PMTiles archive from an overview GeoParquet file (Plan E0).
     ExportPmtiles(ExportPmtilesArgs),
+    /// Decode a PMTiles vector-tile archive back to GeoParquet.
+    Decode(DecodeArgs),
+}
+
+/// Arguments for `gpq-tiles decode`.
+///
+/// The output is the TILED representation, not the original source data:
+/// geometries are simplified per zoom, clipped to (buffered) tile bounds,
+/// duplicated across neighboring tiles and zoom levels, and only the
+/// properties that survived tiling are present. There is no round-trip
+/// guarantee. Matching tippecanoe-decode, nothing is deduplicated; use
+/// `--zoom` (or filter the output's `zoom` column) for a single
+/// representation, and prefer the maximum zoom for the best detail.
+#[derive(Parser, Debug)]
+#[command(after_help = "\
+The output is the tiled representation, not the original source:
+  - simplified: vertices were removed during tiling at lower zooms
+    (extract the max zoom for best detail)
+  - clipped: features are cut at (buffered) tile boundaries
+  - duplicated: a feature appears once per neighboring tile and per
+    zoom level; nothing is deduplicated (matches tippecanoe-decode) -
+    filter with --zoom or the output's `zoom` column
+  - lossy properties: attributes dropped during tiling cannot be
+    recovered
+There is no round-trip guarantee: A.parquet -> B.pmtiles -> C.parquet
+does not reproduce A. See docs/decode.md for details.")]
+struct DecodeArgs {
+    /// Input PMTiles archive (vector tiles).
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Output GeoParquet file.
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+
+    /// Decode a single zoom level (recommended for most uses).
+    #[arg(long, conflicts_with_all = ["min_zoom", "max_zoom"])]
+    zoom: Option<u8>,
+
+    /// Minimum zoom level to decode.
+    #[arg(long)]
+    min_zoom: Option<u8>,
+
+    /// Maximum zoom level to decode.
+    #[arg(long)]
+    max_zoom: Option<u8>,
+
+    /// Only decode features from this MVT layer.
+    #[arg(long, value_name = "NAME")]
+    layer: Option<String>,
+
+    /// Write the JSON decode report to this path.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
 }
 
 /// Arguments for `gpq-tiles export-pmtiles`.
@@ -408,6 +462,20 @@ struct OverviewArgs {
     #[arg(long, default_value = "10000")]
     row_group_size: usize,
 
+    /// Per-level row-group sizing policy (#202).
+    ///
+    /// `constant`: every level uses --row-group-size as its cap (default).
+    /// `zoom-scaled`: the cap doubles per zoom step below the finest level
+    /// (cap = row_group_size << (max_zoom - level_zoom)) — coarse bands, which
+    /// wide viewports read mostly whole anyway, become fewer/larger row groups
+    /// (fewer remote requests) while the finest level keeps tight bbox pruning.
+    #[arg(
+        long,
+        default_value = "constant",
+        value_parser = ["constant", "zoom-scaled"]
+    )]
+    row_group_size_policy: String,
+
     /// Keep full Parquet statistics on every column, including high-cardinality
     /// string/binary property columns and the WKB geometry column.
     ///
@@ -517,6 +585,7 @@ fn main() -> Result<()> {
         Command::Overview(args) => run_overview(*args),
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
+        Command::Decode(args) => run_decode(args),
         Command::Tiles(args) => run_tiles(args),
     }
 }
@@ -530,7 +599,14 @@ fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    const SUBCOMMANDS: [&str; 5] = ["tiles", "overview", "validate", "export-pmtiles", "help"];
+    const SUBCOMMANDS: [&str; 6] = [
+        "tiles",
+        "overview",
+        "validate",
+        "export-pmtiles",
+        "decode",
+        "help",
+    ];
     let argv: Vec<std::ffi::OsString> = args.into_iter().collect();
 
     // Nothing to rewrite for a bare `gpq-tiles` (clap prints help/usage).
@@ -665,6 +741,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
     use gpq_tiles_core::overview::level::Mode;
     use gpq_tiles_core::overview::simplify::SimplifyOptions;
+    use gpq_tiles_core::overview::writer::RowGroupSizePolicy;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -764,6 +841,13 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         gsd_base: args.gsd_base,
         cogp_compat_key: args.cogp_compat,
         max_row_group_size: args.row_group_size,
+        row_group_size_policy: match args.row_group_size_policy.as_str() {
+            "constant" => RowGroupSizePolicy::Constant,
+            "zoom-scaled" => RowGroupSizePolicy::ZoomScaled,
+            other => {
+                anyhow::bail!("invalid --row-group-size-policy '{other}' (constant|zoom-scaled)")
+            }
+        },
         full_column_stats: args.full_column_stats,
         streaming: !args.no_streaming,
         read_batch_size: args.read_batch_size,
@@ -967,6 +1051,64 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         report.total_tile_features,
         report.oversized_tiles,
         report.duration_secs
+    );
+
+    if let Some(path) = &args.report {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
+        println!("  report → {}", path.display());
+    }
+    Ok(())
+}
+
+/// Run `gpq-tiles decode`: PMTiles → GeoParquet (thin facade over
+/// `gpq_tiles_core::decode::decode_pmtiles`).
+fn run_decode(args: DecodeArgs) -> Result<()> {
+    use gpq_tiles_core::decode::{decode_pmtiles, DecodeOptions};
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // `--zoom N` is shorthand for `--min-zoom N --max-zoom N` (clap already
+    // rejects combining them).
+    let (min_zoom, max_zoom) = match args.zoom {
+        Some(z) => (Some(z), Some(z)),
+        None => (args.min_zoom, args.max_zoom),
+    };
+    if let (Some(lo), Some(hi)) = (min_zoom, max_zoom) {
+        if lo > hi {
+            anyhow::bail!("--min-zoom {lo} exceeds --max-zoom {hi}");
+        }
+    }
+    let options = DecodeOptions {
+        min_zoom,
+        max_zoom,
+        layer: args.layer,
+    };
+
+    println!(
+        "Decoding {} → {}",
+        args.input.display(),
+        args.output.display()
+    );
+    let report = decode_pmtiles(&args.input, &args.output, &options)
+        .with_context(|| format!("decode failed for {}", args.input.display()))?;
+
+    match report.zoom_range {
+        Some((lo, hi)) => println!("  zooms z{lo}..z{hi}, layers: {}", report.layers.join(", ")),
+        None => println!("  no features matched the filters"),
+    }
+    println!(
+        "\n✓ {} features from {} tiles ({} skipped as degenerate) in {:.2}s",
+        format_number(report.features_written),
+        format_number(report.tiles_read),
+        report.features_skipped,
+        report.elapsed_secs
+    );
+    println!(
+        "  note: output is the tiled representation (simplified, clipped, \
+         duplicated across zooms); see `gpq-tiles decode --help`"
     );
 
     if let Some(path) = &args.report {

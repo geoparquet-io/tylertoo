@@ -13,6 +13,8 @@ Multi-resolution **overviews for GeoParquet**, plus PMTiles export — in Rust.
 - **`gpq-tiles tiles`** (or the bare form) — one-shot GeoParquet → PMTiles,
   a thin facade over the two steps above.
 - **`gpq-tiles validate`** — check an overview file against the spec.
+- **`gpq-tiles decode`** — decode any PMTiles vector-tile archive back to
+  GeoParquet (the tiled representation; see [Decoding PMTiles](decode.md)).
 
 ## Quick Example
 
@@ -38,9 +40,11 @@ export_pmtiles("overviews.parquet", "output.pmtiles")
 ## Next Steps
 
 - [Getting Started](getting-started.md) — Installation and basic usage
+- [Decoding PMTiles](decode.md) — PMTiles → GeoParquet, limitations included
 - [Overview Tuning](OVERVIEW_TUNING.md) — Every generalization knob explained
 - [API Reference](api-reference.md) — CLI flags, Python API, Rust API
 - [Advanced Usage](advanced-usage.md) — Input optimization, memory, export
+- [Remote Reads](remote-reads.md) — Querying overview files on object storage with DuckDB
 - [Architecture](architecture.md) — Design decisions and internals
 
 ## License
