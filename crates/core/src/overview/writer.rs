@@ -64,6 +64,24 @@ impl LevelSpec {
     }
 }
 
+/// How the per-level row-group cap is derived from `max_row_group_size`
+/// (issue #202).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowGroupSizePolicy {
+    /// Every level uses `max_row_group_size` as its cap (the shipped default).
+    #[default]
+    Constant,
+    /// The cap **doubles per zoom step below the finest level's zoom**:
+    /// `cap(level) = max_row_group_size << (finest_zoom − level_zoom)`,
+    /// saturating. Rationale: a viewport rendered at zoom `z` covers ~4× the
+    /// ground area of one at `z+1`, so the coarser a level is, the larger the
+    /// slice of its band any real viewport reads anyway — bigger row groups
+    /// there cost little pruning but cut request round trips. The finest
+    /// (canonical) level keeps the exact `max_row_group_size` cap for tight
+    /// bbox pruning. Levels without zoom metadata fall back to the base cap.
+    ZoomScaled,
+}
+
 /// Configuration for an [`OverviewWriter`].
 #[derive(Debug, Clone)]
 pub struct OverviewWriterOptions {
@@ -80,6 +98,9 @@ pub struct OverviewWriterOptions {
     /// one broad row group (read whole anyway) while fine bands keep tight
     /// per-row-group bbox statistics for pruning.
     pub max_row_group_size: usize,
+    /// How the per-level cap is derived from `max_row_group_size` (#202).
+    /// Default [`RowGroupSizePolicy::Constant`].
+    pub row_group_size_policy: RowGroupSizePolicy,
     /// Keep full Parquet statistics on **every** column, including
     /// high-cardinality string/binary property columns and the WKB geometry
     /// column (H1). Default `false`: those columns' per-row-group min/max are
@@ -106,6 +127,7 @@ impl OverviewWriterOptions {
             levels,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             max_row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
+            row_group_size_policy: RowGroupSizePolicy::default(),
             full_column_stats: false,
             cogp_compat_key: false,
             version: SPEC_VERSION.to_string(),
@@ -327,7 +349,13 @@ impl<W: Write + Send> OverviewWriter<W> {
         // `ArrowWriter` never splits on its own (its `max_row_group_size` is set
         // to `usize::MAX` in `build_writer_properties`); we drive every row-group
         // boundary here by slicing each encoded batch to `target` and flushing.
-        let target = rg_row_target(self.options.max_row_group_size, level_row_hint);
+        let cap = effective_rg_cap(
+            self.options.max_row_group_size,
+            self.options.row_group_size_policy,
+            self.options.levels.get(level_idx).and_then(|l| l.zoom),
+            self.options.levels.last().and_then(|l| l.zoom),
+        );
+        let target = rg_row_target(cap, level_row_hint);
 
         // Rows accumulated into the current (not-yet-flushed) row group.
         let mut in_rg: usize = 0;
@@ -493,6 +521,29 @@ fn covering_name_for(column_name: &str) -> String {
         "bbox".to_string()
     } else {
         format!("{column_name}_bbox")
+    }
+}
+
+/// Effective row-group cap for one level under a [`RowGroupSizePolicy`]
+/// (#202). `Constant` (and any level/file without zoom metadata) returns the
+/// base cap; `ZoomScaled` doubles it per zoom step below the finest level's
+/// zoom, saturating at `usize::MAX`.
+fn effective_rg_cap(
+    base: usize,
+    policy: RowGroupSizePolicy,
+    level_zoom: Option<u8>,
+    finest_zoom: Option<u8>,
+) -> usize {
+    match (policy, level_zoom, finest_zoom) {
+        (RowGroupSizePolicy::ZoomScaled, Some(z), Some(zmax)) if z < zmax => {
+            let steps = u32::from(zmax - z);
+            if steps >= usize::BITS {
+                usize::MAX
+            } else {
+                base.saturating_mul(1usize << steps)
+            }
+        }
+        _ => base,
     }
 }
 
@@ -1161,6 +1212,87 @@ mod tests {
         assert!(l1.iter().all(|&r| r <= 4), "row groups exceed cap: {l1:?}");
 
         // Every row group is single-level (invariant §4.2) and validates.
+        assert!(crate::overview::check::validate_file(tmp.path())
+            .unwrap()
+            .is_valid());
+    }
+
+    #[test]
+    fn effective_rg_cap_scales_with_zoom_distance() {
+        use RowGroupSizePolicy::{Constant, ZoomScaled};
+        // Constant: the base cap regardless of zooms.
+        assert_eq!(effective_rg_cap(4, Constant, Some(2), Some(4)), 4);
+        // ZoomScaled: doubles per zoom step below the finest level's zoom.
+        assert_eq!(effective_rg_cap(4, ZoomScaled, Some(4), Some(4)), 4);
+        assert_eq!(effective_rg_cap(4, ZoomScaled, Some(3), Some(4)), 8);
+        assert_eq!(effective_rg_cap(4, ZoomScaled, Some(2), Some(4)), 16);
+        // Missing zoom metadata falls back to the base cap.
+        assert_eq!(effective_rg_cap(4, ZoomScaled, None, Some(4)), 4);
+        assert_eq!(effective_rg_cap(4, ZoomScaled, Some(2), None), 4);
+        // Saturates instead of overflowing on absurd zoom spans.
+        assert_eq!(
+            effective_rg_cap(usize::MAX / 2, ZoomScaled, Some(0), Some(30)),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn zoom_scaled_policy_widens_coarse_level_caps() {
+        // Two levels of 10 rows each, base cap 4. Under the constant policy
+        // BOTH levels split into 3 row groups. Under zoom-scaled the coarse
+        // level (z2, two steps below the finest z4) gets cap 4<<2 = 16 and
+        // becomes a SINGLE row group, while the finest level keeps cap 4.
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut opts = OverviewWriterOptions::new(
+            Mode::Duplicating,
+            vec![
+                LevelSpec::new(gsd(2), Some(2)),
+                LevelSpec::new(gsd(4), Some(4)),
+            ],
+        );
+        opts.max_row_group_size = 4;
+        opts.row_group_size_policy = RowGroupSizePolicy::ZoomScaled;
+
+        let ids: Vec<i64> = (0..10).collect();
+        let meta = {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            writer
+                .write_level(
+                    0,
+                    Some(ids.len()),
+                    std::iter::once(source_batch(&schema, &ids)),
+                )
+                .unwrap();
+            writer
+                .write_level(
+                    1,
+                    Some(ids.len()),
+                    std::iter::once(source_batch(&schema, &ids)),
+                )
+                .unwrap();
+            writer.finish().unwrap()
+        };
+
+        // Coarse band: one row group (RG 0); fine band: RGs 1..=3.
+        assert_eq!(meta.levels[0].row_group_end, 0);
+        assert_eq!(meta.levels[1].row_group_end, 3);
+
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert_eq!(pm.num_row_groups(), 4);
+        assert_eq!(pm.row_group(0).num_rows(), 10);
+        let l1: Vec<i64> = (1..=3).map(|r| pm.row_group(r).num_rows()).collect();
+        assert_eq!(l1.iter().sum::<i64>(), 10);
+        assert!(
+            l1.iter().all(|&r| r <= 4),
+            "fine row groups exceed cap: {l1:?}"
+        );
+
+        // Level↔row-group alignment invariants still hold.
         assert!(crate::overview::check::validate_file(tmp.path())
             .unwrap()
             .is_valid());
