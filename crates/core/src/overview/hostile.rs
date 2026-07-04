@@ -20,7 +20,7 @@ use geoparquet::writer::{
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
-use parquet::format::KeyValue;
+use parquet::file::metadata::KeyValue;
 
 use super::check::validate_file;
 use super::convert::{convert_to_overviews, ConvertError, ConvertOptions, LevelPlan};
