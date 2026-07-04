@@ -3,7 +3,8 @@
 V3 access + storage benchmark for **overview GeoParquet** vs the status-quo
 web-map deployment (**gpio GeoParquet + tippecanoe PMTiles**) vs **COGP**
 (`cogp-rs`). The publishable numbers and full method notes live in
-[`RESULTS.md`](./RESULTS.md); this README is the operator's guide.
+[`RESULTS.md`](./RESULTS.md); pipeline performance methodology + history
+live in [`PROFILE.md`](./PROFILE.md); this README is the operator's guide.
 
 ## What it measures
 

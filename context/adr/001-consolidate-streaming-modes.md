@@ -1,7 +1,10 @@
 # ADR-001: Consolidate to Single Geometry-Centric Pipeline
 
 **Date:** 2026-02-25
-**Status:** Accepted
+**Status:** Superseded — the pipeline this ADR consolidated was removed
+entirely with the legacy tiles pipeline (#177, PR #189); see the decision
+record in `context/ARCHITECTURE.md`. Kept as the historical record of
+the consolidation.
 **Context:** PR #63
 
 ## Summary

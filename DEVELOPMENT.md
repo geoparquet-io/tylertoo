@@ -17,255 +17,172 @@ sudo apt-get install protobuf-compiler
 
 # Verify installation
 protoc --version  # Should be 3.x or higher
+
+# Enable the repo git hooks (fmt, clippy, version sync, README sync)
+git config core.hooksPath .githooks
 ```
 
-## Development Tools
-
-```bash
-# Install recommended tools
-cargo install cargo-watch    # Auto-run tests on file changes
-cargo install cargo-tarpaulin # Coverage reporting
-cargo install cargo-mutants   # Mutation testing
-
-# Optional but useful
-cargo install cargo-edit      # Add/remove dependencies with `cargo add`
-cargo install cargo-outdated  # Check for outdated dependencies
-```
+The pre-commit hook runs `cargo fmt --check`, `cargo clippy` (deny
+warnings), a version-consistency check across the four version files,
+and syncs the root `README.md` into `crates/*/README.md`. Never bypass
+it with `--no-verify`.
 
 ## Day-to-Day Workflow
 
-### Fast Feedback Loop (TDD)
-
 ```bash
-# Auto-run unit tests on save
-cargo watch -x "test --lib"
-
-# Auto-run specific test
-cargo watch -x "test --lib mvt_encoding"
+cargo check                    # Fast compile check — use liberally
+cargo build                    # Debug build
+cargo build --release          # Release build
+cargo fmt --all                # Format (required before commit)
 ```
 
-### Full Test Suite
+### Tests: targeted only
+
+The full suite is slow (real parquet I/O, full pipeline runs, nested
+parallelism). Run targeted tests:
 
 ```bash
-# All tests
-cargo test
+# A specific test
+cargo test --package gpq-tiles-core \
+  overview::assign::tests::some_test -- --nocapture
 
-# Just unit tests (fast)
-cargo test --lib
+# A module
+cargo test --package gpq-tiles-core overview::cluster:: -- --nocapture
 
-# Just integration tests
-cargo test --test '*'
-
-# Specific crate
-cargo test -p gpq-tiles-core
-
-# With output (show println!)
-cargo test -- --nocapture
+# The CLI facade integration test
+cargo test --package gpq-tiles --test tiles_facade
 ```
 
-### Coverage
-
-```bash
-# Generate HTML coverage report
-cargo tarpaulin --out html --all-features
-
-# Open report
-open tarpaulin-report.html  # macOS
-xdg-open tarpaulin-report.html  # Linux
-```
+CI runs the full matrix (`cargo test --all-features -- --skip
+large_polygon_regression` on ubuntu/macos × stable/beta) — let it.
 
 ### Benchmarks
 
 ```bash
-# Run all benchmarks
-cargo bench
-
-# Run specific benchmark
-cargo bench mvt_encoding
-
-# Compare with baseline
-cargo bench -- --save-baseline before
-# ... make changes ...
-cargo bench -- --baseline before
+cargo bench --package gpq-tiles-core --bench clipping
+cargo bench --package gpq-tiles-core --bench bbox_containment
+open target/criterion/report/index.html
 ```
 
-### Large File Benchmarks (ADM4)
+The corpus-scale benchmarks (storage/access/conversion) are scripted in
+`benchmarks/overview/`; profiling is documented in `docs/PROFILING.md`.
 
-**CRITICAL:** For accurate benchmarks, you MUST use `--streaming-mode external-sort`.
+## CI Gates — and How to Run Them Locally
 
-The default `fast` mode processes row groups sequentially. Only `external-sort` mode
-enables full parallelization (both `parallel` and `parallel_geoms`), which is 4x faster.
-
-```bash
-# CORRECT: Full parallelization (~3 min on 16-core machine)
-cargo run --release -- input.parquet output.pmtiles \
-    --streaming-mode external-sort \
-    --min-zoom 0 --max-zoom 8
-
-# WRONG: Sequential processing (~12 min) - DO NOT USE FOR BENCHMARKS
-cargo run --release -- input.parquet output.pmtiles \
-    --min-zoom 0 --max-zoom 8
-```
-
-The ADM4 test file (3.3GB, ~364k features) can be downloaded from:
-https://data.fieldmaps.io/edge-matched/humanitarian/intl/adm4_polygons.parquet
-
-Place it in `tests/fixtures/large/` (this directory is gitignored).
-
-**Expected benchmark output with external-sort:**
-```
-⠋ Reading GeoParquet [████████████████████████████████████████] 364/364 row groups | ✓ 363,783 records
-⠋ Sorting by tile ID... ✓ Sorted
-⠋ Encoding tiles [████████████████████████████████████████] 530033/530033 (100%)
-✓ Converted adm4_polygons.parquet → output.pmtiles
-       530,033 tiles in 3 minutes (2889 tiles/sec)
-  5.17 GiB peak memory
-```
-
-### Code Quality
-
-```bash
-# Format code
-cargo fmt
-
-# Check formatting without changing files
-cargo fmt --check
-
-# Lint
-cargo clippy
-
-# Lint in CI mode (deny warnings)
-cargo clippy -- -D warnings
-
-# Fix auto-fixable clippy warnings
-cargo clippy --fix
-```
-
-### Documentation
-
-```bash
-# Build and open docs
-cargo doc --open
-
-# Build docs for all crates
-cargo doc --workspace --no-deps
-
-# Check for broken links
-cargo doc --workspace --no-deps 2>&1 | grep warning
-```
-
-### Building
-
-```bash
-# Debug build (fast, unoptimized)
-cargo build
-
-# Release build (slow, optimized)
-cargo build --release
-
-# Build specific crate
-cargo build -p gpq-tiles-core
-
-# Check compilation without building
-cargo check
-```
-
-## Python Development
-
-Uses **uv** for fast dependency management and **ruff** for linting.
-
-### Quick Start
-
-```bash
-cd crates/python
-
-# Create venv and install dev dependencies (uv auto-detects pyproject.toml)
-uv venv
-uv pip install maturin
-uv sync --group dev
-
-# Build Rust extension and install in development mode
-uv run maturin develop
-
-# Verify installation
-uv run python -c "from gpq_tiles import convert; print(convert.__doc__)"
-```
-
-### Running Python Tests
-
-```bash
-cd crates/python
-
-# Run tests
-uv run pytest tests/ -v
-
-# Run with coverage
-uv run pytest tests/ -v --cov=gpq_tiles
-```
-
-### Linting
-
-```bash
-cd crates/python
-
-# Check
-uv run ruff check tests/
-
-# Fix auto-fixable issues
-uv run ruff check --fix tests/
-
-# Format
-uv run ruff format tests/
-```
-
-### Building Wheels
-
-```bash
-cd crates/python
-
-# Build wheel for current platform
-uv run maturin build --release
-
-# Wheel will be in target/wheels/
-ls ../../target/wheels/
-```
-
-### Usage Example
-
-```python
-from gpq_tiles import convert
-
-# Basic conversion
-convert(
-    input="buildings.parquet",
-    output="buildings.pmtiles",
-    min_zoom=0,
-    max_zoom=14,
-)
-
-# With feature dropping options
-convert(
-    input="buildings.parquet",
-    output="buildings.pmtiles",
-    min_zoom=0,
-    max_zoom=14,
-    drop_density="high",  # "low", "medium", or "high"
-)
-```
-
-## Debugging
+Every PR must pass all gates (they are branch-protection required
+checks). All of them are runnable locally.
 
 ### Rust
 
 ```bash
-# Run with debug output
-RUST_LOG=debug cargo run -- input.parquet output.pmtiles
+# Lint (curated pedantic subset via [workspace.lints.clippy];
+# cognitive-complexity threshold in clippy.toml)
+cargo clippy --all-targets --all-features -- -D warnings
 
-# Run specific test with backtrace
-RUST_BACKTRACE=1 cargo test test_name
+# Format
+cargo fmt --all --check
 
-# Run under debugger (requires lldb or gdb)
-rust-lldb target/debug/gpq-tiles
+# Unused dependencies
+cargo install cargo-machete   # once
+cargo machete
+
+# Supply chain (policy in deny.toml)
+cargo install cargo-audit cargo-deny   # once
+cargo audit
+cargo deny check
+
+# Profiling feature still compiles
+cargo build --features dhat-heap
+
+# Coverage (informational; CI uploads to codecov)
+cargo install cargo-tarpaulin   # once (CI uses a prebuilt binary)
+cargo tarpaulin --out xml --all-features --workspace \
+  --exclude gpq-tiles-python
+```
+
+Some thresholds are **ratchets** set at current-code level and marked
+`RATCHET` in-source (`clippy.toml` cognitive-complexity 30, xenon
+max-absolute C). Lower them as code improves; never raise them.
+
+### Python (`crates/python`)
+
+Everything runs through **uv** (never bare `python`/`pip`):
+
+```bash
+cd crates/python
+uv sync --group dev
+uv run maturin develop          # build the extension module
+
+uv run ruff check .             # strict 16-group ruleset
+uv run ruff format --check .
+uv run mypy                     # strict typing
+uv run python -m mypy.stubtest gpq_tiles \
+  --allowlist stubtest-allowlist.txt   # gpq_tiles.pyi matches the built module
+uv run vulture                  # dead code
+uv run xenon --max-absolute C --max-modules A --max-average A tests
+uv run pytest tests/ -v
+
+# Supply chain
+uv export --no-emit-project --format requirements-txt \
+  -o /tmp/requirements.txt
+uv run pip-audit -r /tmp/requirements.txt --disable-pip
+```
+
+If you change a `#[pyo3(signature = ...)]` in
+`crates/python/src/lib.rs`, update `crates/python/gpq_tiles.pyi` —
+stubtest will fail otherwise.
+
+### Workflows
+
+```bash
+# CI config lint (all action refs must stay SHA-pinned)
+uvx zizmor --min-severity low .github/workflows
+```
+
+### Version consistency
+
+`Cargo.toml` (workspace version + the `gpq-tiles-core` dependency
+version), `crates/python/pyproject.toml`, and `.cz.toml` must agree.
+The pre-commit hook and a CI job both enforce it; `uv run cz bump`
+from the repo root is the only supported way to move versions (see
+CONTRIBUTING.md).
+
+## Module Layout
+
+```
+crates/
+├── core/     # ALL logic: overview/ (the product) + shared infrastructure
+├── cli/      # Thin argument parsing → core (tiles facade, overview,
+│             # validate, export-pmtiles)
+└── python/   # pyo3 bindings → core (+ gpq_tiles.pyi stubs)
+```
+
+The full module map and design rationale live in
+`context/ARCHITECTURE.md`.
+
+## Python Development
+
+```bash
+cd crates/python
+
+uv sync --group dev             # create venv + install dev deps
+uv run maturin develop          # build + install the extension in-place
+uv run python -c "import gpq_tiles; print(gpq_tiles.__doc__)"
+uv run pytest tests/ -v
+
+# Build a release wheel (lands in target/wheels/)
+uv run maturin build --release
+```
+
+## Debugging
+
+```bash
+# Pipeline phase timing / diagnostics
+RUST_LOG=gpq_tiles_core::overview=debug \
+  cargo run --package gpq-tiles -- overview in.parquet out.parquet
+
+# Backtrace on a failing test
+RUST_BACKTRACE=1 cargo test --package gpq-tiles-core <test-name>
 ```
 
 ### Common Issues
@@ -277,140 +194,25 @@ rust-lldb target/debug/gpq-tiles
 **Solution**: `xcode-select --install`
 
 **Problem**: Tests fail with file not found
-**Solution**: Tests run from workspace root, use relative paths like `tests/fixtures/...`
+**Solution**: Tests run from the workspace root; use relative paths like
+`tests/fixtures/...`
 
-## Performance Profiling
+**Problem**: stubtest fails after a binding change
+**Solution**: Update `crates/python/gpq_tiles.pyi` to match the new
+`#[pyo3(signature)]`
 
-### Using cargo-flamegraph
+## Dependency Updates
 
-```bash
-# Install
-cargo install flamegraph
-
-# Profile a benchmark
-cargo flamegraph --bench tiling
-
-# Profile the CLI
-cargo flamegraph -- target/release/gpq-tiles input.parquet output.pmtiles
-```
-
-### Using criterion
-
-Criterion benchmarks automatically generate:
-- HTML reports in `target/criterion/`
-- Statistical analysis of performance
-- Comparison with previous runs
-
-```bash
-cargo bench
-open target/criterion/report/index.html
-```
-
-## Git Workflow
-
-```bash
-# Create feature branch
-git checkout -b feature/your-feature
-
-# Make changes, run tests
-cargo test
-
-# Format and lint
-cargo fmt && cargo clippy
-
-# Commit
-git add .
-git commit -m "feat: your feature description"
-
-# Push
-git push origin feature/your-feature
-```
-
-## CI Checks (What Runs on GitHub)
-
-Before pushing, ensure these pass locally:
-
-```bash
-# Formatting
-cargo fmt --check
-
-# Linting
-cargo clippy -- -D warnings
-
-# Tests
-cargo test
-
-# (Optional) Coverage
-cargo tarpaulin --out xml
-```
-
-## Useful Cargo Commands
-
-```bash
-# Update dependencies
-cargo update
-
-# Check for outdated dependencies
-cargo outdated
-
-# Add a dependency
-cargo add rayon
-
-# Remove a dependency
-cargo rm rayon
-
-# Show dependency tree
-cargo tree
-
-# Clean build artifacts
-cargo clean
-
-# Show package information
-cargo metadata
-```
-
-## Troubleshooting
-
-### Build is slow
-
-```bash
-# Use mold linker (Linux)
-cargo install -f cargo-binutils
-rustup component add llvm-tools-preview
-
-# Or lld (cross-platform)
-# Add to .cargo/config.toml:
-# [target.x86_64-unknown-linux-gnu]
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-```
-
-### Tests are slow
-
-```bash
-# Run only unit tests (skip integration)
-cargo test --lib
-
-# Run tests in parallel (default) or sequentially
-cargo test -- --test-threads=1
-```
-
-### Disk space issues
-
-```bash
-# Clean old build artifacts
-cargo clean
-
-# Clean cargo cache
-rm -rf ~/.cargo/registry
-rm -rf ~/.cargo/git
-```
+Dependabot (weekly) covers cargo, pip (uv lockfile), and GitHub
+Actions; patch/minor updates auto-merge once all gates pass, majors
+wait for a human. A weekly security job (cargo-audit + cargo-deny +
+pip-audit) opens/updates a pinned `security-audit` issue on failure.
 
 ## Resources
 
 - [Rust Book](https://doc.rust-lang.org/book/)
-- [Rust by Example](https://doc.rust-lang.org/rust-by-example/)
 - [Criterion.rs Docs](https://bheisler.github.io/criterion.rs/book/)
 - [pyo3 Guide](https://pyo3.rs/)
 - [MVT Spec](https://github.com/mapbox/vector-tile-spec)
 - [PMTiles Spec](https://github.com/protomaps/PMTiles)
+- [GeoParquet Spec](https://geoparquet.org/)

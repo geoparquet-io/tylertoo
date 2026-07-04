@@ -8,14 +8,12 @@
 Fast GeoParquet → PMTiles converter in Rust.
 
 **Features:**
-- Memory-bounded processing for 100GB+ files
-- Spatial filtering with GeoParquet row group skip
-- Tippecanoe-compatible feature dropping (`--drop-densest-as-needed`, `--drop-smallest-as-needed`)
-- Point clustering (`--cluster-distance`)
-- Automatic zoom levels per feature (`--zoom-by-area`)
-- Property filtering (`-y`, `-x`, `-X`)
-- Parallel row group reading
-- gzip, zstd, and brotli compression
+- COG-style multi-resolution **overviews embedded in GeoParquet** (`gpq-tiles overview`) — the file stays valid, exact, SQL-queryable GeoParquet
+- PMTiles export from an overview file (`gpq-tiles export-pmtiles`)
+- One-shot GeoParquet → PMTiles (`gpq-tiles tiles`, or the bare form)
+- Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
+- Memory-bounded streaming conversion (632k-polygon / 38M-vertex file: ~55 s, ~320 MB peak RSS)
+- Spec validation (`gpq-tiles validate`)
 
 > **⚠️ Work in Progress**:
 > Code is generated with Claude; take it with a grain of salt.
@@ -31,97 +29,71 @@ pip install gpq-tiles      # Python
 ## Usage
 
 ```bash
+# One-shot: GeoParquet in, PMTiles out
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
 
-### Recommended Settings
+### The Two-Step Workflow
 
-For most datasets, use `--drop-densest-as-needed` to avoid bloated output and improve performance:
-
-```bash
-gpq-tiles input.parquet output.pmtiles \
-  --min-zoom 0 --max-zoom 14 \
-  --drop-densest-as-needed
-```
-
-Without dropping, every feature appears at every zoom level, which:
-- Creates massive output files (often larger than input!)
-- Takes much longer to encode
-- Produces unusable tiles (millions of invisible features at z0)
-
-With dropping, features are intelligently thinned at lower zooms where they'd be too dense to render anyway.
-
-### Large File Processing (100GB+)
-
-gpq-tiles handles datasets larger than available RAM using disk-backed external sorting and spatial bucketing. For files over 10GB, this kicks in automatically:
+The overview GeoParquet file is the interesting artifact — keep it:
 
 ```bash
-# Process a directory of partitioned parquet files (auto-tuned)
-gpq-tiles /data/roads/ output.pmtiles --min-zoom 0 --max-zoom 14
+# 1. Embed multi-resolution levels in a GeoParquet file
+gpq-tiles overview input.parquet overviews.parquet \
+  --min-zoom 0 --max-zoom 14
 
-# Force bucketed mode with explicit bucket count
-gpq-tiles huge.parquet output.pmtiles --buckets 256
+# 2. Validate against the spec
+gpq-tiles validate overviews.parquet
+
+# 3. Export a PMTiles archive for map rendering
+gpq-tiles export-pmtiles overviews.parquet output.pmtiles
 ```
 
-Memory usage is bounded to ~10-15GB regardless of input size.
+All tuning knobs live on `overview` / `export-pmtiles` — see
+[Overview Tuning](docs/OVERVIEW_TUNING.md). Defaults are calibrated on
+rendered corpus sweeps and are meant to look right out of the box.
 
-### Spatial Filtering
+### Input Preparation
 
-Skip row groups outside your area of interest using GeoParquet covering metadata:
+Inputs must be WGS84 (EPSG:4326), and should be Hilbert-sorted with sane
+row groups. Use [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
 
 ```bash
-# Filter by tile coordinates (z/x/y)
-gpq-tiles world.parquet sf-bay.pmtiles --bounds 10/163/395
-
-# Filter by WGS84 bounding box
-gpq-tiles world.parquet sf-bay.pmtiles --bounds -122.5,37.7,-122.3,37.9
+gpio convert reproject input.parquet prepared.parquet \
+  -d EPSG:4326 --hilbert --row-group-size 100000
 ```
 
-Row groups whose bounding boxes don't intersect the filter are skipped entirely.
-
-### Size-Based Feature Dropping
-
-Drop the smallest features first when tiles are dense (tippecanoe parity):
-
-```bash
-gpq-tiles input.parquet output.pmtiles \
-  --drop-smallest-as-needed \
-  --drop-smallest-threshold 4.0  # square pixels (default)
-```
-
-Useful for:
-- Building footprints (drop tiny sheds/outbuildings at high zoom)
-- Dense point data (drop smallest markers)
-- Polygon layers (drop single-pixel features)
+### Python
 
 ```python
+from gpq_tiles import overview, export_pmtiles, validate
+
+overview("input.parquet", "overviews.parquet", min_zoom=0, max_zoom=14)
+validate("overviews.parquet")
+export_pmtiles("overviews.parquet", "output.pmtiles")
+
+# One-shot facade (deprecated in favor of the two-step API)
 from gpq_tiles import convert
-
-# Basic
 convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
-
-# With property filtering and progress
-convert(
-    "buildings.parquet", "buildings.pmtiles",
-    include=["name", "height"],
-    progress_callback=lambda e: print(f"{e['phase']}: {e.get('total_tiles', '...')}")
-)
 ```
 
 ## Documentation
 
-- **[Getting Started](docs/getting-started.md)** — Installation, basic usage, property filtering
-- **[Advanced Usage](docs/advanced-usage.md)** — Performance tuning, streaming, CI/CD
-- **[API Reference](docs/api-reference.md)** — CLI flags, Rust API, Python API
+- **[Getting Started](docs/getting-started.md)** — Installation, basic usage, the two-step workflow
+- **[Overview Tuning](docs/OVERVIEW_TUNING.md)** — Every generalization knob explained
+- **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API
+- **[Advanced Usage](docs/advanced-usage.md)** — Input optimization, memory, remote reads, CI/CD
+- **[Format Spec (draft)](context/OVERVIEWS_SPEC.md)** — The `geo:overviews` format contract
 
 ## Development
 
 ```bash
 git clone https://github.com/geoparquet-io/gpq-tiles.git && cd gpq-tiles
-cargo build && cargo test
+git config core.hooksPath .githooks
+cargo build && cargo check
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [DEVELOPMENT.md](DEVELOPMENT.md) for details.
 
 ## License
 
