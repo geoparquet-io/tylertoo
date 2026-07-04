@@ -38,7 +38,7 @@ Surface it exposed:
 
 The fundamental problem: **all of `simplify.rs`'s per-tile functions route
 through a tile-local pixel-space transform** (see
-`context/CARRYOVER.md` §"simplify.rs — ADAPT"), so simplification quality was
+`context/archive/CARRYOVER.md` §"simplify.rs — ADAPT"), so simplification quality was
 coupled to the tile grid and the whole per-tile approach was hard to validate or
 tune. `pipeline.rs` is described in CARRYOVER as "working but stuck … the stuck
 subsystem."
