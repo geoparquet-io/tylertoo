@@ -38,6 +38,9 @@ tippecanoe goldens come from `corpus/goldens.sh`.
 | `format_access.py` | render `access_results.json` into the RESULTS.md tables |
 | `bench_access_remote.py` | the same access benchmark over real S3 (issue #176) → `remote_access_results.json` |
 | `format_remote.py` | render `remote_access_results.json` into the RESULTS.md §2b tables + `remote_access_chart.svg` |
+| `parallel_reader.py` | purpose-built parallel range-request reader (issue #201): 1 footer fetch → stats pruning → concurrent row-group fetches |
+| `bench_parallel.py` | run `parallel_reader.py` over the same S3 artifacts/viewports, cold + footer-cached, asserting feature-count parity with the DuckDB baseline → `parallel_reader_results.json` |
+| `format_parallel.py` | render `parallel_reader_results.json` (+ the DuckDB/PMTiles baseline) into the RESULTS.md "latency floor" tables |
 | `run_conversion.sh` | conversion-cost table (overview vs tippecanoe, `/usr/bin/time -v`) |
 
 Raw/large outputs (regenerated overview parquet, per-run logs, timing
@@ -94,6 +97,21 @@ BENCH_AWS_PROFILE=<profile> \
   uv run --with pmtiles --with requests \
   python3 bench_access_remote.py
 python3 format_remote.py   # -> RESULTS.md §2b tables + chart svg
+```
+
+### Parallel-reader leg (issue #201)
+
+Same bucket/artifacts as the remote leg (also reads the
+`overviews/*.dup.report.json` objects for the zoom→level map, so no
+local corpus is needed). Requires `remote_access_results.json` (the
+DuckDB feature counts are the correctness baseline):
+
+```bash
+BENCH_BUCKET=$BUCKET BENCH_REGION=us-east-2 \
+BENCH_AWS_PROFILE=<profile> \
+  uv run --with pyarrow --with requests \
+  python3 bench_parallel.py
+python3 format_parallel.py  # -> the "latency floor" tables
 ```
 
 ## Fairness rules (enforced by the harness)

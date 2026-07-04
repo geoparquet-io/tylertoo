@@ -1,0 +1,508 @@
+{
+  "bucket": "gpq-tiles-bench",
+  "region": "us-east-2",
+  "runs": 3,
+  "pool": 16,
+  "datasets": {
+    "points-nyc-medium": {
+      "world": {
+        "zoom": 8,
+        "bbox": [
+          -74.299992,
+          40.50005907,
+          -73.69999261,
+          40.9000036
+        ],
+        "level": 8,
+        "expected_features_duckdb": 5772,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1028.4046650049277,
+          "footer_ms": 784.462341980543,
+          "fetch_ms": 239.69804600346833,
+          "decode_ms": 2.853401005268097,
+          "requests": 2,
+          "bytes": 971003,
+          "rg_selected": 1,
+          "rg_total": 116,
+          "data_ranges": 1,
+          "features": 5772,
+          "level": 8,
+          "wall_ms_max": 1168.2310659671202
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 135.93875605147332,
+          "footer_ms": 0.00023102620616555214,
+          "fetch_ms": 132.56661599734798,
+          "decode_ms": 3.3719090279191732,
+          "requests": 1,
+          "bytes": 446715,
+          "rg_selected": 1,
+          "rg_total": 116,
+          "data_ranges": 1,
+          "features": 5772,
+          "level": 8,
+          "wall_ms_max": 141.2980659515597
+        }
+      },
+      "regional": {
+        "zoom": 11,
+        "bbox": [
+          -74.07499222875,
+          40.650038268749995,
+          -73.92499238125001,
+          40.75002440125
+        ],
+        "level": 11,
+        "expected_features_duckdb": 14321,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1725.3369929967448,
+          "footer_ms": 752.7892349753529,
+          "fetch_ms": 963.9851120300591,
+          "decode_ms": 8.562645991332829,
+          "requests": 4,
+          "bytes": 4752647,
+          "rg_selected": 6,
+          "rg_total": 116,
+          "data_ranges": 3,
+          "features": 14321,
+          "level": 11,
+          "wall_ms_max": 1741.3812699960545
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 232.45076497551054,
+          "footer_ms": 0.0004409812390804291,
+          "fetch_ms": 225.87621200364083,
+          "decode_ms": 6.573982012923807,
+          "requests": 3,
+          "bytes": 4228359,
+          "rg_selected": 6,
+          "rg_total": 116,
+          "data_ranges": 3,
+          "features": 14321,
+          "level": 11,
+          "wall_ms_max": 253.1931209960021
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          -73.99000000000001,
+          40.75,
+          -73.97,
+          40.769999999999996
+        ],
+        "level": 14,
+        "expected_features_duckdb": 33865,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1723.8082279800437,
+          "footer_ms": 712.0986719965003,
+          "fetch_ms": 1002.7994210249744,
+          "decode_ms": 10.800777992699295,
+          "requests": 3,
+          "bytes": 6521284,
+          "rg_selected": 9,
+          "rg_total": 116,
+          "data_ranges": 2,
+          "features": 33865,
+          "level": 14,
+          "wall_ms_max": 1846.4993960224092
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 241.14301399094984,
+          "footer_ms": 0.0004409812390804291,
+          "fetch_ms": 228.87126804562286,
+          "decode_ms": 12.271304964087903,
+          "requests": 2,
+          "bytes": 5996996,
+          "rg_selected": 9,
+          "rg_total": 116,
+          "data_ranges": 2,
+          "features": 33865,
+          "level": 14,
+          "wall_ms_max": 249.29546797648072
+        }
+      }
+    },
+    "lines-portland-medium": {
+      "world": {
+        "zoom": 8,
+        "bbox": [
+          -122.9999916,
+          45.3000099,
+          -122.2169605,
+          45.7765525
+        ],
+        "level": 6,
+        "expected_features_duckdb": 14663,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1030.2556369570084,
+          "footer_ms": 793.0395029834472,
+          "fetch_ms": 231.8430370069109,
+          "decode_ms": 4.101871978491545,
+          "requests": 2,
+          "bytes": 1649818,
+          "rg_selected": 2,
+          "rg_total": 81,
+          "data_ranges": 1,
+          "features": 14663,
+          "level": 6,
+          "wall_ms_max": 1071.938702953048
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 138.75072600785643,
+          "footer_ms": 0.000200001522898674,
+          "fetch_ms": 134.10270301392302,
+          "decode_ms": 4.647822992410511,
+          "requests": 1,
+          "bytes": 1125530,
+          "rg_selected": 2,
+          "rg_total": 81,
+          "data_ranges": 1,
+          "features": 14663,
+          "level": 6,
+          "wall_ms_max": 141.67186501435935
+        }
+      },
+      "regional": {
+        "zoom": 11,
+        "bbox": [
+          -122.70635493750001,
+          45.478713375,
+          -122.5105971625,
+          45.597849025
+        ],
+        "level": 9,
+        "expected_features_duckdb": 9261,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1750.6822120049037,
+          "footer_ms": 748.7790650338866,
+          "fetch_ms": 995.7366059534252,
+          "decode_ms": 5.942721967585385,
+          "requests": 3,
+          "bytes": 3961046,
+          "rg_selected": 5,
+          "rg_total": 81,
+          "data_ranges": 2,
+          "features": 9261,
+          "level": 9,
+          "wall_ms_max": 1754.8623149632476
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 252.3940249811858,
+          "footer_ms": 0.0001100124791264534,
+          "fetch_ms": 245.0473009957932,
+          "decode_ms": 6.956494995392859,
+          "requests": 2,
+          "bytes": 3436758,
+          "rg_selected": 5,
+          "rg_total": 81,
+          "data_ranges": 2,
+          "features": 9261,
+          "level": 9,
+          "wall_ms_max": 273.65899796132
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          -122.69000000000001,
+          45.510000000000005,
+          -122.67,
+          45.53
+        ],
+        "level": 12,
+        "expected_features_duckdb": 3701,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1808.6647019954398,
+          "footer_ms": 741.5176620124839,
+          "fetch_ms": 1073.1079410179518,
+          "decode_ms": 10.797562019433826,
+          "requests": 3,
+          "bytes": 6220369,
+          "rg_selected": 5,
+          "rg_total": 81,
+          "data_ranges": 2,
+          "features": 3701,
+          "level": 12,
+          "wall_ms_max": 1897.2641070140526
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 268.18298402940854,
+          "footer_ms": 0.00019004801288247108,
+          "fetch_ms": 257.597908959724,
+          "decode_ms": 10.066947026643902,
+          "requests": 2,
+          "bytes": 5696081,
+          "rg_selected": 5,
+          "rg_total": 81,
+          "data_ranges": 2,
+          "features": 3701,
+          "level": 12,
+          "wall_ms_max": 1364.7251780494116
+        }
+      }
+    },
+    "polygons-portland-medium": {
+      "world": {
+        "zoom": 8,
+        "bbox": [
+          -122.9999994,
+          45.3000049,
+          -122.2996302,
+          45.7002644
+        ],
+        "level": 0,
+        "expected_features_duckdb": 15,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 871.531275974121,
+          "footer_ms": 744.7570749791339,
+          "fetch_ms": 127.21249996684492,
+          "decode_ms": 1.6469380352646112,
+          "requests": 2,
+          "bytes": 526865,
+          "rg_selected": 1,
+          "rg_total": 148,
+          "data_ranges": 1,
+          "features": 15,
+          "level": 0,
+          "wall_ms_max": 986.478581035044
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 131.0962660354562,
+          "footer_ms": 0.0001600128598511219,
+          "fetch_ms": 129.3953790445812,
+          "decode_ms": 1.7628039931878448,
+          "requests": 1,
+          "bytes": 2577,
+          "rg_selected": 1,
+          "rg_total": 148,
+          "data_ranges": 1,
+          "features": 15,
+          "level": 0,
+          "wall_ms_max": 136.58688397845253
+        }
+      },
+      "regional": {
+        "zoom": 11,
+        "bbox": [
+          -122.73736095,
+          45.4501022125,
+          -122.56226865000001,
+          45.5501670875
+        ],
+        "level": 3,
+        "expected_features_duckdb": 2026,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 944.156447018031,
+          "footer_ms": 706.0500519583002,
+          "fetch_ms": 228.97633002139628,
+          "decode_ms": 4.344264976680279,
+          "requests": 2,
+          "bytes": 2126182,
+          "rg_selected": 2,
+          "rg_total": 148,
+          "data_ranges": 1,
+          "features": 2026,
+          "level": 3,
+          "wall_ms_max": 1027.088405971881
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 139.93788498919457,
+          "footer_ms": 0.0005509937182068825,
+          "fetch_ms": 134.80911299120635,
+          "decode_ms": 5.222206003963947,
+          "requests": 1,
+          "bytes": 1601894,
+          "rg_selected": 2,
+          "rg_total": 148,
+          "data_ranges": 1,
+          "features": 2026,
+          "level": 3,
+          "wall_ms_max": 144.39126598881558
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          -122.65,
+          45.550000000000004,
+          -122.63,
+          45.57
+        ],
+        "level": 6,
+        "expected_features_duckdb": 7219,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1781.3632260076702,
+          "footer_ms": 711.6029750322923,
+          "fetch_ms": 1052.1197689813562,
+          "decode_ms": 15.484347997698933,
+          "requests": 5,
+          "bytes": 8140253,
+          "rg_selected": 6,
+          "rg_total": 148,
+          "data_ranges": 4,
+          "features": 7219,
+          "level": 6,
+          "wall_ms_max": 1804.4875349733047
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 281.9264429854229,
+          "footer_ms": 0.00019097933545708656,
+          "fetch_ms": 269.0342469722964,
+          "decode_ms": 13.72209598775953,
+          "requests": 4,
+          "bytes": 7615965,
+          "rg_selected": 6,
+          "rg_total": 148,
+          "data_ranges": 4,
+          "features": 7219,
+          "level": 6,
+          "wall_ms_max": 4195.645515981596
+        }
+      }
+    },
+    "polygons-ftw-moldova-large": {
+      "world": {
+        "zoom": 6,
+        "bbox": [
+          26.592531983585204,
+          45.4719002653674,
+          30.15892038332341,
+          48.4902285248874
+        ],
+        "level": 3,
+        "expected_features_duckdb": 7804,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1398.0274139903486,
+          "footer_ms": 743.4681989834644,
+          "fetch_ms": 557.1263019810431,
+          "decode_ms": 97.43291302584112,
+          "requests": 2,
+          "bytes": 9065576,
+          "rg_selected": 1,
+          "rg_total": 167,
+          "data_ranges": 1,
+          "features": 7804,
+          "level": 3,
+          "wall_ms_max": 1438.022746995557
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 453.00892600789666,
+          "footer_ms": 0.0006409827619791031,
+          "fetch_ms": 351.30902199307457,
+          "decode_ms": 89.9305060156621,
+          "requests": 1,
+          "bytes": 8541288,
+          "rg_selected": 1,
+          "rg_total": 167,
+          "data_ranges": 1,
+          "features": 7804,
+          "level": 3,
+          "wall_ms_max": 455.1308649824932
+        }
+      },
+      "regional": {
+        "zoom": 9,
+        "bbox": [
+          27.92992763348703,
+          46.603773362687406,
+          28.82152473342158,
+          47.3583554275674
+        ],
+        "level": 6,
+        "expected_features_duckdb": 8008,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 2531.874473032076,
+          "footer_ms": 739.5713820005767,
+          "fetch_ms": 1544.8589269653894,
+          "decode_ms": 207.373765995726,
+          "requests": 3,
+          "bytes": 22061870,
+          "rg_selected": 5,
+          "rg_total": 167,
+          "data_ranges": 2,
+          "features": 8008,
+          "level": 6,
+          "wall_ms_max": 2543.3863410144113
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 911.058546975255,
+          "footer_ms": 0.0008709612302482128,
+          "fetch_ms": 705.7686840416864,
+          "decode_ms": 192.50984804239124,
+          "requests": 2,
+          "bytes": 21537582,
+          "rg_selected": 5,
+          "rg_total": 167,
+          "data_ranges": 2,
+          "features": 8008,
+          "level": 6,
+          "wall_ms_max": 923.766975000035
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "bbox": [
+          28.11,
+          47.150000000000006,
+          28.130000000000003,
+          47.17
+        ],
+        "level": 11,
+        "expected_features_duckdb": 1527,
+        "cold": {
+          "mode": "cold",
+          "wall_ms": 1798.8639469840564,
+          "footer_ms": 731.8295059958473,
+          "fetch_ms": 1018.940445035696,
+          "decode_ms": 47.016011958476156,
+          "requests": 3,
+          "bytes": 7065247,
+          "rg_selected": 5,
+          "rg_total": 167,
+          "data_ranges": 2,
+          "features": 1527,
+          "level": 11,
+          "wall_ms_max": 1853.9454540004954
+        },
+        "footer_cached": {
+          "mode": "footer_cached",
+          "wall_ms": 313.4887259802781,
+          "footer_ms": 0.00029098009690642357,
+          "fetch_ms": 251.3115870533511,
+          "decode_ms": 48.207246989477426,
+          "requests": 2,
+          "bytes": 6540959,
+          "rg_selected": 5,
+          "rg_total": 167,
+          "data_ranges": 2,
+          "features": 1527,
+          "level": 11,
+          "wall_ms_max": 316.1800089874305
+        }
+      }
+    }
+  }
+}
