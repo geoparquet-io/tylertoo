@@ -1,4 +1,80 @@
-# Reading Overviews from Object Storage with DuckDB
+# Remote Reads
+
+Two independent capabilities live on this page:
+
+1. [**Converting directly from remote GeoParquet**](#converting-directly-from-remote-geoparquet)
+   — `gpq-tiles overview s3://bucket/file.parquet out.parquet` (native,
+   issue #210).
+2. [**Querying overview files in place with DuckDB**](#reading-overviews-from-object-storage-with-duckdb)
+   — the client-side recipe for files you have already published.
+
+## Converting directly from remote GeoParquet
+
+The `overview` and `tiles` subcommands (and the Python `overview()` /
+`convert()` functions) accept `s3://`, `https://`, `http://`, and
+`gs://` URLs as the *input* path. The converter reads the object with
+HTTP byte-range requests through the same synchronous parquet pipeline
+used for local files: footer first, then each column chunk of each row
+group it actually needs. Nothing is staged to disk.
+
+```bash
+# Full remote conversion
+gpq-tiles overview s3://bucket/country.parquet overviews.parquet
+
+# The headline: a regional extract composing with --bbox row-group
+# pruning (#102) — pruned row groups are NEVER downloaded.
+gpq-tiles overview s3://bucket/country.parquet city.parquet \
+    --bbox 28.75,46.95,28.95,47.10
+```
+
+Measured on the bench bucket (`us-east-2`, residential link): a
+Chisinau extract from the 92 MB Moldova polygons file (20k-row row
+groups) reads **5/31 row groups, 16.6 MiB = 17.9 % of the object** in
+~9 s; a neighborhood extract from the 28 MB NYC points file reads
+**3/23 row groups, 3.7 MiB = 12.9 %** in ~4 s — without ever
+downloading either file.
+Every conversion from a remote input logs (and reports, in the JSON
+report's `remote_fetch` field) the request count and bytes moved.
+
+What to know:
+
+- **Auth (S3)** — the standard AWS credential chain, same as DuckDB's
+  `credential_chain` provider and gpio: env keys, `AWS_PROFILE` /
+  shared config, SSO, IMDS. If the chain resolves nothing, requests
+  fall back to *unsigned*, so public buckets work with no setup. Set
+  the region explicitly (`AWS_REGION=us-east-2`): with no region in
+  env or profile the conversion fails fast with a hint, and a wrong
+  region costs a redirect round trip per request.
+- **Plain HTTPS** — anonymous; any server that honors `Range` works
+  (public S3/GCS URLs, GitHub release assets, ...).
+- **`--bbox` + row groups** — savings are bounded by the input's
+  row-group granularity and spatial ordering. A gpio-optimized input
+  (`gpio sort hilbert --add-bbox`, modest `--row-group-size`) is what
+  makes the few-percent extract real; a file with 4 giant row groups
+  cannot be pruned finer than quarters.
+- **Fetch behavior** — one range request per selected column chunk
+  (the page reader's many small reads are served from a whole-chunk
+  buffer), plus the footer. The parsed footer and up to 256 MiB of
+  fetched chunks are cached per conversion, so the streaming
+  pipeline's per-pass/per-level re-reads are refetch-free while the
+  selected data fits that cache (measured: the default streaming
+  pipeline and `--no-streaming` move identical bytes on a city
+  extract). Only when a conversion's *selected* data exceeds 256 MiB
+  does streaming mode re-fetch evicted chunks on later passes —
+  for a huge full-file remote conversion, consider downloading first.
+- **Latency vs bytes** — requests are issued sequentially, so on a
+  fast link a plain `aws s3 cp` + local convert can still win on wall
+  time (92 MB corpus file, residential fiber: ~3 s download+convert
+  vs ~9 s remote-direct). Remote-direct wins on bytes moved (5.6×
+  less on that extract), on slow/metered links, and whenever you
+  don't want the full file on disk.
+- **Remote output is out of scope** — write locally, then
+  `aws s3 cp`.
+- Rust builds: remote input lives behind the `remote` cargo feature of
+  `gpq-tiles-core` (off by default for the bare library; the CLI and
+  Python builds enable it).
+
+## Reading Overviews from Object Storage with DuckDB
 
 Overview GeoParquet is designed to be queried in place over HTTP range
 requests: a viewport query touches **0.14–6.5 % of the file**, whatever
@@ -15,7 +91,7 @@ viewports, and harness as the §2b baseline; raw data in
 [`benchmarks/overview/duckdb_knobs_results.json`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/duckdb_knobs_results.json),
 harness `bench_duckdb_knobs.py`).
 
-## One-time setup
+### One-time setup
 
 ```sql
 INSTALL httpfs;
@@ -35,7 +111,7 @@ Public buckets / plain HTTPS need no secret at all —
 matters: with the wrong (or defaulted) region every request can pay an
 extra 301-redirect round trip.
 
-## Recommended session settings
+### Recommended session settings
 
 ```sql
 SET enable_http_metadata_cache = true;  -- cache HEAD results across queries
@@ -47,7 +123,7 @@ SET parquet_metadata_cache = true;      -- cache parsed parquet footers
 
 That is the whole recipe. The rest of this section is the evidence.
 
-### What each knob measurably did
+#### What each knob measurably did
 
 Sweep: two datasets (79 MB points, 343 MB polygons), three viewports
 each (world/regional/street), cold = fresh process, 3-run medians.
@@ -70,7 +146,7 @@ you is the *session*: metadata caches plus the (default-on) external
 file cache turn repeat and overlapping viewports from seconds into
 milliseconds.
 
-### Cold vs warm-session behavior
+#### Cold vs warm-session behavior
 
 What to expect, using the 343 MB polygons file as the example
 (medians; the small file behaves the same, scaled down):
@@ -100,7 +176,7 @@ format supports it: a purpose-built reader gets footer-cached pans of
 130–300 ms (see the latency-floor section of `RESULTS.md` §2b and
 `benchmarks/overview/parallel_reader.py`).
 
-## The viewport query (read protocol)
+### The viewport query (read protocol)
 
 An overview file is plain GeoParquet plus a `level` column and a
 `geo:overviews` footer key. The whole read protocol is: pick a level,

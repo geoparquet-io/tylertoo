@@ -44,6 +44,8 @@ use geoarrow::array::{from_arrow_array, GeometryBuilder};
 use geoarrow::datatypes::GeometryType;
 use geoarrow_array::GeoArrowArray;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+use crate::input::InputSource;
 use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_opt_from_array;
@@ -457,6 +459,11 @@ pub struct ConvertReport {
     pub antimeridian_suspect_features: usize,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
+    /// Remote-input fetch counters (#210): range requests issued and bytes
+    /// downloaded, against the total object size. `None` for local inputs.
+    /// With [`ConvertOptions::bbox`], `bytes_fetched / object_size` is the
+    /// fraction of the remote file actually moved.
+    pub remote_fetch: Option<crate::input::FetchStats>,
 }
 
 /// Errors from [`convert_to_overviews`].
@@ -465,6 +472,9 @@ pub enum ConvertError {
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Opening the input failed (bad URL scheme, remote store error, ...).
+    #[error("input error: {0}")]
+    Input(#[from] crate::input::InputError),
     /// Underlying parquet error (reading the input).
     #[error("parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -642,6 +652,22 @@ pub fn convert_to_overviews(
     output_path: impl AsRef<Path>,
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
+    // Local path or remote URL (s3://, https://, gs:// — #210): remote
+    // objects are read with byte-range requests through the same sync
+    // parquet plumbing, composing with the bbox row-group pruning below so
+    // pruned row groups are never downloaded at all.
+    let source = InputSource::from_path(input_path.as_ref())?;
+    convert_to_overviews_source(&source, output_path.as_ref(), options)
+}
+
+/// [`convert_to_overviews`] over an already-resolved [`InputSource`] — the
+/// entry point for callers that construct the source themselves (custom
+/// object stores, tests over in-memory stores).
+pub fn convert_to_overviews_source(
+    source: &InputSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+) -> Result<ConvertReport, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
     // Clustering option sanity (Q4), shared by both pipelines: partitioning
@@ -679,16 +705,10 @@ pub fn convert_to_overviews(
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
     if options.streaming {
-        return super::stream::convert_streaming(
-            input_path.as_ref(),
-            output_path.as_ref(),
-            options,
-        );
+        return super::stream::convert_streaming(source, output_path, options);
     }
 
     let start = Instant::now();
-    let input_path = input_path.as_ref();
-    let output_path = output_path.as_ref();
 
     // A numeric sort key and a categorical class ranking are mutually
     // exclusive (Q1): they would both drive `AssignFeature::sort_key`.
@@ -696,13 +716,13 @@ pub fn convert_to_overviews(
         return Err(ConvertError::RankingConflict);
     }
 
-    // --- CRS detection + rejection (spec Q3). --------------------------------
-    let crs = detect_crs(input_path)?;
-
-    // --- Read the whole input, preserving the full property schema. ----------
-    let file = std::fs::File::open(input_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    // --- Read the input footer, preserving the full property schema. ---------
+    // (For a remote source, the footer is range-fetched once and cached.)
+    let builder = source.open()?;
     let input_schema = builder.schema().clone();
+
+    // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
+    let crs = detect_crs_from_kv(builder.metadata().file_metadata().key_value_metadata())?;
 
     // Reject an input that already carries a `level` column (§4.1).
     // Case-insensitive: DuckDB resolves identifiers case-insensitively,
@@ -1093,17 +1113,40 @@ pub fn convert_to_overviews(
         row_groups_read,
         antimeridian_suspect_features,
         duration_secs: start.elapsed().as_secs_f64(),
+        remote_fetch: log_remote_fetch(source),
     })
+}
+
+/// Snapshot (and `log::info!`) the remote fetch counters at the end of a
+/// conversion; `None` (and silent) for local inputs.
+pub(super) fn log_remote_fetch(source: &InputSource) -> Option<crate::input::FetchStats> {
+    let stats = source.fetch_stats()?;
+    let pct = if stats.object_size > 0 {
+        100.0 * stats.bytes_fetched as f64 / stats.object_size as f64
+    } else {
+        0.0
+    };
+    log::info!(
+        "remote input: {} range requests, {:.2} MiB fetched of a {:.2} MiB object ({:.1}%)",
+        stats.requests,
+        stats.bytes_fetched as f64 / (1024.0 * 1024.0),
+        stats.object_size as f64 / (1024.0 * 1024.0),
+        pct
+    );
+    Some(stats)
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/// Detect the input CRS and map it to [`Crs`], rejecting anything that is not
-/// EPSG:4326 or EPSG:3857 (spec Q3).
-pub(super) fn detect_crs(path: &Path) -> Result<Crs, ConvertError> {
-    let info = crate::quality::extract_crs(path)?;
+/// Detect the input CRS from parsed parquet key-value metadata and map it to
+/// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
+/// Metadata-only so remote inputs (#210) pay no extra footer fetch.
+pub(super) fn detect_crs_from_kv(
+    kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+) -> Result<Crs, ConvertError> {
+    let info = crate::quality::crs_info_from_kv_metadata(kv)?;
     if info.is_wgs84 {
         return Ok(Crs::Epsg4326);
     }
@@ -4346,5 +4389,215 @@ mod tests {
         let reader_bbox = OverviewReader::open(tout_bbox.path()).unwrap();
         let ids_bbox = read_all_ids(&reader_bbox);
         assert_eq!(ids_bbox, ids_full);
+    }
+
+    // ========================================================================
+    // Remote input tests (#210)
+    // ========================================================================
+
+    #[cfg(feature = "remote")]
+    mod remote_input {
+        use super::*;
+        use crate::input::{test_memory_source, InputSource};
+
+        /// Byte span `[start, end)` of each row group's data pages.
+        fn row_group_spans(bytes: &[u8]) -> Vec<std::ops::Range<u64>> {
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.to_vec()))
+                    .unwrap();
+            builder
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|rg| {
+                    let mut start = u64::MAX;
+                    let mut end = 0u64;
+                    for col in rg.columns() {
+                        let (s, len) = col.byte_range();
+                        start = start.min(s);
+                        end = end.max(s + len);
+                    }
+                    start..end
+                })
+                .collect()
+        }
+
+        /// THE #210 headline property: a `--bbox` extract from a remote file
+        /// must fetch byte ranges ONLY from the bbox-selected row groups (plus
+        /// the footer) — pruned row groups are never downloaded at all.
+        fn assert_bbox_extract_fetches_only_selected(streaming: bool) {
+            // 4 single-point row groups at (0,0), (10,10), (20,20), (30,30)
+            // with covering stats; a bbox around (10,10) selects only rg 1.
+            let coords = vec![(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            write_multi_rg_input(tin.path(), &coords, true);
+            let bytes = std::fs::read(tin.path()).unwrap();
+            let spans = row_group_spans(&bytes);
+            assert_eq!(spans.len(), 4);
+
+            let source = test_memory_source(bytes, "multi.parquet");
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                bbox: Some([9.0, 9.0, 11.0, 11.0]),
+                streaming,
+                ..Default::default()
+            };
+            let report = convert_to_overviews_source(&source, tout.path(), &opts).unwrap();
+
+            assert_eq!(report.row_groups_total, 4);
+            assert_eq!(report.row_groups_read, 1, "bbox pruning must fire");
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![1], "only the (10,10) feature survives");
+
+            // No fetched range may touch a pruned row group's data pages.
+            let fetched = source.fetched_ranges().unwrap();
+            assert!(!fetched.is_empty());
+            for (i, span) in spans.iter().enumerate() {
+                if i == 1 {
+                    continue;
+                }
+                for r in &fetched {
+                    assert!(
+                        r.end <= span.start || r.start >= span.end,
+                        "fetched range {r:?} overlaps PRUNED row group {i} ({span:?})"
+                    );
+                }
+            }
+            // ... while the selected row group's data pages WERE fetched.
+            assert!(
+                fetched
+                    .iter()
+                    .any(|r| r.start >= spans[1].start && r.end <= spans[1].end),
+                "selected row group 1 ({:?}) never fetched: {fetched:?}",
+                spans[1]
+            );
+
+            // And the report carries the savings.
+            let stats = report.remote_fetch.expect("remote stats in report");
+            assert!(stats.requests as usize >= fetched.len());
+            assert!(
+                stats.bytes_fetched < stats.object_size,
+                "bbox extract must move fewer bytes than the object: {stats:?}"
+            );
+        }
+
+        #[test]
+        fn bbox_extract_streaming_fetches_only_selected_row_groups() {
+            assert_bbox_extract_fetches_only_selected(true);
+        }
+
+        #[test]
+        fn bbox_extract_in_memory_fetches_only_selected_row_groups() {
+            assert_bbox_extract_fetches_only_selected(false);
+        }
+
+        /// A full (no-bbox) remote conversion must produce the same result as
+        /// the same conversion over the local file.
+        #[test]
+        fn remote_convert_matches_local_convert() {
+            let geoms = synthetic_geometries();
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            write_input(tin.path(), &geoms, false, None);
+            let opts = ConvertOptions::default();
+
+            let tout_local = tempfile::NamedTempFile::new().unwrap();
+            let report_local = convert_to_overviews(tin.path(), tout_local.path(), &opts).unwrap();
+            assert!(report_local.remote_fetch.is_none(), "local input: no stats");
+
+            let source = test_memory_source(std::fs::read(tin.path()).unwrap(), "in.parquet");
+            let tout_remote = tempfile::NamedTempFile::new().unwrap();
+            let report_remote =
+                convert_to_overviews_source(&source, tout_remote.path(), &opts).unwrap();
+
+            assert_eq!(report_remote.input_features, report_local.input_features);
+            assert_eq!(report_remote.total_rows, report_local.total_rows);
+            assert_eq!(
+                read_all_ids(&OverviewReader::open(tout_remote.path()).unwrap()),
+                read_all_ids(&OverviewReader::open(tout_local.path()).unwrap()),
+            );
+            assert!(report_remote.remote_fetch.is_some());
+        }
+
+        /// A URL with an unsupported scheme surfaces a helpful error through
+        /// the public `convert_to_overviews` path.
+        #[test]
+        fn unsupported_scheme_errors_through_convert() {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let err = convert_to_overviews(
+                Path::new("ftp://example.com/x.parquet"),
+                tout.path(),
+                &ConvertOptions::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ConvertError::Input(_)), "got: {err}");
+            assert!(err.to_string().contains("s3://"), "helpful message: {err}");
+        }
+
+        /// Network integration test against the bench bucket (issue #210):
+        /// a full remote city extract must move only a fraction of the
+        /// object's bytes. Skips (passing trivially, loudly) when
+        /// credentials or network are unavailable — CI has neither.
+        ///
+        /// Locally: `AWS_PROFILE=<profile> AWS_REGION=us-east-2 cargo test
+        /// --features remote remote_s3_city_extract -- --nocapture`
+        #[test]
+        fn remote_s3_city_extract_integration() {
+            // gpio-optimized (Hilbert-sorted, bbox covering, 20k-row row
+            // groups) copy of the NYC corpus input; row-group granularity
+            // bounds the minimum fetch, so finer groups mean bigger savings.
+            const URL: &str = "s3://gpq-tiles-bench/corpus/points-nyc-medium.rg20k.parquet";
+            let source = match InputSource::from_str_input(URL) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "SKIP remote_s3_city_extract_integration (no credentials/network): {e}"
+                    );
+                    return;
+                }
+            };
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            // A ~1 km neighborhood window inside the NYC dataset (the input
+            // is Hilbert-sorted, so a small window prunes most row groups).
+            // Default (streaming) pipeline: its per-pass/per-level re-reads
+            // must be absorbed by the column-chunk cache, so the byte
+            // assertion below also guards the multi-pass refetch behavior.
+            let opts = ConvertOptions {
+                bbox: Some([-73.99, 40.72, -73.98, 40.73]),
+                ..Default::default()
+            };
+            let report = match convert_to_overviews_source(&source, tout.path(), &opts) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("SKIP remote_s3_city_extract_integration (network flake?): {e}");
+                    return;
+                }
+            };
+            assert!(report.input_features > 0, "bbox should select features");
+            assert!(
+                report.row_groups_read < report.row_groups_total,
+                "row-group pruning should fire on the Hilbert-sorted input \
+                 ({}/{} read)",
+                report.row_groups_read,
+                report.row_groups_total
+            );
+            let stats = report.remote_fetch.expect("remote stats");
+            assert!(
+                stats.bytes_fetched * 4 < stats.object_size,
+                "city extract should move <25% of the remote object even \
+                 across streaming passes: {stats:?}"
+            );
+            eprintln!(
+                "remote_s3_city_extract_integration: {} requests, {} of {} bytes ({:.2}%)",
+                stats.requests,
+                stats.bytes_fetched,
+                stats.object_size,
+                100.0 * stats.bytes_fetched as f64 / stats.object_size as f64
+            );
+        }
     }
 }

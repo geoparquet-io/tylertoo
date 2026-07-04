@@ -13,6 +13,7 @@ Fast GeoParquet → PMTiles converter in Rust.
 - One-shot GeoParquet → PMTiles (`gpq-tiles tiles`, or the bare form)
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
 - Memory-bounded streaming conversion (632k-polygon / 38M-vertex file: ~55 s, ~320 MB peak RSS)
+- Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
 - Spec validation (`gpq-tiles validate`)
 - PMTiles → GeoParquet decoding (`gpq-tiles decode`) — tippecanoe-decode
   semantics, any PMTiles v3 MVT archive
@@ -98,7 +99,7 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 - **[Decoding PMTiles](docs/decode.md)** — PMTiles → GeoParquet, limitations included
 - **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API
 - **[Advanced Usage](docs/advanced-usage.md)** — Input optimization, memory, remote reads, CI/CD
-- **[Remote Reads](docs/remote-reads.md)** — Querying overview files on object storage with DuckDB
+- **[Remote Reads](docs/remote-reads.md)** — Converting directly from s3://, https://, gs:// inputs, and querying overview files in place with DuckDB
 - **[Format Spec (draft)](context/OVERVIEWS_SPEC.md)** — The `geo:overviews` format contract
 
 ## Development

@@ -178,7 +178,10 @@ struct ExportPmtilesArgs {
 /// Arguments for `gpq-tiles overview`.
 #[derive(Parser, Debug)]
 struct OverviewArgs {
-    /// Input GeoParquet file (EPSG:4326 or EPSG:3857).
+    /// Input GeoParquet file (EPSG:4326 or EPSG:3857): a local path or a
+    /// remote URL (s3://, https://, gs://). Remote inputs are read with
+    /// byte-range requests; with --bbox, only the matching row groups are
+    /// ever downloaded.
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -533,7 +536,9 @@ struct ValidateArgs {
 /// to run was removed (see issue #177).
 #[derive(Parser, Debug)]
 struct TilesArgs {
-    /// Input GeoParquet file (EPSG:4326 or EPSG:3857).
+    /// Input GeoParquet file (EPSG:4326 or EPSG:3857): a local path or a
+    /// remote URL (s3://, https://, gs://); remote inputs are read with
+    /// byte-range requests.
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -1007,10 +1012,27 @@ fn run_validate(args: ValidateArgs) -> Result<()> {
     }
 }
 
+/// Remote (URL) inputs are supported only where the converter reads them
+/// (`overview`, `tiles`); give the other subcommands a helpful error
+/// instead of a confusing `No such file or directory`.
+fn reject_remote_input(input: &std::path::Path, subcommand: &str) -> Result<()> {
+    if input.to_str().is_some_and(|s| s.contains("://")) {
+        anyhow::bail!(
+            "`gpq-tiles {subcommand}` does not support remote inputs (got {}); \
+             remote URLs (s3://, https://, gs://) are supported by the `overview` \
+             and `tiles` subcommands — download the file first (e.g. `aws s3 cp`)",
+            input.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    reject_remote_input(&args.input, "export-pmtiles")?;
 
     let opts = ExportOptions {
         layer_name: args.layer_name,
@@ -1069,6 +1091,8 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
     use gpq_tiles_core::decode::{decode_pmtiles, DecodeOptions};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    reject_remote_input(&args.input, "decode")?;
 
     // `--zoom N` is shorthand for `--min-zoom N --max-zoom N` (clap already
     // rejects combining them).

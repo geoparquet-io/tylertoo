@@ -15,6 +15,17 @@ categories.workspace = true
 [features]
 default = []
 dhat-heap = ["dhat"]
+# Remote input support: read GeoParquet directly from s3://, https://,
+# and gs:// URLs via range requests (issue #210). Off by default to keep
+# the pure-local library build dependency-light; the CLI enables it.
+remote = [
+    "dep:object_store",
+    "dep:tokio",
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:async-trait",
+    "dep:url",
+]
 
 [dependencies]
 dhat = { version = "0.3", optional = true }
@@ -41,6 +52,13 @@ serde = { workspace = true }
 serde_json = "1"
 i_overlay = "7"
 tempfile = "3"
+object_store = { version = "0.12", features = ["aws", "gcp", "http"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
+aws-config = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+async-trait = { version = "0.1", optional = true }
+url = { version = "2", optional = true }
+bytes = "1"
 
 [build-dependencies]
 prost-build = { workspace = true }

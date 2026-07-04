@@ -26,6 +26,19 @@ needs_roads = pytest.mark.skipif(
 )
 
 
+class TestRemoteInput:
+    """Remote-URL input handling (#210) — no network needed."""
+
+    def test_unsupported_scheme_is_helpful_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "o.parquet"
+            with pytest.raises(RuntimeError, match="s3://"):
+                gpq_tiles.overview("ftp://example.com/x.parquet", str(out))
+
+    def test_docstring_mentions_remote_urls(self):
+        assert "s3://" in gpq_tiles.overview.__doc__
+
+
 class TestOverviewApi:
     """API-surface tests for overview() (no fixture needed)."""
 
@@ -182,6 +195,8 @@ class TestOverviewIntegration:
             assert report["input_features"] > 0
             assert report["total_rows"] >= report["input_features"]
             assert report["duration_secs"] > 0
+            # Local inputs carry no remote fetch counters (#210).
+            assert report["remote_fetch"] is None
             # z0..z6 requested; coarse levels where every (tiny) building falls
             # below the visibility gate are omitted, so <= 7 levels survive and
             # the canonical (finest) one is always z6 with every input feature.
