@@ -126,9 +126,12 @@ SELECT * FROM read_parquet('overviews.parquet')
 WHERE level = (SELECT max(level) FROM read_parquet('overviews.parquet'));
 ```
 
-The format contract is `context/OVERVIEWS_SPEC.md`; a dedicated
-consumption guide (DuckDB recipes, GeoPandas, browser demo) is tracked
-in [#175](https://github.com/geoparquet-io/gpq-tiles/issues/175).
+The format contract is `context/OVERVIEWS_SPEC.md`. For querying
+overview files directly on object storage — the DuckDB secret setup,
+recommended session settings, and the level+bbox viewport query — see
+[Remote Reads](remote-reads.md). The broader consumption guide
+(GeoPandas, browser demo) is tracked in
+[#175](https://github.com/geoparquet-io/gpq-tiles/issues/175).
 
 ## Export Details
 

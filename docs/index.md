@@ -44,6 +44,7 @@ export_pmtiles("overviews.parquet", "output.pmtiles")
 - [Overview Tuning](OVERVIEW_TUNING.md) — Every generalization knob explained
 - [API Reference](api-reference.md) — CLI flags, Python API, Rust API
 - [Advanced Usage](advanced-usage.md) — Input optimization, memory, export
+- [Remote Reads](remote-reads.md) — Querying overview files on object storage with DuckDB
 - [Architecture](architecture.md) — Design decisions and internals
 
 ## License

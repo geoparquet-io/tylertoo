@@ -41,6 +41,8 @@ tippecanoe goldens come from `corpus/goldens.sh`.
 | `parallel_reader.py` | purpose-built parallel range-request reader (issue #201): 1 footer fetch → stats pruning → concurrent row-group fetches |
 | `bench_parallel.py` | run `parallel_reader.py` over the same S3 artifacts/viewports, cold + footer-cached, asserting feature-count parity with the DuckDB baseline → `parallel_reader_results.json` |
 | `format_parallel.py` | render `parallel_reader_results.json` (+ the DuckDB/PMTiles baseline) into the RESULTS.md "latency floor" tables |
+| `bench_duckdb_knobs.py` | DuckDB httpfs client-knob sweep on the overview path (issue #203): per-knob cold configs + session (repeat / adjacent-pan) behavior → `duckdb_knobs_results.json` |
+| `format_duckdb_knobs.py` | render `duckdb_knobs_results.json` into the RESULTS.md §2b knob-sweep tables |
 | `run_conversion.sh` | conversion-cost table (overview vs tippecanoe, `/usr/bin/time -v`) |
 
 Raw/large outputs (regenerated overview parquet, per-run logs, timing
@@ -113,6 +115,23 @@ BENCH_AWS_PROFILE=<profile> \
   python3 bench_parallel.py
 python3 format_parallel.py  # -> the "latency floor" tables
 ```
+
+### DuckDB knob-sweep leg (issue #203)
+
+Same bucket/artifacts as the remote leg; stdlib-only (drives the
+`duckdb` CLI). Sweeps client configs (defaults, each candidate knob
+individually, the recommended stack) plus two session configs
+(the #200 symmetric config vs the real-user cache-on config) over
+the two knob-sweep datasets:
+
+```bash
+BENCH_BUCKET=$BUCKET BENCH_REGION=us-east-2 \
+BENCH_AWS_PROFILE=<profile> \
+  python3 bench_duckdb_knobs.py
+python3 format_duckdb_knobs.py  # -> the §2b knob-sweep tables
+```
+
+The resulting recipe is documented in `docs/remote-reads.md`.
 
 ## Fairness rules (enforced by the harness)
 

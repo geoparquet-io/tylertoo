@@ -98,6 +98,7 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 - **[Decoding PMTiles](docs/decode.md)** — PMTiles → GeoParquet, limitations included
 - **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API
 - **[Advanced Usage](docs/advanced-usage.md)** — Input optimization, memory, remote reads, CI/CD
+- **[Remote Reads](docs/remote-reads.md)** — Querying overview files on object storage with DuckDB
 - **[Format Spec (draft)](context/OVERVIEWS_SPEC.md)** — The `geo:overviews` format contract
 
 ## Development
