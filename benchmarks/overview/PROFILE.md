@@ -78,3 +78,89 @@ Full pipeline (GeoParquet → overview file → PMTiles) < 2 min.
   archived `EXPORT_NOTES.md`.
 - `--tile-size-limit` is a single non-iterative drop pass per
   oversized tile — a backstop, not the sizing mechanism.
+
+## Big-file tier (2026-07-04)
+
+Pre-release validation on real multi-GB inputs (maintainer request;
+complements the #179 release-readiness pass). Binary: release build at
+`319d147`; 16-core AMD Ryzen 7040 laptop, 54 GiB RAM. Data lives in
+`corpus/data/bigbench/` (gitignored; provenance in
+`bigbench-manifest.json` there, raw + optimized copies alongside).
+
+### Datasets + gpio optimization
+
+Optimized with the local dev geoparquet-io checkout (gpio 1.3.0 @
+`9b37138`): `gpio sort hilbert <raw> <opt> --add-bbox
+--geoparquet-version 1.1 --compression zstd --overwrite`, wrapped in
+`/usr/bin/time -v`. Overture extracts via DuckDB v1.4.1
+(httpfs+spatial, `COPY ... (FORMAT PARQUET, COMPRESSION ZSTD)`,
+`preserve_insertion_order=false`), release `2026-06-17.0`, Germany
+bbox `[5.87, 47.27, 15.04, 55.06]`.
+
+| dataset | source | rows | raw | gpio | sort wall | sort RSS |
+|---|---|---:|---:|---:|---:|---:|
+| fieldmaps-adm4 | data.fieldmaps.io edge-matched humanitarian ADM0–4 (MultiPolygon) | 363,783 | 3.22 GiB | 2.70 GiB | 47.2 s | 8.6 GiB |
+| overture-germany-buildings | Overture buildings/building (polygons) | 59,032,924 | 5.09 GiB | 6.51 GiB | 3:22.6 | 18.1 GiB |
+| overture-germany-segments | Overture transportation/segment (lines) | 19,243,535 | 1.96 GiB | 2.38 GiB | 1:21.6 | 5.8 GiB |
+
+### Conversion results (`gpq-tiles overview`, default knobs, z0–14)
+
+DNFs are results, not gaps — see findings.
+
+| dataset / mode | wall | peak RSS | CPU | output |
+|---|---:|---:|---:|---:|
+| fieldmaps-adm4, duplicating | **DNF** (>45 min, killed) | — | ~184 % | 1.21 GiB partial |
+| fieldmaps-adm4, partitioning | **2:57.3** | 1.55 GiB | 99 % | 2.92 GiB, 363,783 rows / 15 levels |
+| fieldmaps-adm4 partitioning → `export-pmtiles` | **DNF** (killed at 3 h 13 m wall / 7 h 29 m CPU, 231 %) | — | — | nothing written |
+| fieldmaps-adm4, `gpio pmtiles create` (tippecanoe, keep-everything defaults) | **DNF** (killed at 1:26:08) | 6.0 GiB | 347 % | 15.07 GB partial from a 2.9 GB input |
+| fieldmaps-adm4, `gpio pmtiles create --tile-size-limit` (tippecanoe native triage) | not measured (launched, stopped at ~2 min by decision; rerunnable) | — | — | — |
+| germany-segments, duplicating (run 1) | 3:09.1 | 8.64 GiB | 129 % | 4.80 GiB, 48.4 M rows / 15 levels |
+| germany-segments, duplicating (run 2) | **3:08.1** | 8.64 GiB | 130 % | (same) |
+| germany-buildings, duplicating | **FAILED** at 1:16.5 | 10.5 GiB | 97 % | `level 0 is empty` → #211 |
+
+### Findings
+
+1. **The success bar is parity with tippecanoe minus the GeoJSON
+   detour — and on vertex-heavy global polygons, *every* tool DNF'd
+   in lossless mode.** fieldmaps adm4 carries 261 M vertices in 364 k
+   features (~7× the Moldova stress case). Our duplicating convert
+   exceeded 45 min; our export ran 3 h+ without emitting a tile;
+   tippecanoe with keep-everything flags was killed at 1 h 26 m with
+   a 15 GB partial archive from a 2.9 GB input. Lossless tiling of
+   this class of data is ill-posed for every tool tested. The
+   conclusion (tracked in #212): triage must happen once per level at
+   convert time, not per tile at export time.
+2. **The overview GeoParquet artifact is the product story.**
+   Partitioning-mode convert was the only thing any pipeline produced
+   quickly on fieldmaps: 2.92 GiB, 15 levels, in **2:57 at 1.55 GiB
+   RSS** — a queryable multi-resolution artifact while every
+   tile-materializing path DNF'd.
+3. **Germany segments is the clean win: 19.2 M lines (2.38 GiB) →
+   48.4 M rows / 15 levels (4.80 GiB) in 3:08 at 8.6 GiB RSS**,
+   ~13 MB/s of input, runs 1 and 2 within 1 s of each other. Level
+   duplication amplified rows 2.5× and bytes ~2× — the expected
+   duplicating-mode cost, nothing Moldova-pathological.
+4. **Convert is effectively serial at this scale: 97–130 % CPU on 16
+   cores** across every cell (only tippecanoe exceeded 3 cores).
+   Decode/simplify/write take turns; pipeline parallelism is filed as
+   #213 and is the single biggest wall-clock lever this tier exposed.
+5. **Germany buildings (59 M polygons) fails outright**: every
+   feature drops out of the z0 thinning grid and convert aborts with
+   `level 0 is empty` after 1:16 (#211, release blocker). A big-file
+   tier exists precisely to catch this class of bug before release.
+6. Memory peaked at 18.1 GiB in gpio sort (DuckDB) and 10.5 GiB in
+   the buildings convert — the streaming convert path held fieldmaps
+   partitioning to 1.55 GiB.
+7. The antimeridian warning (#199) fired on real data — 7
+   >180°-wide features in fieldmaps — exactly as designed.
+
+### Methodology notes
+
+- Same harness as above: `/usr/bin/time -v`, release binary, default
+  knobs, `--mode duplicating --min-zoom 0 --max-zoom 14` (plus one
+  `--mode partitioning` cell), `--report` JSON captured per run;
+  45-min timeout per cell.
+- Long benchmark runs must be **detached from agent-harness task
+  groups** (`setsid nohup ... > driver.log`): a harness task-group
+  kill produced a false "converter died" signal (exit 144, no timing
+  file) that cost one fieldmaps run.
