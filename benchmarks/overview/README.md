@@ -36,6 +36,8 @@ tippecanoe goldens come from `corpus/goldens.sh`.
 | `bench_storage.py` | storage table → `storage_results.json` + markdown |
 | `bench_access.py` | the headline access benchmark → `access_results.json` + markdown |
 | `format_access.py` | render `access_results.json` into the RESULTS.md tables |
+| `bench_access_remote.py` | the same access benchmark over real S3 (issue #176) → `remote_access_results.json` |
+| `format_remote.py` | render `remote_access_results.json` into the RESULTS.md §2b tables + `remote_access_chart.svg` |
 | `run_conversion.sh` | conversion-cost table (overview vs tippecanoe, `/usr/bin/time -v`) |
 
 Raw/large outputs (regenerated overview parquet, per-run logs, timing
@@ -70,6 +72,28 @@ python3 format_access.py            # -> the RESULTS.md markdown
 
 # conversion cost
 ./run_conversion.sh
+```
+
+### Remote (S3) leg
+
+Needs the artifacts uploaded once (any bucket; names under
+`overviews/` and `pmtiles/` must match the local layout) and AWS
+credentials for the profile:
+
+```bash
+aws s3 cp ../../corpus/data/bench/overviews/ \
+  s3://$BUCKET/overviews/ --recursive \
+  --exclude "*" --include "*.dup.parquet" \
+  --include "*.dup.report.json"
+aws s3 cp ../../corpus/data/goldens/tippecanoe/ \
+  s3://$BUCKET/pmtiles/ --recursive \
+  --exclude "*" --include "<the four datasets>.pmtiles"
+
+BENCH_BUCKET=$BUCKET BENCH_REGION=us-east-2 \
+BENCH_AWS_PROFILE=<profile> \
+  uv run --with pmtiles --with requests \
+  python3 bench_access_remote.py
+python3 format_remote.py   # -> RESULTS.md §2b tables + chart svg
 ```
 
 ## Fairness rules (enforced by the harness)
