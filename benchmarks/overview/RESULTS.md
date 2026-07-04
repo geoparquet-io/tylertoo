@@ -423,6 +423,82 @@ Harness: `parallel_reader.py` (the reader) + `bench_parallel.py`
 baseline) → `parallel_reader_results.json`; tables via
 `format_parallel.py`.
 
+### DuckDB client knobs (issue #203)
+
+The tables above ran DuckDB near-defaults. This addendum sweeps the
+httpfs client knobs (verified present in DuckDB v1.4.1) on two of the
+four datasets — same bucket, viewports, and 3-run-median protocol.
+The resulting recipe is documented in `docs/remote-reads.md`.
+
+**Cold, per knob** — a fresh process, one viewport query
+(median wall ms / requests / bytes):
+
+| dataset | viewport | defaults | `threads=64` | `disable_parquet_prefetching` | `prefetch_all_parquet_files` | `http_keep_alive=false` | metadata caches on | recommended stack |
+|---|---|---|---|---|---|---|---|---|
+| points-nyc-medium | world | 1,930 / 7 / 564 KB | 1,890 / 7 / 564 KB | 2,010 / 5 / 2.00 MB | 1,990 / 7 / 564 KB | 4,060 / 7 / 564 KB | 1,950 / 7 / 564 KB | 2,040 / 7 / 564 KB |
+| points-nyc-medium | regional | 2,120 / 32 / 4.10 MB | 2,080 / 32 / 4.10 MB | 2,020 / 15 / 11.50 MB | 2,120 / 32 / 4.10 MB | 4,350 / 32 / 4.10 MB | 2,110 / 32 / 4.10 MB | 2,080 / 32 / 4.10 MB |
+| points-nyc-medium | street | 2,200 / 39 / 4.90 MB | 2,130 / 39 / 4.90 MB | 2,090 / 19 / 15.30 MB | 2,160 / 39 / 4.90 MB | 4,330 / 39 / 4.90 MB | 2,080 / 39 / 4.90 MB | 2,130 / 39 / 4.90 MB |
+| polygons-ftw-moldova-large | world | 3,170 / 11 / 8.30 MB | 3,200 / 11 / 8.30 MB | 3,270 / 14 / 10.80 MB | 3,200 / 11 / 8.30 MB | 6,550 / 11 / 8.30 MB | 3,240 / 11 / 8.30 MB | 3,190 / 11 / 8.30 MB |
+| polygons-ftw-moldova-large | regional | 3,120 / 47 / 20.70 MB | 3,050 / 47 / 20.70 MB | 2,990 / 34 / 29.70 MB | 3,040 / 47 / 20.70 MB | 6,570 / 47 / 20.70 MB | 3,100 / 47 / 20.70 MB | 3,040 / 47 / 20.70 MB |
+| polygons-ftw-moldova-large | street | 2,760 / 23 / 1.90 MB | 2,690 / 23 / 1.90 MB | 2,080 / 10 / 6.90 MB | 2,670 / 23 / 1.90 MB | 6,100 / 23 / 1.90 MB | 2,740 / 23 / 1.90 MB | 2,720 / 23 / 1.90 MB |
+
+Configs: `metadata caches on` = `enable_http_metadata_cache` +
+`parquet_metadata_cache`; `recommended stack` = those two + `threads=64`
++ `enable_external_file_cache=true` (the default).
+
+**Session behavior** — one process runs cold → exact repeat →
+adjacent pan (bbox shifted east by one width, same level). `sym200` is
+this section's original symmetric-benchmark config (http metadata cache
+ON, external file/data cache OFF — a fairness device against the
+cacheless pmtiles reader, not a recommendation); `real` is the
+recommended user config (both metadata caches + data cache ON):
+
+| dataset | viewport | config | cold | repeat | adjacent pan |
+|---|---|---|---|---|---|
+| points-nyc-medium | world | sym200 | 1,910 ms / 7 req / 564 KB | 1,860 ms / 6 req / 564 KB | 623 ms / 1 req / 128 KB |
+| points-nyc-medium | world | real | 1,970 ms / 7 req / 564 KB | 10 ms / 0 req / 0 B | 6 ms / 0 req / 0 B |
+| points-nyc-medium | regional | sym200 | 2,090 ms / 32 req / 4.10 MB | 2,030 ms / 31 req / 4.10 MB | 2,030 ms / 17 req / 2.30 MB |
+| points-nyc-medium | regional | real | 2,090 ms / 32 req / 4.10 MB | 12 ms / 0 req / 0 B | 1,310 ms / 5 req / 693 KB |
+| points-nyc-medium | street | sym200 | 2,190 ms / 39 req / 4.90 MB | 2,010 ms / 38 req / 4.90 MB | 1,970 ms / 28 req / 3.80 MB |
+| points-nyc-medium | street | real | 2,250 ms / 39 req / 4.90 MB | 19 ms / 0 req / 0 B | 1,360 ms / 11 req / 1.50 MB |
+| polygons-ftw-moldova-large | world | sym200 | 3,190 ms / 11 req / 8.30 MB | 3,080 ms / 10 req / 8.30 MB | 751 ms / 1 req / 256 KB |
+| polygons-ftw-moldova-large | world | real | 3,170 ms / 11 req / 8.30 MB | 84 ms / 0 req / 0 B | 9 ms / 0 req / 0 B |
+| polygons-ftw-moldova-large | regional | sym200 | 3,070 ms / 47 req / 20.70 MB | 2,990 ms / 46 req / 20.70 MB | 2,900 ms / 37 req / 17.10 MB |
+| polygons-ftw-moldova-large | regional | real | 3,020 ms / 47 req / 20.70 MB | 35 ms / 0 req / 0 B | 46 ms / 0 req / 0 B |
+| polygons-ftw-moldova-large | street | sym200 | 2,680 ms / 23 req / 1.90 MB | 2,630 ms / 22 req / 1.90 MB | 2,520 ms / 22 req / 1.90 MB |
+| polygons-ftw-moldova-large | street | real | 2,710 ms / 23 req / 1.90 MB | 16 ms / 0 req / 0 B | 13 ms / 0 req / 0 B |
+
+(The world adjacent pans land on sparse/empty ground — sym200 still
+pays a request to find that out; `real` answers from cached row
+groups and footer without touching the network.)
+
+Reading the knobs:
+
+- **No knob makes the cold query materially faster.** Cold wall is
+  TLS + footer + data round trips; `threads=64`,
+  `prefetch_all_parquet_files`, and the metadata caches are all
+  within ±3 % of defaults on a single cold viewport.
+- **The defaults that matter are already right.**
+  `http_keep_alive=false` roughly doubles every cold wall
+  (1.9 → 4.1 s NYC world, 3.2 → 6.6 s Moldova world);
+  `disable_parquet_prefetching=true` cuts request counts (39 → 19,
+  NYC street) but fetches 2.3–3.6× the bytes for wall times within
+  noise. Leave both alone.
+- **The session is where configuration pays.** With the real-user
+  config, an exact repeat is 0 requests / 10–84 ms (sym200:
+  1,860–3,080 ms), and an adjacent pan re-fetches only uncached row
+  groups — NYC street 11 req / 1.5 MB / 1.36 s vs 28 req / 3.8 MB /
+  1.97 s; both non-empty Moldova pans were served entirely from
+  cache (0 requests, 13–46 ms) because the Hilbert-clustered row
+  groups fetched for the first viewport already cover the neighbor.
+- Implication for §2b's warm tables above: they understate what a
+  real DuckDB user sees, by design — the external file cache was off
+  there for symmetry with the cacheless pmtiles reader.
+
+Harness: `bench_duckdb_knobs.py` → `duckdb_knobs_results.json`;
+tables via `format_duckdb_knobs.py`; recipe in
+`docs/remote-reads.md`.
+
 ---
 
 ## 3. Conversion cost (wall time + peak RSS)

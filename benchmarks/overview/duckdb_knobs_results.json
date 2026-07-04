@@ -1,0 +1,859 @@
+{
+  "bucket": "gpq-tiles-bench",
+  "region": "us-east-2",
+  "runs": 3,
+  "duckdb": "v1.4.1 (Andium) b390a7c376",
+  "cold_configs": {
+    "defaults": [],
+    "threads_64": [
+      "SET threads=64;"
+    ],
+    "no_parquet_prefetch": [
+      "SET disable_parquet_prefetching=true;"
+    ],
+    "prefetch_all": [
+      "SET prefetch_all_parquet_files=true;"
+    ],
+    "keepalive_off": [
+      "SET http_keep_alive=false;"
+    ],
+    "metadata_caches_on": [
+      "SET enable_http_metadata_cache=true;",
+      "SET parquet_metadata_cache=true;"
+    ],
+    "stack": [
+      "SET threads=64;",
+      "SET enable_http_metadata_cache=true;",
+      "SET parquet_metadata_cache=true;",
+      "SET enable_external_file_cache=true;"
+    ]
+  },
+  "session_configs": {
+    "sym200": [
+      "SET enable_http_metadata_cache=true;",
+      "SET enable_external_file_cache=false;"
+    ],
+    "real": [
+      "SET threads=64;",
+      "SET enable_http_metadata_cache=true;",
+      "SET parquet_metadata_cache=true;",
+      "SET enable_external_file_cache=true;"
+    ]
+  },
+  "datasets": {
+    "points-nyc-medium": {
+      "world": {
+        "zoom": 8,
+        "level": 8,
+        "bbox": [
+          -74.299992,
+          40.50005907,
+          -73.69999261,
+          40.9000036
+        ],
+        "cold": {
+          "defaults": {
+            "bytes": 577740.8,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 1930.0,
+            "features": 5772,
+            "wall_ms_min": 1920.0,
+            "wall_ms_max": 2009.9999999999998
+          },
+          "threads_64": {
+            "bytes": 577740.8,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 1890.0,
+            "features": 5772,
+            "wall_ms_min": 1840.0,
+            "wall_ms_max": 1990.0
+          },
+          "no_parquet_prefetch": {
+            "bytes": 2097152.0,
+            "head": 1,
+            "get": 4,
+            "wall_ms": 2009.9999999999998,
+            "features": 5772,
+            "wall_ms_min": 1930.0,
+            "wall_ms_max": 2050.0
+          },
+          "prefetch_all": {
+            "bytes": 577740.8,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 1990.0,
+            "features": 5772,
+            "wall_ms_min": 1900.0,
+            "wall_ms_max": 2029.9999999999998
+          },
+          "keepalive_off": {
+            "bytes": 577740.8,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 4059.9999999999995,
+            "features": 5772,
+            "wall_ms_min": 4050.0,
+            "wall_ms_max": 4100.0
+          },
+          "metadata_caches_on": {
+            "bytes": 577740.8,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 1950.0,
+            "features": 5772,
+            "wall_ms_min": 1920.0,
+            "wall_ms_max": 1990.0
+          },
+          "stack": {
+            "bytes": 577740.8,
+            "head": 1,
+            "get": 6,
+            "wall_ms": 2040.0,
+            "features": 5772,
+            "wall_ms_min": 1940.0,
+            "wall_ms_max": 2070.0
+          }
+        },
+        "session": {
+          "sym200": {
+            "cold": {
+              "bytes": 577740.8,
+              "head": 1,
+              "get": 6,
+              "wall_ms": 1910.0,
+              "features": 5772,
+              "wall_ms_min": 1790.0,
+              "wall_ms_max": 2029.9999999999998
+            },
+            "repeat": {
+              "bytes": 577740.8,
+              "head": 0,
+              "get": 6,
+              "wall_ms": 1860.0,
+              "features": 5772,
+              "wall_ms_min": 1800.0,
+              "wall_ms_max": 1930.0
+            },
+            "adjacent": {
+              "bytes": 131072.0,
+              "head": 0,
+              "get": 1,
+              "wall_ms": 623.0,
+              "features": 0,
+              "wall_ms_min": 619.0,
+              "wall_ms_max": 795.0
+            }
+          },
+          "real": {
+            "cold": {
+              "bytes": 577740.8,
+              "head": 1,
+              "get": 6,
+              "wall_ms": 1970.0,
+              "features": 5772,
+              "wall_ms_min": 1940.0,
+              "wall_ms_max": 2090.0
+            },
+            "repeat": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 10.5,
+              "features": 5772,
+              "wall_ms_min": 9.6,
+              "wall_ms_max": 10.9
+            },
+            "adjacent": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 5.8999999999999995,
+              "features": 0,
+              "wall_ms_min": 5.5,
+              "wall_ms_max": 6.5
+            }
+          }
+        }
+      },
+      "regional": {
+        "zoom": 11,
+        "level": 11,
+        "bbox": [
+          -74.07499222875,
+          40.650038268749995,
+          -73.92499238125001,
+          40.75002440125
+        ],
+        "cold": {
+          "defaults": {
+            "bytes": 4299161.6,
+            "head": 1,
+            "get": 31,
+            "wall_ms": 2120.0,
+            "features": 14321,
+            "wall_ms_min": 2120.0,
+            "wall_ms_max": 2130.0
+          },
+          "threads_64": {
+            "bytes": 4299161.6,
+            "head": 1,
+            "get": 31,
+            "wall_ms": 2080.0,
+            "features": 14321,
+            "wall_ms_min": 2020.0,
+            "wall_ms_max": 2250.0
+          },
+          "no_parquet_prefetch": {
+            "bytes": 12058624.0,
+            "head": 1,
+            "get": 14,
+            "wall_ms": 2020.0,
+            "features": 14321,
+            "wall_ms_min": 2000.0,
+            "wall_ms_max": 2070.0
+          },
+          "prefetch_all": {
+            "bytes": 4299161.6,
+            "head": 1,
+            "get": 31,
+            "wall_ms": 2120.0,
+            "features": 14321,
+            "wall_ms_min": 2020.0,
+            "wall_ms_max": 2210.0
+          },
+          "keepalive_off": {
+            "bytes": 4299161.6,
+            "head": 1,
+            "get": 31,
+            "wall_ms": 4350.0,
+            "features": 14321,
+            "wall_ms_min": 4280.0,
+            "wall_ms_max": 4370.0
+          },
+          "metadata_caches_on": {
+            "bytes": 4299161.6,
+            "head": 1,
+            "get": 31,
+            "wall_ms": 2110.0,
+            "features": 14321,
+            "wall_ms_min": 2050.0,
+            "wall_ms_max": 2180.0
+          },
+          "stack": {
+            "bytes": 4299161.6,
+            "head": 1,
+            "get": 31,
+            "wall_ms": 2080.0,
+            "features": 14321,
+            "wall_ms_min": 2070.0,
+            "wall_ms_max": 2190.0
+          }
+        },
+        "session": {
+          "sym200": {
+            "cold": {
+              "bytes": 4299161.6,
+              "head": 1,
+              "get": 31,
+              "wall_ms": 2090.0,
+              "features": 14321,
+              "wall_ms_min": 2029.9999999999998,
+              "wall_ms_max": 2180.0
+            },
+            "repeat": {
+              "bytes": 4299161.6,
+              "head": 0,
+              "get": 31,
+              "wall_ms": 2029.9999999999998,
+              "features": 14321,
+              "wall_ms_min": 2009.9999999999998,
+              "wall_ms_max": 2090.0
+            },
+            "adjacent": {
+              "bytes": 2411724.8,
+              "head": 0,
+              "get": 17,
+              "wall_ms": 2029.9999999999998,
+              "features": 11222,
+              "wall_ms_min": 1990.0,
+              "wall_ms_max": 2060.0
+            }
+          },
+          "real": {
+            "cold": {
+              "bytes": 4299161.6,
+              "head": 1,
+              "get": 31,
+              "wall_ms": 2090.0,
+              "features": 14321,
+              "wall_ms_min": 2009.9999999999998,
+              "wall_ms_max": 2090.0
+            },
+            "repeat": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 12.3,
+              "features": 14321,
+              "wall_ms_min": 10.0,
+              "wall_ms_max": 12.8
+            },
+            "adjacent": {
+              "bytes": 709324.8,
+              "head": 0,
+              "get": 5,
+              "wall_ms": 1310.0,
+              "features": 11222,
+              "wall_ms_min": 1190.0,
+              "wall_ms_max": 1380.0
+            }
+          }
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "level": 14,
+        "bbox": [
+          -73.99000000000001,
+          40.75,
+          -73.97,
+          40.769999999999996
+        ],
+        "cold": {
+          "defaults": {
+            "bytes": 5138022.4,
+            "head": 1,
+            "get": 38,
+            "wall_ms": 2200.0,
+            "features": 33865,
+            "wall_ms_min": 2110.0,
+            "wall_ms_max": 2250.0
+          },
+          "threads_64": {
+            "bytes": 5138022.4,
+            "head": 1,
+            "get": 38,
+            "wall_ms": 2130.0,
+            "features": 33865,
+            "wall_ms_min": 2100.0,
+            "wall_ms_max": 2150.0
+          },
+          "no_parquet_prefetch": {
+            "bytes": 16043212.8,
+            "head": 1,
+            "get": 18,
+            "wall_ms": 2090.0,
+            "features": 33865,
+            "wall_ms_min": 2000.0,
+            "wall_ms_max": 2110.0
+          },
+          "prefetch_all": {
+            "bytes": 5138022.4,
+            "head": 1,
+            "get": 38,
+            "wall_ms": 2160.0,
+            "features": 33865,
+            "wall_ms_min": 2090.0,
+            "wall_ms_max": 2300.0
+          },
+          "keepalive_off": {
+            "bytes": 5138022.4,
+            "head": 1,
+            "get": 38,
+            "wall_ms": 4330.0,
+            "features": 33865,
+            "wall_ms_min": 4300.0,
+            "wall_ms_max": 4750.0
+          },
+          "metadata_caches_on": {
+            "bytes": 5138022.4,
+            "head": 1,
+            "get": 38,
+            "wall_ms": 2080.0,
+            "features": 33865,
+            "wall_ms_min": 2029.9999999999998,
+            "wall_ms_max": 2240.0
+          },
+          "stack": {
+            "bytes": 5138022.4,
+            "head": 1,
+            "get": 38,
+            "wall_ms": 2130.0,
+            "features": 33865,
+            "wall_ms_min": 2050.0,
+            "wall_ms_max": 2160.0
+          }
+        },
+        "session": {
+          "sym200": {
+            "cold": {
+              "bytes": 5138022.4,
+              "head": 1,
+              "get": 38,
+              "wall_ms": 2190.0,
+              "features": 33865,
+              "wall_ms_min": 2070.0,
+              "wall_ms_max": 2240.0
+            },
+            "repeat": {
+              "bytes": 5138022.4,
+              "head": 0,
+              "get": 38,
+              "wall_ms": 2009.9999999999998,
+              "features": 33865,
+              "wall_ms_min": 2000.0,
+              "wall_ms_max": 2060.0
+            },
+            "adjacent": {
+              "bytes": 3984588.8,
+              "head": 0,
+              "get": 28,
+              "wall_ms": 1970.0,
+              "features": 9206,
+              "wall_ms_min": 1910.0,
+              "wall_ms_max": 1970.0
+            }
+          },
+          "real": {
+            "cold": {
+              "bytes": 5138022.4,
+              "head": 1,
+              "get": 38,
+              "wall_ms": 2250.0,
+              "features": 33865,
+              "wall_ms_min": 2100.0,
+              "wall_ms_max": 2260.0
+            },
+            "repeat": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 19.0,
+              "features": 33865,
+              "wall_ms_min": 18.9,
+              "wall_ms_max": 20.0
+            },
+            "adjacent": {
+              "bytes": 1572864.0,
+              "head": 0,
+              "get": 11,
+              "wall_ms": 1360.0,
+              "features": 9206,
+              "wall_ms_min": 1220.0,
+              "wall_ms_max": 1370.0
+            }
+          }
+        }
+      }
+    },
+    "polygons-ftw-moldova-large": {
+      "world": {
+        "zoom": 6,
+        "level": 3,
+        "bbox": [
+          26.592531983585204,
+          45.4719002653674,
+          30.15892038332341,
+          48.4902285248874
+        ],
+        "cold": {
+          "defaults": {
+            "bytes": 8703180.8,
+            "head": 1,
+            "get": 10,
+            "wall_ms": 3170.0,
+            "features": 7804,
+            "wall_ms_min": 3020.0,
+            "wall_ms_max": 3430.0
+          },
+          "threads_64": {
+            "bytes": 8703180.8,
+            "head": 1,
+            "get": 10,
+            "wall_ms": 3200.0,
+            "features": 7804,
+            "wall_ms_min": 3120.0,
+            "wall_ms_max": 3210.0
+          },
+          "no_parquet_prefetch": {
+            "bytes": 11324620.8,
+            "head": 1,
+            "get": 13,
+            "wall_ms": 3270.0,
+            "features": 7804,
+            "wall_ms_min": 3270.0,
+            "wall_ms_max": 3400.0
+          },
+          "prefetch_all": {
+            "bytes": 8703180.8,
+            "head": 1,
+            "get": 10,
+            "wall_ms": 3200.0,
+            "features": 7804,
+            "wall_ms_min": 3190.0,
+            "wall_ms_max": 3210.0
+          },
+          "keepalive_off": {
+            "bytes": 8703180.8,
+            "head": 1,
+            "get": 10,
+            "wall_ms": 6550.0,
+            "features": 7804,
+            "wall_ms_min": 6530.0,
+            "wall_ms_max": 6560.0
+          },
+          "metadata_caches_on": {
+            "bytes": 8703180.8,
+            "head": 1,
+            "get": 10,
+            "wall_ms": 3240.0,
+            "features": 7804,
+            "wall_ms_min": 3110.0,
+            "wall_ms_max": 3250.0
+          },
+          "stack": {
+            "bytes": 8703180.8,
+            "head": 1,
+            "get": 10,
+            "wall_ms": 3190.0,
+            "features": 7804,
+            "wall_ms_min": 3180.0,
+            "wall_ms_max": 3200.0
+          }
+        },
+        "session": {
+          "sym200": {
+            "cold": {
+              "bytes": 8703180.8,
+              "head": 1,
+              "get": 10,
+              "wall_ms": 3190.0,
+              "features": 7804,
+              "wall_ms_min": 3080.0,
+              "wall_ms_max": 3200.0
+            },
+            "repeat": {
+              "bytes": 8703180.8,
+              "head": 0,
+              "get": 10,
+              "wall_ms": 3080.0,
+              "features": 7804,
+              "wall_ms_min": 3070.0,
+              "wall_ms_max": 3200.0
+            },
+            "adjacent": {
+              "bytes": 262144.0,
+              "head": 0,
+              "get": 1,
+              "wall_ms": 751.0,
+              "features": 0,
+              "wall_ms_min": 724.0,
+              "wall_ms_max": 756.0
+            }
+          },
+          "real": {
+            "cold": {
+              "bytes": 8703180.8,
+              "head": 1,
+              "get": 10,
+              "wall_ms": 3170.0,
+              "features": 7804,
+              "wall_ms_min": 3140.0,
+              "wall_ms_max": 3300.0
+            },
+            "repeat": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 83.9,
+              "features": 7804,
+              "wall_ms_min": 76.6,
+              "wall_ms_max": 92.60000000000001
+            },
+            "adjacent": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 9.4,
+              "features": 0,
+              "wall_ms_min": 9.2,
+              "wall_ms_max": 9.4
+            }
+          }
+        }
+      },
+      "regional": {
+        "zoom": 9,
+        "level": 6,
+        "bbox": [
+          27.92992763348703,
+          46.603773362687406,
+          28.82152473342158,
+          47.3583554275674
+        ],
+        "cold": {
+          "defaults": {
+            "bytes": 21705523.2,
+            "head": 1,
+            "get": 46,
+            "wall_ms": 3120.0,
+            "features": 8008,
+            "wall_ms_min": 3100.0,
+            "wall_ms_max": 3200.0
+          },
+          "threads_64": {
+            "bytes": 21705523.2,
+            "head": 1,
+            "get": 46,
+            "wall_ms": 3050.0,
+            "features": 8008,
+            "wall_ms_min": 2980.0,
+            "wall_ms_max": 3210.0
+          },
+          "no_parquet_prefetch": {
+            "bytes": 31142707.2,
+            "head": 1,
+            "get": 33,
+            "wall_ms": 2990.0,
+            "features": 8008,
+            "wall_ms_min": 2860.0,
+            "wall_ms_max": 3010.0
+          },
+          "prefetch_all": {
+            "bytes": 21705523.2,
+            "head": 1,
+            "get": 46,
+            "wall_ms": 3040.0,
+            "features": 8008,
+            "wall_ms_min": 3030.0,
+            "wall_ms_max": 3060.0
+          },
+          "keepalive_off": {
+            "bytes": 21705523.2,
+            "head": 1,
+            "get": 46,
+            "wall_ms": 6570.0,
+            "features": 8008,
+            "wall_ms_min": 6480.0,
+            "wall_ms_max": 6940.0
+          },
+          "metadata_caches_on": {
+            "bytes": 21705523.2,
+            "head": 1,
+            "get": 46,
+            "wall_ms": 3100.0,
+            "features": 8008,
+            "wall_ms_min": 2980.0,
+            "wall_ms_max": 3320.0
+          },
+          "stack": {
+            "bytes": 21705523.2,
+            "head": 1,
+            "get": 46,
+            "wall_ms": 3040.0,
+            "features": 8008,
+            "wall_ms_min": 2980.0,
+            "wall_ms_max": 3100.0
+          }
+        },
+        "session": {
+          "sym200": {
+            "cold": {
+              "bytes": 21705523.2,
+              "head": 1,
+              "get": 46,
+              "wall_ms": 3070.0,
+              "features": 8008,
+              "wall_ms_min": 3010.0,
+              "wall_ms_max": 3100.0
+            },
+            "repeat": {
+              "bytes": 21705523.2,
+              "head": 0,
+              "get": 46,
+              "wall_ms": 2990.0,
+              "features": 8008,
+              "wall_ms_min": 2910.0,
+              "wall_ms_max": 3040.0
+            },
+            "adjacent": {
+              "bytes": 17930649.6,
+              "head": 0,
+              "get": 37,
+              "wall_ms": 2900.0,
+              "features": 7345,
+              "wall_ms_min": 2850.0,
+              "wall_ms_max": 3000.0
+            }
+          },
+          "real": {
+            "cold": {
+              "bytes": 21705523.2,
+              "head": 1,
+              "get": 46,
+              "wall_ms": 3020.0,
+              "features": 8008,
+              "wall_ms_min": 2950.0,
+              "wall_ms_max": 3190.0
+            },
+            "repeat": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 35.4,
+              "features": 8008,
+              "wall_ms_min": 33.8,
+              "wall_ms_max": 35.4
+            },
+            "adjacent": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 45.8,
+              "features": 7345,
+              "wall_ms_min": 44.5,
+              "wall_ms_max": 45.900000000000006
+            }
+          }
+        }
+      },
+      "street": {
+        "zoom": 14,
+        "level": 11,
+        "bbox": [
+          28.11,
+          47.150000000000006,
+          28.130000000000003,
+          47.17
+        ],
+        "cold": {
+          "defaults": {
+            "bytes": 1992294.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 2760.0,
+            "features": 1527,
+            "wall_ms_min": 2760.0,
+            "wall_ms_max": 2790.0
+          },
+          "threads_64": {
+            "bytes": 1992294.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 2690.0,
+            "features": 1527,
+            "wall_ms_min": 2660.0,
+            "wall_ms_max": 2830.0
+          },
+          "no_parquet_prefetch": {
+            "bytes": 7235174.4,
+            "head": 1,
+            "get": 9,
+            "wall_ms": 2080.0,
+            "features": 1527,
+            "wall_ms_min": 2000.0,
+            "wall_ms_max": 2190.0
+          },
+          "prefetch_all": {
+            "bytes": 1992294.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 2670.0,
+            "features": 1527,
+            "wall_ms_min": 2650.0,
+            "wall_ms_max": 2800.0
+          },
+          "keepalive_off": {
+            "bytes": 1992294.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 6100.0,
+            "features": 1527,
+            "wall_ms_min": 5960.0,
+            "wall_ms_max": 6120.0
+          },
+          "metadata_caches_on": {
+            "bytes": 1992294.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 2740.0,
+            "features": 1527,
+            "wall_ms_min": 2710.0,
+            "wall_ms_max": 2750.0
+          },
+          "stack": {
+            "bytes": 1992294.4,
+            "head": 1,
+            "get": 22,
+            "wall_ms": 2720.0,
+            "features": 1527,
+            "wall_ms_min": 2660.0,
+            "wall_ms_max": 2740.0
+          }
+        },
+        "session": {
+          "sym200": {
+            "cold": {
+              "bytes": 1992294.4,
+              "head": 1,
+              "get": 22,
+              "wall_ms": 2680.0,
+              "features": 1527,
+              "wall_ms_min": 2570.0,
+              "wall_ms_max": 2780.0
+            },
+            "repeat": {
+              "bytes": 1992294.4,
+              "head": 0,
+              "get": 22,
+              "wall_ms": 2630.0,
+              "features": 1527,
+              "wall_ms_min": 2600.0,
+              "wall_ms_max": 2710.0
+            },
+            "adjacent": {
+              "bytes": 1992294.4,
+              "head": 0,
+              "get": 22,
+              "wall_ms": 2520.0,
+              "features": 427,
+              "wall_ms_min": 2480.0,
+              "wall_ms_max": 2600.0
+            }
+          },
+          "real": {
+            "cold": {
+              "bytes": 1992294.4,
+              "head": 1,
+              "get": 22,
+              "wall_ms": 2710.0,
+              "features": 1527,
+              "wall_ms_min": 2550.0,
+              "wall_ms_max": 2800.0
+            },
+            "repeat": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 16.2,
+              "features": 1527,
+              "wall_ms_min": 16.1,
+              "wall_ms_max": 16.9
+            },
+            "adjacent": {
+              "bytes": 0.0,
+              "head": 0,
+              "get": 0,
+              "wall_ms": 13.0,
+              "features": 427,
+              "wall_ms_min": 12.4,
+              "wall_ms_max": 14.5
+            }
+          }
+        }
+      }
+    }
+  }
+}
