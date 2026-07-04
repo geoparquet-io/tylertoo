@@ -116,6 +116,26 @@ pub(super) fn convert_streaming(
     let file = File::open(input_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let input_schema: SchemaRef = builder.schema().clone();
+
+    // Regional extract (#102): prune input row groups by bbox covering
+    // statistics — footer metadata only, no data pages of skipped groups are
+    // ever read. Both passes read the SAME selection, so the global row
+    // indices addressing the winner tables stay aligned. Groups without
+    // stats are kept; the exact per-feature filter in pass 1 guarantees
+    // identical output either way.
+    let row_groups_total = builder.metadata().num_row_groups();
+    let bbox_units = options
+        .bbox
+        .map(|b| super::convert::bbox_to_crs_units(&b, crs));
+    let selected_row_groups: Option<Vec<usize>> = bbox_units
+        .as_ref()
+        .map(|bb| super::convert::select_input_row_groups(builder.metadata(), bb));
+    let row_groups_read = selected_row_groups
+        .as_ref()
+        .map_or(row_groups_total, Vec::len);
+    if selected_row_groups.is_some() {
+        log::info!("bbox filter: reading {row_groups_read}/{row_groups_total} input row groups");
+    }
     drop(builder);
 
     if input_schema
@@ -142,7 +162,15 @@ pub(super) fn convert_streaming(
         coalesce: coalesce_scratch,
         num_rows,
         skipped_rows,
-    } = run_pass1(input_path, &input_schema, geom_idx, options, &acc_cols)?;
+    } = run_pass1(
+        input_path,
+        &input_schema,
+        geom_idx,
+        options,
+        &acc_cols,
+        selected_row_groups.as_deref(),
+        bbox_units.as_ref(),
+    )?;
     if skipped_rows > 0 {
         log::warn!(
             "skipping {skipped_rows} of {num_rows} input rows with a null, \
@@ -400,6 +428,7 @@ pub(super) fn convert_streaming(
             e.hint,
             input_path,
             options.read_batch_size,
+            selected_row_groups.as_deref(),
             &ctx,
         )?;
         level_reports.push(LevelReport {
@@ -437,6 +466,8 @@ pub(super) fn convert_streaming(
         total_rows,
         total_vertices,
         total_compressed_bytes,
+        row_groups_total,
+        row_groups_read,
         antimeridian_suspect_features,
         duration_secs: start.elapsed().as_secs_f64(),
     })
@@ -645,6 +676,8 @@ fn run_pass1(
     geom_idx: usize,
     options: &ConvertOptions,
     acc_cols: &[usize],
+    row_groups: Option<&[usize]>,
+    bbox_units: Option<&[f64; 4]>,
 ) -> Result<Pass1Output, ConvertError> {
     let mut plan = build_rank_plan(input_schema, options)?;
 
@@ -668,8 +701,13 @@ fn run_pass1(
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
 
     let file = File::open(input_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
+    // Regional extract (#102): read only the bbox-selected row groups
+    // (identical selection in pass 2, keeping row indices aligned).
+    if let Some(rgs) = row_groups {
+        builder = builder.with_row_groups(rgs.to_vec());
+    }
     let reader = builder
         .with_projection(mask)
         .with_batch_size(options.read_batch_size.max(1))
@@ -715,6 +753,16 @@ fn run_pass1(
                 skipped_rows += 1;
                 continue;
             };
+            // Regional extract (#102): a feature whose bbox misses the region
+            // produces no AssignFeature — its winner-table slot stays at the
+            // UNASSIGNED sentinel, so pass 2 drops the row too. The row index
+            // still advances (row-keyed tables stay aligned).
+            let fbbox = geometry_bbox(g);
+            if let Some(bb) = bbox_units {
+                if !super::convert::bboxes_intersect(&fbbox, bb) {
+                    continue;
+                }
+            }
             let kind = feature_kind(g);
             if matches!(kind, FeatureKind::Point) {
                 point_count += 1;
@@ -726,7 +774,7 @@ fn run_pass1(
             }
             features.push(AssignFeature {
                 index: base + i,
-                bbox: geometry_bbox(g),
+                bbox: fbbox,
                 kind,
                 sort_key: None, // filled below once the ranking tier resolves
             });
@@ -953,12 +1001,18 @@ fn write_level_streaming(
     hint: usize,
     input_path: &Path,
     read_batch_size: usize,
+    row_groups: Option<&[usize]>,
     ctx: &LevelStreamCtx<'_>,
 ) -> Result<(usize, usize), ConvertError> {
     let file = File::open(input_path)?;
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-        .with_batch_size(read_batch_size.max(1))
-        .build()?;
+    let mut builder =
+        ParquetRecordBatchReaderBuilder::try_new(file)?.with_batch_size(read_batch_size.max(1));
+    // Regional extract (#102): read the same bbox-selected row groups as
+    // pass 1, so the winner tables' global row indices line up.
+    if let Some(rgs) = row_groups {
+        builder = builder.with_row_groups(rgs.to_vec());
+    }
+    let mut reader = builder.build()?;
 
     // `write_level` consumes an infallible batch iterator; errors inside the
     // stream are parked in `err` (fusing the iterator) and re-raised after.

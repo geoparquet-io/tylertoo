@@ -544,6 +544,46 @@ stay laptop-sized.
 
 ---
 
+## Regional extract: `--bbox`
+
+`--bbox xmin,ymin,xmax,ymax` (lon/lat degrees, EPSG:4326) converts only the
+features whose bounding box intersects the given region — useful for extracting
+a city from a country-wide file without processing the whole dataset.
+
+```bash
+# Tile just Antananarivo from a Madagascar-wide file
+gpq-tiles overview madagascar.parquet antananarivo.parquet \
+  --bbox 47.4,-19.0,47.6,-18.8 \
+  --min-zoom 0 --max-zoom 14
+```
+
+The filter is two-stage:
+
+1. **Row-group pruning** (statistics-based): row groups whose GeoParquet 1.1
+   bbox covering column statistics don't intersect the region are skipped at
+   the parquet footer level — their data pages are never read. This is the
+   big win: a gpio-optimized (Hilbert-sorted) file typically reduces I/O by
+   90%+ for small regional extracts.
+
+2. **Exact feature filter**: features of the surviving row groups whose own
+   bbox misses the region are dropped exactly. This guarantees correctness
+   even when the input lacks covering statistics.
+
+**Graceful degradation**: if the input has no covering column or its statistics
+are unavailable (non-gpio-optimized, GDAL without covering, etc.), all row
+groups are read and only the exact per-feature filter applies — the output is
+identical, just slower. Check `ConvertReport.row_groups_read` vs
+`row_groups_total` to see whether pruning fired.
+
+| Knob | Default | Units | Effect |
+|------|---------|-------|--------|
+| `--bbox xmin,ymin,xmax,ymax` | — | lon/lat degrees | only features intersecting this region; omit = full extent |
+
+**Tip**: for EPSG:3857 inputs, still pass lon/lat degrees — the converter
+reprojects the bbox internally.
+
+---
+
 ## Worked scenarios
 
 | Symptom | Fix |

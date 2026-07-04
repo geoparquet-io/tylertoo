@@ -353,6 +353,18 @@ pub struct ConvertOptions {
     /// merge best-pair-first, so arterials chain THROUGH same-class
     /// crossings (fewer, longer strokes at the cost of over-merging).
     pub coalesce_junction_angle: f64,
+    /// Regional extract (#102): `[xmin, ymin, xmax, ymax]` in EPSG:4326
+    /// lon/lat degrees. When set, the conversion behaves as if the input
+    /// contained only the features whose bounding box intersects this region
+    /// (closed-interval AABB test): input row groups whose GeoParquet 1.1
+    /// bbox covering statistics don't intersect are skipped at the parquet
+    /// footer level (their data pages are never read), and features of the
+    /// surviving row groups are filtered exactly by their own bbox. Inputs
+    /// without covering statistics degrade gracefully — every row group is
+    /// read and only the exact per-feature filter applies, so the output is
+    /// identical either way. Default `None` (full-extent conversion,
+    /// byte-identical output to a build without this option).
+    pub bbox: Option<[f64; 4]>,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -384,6 +396,7 @@ impl Default for ConvertOptions {
             coalesce_snap: DEFAULT_SNAP_GSD_FACTOR,
             coalesce_max_level_rows: DEFAULT_COALESCE_MAX_LEVEL_ROWS,
             coalesce_junction_angle: DEFAULT_JUNCTION_ANGLE_DEG,
+            bbox: None,
         }
     }
 }
@@ -422,6 +435,13 @@ pub struct ConvertReport {
     pub total_vertices: usize,
     /// Total compressed output size (bytes) across all levels.
     pub total_compressed_bytes: i64,
+    /// Total row groups in the input file.
+    pub row_groups_total: usize,
+    /// Input row groups actually read. Less than
+    /// [`row_groups_total`](Self::row_groups_total) only when
+    /// [`ConvertOptions::bbox`] pruned row groups via the input's bbox
+    /// covering statistics (#102).
+    pub row_groups_read: usize,
     /// Features whose bbox spans more than 180° of longitude — almost
     /// certainly antimeridian-crossing geometry stored verbatim. Warned
     /// about (one aggregate `log::warn!`), never mutated; see
@@ -594,6 +614,18 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
             "coalesce-junction-angle must not be NaN (use 0 to disable)".to_string(),
         ));
     }
+    if let Some(bb) = &options.bbox {
+        if bb.iter().any(|v| !v.is_finite()) {
+            return Err(ConvertError::InvalidConfig(format!(
+                "bbox {bb:?} must contain only finite values"
+            )));
+        }
+        if bb[0] > bb[2] || bb[1] > bb[3] {
+            return Err(ConvertError::InvalidConfig(format!(
+                "bbox {bb:?} must satisfy xmin <= xmax and ymin <= ymax"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -684,6 +716,22 @@ pub fn convert_to_overviews(
     // Coalescing schema check (Q3).
     validate_coalesce_schema(&input_schema, options)?;
 
+    // Regional extract (#102): prune input row groups by bbox covering
+    // statistics (footer-only), before any data pages are read. Groups
+    // without stats are kept; the exact per-feature filter below guarantees
+    // identical output either way.
+    let row_groups_total = builder.metadata().num_row_groups();
+    let bbox_units = options.bbox.map(|b| bbox_to_crs_units(&b, crs));
+    let (builder, row_groups_read) = match &bbox_units {
+        Some(bb) => {
+            let sel = select_input_row_groups(builder.metadata(), bb);
+            let n = sel.len();
+            log::info!("bbox filter: reading {n}/{row_groups_total} input row groups");
+            (builder.with_row_groups(sel), n)
+        }
+        None => (builder, row_groups_total),
+    };
+
     let reader = builder.build()?;
     let mut batches: Vec<RecordBatch> = Vec::new();
     for batch in reader {
@@ -701,17 +749,30 @@ pub fn convert_to_overviews(
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
     let mut geom_opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(full.num_rows());
     extract_geometries_opt_from_array(geom_array.as_ref(), &mut geom_opts)?;
+    let mut geom_skipped = 0usize;
     let keep: Vec<bool> = geom_opts
         .iter()
-        .map(|g| g.as_ref().is_some_and(usable_geometry))
+        .map(|g| match g.as_ref().filter(|g| usable_geometry(g)) {
+            // Regional extract (#102): drop features whose bbox misses the
+            // requested region exactly, independent of row-group pruning.
+            Some(g) => bbox_units
+                .as_ref()
+                .is_none_or(|bb| bboxes_intersect(&geometry_bbox(g), bb)),
+            None => {
+                geom_skipped += 1;
+                false
+            }
+        })
         .collect();
     let skipped = keep.iter().filter(|k| !**k).count();
     let (full, geometries): (RecordBatch, Vec<Geometry<f64>>) = if skipped > 0 {
-        log::warn!(
-            "skipping {skipped} of {} input rows with a null, empty, or \
-             non-finite geometry",
-            full.num_rows()
-        );
+        if geom_skipped > 0 {
+            log::warn!(
+                "skipping {geom_skipped} of {} input rows with a null, empty, or \
+                 non-finite geometry",
+                full.num_rows()
+            );
+        }
         let mask = arrow_array::BooleanArray::from(keep.clone());
         let filtered = arrow_select::filter::filter_record_batch(&full, &mask)?;
         let geoms = geom_opts
@@ -1016,6 +1077,8 @@ pub fn convert_to_overviews(
         total_rows,
         total_vertices,
         total_compressed_bytes,
+        row_groups_total,
+        row_groups_read,
         antimeridian_suspect_features,
         duration_secs: start.elapsed().as_secs_f64(),
     })
@@ -1045,6 +1108,74 @@ pub(super) fn detect_crs(path: &Path) -> Result<Crs, ConvertError> {
             .or_else(|| info.name.clone())
             .unwrap_or_else(|| "unknown".to_string()),
     })
+}
+
+/// Half the Web Mercator world extent in meters (`±` = the x/y range of
+/// EPSG:3857). Matches the constant used by the export reprojection.
+const WEBMERC_HALF_M: f64 = 20_037_508.342_789_244;
+
+/// Web Mercator latitude clamp (the projection diverges at the poles).
+const WEBMERC_MAX_LAT: f64 = 85.051_128_779_806_59;
+
+/// Reproject one EPSG:4326 point (lon/lat degrees) to EPSG:3857 (meters) —
+/// the exact inverse of the export path's `webmerc_to_lnglat`. Latitude is
+/// clamped to the projection's valid range.
+#[inline]
+fn lnglat_to_webmerc(lng: f64, lat: f64) -> (f64, f64) {
+    use std::f64::consts::{FRAC_PI_4, PI};
+    let x = lng / 180.0 * WEBMERC_HALF_M;
+    let lat = lat.clamp(-WEBMERC_MAX_LAT, WEBMERC_MAX_LAT);
+    let y = (FRAC_PI_4 + lat.to_radians() / 2.0).tan().ln() / PI * WEBMERC_HALF_M;
+    (x, y)
+}
+
+/// Express a `[xmin, ymin, xmax, ymax]` EPSG:4326 bbox in the input file's
+/// coordinate units ([`ConvertOptions::bbox`] is always lon/lat degrees; a
+/// 3857 input stores meters).
+pub(super) fn bbox_to_crs_units(bbox: &[f64; 4], crs: Crs) -> [f64; 4] {
+    match crs {
+        Crs::Epsg4326 => *bbox,
+        Crs::Epsg3857 => {
+            let (xmin, ymin) = lnglat_to_webmerc(bbox[0], bbox[1]);
+            let (xmax, ymax) = lnglat_to_webmerc(bbox[2], bbox[3]);
+            [xmin, ymin, xmax, ymax]
+        }
+    }
+}
+
+/// Closed-interval AABB intersection of two `[xmin, ymin, xmax, ymax]` boxes
+/// (touching edges count as intersecting, matching
+/// [`crate::covering::RowGroupBounds::intersects`]).
+pub(super) fn bboxes_intersect(a: &[f64; 4], b: &[f64; 4]) -> bool {
+    a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
+}
+
+/// Row groups of the input whose bbox covering statistics intersect
+/// `bbox_units` (`[xmin, ymin, xmax, ymax]` in the file's CRS units).
+///
+/// Statistics-only: operates purely on the parsed parquet footer
+/// ([`crate::covering::extract_row_group_bounds_from_metadata`]); no data
+/// pages are touched. Row groups with missing/unparseable covering
+/// statistics are conservatively KEPT (graceful degradation — the exact
+/// per-feature bbox filter downstream guarantees correctness either way).
+pub(super) fn select_input_row_groups(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    bbox_units: &[f64; 4],
+) -> Vec<usize> {
+    let bounds = crate::covering::extract_row_group_bounds_from_metadata(metadata)
+        .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]);
+    let filter = crate::tile::TileBounds {
+        lng_min: bbox_units[0],
+        lat_min: bbox_units[1],
+        lng_max: bbox_units[2],
+        lat_max: bbox_units[3],
+    };
+    (0..metadata.num_row_groups())
+        .filter(|&i| match bounds.get(i).and_then(|b| b.as_ref()) {
+            Some(b) => b.intersects(&filter),
+            None => true, // no stats — must read to stay correct
+        })
+        .collect()
 }
 
 /// Find the primary geometry column index (name `geometry`, else first `geom*`).
@@ -3998,5 +4129,210 @@ mod tests {
         };
         let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
         assert!(matches!(err, ConvertError::SortKeyColumnMissing { .. }));
+    }
+
+    // ========================================================================
+    // Bbox row-group filtering tests (#102)
+    // ========================================================================
+
+    /// Write a multi-row-group GeoParquet file with covering column stats so
+    /// row-group pruning can actually bite. Each row group contains one point
+    /// at `(x, y)` with id = row-group index.
+    fn write_multi_rg_input(path: &Path, coords: &[(f64, f64)], with_covering: bool) {
+        use parquet::file::properties::WriterProperties;
+
+        let geoms: Vec<Geometry<f64>> = coords
+            .iter()
+            .map(|&(x, y)| Geometry::Point(Point::new(x, y)))
+            .collect();
+        let n = geoms.len();
+        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+        let geom_arr = build_geometry_array(&geoms);
+        let geom_field = geom_arr.data_type().to_field("geometry", true);
+        let fields = vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(geom_field),
+        ];
+        let columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), geom_arr.to_array_ref()];
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+        let gpq_options = GeoParquetWriterOptionsBuilder::default()
+            .set_encoding(GeoParquetWriterEncoding::WKB)
+            .set_generate_covering(with_covering)
+            .build();
+        let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+        let target_schema = encoder.target_schema();
+        // Row-group size = 1 to force n row groups.
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(1)
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
+        let mut encoder = encoder;
+        let encoded = encoder.encode_record_batch(&batch).unwrap();
+        writer.write(&encoded).unwrap();
+        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+        writer.close().unwrap();
+    }
+
+    /// Read all ids from all levels of an overview file.
+    fn read_all_ids(reader: &OverviewReader) -> Vec<i64> {
+        use arrow_array::cast::AsArray;
+        let mut ids = Vec::new();
+        for level in 0..reader.num_levels() {
+            let rdr = reader.read_level(level, None).unwrap();
+            for batch in rdr {
+                let batch = batch.unwrap();
+                let col = batch
+                    .column(batch.schema().index_of("id").unwrap())
+                    .as_primitive::<arrow_array::types::Int64Type>();
+                ids.extend(col.iter().flatten());
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    #[test]
+    fn bbox_filter_matches_posthoc_filter() {
+        // 4 row groups with points at (0,0), (10,10), (20,20), (30,30).
+        // A bbox around (10,10) should keep only id=1.
+        let coords = vec![(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+
+        // Full unfiltered conversion.
+        let tout_full = tempfile::NamedTempFile::new().unwrap();
+        let opts_full = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            ..Default::default()
+        };
+        let report_full = convert_to_overviews(tin.path(), tout_full.path(), &opts_full).unwrap();
+        assert_eq!(report_full.row_groups_total, 4);
+        assert_eq!(report_full.row_groups_read, 4);
+        let reader_full = OverviewReader::open(tout_full.path()).unwrap();
+        let ids_full = read_all_ids(&reader_full);
+
+        // Bbox-filtered conversion: keep only (10,10).
+        let tout_bbox = tempfile::NamedTempFile::new().unwrap();
+        let opts_bbox = ConvertOptions {
+            bbox: Some([9.0, 9.0, 11.0, 11.0]),
+            ..opts_full.clone()
+        };
+        let report_bbox = convert_to_overviews(tin.path(), tout_bbox.path(), &opts_bbox).unwrap();
+        // The bbox intersects only one row group, so pruning should fire.
+        assert_eq!(report_bbox.row_groups_total, 4);
+        assert_eq!(
+            report_bbox.row_groups_read, 1,
+            "bbox pruning did not fire: read {} row groups",
+            report_bbox.row_groups_read
+        );
+        let reader_bbox = OverviewReader::open(tout_bbox.path()).unwrap();
+        let ids_bbox = read_all_ids(&reader_bbox);
+        assert_eq!(ids_bbox, vec![1], "bbox filter kept wrong ids");
+
+        // Correctness: filtered == unfiltered then post-hoc filtered.
+        let ids_posthoc: Vec<i64> = ids_full
+            .into_iter()
+            .filter(|&id| {
+                let (x, y) = coords[id as usize];
+                x >= 9.0 && x <= 11.0 && y >= 9.0 && y <= 11.0
+            })
+            .collect();
+        assert_eq!(ids_bbox, ids_posthoc);
+    }
+
+    #[test]
+    fn bbox_filter_stats_free_degradation() {
+        // Same layout but WITHOUT covering column (stats-free input).
+        let coords = vec![(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, false);
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            bbox: Some([9.0, 9.0, 11.0, 11.0]),
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        // Without stats, all row groups are read (graceful degradation).
+        assert_eq!(report.row_groups_total, 4);
+        assert_eq!(
+            report.row_groups_read, 4,
+            "stats-free should read all row groups"
+        );
+        // Exact per-feature filter still applies: only id=1 survives.
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let ids = read_all_ids(&reader);
+        assert_eq!(ids, vec![1], "exact filter did not apply");
+    }
+
+    #[test]
+    fn bbox_filter_nothing_intersects() {
+        let coords = vec![(0.0, 0.0), (10.0, 10.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            bbox: Some([100.0, 100.0, 110.0, 110.0]), // far away
+            ..Default::default()
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+        // No features survive → NoData error.
+        assert!(
+            matches!(err, ConvertError::NoData),
+            "expected NoData, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bbox_filter_everything_intersects() {
+        let coords = vec![(0.0, 0.0), (10.0, 10.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+
+        // Full conversion (no bbox).
+        let tout_full = tempfile::NamedTempFile::new().unwrap();
+        let opts_full = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            ..Default::default()
+        };
+        let report_full = convert_to_overviews(tin.path(), tout_full.path(), &opts_full).unwrap();
+        let reader_full = OverviewReader::open(tout_full.path()).unwrap();
+        let ids_full = read_all_ids(&reader_full);
+
+        // Bbox containing everything.
+        let tout_bbox = tempfile::NamedTempFile::new().unwrap();
+        let opts_bbox = ConvertOptions {
+            bbox: Some([-1.0, -1.0, 11.0, 11.0]),
+            ..opts_full.clone()
+        };
+        let report_bbox = convert_to_overviews(tin.path(), tout_bbox.path(), &opts_bbox).unwrap();
+        // All row groups intersect, so row_groups_read == row_groups_total.
+        assert_eq!(report_bbox.row_groups_read, report_bbox.row_groups_total);
+        let reader_bbox = OverviewReader::open(tout_bbox.path()).unwrap();
+        let ids_bbox = read_all_ids(&reader_bbox);
+        assert_eq!(ids_bbox, ids_full);
     }
 }
