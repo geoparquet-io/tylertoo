@@ -1,0 +1,32 @@
+[package]
+name = "gpq-tiles-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gpq-tiles-core = { path = "../crates/core" }
+
+[[bin]]
+name = "footer_json"
+path = "fuzz_targets/footer_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wkb"
+path = "fuzz_targets/wkb.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace: this crate is deliberately NOT a member of the root
+# workspace, so it never affects `cargo build/check/test --workspace` or the
+# per-PR CI wall time. Run it explicitly with `cargo fuzz` (see README.md).
+[workspace]
+members = ["."]
