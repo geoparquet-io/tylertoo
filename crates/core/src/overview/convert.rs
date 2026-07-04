@@ -500,6 +500,45 @@ pub(super) fn warn_plan_skipped_levels(
     );
 }
 
+/// Fold one [`OverviewWriter::write_level`] outcome into the driver
+/// bookkeeping shared by both pipelines (#211): a written level appends a
+/// [`LevelReport`] renumbered to the written count; an empty level (every
+/// candidate collapsed during simplification) warns and records `planned` in
+/// the skipped list instead.
+pub(super) fn record_level_outcome(
+    outcome: LevelWriteOutcome,
+    planned: SkippedLevelReport,
+    candidates: usize,
+    rows: usize,
+    vertices: usize,
+    level_reports: &mut Vec<LevelReport>,
+    skipped: &mut Vec<SkippedLevelReport>,
+) {
+    match outcome {
+        LevelWriteOutcome::SkippedEmpty => {
+            log::warn!(
+                "level planned at GSD {:.2} m{} became empty after simplification \
+                 (all {} candidate feature(s) collapsed); omitted from the output pyramid",
+                planned.gsd,
+                planned
+                    .zoom
+                    .map_or_else(String::new, |z| format!(" (zoom {z})")),
+                candidates,
+            );
+            skipped.push(planned);
+        }
+        LevelWriteOutcome::Written => level_reports.push(LevelReport {
+            level: level_reports.len(),
+            gsd: planned.gsd,
+            zoom: planned.zoom,
+            feature_count: rows,
+            vertex_count: vertices,
+            uncompressed_bytes: 0,
+            compressed_bytes: 0,
+        }),
+    }
+}
+
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConvertReport {
@@ -1218,26 +1257,23 @@ pub(crate) fn convert_to_overviews_source_strategy(
             // Canonical level (and guard-skipped runs): table is None ⇒ all 1.
             batch = apply_coalesced_count(batch, &out_schema, &e.indices, e.coalesce.as_ref())?;
         }
-        match writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))? {
-            // Unreachable here (every emitted level has >= 1 feature), but
-            // kept aligned with the streaming path's bookkeeping.
-            LevelWriteOutcome::SkippedEmpty => {
-                skipped.push(SkippedLevelReport {
-                    planned_level: e.orig,
-                    gsd: e.gsd,
-                    zoom: e.zoom,
-                });
-            }
-            LevelWriteOutcome::Written => level_reports.push(LevelReport {
-                level: level_reports.len(),
+        // SkippedEmpty is unreachable here (every emitted level has >= 1
+        // feature), but the bookkeeping stays aligned with the streaming path.
+        let outcome =
+            writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
+        record_level_outcome(
+            outcome,
+            SkippedLevelReport {
+                planned_level: e.orig,
                 gsd: e.gsd,
                 zoom: e.zoom,
-                feature_count: e.indices.len(),
-                vertex_count: e.vertex_count,
-                uncompressed_bytes: 0,
-                compressed_bytes: 0,
-            }),
-        }
+            },
+            e.indices.len(),
+            e.indices.len(),
+            e.vertex_count,
+            &mut level_reports,
+            &mut skipped,
+        );
     }
     skipped.sort_by_key(|s| s.planned_level);
 

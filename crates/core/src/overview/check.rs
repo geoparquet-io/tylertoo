@@ -876,7 +876,9 @@ fn parse_semver_major(v: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::overview::level::{gsd, Level};
-    use crate::overview::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions};
+    use crate::overview::writer::{
+        LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions,
+    };
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use geo::{Geometry, LineString, Point, Polygon};
@@ -957,13 +959,16 @@ mod tests {
         opts.cogp_compat_key = cogp;
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         for (k, ids) in level_ids.iter().enumerate() {
-            let _ = writer
-                .write_level(
-                    k,
-                    Some(ids.len()),
-                    std::iter::once(source_batch(&schema, ids)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        k,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
         }
         writer.finish().unwrap()
     }
@@ -1103,9 +1108,12 @@ mod tests {
                 columns.push(Arc::new(I64::from(counts[k].clone())));
             }
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-            let _ = writer
-                .write_level(k, Some(ids.len()), std::iter::once(batch))
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(k, Some(ids.len()), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
         }
         writer.finish().unwrap();
     }
@@ -1296,9 +1304,12 @@ mod tests {
                 columns.push(Arc::new(I32::from(counts[k].clone())));
             }
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-            let _ = writer
-                .write_level(k, Some(ids.len()), std::iter::once(batch))
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(k, Some(ids.len()), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
         }
         writer.finish().unwrap();
     }

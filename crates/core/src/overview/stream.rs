@@ -74,9 +74,9 @@ use super::convert::{
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
     count_vertices, extract_class_ranks, extract_sort_keys, feature_kind, fill_level_bytes,
     find_geometry_column, geometry_bbox, mixed_geometry_field, overture_road_ranking,
-    usable_geometry, validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels,
-    ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
-    LevelReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    record_level_outcome, usable_geometry, validate_cluster_schema, validate_coalesce_schema,
+    warn_plan_skipped_levels, ClassRanking, CoalesceTable, ConvertError, ConvertOptions,
+    ConvertReport, GroupInterner, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipeline;
@@ -535,40 +535,26 @@ pub(crate) fn convert_streaming_strategy(
         }
     };
 
-    // Build reports for the written levels; a level whose every candidate
-    // collapsed during simplification was skipped by the writer (#211) — record
-    // it as a write-time omission. The writer renumbers the physical `level`
-    // column, and `level_reports.len()` mirrors that contiguous written index.
+    // Fold each emitted level's write outcome into the shared bookkeeping
+    // (#211): `record_level_outcome` appends a renumbered `LevelReport` for a
+    // written level, or — for a level the writer omitted because every
+    // candidate collapsed during simplification — warns and records the plan in
+    // `skipped`, exactly like a plan-time omission.
     let mut level_reports = Vec::with_capacity(emitted.len());
     for (e, (outcome, rows, vertices)) in emitted.iter().zip(level_stats) {
-        match outcome {
-            // #211: the winner table promised rows but simplification dropped
-            // every one (pathological geometry, e.g. a huge-bbox sliver). The
-            // writer skipped the level; record it like a plan-time omission.
-            LevelWriteOutcome::SkippedEmpty => {
-                log::warn!(
-                    "level planned at GSD {:.2} m{} became empty after simplification \
-                     (all {} candidate feature(s) collapsed); omitted from the output pyramid",
-                    e.gsd,
-                    e.zoom.map_or_else(String::new, |z| format!(" (zoom {z})")),
-                    e.hint,
-                );
-                skipped.push(SkippedLevelReport {
-                    planned_level: e.orig as usize,
-                    gsd: e.gsd,
-                    zoom: e.zoom,
-                });
-            }
-            LevelWriteOutcome::Written => level_reports.push(LevelReport {
-                level: level_reports.len(),
+        record_level_outcome(
+            outcome,
+            SkippedLevelReport {
+                planned_level: e.orig as usize,
                 gsd: e.gsd,
                 zoom: e.zoom,
-                feature_count: rows,
-                vertex_count: vertices,
-                uncompressed_bytes: 0,
-                compressed_bytes: 0,
-            }),
-        }
+            },
+            e.hint,
+            rows,
+            vertices,
+            &mut level_reports,
+            &mut skipped,
+        );
     }
     skipped.sort_by_key(|s| s.planned_level);
     if level_reports.is_empty() {

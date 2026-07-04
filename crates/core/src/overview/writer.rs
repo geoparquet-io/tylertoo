@@ -974,15 +974,24 @@ mod tests {
         {
             let mut writer =
                 OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
-            let _ = writer
-                .write_level(0, None, std::iter::once(make_batch(&[0, 3])))
-                .unwrap();
-            let _ = writer
-                .write_level(1, None, std::iter::once(make_batch(&[0, 1, 3])))
-                .unwrap();
-            let _ = writer
-                .write_level(2, None, std::iter::once(make_batch(&[0, 1, 2, 3])))
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(0, None, std::iter::once(make_batch(&[0, 3])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(1, None, std::iter::once(make_batch(&[0, 1, 3])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(2, None, std::iter::once(make_batch(&[0, 1, 2, 3])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap();
         }
 
@@ -1038,19 +1047,28 @@ mod tests {
         let written_meta = {
             let mut writer =
                 OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
-            let _ = writer
-                .write_level(0, None, std::iter::once(source_batch(&schema, &level0_ids)))
-                .unwrap();
-            let _ = writer
-                .write_level(1, None, std::iter::once(source_batch(&schema, &level1_ids)))
-                .unwrap();
-            let _ = writer
-                .write_level(
-                    2,
-                    None,
-                    std::iter::once(source_batch(&schema, &canonical_ids)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(0, None, std::iter::once(source_batch(&schema, &level0_ids)))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(1, None, std::iter::once(source_batch(&schema, &level1_ids)))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(
+                        2,
+                        None,
+                        std::iter::once(source_batch(&schema, &canonical_ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1213,12 +1231,18 @@ mod tests {
 
         let written_meta = {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
-            let _ = writer
-                .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 2])))
-                .unwrap();
-            let _ = writer
-                .write_level(1, None, std::iter::once(source_batch(&schema, &[1, 3, 5])))
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 2])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(1, None, std::iter::once(source_batch(&schema, &[1, 3, 5])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1260,9 +1284,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut writer =
             OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
-        let _ = writer
-            .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 3])))
-            .unwrap();
+        assert_eq!(
+            writer
+                .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 3])))
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
         let err = writer.finish().unwrap_err();
         assert!(matches!(
             err,
@@ -1307,22 +1334,28 @@ mod tests {
         let meta = {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
             // Level 0: 3 rows (<= cap 4) -> single row group.
-            let _ = writer
-                .write_level(
-                    0,
-                    Some(3),
-                    std::iter::once(source_batch(&schema, &[0, 1, 2])),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        0,
+                        Some(3),
+                        std::iter::once(source_batch(&schema, &[0, 1, 2])),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             // Level 1: 10 rows (> cap 4) -> ceil(10/4)=3 uniform row groups.
             let ids: Vec<i64> = (0..10).collect();
-            let _ = writer
-                .write_level(
-                    1,
-                    Some(ids.len()),
-                    std::iter::once(source_batch(&schema, &ids)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        1,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1389,20 +1422,26 @@ mod tests {
         let ids: Vec<i64> = (0..10).collect();
         let meta = {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
-            let _ = writer
-                .write_level(
-                    0,
-                    Some(ids.len()),
-                    std::iter::once(source_batch(&schema, &ids)),
-                )
-                .unwrap();
-            let _ = writer
-                .write_level(
-                    1,
-                    Some(ids.len()),
-                    std::iter::once(source_batch(&schema, &ids)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        0,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(
+                        1,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1452,23 +1491,32 @@ mod tests {
         let mut opts = duplicating_options();
         opts.full_column_stats = full_column_stats;
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
-        let _ = writer
-            .write_level(0, Some(2), std::iter::once(source_batch(&schema, &[0, 3])))
-            .unwrap();
-        let _ = writer
-            .write_level(
-                1,
-                Some(3),
-                std::iter::once(source_batch(&schema, &[0, 1, 3])),
-            )
-            .unwrap();
-        let _ = writer
-            .write_level(
-                2,
-                Some(4),
-                std::iter::once(source_batch(&schema, &[0, 1, 2, 3])),
-            )
-            .unwrap();
+        assert_eq!(
+            writer
+                .write_level(0, Some(2), std::iter::once(source_batch(&schema, &[0, 3])))
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        assert_eq!(
+            writer
+                .write_level(
+                    1,
+                    Some(3),
+                    std::iter::once(source_batch(&schema, &[0, 1, 3])),
+                )
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        assert_eq!(
+            writer
+                .write_level(
+                    2,
+                    Some(4),
+                    std::iter::once(source_batch(&schema, &[0, 1, 2, 3])),
+                )
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
         writer.finish().unwrap();
     }
 
