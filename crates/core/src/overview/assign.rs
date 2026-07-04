@@ -1279,4 +1279,70 @@ mod tests {
             "disabled budget must be an identity"
         );
     }
+
+    // ---- antimeridian-crossing bboxes (issue #188 behavior pins) -------------
+    //
+    // The convert pipeline stores geometries verbatim and computes bboxes with
+    // `geo::bounding_rect` (plain min/max), so a feature straddling ±180° gets
+    // an *inflated* bbox spanning nearly the whole world (lng_min ≈ -179.9,
+    // lng_max ≈ +179.9) rather than a wrapped one (lng_min > lng_max never
+    // arises). These tests PIN the downstream consequences for level
+    // assignment — they document current behavior, not desired behavior. See
+    // `context/ANTIMERIDIAN.md`.
+
+    #[test]
+    fn antimeridian_inflated_bbox_assigned_to_coarsest_level() {
+        // A polygon whose true extent is 0.2° × 0.2° straddling the
+        // antimeridian. Our bbox math hands assignment the inflated bbox
+        // [-179.9, -0.1, 179.9, 0.1] (diag ≈ 359.8°), so the polygon clears
+        // every visibility gate and wins the coarsest level.
+        let inflated = poly(0, -179.9, -0.1, 179.9, 0.1);
+        // The same feature's *true* extent, expressed unwrapped past 180°
+        // (diag ≈ 0.28°): gated out of level 0 (gate = 4·gsd(2) ≈ 0.35°),
+        // eligible only at the finest level.
+        let true_extent = poly(1, 179.9, -0.1, 180.1, 0.1);
+        let gsds = [gsd(2), gsd(6)];
+        let out = assign_levels(
+            &[inflated, true_extent],
+            &gsds,
+            &AssignConfig::default(),
+            Crs::Epsg4326,
+        );
+        assert_eq!(
+            out.assignments[0].min_level, 0,
+            "PIN: inflated antimeridian bbox promotes a 0.2°-wide feature \
+             to the coarsest level"
+        );
+        assert_eq!(
+            out.assignments[1].min_level, 1,
+            "the same feature at its true extent is visibility-gated to the \
+             finest level"
+        );
+    }
+
+    #[test]
+    fn antimeridian_center_lands_on_prime_meridian_and_displaces_neighbor() {
+        // The bbox center of the inflated bbox is lng ≈ 0 — the wrong
+        // hemisphere. The feature therefore competes in a grid cell at the
+        // prime meridian, and its huge bbox diagonal out-ranks any genuine
+        // local feature sharing that cell.
+        let antimeridian = poly(0, -179.9, -0.1, 179.9, 0.1); // center (0, 0)
+        let local = poly(1, -0.5, -0.5, 0.5, 0.5); // genuinely at (0, 0)
+        let gsds = [gsd(2), gsd(6)];
+        let out = assign_levels(
+            &[antimeridian, local],
+            &gsds,
+            &AssignConfig::default(),
+            Crs::Epsg4326,
+        );
+        assert_eq!(
+            out.assignments[0].min_level, 0,
+            "PIN: antimeridian feature wins the prime-meridian cell"
+        );
+        assert_eq!(
+            out.assignments[1].min_level, 1,
+            "PIN: genuine prime-meridian feature is displaced to the finest \
+             level by the antimeridian feature's inflated priority"
+        );
+    }
 }
