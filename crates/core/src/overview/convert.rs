@@ -763,9 +763,12 @@ pub fn convert_to_overviews(
         .map(|g| match g.as_ref().filter(|g| usable_geometry(g)) {
             // Regional extract (#102): drop features whose bbox misses the
             // requested region exactly, independent of row-group pruning.
+            // (map_or, not is_none_or: the latter is stable only since Rust
+            // 1.82 and the crate MSRV is 1.75.)
+            #[allow(clippy::unnecessary_map_or)]
             Some(g) => bbox_units
                 .as_ref()
-                .is_none_or(|bb| bboxes_intersect(&geometry_bbox(g), bb)),
+                .map_or(true, |bb| bboxes_intersect(&geometry_bbox(g), bb)),
             None => {
                 geom_skipped += 1;
                 false
@@ -4174,7 +4177,7 @@ mod tests {
         let target_schema = encoder.target_schema();
         // Row-group size = 1 to force n row groups.
         let props = WriterProperties::builder()
-            .set_max_row_group_size(1)
+            .set_max_row_group_row_count(Some(1))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
@@ -4251,7 +4254,7 @@ mod tests {
             .into_iter()
             .filter(|&id| {
                 let (x, y) = coords[id as usize];
-                x >= 9.0 && x <= 11.0 && y >= 9.0 && y <= 11.0
+                (9.0..=11.0).contains(&x) && (9.0..=11.0).contains(&y)
             })
             .collect();
         assert_eq!(ids_bbox, ids_posthoc);
@@ -4327,7 +4330,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let report_full = convert_to_overviews(tin.path(), tout_full.path(), &opts_full).unwrap();
+        let _report_full = convert_to_overviews(tin.path(), tout_full.path(), &opts_full).unwrap();
         let reader_full = OverviewReader::open(tout_full.path()).unwrap();
         let ids_full = read_all_ids(&reader_full);
 
