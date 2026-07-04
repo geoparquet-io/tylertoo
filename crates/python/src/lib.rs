@@ -167,6 +167,8 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     dict.set_item("total_rows", report.total_rows)?;
     dict.set_item("total_vertices", report.total_vertices)?;
     dict.set_item("total_compressed_bytes", report.total_compressed_bytes)?;
+    dict.set_item("row_groups_total", report.row_groups_total)?;
+    dict.set_item("row_groups_read", report.row_groups_read)?;
     dict.set_item("duration_secs", report.duration_secs)?;
     Ok(dict.into())
 }
@@ -268,13 +270,20 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         pipeline. Defaults to True.
 ///     read_batch_size (int, optional): Rows per Arrow read batch in the
 ///         streaming pipeline. Defaults to 8192.
+///     bbox (tuple, optional): Regional extract as ``(xmin, ymin, xmax,
+///         ymax)`` in EPSG:4326 lon/lat degrees. Only features whose bbox
+///         intersects the region are converted; input row groups whose bbox
+///         covering statistics don't intersect are skipped without reading
+///         their data pages (inputs without covering stats read everything
+///         and rely on the exact per-feature filter). Defaults to None
+///         (full extent).
 ///
 /// Returns:
 ///     dict: Conversion report with keys "mode", "levels" (list of dicts with
 ///     "level", "gsd", "zoom", "feature_count", "vertex_count",
 ///     "uncompressed_bytes", "compressed_bytes"), "input_features",
 ///     "total_rows", "total_vertices", "total_compressed_bytes",
-///     "duration_secs".
+///     "row_groups_total", "row_groups_read", "duration_secs".
 ///
 /// Raises:
 ///     ValueError: Invalid options (bad mode/direction/op, conflicting or
@@ -327,6 +336,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     full_column_stats=false,
     streaming=true,
     read_batch_size=8192,
+    bbox=None,
 ))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
@@ -365,6 +375,7 @@ fn overview(
     full_column_stats: bool,
     streaming: bool,
     read_batch_size: usize,
+    bbox: Option<(f64, f64, f64, f64)>,
 ) -> PyResult<Py<PyDict>> {
     let mode = match mode {
         "duplicating" => Mode::Duplicating,
@@ -495,6 +506,7 @@ fn overview(
         coalesce_snap,
         coalesce_max_level_rows,
         coalesce_junction_angle,
+        bbox: bbox.map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]),
     };
 
     let input_path = Path::new(input).to_path_buf();

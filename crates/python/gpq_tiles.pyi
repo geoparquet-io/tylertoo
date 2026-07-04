@@ -51,6 +51,7 @@ def overview(
     full_column_stats: bool = False,
     streaming: bool = True,
     read_batch_size: int = 8192,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> dict[str, Any]: ...
 def export_pmtiles(
     input: str,

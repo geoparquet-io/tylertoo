@@ -42,6 +42,27 @@ fn parse_size_bytes(s: &str) -> Result<u32, String> {
     u32::try_from(bytes).map_err(|_| format!("Size {} too large for u32", s))
 }
 
+/// Parse a --bbox argument: xmin,ymin,xmax,ymax (lon/lat degrees).
+fn parse_bbox(s: &str) -> Result<[f64; 4]> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        anyhow::bail!("--bbox must be xmin,ymin,xmax,ymax (4 comma-separated values)");
+    }
+    let vals: Vec<f64> = parts
+        .iter()
+        .map(|p| {
+            p.trim()
+                .parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("invalid number in --bbox: {e}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bbox = [vals[0], vals[1], vals[2], vals[3]];
+    if bbox[0] > bbox[2] || bbox[1] > bbox[3] {
+        anyhow::bail!("--bbox must satisfy xmin <= xmax and ymin <= ymax");
+    }
+    Ok(bbox)
+}
+
 /// Top-level CLI: a default (bare) tile pipeline plus subcommands.
 ///
 /// `gpq-tiles input.parquet output.pmtiles` still works (bare tile pipeline);
@@ -198,6 +219,15 @@ struct OverviewArgs {
     /// docs/OVERVIEW_TUNING.md.
     #[arg(long, value_name = "F", default_value = "1024.0")]
     gsd_base: f64,
+
+    /// Regional extract: only convert features whose bbox intersects this
+    /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). Row groups whose
+    /// GeoParquet 1.1 covering statistics don't intersect are skipped at the
+    /// parquet footer level (no data pages read); inputs without covering
+    /// stats degrade gracefully (all row groups read, exact per-feature
+    /// filter still applies).
+    #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
+    bbox: Option<String>,
 
     /// Column name used as the cell-winner priority (sort) key. Mutually
     /// exclusive with --class-rank.
@@ -519,6 +549,12 @@ struct TilesArgs {
     #[arg(long, default_value = "14")]
     max_zoom: u8,
 
+    /// Regional extract: only convert features whose bbox intersects this
+    /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). See --bbox in
+    /// `gpq-tiles overview --help` for details.
+    #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
+    bbox: Option<String>,
+
     /// Layer name for the output tiles (default: derived from input filename).
     #[arg(long)]
     layer_name: Option<String>,
@@ -624,11 +660,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             .to_string()
     });
 
+    let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
+
     let options = ConvertOptions {
         levels: LevelPlan::ZoomRange {
             min_zoom: args.min_zoom,
             max_zoom: args.max_zoom,
         },
+        bbox,
         ..ConvertOptions::default()
     };
 
@@ -818,6 +857,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         coalesce_snap: args.coalesce_snap,
         coalesce_max_level_rows: args.coalesce_max_level_rows,
         coalesce_junction_angle: args.coalesce_junction_angle,
+        bbox: args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?,
     };
 
     let report = convert_to_overviews(&args.input, &args.output, &options)
