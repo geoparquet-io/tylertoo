@@ -1206,6 +1206,12 @@ mod tests {
     /// produced by the pre-refactor per-zoom BTreeMap implementation. The
     /// reference hash was captured from that implementation (commit b8a1635)
     /// on this exact fixture before the partitioned-streaming rewrite.
+    ///
+    /// REPIN (issue #112): the MVT winding fix (orient_polygon_for_mvt now
+    /// emits spec-compliant positive-area exterior rings) intentionally
+    /// changed polygon command bytes; the hash was re-captured from the
+    /// fixed encoder. The anchor still guards the export restructure — the
+    /// partition-invariance test alongside it is unchanged.
     #[test]
     fn export_archive_matches_pre_refactor_reference() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -1220,7 +1226,7 @@ mod tests {
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            "58d90ae6c69d16f6",
+            "a108f1607d994a92",
             "archive bytes diverged from the pre-refactor reference"
         );
     }
