@@ -927,6 +927,59 @@ fn antimeridian_bbox_is_inflated_never_wrapped() {
 }
 
 #[test]
+fn antimeridian_suspect_features_warned_normal_inputs_clean() {
+    // Convert-time detection (#188 follow-up): a feature whose bbox spans
+    // more than 180° of longitude is counted as antimeridian-suspect and
+    // surfaced via `ConvertReport::antimeridian_suspect_features` plus ONE
+    // aggregate `log::warn!` at the end of convert. Detection only — the
+    // geometry itself is stored verbatim, never mutated.
+    let suspect = Geometry::Polygon(Polygon::new(
+        LineString::from(vec![
+            (-179.9, -0.1),
+            (179.9, -0.1),
+            (179.9, 0.1),
+            (-179.9, 0.1),
+            (-179.9, -0.1),
+        ]),
+        vec![],
+    ));
+    let geoms: Vec<Option<Geometry<f64>>> = vec![
+        Some(suspect),
+        Some(Geometry::Point(Point::new(10.0, 10.0))),
+        Some(Geometry::Point(Point::new(-170.0, 5.0))),
+    ];
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, true, None);
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
+        assert_eq!(
+            report.antimeridian_suspect_features, 1,
+            "streaming={streaming}: exactly the wide polygon is flagged"
+        );
+    }
+
+    // A normal (wide but < 180°) dataset triggers nothing.
+    let normal: Vec<Option<Geometry<f64>>> = vec![
+        Some(Geometry::LineString(LineString::from(vec![
+            (-80.0, 0.0),
+            (80.0, 10.0),
+        ]))),
+        Some(Geometry::Point(Point::new(0.0, 0.0))),
+    ];
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &normal, true, None);
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
+        assert_eq!(
+            report.antimeridian_suspect_features, 0,
+            "streaming={streaming}: sub-180° extents are not flagged"
+        );
+    }
+}
+
+#[test]
 fn antimeridian_polygon_export_smears_world_row() {
     // End-to-end: one 0.2°-wide polygon straddling ±180° at the equator.
     // A wrap-aware exporter would emit ~2 tile columns per zoom (one on each

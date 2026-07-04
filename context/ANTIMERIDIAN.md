@@ -1,6 +1,7 @@
 # Antimeridian handling — decision memo (issue #188)
 
 **Status:** decided (research memo; pins in tree)
+**User-facing docs:** `docs/advanced-usage.md`, "Antimeridian-Crossing Geometry"
 **Date:** 2026-07-04
 **Follow-up to:** #173 / PR #186 (H4 hostile-input hardening)
 
@@ -115,9 +116,15 @@ new pin needed beyond the bbox pin (F1).
   downstream failure") is met only by synthetic fixtures that are
   already spec-non-conformant inputs.
 - The cheap, contract-preserving improvement instead: **warn at convert
-  time** when a feature bbox spans > 180° of longitude (the H4 warning
-  channel already exists for skipped rows), mirroring the validator's
-  SHOULD-warn. Tracked as follow-up; not part of this memo's pins.
+  time** when a feature bbox spans > 180° of longitude, mirroring the
+  validator's SHOULD-warn. **Implemented** alongside this memo:
+  `bbox_antimeridian_suspect` / `warn_antimeridian_suspects` in
+  `overview/convert.rs`, wired into both the in-memory and streaming
+  paths — one aggregate `log::warn!` per convert (surfaced by the CLI's
+  default `info` log filter), plus a
+  `ConvertReport::antimeridian_suspect_features` counter. Pure
+  detection; geometry is never mutated. User-facing explanation:
+  `docs/advanced-usage.md`, "Antimeridian-Crossing Geometry".
 
 ### (b) If splitting ever becomes necessary, export time only. **Yes.**
 
@@ -151,6 +158,8 @@ bbox/assignment/clip semantics.
 - `tile::tests::antimeridian_inflated_bbox_covers_full_world_row`
 - `overview::hostile::antimeridian_bbox_is_inflated_never_wrapped`
 - `overview::hostile::antimeridian_polygon_export_smears_world_row`
+- `overview::hostile::antimeridian_suspect_features_warned_normal_inputs_clean`
+  (convert-time detection counter, both streaming modes)
 
 Pre-existing (PR #186): `overview::hostile::antimeridian_and_pole_features_convert`
 (no-crash pin); `tile::tests::test_tiles_for_bbox_antimeridian_crossing`
