@@ -34,19 +34,19 @@ thiserror = { workspace = true }
 log = { workspace = true }
 tracing = { workspace = true }
 flate2 = "1"
-brotli = "7"
+brotli = "8"
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde = { workspace = true }
 serde_json = "1"
-i_overlay = "4"
+i_overlay = "7"
 tempfile = "3"
 
 [build-dependencies]
 prost-build = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 serde_json = "1"
 proptest = { workspace = true }
 
