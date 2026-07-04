@@ -293,7 +293,7 @@ struct OverviewArgs {
     ///
     /// BIGGER = SPARSER (fewer lines survive per level), SMALLER = denser.
     /// See --point-thinning; this is the roads/line knob. Default retuned
-    /// 2.0 -> 1.0 after the Portland sweep (corpus/SWEEP_NOTES.md): 1.0
+    /// 2.0 -> 1.0 after the Portland sweep (corpus/SWEEPS.md): 1.0
     /// keeps road networks visibly more continuous at coarse zooms.
     #[arg(long, default_value = "1.0")]
     line_thinning: f64,
@@ -340,7 +340,7 @@ struct OverviewArgs {
     /// tippecanoe's nominal 2.5 because our budget anchors on the full canonical
     /// count N (every feature appears at the finest level), not a per-tile
     /// basezoom count. The canonical (finest) level is never dropped. See
-    /// docs/OVERVIEW_TUNING.md and corpus/SWEEP_NOTES.md.
+    /// docs/OVERVIEW_TUNING.md and corpus/SWEEPS.md.
     #[arg(long, value_name = "F", default_value = "1.65")]
     drop_rate: f64,
 

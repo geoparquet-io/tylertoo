@@ -26,7 +26,7 @@
 //!    ascending `(x, y)` order per zoom — the historical order — so the
 //!    archive's tile-data layout, deduplication, and directory are unchanged.
 //!
-//! ## What this deliberately does NOT do (per `context/CARRYOVER.md`)
+//! ## What this deliberately does NOT do (per `context/archive/CARRYOVER.md`)
 //!
 //! - **No global cross-zoom external sort / per-tile fan-out.** Tiling is done
 //!   one zoom at a time, one tile partition at a time; each partition is

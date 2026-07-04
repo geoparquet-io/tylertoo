@@ -6,8 +6,8 @@
 # matching tippecanoe zoom from the goldens, then writes the contact
 # sheet (data/renders/index.html) and corpus/V2_METRICS.md.
 #
-# Outputs land under corpus/data/renders/ (gitignored). Only the script,
-# V2_METRICS.md and V2_REVIEW.md are committed.
+# Outputs land under corpus/data/renders/ (gitignored). V2_METRICS.md
+# and V2_REVIEW.md are regenerated artifacts (gitignored, not committed).
 #
 # Deps are pulled per-run by uv (never bare python). Pass --only <id> to
 # render a single dataset while iterating.

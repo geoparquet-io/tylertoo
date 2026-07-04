@@ -131,7 +131,7 @@ impl AssignFeature {
 /// Defaults: point thinning 4, line 1, polygon 1; line visibility 2,
 /// polygon 4; sort descending. Point/polygon match the cogp-rs
 /// reference; line thinning was retuned 2.0 → 1.0 after the 2026-07-02
-/// Portland-roads parameter sweep (corpus/SWEEP_NOTES.md): lt=1 keeps
+/// Portland-roads parameter sweep (corpus/SWEEPS.md): lt=1 keeps
 /// road networks visibly more continuous at coarse zooms, chosen by
 /// maintainer review of the true-scale sweep renders.
 #[derive(Debug, Clone, Copy)]
@@ -432,7 +432,7 @@ pub fn assign_levels(
 // Cell-winner thinning (above) stops binding once the grid cell is smaller than
 // the typical feature spacing: at mid zooms *every* feature wins its own cell,
 // so counts plateau at ~the whole dataset (Portland roads: ours/tippecanoe ≈
-// 2–3x at z9–z11; see `corpus/SWEEP_NOTES.md`). Tippecanoe instead applies a
+// 2–3x at z9–z11; see `corpus/SWEEPS.md`). Tippecanoe instead applies a
 // rank-ordered drop-rate per zoom. This stage layers that on top of the
 // cell-winner assignment: it imposes a per-level feature **budget** that decays
 // geometrically toward coarse zooms and drops the lowest-priority survivors
@@ -508,7 +508,7 @@ impl Default for DensityBudgetConfig {
             // Calibrated on lines-portland-medium (duplicating, auto-rank): this
             // brings z9 (1.21x) and z10 (1.03x) into the 1.0–1.3x tippecanoe band
             // and z8 to ~1.0x, while the coarse zooms stay cell-winner-limited.
-            // See `corpus/SWEEP_NOTES.md`. Smaller than tippecanoe's nominal 2.5
+            // See `corpus/SWEEPS.md`. Smaller than tippecanoe's nominal 2.5
             // because our budget anchors on the full canonical count N (every
             // feature is present at the finest level), not a per-tile basezoom
             // count.
