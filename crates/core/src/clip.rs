@@ -1072,6 +1072,62 @@ mod tests {
 
     // ========== Sutherland-Hodgman Clipping Unit Tests ==========
 
+    // ---- antimeridian-crossing geometries (issue #188 behavior pins) --------
+    //
+    // Geometries are stored verbatim, so a polygon whose vertices sit at
+    // lng ±179.9 is, in coordinate space, a near-world-wide rectangle passing
+    // through lng 0 — NOT two slivers at the antimeridian. These tests PIN
+    // what export-time clipping does with such a geometry: every tile in the
+    // world row intersects it ("smearing"). Documenting current behavior,
+    // not desired behavior. See `context/ANTIMERIDIAN.md`.
+
+    /// A polygon with vertices at lng ±179.9 — intended by the data author as
+    /// a 0.2°-wide feature crossing the antimeridian, but stored (verbatim)
+    /// as a 359.8°-wide rectangle.
+    fn antimeridian_polygon() -> Geometry<f64> {
+        Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                Coord { x: -179.9, y: -0.1 },
+                Coord { x: 179.9, y: -0.1 },
+                Coord { x: 179.9, y: 0.1 },
+                Coord { x: -179.9, y: 0.1 },
+                Coord { x: -179.9, y: -0.1 },
+            ]),
+            vec![],
+        ))
+    }
+
+    #[test]
+    fn antimeridian_polygon_smears_into_prime_meridian_tile() {
+        // A tile at lng ≈ 0 is ~180° from either "true" half of the feature,
+        // yet clipping yields content there because the stored rectangle
+        // passes straight through it.
+        let tile = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        let clipped = clip_geometry(&antimeridian_polygon(), &tile, 0.0);
+        let clipped = clipped.expect(
+            "PIN: prime-meridian tile receives geometry from an \
+             antimeridian-crossing polygon (smearing)",
+        );
+        // The smear fills the tile's full x-range.
+        let rect = clipped.bounding_rect().unwrap();
+        assert!(
+            (rect.min().x - (-1.0)).abs() < 1e-9 && (rect.max().x - 1.0).abs() < 1e-9,
+            "PIN: smear spans the entire tile width, got {rect:?}"
+        );
+    }
+
+    #[test]
+    fn antimeridian_polygon_clips_at_edge_tile() {
+        // A tile adjacent to +180° also intersects — the geometry is present
+        // where the author intended it, in addition to the world-row smear.
+        let tile = TileBounds::new(178.0, -1.0, 180.0, 1.0);
+        let clipped = clip_geometry(&antimeridian_polygon(), &tile, 0.0);
+        assert!(
+            clipped.is_some(),
+            "tile at the +180° edge intersects the stored rectangle"
+        );
+    }
+
     #[test]
     fn test_sutherland_hodgman_fully_inside() {
         // Polygon fully inside clip bounds -- should be unchanged

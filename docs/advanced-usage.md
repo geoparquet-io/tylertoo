@@ -22,6 +22,59 @@ gpio convert reproject input.parquet prepared.parquet \
 
 Non-WGS84 input is rejected with the exact command to fix it.
 
+## Antimeridian-Crossing Geometry
+
+gpq-tiles stores your geometry exactly as written — it never reprojects,
+clips, or splits it. That is the right default, but it has one sharp
+edge: features that cross the antimeridian (the ±180° longitude line).
+
+Say you have a polygon around Fiji whose western edge is at longitude
++179.9 and whose eastern edge is at −179.9. On a globe that is a small
+polygon, about 0.2° wide. But written out as plain coordinates, its
+bounding box runs from −179.9 all the way to +179.9 — software that
+doesn't know about the antimeridian sees a polygon nearly 360° wide,
+wrapping the wrong way around the Earth through the prime meridian.
+
+If you convert such a file as-is, three things go wrong:
+
+- **Wrong overview levels.** Level assignment sizes features by their
+  bounding box, so your small Fiji polygon looks planet-sized and is
+  kept at the coarsest zoom levels, where it also crowds out genuinely
+  large features near longitude 0.
+- **Smeared tiles on export.** `export-pmtiles` clips the stored
+  coordinates verbatim, so the polygon renders as a horizontal band
+  across *every* tile at its latitude — a world-wide smear, not a small
+  shape near Fiji.
+- **Broken bbox pruning.** The bounding box stored in the overview file
+  spans nearly all longitudes, so every viewport query at that latitude
+  fetches the feature's row group. Spatial filtering stops helping.
+
+gpq-tiles detects this and warns — once per conversion, with a count of
+affected features — but deliberately does **not** modify your geometry:
+
+```text
+warning: 3 feature(s) have bounding boxes wider than 180° of
+longitude — likely antimeridian-crossing geometry. ...
+```
+
+**The fix is to split such features at ±180° before converting**, so
+the Fiji polygon becomes a MultiPolygon with one part on each side of
+the line. This matches GeoParquet upstream guidance (and the
+`geo:overviews` spec, §7.2): antimeridian handling is the data
+producer's job, done once at the source, rather than every downstream
+tool guessing. The Python [`antimeridian`](https://pypi.org/project/antimeridian/)
+package does exactly this split correctly (holes, multi-part geometry
+and all); many GIS pipelines also have a dateline-wrapping option.
+After splitting, re-run the gpio preparation step above and convert as
+usual — the warning disappears and levels, tiles, and pruning all
+behave.
+
+If you never see the warning, you have nothing to do: data that stays
+inside ±180° is unaffected.
+
+(Design background and the evidence behind this policy live in
+`context/ANTIMERIDIAN.md`.)
+
 ## Memory Control
 
 Conversion streams by default (two passes; peak memory

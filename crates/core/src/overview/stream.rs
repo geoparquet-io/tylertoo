@@ -150,6 +150,14 @@ pub(super) fn convert_streaming(
         );
     }
     let num_features = features.len();
+
+    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
+    let antimeridian_suspect_features = features
+        .iter()
+        .filter(|f| super::convert::bbox_antimeridian_suspect(&f.bbox, crs))
+        .count();
+    super::convert::warn_antimeridian_suspects(antimeridian_suspect_features);
+
     log::debug!(
         "[profile] pass1 stream+scan: {:.2}s",
         t_pass1.elapsed().as_secs_f64()
@@ -429,6 +437,7 @@ pub(super) fn convert_streaming(
         total_rows,
         total_vertices,
         total_compressed_bytes,
+        antimeridian_suspect_features,
         duration_secs: start.elapsed().as_secs_f64(),
     })
 }

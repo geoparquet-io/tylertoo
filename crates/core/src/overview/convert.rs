@@ -62,6 +62,7 @@ use super::coalesce::{
 use super::level::{
     gsd_with_base, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance, Crs,
     DensityProvenance, Generalization, GeneralizationLevel, Mode, RankingProvenance, GSD_TILE_BASE,
+    METERS_PER_DEGREE,
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, WriterError, LEVEL_COLUMN};
@@ -421,6 +422,11 @@ pub struct ConvertReport {
     pub total_vertices: usize,
     /// Total compressed output size (bytes) across all levels.
     pub total_compressed_bytes: i64,
+    /// Features whose bbox spans more than 180° of longitude — almost
+    /// certainly antimeridian-crossing geometry stored verbatim. Warned
+    /// about (one aggregate `log::warn!`), never mutated; see
+    /// `context/ANTIMERIDIAN.md` (issue #188).
+    pub antimeridian_suspect_features: usize,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
 }
@@ -758,6 +764,14 @@ pub fn convert_to_overviews(
             sort_key: sort_keys[i],
         })
         .collect();
+
+    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
+    let antimeridian_suspect_features = features
+        .iter()
+        .filter(|f| bbox_antimeridian_suspect(&f.bbox, crs))
+        .count();
+    warn_antimeridian_suspects(antimeridian_suspect_features);
+
     let assignment = assign_levels(&features, &level_gsds, &options.assign, crs);
     // Q2: layer the per-level density budget on top of cell-winner thinning.
     // When disabled this is an identity, so `--no-density-drop` reproduces the
@@ -1002,6 +1016,7 @@ pub fn convert_to_overviews(
         total_rows,
         total_vertices,
         total_compressed_bytes,
+        antimeridian_suspect_features,
         duration_secs: start.elapsed().as_secs_f64(),
     })
 }
@@ -1051,6 +1066,29 @@ pub(super) fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
     match g.bounding_rect() {
         Some(r) => [r.min().x, r.min().y, r.max().x, r.max().y],
         None => [0.0, 0.0, 0.0, 0.0],
+    }
+}
+
+/// Whether a feature bbox is antimeridian-suspect: wider than 180° of
+/// longitude. A real feature that wide is essentially impossible; the near
+/// certain cause is an antimeridian-crossing geometry stored verbatim, whose
+/// min/max bbox inflates to ~360° (see `context/ANTIMERIDIAN.md`, #188).
+/// Detection only — geometry is never mutated.
+pub(super) fn bbox_antimeridian_suspect(bbox: &[f64; 4], crs: Crs) -> bool {
+    bbox[2] - bbox[0] > crs.meters_to_units(180.0 * METERS_PER_DEGREE)
+}
+
+/// Emit the single aggregate antimeridian warning (#188 follow-up). Called
+/// once per convert, from both the streaming and in-memory paths.
+pub(super) fn warn_antimeridian_suspects(count: usize) {
+    if count > 0 {
+        log::warn!(
+            "{count} feature(s) have bounding boxes wider than 180° of longitude — \
+             likely antimeridian-crossing geometry. These will be assigned to \
+             overly coarse levels and defeat bbox pruning; pre-split them at \
+             ±180° before converting (see docs/advanced-usage.md, \
+             \"Antimeridian-Crossing Geometry\")."
+        );
     }
 }
 

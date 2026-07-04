@@ -889,3 +889,128 @@ fn export_partitioning_mode_file_works() {
     let report = export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
     assert!(report.total_tiles > 0);
 }
+
+// ============================================================================
+// Issue #188: antimeridian downstream behavior pins
+// ============================================================================
+//
+// PR #186 (class 4 above) pinned that antimeridian/polar inputs never crash.
+// These tests pin what the verbatim contract does DOWNSTREAM: the bbox math
+// never produces a wrapped bbox, and export smears an antimeridian-crossing
+// polygon across the whole world row. They document current behavior, not
+// desired behavior. See `context/ANTIMERIDIAN.md`.
+
+#[test]
+fn antimeridian_bbox_is_inflated_never_wrapped() {
+    use super::convert::geometry_bbox;
+    // A 0.2°-wide polygon straddling ±180°, stored verbatim.
+    let poly = Geometry::Polygon(Polygon::new(
+        LineString::from(vec![
+            (-179.9, -0.1),
+            (179.9, -0.1),
+            (179.9, 0.1),
+            (-179.9, 0.1),
+            (-179.9, -0.1),
+        ]),
+        vec![],
+    ));
+    let [xmin, ymin, xmax, ymax] = geometry_bbox(&poly);
+    // Plain min/max: never a wrapped bbox (xmin > xmax cannot arise), so the
+    // wrapped-bbox branch in `tiles_for_bbox` is unreachable from this
+    // pipeline's own bboxes.
+    assert_eq!(
+        [xmin, ymin, xmax, ymax],
+        [-179.9, -0.1, 179.9, 0.1],
+        "PIN: bounding_rect yields the inflated (359.8°-wide) bbox"
+    );
+    assert!(xmin < xmax, "PIN: wrapped bboxes never arise");
+}
+
+#[test]
+fn antimeridian_suspect_features_warned_normal_inputs_clean() {
+    // Convert-time detection (#188 follow-up): a feature whose bbox spans
+    // more than 180° of longitude is counted as antimeridian-suspect and
+    // surfaced via `ConvertReport::antimeridian_suspect_features` plus ONE
+    // aggregate `log::warn!` at the end of convert. Detection only — the
+    // geometry itself is stored verbatim, never mutated.
+    let suspect = Geometry::Polygon(Polygon::new(
+        LineString::from(vec![
+            (-179.9, -0.1),
+            (179.9, -0.1),
+            (179.9, 0.1),
+            (-179.9, 0.1),
+            (-179.9, -0.1),
+        ]),
+        vec![],
+    ));
+    let geoms: Vec<Option<Geometry<f64>>> = vec![
+        Some(suspect),
+        Some(Geometry::Point(Point::new(10.0, 10.0))),
+        Some(Geometry::Point(Point::new(-170.0, 5.0))),
+    ];
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, true, None);
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
+        assert_eq!(
+            report.antimeridian_suspect_features, 1,
+            "streaming={streaming}: exactly the wide polygon is flagged"
+        );
+    }
+
+    // A normal (wide but < 180°) dataset triggers nothing.
+    let normal: Vec<Option<Geometry<f64>>> = vec![
+        Some(Geometry::LineString(LineString::from(vec![
+            (-80.0, 0.0),
+            (80.0, 10.0),
+        ]))),
+        Some(Geometry::Point(Point::new(0.0, 0.0))),
+    ];
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &normal, true, None);
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
+        assert_eq!(
+            report.antimeridian_suspect_features, 0,
+            "streaming={streaming}: sub-180° extents are not flagged"
+        );
+    }
+}
+
+#[test]
+fn antimeridian_polygon_export_smears_world_row() {
+    // End-to-end: one 0.2°-wide polygon straddling ±180° at the equator.
+    // A wrap-aware exporter would emit ~2 tile columns per zoom (one on each
+    // side of ±180°); the verbatim rectangle instead intersects EVERY column,
+    // so the finest zoom (z6, 64 columns × 2 equator rows) writes ~128 tiles.
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tovr = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let geoms: Vec<Option<Geometry<f64>>> = vec![Some(Geometry::Polygon(Polygon::new(
+        LineString::from(vec![
+            (-179.9, -0.1),
+            (179.9, -0.1),
+            (179.9, 0.1),
+            (-179.9, 0.1),
+            (-179.9, -0.1),
+        ]),
+        vec![],
+    )))];
+    write_input(tin.path(), &geoms, true, None);
+    convert_to_overviews(tin.path(), tovr.path(), &opts(true)).unwrap();
+    let report = export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
+
+    for z in &report.zooms {
+        eprintln!("z{}: {} tiles", z.zoom, z.tile_count);
+    }
+    let finest = report.zooms.last().unwrap();
+    assert_eq!(finest.zoom, 6);
+    assert!(
+        finest.tile_count >= 64,
+        "PIN: export smears the polygon across the full world row at z6 \
+         (>= 64 tile columns), got {} tiles",
+        finest.tile_count
+    );
+}

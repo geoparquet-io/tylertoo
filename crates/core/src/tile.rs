@@ -372,6 +372,25 @@ mod tests {
     }
 
     #[test]
+    fn antimeridian_inflated_bbox_covers_full_world_row() {
+        // Issue #188 behavior pin. `tiles_for_bbox` supports wrapped bboxes
+        // (lng_min > lng_max, tested above), but the overview pipeline never
+        // produces one: bboxes come from `geo::bounding_rect` (plain min/max),
+        // so an antimeridian-crossing feature arrives as the INFLATED bbox
+        // [-179.9, .., 179.9]. That bbox enumerates every x column at the
+        // zoom — the full world row — not two columns at ±180°.
+        // See `context/ANTIMERIDIAN.md`.
+        let bbox = TileBounds::new(-179.9, -0.1, 179.9, 0.1);
+        let tiles: Vec<_> = tiles_for_bbox(&bbox, 4).collect();
+        let x_coords: std::collections::HashSet<_> = tiles.iter().map(|t| t.x).collect();
+        assert_eq!(
+            x_coords.len(),
+            16,
+            "PIN: inflated antimeridian bbox spans all 16 x columns at z4"
+        );
+    }
+
+    #[test]
     fn test_tiles_for_bbox_normal_still_works() {
         // Normal case: Europe (doesn't cross antimeridian)
         let bbox = TileBounds::new(-10.0, 40.0, 10.0, 50.0);
