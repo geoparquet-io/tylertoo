@@ -68,7 +68,8 @@ use super::level::{
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{
-    LevelSpec, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy, WriterError, LEVEL_COLUMN,
+    LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy,
+    WriterError, LEVEL_COLUMN,
 };
 
 /// How the caller specifies the overview levels.
@@ -449,13 +450,71 @@ pub struct LevelReport {
     pub compressed_bytes: i64,
 }
 
+/// A planned level omitted from the output because it contained no rows
+/// (#211 auto-clamp; spec §7.3 requires empty levels to be omitted and the
+/// remaining levels renumbered).
+///
+/// The most common shape is a coarse prefix: e.g. country-scale buildings
+/// where every feature is culled by the visibility gates at world zooms, so
+/// the written pyramid starts at the first zoom with visible features.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SkippedLevelReport {
+    /// Index of the level in the *planned* (requested) level range
+    /// (0 = requested coarsest). NOT an index into the written file.
+    pub planned_level: usize,
+    /// Planned ground sample distance in meters.
+    pub gsd: f64,
+    /// Planned Web Mercator zoom, if the level plan supplied one.
+    pub zoom: Option<u8>,
+}
+
+/// One WARN for the planned levels omitted because no feature is visible at
+/// their scale (#211 auto-clamp). No-op when nothing was skipped.
+pub(super) fn warn_plan_skipped_levels(
+    skipped: &[SkippedLevelReport],
+    input_features: usize,
+    first_written_gsd: f64,
+    first_written_zoom: Option<u8>,
+) {
+    if skipped.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = skipped
+        .iter()
+        .map(|s| s.planned_level.to_string())
+        .collect();
+    let gsd_max = skipped.iter().map(|s| s.gsd).fold(f64::MIN, f64::max);
+    let gsd_min = skipped.iter().map(|s| s.gsd).fold(f64::MAX, f64::min);
+    let zoom_note = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
+    log::warn!(
+        "omitting {} empty level(s) [{}] spanning GSD {:.2}–{:.2} m: none of the {} input \
+         feature(s) are visible at those scales (visibility gates / density budget); the \
+         output pyramid starts at GSD {:.2} m{}",
+        skipped.len(),
+        ids.join(", "),
+        gsd_max,
+        gsd_min,
+        input_features,
+        first_written_gsd,
+        zoom_note,
+    );
+}
+
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConvertReport {
     /// Level materialization mode used.
     pub mode: Mode,
-    /// Per-level statistics, coarse→fine.
+    /// Per-level statistics, coarse→fine. `level` here is the index in the
+    /// WRITTEN file, which is shifted down from the planned range when empty
+    /// levels were skipped (see
+    /// [`skipped_empty_levels`](Self::skipped_empty_levels)).
     pub levels: Vec<LevelReport>,
+    /// Planned levels omitted because they contained no rows (#211
+    /// auto-clamp), ordered by planned level. Empty when every planned level
+    /// was written. The effective level range of the output is exactly
+    /// [`levels`](Self::levels).
+    pub skipped_empty_levels: Vec<SkippedLevelReport>,
     /// Number of source features read from the input.
     pub input_features: usize,
     /// Total rows written across all levels.
@@ -716,6 +775,61 @@ pub(crate) fn convert_to_overviews_strategy(
     convert_to_overviews_source_strategy(&source, output_path.as_ref(), options, strategy)
 }
 
+/// Decode every geometry in `full` (row-aligned to the batch) and drop the rows
+/// that cannot participate in level assignment: a null/empty/non-finite
+/// geometry, or — under a regional extract (#102) — one whose bbox misses
+/// `bbox_units`. The batch and the geometry vec are filtered together so every
+/// downstream index stays aligned. Returns the filtered batch and its surviving
+/// geometries.
+fn decode_and_filter_geometries(
+    full: RecordBatch,
+    geom_idx: usize,
+    geom_field: &Field,
+    bbox_units: Option<&[f64; 4]>,
+) -> Result<(RecordBatch, Vec<Geometry<f64>>), ConvertError> {
+    let geom_array: Arc<dyn GeoArrowArray> =
+        from_arrow_array(full.column(geom_idx).as_ref(), geom_field)
+            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+    let mut geom_opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(full.num_rows());
+    extract_geometries_opt_from_array(geom_array.as_ref(), &mut geom_opts)?;
+    let mut geom_skipped = 0usize;
+    let keep: Vec<bool> = geom_opts
+        .iter()
+        .map(|g| match g.as_ref().filter(|g| usable_geometry(g)) {
+            // Regional extract (#102): drop features whose bbox misses the
+            // requested region exactly, independent of row-group pruning.
+            // (map_or, not is_none_or: the latter is stable only since Rust
+            // 1.82 and the crate MSRV is 1.75.)
+            #[allow(clippy::unnecessary_map_or)]
+            Some(g) => bbox_units.map_or(true, |bb| bboxes_intersect(&geometry_bbox(g), bb)),
+            None => {
+                geom_skipped += 1;
+                false
+            }
+        })
+        .collect();
+    let dropped = keep.iter().filter(|k| !**k).count();
+    if dropped == 0 {
+        return Ok((full, geom_opts.into_iter().flatten().collect()));
+    }
+    if geom_skipped > 0 {
+        log::warn!(
+            "skipping {geom_skipped} of {} input rows with a null, empty, or \
+             non-finite geometry",
+            full.num_rows()
+        );
+    }
+    let mask = arrow_array::BooleanArray::from(keep.clone());
+    let filtered = arrow_select::filter::filter_record_batch(&full, &mask)?;
+    let geoms = geom_opts
+        .into_iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(g, _)| g.expect("kept rows are Some"))
+        .collect();
+    Ok((filtered, geoms))
+}
+
 /// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
 /// Runs the full option normalization (validation, cluster/accumulate checks,
 /// the partitioning-coalesce-inert rewrite) before dispatching.
@@ -826,53 +940,11 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     // Decode geometries once (in-memory v1), row-aligned. Rows with a null,
     // empty, or non-finite geometry cannot participate in level assignment:
-    // they are dropped HERE, from the batch and the geometry vec together, so
-    // every downstream index stays aligned (H4: an interleaved null geometry
-    // must never shift attributes onto a neighboring row's geometry).
-    let geom_array: Arc<dyn GeoArrowArray> =
-        from_arrow_array(full.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-    let mut geom_opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(full.num_rows());
-    extract_geometries_opt_from_array(geom_array.as_ref(), &mut geom_opts)?;
-    let mut geom_skipped = 0usize;
-    let keep: Vec<bool> = geom_opts
-        .iter()
-        .map(|g| match g.as_ref().filter(|g| usable_geometry(g)) {
-            // Regional extract (#102): drop features whose bbox misses the
-            // requested region exactly, independent of row-group pruning.
-            // (map_or, not is_none_or: the latter is stable only since Rust
-            // 1.82 and the crate MSRV is 1.75.)
-            #[allow(clippy::unnecessary_map_or)]
-            Some(g) => bbox_units
-                .as_ref()
-                .map_or(true, |bb| bboxes_intersect(&geometry_bbox(g), bb)),
-            None => {
-                geom_skipped += 1;
-                false
-            }
-        })
-        .collect();
-    let skipped = keep.iter().filter(|k| !**k).count();
-    let (full, geometries): (RecordBatch, Vec<Geometry<f64>>) = if skipped > 0 {
-        if geom_skipped > 0 {
-            log::warn!(
-                "skipping {geom_skipped} of {} input rows with a null, empty, or \
-                 non-finite geometry",
-                full.num_rows()
-            );
-        }
-        let mask = arrow_array::BooleanArray::from(keep.clone());
-        let filtered = arrow_select::filter::filter_record_batch(&full, &mask)?;
-        let geoms = geom_opts
-            .into_iter()
-            .zip(&keep)
-            .filter(|(_, k)| **k)
-            .map(|(g, _)| g.expect("kept rows are Some"))
-            .collect();
-        (filtered, geoms)
-    } else {
-        (full, geom_opts.into_iter().flatten().collect())
-    };
+    // they are dropped, from the batch and the geometry vec together, so every
+    // downstream index stays aligned (H4: an interleaved null geometry must
+    // never shift attributes onto a neighboring row's geometry).
+    let (full, geometries) =
+        decode_and_filter_geometries(full, geom_idx, &geom_field, bbox_units.as_ref())?;
     let num_features = full.num_rows();
 
     // Resolve the cell-winner ranking (Q1): explicit sort key / explicit class
@@ -980,6 +1052,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         coalesce: Option<CoalesceTable>,
     }
     let mut emitted: Vec<EmittedLevel> = Vec::new();
+    let mut skipped: Vec<SkippedLevelReport> = Vec::new();
 
     for (level, &(gsd_m, zoom)) in level_specs.iter().enumerate() {
         let member_indices: Vec<usize> = match options.mode {
@@ -1056,8 +1129,14 @@ pub(crate) fn convert_to_overviews_source_strategy(
             }
         }
 
-        // Empty levels are not allowed (§7.3): omit and renumber.
+        // Empty levels are not allowed (§7.3): omit and renumber (#211
+        // auto-clamp), recording the omission for the report + warning.
         if indices.is_empty() {
+            skipped.push(SkippedLevelReport {
+                planned_level: level,
+                gsd: gsd_m,
+                zoom,
+            });
             continue;
         }
         emitted.push(EmittedLevel {
@@ -1074,6 +1153,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     if emitted.is_empty() {
         return Err(ConvertError::NoData);
     }
+    warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
 
     // --- Build the output writer schema (source schema + geoarrow geometry). -
     let geom_name = geom_field.name().clone();
@@ -1138,17 +1218,28 @@ pub(crate) fn convert_to_overviews_source_strategy(
             // Canonical level (and guard-skipped runs): table is None ⇒ all 1.
             batch = apply_coalesced_count(batch, &out_schema, &e.indices, e.coalesce.as_ref())?;
         }
-        writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
-        level_reports.push(LevelReport {
-            level: level_idx,
-            gsd: e.gsd,
-            zoom: e.zoom,
-            feature_count: e.indices.len(),
-            vertex_count: e.vertex_count,
-            uncompressed_bytes: 0,
-            compressed_bytes: 0,
-        });
+        match writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))? {
+            // Unreachable here (every emitted level has >= 1 feature), but
+            // kept aligned with the streaming path's bookkeeping.
+            LevelWriteOutcome::SkippedEmpty => {
+                skipped.push(SkippedLevelReport {
+                    planned_level: e.orig,
+                    gsd: e.gsd,
+                    zoom: e.zoom,
+                });
+            }
+            LevelWriteOutcome::Written => level_reports.push(LevelReport {
+                level: level_reports.len(),
+                gsd: e.gsd,
+                zoom: e.zoom,
+                feature_count: e.indices.len(),
+                vertex_count: e.vertex_count,
+                uncompressed_bytes: 0,
+                compressed_bytes: 0,
+            }),
+        }
     }
+    skipped.sort_by_key(|s| s.planned_level);
 
     let meta = writer.finish()?;
 
@@ -1162,6 +1253,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     Ok(ConvertReport {
         mode: options.mode,
         levels: level_reports,
+        skipped_empty_levels: skipped,
         input_features: num_features,
         total_rows,
         total_vertices,
@@ -4829,5 +4921,204 @@ mod tests {
                 100.0 * stats.bytes_fetched as f64 / stats.object_size as f64
             );
         }
+    }
+
+    // --- empty coarse levels: auto-clamp (#211) ------------------------------
+
+    /// Tiny (~10 m) squares spread far apart: they fail the polygon
+    /// visibility gate (4 × GSD) at every coarse zoom, so only the canonical
+    /// level keeps them.
+    fn tiny_polygons(n: usize) -> Vec<Geometry<f64>> {
+        (0..n)
+            .map(|i| {
+                let cx = -150.0 + (i % 10) as f64 * 3.0;
+                let cy = -60.0 + (i / 10) as f64 * 1.5;
+                let h = 5e-5;
+                let ext = LineString::from(vec![
+                    (cx - h, cy - h),
+                    (cx + h, cy - h),
+                    (cx + h, cy + h),
+                    (cx - h, cy + h),
+                    (cx - h, cy - h),
+                ]);
+                Geometry::Polygon(Polygon::new(ext, vec![]))
+            })
+            .collect()
+    }
+
+    /// Convert `tiny_polygons` over z0..z4 and assert the pyramid is clamped
+    /// to the canonical level, with the skipped planned levels recorded.
+    fn assert_clamped_pyramid(mode: Mode, streaming: bool) {
+        let geoms = tiny_polygons(20);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 4,
+            },
+            streaming,
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+
+        // Only the canonical level survives; the pyramid clamps to it.
+        assert_eq!(report.levels.len(), 1, "expected a single written level");
+        assert_eq!(report.levels[0].level, 0);
+        assert_eq!(report.levels[0].zoom, Some(4));
+        assert_eq!(report.levels[0].feature_count, geoms.len());
+        assert_eq!(report.total_rows, geoms.len());
+
+        // The skipped planned levels are recorded coarse→fine with their
+        // planned zoom and a positive GSD.
+        let skipped: Vec<(usize, Option<u8>)> = report
+            .skipped_empty_levels
+            .iter()
+            .map(|s| (s.planned_level, s.zoom))
+            .collect();
+        assert_eq!(
+            skipped,
+            vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))]
+        );
+        assert!(report.skipped_empty_levels.iter().all(|s| s.gsd > 0.0));
+
+        // The clamped file is valid, readable, and exportable: the PMTiles
+        // header starts at the clamped (canonical) zoom.
+        let vr = validate_file(tout.path()).unwrap();
+        assert!(
+            vr.is_valid(),
+            "failures: {:?}",
+            vr.failures().collect::<Vec<_>>()
+        );
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        assert_eq!(reader.num_levels(), 1);
+        let tpm = tempfile::NamedTempFile::new().unwrap();
+        let export = crate::overview::export::export_pmtiles(
+            tout.path(),
+            tpm.path(),
+            &crate::overview::export::ExportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(export.min_zoom, 4);
+        assert_eq!(export.max_zoom, 4);
+    }
+
+    #[test]
+    fn empty_coarse_levels_clamped_duplicating_memory() {
+        assert_clamped_pyramid(Mode::Duplicating, false);
+    }
+
+    #[test]
+    fn empty_coarse_levels_clamped_duplicating_streaming() {
+        assert_clamped_pyramid(Mode::Duplicating, true);
+    }
+
+    #[test]
+    fn empty_coarse_levels_clamped_partitioning_memory() {
+        assert_clamped_pyramid(Mode::Partitioning, false);
+    }
+
+    #[test]
+    fn empty_coarse_levels_clamped_partitioning_streaming() {
+        assert_clamped_pyramid(Mode::Partitioning, true);
+    }
+
+    /// The degenerate extreme — NO level has any rows (empty input) — must
+    /// remain a hard, actionable error in both pipelines.
+    #[test]
+    fn all_levels_empty_is_hard_error() {
+        for streaming in [false, true] {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_input(tin.path(), &[], false, None);
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 3,
+                },
+                streaming,
+                ..Default::default()
+            };
+            let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+            assert!(
+                matches!(err, ConvertError::NoData),
+                "streaming={streaming}: expected NoData, got {err:?}"
+            );
+        }
+    }
+
+    /// #211 regression: a feature can pass the assign visibility gate (huge
+    /// bbox) yet be dropped by simplification at write time (degenerate
+    /// sliver). The streaming pass 2 must skip the now-empty level instead of
+    /// failing the whole conversion with `EmptyLevel`.
+    #[test]
+    fn write_time_empty_level_skipped_streaming() {
+        let mut geoms = tiny_polygons(8);
+        // Pathological feature: a MultiPolygon of two ~10 m squares 160°
+        // apart. Its whole-feature bbox diagonal passes the assign visibility
+        // gate at every zoom, but each PART is far below the per-level
+        // simplify tolerance, so `simplify_for_level` drops the feature at
+        // every non-canonical level.
+        let square = |cx: f64, cy: f64| {
+            let h = 5e-5;
+            Polygon::new(
+                LineString::from(vec![
+                    (cx - h, cy - h),
+                    (cx + h, cy - h),
+                    (cx + h, cy + h),
+                    (cx - h, cy + h),
+                    (cx - h, cy - h),
+                ]),
+                vec![],
+            )
+        };
+        geoms.push(Geometry::MultiPolygon(geo::MultiPolygon::new(vec![
+            square(-80.0, 10.0),
+            square(80.0, 30.0),
+        ])));
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 3,
+            },
+            streaming: true,
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+
+        // Levels z0..z2 each contained only the sliver, which simplification
+        // dropped: they are skipped at write time and the pyramid clamps to
+        // the canonical level.
+        assert_eq!(report.levels.len(), 1);
+        assert_eq!(report.levels[0].level, 0);
+        assert_eq!(report.levels[0].zoom, Some(3));
+        assert_eq!(report.levels[0].feature_count, geoms.len());
+        assert_eq!(
+            report
+                .skipped_empty_levels
+                .iter()
+                .map(|s| s.planned_level)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let vr = validate_file(tout.path()).unwrap();
+        assert!(
+            vr.is_valid(),
+            "failures: {:?}",
+            vr.failures().collect::<Vec<_>>()
+        );
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        assert_eq!(reader.num_levels(), 1);
     }
 }

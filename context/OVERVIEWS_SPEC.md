@@ -651,6 +651,12 @@ future version. (Resolved Q3, §11.)
 - If generalization would empty a level (e.g. every feature dropped below
   the visibility gate), the writer MUST either merge it into the adjacent
   coarser level or omit it entirely (renumbering levels).
+- Omitting empty *coarse* levels is expected and normal, not an edge case:
+  a dataset of small features (e.g. country-scale buildings) is legitimately
+  invisible at world scales, so its pyramid simply starts at a finer GSD
+  than a producer's requested range. Readers MUST NOT assume level 0
+  corresponds to any particular zoom or GSD — the `levels[].gsd` (and
+  optional `zoom`) values are the only source of truth for a level's scale.
 
 ### 7.4 Single-level degenerate files
 

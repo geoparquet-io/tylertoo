@@ -165,6 +165,15 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
         levels.append(d)?;
     }
     dict.set_item("levels", levels)?;
+    let skipped = PyList::empty(py);
+    for s in &report.skipped_empty_levels {
+        let d = PyDict::new(py);
+        d.set_item("planned_level", s.planned_level)?;
+        d.set_item("gsd", s.gsd)?;
+        d.set_item("zoom", s.zoom)?;
+        skipped.append(d)?;
+    }
+    dict.set_item("skipped_empty_levels", skipped)?;
     dict.set_item("input_features", report.input_features)?;
     dict.set_item("total_rows", report.total_rows)?;
     dict.set_item("total_vertices", report.total_vertices)?;
@@ -305,7 +314,10 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 /// Returns:
 ///     dict: Conversion report with keys "mode", "levels" (list of dicts with
 ///     "level", "gsd", "zoom", "feature_count", "vertex_count",
-///     "uncompressed_bytes", "compressed_bytes"), "input_features",
+///     "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels"
+///     (list of dicts with "planned_level", "gsd", "zoom": planned levels
+///     omitted because no feature is visible at their scale — the written
+///     pyramid is auto-clamped to the non-empty levels), "input_features",
 ///     "total_rows", "total_vertices", "total_compressed_bytes",
 ///     "row_groups_total", "row_groups_read", "duration_secs", and
 ///     "remote_fetch" (None for local inputs; for remote URLs a dict with

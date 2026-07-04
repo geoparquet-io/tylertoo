@@ -957,7 +957,7 @@ mod tests {
         opts.cogp_compat_key = cogp;
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         for (k, ids) in level_ids.iter().enumerate() {
-            writer
+            let _ = writer
                 .write_level(
                     k,
                     Some(ids.len()),
@@ -1103,7 +1103,7 @@ mod tests {
                 columns.push(Arc::new(I64::from(counts[k].clone())));
             }
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-            writer
+            let _ = writer
                 .write_level(k, Some(ids.len()), std::iter::once(batch))
                 .unwrap();
         }
@@ -1296,7 +1296,7 @@ mod tests {
                 columns.push(Arc::new(I32::from(counts[k].clone())));
             }
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-            writer
+            let _ = writer
                 .write_level(k, Some(ids.len()), std::iter::once(batch))
                 .unwrap();
         }

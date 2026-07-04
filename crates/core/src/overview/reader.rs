@@ -356,7 +356,7 @@ mod tests {
 
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         for (k, ids) in level_ids.iter().enumerate() {
-            writer
+            let _ = writer
                 .write_level(
                     k,
                     Some(ids.len()),

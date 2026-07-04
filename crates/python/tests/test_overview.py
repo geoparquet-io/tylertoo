@@ -210,6 +210,14 @@ class TestOverviewIntegration:
                 assert lvl["vertex_count"] >= 0
             assert report["levels"][-1]["zoom"] == 6
             assert report["levels"][-1]["feature_count"] == report["input_features"]
+            # Auto-clamp accounting (#211): written + skipped == planned (z0..z6),
+            # and every skipped entry names its planned level, GSD, and zoom.
+            skipped = report["skipped_empty_levels"]
+            assert len(report["levels"]) + len(skipped) == 7
+            for entry in skipped:
+                assert 0 <= entry["planned_level"] < 7
+                assert entry["gsd"] > 0
+                assert entry["zoom"] == entry["planned_level"]
 
             # Output must pass the spec conformance checklist.
             result = gpq_tiles.validate(str(out))

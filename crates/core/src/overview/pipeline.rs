@@ -49,7 +49,7 @@ use crate::input::InputSource;
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
 use super::stream::{process_level_batch, LevelStreamCtx, Pass2Timers};
-use super::writer::OverviewWriter;
+use super::writer::{LevelWriteOutcome, OverviewWriter};
 
 /// How a level's buffered output is held until it is written.
 #[derive(Clone, Copy, Debug)]
@@ -167,8 +167,10 @@ impl SpillState {
 }
 
 /// Buffer + write levels `0..ctxs.len()` (all but the streamed finest level)
-/// from a single read of the input. Returns `(rows_written, vertex_count)` per
-/// level, in level order.
+/// from a single read of the input. Returns `(outcome, rows_written,
+/// vertex_count)` per level, in level order — the outcome flags a level the
+/// writer skipped because every candidate collapsed during simplification
+/// (#211).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_pass2_buffered(
     writer: &mut OverviewWriter<File>,
@@ -180,7 +182,7 @@ pub(super) fn run_pass2_buffered(
     in_flight: usize,
     backing: SinkBacking,
     out_schema: &Schema,
-) -> Result<Vec<(usize, usize)>, ConvertError> {
+) -> Result<Vec<(LevelWriteOutcome, usize, usize)>, ConvertError> {
     let num_levels = ctxs.len();
     debug_assert_eq!(num_levels, hints.len());
 
@@ -265,14 +267,21 @@ pub(super) fn run_pass2_buffered(
     }
     consume?;
 
-    // Drain each level's sink into the writer, in level order.
+    // Drain each level's sink into the writer, in level order. An empty
+    // buffered level is skipped and renumbered by the writer (#211); the
+    // outcome is threaded back to the caller with the level's stats.
+    let mut outcomes = Vec::with_capacity(num_levels);
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
-        drain_sink(writer, li, hints[li], sink)?;
+        outcomes.push(drain_sink(writer, li, hints[li], sink)?);
     }
 
     timers.log_engine_summary(t_engine.elapsed().as_secs_f64(), rows.iter().sum());
-    Ok(rows.into_iter().zip(verts).collect())
+    Ok(outcomes
+        .into_iter()
+        .zip(rows.into_iter().zip(verts))
+        .map(|(outcome, (r, v))| (outcome, r, v))
+        .collect())
 }
 
 /// Drain one level's sink into `writer.write_level`. The RAM path is
@@ -284,11 +293,10 @@ fn drain_sink(
     level_idx: usize,
     hint: usize,
     sink: LevelSink,
-) -> Result<(), ConvertError> {
+) -> Result<LevelWriteOutcome, ConvertError> {
     match sink {
         LevelSink::Ram(batches) => {
-            writer.write_level(level_idx, Some(hint), batches.into_iter())?;
-            Ok(())
+            Ok(writer.write_level(level_idx, Some(hint), batches.into_iter())?)
         }
         LevelSink::Spill(state) => {
             // `_temp` keeps the spill file on disk until the reader is drained.
@@ -306,8 +314,7 @@ fn drain_sink(
             if let Some(e) = err.borrow_mut().take() {
                 return Err(e); // spill read error takes precedence over the writer's
             }
-            res?;
-            Ok(())
+            Ok(res?)
         }
     }
 }
