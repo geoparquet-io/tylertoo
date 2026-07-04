@@ -5,7 +5,9 @@
 //
 // Run with: cargo bench --package gpq-tiles-core -- clipping
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, LineString, Polygon};
 use gpq_tiles_core::clip::clip_geometry;
 use gpq_tiles_core::ioverlay_clip::clip_polygon_ioverlay;

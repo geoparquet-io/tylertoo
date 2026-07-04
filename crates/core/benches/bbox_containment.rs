@@ -6,7 +6,9 @@
 //
 // Run with: cargo bench --package gpq-tiles-core -- bbox_containment
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{BoundingRect, Coord, Geometry, LineString, MultiPolygon, Polygon};
 use gpq_tiles_core::clip::clip_geometry;
 use gpq_tiles_core::tile::TileBounds;
