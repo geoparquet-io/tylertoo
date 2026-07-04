@@ -36,7 +36,9 @@ class TestRemoteInput:
                 gpq_tiles.overview("ftp://example.com/x.parquet", str(out))
 
     def test_docstring_mentions_remote_urls(self):
-        assert "s3://" in gpq_tiles.overview.__doc__
+        doc = gpq_tiles.overview.__doc__
+        assert doc is not None
+        assert "s3://" in doc
 
 
 class TestOverviewApi:

@@ -1,0 +1,17 @@
+# cargo-audit configuration — keep in sync with deny.toml's
+# [advisories].ignore list (cargo-audit does not read deny.toml).
+# CI: Security Audit job runs `cargo audit` AND `cargo deny check`;
+# an exception must be recorded in BOTH files, with the full
+# justification living in deny.toml next to the entry.
+
+[advisories]
+ignore = [
+    # quick-xml < 0.41 XML-parsing DoS pathologies; transitive via
+    # object_store's S3/GCS support (remote input, #210). quick-xml there
+    # only parses XML responses from the configured storage endpoint, not
+    # attacker-supplied documents. No object_store release reaches the
+    # quick-xml >=0.41 fix (0.14.0 pins ^0.40.1). See deny.toml for the
+    # full rationale; re-evaluate on object_store bump.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
