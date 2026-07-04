@@ -125,7 +125,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-machete
-        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-machete
 
@@ -333,7 +333,7 @@ jobs:
       - name: Install tarpaulin
         # Prebuilt binary via install-action; `cargo install cargo-tarpaulin`
         # was several minutes of compile time on every run.
-        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-tarpaulin
 
@@ -395,7 +395,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-audit,cargo-deny
 
