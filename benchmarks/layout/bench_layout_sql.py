@@ -32,10 +32,10 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BUCKET = "gpq-tiles-bench"
-REGION = "us-east-2"
-PROFILE = "nissim-admin"
-PREFIX = "layoutbench"
+BUCKET = os.environ.get("BENCH_BUCKET", "gpq-tiles-bench")
+REGION = os.environ.get("BENCH_REGION", "us-east-2")
+PROFILE = os.environ.get("BENCH_AWS_PROFILE", "default")
+PREFIX = os.environ.get("BENCH_PREFIX", "layoutbench")
 N_RUNS = int(os.environ.get("BENCH_RUNS", "3"))
 RESULTS = os.environ.get("BENCH_RESULTS", os.path.join(HERE, "layout_sql_results.json"))
 

@@ -49,10 +49,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 LOCAL = os.path.join(ROOT, "corpus", "data", "layoutbench")
 
-BUCKET = "gpq-tiles-bench"
-REGION = "us-east-2"
-PROFILE = "nissim-admin"
-PREFIX = "layoutbench"
+BUCKET = os.environ.get("BENCH_BUCKET", "gpq-tiles-bench")
+REGION = os.environ.get("BENCH_REGION", "us-east-2")
+PROFILE = os.environ.get("BENCH_AWS_PROFILE", "default")
+PREFIX = os.environ.get("BENCH_PREFIX", "layoutbench")
 N_RUNS = int(os.environ.get("BENCH_RUNS", "3"))
 RESULTS = os.environ.get("BENCH_RESULTS", os.path.join(HERE, "layout_read_results.json"))
 
