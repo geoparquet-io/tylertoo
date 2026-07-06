@@ -48,6 +48,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
@@ -75,6 +76,7 @@ use super::convert::{
     KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
+use super::pipeline;
 use super::simplify::{
     full_resolution_fallback_count, simplify_for_level, Simplified, SimplifyOptions,
 };
@@ -97,11 +99,25 @@ struct EmitLevel {
     hint: usize,
 }
 
-/// Streaming counterpart of [`super::convert::convert_to_overviews`].
-pub(super) fn convert_streaming(
+/// Pass-2 execution strategy. Both produce byte-identical output; `Serial` is
+/// the pre-#213 per-level-re-read reference, retained for differential testing.
+#[derive(Clone, Copy)]
+pub(crate) enum Pass2Strategy {
+    /// One in-order re-read per level (the reference path).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Serial,
+    /// Single-read pipelined engine ([`super::pipeline`]); the production path.
+    Pipelined,
+}
+
+/// Streaming counterpart of [`super::convert::convert_to_overviews`], with an
+/// explicit pass-2 [`Pass2Strategy`] (production uses `Pipelined`; tests pin
+/// `Serial` to assert the pipelined engine is equivalent).
+pub(crate) fn convert_streaming_strategy(
     source: &InputSource,
     output_path: &Path,
     options: &ConvertOptions,
+    strategy: Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
     let start = Instant::now();
 
@@ -379,64 +395,131 @@ pub(super) fn convert_streaming(
         .filter(|&c| c != geom_idx)
         .collect();
 
-    // --- Pass 2: per level, stream → filter → simplify → write. --------------
+    // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     let t_pass2 = Instant::now();
-    let mut level_reports = Vec::with_capacity(emitted.len());
-    for (level_idx, e) in emitted.iter().enumerate() {
-        // Verbatim path: partitioning at every level (§2.3), and duplicating at
-        // the canonical (finest) level (§2.4).
-        let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-        // Coalescing (Q3): rebuild this level's chain table (chains + gate +
-        // thin + simplify) from the pass-1 line scratch. Canonical level is
-        // never coalesced (§2.4). Memory: one level's surviving chains.
-        let coalesce_table: Option<CoalesceTable> = coalesce_scratch
-            .as_ref()
-            .filter(|_| !verbatim)
-            .map(|scratch| {
-                build_level_coalesce_table(
-                    &scratch.inputs(),
-                    e.orig as usize,
-                    finest,
-                    e.gsd,
-                    crs,
-                    options,
+
+    // Prebuild every non-verbatim level's coalesce chain table up front, in
+    // parallel: the single read fans each batch to all levels at once, so all
+    // levels' tables must exist during the read. Deterministic and keyed by rep
+    // row, so this is byte-identical to the former per-level build.
+    let coalesce_tables: Vec<Option<CoalesceTable>> = match &coalesce_scratch {
+        Some(scratch) => {
+            let inputs = scratch.inputs();
+            emitted
+                .par_iter()
+                .map(|e| {
+                    let verbatim =
+                        matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
+                    (!verbatim).then(|| {
+                        build_level_coalesce_table(
+                            &inputs,
+                            e.orig as usize,
+                            finest,
+                            e.gsd,
+                            crs,
+                            options,
+                        )
+                    })
+                })
+                .collect()
+        }
+        None => std::iter::repeat_with(|| None)
+            .take(emitted.len())
+            .collect(),
+    };
+
+    let duplicating = matches!(options.mode, Mode::Duplicating);
+    let ctxs: Vec<LevelStreamCtx> = emitted
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
+            LevelStreamCtx {
+                source_schema: &source_schema,
+                cluster_schema: &cluster_schema,
+                out_schema: &out_schema,
+                non_geom_cols: &non_geom_cols,
+                geom_idx,
+                min_levels: &min_levels,
+                orig_level: e.orig,
+                duplicating,
+                verbatim,
+                gsd_m: e.gsd,
+                crs,
+                simplify: &options.simplify,
+                cluster_enabled: options.cluster,
+                // Canonical level: singleton clusters, columns verbatim (§2.4).
+                cluster_table: cluster_tables
+                    .as_ref()
+                    .filter(|_| e.orig as usize != finest)
+                    .map(|t| &t[e.orig as usize]),
+                acc_cols: &acc_cols,
+                coalesce_enabled: options.coalesce_lines,
+                kinds: kinds.as_deref(),
+                coalesce_table: coalesce_tables[i].as_ref(),
+            }
+        })
+        .collect();
+
+    let n = emitted.len();
+    let hints: Vec<usize> = emitted.iter().map(|e| e.hint).collect();
+
+    // `(rows, vertices)` per level, in level order.
+    let level_stats: Vec<(usize, usize)> = match strategy {
+        // Reference: one in-order re-read per level (pre-#213 behavior).
+        Pass2Strategy::Serial => ctxs
+            .iter()
+            .enumerate()
+            .map(|(i, ctx)| {
+                write_level_streaming(
+                    &mut writer,
+                    i,
+                    hints[i],
+                    source,
+                    options.read_batch_size,
+                    selected_row_groups.as_deref(),
+                    ctx,
                 )
-            });
-        let ctx = LevelStreamCtx {
-            source_schema: &source_schema,
-            cluster_schema: &cluster_schema,
-            out_schema: &out_schema,
-            non_geom_cols: &non_geom_cols,
-            geom_idx,
-            min_levels: &min_levels,
-            orig_level: e.orig,
-            duplicating: matches!(options.mode, Mode::Duplicating),
-            verbatim,
-            gsd_m: e.gsd,
-            crs,
-            simplify: &options.simplify,
-            cluster_enabled: options.cluster,
-            // Canonical level: singleton clusters, columns verbatim (§2.4).
-            cluster_table: cluster_tables
-                .as_ref()
-                .filter(|_| e.orig as usize != finest)
-                .map(|t| &t[e.orig as usize]),
-            acc_cols: &acc_cols,
-            coalesce_enabled: options.coalesce_lines,
-            kinds: kinds.as_deref(),
-            coalesce_table: coalesce_table.as_ref(),
-        };
-        let (rows, vertices) = write_level_streaming(
-            &mut writer,
-            level_idx,
-            e.hint,
-            source,
-            options.read_batch_size,
-            selected_row_groups.as_deref(),
-            &ctx,
-        )?;
+            })
+            .collect::<Result<_, _>>()?,
+        // Production: buffer levels 0..n-1 from a single read, then stream the
+        // finest (verbatim, largest) level last straight into the writer.
+        Pass2Strategy::Pipelined => {
+            let buffered_rows: usize = hints[..n - 1].iter().sum();
+            let backing = pipeline::resolve_backing(options.profile, options.mode, buffered_rows);
+            let mut stats = if n > 1 {
+                pipeline::run_pass2_buffered(
+                    &mut writer,
+                    &ctxs[..n - 1],
+                    &hints[..n - 1],
+                    source,
+                    options.read_batch_size,
+                    selected_row_groups.as_deref(),
+                    options.in_flight_batches,
+                    backing,
+                    &out_schema,
+                )?
+            } else {
+                Vec::new()
+            };
+            stats.push(write_level_streaming(
+                &mut writer,
+                n - 1,
+                hints[n - 1],
+                source,
+                options.read_batch_size,
+                selected_row_groups.as_deref(),
+                &ctxs[n - 1],
+            )?);
+            stats
+        }
+    };
+
+    let mut level_reports = Vec::with_capacity(emitted.len());
+    for (i, e) in emitted.iter().enumerate() {
+        let (rows, vertices) = level_stats[i];
         level_reports.push(LevelReport {
-            level: level_idx,
+            level: i,
             gsd: e.gsd,
             zoom: e.zoom,
             feature_count: rows,
@@ -939,27 +1022,54 @@ fn run_pass1(
 // Pass 2: per-level streaming filter → simplify → write
 // ============================================================================
 
-/// Wall-time accumulators for one level's pass-2 stream ([profile] logging).
+/// Wall-time accumulators for pass-2 stages ([profile] logging), stored as
+/// nanoseconds. Atomic so the pipelined engine ([`super::pipeline`]) can share
+/// one set across the parallel per-level processing of a batch; the serial
+/// [`write_level_streaming`] path uses it single-threaded.
 #[derive(Default)]
-struct Pass2Timers {
+pub(super) struct Pass2Timers {
     /// Parquet read + Arrow decode of the raw batch (`reader.next()`).
-    read: Cell<Duration>,
+    read: AtomicU64,
     /// Winner selection + geometry take/decode to `geo::Geometry`.
-    decode: Cell<Duration>,
+    decode: AtomicU64,
     /// Simplification (or verbatim vertex counting at the canonical level).
-    simplify: Cell<Duration>,
+    simplify: AtomicU64,
     /// Output batch assembly (`build_level_batch`).
-    build: Cell<Duration>,
+    build: AtomicU64,
 }
 
 impl Pass2Timers {
-    fn add(cell: &Cell<Duration>, start: Instant) {
-        cell.set(cell.get() + start.elapsed());
+    fn add(cell: &AtomicU64, start: Instant) {
+        cell.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    /// Add a pre-measured duration (used by the reader thread for read time).
+    pub(super) fn add_dur(cell: &AtomicU64, dur: Duration) {
+        cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+    }
+    fn secs(cell: &AtomicU64) -> f64 {
+        Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
+    }
+    pub(super) fn read_cell(&self) -> &AtomicU64 {
+        &self.read
+    }
+    /// Emit the aggregated per-stage breakdown ([profile] logging) for the
+    /// pipelined engine, where stages interleave across levels so a per-level
+    /// split is not meaningful.
+    pub(super) fn log_engine_summary(&self, total_secs: f64, rows: usize) {
+        let read_s = Self::secs(&self.read);
+        let decode_s = Self::secs(&self.decode);
+        let simplify_s = Self::secs(&self.simplify);
+        let build_s = Self::secs(&self.build);
+        log::debug!(
+            "[profile] pass2 engine ({rows} rows): wall={total_secs:.2}s \
+             read={read_s:.2}s decode={decode_s:.2}s simplify={simplify_s:.2}s \
+             build={build_s:.2}s (stage sums are core-seconds, overlap wall)"
+        );
     }
 }
 
 /// Immutable context for one level's pass-2 stream.
-struct LevelStreamCtx<'a> {
+pub(super) struct LevelStreamCtx<'a> {
     source_schema: &'a Schema,
     /// `source_schema` + trailing `point_count` when clustering, otherwise
     /// identical (the schema [`apply_cluster_columns`] produces).
@@ -1058,21 +1168,23 @@ fn write_level_streaming(
         return Err(e); // stream error takes precedence over the writer's
     }
     res?;
-    let total = t_level.elapsed();
-    let accounted =
-        timers.read.get() + timers.decode.get() + timers.simplify.get() + timers.build.get();
+    let total = t_level.elapsed().as_secs_f64();
+    let read_s = Pass2Timers::secs(&timers.read);
+    let decode_s = Pass2Timers::secs(&timers.decode);
+    let simplify_s = Pass2Timers::secs(&timers.simplify);
+    let build_s = Pass2Timers::secs(&timers.build);
     log::debug!(
         "[profile] level {} ({}, {} rows): total={:.2}s read={:.2}s decode={:.2}s \
          simplify={:.2}s build={:.2}s write={:.2}s",
         level_idx,
         if ctx.verbatim { "verbatim" } else { "simplify" },
         rows.get(),
-        total.as_secs_f64(),
-        timers.read.get().as_secs_f64(),
-        timers.decode.get().as_secs_f64(),
-        timers.simplify.get().as_secs_f64(),
-        timers.build.get().as_secs_f64(),
-        total.saturating_sub(accounted).as_secs_f64(),
+        total,
+        read_s,
+        decode_s,
+        simplify_s,
+        build_s,
+        (total - (read_s + decode_s + simplify_s + build_s)).max(0.0),
     );
     let fallbacks = full_resolution_fallback_count() - fallbacks_before;
     if fallbacks > 0 {
@@ -1087,7 +1199,7 @@ fn write_level_streaming(
 /// Process one input batch for one level: select the level's members from the
 /// winner table, decode only their geometries, simplify (unless verbatim), and
 /// assemble the output batch. Returns `None` when no member row survives.
-fn process_level_batch(
+pub(super) fn process_level_batch(
     batch: &RecordBatch,
     row_offset: usize,
     ctx: &LevelStreamCtx<'_>,

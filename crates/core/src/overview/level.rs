@@ -115,6 +115,30 @@ pub enum Mode {
     Partitioning,
 }
 
+/// Memory/throughput profile for the streaming pass-2 engine.
+///
+/// The engine reads the input **once** and pipelines Parquet read/decode with
+/// parallel per-feature simplification, buffering each output level until it is
+/// written (levels are written coarse→fine). This profile selects how that
+/// per-level output is buffered — it changes **speed and peak memory only**;
+/// output bytes are identical across all profiles and thread counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryProfile {
+    /// Resolve per mode + estimated output size at convert entry (duplicating →
+    /// [`Speed`](Self::Speed), partitioning → [`Bounded`](Self::Bounded); any
+    /// run whose estimated buffered output exceeds a memory budget flips to
+    /// `Bounded`). The resolved choice is logged. This is the default.
+    #[default]
+    Auto,
+    /// Buffer each output level's rows in RAM before writing. Fastest; peak RAM
+    /// grows with total buffered output.
+    Speed,
+    /// Spill each output level's rows to a temporary Arrow IPC file and stream
+    /// them back at write time, capping peak RAM.
+    Bounded,
+}
+
 /// OPTIONAL, informative per-level generalization provenance (§3.5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Generalization {

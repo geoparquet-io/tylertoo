@@ -32,6 +32,11 @@ interact.
 >   disable it entirely use `--no-density-drop`.
 > - **A rank-ordered cut is emptying sparse rural areas** → RAISE `--drop-gamma`
 >   (protects sparse neighborhoods).
+> - **Conversion is slow / pins one core** → it now reads the input once and
+>   uses all cores; RAISE `--in-flight-batches` for more read/compute overlap.
+> - **Conversion runs out of memory in `speed` mode** → `--profile bounded`
+>   (spills each level to temp files; `--profile auto`, the default, picks this
+>   for you on large partitioning runs). Output is byte-identical either way.
 
 ---
 
@@ -518,6 +523,8 @@ Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
 |------|---------|-------|-----------|
 | `--read-batch-size N` | `8192` | rows per read batch | **bigger = faster-ish, more memory** |
 | `--no-streaming` | off | flag | revert to the one-pass in-memory pipeline |
+| `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles---profile---in-flight-batches) |
+| `--in-flight-batches N` | `4` | read batches in flight | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches) |
 
 **`--read-batch-size`** bounds the transient working set of both passes: each
 batch is decoded, filtered, simplified, and written before the next is read.
@@ -584,6 +591,62 @@ reprojects the bbox internally.
 
 ---
 
+## Performance profiles: `--profile`, `--in-flight-batches`
+
+Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),
+these never change the output's content: **the produced file is byte-identical
+across every profile, `--in-flight-batches` value, and thread count.** They
+control only how fast the conversion runs and how much memory it uses while
+running.
+
+The rewritten pass-2 engine reads the input Parquet **once** and pipelines
+Parquet read/decode with per-feature simplification fanned out across **all
+cores**. This replaces the old pass 2, which re-read the whole input once per
+level (15 reads on a 15-level plan) and simplified effectively on a single
+core. The win is largest on vertex-heavy duplicating-mode conversions and on
+partitioning mode, which previously spent ~73% of wall time re-reading the
+input (#212 / #213).
+
+The one remaining choice is **where each output level's rows live between the
+compute stage and the write stage**:
+
+- **`speed`** buffers each level's rows in RAM, then writes them. Fastest — no
+  temp I/O — but peak RAM grows with total *output* size. Best when the output
+  comfortably fits: duplicating mode, or partitioning on inputs well under
+  available RAM.
+- **`bounded`** spills each level's rows to temporary **Arrow IPC** files and
+  streams them back at write time, capping peak RAM regardless of output size.
+  Slightly slower (temp read/write) but memory-safe for very large / wide
+  inputs. Best for partitioning mode on multi-GB inputs, or memory-constrained
+  machines.
+- **`auto`** (default) picks per mode and buffered size: duplicating always uses
+  `speed` (it buffers only the small, geometrically-decayed coarse levels);
+  partitioning uses `speed` while the buffered set is small and `bounded` once it
+  grows large (partitioning buffers full-resolution geometry). The chosen profile
+  is logged.
+
+| Knob | Default | Units | Direction |
+|------|---------|-------|-----------|
+| `--profile speed\|bounded\|auto` | `auto` | preset | `speed` = fastest, most RAM; `bounded` = capped RAM, temp I/O |
+| `--in-flight-batches N` | `4` | read batches in flight | **bigger = more overlap + core use, more memory** |
+
+**`--in-flight-batches`** is the primary read/compute-overlap knob: it sets how
+many Arrow read batches may be moving through the pipeline at once (the
+bounded-channel depth). RAISE it for more read/compute overlap and better core
+utilization when a few long-pole geometries otherwise stall the pipeline; each
+extra in-flight batch costs proportionally more peak RAM (`N × read_batch_size`
+rows resident). `--read-batch-size` (above) remains the rows-per-batch knob;
+`--in-flight-batches` is how many such batches coexist.
+
+⚠️ **Interaction — `speed` + partitioning on a multi-GB input is the
+memory-risky quadrant.** `speed` buffers whole output levels in RAM, and
+partitioning's output can approach input size; on a multi-GB input that can
+exhaust memory. `auto` (the default) already routes partitioning and any
+over-budget run to `bounded` — only an explicit `--profile speed` overrides
+that. If you force `speed` on a large partitioning run, watch peak RSS.
+
+---
+
 ## Worked scenarios
 
 | Symptom | Fix |
@@ -602,6 +665,8 @@ reprojects the bbox internally.
 | Need server-side row-group skipping on a property predicate | pass `--full-column-stats` (bigger footer, gains column pruning) |
 | Tiny viewports over high-latency storage fetch too much | LOWER `--row-group-size` for tighter bbox pruning |
 | Conversion runs out of memory / swaps on a big file | streaming is already the default; LOWER `--read-batch-size`; make sure `--no-streaming` is NOT set |
+| Conversion is slow / uses only one core | the engine now reads the input once and parallelizes simplification across all cores; RAISE `--in-flight-batches` for more read/compute overlap |
+| Conversion runs out of memory in `speed` profile | `--profile bounded` (spills each level to temp files, caps RAM); `--profile auto` picks this automatically for large partitioning runs |
 
 See `corpus/SWEEPS.md` for an empirical `--line-thinning` ×
 `--simplify-factor` sweep on Portland roads, and the Q2 section there for the

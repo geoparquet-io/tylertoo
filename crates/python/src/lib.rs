@@ -11,7 +11,7 @@ use gpq_tiles_core::overview::convert::{
     convert_to_overviews, ClassRanking, ConvertError, ConvertOptions, ConvertReport, LevelPlan,
 };
 use gpq_tiles_core::overview::export::{export_pmtiles as export_pmtiles_core, ExportOptions};
-use gpq_tiles_core::overview::level::Mode;
+use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
 use gpq_tiles_core::overview::simplify::SimplifyOptions;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -293,6 +293,14 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         their data pages (inputs without covering stats read everything
 ///         and rely on the exact per-feature filter). Defaults to None
 ///         (full extent).
+///     profile (str, optional): Memory/throughput profile for the single-read
+///         pass-2 engine: "speed" (buffer output in RAM), "bounded" (spill to
+///         temporary Arrow IPC files), or "auto" (pick per mode + estimated
+///         size). Output is byte-identical across profiles. Defaults to "auto".
+///     in_flight_batches (int, optional): Read batches allowed in flight through
+///         the pass-2 pipeline at once (read/compute-overlap knob). Higher
+///         improves core utilization at proportionally more peak memory.
+///         Defaults to 4.
 ///
 /// Returns:
 ///     dict: Conversion report with keys "mode", "levels" (list of dicts with
@@ -355,6 +363,8 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     streaming=true,
     read_batch_size=8192,
     bbox=None,
+    profile="auto",
+    in_flight_batches=4,
 ))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
@@ -394,6 +404,8 @@ fn overview(
     streaming: bool,
     read_batch_size: usize,
     bbox: Option<(f64, f64, f64, f64)>,
+    profile: &str,
+    in_flight_batches: usize,
 ) -> PyResult<Py<PyDict>> {
     let mode = match mode {
         "duplicating" => Mode::Duplicating,
@@ -401,6 +413,18 @@ fn overview(
         other => {
             return Err(PyErr::new::<PyValueError, _>(format!(
                 "Invalid mode: '{}'. Valid options: duplicating, partitioning",
+                other
+            )))
+        }
+    };
+
+    let profile = match profile {
+        "auto" => MemoryProfile::Auto,
+        "speed" => MemoryProfile::Speed,
+        "bounded" => MemoryProfile::Bounded,
+        other => {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "Invalid profile: '{}'. Valid options: auto, speed, bounded",
                 other
             )))
         }
@@ -518,6 +542,8 @@ fn overview(
         full_column_stats,
         streaming,
         read_batch_size,
+        profile,
+        in_flight_batches,
         cluster,
         accumulate,
         coalesce_lines,
