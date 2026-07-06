@@ -21,7 +21,7 @@ name = "gpq-tiles"
 path = "src/main.rs"
 
 [dependencies]
-gpq-tiles-core = { workspace = true }
+gpq-tiles-core = { workspace = true, features = ["remote"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }

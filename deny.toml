@@ -16,6 +16,23 @@ ignore = [
     # paste is unmaintained; pulled in transitively by parquet (arrow-rs).
     # Blocked on arrow-rs migrating off it. Re-evaluate on arrow/parquet bump.
     { id = "RUSTSEC-2024-0436", reason = "transitive via parquet/arrow-rs; no fix released" },
+    # quick-xml < 0.41 XML-parsing DoS pathologies (quadratic duplicate-
+    # attribute check; unbounded NsReader namespace allocation). Transitive
+    # via object_store's S3/GCS support (remote input, #210), which uses
+    # quick-xml only to parse XML responses from the *configured* storage
+    # endpoint (list/multipart/error bodies) — not attacker-supplied
+    # documents; worst case is self-DoS by a hostile bucket provider. No
+    # object_store release reaches the fix yet: even 0.14.0 pins
+    # quick-xml ^0.40.1 (< 0.41), and 0.13+ needs rustc 1.85 > our 1.75
+    # MSRV anyway. Mirror of the same ignores in .cargo/audit.toml
+    # (cargo-audit does not read this file). Re-evaluate on object_store
+    # bump.
+    { id = "RUSTSEC-2026-0194", reason = "transitive via object_store (s3/gcs XML responses); no release with quick-xml >=0.41 exists" },
+    { id = "RUSTSEC-2026-0195", reason = "transitive via object_store (s3/gcs XML responses); no release with quick-xml >=0.41 exists" },
+    # rustls-pemfile is unmaintained (functionality folded into rustls-pki-
+    # types); pulled in transitively by object_store (remote input, #210).
+    # Blocked on object_store dropping it upstream. Re-evaluate on bump.
+    { id = "RUSTSEC-2025-0134", reason = "transitive via object_store; unmaintained-only advisory, no vulnerability" },
 ]
 
 [licenses]

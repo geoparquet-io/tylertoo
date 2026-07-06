@@ -120,9 +120,20 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
 
     let metadata = reader.metadata();
     let file_metadata = metadata.file_metadata();
+    crs_info_from_kv_metadata(file_metadata.key_value_metadata())
+}
 
+/// Extract CRS information from already-parsed parquet key-value metadata.
+///
+/// The metadata-only core of [`extract_crs`], shared with input paths that
+/// have a parsed footer in hand already (e.g. remote inputs, #210, where the
+/// footer was range-fetched once and re-opening the file would cost another
+/// round trip).
+pub fn crs_info_from_kv_metadata(
+    kv_metadata: Option<&Vec<parquet::file::metadata::KeyValue>>,
+) -> Result<CrsInfo> {
     // Look for the "geo" key in key-value metadata
-    let Some(kv_metadata) = file_metadata.key_value_metadata() else {
+    let Some(kv_metadata) = kv_metadata else {
         // No metadata at all - assume WGS84 with warning
         tracing::warn!("GeoParquet file has no key-value metadata; assuming WGS84");
         return Ok(CrsInfo::wgs84());

@@ -55,11 +55,11 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use arrow_select::take::take;
 use geo::Geometry;
 use geoarrow::array::from_arrow_array;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use rayon::prelude::*;
 
 use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
+use crate::input::InputSource;
 
 use super::assign::{apply_density_budget, assign_levels, AssignFeature, FeatureKind};
 use super::cluster::{build_cluster_tables, verify_sum_invariant, ClusterEntry, ClusterTables};
@@ -68,11 +68,11 @@ use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
-    count_vertices, detect_crs, extract_class_ranks, extract_sort_keys, feature_kind,
-    fill_level_bytes, find_geometry_column, geometry_bbox, mixed_geometry_field,
-    overture_road_ranking, usable_geometry, validate_cluster_schema, validate_coalesce_schema,
-    ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
-    LevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    count_vertices, extract_class_ranks, extract_sort_keys, feature_kind, fill_level_bytes,
+    find_geometry_column, geometry_bbox, mixed_geometry_field, overture_road_ranking,
+    usable_geometry, validate_cluster_schema, validate_coalesce_schema, ClassRanking,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
+    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::simplify::{
@@ -99,7 +99,7 @@ struct EmitLevel {
 
 /// Streaming counterpart of [`super::convert::convert_to_overviews`].
 pub(super) fn convert_streaming(
-    input_path: &Path,
+    source: &InputSource,
     output_path: &Path,
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
@@ -109,13 +109,16 @@ pub(super) fn convert_streaming(
         return Err(ConvertError::RankingConflict);
     }
 
-    // CRS detection + rejection (spec Q3) — footer-only read.
-    let crs = detect_crs(input_path)?;
-
     // Schema checks (level column, geometry column) — footer-only read.
-    let file = File::open(input_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    // (For a remote source, #210, the footer is range-fetched once here and
+    // cached across the passes below.)
+    let builder = source.open()?;
     let input_schema: SchemaRef = builder.schema().clone();
+
+    // CRS detection + rejection (spec Q3) — footer metadata only.
+    let crs = super::convert::detect_crs_from_kv(
+        builder.metadata().file_metadata().key_value_metadata(),
+    )?;
 
     // Regional extract (#102): prune input row groups by bbox covering
     // statistics — footer metadata only, no data pages of skipped groups are
@@ -163,7 +166,7 @@ pub(super) fn convert_streaming(
         num_rows,
         skipped_rows,
     } = run_pass1(
-        input_path,
+        source,
         &input_schema,
         geom_idx,
         options,
@@ -427,7 +430,7 @@ pub(super) fn convert_streaming(
             &mut writer,
             level_idx,
             e.hint,
-            input_path,
+            source,
             options.read_batch_size,
             selected_row_groups.as_deref(),
             &ctx,
@@ -471,6 +474,7 @@ pub(super) fn convert_streaming(
         row_groups_read,
         antimeridian_suspect_features,
         duration_secs: start.elapsed().as_secs_f64(),
+        remote_fetch: super::convert::log_remote_fetch(source),
     })
 }
 
@@ -672,7 +676,7 @@ struct Pass1Output {
 /// the per-spec source values (parallel to `acc_cols`). Memory: `O(read
 /// batch)` transient + `O(N)` small per-feature records.
 fn run_pass1(
-    input_path: &Path,
+    source: &InputSource,
     input_schema: &Schema,
     geom_idx: usize,
     options: &ConvertOptions,
@@ -701,8 +705,7 @@ fn run_pass1(
     // Original schema index → projected batch column index.
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
 
-    let file = File::open(input_path)?;
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mut builder = source.open()?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
     // Regional extract (#102): read only the bbox-selected row groups
     // (identical selection in pass 2, keeping row indices aligned).
@@ -1000,14 +1003,12 @@ fn write_level_streaming(
     writer: &mut OverviewWriter<File>,
     level_idx: usize,
     hint: usize,
-    input_path: &Path,
+    source: &InputSource,
     read_batch_size: usize,
     row_groups: Option<&[usize]>,
     ctx: &LevelStreamCtx<'_>,
 ) -> Result<(usize, usize), ConvertError> {
-    let file = File::open(input_path)?;
-    let mut builder =
-        ParquetRecordBatchReaderBuilder::try_new(file)?.with_batch_size(read_batch_size.max(1));
+    let mut builder = source.open()?.with_batch_size(read_batch_size.max(1));
     // Regional extract (#102): read the same bbox-selected row groups as
     // pass 1, so the winner tables' global row indices line up.
     if let Some(rgs) = row_groups {

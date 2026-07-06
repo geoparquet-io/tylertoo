@@ -217,6 +217,8 @@ crates/core/src/
 │   ├── simplify.rs     #   World-space RDP simplification (GSD tolerance)
 │   ├── stream.rs       #   Two-pass bounded-memory streaming pipeline
 │   └── writer.rs       #   Level-banded GeoParquet writer
+├── input.rs            # Input source abstraction: local file or remote
+│                       # object (s3/https/gs) via byte-range reads (#210)
 ├── batch_processor.rs  # GeoArrow batch → geo::Geometry decoding
 ├── clip.rs             # Geometry clipping (dispatcher)
 ├── ioverlay_clip.rs    # i_overlay-based robust polygon clipping

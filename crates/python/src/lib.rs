@@ -36,7 +36,9 @@ use std::path::Path;
 /// them raises ``TypeError``.
 ///
 /// Args:
-///     input (str): Path to input GeoParquet file (EPSG:4326 or EPSG:3857).
+///     input (str): Path to input GeoParquet file (EPSG:4326 or EPSG:3857),
+///         or a remote URL (``s3://``, ``https://``, ``gs://``) read via
+///         byte-range requests.
 ///     output (str): Path to output PMTiles file.
 ///     min_zoom (int, optional): Minimum (coarsest) zoom level. Defaults to 0.
 ///     max_zoom (int, optional): Maximum (finest) zoom level. Defaults to 14.
@@ -170,6 +172,17 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     dict.set_item("row_groups_total", report.row_groups_total)?;
     dict.set_item("row_groups_read", report.row_groups_read)?;
     dict.set_item("duration_secs", report.duration_secs)?;
+    // Remote-input fetch counters (#210); None for local inputs.
+    match &report.remote_fetch {
+        Some(stats) => {
+            let rf = PyDict::new(py);
+            rf.set_item("requests", stats.requests)?;
+            rf.set_item("bytes_fetched", stats.bytes_fetched)?;
+            rf.set_item("object_size", stats.object_size)?;
+            dict.set_item("remote_fetch", rf)?;
+        }
+        None => dict.set_item("remote_fetch", py.None())?,
+    }
     Ok(dict.into())
 }
 
@@ -183,7 +196,10 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 /// exportable to PMTiles by ``export_pmtiles()``.
 ///
 /// Args:
-///     input (str): Input GeoParquet file (EPSG:4326 or EPSG:3857).
+///     input (str): Input GeoParquet file (EPSG:4326 or EPSG:3857): a local
+///         path or a remote URL (``s3://``, ``https://``, ``gs://``) read via
+///         byte-range requests. With ``bbox``, only the matching row groups
+///         of a remote input are ever downloaded.
 ///     output (str): Output overview GeoParquet file.
 ///     mode (str, optional): Level materialization mode, "duplicating" (each
 ///         level is a self-contained rendering) or "partitioning" (each
@@ -283,7 +299,9 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     "level", "gsd", "zoom", "feature_count", "vertex_count",
 ///     "uncompressed_bytes", "compressed_bytes"), "input_features",
 ///     "total_rows", "total_vertices", "total_compressed_bytes",
-///     "row_groups_total", "row_groups_read", "duration_secs".
+///     "row_groups_total", "row_groups_read", "duration_secs", and
+///     "remote_fetch" (None for local inputs; for remote URLs a dict with
+///     "requests", "bytes_fetched", "object_size").
 ///
 /// Raises:
 ///     ValueError: Invalid options (bad mode/direction/op, conflicting or

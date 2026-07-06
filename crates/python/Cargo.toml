@@ -14,7 +14,7 @@ name = "gpq_tiles"
 crate-type = ["cdylib"]
 
 [dependencies]
-gpq-tiles-core = { workspace = true }
+gpq-tiles-core = { workspace = true, features = ["remote"] }
 pyo3 = { workspace = true }
 tempfile = "3"
 
