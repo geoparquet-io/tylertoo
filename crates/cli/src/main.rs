@@ -514,6 +514,30 @@ struct OverviewArgs {
     #[arg(long, value_name = "ROWS", default_value = "8192")]
     read_batch_size: usize,
 
+    /// Memory/throughput profile for the single-read pass-2 engine (#213/#212).
+    ///
+    /// `speed` buffers each output level's rows in RAM (fastest; peak RAM grows
+    /// with buffered output). `bounded` spills them to temporary Arrow IPC
+    /// files (memory-capped; slight temp-I/O cost). `auto` (default) picks per
+    /// mode + estimated size — duplicating → speed, partitioning → bounded, and
+    /// any run whose estimated buffered output exceeds a budget → bounded.
+    /// Output is byte-identical across profiles. No effect with --no-streaming.
+    #[arg(
+        long,
+        default_value = "auto",
+        value_parser = ["auto", "speed", "bounded"]
+    )]
+    profile: String,
+
+    /// Read batches allowed in flight through the pass-2 pipeline at once
+    /// (read/compute-overlap knob; bounded-channel depth).
+    ///
+    /// Higher improves core utilization on long-pole geometries at
+    /// proportionally more peak memory (in-flight-batches × read-batch-size rows
+    /// resident). No effect with --no-streaming.
+    #[arg(long, value_name = "N", default_value = "4")]
+    in_flight_batches: usize,
+
     /// Write the JSON conversion report to this path.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
@@ -744,7 +768,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 fn run_overview(args: OverviewArgs) -> Result<()> {
     use gpq_tiles_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
     use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use gpq_tiles_core::overview::level::Mode;
+    use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
     use gpq_tiles_core::overview::simplify::SimplifyOptions;
     use gpq_tiles_core::overview::writer::RowGroupSizePolicy;
 
@@ -754,6 +778,13 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         "duplicating" => Mode::Duplicating,
         "partitioning" => Mode::Partitioning,
         other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
+    };
+
+    let profile = match args.profile.as_str() {
+        "auto" => MemoryProfile::Auto,
+        "speed" => MemoryProfile::Speed,
+        "bounded" => MemoryProfile::Bounded,
+        other => anyhow::bail!("invalid --profile '{other}' (auto|speed|bounded)"),
     };
 
     // Explicit --gsd list overrides the zoom range.
@@ -856,6 +887,8 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         full_column_stats: args.full_column_stats,
         streaming: !args.no_streaming,
         read_batch_size: args.read_batch_size,
+        profile,
+        in_flight_batches: args.in_flight_batches,
         cluster: args.cluster,
         accumulate,
         coalesce_lines,

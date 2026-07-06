@@ -20,6 +20,7 @@ pub mod export;
 #[cfg(test)]
 mod hostile;
 pub mod level;
+mod pipeline;
 pub mod reader;
 pub mod simplify;
 mod stream;

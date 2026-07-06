@@ -37,10 +37,12 @@ parquet = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-select = { workspace = true }
+arrow-ipc = { workspace = true }
 geo = { workspace = true }
 geozero = { workspace = true }
 prost = { workspace = true }
 rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 tracing = { workspace = true }

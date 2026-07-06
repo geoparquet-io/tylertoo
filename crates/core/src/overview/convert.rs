@@ -63,8 +63,8 @@ use super::coalesce::{
 };
 use super::level::{
     gsd_with_base, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance, Crs,
-    DensityProvenance, Generalization, GeneralizationLevel, Mode, RankingProvenance, GSD_TILE_BASE,
-    METERS_PER_DEGREE,
+    DensityProvenance, Generalization, GeneralizationLevel, MemoryProfile, Mode, RankingProvenance,
+    GSD_TILE_BASE, METERS_PER_DEGREE,
 };
 use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{
@@ -314,6 +314,18 @@ pub struct ConvertOptions {
     /// overhead at the cost of proportionally more peak memory; smaller
     /// batches bound memory tighter. No effect when `streaming` is `false`.
     pub read_batch_size: usize,
+    /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
+    /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
+    /// size at convert entry. Changes speed and peak memory only — output is
+    /// byte-identical across profiles. No effect when `streaming` is `false`.
+    pub profile: MemoryProfile,
+    /// Number of Arrow read batches allowed in flight through the streaming
+    /// pass-2 pipeline at once (bounded-channel depth / read-compute overlap
+    /// knob). Default [`DEFAULT_IN_FLIGHT_BATCHES`]. Higher improves core
+    /// utilization on long-pole geometries at proportionally more peak memory
+    /// (`in_flight_batches × read_batch_size` rows resident). No effect when
+    /// `streaming` is `false`.
+    pub in_flight_batches: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
     /// other point features in their cell: the output gains a `point_count`
@@ -379,6 +391,11 @@ pub struct ConvertOptions {
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
 
+/// Default number of read batches in flight through the pass-2 pipeline
+/// (#213). Four keeps a few cores fed on long-pole geometries while bounding
+/// resident batches to `4 × read_batch_size` rows.
+pub const DEFAULT_IN_FLIGHT_BATCHES: usize = 4;
+
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
@@ -400,6 +417,8 @@ impl Default for ConvertOptions {
             full_column_stats: false,
             streaming: true,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
+            profile: MemoryProfile::Auto,
+            in_flight_batches: DEFAULT_IN_FLIGHT_BATCHES,
             cluster: false,
             accumulate: Vec::new(),
             coalesce_lines: true,
@@ -644,6 +663,11 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
             )));
         }
     }
+    if options.in_flight_batches == 0 {
+        return Err(ConvertError::InvalidConfig(
+            "in-flight-batches must be >= 1".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -667,6 +691,39 @@ pub fn convert_to_overviews_source(
     source: &InputSource,
     output_path: &Path,
     options: &ConvertOptions,
+) -> Result<ConvertReport, ConvertError> {
+    convert_to_overviews_source_strategy(
+        source,
+        output_path,
+        options,
+        super::stream::Pass2Strategy::Pipelined,
+    )
+}
+
+/// [`convert_to_overviews`] over a path with an explicit pass-2
+/// [`Pass2Strategy`] — tests pin the serial reference strategy through the
+/// exact production setup.
+///
+/// [`Pass2Strategy`]: super::stream::Pass2Strategy
+#[cfg(test)]
+pub(crate) fn convert_to_overviews_strategy(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    options: &ConvertOptions,
+    strategy: super::stream::Pass2Strategy,
+) -> Result<ConvertReport, ConvertError> {
+    let source = InputSource::from_path(input_path.as_ref())?;
+    convert_to_overviews_source_strategy(&source, output_path.as_ref(), options, strategy)
+}
+
+/// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
+/// Runs the full option normalization (validation, cluster/accumulate checks,
+/// the partitioning-coalesce-inert rewrite) before dispatching.
+pub(crate) fn convert_to_overviews_source_strategy(
+    source: &InputSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+    strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
@@ -705,7 +762,7 @@ pub fn convert_to_overviews_source(
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
     if options.streaming {
-        return super::stream::convert_streaming(source, output_path, options);
+        return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
     }
 
     let start = Instant::now();
@@ -3148,6 +3205,179 @@ mod tests {
                 read_level_rows(&mr, level),
                 read_level_rows(&sr, level),
                 "level {level} rows differ"
+            );
+        }
+    }
+
+    /// Assert two overview output files are structurally + logically identical:
+    /// same row-group layout (the deterministic on-disk structure), same footer
+    /// `geo:overviews` metadata, and same per-level row content (ids, attrs,
+    /// geometry, order). This is the meaningful "byte-identical" invariant — the
+    /// Parquet writer's footer metadata region is not byte-deterministic
+    /// run-to-run (serial-vs-serial also differs by a few bytes there), so a raw
+    /// `Vec<u8>` compare is not a valid equivalence check.
+    fn assert_outputs_equivalent(a: &Path, b: &Path, ctx: &str) {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        // Row-group layout (num groups, rows per group, column count).
+        let layout = |p: &Path| -> Vec<(i64, usize)> {
+            let r = SerializedFileReader::new(std::fs::File::open(p).unwrap()).unwrap();
+            let md = r.metadata();
+            (0..md.num_row_groups())
+                .map(|i| (md.row_group(i).num_rows(), md.row_group(i).columns().len()))
+                .collect()
+        };
+        assert_eq!(layout(a), layout(b), "{ctx}: row-group layout differs");
+
+        // Footer geo:overviews metadata (semantic).
+        assert_eq!(
+            overviews_footer_json(a),
+            overviews_footer_json(b),
+            "{ctx}: geo:overviews footer differs"
+        );
+
+        // Per-level row content + order.
+        let ra = OverviewReader::open(a).unwrap();
+        let rb = OverviewReader::open(b).unwrap();
+        assert_eq!(
+            ra.num_levels(),
+            rb.num_levels(),
+            "{ctx}: level count differs"
+        );
+        for level in 0..ra.num_levels() {
+            assert_eq!(
+                read_level_rows(&ra, level),
+                read_level_rows(&rb, level),
+                "{ctx}: level {level} rows differ"
+            );
+        }
+    }
+
+    /// The single-read pipelined engine (#213/#212) must produce output
+    /// identical to the serial per-level-re-read reference — across both modes,
+    /// both sink backings (speed = RAM, bounded = Arrow IPC spill), and the
+    /// clustering feature. The bounded case also proves the spill round-trip is
+    /// lossless.
+    #[test]
+    fn pipelined_matches_serial() {
+        use super::super::level::MemoryProfile;
+        use super::super::stream::Pass2Strategy;
+
+        // A polygon set (duplicating/clustering simplify paths) and a dense
+        // point grid (partitioning fans many features across several levels, so
+        // the engine buffers/spills multiple non-finest levels).
+        let poly_in = tempfile::NamedTempFile::new().unwrap();
+        write_input(poly_in.path(), &synthetic_geometries(), false, None);
+        let grid_in = tempfile::NamedTempFile::new().unwrap();
+        write_input(grid_in.path(), &grid_points(600), false, None);
+
+        let cases: Vec<(&str, &Path, ConvertOptions)> = vec![
+            (
+                "duplicating",
+                poly_in.path(),
+                ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 1,
+                        max_zoom: 10,
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "partitioning",
+                grid_in.path(),
+                ConvertOptions {
+                    mode: Mode::Partitioning,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 1,
+                        max_zoom: 9,
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "clustering",
+                grid_in.path(),
+                ConvertOptions {
+                    mode: Mode::Duplicating,
+                    cluster: true,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 1,
+                        max_zoom: 9,
+                    },
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (name, input, base) in &cases {
+            let serial_out = tempfile::NamedTempFile::new().unwrap();
+            convert_to_overviews_strategy(input, serial_out.path(), base, Pass2Strategy::Serial)
+                .unwrap();
+
+            for profile in [MemoryProfile::Speed, MemoryProfile::Bounded] {
+                let opts = ConvertOptions {
+                    profile,
+                    ..base.clone()
+                };
+                let piped_out = tempfile::NamedTempFile::new().unwrap();
+                convert_to_overviews_strategy(
+                    input,
+                    piped_out.path(),
+                    &opts,
+                    Pass2Strategy::Pipelined,
+                )
+                .unwrap();
+                assert_outputs_equivalent(
+                    serial_out.path(),
+                    piped_out.path(),
+                    &format!("{name}/{profile:?}"),
+                );
+            }
+        }
+    }
+
+    /// Pipelined output must be invariant to batching/overlap knobs
+    /// (`read_batch_size`, `in_flight_batches`) — proving the ordered-sink /
+    /// no-reorder-buffer invariant holds regardless of how the single read is
+    /// chunked or how many batches overlap in flight.
+    #[test]
+    fn pipelined_invariant_to_batching_knobs() {
+        use super::super::stream::Pass2Strategy;
+
+        let geoms = grid_points(600);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 9,
+            },
+            ..Default::default()
+        };
+
+        let convert = |read_batch_size: usize, in_flight_batches: usize| {
+            let opts = ConvertOptions {
+                read_batch_size,
+                in_flight_batches,
+                ..base.clone()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            convert_to_overviews_strategy(tin.path(), out.path(), &opts, Pass2Strategy::Pipelined)
+                .unwrap();
+            out
+        };
+
+        let reference = convert(7, 1);
+        for (rbs, ifb) in [(64usize, 4usize), (4096, 8)] {
+            let candidate = convert(rbs, ifb);
+            assert_outputs_equivalent(
+                reference.path(),
+                candidate.path(),
+                &format!("read_batch_size={rbs} in_flight_batches={ifb}"),
             );
         }
     }
