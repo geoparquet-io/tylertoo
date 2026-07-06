@@ -1,0 +1,310 @@
+{
+  "viewports": {
+    "world": {
+      "zoom": 8,
+      "bbox": [
+        7.8,
+        49.5,
+        10.2,
+        51.6
+      ]
+    },
+    "regional": {
+      "zoom": 11,
+      "bbox": [
+        8.7,
+        50.2875,
+        9.3,
+        50.8125
+      ]
+    },
+    "street": {
+      "zoom": 14,
+      "bbox": [
+        8.76,
+        50.22,
+        8.78,
+        50.24
+      ]
+    }
+  },
+  "runs": 3,
+  "files": {
+    "dup": {
+      "file_bytes": 1066764608,
+      "footer_bytes": 985046,
+      "kind": "duplicating",
+      "levels": [
+        {
+          "zoom": 7,
+          "rg_end": 0
+        },
+        {
+          "zoom": 8,
+          "rg_end": 1
+        },
+        {
+          "zoom": 9,
+          "rg_end": 2
+        },
+        {
+          "zoom": 10,
+          "rg_end": 4
+        },
+        {
+          "zoom": 11,
+          "rg_end": 13
+        },
+        {
+          "zoom": 12,
+          "rg_end": 71
+        },
+        {
+          "zoom": 13,
+          "rg_end": 391
+        },
+        {
+          "zoom": 14,
+          "rg_end": 919
+        }
+      ],
+      "views": {
+        "world": {
+          "zoom": 8,
+          "level": 1,
+          "column": "geometry",
+          "row_groups_read": 1,
+          "row_groups_candidate": 1,
+          "rows_spanned": 64,
+          "requests": 3,
+          "bytes": 992792,
+          "wall_s": 1.3701356950004993
+        },
+        "regional": {
+          "zoom": 11,
+          "level": 4,
+          "column": "geometry",
+          "row_groups_read": 5,
+          "row_groups_candidate": 9,
+          "rows_spanned": 48880,
+          "requests": 7,
+          "bytes": 4140381,
+          "wall_s": 2.3487590579970856
+        },
+        "street": {
+          "zoom": 14,
+          "level": 7,
+          "column": "geometry",
+          "row_groups_read": 5,
+          "row_groups_candidate": 528,
+          "rows_spanned": 49995,
+          "requests": 7,
+          "bytes": 4469408,
+          "wall_s": 2.045469882999896
+        }
+      }
+    },
+    "part": {
+      "file_bytes": 664934795,
+      "footer_bytes": 511034,
+      "kind": "partitioning",
+      "levels": [
+        {
+          "zoom": 7,
+          "rg_end": 0
+        },
+        {
+          "zoom": 8,
+          "rg_end": 1
+        },
+        {
+          "zoom": 9,
+          "rg_end": 2
+        },
+        {
+          "zoom": 10,
+          "rg_end": 4
+        },
+        {
+          "zoom": 11,
+          "rg_end": 12
+        },
+        {
+          "zoom": 12,
+          "rg_end": 61
+        },
+        {
+          "zoom": 13,
+          "rg_end": 324
+        },
+        {
+          "zoom": 14,
+          "rg_end": 532
+        }
+      ],
+      "views": {
+        "world": {
+          "zoom": 8,
+          "level": 1,
+          "column": "geometry",
+          "row_groups_read": 2,
+          "row_groups_candidate": 2,
+          "rows_spanned": 81,
+          "requests": 4,
+          "bytes": 563002,
+          "wall_s": 1.705827401001443
+        },
+        "regional": {
+          "zoom": 11,
+          "level": 4,
+          "column": "geometry",
+          "row_groups_read": 10,
+          "row_groups_candidate": 13,
+          "rows_spanned": 59731,
+          "requests": 12,
+          "bytes": 11499547,
+          "wall_s": 2.2836646110008587
+        },
+        "street": {
+          "zoom": 14,
+          "level": 7,
+          "column": "geometry",
+          "row_groups_read": 15,
+          "row_groups_candidate": 533,
+          "rows_spanned": 111170,
+          "requests": 17,
+          "bytes": 14010884,
+          "wall_s": 2.621659410000575
+        }
+      }
+    },
+    "gpo": {
+      "file_bytes": 566856857,
+      "footer_bytes": 118501,
+      "kind": "gpo",
+      "levels": [
+        {
+          "zoom": 10,
+          "rg_end": 31
+        },
+        {
+          "zoom": 12,
+          "rg_end": 63
+        },
+        {
+          "zoom": 24,
+          "rg_end": 88
+        }
+      ],
+      "views": {
+        "world": {
+          "zoom": 8,
+          "level": 0,
+          "column": "overview",
+          "row_groups_read": 32,
+          "row_groups_candidate": 32,
+          "rows_spanned": 158375,
+          "requests": 34,
+          "bytes": 4735854,
+          "wall_s": 2.2820108289997734
+        },
+        "regional": {
+          "zoom": 11,
+          "level": 1,
+          "column": "overview",
+          "row_groups_read": 16,
+          "row_groups_candidate": 64,
+          "rows_spanned": 435527,
+          "requests": 18,
+          "bytes": 8896634,
+          "wall_s": 2.101241189000575
+        },
+        "street": {
+          "zoom": 14,
+          "level": 2,
+          "column": "geometry",
+          "row_groups_read": 5,
+          "row_groups_candidate": 89,
+          "rows_spanned": 236294,
+          "requests": 7,
+          "bytes": 16071466,
+          "wall_s": 2.268408107000141
+        }
+      }
+    },
+    "cpz": {
+      "file_bytes": 881505116,
+      "footer_bytes": 582643,
+      "kind": "column-per-zoom",
+      "levels": [
+        {
+          "zoom": 7,
+          "column": "geom_z7"
+        },
+        {
+          "zoom": 8,
+          "column": "geom_z8"
+        },
+        {
+          "zoom": 9,
+          "column": "geom_z9"
+        },
+        {
+          "zoom": 10,
+          "column": "geom_z10"
+        },
+        {
+          "zoom": 11,
+          "column": "geom_z11"
+        },
+        {
+          "zoom": 12,
+          "column": "geom_z12"
+        },
+        {
+          "zoom": 13,
+          "column": "geom_z13"
+        },
+        {
+          "zoom": 14,
+          "column": "geometry"
+        }
+      ],
+      "views": {
+        "world": {
+          "zoom": 8,
+          "level": 1,
+          "column": "geom_z8",
+          "row_groups_read": 1,
+          "row_groups_candidate": 1,
+          "rows_spanned": 10240,
+          "requests": 3,
+          "bytes": 590490,
+          "wall_s": 1.2599064130008628
+        },
+        "regional": {
+          "zoom": 11,
+          "level": 4,
+          "column": "geom_z11",
+          "row_groups_read": 6,
+          "row_groups_candidate": 9,
+          "rows_spanned": 61440,
+          "requests": 8,
+          "bytes": 4665267,
+          "wall_s": 2.2617635499991593
+        },
+        "street": {
+          "zoom": 14,
+          "level": 7,
+          "column": "geometry",
+          "row_groups_read": 10,
+          "row_groups_candidate": 516,
+          "rows_spanned": 102400,
+          "requests": 12,
+          "bytes": 13649153,
+          "wall_s": 2.4166796909994446
+        }
+      }
+    }
+  }
+}

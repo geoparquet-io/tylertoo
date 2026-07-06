@@ -1,0 +1,118 @@
+{
+  "runs": 3,
+  "windows": {
+    "win_street": [
+      8.76,
+      50.22,
+      8.78,
+      50.24
+    ],
+    "win_regional": [
+      8.7,
+      50.2875,
+      9.3,
+      50.8125
+    ]
+  },
+  "files": {
+    "dup": {
+      "agg_naive": {
+        "bytes": 21705523.2,
+        "head": 1,
+        "get": 920,
+        "wall_s": 11.0,
+        "result": "9136026|5.128592560015255"
+      },
+      "agg_correct": {
+        "bytes": 10905190.4,
+        "head": 1,
+        "get": 1056,
+        "wall_s": 12.88,
+        "result": "5279151|4.847418686955355"
+      },
+      "win_street": {
+        "bytes": 4089446.4,
+        "head": 1,
+        "get": 9,
+        "wall_s": 1.96,
+        "result": "5633|735289"
+      },
+      "win_regional": {
+        "bytes": 46137344.0,
+        "head": 1,
+        "get": 98,
+        "wall_s": 2.91,
+        "result": "352223|41258851"
+      }
+    },
+    "part": {
+      "agg_naive": {
+        "bytes": 10800332.8,
+        "head": 1,
+        "get": 533,
+        "wall_s": 6.7,
+        "result": "5279151|4.847418686955393"
+      },
+      "win_street": {
+        "bytes": 12687769.6,
+        "head": 1,
+        "get": 25,
+        "wall_s": 1.93,
+        "result": "5633|735289"
+      },
+      "win_regional": {
+        "bytes": 76126617.6,
+        "head": 1,
+        "get": 147,
+        "wall_s": 3.25,
+        "result": "352223|41258851"
+      }
+    },
+    "gpo": {
+      "agg_naive": {
+        "bytes": 6710886.4,
+        "head": 1,
+        "get": 89,
+        "wall_s": 2.25,
+        "result": "5279151|4.847418686955396"
+      },
+      "win_street": {
+        "bytes": 16252928.0,
+        "head": 1,
+        "get": 8,
+        "wall_s": 2.21,
+        "result": "5635|735539"
+      },
+      "win_regional": {
+        "bytes": 101607014.4,
+        "head": 1,
+        "get": 41,
+        "wall_s": 4.82,
+        "result": "352241|41261517"
+      }
+    },
+    "cpz": {
+      "agg_naive": {
+        "bytes": 8074035.2,
+        "head": 1,
+        "get": 516,
+        "wall_s": 7.45,
+        "result": "5279151|4.847418686955393"
+      },
+      "win_street": {
+        "bytes": 12582912.0,
+        "head": 1,
+        "get": 18,
+        "wall_s": 1.95,
+        "result": "5633|735289"
+      },
+      "win_regional": {
+        "bytes": 71198310.4,
+        "head": 1,
+        "get": 129,
+        "wall_s": 2.97,
+        "result": "352223|41258851"
+      }
+    }
+  }
+}
