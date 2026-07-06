@@ -137,6 +137,34 @@ level coarser purely because the GSD (and therefore the gate) doubled. This is a
 *hard drop*, distinct from thinning's *one-per-cell* competition: a feature can
 be gated out even if its cell is otherwise empty.
 
+### Empty coarse levels: the auto-clamp
+
+When **every** feature is culled at a coarse level — the normal outcome for
+datasets of small features at world zooms (e.g. country-scale buildings with
+`--min-zoom 0`: no building's bbox clears `4 × gsd(z0)` ≈ 156 km) — that level
+is **omitted from the output and the remaining levels are renumbered** (spec
+§7.3), instead of failing the conversion. You will see a `WARN` like:
+
+```
+omitting 4 empty level(s) [0, 1, 2, 3] spanning GSD 39135.76–4891.97 m: none of
+the 59032924 input feature(s) are visible at those scales (visibility gates /
+density budget); the output pyramid starts at GSD 2445.98 m (zoom 4)
+```
+
+plus a `note:` line under the CLI level table, and the omitted levels are
+recorded in the report's `skipped_empty_levels` (planned level index, GSD,
+zoom) — the written `levels` array is the effective range. The same clamp
+applies when a level empties late, during simplification (a pathological
+feature whose bbox clears the gate but whose geometry collapses below the
+level tolerance). PMTiles export of a clamped file starts at the coarsest
+*written* level's zoom.
+
+This is expected behavior, not data loss: the features are simply not
+representable at those scales. To *force* coarse levels to be populated,
+lower the gates (`--polygon-visibility` / `--line-visibility`) or coarsen the
+ladder (`--gsd-base`). If **no** level has any rows at all (empty input, or an
+empty `--bbox` selection), the conversion still fails with a hard error.
+
 ---
 
 ## Per-feature simplification: `--simplify-factor`

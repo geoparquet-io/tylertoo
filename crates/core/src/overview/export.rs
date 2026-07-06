@@ -1070,7 +1070,9 @@ mod tests {
     use super::*;
     use crate::mvt::{command_decode, zigzag_decode};
     use crate::overview::level::{gsd, Level, Mode};
-    use crate::overview::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions};
+    use crate::overview::writer::{
+        LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions,
+    };
     use crate::vector_tile::tile::GeomType;
     use crate::vector_tile::Tile;
     use arrow_array::{Int64Array, RecordBatch, StringArray};
@@ -1124,13 +1126,16 @@ mod tests {
         opts.max_row_group_size = 10_000;
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         for (k, (ids, geoms)) in level_geoms.iter().enumerate() {
-            writer
-                .write_level(
-                    k,
-                    Some(ids.len()),
-                    std::iter::once(batch(&schema, ids, geoms)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        k,
+                        Some(ids.len()),
+                        std::iter::once(batch(&schema, ids, geoms)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
         }
         writer.finish().unwrap()
     }
@@ -1326,26 +1331,32 @@ mod tests {
         let mut opts = OverviewWriterOptions::new(Mode::Partitioning, specs);
         opts.max_row_group_size = 10_000;
         let mut w = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
-        w.write_level(
-            0,
-            Some(1),
-            std::iter::once(batch(
-                &schema,
-                &[0],
-                &[Geometry::Point(Point::new(1.0, 1.0))],
-            )),
-        )
-        .unwrap();
-        w.write_level(
-            1,
-            Some(1),
-            std::iter::once(batch(
-                &schema,
-                &[1],
-                &[Geometry::Point(Point::new(2.0, 2.0))],
-            )),
-        )
-        .unwrap();
+        assert_eq!(
+            w.write_level(
+                0,
+                Some(1),
+                std::iter::once(batch(
+                    &schema,
+                    &[0],
+                    &[Geometry::Point(Point::new(1.0, 1.0))],
+                )),
+            )
+            .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        assert_eq!(
+            w.write_level(
+                1,
+                Some(1),
+                std::iter::once(batch(
+                    &schema,
+                    &[1],
+                    &[Geometry::Point(Point::new(2.0, 2.0))],
+                )),
+            )
+            .unwrap(),
+            LevelWriteOutcome::Written
+        );
         w.finish().unwrap();
 
         let reader = OverviewReader::open(tmp.path()).unwrap();

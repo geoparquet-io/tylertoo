@@ -36,13 +36,16 @@
 //! in-memory path omits (and renumbers past) a level whose *simplified*
 //! output is empty, whereas this path decides level omission from the winner
 //! table before simplification. The two only differ when **every** winner of
-//! a level degenerates during simplification — impossible under the default
-//! knobs (the assign visibility gates, 2–4 × GSD, are stricter than the
-//! simplify drop gate at 1 × GSD) and pathological otherwise; if it ever
-//! happens the writer reports [`WriterError::EmptyLevel`] instead of silently
-//! renumbering.
+//! a level degenerates during simplification — rare under the default knobs
+//! (the assign visibility gates, 2–4 × GSD, are stricter than the simplify
+//! drop gate at 1 × GSD) but real on dirty data (#211: a sliver with a huge
+//! bbox passes the gate, then collapses). When it happens the writer skips
+//! the level ([`LevelWriteOutcome::SkippedEmpty`]) and this driver records it
+//! in [`ConvertReport::skipped_empty_levels`], exactly like a plan-time
+//! omission — the two pipelines converge on the same output pyramid.
 //!
-//! [`WriterError::EmptyLevel`]: super::writer::WriterError::EmptyLevel
+//! [`LevelWriteOutcome::SkippedEmpty`]: super::writer::LevelWriteOutcome::SkippedEmpty
+//! [`ConvertReport::skipped_empty_levels`]: super::convert::ConvertReport::skipped_empty_levels
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -71,16 +74,18 @@ use super::convert::{
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
     count_vertices, extract_class_ranks, extract_sort_keys, feature_kind, fill_level_bytes,
     find_geometry_column, geometry_bbox, mixed_geometry_field, overture_road_ranking,
-    usable_geometry, validate_cluster_schema, validate_coalesce_schema, ClassRanking,
-    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
-    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    record_level_outcome, usable_geometry, validate_cluster_schema, validate_coalesce_schema,
+    warn_plan_skipped_levels, ClassRanking, CoalesceTable, ConvertError, ConvertOptions,
+    ConvertReport, GroupInterner, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipeline;
 use super::simplify::{
     full_resolution_fallback_count, simplify_for_level, Simplified, SimplifyOptions,
 };
-use super::writer::{LevelSpec, OverviewWriter, OverviewWriterOptions, LEVEL_COLUMN};
+use super::writer::{
+    LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, LEVEL_COLUMN,
+};
 
 /// Row-indexed winner-table sentinel for rows with no feature (null, empty,
 /// or non-finite geometry — skipped in pass 1). It matches no level in either
@@ -340,6 +345,18 @@ pub(crate) fn convert_streaming_strategy(
         }
     }
 
+    // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
+    // record them for the report + warning.
+    let mut skipped: Vec<SkippedLevelReport> = level_specs
+        .iter()
+        .enumerate()
+        .filter(|&(l, _)| counts[l] == 0)
+        .map(|(l, &(gsd, zoom))| SkippedLevelReport {
+            planned_level: l,
+            gsd,
+            zoom,
+        })
+        .collect();
     let emitted: Vec<EmitLevel> = level_specs
         .iter()
         .enumerate()
@@ -354,6 +371,7 @@ pub(crate) fn convert_streaming_strategy(
     if emitted.is_empty() {
         return Err(ConvertError::NoData);
     }
+    warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
 
     // --- Writer setup (identical to the in-memory path). ---------------------
     let geom_name = geom_field.name().clone();
@@ -464,8 +482,10 @@ pub(crate) fn convert_streaming_strategy(
     let n = emitted.len();
     let hints: Vec<usize> = emitted.iter().map(|e| e.hint).collect();
 
-    // `(rows, vertices)` per level, in level order.
-    let level_stats: Vec<(usize, usize)> = match strategy {
+    // `(outcome, rows, vertices)` per emitted level, in level order. The
+    // outcome distinguishes a written level from one the writer skipped because
+    // every candidate collapsed during simplification (#211).
+    let level_stats: Vec<(LevelWriteOutcome, usize, usize)> = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
         Pass2Strategy::Serial => ctxs
             .iter()
@@ -515,18 +535,32 @@ pub(crate) fn convert_streaming_strategy(
         }
     };
 
+    // Fold each emitted level's write outcome into the shared bookkeeping
+    // (#211): `record_level_outcome` appends a renumbered `LevelReport` for a
+    // written level, or — for a level the writer omitted because every
+    // candidate collapsed during simplification — warns and records the plan in
+    // `skipped`, exactly like a plan-time omission.
     let mut level_reports = Vec::with_capacity(emitted.len());
-    for (i, e) in emitted.iter().enumerate() {
-        let (rows, vertices) = level_stats[i];
-        level_reports.push(LevelReport {
-            level: i,
-            gsd: e.gsd,
-            zoom: e.zoom,
-            feature_count: rows,
-            vertex_count: vertices,
-            uncompressed_bytes: 0,
-            compressed_bytes: 0,
-        });
+    for (e, (outcome, rows, vertices)) in emitted.iter().zip(level_stats) {
+        record_level_outcome(
+            outcome,
+            SkippedLevelReport {
+                planned_level: e.orig as usize,
+                gsd: e.gsd,
+                zoom: e.zoom,
+            },
+            e.hint,
+            rows,
+            vertices,
+            &mut level_reports,
+            &mut skipped,
+        );
+    }
+    skipped.sort_by_key(|s| s.planned_level);
+    if level_reports.is_empty() {
+        // Every emitted level collapsed at write time: no valid overview file
+        // can be produced (`levels` MUST be non-empty, §3.3).
+        return Err(ConvertError::NoData);
     }
 
     log::debug!(
@@ -549,6 +583,7 @@ pub(crate) fn convert_streaming_strategy(
     Ok(ConvertReport {
         mode: options.mode,
         levels: level_reports,
+        skipped_empty_levels: skipped,
         input_features: num_features,
         total_rows,
         total_vertices,
@@ -1107,8 +1142,9 @@ pub(super) struct LevelStreamCtx<'a> {
     coalesce_table: Option<&'a CoalesceTable>,
 }
 
-/// Stream one level from the input file into the writer. Returns
-/// `(rows_written, vertex_count)`.
+/// Stream one level from the input file into the writer. Returns the writer
+/// outcome (a level whose every candidate collapses during simplification is
+/// skipped, #211) plus `(rows_written, vertex_count)`.
 fn write_level_streaming(
     writer: &mut OverviewWriter<File>,
     level_idx: usize,
@@ -1117,7 +1153,7 @@ fn write_level_streaming(
     read_batch_size: usize,
     row_groups: Option<&[usize]>,
     ctx: &LevelStreamCtx<'_>,
-) -> Result<(usize, usize), ConvertError> {
+) -> Result<(LevelWriteOutcome, usize, usize), ConvertError> {
     let mut builder = source.open()?.with_batch_size(read_batch_size.max(1));
     // Regional extract (#102): read the same bbox-selected row groups as
     // pass 1, so the winner tables' global row indices line up.
@@ -1167,7 +1203,7 @@ fn write_level_streaming(
     if let Some(e) = err.borrow_mut().take() {
         return Err(e); // stream error takes precedence over the writer's
     }
-    res?;
+    let outcome = res?;
     let total = t_level.elapsed().as_secs_f64();
     let read_s = Pass2Timers::secs(&timers.read);
     let decode_s = Pass2Timers::secs(&timers.decode);
@@ -1193,7 +1229,7 @@ fn write_level_streaming(
              resolution (invalid RDP candidate after all epsilon retries)"
         );
     }
-    Ok((rows.get(), vertices.get()))
+    Ok((outcome, rows.get(), vertices.get()))
 }
 
 /// Process one input batch for one level: select the level's members from the

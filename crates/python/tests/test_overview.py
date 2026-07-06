@@ -217,6 +217,17 @@ class TestOverviewIntegration:
             assert len(result["checks"]) > 0
             assert all(c["passed"] for c in result["checks"])
 
+    def test_overview_report_clamp_accounting(self):
+        """Auto-clamp accounting (#211): written + skipped == planned (z0..z6),
+        and every skipped entry names its planned level, GSD, and zoom."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, report = self._overview(tmpdir)
+            skipped = report["skipped_empty_levels"]
+            assert len(report["levels"]) + len(skipped) == 7
+            assert all(0 <= s["planned_level"] < 7 for s in skipped)
+            assert all(s["gsd"] > 0 for s in skipped)
+            assert all(s["zoom"] == s["planned_level"] for s in skipped)
+
     def test_overview_zoom_range(self):
         """Fine zooms suit the small building footprints: all levels survive."""
         with tempfile.TemporaryDirectory() as tmpdir:

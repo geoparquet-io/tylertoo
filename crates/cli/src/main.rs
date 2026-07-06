@@ -933,6 +933,22 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             HumanBytes(lvl.compressed_bytes.max(0) as u64)
         );
     }
+    if !report.skipped_empty_levels.is_empty() {
+        let planned: Vec<String> = report
+            .skipped_empty_levels
+            .iter()
+            .map(|s| match s.zoom {
+                Some(z) => format!("z{z}"),
+                None => format!("level {}", s.planned_level),
+            })
+            .collect();
+        println!(
+            "  note: {} empty level(s) omitted ({}) — no features visible at those \
+             scales; the pyramid starts at the coarsest non-empty level",
+            report.skipped_empty_levels.len(),
+            planned.join(", ")
+        );
+    }
 
     if let Some(report_path) = &args.report {
         let json =

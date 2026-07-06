@@ -735,7 +735,8 @@ fn reserved_columns_rejected_case_insensitive() {
 fn empty_coarse_levels_omitted_across_pipelines() {
     // Tiny lines fail the visibility gate at every coarse level: with
     // coalescing off those levels are empty and must be omitted (not written,
-    // not EmptyLevel-crashed), leaving a valid file with fewer levels.
+    // not crashed on — #211 auto-clamp), leaving a valid file with fewer
+    // levels.
     let tiny_lines: Vec<Option<Geometry<f64>>> = (0..4)
         .map(|i| {
             let x = 10.0 + i as f64 * 5.0;

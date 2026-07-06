@@ -174,11 +174,15 @@ pub enum WriterError {
         /// Index the caller passed.
         got: usize,
     },
-    /// A level produced no row groups (empty level; §7.3).
-    #[error("level {level} is empty (produced no rows / row groups)")]
-    EmptyLevel {
-        /// The offending level index.
-        level: usize,
+    /// Every declared level was empty: nothing was written, so no valid
+    /// overview file can be produced (`levels` MUST be non-empty, §3.3).
+    #[error(
+        "all {expected} declared level(s) were empty — no output rows at any \
+         level (empty input, or every feature dropped at every scale)"
+    )]
+    AllLevelsEmpty {
+        /// Levels declared in the options.
+        expected: usize,
     },
     /// `finish` was called before all declared levels were written.
     #[error("finish called with {written} of {expected} levels written")]
@@ -188,6 +192,24 @@ pub enum WriterError {
         /// Levels declared in the options.
         expected: usize,
     },
+}
+
+/// Outcome of one [`OverviewWriter::write_level`] call.
+///
+/// A level whose batch stream yields zero rows is **omitted** from the output
+/// (and later levels are renumbered) rather than treated as an error: spec
+/// §7.3 forbids empty levels and requires the writer to omit-and-renumber.
+/// Callers use the outcome to keep their own level bookkeeping (reports,
+/// warnings) aligned with the physical file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an empty level is silently omitted; callers must renumber their own bookkeeping"]
+pub enum LevelWriteOutcome {
+    /// The level produced rows and was written (at least one row group).
+    Written,
+    /// The level produced no rows: nothing was written, the declared spec is
+    /// dropped from the footer, and subsequent levels shift down by one
+    /// physical index (§7.3).
+    SkippedEmpty,
 }
 
 /// A level-banded GeoParquet overview writer.
@@ -203,8 +225,12 @@ pub struct OverviewWriter<W: Write + Send> {
     /// bbox-covering struct columns whose name collides with the covering the
     /// encoder will generate (§4.4). See [`Self::try_new`].
     drop_indices: Vec<usize>,
-    /// `row_group_end` recorded for each completed level.
+    /// `row_group_end` recorded for each completed (non-empty) level.
     level_row_group_ends: Vec<i64>,
+    /// For each completed level, the index of its declared
+    /// [`LevelSpec`](OverviewWriterOptions::levels). Diverges from the
+    /// physical index once an empty level is skipped (§7.3).
+    written_spec_indices: Vec<usize>,
     /// Index of the next level expected by [`Self::write_level`].
     next_level_idx: usize,
 }
@@ -305,6 +331,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             options,
             drop_indices,
             level_row_group_ends: Vec::new(),
+            written_spec_indices: Vec::new(),
             next_level_idx: 0,
         })
     }
@@ -330,12 +357,18 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// splitting every `max_row_group_size` rows. Either way the level ends
     /// exactly on a row-group boundary and never shares a row group with another
     /// level (§4.2) — the RG-boundary-per-level invariant is exact.
+    ///
+    /// A level whose batches yield **zero rows** is skipped, not an error
+    /// (§7.3): nothing is written, the declared spec is dropped from the
+    /// footer, and subsequent levels are renumbered down by one physical
+    /// index (their `level` column values stay contiguous from 0). The
+    /// returned [`LevelWriteOutcome`] tells the caller which case occurred.
     pub fn write_level(
         &mut self,
         level_idx: usize,
         level_row_hint: Option<usize>,
         batches: impl Iterator<Item = RecordBatch>,
-    ) -> Result<(), WriterError> {
+    ) -> Result<LevelWriteOutcome, WriterError> {
         if level_idx != self.next_level_idx {
             return Err(WriterError::LevelOutOfOrder {
                 expected: self.next_level_idx,
@@ -360,9 +393,14 @@ impl<W: Write + Send> OverviewWriter<W> {
         // Rows accumulated into the current (not-yet-flushed) row group.
         let mut in_rg: usize = 0;
 
+        // The PHYSICAL level index this level will occupy in the output file:
+        // the count of levels actually written so far. It trails `level_idx`
+        // once an empty level has been skipped (§7.3 renumbering).
+        let physical_idx = self.level_row_group_ends.len();
+
         for batch in batches {
             let num_rows = batch.num_rows();
-            let level_array = Int32Array::from(vec![level_idx as i32; num_rows]);
+            let level_array = Int32Array::from(vec![physical_idx as i32; num_rows]);
 
             // Drop the colliding covering column(s) (§4.4), then append `level`.
             let mut columns: Vec<_> = batch
@@ -405,12 +443,17 @@ impl<W: Write + Send> OverviewWriter<W> {
 
         let rg_after = self.writer.flushed_row_groups().len();
         if rg_after <= rg_before {
-            return Err(WriterError::EmptyLevel { level: level_idx });
+            // Empty level: omit it entirely and renumber (§7.3). No rows were
+            // written (a partial row group would have been flushed above), so
+            // the file carries no trace of it; only the bookkeeping moves on.
+            self.next_level_idx += 1;
+            return Ok(LevelWriteOutcome::SkippedEmpty);
         }
 
         self.level_row_group_ends.push(rg_after as i64 - 1);
+        self.written_spec_indices.push(level_idx);
         self.next_level_idx += 1;
-        Ok(())
+        Ok(LevelWriteOutcome::Written)
     }
 
     /// Finalize the file: write the `geo` and `geo:overviews` footer keys (plus
@@ -420,6 +463,15 @@ impl<W: Write + Send> OverviewWriter<W> {
         if self.next_level_idx != self.options.levels.len() {
             return Err(WriterError::IncompleteLevels {
                 written: self.next_level_idx,
+                expected: self.options.levels.len(),
+            });
+        }
+
+        // Every level may legally be skipped-as-empty individually, but a
+        // file with NO levels is invalid (`levels` MUST be non-empty, §3.3):
+        // fail with an actionable error instead of writing garbage.
+        if self.level_row_group_ends.is_empty() {
+            return Err(WriterError::AllLevelsEmpty {
                 expected: self.options.levels.len(),
             });
         }
@@ -454,28 +506,46 @@ impl<W: Write + Send> OverviewWriter<W> {
     }
 
     fn build_meta(&self) -> OverviewsMeta {
+        // Only the levels actually written appear in the footer; skipped
+        // (empty) levels drop their declared spec too, keeping `levels`,
+        // `row_group_end`, and the physical `level` column aligned (§7.3).
         let levels: Vec<Level> = self
             .level_row_group_ends
             .iter()
-            .zip(self.options.levels.iter())
-            .map(|(&row_group_end, spec)| Level {
+            .zip(self.written_spec_indices.iter())
+            .map(|(&row_group_end, &spec_idx)| Level {
                 row_group_end,
-                gsd: spec.gsd,
-                zoom: spec.zoom,
+                gsd: self.options.levels[spec_idx].gsd,
+                zoom: self.options.levels[spec_idx].zoom,
             })
             .collect();
 
         let canonical_level = match self.options.mode {
-            Mode::Duplicating => Some(self.options.levels.len() as i64 - 1),
+            Mode::Duplicating => Some(levels.len() as i64 - 1),
             Mode::Partitioning => None,
         };
+
+        // The provenance `levels` array is parallel to the top-level `levels`
+        // (§3.5): drop the skipped entries there as well.
+        let generalization = self.options.generalization.clone().map(|mut g| {
+            if g.levels.len() == self.options.levels.len()
+                && self.written_spec_indices.len() != self.options.levels.len()
+            {
+                g.levels = self
+                    .written_spec_indices
+                    .iter()
+                    .map(|&i| g.levels[i].clone())
+                    .collect();
+            }
+            g
+        });
 
         OverviewsMeta {
             version: self.options.version.clone(),
             mode: Some(self.options.mode),
             canonical_level,
             levels,
-            generalization: self.options.generalization.clone(),
+            generalization,
         }
     }
 }
@@ -785,6 +855,68 @@ mod tests {
     }
 
     #[test]
+    fn empty_level_is_skipped_and_renumbered() {
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
+
+        // Level 0 (z2) yields no rows: skipped, not an error (§7.3, #211).
+        let outcome = writer
+            .write_level(0, Some(0), std::iter::empty::<RecordBatch>())
+            .unwrap();
+        assert_eq!(outcome, LevelWriteOutcome::SkippedEmpty);
+        assert_eq!(
+            writer
+                .write_level(1, None, std::iter::once(source_batch(&schema, &[0, 1])))
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        assert_eq!(
+            writer
+                .write_level(
+                    2,
+                    None,
+                    std::iter::once(source_batch(&schema, &[0, 1, 2, 3]))
+                )
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        let meta = writer.finish().unwrap();
+
+        // Footer: two levels carrying the z4/z6 specs; canonical renumbered.
+        assert_eq!(meta.levels.len(), 2);
+        assert_eq!(meta.levels[0].zoom, Some(4));
+        assert_eq!(meta.levels[1].zoom, Some(6));
+        assert_eq!(meta.levels[0].gsd, gsd(4));
+        assert_eq!(meta.levels[1].gsd, gsd(6));
+        assert_eq!(meta.canonical_level, Some(1));
+
+        // The physical `level` column is renumbered contiguously from 0.
+        assert_eq!(read_level_column(tmp.path(), 0), vec![0, 0]);
+        assert_eq!(read_level_column(tmp.path(), 1), vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn finish_with_all_levels_empty_errors() {
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
+        for level in 0..3 {
+            let outcome = writer
+                .write_level(level, Some(0), std::iter::empty::<RecordBatch>())
+                .unwrap();
+            assert_eq!(outcome, LevelWriteOutcome::SkippedEmpty);
+        }
+        let err = writer.finish().unwrap_err();
+        assert!(
+            matches!(err, WriterError::AllLevelsEmpty { expected: 3 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn preexisting_bbox_covering_is_not_duplicated() {
         use arrow_array::{Float64Array, StructArray};
         use arrow_schema::Fields;
@@ -842,15 +974,24 @@ mod tests {
         {
             let mut writer =
                 OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
-            writer
-                .write_level(0, None, std::iter::once(make_batch(&[0, 3])))
-                .unwrap();
-            writer
-                .write_level(1, None, std::iter::once(make_batch(&[0, 1, 3])))
-                .unwrap();
-            writer
-                .write_level(2, None, std::iter::once(make_batch(&[0, 1, 2, 3])))
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(0, None, std::iter::once(make_batch(&[0, 3])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(1, None, std::iter::once(make_batch(&[0, 1, 3])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(2, None, std::iter::once(make_batch(&[0, 1, 2, 3])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap();
         }
 
@@ -906,19 +1047,28 @@ mod tests {
         let written_meta = {
             let mut writer =
                 OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
-            writer
-                .write_level(0, None, std::iter::once(source_batch(&schema, &level0_ids)))
-                .unwrap();
-            writer
-                .write_level(1, None, std::iter::once(source_batch(&schema, &level1_ids)))
-                .unwrap();
-            writer
-                .write_level(
-                    2,
-                    None,
-                    std::iter::once(source_batch(&schema, &canonical_ids)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(0, None, std::iter::once(source_batch(&schema, &level0_ids)))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(1, None, std::iter::once(source_batch(&schema, &level1_ids)))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(
+                        2,
+                        None,
+                        std::iter::once(source_batch(&schema, &canonical_ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1081,12 +1231,18 @@ mod tests {
 
         let written_meta = {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
-            writer
-                .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 2])))
-                .unwrap();
-            writer
-                .write_level(1, None, std::iter::once(source_batch(&schema, &[1, 3, 5])))
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 2])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(1, None, std::iter::once(source_batch(&schema, &[1, 3, 5])))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1128,9 +1284,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut writer =
             OverviewWriter::create(tmp.path(), &schema, duplicating_options()).unwrap();
-        writer
-            .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 3])))
-            .unwrap();
+        assert_eq!(
+            writer
+                .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 3])))
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
         let err = writer.finish().unwrap_err();
         assert!(matches!(
             err,
@@ -1175,22 +1334,28 @@ mod tests {
         let meta = {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
             // Level 0: 3 rows (<= cap 4) -> single row group.
-            writer
-                .write_level(
-                    0,
-                    Some(3),
-                    std::iter::once(source_batch(&schema, &[0, 1, 2])),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        0,
+                        Some(3),
+                        std::iter::once(source_batch(&schema, &[0, 1, 2])),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             // Level 1: 10 rows (> cap 4) -> ceil(10/4)=3 uniform row groups.
             let ids: Vec<i64> = (0..10).collect();
-            writer
-                .write_level(
-                    1,
-                    Some(ids.len()),
-                    std::iter::once(source_batch(&schema, &ids)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        1,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1257,20 +1422,26 @@ mod tests {
         let ids: Vec<i64> = (0..10).collect();
         let meta = {
             let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
-            writer
-                .write_level(
-                    0,
-                    Some(ids.len()),
-                    std::iter::once(source_batch(&schema, &ids)),
-                )
-                .unwrap();
-            writer
-                .write_level(
-                    1,
-                    Some(ids.len()),
-                    std::iter::once(source_batch(&schema, &ids)),
-                )
-                .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(
+                        0,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(
+                        1,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
             writer.finish().unwrap()
         };
 
@@ -1320,23 +1491,32 @@ mod tests {
         let mut opts = duplicating_options();
         opts.full_column_stats = full_column_stats;
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
-        writer
-            .write_level(0, Some(2), std::iter::once(source_batch(&schema, &[0, 3])))
-            .unwrap();
-        writer
-            .write_level(
-                1,
-                Some(3),
-                std::iter::once(source_batch(&schema, &[0, 1, 3])),
-            )
-            .unwrap();
-        writer
-            .write_level(
-                2,
-                Some(4),
-                std::iter::once(source_batch(&schema, &[0, 1, 2, 3])),
-            )
-            .unwrap();
+        assert_eq!(
+            writer
+                .write_level(0, Some(2), std::iter::once(source_batch(&schema, &[0, 3])))
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        assert_eq!(
+            writer
+                .write_level(
+                    1,
+                    Some(3),
+                    std::iter::once(source_batch(&schema, &[0, 1, 3])),
+                )
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        assert_eq!(
+            writer
+                .write_level(
+                    2,
+                    Some(4),
+                    std::iter::once(source_batch(&schema, &[0, 1, 2, 3])),
+                )
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
         writer.finish().unwrap();
     }
 
