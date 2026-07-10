@@ -355,6 +355,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     no_auto_rank=false,
     simplify_factor=1.0,
     collapse=false,
+    cascade=true,
     point_thinning=None,
     line_thinning=1.0,
     polygon_thinning=1.0,
@@ -396,6 +397,7 @@ fn overview(
     no_auto_rank: bool,
     simplify_factor: f64,
     collapse: bool,
+    cascade: bool,
     point_thinning: Option<f64>,
     line_thinning: f64,
     polygon_thinning: f64,
@@ -541,6 +543,7 @@ fn overview(
         simplify: SimplifyOptions {
             factor: simplify_factor,
             collapse,
+            cascade,
         },
         density: DensityBudgetConfig {
             enabled: density_drop,

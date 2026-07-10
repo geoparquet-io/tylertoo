@@ -102,6 +102,21 @@ pub struct SimplifyOptions {
     /// a polygon / multipolygon that collapses below the visibility gate is
     /// replaced by a representative [`Point`] instead of being dropped.
     pub collapse: bool,
+    /// Cascading simplification (#218, default **on**). When `true`:
+    ///
+    /// - conversion paths derive each coarser level from the next-finer
+    ///   level's already-simplified output via [`simplify_cascade`] instead
+    ///   of re-simplifying canonical geometry per level, and
+    /// - a polygon whose RDP candidate self-intersects is repaired into its
+    ///   valid even-odd interpretation
+    ///   ([`crate::ioverlay_clip::repair_polygon_ioverlay`]) instead of
+    ///   being epsilon-retried and ultimately kept at full resolution — a
+    ///   full-resolution fallback would poison every coarser cascade step
+    ///   for that feature.
+    ///
+    /// Output-changing: coarse-level geometry differs from the non-cascaded
+    /// pipeline. `false` reproduces the pre-#218 output byte-for-byte.
+    pub cascade: bool,
 }
 
 impl Default for SimplifyOptions {
@@ -109,6 +124,7 @@ impl Default for SimplifyOptions {
         Self {
             factor: DEFAULT_SIMPLIFY_FACTOR,
             collapse: false,
+            cascade: true,
         }
     }
 }
@@ -196,18 +212,23 @@ pub fn simplify_for_level(
             }
         }
 
-        Geometry::Polygon(poly) => simplify_polygon_impl(poly, tol, opts.collapse),
+        Geometry::Polygon(poly) => simplify_polygon_impl(poly, tol, opts.collapse, opts.cascade),
 
         Geometry::MultiPolygon(mp) => {
             // Simplify each part with collapse disabled: a collapsed *part* is
             // dropped, never turned into a Point (a MultiPolygon cannot hold
-            // one). Whole-feature collapse is decided after.
+            // one). Whole-feature collapse is decided after. A repaired part
+            // (cascade path) may itself be a MultiPolygon; its parts are
+            // flattened in.
             let kept: Vec<Polygon<f64>> =
                 mp.0.iter()
-                    .filter_map(|p| match simplify_polygon_impl(p, tol, false) {
-                        Simplified::Keep(Geometry::Polygon(poly)) => Some(poly),
-                        _ => None,
-                    })
+                    .flat_map(
+                        |p| match simplify_polygon_impl(p, tol, false, opts.cascade) {
+                            Simplified::Keep(Geometry::Polygon(poly)) => vec![poly],
+                            Simplified::Keep(Geometry::MultiPolygon(parts)) => parts.0,
+                            _ => Vec::new(),
+                        },
+                    )
                     .collect();
             if !kept.is_empty() {
                 Simplified::Keep(Geometry::MultiPolygon(MultiPolygon::new(kept)))
@@ -225,6 +246,41 @@ pub fn simplify_for_level(
         // pass through untouched.
         other => Simplified::Keep(other.clone()),
     }
+}
+
+/// Cascading simplification (#218): fold a geometry through a fine→coarse
+/// chain of level GSDs, feeding each coarser level the previous level's
+/// already-simplified output instead of re-simplifying canonical geometry.
+///
+/// `gsds_fine_to_coarse` lists the GSDs of every non-canonical level from
+/// the finest (first) down to the target level (last). The fold is a pure
+/// function of `(geom, chain, crs, opts)` — independent of engine, batch
+/// boundaries, and neighboring features — so every conversion path
+/// (in-memory, serial streaming, pipelined) computes identical results for
+/// identical inputs.
+///
+/// Dropping is monotone along the chain: tolerances grow while the working
+/// geometry's extent can only shrink (RDP keeps a vertex subset), so a
+/// feature dropped at a fine step can never survive a coarser one — the fold
+/// short-circuits on the first [`Simplified::Dropped`].
+///
+/// An empty chain is the identity (bit-identical clone), matching
+/// [`simplify_for_level`]'s canonical path at zero tolerance.
+pub fn simplify_cascade(
+    geom: &Geometry<f64>,
+    gsds_fine_to_coarse: &[f64],
+    crs: Crs,
+    opts: &SimplifyOptions,
+) -> Simplified {
+    let mut current: Option<Geometry<f64>> = None;
+    for &gsd in gsds_fine_to_coarse {
+        let input = current.as_ref().unwrap_or(geom);
+        match simplify_for_level(input, gsd, crs, opts) {
+            Simplified::Keep(g) => current = Some(g),
+            Simplified::Dropped => return Simplified::Dropped,
+        }
+    }
+    Simplified::Keep(current.unwrap_or_else(|| geom.clone()))
 }
 
 // ============================================================================
@@ -307,12 +363,19 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
 ///   fall below the gate are dropped.
 /// - If the exterior collapses (too few points or sub-tolerance area) ⇒
 ///   collapse.
-/// - If RDP introduces an invalid (self-intersecting) polygon, retry with a
-///   progressively halved epsilon ([`INVALID_RETRY_HALVINGS`] retries): a
-///   smaller tolerance keeps more vertices and usually restores validity while
-///   still shedding sub-tolerance detail. Only when every retry fails is the
-///   original geometry kept verbatim (boundary-preserving last resort, counted
-///   in [`full_resolution_fallback_count`]).
+/// - If RDP introduces an invalid (self-intersecting) polygon:
+///   - `repair` **off** (pre-#218 behavior): retry with a progressively
+///     halved epsilon ([`INVALID_RETRY_HALVINGS`] retries): a smaller
+///     tolerance keeps more vertices and usually restores validity while
+///     still shedding sub-tolerance detail. Only when every retry fails is
+///     the original geometry kept verbatim (boundary-preserving last resort,
+///     counted in [`full_resolution_fallback_count`]).
+///   - `repair` **on** (cascade path, #218): no retries — the candidate's
+///     self-crossings are resolved into their valid even-odd interpretation
+///     ([`repair_polygon_ioverlay`]), with repaired parts re-gated. A
+///     full-resolution fallback here would poison every coarser cascade step
+///     for the feature, and the epsilon retries were the profiled waste
+///     (4× RDP + `is_valid` on near-full-resolution rings).
 ///
 /// Validation-cost notes (H3(c) profile, lever 3): the candidate skips
 /// `is_valid()` entirely when RDP removed no vertices (identical to the
@@ -321,7 +384,12 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
 /// ~96% of coarse-level simplification cost. A consequence: an *invalid
 /// source* polygon whose candidates all fail validation is now kept verbatim
 /// (like the canonical level does) instead of being collapsed/dropped.
-fn simplify_polygon_impl(poly: &Polygon<f64>, tol: f64, collapse: bool) -> Simplified {
+fn simplify_polygon_impl(
+    poly: &Polygon<f64>,
+    tol: f64,
+    collapse: bool,
+    repair: bool,
+) -> Simplified {
     if polygon_diag(poly) < tol {
         return collapse_polygon(poly, collapse);
     }
@@ -330,8 +398,14 @@ fn simplify_polygon_impl(poly: &Polygon<f64>, tol: f64, collapse: bool) -> Simpl
     // epsilon backs off below it.
     let min_area = tol * tol;
 
+    let attempts = if repair {
+        1
+    } else {
+        INVALID_RETRY_HALVINGS + 1
+    };
     let mut eps = tol;
-    for _ in 0..=INVALID_RETRY_HALVINGS {
+    let mut invalid_candidate: Option<Polygon<f64>> = None;
+    for _ in 0..attempts {
         let simplified = poly.simplify(eps);
 
         // Drop interior rings that collapsed below the gate.
@@ -356,7 +430,21 @@ fn simplify_polygon_impl(poly: &Polygon<f64>, tol: f64, collapse: bool) -> Simpl
         if polygon_unchanged(&candidate, poly) || candidate.is_valid() {
             return Simplified::Keep(Geometry::Polygon(candidate));
         }
+        invalid_candidate = Some(candidate);
         eps *= 0.5;
+    }
+
+    if repair {
+        let candidate = invalid_candidate.expect("loop ran at least once");
+        if let Some(repaired) = repair_candidate(&candidate, tol, min_area) {
+            log::trace!(
+                "overview simplify: repaired self-intersecting RDP candidate \
+                 instead of keeping full resolution"
+            );
+            return Simplified::Keep(repaired);
+        }
+        // Repair left nothing above the gates (self-canceling sliver).
+        return collapse_polygon(poly, collapse);
     }
 
     // Every retry self-intersected: keep the original geometry rather than
@@ -368,6 +456,26 @@ fn simplify_polygon_impl(poly: &Polygon<f64>, tol: f64, collapse: bool) -> Simpl
         INVALID_RETRY_HALVINGS + 1
     );
     Simplified::Keep(Geometry::Polygon(poly.clone()))
+}
+
+/// Resolve an invalid RDP candidate's self-crossings into their valid
+/// even-odd interpretation, re-applying the level gates per repaired part
+/// (a bowtie lobe can fall below the visibility gate its parent passed).
+/// Returns `None` when no part survives.
+fn repair_candidate(candidate: &Polygon<f64>, tol: f64, min_area: f64) -> Option<Geometry<f64>> {
+    let kept: Vec<Polygon<f64>> = match crate::ioverlay_clip::repair_polygon_ioverlay(candidate)? {
+        Geometry::Polygon(p) => vec![p],
+        Geometry::MultiPolygon(mp) => mp.0,
+        _ => return None,
+    }
+    .into_iter()
+    .filter(|p| polygon_diag(p) >= tol && p.unsigned_area() >= min_area)
+    .collect();
+    match kept.len() {
+        0 => None,
+        1 => Some(Geometry::Polygon(kept.into_iter().next().expect("len 1"))),
+        _ => Some(Geometry::MultiPolygon(MultiPolygon::new(kept))),
+    }
 }
 
 /// Resolve a collapsed polygon: drop by default, or (opt-in) a representative
@@ -769,7 +877,11 @@ mod tests {
         );
 
         // gsd 4 m in EPSG:3857 (meters) with factor 1.0 => tol = 4.0.
-        let opts = SimplifyOptions::default();
+        // cascade off pins the pre-#218 epsilon-retry behavior.
+        let opts = SimplifyOptions {
+            cascade: false,
+            ..SimplifyOptions::default()
+        };
         match simplify_for_level(&Geometry::Polygon(poly), 4.0, Crs::Epsg3857, &opts) {
             Simplified::Keep(Geometry::Polygon(p)) => {
                 assert!(
@@ -786,6 +898,105 @@ mod tests {
             }
             other => panic!("expected Keep(Polygon), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_invalid_rdp_candidate_repaired_when_cascade() {
+        let poly = notch_finger_polygon();
+        let orig_len = poly.exterior().0.len();
+        assert!(
+            !poly.simplify(4.0).is_valid(),
+            "fixture must self-intersect at the full tolerance (precondition)"
+        );
+
+        // cascade on (default): the invalid candidate is repaired in one
+        // pass instead of epsilon-retried or kept at full resolution.
+        let opts = SimplifyOptions::default();
+        let fallbacks_before = full_resolution_fallback_count();
+        match simplify_for_level(&Geometry::Polygon(poly), 4.0, Crs::Epsg3857, &opts) {
+            Simplified::Keep(g) => {
+                assert!(g.is_valid(), "repaired output must be valid, got {g:?}");
+                let out_len: usize = match &g {
+                    Geometry::Polygon(p) => p.exterior().0.len(),
+                    Geometry::MultiPolygon(mp) => mp.0.iter().map(|p| p.exterior().0.len()).sum(),
+                    other => panic!("expected (Multi)Polygon, got {other:?}"),
+                };
+                assert!(
+                    out_len < orig_len,
+                    "repaired output must be simplified, not the \
+                     full-resolution fallback ({out_len} !< {orig_len})"
+                );
+            }
+            other => panic!("expected Keep, got {other:?}"),
+        }
+        assert_eq!(
+            full_resolution_fallback_count(),
+            fallbacks_before,
+            "repair path must never count a full-resolution fallback"
+        );
+    }
+
+    // ---- cascading simplification (#218) -----------------------------------
+
+    #[test]
+    fn test_cascade_default_on() {
+        assert!(SimplifyOptions::default().cascade);
+    }
+
+    #[test]
+    fn test_cascade_empty_chain_is_identity() {
+        let g = Geometry::LineString(wiggly_line(50, 10.0));
+        assert_eq!(
+            simplify_cascade(&g, &[], Crs::Epsg3857, &SimplifyOptions::default()),
+            Simplified::Keep(g.clone())
+        );
+    }
+
+    #[test]
+    fn test_cascade_single_step_matches_direct() {
+        let g = Geometry::LineString(wiggly_line(200, 30.0));
+        let opts = SimplifyOptions::default();
+        assert_eq!(
+            simplify_cascade(&g, &[100.0], Crs::Epsg3857, &opts),
+            simplify_for_level(&g, 100.0, Crs::Epsg3857, &opts)
+        );
+    }
+
+    #[test]
+    fn test_cascade_vertices_subset_of_canonical() {
+        // RDP keeps a vertex subset; the fold composes subsets, so every
+        // cascaded vertex must be a canonical vertex.
+        let canonical = wiggly_line(400, 60.0);
+        let canonical_set: Vec<Coord<f64>> = canonical.0.clone();
+        let g = Geometry::LineString(canonical);
+        let opts = SimplifyOptions::default();
+        match simplify_cascade(&g, &[25.0, 50.0, 100.0], Crs::Epsg3857, &opts) {
+            Simplified::Keep(Geometry::LineString(out)) => {
+                assert!(out.0.len() < canonical_set.len(), "chain must simplify");
+                for c in &out.0 {
+                    assert!(
+                        canonical_set.contains(c),
+                        "cascaded vertex {c:?} not in canonical geometry"
+                    );
+                }
+            }
+            other => panic!("expected Keep(LineString), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cascade_drop_short_circuits() {
+        // A feature below the gate at the *finest* chain step is dropped for
+        // the coarser target too (monotone drops).
+        let tiny = Geometry::LineString(LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 10.0, y: 0.0 },
+        ]));
+        let opts = SimplifyOptions::default();
+        assert_eq!(
+            simplify_cascade(&tiny, &[1000.0, 5000.0], Crs::Epsg3857, &opts),
+            Simplified::Dropped
+        );
     }
 
     // ---- multi-geometry part dropping -------------------------------------
