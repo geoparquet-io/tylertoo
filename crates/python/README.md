@@ -100,7 +100,7 @@ export_pmtiles("nyc-trees-overviews.parquet", "nyc-trees.pmtiles",
 Every knob of `gpq-tiles overview` is available: `mode`
 ("duplicating"/"partitioning"), `gsds`/`gsd_base`, `sort_key`/`sort_direction`,
 `class_rank_column`/`class_ranks`/`class_rank_unknown`, `no_auto_rank`,
-`simplify_factor`/`collapse`, per-kind `*_thinning` and `*_visibility`
+`simplify_factor`/`collapse`/`cascade`, per-kind `*_thinning` and `*_visibility`
 factors, density budget (`density_drop`, `drop_rate`, `drop_gamma`),
 clustering (`cluster`, `accumulate_attributes`), line coalescing
 (`coalesce_lines`, `coalesce_snap`, `coalesce_junction_angle`,

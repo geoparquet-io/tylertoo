@@ -153,6 +153,17 @@ pub struct Generalization {
     pub gsd_base: Option<f64>,
     /// Parallel to the top-level `levels` array.
     pub levels: Vec<GeneralizationLevel>,
+    /// OPTIONAL cascading-simplification provenance (§3.5, additive;
+    /// informative). `Some(true)` when each non-canonical level's geometry
+    /// was simplified from the next-finer level's already-simplified output
+    /// (tippecanoe-style, #218) rather than from canonical geometry — the
+    /// generalization is not reproducible from
+    /// `levels[].simplify_tolerance_m` alone without knowing this. Absent
+    /// when cascading was off (`--no-cascade`), in partitioning mode (no
+    /// simplification), or on files written before this field existed;
+    /// readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<bool>,
     /// OPTIONAL cell-winner ranking provenance (§3.5, additive; informative).
     ///
     /// Records how the assignment engine broke ties for which feature wins a
@@ -916,6 +927,7 @@ mod tests {
         meta.generalization = Some(Generalization {
             engine: "gpq-tiles test".to_string(),
             gsd_base: None,
+            cascade: None,
             levels: vec![],
             ranking: Some(RankingProvenance {
                 mode: "auto-overture-roads".to_string(),
@@ -985,6 +997,7 @@ mod tests {
         meta.generalization = Some(Generalization {
             engine: "gpq-tiles test".to_string(),
             gsd_base: None,
+            cascade: None,
             levels: vec![],
             ranking: None,
             density_drop: Some(DensityProvenance {
@@ -1023,6 +1036,7 @@ mod tests {
         meta.generalization = Some(Generalization {
             engine: "gpq-tiles test".to_string(),
             gsd_base: None,
+            cascade: None,
             levels: vec![],
             ranking: None,
             density_drop: None,
@@ -1099,6 +1113,7 @@ mod tests {
         meta.generalization = Some(Generalization {
             engine: "gpq-tiles test".to_string(),
             gsd_base: None,
+            cascade: None,
             levels: vec![],
             ranking: None,
             density_drop: None,

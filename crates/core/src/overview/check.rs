@@ -1079,6 +1079,7 @@ mod tests {
         opts.generalization = Some(Generalization {
             engine: "gpq-tiles test".to_string(),
             gsd_base: None,
+            cascade: None,
             levels: vec![],
             ranking: None,
             density_drop: None,
@@ -1276,6 +1277,7 @@ mod tests {
         opts.generalization = Some(Generalization {
             engine: "gpq-tiles test".to_string(),
             gsd_base: None,
+            cascade: None,
             levels: vec![],
             ranking: None,
             density_drop: None,

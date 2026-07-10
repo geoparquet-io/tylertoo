@@ -1468,7 +1468,7 @@ pub(super) fn process_batch_cascade(
     let t_decode = Instant::now();
     let mut pos_of_row: Vec<u32> = vec![u32::MAX; n];
     let mut selected: Vec<usize> = Vec::with_capacity(n);
-    for i in 0..n {
+    for (i, pos) in pos_of_row.iter_mut().enumerate() {
         let g = row_offset + i;
         if finest.coalesce_table.is_some()
             && finest.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line
@@ -1476,7 +1476,7 @@ pub(super) fn process_batch_cascade(
             continue;
         }
         if finest.min_levels[g] <= finest.orig_level {
-            pos_of_row[i] = u32::try_from(selected.len()).expect("batch rows fit in u32");
+            *pos = u32::try_from(selected.len()).expect("batch rows fit in u32");
             selected.push(i);
         }
     }
@@ -1538,7 +1538,7 @@ pub(super) fn process_batch_cascade(
             let mut kept_idx: Vec<usize> = Vec::new();
             let mut kept_geoms: Vec<Geometry<f64>> = Vec::new();
             let mut verts = 0usize;
-            for i in 0..n {
+            for (i, &pos) in pos_of_row.iter().enumerate() {
                 let g = row_offset + i;
                 if let Some(table) = ctx.coalesce_table {
                     if ctx.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line {
@@ -1551,7 +1551,6 @@ pub(super) fn process_batch_cascade(
                     }
                 }
                 if ctx.min_levels[g] <= ctx.orig_level {
-                    let pos = pos_of_row[i];
                     debug_assert_ne!(pos, u32::MAX, "member row missing from cascade superset");
                     if let Some(Simplified::Keep(s)) = folds[pos as usize].get(depth) {
                         verts += count_vertices(s);

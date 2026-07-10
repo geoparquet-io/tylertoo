@@ -246,6 +246,13 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         higher = cruder and lighter. Defaults to 1.0.
 ///     collapse (bool, optional): Collapse below-visibility polygons to a
 ///         representative point instead of dropping them. Defaults to False.
+///     cascade (bool, optional): Cascading simplification (duplicating mode
+///         only): simplify each coarser level from the next-finer level's
+///         already-simplified output (tippecanoe-style) and repair invalid
+///         RDP candidates via a boolean overlay instead of epsilon-retrying.
+///         Much faster; coarse-level coordinates differ slightly from the
+///         non-cascaded pipeline. Set False to reproduce pre-cascade output
+///         byte-for-byte. Defaults to True.
 ///     point_thinning (float, optional): Point thinning grid factor (cell
 ///         size = factor * gsd). Defaults to 4.0, or 16.0 when cluster=True
 ///         (absorbed points are summarized rather than dropped).

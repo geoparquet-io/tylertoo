@@ -296,6 +296,12 @@ Provenance := {
       "visibility_gate_m":    number,   // min bbox-diagonal kept, meters
       "geometry_types":       [string]  // union of kinds at this level
   } ],
+  "cascade":      boolean,     // OPTIONAL: cascading simplification —
+                               // each non-canonical level simplified
+                               // from the next-finer level's output,
+                               // not from canonical geometry; absent
+                               // when levels were simplified from
+                               // canonical geometry directly
   "ranking":      Ranking,     // OPTIONAL: cell-winner priority source
   "density_drop": DensityDrop, // OPTIONAL: per-level feature budget
   "clustering":   Clustering,  // OPTIONAL: point clustering (§12.4)
@@ -323,7 +329,12 @@ DensityDrop := {
 
 `Ranking` and `DensityDrop` record which mechanism a producer used
 (FYI, never a contract); `Clustering` and `Coalescing` are defined in
-§12.4 and §13.4. Producer-side default values for these mechanisms
+§12.4 and §13.4. `cascade` matters for reproducibility: with the same
+`levels[].simplify_tolerance_m`, cascaded and non-cascaded producers
+emit different coarse-level coordinates, so a producer that cascades
+SHOULD record `"cascade": true`. It asserts no structural fact
+(informative, no validator rule); canonical fidelity (§2.4) is
+unaffected because the canonical level is never simplified. Producer-side default values for these mechanisms
 are an implementation concern, not fixed by this spec (for gpq-tiles
 they are documented in `docs/OVERVIEW_TUNING.md`, with the code
 constants as the source of truth).

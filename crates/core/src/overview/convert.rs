@@ -2039,6 +2039,15 @@ pub(super) fn build_generalization(
             Some(options.gsd_base)
         },
         levels,
+        // Recorded only when cascading applied (#218, duplicating default):
+        // a --no-cascade run omits the member so its footer stays
+        // byte-identical to pre-cascade output. Partitioning never
+        // simplifies, so it never cascades.
+        cascade: if matches!(options.mode, Mode::Duplicating) && options.simplify.cascade {
+            Some(true)
+        } else {
+            None
+        },
         ranking: Some(ranking),
         // Record the density budget only when it was applied; a disabled run
         // omits the block so its footer matches pre-Q2 output.
