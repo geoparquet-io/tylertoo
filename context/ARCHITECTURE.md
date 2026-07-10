@@ -90,11 +90,25 @@ falling back to the original geometry (counted, logged at debug level).
 Batch PMTiles export **from** an overview file. The overview file already
 holds thinned/simplified/ranked features per level, so export is mechanical
 and single-pass per zoom: resolve each level to a Web Mercator zoom, stream
-the level band, assign features to intersecting tiles, clip to buffered tile
+the level band, split each feature into its tiles, clip to buffered tile
 bounds (bbox fast path skips the clip when fully inside), MVT-encode
 (rayon-parallel), and stream finished tile partitions into the
 `StreamingPmtilesWriter`. No global external sort, no per-tile budget retry
 loop.
+
+Feature→tile splitting is a **top-down recursive quadtree cascade** (#226,
+tippecanoe's tiling model): starting from the feature's covering tile, each
+pyramid level clips the parent's already-reduced geometry into its four child
+regions down to the target zoom. A vertex therefore takes part in `O(depth)`
+clips instead of `O(tiles_spanned)`, so cost scales with output size + depth
+rather than `Σ_features (tiles_spanned × vertices)` — the earlier per-feature
+`tiles_for_bbox` loop clipped the full geometry once per covered tile and blew
+up to billions of clip-vertex ops on large admin polygons (adm4 export DNF'd
+at 3h13m). The cascade is a proper superset chain (`child ± buffer ⊆ parent ±
+buffer`), so each leaf's clip equals the direct clip — interior features pass
+through byte-identical; seam-crossers match modulo float/ring-normalization
+noise. The recursion is bounded by the same `tile_ranges_for_bbox` math
+`tiles_for_bbox` uses, so the emitted tile set is unchanged.
 
 The one safety valve is `--tile-size-limit`: an oversized tile gets a
 **single, non-iterative** drop pass shedding its largest-geometry features,

@@ -17,14 +17,17 @@
 //! 3. **Partition pass**: split the zoom's tiles into contiguous ascending
 //!    `(x, y)` ranges of roughly [`DEFAULT_PARTITION_TARGET`] members each.
 //!    For each partition, in tile order: re-read the band (row groups pruned
-//!    to the partition's bbox), assign every feature to the tile(s) it
-//!    intersects at that zoom ([`tiles_for_bbox`]) restricted to the
-//!    partition's range, clip each to the tile bounds **plus a pixel buffer**
-//!    (reusing the shelved [`clip_geometry`] entry point), MVT-encode
-//!    (reusing [`crate::mvt`]), and immediately stream the finished
-//!    partition's tiles to [`StreamingPmtilesWriter`]. Tiles are written in
-//!    ascending `(x, y)` order per zoom — the historical order — so the
-//!    archive's tile-data layout, deduplication, and directory are unchanged.
+//!    to the partition's bbox) and split every feature into its tiles with a
+//!    **top-down recursive quadtree cascade** (see [`feature_tile_members`]):
+//!    each feature is clipped once per pyramid level into an already-reduced
+//!    child region down to the target zoom, restricted to the partition's key
+//!    range, so a vertex takes part in `O(depth)` clips rather than
+//!    `O(tiles_spanned)` (issue #226). The per-tile clips reuse the
+//!    [`clip_geometry`] entry point, MVT-encode via [`crate::mvt`], and the
+//!    finished partition's tiles stream immediately to
+//!    [`StreamingPmtilesWriter`]. Tiles are written in ascending `(x, y)` order
+//!    per zoom — the historical order — so the archive's tile-data layout,
+//!    deduplication, and directory are unchanged.
 //!
 //! ## What this deliberately does NOT do (per `context/archive/CARRYOVER.md`)
 //!
@@ -81,7 +84,7 @@ use crate::clip::clip_geometry;
 use crate::compression::Compression;
 use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
-use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
+use crate::tile::{tile_ranges_for_bbox, tiles_for_bbox, BboxTileRanges, TileBounds, TileCoord};
 
 use super::level::{zoom_for_gsd, Crs, OverviewsMeta};
 use super::reader::{OverviewReader, ReaderError};
@@ -671,7 +674,36 @@ fn collect_batch_members(
 }
 
 /// Clip (or fast-path pass through) one feature into every tile it intersects
-/// at `zoom` whose key falls within `[key_lo, key_hi]`.
+/// at `zoom` whose key falls within `[key_lo, key_hi]`, via a **top-down
+/// recursive quadtree cascade** (issue #226, tippecanoe's tiling model).
+///
+/// ## Why recursion (the tiles×vertices blowup)
+///
+/// The straightforward loop — enumerate every tile the feature bbox covers and
+/// clip the feature's **full** geometry against each — costs
+/// `Σ_features (tiles_spanned × vertices)`. A large admin polygon covering a
+/// fraction `F` of the map touches `≈ (F·2^z)²` tiles at zoom `z`, each a full
+/// ring clip; at z12–14 this is billions of clip-vertex ops (the adm4 export
+/// DNF'd at 3h13m). This is the spatial analogue of #218's repeated work.
+///
+/// Instead we walk the tile pyramid from the root down to `zoom`. At each node
+/// we clip the parent's **already-reduced** geometry to the node's bounds plus
+/// buffer, then split into four children. Because a child's buffered bounds are
+/// contained in its parent's (the pixel buffer in world units doubles per level
+/// up, so `child ± buf(child) ⊆ parent ± buf(parent)` on both axes, Mercator
+/// latitude included), the cascade is a proper superset chain and
+/// `clip(clip(G, parent), leaf) = clip(G, leaf)` — the leaf result is the same
+/// clip as the direct loop would produce (modulo float-noise / ring-normalization
+/// on genuine seam-crossers; interior features pass through byte-identical). Each
+/// vertex now takes part in `O(depth)` clips, not `O(tiles_spanned)`.
+///
+/// ## Identical leaf set
+///
+/// The recursion is bounded by [`tile_ranges_for_bbox`] — the same range math
+/// [`tiles_for_bbox`] uses — so the emitted key set equals
+/// `tiles_for_bbox(feature_bbox) ∩ [key_lo, key_hi]` exactly. That keeps the
+/// scan pass's per-tile counts valid (every emitted key lies in a planned
+/// partition) and the archive's tile set unchanged.
 fn feature_tile_members(
     geom: &Geometry<f64>,
     zoom: u8,
@@ -683,24 +715,256 @@ fn feature_tile_members(
         return Vec::new();
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    // Target leaf-tile ranges at `zoom` — the authority for which tiles this
+    // feature belongs to (shared with `tiles_for_bbox`).
+    let ranges = tile_ranges_for_bbox(&bbox, zoom);
     let mut out = Vec::new();
-    for tc in tiles_for_bbox(&bbox, zoom) {
+
+    // Dispatch on the *direct* path's cost — the ticket's own model,
+    // `tiles_spanned × vertex_count`. The recursive cascade wins big when that
+    // product explodes (few huge admin polygons: high span AND high vertex
+    // count, the adm4 blowup), but its per-node overhead (an intermediate clip
+    // + trig-heavy `TileCoord::bounds()` at every pyramid node) is dead weight
+    // for the common case of many features that are already small — overview
+    // levels are pre-simplified, so a deep-zoom feature carries few vertices and
+    // the plain per-tile clip is cheaper. Routing those through the direct loop
+    // keeps them byte-identical to the pre-#226 path and avoids a regression on
+    // dense corpora, while the giant polygons that actually caused the DNF take
+    // the cascade.
+    let direct_cost = tile_span(&ranges).saturating_mul(geom.coords_count() as u64);
+    if direct_cost <= DIRECT_CLIP_BUDGET {
+        feature_tile_members_direct(geom, &bbox, zoom, opts, key_lo, key_hi, &mut out);
+    } else {
+        // Start the descent at the feature's covering tile (the deepest tile
+        // whose bounds contain the whole feature bbox) rather than the world
+        // root: every level above it is a single-child pass-through, so
+        // skipping them is free and yields an identical leaf set.
+        let root = covering_tile(&ranges, zoom);
+        split_feature_into_tiles(
+            root, geom, &bbox, zoom, opts, key_lo, key_hi, &ranges, &mut out,
+        );
+    }
+    out
+}
+
+/// Direct-path cost budget, in `tiles_spanned × vertices` clip-vertex ops. At
+/// or below it the per-tile direct clip beats the recursive cascade's per-node
+/// overhead; above it the cascade's `O(depth)` vertex participation wins. Tuned
+/// so pre-simplified overview features (low vertex count, modest span) stay on
+/// the direct — and byte-identical — path, and only genuinely huge polygons
+/// recurse.
+const DIRECT_CLIP_BUDGET: u64 = 100_000;
+
+/// Number of leaf tiles the feature's bbox covers at the target zoom (both
+/// x-bands when it crosses the antimeridian).
+#[inline]
+fn tile_span(ranges: &BboxTileRanges) -> u64 {
+    let x1 = (ranges.x.1 - ranges.x.0 + 1) as u64;
+    let x2 = ranges.x2.map_or(0, |(a, b)| (b - a + 1) as u64);
+    let y = (ranges.y.1 - ranges.y.0 + 1) as u64;
+    (x1 + x2) * y
+}
+
+/// The pre-#226 direct path: enumerate every tile the feature bbox covers and
+/// clip the feature's full geometry against each (fast-pathing interior
+/// features). Used for features whose direct cost is under
+/// [`DIRECT_CLIP_BUDGET`]; its output is byte-identical to the historical
+/// export. Appends `(key, geom)` members within `[key_lo, key_hi]` to `out`.
+fn feature_tile_members_direct(
+    geom: &Geometry<f64>,
+    bbox: &TileBounds,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+    out: &mut Vec<(u64, Geometry<f64>)>,
+) {
+    for tc in tiles_for_bbox(bbox, zoom) {
         let key = tile_key(tc.x, tc.y);
         if key < key_lo || key > key_hi {
             continue;
         }
         let tb = tc.bounds();
         let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
-        // Fast path (H3(c) lever 4): a feature whose bbox lies entirely
-        // within the buffered tile bounds is unaffected by clipping —
-        // skip the BooleanOps intersection and emit the geometry as-is.
-        // At z14 ~80% of features are interior to a single tile.
-        if bbox_within_buffered(&bbox, &tb, buffer_deg) {
+        if bbox_within_buffered(bbox, &tb, buffer_deg) {
             out.push((key, geom.clone()));
         } else if let Some(clipped) = clip_geometry(geom, &tb, buffer_deg) {
             out.push((key, clipped));
         }
     }
+}
+
+/// The deepest tile whose subtree contains every tile the feature covers — the
+/// common ancestor of the target range corners. Starting the cascade here
+/// instead of at the world root skips the pure single-child descent while
+/// producing an identical leaf set. Antimeridian-crossing ranges (two x-bands)
+/// have no single covering tile below the root, so fall back to `(0, 0, 0)`.
+#[inline]
+fn covering_tile(ranges: &BboxTileRanges, zoom: u8) -> TileCoord {
+    if ranges.x2.is_some() {
+        return TileCoord::new(0, 0, 0);
+    }
+    let (x_lo, x_hi) = ranges.x;
+    let (y_lo, y_hi) = ranges.y;
+    // Smallest shift `s` at which both corners share a tile = deepest common
+    // ancestor (at zoom `zoom - s`).
+    let mut s = 0u8;
+    while s < zoom && !((x_lo >> s) == (x_hi >> s) && (y_lo >> s) == (y_hi >> s)) {
+        s += 1;
+    }
+    TileCoord::new(x_lo >> s, y_lo >> s, zoom - s)
+}
+
+/// `true` when tile node `(x, y, z)`'s descendant-leaf footprint at `zoom`
+/// overlaps the target ranges (i.e. the node's subtree contains at least one
+/// tile the feature bbox covers).
+#[inline]
+fn node_overlaps_ranges(node: TileCoord, zoom: u8, ranges: &BboxTileRanges) -> bool {
+    let shift = (zoom - node.z) as u32;
+    let x_lo = (node.x as u64) << shift;
+    let x_hi = (((node.x as u64) + 1) << shift) - 1;
+    let y_lo = (node.y as u64) << shift;
+    let y_hi = (((node.y as u64) + 1) << shift) - 1;
+    let overlaps = |a: (u32, u32), b: (u64, u64)| a.0 as u64 <= b.1 && b.0 <= a.1 as u64;
+    if !overlaps(ranges.y, (y_lo, y_hi)) {
+        return false;
+    }
+    overlaps(ranges.x, (x_lo, x_hi)) || ranges.x2.is_some_and(|x2| overlaps(x2, (x_lo, x_hi)))
+}
+
+/// `true` when tile node `(x, y, z)`'s descendant-leaf key range overlaps the
+/// partition key window `[key_lo, key_hi]`. Keys are `x`-major
+/// (`(x << 32) | y`), so a node's subtree spans `[min_key, max_key]` with
+/// `min = (x_lo << 32) | y_lo`, `max = (x_hi << 32) | y_hi`. The test is
+/// conservative (the subtree key range has row-major gaps), which only lets a
+/// branch be visited — the exact leaf key guard drops any non-member — so it
+/// never skips a needed tile. It is what keeps a giant feature's per-partition
+/// work bounded to the partition's slice instead of re-walking the whole
+/// subtree once per partition it spans.
+#[inline]
+fn node_key_overlaps(node: TileCoord, zoom: u8, key_lo: u64, key_hi: u64) -> bool {
+    let shift = (zoom - node.z) as u32;
+    let x_lo = (node.x as u64) << shift;
+    let x_hi = (((node.x as u64) + 1) << shift) - 1;
+    let y_lo = (node.y as u64) << shift;
+    let y_hi = (((node.y as u64) + 1) << shift) - 1;
+    let min_key = (x_lo << 32) | y_lo;
+    let max_key = (x_hi << 32) | y_hi;
+    max_key >= key_lo && min_key <= key_hi
+}
+
+/// One node of the recursive cascade: reduce `cur` (the geometry already
+/// clipped to this node's parent buffered region, with bounding box `cur_bbox`)
+/// to this node, then either emit the leaf member or split into four children.
+#[allow(clippy::too_many_arguments)]
+fn split_feature_into_tiles(
+    node: TileCoord,
+    cur: &Geometry<f64>,
+    cur_bbox: &TileBounds,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+    ranges: &BboxTileRanges,
+    out: &mut Vec<(u64, Geometry<f64>)>,
+) {
+    // Prune: outside the feature's target tiles, or outside this partition.
+    if !node_overlaps_ranges(node, zoom, ranges) || !node_key_overlaps(node, zoom, key_lo, key_hi) {
+        return;
+    }
+
+    let tb = node.bounds();
+    let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
+
+    if node.z == zoom {
+        // Leaf tile. The prune above already proved this tile is in the
+        // feature's target set; enforce the exact partition key window here.
+        let key = tile_key(node.x, node.y);
+        if key < key_lo || key > key_hi {
+            return;
+        }
+        // Fast path (H3(c) lever 4): a feature whose bbox lies entirely within
+        // the buffered tile is unaffected by clipping — emit as-is. For a
+        // feature interior to the leaf this reproduces the direct loop's
+        // `geom.clone()` byte-for-byte, since every ancestor also fast-pathed
+        // and `cur` is still the original geometry.
+        if bbox_within_buffered(cur_bbox, &tb, buffer_deg) {
+            out.push((key, cur.clone()));
+        } else if let Some(clipped) = clip_geometry(cur, &tb, buffer_deg) {
+            out.push((key, clipped));
+        }
+        return;
+    }
+
+    // Internal node: shrink `cur` to this node's buffered bounds before
+    // splitting, so each child clips an already-halved geometry. Clipping to
+    // `node ± buffer` (not the bare node) preserves the superset chain that
+    // makes the cascade equal to a direct leaf clip.
+    let children = node.children().expect("non-leaf node has children");
+    if bbox_within_buffered(cur_bbox, &tb, buffer_deg) {
+        // Feature already inside this node's buffered bounds — no clip needed;
+        // descend with the same geometry (this is what makes the coarse top of
+        // the pyramid essentially free).
+        for child in children {
+            split_feature_into_tiles(
+                child, cur, cur_bbox, zoom, opts, key_lo, key_hi, ranges, out,
+            );
+        }
+    } else if let Some(clipped) = clip_geometry(cur, &tb, buffer_deg) {
+        let cbbox = match clipped.bounding_rect() {
+            Some(r) => TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y),
+            None => return,
+        };
+        for child in children {
+            split_feature_into_tiles(
+                child, &clipped, &cbbox, zoom, opts, key_lo, key_hi, ranges, out,
+            );
+        }
+    }
+    // else: `cur` does not intersect this node's buffered bounds — whole
+    // subtree pruned.
+}
+
+/// Test helper: run the direct path unconditionally (bypassing the dispatch
+/// budget) and collect its members — the oracle the recursive cascade is
+/// verified against.
+#[cfg(test)]
+fn members_direct_vec(
+    geom: &Geometry<f64>,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+) -> Vec<(u64, Geometry<f64>)> {
+    let Some(rect) = geom.bounding_rect() else {
+        return Vec::new();
+    };
+    let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    let mut out = Vec::new();
+    feature_tile_members_direct(geom, &bbox, zoom, opts, key_lo, key_hi, &mut out);
+    out
+}
+
+/// Test helper: run the recursive cascade unconditionally (bypassing the
+/// dispatch budget) and collect its members.
+#[cfg(test)]
+fn members_recursive_vec(
+    geom: &Geometry<f64>,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+) -> Vec<(u64, Geometry<f64>)> {
+    let Some(rect) = geom.bounding_rect() else {
+        return Vec::new();
+    };
+    let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    let ranges = tile_ranges_for_bbox(&bbox, zoom);
+    let root = covering_tile(&ranges, zoom);
+    let mut out = Vec::new();
+    split_feature_into_tiles(
+        root, geom, &bbox, zoom, opts, key_lo, key_hi, &ranges, &mut out,
+    );
     out
 }
 
@@ -1267,6 +1531,176 @@ mod tests {
         assert_eq!(r_many.total_tiles, r_one.total_tiles);
         assert_eq!(r_many.total_tile_features, r_one.total_tile_features);
         assert_eq!(r_many.oversized_tiles, r_one.oversized_tiles);
+    }
+
+    // --- recursive splitter equivalence (issue #226) -------------------------
+
+    /// Collect a single feature's `(key, geom)` members into a key→geom map,
+    /// asserting the "one member per feature per tile" invariant both paths
+    /// hold.
+    fn members_by_key(v: Vec<(u64, Geometry<f64>)>) -> HashMap<u64, Geometry<f64>> {
+        let mut m = HashMap::new();
+        for (k, g) in v {
+            assert!(m.insert(k, g).is_none(), "duplicate member for one feature");
+        }
+        m
+    }
+
+    /// Encode one tile member to MVT bytes on its own tile bounds — the exact
+    /// quantized output the archive would carry, so byte-equality here means
+    /// tile-output equivalence.
+    fn tile_mvt(key: u64, geom: &Geometry<f64>, zoom: u8, opts: &ExportOptions) -> Vec<u8> {
+        let (x, y) = ((key >> 32) as u32, key as u32);
+        let tb = TileCoord::new(x, y, zoom).bounds();
+        let m = Member {
+            key,
+            seq: 0,
+            geom: geom.clone(),
+            props: Arc::new(Vec::new()),
+        };
+        build_mvt(std::iter::once(&m), &tb, opts)
+    }
+
+    /// The recursive cascade must emit the same tile-key set as the direct
+    /// (full-geometry, per-tile) oracle, and each tile's encoded MVT bytes must
+    /// match.
+    fn assert_recursive_matches_direct(geom: &Geometry<f64>, zoom: u8, opts: &ExportOptions) {
+        let rec = members_by_key(members_recursive_vec(geom, zoom, opts, 0, u64::MAX));
+        let dir = members_by_key(members_direct_vec(geom, zoom, opts, 0, u64::MAX));
+        let mut rk: Vec<u64> = rec.keys().copied().collect();
+        rk.sort_unstable();
+        let mut dk: Vec<u64> = dir.keys().copied().collect();
+        dk.sort_unstable();
+        assert_eq!(rk, dk, "tile key set diverges at z{zoom}");
+        for k in rk {
+            assert_eq!(
+                tile_mvt(k, &rec[&k], zoom, opts),
+                tile_mvt(k, &dir[&k], zoom, opts),
+                "tile ({}, {}) MVT diverges at z{zoom}",
+                (k >> 32) as u32,
+                k as u32,
+            );
+        }
+    }
+
+    /// Feature corpus + zoom caps chosen so the oracle's `tiles×vertices` cost
+    /// stays bounded: interior/seam-crossing features run deep, wide features
+    /// only at coarse zooms.
+    fn equivalence_corpus() -> Vec<(&'static str, Geometry<f64>, Vec<u8>)> {
+        // A small polygon that straddles a z14 seam near NYC.
+        let seam_poly = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-73.985, 40.700),
+                (-73.955, 40.700),
+                (-73.955, 40.730),
+                (-73.985, 40.730),
+                (-73.985, 40.700),
+            ]),
+            vec![],
+        ));
+        let concave = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-100.0, 25.0),
+                (-98.0, 25.0),
+                (-98.0, 27.0),
+                (-99.0, 25.5),
+                (-100.0, 27.0),
+                (-100.0, 25.0),
+            ]),
+            vec![],
+        ));
+        let big_box = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-20.0, -20.0),
+                (20.0, -20.0),
+                (20.0, 20.0),
+                (-20.0, 20.0),
+                (-20.0, -20.0),
+            ]),
+            vec![],
+        ));
+        let mut wig = Vec::new();
+        for k in 0..200 {
+            wig.push((30.0 + k as f64 * 0.3, -20.0 + (k as f64 * 0.1).sin()));
+        }
+        let wiggly = Geometry::LineString(LineString::from(wig));
+        let antimeridian = Geometry::LineString(LineString::from(vec![
+            (170.0, 5.0),
+            (178.0, 8.0),
+            (-176.0, 6.0),
+            (-170.0, 9.0),
+        ]));
+        vec![
+            (
+                "interior_point",
+                Geometry::Point(Point::new(-73.97, 40.71)),
+                vec![4, 8, 14],
+            ),
+            ("seam_poly", seam_poly, vec![10, 12, 14]),
+            ("concave", concave, vec![4, 6, 8]),
+            ("big_box", big_box, vec![3, 5, 6]),
+            ("wiggly", wiggly, vec![4, 6]),
+            ("antimeridian", antimeridian, vec![3, 5]),
+        ]
+    }
+
+    /// Cross-check the recursive cascade against the direct oracle across a
+    /// corpus that exercises interior, seam-crossing, concave, wide, dense and
+    /// antimeridian features at a range of zooms (incl. depth-14 cascades). The
+    /// full unbounded key range stands in for a single all-covering partition.
+    #[test]
+    fn recursive_split_matches_direct_oracle() {
+        let opts = ExportOptions::default();
+        for (name, geom, zooms) in equivalence_corpus() {
+            for z in zooms {
+                // Panics carry the feature name via the zoom-tagged messages;
+                // prefix here for quick triage.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert_recursive_matches_direct(&geom, z, &opts);
+                }))
+                .unwrap_or_else(|_| panic!("equivalence failed for feature '{name}' at z{z}"));
+            }
+        }
+    }
+
+    /// Splitting the key space into partitions must not change the union of
+    /// emitted tiles or their bytes: the key-range prune plus the exact leaf
+    /// key guard must partition the feature's tiles cleanly (no drops, dups, or
+    /// altered clips at a partition seam).
+    #[test]
+    fn recursive_split_is_partition_range_invariant() {
+        let opts = ExportOptions::default();
+        for (name, geom, zooms) in equivalence_corpus() {
+            for z in zooms {
+                let full = members_by_key(feature_tile_members(&geom, z, &opts, 0, u64::MAX));
+                if full.is_empty() {
+                    continue;
+                }
+                // Split at the median emitted key so both halves are non-empty.
+                let mut keys: Vec<u64> = full.keys().copied().collect();
+                keys.sort_unstable();
+                let split = keys[keys.len() / 2];
+                let lo = feature_tile_members(&geom, z, &opts, 0, split);
+                let hi = feature_tile_members(&geom, z, &opts, split + 1, u64::MAX);
+                let mut union = HashMap::new();
+                for (k, g) in lo.into_iter().chain(hi) {
+                    assert!(
+                        union.insert(k, g).is_none(),
+                        "tile {k:x} emitted by both partitions ('{name}' z{z})"
+                    );
+                }
+                let mut uk: Vec<u64> = union.keys().copied().collect();
+                uk.sort_unstable();
+                assert_eq!(uk, keys, "partitioned tile set diverges ('{name}' z{z})");
+                for k in keys {
+                    assert_eq!(
+                        tile_mvt(k, &union[&k], z, &opts),
+                        tile_mvt(k, &full[&k], z, &opts),
+                        "partitioned tile {k:x} bytes diverge ('{name}' z{z})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

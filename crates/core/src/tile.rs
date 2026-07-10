@@ -188,6 +188,43 @@ pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
 ///
 /// Iterator of TileCoord that intersect the bbox
 pub fn tiles_for_bbox(bbox: &TileBounds, zoom: u8) -> impl Iterator<Item = TileCoord> {
+    let r = tile_ranges_for_bbox(bbox, zoom);
+    let (min_y_tile, max_y_tile) = r.y;
+    let first = r.x;
+    let second = r.x2;
+
+    // Generate tiles for the first x-range
+    let first_tiles = (min_y_tile..=max_y_tile)
+        .flat_map(move |y| (first.0..=first.1).map(move |x| TileCoord::new(x, y, zoom)));
+
+    // Generate tiles for the second x-range (if crossing antimeridian)
+    let second_tiles = second.into_iter().flat_map(move |(x_min, x_max)| {
+        (min_y_tile..=max_y_tile)
+            .flat_map(move |y| (x_min..=x_max).map(move |x| TileCoord::new(x, y, zoom)))
+    });
+
+    first_tiles.chain(second_tiles)
+}
+
+/// Inclusive tile-index ranges covering a bbox at a zoom: one y-range and one
+/// or two x-ranges (two when the bbox crosses the antimeridian).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BboxTileRanges {
+    /// Inclusive `(min_y, max_y)` tile range.
+    pub y: (u32, u32),
+    /// Primary inclusive `(min_x, max_x)` tile range.
+    pub x: (u32, u32),
+    /// Second `(min_x, max_x)` range, present only for antimeridian-crossing
+    /// bboxes (`[lng_min, 180°]` = `x`, `[-180°, lng_max]` = `x2`).
+    pub x2: Option<(u32, u32)>,
+}
+
+/// Compute the antimeridian-aware tile-index ranges of `bbox` at `zoom`.
+///
+/// This is the shared authority for "which tiles a bbox covers": both
+/// [`tiles_for_bbox`] and the export recursive tile splitter drive off it, so
+/// their leaf-tile sets are identical by construction (no lost or extra tiles).
+pub(crate) fn tile_ranges_for_bbox(bbox: &TileBounds, zoom: u8) -> BboxTileRanges {
     let crosses_antimeridian = bbox.lng_min > bbox.lng_max;
 
     // Get y-tile range (latitude doesn't wrap)
@@ -197,7 +234,7 @@ pub fn tiles_for_bbox(bbox: &TileBounds, zoom: u8) -> impl Iterator<Item = TileC
     let max_tile_x = 2_u32.pow(zoom as u32) - 1;
 
     // Calculate x-tile ranges
-    let (x_ranges, second_range): ((u32, u32), Option<(u32, u32)>) = if crosses_antimeridian {
+    let (x, x2): ((u32, u32), Option<(u32, u32)>) = if crosses_antimeridian {
         // Split into two ranges: [lng_min, 180°] and [-180°, lng_max]
         let west_x = lng_lat_to_tile(bbox.lng_min, 0.0, zoom).x; // From lng_min to 180°
         let east_x = lng_lat_to_tile(bbox.lng_max, 0.0, zoom).x; // From -180° to lng_max
@@ -212,17 +249,11 @@ pub fn tiles_for_bbox(bbox: &TileBounds, zoom: u8) -> impl Iterator<Item = TileC
         ((min_x, max_x), None)
     };
 
-    // Generate tiles for the first x-range
-    let first_tiles = (min_y_tile..=max_y_tile)
-        .flat_map(move |y| (x_ranges.0..=x_ranges.1).map(move |x| TileCoord::new(x, y, zoom)));
-
-    // Generate tiles for the second x-range (if crossing antimeridian)
-    let second_tiles = second_range.into_iter().flat_map(move |(x_min, x_max)| {
-        (min_y_tile..=max_y_tile)
-            .flat_map(move |y| (x_min..=x_max).map(move |x| TileCoord::new(x, y, zoom)))
-    });
-
-    first_tiles.chain(second_tiles)
+    BboxTileRanges {
+        y: (min_y_tile, max_y_tile),
+        x,
+        x2,
+    }
 }
 
 #[cfg(test)]
