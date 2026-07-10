@@ -81,7 +81,8 @@ use super::convert::{
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipeline;
 use super::simplify::{
-    full_resolution_fallback_count, simplify_for_level, Simplified, SimplifyOptions,
+    full_resolution_fallback_count, simplify_cascade, simplify_for_level, Simplified,
+    SimplifyOptions,
 };
 use super::writer::{
     LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, LEVEL_COLUMN,
@@ -447,6 +448,27 @@ pub(crate) fn convert_streaming_strategy(
     };
 
     let duplicating = matches!(options.mode, Mode::Duplicating);
+    // Cascading (#218): per level, the fine→coarse GSD chain from the finest
+    // non-canonical level down to (and including) that level. Chains are
+    // built from the emitted plan, so the Serial fold, the pipelined
+    // incremental fold, and the in-memory path all step through the same GSD
+    // sequence. Empty when cascading does not apply to the level.
+    let cascade_chains: Vec<Vec<f64>> = emitted
+        .iter()
+        .map(|e| {
+            let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
+            if !duplicating || verbatim || !options.simplify.cascade {
+                return Vec::new();
+            }
+            let mut chain: Vec<f64> = emitted
+                .iter()
+                .filter(|f| (f.orig as usize) < finest && f.orig >= e.orig)
+                .map(|f| f.gsd)
+                .collect();
+            chain.reverse();
+            chain
+        })
+        .collect();
     let ctxs: Vec<LevelStreamCtx> = emitted
         .iter()
         .enumerate()
@@ -475,6 +497,7 @@ pub(crate) fn convert_streaming_strategy(
                 coalesce_enabled: options.coalesce_lines,
                 kinds: kinds.as_deref(),
                 coalesce_table: coalesce_tables[i].as_ref(),
+                cascade_chain: &cascade_chains[i],
             }
         })
         .collect();
@@ -1140,6 +1163,21 @@ pub(super) struct LevelStreamCtx<'a> {
     /// member count); `None` at verbatim levels or when coalescing is
     /// off/guard-skipped.
     coalesce_table: Option<&'a CoalesceTable>,
+    /// Cascading simplification (#218): fine→coarse GSD chain ending at this
+    /// level (`[gsd_finest-1, …, gsd_this]`), fed to
+    /// [`simplify_cascade`]. Empty when cascading does not apply (cascade
+    /// off, partitioning, or verbatim level) — the level then simplifies
+    /// canonical geometry directly with `gsd_m`.
+    cascade_chain: &'a [f64],
+}
+
+impl LevelStreamCtx<'_> {
+    /// Whether the pipelined engine should process batches through the
+    /// cascade fan-out ([`process_batch_cascade`], #218): duplicating mode
+    /// with cascading enabled. Uniform across a conversion's level set.
+    pub(super) fn is_cascading_duplicating(&self) -> bool {
+        self.duplicating && self.simplify.cascade
+    }
 }
 
 /// Stream one level from the input file into the writer. Returns the writer
@@ -1296,6 +1334,12 @@ pub(super) fn process_level_batch(
         // Chain reps substitute their merged, already-simplified geometry
         // (simplified once in `build_level_coalesce_table`, identically to
         // the in-memory path).
+        //
+        // Cascading (#218): a non-empty `cascade_chain` folds canonical
+        // geometry fine→coarse down to this level. This per-level recompute
+        // is O(levels) per feature — it exists for the Serial reference
+        // engine; the pipelined engine shares fold prefixes across levels
+        // via `process_batch_cascade` and computes identical results.
         let simplified: Vec<Simplified> = geoms
             .par_iter()
             .zip(&selected)
@@ -1303,6 +1347,8 @@ pub(super) fn process_level_batch(
                 if let Some((merged, _)) = ctx.coalesce_table.and_then(|t| t.get(&(row_offset + i)))
                 {
                     Simplified::Keep(merged.clone())
+                } else if !ctx.cascade_chain.is_empty() {
+                    simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify)
                 } else {
                     simplify_for_level(g, ctx.gsd_m, ctx.crs, ctx.simplify)
                 }
@@ -1328,13 +1374,29 @@ pub(super) fn process_level_batch(
     Pass2Timers::add(&timers.simplify, t_simplify);
 
     let t_build = Instant::now();
+    let out_batch = assemble_level_batch(batch, row_offset, ctx, &kept_idx, &kept_geoms)?;
+    Pass2Timers::add(&timers.build, t_build);
+    Ok(Some((out_batch, verts)))
+}
+
+/// Assemble one level's output batch from kept row indices + geometries:
+/// project source columns, splice the geometry column, then append
+/// cluster / coalesced-count columns. Shared by [`process_level_batch`] and
+/// [`process_batch_cascade`].
+fn assemble_level_batch(
+    batch: &RecordBatch,
+    row_offset: usize,
+    ctx: &LevelStreamCtx<'_>,
+    kept_idx: &[usize],
+    kept_geoms: &[Geometry<f64>],
+) -> Result<RecordBatch, ConvertError> {
     let mut out_batch = build_level_batch(
         ctx.source_schema,
         batch,
         ctx.non_geom_cols,
         ctx.geom_idx,
-        &kept_idx,
-        &kept_geoms,
+        kept_idx,
+        kept_geoms,
     )?;
     if ctx.cluster_enabled || ctx.coalesce_enabled {
         // Cluster/coalesce-table keys are global row indices; kept_idx is
@@ -1354,6 +1416,161 @@ pub(super) fn process_level_batch(
                 apply_coalesced_count(out_batch, ctx.out_schema, &globals, ctx.coalesce_table)?;
         }
     }
+    Ok(out_batch)
+}
+
+/// Pipelined-engine batch processor for cascading simplification (#218).
+///
+/// Instead of every level independently decoding canonical geometry and
+/// simplifying it from full resolution ([`process_level_batch`] per level),
+/// this decodes each batch's member geometries **once**, computes each
+/// feature's fine→coarse simplification fold **once** (level *k* consumes
+/// level *k+1*'s output — the shared prefix is what the per-level path
+/// recomputes), then assembles every level's output batch.
+///
+/// Bit-identical to running [`process_level_batch`] per level with the same
+/// ctxs (the Serial reference): the incremental fold steps through exactly
+/// the per-level `cascade_chain` GSD sequence, and each level's rows are
+/// gathered in the same ascending batch order the per-level selection uses.
+///
+/// `ctxs` must be the pipelined engine's buffered slice: all non-verbatim
+/// duplicating levels, coarse→fine.
+pub(super) fn process_batch_cascade(
+    batch: &RecordBatch,
+    row_offset: usize,
+    ctxs: &[LevelStreamCtx<'_>],
+    timers: &Pass2Timers,
+) -> Result<Vec<Option<(RecordBatch, usize)>>, ConvertError> {
+    let Some(finest) = ctxs.last() else {
+        return Ok(Vec::new());
+    };
+    debug_assert!(ctxs.iter().all(|c| c.duplicating && !c.verbatim));
+    // The incremental fold steps ctx-by-ctx; each level's cascade_chain must
+    // be exactly the GSD suffix from the finest buffered level down to it,
+    // or Serial and Pipelined would diverge.
+    debug_assert!(ctxs
+        .iter()
+        .enumerate()
+        .all(|(li, c)| c.cascade_chain.len() == ctxs.len() - li
+            && c.cascade_chain.last() == Some(&c.gsd_m)));
+    // Coalesce-table presence is uniform across buffered levels (tables are
+    // built for every non-verbatim level or none); the superset selection
+    // below relies on it.
+    debug_assert!(ctxs
+        .iter()
+        .all(|c| c.coalesce_table.is_some() == finest.coalesce_table.is_some()));
+
+    let n = batch.num_rows();
+
+    // --- Select the cascade superset: members of the finest buffered level.
+    // Coalesced line rows never cascade — each level emits its own chain
+    // reps with merged, per-level-simplified geometry instead.
+    let t_decode = Instant::now();
+    let mut pos_of_row: Vec<u32> = vec![u32::MAX; n];
+    let mut selected: Vec<usize> = Vec::with_capacity(n);
+    for (i, pos) in pos_of_row.iter_mut().enumerate() {
+        let g = row_offset + i;
+        if finest.coalesce_table.is_some()
+            && finest.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line
+        {
+            continue;
+        }
+        if finest.min_levels[g] <= finest.orig_level {
+            *pos = u32::try_from(selected.len()).expect("batch rows fit in u32");
+            selected.push(i);
+        }
+    }
+
+    // Decode only the selected rows' geometries, once for all levels.
+    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(selected.len());
+    if !selected.is_empty() {
+        let take_idx = UInt32Array::from(selected.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let geom_taken = take(batch.column(finest.geom_idx).as_ref(), &take_idx, None)?;
+        let schema = batch.schema();
+        let gfield = schema.field(finest.geom_idx);
+        let garr = from_arrow_array(geom_taken.as_ref(), gfield)
+            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+        extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
+    }
+    Pass2Timers::add(&timers.decode, t_decode);
+
+    // --- Per-feature incremental fold, fine→coarse, parallel over features.
+    // folds[pos][d] is the result at ctxs[len-1-d]; entries stop at the
+    // feature's coarsest member level, or earlier on Dropped (drops are
+    // monotone fine→coarse, so a missing depth reads as dropped).
+    let t_simplify = Instant::now();
+    let folds: Vec<Vec<Simplified>> = geoms
+        .par_iter()
+        .zip(&selected)
+        .map(|(g, &i)| {
+            let ml = finest.min_levels[row_offset + i];
+            let mut out: Vec<Simplified> = Vec::with_capacity(ctxs.len());
+            let mut current: Option<Geometry<f64>> = None;
+            for ctx in ctxs.iter().rev() {
+                if ml > ctx.orig_level {
+                    break; // duplicating membership is a contiguous fine suffix
+                }
+                let input = current.as_ref().unwrap_or(g);
+                match simplify_for_level(input, ctx.gsd_m, ctx.crs, ctx.simplify) {
+                    Simplified::Keep(s) => {
+                        out.push(Simplified::Keep(s.clone()));
+                        current = Some(s);
+                    }
+                    Simplified::Dropped => {
+                        out.push(Simplified::Dropped);
+                        break;
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+    Pass2Timers::add(&timers.simplify, t_simplify);
+
+    // --- Assemble every level's batch, in the per-level selection's
+    // ascending row order (chain reps interleaved by global row index).
+    let t_build = Instant::now();
+    let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = ctxs
+        .par_iter()
+        .enumerate()
+        .map(|(li, ctx)| {
+            let depth = ctxs.len() - 1 - li;
+            let mut kept_idx: Vec<usize> = Vec::new();
+            let mut kept_geoms: Vec<Geometry<f64>> = Vec::new();
+            let mut verts = 0usize;
+            for (i, &pos) in pos_of_row.iter().enumerate() {
+                let g = row_offset + i;
+                if let Some(table) = ctx.coalesce_table {
+                    if ctx.kinds.expect("kinds present when coalescing")[g] == FeatureKind::Line {
+                        if let Some((merged, _)) = table.get(&g) {
+                            verts += count_vertices(merged);
+                            kept_idx.push(i);
+                            kept_geoms.push(merged.clone());
+                        }
+                        continue;
+                    }
+                }
+                if ctx.min_levels[g] <= ctx.orig_level {
+                    debug_assert_ne!(pos, u32::MAX, "member row missing from cascade superset");
+                    if let Some(Simplified::Keep(s)) = folds[pos as usize].get(depth) {
+                        verts += count_vertices(s);
+                        kept_idx.push(i);
+                        kept_geoms.push(s.clone());
+                    }
+                }
+            }
+            if kept_idx.is_empty() {
+                return Ok(None);
+            }
+            let out_batch = assemble_level_batch(batch, row_offset, ctx, &kept_idx, &kept_geoms)?;
+            Ok(Some((out_batch, verts)))
+        })
+        .collect();
     Pass2Timers::add(&timers.build, t_build);
-    Ok(Some((out_batch, verts)))
+
+    let mut per_level = Vec::with_capacity(results.len());
+    for res in results {
+        per_level.push(res?);
+    }
+    Ok(per_level)
 }

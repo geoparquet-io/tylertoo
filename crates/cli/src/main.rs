@@ -270,6 +270,18 @@ struct OverviewArgs {
     #[arg(long)]
     collapse: bool,
 
+    /// Disable cascading simplification (#218) and reproduce the pre-cascade
+    /// output byte-for-byte.
+    ///
+    /// By default each coarser level is simplified from the next-finer
+    /// level's already-simplified output (tippecanoe-style) and invalid RDP
+    /// candidates are repaired via a boolean overlay instead of epsilon-
+    /// retried — much faster on duplicating mode, at the cost of coarse-level
+    /// coordinates differing slightly from the non-cascaded pipeline (bounded
+    /// by ~2x the level tolerance). See docs/OVERVIEW_TUNING.md.
+    #[arg(long)]
+    no_cascade: bool,
+
     /// Enable point clustering (duplicating mode only; opt-in).
     ///
     /// At each overview level, the surviving point in each thinning grid cell
@@ -868,6 +880,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         simplify: SimplifyOptions {
             factor: args.simplify_factor,
             collapse: args.collapse,
+            cascade: !args.no_cascade,
         },
         density: DensityBudgetConfig {
             enabled: !args.no_density_drop,

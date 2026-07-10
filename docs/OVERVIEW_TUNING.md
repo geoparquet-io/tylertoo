@@ -180,6 +180,7 @@ tolerance = simplify_factor * gsd(level)          (meters, then CRS-converted)
 |------|---------|-------|-----------|
 | `--simplify-factor` | `1.0` | × GSD (RDP tolerance) | **bigger = cruder + lighter** |
 | `--collapse` | off | flag | below-gate polygons become a representative point instead of dropping |
+| `--no-cascade` | off (cascading **on**) | flag | disables cascading simplification, reproducing pre-cascade output byte-for-byte |
 
 - **LOWER `--simplify-factor` = smoother / less aggressive** = more vertices
   kept = crisper but heavier coarse levels.
@@ -194,6 +195,25 @@ diagonal falls below the tolerance is *dropped*, not just smoothed. So a very
 high `--simplify-factor` removes features in addition to shedding vertices — it
 is not a pure "smoothing" knob at the extremes. If you only want fewer vertices,
 keep the factor modest and adjust density with the thinning/visibility knobs.
+
+### Cascading simplification (default on): `--no-cascade`
+
+By default (duplicating mode), each coarser level is simplified from the
+**next-finer level's already-simplified output** rather than from canonical
+full-resolution geometry (tippecanoe-style, #218). Because a feature at its
+coarsest level would otherwise be re-simplified from full resolution at every
+finer level it repeats on, cascading removes the dominant repeat cost of
+duplicating-mode conversion; it also repairs a self-intersecting RDP candidate
+into its valid even-odd interpretation in one boolean-overlay pass instead of
+epsilon-retrying it four times and shipping full resolution.
+
+Trade-off: coarse-level coordinates differ slightly from the non-cascaded
+pipeline. Cascaded output vertices are still a subset of canonical vertices,
+every step's output is validity-checked or repaired, and the cumulative
+positional deviation is bounded by the geometric GSD ladder (≈ 2× the target
+level's tolerance instead of 1×). Files record `generalization.cascade: true`
+in the footer provenance. Pass `--no-cascade` to reproduce the pre-cascade
+output byte-for-byte.
 
 ---
 

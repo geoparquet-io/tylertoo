@@ -110,7 +110,8 @@ DNFs are results, not gaps — see findings.
 | dataset / mode | wall | peak RSS | CPU | output |
 |---|---:|---:|---:|---:|
 | fieldmaps-adm4, duplicating | **DNF** (>45 min, killed) | — | ~184 % | 1.21 GiB partial |
-| fieldmaps-adm4, partitioning | **2:57.3** | 1.55 GiB | 99 % | 2.92 GiB, 363,783 rows / 15 levels |
+| fieldmaps-adm4, partitioning (pre-#221, 15× re-read) | **2:57.3** | 1.55 GiB | 99 % | 2.92 GiB, 363,783 rows / 15 levels |
+| fieldmaps-adm4, partitioning (#221 single-read) | **0:55.6** | 5.51 GiB | 109 % | identical: 363,783 rows / 15 levels |
 | fieldmaps-adm4 partitioning → `export-pmtiles` | **DNF** (killed at 3 h 13 m wall / 7 h 29 m CPU, 231 %) | — | — | nothing written |
 | fieldmaps-adm4, `gpio pmtiles create` (tippecanoe, keep-everything defaults) | **DNF** (killed at 1:26:08) | 6.0 GiB | 347 % | 15.07 GB partial from a 2.9 GB input |
 | fieldmaps-adm4, `gpio pmtiles create --tile-size-limit` (tippecanoe native triage) | not measured (launched, stopped at ~2 min by decision; rerunnable) | — | — | — |
@@ -134,7 +135,14 @@ DNFs are results, not gaps — see findings.
    Partitioning-mode convert was the only thing any pipeline produced
    quickly on fieldmaps: 2.92 GiB, 15 levels, in **2:57 at 1.55 GiB
    RSS** — a queryable multi-resolution artifact while every
-   tile-materializing path DNF'd.
+   tile-materializing path DNF'd. **Update (2026-07-08, #221 merged):**
+   the single-read engine cut this to **0:55.6 (3.2×)**, landing on the
+   ~50 s target #220 was opened to chase. #220 (per-level row-group
+   winner indexes) is therefore **closed as obviated** — CPU held at
+   109 % (≈1.1 cores), confirming partitioning is now I/O-/single-thread
+   bound, not row-filter bound, so an index would chase a ~5 s residual.
+   The speed came at RAM cost (1.55 → 5.51 GiB) from the `auto` profile
+   buffering full-resolution output; `--profile bounded` caps it.
 3. **Germany segments is the clean win: 19.2 M lines (2.38 GiB) →
    48.4 M rows / 15 levels (4.80 GiB) in 3:08 at 8.6 GiB RSS**,
    ~13 MB/s of input, runs 1 and 2 within 1 s of each other. Level

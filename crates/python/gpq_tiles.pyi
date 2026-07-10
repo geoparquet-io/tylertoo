@@ -32,6 +32,7 @@ def overview(
     no_auto_rank: bool = False,
     simplify_factor: float = 1.0,
     collapse: bool = False,
+    cascade: bool = True,
     point_thinning: float | None = None,
     line_thinning: float = 1.0,
     polygon_thinning: float = 1.0,

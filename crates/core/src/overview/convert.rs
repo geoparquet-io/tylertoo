@@ -66,7 +66,7 @@ use super::level::{
     DensityProvenance, Generalization, GeneralizationLevel, MemoryProfile, Mode, RankingProvenance,
     GSD_TILE_BASE, METERS_PER_DEGREE,
 };
-use super::simplify::{simplify_for_level, Simplified, SimplifyOptions};
+use super::simplify::{simplify_cascade, simplify_for_level, Simplified, SimplifyOptions};
 use super::writer::{
     LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy,
     WriterError, LEVEL_COLUMN,
@@ -1141,6 +1141,20 @@ pub(crate) fn convert_to_overviews_source_strategy(
         let mut geoms = Vec::with_capacity(member_indices.len());
         let mut vertex_count = 0usize;
 
+        // Cascading (#218, duplicating default): fold canonical geometry
+        // through the fine→coarse GSD chain ending at this level, so this
+        // level consumes the next-finer level's output. Same chain the
+        // streaming ctxs build — the paths stay in lockstep.
+        let cascade_chain: Vec<f64> = if options.simplify.cascade && !verbatim {
+            level_specs[level..finest]
+                .iter()
+                .rev()
+                .map(|&(g, _)| g)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         if verbatim {
             for i in member_indices {
                 let g = &geometries[i];
@@ -1157,7 +1171,12 @@ pub(crate) fn convert_to_overviews_source_strategy(
                     geoms.push(g.clone());
                     continue;
                 }
-                match simplify_for_level(&geometries[i], gsd_m, crs, &options.simplify) {
+                let simplified = if cascade_chain.is_empty() {
+                    simplify_for_level(&geometries[i], gsd_m, crs, &options.simplify)
+                } else {
+                    simplify_cascade(&geometries[i], &cascade_chain, crs, &options.simplify)
+                };
+                match simplified {
                     Simplified::Keep(g) => {
                         vertex_count += count_vertices(&g);
                         indices.push(i);
@@ -2020,6 +2039,15 @@ pub(super) fn build_generalization(
             Some(options.gsd_base)
         },
         levels,
+        // Recorded only when cascading applied (#218, duplicating default):
+        // a --no-cascade run omits the member so its footer stays
+        // byte-identical to pre-cascade output. Partitioning never
+        // simplifies, so it never cascades.
+        cascade: if matches!(options.mode, Mode::Duplicating) && options.simplify.cascade {
+            Some(true)
+        } else {
+            None
+        },
         ranking: Some(ranking),
         // Record the density budget only when it was applied; a disabled run
         // omits the block so its footer matches pre-Q2 output.

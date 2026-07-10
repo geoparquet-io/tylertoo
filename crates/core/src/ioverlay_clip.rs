@@ -31,7 +31,7 @@
 //! the overhead of coordinate conversion that wagyu requires.
 
 use crate::tile::TileBounds;
-use geo::{Coord, Geometry, LineString, MultiPolygon, Polygon};
+use geo::{BoundingRect, Coord, Geometry, LineString, MultiPolygon, Polygon};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::overlay::FloatOverlay;
@@ -276,6 +276,32 @@ pub fn clip_multipolygon_ioverlay(
     ioverlay_to_geometry(result)
 }
 
+/// Repair a self-intersecting polygon by re-tracing it through a boolean
+/// intersection with its own (padded) bounding box.
+///
+/// RDP simplification can fold a ring across itself (bowtie / spike
+/// crossings). Intersecting with a strict-superset box under
+/// `FillRule::EvenOdd` re-resolves the crossings into one or more valid
+/// simple polygons — the same interpretation `clip_polygon_ioverlay` applies
+/// to self-intersecting input (see `test_clip_self_intersecting_bowtie`).
+///
+/// Returns `None` when nothing remains (degenerate rings or a fully
+/// self-canceling shape).
+pub fn repair_polygon_ioverlay(poly: &Polygon<f64>) -> Option<Geometry<f64>> {
+    let rect = poly.bounding_rect()?;
+    // Pad so no vertex lies exactly on the clip-box edge; any positive
+    // fraction of the extent works, the box just has to strictly contain
+    // the shape.
+    let pad = rect.width().max(rect.height()).max(f64::MIN_POSITIVE) * 0.5;
+    let bounds = TileBounds::new(
+        rect.min().x - pad,
+        rect.min().y - pad,
+        rect.max().x + pad,
+        rect.max().y + pad,
+    );
+    clip_polygon_ioverlay(poly, &bounds)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -369,6 +395,47 @@ mod tests {
                 // Also acceptable if it merges them somehow
             }
             other => panic!("Expected Polygon or MultiPolygon, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_repair_self_intersecting_bowtie() {
+        use geo::Validation;
+        let bowtie = Polygon::new(
+            LineString::new(vec![
+                Coord { x: -1.0, y: -1.0 },
+                Coord { x: 1.0, y: 1.0 },
+                Coord { x: -1.0, y: 1.0 },
+                Coord { x: 1.0, y: -1.0 },
+                Coord { x: -1.0, y: -1.0 },
+            ]),
+            vec![],
+        );
+        assert!(!bowtie.is_valid(), "fixture must self-intersect");
+
+        let repaired = repair_polygon_ioverlay(&bowtie).expect("bowtie repairs to non-empty");
+        match repaired {
+            Geometry::MultiPolygon(mp) => {
+                assert_eq!(mp.0.len(), 2, "bowtie should split into 2 triangles");
+                for p in &mp.0 {
+                    assert!(p.is_valid(), "repaired part must be valid");
+                }
+            }
+            other => panic!("expected MultiPolygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_repair_valid_polygon_stays_equivalent() {
+        use geo::{Area, Validation};
+        let square = make_square(0.0, 0.0, 10.0, 10.0);
+        let repaired = repair_polygon_ioverlay(&square).expect("valid input survives repair");
+        match repaired {
+            Geometry::Polygon(p) => {
+                assert!(p.is_valid());
+                assert!((p.unsigned_area() - 100.0).abs() < 1e-9);
+            }
+            other => panic!("expected Polygon, got {other:?}"),
         }
     }
 

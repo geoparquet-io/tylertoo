@@ -48,7 +48,7 @@ use crate::input::InputSource;
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
-use super::stream::{process_level_batch, LevelStreamCtx, Pass2Timers};
+use super::stream::{process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers};
 use super::writer::{LevelWriteOutcome, OverviewWriter};
 
 /// How a level's buffered output is held until it is written.
@@ -235,20 +235,37 @@ pub(super) fn run_pass2_buffered(
         Ok(())
     });
 
-    // Consumer: process batches in read order; parallelize across levels within
-    // each batch. Because batches arrive in order and are appended before the
-    // next is pulled, each sink stays in input order without a reorder buffer.
+    // Consumer: process batches in read order; parallelize within each batch.
+    // Because batches arrive in order and are appended before the next is
+    // pulled, each sink stays in input order without a reorder buffer.
+    //
+    // Cascading (#218, duplicating default): one call decodes the batch's
+    // member geometries once and folds each feature fine→coarse, so level k
+    // reuses level k+1's output instead of re-simplifying canonical
+    // geometry. Otherwise (cascade off, or partitioning where every feature
+    // lands on exactly one level) fan out per level as before.
+    let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
     let consume: Result<(), ConvertError> = (|| {
         for msg in rx.iter() {
             Pass2Timers::add_dur(timers.read_cell(), msg.read_dur);
             let batch = &msg.batch;
             let row_offset = msg.row_offset;
-            let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = (0..num_levels)
-                .into_par_iter()
-                .map(|li| process_level_batch(batch, row_offset, &ctxs[li], &timers))
-                .collect();
-            for (li, res) in results.into_iter().enumerate() {
-                if let Some((out, v)) = res? {
+            let per_level: Vec<Option<(RecordBatch, usize)>> = if cascade {
+                process_batch_cascade(batch, row_offset, ctxs, &timers)?
+            } else {
+                let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = (0
+                    ..num_levels)
+                    .into_par_iter()
+                    .map(|li| process_level_batch(batch, row_offset, &ctxs[li], &timers))
+                    .collect();
+                let mut v = Vec::with_capacity(num_levels);
+                for res in results {
+                    v.push(res?);
+                }
+                v
+            };
+            for (li, out) in per_level.into_iter().enumerate() {
+                if let Some((out, v)) = out {
                     rows[li] += out.num_rows();
                     verts[li] += v;
                     sinks[li].push(out)?;
