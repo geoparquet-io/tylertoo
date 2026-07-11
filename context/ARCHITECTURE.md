@@ -119,6 +119,21 @@ export per-zoom feature totals (a feature spanning a tile seam appears in
 every tile it touches): 0% while a level fits one tile, ~7% at z14 on
 Portland roads.
 
+**Progress logging & salvageable output (#229).** Long exports get stuck in the
+finest level's scan/clip (adm4 DNF'd at 3h13m with nothing written), so export
+emits `[export]`-prefixed `log::info!` lines — visible under the CLI's default
+`info` filter — at three granularities: a `scan complete` marker, a per-level
+`done` summary (level *i/N*, zoom, feats, tiles, partitions, elapsed), and a
+throttled within-level **wave counter** (`WAVE_LOG_INTERVAL`, 30 s) so a stuck
+level is diagnosable in minutes (counter frozen) vs merely slow (counter
+advancing). After each finished level — throttled to `CHECKPOINT_INTERVAL`
+(60 s), so fast exports that finish in one `finalize` pay nothing —
+`writer.checkpoint()` snapshots a valid archive capped at that zoom, so an
+interrupted run keeps its finished coarse zooms instead of losing hours of
+compute. `checkpoint` and `finalize` route through the same assembler, so the
+final archive is **byte-identical** whether or not any checkpoints were taken
+(verified on madagascar-adm4).
+
 ### Validate (`overview/check.rs`)
 
 `gpq-tiles validate` checks a file against spec §6.2: footer schema, level
@@ -202,6 +217,15 @@ in `benchmarks/overview/RESULTS.md` (a 631k-feature file's footer dropped
 8.84 MB → 0.24 MB).
 
 ## StreamingPmtilesWriter
+
+The writer's archive assembly (sort entries → header + directory + metadata →
+copy tile data) lives in a non-consuming `write_archive`, written to a sibling
+`<output>.partial` and atomically renamed over the target. `finalize` runs it
+once then drops the temp file; `checkpoint` (#229) runs it repeatedly without
+consuming the writer, so a kill mid-write never corrupts a previously
+checkpointed archive. Tile ids are unique, so re-sorting entries between
+checkpoints is deterministic — the final bytes are identical regardless of how
+many checkpoints ran.
 
 Export's PMTiles v3 writer streams tile data to a temp file, builds the
 directory incrementally, and deduplicates tiles by XXH3 hash → file offset,
