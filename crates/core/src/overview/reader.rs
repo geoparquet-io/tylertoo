@@ -268,6 +268,30 @@ impl OverviewReader {
             .build()?;
         Ok(reader)
     }
+
+    /// Read exactly `level_idx`'s **own** row-group band (`start..=end`, the
+    /// §3.3 span), unpruned and independent of mode, with an explicit Arrow
+    /// batch size.
+    ///
+    /// Unlike [`Self::read_level_with_batch_size`] — which in partitioning mode
+    /// reads the accumulating prefix `0..=end` — this reads only the band that
+    /// *belongs to* the level. It is the unit of work for a single-read,
+    /// fan-out scan of the whole file (issue #233): reading each band once
+    /// (`Σ_j |band_j|` = every row group exactly once) instead of re-reading a
+    /// coarse band from every finer level's prefix (`Σ_k |prefix_k|`).
+    pub fn read_band_with_batch_size(
+        &self,
+        level_idx: usize,
+        batch_size: usize,
+    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+        let (start, end) = self.level_band(level_idx)?;
+        let file = File::open(&self.path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_row_groups((start..=end).collect())
+            .with_batch_size(batch_size)
+            .build()?;
+        Ok(reader)
+    }
 }
 
 #[cfg(test)]
