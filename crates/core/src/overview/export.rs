@@ -15,16 +15,19 @@
 //!    this module treats both modes identically: "read level `k`, emit tiles
 //!    at level `k`'s zoom".
 //! 3. **Partition pass**: split the zoom's tiles into contiguous ascending
-//!    `(x, y)` ranges of roughly [`DEFAULT_PARTITION_TARGET`] members each.
-//!    For each partition, in tile order: re-read the band (row groups pruned
-//!    to the partition's bbox) and split every feature into its tiles with a
-//!    **top-down recursive quadtree cascade** (see [`feature_tile_members`]):
-//!    each feature is clipped once per pyramid level into an already-reduced
-//!    child region down to the target zoom, restricted to the partition's key
-//!    range, so a vertex takes part in `O(depth)` clips rather than
-//!    `O(tiles_spanned)` (issue #226). The per-tile clips reuse the
-//!    [`clip_geometry`] entry point, MVT-encode via [`crate::mvt`], and the
-//!    finished partition's tiles stream immediately to
+//!    `(x, y)` ranges of roughly [`DEFAULT_PARTITION_TARGET`] members each, then
+//!    process them in **waves** of [`PARTITION_WAVE`] partitions. Each wave
+//!    reads the band **once** (row groups pruned to the wave's combined bbox),
+//!    splits every feature into its tiles with a **top-down recursive quadtree
+//!    cascade** (see [`feature_tile_members`]) — each feature clipped once per
+//!    pyramid level into an already-reduced child region down to the target
+//!    zoom, so a vertex takes part in `O(depth)` clips rather than
+//!    `O(tiles_spanned)` (issue #226) — and *routes* each resulting member to
+//!    its owning partition (see [`process_wave`]). Sharing one read+decode
+//!    across a wave replaces the old per-partition re-read (issue #228): a level
+//!    now costs `ceil(P / PARTITION_WAVE)` band reads, not `P`. The per-tile
+//!    clips reuse the [`clip_geometry`] entry point, MVT-encode via
+//!    [`crate::mvt`], and each finished partition's tiles stream immediately to
 //!    [`StreamingPmtilesWriter`]. Tiles are written in ascending `(x, y)` order
 //!    per zoom — the historical order — so the archive's tile-data layout,
 //!    deduplication, and directory are unchanged.
@@ -202,7 +205,7 @@ pub enum ExportError {
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
 /// properties carried over from the overview file (level column + covering
 /// struct excluded). Test-support only: production streams members directly
-/// instead of materializing features (see [`collect_batch_members`]).
+/// instead of materializing features (see [`collect_wave_members`]).
 #[cfg(test)]
 struct Feature {
     geom: Geometry<f64>,
@@ -249,11 +252,14 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> u8 {
 /// holding the whole zoom in memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
-/// Number of partitions processed concurrently per wave. Each partition
-/// re-reads (a row-group-pruned subset of) the level band; the wave overlaps
-/// those serial read/decode passes with parallel clip/encode work while
-/// keeping peak memory at O(`PARTITION_WAVE` partitions). Waves complete in
-/// order, so the writer still receives tiles in ascending `(x, y)` order.
+/// Number of partitions grouped into one wave. A wave reads the level band
+/// **once** (row groups pruned to the wave's combined bbox), decodes it a single
+/// time, and routes the decoded features to its partitions — so a level costs
+/// `ceil(P / PARTITION_WAVE)` band reads instead of one per partition (issue
+/// #228). Peak memory stays at O(`PARTITION_WAVE` partitions), and one shared
+/// decode per wave (rather than one per partition) also lowers the peak. Waves
+/// complete in order, so the writer still receives tiles in ascending `(x, y)`
+/// order.
 const PARTITION_WAVE: usize = 6;
 
 /// Arrow batch size for the partition read passes (the parquet reader default
@@ -347,10 +353,7 @@ fn export_pmtiles_with_partition_target(
         let mut oversized = 0usize;
         let mut write_secs = 0f64;
         for wave in partitions.chunks(PARTITION_WAVE) {
-            let results: Vec<Vec<EncodedTile>> = wave
-                .par_iter()
-                .map(|part| process_partition(&ctx, part))
-                .collect::<Result<_, _>>()?;
+            let results: Vec<Vec<EncodedTile>> = process_wave(&ctx, wave)?;
             let t_write = Instant::now();
             for tiles in &results {
                 for t in tiles {
@@ -615,24 +618,39 @@ fn plan_partitions(
     out
 }
 
-/// Pass 2, one partition: re-read the band (row groups pruned to the
-/// partition bbox), clip every feature into its tiles within the partition's
-/// key range, group by tile via a parallel sort, and MVT-encode each tile in
-/// parallel. Returns encoded tiles in ascending `(x, y)` order.
-fn process_partition(
+/// Pass 2, one wave of partitions: **read the band once** (row groups pruned to
+/// the wave's combined bbox), clip every feature into its tiles across the
+/// wave's whole key range, and *route* each member to its owning partition.
+/// Each partition is then grouped-by-tile and MVT-encoded in parallel exactly
+/// as a standalone partition would be. Returns one `Vec<EncodedTile>` per
+/// partition, in the wave's ascending partition order, each in ascending
+/// `(x, y)` order.
+///
+/// This replaces the old per-partition re-read (issue #228): instead of `P`
+/// independent band reads + decodes per level, a wave of `PARTITION_WAVE`
+/// partitions shares a single read + decode. Byte-identical to the per-partition
+/// path — each partition receives exactly the members with key in its
+/// `[key_lo, key_hi]` window (a tile's clipped geometry is window-independent),
+/// and within-tile `(key, seq)` order is preserved because row-group pruning
+/// keeps kept rows in band order regardless of how wide the read is.
+fn process_wave(
     ctx: &LevelCtx<'_>,
-    part: &Partition,
-) -> Result<Vec<EncodedTile>, ExportError> {
-    // Row-group pruning is only valid when the file's coordinates (and thus
-    // its row-group bbox statistics) are lon/lat. For 3857 files the stats
-    // are in meters; skip pruning (correct, just unpruned).
+    wave: &[Partition],
+) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
+    debug_assert!(!wave.is_empty(), "wave must be non-empty");
+
+    // Row-group pruning is only valid when the file's coordinates (and thus its
+    // row-group bbox statistics) are lon/lat. For 3857 files the stats are in
+    // meters; skip pruning (correct, just unpruned). Prune to the *union* of the
+    // wave's partition bboxes.
     let bbox = match ctx.crs {
-        Crs::Epsg4326 => Some([
-            part.bbox.lng_min,
-            part.bbox.lat_min,
-            part.bbox.lng_max,
-            part.bbox.lat_max,
-        ]),
+        Crs::Epsg4326 => {
+            let mut b = wave[0].bbox;
+            for p in &wave[1..] {
+                b.expand(&p.bbox);
+            }
+            Some([b.lng_min, b.lat_min, b.lng_max, b.lat_max])
+        }
         Crs::Epsg3857 => None,
     };
     let batch_reader =
@@ -640,41 +658,67 @@ fn process_partition(
             .read_level_with_batch_size(ctx.level_idx, bbox, EXPORT_BATCH_SIZE)?;
 
     let t_collect = Instant::now();
-    let mut members: Vec<Member> = Vec::new();
+    let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     let mut seq = 0u64;
     for batch in batch_reader {
         let batch = batch?;
-        collect_batch_members(ctx, part, &batch, &mut seq, &mut members)?;
+        collect_wave_members(ctx, wave, &batch, &mut seq, &mut buckets)?;
     }
     let collect_secs = t_collect.elapsed().as_secs_f64();
+    let n_members: usize = buckets.iter().map(Vec::len).sum();
+
     let t_encode = Instant::now();
-    let n_members = members.len();
-    let tiles = encode_members(members, ctx.zoom, ctx.opts)?;
+    let tiles: Vec<Vec<EncodedTile>> = buckets
+        .into_par_iter()
+        .map(|members| encode_members(members, ctx.zoom, ctx.opts))
+        .collect::<Result<_, _>>()?;
+    let n_tiles: usize = tiles.iter().map(Vec::len).sum();
     log::debug!(
-        "[profile]     z{} partition [{:x}..{:x}]: rows_read={seq} members={n_members} \
-         tiles={} collect={collect_secs:.2}s sort+encode={:.2}s",
+        "[profile]     z{} wave [{:x}..{:x}] ({} partitions): rows_read={seq} \
+         members={n_members} tiles={n_tiles} collect={collect_secs:.2}s \
+         sort+encode={:.2}s",
         ctx.zoom,
-        part.key_lo,
-        part.key_hi,
-        tiles.len(),
+        wave[0].key_lo,
+        wave[wave.len() - 1].key_hi,
+        wave.len(),
         t_encode.elapsed().as_secs_f64(),
     );
     Ok(tiles)
 }
 
-/// Decode one record batch and append this partition's members: clip every
-/// feature (in parallel) into its intersecting tiles restricted to the
-/// partition's key range, then attach shared per-feature properties in band
-/// order. `seq` is the running band-order counter (advanced for every row,
-/// member-producing or not, so within-tile ordering matches the old
-/// whole-band feature indexing).
-fn collect_batch_members(
+/// The wave partition owning `key`. The wave's partitions are contiguous,
+/// disjoint, ascending `[key_lo, key_hi]` ranges, and every emitted key was
+/// scanned (so it lies in exactly one of them), giving an unambiguous home.
+#[inline]
+fn route_partition(wave: &[Partition], key: u64) -> usize {
+    // Rightmost partition whose `key_lo <= key`.
+    let idx = wave.partition_point(|p| p.key_lo <= key).saturating_sub(1);
+    debug_assert!(
+        key >= wave[idx].key_lo && key <= wave[idx].key_hi,
+        "member key {key:x} falls outside its wave partition [{:x}..{:x}]",
+        wave[idx].key_lo,
+        wave[idx].key_hi,
+    );
+    idx
+}
+
+/// Decode one record batch and append its members to the wave's per-partition
+/// buckets: clip every feature (in parallel) into its intersecting tiles across
+/// the wave's whole key range, route each member to its owning partition, then
+/// attach shared per-feature properties in band order. `seq` is the running
+/// band-order counter (advanced for every row, member-producing or not, so
+/// within-tile ordering matches the old whole-band feature indexing).
+fn collect_wave_members(
     ctx: &LevelCtx<'_>,
-    part: &Partition,
+    wave: &[Partition],
     batch: &RecordBatch,
     seq: &mut u64,
-    members: &mut Vec<Member>,
+    buckets: &mut [Vec<Member>],
 ) -> Result<(), ExportError> {
+    debug_assert_eq!(buckets.len(), wave.len());
+    let key_lo = wave[0].key_lo;
+    let key_hi = wave[wave.len() - 1].key_hi;
+
     let schema = batch.schema();
     let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
     let geom_field = schema.field(geom_idx).clone();
@@ -687,10 +731,10 @@ fn collect_batch_members(
         geoms = geoms.par_iter().map(reproject_3857_to_4326).collect();
     }
 
-    // Parallel per-feature clip (H3(c) lever 2), restricted to this partition.
+    // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key range.
     let row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
         .par_iter()
-        .map(|g| feature_tile_members(g, ctx.zoom, ctx.opts, part.key_lo, part.key_hi))
+        .map(|g| feature_tile_members(g, ctx.zoom, ctx.opts, key_lo, key_hi))
         .collect();
     drop(geoms);
 
@@ -720,7 +764,7 @@ fn collect_batch_members(
         }
         let props = Arc::new(props);
         for (key, geom) in items {
-            members.push(Member {
+            buckets[route_partition(wave, key)].push(Member {
                 key,
                 seq: *seq,
                 geom,
