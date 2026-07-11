@@ -1363,6 +1363,73 @@ impl StreamingPmtilesWriter {
         Ok(())
     }
 
+    /// Add a tile whose bytes are **already compressed** with this writer's
+    /// `tile_compression`.
+    ///
+    /// This is the parallel-friendly counterpart of [`Self::add_tile_with_count`]:
+    /// the caller compresses tile bytes off-thread (e.g. inside a Rayon
+    /// `par_iter`) and hands the finished bytes here so the serial ordering loop
+    /// never runs gzip. To keep deduplication byte-for-byte identical to the
+    /// serial path, `hash` MUST be the [`TileHasher::hash`] of the tile's
+    /// **uncompressed** MVT bytes (never the compressed bytes), and `raw_len` the
+    /// uncompressed length (used only for the dedup byte-savings stat). Because
+    /// compression is deterministic, an identical uncompressed hash implies
+    /// identical compressed bytes, so the archive is bit-identical to compressing
+    /// serially.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_tile_precompressed(
+        &mut self,
+        z: u8,
+        x: u32,
+        y: u32,
+        hash: u64,
+        compressed: &[u8],
+        raw_len: usize,
+        feature_count: usize,
+    ) -> std::io::Result<()> {
+        let temp_file = self
+            .temp_file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
+
+        let id = tile_id(z, x, y);
+        self.stats.total_tiles += 1;
+        self.total_features += feature_count as u64;
+
+        // Track zoom range
+        self.min_zoom = self.min_zoom.min(z);
+        self.max_zoom = self.max_zoom.max(z);
+
+        // Dedup on the uncompressed hash (same key as add_tile_with_count).
+        if let Some((offset, length)) = self.dedup_cache.get(&hash) {
+            self.entries.push(StreamingDirEntry {
+                tile_id: id,
+                offset: *offset,
+                length: *length,
+            });
+            self.stats.bytes_saved_dedup += raw_len as u64;
+            return Ok(());
+        }
+
+        // New unique tile - write the pre-compressed bytes verbatim.
+        let compressed_len = compressed.len() as u32;
+        temp_file.write_all(compressed)?;
+
+        let offset = self.current_offset;
+        self.dedup_cache.insert(hash, (offset, compressed_len));
+        self.entries.push(StreamingDirEntry {
+            tile_id: id,
+            offset,
+            length: compressed_len,
+        });
+
+        self.current_offset += compressed_len as u64;
+        self.stats.unique_tiles += 1;
+        self.stats.bytes_written += compressed_len as u64;
+
+        Ok(())
+    }
+
     /// Finalize the PMTiles file.
     ///
     /// Reads tile data from temp file and assembles the final PMTiles archive
@@ -2931,5 +2998,58 @@ mod tests {
         }
 
         let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn add_tile_precompressed_matches_add_tile_with_count() {
+        // Issue #227 moves gzip off the serial writer thread: the export loop
+        // now compresses tiles inside the parallel encode section and hands the
+        // finished bytes (plus the *uncompressed* hash) to
+        // add_tile_precompressed. The resulting archive must be byte-identical
+        // to compressing serially via add_tile_with_count, including dedup: the
+        // 4th tile below repeats the 1st tile's content.
+        let tiles: Vec<(u8, u32, u32, Vec<u8>)> = vec![
+            (0, 0, 0, vec![0x1a, 0x05, b'h', b'e', b'l', b'l', b'o']),
+            (1, 0, 0, vec![0x1a, 0x03, b'a', b'b', b'c']),
+            (1, 0, 1, vec![0x1a, 0x03, b'x', b'y', b'z']),
+            (1, 1, 1, vec![0x1a, 0x05, b'h', b'e', b'l', b'l', b'o']), // dup of (0,0,0)
+        ];
+        let dir = std::env::temp_dir();
+
+        // Baseline: writer compresses each tile serially.
+        let mut serial = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        serial.set_layer_name("test");
+        serial.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+        for (z, x, y, data) in &tiles {
+            serial.add_tile_with_count(*z, *x, *y, data, 1).unwrap();
+        }
+        let serial_path = dir.join("gpq-227-serial.pmtiles");
+        let _ = fs::remove_file(&serial_path);
+        serial.finalize(&serial_path).unwrap();
+
+        // New path: compress up front, hand bytes + uncompressed hash to writer.
+        let mut parallel = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        parallel.set_layer_name("test");
+        parallel.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+        for (z, x, y, data) in &tiles {
+            let hash = TileHasher::hash(data);
+            let compressed = compression::compress(data, Compression::Gzip).unwrap();
+            parallel
+                .add_tile_precompressed(*z, *x, *y, hash, &compressed, data.len(), 1)
+                .unwrap();
+        }
+        let parallel_path = dir.join("gpq-227-parallel.pmtiles");
+        let _ = fs::remove_file(&parallel_path);
+        parallel.finalize(&parallel_path).unwrap();
+
+        let a = fs::read(&serial_path).unwrap();
+        let b = fs::read(&parallel_path).unwrap();
+        assert_eq!(
+            a, b,
+            "precompressed archive must be byte-identical to serial compression"
+        );
+
+        let _ = fs::remove_file(&serial_path);
+        let _ = fs::remove_file(&parallel_path);
     }
 }

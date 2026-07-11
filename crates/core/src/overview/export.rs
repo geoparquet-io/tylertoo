@@ -81,7 +81,8 @@ use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_from_array;
 use crate::clip::clip_geometry;
-use crate::compression::Compression;
+use crate::compression::{self, Compression};
+use crate::dedup::TileHasher;
 use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, tiles_for_bbox, BboxTileRanges, TileBounds, TileCoord};
@@ -208,11 +209,17 @@ struct Feature {
     props: Vec<(String, PropertyValue)>,
 }
 
-/// An encoded tile ready to hand to the PMTiles writer.
+/// An encoded tile ready to hand to the PMTiles writer. `data` is already
+/// **gzip-compressed** (compression runs in the parallel encode section, not on
+/// the serial writer thread — issue #227). `hash` is [`TileHasher::hash`] of the
+/// *uncompressed* MVT bytes, the dedup key; `raw_len` is the uncompressed length,
+/// kept for the writer's dedup byte-savings stat.
 struct EncodedTile {
     x: u32,
     y: u32,
     data: Vec<u8>,
+    hash: u64,
+    raw_len: usize,
     feature_count: usize,
     oversized: bool,
 }
@@ -351,7 +358,15 @@ fn export_pmtiles_with_partition_target(
                     if t.oversized {
                         oversized += 1;
                     }
-                    writer.add_tile_with_count(zoom, t.x, t.y, &t.data, t.feature_count)?;
+                    writer.add_tile_precompressed(
+                        zoom,
+                        t.x,
+                        t.y,
+                        t.hash,
+                        &t.data,
+                        t.raw_len,
+                        t.feature_count,
+                    )?;
                 }
                 tile_count += tiles.len();
             }
@@ -359,7 +374,7 @@ fn export_pmtiles_with_partition_target(
         }
         log::debug!(
             "[profile] z{zoom} (level {level_idx}, {} feats, {tile_count} tiles, {} partitions): \
-             scan={scan_secs:.2}s clip+encode={:.2}s write(gzip)={write_secs:.2}s",
+             scan={scan_secs:.2}s clip+encode+gzip={:.2}s write={write_secs:.2}s",
             scan.feature_count,
             partitions.len(),
             t_tiles.elapsed().as_secs_f64() - write_secs,
@@ -458,10 +473,6 @@ struct LevelCtx<'a> {
     opts: &'a ExportOptions,
 }
 
-/// Pass 1: stream the level band once and record, per tile, how many
-/// (feature × tile) members it will receive, plus the band's row count and
-/// the union of feature bboxes. Geometries are decoded for their bbox and
-/// dropped immediately; properties are not extracted.
 fn scan_level(
     reader: &OverviewReader,
     level_idx: usize,
@@ -485,26 +496,74 @@ fn scan_level(
         let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
         extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
         scan.feature_count += geoms.len();
-        for geom in &geoms {
-            let Some(rect) = geom.bounding_rect() else {
-                continue;
-            };
-            let mut bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-            if matches!(crs, Crs::Epsg3857) {
-                // Web Mercator -> lon/lat is monotone per axis, so reprojecting
-                // the two corners reprojects the bbox — bit-identical to taking
-                // the bbox of the reprojected geometry.
-                let (lng_min, lat_min) = webmerc_to_lnglat(bbox.lng_min, bbox.lat_min);
-                let (lng_max, lat_max) = webmerc_to_lnglat(bbox.lng_max, bbox.lat_max);
-                bbox = TileBounds::new(lng_min, lat_min, lng_max, lat_max);
-            }
+
+        // Sizing every feature's tile footprint is embarrassingly parallel per
+        // feature (issue #227): each feature independently contributes its bbox
+        // to the bounds union and one member to each tile it spans. Fold into
+        // per-thread (bounds, counts) accumulators, then reduce. Both reductions
+        // (bbox union, per-tile count sum) are commutative and associative, so
+        // the merged result — and thus the exported archive — is identical to
+        // the old serial scan regardless of thread scheduling.
+        let (batch_bounds, batch_counts) = geoms
+            .par_iter()
+            .fold(
+                || (None::<TileBounds>, HashMap::<u64, usize>::new()),
+                |(mut bounds, mut counts), geom| {
+                    if let Some(rect) = geom.bounding_rect() {
+                        let mut bbox =
+                            TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+                        if matches!(crs, Crs::Epsg3857) {
+                            // Web Mercator -> lon/lat is monotone per axis, so
+                            // reprojecting the two corners reprojects the bbox —
+                            // bit-identical to taking the bbox of the reprojected
+                            // geometry.
+                            let (lng_min, lat_min) = webmerc_to_lnglat(bbox.lng_min, bbox.lat_min);
+                            let (lng_max, lat_max) = webmerc_to_lnglat(bbox.lng_max, bbox.lat_max);
+                            bbox = TileBounds::new(lng_min, lat_min, lng_max, lat_max);
+                        }
+                        match &mut bounds {
+                            Some(acc) => acc.expand(&bbox),
+                            None => bounds = Some(bbox),
+                        }
+                        for tc in tiles_for_bbox(&bbox, zoom) {
+                            *counts.entry(tile_key(tc.x, tc.y)).or_insert(0) += 1;
+                        }
+                    }
+                    (bounds, counts)
+                },
+            )
+            .reduce(
+                || (None::<TileBounds>, HashMap::<u64, usize>::new()),
+                |(b_a, c_a), (b_b, c_b)| {
+                    let bounds = match (b_a, b_b) {
+                        (Some(mut a), Some(b)) => {
+                            a.expand(&b);
+                            Some(a)
+                        }
+                        (Some(a), None) | (None, Some(a)) => Some(a),
+                        (None, None) => None,
+                    };
+                    // Merge the smaller map into the larger to minimize rehashing.
+                    let (mut dst, src) = if c_a.len() >= c_b.len() {
+                        (c_a, c_b)
+                    } else {
+                        (c_b, c_a)
+                    };
+                    for (k, v) in src {
+                        *dst.entry(k).or_insert(0) += v;
+                    }
+                    (bounds, dst)
+                },
+            );
+
+        if let Some(b) = batch_bounds {
             match &mut scan.bounds {
-                Some(acc) => acc.expand(&bbox),
-                None => scan.bounds = Some(bbox),
+                Some(acc) => acc.expand(&b),
+                None => scan.bounds = Some(b),
             }
-            for tc in tiles_for_bbox(&bbox, zoom) {
-                *scan.tile_counts.entry(tile_key(tc.x, tc.y)).or_insert(0) += 1;
-            }
+        }
+        for (k, v) in batch_counts {
+            *scan.tile_counts.entry(k).or_insert(0) += v;
         }
     }
     Ok(scan)
@@ -590,7 +649,7 @@ fn process_partition(
     let collect_secs = t_collect.elapsed().as_secs_f64();
     let t_encode = Instant::now();
     let n_members = members.len();
-    let tiles = encode_members(members, ctx.zoom, ctx.opts);
+    let tiles = encode_members(members, ctx.zoom, ctx.opts)?;
     log::debug!(
         "[profile]     z{} partition [{:x}..{:x}]: rows_read={seq} members={n_members} \
          tiles={} collect={collect_secs:.2}s sort+encode={:.2}s",
@@ -968,13 +1027,11 @@ fn members_recursive_vec(
     out
 }
 
-/// Group members by tile and MVT-encode. A **parallel sort** on
-/// `(tile key, band order)` replaces the old serial per-zoom `BTreeMap`
-/// merge — `(key, seq)` pairs are unique (one member per feature per tile),
-/// so the unstable sort is deterministic, and within a tile members stay in
-/// band (file) order, exactly as before. Encoded tiles come back in ascending
-/// `(x, y)` order; empty tiles are dropped.
-fn encode_members(mut members: Vec<Member>, zoom: u8, opts: &ExportOptions) -> Vec<EncodedTile> {
+fn encode_members(
+    mut members: Vec<Member>,
+    zoom: u8,
+    opts: &ExportOptions,
+) -> Result<Vec<EncodedTile>, ExportError> {
     members.par_sort_unstable_by_key(|m| (m.key, m.seq));
 
     // Group boundaries (manual scan: `slice::chunk_by` needs Rust 1.77, MSRV
@@ -988,6 +1045,10 @@ fn encode_members(mut members: Vec<Member>, zoom: u8, opts: &ExportOptions) -> V
         }
     }
 
+    // Encode AND gzip-compress every tile in the parallel section, so the serial
+    // writer loop only dedups and appends bytes (issue #227). Compression must
+    // match the writer's `tile_compression` (Gzip) so `add_tile_precompressed`
+    // stays byte-identical to the old serial `add_tile_with_count` path.
     groups
         .into_par_iter()
         .filter_map(|g| {
@@ -997,13 +1058,21 @@ fn encode_members(mut members: Vec<Member>, zoom: u8, opts: &ExportOptions) -> V
             if count == 0 {
                 return None;
             }
-            Some(EncodedTile {
+            let hash = TileHasher::hash(&data);
+            let raw_len = data.len();
+            let compressed = match compression::compress(&data, Compression::Gzip) {
+                Ok(c) => c,
+                Err(e) => return Some(Err(ExportError::from(e))),
+            };
+            Some(Ok(EncodedTile {
                 x,
                 y,
-                data,
+                data: compressed,
+                hash,
+                raw_len,
                 feature_count: count,
                 oversized,
-            })
+            }))
         })
         .collect()
 }
@@ -1089,7 +1158,16 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
             });
         }
     }
-    encode_members(members, zoom, opts)
+    // `encode_members` returns gzip-COMPRESSED tile bytes (issue #227 moved
+    // compression into the parallel encode section). This helper exists to
+    // exercise MVT *encoding*, so decompress each tile back to raw MVT bytes;
+    // the assertions in the tests below operate on the uncompressed payload.
+    let mut tiles = encode_members(members, zoom, opts).expect("in-memory gzip is infallible");
+    for t in &mut tiles {
+        t.data = crate::compression::decompress(&t.data, Compression::Gzip)
+            .expect("gzip roundtrip of just-compressed tile");
+    }
+    tiles
 }
 
 /// Test-support: read every feature (geometry + carried properties) of a level
