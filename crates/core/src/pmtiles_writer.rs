@@ -1437,19 +1437,55 @@ impl StreamingPmtilesWriter {
     ///
     /// The temp file is deleted after successful finalization.
     pub fn finalize(mut self, output_path: &Path) -> Result<StreamingWriteStats> {
-        // Take the temp file handle to close it properly
-        let temp_file = self
-            .temp_file
-            .take()
-            .ok_or_else(|| Error::PMTilesWrite("Writer already finalized".to_string()))?;
+        // Assemble the complete archive (byte-identical to the last checkpoint,
+        // if any). This flushes the temp buffer in place but leaves the handle
+        // open so we can close it deterministically below.
+        self.write_archive(output_path)?;
 
-        // Flush and close temp file
-        let inner = temp_file
-            .into_inner()
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to flush temp file: {}", e)))?;
-        drop(inner); // Explicitly close
+        // Close and remove the temp file now that the run is complete.
+        drop(self.temp_file.take());
+        let _ = std::fs::remove_file(&self.temp_path);
 
-        // Sort entries by tile_id for clustered mode
+        // Mark as finalized so Drop doesn't try to clean up again
+        self.finalized = true;
+
+        Ok(self.stats.clone())
+    }
+
+    /// Write a valid, self-contained PMTiles archive containing every tile
+    /// added so far, *without* consuming the writer or closing the temp file
+    /// (Issue #229 — salvageable output).
+    ///
+    /// The export loop calls this after each finished level so an interrupted
+    /// run still yields a valid archive capped at the last completed zoom
+    /// instead of losing hours of compute. `finalize` routes through the same
+    /// assembler, so the final archive is byte-identical whether or not any
+    /// intermediate checkpoints were taken.
+    ///
+    /// The archive is written to a sibling `<output>.partial` file and then
+    /// atomically renamed over `output_path`, so a kill mid-write never
+    /// corrupts a previously-checkpointed archive.
+    pub fn checkpoint(&mut self, output_path: &Path) -> Result<()> {
+        self.write_archive(output_path)
+    }
+
+    /// Shared archive assembler backing both [`checkpoint`](Self::checkpoint)
+    /// and [`finalize`](Self::finalize). Flushes the temp buffer in place (the
+    /// handle stays open so the writer remains usable) and writes the header,
+    /// directory, metadata and tile data to `output_path` atomically.
+    fn write_archive(&mut self, output_path: &Path) -> Result<()> {
+        // Flush buffered tile bytes to the temp file on disk without consuming
+        // the handle — the writer must stay usable after a checkpoint.
+        match self.temp_file.as_mut() {
+            Some(tf) => tf
+                .flush()
+                .map_err(|e| Error::PMTilesWrite(format!("Failed to flush temp file: {}", e)))?,
+            None => return Err(Error::PMTilesWrite("Writer already finalized".to_string())),
+        }
+
+        // Sort entries by tile_id for clustered mode. Tile ids are unique, so
+        // this is deterministic and idempotent — re-sorting between checkpoints
+        // and later adds yields the same final ordering as sorting once.
         self.entries.sort_by_key(|e| e.tile_id);
 
         // Build run-length encoded directory entries
@@ -1521,8 +1557,15 @@ impl StreamingPmtilesWriter {
             center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
         };
 
-        // Create output file and write all sections
-        let output_file = File::create(output_path)
+        // Assemble into a sibling `<output>.partial` file, then atomically
+        // rename over `output_path`. A kill mid-write leaves any previously
+        // checkpointed archive at `output_path` intact.
+        let partial_path = {
+            let mut os = output_path.as_os_str().to_owned();
+            os.push(".partial");
+            PathBuf::from(os)
+        };
+        let output_file = File::create(&partial_path)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to create output file: {}", e)))?;
         let mut writer = BufWriter::new(output_file);
 
@@ -1557,14 +1600,14 @@ impl StreamingPmtilesWriter {
         writer
             .flush()
             .map_err(|e| Error::PMTilesWrite(format!("Failed to flush output: {}", e)))?;
+        // Close the output handle before renaming so the bytes are fully on disk.
+        drop(writer);
 
-        // Clean up temp file
-        let _ = std::fs::remove_file(&self.temp_path);
+        // Atomically publish the assembled archive.
+        std::fs::rename(&partial_path, output_path)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to publish archive: {}", e)))?;
 
-        // Mark as finalized so Drop doesn't try to clean up again
-        self.finalized = true;
-
-        Ok(self.stats.clone())
+        Ok(())
     }
 
     /// Build directory entries with run-length encoding for consecutive identical tiles.
@@ -3051,5 +3094,107 @@ mod tests {
 
         let _ = fs::remove_file(&serial_path);
         let _ = fs::remove_file(&parallel_path);
+    }
+
+    #[test]
+    fn checkpoint_produces_valid_capped_pmtiles() {
+        // Issue #229: a mid-run checkpoint must produce a fully valid PMTiles
+        // archive capped at the zooms written so far, WITHOUT consuming the
+        // writer — the export loop keeps adding finer levels afterwards.
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        // Two coarse levels finished (z0: 1 tile, z1: 2 tiles).
+        writer.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
+        writer.add_tile(1, 0, 0, &[0x1a, 0x01]).unwrap();
+        writer.add_tile(1, 0, 1, &[0x1a, 0x02]).unwrap();
+
+        let ckpt_path = std::env::temp_dir().join("gpq-229-checkpoint.pmtiles");
+        let _ = fs::remove_file(&ckpt_path);
+        writer
+            .checkpoint(&ckpt_path)
+            .expect("checkpoint should succeed");
+
+        // Checkpoint is a valid, capped archive.
+        let ck = fs::read(&ckpt_path).unwrap();
+        assert_eq!(&ck[0..7], b"PMTiles", "checkpoint has PMTiles magic");
+        assert_eq!(ck[7], 3, "checkpoint is version 3");
+        assert_eq!(ck[100], 0, "checkpoint min_zoom == 0");
+        assert_eq!(
+            ck[101], 1,
+            "checkpoint max_zoom capped at last finished level"
+        );
+        let ck_addressed = u64::from_le_bytes(ck[72..80].try_into().unwrap());
+        assert_eq!(ck_addressed, 3, "checkpoint holds the 3 finished tiles");
+
+        // Writer is still usable: add a finer level and finalize.
+        writer.add_tile(2, 0, 0, &[0x1a, 0x03]).unwrap();
+        let final_path = std::env::temp_dir().join("gpq-229-checkpoint-final.pmtiles");
+        let _ = fs::remove_file(&final_path);
+        writer
+            .finalize(&final_path)
+            .expect("finalize after checkpoint");
+
+        let fin = fs::read(&final_path).unwrap();
+        assert_eq!(fin[101], 2, "final max_zoom includes the finer level");
+        let fin_addressed = u64::from_le_bytes(fin[72..80].try_into().unwrap());
+        assert_eq!(fin_addressed, 4, "final holds all 4 tiles");
+
+        let _ = fs::remove_file(&ckpt_path);
+        let _ = fs::remove_file(&final_path);
+    }
+
+    #[test]
+    fn checkpoint_then_finalize_byte_identical_to_no_checkpoint() {
+        // Issue #229: intermediate checkpoints must NOT change the final bytes.
+        // Both checkpoint and finalize route through the same archive assembler,
+        // so a run that checkpoints midway must be byte-identical to one that
+        // never checkpoints. The 4th tile dups the 1st to exercise dedup.
+        let tiles: Vec<(u8, u32, u32, Vec<u8>)> = vec![
+            (0, 0, 0, vec![0x1a, 0x05, b'h', b'e', b'l', b'l', b'o']),
+            (1, 0, 0, vec![0x1a, 0x03, b'a', b'b', b'c']),
+            (1, 0, 1, vec![0x1a, 0x03, b'x', b'y', b'z']),
+            (1, 1, 1, vec![0x1a, 0x05, b'h', b'e', b'l', b'l', b'o']), // dup of (0,0,0)
+        ];
+        let dir = std::env::temp_dir();
+
+        // Baseline: no checkpoint, single finalize.
+        let mut plain = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        plain.set_layer_name("test");
+        plain.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+        for (z, x, y, data) in &tiles {
+            plain.add_tile(*z, *x, *y, data).unwrap();
+        }
+        let plain_path = dir.join("gpq-229-plain.pmtiles");
+        let _ = fs::remove_file(&plain_path);
+        plain.finalize(&plain_path).unwrap();
+
+        // Checkpointed: assemble the archive after the first tile, keep going.
+        let mut ckpt = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        ckpt.set_layer_name("test");
+        ckpt.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+        let ckpt_path = dir.join("gpq-229-intermediate.pmtiles");
+        let final_path = dir.join("gpq-229-checkpointed-final.pmtiles");
+        let _ = fs::remove_file(&final_path);
+        for (i, (z, x, y, data)) in tiles.iter().enumerate() {
+            ckpt.add_tile(*z, *x, *y, data).unwrap();
+            if i == 0 {
+                let _ = fs::remove_file(&ckpt_path);
+                ckpt.checkpoint(&ckpt_path).unwrap();
+            }
+        }
+        ckpt.finalize(&final_path).unwrap();
+
+        let a = fs::read(&plain_path).unwrap();
+        let b = fs::read(&final_path).unwrap();
+        assert_eq!(
+            a, b,
+            "checkpointed run must be byte-identical to the non-checkpointed finalize"
+        );
+
+        let _ = fs::remove_file(&plain_path);
+        let _ = fs::remove_file(&ckpt_path);
+        let _ = fs::remove_file(&final_path);
     }
 }

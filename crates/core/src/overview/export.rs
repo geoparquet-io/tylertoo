@@ -66,7 +66,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -268,6 +268,19 @@ const PARTITION_WAVE: usize = 6;
 /// keeping per-batch memory modest).
 const EXPORT_BATCH_SIZE: usize = 8_192;
 
+/// Minimum wall-clock gap between incremental checkpoints (Issue #229). After a
+/// level finishes we snapshot a valid archive capped at that zoom, but only if
+/// this much time has elapsed since the last snapshot — so fast exports (which
+/// finish in one `finalize` well under this interval) pay nothing, while a
+/// multi-hour run keeps its finished zooms salvageable within a minute of each
+/// level completing.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Minimum wall-clock gap between within-level wave-progress log lines (Issue
+/// #229). A level stuck in its scan/clip loop stays diagnosable in minutes (the
+/// wave counter advances, or visibly does not) instead of hours of silence.
+const WAVE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Export an overview GeoParquet file to a PMTiles archive.
 ///
 /// See the module documentation for the full pipeline and the design
@@ -318,8 +331,8 @@ fn export_pmtiles_with_partition_target(
     // byte-identical to independent per-level scans.
     let t_scan = Instant::now();
     let scans = scan_all_levels(&reader, crs, &meta)?;
-    log::debug!(
-        "[profile] scan (all {num_levels} levels, single read): {:.2}s",
+    log::info!(
+        "[export] scan complete: {num_levels} levels, single read, {:.2}s",
         t_scan.elapsed().as_secs_f64()
     );
 
@@ -332,6 +345,18 @@ fn export_pmtiles_with_partition_target(
             }
         }
     }
+
+    // Set bounds up front so per-level checkpoints (#229) carry the correct
+    // archive bounds, not the writer's empty default. The value is identical to
+    // setting it just before `finalize`, so the final bytes are unchanged.
+    if let Some(b) = &overall_bounds {
+        writer.set_bounds(b);
+    }
+
+    // Throttle for incremental checkpoints (#229): a fast export finishes before
+    // the first interval elapses and never checkpoints, letting `finalize` do
+    // all the work.
+    let mut last_checkpoint = Instant::now();
 
     let mut zooms: Vec<ZoomReport> = Vec::with_capacity(num_levels);
 
@@ -360,7 +385,12 @@ fn export_pmtiles_with_partition_target(
         let mut tile_feature_count = 0usize;
         let mut oversized = 0usize;
         let mut write_secs = 0f64;
-        for wave in partitions.chunks(PARTITION_WAVE) {
+        let total_waves = partitions.len().div_ceil(PARTITION_WAVE);
+        // Within-level progress (#229): a long finest level is where runs get
+        // stuck, so emit a throttled wave counter. If it advances the level is
+        // slow; if it freezes the level is stuck — diagnosable in minutes.
+        let mut last_wave_log = Instant::now();
+        for (wave_idx, wave) in partitions.chunks(PARTITION_WAVE).enumerate() {
             let results: Vec<Vec<EncodedTile>> = process_wave(&ctx, wave)?;
             let t_write = Instant::now();
             for tiles in &results {
@@ -382,7 +412,29 @@ fn export_pmtiles_with_partition_target(
                 tile_count += tiles.len();
             }
             write_secs += t_write.elapsed().as_secs_f64();
+
+            if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
+                log::info!(
+                    "[export] level {}/{num_levels} z{zoom}: wave {}/{total_waves}, \
+                     {tile_count} tiles, {:.0}s",
+                    level_idx + 1,
+                    wave_idx + 1,
+                    start.elapsed().as_secs_f64(),
+                );
+                last_wave_log = Instant::now();
+            }
         }
+        // Per-level summary at info so operators see progress without RUST_LOG
+        // (env_logger defaults to info). Detailed clip/write split stays debug.
+        log::info!(
+            "[export] level {}/{num_levels} z{zoom} done: {} feats, {tile_count} tiles, \
+             {} partitions, {:.1}s (total {:.0}s)",
+            level_idx + 1,
+            scan.feature_count,
+            partitions.len(),
+            t_tiles.elapsed().as_secs_f64(),
+            start.elapsed().as_secs_f64(),
+        );
         log::debug!(
             "[profile] z{zoom} (level {level_idx}, {} feats, {tile_count} tiles, {} partitions): \
              clip+encode+gzip={:.2}s write={write_secs:.2}s",
@@ -399,16 +451,29 @@ fn export_pmtiles_with_partition_target(
             tile_feature_count,
             oversized_tiles: oversized,
         });
+
+        // Salvageable output (#229): snapshot a valid archive capped at this
+        // zoom so an interrupted run keeps its finished zooms. Throttled, and
+        // skipped on the last level since `finalize` immediately follows and
+        // produces the complete archive.
+        if level_idx + 1 < num_levels && last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
+            let t_ckpt = Instant::now();
+            writer.checkpoint(output_path.as_ref())?;
+            last_checkpoint = Instant::now();
+            log::info!(
+                "[export] checkpoint written: zooms {}..={zoom} salvageable ({:.2}s)",
+                zoom_for_level(&meta, 0),
+                t_ckpt.elapsed().as_secs_f64(),
+            );
+        }
     }
 
-    if let Some(b) = &overall_bounds {
-        writer.set_bounds(b);
-    }
     let t_finalize = Instant::now();
     writer.finalize(output_path.as_ref())?;
-    log::debug!(
-        "[profile] pmtiles finalize: {:.2}s",
-        t_finalize.elapsed().as_secs_f64()
+    log::info!(
+        "[export] finalize complete: {:.2}s (total {:.0}s)",
+        t_finalize.elapsed().as_secs_f64(),
+        start.elapsed().as_secs_f64(),
     );
 
     let total_tiles = zooms.iter().map(|z| z.tile_count).sum();
