@@ -90,7 +90,7 @@ use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, tiles_for_bbox, BboxTileRanges, TileBounds, TileCoord};
 
-use super::level::{zoom_for_gsd, Crs, OverviewsMeta};
+use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
 use super::reader::{OverviewReader, ReaderError};
 use super::writer::LEVEL_COLUMN;
 
@@ -309,26 +309,34 @@ fn export_pmtiles_with_partition_target(
         geometry_index(reader.schema()),
     ));
 
-    let mut zooms: Vec<ZoomReport> = Vec::with_capacity(num_levels);
+    // Pass 1 (scan), **all levels in one streaming read of the file** (issue
+    // #233). Scanning each level independently re-reads and re-decodes every
+    // coarse row group from every finer level's accumulating prefix (§5.1) —
+    // `Σ_k |prefix_k|` decodes. Instead read each band once and fan its
+    // features to the tile-size accumulators of every level whose prefix
+    // includes it. O(#tiles) memory per level; the per-level `LevelScan`s are
+    // byte-identical to independent per-level scans.
+    let t_scan = Instant::now();
+    let scans = scan_all_levels(&reader, crs, &meta)?;
+    log::debug!(
+        "[profile] scan (all {num_levels} levels, single read): {:.2}s",
+        t_scan.elapsed().as_secs_f64()
+    );
+
     let mut overall_bounds: Option<TileBounds> = None;
-
-    for level_idx in 0..num_levels {
-        let zoom = zoom_for_level(&meta, level_idx);
-
-        // Pass 1 (scan): stream the level band once, decoding geometries only,
-        // to size every tile (member counts), expand the overall geographic
-        // bounds, and count the band's rows. O(#tiles) memory. The reader
-        // already applies duplicating (single band) vs partitioning (prefix)
-        // semantics.
-        let t_scan = Instant::now();
-        let scan = scan_level(&reader, level_idx, crs, zoom)?;
-        let scan_secs = t_scan.elapsed().as_secs_f64();
+    for scan in &scans {
         if let Some(b) = &scan.bounds {
             match &mut overall_bounds {
                 Some(acc) => acc.expand(b),
                 None => overall_bounds = Some(*b),
             }
         }
+    }
+
+    let mut zooms: Vec<ZoomReport> = Vec::with_capacity(num_levels);
+
+    for (level_idx, scan) in scans.iter().enumerate() {
+        let zoom = zoom_for_level(&meta, level_idx);
 
         // Split the zoom's tiles into contiguous ascending (x, y) ranges of
         // roughly `partition_target` members each.
@@ -377,7 +385,7 @@ fn export_pmtiles_with_partition_target(
         }
         log::debug!(
             "[profile] z{zoom} (level {level_idx}, {} feats, {tile_count} tiles, {} partitions): \
-             scan={scan_secs:.2}s clip+encode+gzip={:.2}s write={write_secs:.2}s",
+             clip+encode+gzip={:.2}s write={write_secs:.2}s",
             scan.feature_count,
             partitions.len(),
             t_tiles.elapsed().as_secs_f64() - write_secs,
@@ -444,7 +452,8 @@ struct Member {
     props: Arc<Vec<(String, PropertyValue)>>,
 }
 
-/// Result of the per-level scan pass.
+/// One level's result from the scan pass ([`scan_all_levels`]).
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct LevelScan {
     /// Rows in the level band.
     feature_count: usize,
@@ -476,6 +485,166 @@ struct LevelCtx<'a> {
     opts: &'a ExportOptions,
 }
 
+/// Scan **every** level in a single streaming read of the file (issue #233).
+///
+/// Scanning level `k` independently reads its *render set* — in partitioning
+/// mode the accumulating prefix `0..=end_k` (spec §5.1) — so a row group
+/// belonging to level `j` is re-read and re-decoded by every finer level
+/// `k >= j` whose prefix includes it: `Σ_k |prefix_k|` row-group decodes.
+///
+/// This reads each level's **own band once** (`Σ_j |band_j|` = every row group
+/// exactly once via [`OverviewReader::read_band_with_batch_size`]) and *fans*
+/// every decoded feature to the accumulators of every level whose render set
+/// includes its band — level `j`'s features contribute to levels `{j}`
+/// (duplicating, self-contained bands) or `{j..N}` (partitioning prefix).
+///
+/// The returned `LevelScan`s are **byte-identical** to `N` independent per-level
+/// scans: a level's bounds union is component-wise `min`/`max` and its per-tile
+/// counts are integer sums, both order- **and** grouping-independent — so
+/// splitting the prefix into per-band reads and merging in band order yields the
+/// same bounds rectangle and the same `tile_counts` map (and hence the same
+/// partition plan and the same archive). Peak memory is one batch's bboxes plus
+/// the `N` per-level `O(#tiles)` count maps.
+fn scan_all_levels(
+    reader: &OverviewReader,
+    crs: Crs,
+    meta: &OverviewsMeta,
+) -> Result<Vec<LevelScan>, ExportError> {
+    let num_levels = reader.num_levels();
+    let partitioning = matches!(reader.mode(), Mode::Partitioning);
+    let zooms: Vec<u8> = (0..num_levels).map(|k| zoom_for_level(meta, k)).collect();
+    let mut scans: Vec<LevelScan> = (0..num_levels)
+        .map(|_| LevelScan {
+            feature_count: 0,
+            bounds: None,
+            tile_counts: BTreeMap::new(),
+        })
+        .collect();
+
+    for j in 0..num_levels {
+        // Bands accumulate into finer levels' render sets only in partitioning
+        // mode; duplicating bands are self-contained, so band `j` feeds level
+        // `j` alone.
+        let last = if partitioning { num_levels - 1 } else { j };
+        let band_reader = reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE)?;
+        for batch in band_reader {
+            // Decode + (for 3857) reproject each feature's bbox once per band;
+            // sizing the same bbox into every target level below is bit-identical
+            // to reprojecting it once per level, since reprojection is a pure fn.
+            let bboxes = decode_batch_bboxes(&batch?, crs)?;
+            for k in j..=last {
+                let scan = &mut scans[k];
+                scan.feature_count += bboxes.len();
+                let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zooms[k]);
+                if let Some(b) = batch_bounds {
+                    match &mut scan.bounds {
+                        Some(acc) => acc.expand(&b),
+                        None => scan.bounds = Some(b),
+                    }
+                }
+                for (key, v) in batch_counts {
+                    *scan.tile_counts.entry(key).or_insert(0) += v;
+                }
+            }
+        }
+    }
+    Ok(scans)
+}
+
+/// Decode one record batch's geometries into per-feature bounding boxes,
+/// already reprojected to lon/lat (EPSG:4326) when the file is EPSG:3857 —
+/// element `i` is `None` when feature `i` has no bounding rectangle
+/// (empty/degenerate). Reprojecting the two bbox corners is monotone per axis,
+/// hence bit-identical to the bbox of the reprojected geometry.
+fn decode_batch_bboxes(
+    batch: &RecordBatch,
+    crs: Crs,
+) -> Result<Vec<Option<TileBounds>>, ExportError> {
+    let schema = batch.schema();
+    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
+    let geom_field = schema.field(geom_idx).clone();
+    let garr: Arc<dyn GeoArrowArray> =
+        from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
+            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
+    extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
+    let bboxes = geoms
+        .par_iter()
+        .map(|geom| {
+            geom.bounding_rect().map(|rect| {
+                let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+                if matches!(crs, Crs::Epsg3857) {
+                    let (lng_min, lat_min) = webmerc_to_lnglat(bbox.lng_min, bbox.lat_min);
+                    let (lng_max, lat_max) = webmerc_to_lnglat(bbox.lng_max, bbox.lat_max);
+                    TileBounds::new(lng_min, lat_min, lng_max, lat_max)
+                } else {
+                    bbox
+                }
+            })
+        })
+        .collect();
+    Ok(bboxes)
+}
+
+/// Size a batch of (already-reprojected) feature bboxes at `zoom`: union their
+/// bounds and count one member per tile each spans. Sizing is embarrassingly
+/// parallel per feature (issue #227): fold into per-thread `(bounds, counts)`
+/// accumulators, then reduce. Both reductions (bbox union, per-tile count sum)
+/// are commutative and associative, so the merged result is identical
+/// regardless of thread scheduling or how features were grouped into batches.
+fn size_bboxes(
+    bboxes: &[Option<TileBounds>],
+    zoom: u8,
+) -> (Option<TileBounds>, HashMap<u64, usize>) {
+    bboxes
+        .par_iter()
+        .fold(
+            || (None::<TileBounds>, HashMap::<u64, usize>::new()),
+            |(mut bounds, mut counts), bbox| {
+                if let Some(bbox) = bbox {
+                    match &mut bounds {
+                        Some(acc) => acc.expand(bbox),
+                        None => bounds = Some(*bbox),
+                    }
+                    for tc in tiles_for_bbox(bbox, zoom) {
+                        *counts.entry(tile_key(tc.x, tc.y)).or_insert(0) += 1;
+                    }
+                }
+                (bounds, counts)
+            },
+        )
+        .reduce(
+            || (None::<TileBounds>, HashMap::<u64, usize>::new()),
+            |(b_a, c_a), (b_b, c_b)| {
+                let bounds = match (b_a, b_b) {
+                    (Some(mut a), Some(b)) => {
+                        a.expand(&b);
+                        Some(a)
+                    }
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                // Merge the smaller map into the larger to minimize rehashing.
+                let (mut dst, src) = if c_a.len() >= c_b.len() {
+                    (c_a, c_b)
+                } else {
+                    (c_b, c_a)
+                };
+                for (k, v) in src {
+                    *dst.entry(k).or_insert(0) += v;
+                }
+                (bounds, dst)
+            },
+        )
+}
+
+/// Per-level scan oracle: reads level `level_idx`'s full render set (the
+/// mode-dependent prefix, via [`OverviewReader::read_level_with_batch_size`])
+/// and sizes it at `zoom`. This is the pre-#233 independent-per-level read path,
+/// retained as the byte-identity oracle for [`scan_all_levels`] — a genuinely
+/// different read (one prefix vs a fan of per-band reads) that must yield the
+/// same `LevelScan`.
+#[cfg(test)]
 fn scan_level(
     reader: &OverviewReader,
     level_idx: usize,
@@ -489,76 +658,9 @@ fn scan_level(
         tile_counts: BTreeMap::new(),
     };
     for batch in batch_reader {
-        let batch = batch?;
-        let schema = batch.schema();
-        let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
-        let geom_field = schema.field(geom_idx).clone();
-        let garr: Arc<dyn GeoArrowArray> =
-            from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-                .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-        let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-        extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
-        scan.feature_count += geoms.len();
-
-        // Sizing every feature's tile footprint is embarrassingly parallel per
-        // feature (issue #227): each feature independently contributes its bbox
-        // to the bounds union and one member to each tile it spans. Fold into
-        // per-thread (bounds, counts) accumulators, then reduce. Both reductions
-        // (bbox union, per-tile count sum) are commutative and associative, so
-        // the merged result — and thus the exported archive — is identical to
-        // the old serial scan regardless of thread scheduling.
-        let (batch_bounds, batch_counts) = geoms
-            .par_iter()
-            .fold(
-                || (None::<TileBounds>, HashMap::<u64, usize>::new()),
-                |(mut bounds, mut counts), geom| {
-                    if let Some(rect) = geom.bounding_rect() {
-                        let mut bbox =
-                            TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                        if matches!(crs, Crs::Epsg3857) {
-                            // Web Mercator -> lon/lat is monotone per axis, so
-                            // reprojecting the two corners reprojects the bbox —
-                            // bit-identical to taking the bbox of the reprojected
-                            // geometry.
-                            let (lng_min, lat_min) = webmerc_to_lnglat(bbox.lng_min, bbox.lat_min);
-                            let (lng_max, lat_max) = webmerc_to_lnglat(bbox.lng_max, bbox.lat_max);
-                            bbox = TileBounds::new(lng_min, lat_min, lng_max, lat_max);
-                        }
-                        match &mut bounds {
-                            Some(acc) => acc.expand(&bbox),
-                            None => bounds = Some(bbox),
-                        }
-                        for tc in tiles_for_bbox(&bbox, zoom) {
-                            *counts.entry(tile_key(tc.x, tc.y)).or_insert(0) += 1;
-                        }
-                    }
-                    (bounds, counts)
-                },
-            )
-            .reduce(
-                || (None::<TileBounds>, HashMap::<u64, usize>::new()),
-                |(b_a, c_a), (b_b, c_b)| {
-                    let bounds = match (b_a, b_b) {
-                        (Some(mut a), Some(b)) => {
-                            a.expand(&b);
-                            Some(a)
-                        }
-                        (Some(a), None) | (None, Some(a)) => Some(a),
-                        (None, None) => None,
-                    };
-                    // Merge the smaller map into the larger to minimize rehashing.
-                    let (mut dst, src) = if c_a.len() >= c_b.len() {
-                        (c_a, c_b)
-                    } else {
-                        (c_b, c_a)
-                    };
-                    for (k, v) in src {
-                        *dst.entry(k).or_insert(0) += v;
-                    }
-                    (bounds, dst)
-                },
-            );
-
+        let bboxes = decode_batch_bboxes(&batch?, crs)?;
+        scan.feature_count += bboxes.len();
+        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom);
         if let Some(b) = batch_bounds {
             match &mut scan.bounds {
                 Some(acc) => acc.expand(&b),
@@ -1921,6 +2023,128 @@ mod tests {
         // Level 0 band = {feature 0}. Level 1 = prefix {0,1}.
         assert_eq!(l0.len(), 1);
         assert_eq!(l1.len(), 2);
+    }
+
+    /// Write an `N`-level **partitioning** fixture: `level_geoms[k]` is level
+    /// `k`'s own band (the features added at that level). Small row groups
+    /// (`max_row_group_size = 2`) force each band to span several row groups, so
+    /// a per-band read (`start..=end`) genuinely differs from a prefix read
+    /// (`0..=end`). Levels use `z = 2 + 2k`.
+    fn write_partitioning_fixture(
+        path: &Path,
+        level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)],
+    ) -> OverviewsMeta {
+        let schema = Arc::new(source_schema());
+        let specs: Vec<LevelSpec> = (0..level_geoms.len())
+            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
+            .collect();
+        let mut opts = OverviewWriterOptions::new(Mode::Partitioning, specs);
+        opts.max_row_group_size = 2;
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        for (k, (ids, geoms)) in level_geoms.iter().enumerate() {
+            assert_eq!(
+                writer
+                    .write_level(
+                        k,
+                        Some(ids.len()),
+                        std::iter::once(batch(&schema, ids, geoms))
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap()
+    }
+
+    /// #233: the single-read fan-out scan ([`scan_all_levels`]) must produce, for
+    /// every level, a `LevelScan` byte-identical to the independent per-level
+    /// prefix scan ([`scan_level`]) it replaces. In partitioning mode this is the
+    /// load-bearing case: level `k`'s render set is the accumulating prefix
+    /// `0..=k`, so a coarse band fans into every finer level. Equal `feature_count`,
+    /// `bounds`, and `tile_counts` ⇒ identical partition plans ⇒ identical archive.
+    #[test]
+    fn fanout_scan_matches_per_level_prefix_scan_partitioning() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Three bands with distinct, partly-overlapping footprints so counts
+        // accumulate across levels and every level has non-empty bounds.
+        let poly = |x: f64, y: f64| {
+            Geometry::Polygon(geo::Polygon::new(
+                LineString::from(vec![
+                    (x, y),
+                    (x + 8.0, y),
+                    (x + 8.0, y + 6.0),
+                    (x, y + 6.0),
+                    (x, y),
+                ]),
+                vec![],
+            ))
+        };
+        let line = Geometry::LineString(LineString::from(vec![
+            (-70.0, -10.0),
+            (-40.0, 5.0),
+            (-10.0, -5.0),
+            (20.0, 8.0),
+        ]));
+        let meta = write_partitioning_fixture(
+            tmp.path(),
+            &[
+                // Level 0 (coarsest, z2): a few spread points + one polygon.
+                (
+                    vec![0, 1, 2],
+                    vec![
+                        Geometry::Point(Point::new(-120.0, 40.0)),
+                        Geometry::Point(Point::new(100.0, -30.0)),
+                        poly(-100.0, 20.0),
+                    ],
+                ),
+                // Level 1 (z4): a line crossing several tiles + points.
+                (
+                    vec![3, 4, 5, 6],
+                    vec![
+                        line,
+                        Geometry::Point(Point::new(0.0, 0.0)),
+                        Geometry::Point(Point::new(-119.5, 39.5)),
+                        poly(10.0, -40.0),
+                    ],
+                ),
+                // Level 2 (finest, z6): denser cluster of points + a polygon.
+                (
+                    vec![7, 8, 9, 10, 11],
+                    vec![
+                        Geometry::Point(Point::new(-118.0, 34.0)),
+                        Geometry::Point(Point::new(-117.5, 33.8)),
+                        Geometry::Point(Point::new(-117.0, 34.2)),
+                        Geometry::Point(Point::new(2.0, 48.0)),
+                        poly(30.0, 30.0),
+                    ],
+                ),
+            ],
+        );
+
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert!(matches!(reader.mode(), Mode::Partitioning));
+        let num_levels = reader.num_levels();
+        assert_eq!(num_levels, 3);
+
+        let scans = scan_all_levels(&reader, Crs::Epsg4326, &meta).unwrap();
+        assert_eq!(scans.len(), num_levels);
+
+        // Feature counts must equal the accumulating prefix sizes (3, 3+4, 3+4+5).
+        assert_eq!(scans[0].feature_count, 3);
+        assert_eq!(scans[1].feature_count, 7);
+        assert_eq!(scans[2].feature_count, 12);
+
+        for (level_idx, scan) in scans.iter().enumerate() {
+            let zoom = zoom_for_level(&meta, level_idx);
+            let oracle = scan_level(&reader, level_idx, Crs::Epsg4326, zoom).unwrap();
+            assert_eq!(
+                *scan, oracle,
+                "fan-out scan differs from per-level prefix scan at level {level_idx}"
+            );
+            // Guard against a vacuous pass: the level must actually size tiles.
+            assert!(!scan.tile_counts.is_empty());
+            assert!(scan.bounds.is_some());
+        }
     }
 
     #[test]
