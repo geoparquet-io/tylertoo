@@ -575,9 +575,17 @@ fn clip_multipolygon(
             continue;
         }
 
-        // Polygon intersects but isn't fully inside -- needs clipping with SH
-        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds, assume_simple) {
-            clipped_polys.push(clipped);
+        // Polygon intersects but isn't fully inside -- needs clipping. The
+        // clip may split one part into several disjoint pieces (a tile edge
+        // crossing a wiggly boundary more than once, or the i_overlay
+        // fallback resolving an S-H bridge into its true parts) — keep every
+        // piece. Discarding the MultiPolygon case here silently deleted
+        // boundary-straddling parts from individual tiles (#244).
+        match clip_polygon(poly, bounds, assume_simple) {
+            Some(Geometry::Polygon(clipped)) => clipped_polys.push(clipped),
+            Some(Geometry::MultiPolygon(pieces)) => clipped_polys.extend(pieces.0),
+            Some(other) => debug_assert!(false, "polygon clip returned {other:?}"),
+            None => {}
         }
     }
 
@@ -717,6 +725,102 @@ pub fn polygon_to_world_rings(poly: &Polygon<f64>) -> (Vec<WorldCoord>, Vec<Vec<
 mod tests {
     use super::*;
     use geo::point;
+
+    // ========== MultiPolygon part-splitting clips (issue #244) ==========
+
+    /// A one-part MultiPolygon whose part is a U: two vertical prongs
+    /// (x ∈ [0,1] and x ∈ [3,4], rising to y=5) joined by a base (y ∈ [0,1]).
+    fn u_multipolygon() -> MultiPolygon<f64> {
+        MultiPolygon::new(vec![Polygon::new(
+            LineString::from(vec![
+                (0.0, 0.0),
+                (4.0, 0.0),
+                (4.0, 5.0),
+                (3.0, 5.0),
+                (3.0, 1.0),
+                (1.0, 1.0),
+                (1.0, 5.0),
+                (0.0, 5.0),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        )])
+    }
+
+    #[test]
+    fn multipolygon_part_splitting_into_pieces_is_kept() {
+        // Clip window covering only the prong tips: the single U part clips
+        // into TWO disjoint pieces. `clip_polygon` correctly reports that as a
+        // MultiPolygon; the part collector must keep both pieces instead of
+        // silently dropping the result (#244 — the field failure dropped
+        // boundary-straddling admin polygons from individual tiles, cutting
+        // them off along razor-straight tile-boundary lines).
+        let mp = u_multipolygon();
+        let window = TileBounds::new(-0.5, 3.0, 4.5, 6.0);
+        let clipped = clip_multipolygon(&mp, &window, false)
+            .expect("clip must not drop a genuinely-overlapping feature");
+        assert_eq!(clipped.0.len(), 2, "both prong pieces must survive");
+        // Same through the public geometry entry point, simple-path flavor.
+        let via_public = clip_geometry_simple(&Geometry::MultiPolygon(mp), &window, 0.0, true)
+            .expect("public entry point must keep the feature");
+        match via_public {
+            Geometry::MultiPolygon(m) => assert_eq!(m.0.len(), 2),
+            other => panic!("expected MultiPolygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tielt_winge_boundary_sliver_regression() {
+        // Real-data regression for #244: Tielt-Winge (fieldmaps Belgium adm4,
+        // 401 verts, valid, simple) overlaps six z12 tiles; its eastern sliver
+        // in tile 12/2104/1372 clips into two disjoint pieces and was silently
+        // dropped, cutting the municipality off along lon 4.921875. Verifies
+        // both the direct leaf clip and the export cascade's ancestor chain.
+        use geo::Contains;
+        use geozero::ToGeo;
+        let path = std::path::Path::new("../../tests/fixtures/realdata/tielt-winge-adm4.wkb");
+        if !path.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+        let geom: Geometry<f64> = geozero::wkb::Wkb(std::fs::read(path).unwrap())
+            .to_geo()
+            .unwrap();
+        let simple = geometry_is_simple(&geom);
+        let buf = |b: &TileBounds| b.width() * 8.0 / 4096.0;
+
+        // The user-reported hole: this point is inside the municipality and
+        // inside tile 12/2104/1372.
+        let hole = point!(x: 4.9265, y: 50.9468);
+        let contains_hole = |g: &Geometry<f64>| match g {
+            Geometry::MultiPolygon(m) => m.contains(&hole),
+            Geometry::Polygon(p) => p.contains(&hole),
+            other => panic!("unexpected clip output {other:?}"),
+        };
+        let leaf = crate::tile::tile_bounds(2104, 1372, 12);
+
+        let direct = clip_geometry_simple(&geom, &leaf, buf(&leaf), simple)
+            .expect("direct leaf clip must keep the eastern sliver");
+        assert!(
+            contains_hole(&direct),
+            "clipped sliver must cover the reported hole point"
+        );
+
+        // Export cascade replay: ancestors of (2104,1372) below the z8
+        // covering tile. Every ancestor clip must retain the sliver region.
+        let mut cur = geom;
+        for (x, y, z) in [(263u32, 171u32, 9u8), (526, 343, 10), (1052, 686, 11)] {
+            let nb = crate::tile::tile_bounds(x, y, z);
+            cur = clip_geometry_simple(&cur, &nb, buf(&nb), simple)
+                .unwrap_or_else(|| panic!("cascade lost the feature at z{z} ({x},{y})"));
+        }
+        let casc = clip_geometry_simple(&cur, &leaf, buf(&leaf), simple)
+            .expect("cascade leaf clip must keep the eastern sliver");
+        assert!(
+            contains_hole(&casc),
+            "cascade-clipped sliver must cover the reported hole point"
+        );
+    }
 
     // ========== Simplicity fast-path (issue #237, RC3) ==========
 
