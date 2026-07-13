@@ -215,6 +215,16 @@ level's tolerance instead of 1×). Files record `generalization.cascade: true`
 in the footer provenance. Pass `--no-cascade` to reproduce the pre-cascade
 output byte-for-byte.
 
+Validity-check vertex cap (#242): a simplification candidate with more than
+2,048 total vertices skips the exact validity check and is assumed valid —
+the check is O(V²) in ring size, and on continental-scale rings at fine GSDs
+it stalled conversion for tens of minutes per feature. Oversized candidates
+arise exactly when RDP removed few vertices from already-valid input, the
+least likely case to have acquired a self-intersection; geometry validity is
+not an overviews conformance requirement (OVERVIEWS_SPEC §2). Candidates at
+or below the cap are validated (and repaired) exactly as before. A skipped
+check is counted and summarized at the end of conversion at info level.
+
 ---
 
 ## Ranking: which feature wins a cell

@@ -81,8 +81,8 @@ use super::convert::{
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipeline;
 use super::simplify::{
-    full_resolution_fallback_count, simplify_cascade, simplify_for_level, Simplified,
-    SimplifyOptions,
+    full_resolution_fallback_count, simplify_cascade, simplify_for_level, validation_skip_count,
+    Simplified, SimplifyOptions,
 };
 use super::writer::{
     LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, LEVEL_COLUMN,
@@ -119,6 +119,20 @@ pub(crate) enum Pass2Strategy {
 /// Streaming counterpart of [`super::convert::convert_to_overviews`], with an
 /// explicit pass-2 [`Pass2Strategy`] (production uses `Pipelined`; tests pin
 /// `Serial` to assert the pipelined engine is equivalent).
+/// Info-level summary of RDP candidates whose validity check was skipped by
+/// the vertex cap during this conversion (#242). `skips_before` is the
+/// process-wide counter snapshot taken before pass 2.
+fn log_validation_skips(skips_before: u64) {
+    let skips = validation_skip_count() - skips_before;
+    if skips > 0 {
+        log::info!(
+            "[convert] {skips} oversized RDP candidate(s) skipped exact \
+             validity checking and were assumed valid (#242; geometry \
+             validity is not an overviews conformance requirement)"
+        );
+    }
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &InputSource,
     output_path: &Path,
@@ -211,6 +225,10 @@ pub(crate) fn convert_streaming_strategy(
         .count();
     super::convert::warn_antimeridian_suspects(antimeridian_suspect_features);
 
+    // Stage markers (#242): everything between pass 1 and the writer used to
+    // run in total info-level silence — on planet-scale inputs that was tens
+    // of minutes with no output.
+    log::info!("[convert] scan complete: {num_features} feature(s) from {num_rows} row(s)");
     log::debug!(
         "[profile] pass1 stream+scan: {:.2}s",
         t_pass1.elapsed().as_secs_f64()
@@ -236,6 +254,11 @@ pub(crate) fn convert_streaming_strategy(
     };
     log::debug!(
         "[profile] assignment+budget: {:.2}s",
+        t_assign.elapsed().as_secs_f64()
+    );
+    log::info!(
+        "[convert] level assignment complete: {} level(s) in {:.1}s",
+        level_gsds.len(),
         t_assign.elapsed().as_secs_f64()
     );
 
@@ -423,6 +446,10 @@ pub(crate) fn convert_streaming_strategy(
     // row, so this is byte-identical to the former per-level build.
     let coalesce_tables: Vec<Option<CoalesceTable>> = match &coalesce_scratch {
         Some(scratch) => {
+            log::info!(
+                "[convert] building coalesce chain tables for {} level(s)",
+                emitted.len()
+            );
             let inputs = scratch.inputs();
             emitted
                 .par_iter()
@@ -505,6 +532,10 @@ pub(crate) fn convert_streaming_strategy(
     let n = emitted.len();
     let hints: Vec<usize> = emitted.iter().map(|e| e.hint).collect();
 
+    // Snapshot for the end-of-pass-2 summary: the counter is process-wide,
+    // so report the delta from this conversion only (#242).
+    let validation_skips_before = validation_skip_count();
+
     // `(outcome, rows, vertices)` per emitted level, in level order. The
     // outcome distinguishes a written level from one the writer skipped because
     // every candidate collapsed during simplification (#211).
@@ -530,6 +561,10 @@ pub(crate) fn convert_streaming_strategy(
         Pass2Strategy::Pipelined => {
             let buffered_rows: usize = hints[..n - 1].iter().sum();
             let backing = pipeline::resolve_backing(options.profile, options.mode, buffered_rows);
+            log::info!(
+                "[convert] pass 2: building {n} overview level(s) from a \
+                 single read (finest level streamed last)"
+            );
             let mut stats = if n > 1 {
                 pipeline::run_pass2_buffered(
                     &mut writer,
@@ -557,6 +592,7 @@ pub(crate) fn convert_streaming_strategy(
             stats
         }
     };
+    log_validation_skips(validation_skips_before);
 
     // Fold each emitted level's write outcome into the shared bookkeeping
     // (#211): `record_level_outcome` appends a renumbered `LevelReport` for a
@@ -1210,7 +1246,19 @@ fn write_level_streaming(
     let fallbacks_before = full_resolution_fallback_count();
     let t_level = Instant::now();
 
+    // Heartbeat (#242): the finest level re-streams the whole input; keep
+    // the operator informed on planet-scale files (quiet on small ones).
+    let mut last_progress = Instant::now();
     let batches = std::iter::from_fn(|| loop {
+        if last_progress.elapsed().as_secs() >= 10 {
+            last_progress = Instant::now();
+            log::info!(
+                "[convert] level {level_idx}: {} input row(s) scanned, {} \
+                 row(s) written",
+                row_offset,
+                rows.get(),
+            );
+        }
         let t_read = Instant::now();
         let batch = match reader.next() {
             None => return None,

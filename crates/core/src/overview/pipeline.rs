@@ -245,6 +245,10 @@ pub(super) fn run_pass2_buffered(
     // geometry. Otherwise (cascade off, or partitioning where every feature
     // lands on exactly one level) fan out per level as before.
     let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
+    // Heartbeat (#242): a planet-scale pass 2 runs for minutes-to-hours;
+    // without this the phase is silent at info level. Time-based so small
+    // inputs stay quiet.
+    let mut last_progress = Instant::now();
     let consume: Result<(), ConvertError> = (|| {
         for msg in rx.iter() {
             Pass2Timers::add_dur(timers.read_cell(), msg.read_dur);
@@ -270,6 +274,15 @@ pub(super) fn run_pass2_buffered(
                     verts[li] += v;
                     sinks[li].push(out)?;
                 }
+            }
+            if last_progress.elapsed().as_secs() >= 10 {
+                last_progress = Instant::now();
+                log::info!(
+                    "[convert] pass 2: {} input row(s) processed ({} output \
+                     row(s) buffered across {num_levels} level(s))",
+                    row_offset + batch.num_rows(),
+                    rows.iter().sum::<usize>(),
+                );
             }
         }
         Ok(())
