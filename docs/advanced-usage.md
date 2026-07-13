@@ -149,9 +149,10 @@ recommended session settings, and the level+bbox viewport query — see
   (explicit `levels[].zoom` in the footer, else derived from its GSD);
   the PMTiles header min/max zoom come from that range and renderers
   overzoom beyond it.
-- **Tile size:** `--tile-size-limit BYTES` is a single, non-iterative
-  drop pass per oversized tile — the overview density budget is the
-  real sizing mechanism; the limit is a backstop.
+- **Tile size:** `--tile-size-limit SIZE` (accepts `500K`, `1M`, or raw
+  bytes; `--max-tile-size` on `tiles` is the same knob) is a single,
+  non-iterative drop pass per oversized tile — the overview density
+  budget is the real sizing mechanism; the limit is a backstop.
 - **Border duplication:** a feature spanning a tile seam appears in
   every tile it touches, so per-zoom exported feature totals slightly
   exceed the level counts (~0–7%).

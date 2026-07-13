@@ -61,7 +61,7 @@ Commands:
 |------|---------|-------------|
 | `--layer-name <NAME>` | `overview` | MVT layer name written into every tile |
 | `--tile-buffer <PX>` | `8` | Per-tile edge buffer in tile pixels (seam continuity) |
-| `--tile-size-limit <BYTES>` | — | Optional per-tile MVT cap (single non-iterative drop pass) |
+| `--tile-size-limit <SIZE>` | — | Optional per-tile MVT cap, e.g. `500K`, `1M`, or raw bytes (single non-iterative drop pass). Aliased `--max-tile-size` |
 | `--report <PATH>` | — | Write the JSON export report |
 
 Tiles are gzip-compressed (the PMTiles-viewer-safe default; there is no
@@ -75,18 +75,26 @@ Exit code 0 on pass.
 
 ### `gpq-tiles tiles <INPUT> <OUTPUT>` (and the bare form)
 
-One-shot facade: overview convert (default knobs) → temporary GeoParquet →
-export-pmtiles.
+One-shot facade: overview convert → temporary GeoParquet → export-pmtiles.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--min-zoom <N>` / `--max-zoom <N>` | `0` / `14` | Zoom range (feeds the overview level plan) |
 | `--bbox <XMIN,YMIN,XMAX,YMAX>` | — | Regional extract (lon/lat degrees); see `overview --bbox` |
 | `--layer-name <NAME>` | derived from input filename | MVT layer name |
-| `--max-tile-size <SIZE>` | — | Per-tile byte cap (e.g. `500K`, `1M`) |
+| `--tile-buffer <PX>` | `8` | Per-tile edge buffer in tile pixels (seam continuity) |
+| `--max-tile-size <SIZE>` | — | Per-tile byte cap, e.g. `500K`, `1M`, or raw bytes. Aliased `--tile-size-limit` |
 | `-v, --verbose` | off | Per-level / per-zoom breakdowns |
 
-For any other tuning, use `overview` + `export-pmtiles` directly.
+Every convert-tuning knob from the `overview` table above — ranking,
+generalization, thinning/visibility, the density budget, clustering,
+line coalescing, and the memory/performance flags (`--profile`,
+`--read-batch-size`, `--in-flight-batches`, `--no-streaming`) — is also
+accepted here and threads through to the overview stage unchanged, so a
+one-shot `tiles` run is equivalent to the two-step chain with the same
+flags. `gpq-tiles tiles --help` groups them under headings. Overview
+**format** options that have no PMTiles meaning (`--mode`, `--gsd`,
+`--cogp-compat`, `--report`) stay on `overview`.
 
 ### `gpq-tiles decode <INPUT> <OUTPUT>`
 

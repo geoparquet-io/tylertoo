@@ -118,10 +118,21 @@ gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 # equivalently: gpq-tiles tiles input.parquet output.pmtiles ...
 ```
 
-This runs overview convert (default knobs) into a temporary file, then
-export. Flags: `--min-zoom`, `--max-zoom`, `--bbox`, `--layer-name`,
-`--max-tile-size`, `--verbose`. For any tuning beyond that, use the
-two-step workflow.
+This runs overview convert into a temporary file, then export. Beyond the
+essentials (`--min-zoom`, `--max-zoom`, `--layer-name`, `--tile-buffer`,
+`--max-tile-size`, `--verbose`), the one-shot command also accepts every
+convert-tuning knob from `overview` — quality and memory alike:
+
+```bash
+# Denser coarse zooms, memory-bounded, in one shot
+gpq-tiles input.parquet output.pmtiles --max-zoom 14 \
+  --polygon-visibility 2.0 --collapse --drop-rate 1.3 \
+  --profile bounded
+```
+
+A `tiles` run is equivalent to the two-step `overview` + `export-pmtiles`
+chain with the same flags. See `gpq-tiles tiles --help` (flags are grouped
+by heading) and the [API reference](api-reference.md) for the full set.
 
 ## Python
 
