@@ -3,7 +3,7 @@
 //! This is a thin wrapper around the gpq-tiles-core library.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::path::PathBuf;
 
@@ -36,10 +36,14 @@ fn parse_memory_size(s: &str) -> Result<usize, String> {
         })
 }
 
-/// Parse human-readable size (e.g., "500K", "1M", "2G") to bytes as u32.
-fn parse_size_bytes(s: &str) -> Result<u32, String> {
-    let bytes = parse_memory_size(s)?;
-    u32::try_from(bytes).map_err(|_| format!("Size {} too large for u32", s))
+/// Parse a human-readable byte size (e.g., "500K", "1M", "2G") as usize.
+///
+/// A plain integer with no suffix is interpreted as raw bytes, so callers that
+/// previously passed a byte count (e.g. `--tile-size-limit 500000`) keep working.
+fn parse_size_bytes(s: &str) -> Result<usize, String> {
+    parse_memory_size(s).map_err(|_| {
+        format!("Invalid size: '{s}'. Use a byte count or a suffixed size like '500K', '1M', '2G'")
+    })
 }
 
 /// Parse a --bbox argument: xmin,ymin,xmax,ymax (lon/lat degrees).
@@ -82,7 +86,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Generate PMTiles vector tiles (the default pipeline).
-    Tiles(TilesArgs),
+    Tiles(Box<TilesArgs>),
     /// Build a multi-resolution overview GeoParquet file.
     Overview(Box<OverviewArgs>),
     /// Validate a GeoParquet overview file against the spec (§6.2).
@@ -164,10 +168,11 @@ struct ExportPmtilesArgs {
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
 
-    /// Optional per-tile MVT size limit in BYTES. When a tile exceeds it, a
-    /// single non-iterative drop pass sheds the lowest-priority (smallest)
-    /// features for that tile only. Omit to enforce no limit.
-    #[arg(long, value_name = "BYTES")]
+    /// Optional per-tile MVT size limit (e.g., "500K", "1M", or raw bytes).
+    /// When a tile exceeds it, a single non-iterative drop pass sheds the
+    /// lowest-priority (smallest) features for that tile only. Omit to enforce
+    /// no limit. Aliased as --max-tile-size for parity with the `tiles` command.
+    #[arg(long, value_name = "SIZE", alias = "max-tile-size", value_parser = parse_size_bytes)]
     tile_size_limit: Option<usize>,
 
     /// Write the JSON export report to this path.
@@ -206,6 +211,52 @@ struct OverviewArgs {
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
+    /// Regional extract: only convert features whose bbox intersects this
+    /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). Row groups whose
+    /// GeoParquet 1.1 covering statistics don't intersect are skipped at the
+    /// parquet footer level (no data pages read); inputs without covering
+    /// stats degrade gracefully (all row groups read, exact per-feature
+    /// filter still applies).
+    #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
+    bbox: Option<String>,
+
+    /// Emit the optional COGP compatibility footer key (partitioning mode).
+    #[arg(long)]
+    cogp_compat: bool,
+
+    /// Write the JSON conversion report to this path.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+
+    #[command(flatten)]
+    tuning: ConvertTuningArgs,
+}
+
+/// Shared convert-tuning knobs, flattened into both `overview` and `tiles` so
+/// the one-shot command reaches every quality/memory lever the two-step chain
+/// exposes. Levels (`--min-zoom`/`--max-zoom`/`--gsd`), `--bbox`, `--mode`, and
+/// `--cogp-compat` stay on the parent command; everything here maps into
+/// [`ConvertOptions`] via [`ConvertTuningArgs::build_convert_options`].
+#[derive(Args, Debug)]
+struct ConvertTuningArgs {
+    /// Column name used as the cell-winner priority (sort) key. Mutually
+    /// exclusive with --class-rank.
+    #[arg(long, value_name = "COL", help_heading = "Ranking")]
+    sort_key: Option<String>,
+
+    /// Categorical class ranking (higher priority wins a cell). Format:
+    /// `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g.
+    /// `--class-rank road_class:motorway=5,primary=4,residential=2`.
+    /// Present-but-unlisted values rank below every listed value (but above
+    /// nulls). Mutually exclusive with --sort-key.
+    #[arg(long, value_name = "SPEC", help_heading = "Ranking")]
+    class_rank: Option<String>,
+
+    /// Disable auto-detection of well-known schemas (Overture roads `class`/
+    /// `road_class`, Overture places `confidence`).
+    #[arg(long, help_heading = "Ranking")]
+    no_auto_rank: bool,
+
     /// GSD tile-band base for the zoom→GSD mapping: gsd(z) = 40075016.69 /
     /// base / 2^z (spec §5.2, cogp-rs default 1024).
     ///
@@ -220,35 +271,13 @@ struct OverviewArgs {
     /// Cheat sheet: coarse levels too sparse → RAISE --gsd-base (or lower the
     /// thinning factors); too crude → lower --simplify-factor. See
     /// docs/OVERVIEW_TUNING.md.
-    #[arg(long, value_name = "F", default_value = "1024.0")]
+    #[arg(
+        long,
+        value_name = "F",
+        default_value = "1024.0",
+        help_heading = "Generalization"
+    )]
     gsd_base: f64,
-
-    /// Regional extract: only convert features whose bbox intersects this
-    /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). Row groups whose
-    /// GeoParquet 1.1 covering statistics don't intersect are skipped at the
-    /// parquet footer level (no data pages read); inputs without covering
-    /// stats degrade gracefully (all row groups read, exact per-feature
-    /// filter still applies).
-    #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
-    bbox: Option<String>,
-
-    /// Column name used as the cell-winner priority (sort) key. Mutually
-    /// exclusive with --class-rank.
-    #[arg(long, value_name = "COL")]
-    sort_key: Option<String>,
-
-    /// Categorical class ranking (higher priority wins a cell). Format:
-    /// `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g.
-    /// `--class-rank road_class:motorway=5,primary=4,residential=2`.
-    /// Present-but-unlisted values rank below every listed value (but above
-    /// nulls). Mutually exclusive with --sort-key.
-    #[arg(long, value_name = "SPEC")]
-    class_rank: Option<String>,
-
-    /// Disable auto-detection of well-known schemas (Overture roads `class`/
-    /// `road_class`, Overture places `confidence`).
-    #[arg(long)]
-    no_auto_rank: bool,
 
     /// Simplification tolerance factor: RDP tolerance = factor * gsd (meters),
     /// duplicating mode only (default 1.0).
@@ -262,12 +291,12 @@ struct OverviewArgs {
     ///
     /// Cheat sheet: coarse levels look too crude/blocky → LOWER
     /// --simplify-factor. See docs/OVERVIEW_TUNING.md.
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value = "1.0", help_heading = "Generalization")]
     simplify_factor: f64,
 
     /// Collapse below-visibility polygons to a representative point instead of
     /// dropping them (spec Q4 opt-in).
-    #[arg(long)]
+    #[arg(long, help_heading = "Generalization")]
     collapse: bool,
 
     /// Disable cascading simplification (#218) and reproduce the pre-cascade
@@ -279,99 +308,8 @@ struct OverviewArgs {
     /// retried — much faster on duplicating mode, at the cost of coarse-level
     /// coordinates differing slightly from the non-cascaded pipeline (bounded
     /// by ~2x the level tolerance). See docs/OVERVIEW_TUNING.md.
-    #[arg(long)]
+    #[arg(long, help_heading = "Generalization")]
     no_cascade: bool,
-
-    /// Enable point clustering (duplicating mode only; opt-in).
-    ///
-    /// At each overview level, the surviving point in each thinning grid cell
-    /// ABSORBS the other points in its cell instead of them simply vanishing:
-    /// the output gains a `point_count` INT64 NOT NULL column recording how
-    /// many source features each row represents at its level (tippecanoe /
-    /// supercluster convention; always 1 at the canonical level). The winner
-    /// keeps its own geometry and attribute values. Lines and polygons are
-    /// unaffected (their rows carry point_count = 1). Use for graduated-dot
-    /// rendering of dense point data. See docs/OVERVIEW_TUNING.md.
-    #[arg(long)]
-    cluster: bool,
-
-    /// Aggregate a numeric column across clustered points: COL:OP where OP is
-    /// sum, max, min, or mean. Repeatable. Requires --cluster.
-    ///
-    /// At each level the winner's value of COL becomes the aggregate over
-    /// itself + the points it absorbed at that level (computed per level from
-    /// SOURCE values — mean is exact, never a mean of means). All other
-    /// columns keep the winner's own values. Example:
-    /// --accumulate-attribute population:sum
-    /// --accumulate-attribute confidence:mean
-    #[arg(long = "accumulate-attribute", value_name = "COL:OP")]
-    accumulate_attribute: Vec<String>,
-
-    /// Disable line network coalescing (ON by default; duplicating mode).
-    ///
-    /// By default, at each non-canonical level touching same-class line
-    /// segments are chained into single "stroke" LineStrings BEFORE the
-    /// visibility gate and thinning run, so a chain of individually
-    /// sub-visibility fragments survives as one long, connected artery —
-    /// road/river networks read as continuous lines at coarse zooms instead
-    /// of scattered dashes. Chains never merge across class values (when a
-    /// class ranking is active); junctions continue only within
-    /// --coalesce-junction-angle of straight. The merged feature keeps the
-    /// attributes of its highest-priority member, and the output gains a
-    /// `coalesced_count` INT32 NOT NULL column (source segments merged per
-    /// row; 1 for unmerged rows and everywhere at the canonical level).
-    /// Points and polygons are unaffected. In partitioning mode coalescing
-    /// is inert (a merged chain cannot satisfy the feature-once/verbatim
-    /// contract). See docs/OVERVIEW_TUNING.md.
-    #[arg(long)]
-    no_coalesce_lines: bool,
-
-    /// Deprecated no-op: coalescing is now the default. Kept so existing
-    /// invocations keep working; rejected with partitioning mode (where the
-    /// default silently disables instead).
-    #[arg(long, hide = true, conflicts_with = "no_coalesce_lines")]
-    coalesce_lines: bool,
-
-    /// Junction continuation angle for line coalescing, in degrees
-    /// (default 0 = OFF: junctions terminate chains, preserving network
-    /// topology — chosen from the Portland junction-angle sweep in
-    /// corpus/data/bench/q3/, where strict degree-2 chaining rendered
-    /// better).
-    ///
-    /// When > 0: at a junction (3+ same-class segment endpoints meeting),
-    /// the pair of lines that best continue each other merge when their
-    /// deviation from a straight continuation is at most this angle — best
-    /// pair first, so a 4-way crossing continues BOTH through-streets.
-    /// BIGGER = chains bend further through junctions (longer, fewer
-    /// strokes; risk of merging through genuine turns).
-    #[arg(long, value_name = "DEG", default_value = "0.0")]
-    coalesce_junction_angle: f64,
-
-    /// Endpoint snap tolerance for line coalescing, in GSD multiples
-    /// (default 1.0).
-    ///
-    /// Exactly-touching endpoints always chain; this knob additionally joins
-    /// chain ends within factor * gsd of each other (two endpoints closer
-    /// than one ground sample are indistinguishable at that level). BIGGER =
-    /// bridges larger digitization gaps (risk: rungs of nearby parallel
-    /// lines fusing); 0 = exact endpoint matching only.
-    #[arg(long, value_name = "F", default_value = "1.0")]
-    coalesce_snap: f64,
-
-    /// Per-level candidate-line ceiling for line coalescing (memory guard).
-    ///
-    /// Chaining holds the level's candidate line geometries in memory at
-    /// once (every line is a candidate at every non-canonical level, since
-    /// sub-visibility fragments must be reclaimable). Datasets with more
-    /// lines than this skip coalescing with a warning instead of breaking
-    /// the streaming pipeline's memory bound; near-canonical levels that
-    /// large need coalescing least (segments are individually visible).
-    #[arg(long, value_name = "ROWS", default_value = "2000000")]
-    coalesce_max_level_rows: usize,
-
-    /// Emit the optional COGP compatibility footer key (partitioning mode).
-    #[arg(long)]
-    cogp_compat: bool,
 
     /// Point thinning factor: grid cell size = factor * gsd.
     ///
@@ -385,7 +323,7 @@ struct OverviewArgs {
     /// the GSD cell size, so it interacts with --gsd-base (which sets the GSD).
     ///
     /// Cheat sheet: coarse levels too sparse → LOWER the thinning factors.
-    #[arg(long)]
+    #[arg(long, help_heading = "Thinning & visibility")]
     point_thinning: Option<f64>,
 
     /// Line thinning factor: grid cell size = factor * gsd (default 1.0).
@@ -394,14 +332,14 @@ struct OverviewArgs {
     /// See --point-thinning; this is the roads/line knob. Default retuned
     /// 2.0 -> 1.0 after the Portland sweep (corpus/SWEEPS.md): 1.0
     /// keeps road networks visibly more continuous at coarse zooms.
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value = "1.0", help_heading = "Thinning & visibility")]
     line_thinning: f64,
 
     /// Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
     ///
     /// BIGGER = SPARSER, SMALLER = denser. Polygons thin least by default
     /// (1.0) since they tile space rather than cluster.
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value = "1.0", help_heading = "Thinning & visibility")]
     polygon_thinning: f64,
 
     /// Line visibility gate in GSD multiples: a line is eligible at a level
@@ -410,7 +348,7 @@ struct OverviewArgs {
     /// This is a hard drop, not a thin: BIGGER = more small lines dropped at
     /// coarse levels (sparser); SMALLER = more small lines kept. The gate is
     /// multiplied by the level GSD, so --gsd-base moves it too.
-    #[arg(long, default_value = "2.0")]
+    #[arg(long, default_value = "2.0", help_heading = "Thinning & visibility")]
     line_visibility: f64,
 
     /// Polygon visibility gate in GSD multiples: a polygon is eligible only if
@@ -418,7 +356,7 @@ struct OverviewArgs {
     ///
     /// BIGGER = more small polygons dropped at coarse levels (sparser);
     /// SMALLER = more kept. See --line-visibility.
-    #[arg(long, default_value = "4.0")]
+    #[arg(long, default_value = "4.0", help_heading = "Thinning & visibility")]
     polygon_visibility: f64,
 
     /// Per-level density drop rate: each coarser level keeps 1/rate of the
@@ -440,7 +378,12 @@ struct OverviewArgs {
     /// count N (every feature appears at the finest level), not a per-tile
     /// basezoom count. The canonical (finest) level is never dropped. See
     /// docs/OVERVIEW_TUNING.md and corpus/SWEEPS.md.
-    #[arg(long, value_name = "F", default_value = "1.65")]
+    #[arg(
+        long,
+        value_name = "F",
+        default_value = "1.65",
+        help_heading = "Density budget"
+    )]
     drop_rate: f64,
 
     /// Spatial-fairness strength for the density budget (default 1.5).
@@ -457,7 +400,12 @@ struct OverviewArgs {
     /// relative thinning of dense areas. Does not change per-level totals (it
     /// only redistributes which features survive spatially), so it is
     /// independent of --drop-rate. No effect when --no-density-drop is set.
-    #[arg(long, value_name = "F", default_value = "1.5")]
+    #[arg(
+        long,
+        value_name = "F",
+        default_value = "1.5",
+        help_heading = "Density budget"
+    )]
     drop_gamma: f64,
 
     /// Disable the Q2 per-level density budget entirely (off switch).
@@ -465,8 +413,114 @@ struct OverviewArgs {
     /// Reverts to pure cell-winner thinning — the pre-Q2 behavior — and emits a
     /// byte-identical footer (no density_drop provenance). Use this to compare
     /// before/after, or when the cell-winner thinning already meets your needs.
-    #[arg(long)]
+    #[arg(long, help_heading = "Density budget")]
     no_density_drop: bool,
+
+    /// Enable point clustering (duplicating mode only; opt-in).
+    ///
+    /// At each overview level, the surviving point in each thinning grid cell
+    /// ABSORBS the other points in its cell instead of them simply vanishing:
+    /// the output gains a `point_count` INT64 NOT NULL column recording how
+    /// many source features each row represents at its level (tippecanoe /
+    /// supercluster convention; always 1 at the canonical level). The winner
+    /// keeps its own geometry and attribute values. Lines and polygons are
+    /// unaffected (their rows carry point_count = 1). Use for graduated-dot
+    /// rendering of dense point data. See docs/OVERVIEW_TUNING.md.
+    #[arg(long, help_heading = "Clustering")]
+    cluster: bool,
+
+    /// Aggregate a numeric column across clustered points: COL:OP where OP is
+    /// sum, max, min, or mean. Repeatable. Requires --cluster.
+    ///
+    /// At each level the winner's value of COL becomes the aggregate over
+    /// itself + the points it absorbed at that level (computed per level from
+    /// SOURCE values — mean is exact, never a mean of means). All other
+    /// columns keep the winner's own values. Example:
+    /// --accumulate-attribute population:sum
+    /// --accumulate-attribute confidence:mean
+    #[arg(
+        long = "accumulate-attribute",
+        value_name = "COL:OP",
+        help_heading = "Clustering"
+    )]
+    accumulate_attribute: Vec<String>,
+
+    /// Disable line network coalescing (ON by default; duplicating mode).
+    ///
+    /// By default, at each non-canonical level touching same-class line
+    /// segments are chained into single "stroke" LineStrings BEFORE the
+    /// visibility gate and thinning run, so a chain of individually
+    /// sub-visibility fragments survives as one long, connected artery —
+    /// road/river networks read as continuous lines at coarse zooms instead
+    /// of scattered dashes. Chains never merge across class values (when a
+    /// class ranking is active); junctions continue only within
+    /// --coalesce-junction-angle of straight. The merged feature keeps the
+    /// attributes of its highest-priority member, and the output gains a
+    /// `coalesced_count` INT32 NOT NULL column (source segments merged per
+    /// row; 1 for unmerged rows and everywhere at the canonical level).
+    /// Points and polygons are unaffected. In partitioning mode coalescing
+    /// is inert (a merged chain cannot satisfy the feature-once/verbatim
+    /// contract). See docs/OVERVIEW_TUNING.md.
+    #[arg(long, help_heading = "Line coalescing")]
+    no_coalesce_lines: bool,
+
+    /// Deprecated no-op: coalescing is now the default. Kept so existing
+    /// invocations keep working; rejected with partitioning mode (where the
+    /// default silently disables instead).
+    #[arg(long, hide = true, conflicts_with = "no_coalesce_lines")]
+    coalesce_lines: bool,
+
+    /// Junction continuation angle for line coalescing, in degrees
+    /// (default 0 = OFF: junctions terminate chains, preserving network
+    /// topology — chosen from the Portland junction-angle sweep in
+    /// corpus/data/bench/q3/, where strict degree-2 chaining rendered
+    /// better).
+    ///
+    /// When > 0: at a junction (3+ same-class segment endpoints meeting),
+    /// the pair of lines that best continue each other merge when their
+    /// deviation from a straight continuation is at most this angle — best
+    /// pair first, so a 4-way crossing continues BOTH through-streets.
+    /// BIGGER = chains bend further through junctions (longer, fewer
+    /// strokes; risk of merging through genuine turns).
+    #[arg(
+        long,
+        value_name = "DEG",
+        default_value = "0.0",
+        help_heading = "Line coalescing"
+    )]
+    coalesce_junction_angle: f64,
+
+    /// Endpoint snap tolerance for line coalescing, in GSD multiples
+    /// (default 1.0).
+    ///
+    /// Exactly-touching endpoints always chain; this knob additionally joins
+    /// chain ends within factor * gsd of each other (two endpoints closer
+    /// than one ground sample are indistinguishable at that level). BIGGER =
+    /// bridges larger digitization gaps (risk: rungs of nearby parallel
+    /// lines fusing); 0 = exact endpoint matching only.
+    #[arg(
+        long,
+        value_name = "F",
+        default_value = "1.0",
+        help_heading = "Line coalescing"
+    )]
+    coalesce_snap: f64,
+
+    /// Per-level candidate-line ceiling for line coalescing (memory guard).
+    ///
+    /// Chaining holds the level's candidate line geometries in memory at
+    /// once (every line is a candidate at every non-canonical level, since
+    /// sub-visibility fragments must be reclaimable). Datasets with more
+    /// lines than this skip coalescing with a warning instead of breaking
+    /// the streaming pipeline's memory bound; near-canonical levels that
+    /// large need coalescing least (segments are individually visible).
+    #[arg(
+        long,
+        value_name = "ROWS",
+        default_value = "2000000",
+        help_heading = "Line coalescing"
+    )]
+    coalesce_max_level_rows: usize,
 
     /// Maximum output row-group size in rows.
     ///
@@ -474,7 +528,7 @@ struct OverviewArgs {
     /// a single row group; a larger level is split into roughly uniform row
     /// groups of at most this size. Coarse bands (few features) therefore become
     /// one broad row group; fine bands keep tight per-row-group bbox statistics.
-    #[arg(long, default_value = "10000")]
+    #[arg(long, default_value = "10000", help_heading = "Output layout")]
     row_group_size: usize,
 
     /// Per-level row-group sizing policy (#202).
@@ -487,7 +541,8 @@ struct OverviewArgs {
     #[arg(
         long,
         default_value = "constant",
-        value_parser = ["constant", "zoom-scaled"]
+        value_parser = ["constant", "zoom-scaled"],
+        help_heading = "Output layout"
     )]
     row_group_size_policy: String,
 
@@ -500,7 +555,7 @@ struct OverviewArgs {
     /// The bbox covering and `level` column always keep their pruning stats.
     /// Enable this if remote clients push predicates on property columns and
     /// want row-group skipping on them.
-    #[arg(long)]
+    #[arg(long, help_heading = "Output layout")]
     full_column_stats: bool,
 
     /// Disable the two-pass bounded-memory streaming pipeline (H3).
@@ -514,7 +569,7 @@ struct OverviewArgs {
     /// (same level assignments, rows, and footer). This flag reverts to the
     /// original in-memory pipeline, which decodes the whole dataset once and
     /// may be marginally faster on small inputs that comfortably fit in RAM.
-    #[arg(long)]
+    #[arg(long, help_heading = "Memory & performance")]
     no_streaming: bool,
 
     /// Rows per Arrow read batch in the streaming pipeline (both passes).
@@ -523,7 +578,12 @@ struct OverviewArgs {
     /// cost of proportionally more peak memory; SMALLER batches bound memory
     /// tighter. The default (8192) keeps per-batch transients in the tens of
     /// MB even for vertex-heavy polygon data. No effect with --no-streaming.
-    #[arg(long, value_name = "ROWS", default_value = "8192")]
+    #[arg(
+        long,
+        value_name = "ROWS",
+        default_value = "8192",
+        help_heading = "Memory & performance"
+    )]
     read_batch_size: usize,
 
     /// Memory/throughput profile for the single-read pass-2 engine (#213/#212).
@@ -537,7 +597,8 @@ struct OverviewArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["auto", "speed", "bounded"]
+        value_parser = ["auto", "speed", "bounded"],
+        help_heading = "Memory & performance"
     )]
     profile: String,
 
@@ -547,12 +608,138 @@ struct OverviewArgs {
     /// Higher improves core utilization on long-pole geometries at
     /// proportionally more peak memory (in-flight-batches × read-batch-size rows
     /// resident). No effect with --no-streaming.
-    #[arg(long, value_name = "N", default_value = "4")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "4",
+        help_heading = "Memory & performance"
+    )]
     in_flight_batches: usize,
+}
 
-    /// Write the JSON conversion report to this path.
-    #[arg(long, value_name = "PATH")]
-    report: Option<PathBuf>,
+impl ConvertTuningArgs {
+    /// Build [`ConvertOptions`] from the shared tuning flags, applying the same
+    /// validation both `overview` and `tiles` rely on. The parent command owns
+    /// `mode`, the `levels` plan, `bbox`, and `cogp_compat` and passes them in.
+    fn build_convert_options(
+        &self,
+        mode: gpq_tiles_core::overview::level::Mode,
+        levels: gpq_tiles_core::overview::convert::LevelPlan,
+        bbox: Option<[f64; 4]>,
+        cogp_compat: bool,
+    ) -> Result<gpq_tiles_core::overview::convert::ConvertOptions> {
+        use gpq_tiles_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
+        use gpq_tiles_core::overview::convert::ConvertOptions;
+        use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
+        use gpq_tiles_core::overview::simplify::SimplifyOptions;
+        use gpq_tiles_core::overview::writer::RowGroupSizePolicy;
+
+        let profile = match self.profile.as_str() {
+            "auto" => MemoryProfile::Auto,
+            "speed" => MemoryProfile::Speed,
+            "bounded" => MemoryProfile::Bounded,
+            other => anyhow::bail!("invalid --profile '{other}' (auto|speed|bounded)"),
+        };
+
+        let row_group_size_policy = match self.row_group_size_policy.as_str() {
+            "constant" => RowGroupSizePolicy::Constant,
+            "zoom-scaled" => RowGroupSizePolicy::ZoomScaled,
+            other => {
+                anyhow::bail!("invalid --row-group-size-policy '{other}' (constant|zoom-scaled)")
+            }
+        };
+
+        // Cluster-conditional default: with --cluster, absorbed points are
+        // summarized (point_count), so the sparser 16.0 grid is the better look.
+        let point_thinning = self.point_thinning.unwrap_or(if self.cluster {
+            gpq_tiles_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
+        } else {
+            AssignConfig::default().point_thinning
+        });
+
+        let assign = AssignConfig {
+            point_thinning,
+            line_thinning: self.line_thinning,
+            polygon_thinning: self.polygon_thinning,
+            line_visibility: self.line_visibility,
+            polygon_visibility: self.polygon_visibility,
+            sort_direction: SortDirection::Desc,
+        };
+
+        // --class-rank and --sort-key are mutually exclusive (also enforced in core).
+        if self.class_rank.is_some() && self.sort_key.is_some() {
+            anyhow::bail!("--class-rank and --sort-key are mutually exclusive");
+        }
+        let class_ranking = match &self.class_rank {
+            Some(spec) => Some(parse_class_rank(spec)?),
+            None => None,
+        };
+
+        // Clustering flags (Q4; also enforced in core).
+        if !self.accumulate_attribute.is_empty() && !self.cluster {
+            anyhow::bail!("--accumulate-attribute requires --cluster");
+        }
+        if self.cluster && mode == Mode::Partitioning {
+            anyhow::bail!(
+                "--cluster requires --mode duplicating: a partitioning-mode feature has \
+                 one row read across many zoom prefixes, so a per-level point_count \
+                 cannot be represented without double counting"
+            );
+        }
+        let accumulate = self
+            .accumulate_attribute
+            .iter()
+            .map(|s| parse_accumulate(s))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Coalescing flags (Q3). Coalescing is ON by default (opt out with
+        // --no-coalesce-lines); with partitioning mode the default is silently
+        // inert (core logs it), but an EXPLICIT --coalesce-lines request is an
+        // error the user should hear about.
+        if self.coalesce_lines && mode == Mode::Partitioning {
+            anyhow::bail!(
+                "--coalesce-lines requires --mode duplicating: partitioning places \
+                 each feature exactly once with geometry verbatim, which a merged \
+                 chain cannot satisfy"
+            );
+        }
+        let coalesce_lines = !self.no_coalesce_lines;
+
+        Ok(ConvertOptions {
+            mode,
+            levels,
+            assign,
+            sort_key: self.sort_key.clone(),
+            class_ranking,
+            no_auto_rank: self.no_auto_rank,
+            simplify: SimplifyOptions {
+                factor: self.simplify_factor,
+                collapse: self.collapse,
+                cascade: !self.no_cascade,
+            },
+            density: DensityBudgetConfig {
+                enabled: !self.no_density_drop,
+                drop_rate: self.drop_rate,
+                gamma: self.drop_gamma,
+            },
+            gsd_base: self.gsd_base,
+            cogp_compat_key: cogp_compat,
+            max_row_group_size: self.row_group_size,
+            row_group_size_policy,
+            full_column_stats: self.full_column_stats,
+            streaming: !self.no_streaming,
+            read_batch_size: self.read_batch_size,
+            profile,
+            in_flight_batches: self.in_flight_batches,
+            cluster: self.cluster,
+            accumulate,
+            coalesce_lines,
+            coalesce_snap: self.coalesce_snap,
+            coalesce_max_level_rows: self.coalesce_max_level_rows,
+            coalesce_junction_angle: self.coalesce_junction_angle,
+            bbox,
+        })
+    }
 }
 
 /// Arguments for `gpq-tiles validate`.
@@ -566,10 +753,12 @@ struct ValidateArgs {
 /// Arguments for `gpq-tiles tiles` — the one-shot GeoParquet → PMTiles facade.
 ///
 /// This is a thin wrapper that runs `overview` (convert) into a temporary
-/// GeoParquet file and then `export-pmtiles` from it. Every knob of the two
-/// underlying subcommands remains available on those subcommands; this facade
-/// only exposes the essentials. The legacy per-tile pipeline this command used
-/// to run was removed (see issue #177).
+/// GeoParquet file and then `export-pmtiles` from it. The full convert-tuning
+/// set (ranking, generalization, thinning/visibility, density budget,
+/// clustering, coalescing, memory/performance) is flattened in below, so a
+/// one-shot `tiles` run reaches the same quality and memory levers as the
+/// two-step chain — see `--help` for the grouped flags. The legacy per-tile
+/// pipeline this command used to run was removed (see issue #177).
 #[derive(Parser, Debug)]
 struct TilesArgs {
     /// Input GeoParquet file (EPSG:4326 or EPSG:3857): a local path or a
@@ -600,14 +789,24 @@ struct TilesArgs {
     #[arg(long)]
     layer_name: Option<String>,
 
-    /// Maximum tile size in bytes (e.g., "500K", "1M"). When a tile exceeds
-    /// this limit, the export sheds its lowest-priority features.
-    #[arg(long, value_parser = parse_size_bytes)]
-    max_tile_size: Option<u32>,
+    /// Maximum tile size (e.g., "500K", "1M", or raw bytes). When a tile
+    /// exceeds this limit, the export sheds its lowest-priority features in a
+    /// single non-iterative pass. Aliased as --tile-size-limit for parity with
+    /// `export-pmtiles`.
+    #[arg(long, value_name = "SIZE", alias = "tile-size-limit", value_parser = parse_size_bytes)]
+    max_tile_size: Option<usize>,
+
+    /// Per-tile edge buffer, in tile pixels, carried across tile seams so
+    /// features don't clip at boundaries.
+    #[arg(long, default_value = "8")]
+    tile_buffer: u32,
 
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
     verbose: bool,
+
+    #[command(flatten)]
+    tuning: ConvertTuningArgs,
 }
 
 fn main() -> Result<()> {
@@ -627,7 +826,7 @@ fn main() -> Result<()> {
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Decode(args) => run_decode(args),
-        Command::Tiles(args) => run_tiles(args),
+        Command::Tiles(args) => run_tiles(*args),
     }
 }
 
@@ -687,8 +886,9 @@ where
 /// file lives next to the output (same filesystem) and is removed on both
 /// success and failure via [`tempfile::NamedTempFile`]'s drop guard.
 fn run_tiles(args: TilesArgs) -> Result<()> {
-    use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+    use gpq_tiles_core::overview::convert::{convert_to_overviews, LevelPlan};
     use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
+    use gpq_tiles_core::overview::level::Mode;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -703,14 +903,16 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
-    let options = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: args.min_zoom,
-            max_zoom: args.max_zoom,
-        },
-        bbox,
-        ..ConvertOptions::default()
+    // Overviews for PMTiles are always duplicating (partitioning can't be
+    // exported to per-tile MVT). Every other convert knob comes from the
+    // shared tuning set, so `tiles` matches the two-step overview → export.
+    let levels = LevelPlan::ZoomRange {
+        min_zoom: args.min_zoom,
+        max_zoom: args.max_zoom,
     };
+    let options = args
+        .tuning
+        .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
 
     // Intermediate overview file next to the output (same filesystem);
     // NamedTempFile removes it on drop — success or failure alike.
@@ -741,9 +943,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     let export_opts = ExportOptions {
         layer_name,
-        tile_buffer: 8,
+        tile_buffer: args.tile_buffer,
         extent: 4096,
-        tile_size_limit: args.max_tile_size.map(|v| v as usize),
+        tile_size_limit: args.max_tile_size,
     };
     let export_report = export_pmtiles(overview_tmp.path(), &args.output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -778,11 +980,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
 /// Run `gpq-tiles overview`: build a multi-resolution overview GeoParquet file.
 fn run_overview(args: OverviewArgs) -> Result<()> {
-    use gpq_tiles_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
-    use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-    use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
-    use gpq_tiles_core::overview::simplify::SimplifyOptions;
-    use gpq_tiles_core::overview::writer::RowGroupSizePolicy;
+    use gpq_tiles_core::overview::convert::{convert_to_overviews, LevelPlan};
+    use gpq_tiles_core::overview::level::Mode;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -790,13 +989,6 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         "duplicating" => Mode::Duplicating,
         "partitioning" => Mode::Partitioning,
         other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
-    };
-
-    let profile = match args.profile.as_str() {
-        "auto" => MemoryProfile::Auto,
-        "speed" => MemoryProfile::Speed,
-        "bounded" => MemoryProfile::Bounded,
-        other => anyhow::bail!("invalid --profile '{other}' (auto|speed|bounded)"),
     };
 
     // Explicit --gsd list overrides the zoom range.
@@ -814,102 +1006,11 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         }
     };
 
-    // Cluster-conditional default: with --cluster, absorbed points are
-    // summarized (point_count), so the sparser 16.0 grid is the better look.
-    let point_thinning = args.point_thinning.unwrap_or(if args.cluster {
-        gpq_tiles_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
-    } else {
-        AssignConfig::default().point_thinning
-    });
+    let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
-    let assign = AssignConfig {
-        point_thinning,
-        line_thinning: args.line_thinning,
-        polygon_thinning: args.polygon_thinning,
-        line_visibility: args.line_visibility,
-        polygon_visibility: args.polygon_visibility,
-        sort_direction: SortDirection::Desc,
-    };
-
-    // --class-rank and --sort-key are mutually exclusive (also enforced in core).
-    if args.class_rank.is_some() && args.sort_key.is_some() {
-        anyhow::bail!("--class-rank and --sort-key are mutually exclusive");
-    }
-    let class_ranking = match &args.class_rank {
-        Some(spec) => Some(parse_class_rank(spec)?),
-        None => None,
-    };
-
-    // Clustering flags (Q4; also enforced in core).
-    if !args.accumulate_attribute.is_empty() && !args.cluster {
-        anyhow::bail!("--accumulate-attribute requires --cluster");
-    }
-    if args.cluster && mode == Mode::Partitioning {
-        anyhow::bail!(
-            "--cluster requires --mode duplicating: a partitioning-mode feature has \
-             one row read across many zoom prefixes, so a per-level point_count \
-             cannot be represented without double counting"
-        );
-    }
-    let accumulate = args
-        .accumulate_attribute
-        .iter()
-        .map(|s| parse_accumulate(s))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Coalescing flags (Q3). Coalescing is ON by default (opt out with
-    // --no-coalesce-lines); with partitioning mode the default is silently
-    // inert (core logs it), but an EXPLICIT --coalesce-lines request is an
-    // error the user should hear about.
-    if args.coalesce_lines && mode == Mode::Partitioning {
-        anyhow::bail!(
-            "--coalesce-lines requires --mode duplicating: partitioning places \
-             each feature exactly once with geometry verbatim, which a merged \
-             chain cannot satisfy"
-        );
-    }
-    let coalesce_lines = !args.no_coalesce_lines;
-
-    let options = ConvertOptions {
-        mode,
-        levels,
-        assign,
-        sort_key: args.sort_key.clone(),
-        class_ranking,
-        no_auto_rank: args.no_auto_rank,
-        simplify: SimplifyOptions {
-            factor: args.simplify_factor,
-            collapse: args.collapse,
-            cascade: !args.no_cascade,
-        },
-        density: DensityBudgetConfig {
-            enabled: !args.no_density_drop,
-            drop_rate: args.drop_rate,
-            gamma: args.drop_gamma,
-        },
-        gsd_base: args.gsd_base,
-        cogp_compat_key: args.cogp_compat,
-        max_row_group_size: args.row_group_size,
-        row_group_size_policy: match args.row_group_size_policy.as_str() {
-            "constant" => RowGroupSizePolicy::Constant,
-            "zoom-scaled" => RowGroupSizePolicy::ZoomScaled,
-            other => {
-                anyhow::bail!("invalid --row-group-size-policy '{other}' (constant|zoom-scaled)")
-            }
-        },
-        full_column_stats: args.full_column_stats,
-        streaming: !args.no_streaming,
-        read_batch_size: args.read_batch_size,
-        profile,
-        in_flight_batches: args.in_flight_batches,
-        cluster: args.cluster,
-        accumulate,
-        coalesce_lines,
-        coalesce_snap: args.coalesce_snap,
-        coalesce_max_level_rows: args.coalesce_max_level_rows,
-        coalesce_junction_angle: args.coalesce_junction_angle,
-        bbox: args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?,
-    };
+    let options = args
+        .tuning
+        .build_convert_options(mode, levels, bbox, args.cogp_compat)?;
 
     let report = convert_to_overviews(&args.input, &args.output, &options)
         .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))?;
@@ -1248,5 +1349,127 @@ mod tests {
         assert!(parse_accumulate(":sum").is_err(), "empty column");
         assert!(parse_accumulate("pop:median").is_err(), "unknown op");
         assert!(parse_accumulate("pop:").is_err(), "empty op");
+    }
+
+    /// Parse a `tiles` invocation and return its args (INPUT/OUTPUT are dummies).
+    fn parse_tiles(flags: &[&str]) -> TilesArgs {
+        let mut argv = vec!["gpq-tiles", "tiles", "in.parquet", "out.pmtiles"];
+        argv.extend_from_slice(flags);
+        match Cli::try_parse_from(argv)
+            .expect("tiles args should parse")
+            .command
+        {
+            Command::Tiles(a) => *a,
+            other => panic!("expected tiles subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_size_bytes_accepts_suffixed_and_raw() {
+        assert_eq!(parse_size_bytes("500K").unwrap(), 500 * 1024);
+        assert_eq!(parse_size_bytes("1M").unwrap(), 1024 * 1024);
+        // A plain integer is raw bytes — keeps pre-reconciliation invocations working.
+        assert_eq!(parse_size_bytes("500000").unwrap(), 500_000);
+        assert!(parse_size_bytes("banana").is_err());
+    }
+
+    #[test]
+    fn tiles_accepts_convert_tuning_flags() {
+        // #249: every shared convert knob must be reachable on the one-shot command.
+        let a = parse_tiles(&[
+            "--polygon-visibility",
+            "2.0",
+            "--collapse",
+            "--drop-rate",
+            "1.3",
+            "--profile",
+            "bounded",
+            "--cluster",
+            "--no-coalesce-lines",
+        ]);
+        assert_eq!(a.tuning.polygon_visibility, 2.0);
+        assert!(a.tuning.collapse);
+        assert_eq!(a.tuning.drop_rate, 1.3);
+        assert_eq!(a.tuning.profile, "bounded");
+        assert!(a.tuning.cluster);
+        assert!(a.tuning.no_coalesce_lines);
+    }
+
+    #[test]
+    fn tiles_size_limit_alias_matches_max_tile_size() {
+        // The two spellings are aliases and both accept human-readable sizes.
+        let a = parse_tiles(&["--max-tile-size", "500K"]);
+        let b = parse_tiles(&["--tile-size-limit", "500K"]);
+        assert_eq!(a.max_tile_size, Some(500 * 1024));
+        assert_eq!(a.max_tile_size, b.max_tile_size);
+    }
+
+    #[test]
+    fn tiles_build_convert_options_threads_tuning() {
+        use gpq_tiles_core::overview::convert::LevelPlan;
+        use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
+
+        let a = parse_tiles(&[
+            "--polygon-visibility",
+            "2.0",
+            "--collapse",
+            "--drop-rate",
+            "1.3",
+            "--profile",
+            "bounded",
+        ]);
+        let opts = a
+            .tuning
+            .build_convert_options(
+                Mode::Duplicating,
+                LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 9,
+                },
+                None,
+                false,
+            )
+            .expect("valid tuning should build options");
+
+        assert_eq!(opts.assign.polygon_visibility, 2.0);
+        assert!(opts.simplify.collapse);
+        assert_eq!(opts.density.drop_rate, 1.3);
+        assert!(matches!(opts.profile, MemoryProfile::Bounded));
+    }
+
+    #[test]
+    fn build_convert_options_enforces_shared_validation() {
+        use gpq_tiles_core::overview::convert::LevelPlan;
+        use gpq_tiles_core::overview::level::Mode;
+
+        let levels = || LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 6,
+        };
+
+        // --class-rank and --sort-key are mutually exclusive.
+        let a = parse_tiles(&["--class-rank", "k:a=1", "--sort-key", "height"]);
+        assert!(a
+            .tuning
+            .build_convert_options(Mode::Duplicating, levels(), None, false)
+            .is_err());
+
+        // --accumulate-attribute requires --cluster.
+        let a = parse_tiles(&["--accumulate-attribute", "pop:sum"]);
+        assert!(a
+            .tuning
+            .build_convert_options(Mode::Duplicating, levels(), None, false)
+            .is_err());
+
+        // --cluster requires duplicating mode.
+        let a = parse_tiles(&["--cluster"]);
+        assert!(a
+            .tuning
+            .build_convert_options(Mode::Partitioning, levels(), None, false)
+            .is_err());
+        assert!(a
+            .tuning
+            .build_convert_options(Mode::Duplicating, levels(), None, false)
+            .is_ok());
     }
 }
