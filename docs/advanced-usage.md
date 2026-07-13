@@ -89,6 +89,14 @@ gpq-tiles overview big.parquet out.parquet --read-batch-size 1024
 gpq-tiles overview small.parquet out.parquet --no-streaming
 ```
 
+For very large exports where pass-2 output buffering is the pressure,
+`--profile bounded` spills buffered tiles to temporary Arrow IPC files
+instead of holding them in RAM (`auto`, the default, picks `speed` or
+`bounded` per mode and estimated size — output is byte-identical either
+way). `--in-flight-batches <N>` (default 4) trades peak memory for
+read/compute overlap: higher keeps more read batches resident but improves
+core utilization on long-pole geometries.
+
 Line coalescing holds one level's candidate lines in memory; datasets
 with more lines than `--coalesce-max-level-rows` (default 2,000,000)
 skip coalescing per level with a warning instead of breaking the bound.

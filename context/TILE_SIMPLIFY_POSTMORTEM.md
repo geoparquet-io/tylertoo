@@ -1,5 +1,13 @@
 # Postmortem — per-tile zoom-dependent simplification (PR #158)
 
+> **Status: historical.** This is a point-in-time decision record. It describes
+> the per-tile zoom-dependent simplification of #158 (excised in commit
+> `d897110`) and the per-tile pipeline that hosted it (removed in #177) — it does
+> **not** describe current code. In particular there is no top-level
+> `crates/core/src/simplify.rs` anymore; the live simplifier is
+> `crates/core/src/overview/simplify.rs` (world-space RDP, see
+> [ARCHITECTURE.md](ARCHITECTURE.md)). Kept only for the reasoning it captured.
+
 Date: 2026-07-03
 Decision: **EXCISED** (removed, not repaired) by maintainer during Phase 5 / H2.
 Removal commit: `d897110` (`refactor(tiles): remove unproven zoom-dependent

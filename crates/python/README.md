@@ -7,6 +7,17 @@
 
 Fast GeoParquet → PMTiles converter in Rust.
 
+**Features:**
+- COG-style multi-resolution **overviews embedded in GeoParquet** (`gpq-tiles overview`) — the file stays valid, exact, SQL-queryable GeoParquet
+- PMTiles export from an overview file (`gpq-tiles export-pmtiles`)
+- One-shot GeoParquet → PMTiles (`gpq-tiles tiles`, or the bare form)
+- Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
+- Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
+- Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
+- Spec validation (`gpq-tiles validate`)
+- PMTiles → GeoParquet decoding (`gpq-tiles decode`) — tippecanoe-decode
+  semantics, any PMTiles v3 MVT archive
+
 > **⚠️ Work in Progress**:
 > Code is generated with Claude; take it with a grain of salt.
 > --Nissim
@@ -21,107 +32,85 @@ pip install gpq-tiles      # Python
 ## Usage
 
 ```bash
+# One-shot: GeoParquet in, PMTiles out
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
 
-### Size-Based Feature Dropping
+### The Two-Step Workflow
 
-Drop the smallest features first when tiles are dense (tippecanoe parity):
+The overview GeoParquet file is the interesting artifact — keep it:
 
 ```bash
-gpq-tiles input.parquet output.pmtiles \
-  --drop-smallest-as-needed \
-  --drop-smallest-threshold 4.0  # square pixels (default)
+# 1. Embed multi-resolution levels in a GeoParquet file
+gpq-tiles overview input.parquet overviews.parquet \
+  --min-zoom 0 --max-zoom 14
+
+# 2. Validate against the spec
+gpq-tiles validate overviews.parquet
+
+# 3. Export a PMTiles archive for map rendering
+gpq-tiles export-pmtiles overviews.parquet output.pmtiles
 ```
 
-Useful for:
-- Building footprints (drop tiny sheds/outbuildings at high zoom)
-- Dense point data (drop smallest markers)
-- Polygon layers (drop single-pixel features)
+All tuning knobs live on `overview` / `export-pmtiles` — see
+[Overview Tuning](docs/OVERVIEW_TUNING.md). Defaults are calibrated on
+rendered corpus sweeps and are meant to look right out of the box.
+
+### Decoding PMTiles back to GeoParquet
+
+```bash
+# Extract one zoom of any PMTiles v3 vector archive as GeoParquet
+gpq-tiles decode input.pmtiles output.parquet --zoom 14
+```
+
+The output is the **tiled representation** (simplified, clipped, duplicated
+across tiles and zooms — no round-trip guarantee), with `zoom`/`layer`/
+`mvt_id` provenance columns for filtering. See
+[Decoding PMTiles](docs/decode.md).
+
+### Input Preparation
+
+Inputs must be WGS84 (EPSG:4326), and should be Hilbert-sorted with sane
+row groups. Use [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
+
+```bash
+gpio convert reproject input.parquet prepared.parquet \
+  -d EPSG:4326 --hilbert --row-group-size 100000
+```
+
+### Python
 
 ```python
+from gpq_tiles import overview, export_pmtiles, validate
+
+overview("input.parquet", "overviews.parquet", min_zoom=0, max_zoom=14)
+validate("overviews.parquet")
+export_pmtiles("overviews.parquet", "output.pmtiles")
+
+# One-shot facade (deprecated in favor of the two-step API)
 from gpq_tiles import convert
-
-# Basic
 convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
-
-# With property filtering and progress
-convert(
-    "buildings.parquet", "buildings.pmtiles",
-    include=["name", "height"],
-    progress_callback=lambda e: print(f"{e['phase']}: {e.get('total_tiles', '...')}")
-)
 ```
-
-### Multi-Resolution Overviews (Python)
-
-The overview pipeline builds COG-style vector overviews: a single
-level-banded GeoParquet file with progressively generalized copies of the
-data, plus a PMTiles exporter and a spec validator. All CLI knobs are
-exposed with identical defaults.
-
-```python
-from gpq_tiles import overview, validate, export_pmtiles
-
-# Polygon workflow (e.g. Moldova buildings/admin areas):
-# thin + simplify across z0-z10, then export tiles.
-report = overview(
-    "moldova.parquet", "moldova-overviews.parquet",
-    min_zoom=0, max_zoom=10,
-    simplify_factor=1.0,        # RDP tolerance = factor * level GSD
-    polygon_visibility=4.0,     # drop polygons smaller than 4 GSDs
-    drop_rate=1.65,             # per-level density budget
-)
-for lvl in report["levels"]:
-    print(lvl["level"], lvl["gsd"], lvl["feature_count"])
-
-result = validate("moldova-overviews.parquet")
-assert result["valid"], [c for c in result["checks"] if not c["passed"]]
-
-export_pmtiles(
-    "moldova-overviews.parquet", "moldova.pmtiles",
-    layer_name="buildings",
-)
-
-# Clustered point workflow (e.g. NYC trees): each level's surviving
-# point absorbs its grid-cell neighbors (point_count column), and
-# numeric attributes aggregate across each cluster.
-overview(
-    "nyc-trees.parquet", "nyc-trees-overviews.parquet",
-    min_zoom=8, max_zoom=14,
-    cluster=True,                                  # point_thinning defaults to 16.0
-    accumulate_attributes={"health_score": "mean"},
-    sort_key="diameter", sort_direction="desc",    # biggest tree wins the cell
-)
-export_pmtiles("nyc-trees-overviews.parquet", "nyc-trees.pmtiles",
-               layer_name="trees")
-```
-
-Every knob of `gpq-tiles overview` is available: `mode`
-("duplicating"/"partitioning"), `gsds`/`gsd_base`, `sort_key`/`sort_direction`,
-`class_rank_column`/`class_ranks`/`class_rank_unknown`, `no_auto_rank`,
-`simplify_factor`/`collapse`/`cascade`, per-kind `*_thinning` and `*_visibility`
-factors, density budget (`density_drop`, `drop_rate`, `drop_gamma`),
-clustering (`cluster`, `accumulate_attributes`), line coalescing
-(`coalesce_lines`, `coalesce_snap`, `coalesce_junction_angle`,
-`coalesce_max_level_rows`), writer options (`row_group_size`,
-`full_column_stats`, `cogp_compat`), and streaming controls (`streaming`,
-`read_batch_size`). See `help(gpq_tiles.overview)`.
 
 ## Documentation
 
-- **[Getting Started](docs/getting-started.md)** — Installation, basic usage, property filtering
-- **[Advanced Usage](docs/advanced-usage.md)** — Performance tuning, streaming, CI/CD
-- **[API Reference](docs/api-reference.md)** — CLI flags, Rust API, Python API
+- **[Getting Started](docs/getting-started.md)** — Installation, basic usage, the two-step workflow
+- **[Overview Tuning](docs/OVERVIEW_TUNING.md)** — Every generalization knob explained
+- **[Decoding PMTiles](docs/decode.md)** — PMTiles → GeoParquet, limitations included
+- **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API
+- **[Advanced Usage](docs/advanced-usage.md)** — Input optimization, memory, remote reads, CI/CD
+- **[Remote Reads](docs/remote-reads.md)** — Converting directly from s3://, https://, gs:// inputs, and querying overview files in place with DuckDB
+- **[Format Spec (draft)](context/OVERVIEWS_SPEC.md)** — The `geo:overviews` format contract
 
 ## Development
 
 ```bash
 git clone https://github.com/geoparquet-io/gpq-tiles.git && cd gpq-tiles
-cargo build && cargo test
+git config core.hooksPath .githooks
+cargo build && cargo check
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [DEVELOPMENT.md](DEVELOPMENT.md) for details.
 
 ## License
 

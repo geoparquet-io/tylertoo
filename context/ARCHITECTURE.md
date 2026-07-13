@@ -21,7 +21,7 @@ The legacy per-tile pipeline (`pipeline.rs`, `Converter`, the streaming
 external-sort/bucketed tiler and its quality features) was **removed**. The
 overview pipeline (`overview convert` → `export-pmtiles`) supersedes it for
 the project's core workflow: it is faster (Moldova full pipeline < 2 min),
-memory-bounded (convert ~306 MB / export ~0.89 GB), and carries the quality
+memory-bounded (convert ~0.4 GB for a z0–6 pyramid, ~1.4 GB for z0–14; export ~0.89 GB), and carries the quality
 ladder (ranking, density budget, clustering, coalescing) the tile path never
 got. See `context/TILE_SIMPLIFY_POSTMORTEM.md` for why the tile-path quality
 work had already been excised.
@@ -71,19 +71,30 @@ verbatim (spec §2.4).
 1. **Pass 1** streams the input once, keeping only a small per-feature record
    (bbox, kind, ranking key). Level assignment + density budget run over
    those records to produce per-level **winner tables** (~1 byte/feature).
-2. **Pass 2** re-reads the seekable input once per level, filters each Arrow
-   read batch against the winner table, simplifies only the winners
-   (rayon-parallel within each batch), and writes batch-by-batch.
+2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
+   levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
+   reader thread streams batches over a bounded channel while a consumer
+   parallelizes every `(level × feature)` simplification across cores; each
+   level's output drains to the writer in level order, canonical last. A
+   serial engine that re-reads the input once per level is retained as the
+   equivalence-tested reference.
 
 Peak memory is `O(read batch + winner tables)` — Moldova (632k polygons,
-38M vertices) converts in ~55 s / ~320 MB peak RSS on a 16-core machine.
+38M vertices) converts to a z0–14 pyramid in ~45 s / ~1.4 GB peak RSS on a 16-core machine
+(a default z0–6 pyramid is ~7 s / ~0.4 GB).
 `--no-streaming` keeps the in-memory pipeline as the equivalence-tested
 reference implementation.
 
 Simplification (`overview/simplify.rs`) is Ramer–Douglas–Peucker in world
-space with tolerance = `simplify_factor × gsd(level)`, with ring-validity
-checking: an invalid RDP candidate retries at `eps/2, eps/4, eps/8` before
-falling back to the original geometry (counted, logged at debug level).
+space with tolerance = `simplify_factor × gsd(level)`. By default it
+**cascades** (#218): each coarser level simplifies the next-finer level's
+already-simplified output (tippecanoe-style), and an invalid RDP candidate is
+repaired in a single boolean-overlay pass. `--no-cascade` restores the
+non-cascaded path, where an invalid candidate instead retries at
+`eps/2, eps/4, eps/8` before falling back to the original geometry (counted,
+logged at debug level). Either way the validity check is capped at 2048
+vertices on oversized candidates (#242) to avoid an O(V²) stall, and the
+canonical level is always verbatim.
 
 ### Export (`export-pmtiles`, `overview/export.rs`)
 
@@ -146,7 +157,7 @@ banding/row-group alignment, canonical fidelity, monotonicity, cluster
 | Area | Our approach | Tippecanoe | Notes |
 |------|--------------|------------|-------|
 | Generalization space | World-space, per **level**, stored in the file | Tile-space, per tile, at encode time | The core format difference: levels are reusable, exact, SQL-queryable |
-| Simplification | RDP, tolerance = factor × level GSD, validity-checked with eps-halving retries | `douglas_peucker` in tile pixel space | Canonical level always verbatim |
+| Simplification | RDP, tolerance = factor × level GSD, **cascading** by default (#218) with boolean-overlay validity repair (vertex-capped, #242) | `douglas_peucker` in tile pixel space | Canonical level always verbatim; `--no-cascade` reverts to per-level eps-halving |
 | Density drop rate | `--drop-rate 1.65`, budget anchored on full canonical count `N` | `-r`/`--drop-rate` 2.5, anchored on per-tile basezoom count | Same geometric ladder; different anchor ⇒ different numeric default (see `corpus/SWEEPS.md`) |
 | Spatial fairness | `--drop-gamma` per super-cell allocation ∝ population^(1/γ) | gamma dot-dropping in dense areas | Same idea, applied per super-cell so per-level totals are unchanged |
 | Point clustering | Winner **keeps its own geometry** and absorbs cell losers into `point_count` | Cluster centroid is the mean position | Deliberate: anchor stays a real feature; deterministic |
@@ -253,7 +264,8 @@ crates/core/src/
 │   ├── level.rs        #   Footer metadata model, SPEC_VERSION
 │   ├── reader.rs       #   Overview file reader (level-banded row groups)
 │   ├── simplify.rs     #   World-space RDP simplification (GSD tolerance)
-│   ├── stream.rs       #   Two-pass bounded-memory streaming pipeline
+│   ├── pipeline.rs     #   Single-read pass-2 engine (#213): fans each batch to all levels
+│   ├── stream.rs       #   Two-pass streaming orchestration (pass-1 scan; pass-2 → pipeline.rs)
 │   └── writer.rs       #   Level-banded GeoParquet writer
 ├── input.rs            # Input source abstraction: local file or remote
 │                       # object (s3/https/gs) via byte-range reads (#210)

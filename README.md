@@ -12,7 +12,7 @@ Fast GeoParquet → PMTiles converter in Rust.
 - PMTiles export from an overview file (`gpq-tiles export-pmtiles`)
 - One-shot GeoParquet → PMTiles (`gpq-tiles tiles`, or the bare form)
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
-- Memory-bounded streaming conversion (632k-polygon / 38M-vertex file: ~55 s, ~320 MB peak RSS)
+- Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
 - Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
 - Spec validation (`gpq-tiles validate`)
 - PMTiles → GeoParquet decoding (`gpq-tiles decode`) — tippecanoe-decode

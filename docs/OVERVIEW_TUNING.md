@@ -536,6 +536,21 @@ suppressed by default (below), even hundreds of row groups keep the footer
 small, so there is rarely a reason to raise it. LOWER it if you serve tiny
 viewports over a high-latency store and want tighter pruning.
 
+### `--row-group-size-policy` (default `constant`): per-level cap scaling
+
+Controls how the `--row-group-size` cap is applied across levels (#202):
+
+- **`constant`** (default): every level uses the same cap.
+- **`zoom-scaled`**: the cap doubles for each zoom step *below* the finest
+  level (`cap = row-group-size << (max_zoom − level_zoom)`). Coarse bands —
+  which a wide viewport reads mostly whole anyway — collapse into fewer, larger
+  row groups (fewer remote requests), while the finest level keeps tight
+  per-row-group bbox pruning.
+
+Reach for `zoom-scaled` when a deep pyramid's coarse levels fragment into many
+tiny row groups and bloat the footer; leave it `constant` otherwise. See
+`corpus/SWEEPS.md` (Decision 5) for the rationale.
+
 ### `--full-column-stats` (default off): statistics suppression
 
 By default the writer **suppresses** Parquet per-row-group min/max statistics
@@ -569,9 +584,14 @@ By default the converter runs a **two-pass streaming pipeline** (H3):
    (bbox, geometry kind, ranking key — no geometry). The level-assignment
    engine and density budget run over those records to build the **winner
    table**: one byte per feature saying which levels it survives at.
-2. **Pass 2** re-reads the input once per level (Parquet is seekable, so
-   re-reads are cheap), filters each read batch against the winner table,
-   simplifies only the selected rows, and writes batch-by-batch.
+2. **Pass 2** reads the input **once more** and fans each read batch out to
+   *all* levels at once (the single-read pipelined engine, #213): a reader
+   thread streams batches over a bounded channel while a consumer parallelizes
+   every `(level × feature)` simplification across cores, and each level's
+   output drains to the writer in level order. The finest (canonical) level is
+   verbatim and streamed to the writer last. An older engine that re-read the
+   input once *per level* survives only as the equivalence-tested reference
+   path — see [Performance profiles](#performance-profiles---profile---in-flight-batches).
 
 Peak memory is `O(read batch + winner tables)` instead of `O(dataset)`: on the
 Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
@@ -595,10 +615,10 @@ of coastline-sized multipolygons can be large); RAISE it (e.g. 65536) only if
 profiling shows per-batch overhead dominating on a machine with RAM to spare.
 
 **`--no-streaming`** runs the original in-memory pipeline: the whole table and
-every decoded geometry are held at once (`O(dataset)` memory). It reads the
-input exactly once instead of once per level, so it can be marginally faster
-on *small* inputs that comfortably fit in RAM; on large inputs it is both
-slower and enormously more memory-hungry. It is kept as the reference
+every decoded geometry are held at once (`O(dataset)` memory). It decodes each
+geometry only once — the streaming default re-decodes the winners in pass 2 —
+so it can be marginally faster on *small* inputs that comfortably fit in RAM;
+on large inputs it is both slower and enormously more memory-hungry. It is kept as the reference
 implementation — the two paths are equivalence-tested against each other —
 and as an escape hatch; there is no output-quality reason to use it.
 
