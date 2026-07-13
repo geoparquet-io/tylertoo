@@ -28,9 +28,10 @@
 //!
 //! See: https://github.com/felt/tippecanoe (clipping documentation)
 
+use geo::algorithm::sweep::Intersections;
 use geo::{
-    BooleanOps, BoundingRect, Coord, Geometry, LineString, MultiLineString, MultiPolygon, Point,
-    Polygon, Rect,
+    BooleanOps, BoundingRect, Coord, Geometry, Line, LineString, MultiLineString, MultiPolygon,
+    Point, Polygon, Rect,
 };
 
 use crate::ioverlay_clip;
@@ -48,14 +49,6 @@ pub const DEFAULT_EXTENT: u32 = 4096;
 // Structural Validity Checks (Issue #94)
 // ============================================================================
 
-/// Ring length above which [`has_self_intersecting_edges`] skips its O(n²) scan
-/// and reports "simple" (issue #237). Chosen to sit well above any ordinary
-/// tile feature's per-ring vertex count — including the largest rings in the
-/// real-data test fixtures — so capping never changes normal output, while
-/// bounding the cost on pathological continental rings that would otherwise
-/// stall the export for minutes.
-const MAX_SELF_INTERSECT_VERTS: usize = 2_048;
-
 /// Check if a polygon has structural issues that indicate clipping failure.
 ///
 /// This performs cheap O(n) checks for problems that Sutherland-Hodgman
@@ -67,19 +60,21 @@ const MAX_SELF_INTERSECT_VERTS: usize = 2_048;
 ///
 /// # `assume_simple` (issue #237, RC3)
 ///
-/// The self-intersecting-edges test is **O(n²)** and previously ran on every
-/// clip. When the caller has already established that the source feature's
-/// rings are simple (no self-intersections) — computed **once per feature** via
-/// [`geometry_is_simple`] — pass `assume_simple = true` to skip that check here.
-/// This is byte-identical, not merely an approximation: `assume_simple` is only
-/// ever `true` when [`has_self_intersecting_edges`] would have returned `false`,
-/// so the branch it skips could not have changed the result. The cheap O(n)
-/// degenerate/duplicate checks always run.
+/// The self-intersecting-edges test (an O((n + m) log n) sweep, issue #241) runs
+/// on every clip. When the caller has already established that the source
+/// feature's rings are simple (no self-intersections) — computed **once per
+/// feature** via [`geometry_is_simple`] — pass `assume_simple = true` to skip
+/// that check here. A continental admin polygon covering thousands of tiles thus
+/// pays the sweep once instead of once per tile. This is byte-identical, not
+/// merely an approximation: `assume_simple` is only ever `true` when
+/// [`has_self_intersecting_edges`] would have returned `false`, so the branch it
+/// skips could not have changed the result. The cheap O(n) degenerate/duplicate
+/// checks always run.
 ///
 /// # Performance
 ///
 /// - O(n) for the vertex checks (always run)
-/// - O(n²) worst case for edge intersection (skipped when `assume_simple`)
+/// - O((n + m) log n) sweep for edge intersection (skipped when `assume_simple`)
 fn has_structural_issues(poly: &Polygon<f64>, assume_simple: bool) -> bool {
     let ring = poly.exterior();
 
@@ -102,9 +97,9 @@ fn has_structural_issues(poly: &Polygon<f64>, assume_simple: bool) -> bool {
         }
     }
 
-    // Check for self-intersecting edges (O(n²), early-exits on the first
-    // intersection). Skipped when the feature was pre-validated as simple —
-    // see the `assume_simple` note above.
+    // Check for self-intersecting edges (O((n + m) log n) sweepline). Skipped
+    // when the feature was pre-validated as simple — see the `assume_simple`
+    // note above.
     if !assume_simple && has_self_intersecting_edges(&ring.0) {
         return true;
     }
@@ -112,68 +107,55 @@ fn has_structural_issues(poly: &Polygon<f64>, assume_simple: bool) -> bool {
     false
 }
 
-/// Check if a ring has self-intersecting edges.
+/// Check if a ring has self-intersecting edges (any two non-adjacent edges that
+/// *properly* cross).
 ///
-/// Uses the cross-product method to detect if any two non-adjacent edges
-/// cross each other.
+/// # Sweepline (issue #241)
 ///
-/// # Vertex cap (issue #237)
+/// This runs a Bentley–Ottmann sweep (`geo::algorithm::sweep::Intersections`) to
+/// enumerate candidate intersecting edge pairs in **O((n + m) log n)** — where
+/// `m` is the number of x-overlapping pairs — instead of the previous
+/// **O(n²)** pairwise scan. The sweep replaced a capped scan (issue #237 skipped
+/// rings above 2048 vertices to keep the export from stalling on continental
+/// admin rings); with the sweep the cap is gone, so even a genuinely
+/// self-intersecting giant ring is now detected and routed to i_overlay repair.
 ///
-/// This is **O(n²)** in the ring's vertex count. For ordinary tile geometry that
-/// is fine, but a fine-zoom overview of a continental admin polygon can carry
-/// hundreds of thousands of vertices in a single ring, at which point the
-/// pairwise scan runs for minutes and stalls the whole export (it was the
-/// dominant term in the adm4 DNF). Rings longer than [`MAX_SELF_INTERSECT_VERTS`]
-/// are therefore reported as **not self-intersecting** without scanning: such
-/// rings come from real, valid source data (they are the pre-simplified boundary
-/// of a country/region), and treating an already-simple ring as simple is the
-/// same answer the full scan would return — only the pathological
-/// genuinely-self-intersecting giant ring is affected, and that case is out of
-/// scope here (it is handled, if at all, by the i_overlay path via the O(n)
-/// boundary gate). Keeping the cap well above any ordinary feature's ring size
-/// leaves normal output byte-identical.
+/// ## Byte-identical decision
+///
+/// The sweep only decides which pairs to *test*; the accept/reject decision is
+/// the unchanged [`edges_intersect_properly`] predicate applied to each
+/// candidate. A proper crossing meets at a point interior to both edges, so its
+/// two edges always overlap in x and are therefore always surfaced by the sweep
+/// — no proper crossing is missed. Adjacent edges (sharing a vertex) and
+/// collinear overlaps yield a zero cross-product and are rejected by the
+/// predicate exactly as before, so the boolean result matches the old scan on
+/// every real (simple) ring. Degenerate zero-length edges are dropped up front,
+/// matching the old scan's `continue`.
 fn has_self_intersecting_edges(coords: &[Coord<f64>]) -> bool {
     let n = coords.len();
     if n < 4 {
         return false;
     }
-    if n > MAX_SELF_INTERSECT_VERTS {
-        // Too large to scan in O(n²); assume simple (see the note above).
-        return false;
-    }
 
-    // Check all pairs of non-adjacent edges
-    for i in 0..n - 1 {
-        let a1 = coords[i];
-        let a2 = coords[i + 1];
-
-        // Skip degenerate edges
-        if (a1.x - a2.x).abs() < 1e-10 && (a1.y - a2.y).abs() < 1e-10 {
-            continue;
-        }
-
-        // Check against all non-adjacent edges
-        for j in (i + 2)..n - 1 {
-            // Skip adjacent edges (they share a vertex)
-            if j == i + 1 || (i == 0 && j == n - 2) {
-                continue;
+    // Ring edges as sweep-line segments, dropping degenerate (zero-length)
+    // edges just as the previous pairwise scan skipped them.
+    let segments: Vec<Line<f64>> = coords
+        .windows(2)
+        .filter_map(|w| {
+            let (a, b) = (w[0], w[1]);
+            if (a.x - b.x).abs() < 1e-10 && (a.y - b.y).abs() < 1e-10 {
+                None
+            } else {
+                Some(Line::new(a, b))
             }
+        })
+        .collect();
 
-            let b1 = coords[j];
-            let b2 = coords[j + 1];
-
-            // Skip degenerate edges
-            if (b1.x - b2.x).abs() < 1e-10 && (b1.y - b2.y).abs() < 1e-10 {
-                continue;
-            }
-
-            if edges_intersect_properly(a1, a2, b1, b2) {
-                return true;
-            }
-        }
-    }
-
-    false
+    // The sweep yields every edge pair that overlaps in x and meets; re-apply
+    // the exact proper-crossing predicate to keep the result byte-identical to
+    // the old O(n²) scan (see the note above).
+    Intersections::from_iter(segments)
+        .any(|(a, b, _)| edges_intersect_properly(a.start, a.end, b.start, b.end))
 }
 
 /// Check if two line segments intersect properly (crossing, not touching at endpoints).
@@ -213,12 +195,12 @@ fn geometry_has_structural_issues(geom: &Geometry<f64>, assume_simple: bool) -> 
 /// Whether a geometry's polygon exterior rings are **simple** (free of
 /// self-intersecting edges).
 ///
-/// This runs the same O(n²) edge-pair test as [`has_structural_issues`], but is
-/// meant to be called **once per feature** rather than once per clip. Threading
-/// the result into the clip pipeline as `assume_simple` lets the hot path skip
-/// that O(n²) check on every tile the feature touches (issue #237, RC3): a
-/// continental admin polygon covering thousands of tiles pays the cost once
-/// instead of thousands of times.
+/// This runs the same self-intersection sweep as [`has_structural_issues`] (an
+/// O((n + m) log n) Bentley–Ottmann pass, issue #241), but is meant to be called
+/// **once per feature** rather than once per clip. Threading the result into the
+/// clip pipeline as `assume_simple` lets the hot path skip that check on every
+/// tile the feature touches (issue #237, RC3): a continental admin polygon
+/// covering thousands of tiles pays the cost once instead of thousands of times.
 ///
 /// Only exterior rings are inspected, matching what [`has_structural_issues`]
 /// (and hence the S-H validity gate) actually checks. Non-polygon geometries
@@ -881,7 +863,8 @@ mod tests {
     }
 
     /// A crossing ("bowtie") ring of `n` vertices: two dense diagonals that
-    /// intersect. Used to exercise the O(n²) self-intersection scan and its cap.
+    /// intersect. Used to exercise the sweepline self-intersection test at a
+    /// range of ring sizes.
     fn crossing_ring(n: usize) -> Vec<Coord<f64>> {
         let half = n / 2;
         let mut v: Vec<Coord<f64>> = Vec::with_capacity(n + 1);
@@ -908,21 +891,41 @@ mod tests {
     }
 
     #[test]
-    fn self_intersection_detected_below_cap() {
+    fn self_intersection_detected_small_ring() {
         let ring = crossing_ring(64);
-        assert!(ring.len() <= MAX_SELF_INTERSECT_VERTS);
         assert!(has_self_intersecting_edges(&ring));
     }
 
     #[test]
-    fn self_intersection_scan_capped_above_threshold() {
-        // A genuinely self-intersecting ring larger than the cap is reported as
-        // "simple" — the O(n²) scan is skipped to keep the export from stalling
-        // on huge continental rings (issue #237). This is the intended trade:
-        // pathological giant invalid rings are not repaired, everything smaller
-        // is validated exactly as before.
-        let ring = crossing_ring(MAX_SELF_INTERSECT_VERTS + 500);
-        assert!(ring.len() > MAX_SELF_INTERSECT_VERTS);
+    fn large_self_intersecting_ring_detected() {
+        // Issue #241: a genuinely self-intersecting ring far larger than the old
+        // O(n²) cap (2048) must still be reported as self-intersecting. The
+        // sweepline test carries no vertex cap, so the crossing is found
+        // regardless of ring size — closing the latent correctness gap left by
+        // the capped scan.
+        let ring = crossing_ring(6_000);
+        assert!(ring.len() > 2_048);
+        assert!(has_self_intersecting_edges(&ring));
+    }
+
+    #[test]
+    fn large_simple_ring_not_self_intersecting() {
+        // A large convex ring (regular polygon approximating a circle), far
+        // above the old cap, must be reported simple. This guards the sweepline
+        // against false positives at scale and confirms it stays fast where the
+        // old O(n²) scan would have stalled (issue #241).
+        let n = 20_000usize;
+        let mut ring: Vec<Coord<f64>> = (0..n)
+            .map(|i| {
+                let theta = std::f64::consts::TAU * (i as f64) / (n as f64);
+                Coord {
+                    x: theta.cos(),
+                    y: theta.sin(),
+                }
+            })
+            .collect();
+        ring.push(ring[0]); // close
+        assert!(ring.len() > 2_048);
         assert!(!has_self_intersecting_edges(&ring));
     }
 
