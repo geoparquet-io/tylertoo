@@ -119,7 +119,7 @@ gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
 
 This runs overview convert (default knobs) into a temporary file, then
-export. Flags: `--min-zoom`, `--max-zoom`, `--layer-name`,
+export. Flags: `--min-zoom`, `--max-zoom`, `--bbox`, `--layer-name`,
 `--max-tile-size`, `--verbose`. For any tuning beyond that, use the
 two-step workflow.
 

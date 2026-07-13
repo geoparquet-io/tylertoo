@@ -15,6 +15,7 @@ Commands:
   overview        Build a multi-resolution overview GeoParquet file
   validate        Validate an overview file against the spec (§6.2)
   export-pmtiles  Export a PMTiles archive from an overview file
+  decode          Decode a PMTiles v3 vector archive back to GeoParquet
 ```
 
 ### `gpq-tiles overview <INPUT> <OUTPUT>`
@@ -25,11 +26,13 @@ Commands:
 | `--min-zoom <N>` / `--max-zoom <N>` | `0` / `6` | Coarsest / finest (canonical) Web Mercator zoom for the level plan |
 | `--gsd <G1,G2,…>` | — | Explicit GSD list (meters, strictly decreasing); overrides the zoom range |
 | `--gsd-base <F>` | `1024.0` | Master detail knob: `gsd(z) = 40075016.69 / base / 2^z` |
+| `--bbox <XMIN,YMIN,XMAX,YMAX>` | — | Regional extract (lon/lat degrees): convert only features whose bbox intersects; prunes non-matching row groups via GeoParquet 1.1 covering stats |
 | `--sort-key <COL>` | — | Numeric cell-winner priority column (mutually exclusive with `--class-rank`) |
 | `--class-rank <SPEC>` | — | Categorical ranking, e.g. `road_class:motorway=5,primary=4` |
 | `--no-auto-rank` | off | Disable auto-detection of Overture roads/places schemas |
 | `--simplify-factor <F>` | `1.0` | RDP tolerance = factor × GSD (duplicating mode) |
 | `--collapse` | off | Collapse below-visibility polygons to a representative point |
+| `--no-cascade` | off (cascade ON) | Disable cascading simplification (each coarse level re-simplifies the next-finer output); reproduces pre-#218 output byte-for-byte |
 | `--cluster` | off | Point clustering: winners absorb cell losers into a `point_count` column |
 | `--accumulate-attribute <COL:OP>` | — | Aggregate a numeric column across clusters (`sum`/`max`/`min`/`mean`; repeatable; requires `--cluster`) |
 | `--no-coalesce-lines` | off (coalescing ON) | Disable line network coalescing |
@@ -44,9 +47,12 @@ Commands:
 | `--no-density-drop` | off | Disable the density budget entirely |
 | `--cogp-compat` | off | Emit the COGP compatibility footer key (partitioning mode) |
 | `--row-group-size <N>` | `10000` | Per-level row-group cap |
+| `--row-group-size-policy <POLICY>` | `constant` | `constant` (every level uses the cap) or `zoom-scaled` (cap doubles per zoom step below the finest) |
 | `--full-column-stats` | off | Keep Parquet stats on all columns (default suppresses geometry/string stats) |
 | `--no-streaming` | off (streaming ON) | Revert to the in-memory reference pipeline |
 | `--read-batch-size <N>` | `8192` | Rows per Arrow read batch (streaming) |
+| `--profile <MODE>` | `auto` | Pass-2 buffering: `speed` (in-RAM), `bounded` (spill to temp Arrow IPC), `auto` (per mode + size). Output is byte-identical across profiles |
+| `--in-flight-batches <N>` | `4` | Read/compute overlap depth in pass 2 (higher = better core use, proportionally more peak memory) |
 | `--report <PATH>` | — | Write the JSON conversion report |
 
 ### `gpq-tiles export-pmtiles <INPUT> <OUTPUT>`
@@ -75,11 +81,30 @@ export-pmtiles.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--min-zoom <N>` / `--max-zoom <N>` | `0` / `14` | Zoom range (feeds the overview level plan) |
+| `--bbox <XMIN,YMIN,XMAX,YMAX>` | — | Regional extract (lon/lat degrees); see `overview --bbox` |
 | `--layer-name <NAME>` | derived from input filename | MVT layer name |
 | `--max-tile-size <SIZE>` | — | Per-tile byte cap (e.g. `500K`, `1M`) |
 | `-v, --verbose` | off | Per-level / per-zoom breakdowns |
 
 For any other tuning, use `overview` + `export-pmtiles` directly.
+
+### `gpq-tiles decode <INPUT> <OUTPUT>`
+
+Decode a PMTiles v3 vector archive back to GeoParquet (tippecanoe-decode
+semantics). The output is the **tiled** representation — simplified,
+clipped, and duplicated across tiles/zooms — with no round-trip
+guarantee; `zoom`/`layer`/`mvt_id` columns carry provenance for filtering.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--zoom <N>` | — | Decode only this zoom (mutually exclusive with the range flags) |
+| `--min-zoom <N>` / `--max-zoom <N>` | — | Decode a zoom range |
+| `--layer <NAME>` | — | Only decode features from this MVT layer |
+| `--report <PATH>` | — | Write the JSON decode report |
+
+See [Decoding PMTiles](decode.md) for output columns and limitations.
+Decode has no Python binding; it is CLI- and Rust-only
+(`gpq_tiles_core::decode::decode_pmtiles` / `DecodeOptions`).
 
 ---
 
@@ -110,6 +135,7 @@ report = overview(
     no_auto_rank: bool = False,
     simplify_factor: float = 1.0,
     collapse: bool = False,
+    cascade: bool = True,
     point_thinning: float | None = None,
     line_thinning: float = 1.0,
     polygon_thinning: float = 1.0,
@@ -129,6 +155,9 @@ report = overview(
     full_column_stats: bool = False,
     streaming: bool = True,
     read_batch_size: int = 8192,
+    bbox: tuple[float, float, float, float] | None = None,
+    profile: str = "auto",
+    in_flight_batches: int = 4,
 ) -> dict  # the JSON conversion report
 ```
 
