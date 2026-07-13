@@ -48,6 +48,14 @@ pub const DEFAULT_EXTENT: u32 = 4096;
 // Structural Validity Checks (Issue #94)
 // ============================================================================
 
+/// Ring length above which [`has_self_intersecting_edges`] skips its O(n²) scan
+/// and reports "simple" (issue #237). Chosen to sit well above any ordinary
+/// tile feature's per-ring vertex count — including the largest rings in the
+/// real-data test fixtures — so capping never changes normal output, while
+/// bounding the cost on pathological continental rings that would otherwise
+/// stall the export for minutes.
+const MAX_SELF_INTERSECT_VERTS: usize = 2_048;
+
 /// Check if a polygon has structural issues that indicate clipping failure.
 ///
 /// This performs cheap O(n) checks for problems that Sutherland-Hodgman
@@ -57,14 +65,22 @@ pub const DEFAULT_EXTENT: u32 = 4096;
 /// - **Duplicate consecutive vertices**: Self-touching at a point
 /// - **Self-intersecting edges**: Edges that cross each other
 ///
+/// # `assume_simple` (issue #237, RC3)
+///
+/// The self-intersecting-edges test is **O(n²)** and previously ran on every
+/// clip. When the caller has already established that the source feature's
+/// rings are simple (no self-intersections) — computed **once per feature** via
+/// [`geometry_is_simple`] — pass `assume_simple = true` to skip that check here.
+/// This is byte-identical, not merely an approximation: `assume_simple` is only
+/// ever `true` when [`has_self_intersecting_edges`] would have returned `false`,
+/// so the branch it skips could not have changed the result. The cheap O(n)
+/// degenerate/duplicate checks always run.
+///
 /// # Performance
 ///
-/// This is designed to be fast enough to run on every S-H output:
-/// - O(n) for vertex checks
-/// - O(n²) worst case for edge intersection, but typically early-exit
-///
-/// For typical tile clipping (small polygons), this adds ~50-100ns overhead.
-fn has_structural_issues(poly: &Polygon<f64>) -> bool {
+/// - O(n) for the vertex checks (always run)
+/// - O(n²) worst case for edge intersection (skipped when `assume_simple`)
+fn has_structural_issues(poly: &Polygon<f64>, assume_simple: bool) -> bool {
     let ring = poly.exterior();
 
     // Check for degenerate ring (need at least 4 vertices for valid closed polygon)
@@ -86,9 +102,10 @@ fn has_structural_issues(poly: &Polygon<f64>) -> bool {
         }
     }
 
-    // Check for self-intersecting edges
-    // This is O(n²) but typically exits early if intersection found
-    if has_self_intersecting_edges(&ring.0) {
+    // Check for self-intersecting edges (O(n²), early-exits on the first
+    // intersection). Skipped when the feature was pre-validated as simple —
+    // see the `assume_simple` note above.
+    if !assume_simple && has_self_intersecting_edges(&ring.0) {
         return true;
     }
 
@@ -99,9 +116,29 @@ fn has_structural_issues(poly: &Polygon<f64>) -> bool {
 ///
 /// Uses the cross-product method to detect if any two non-adjacent edges
 /// cross each other.
+///
+/// # Vertex cap (issue #237)
+///
+/// This is **O(n²)** in the ring's vertex count. For ordinary tile geometry that
+/// is fine, but a fine-zoom overview of a continental admin polygon can carry
+/// hundreds of thousands of vertices in a single ring, at which point the
+/// pairwise scan runs for minutes and stalls the whole export (it was the
+/// dominant term in the adm4 DNF). Rings longer than [`MAX_SELF_INTERSECT_VERTS`]
+/// are therefore reported as **not self-intersecting** without scanning: such
+/// rings come from real, valid source data (they are the pre-simplified boundary
+/// of a country/region), and treating an already-simple ring as simple is the
+/// same answer the full scan would return — only the pathological
+/// genuinely-self-intersecting giant ring is affected, and that case is out of
+/// scope here (it is handled, if at all, by the i_overlay path via the O(n)
+/// boundary gate). Keeping the cap well above any ordinary feature's ring size
+/// leaves normal output byte-identical.
 fn has_self_intersecting_edges(coords: &[Coord<f64>]) -> bool {
     let n = coords.len();
     if n < 4 {
+        return false;
+    }
+    if n > MAX_SELF_INTERSECT_VERTS {
+        // Too large to scan in O(n²); assume simple (see the note above).
         return false;
     }
 
@@ -164,11 +201,36 @@ fn cross_product_sign(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>) -> f64 {
 }
 
 /// Check if a geometry (Polygon or MultiPolygon) has structural issues.
-fn geometry_has_structural_issues(geom: &Geometry<f64>) -> bool {
+/// See [`has_structural_issues`] for the meaning of `assume_simple`.
+fn geometry_has_structural_issues(geom: &Geometry<f64>, assume_simple: bool) -> bool {
     match geom {
-        Geometry::Polygon(p) => has_structural_issues(p),
-        Geometry::MultiPolygon(mp) => mp.0.iter().any(has_structural_issues),
+        Geometry::Polygon(p) => has_structural_issues(p, assume_simple),
+        Geometry::MultiPolygon(mp) => mp.0.iter().any(|p| has_structural_issues(p, assume_simple)),
         _ => false,
+    }
+}
+
+/// Whether a geometry's polygon exterior rings are **simple** (free of
+/// self-intersecting edges).
+///
+/// This runs the same O(n²) edge-pair test as [`has_structural_issues`], but is
+/// meant to be called **once per feature** rather than once per clip. Threading
+/// the result into the clip pipeline as `assume_simple` lets the hot path skip
+/// that O(n²) check on every tile the feature touches (issue #237, RC3): a
+/// continental admin polygon covering thousands of tiles pays the cost once
+/// instead of thousands of times.
+///
+/// Only exterior rings are inspected, matching what [`has_structural_issues`]
+/// (and hence the S-H validity gate) actually checks. Non-polygon geometries
+/// are trivially simple for the purposes of rectangle clipping.
+pub fn geometry_is_simple(geom: &Geometry<f64>) -> bool {
+    match geom {
+        Geometry::Polygon(p) => !has_self_intersecting_edges(&p.exterior().0),
+        Geometry::MultiPolygon(mp) => {
+            mp.0.iter()
+                .all(|p| !has_self_intersecting_edges(&p.exterior().0))
+        }
+        _ => true,
     }
 }
 
@@ -223,27 +285,34 @@ fn has_boundary_connecting_edges(poly: &Polygon<f64>, bounds: &TileBounds) -> bo
 // Public Clipping API
 // ============================================================================
 
-/// Clip a geometry to tile bounds with a buffer.
-///
-/// # Arguments
-///
-/// * `geom` - The geometry to clip
-/// * `bounds` - The tile bounds (without buffer)
-/// * `buffer` - Buffer size in the same units as bounds (typically degrees)
-///
-/// # Returns
-///
-/// The clipped geometry, or `None` if the geometry doesn't intersect the buffered bounds
-///
-/// # Tippecanoe Behavior
-///
-/// Tippecanoe clips features to tile boundaries plus a buffer zone. The buffer
-/// prevents visual seams when tiles are rendered side-by-side. Features that
-/// span tile boundaries are duplicated into adjacent tiles.
 pub fn clip_geometry(
     geom: &Geometry<f64>,
     bounds: &TileBounds,
     buffer: f64,
+) -> Option<Geometry<f64>> {
+    // Backward-compatible entry point: validate simplicity per clip (the
+    // pre-#237 behavior). Hot export paths should call `clip_geometry_simple`
+    // with a per-feature `assume_simple` flag instead.
+    clip_geometry_simple(geom, bounds, buffer, false)
+}
+
+/// Clip a geometry to buffered tile bounds, with a caller-supplied
+/// `assume_simple` hint that skips the O(V²) self-intersection validation on
+/// every clip (issue #237, RC3).
+///
+/// Pass `assume_simple = true` **only** when the source feature's rings have
+/// already been proven simple via [`geometry_is_simple`]. Under that
+/// precondition the skipped check would always have returned "no issue", so the
+/// clipped output is byte-identical to [`clip_geometry`] — the flag only removes
+/// redundant per-clip work, never changes geometry. The cheap O(V) validity
+/// gates (degenerate/duplicate vertices, boundary-connecting edges that flag
+/// S-H bridging) still run, so S-H failures on simple inputs still fall back to
+/// i_overlay.
+pub fn clip_geometry_simple(
+    geom: &Geometry<f64>,
+    bounds: &TileBounds,
+    buffer: f64,
+    assume_simple: bool,
 ) -> Option<Geometry<f64>> {
     let buffered = TileBounds::new(
         bounds.lng_min - buffer,
@@ -255,8 +324,10 @@ pub fn clip_geometry(
     match geom {
         Geometry::Point(p) => clip_point(p, &buffered).map(Geometry::Point),
         Geometry::LineString(ls) => clip_linestring(ls, &buffered),
-        Geometry::Polygon(poly) => clip_polygon(poly, &buffered),
-        Geometry::MultiPolygon(mp) => clip_multipolygon(mp, &buffered).map(Geometry::MultiPolygon),
+        Geometry::Polygon(poly) => clip_polygon(poly, &buffered, assume_simple),
+        Geometry::MultiPolygon(mp) => {
+            clip_multipolygon(mp, &buffered, assume_simple).map(Geometry::MultiPolygon)
+        }
         Geometry::MultiLineString(mls) => clip_multilinestring(mls, &buffered),
         other => {
             // For other geometry types, use bounding box check
@@ -389,29 +460,11 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
     }
 }
 
-/// Clip a polygon to bounds using hybrid S-H + i_overlay approach.
-///
-/// Primary: Sutherland-Hodgman for O(n) clipping against axis-aligned tile boundaries.
-/// Fallback: i_overlay boolean operations for edge cases S-H can't handle.
-///
-/// # Algorithm Selection (Issue #94)
-///
-/// 1. Try Sutherland-Hodgman first (fast, O(n))
-/// 2. Check result for structural issues (cheap O(n) validation)
-/// 3. If issues found, fall back to i_overlay (robust, O(n log n))
-///
-/// This gives us the best of both worlds:
-/// - 99%+ of polygons use fast S-H path
-/// - Edge cases (self-intersecting, U-shapes) get correct results via i_overlay
-///
-/// # DIVERGENCE FROM TIPPECANOE: coordinate space
-/// Tippecanoe operates in integer tile coordinates (0-4096).
-/// We operate in f64 geographic coordinates to avoid coordinate conversion overhead.
-/// The algorithm is identical; only the coordinate space differs.
-///
-/// Returns `Geometry::Polygon` or `Geometry::MultiPolygon` with the clipped result,
-/// or `None` if the polygon doesn't intersect the bounds.
-fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+fn clip_polygon(
+    poly: &Polygon<f64>,
+    bounds: &TileBounds,
+    assume_simple: bool,
+) -> Option<Geometry<f64>> {
     // Quick rejection test using bounding box
     let poly_rect = poly.bounding_rect()?;
     if !intersects_bounds(&poly_rect, bounds) {
@@ -420,8 +473,10 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
 
     // Check if input polygon has structural issues (self-intersecting, etc.)
     // If so, we MUST use i_overlay even for "fully inside" polygons because
-    // i_overlay will repair the geometry while S-H cannot.
-    let input_has_issues = has_structural_issues(poly);
+    // i_overlay will repair the geometry while S-H cannot. When the feature was
+    // pre-validated as simple (issue #237), the O(V²) self-intersection scan is
+    // skipped here — see `has_structural_issues`.
+    let input_has_issues = has_structural_issues(poly, assume_simple);
 
     // FAST PATH: If polygon is fully inside bounds AND valid, return as-is
     if is_fully_inside(&poly_rect, bounds) && !input_has_issues {
@@ -437,12 +492,16 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
     // Primary path: Use Sutherland-Hodgman for O(n) rectangle clipping
     let sh_result = sutherland_hodgman::clip_polygon_sh(poly, bounds);
 
-    // Check if S-H produced valid output
+    // Validate S-H output and fall back to i_overlay on structural issues or
+    // boundary-connecting bridges. `assume_simple` (issue #237) only suppresses
+    // the O(V²) self-intersection re-scan inside `geometry_has_structural_issues`
+    // — the cheap O(V) `has_boundary_connecting_edges` gate that catches S-H's
+    // U-shape bridging still runs, so the chosen result stays byte-identical.
     match &sh_result {
         Some(Geometry::Polygon(p)) => {
             // Check for structural issues OR boundary-connecting edges
             // (the latter indicates S-H connected disconnected regions)
-            if geometry_has_structural_issues(sh_result.as_ref().unwrap())
+            if geometry_has_structural_issues(sh_result.as_ref().unwrap(), assume_simple)
                 || has_boundary_connecting_edges(p, bounds)
             {
                 ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
@@ -452,9 +511,9 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         }
         Some(Geometry::MultiPolygon(mp)) => {
             // Check each polygon for issues
-            let has_issues =
-                mp.0.iter()
-                    .any(|p| has_structural_issues(p) || has_boundary_connecting_edges(p, bounds));
+            let has_issues = mp.0.iter().any(|p| {
+                has_structural_issues(p, assume_simple) || has_boundary_connecting_edges(p, bounds)
+            });
             if has_issues {
                 ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
             } else {
@@ -473,16 +532,11 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
     }
 }
 
-/// Clip a multipolygon to bounds using Sutherland-Hodgman algorithm.
-///
-/// Applies a two-level bounding box filter:
-/// 1. Overall MultiPolygon bbox check (fast rejection for the whole geometry)
-/// 2. Per-polygon bbox check (skips sub-polygons that don't intersect the tile)
-///
-/// For MultiPolygons like Antarctica (7453 sub-polygons spanning the globe),
-/// the per-polygon filter eliminates the vast majority of sub-polygons before
-/// any clipping work is done.
-fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<MultiPolygon<f64>> {
+fn clip_multipolygon(
+    mp: &MultiPolygon<f64>,
+    bounds: &TileBounds,
+    assume_simple: bool,
+) -> Option<MultiPolygon<f64>> {
     // Level 1: Quick rejection using overall MultiPolygon bbox
     let mp_rect = mp.bounding_rect()?;
     if !intersects_bounds(&mp_rect, bounds) {
@@ -522,7 +576,7 @@ fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<Mult
         }
 
         // Polygon intersects but isn't fully inside -- needs clipping with SH
-        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds) {
+        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds, assume_simple) {
             clipped_polys.push(clipped);
         }
     }
@@ -664,6 +718,140 @@ mod tests {
     use super::*;
     use geo::point;
 
+    // ========== Simplicity fast-path (issue #237, RC3) ==========
+
+    fn square(minx: f64, miny: f64, maxx: f64, maxy: f64) -> Polygon<f64> {
+        Polygon::new(
+            LineString::from(vec![
+                (minx, miny),
+                (maxx, miny),
+                (maxx, maxy),
+                (minx, maxy),
+                (minx, miny),
+            ]),
+            vec![],
+        )
+    }
+
+    #[test]
+    fn geometry_is_simple_true_for_simple_polygon() {
+        let g = Geometry::Polygon(square(0.0, 0.0, 4.0, 4.0));
+        assert!(geometry_is_simple(&g));
+    }
+
+    #[test]
+    fn geometry_is_simple_false_for_bowtie() {
+        // Figure-eight: edges (0,0)->(2,2) and (2,0)->(0,2) cross.
+        let bowtie = Polygon::new(
+            LineString::from(vec![
+                (0.0, 0.0),
+                (2.0, 2.0),
+                (2.0, 0.0),
+                (0.0, 2.0),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        );
+        assert!(!geometry_is_simple(&Geometry::Polygon(bowtie)));
+    }
+
+    #[test]
+    fn geometry_is_simple_multipolygon_all_or_nothing() {
+        let good = square(0.0, 0.0, 1.0, 1.0);
+        let bowtie = Polygon::new(
+            LineString::from(vec![
+                (0.0, 0.0),
+                (2.0, 2.0),
+                (2.0, 0.0),
+                (0.0, 2.0),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        );
+        assert!(geometry_is_simple(&Geometry::MultiPolygon(
+            MultiPolygon::new(vec![good.clone(), square(5.0, 5.0, 6.0, 6.0)])
+        )));
+        assert!(!geometry_is_simple(&Geometry::MultiPolygon(
+            MultiPolygon::new(vec![good, bowtie])
+        )));
+    }
+
+    /// A crossing ("bowtie") ring of `n` vertices: two dense diagonals that
+    /// intersect. Used to exercise the O(n²) self-intersection scan and its cap.
+    fn crossing_ring(n: usize) -> Vec<Coord<f64>> {
+        let half = n / 2;
+        let mut v: Vec<Coord<f64>> = Vec::with_capacity(n + 1);
+        // Diagonal A: (0,0) -> (10,10), the line y = x.
+        for i in 0..half {
+            let t = i as f64 / half as f64;
+            v.push(Coord {
+                x: 10.0 * t,
+                y: 10.0 * t,
+            });
+        }
+        // Diagonal B: (10,0.7) -> (0,10.7), the line y = 10.7 - x. A and B cross
+        // transversally at (~5.35, ~5.35), which the 0.7 offset keeps off every
+        // vertex so it is a *proper* self-intersection.
+        for i in 0..half {
+            let t = i as f64 / half as f64;
+            v.push(Coord {
+                x: 10.0 - 10.0 * t,
+                y: 0.7 + 10.0 * t,
+            });
+        }
+        v.push(v[0]); // close
+        v
+    }
+
+    #[test]
+    fn self_intersection_detected_below_cap() {
+        let ring = crossing_ring(64);
+        assert!(ring.len() <= MAX_SELF_INTERSECT_VERTS);
+        assert!(has_self_intersecting_edges(&ring));
+    }
+
+    #[test]
+    fn self_intersection_scan_capped_above_threshold() {
+        // A genuinely self-intersecting ring larger than the cap is reported as
+        // "simple" — the O(n²) scan is skipped to keep the export from stalling
+        // on huge continental rings (issue #237). This is the intended trade:
+        // pathological giant invalid rings are not repaired, everything smaller
+        // is validated exactly as before.
+        let ring = crossing_ring(MAX_SELF_INTERSECT_VERTS + 500);
+        assert!(ring.len() > MAX_SELF_INTERSECT_VERTS);
+        assert!(!has_self_intersecting_edges(&ring));
+    }
+
+    #[test]
+    fn geometry_is_simple_true_for_non_polygon() {
+        let g = Geometry::Point(point!(x: 1.0, y: 1.0));
+        assert!(geometry_is_simple(&g));
+    }
+
+    #[test]
+    fn clip_geometry_simple_byte_identical_on_simple_input() {
+        // A simple polygon that straddles the clip bounds (so it is actually
+        // clipped, exercising the S-H path + output validity gate). With a
+        // simple input, `assume_simple = true` must produce output identical to
+        // the default full-validation path — the RC3 guarantee.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let buffer = 0.5;
+        let cases = vec![
+            Geometry::Polygon(square(-3.0, -3.0, 5.0, 5.0)),
+            Geometry::Polygon(square(2.0, 2.0, 20.0, 8.0)),
+            Geometry::MultiPolygon(MultiPolygon::new(vec![
+                square(-2.0, -2.0, 4.0, 4.0),
+                square(6.0, 6.0, 13.0, 13.0),
+            ])),
+        ];
+        for g in cases {
+            assert!(geometry_is_simple(&g));
+            let default = clip_geometry(&g, &bounds, buffer);
+            let fast = clip_geometry_simple(&g, &bounds, buffer, true);
+            assert_eq!(default, fast, "assume_simple output diverged for {g:?}");
+        }
+    }
+
     // ========== Point Clipping Tests ==========
 
     #[test]
@@ -703,7 +891,7 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&poly, &bounds);
+        let result = clip_polygon(&poly, &bounds, false);
         assert!(result.is_some());
 
         // Extract the polygon (should be single polygon for this simple case)
@@ -740,7 +928,7 @@ mod tests {
             ]),
             vec![],
         );
-        assert!(clip_polygon(&poly, &bounds).is_none());
+        assert!(clip_polygon(&poly, &bounds, false).is_none());
     }
 
     #[test]
@@ -757,7 +945,7 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&poly, &bounds);
+        let result = clip_polygon(&poly, &bounds, false);
         assert!(result.is_some());
     }
 
@@ -940,7 +1128,7 @@ mod tests {
         let mp = MultiPolygon::new(polygons);
 
         // Clip to the tile
-        let result = clip_multipolygon(&mp, &tile_bounds);
+        let result = clip_multipolygon(&mp, &tile_bounds, false);
 
         // Should produce output (the 10 inside polygons)
         assert!(
@@ -999,7 +1187,7 @@ mod tests {
             .collect();
 
         let mp = MultiPolygon::new(polygons);
-        let result = clip_multipolygon(&mp, &tile_bounds);
+        let result = clip_multipolygon(&mp, &tile_bounds, false);
         assert!(
             result.is_none(),
             "All-outside multipolygon should return None"
@@ -1042,7 +1230,7 @@ mod tests {
         );
 
         // Clip to small tile
-        let result = clip_polygon(&large_poly, &tile_bounds);
+        let result = clip_polygon(&large_poly, &tile_bounds, false);
         assert!(result.is_some(), "Large polygon should intersect the tile");
 
         // Verify the clipped result is reasonable
@@ -1293,7 +1481,7 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&u_shape, &bounds);
+        let result = clip_polygon(&u_shape, &bounds, false);
         assert!(result.is_some(), "U-shape should intersect the band");
 
         // i_overlay correctly produces a MultiPolygon with 2 separate polygons

@@ -26,7 +26,7 @@
 //!    its owning partition (see [`process_wave`]). Sharing one read+decode
 //!    across a wave replaces the old per-partition re-read (issue #228): a level
 //!    now costs `ceil(P / PARTITION_WAVE)` band reads, not `P`. The per-tile
-//!    clips reuse the [`clip_geometry`] entry point, MVT-encode via
+//!    clips reuse the [`clip_geometry_simple`] entry point, MVT-encode via
 //!    [`crate::mvt`], and each finished partition's tiles stream immediately to
 //!    [`StreamingPmtilesWriter`]. Tiles are written in ascending `(x, y)` order
 //!    per zoom — the historical order — so the archive's tile-data layout,
@@ -83,7 +83,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_from_array;
-use crate::clip::clip_geometry;
+use crate::clip::{clip_geometry_simple, geometry_is_simple};
 use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
 use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
@@ -1001,9 +1001,26 @@ fn feature_tile_members(
     // keeps them byte-identical to the pre-#226 path and avoids a regression on
     // dense corpora, while the giant polygons that actually caused the DNF take
     // the cascade.
+    // Validate the feature's ring simplicity **once** here, then thread the
+    // result through every clip this feature performs (issue #237, RC3). The
+    // O(V²) self-intersection scan that `clip_polygon` used to run on *every*
+    // tile now runs a single time per feature; a continental polygon touching
+    // thousands of tiles pays it once instead of thousands of times. The clip
+    // output is unchanged — see `clip::clip_geometry_simple`.
+    let assume_simple = geometry_is_simple(geom);
+
     let direct_cost = tile_span(&ranges).saturating_mul(geom.coords_count() as u64);
     if direct_cost <= DIRECT_CLIP_BUDGET {
-        feature_tile_members_direct(geom, &bbox, zoom, opts, key_lo, key_hi, &mut out);
+        feature_tile_members_direct(
+            geom,
+            &bbox,
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            assume_simple,
+            &mut out,
+        );
     } else {
         // Start the descent at the feature's covering tile (the deepest tile
         // whose bounds contain the whole feature bbox) rather than the world
@@ -1011,7 +1028,16 @@ fn feature_tile_members(
         // skipping them is free and yields an identical leaf set.
         let root = covering_tile(&ranges, zoom);
         split_feature_into_tiles(
-            root, geom, &bbox, zoom, opts, key_lo, key_hi, &ranges, &mut out,
+            root,
+            geom,
+            &bbox,
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            &ranges,
+            assume_simple,
+            &mut out,
         );
     }
     out
@@ -1024,6 +1050,19 @@ fn feature_tile_members(
 /// the direct — and byte-identical — path, and only genuinely huge polygons
 /// recurse.
 const DIRECT_CLIP_BUDGET: u64 = 100_000;
+
+/// Cascade depth (levels remaining below a node) above which the four child
+/// subtrees are split across Rayon threads (issue #237, RC4).
+///
+/// The wave already runs one `par_iter` task per feature, but a single
+/// continental polygon — the adm4 straggler carries ~100k vertices and covers
+/// thousands of tiles — serializes an entire level on one core while the other
+/// 15 sit idle once the small features finish. Forking its cascade lets those
+/// idle cores steal the subtrees. Only the coarse top of a large cascade forks
+/// (a node this shallow roots ≥ `4^DEPTH` leaves, so the fork amortizes); the
+/// dense lower levels recurse sequentially to avoid drowning the pool in
+/// microtasks. Small features take the direct path and never reach here.
+const CASCADE_PARALLEL_DEPTH: u32 = 3;
 
 /// Number of leaf tiles the feature's bbox covers at the target zoom (both
 /// x-bands when it crosses the antimeridian).
@@ -1040,6 +1079,8 @@ fn tile_span(ranges: &BboxTileRanges) -> u64 {
 /// features). Used for features whose direct cost is under
 /// [`DIRECT_CLIP_BUDGET`]; its output is byte-identical to the historical
 /// export. Appends `(key, geom)` members within `[key_lo, key_hi]` to `out`.
+/// `assume_simple` is the per-feature ring-simplicity hint (issue #237, RC3).
+#[allow(clippy::too_many_arguments)]
 fn feature_tile_members_direct(
     geom: &Geometry<f64>,
     bbox: &TileBounds,
@@ -1047,6 +1088,7 @@ fn feature_tile_members_direct(
     opts: &ExportOptions,
     key_lo: u64,
     key_hi: u64,
+    assume_simple: bool,
     out: &mut Vec<(u64, Geometry<f64>)>,
 ) {
     for tc in tiles_for_bbox(bbox, zoom) {
@@ -1058,7 +1100,7 @@ fn feature_tile_members_direct(
         let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
         if bbox_within_buffered(bbox, &tb, buffer_deg) {
             out.push((key, geom.clone()));
-        } else if let Some(clipped) = clip_geometry(geom, &tb, buffer_deg) {
+        } else if let Some(clipped) = clip_geometry_simple(geom, &tb, buffer_deg, assume_simple) {
             out.push((key, clipped));
         }
     }
@@ -1123,9 +1165,6 @@ fn node_key_overlaps(node: TileCoord, zoom: u8, key_lo: u64, key_hi: u64) -> boo
     max_key >= key_lo && min_key <= key_hi
 }
 
-/// One node of the recursive cascade: reduce `cur` (the geometry already
-/// clipped to this node's parent buffered region, with bounding box `cur_bbox`)
-/// to this node, then either emit the leaf member or split into four children.
 #[allow(clippy::too_many_arguments)]
 fn split_feature_into_tiles(
     node: TileCoord,
@@ -1136,6 +1175,7 @@ fn split_feature_into_tiles(
     key_lo: u64,
     key_hi: u64,
     ranges: &BboxTileRanges,
+    assume_simple: bool,
     out: &mut Vec<(u64, Geometry<f64>)>,
 ) {
     // Prune: outside the feature's target tiles, or outside this partition.
@@ -1160,7 +1200,7 @@ fn split_feature_into_tiles(
         // and `cur` is still the original geometry.
         if bbox_within_buffered(cur_bbox, &tb, buffer_deg) {
             out.push((key, cur.clone()));
-        } else if let Some(clipped) = clip_geometry(cur, &tb, buffer_deg) {
+        } else if let Some(clipped) = clip_geometry_simple(cur, &tb, buffer_deg, assume_simple) {
             out.push((key, clipped));
         }
         return;
@@ -1175,24 +1215,117 @@ fn split_feature_into_tiles(
         // Feature already inside this node's buffered bounds — no clip needed;
         // descend with the same geometry (this is what makes the coarse top of
         // the pyramid essentially free).
-        for child in children {
-            split_feature_into_tiles(
-                child, cur, cur_bbox, zoom, opts, key_lo, key_hi, ranges, out,
-            );
-        }
-    } else if let Some(clipped) = clip_geometry(cur, &tb, buffer_deg) {
+        fanout_children(
+            children,
+            node.z,
+            cur,
+            cur_bbox,
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            ranges,
+            assume_simple,
+            out,
+        );
+    } else if let Some(clipped) = clip_geometry_simple(cur, &tb, buffer_deg, assume_simple) {
         let cbbox = match clipped.bounding_rect() {
             Some(r) => TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y),
             None => return,
         };
-        for child in children {
-            split_feature_into_tiles(
-                child, &clipped, &cbbox, zoom, opts, key_lo, key_hi, ranges, out,
-            );
-        }
+        fanout_children(
+            children,
+            node.z,
+            &clipped,
+            &cbbox,
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            ranges,
+            assume_simple,
+            out,
+        );
     }
     // else: `cur` does not intersect this node's buffered bounds — whole
     // subtree pruned.
+}
+
+/// Recurse into a node's four children with `child_geom` (already reduced to the
+/// parent's buffered bounds). Near the top of a large cascade the two halves run
+/// on separate Rayon threads (issue #237, RC4); deeper down — or for the common
+/// small-cascade case — it stays sequential. Emission order is irrelevant:
+/// `collect_wave_members` buckets members by tile key, and a feature emits at
+/// most one member per key, so parallel interleaving cannot change the archive.
+#[allow(clippy::too_many_arguments)]
+fn fanout_children(
+    children: [TileCoord; 4],
+    node_z: u8,
+    child_geom: &Geometry<f64>,
+    child_bbox: &TileBounds,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+    ranges: &BboxTileRanges,
+    assume_simple: bool,
+    out: &mut Vec<(u64, Geometry<f64>)>,
+) {
+    if (zoom - node_z) as u32 > CASCADE_PARALLEL_DEPTH {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        rayon::join(
+            || {
+                for &child in &children[..2] {
+                    split_feature_into_tiles(
+                        child,
+                        child_geom,
+                        child_bbox,
+                        zoom,
+                        opts,
+                        key_lo,
+                        key_hi,
+                        ranges,
+                        assume_simple,
+                        &mut left,
+                    );
+                }
+            },
+            || {
+                for &child in &children[2..] {
+                    split_feature_into_tiles(
+                        child,
+                        child_geom,
+                        child_bbox,
+                        zoom,
+                        opts,
+                        key_lo,
+                        key_hi,
+                        ranges,
+                        assume_simple,
+                        &mut right,
+                    );
+                }
+            },
+        );
+        out.append(&mut left);
+        out.append(&mut right);
+    } else {
+        for child in children {
+            split_feature_into_tiles(
+                child,
+                child_geom,
+                child_bbox,
+                zoom,
+                opts,
+                key_lo,
+                key_hi,
+                ranges,
+                assume_simple,
+                out,
+            );
+        }
+    }
 }
 
 /// Test helper: run the direct path unconditionally (bypassing the dispatch
@@ -1210,8 +1343,18 @@ fn members_direct_vec(
         return Vec::new();
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    let assume_simple = geometry_is_simple(geom);
     let mut out = Vec::new();
-    feature_tile_members_direct(geom, &bbox, zoom, opts, key_lo, key_hi, &mut out);
+    feature_tile_members_direct(
+        geom,
+        &bbox,
+        zoom,
+        opts,
+        key_lo,
+        key_hi,
+        assume_simple,
+        &mut out,
+    );
     out
 }
 
@@ -1231,9 +1374,19 @@ fn members_recursive_vec(
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
     let ranges = tile_ranges_for_bbox(&bbox, zoom);
     let root = covering_tile(&ranges, zoom);
+    let assume_simple = geometry_is_simple(geom);
     let mut out = Vec::new();
     split_feature_into_tiles(
-        root, geom, &bbox, zoom, opts, key_lo, key_hi, &ranges, &mut out,
+        root,
+        geom,
+        &bbox,
+        zoom,
+        opts,
+        key_lo,
+        key_hi,
+        &ranges,
+        assume_simple,
+        &mut out,
     );
     out
 }
