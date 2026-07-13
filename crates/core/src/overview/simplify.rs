@@ -76,6 +76,17 @@ pub fn full_resolution_fallback_count() -> u64 {
     FULL_RES_FALLBACKS.load(Ordering::Relaxed)
 }
 
+/// Process-wide count of RDP candidates that skipped the validity check
+/// because they exceeded `MAX_VALIDATION_VERTS` (#242). Logged as a delta
+/// alongside [`full_resolution_fallback_count`] by the streaming convert
+/// loop.
+static VALIDATION_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-wide capped-validation skip counter.
+pub fn validation_skip_count() -> u64 {
+    VALIDATION_SKIPS.load(Ordering::Relaxed)
+}
+
 /// Default simplification factor: `tolerance = factor * gsd`.
 ///
 /// `1.0` means "simplify away detail finer than one ground sample". One GSD is
@@ -338,6 +349,53 @@ fn simplify_linestring_impl(ls: &LineString<f64>, tol: f64) -> Option<LineString
 /// geometry. Attempts run at `tol, tol/2, tol/4, tol/8`.
 const INVALID_RETRY_HALVINGS: u32 = 3;
 
+/// Vertex cap above which the RDP candidate skips `geo`'s validity check and
+/// is assumed valid.
+///
+/// # Why (issue #242)
+///
+/// `geo::algorithm::validation`'s per-ring simplicity test is **O(V²)** in
+/// ring vertex count. A fine-GSD cascade step over a continental admin
+/// polygon hands it a candidate with hundreds of thousands of vertices —
+/// gdb sampling showed a single rayon worker pinned inside
+/// `linestring_has_self_intersection` for the entire "convert wall" (~450 s
+/// per level per feature at 300 K vertices, × every fine level), which is
+/// exactly the export-side pathology capped in `clip.rs`
+/// (`MAX_SELF_INTERSECT_VERTS`, issue #237).
+///
+/// # Why assuming valid is the right default above the cap
+///
+/// A candidate only stays huge when the epsilon was small relative to the
+/// ring's detail, i.e. RDP removed few, near-collinear vertices from input
+/// we already assume valid — the *least* likely candidate to have acquired a
+/// crossing. The expensive-to-check case and the low-risk case coincide.
+/// The trade is the same as `clip.rs`: a giant candidate that *did* acquire
+/// a crossing ships unrepaired, which the overviews spec explicitly permits
+/// (geometry validity is not a conformance requirement, OVERVIEWS_SPEC §
+/// "validity") and matches tippecanoe, which never validates simplification
+/// output. Everything at or below the cap is validated exactly as before.
+const MAX_VALIDATION_VERTS: usize = 2_048;
+
+/// Total vertices across the polygon's exterior and interior rings.
+fn polygon_vertex_count(poly: &Polygon<f64>) -> usize {
+    poly.exterior().0.len() + poly.interiors().iter().map(|r| r.0.len()).sum::<usize>()
+}
+
+/// `is_valid`, capped: candidates above [`MAX_VALIDATION_VERTS`] total
+/// vertices are assumed valid without running the O(V²) scan (#242).
+fn capped_is_valid(candidate: &Polygon<f64>) -> bool {
+    let verts = polygon_vertex_count(candidate);
+    if verts > MAX_VALIDATION_VERTS {
+        VALIDATION_SKIPS.fetch_add(1, Ordering::Relaxed);
+        log::trace!(
+            "overview simplify: skipping O(V²) validity check on {verts}-vertex \
+             candidate (cap {MAX_VALIDATION_VERTS}); assuming valid"
+        );
+        return true;
+    }
+    candidate.is_valid()
+}
+
 /// `true` when RDP removed nothing: the candidate has the same ring count and
 /// per-ring vertex counts as the original. RDP output vertices are always an
 /// ordered subset of the input (endpoints included), so equal counts imply an
@@ -427,7 +485,7 @@ fn simplify_polygon_impl(
             return collapse_polygon(poly, collapse);
         }
 
-        if polygon_unchanged(&candidate, poly) || candidate.is_valid() {
+        if polygon_unchanged(&candidate, poly) || capped_is_valid(&candidate) {
             return Simplified::Keep(Geometry::Polygon(candidate));
         }
         invalid_candidate = Some(candidate);
@@ -1055,5 +1113,114 @@ mod tests {
             simplify_for_level(&mls, 1000.0, Crs::Epsg3857, &opts),
             Simplified::Dropped
         );
+    }
+
+    // ---- validation vertex cap (#242) --------------------------------------
+
+    /// A bowtie (self-crossing) quad whose left edge is padded with a fine
+    /// staircase (per period: four corners with a 0.05 x-excursion, which RDP
+    /// at epsilon 0.01 always keeps, plus one filler vertex offset 0.001 from
+    /// the middle of a straight run, which RDP always removes). The removed
+    /// fillers defeat the `polygon_unchanged` short-circuit so the candidate
+    /// reaches validation; the surviving corners keep it big. The staircase
+    /// lives at x ∈ [0, 0.051], y ∈ [1, 9] — far from the diagonals'
+    /// crossing at (5, 5) — so the candidate stays a genuine bowtie.
+    fn padded_bowtie(periods: usize) -> Polygon<f64> {
+        let mut v = vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 10.0, y: 10.0 },
+            Coord { x: 10.0, y: 0.0 },
+            Coord { x: 0.0, y: 10.0 },
+        ];
+        // Descend the left edge from y=9 toward y=1.
+        let h = 8.0 / periods as f64;
+        for i in 0..periods {
+            let y = 9.0 - i as f64 * h;
+            v.push(Coord { x: 0.0, y });
+            v.push(Coord { x: 0.05, y });
+            // Filler on the vertical run at x=0.05: deviates only 0.001 from
+            // the run's chord, so RDP (eps 0.01) removes it.
+            v.push(Coord {
+                x: 0.051,
+                y: y - h / 2.0,
+            });
+            v.push(Coord { x: 0.05, y: y - h });
+            v.push(Coord { x: 0.0, y: y - h });
+        }
+        v.push(v[0]);
+        Polygon::new(LineString::new(v), vec![])
+    }
+
+    #[test]
+    fn validation_skipped_above_vertex_cap_keeps_candidate() {
+        // geo's recursive RDP degenerates to O(n) recursion depth on the
+        // uniform-amplitude zigzag (every split is a tie), which overflows
+        // the default test stack in debug builds — run on a roomy stack.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(validation_skipped_above_vertex_cap_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The bowtie's two diagonals cross at exactly (5, 5). Even-odd repair
+    /// materializes that crossing as an explicit vertex; the raw RDP
+    /// candidate has no vertex anywhere near it (corners sit on x ∈ {0, 10},
+    /// padding on x ≈ 0). Presence of the vertex is therefore a race-free
+    /// witness that repair ran.
+    fn has_crossing_vertex(g: &Geometry<f64>) -> bool {
+        use geo::coords_iter::CoordsIter;
+        g.coords_iter()
+            .any(|c| (c.x - 5.0).abs() < 1e-6 && (c.y - 5.0).abs() < 1e-6)
+    }
+
+    fn validation_skipped_above_vertex_cap_impl() {
+        // Above MAX_VALIDATION_VERTS the O(V²) `is_valid` scan is skipped and
+        // the RDP candidate is assumed valid (#242): the bowtie is kept
+        // verbatim, crossing and all, instead of being even-odd repaired.
+        // 1200 periods: RDP keeps at least the two x-extreme corners per
+        // period (their 0.05 horizontal deviation is epsilon-independent),
+        // so the candidate stays comfortably above the cap.
+        let poly = padded_bowtie(1_200);
+        assert!(poly.exterior().0.len() > MAX_VALIDATION_VERTS);
+        match simplify_polygon_impl(&poly, 0.01, false, true) {
+            Simplified::Keep(g @ Geometry::Polygon(_)) => {
+                let Geometry::Polygon(ref out) = g else {
+                    unreachable!()
+                };
+                assert!(
+                    out.exterior().0.len() > MAX_VALIDATION_VERTS,
+                    "RDP should keep the zigzag padding (got {} verts)",
+                    out.exterior().0.len()
+                );
+                assert!(
+                    out.exterior().0.len() < poly.exterior().0.len(),
+                    "RDP should remove the sub-epsilon padding vertices"
+                );
+                assert!(
+                    !has_crossing_vertex(&g),
+                    "candidate must be kept verbatim, not repaired"
+                );
+            }
+            other => panic!("expected Keep(Polygon) above the cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_exact_below_vertex_cap_still_repairs() {
+        // Below the cap nothing changes: the invalid candidate is detected
+        // and even-odd repaired, materializing the (5,5) crossing vertex.
+        let poly = padded_bowtie(40);
+        assert!(poly.exterior().0.len() <= MAX_VALIDATION_VERTS);
+        match simplify_polygon_impl(&poly, 0.01, false, true) {
+            Simplified::Keep(g) => {
+                assert!(
+                    has_crossing_vertex(&g),
+                    "below the cap the bowtie must be repaired, got {g:?}"
+                );
+            }
+            other => panic!("expected Keep(repaired geometry), got {other:?}"),
+        }
     }
 }
