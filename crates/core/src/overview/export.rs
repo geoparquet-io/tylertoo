@@ -130,7 +130,10 @@ pub struct ExportOptions {
     /// fill-equivalent to the i_overlay split under nonzero winding, so the
     /// fallback (which fires on ~94% of fine-zoom polygon clips) is wasted work.
     /// Non-simple inputs always keep the fallback, preserving the #94 U-shape
-    /// fix. Defaults to `false` (fallback always on) pending viewer validation.
+    /// fix. Defaults to `true` (fast path on); the S-H clip of a simple ring is
+    /// render-equivalent to the fallback but stored rotated to a different start
+    /// vertex, so disable it (`--no-simple-clip-fastpath`) only when byte-stable
+    /// tile output is required.
     pub simple_clip_fastpath: bool,
 }
 
@@ -141,7 +144,7 @@ impl Default for ExportOptions {
             tile_buffer: DEFAULT_TILE_BUFFER_PX,
             extent: DEFAULT_EXTENT,
             tile_size_limit: None,
-            simple_clip_fastpath: false,
+            simple_clip_fastpath: true,
         }
     }
 }

@@ -50,7 +50,8 @@ use std::path::Path;
 ///     simple_clip_fastpath (bool, optional): Skip the i_overlay boundary-bridge
 ///         fallback for features whose rings are already simple (issue #239).
 ///         Faster fine-zoom polygon export; output is render-equivalent on
-///         simple rings. Experimental. Defaults to False.
+///         simple rings but stores them rotated to a different start vertex.
+///         Defaults to True; set False for byte-stable tile output.
 ///
 /// Returns:
 ///     None
@@ -64,7 +65,7 @@ use std::path::Path;
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=None, simple_clip_fastpath=false))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=None, simple_clip_fastpath=true))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
     py: Python<'_>,
@@ -613,7 +614,8 @@ fn overview(
 ///     simple_clip_fastpath (bool, optional): Skip the i_overlay boundary-bridge
 ///         fallback for features whose rings are already simple (issue #239).
 ///         Faster fine-zoom polygon export; output is render-equivalent on
-///         simple rings. Experimental. Defaults to False.
+///         simple rings but stores them rotated to a different start vertex.
+///         Defaults to True; set False for byte-stable tile output.
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
@@ -631,7 +633,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=None, simple_clip_fastpath=false))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=None, simple_clip_fastpath=true))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,

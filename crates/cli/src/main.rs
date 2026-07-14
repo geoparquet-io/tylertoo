@@ -179,12 +179,13 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
-    /// Skip the i_overlay boundary-bridge fallback for features whose rings are
-    /// already simple (issue #239). Cuts the ~94% fine-zoom i_overlay fallback;
-    /// output is render-equivalent on simple rings (self-touching S-H ring,
-    /// same area/fill). Experimental — off by default pending viewer validation.
+    /// Disable the simple-clip fast path (issue #239), forcing the i_overlay
+    /// boundary-bridge fallback on every polygon clip. The fast path is on by
+    /// default (render-equivalent on simple rings); pass this only when you need
+    /// byte-stable tile output, since the fast path rotates simple rings to a
+    /// different start vertex.
     #[arg(long)]
-    simple_clip_fastpath: bool,
+    no_simple_clip_fastpath: bool,
 }
 
 /// Arguments for `gpq-tiles overview`.
@@ -803,12 +804,13 @@ struct TilesArgs {
     #[arg(long, value_name = "SIZE", alias = "tile-size-limit", value_parser = parse_size_bytes)]
     max_tile_size: Option<usize>,
 
-    /// Skip the i_overlay boundary-bridge fallback for features whose rings are
-    /// already simple (issue #239). Cuts the ~94% fine-zoom i_overlay fallback;
-    /// output is render-equivalent on simple rings (self-touching S-H ring,
-    /// same area/fill). Experimental — off by default pending viewer validation.
+    /// Disable the simple-clip fast path (issue #239), forcing the i_overlay
+    /// boundary-bridge fallback on every polygon clip. The fast path is on by
+    /// default (render-equivalent on simple rings); pass this only when you need
+    /// byte-stable tile output, since the fast path rotates simple rings to a
+    /// different start vertex.
     #[arg(long)]
-    simple_clip_fastpath: bool,
+    no_simple_clip_fastpath: bool,
 
     /// Per-tile edge buffer, in tile pixels, carried across tile seams so
     /// features don't clip at boundaries.
@@ -960,7 +962,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         tile_buffer: args.tile_buffer,
         extent: 4096,
         tile_size_limit: args.max_tile_size,
-        simple_clip_fastpath: args.simple_clip_fastpath,
+        simple_clip_fastpath: !args.no_simple_clip_fastpath,
     };
     let export_report = export_pmtiles(overview_tmp.path(), &args.output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -1217,7 +1219,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         tile_buffer: args.tile_buffer,
         extent: 4096,
         tile_size_limit: args.tile_size_limit,
-        simple_clip_fastpath: args.simple_clip_fastpath,
+        simple_clip_fastpath: !args.no_simple_clip_fastpath,
     };
 
     println!(

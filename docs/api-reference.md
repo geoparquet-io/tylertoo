@@ -62,7 +62,7 @@ Commands:
 | `--layer-name <NAME>` | `overview` | MVT layer name written into every tile |
 | `--tile-buffer <PX>` | `8` | Per-tile edge buffer in tile pixels (seam continuity) |
 | `--tile-size-limit <SIZE>` | — | Optional per-tile MVT cap, e.g. `500K`, `1M`, or raw bytes (single non-iterative drop pass). Aliased `--max-tile-size` |
-| `--simple-clip-fastpath` | off | Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (#239). Cuts the ~94% fine-zoom i_overlay fallback; render-equivalent on simple rings. Experimental — see the note below |
+| `--no-simple-clip-fastpath` | off (fast path on) | Disable the simple-clip fast path (#239), forcing the i_overlay boundary-bridge fallback on every polygon clip. Pass only when byte-stable tile output is required — see the note below |
 | `--report <PATH>` | — | Write the JSON export report |
 
 Tiles are gzip-compressed (the PMTiles-viewer-safe default; there is no
@@ -85,7 +85,7 @@ One-shot facade: overview convert → temporary GeoParquet → export-pmtiles.
 | `--layer-name <NAME>` | derived from input filename | MVT layer name |
 | `--tile-buffer <PX>` | `8` | Per-tile edge buffer in tile pixels (seam continuity) |
 | `--max-tile-size <SIZE>` | — | Per-tile byte cap, e.g. `500K`, `1M`, or raw bytes. Aliased `--tile-size-limit` |
-| `--simple-clip-fastpath` | off | Skip the i_overlay boundary-bridge fallback for simple rings (#239); see the note below |
+| `--no-simple-clip-fastpath` | off (fast path on) | Disable the simple-clip fast path (#239), forcing the i_overlay fallback on every polygon clip; see the note below |
 | `-v, --verbose` | off | Per-level / per-zoom breakdowns |
 
 Every convert-tuning knob from the `overview` table above — ranking,
@@ -98,7 +98,7 @@ flags. `gpq-tiles tiles --help` groups them under headings. Overview
 **format** options that have no PMTiles meaning (`--mode`, `--gsd`,
 `--cogp-compat`, `--report`) stay on `overview`.
 
-#### `--simple-clip-fastpath` (experimental, #239)
+#### `--no-simple-clip-fastpath` (#239)
 
 Per-tile polygon clipping uses Sutherland–Hodgman (S-H) and falls back to the
 heavier i_overlay clipper whenever the S-H result has an edge running along the
@@ -108,13 +108,17 @@ result is a self-touching ring that encloses the same area and leaves the same
 regions filled as the i_overlay split (nonzero-winding equivalent). The fallback
 there is pure wasted work.
 
-`--simple-clip-fastpath` skips it for simple features. Features with
+The fast path that skips it is **on by default**. Features with
 self-intersecting rings always keep the fallback, so genuinely-broken input is
 unaffected. Measured on Natural Earth admin polygons (z0–11): ~18% faster
 end-to-end (up to ~50% on the finest levels), **identical tile counts at every
 zoom**, output within ~1% (the S-H ring is stored rotated to a different start
-vertex, not reshaped). Output is render-equivalent but **not byte-identical** to
-the default, which is why it is opt-in.
+vertex, not reshaped).
+
+Pass `--no-simple-clip-fastpath` to force the i_overlay fallback on every clip.
+The only reason to do so is **byte-stable tile output**: the fast path is
+render-equivalent but not byte-identical to the fallback (rotation only), so
+downstream consumers that hash raw tile bytes will see different hashes.
 
 ### `gpq-tiles decode <INPUT> <OUTPUT>`
 
@@ -207,7 +211,7 @@ report = export_pmtiles(
     tile_buffer: int = 8,
     extent: int = 4096,
     tile_size_limit: int | None = None,
-    simple_clip_fastpath: bool = False,  # #239, experimental; see CLI note
+    simple_clip_fastpath: bool = True,  # #239, default on; see CLI note
 ) -> dict  # the JSON export report
 ```
 
@@ -231,7 +235,7 @@ convert(
     max_zoom: int = 14,
     layer_name: str | None = None,
     tile_size_limit: int | None = None,
-    simple_clip_fastpath: bool = False,  # #239, experimental; see CLI note
+    simple_clip_fastpath: bool = True,  # #239, default on; see CLI note
 ) -> None
 ```
 
