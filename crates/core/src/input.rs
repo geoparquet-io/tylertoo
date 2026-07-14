@@ -20,12 +20,15 @@
 //! object's bytes. [`InputSource::fetch_stats`] exposes request/byte
 //! counters so callers (and tests) can verify that property.
 //!
-//! The streaming pipeline re-reads the input once per pass/level. Each
+//! The streaming pipeline re-reads the input across two passes. Each
 //! [`InputSource::open`] of a remote source reuses a cached parsed footer,
 //! and fetched column chunks stay in a bounded LRU-ish cache
-//! ([`remote::CHUNK_CACHE_MAX_BYTES`], insertion-order eviction), so those
-//! re-reads are refetch-free while the selected data fits the cache. See
-//! `docs/remote-reads.md` for the fetch-count implications.
+//! (insertion-order eviction), so within a pass the reader never re-fetches a
+//! chunk. The cache budget is sized to the largest row group's working set
+//! (floored at [`remote::CHUNK_CACHE_MAX_BYTES`]) so that a row group larger
+//! than the floor does not thrash — the fix for the per-page re-fetch of an
+//! oversized column chunk (issue #261). See `docs/remote-reads.md` for the
+//! fetch-count implications.
 //!
 //! Remote support is compiled behind the `remote` cargo feature; the CLI and
 //! Python bindings enable it by default. Without the feature, URL inputs
@@ -357,6 +360,11 @@ pub(crate) mod remote {
         shared: Arc<SharedState>,
         metadata: OnceLock<ArrowReaderMetadata>,
         cache: Arc<Mutex<ChunkCache>>,
+        /// Floor for the chunk-cache eviction budget. [`Self::open_builder`]
+        /// raises the live cap to the largest row group's working set but
+        /// never below this. Production uses [`CHUNK_CACHE_MAX_BYTES`]; tests
+        /// inject a tiny value to exercise the eviction path at small scale.
+        cap_base: u64,
     }
 
     impl RemoteSource {
@@ -403,6 +411,19 @@ pub(crate) mod remote {
             location: ObjectPath,
             url: String,
         ) -> Result<Self, InputError> {
+            Self::from_store_with_cap_base(store, location, url, CHUNK_CACHE_MAX_BYTES)
+        }
+
+        /// [`Self::from_store`] with an explicit chunk-cache floor. Tests pass
+        /// a tiny `cap_base` so a small fixture's row group exceeds it, which
+        /// exercises the eviction path (and the #261 refetch pathology) at
+        /// unit-test scale instead of needing a >256 MiB object.
+        pub(crate) fn from_store_with_cap_base(
+            store: Arc<dyn ObjectStore>,
+            location: ObjectPath,
+            url: String,
+            cap_base: u64,
+        ) -> Result<Self, InputError> {
             let head = runtime()
                 .block_on(store.head(&location))
                 .map_err(|e| store_error(&url, e))?;
@@ -413,7 +434,8 @@ pub(crate) mod remote {
                 size: head.size,
                 shared: Arc::new(SharedState::default()),
                 metadata: OnceLock::new(),
-                cache: Arc::new(Mutex::new(ChunkCache::default())),
+                cache: Arc::new(Mutex::new(ChunkCache::new(cap_base))),
+                cap_base,
             })
         }
 
@@ -454,6 +476,33 @@ pub(crate) mod remote {
                 ranges.sort_by_key(|r| r.start);
                 ranges
             });
+            // Size the chunk-cache eviction budget to the largest row group's
+            // working set (#261). The arrow reader interleaves a row group's
+            // projected column chunks across batches, so if their combined size
+            // exceeds the cache the reader thrashes — a chunk is evicted and
+            // re-fetched on the next batch. A remote input whose geometry
+            // column chunk alone dwarfs the 256 MiB floor then re-fetches that
+            // chunk on every page read (measured 96× on fieldmaps-adm4, whose
+            // 3 row groups each carry a 1.3 GiB geometry chunk). Holding one
+            // row group's chunks resident bounds the fetch to ≈ 1× per pass;
+            // memory stays O(largest row group), which the whole-chunk fetch
+            // already materializes to serve a range.
+            let max_row_group: u64 = metadata
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|rg| {
+                    rg.columns()
+                        .iter()
+                        .map(|col| col.compressed_size().max(0) as u64)
+                        .sum::<u64>()
+                })
+                .max()
+                .unwrap_or(0);
+            {
+                let mut cache = self.cache.lock().expect("chunk cache lock");
+                cache.cap = self.cap_base.max(max_row_group);
+            }
             Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
                 reader, metadata,
             ))
@@ -580,10 +629,13 @@ pub(crate) mod remote {
         }
     }
 
-    /// Upper bound on the per-reader column-chunk fetch cache. The working
-    /// set is one row group's compressed column chunks (the arrow reader
-    /// interleaves the columns of the row group it is decoding), so this cap
-    /// is a hard safety net, not the expected occupancy.
+    /// Floor for the per-reader column-chunk fetch cache. The true working set
+    /// is one row group's compressed column chunks (the arrow reader
+    /// interleaves the columns of the row group it is decoding), so
+    /// [`RemoteSource::open_builder`] raises the live cap to the largest row
+    /// group's working set when that exceeds this floor — otherwise a row group
+    /// bigger than the cache thrashes, re-fetching an evicted chunk on the next
+    /// batch (issue #261). This constant is just the small-input floor.
     const CHUNK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
     /// Per-reader cache of whole column chunks, insertion-ordered for
@@ -593,11 +645,30 @@ pub(crate) mod remote {
     /// whole chunk on first touch turns that into ONE range request per
     /// selected column chunk. Chunks of bbox-pruned row groups are never
     /// touched, so they are still never fetched.
-    #[derive(Debug, Default)]
+    ///
+    /// `cap` is the eviction budget. It starts at the [`CHUNK_CACHE_MAX_BYTES`]
+    /// floor and is raised at open time to the largest row group's working set
+    /// ([`RemoteSource::open_builder`]) so that a row group whose column chunks
+    /// exceed the floor is never evicted mid-read — the fix for issue #261,
+    /// where a >256 MiB geometry chunk was evicted on insert and re-fetched
+    /// on every page read (measured 96× re-fetch on a vertex-heavy input).
+    #[derive(Debug)]
     struct ChunkCache {
         entries: std::collections::HashMap<u64, (Range<u64>, Bytes)>,
         order: std::collections::VecDeque<u64>,
         total: u64,
+        cap: u64,
+    }
+
+    impl ChunkCache {
+        fn new(cap: u64) -> Self {
+            ChunkCache {
+                entries: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                total: 0,
+                cap,
+            }
+        }
     }
 
     /// Range-request reader over one remote object. Cloneable; all clones
@@ -657,7 +728,7 @@ pub(crate) mod remote {
                     .entries
                     .insert(chunk.start, (chunk.clone(), data.clone()));
                 cache.order.push_back(chunk.start);
-                while cache.total > CHUNK_CACHE_MAX_BYTES {
+                while cache.total > cache.cap {
                     let Some(oldest) = cache.order.pop_front() else {
                         break;
                     };
@@ -781,6 +852,38 @@ pub(crate) fn test_memory_source(bytes: Vec<u8>, name: &str) -> InputSource {
     rt.block_on(store.put(&location, bytes.into())).unwrap();
     InputSource::Remote(
         remote::RemoteSource::from_store(store, location, format!("memory://{name}")).unwrap(),
+    )
+}
+
+/// Test-only: [`test_memory_source`] with an explicit chunk-cache floor, so a
+/// small fixture whose row group exceeds `cap_base` exercises the eviction /
+/// re-fetch path at unit-test scale (issue #261 regression coverage).
+#[cfg(all(test, feature = "remote"))]
+pub(crate) fn test_memory_source_with_cap(
+    bytes: Vec<u8>,
+    name: &str,
+    cap_base: u64,
+) -> InputSource {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::ObjectStore;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let location = ObjectPath::from(name);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(store.put(&location, bytes.into())).unwrap();
+    InputSource::Remote(
+        remote::RemoteSource::from_store_with_cap_base(
+            store,
+            location,
+            format!("memory://{name}"),
+            cap_base,
+        )
+        .unwrap(),
     )
 }
 
@@ -943,6 +1046,146 @@ mod tests {
             assert!(
                 stats.bytes_fetched < stats.object_size,
                 "footer open must be a partial fetch: {stats:?}"
+            );
+        }
+
+        /// A two-column parquet with many small data pages in one row group,
+        /// so the arrow reader interleaves the wide column with the narrow one
+        /// across batches and touches the wide chunk's pages repeatedly — the
+        /// access pattern that made issue #261's oversized geometry chunk
+        /// re-fetch per page. Dictionary encoding is off and the strings are
+        /// distinct so the wide column stays genuinely wide.
+        fn two_column_multipage_parquet(rows: usize) -> Vec<u8> {
+            use arrow_array::{Int64Array, RecordBatch, StringArray};
+            use parquet::file::properties::WriterProperties;
+            use std::sync::Arc as SArc;
+
+            let wide: Vec<String> = (0..rows)
+                .map(|i| format!("feature-{i:08}-{:-<48}", i % 7))
+                .collect();
+            let narrow: Vec<i64> = (0..rows as i64).collect();
+            let batch = RecordBatch::try_from_iter([
+                ("geo", SArc::new(StringArray::from(wide)) as _),
+                ("tag", SArc::new(Int64Array::from(narrow)) as _),
+            ])
+            .unwrap();
+            let props = WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_data_page_row_count_limit(128)
+                .build();
+            let mut buf = Vec::new();
+            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
+                .unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            buf
+        }
+
+        /// #261 regression: when a row group's working set exceeds the chunk
+        /// cache floor, a single in-order read must still move ≈ the object's
+        /// bytes, not re-fetch the wide column per page. With a tiny `cap_base`
+        /// the pre-fix cache evicted the wide chunk on insert and re-fetched it
+        /// on every page read (measured 96× on a vertex-heavy input); the
+        /// footer-sized cap keeps the row group's chunks resident.
+        #[test]
+        fn oversized_row_group_is_not_refetched_per_page() {
+            let bytes = two_column_multipage_parquet(4096);
+            let object_size = bytes.len() as u64;
+            // Floor far below one row group, forcing the eviction path.
+            let source = super::super::test_memory_source_with_cap(bytes, "wide.parquet", 64);
+
+            let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+            let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+            assert_eq!(rows, 4096);
+
+            let stats = source.fetch_stats().unwrap();
+            assert_eq!(stats.object_size, object_size);
+            // One in-order pass moves the object once (plus footer overhead),
+            // never a multiple of it. Pre-fix this ratio was many×.
+            assert!(
+                stats.bytes_fetched <= object_size + object_size / 2,
+                "single read re-fetched the input: moved {} bytes for a {}-byte \
+                 object ({:.1}×) — oversized chunk evicted mid-read (#261)",
+                stats.bytes_fetched,
+                object_size,
+                stats.bytes_fetched as f64 / object_size as f64,
+            );
+        }
+
+        /// Like [`two_column_multipage_parquet`] but split into `groups` row
+        /// groups, so a full read walks several oversized row groups in
+        /// sequence — exercising cross-row-group eviction (the cache must drop
+        /// the previous group's chunks, not accumulate them).
+        fn multi_row_group_wide_parquet(rows_per_group: usize, groups: usize) -> Vec<u8> {
+            use arrow_array::{Int64Array, RecordBatch, StringArray};
+            use parquet::file::properties::WriterProperties;
+            use std::sync::Arc as SArc;
+
+            let props = WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_data_page_row_count_limit(128)
+                .set_max_row_group_row_count(Some(rows_per_group))
+                .build();
+            let total = rows_per_group * groups;
+            let wide: Vec<String> = (0..total)
+                .map(|i| format!("feature-{i:08}-{:-<48}", i % 7))
+                .collect();
+            let narrow: Vec<i64> = (0..total as i64).collect();
+            let batch = RecordBatch::try_from_iter([
+                ("geo", SArc::new(StringArray::from(wide)) as _),
+                ("tag", SArc::new(Int64Array::from(narrow)) as _),
+            ])
+            .unwrap();
+            let mut buf = Vec::new();
+            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
+                .unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            buf
+        }
+
+        /// #261 benchmark: report the remote-fetch amplification (bytes moved ÷
+        /// object size) for a single in-order read of an input whose row groups
+        /// each exceed the chunk-cache floor. Shrinking the cache via `cap_base`
+        /// reproduces the "row group larger than cache" regime at MB scale —
+        /// the same mechanism as fieldmaps-adm4's 1.3 GiB geometry chunks vs the
+        /// 256 MiB floor. Run with:
+        ///
+        /// ```text
+        /// cargo test -p gpq-tiles-core --features remote --lib \
+        ///   remote_tests::bench_remote_refetch_ratio -- --ignored --nocapture
+        /// ```
+        #[test]
+        #[ignore = "benchmark: prints the #261 fetch-amplification ratio"]
+        fn bench_remote_refetch_ratio() {
+            // 3 row groups, each ~1.4 MiB of wide-column pages; floor 256 KiB
+            // sits below one row group, so the pre-fix cache thrashed.
+            let bytes = multi_row_group_wide_parquet(8192, 3);
+            let object_size = bytes.len() as u64;
+            let cap_base = 256 * 1024;
+            let source =
+                super::super::test_memory_source_with_cap(bytes, "bench-wide.parquet", cap_base);
+
+            let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+            let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+            assert_eq!(rows, 8192 * 3);
+
+            let stats = source.fetch_stats().unwrap();
+            let ratio = stats.bytes_fetched as f64 / object_size as f64;
+            eprintln!(
+                "[#261 bench] object={} B  moved={} B  ratio={:.2}×  requests={}  \
+                 cap_base={} B  max_rg≈{} B",
+                object_size,
+                stats.bytes_fetched,
+                ratio,
+                stats.requests,
+                cap_base,
+                object_size / 3,
+            );
+            assert!(
+                ratio <= 1.5,
+                "single read amplified {ratio:.2}× (expected ≈1× with the \
+                 footer-sized cap; a large ratio means #261 regressed)"
             );
         }
 
