@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>gpq-tiles demo — Germany buildings</title>
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+
+  <!-- Pinned CDN deps. PMTiles range reads need the host to serve Range + CORS. -->
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/pmtiles@3.2.1/dist/pmtiles.js"></script>
+
+  <style>
+    :root { --panel: rgba(17,19,24,.86); --ink:#e7e9ee; --muted:#9aa2b1; --line:#2b3040; }
+    html,body { margin:0; height:100%; background:#0b0d12; font:14px/1.4 system-ui,sans-serif; color:var(--ink); }
+    #map { position:absolute; inset:0; }
+    #panel {
+      position:absolute; z-index:5; top:12px; left:12px; max-width:320px;
+      background:var(--panel); border:1px solid var(--line); border-radius:10px;
+      padding:12px 14px; backdrop-filter:blur(6px);
+    }
+    #panel h1 { margin:0 0 6px; font-size:14px; font-weight:600; }
+    #panel p { margin:0 0 8px; color:var(--muted); font-size:12px; }
+    .views { display:flex; gap:6px; flex-wrap:wrap; }
+    button { background:#0f1219; color:var(--ink); border:1px solid var(--line);
+      border-radius:6px; padding:5px 9px; font:inherit; cursor:pointer; }
+    button:hover { border-color:#41506e; }
+    #err { position:absolute; z-index:6; bottom:12px; left:12px; right:12px; max-width:620px;
+      background:#3a1620; border:1px solid #7a2b3c; color:#ffd9df; border-radius:8px;
+      padding:8px 12px; font-size:12px; display:none; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <h1>Germany buildings — gpq-tiles</h1>
+    <p>59M Overture building footprints, GeoParquet → PMTiles in one native step
+       (tuned). Rendered on CARTO Dark Matter.</p>
+    <div class="views">
+      <button data-view="germany">Germany</button>
+      <button data-view="berlin">Berlin</button>
+      <button data-view="hamburg">Hamburg</button>
+      <button data-view="munich">Munich</button>
+    </div>
+  </div>
+  <div id="err"></div>
+
+  <script>
+    "use strict";
+
+    // Tuned Germany-buildings PMTiles on Source Cooperative (Range + CORS).
+    // Override at runtime with ?pmtiles=<url>.
+    const DEFAULT_PMTILES =
+      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/germany-buildings-gpq-tuned.pmtiles";
+
+    const VIEWS = {
+      germany: { center: [10.45, 51.16], zoom: 5.4 },
+      berlin:  { center: [13.405, 52.52], zoom: 11.5 },
+      hamburg: { center: [9.993, 53.551], zoom: 11.5 },
+      munich:  { center: [11.582, 48.135], zoom: 11.5 },
+    };
+    const LAYER = "buildings"; // MVT source-layer name
+
+    function showErr(m) { const e = document.getElementById("err"); e.style.display = "block"; e.textContent = m; }
+
+    const q = new URLSearchParams(location.search);
+    let url = q.get("pmtiles") || DEFAULT_PMTILES;
+    if (!url.startsWith("pmtiles://")) url = "pmtiles://" + url;
+
+    maplibregl.addProtocol("pmtiles", new pmtiles.Protocol().tile);
+
+    const CARTO = ["a", "b", "c", "d"].map(s =>
+      `https://${s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png`);
+
+    const style = {
+      version: 8,
+      sources: {
+        carto: { type: "raster", tiles: CARTO, tileSize: 256, maxzoom: 20,
+          attribution: '&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>' },
+        buildings: { type: "vector", url,
+          attribution: 'Buildings: <a href="https://overturemaps.org">Overture</a> via gpq-tiles' },
+      },
+      layers: [
+        { id: "carto", type: "raster", source: "carto" },
+        { id: "bld-fill", type: "fill", source: "buildings", "source-layer": LAYER,
+          paint: { "fill-color": "#4cc9f0", "fill-opacity": 0.45 } },
+        { id: "bld-line", type: "line", source: "buildings", "source-layer": LAYER,
+          paint: { "line-color": "#9be7ff", "line-width": 0.3, "line-opacity": 0.5 } },
+      ],
+    };
+
+    const start = VIEWS.germany;
+    const map = new maplibregl.Map({ container: "map", style,
+      center: start.center, zoom: start.zoom, hash: true, maxZoom: 16 });
+    map.addControl(new maplibregl.NavigationControl(), "bottom-right");
+    map.on("error", e => { if (e && e.error) showErr("Map error: " + (e.error.message || e.error)); });
+
+    document.querySelectorAll("[data-view]").forEach(b =>
+      b.addEventListener("click", () => { const v = VIEWS[b.dataset.view]; if (v) map.flyTo({ ...v, speed: 1.6 }); }));
+  </script>
+</body>
+</html>
