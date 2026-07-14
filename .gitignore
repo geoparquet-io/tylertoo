@@ -44,6 +44,9 @@ lcov.info
 # Benchmarks
 target/criterion/
 
+# Performance-sweep outputs (regenerable via benchmarks/overview/run_sweep.sh)
+benchmarks/overview/sweep_out/
+
 # Large benchmark fixtures (download manually, not tracked in repo)
 tests/fixtures/realdata/adm2_polygons.parquet
 
