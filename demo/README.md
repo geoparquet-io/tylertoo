@@ -5,8 +5,7 @@ End-to-end **GeoParquet → PMTiles** on real Overture data (Germany buildings,
 geoparquet-io recommended pipeline (GeoJSON → tippecanoe).
 
 - `compare.html` — side-by-side swipe viewer (MapLibre + `pmtiles://`).
-- `RESULTS.md` — the head-to-head metrics table (added once the benchmark run
-  completes).
+- `RESULTS.md` — the head-to-head metrics table (measured).
 
 ## The comparison
 
