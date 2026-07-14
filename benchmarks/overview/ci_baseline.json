@@ -1,0 +1,173 @@
+{
+  "admin": {
+    "input_features": 17465,
+    "levels": [
+      {
+        "feature_count": 1,
+        "level": 0,
+        "vertex_count": 5
+      },
+      {
+        "feature_count": 187,
+        "level": 1,
+        "vertex_count": 876
+      },
+      {
+        "feature_count": 252,
+        "level": 2,
+        "vertex_count": 1517
+      },
+      {
+        "feature_count": 254,
+        "level": 3,
+        "vertex_count": 2377
+      },
+      {
+        "feature_count": 256,
+        "level": 4,
+        "vertex_count": 3749
+      },
+      {
+        "feature_count": 318,
+        "level": 5,
+        "vertex_count": 7290
+      },
+      {
+        "feature_count": 525,
+        "level": 6,
+        "vertex_count": 15989
+      },
+      {
+        "feature_count": 865,
+        "level": 7,
+        "vertex_count": 31450
+      },
+      {
+        "feature_count": 1428,
+        "level": 8,
+        "vertex_count": 56881
+      },
+      {
+        "feature_count": 2356,
+        "level": 9,
+        "vertex_count": 98200
+      },
+      {
+        "feature_count": 3888,
+        "level": 10,
+        "vertex_count": 170612
+      },
+      {
+        "feature_count": 6415,
+        "level": 11,
+        "vertex_count": 319242
+      },
+      {
+        "feature_count": 10585,
+        "level": 12,
+        "vertex_count": 587158
+      },
+      {
+        "feature_count": 17465,
+        "level": 13,
+        "vertex_count": 1749880
+      }
+    ],
+    "total_rows": 44795,
+    "total_vertices": 3045226
+  },
+  "lines": {
+    "input_features": 1000,
+    "levels": [
+      {
+        "feature_count": 2,
+        "level": 0,
+        "vertex_count": 4
+      },
+      {
+        "feature_count": 20,
+        "level": 1,
+        "vertex_count": 42
+      },
+      {
+        "feature_count": 86,
+        "level": 2,
+        "vertex_count": 192
+      },
+      {
+        "feature_count": 204,
+        "level": 3,
+        "vertex_count": 472
+      },
+      {
+        "feature_count": 256,
+        "level": 4,
+        "vertex_count": 719
+      },
+      {
+        "feature_count": 256,
+        "level": 5,
+        "vertex_count": 967
+      },
+      {
+        "feature_count": 256,
+        "level": 6,
+        "vertex_count": 1323
+      },
+      {
+        "feature_count": 367,
+        "level": 7,
+        "vertex_count": 2213
+      },
+      {
+        "feature_count": 606,
+        "level": 8,
+        "vertex_count": 3623
+      },
+      {
+        "feature_count": 1000,
+        "level": 9,
+        "vertex_count": 5433
+      }
+    ],
+    "total_rows": 3053,
+    "total_vertices": 14988
+  },
+  "polygons": {
+    "input_features": 1000,
+    "levels": [
+      {
+        "feature_count": 1,
+        "level": 0,
+        "vertex_count": 4
+      },
+      {
+        "feature_count": 7,
+        "level": 1,
+        "vertex_count": 30
+      },
+      {
+        "feature_count": 70,
+        "level": 2,
+        "vertex_count": 342
+      },
+      {
+        "feature_count": 307,
+        "level": 3,
+        "vertex_count": 1673
+      },
+      {
+        "feature_count": 606,
+        "level": 4,
+        "vertex_count": 3540
+      },
+      {
+        "feature_count": 1000,
+        "level": 5,
+        "vertex_count": 6945
+      }
+    ],
+    "total_rows": 1991,
+    "total_vertices": 12534
+  }
+}

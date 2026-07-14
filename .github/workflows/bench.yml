@@ -1,9 +1,17 @@
-# Benchmarks — runs on every push to main and on demand.
+# Benchmarks + convert-regression guard.
 #
-# Purpose: track performance of the geometry micro-benchmarks (clipping,
-# bbox_containment) over time via uploaded criterion reports. This lives
-# outside ci.yml on purpose: benchmarks are not a PR gate, and keeping them
-# here means no permanently-skipped job clutters PR check lists.
+# Two jobs:
+#   bench         — criterion micro-benches (clipping, bbox_containment),
+#                   tracked over time via uploaded reports. NOT a PR gate
+#                   (push/dispatch only) so no permanently-skipped job
+#                   clutters PR check lists.
+#   convert-guard — deterministic structural check that a change hasn't
+#                   altered convert output (per-level feature/vertex counts,
+#                   total rows) on the fixtures-v1 inputs. THIS one gates
+#                   PRs. Timing/RSS are intentionally not gated — far too
+#                   noisy on shared runners; see benchmarks/overview/PROFILE.md
+#                   for the tracked timing numbers and ci_guard.py for the
+#                   gated structural signature.
 #
 # The old tiling/streaming pipeline benches were deleted with the legacy
 # pipeline (#177/#189); this runs the surviving bench targets in
@@ -14,6 +22,7 @@ name: Benchmarks
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -26,6 +35,7 @@ jobs:
   bench:
     name: Benchmark
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -76,3 +86,51 @@ jobs:
         with:
           name: criterion-reports
           path: target/criterion/
+
+  convert-guard:
+    name: Convert regression guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-guard-target-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Build release binary
+        run: cargo build --release --package gpq-tiles
+
+      - name: Convert regression guard (structural, deterministic)
+        run: python3 benchmarks/overview/ci_guard.py --check

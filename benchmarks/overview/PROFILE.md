@@ -79,7 +79,78 @@ Full pipeline (GeoParquet → overview file → PMTiles) < 2 min.
 - `--tile-size-limit` is a single non-iterative drop pass per
   oversized tile — a backstop, not the sizing mechanism.
 
-## Big-file tier (2026-07-04)
+## Big-file tier refresh (2026-07-14, current main)
+
+Supersedes the 2026-07-04 section below: every DNF/FAILED row there was
+from now-closed tickets (#211, #212, #213, #239). Binary: release build
+at `60c1bd6` + a local `allow_http` fix (see note); same 16-core AMD
+Ryzen 7040 laptop, 54 GiB RAM, same gpio-optimized inputs in
+`corpus/data/bigbench/`. Harness: `benchmarks/overview/run_sweep.sh`.
+
+**Timing is measured on local reads** (`LOCAL=1`), so wall/RSS/CPU are
+clean convert cost. **Bytes moved is measured separately** over a
+localhost `logging_server.py` (exact `/__stats` accounting, cross-checked
+against the converter's own `report.remote_fetch`). The two are split on
+purpose: reading over the network re-fetches the input (see remote table
++ #261), which inflates wall and depresses CPU — not a property of
+convert itself.
+
+### Convert performance (local reads, default knobs, z0–14)
+
+| dataset / mode | wall | peak RSS | CPU | feat/s |
+|---|---:|---:|---:|---:|
+| points-nyc-medium (points, dup) | 1.65 s | 0.28 GiB | 131 % | 277 k |
+| germany-segments (lines, dup) | 2:02 | 11.9 GiB | 138 % | 158 k |
+| germany-buildings (polygons, dup) | 4:00 | 14.8 GiB | 138 % | 246 k |
+| germany-buildings, `--profile speed` | 3:58 | 14.8 GiB | 137 % | 246 k |
+| germany-buildings, `--profile bounded` | 4:00 | **10.5 GiB** | 138 % | 246 k |
+| fieldmaps-adm4 (MultiPolygon, dup) | **1:54** | 4.7 GiB | 487 % | — |
+| fieldmaps-adm4, partitioning | **0:54** | 5.5 GiB | 111 % | — |
+
+(feat/s omitted for fieldmaps: 364 k features but 261 M vertices — it is
+vertex-bound, not feature-bound, so the rate isn't comparable.)
+
+### Remote read cost (localhost byte accounting)
+
+| dataset / call | bytes moved | ÷ file | requests |
+|---|---:|---:|---:|
+| points-nyc (full file) | 30.8 MB | 1.00× | 35 |
+| germany-segments (full file) | 6.82 GB | 2.67× | 2 829 |
+| germany-buildings (full file) | 18.1 GB | 2.59× | 8 180 |
+| fieldmaps-adm4 (full file, dup ≡ par) | 278 GB | **96×** | 591 |
+| germany-buildings `--bbox` Berlin | **52 MB** | **0.0074×** | 27 |
+
+### Findings (2026-07-14)
+
+1. **#211 fixed.** Germany buildings converts with default knobs in
+   **4:00** — the 2026-07-04 `level 0 is empty` FAILED row is gone.
+2. **#212 fixed.** fieldmaps duplicating, the former **DNF (>45 min)**,
+   is now **1:54**; partitioning is **0:54** (2× the dup — the mode
+   lever). Both from a hard DNF.
+3. **#213 landed, partially.** fieldmaps-dup now drives **487 % CPU**
+   (~5 cores) vs ~184 % before — the pipeline parallelism is real. But
+   the large-feature cells (buildings, segments) still sit at ~138 %
+   (~1.4 cores), so feature-parallel headroom remains.
+4. **`--profile bounded` is a free RAM win**: buildings peak RSS
+   14.8 → **10.5 GiB (−29 %)** at identical wall (4:00 vs 3:58).
+5. **Remote selective read is the differentiator, and its dark twin is
+   #261.** A Berlin `--bbox` extract from the 6.99 GB country file moves
+   **0.74 % of it in 0.83 s**. But a *full-file* remote convert
+   re-fetches the input 2.6–96× (mode-independent; per-level re-reads
+   overflow the 256 MiB cache) — filed as **#261**. This is exactly why
+   the timing table above uses local reads.
+
+*Not re-measured this pass:* the export phase (`export-pmtiles`). The
+2026-07-04 export DNF was #239, since closed; a convert+export
+end-to-end pass is future work.
+
+*Note on the binary:* the localhost harness needed a one-line
+`input.rs` fix — the HTTP object store was built without `allow_http`,
+so object_store's https-only default builder-errored every `http://`
+input despite `http://` being documented as supported. Unrelated to the
+numbers here (reproduces on `s3://`/`https://`); landing as its own PR.
+
+## Big-file tier (2026-07-04, superseded — DNFs since resolved; see refresh above)
 
 Pre-release validation on real multi-GB inputs (maintainer request;
 complements the #179 release-readiness pass). Binary: release build at
