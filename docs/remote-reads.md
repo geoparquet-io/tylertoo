@@ -62,10 +62,13 @@ What to know:
   group's working set (floored at 256 MiB), so a single row group whose
   column chunks exceed the floor — e.g. a multi-GB geometry chunk — is
   no longer evicted mid-read and re-fetched per page (issue #261). What
-  remains is the two-pass baseline: a full-file conversion reads the
-  input roughly twice (the assign pass, then the write pass), so a huge
-  full-file remote conversion moves ~2× the object's bytes — if that
-  matters, download first.
+  remains is the multi-pass baseline: a full-file conversion reads the
+  input a few times — the assign pass, the write pass, and (at higher
+  zoom) a finest-level canonical re-read — so a full-file remote
+  conversion moves a small constant multiple of the object's bytes.
+  Measured on fieldmaps-adm4 (2.90 GB, z0–14): **96× before #261, 3.0×
+  after**. Eliminating the finest-level re-read to approach ~1× is
+  tracked in #219; if the residual matters today, download first.
 - **Latency vs bytes** — requests are issued sequentially, so on a
   fast link a plain `aws s3 cp` + local convert can still win on wall
   time (92 MB corpus file, residential fiber: ~3 s download+convert
