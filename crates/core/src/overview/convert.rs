@@ -4909,6 +4909,157 @@ mod tests {
             assert!(report_remote.remote_fetch.is_some());
         }
 
+        /// A throwaway localhost HTTP/1.1 server that serves one byte blob with
+        /// Range support — the hermetic, no-network stand-in for object storage.
+        /// Answers `HEAD` (size) and ranged/full `GET` exactly as object_store's
+        /// HTTP store expects. Returns the base URL (`http://127.0.0.1:PORT`);
+        /// the accept loop runs on a detached thread until the test process
+        /// exits. Binding happens before return, so the listen backlog absorbs
+        /// any connect that races the accept loop.
+        fn serve_bytes_over_http(body: Vec<u8>) -> String {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+            use std::sync::Arc;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body = Arc::new(body);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let body = Arc::clone(&body);
+                    std::thread::spawn(move || {
+                        let peer = stream.try_clone().unwrap();
+                        let mut reader = BufReader::new(peer);
+                        let size = body.len() as u64;
+                        // One connection may carry several keep-alive requests.
+                        loop {
+                            let mut request_line = String::new();
+                            match reader.read_line(&mut request_line) {
+                                Ok(0) | Err(_) => break, // client closed
+                                Ok(_) => {}
+                            }
+                            let mut parts = request_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            if method.is_empty() {
+                                break;
+                            }
+                            // Consume headers; only Range matters.
+                            let mut range: Option<(u64, u64)> = None;
+                            loop {
+                                let mut header = String::new();
+                                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                                    break;
+                                }
+                                if header == "\r\n" || header == "\n" {
+                                    break;
+                                }
+                                let lower = header.to_ascii_lowercase();
+                                let Some(spec) = lower
+                                    .strip_prefix("range:")
+                                    .and_then(|v| v.trim().strip_prefix("bytes="))
+                                else {
+                                    continue;
+                                };
+                                let spec = spec.split(',').next().unwrap_or("").trim();
+                                let (a, b) = spec.split_once('-').unwrap_or((spec, ""));
+                                let (start, end) = if a.is_empty() {
+                                    // Suffix range: the last N bytes.
+                                    let n: u64 = b.trim().parse().unwrap_or(0);
+                                    (size.saturating_sub(n), size.saturating_sub(1))
+                                } else {
+                                    let start = a.trim().parse().unwrap_or(0);
+                                    let end = if b.trim().is_empty() {
+                                        size.saturating_sub(1)
+                                    } else {
+                                        b.trim().parse().unwrap_or(size - 1)
+                                    };
+                                    (start, end.min(size.saturating_sub(1)))
+                                };
+                                range = Some((start, end));
+                            }
+                            let response: Vec<u8> = match (method.as_str(), range) {
+                                ("HEAD", _) => format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                                     Accept-Ranges: bytes\r\nContent-Length: {size}\r\n\r\n"
+                                )
+                                .into_bytes(),
+                                ("GET", Some((start, end))) => {
+                                    let slice = &body[start as usize..=end as usize];
+                                    let mut resp = format!(
+                                        "HTTP/1.1 206 Partial Content\r\n\
+                                         Content-Type: application/octet-stream\r\n\
+                                         Accept-Ranges: bytes\r\n\
+                                         Content-Range: bytes {start}-{end}/{size}\r\n\
+                                         Content-Length: {}\r\n\r\n",
+                                        slice.len()
+                                    )
+                                    .into_bytes();
+                                    resp.extend_from_slice(slice);
+                                    resp
+                                }
+                                ("GET", None) => {
+                                    let mut resp = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                                         Accept-Ranges: bytes\r\nContent-Length: {size}\r\n\r\n"
+                                    )
+                                    .into_bytes();
+                                    resp.extend_from_slice(&body);
+                                    resp
+                                }
+                                _ => {
+                                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
+                                        .to_vec()
+                                }
+                            };
+                            if stream.write_all(&response).is_err() {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
+                    });
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        /// #262 end-to-end guard: a full conversion from an `http://` input must
+        /// succeed and match the local conversion. Without `allow_http` on the
+        /// store the `http://` input builder-errors immediately, so this test
+        /// fails the moment that regresses — no network, no credentials.
+        #[test]
+        fn remote_http_convert_matches_local() {
+            let geoms = synthetic_geometries();
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            write_input(tin.path(), &geoms, false, None);
+            let opts = ConvertOptions::default();
+
+            let tout_local = tempfile::NamedTempFile::new().unwrap();
+            let report_local = convert_to_overviews(tin.path(), tout_local.path(), &opts).unwrap();
+
+            let base = serve_bytes_over_http(std::fs::read(tin.path()).unwrap());
+            let url = format!("{base}/in.parquet");
+            let source = InputSource::from_str_input(&url).unwrap();
+            assert!(source.is_remote(), "http:// input must be remote");
+
+            let tout_remote = tempfile::NamedTempFile::new().unwrap();
+            let report_remote =
+                convert_to_overviews_source(&source, tout_remote.path(), &opts).unwrap();
+
+            assert_eq!(report_remote.input_features, report_local.input_features);
+            assert_eq!(
+                read_all_ids(&OverviewReader::open(tout_remote.path()).unwrap()),
+                read_all_ids(&OverviewReader::open(tout_local.path()).unwrap()),
+            );
+            let stats = report_remote
+                .remote_fetch
+                .expect("http input reports fetch stats");
+            assert!(
+                stats.bytes_fetched > 0 && stats.requests > 0,
+                "http conversion moved bytes: {stats:?}"
+            );
+        }
+
         /// A URL with an unsupported scheme surfaces a helpful error through
         /// the public `convert_to_overviews` path.
         #[test]
