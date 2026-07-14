@@ -54,14 +54,18 @@ What to know:
   cannot be pruned finer than quarters.
 - **Fetch behavior** — one range request per selected column chunk
   (the page reader's many small reads are served from a whole-chunk
-  buffer), plus the footer. The parsed footer and up to 256 MiB of
-  fetched chunks are cached per conversion, so the streaming
-  pipeline's per-pass/per-level re-reads are refetch-free while the
-  selected data fits that cache (measured: the default streaming
-  pipeline and `--no-streaming` move identical bytes on a city
-  extract). Only when a conversion's *selected* data exceeds 256 MiB
-  does streaming mode re-fetch evicted chunks on later passes —
-  for a huge full-file remote conversion, consider downloading first.
+  buffer), plus the footer. The parsed footer and a cache of fetched
+  column chunks are held per conversion, so the streaming pipeline's
+  per-pass re-reads are refetch-free within a pass (measured: the
+  default streaming pipeline and `--no-streaming` move identical bytes
+  on a city extract). The cache budget is sized to the largest row
+  group's working set (floored at 256 MiB), so a single row group whose
+  column chunks exceed the floor — e.g. a multi-GB geometry chunk — is
+  no longer evicted mid-read and re-fetched per page (issue #261). What
+  remains is the two-pass baseline: a full-file conversion reads the
+  input roughly twice (the assign pass, then the write pass), so a huge
+  full-file remote conversion moves ~2× the object's bytes — if that
+  matters, download first.
 - **Latency vs bytes** — requests are issued sequentially, so on a
   fast link a plain `aws s3 cp` + local convert can still win on wall
   time (92 MB corpus file, residential fiber: ~3 s download+convert
