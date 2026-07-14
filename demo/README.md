@@ -1,78 +1,57 @@
-# gpq-tiles demo — Germany buildings, head-to-head
+# gpq-tiles demo — Germany buildings
 
 End-to-end **GeoParquet → PMTiles** on real Overture data (Germany buildings,
-59,032,924 features), comparing the native gpq-tiles path against the current
-geoparquet-io recommended pipeline (GeoJSON → tippecanoe).
+59,032,924 features), head-to-head against the geoparquet-io recommended pipeline
+(GeoJSON → tippecanoe).
 
-- `compare.html` — side-by-side swipe viewer (MapLibre + `pmtiles://`).
-- `RESULTS.md` — the head-to-head metrics table (measured).
+- **Live demo:** [docs/demo.md](../docs/demo.md) → renders on the docs site at
+  `/demo/`, with the interactive map at [docs/demo/viewer.html](../docs/demo/viewer.html).
+- **Numbers + methodology:** [RESULTS.md](./RESULTS.md).
 
-## The comparison
+## Hosting
 
-| pipeline | command |
-|---|---|
-| incumbent | `gpio convert geojson data.parquet \| tippecanoe -P -Z0 -z14 -l buildings -o out.pmtiles` |
-| gpq-tiles (default) | `gpq-tiles tiles data.parquet out.pmtiles --min-zoom 0 --max-zoom 14 --layer-name buildings --max-tile-size 500K` |
-| gpq-tiles (tuned) | above `+ --polygon-visibility 2.0 --collapse --drop-rate 1.3 --profile bounded` |
+The tuned Germany-buildings PMTiles is published to **Source Cooperative** and
+rendered live (tuned only — the default archive differs only marginally):
 
-Both start from the **same** gpio-optimized GeoParquet; the incumbent round-trips
-through a GeoJSON stream, gpq-tiles reads the Parquet natively with no
-intermediate.
-
-## Hosting the viewer (required for it to work)
-
-`compare.html` reads tiles with HTTP **Range** requests straight from a bucket.
-The bucket **must** serve:
-
-1. **Range requests** (`Accept-Ranges: bytes`, `206 Partial Content`), and
-2. **CORS** (`Access-Control-Allow-Origin`, and `Access-Control-Expose-Headers:
-   Content-Range` so the client can read the ranged response).
-
-Without **both**, PMTiles fails silently — a blank map, no error. This is the
-single most common demo-hosting mistake.
-
-Upload the three `.pmtiles` files, then point the viewer at them one of two ways:
-
-- **Edit the file:** set the URLs in the `DEFAULT_SOURCES` block near the top of
-  `compare.html`.
-- **Pass at runtime** (no edit):
-  ```
-  compare.html?gpq_default=https://bucket/germany-buildings-gpq-default.pmtiles
-              &gpq_tuned=https://bucket/germany-buildings-gpq-tuned.pmtiles
-              &tippecanoe=https://bucket/germany-buildings-tippecanoe.pmtiles
-  ```
-  (URLs may omit the `pmtiles://` prefix — it's added automatically.)
-
-The two dropdowns choose which outputs sit on the left/right of the swipe;
-default-vs-tuned and gpq-vs-tippecanoe are both one selection away. View-preset
-buttons jump to Germany / Berlin / Hamburg.
-
-### Preview locally before hosting
-
-Python's `http.server` (3.7+) honors Range, which is enough to smoke-test the
-viewer against local files:
-
-```bash
-cd demo
-cp /path/to/*.pmtiles .
-python3 -m http.server 8080
-# open http://localhost:8080/compare.html?gpq_default=http://localhost:8080/germany-buildings-gpq-default.pmtiles&...
+```
+s3://us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/
+  germany-buildings-gpq-tuned.pmtiles     # rendered in the viewer
+  germany-buildings-gpq-default.pmtiles   # benchmark artifact
 ```
 
-(Local `http.server` does **not** send CORS headers, but same-origin local files
-don't need them — this only validates rendering, not the CORS side of hosting.)
+Public URL (serves HTTP **Range** + **CORS**, which PMTiles requires):
 
-### pmtiles.io fallback
+```
+https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/germany-buildings-gpq-tuned.pmtiles
+```
 
-For a zero-setup share, drop a hosted `.pmtiles` URL into
-<https://pmtiles.io/> — it renders a single archive with a layer inspector. The
-swipe comparison, though, needs `compare.html`.
+The viewer (`docs/demo/viewer.html`) renders the buildings over
+[CARTO Dark Matter](https://carto.com/basemaps/) and defaults to that URL; override
+with `?pmtiles=<url>`.
 
-## Fallback / fairness notes
+### Re-uploading
 
-- Zoom range, layer name (`buildings`), and the 500K per-tile size cap are matched
-  across all three pipelines. tippecanoe's default max-tile is 500K; gpq-tiles is
-  pinned to match via `--max-tile-size 500K`.
-- Clipping and simplification differ from tippecanoe by design — see
-  `context/ARCHITECTURE.md` for the documented divergences. The comparison is of
-  *pipelines and their output*, not a claim of byte-identical tiling.
+```bash
+export AWS_PROFILE=source-coop
+aws s3 cp germany-buildings-gpq-tuned.pmtiles \
+  s3://us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/ \
+  --content-type application/octet-stream
+```
+
+Any bucket works as long as it serves **Range + CORS** — without both, PMTiles
+fails silently (blank map, no error). Source Cooperative's `opendata` bucket does
+by default. To preview against local files, Python's `http.server` (3.7+) honors
+Range:
+
+```bash
+cd docs/demo
+python3 -m http.server 8080
+# open http://localhost:8080/viewer.html?pmtiles=http://localhost:8080/local.pmtiles
+```
+
+## Fairness notes
+
+Zoom range (`z0–14`), layer name (`buildings`), and the 500K per-tile cap are
+matched across pipelines. Clipping and simplification differ from tippecanoe by
+design — see [`context/ARCHITECTURE.md`](../context/ARCHITECTURE.md). This
+compares *pipelines and their output*, not byte-identical tiling.

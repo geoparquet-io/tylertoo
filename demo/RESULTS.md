@@ -79,4 +79,6 @@ throughput.
   [`context/ARCHITECTURE.md`](../context/ARCHITECTURE.md)); this compares
   *pipelines and their output*, not byte-identical tiling.
 
-See [`compare.html`](./compare.html) for the side-by-side swipe viewer.
+The tuned archive is hosted on Source Cooperative and rendered live on the docs
+site — see [`docs/demo.md`](../docs/demo.md) and the viewer at
+[`docs/demo/viewer.html`](../docs/demo/viewer.html).
