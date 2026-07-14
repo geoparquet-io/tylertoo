@@ -130,7 +130,10 @@ pub struct ExportOptions {
     /// fill-equivalent to the i_overlay split under nonzero winding, so the
     /// fallback (which fires on ~94% of fine-zoom polygon clips) is wasted work.
     /// Non-simple inputs always keep the fallback, preserving the #94 U-shape
-    /// fix. Defaults to `false` (fallback always on) pending viewer validation.
+    /// fix. Defaults to `true` (fast path on); the S-H clip of a simple ring is
+    /// render-equivalent to the fallback but stored rotated to a different start
+    /// vertex, so disable it (`--no-simple-clip-fastpath`) only when byte-stable
+    /// tile output is required.
     pub simple_clip_fastpath: bool,
 }
 
@@ -141,7 +144,7 @@ impl Default for ExportOptions {
             tile_buffer: DEFAULT_TILE_BUFFER_PX,
             extent: DEFAULT_EXTENT,
             tile_size_limit: None,
-            simple_clip_fastpath: false,
+            simple_clip_fastpath: true,
         }
     }
 }
@@ -2119,7 +2122,19 @@ mod tests {
     /// full unbounded key range stands in for a single all-covering partition.
     #[test]
     fn recursive_split_matches_direct_oracle() {
-        let opts = ExportOptions::default();
+        // Pin the fast path OFF: this oracle asserts the recursive cascade and
+        // the direct clip produce byte-identical MVT, which is a property of the
+        // splitter (#226) and holds only under the deterministic i_overlay clip.
+        // With `simple_clip_fastpath` on (the default), Sutherland–Hodgman
+        // rotates a clipped simple ring to a different start vertex, and the
+        // rotation differs between the recursive-halving and direct-clip paths —
+        // render-equivalent but not byte-identical, so the two paths legitimately
+        // diverge in bytes here. That render-equivalence is covered separately by
+        // the `clip.rs` `fastpath_*_render_equivalent` tests.
+        let opts = ExportOptions {
+            simple_clip_fastpath: false,
+            ..Default::default()
+        };
         for (name, geom, zooms) in equivalence_corpus() {
             for z in zooms {
                 // Panics carry the feature name via the zoom-tagged messages;

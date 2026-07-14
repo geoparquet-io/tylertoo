@@ -223,16 +223,21 @@ same enclosed area, same regions filled (verified in `clip.rs` tests
 `fastpath_u_render_equivalent` and `fastpath_comb_render_equivalent`, and on the
 corpus: identical tile counts at every zoom, geometry differing only by ring
 start-vertex rotation). The `simple_clip_fastpath` option (`ExportOptions`,
-`--simple-clip-fastpath`) skips the boundary-edge gate for simple features,
-recovering that ~94% as wasted work avoided (~18% faster end-to-end on Natural
-Earth admin z0–11, up to ~50% on the finest levels). It is gated on
-per-feature simplicity (`geometry_is_simple`), so self-intersecting input still
-takes the fallback and the #94 fix is preserved.
+default `true`) skips the boundary-edge gate for simple features, recovering
+that ~94% as wasted work avoided (~18% faster end-to-end on Natural Earth admin
+z0–11, up to ~50% on the finest levels). It is gated on per-feature simplicity
+(`geometry_is_simple`), so self-intersecting input still takes the fallback and
+the #94 fix is preserved.
 
-**DIVERGENCE (staging):** the fast path changes output bytes (the SH ring is
-stored rotated, not reshaped), so it is **opt-in** today to keep the default
-byte-identical to prior releases. It is intended to become the default once the
-frozen-hash export anchors are re-baselined against the fast-path output.
+**Default output note (#256):** the fast path changes output bytes (the SH ring
+is stored rotated, not reshaped), so making it the default changed the canonical
+tile bytes versus prior releases — render-equivalent, but downstream consumers
+that hash raw tiles will see different hashes. It can be disabled with
+`--no-simple-clip-fastpath` (`ExportOptions { simple_clip_fastpath: false }`)
+when byte-stable output is required. The frozen-hash export anchor in
+`export.rs` is unaffected: its fixture polygon never crosses a tile boundary, so
+the fast path does not diverge there; the fast path's render-equivalence is
+guarded instead by the `clip.rs` `fastpath_*_render_equivalent` tests.
 
 ## Input Contract: gpio-Optimized GeoParquet
 
