@@ -278,7 +278,7 @@ pub(crate) mod remote {
     use object_store::gcp::GoogleCloudStorageBuilder;
     use object_store::http::HttpBuilder;
     use object_store::path::Path as ObjectPath;
-    use object_store::{CredentialProvider, ObjectStore, ObjectStoreScheme};
+    use object_store::{ClientOptions, CredentialProvider, ObjectStore, ObjectStoreScheme};
     use parquet::arrow::arrow_reader::{
         ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
     };
@@ -381,6 +381,7 @@ pub(crate) mod remote {
                     Arc::new(
                         HttpBuilder::new()
                             .with_url(origin)
+                            .with_client_options(ClientOptions::new().with_allow_http(true))
                             .build()
                             .map_err(|e| store_error(url_str, e))?,
                     )
