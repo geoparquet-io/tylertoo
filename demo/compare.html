@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>gpq-tiles demo — PMTiles compare</title>
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+
+  <!-- Pinned CDN deps (verified resolving). PMTiles range reads need the
+       host bucket to serve HTTP Range + CORS, or tiles silently fail. -->
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/pmtiles@3.2.1/dist/pmtiles.js"></script>
+  <script src="https://unpkg.com/@maplibre/maplibre-gl-compare@0.5.0/dist/maplibre-gl-compare.js"></script>
+  <link href="https://unpkg.com/@maplibre/maplibre-gl-compare@0.5.0/dist/maplibre-gl-compare.css" rel="stylesheet" />
+
+  <style>
+    :root { --panel: rgba(17,19,24,.86); --ink:#e7e9ee; --muted:#9aa2b1; --line:#2b3040; }
+    html,body { margin:0; height:100%; background:#0b0d12; font:14px/1.4 system-ui,sans-serif; color:var(--ink); }
+    #comparison-container { position:absolute; inset:0; }
+    .map { position:absolute; inset:0; }
+
+    #panel {
+      position:absolute; z-index:5; top:12px; left:12px; max-width:340px;
+      background:var(--panel); border:1px solid var(--line); border-radius:10px;
+      padding:12px 14px; backdrop-filter:blur(6px);
+    }
+    #panel h1 { margin:0 0 8px; font-size:14px; font-weight:600; letter-spacing:.2px; }
+    #panel .row { display:flex; gap:8px; align-items:center; margin:6px 0; }
+    #panel label { color:var(--muted); width:44px; flex:none; }
+    select, button { background:#0f1219; color:var(--ink); border:1px solid var(--line);
+      border-radius:6px; padding:5px 7px; font:inherit; }
+    button { cursor:pointer; }
+    button:hover { border-color:#41506e; }
+    .views { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; }
+    .hint { color:var(--muted); font-size:12px; margin-top:8px; }
+    .badge { position:absolute; z-index:5; top:12px; padding:4px 9px; border-radius:6px;
+      background:var(--panel); border:1px solid var(--line); font-size:12px; font-weight:600; }
+    #badge-left  { left:calc(50% - 120px); }
+    #badge-right { right:calc(50% - 120px); }
+    #err { position:absolute; z-index:6; bottom:12px; left:12px; right:12px; max-width:640px;
+      background:#3a1620; border:1px solid #7a2b3c; color:#ffd9df; border-radius:8px;
+      padding:8px 12px; font-size:12px; display:none; }
+    code { color:#c8d2ff; }
+  </style>
+</head>
+<body>
+  <div id="comparison-container">
+    <div id="before" class="map"></div>
+    <div id="after"  class="map"></div>
+  </div>
+
+  <div id="badge-left"  class="badge">left</div>
+  <div id="badge-right" class="badge">right</div>
+
+  <div id="panel">
+    <h1>gpq-tiles — PMTiles compare</h1>
+    <div class="row"><label for="left">Left</label>  <select id="left"></select></div>
+    <div class="row"><label for="right">Right</label><select id="right"></select></div>
+    <div class="views">
+      <button data-view="germany">Germany</button>
+      <button data-view="berlin">Berlin</button>
+      <button data-view="hamburg">Hamburg</button>
+    </div>
+    <div class="hint">Drag the slider to swipe. Buildings layer rendered over a
+      neutral background so tile geometry differences are visible.</div>
+  </div>
+
+  <div id="err"></div>
+
+  <script>
+    "use strict";
+
+    // ---- Sources -----------------------------------------------------------
+    // Fill these with your bucket URLs (HTTP Range + CORS required), or pass
+    // them at runtime:  compare.html?sources=<url-encoded JSON label->url>
+    // Individual overrides also work: ?gpq_default=<url>&gpq_tuned=<url>&tippecanoe=<url>
+    const DEFAULT_SOURCES = {
+      "gpq-tiles (default)": "pmtiles://https://REPLACE-ME/germany-buildings-gpq-default.pmtiles",
+      "gpq-tiles (tuned)":   "pmtiles://https://REPLACE-ME/germany-buildings-gpq-tuned.pmtiles",
+      "gpio + tippecanoe":   "pmtiles://https://REPLACE-ME/germany-buildings-tippecanoe.pmtiles",
+    };
+
+    const VIEWS = {
+      germany: { center: [10.45, 51.16], zoom: 5.4 },
+      berlin:  { center: [13.405, 52.52], zoom: 11 },
+      hamburg: { center: [9.993, 53.551], zoom: 11 },
+    };
+
+    const LAYER_NAME = "buildings"; // MVT source-layer written by both pipelines
+
+    // ---- Resolve sources from query string ---------------------------------
+    function resolveSources() {
+      const q = new URLSearchParams(location.search);
+      let src = structuredClone(DEFAULT_SOURCES);
+      if (q.has("sources")) {
+        try { src = JSON.parse(q.get("sources")); } catch (e) { showErr("Bad ?sources JSON: " + e.message); }
+      }
+      const map = { gpq_default: "gpq-tiles (default)", gpq_tuned: "gpq-tiles (tuned)", tippecanoe: "gpio + tippecanoe" };
+      for (const [k, label] of Object.entries(map)) if (q.has(k)) src[label] = withProto(q.get(k));
+      return src;
+    }
+    function withProto(u) { return u.startsWith("pmtiles://") ? u : "pmtiles://" + u; }
+
+    function showErr(msg) {
+      const el = document.getElementById("err");
+      el.style.display = "block";
+      el.innerHTML = msg;
+    }
+
+    // ---- Style for one PMTiles source --------------------------------------
+    function styleFor(url) {
+      return {
+        version: 8,
+        sources: { data: { type: "vector", url: url } },
+        layers: [
+          { id: "bg", type: "background", paint: { "background-color": "#0e1016" } },
+          { id: "fill", type: "fill", source: "data", "source-layer": LAYER_NAME,
+            paint: { "fill-color": "#5b8cff", "fill-opacity": 0.55 } },
+          { id: "line", type: "line", source: "data", "source-layer": LAYER_NAME,
+            paint: { "line-color": "#a9c2ff", "line-width": 0.3, "line-opacity": 0.5 } },
+        ],
+      };
+    }
+
+    // ---- Boot --------------------------------------------------------------
+    const SOURCES = resolveSources();
+    const labels = Object.keys(SOURCES);
+    if (labels.some(l => SOURCES[l].includes("REPLACE-ME")))
+      showErr("No bucket URLs set. Edit <code>DEFAULT_SOURCES</code> in this file, " +
+              "or open with <code>?gpq_default=…&amp;gpq_tuned=…&amp;tippecanoe=…</code>. " +
+              "The bucket must serve <code>Range</code> + <code>CORS</code>.");
+
+    // register the pmtiles:// protocol once
+    maplibregl.addProtocol("pmtiles", new pmtiles.Protocol().tile);
+
+    const start = VIEWS.germany;
+    const beforeMap = new maplibregl.Map({ container: "before", style: styleFor(SOURCES[labels[0]]),
+      center: start.center, zoom: start.zoom, hash: false });
+    const afterMap  = new maplibregl.Map({ container: "after",  style: styleFor(SOURCES[labels[1] || labels[0]]),
+      center: start.center, zoom: start.zoom });
+
+    beforeMap.addControl(new maplibregl.NavigationControl(), "bottom-right");
+    for (const m of [beforeMap, afterMap]) m.on("error", e => {
+      if (e && e.error) showErr("Map error: " + (e.error.message || e.error));
+    });
+
+    // swipe slider syncs the two maps
+    // eslint-disable-next-line no-new
+    new maplibregl.Compare(beforeMap, afterMap, "#comparison-container", { mousemove: false, orientation: "vertical" });
+
+    // ---- Dropdowns ---------------------------------------------------------
+    const leftSel = document.getElementById("left"), rightSel = document.getElementById("right");
+    for (const sel of [leftSel, rightSel]) {
+      for (const l of labels) { const o = document.createElement("option"); o.value = l; o.textContent = l; sel.appendChild(o); }
+    }
+    leftSel.value = labels[0];
+    rightSel.value = labels[1] || labels[0];
+
+    function setSide(map, badgeId, label) {
+      map.setStyle(styleFor(SOURCES[label]));
+      document.getElementById(badgeId).textContent = label;
+    }
+    leftSel.addEventListener("change", () => setSide(beforeMap, "badge-left", leftSel.value));
+    rightSel.addEventListener("change", () => setSide(afterMap, "badge-right", rightSel.value));
+    setSide(beforeMap, "badge-left", leftSel.value);
+    setSide(afterMap, "badge-right", rightSel.value);
+
+    // ---- View presets ------------------------------------------------------
+    document.querySelectorAll("[data-view]").forEach(b => b.addEventListener("click", () => {
+      const v = VIEWS[b.dataset.view]; if (!v) return;
+      beforeMap.jumpTo(v); afterMap.jumpTo(v);
+    }));
+  </script>
+</body>
+</html>
