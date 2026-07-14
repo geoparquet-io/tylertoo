@@ -208,6 +208,32 @@ matches tippecanoe. For cases SH cannot handle robustly, `ioverlay_clip.rs`
 provides an [i_overlay](https://crates.io/crates/i_overlay)-based fallback
 (`clip.rs` dispatches).
 
+### When the i_overlay fallback fires — and the simple-clip fast path (#239)
+
+`clip.rs` routes an SH result to the i_overlay fallback when it detects a
+structural issue OR a *boundary-connecting edge* — an SH edge running along the
+tile boundary, which is how SH signals it bridged a gap (the #94 U-shape case).
+That boundary-edge gate is deliberately coarse: an ordinary polygon straddling a
+tile always produces one boundary edge, so the gate over-triggers on ~94% of
+fine-zoom polygon clips even though SH was correct.
+
+For a feature whose rings are already **simple**, the over-trigger is pure cost:
+the self-touching SH ring is nonzero-winding-equivalent to the i_overlay split —
+same enclosed area, same regions filled (verified in `clip.rs` tests
+`fastpath_u_render_equivalent` and `fastpath_comb_render_equivalent`, and on the
+corpus: identical tile counts at every zoom, geometry differing only by ring
+start-vertex rotation). The `simple_clip_fastpath` option (`ExportOptions`,
+`--simple-clip-fastpath`) skips the boundary-edge gate for simple features,
+recovering that ~94% as wasted work avoided (~18% faster end-to-end on Natural
+Earth admin z0–11, up to ~50% on the finest levels). It is gated on
+per-feature simplicity (`geometry_is_simple`), so self-intersecting input still
+takes the fallback and the #94 fix is preserved.
+
+**DIVERGENCE (staging):** the fast path changes output bytes (the SH ring is
+stored rotated, not reshaped), so it is **opt-in** today to keep the default
+byte-identical to prior releases. It is intended to become the default once the
+frozen-hash export anchors are re-baselined against the fast-path output.
+
 ## Input Contract: gpio-Optimized GeoParquet
 
 The converter assumes (and `gpq-tiles` recommends) input prepared with
