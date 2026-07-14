@@ -47,6 +47,10 @@ use std::path::Path;
 ///     tile_size_limit (int, optional): Per-tile MVT size limit in bytes.
 ///         A tile exceeding it sheds its lowest-priority features. Defaults
 ///         to None (no limit).
+///     simple_clip_fastpath (bool, optional): Skip the i_overlay boundary-bridge
+///         fallback for features whose rings are already simple (issue #239).
+///         Faster fine-zoom polygon export; output is render-equivalent on
+///         simple rings. Experimental. Defaults to False.
 ///
 /// Returns:
 ///     None
@@ -60,7 +64,8 @@ use std::path::Path;
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=None))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=None, simple_clip_fastpath=false))]
+#[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
     py: Python<'_>,
     input: &str,
@@ -69,6 +74,7 @@ fn convert(
     max_zoom: u8,
     layer_name: Option<String>,
     tile_size_limit: Option<usize>,
+    simple_clip_fastpath: bool,
 ) -> PyResult<()> {
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
@@ -92,6 +98,7 @@ fn convert(
         tile_buffer: 8,
         extent: 4096,
         tile_size_limit,
+        simple_clip_fastpath,
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -603,6 +610,10 @@ fn overview(
 ///     tile_size_limit (int, optional): Per-tile MVT size limit in bytes.
 ///         A tile exceeding it sheds its lowest-priority (smallest) features
 ///         in a single non-iterative drop pass. Defaults to None (no limit).
+///     simple_clip_fastpath (bool, optional): Skip the i_overlay boundary-bridge
+///         fallback for features whose rings are already simple (issue #239).
+///         Faster fine-zoom polygon export; output is render-equivalent on
+///         simple rings. Experimental. Defaults to False.
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
@@ -620,7 +631,8 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=None, simple_clip_fastpath=false))]
+#[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
     input: &str,
@@ -629,12 +641,14 @@ fn export_pmtiles(
     tile_buffer: u32,
     extent: u32,
     tile_size_limit: Option<usize>,
+    simple_clip_fastpath: bool,
 ) -> PyResult<Py<PyDict>> {
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
         tile_buffer,
         extent,
         tile_size_limit,
+        simple_clip_fastpath,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

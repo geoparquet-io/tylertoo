@@ -275,26 +275,35 @@ pub fn clip_geometry(
     // Backward-compatible entry point: validate simplicity per clip (the
     // pre-#237 behavior). Hot export paths should call `clip_geometry_simple`
     // with a per-feature `assume_simple` flag instead.
-    clip_geometry_simple(geom, bounds, buffer, false)
+    clip_geometry_simple(geom, bounds, buffer, false, false)
 }
 
-/// Clip a geometry to buffered tile bounds, with a caller-supplied
-/// `assume_simple` hint that skips the O(V²) self-intersection validation on
-/// every clip (issue #237, RC3).
+/// Clip a geometry to buffered tile bounds, with caller-supplied hints that skip
+/// redundant validity work on features already proven simple.
 ///
-/// Pass `assume_simple = true` **only** when the source feature's rings have
-/// already been proven simple via [`geometry_is_simple`]. Under that
-/// precondition the skipped check would always have returned "no issue", so the
-/// clipped output is byte-identical to [`clip_geometry`] — the flag only removes
-/// redundant per-clip work, never changes geometry. The cheap O(V) validity
-/// gates (degenerate/duplicate vertices, boundary-connecting edges that flag
-/// S-H bridging) still run, so S-H failures on simple inputs still fall back to
-/// i_overlay.
+/// # `assume_simple` (issue #237, RC3)
+///
+/// Pass `true` **only** when the source feature's rings have already been proven
+/// simple via [`geometry_is_simple`]. It skips the O(V²) self-intersection
+/// re-scan per clip; under its precondition that scan would always have returned
+/// "no issue", so the result is byte-identical to [`clip_geometry`].
+///
+/// # `skip_boundary_fallback` (issue #239)
+///
+/// Consulted **only when `assume_simple` is also true**. It additionally skips
+/// the O(V) `has_boundary_connecting_edges` gate, so a simple polygon whose S-H
+/// clip runs an edge along the tile boundary keeps the (cheap) S-H result
+/// instead of routing to i_overlay. For simple rings that S-H "bridge" is a
+/// self-touching ring that is area- and fill-equivalent to i_overlay's split
+/// under nonzero winding (measured — see `fastpath_u_render_equivalent`), so this
+/// removes the ~94% fine-zoom i_overlay fallback without changing rendered
+/// output. On non-simple inputs the gate always runs, preserving the #94 fix.
 pub fn clip_geometry_simple(
     geom: &Geometry<f64>,
     bounds: &TileBounds,
     buffer: f64,
     assume_simple: bool,
+    skip_boundary_fallback: bool,
 ) -> Option<Geometry<f64>> {
     let buffered = TileBounds::new(
         bounds.lng_min - buffer,
@@ -306,9 +315,12 @@ pub fn clip_geometry_simple(
     match geom {
         Geometry::Point(p) => clip_point(p, &buffered).map(Geometry::Point),
         Geometry::LineString(ls) => clip_linestring(ls, &buffered),
-        Geometry::Polygon(poly) => clip_polygon(poly, &buffered, assume_simple),
+        Geometry::Polygon(poly) => {
+            clip_polygon(poly, &buffered, assume_simple, skip_boundary_fallback)
+        }
         Geometry::MultiPolygon(mp) => {
-            clip_multipolygon(mp, &buffered, assume_simple).map(Geometry::MultiPolygon)
+            clip_multipolygon(mp, &buffered, assume_simple, skip_boundary_fallback)
+                .map(Geometry::MultiPolygon)
         }
         Geometry::MultiLineString(mls) => clip_multilinestring(mls, &buffered),
         other => {
@@ -446,6 +458,7 @@ fn clip_polygon(
     poly: &Polygon<f64>,
     bounds: &TileBounds,
     assume_simple: bool,
+    skip_boundary_fallback: bool,
 ) -> Option<Geometry<f64>> {
     // Quick rejection test using bounding box
     let poly_rect = poly.bounding_rect()?;
@@ -476,15 +489,21 @@ fn clip_polygon(
 
     // Validate S-H output and fall back to i_overlay on structural issues or
     // boundary-connecting bridges. `assume_simple` (issue #237) only suppresses
-    // the O(V²) self-intersection re-scan inside `geometry_has_structural_issues`
-    // — the cheap O(V) `has_boundary_connecting_edges` gate that catches S-H's
-    // U-shape bridging still runs, so the chosen result stays byte-identical.
+    // the O(V²) self-intersection re-scan inside `geometry_has_structural_issues`.
+    //
+    // `skip_boundary_fallback` (issue #239) additionally suppresses the O(V)
+    // `has_boundary_connecting_edges` gate, but ONLY when `assume_simple` — for a
+    // ring proven simple, S-H's boundary-following "bridge" is a self-touching
+    // ring that is area- and fill-identical to the i_overlay result under nonzero
+    // winding (measured: `fastpath_u_render_equivalent`), so the fallback is pure
+    // wasted work. On non-simple inputs the gate always runs, preserving #94.
+    let skip_boundary = assume_simple && skip_boundary_fallback;
     match &sh_result {
         Some(Geometry::Polygon(p)) => {
             // Check for structural issues OR boundary-connecting edges
             // (the latter indicates S-H connected disconnected regions)
             if geometry_has_structural_issues(sh_result.as_ref().unwrap(), assume_simple)
-                || has_boundary_connecting_edges(p, bounds)
+                || (!skip_boundary && has_boundary_connecting_edges(p, bounds))
             {
                 ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
             } else {
@@ -494,7 +513,8 @@ fn clip_polygon(
         Some(Geometry::MultiPolygon(mp)) => {
             // Check each polygon for issues
             let has_issues = mp.0.iter().any(|p| {
-                has_structural_issues(p, assume_simple) || has_boundary_connecting_edges(p, bounds)
+                has_structural_issues(p, assume_simple)
+                    || (!skip_boundary && has_boundary_connecting_edges(p, bounds))
             });
             if has_issues {
                 ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
@@ -518,6 +538,7 @@ fn clip_multipolygon(
     mp: &MultiPolygon<f64>,
     bounds: &TileBounds,
     assume_simple: bool,
+    skip_boundary_fallback: bool,
 ) -> Option<MultiPolygon<f64>> {
     // Level 1: Quick rejection using overall MultiPolygon bbox
     let mp_rect = mp.bounding_rect()?;
@@ -563,7 +584,7 @@ fn clip_multipolygon(
         // fallback resolving an S-H bridge into its true parts) — keep every
         // piece. Discarding the MultiPolygon case here silently deleted
         // boundary-straddling parts from individual tiles (#244).
-        match clip_polygon(poly, bounds, assume_simple) {
+        match clip_polygon(poly, bounds, assume_simple, skip_boundary_fallback) {
             Some(Geometry::Polygon(clipped)) => clipped_polys.push(clipped),
             Some(Geometry::MultiPolygon(pieces)) => clipped_polys.extend(pieces.0),
             Some(other) => debug_assert!(false, "polygon clip returned {other:?}"),
@@ -739,12 +760,13 @@ mod tests {
         // them off along razor-straight tile-boundary lines).
         let mp = u_multipolygon();
         let window = TileBounds::new(-0.5, 3.0, 4.5, 6.0);
-        let clipped = clip_multipolygon(&mp, &window, false)
+        let clipped = clip_multipolygon(&mp, &window, false, false)
             .expect("clip must not drop a genuinely-overlapping feature");
         assert_eq!(clipped.0.len(), 2, "both prong pieces must survive");
         // Same through the public geometry entry point, simple-path flavor.
-        let via_public = clip_geometry_simple(&Geometry::MultiPolygon(mp), &window, 0.0, true)
-            .expect("public entry point must keep the feature");
+        let via_public =
+            clip_geometry_simple(&Geometry::MultiPolygon(mp), &window, 0.0, true, false)
+                .expect("public entry point must keep the feature");
         match via_public {
             Geometry::MultiPolygon(m) => assert_eq!(m.0.len(), 2),
             other => panic!("expected MultiPolygon, got {other:?}"),
@@ -781,7 +803,7 @@ mod tests {
         };
         let leaf = crate::tile::tile_bounds(2104, 1372, 12);
 
-        let direct = clip_geometry_simple(&geom, &leaf, buf(&leaf), simple)
+        let direct = clip_geometry_simple(&geom, &leaf, buf(&leaf), simple, false)
             .expect("direct leaf clip must keep the eastern sliver");
         assert!(
             contains_hole(&direct),
@@ -793,10 +815,10 @@ mod tests {
         let mut cur = geom;
         for (x, y, z) in [(263u32, 171u32, 9u8), (526, 343, 10), (1052, 686, 11)] {
             let nb = crate::tile::tile_bounds(x, y, z);
-            cur = clip_geometry_simple(&cur, &nb, buf(&nb), simple)
+            cur = clip_geometry_simple(&cur, &nb, buf(&nb), simple, false)
                 .unwrap_or_else(|| panic!("cascade lost the feature at z{z} ({x},{y})"));
         }
-        let casc = clip_geometry_simple(&cur, &leaf, buf(&leaf), simple)
+        let casc = clip_geometry_simple(&cur, &leaf, buf(&leaf), simple, false)
             .expect("cascade leaf clip must keep the eastern sliver");
         assert!(
             contains_hole(&casc),
@@ -954,7 +976,7 @@ mod tests {
         for g in cases {
             assert!(geometry_is_simple(&g));
             let default = clip_geometry(&g, &bounds, buffer);
-            let fast = clip_geometry_simple(&g, &bounds, buffer, true);
+            let fast = clip_geometry_simple(&g, &bounds, buffer, true, false);
             assert_eq!(default, fast, "assume_simple output diverged for {g:?}");
         }
     }
@@ -998,7 +1020,7 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&poly, &bounds, false);
+        let result = clip_polygon(&poly, &bounds, false, false);
         assert!(result.is_some());
 
         // Extract the polygon (should be single polygon for this simple case)
@@ -1035,7 +1057,7 @@ mod tests {
             ]),
             vec![],
         );
-        assert!(clip_polygon(&poly, &bounds, false).is_none());
+        assert!(clip_polygon(&poly, &bounds, false, false).is_none());
     }
 
     #[test]
@@ -1052,7 +1074,7 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&poly, &bounds, false);
+        let result = clip_polygon(&poly, &bounds, false, false);
         assert!(result.is_some());
     }
 
@@ -1235,7 +1257,7 @@ mod tests {
         let mp = MultiPolygon::new(polygons);
 
         // Clip to the tile
-        let result = clip_multipolygon(&mp, &tile_bounds, false);
+        let result = clip_multipolygon(&mp, &tile_bounds, false, false);
 
         // Should produce output (the 10 inside polygons)
         assert!(
@@ -1294,7 +1316,7 @@ mod tests {
             .collect();
 
         let mp = MultiPolygon::new(polygons);
-        let result = clip_multipolygon(&mp, &tile_bounds, false);
+        let result = clip_multipolygon(&mp, &tile_bounds, false, false);
         assert!(
             result.is_none(),
             "All-outside multipolygon should return None"
@@ -1337,7 +1359,7 @@ mod tests {
         );
 
         // Clip to small tile
-        let result = clip_polygon(&large_poly, &tile_bounds, false);
+        let result = clip_polygon(&large_poly, &tile_bounds, false, false);
         assert!(result.is_some(), "Large polygon should intersect the tile");
 
         // Verify the clipped result is reasonable
@@ -1588,7 +1610,7 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&u_shape, &bounds, false);
+        let result = clip_polygon(&u_shape, &bounds, false, false);
         assert!(result.is_some(), "U-shape should intersect the band");
 
         // i_overlay correctly produces a MultiPolygon with 2 separate polygons
@@ -1632,6 +1654,144 @@ mod tests {
             }
             other => panic!("Expected Polygon or MultiPolygon, got {:?}", other),
         }
+    }
+
+    // ========== Simple-clip fast path (issue #239) ==========
+    //
+    // The `simple_clip_fastpath` flag skips the i_overlay boundary-bridge
+    // fallback for features whose rings are already simple. These tests pin the
+    // behavior and the equivalence it relies on: on a simple concave polygon,
+    // S-H's self-touching output is area- and fill-identical to i_overlay's
+    // split under nonzero winding, so skipping the fallback changes nothing that
+    // renders. The concave "U" cut across its mouth is the case #94's fallback
+    // was built for; the flag deliberately keeps S-H there.
+
+    /// A genuinely SIMPLE concave U (opening upward), non-self-intersecting.
+    ///
+    /// NOTE: the existing `test_clip_polygon_u_shape` fixture is *self-
+    /// intersecting* (its inner edge at y=2 passes through the arm verticals at
+    /// (2,2)/(8,2)), so `geometry_is_simple` is false for it and the self-
+    /// intersection check — not the boundary gate — routes it to i_overlay. To
+    /// isolate the boundary gate we need a clean simple U: solid base y∈[0,3]
+    /// across x∈[0,10], arms x∈[0,3] and x∈[7,10] up to y=10, notch x∈[3,7].
+    fn u_shape() -> Polygon<f64> {
+        Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 10.0, y: 0.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 7.0, y: 10.0 },
+                Coord { x: 7.0, y: 3.0 },
+                Coord { x: 3.0, y: 3.0 },
+                Coord { x: 3.0, y: 10.0 },
+                Coord { x: 0.0, y: 10.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )
+    }
+
+    /// The flag's behavioral contract on a simple concave ring: OFF splits into
+    /// clean parts (the #94 fallback), ON keeps S-H's single self-touching ring.
+    /// Both are correct; the equivalence is proven by the two tests below.
+    #[test]
+    fn simple_u_fastpath_keeps_single_ring() {
+        let u = u_shape();
+        let bounds = TileBounds::new(0.0, 4.0, 10.0, 6.0);
+
+        // The U-shape passes the simplicity check → `assume_simple` is true for
+        // it in the real export path, so the flag applies to it.
+        assert!(
+            geometry_is_simple(&Geometry::Polygon(u.clone())),
+            "U-shape is a simple polygon; assume_simple is true in prod"
+        );
+
+        // Flag OFF (default): the boundary gate fires even at assume_simple=true,
+        // so the fallback yields the clean 2-part split.
+        match clip_polygon(&u, &bounds, true, false).unwrap() {
+            Geometry::MultiPolygon(mp) => assert_eq!(mp.0.len(), 2),
+            other => panic!("flag off should split; got {other:?}"),
+        }
+
+        // Flag ON (#239): the boundary gate is skipped for this simple ring, so
+        // S-H's single self-touching polygon is kept (no i_overlay).
+        match clip_polygon(&u, &bounds, true, true).unwrap() {
+            Geometry::Polygon(_) => {}
+            other => panic!("flag on should keep the S-H single polygon; got {other:?}"),
+        }
+    }
+
+    /// The equivalence the flag relies on: on a simple U, S-H's kept ring has the
+    /// same enclosed AREA as i_overlay's split and leaves the mouth EMPTY under
+    /// nonzero winding — so it renders identically despite being self-touching.
+    #[test]
+    fn fastpath_u_render_equivalent() {
+        use geo::{Area, Contains};
+        let u = u_shape();
+        let bounds = TileBounds::new(0.0, 4.0, 10.0, 6.0);
+
+        let sh = sutherland_hodgman::clip_polygon_sh(&u, &bounds).unwrap();
+        let io = ioverlay_clip::clip_polygon_ioverlay(&u, &bounds).unwrap();
+
+        // Notch center: inside the band, inside the mouth → NOT part of the U.
+        let notch = Point::new(5.0, 5.0);
+        assert!(!io.contains(&notch), "i_overlay: mouth empty");
+        assert!(
+            !sh.contains(&notch),
+            "S-H: mouth also empty (winding cancels)"
+        );
+        assert!(
+            (sh.unsigned_area() - io.unsigned_area()).abs() < 1e-9,
+            "areas must match: sh={} io={}",
+            sh.unsigned_area(),
+            io.unsigned_area()
+        );
+    }
+
+    /// Equivalence generalizes to a MULTI-mouth shape: a 3-tooth comb has two
+    /// notches, and if S-H's bridge windings failed to cancel, area or fill would
+    /// diverge here. They don't.
+    #[test]
+    fn fastpath_comb_render_equivalent() {
+        use geo::{Area, Contains};
+        // Base y∈[0,3] across x∈[0,15]; arms at x∈[0,3],[6,9],[12,15] up to y=10;
+        // notches at x∈[3,6] and x∈[9,12].
+        let comb = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 15.0, y: 0.0 },
+                Coord { x: 15.0, y: 10.0 },
+                Coord { x: 12.0, y: 10.0 },
+                Coord { x: 12.0, y: 3.0 },
+                Coord { x: 9.0, y: 3.0 },
+                Coord { x: 9.0, y: 10.0 },
+                Coord { x: 6.0, y: 10.0 },
+                Coord { x: 6.0, y: 3.0 },
+                Coord { x: 3.0, y: 3.0 },
+                Coord { x: 3.0, y: 10.0 },
+                Coord { x: 0.0, y: 10.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        );
+        let bounds = TileBounds::new(0.0, 4.0, 15.0, 6.0);
+        assert!(
+            geometry_is_simple(&Geometry::Polygon(comb.clone())),
+            "comb must be simple to be an assume_simple case"
+        );
+
+        let sh = sutherland_hodgman::clip_polygon_sh(&comb, &bounds).unwrap();
+        let io = ioverlay_clip::clip_polygon_ioverlay(&comb, &bounds).unwrap();
+        let notch1 = Point::new(4.5, 5.0);
+        let notch2 = Point::new(10.5, 5.0);
+        assert!(
+            (sh.unsigned_area() - io.unsigned_area()).abs() < 1e-9,
+            "areas must match across multiple mouths"
+        );
+        assert!(
+            !sh.contains(&notch1) && !sh.contains(&notch2),
+            "both mouths stay empty under S-H"
+        );
     }
 
     // ========== WorldCoord-based Clipping Tests ==========

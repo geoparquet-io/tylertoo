@@ -124,6 +124,14 @@ pub struct ExportOptions {
     /// are dropped in one pass and the tile is re-encoded once. When `None`, no
     /// size limit is enforced and `oversized_tiles` is always 0.
     pub tile_size_limit: Option<usize>,
+    /// Skip the i_overlay boundary-bridge fallback for features whose rings are
+    /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
+    /// boundary-following clip is a self-touching polygon that is area- and
+    /// fill-equivalent to the i_overlay split under nonzero winding, so the
+    /// fallback (which fires on ~94% of fine-zoom polygon clips) is wasted work.
+    /// Non-simple inputs always keep the fallback, preserving the #94 U-shape
+    /// fix. Defaults to `false` (fallback always on) pending viewer validation.
+    pub simple_clip_fastpath: bool,
 }
 
 impl Default for ExportOptions {
@@ -133,6 +141,7 @@ impl Default for ExportOptions {
             tile_buffer: DEFAULT_TILE_BUFFER_PX,
             extent: DEFAULT_EXTENT,
             tile_size_limit: None,
+            simple_clip_fastpath: false,
         }
     }
 }
@@ -1100,7 +1109,13 @@ fn feature_tile_members_direct(
         let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
         if bbox_within_buffered(bbox, &tb, buffer_deg) {
             out.push((key, geom.clone()));
-        } else if let Some(clipped) = clip_geometry_simple(geom, &tb, buffer_deg, assume_simple) {
+        } else if let Some(clipped) = clip_geometry_simple(
+            geom,
+            &tb,
+            buffer_deg,
+            assume_simple,
+            opts.simple_clip_fastpath,
+        ) {
             out.push((key, clipped));
         }
     }
@@ -1200,7 +1215,13 @@ fn split_feature_into_tiles(
         // and `cur` is still the original geometry.
         if bbox_within_buffered(cur_bbox, &tb, buffer_deg) {
             out.push((key, cur.clone()));
-        } else if let Some(clipped) = clip_geometry_simple(cur, &tb, buffer_deg, assume_simple) {
+        } else if let Some(clipped) = clip_geometry_simple(
+            cur,
+            &tb,
+            buffer_deg,
+            assume_simple,
+            opts.simple_clip_fastpath,
+        ) {
             out.push((key, clipped));
         }
         return;
@@ -1228,7 +1249,13 @@ fn split_feature_into_tiles(
             assume_simple,
             out,
         );
-    } else if let Some(clipped) = clip_geometry_simple(cur, &tb, buffer_deg, assume_simple) {
+    } else if let Some(clipped) = clip_geometry_simple(
+        cur,
+        &tb,
+        buffer_deg,
+        assume_simple,
+        opts.simple_clip_fastpath,
+    ) {
         let cbbox = match clipped.bounding_rect() {
             Some(r) => TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y),
             None => return,
