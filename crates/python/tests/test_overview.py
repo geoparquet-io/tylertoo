@@ -41,6 +41,49 @@ class TestRemoteInput:
         assert "s3://" in doc
 
 
+STREAMING_SMALL = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
+
+needs_streaming_small = pytest.mark.skipif(
+    not STREAMING_SMALL.exists(),
+    reason="multi-rowgroup-small.parquet fixture not available",
+)
+
+
+class TestMultiPartitionInput:
+    """list[str] input (v0.7 multi-partition): explicit ordered part list."""
+
+    @needs_streaming_small
+    def test_list_input_concatenates_parts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            single = Path(tmpdir) / "single.parquet"
+            double = Path(tmpdir) / "double.parquet"
+            r1 = gpq_tiles.overview(str(STREAMING_SMALL), str(single), max_zoom=4)
+            r2 = gpq_tiles.overview(
+                [str(STREAMING_SMALL), str(STREAMING_SMALL)],
+                str(double),
+                max_zoom=4,
+            )
+            assert r2["input_features"] == 2 * r1["input_features"]
+
+    @needs_streaming_small
+    def test_list_input_missing_entry_names_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "o.parquet"
+            missing = Path(tmpdir) / "nope.parquet"
+            with pytest.raises((RuntimeError, ValueError), match=r"nope\.parquet"):
+                gpq_tiles.overview(
+                    [str(STREAMING_SMALL), str(missing)], str(out), max_zoom=4
+                )
+
+    def test_input_wrong_type_is_type_error(self):
+        with pytest.raises(TypeError, match=r"list\[str\]"):
+            gpq_tiles.overview(123, "/tmp/o.parquet")  # type: ignore[arg-type]
+
+    def test_empty_list_is_an_error(self):
+        with pytest.raises((RuntimeError, ValueError)):
+            gpq_tiles.overview([], "/tmp/o.parquet")
+
+
 class TestOverviewApi:
     """API-surface tests for overview() (no fixture needed)."""
 

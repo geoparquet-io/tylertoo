@@ -18,7 +18,7 @@ def convert(
     simple_clip_fastpath: bool = True,
 ) -> None: ...
 def overview(
-    input: str,
+    input: str | list[str],
     output: str,
     *,
     mode: str = "duplicating",

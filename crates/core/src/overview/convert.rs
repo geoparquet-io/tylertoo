@@ -822,6 +822,24 @@ pub fn convert_to_overviews(
     )
 }
 
+/// [`convert_to_overviews`] over an already-resolved [`ConvertSource`] —
+/// the entry point for callers that build the (possibly multi-partition)
+/// source themselves: a `--files-from` manifest
+/// ([`ConvertSource::from_manifest`]), an explicit input list
+/// ([`ConvertSource::from_input_list`]), or custom object stores.
+pub fn convert_to_overviews_sources(
+    source: &ConvertSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+) -> Result<ConvertReport, ConvertError> {
+    convert_to_overviews_source_strategy(
+        source,
+        output_path,
+        options,
+        super::stream::Pass2Strategy::Pipelined,
+    )
+}
+
 /// [`convert_to_overviews`] over an already-resolved [`InputSource`] — the
 /// entry point for callers that construct the source themselves (custom
 /// object stores, tests over in-memory stores).
@@ -1552,42 +1570,51 @@ pub(super) const FULL_FILE_REMOTE_WARN_BYTES: u64 = 1 << 30;
 /// for local inputs (OS page cache), for effective bbox extracts (fewer row
 /// groups read than the file holds), and for objects below the threshold.
 pub(super) fn full_file_remote_warning(
-    is_remote: bool,
+    remote_parts: usize,
     row_groups_read: usize,
     row_groups_total: usize,
     object_size: u64,
 ) -> Option<String> {
-    if !is_remote || row_groups_read < row_groups_total || object_size < FULL_FILE_REMOTE_WARN_BYTES
+    if remote_parts == 0
+        || row_groups_read < row_groups_total
+        || object_size < FULL_FILE_REMOTE_WARN_BYTES
     {
         return None;
     }
+    let gib = object_size as f64 / (1024.0 * 1024.0 * 1024.0);
+    // Multi-partition sources (v0.7) sum object_size over their remote
+    // parts, so name the part count: 20 × 600 MB partitions trip the same
+    // ≥1 GiB total-transfer threshold as one 12 GiB object.
+    let what = if remote_parts > 1 {
+        format!("{remote_parts} remote partitions totalling {gib:.1} GiB")
+    } else {
+        format!("a {gib:.1} GiB object")
+    };
     Some(format!(
-        "full-file remote convert of a {:.1} GiB object: it is fetched once over \
+        "full-file remote convert of {what}: the input is fetched once over \
          the network (≈1× — the local spill keeps later passes off the network, \
          #219) and staged under $TMPDIR. For a region of interest pass --bbox to \
          fetch only the covering row groups (and skip the spill); otherwise \
          downloading first (e.g. `aws s3 cp`) and converting locally avoids the \
          second-pass disk read. Point --spill-dir (or $TMPDIR) at fast local disk \
          with room for it, not a small tmpfs.",
-        object_size as f64 / (1024.0 * 1024.0 * 1024.0),
     ))
 }
 
 /// Emit the #267 nudge for a full-file remote convert, if warranted. Thin
 /// logging wrapper over [`full_file_remote_warning`] (for a multi source,
-/// `object_size` is summed over the remote parts).
+/// `object_size` is summed over the remote parts and the part count is
+/// named in the message).
 pub(super) fn warn_full_file_remote(
     source: &ConvertSource,
     row_groups_read: usize,
     row_groups_total: usize,
 ) {
     let object_size = source.fetch_stats().map_or(0, |s| s.object_size);
-    if let Some(msg) = full_file_remote_warning(
-        source.is_remote(),
-        row_groups_read,
-        row_groups_total,
-        object_size,
-    ) {
+    let remote_parts = source.parts().iter().filter(|p| p.is_remote()).count();
+    if let Some(msg) =
+        full_file_remote_warning(remote_parts, row_groups_read, row_groups_total, object_size)
+    {
         log::warn!("{msg}");
     }
 }
@@ -2589,24 +2616,50 @@ mod tests {
     #[test]
     fn full_file_remote_warning_gated_on_large_unpruned_remote() {
         const BIG: u64 = 4 << 30; // 4 GiB, above the 1 GiB threshold
-                                  // Local input: re-reads hit the OS page cache — never warn.
-        assert!(full_file_remote_warning(false, 8, 8, BIG).is_none());
+                                  // Local input (0 remote parts): re-reads hit
+                                  // the OS page cache — never warn.
+        assert!(full_file_remote_warning(0, 8, 8, BIG).is_none());
         // Effective bbox extract (fewer row groups read): never warn.
-        assert!(full_file_remote_warning(true, 2, 8, BIG).is_none());
+        assert!(full_file_remote_warning(1, 2, 8, BIG).is_none());
         // Small remote object: below threshold — never warn.
-        assert!(full_file_remote_warning(true, 8, 8, 100 << 20).is_none());
+        assert!(full_file_remote_warning(1, 8, 8, 100 << 20).is_none());
         // Just below the threshold: still quiet.
-        assert!(full_file_remote_warning(true, 8, 8, FULL_FILE_REMOTE_WARN_BYTES - 1).is_none());
+        assert!(full_file_remote_warning(1, 8, 8, FULL_FILE_REMOTE_WARN_BYTES - 1).is_none());
         // At the threshold: warns (guard is a strict `<`).
-        assert!(full_file_remote_warning(true, 8, 8, FULL_FILE_REMOTE_WARN_BYTES).is_some());
+        assert!(full_file_remote_warning(1, 8, 8, FULL_FILE_REMOTE_WARN_BYTES).is_some());
         // Large full-file remote: warns, and the nudge names the cheaper paths.
-        let msg = full_file_remote_warning(true, 8, 8, BIG)
+        let msg = full_file_remote_warning(1, 8, 8, BIG)
             .expect("large full-file remote convert should warn");
         assert!(msg.contains("--bbox"), "nudge should mention --bbox: {msg}");
         assert!(
             msg.contains("4.0 GiB"),
             "nudge should state the object size: {msg}"
         );
+        assert!(
+            !msg.contains("partitions"),
+            "single object: no part count in the message: {msg}"
+        );
+    }
+
+    /// v0.7 multi-partition: the summed object size trips the same
+    /// threshold (20 × 600 MB with no bbox IS a ≥1 GiB full-file remote
+    /// convert), and the message names the part count so the total is not
+    /// mistaken for one object.
+    #[test]
+    fn full_file_remote_warning_names_partition_count() {
+        const PART: u64 = 600 << 20; // 600 MB per partition
+        let msg = full_file_remote_warning(20, 40, 40, 20 * PART)
+            .expect("20 x 600 MB unpruned remote parts should warn");
+        assert!(
+            msg.contains("20 remote partitions"),
+            "message names the part count: {msg}"
+        );
+        assert!(
+            msg.contains("11.7 GiB"),
+            "message states the summed size: {msg}"
+        );
+        // Summed size below the threshold stays quiet regardless of count.
+        assert!(full_file_remote_warning(20, 40, 40, 500 << 20).is_none());
     }
 
     /// #272: the spill free-space preflight warns when the projected spill
@@ -5450,6 +5503,162 @@ mod tests {
                 read_all_ids(&OverviewReader::open(tout_local.path()).unwrap()),
             );
             assert!(report_remote.remote_fetch.is_some());
+        }
+
+        // --- multi-partition remote input (v0.7 PR-B) ------------------------
+
+        /// Partition bytes for `geoms[range]`, via the shared local writer.
+        fn partition_bytes(
+            geoms: &[Geometry<f64>],
+            range: std::ops::Range<usize>,
+            row_group_rows: Option<usize>,
+        ) -> Vec<u8> {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            write_input_partition(tmp.path(), geoms, range, row_group_rows);
+            std::fs::read(tmp.path()).unwrap()
+        }
+
+        /// Convert a remote ConvertSource and export to PMTiles; returns
+        /// the archive bytes (PMTiles export is byte-deterministic).
+        fn convert_sources_and_export(
+            source: &crate::input_set::ConvertSource,
+            workdir: &Path,
+            tag: &str,
+            opts: &ConvertOptions,
+        ) -> Vec<u8> {
+            use crate::overview::export::{export_pmtiles, ExportOptions};
+            let overview = workdir.join(format!("{tag}-overview.parquet"));
+            let pmtiles = workdir.join(format!("{tag}.pmtiles"));
+            convert_to_overviews_sources(source, &overview, opts).unwrap();
+            export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
+            std::fs::read(&pmtiles).unwrap()
+        }
+
+        /// #219's ≈1× guarantee must hold PER PART across the streaming
+        /// pipeline's three passes (assign, coarse levels, finest last):
+        /// each part's fetched ranges sum to at most ~1.5× its object size
+        /// (footer overhead), and no byte range crosses the network twice.
+        #[test]
+        fn multi_part_three_pass_moves_each_part_once() {
+            let geoms = synthetic_geometries();
+            let n = geoms.len();
+            let (source, parts) = crate::input::test_memory_multi_source(vec![
+                ("p0.parquet", partition_bytes(&geoms, 0..5, None)),
+                ("p1.parquet", partition_bytes(&geoms, 5..9, None)),
+                ("p2.parquet", partition_bytes(&geoms, 9..n, None)),
+            ]);
+            assert_eq!(parts.len(), 3);
+
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let report =
+                convert_to_overviews_sources(&source, tout.path(), &multi_test_options()).unwrap();
+            assert_eq!(report.input_features, n);
+
+            let summed = report.remote_fetch.expect("multi remote reports stats");
+            let mut object_total = 0;
+            for part in &parts {
+                let stats = part.fetch_stats().expect("remote part has stats");
+                object_total += stats.object_size;
+                assert!(
+                    stats.bytes_fetched <= stats.object_size + stats.object_size / 2,
+                    "part {} moved {} bytes for a {}-byte object (>1.5x, #219 \
+                     must hold per part)",
+                    part.display_name(),
+                    stats.bytes_fetched,
+                    stats.object_size,
+                );
+                // No byte range crosses the network twice for any part.
+                let mut seen = std::collections::HashSet::new();
+                for r in part.fetched_ranges().expect("remote part logs ranges") {
+                    assert!(
+                        seen.insert((r.start, r.end)),
+                        "part {}: range {r:?} fetched more than once (#219)",
+                        part.display_name(),
+                    );
+                }
+            }
+            assert_eq!(
+                summed.object_size, object_total,
+                "ConvertReport.remote_fetch.object_size sums the parts"
+            );
+        }
+
+        /// bbox pruning an ENTIRE part: its row groups are pruned at the
+        /// footer level, so the network never touches that part's data
+        /// pages — only its footer (fetched once at set construction).
+        #[test]
+        fn multi_part_bbox_prunes_part_to_footer_only() {
+            let geoms = synthetic_geometries();
+            let n = geoms.len();
+            // p1 holds ONLY the lines (x 40..96); the bbox below excludes them.
+            let p1_bytes = partition_bytes(&geoms, 6..10, None);
+            let p1_spans = row_group_spans(&p1_bytes);
+            let (source, parts) = crate::input::test_memory_multi_source(vec![
+                ("p0.parquet", partition_bytes(&geoms, 0..6, None)),
+                ("p1.parquet", p1_bytes),
+                ("p2.parquet", partition_bytes(&geoms, 10..n, None)),
+            ]);
+
+            let opts = ConvertOptions {
+                bbox: Some([-100.0, -70.0, 30.0, 20.0]),
+                ..multi_test_options()
+            };
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let report = convert_to_overviews_sources(&source, tout.path(), &opts).unwrap();
+            assert!(
+                report.row_groups_read < report.row_groups_total,
+                "bbox must prune the lines part: {}/{}",
+                report.row_groups_read,
+                report.row_groups_total
+            );
+
+            let pruned = &parts[1];
+            let fetched = pruned.fetched_ranges().expect("remote part logs ranges");
+            assert!(
+                !fetched.is_empty(),
+                "the footer itself is fetched at set construction"
+            );
+            for r in &fetched {
+                for span in &p1_spans {
+                    assert!(
+                        r.end <= span.start || r.start >= span.end,
+                        "pruned part fetched data-page range {r:?} \
+                         (row-group span {span:?}) — must be footer-only"
+                    );
+                }
+            }
+        }
+
+        /// The PR-A anchor, over the wire: the same rows as one remote
+        /// object and as three remote partitions under one prefix must
+        /// produce byte-identical PMTiles.
+        #[test]
+        fn multi_part_remote_output_matches_single_remote() {
+            let geoms = synthetic_geometries();
+            let n = geoms.len();
+            let dir = tempfile::tempdir().unwrap();
+            let opts = multi_test_options();
+
+            let (single, _) = crate::input::test_memory_multi_source(vec![(
+                "single.parquet",
+                partition_bytes(&geoms, 0..n, None),
+            )]);
+            let (multi, parts) = crate::input::test_memory_multi_source(vec![
+                ("part-000.parquet", partition_bytes(&geoms, 0..5, None)),
+                ("part-001.parquet", partition_bytes(&geoms, 5..9, None)),
+                ("part-002.parquet", partition_bytes(&geoms, 9..n, None)),
+            ]);
+            assert_eq!(parts.len(), 3);
+
+            let pm_single = convert_sources_and_export(&single, dir.path(), "single", &opts);
+            let pm_multi = convert_sources_and_export(&multi, dir.path(), "multi", &opts);
+            assert!(
+                pm_single == pm_multi,
+                "remote multi-partition output must be byte-identical to the \
+                 single remote object ({} vs {} bytes)",
+                pm_single.len(),
+                pm_multi.len()
+            );
         }
 
         /// A throwaway localhost HTTP/1.1 server that serves one byte blob with

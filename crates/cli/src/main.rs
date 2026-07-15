@@ -191,16 +191,27 @@ struct ExportPmtilesArgs {
 /// Arguments for `gpq-tiles overview`.
 #[derive(Parser, Debug)]
 struct OverviewArgs {
-    /// Input GeoParquet file (EPSG:4326 or EPSG:3857): a local path or a
-    /// remote URL (s3://, https://, gs://). Remote inputs are read with
-    /// byte-range requests; with --bbox, only the matching row groups are
-    /// ever downloaded.
-    #[arg(value_name = "INPUT")]
-    input: PathBuf,
+    /// Input GeoParquet (EPSG:4326 or EPSG:3857): a local file, a directory
+    /// or glob of partitions, or a remote URL (s3://, https://, gs://).
+    /// s3://.../ and gs://.../ prefixes (trailing slash) are listed to their
+    /// .parquet objects. Remote inputs are read with byte-range requests;
+    /// with --bbox, only the matching row groups are ever downloaded.
+    /// Omit when --files-from is given (then the one positional is OUTPUT).
+    #[arg(value_name = "INPUT", required_unless_present = "files_from")]
+    input: Option<PathBuf>,
 
     /// Output overview GeoParquet file.
-    #[arg(value_name = "OUTPUT")]
-    output: PathBuf,
+    #[arg(value_name = "OUTPUT", required_unless_present = "files_from")]
+    output: Option<PathBuf>,
+
+    /// Convert the inputs listed in this manifest instead of a positional
+    /// INPUT: one local path or remote URL per line; `#` comment lines and
+    /// blank lines are skipped; line order is preserved VERBATIM (it defines
+    /// the dataset row order). Each line must be a single .parquet
+    /// file/object — no directories, globs, or prefixes. Local and remote
+    /// entries may be mixed. Usage: --files-from <PATH> OUTPUT.
+    #[arg(long, value_name = "PATH")]
+    files_from: Option<PathBuf>,
 
     /// Level materialization mode.
     #[arg(long, default_value = "duplicating", value_parser = ["duplicating", "partitioning"])]
@@ -788,15 +799,26 @@ struct ValidateArgs {
 /// pipeline this command used to run was removed (see issue #177).
 #[derive(Parser, Debug)]
 struct TilesArgs {
-    /// Input GeoParquet file (EPSG:4326 or EPSG:3857): a local path or a
-    /// remote URL (s3://, https://, gs://); remote inputs are read with
-    /// byte-range requests.
-    #[arg(value_name = "INPUT")]
-    input: PathBuf,
+    /// Input GeoParquet (EPSG:4326 or EPSG:3857): a local file, a directory
+    /// or glob of partitions, or a remote URL (s3://, https://, gs://).
+    /// s3://.../ and gs://.../ prefixes (trailing slash) are listed to their
+    /// .parquet objects; remote inputs are read with byte-range requests.
+    /// Omit when --files-from is given (then the one positional is OUTPUT).
+    #[arg(value_name = "INPUT", required_unless_present = "files_from")]
+    input: Option<PathBuf>,
 
     /// Output PMTiles file.
-    #[arg(value_name = "OUTPUT")]
-    output: PathBuf,
+    #[arg(value_name = "OUTPUT", required_unless_present = "files_from")]
+    output: Option<PathBuf>,
+
+    /// Convert the inputs listed in this manifest instead of a positional
+    /// INPUT: one local path or remote URL per line; `#` comment lines and
+    /// blank lines are skipped; line order is preserved VERBATIM (it defines
+    /// the dataset row order). Each line must be a single .parquet
+    /// file/object — no directories, globs, or prefixes. Local and remote
+    /// entries may be mixed. Usage: --files-from <PATH> OUTPUT.
+    #[arg(long, value_name = "PATH")]
+    files_from: Option<PathBuf>,
 
     /// Minimum (coarsest) Web Mercator zoom level.
     #[arg(long, default_value = "0")]
@@ -914,6 +936,79 @@ where
     rewritten
 }
 
+/// The resolved input shape of `tiles`/`overview`.
+#[derive(Debug)]
+enum InputSpec {
+    /// Positional INPUT: file, directory, glob, or URL/prefix.
+    Path(PathBuf),
+    /// `--files-from` manifest of explicit files/URLs.
+    Manifest(PathBuf),
+}
+
+impl InputSpec {
+    /// Label for summary lines (input file name or manifest file name).
+    fn label(&self) -> String {
+        let p = match self {
+            InputSpec::Path(p) | InputSpec::Manifest(p) => p,
+        };
+        p.file_name().unwrap_or_default().to_string_lossy().into()
+    }
+}
+
+/// Sort out positional INPUT/OUTPUT vs `--files-from`, shared by `tiles`
+/// and `overview`. Without `--files-from`, clap enforces both positionals.
+/// With it, exactly ONE positional is expected — the OUTPUT, which clap
+/// slots into the INPUT position; a second positional means INPUT was also
+/// given, which conflicts with the manifest.
+fn resolve_io(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    files_from: Option<PathBuf>,
+) -> Result<(InputSpec, PathBuf)> {
+    match files_from {
+        None => match (input, output) {
+            (Some(i), Some(o)) => Ok((InputSpec::Path(i), o)),
+            // Unreachable via clap (`required_unless_present`), kept for
+            // direct callers/tests.
+            _ => anyhow::bail!("INPUT and OUTPUT are required"),
+        },
+        Some(manifest) => match (input, output) {
+            (Some(out), None) => Ok((InputSpec::Manifest(manifest), out)),
+            (Some(input), Some(output)) => anyhow::bail!(
+                "--files-from conflicts with the positional INPUT: got both the \
+                 manifest and {:?}; pass only the OUTPUT ({:?})",
+                input,
+                output
+            ),
+            (None, _) => {
+                anyhow::bail!("missing OUTPUT (usage: --files-from <PATH> OUTPUT)")
+            }
+        },
+    }
+}
+
+/// Convert via the core pipeline, dispatching on the input shape: a path
+/// (file/dir/glob/URL/prefix, resolved by core) or a `--files-from`
+/// manifest (explicit ordered file list, order preserved verbatim).
+fn run_convert(
+    spec: &InputSpec,
+    output: &std::path::Path,
+    options: &gpq_tiles_core::overview::convert::ConvertOptions,
+) -> Result<gpq_tiles_core::overview::convert::ConvertReport> {
+    use gpq_tiles_core::input_set::ConvertSource;
+    use gpq_tiles_core::overview::convert::{
+        convert_to_overviews, convert_to_overviews_sources, ConvertError,
+    };
+
+    match spec {
+        InputSpec::Path(p) => convert_to_overviews(p, output, options),
+        InputSpec::Manifest(m) => ConvertSource::from_manifest(m)
+            .map_err(ConvertError::from)
+            .and_then(|source| convert_to_overviews_sources(&source, output, options)),
+    }
+    .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
+}
+
 /// Run `gpq-tiles tiles`: the one-shot GeoParquet → PMTiles facade.
 ///
 /// Chains the two product pipelines through a temporary overview file:
@@ -921,16 +1016,20 @@ where
 /// file lives next to the output (same filesystem) and is removed on both
 /// success and failure via [`tempfile::NamedTempFile`]'s drop guard.
 fn run_tiles(args: TilesArgs) -> Result<()> {
-    use gpq_tiles_core::overview::convert::{convert_to_overviews, LevelPlan};
+    use gpq_tiles_core::overview::convert::LevelPlan;
     use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
     use gpq_tiles_core::overview::level::Mode;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Derive layer name from input filename if not specified.
+    let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
+
+    // Derive layer name from the input (or manifest) filename if not given.
     let layer_name = args.layer_name.clone().unwrap_or_else(|| {
-        args.input
-            .file_stem()
+        let p = match &spec {
+            InputSpec::Path(p) | InputSpec::Manifest(p) => p,
+        };
+        p.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("layer")
             .to_string()
@@ -951,8 +1050,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     // Intermediate overview file next to the output (same filesystem);
     // NamedTempFile removes it on drop — success or failure alike.
-    let tmp_dir = args
-        .output
+    let tmp_dir = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
@@ -963,8 +1061,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .tempfile_in(&tmp_dir)
         .context("failed to create temporary overview file")?;
 
-    let convert_report = convert_to_overviews(&args.input, overview_tmp.path(), &options)
-        .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))?;
+    let convert_report = run_convert(&spec, overview_tmp.path(), &options)?;
 
     if args.verbose {
         println!(
@@ -983,7 +1080,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         tile_size_limit: args.max_tile_size,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
     };
-    let export_report = export_pmtiles(overview_tmp.path(), &args.output, &export_opts)
+    let export_report = export_pmtiles(overview_tmp.path(), &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
 
     if args.verbose {
@@ -997,11 +1094,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     println!(
         "✓ Converted {} → {}",
-        args.input.file_name().unwrap_or_default().to_string_lossy(),
-        args.output
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        spec.label(),
+        output.file_name().unwrap_or_default().to_string_lossy()
     );
     println!(
         "  {} tiles across z{}..z{} in {:.2}s",
@@ -1016,10 +1110,12 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
 /// Run `gpq-tiles overview`: build a multi-resolution overview GeoParquet file.
 fn run_overview(args: OverviewArgs) -> Result<()> {
-    use gpq_tiles_core::overview::convert::{convert_to_overviews, LevelPlan};
+    use gpq_tiles_core::overview::convert::LevelPlan;
     use gpq_tiles_core::overview::level::Mode;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
 
     let mode = match args.mode.as_str() {
         "duplicating" => Mode::Duplicating,
@@ -1048,18 +1144,14 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         .tuning
         .build_convert_options(mode, levels, bbox, args.cogp_compat)?;
 
-    let report = convert_to_overviews(&args.input, &args.output, &options)
-        .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))?;
+    let report = run_convert(&spec, &output, &options)?;
 
     // Human-readable summary.
     println!();
     println!(
         "✓ Overview {} → {}  ({:?} mode)",
-        args.input.file_name().unwrap_or_default().to_string_lossy(),
-        args.output
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy(),
+        spec.label(),
+        output.file_name().unwrap_or_default().to_string_lossy(),
         report.mode
     );
     println!(
@@ -1386,6 +1478,74 @@ mod tests {
         assert!(parse_accumulate(":sum").is_err(), "empty column");
         assert!(parse_accumulate("pop:median").is_err(), "unknown op");
         assert!(parse_accumulate("pop:").is_err(), "empty op");
+    }
+
+    // --- --files-from (v0.7 multi-partition) ---------------------------------
+
+    /// `--files-from` parses on BOTH subcommands; the single positional is
+    /// the OUTPUT (clap slots it into the INPUT position; resolve_io swaps).
+    #[test]
+    fn files_from_parses_on_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["gpq-tiles", "tiles", "--files-from", "m.txt", "out.pmtiles"])
+                .expect("tiles --files-from should parse");
+        let Command::Tiles(a) = cli.command else {
+            panic!("expected tiles");
+        };
+        let (spec, out) = resolve_io(a.input, a.output, a.files_from).unwrap();
+        assert!(matches!(spec, InputSpec::Manifest(ref m) if m == &PathBuf::from("m.txt")));
+        assert_eq!(out, PathBuf::from("out.pmtiles"));
+
+        let cli = Cli::try_parse_from([
+            "gpq-tiles",
+            "overview",
+            "--files-from",
+            "m.txt",
+            "out.parquet",
+        ])
+        .expect("overview --files-from should parse");
+        let Command::Overview(a) = cli.command else {
+            panic!("expected overview");
+        };
+        let (spec, out) = resolve_io(a.input, a.output, a.files_from).unwrap();
+        assert!(matches!(spec, InputSpec::Manifest(_)));
+        assert_eq!(out, PathBuf::from("out.parquet"));
+    }
+
+    /// `--files-from` conflicts with a positional INPUT; INPUT stays
+    /// required without it; OUTPUT is still required with it.
+    #[test]
+    fn files_from_conflicts_with_positional_input() {
+        let cli = Cli::try_parse_from([
+            "gpq-tiles",
+            "overview",
+            "--files-from",
+            "m.txt",
+            "in.parquet",
+            "out.parquet",
+        ])
+        .expect("clap accepts; resolve_io rejects");
+        let Command::Overview(a) = cli.command else {
+            panic!("expected overview");
+        };
+        let err = resolve_io(a.input, a.output, a.files_from).unwrap_err();
+        assert!(
+            err.to_string().contains("conflicts"),
+            "conflict named: {err}"
+        );
+
+        // Without --files-from, INPUT/OUTPUT stay clap-required.
+        assert!(Cli::try_parse_from(["gpq-tiles", "overview"]).is_err());
+        assert!(Cli::try_parse_from(["gpq-tiles", "tiles", "only-one"]).is_err());
+
+        // With --files-from but no positional at all: OUTPUT is missing.
+        let cli = Cli::try_parse_from(["gpq-tiles", "tiles", "--files-from", "m.txt"])
+            .expect("parses; resolve_io names the missing OUTPUT");
+        let Command::Tiles(a) = cli.command else {
+            panic!("expected tiles");
+        };
+        let err = resolve_io(a.input, a.output, a.files_from).unwrap_err();
+        assert!(err.to_string().contains("OUTPUT"), "names OUTPUT: {err}");
     }
 
     /// Parse a `tiles` invocation and return its args (INPUT/OUTPUT are dummies).

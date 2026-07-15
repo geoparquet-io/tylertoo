@@ -2,18 +2,20 @@
 //!
 //! This module exposes the gpq-tiles-core functionality to Python via pyo3.
 
+use gpq_tiles_core::input_set::ConvertSource;
 use gpq_tiles_core::overview::assign::{
     AssignConfig, DensityBudgetConfig, SortDirection, CLUSTER_POINT_THINNING_DEFAULT,
 };
 use gpq_tiles_core::overview::check::validate_file;
 use gpq_tiles_core::overview::cluster::{AccumulateOp, AccumulateSpec};
 use gpq_tiles_core::overview::convert::{
-    convert_to_overviews, ClassRanking, ConvertError, ConvertOptions, ConvertReport, LevelPlan,
+    convert_to_overviews, convert_to_overviews_sources, ClassRanking, ConvertError, ConvertOptions,
+    ConvertReport, LevelPlan,
 };
 use gpq_tiles_core::overview::export::{export_pmtiles as export_pmtiles_core, ExportOptions};
 use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
 use gpq_tiles_core::overview::simplify::SimplifyOptions;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
@@ -213,10 +215,15 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 /// exportable to PMTiles by ``export_pmtiles()``.
 ///
 /// Args:
-///     input (str): Input GeoParquet file (EPSG:4326 or EPSG:3857): a local
-///         path or a remote URL (``s3://``, ``https://``, ``gs://``) read via
-///         byte-range requests. With ``bbox``, only the matching row groups
-///         of a remote input are ever downloaded.
+///     input (str or list[str]): Input GeoParquet (EPSG:4326 or EPSG:3857):
+///         a local file, a directory or glob of partitions, a remote URL
+///         (``s3://``, ``https://``, ``gs://``), an ``s3://…/`` or
+///         ``gs://…/`` prefix (listed to its ``.parquet`` objects, sorted by
+///         key), or an explicit ordered ``list[str]`` of files/URLs (each a
+///         single file/object — no expansion; list order defines the dataset
+///         row order). Remote inputs are read via byte-range requests. With
+///         ``bbox``, only the matching row groups of a remote input are ever
+///         downloaded.
 ///     output (str): Output overview GeoParquet file.
 ///     mode (str, optional): Level materialization mode, "duplicating" (each
 ///         level is a self-contained rendering) or "partitioning" (each
@@ -406,7 +413,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
     py: Python<'_>,
-    input: &str,
+    input: &Bound<'_, PyAny>,
     output: &str,
     mode: &str,
     min_zoom: u8,
@@ -594,12 +601,37 @@ fn overview(
         spill_dir,
     };
 
-    let input_path = Path::new(input).to_path_buf();
+    // `str` stays the single-input path (files, directories, globs, remote
+    // URLs/prefixes — resolved by core); `list[str]` is an explicit ordered
+    // part list (v0.7 multi-partition). The str check runs FIRST: a str is
+    // itself a sequence, so Vec extraction would happily split it into
+    // characters.
+    enum OverviewInput {
+        Path(PathBuf),
+        List(Vec<String>),
+    }
+    let parsed = if let Ok(s) = input.extract::<String>() {
+        OverviewInput::Path(PathBuf::from(s))
+    } else if let Ok(list) = input.extract::<Vec<String>>() {
+        OverviewInput::List(list)
+    } else {
+        return Err(PyTypeError::new_err(
+            "input must be a str path/URL or a list[str] of paths/URLs",
+        ));
+    };
     let output_path = Path::new(output).to_path_buf();
 
     // Release the GIL while the Rust pipeline runs.
     let report = py
-        .detach(|| convert_to_overviews(&input_path, &output_path, &options))
+        .detach(|| match &parsed {
+            OverviewInput::Path(input_path) => {
+                convert_to_overviews(input_path, &output_path, &options)
+            }
+            OverviewInput::List(inputs) => {
+                let source = ConvertSource::from_input_list(inputs).map_err(ConvertError::from)?;
+                convert_to_overviews_sources(&source, &output_path, &options)
+            }
+        })
         .map_err(convert_error_to_py)?;
 
     convert_report_to_dict(py, &report)

@@ -118,15 +118,38 @@ pub enum InputError {
         /// The original input string (directory path or glob pattern).
         input: String,
     },
-    /// A remote URL that is not a single `.parquet` object (a bucket prefix /
-    /// "directory"). Listing remote prefixes lands later in this release.
+    /// An `http(s)://` URL naming a prefix ("directory"). Generic HTTP has
+    /// no listing API, so the objects must be named explicitly; `s3://` and
+    /// `gs://` prefixes are listed natively.
     #[error(
-        "remote prefix input {url:?} is not yet supported (single .parquet object \
-         URLs are; remote prefix listing is coming later in this release)"
+        "cannot list objects under {url:?}: http(s) prefixes have no generic \
+         listing API. Pass the object URLs explicitly with --files-from \
+         <manifest> (one per line); s3:// and gs:// prefixes are listed \
+         natively"
     )]
     RemotePrefixUnsupported {
         /// The rejected URL.
         url: String,
+    },
+    /// The `--files-from` manifest itself could not be read.
+    #[error("cannot read --files-from manifest {path:?}: {source}")]
+    ManifestRead {
+        /// The manifest path as supplied.
+        path: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// An explicitly listed input (a `--files-from` manifest line or a
+    /// Python input-list entry) does not exist as a local file. Listed
+    /// entries are single files/objects only — no directory, glob, or
+    /// prefix expansion.
+    #[error("{context}: input {input:?} does not exist or is not a file")]
+    MissingListedInput {
+        /// Where the entry came from (manifest line / list position).
+        context: String,
+        /// The offending entry.
+        input: String,
     },
     /// A glob input string is not a valid glob pattern.
     #[error("invalid glob pattern {pattern:?}: {message}")]
@@ -487,40 +510,139 @@ pub(crate) mod remote {
         cap_base: u64,
     }
 
-    impl RemoteSource {
-        /// Connect to `url`, resolving the backing store from the scheme
-        /// and HEAD-ing the object for its size.
-        pub(crate) fn connect(url_str: &str) -> Result<Self, InputError> {
-            let url = Url::parse(url_str)
-                .map_err(|e| InputError::RemoteConfig(format!("invalid URL {url_str:?}: {e}")))?;
-            let (scheme, location) = ObjectStoreScheme::parse(&url).map_err(|e| {
-                InputError::RemoteConfig(format!("cannot interpret URL {url_str:?}: {e}"))
-            })?;
-            let store: Arc<dyn ObjectStore> = match scheme {
-                ObjectStoreScheme::AmazonS3 => build_s3(&url)?,
-                ObjectStoreScheme::GoogleCloudStorage => Arc::new(
-                    GoogleCloudStorageBuilder::from_env()
-                        .with_url(url_str)
+    /// Resolve the object store + object path for `url_str`.
+    ///
+    /// Stores are cached per `scheme://authority` for the life of the
+    /// process, so one convert resolves credentials ONCE per bucket: a
+    /// prefix listing and its N per-part sources, or N `--files-from`
+    /// manifest entries in the same bucket, all share one store instance
+    /// (the AWS credential chain probe in [`build_s3`] is otherwise paid
+    /// per part).
+    pub(crate) fn store_and_location(
+        url_str: &str,
+    ) -> Result<(Arc<dyn ObjectStore>, ObjectPath), InputError> {
+        static STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>> =
+            OnceLock::new();
+
+        let url = Url::parse(url_str)
+            .map_err(|e| InputError::RemoteConfig(format!("invalid URL {url_str:?}: {e}")))?;
+        let (scheme, location) = ObjectStoreScheme::parse(&url).map_err(|e| {
+            InputError::RemoteConfig(format!("cannot interpret URL {url_str:?}: {e}"))
+        })?;
+        let key = url[..url::Position::BeforePath].to_ascii_lowercase();
+        let stores = STORES.get_or_init(Default::default);
+        if let Some(store) = stores.lock().expect("store cache lock").get(&key) {
+            return Ok((Arc::clone(store), location));
+        }
+        let store: Arc<dyn ObjectStore> = match scheme {
+            ObjectStoreScheme::AmazonS3 => build_s3(&url)?,
+            ObjectStoreScheme::GoogleCloudStorage => Arc::new(
+                GoogleCloudStorageBuilder::from_env()
+                    .with_url(url_str)
+                    .build()
+                    .map_err(|e| store_error(url_str, e))?,
+            ),
+            ObjectStoreScheme::Http => {
+                let origin = &url[..url::Position::BeforePath];
+                Arc::new(
+                    HttpBuilder::new()
+                        .with_url(origin)
+                        .with_client_options(ClientOptions::new().with_allow_http(true))
                         .build()
                         .map_err(|e| store_error(url_str, e))?,
-                ),
-                ObjectStoreScheme::Http => {
-                    let origin = &url[..url::Position::BeforePath];
-                    Arc::new(
-                        HttpBuilder::new()
-                            .with_url(origin)
-                            .with_client_options(ClientOptions::new().with_allow_http(true))
-                            .build()
-                            .map_err(|e| store_error(url_str, e))?,
-                    )
-                }
-                _ => {
-                    return Err(InputError::UnsupportedScheme {
-                        scheme: url.scheme().to_string(),
-                        url: url_str.to_string(),
-                    })
-                }
-            };
+                )
+            }
+            _ => {
+                return Err(InputError::UnsupportedScheme {
+                    scheme: url.scheme().to_string(),
+                    url: url_str.to_string(),
+                })
+            }
+        };
+        // A concurrent resolve may have raced us; either instance works,
+        // last insert wins.
+        stores
+            .lock()
+            .expect("store cache lock")
+            .insert(key, Arc::clone(&store));
+        Ok((store, location))
+    }
+
+    /// One `.parquet` object found under a remote prefix.
+    pub(crate) struct ListedPart {
+        /// Full object key (from the bucket root).
+        pub location: ObjectPath,
+        /// Object size in bytes, straight from the listing (no HEAD).
+        pub size: u64,
+    }
+
+    /// List the `.parquet` objects under remote prefix `prefix`, applying
+    /// the same hygiene as the local directory walk
+    /// ([`crate::input_set::list_parquet_files`]): keys must end
+    /// `.parquet`; zero-byte objects and any path component below the
+    /// prefix starting with `.` or `_` (`_SUCCESS`, `_delta_log/…`,
+    /// `.crc`) are skipped; results are sorted by key — the ordering the
+    /// converter's row-order invariant keys on.
+    pub(crate) fn list_parquet_under_prefix(
+        store: &Arc<dyn ObjectStore>,
+        prefix: &ObjectPath,
+        url_str: &str,
+    ) -> Result<Vec<ListedPart>, InputError> {
+        use futures_util::TryStreamExt;
+        let metas: Vec<object_store::ObjectMeta> = runtime()
+            .block_on(store.list(Some(prefix)).try_collect())
+            .map_err(|e| store_error(url_str, e))?;
+        let prefix_depth = prefix.parts().count();
+        let mut parts: Vec<ListedPart> = metas
+            .into_iter()
+            .filter(|m| {
+                m.size > 0
+                    && m.location.as_ref().ends_with(".parquet")
+                    && m.location
+                        .parts()
+                        .skip(prefix_depth)
+                        .all(|c| !c.as_ref().starts_with(['.', '_']))
+            })
+            .map(|m| ListedPart {
+                location: m.location,
+                size: m.size,
+            })
+            .collect();
+        parts.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
+        Ok(parts)
+    }
+
+    /// Connect every listed `.parquet` object under remote prefix
+    /// `url_str`, in key order. ONE store instance serves the listing and
+    /// all returned sources (one credential resolution), and the object
+    /// sizes come from the listing itself — no per-part HEAD requests.
+    pub(crate) fn sources_under_prefix(url_str: &str) -> Result<Vec<RemoteSource>, InputError> {
+        let (store, prefix) = store_and_location(url_str)?;
+        let parts = list_parquet_under_prefix(&store, &prefix, url_str)?;
+        Ok(parts
+            .into_iter()
+            .map(|p| {
+                let url = part_url(url_str, &p.location);
+                RemoteSource::from_store_sized(Arc::clone(&store), p.location, url, p.size)
+            })
+            .collect())
+    }
+
+    /// URL of one listed object: the prefix URL's `scheme://authority`
+    /// plus the object's full key.
+    fn part_url(prefix_url: &str, location: &ObjectPath) -> String {
+        match Url::parse(prefix_url) {
+            Ok(u) => format!("{}/{}", &u[..url::Position::BeforePath], location),
+            Err(_) => format!("{prefix_url}{location}"),
+        }
+    }
+
+    impl RemoteSource {
+        /// Connect to `url`, resolving the backing store from the scheme
+        /// (cached per bucket, see [`store_and_location`]) and HEAD-ing the
+        /// object for its size.
+        pub(crate) fn connect(url_str: &str) -> Result<Self, InputError> {
+            let (store, location) = store_and_location(url_str)?;
             Self::from_store(store, location, url_str.to_string())
         }
 
@@ -547,17 +669,41 @@ pub(crate) mod remote {
             let head = runtime()
                 .block_on(store.head(&location))
                 .map_err(|e| store_error(&url, e))?;
-            Ok(Self {
+            Ok(Self::from_store_sized_with_cap_base(
+                store, location, url, head.size, cap_base,
+            ))
+        }
+
+        /// [`Self::from_store`] with the object size already known (from a
+        /// prefix listing) — skips the HEAD request, so connecting N listed
+        /// parts costs no network round-trips at all.
+        pub(crate) fn from_store_sized(
+            store: Arc<dyn ObjectStore>,
+            location: ObjectPath,
+            url: String,
+            size: u64,
+        ) -> Self {
+            Self::from_store_sized_with_cap_base(store, location, url, size, CHUNK_CACHE_MAX_BYTES)
+        }
+
+        fn from_store_sized_with_cap_base(
+            store: Arc<dyn ObjectStore>,
+            location: ObjectPath,
+            url: String,
+            size: u64,
+            cap_base: u64,
+        ) -> Self {
+            Self {
                 url,
                 store,
                 location,
-                size: head.size,
+                size,
                 shared: Arc::new(SharedState::default()),
                 metadata: OnceLock::new(),
                 cache: Arc::new(Mutex::new(ChunkCache::new(cap_base))),
                 spill: Arc::new(Mutex::new(DiskSpill::default())),
                 cap_base,
-            })
+            }
         }
 
         /// The input URL.
@@ -1166,6 +1312,56 @@ pub(crate) fn test_memory_source(bytes: Vec<u8>, name: &str) -> InputSource {
     InputSource::Remote(
         remote::RemoteSource::from_store(store, location, format!("memory://{name}")).unwrap(),
     )
+}
+
+/// Test-only: a multi-partition [`crate::input_set::ConvertSource`] over ONE
+/// in-memory object store — `objects` are `(basename, bytes)` pairs placed
+/// under a `set/` prefix and resolved through the REAL prefix-listing path
+/// (filtering, key sort, shared store instance, sizes from the listing).
+/// Also returns the per-part [`InputSource`] handles: clones share the fetch
+/// counters, so tests can assert per-part fetched ranges after a convert.
+#[cfg(all(test, feature = "remote"))]
+pub(crate) fn test_memory_multi_source(
+    objects: Vec<(&str, Vec<u8>)>,
+) -> (crate::input_set::ConvertSource, Vec<InputSource>) {
+    use crate::input_set::{ConvertSource, MultiSource};
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::ObjectStore;
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemory::new());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (name, bytes) in objects {
+        rt.block_on(store.put(&ObjectPath::from(format!("set/{name}")), bytes.into()))
+            .unwrap();
+    }
+    let store: Arc<dyn ObjectStore> = store;
+    let listed =
+        remote::list_parquet_under_prefix(&store, &ObjectPath::from("set"), "memory://set/")
+            .unwrap();
+    let parts: Vec<InputSource> = listed
+        .into_iter()
+        .map(|p| {
+            InputSource::Remote(remote::RemoteSource::from_store_sized(
+                Arc::clone(&store),
+                p.location.clone(),
+                format!("memory://{}", p.location),
+                p.size,
+            ))
+        })
+        .collect();
+    let source = if parts.len() == 1 {
+        ConvertSource::single(parts[0].clone())
+    } else {
+        ConvertSource::Multi(
+            MultiSource::from_sources("memory://set/".to_string(), parts.clone()).unwrap(),
+        )
+    };
+    (source, parts)
 }
 
 /// Test-only: [`test_memory_source`] with an explicit chunk-cache floor, so a
