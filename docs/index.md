@@ -45,6 +45,7 @@ export_pmtiles("overviews.parquet", "output.pmtiles")
 - [API Reference](api-reference.md) — CLI flags, Python API, Rust API
 - [Advanced Usage](advanced-usage.md) — Input optimization, memory, export
 - [Remote Reads](remote-reads.md) — Converting directly from s3://, https://, gs:// inputs, and querying overview files in place with DuckDB
+- [Multi-Partition Input](multi-partition.md) — Directories, globs, s3://gs:// prefixes, and --files-from manifests as one dataset
 - [Architecture](architecture.md) — Design decisions and internals
 
 ## License
