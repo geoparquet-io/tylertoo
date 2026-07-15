@@ -322,23 +322,25 @@ impl ConvertSource {
     /// Shared by [`Self::from_manifest`] and [`Self::from_input_list`]:
     /// resolve each `(context, entry)` as a single source, requiring local
     /// entries to exist up front so the error can name the entry instead
-    /// of surfacing as a bare I/O error at footer-load time.
+    /// of surfacing as a bare I/O error at footer-load time. Remote entries
+    /// connect (one HEAD each) under bounded concurrency
+    /// ([`LIST_CONNECT_CONCURRENCY`]); entry order is preserved verbatim
+    /// in the resulting parts (the row-order invariant).
     fn from_explicit_list(root: &str, entries: &[(String, String)]) -> Result<Self, InputError> {
-        let mut parts = Vec::with_capacity(entries.len());
-        for (context, entry) in entries {
+        let parts = resolve_list_entries(entries, |context, entry| {
             let src = InputSource::from_str_input(entry)?;
             // Without the `remote` feature `Local` is the only variant.
             #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
             if let InputSource::Local(p) = &src {
                 if !p.is_file() {
                     return Err(InputError::MissingListedInput {
-                        context: context.clone(),
-                        input: entry.clone(),
+                        context: context.to_string(),
+                        input: entry.to_string(),
                     });
                 }
             }
-            parts.push(src);
-        }
+            Ok(src)
+        })?;
         Self::from_parts(root, parts)
     }
 
@@ -812,6 +814,58 @@ impl Iterator for SourceStream<'_> {
 /// Whether `input` contains glob metacharacters (`*`, `?`, `[`).
 fn has_glob_meta(input: &str) -> bool {
     input.contains(['*', '?', '['])
+}
+
+/// Entry-resolution concurrency for explicit lists (`--files-from`
+/// manifests, Python input lists). Remote entries cost one connect (HEAD)
+/// each, so hundreds of manifest lines would otherwise serialize hundreds
+/// of round-trips; matches [`FOOTER_LOAD_CONCURRENCY`].
+const LIST_CONNECT_CONCURRENCY: usize = 8;
+
+/// Resolve every `(context, entry)` pair with `resolve` under bounded
+/// concurrency ([`LIST_CONNECT_CONCURRENCY`]). Results are written into
+/// per-index slots, so the returned vector always matches `entries` order
+/// regardless of completion order — the row-order invariant — and the
+/// first error (by entry index) wins.
+fn resolve_list_entries<F>(
+    entries: &[(String, String)],
+    resolve: F,
+) -> Result<Vec<InputSource>, InputError>
+where
+    F: Fn(&str, &str) -> Result<InputSource, InputError> + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = LIST_CONNECT_CONCURRENCY.min(entries.len());
+    if workers <= 1 {
+        return entries
+            .iter()
+            .map(|(context, entry)| resolve(context, entry))
+            .collect();
+    }
+    let next = AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<InputSource, InputError>>>> = (0..entries.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= entries.len() {
+                    break;
+                }
+                let (context, entry) = &entries[i];
+                *slots[i].lock().expect("entry slot lock") = Some(resolve(context, entry));
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("entry slot lock")
+                .expect("every slot filled by a worker")
+        })
+        .collect()
 }
 
 /// Parse `--files-from` manifest text into `(1-based line number, entry)`
@@ -1671,6 +1725,102 @@ b.parquet
             assert_eq!(stream_ids(&src, &plan), vec![0, 1, 10, 11]);
             let stats = src.fetch_stats().expect("remote parts have stats");
             assert!(stats.object_size > 0, "object_size sums the parts");
+        }
+
+        /// PR-C: explicit-list (manifest / input-list) entries resolve under
+        /// bounded parallelism, but the resulting parts MUST preserve entry
+        /// order VERBATIM (the row-order invariant) — never completion or
+        /// lexicographic order.
+        #[test]
+        fn explicit_list_parallel_connect_preserves_order() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Condvar, Mutex as StdMutex};
+
+            let store = seeded_store(&[
+                ("m/a.parquet", parquet_bytes(vec![10])),
+                ("m/b.parquet", parquet_bytes(vec![0, 1])),
+                ("m/c.parquet", parquet_bytes(vec![20])),
+            ]);
+            let store: Arc<dyn ObjectStore> = store;
+
+            // Deliberately NOT lexicographic: c, a, b.
+            let entries: Vec<(String, String)> = ["m/c.parquet", "m/a.parquet", "m/b.parquet"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, key)| (format!("entry {}", i + 1), key.to_string()))
+                .collect();
+
+            // Overlap detector: the first resolver call blocks until a
+            // second one is in flight (or a generous timeout passes), so a
+            // serial implementation fails the `overlapped` assertion while
+            // a parallel one passes deterministically.
+            let in_flight = StdMutex::new(0usize);
+            let cv = Condvar::new();
+            let overlapped = AtomicBool::new(false);
+
+            let resolved = resolve_list_entries(&entries, |_context, entry| {
+                {
+                    let mut n = in_flight.lock().unwrap();
+                    *n += 1;
+                    if *n >= 2 {
+                        overlapped.store(true, Ordering::SeqCst);
+                        cv.notify_all();
+                    } else {
+                        let (guard, _) = cv
+                            .wait_timeout_while(n, std::time::Duration::from_secs(10), |_| {
+                                !overlapped.load(Ordering::SeqCst)
+                            })
+                            .unwrap();
+                        drop(guard);
+                    }
+                }
+                Ok(InputSource::Remote(RemoteSource::from_store(
+                    Arc::clone(&store),
+                    ObjectPath::from(entry),
+                    format!("memory://{entry}"),
+                )?))
+            })
+            .unwrap();
+            assert!(
+                overlapped.load(Ordering::SeqCst),
+                "entry connects must overlap (bounded parallelism), not run serially"
+            );
+
+            let src = ConvertSource::from_parts("list", resolved).unwrap();
+            let plan = ReadPlan {
+                batch_size: 1024,
+                projection: None,
+                row_groups: None,
+            };
+            assert_eq!(
+                stream_ids(&src, &plan),
+                vec![20, 10, 0, 1],
+                "parts follow entry order verbatim"
+            );
+        }
+
+        /// Parallel completion order must not change WHICH error surfaces:
+        /// the first failing entry by INDEX wins.
+        #[test]
+        fn explicit_list_first_error_by_index_wins() {
+            let entries: Vec<(String, String)> = (1..=4)
+                .map(|i| (format!("entry {i}"), format!("e{i}")))
+                .collect();
+            let err = resolve_list_entries(&entries, |context, entry| {
+                if entry == "e2" || entry == "e4" {
+                    return Err(InputError::MissingListedInput {
+                        context: context.to_string(),
+                        input: entry.to_string(),
+                    });
+                }
+                Ok(InputSource::Local(PathBuf::from(entry)))
+            })
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("entry 2"),
+                "first failing entry by index wins: {msg}"
+            );
         }
     }
 
