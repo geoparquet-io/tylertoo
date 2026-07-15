@@ -69,8 +69,18 @@ What to know:
   This bounds a full-file remote conversion to ≈1× the object's bytes
   regardless of pass or level count (issue #219). Measured on
   fieldmaps-adm4 (2.90 GB, z0–14): **96× before #261, 3.0× after #261,
-  ≈1× after #219**. The spill file lives under `TMPDIR`; point that at
-  real disk if your default temp dir is a small tmpfs.
+  ≈1× after #219**. The spill file lives under `TMPDIR` by default;
+  `--spill-dir <path>` (Python: `spill_dir=`) places it on a volume of
+  your choosing instead (issue #272) — point it at real disk if your
+  default temp dir is a small tmpfs. The spill grows to ≈1× the
+  *touched* input bytes (the whole object for a full-file convert, only
+  the covering row groups with `--bbox`); before pass 1 the converter
+  compares that projection against the free space on the spill volume
+  and logs a warning naming the directory and the shortfall if it may
+  not fit. The spill stays best-effort either way: if the volume fills
+  mid-convert (or the file can't be created), the spill disables itself
+  with a log line and later passes fall back to network re-fetch —
+  correctness is preserved, only the ≈1× bound degrades.
 - **Latency vs bytes** — requests are issued sequentially, so on a
   fast link a plain `aws s3 cp` + local convert can still win on wall
   time (92 MB corpus file, residential fiber: ~3 s download+convert

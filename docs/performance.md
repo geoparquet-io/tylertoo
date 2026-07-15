@@ -115,12 +115,23 @@ The residual full-file cost is now local, not network: the passes still
 re-*read* the spilled bytes from disk (seek latency) and re-*decode*
 them. For latency-sensitive whole-file conversions, downloading first
 (`aws s3 cp` + local convert) still avoids the second-pass disk read; the
-disk spill lives under `TMPDIR`, so point that at fast local disk (not a
-small tmpfs) when converting large remote files.
+disk spill lives under `TMPDIR` by default, and `--spill-dir <path>`
+(Python: `spill_dir=`,
+[#272](https://github.com/geoparquet-io/gpq-tiles/issues/272)) moves it
+to a volume of your choosing — fast local disk, not a small tmpfs, when
+converting large remote files.
 
-The converter makes this actionable at runtime: a whole-file remote
+The converter makes this actionable at runtime. A whole-file remote
 convert of an object ≥ 1 GiB logs a one-line warning
 ([#267](https://github.com/geoparquet-io/gpq-tiles/issues/267)) steering
 you to `--bbox` or a download-first workflow and reminding you to place
-`$TMPDIR` on fast disk. `--bbox` extracts stay quiet — they already fetch
-only a fraction of the object.
+the spill on fast disk. And because the spill grows to ≈1× the *touched*
+input bytes — a number known exactly from the parquet footer once the
+`--bbox` row-group selection is made — the converter also preflights the
+spill volume ([#272](https://github.com/geoparquet-io/gpq-tiles/issues/272)):
+if the projected spill (plus a 5% margin) exceeds the free space where
+the spill will live, it warns up front, naming the directory and the
+shortfall, instead of letting the spill silently degrade to network
+re-fetch when the volume fills mid-convert. `--bbox` extracts stay quiet
+in both cases — they already fetch (and spill) only a fraction of the
+object.

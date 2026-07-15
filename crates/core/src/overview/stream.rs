@@ -180,6 +180,16 @@ pub(crate) fn convert_streaming_strategy(
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
     super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total);
+    // #272: preflight the spill volume. The disk spill (#219) grows to ≈ the
+    // selected input bytes — known exactly here, the first moment after
+    // row-group selection — so compare it against the free space where the
+    // spill will live and warn up front (naming the dir and the shortfall)
+    // instead of silently degrading to network re-fetch mid-convert.
+    super::convert::warn_spill_space(
+        source,
+        crate::input::selected_compressed_bytes(builder.metadata(), selected_row_groups.as_deref()),
+        options.spill_dir.as_deref(),
+    );
     drop(builder);
 
     if input_schema

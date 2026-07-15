@@ -17,7 +17,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Convert GeoParquet to PMTiles in one shot (overview facade).
 ///
@@ -325,6 +325,13 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         the pass-2 pipeline at once (read/compute-overlap knob). Higher
 ///         improves core utilization at proportionally more peak memory.
 ///         Defaults to 4.
+///     spill_dir (str or os.PathLike, optional): Directory for the
+///         remote-input spill file. A remote convert stages every fetched
+///         chunk on local disk (≈1x the touched input bytes) so later passes
+///         re-read from disk instead of the network; a free-space preflight
+///         warns if the projected spill may not fit there. The directory
+///         must exist. Local inputs never spill. Defaults to None (the
+///         process temp dir, $TMPDIR).
 ///
 /// Returns:
 ///     dict: Conversion report with keys "mode", "levels" (list of dicts with
@@ -393,6 +400,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     bbox=None,
     profile="auto",
     in_flight_batches=4,
+    spill_dir=None,
 ))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
@@ -435,6 +443,7 @@ fn overview(
     bbox: Option<(f64, f64, f64, f64)>,
     profile: &str,
     in_flight_batches: usize,
+    spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
     let mode = match mode {
         "duplicating" => Mode::Duplicating,
@@ -581,6 +590,7 @@ fn overview(
         coalesce_max_level_rows,
         coalesce_junction_angle,
         bbox: bbox.map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]),
+        spill_dir,
     };
 
     let input_path = Path::new(input).to_path_buf();

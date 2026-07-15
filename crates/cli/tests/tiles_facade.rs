@@ -88,3 +88,36 @@ fn bare_invocation_rewrites_to_tiles() {
     let bytes = std::fs::read(&output).expect("read output pmtiles");
     assert_eq!(&bytes[..PMTILES_MAGIC.len()], PMTILES_MAGIC);
 }
+
+/// #272: `--spill-dir` parses on both convert subcommands and reaches
+/// `ConvertOptions` — a nonexistent directory is rejected by core option
+/// validation (which runs before any input I/O, so no fixture is needed).
+#[test]
+fn spill_dir_flag_reaches_convert_options() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.parquet");
+    std::fs::write(&input, b"not really parquet").unwrap();
+
+    for subcommand in ["overview", "tiles"] {
+        let out = dir.path().join(format!("{subcommand}-out"));
+        let output = Command::new(gpq_tiles_bin())
+            .args([
+                subcommand,
+                input.to_str().unwrap(),
+                out.to_str().unwrap(),
+                "--spill-dir",
+                "/nonexistent/gpq-tiles-spill-dir-272",
+            ])
+            .output()
+            .expect("run gpq-tiles");
+        assert!(
+            !output.status.success(),
+            "{subcommand}: nonexistent --spill-dir must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("spill-dir") && stderr.contains("/nonexistent/gpq-tiles-spill-dir-272"),
+            "{subcommand}: error should name the option and path, got: {stderr}"
+        );
+    }
+}
