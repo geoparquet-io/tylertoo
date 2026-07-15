@@ -46,6 +46,7 @@ use geoarrow_array::GeoArrowArray;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::input::InputSource;
+use crate::input_set::ConvertSource;
 use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_opt_from_array;
@@ -670,6 +671,13 @@ pub enum ConvertError {
     /// `--accumulate-attribute` was supplied without `--cluster`.
     #[error("--accumulate-attribute requires --cluster")]
     AccumulateWithoutCluster,
+    /// Multi-partition input (directory / glob) reached the in-memory
+    /// reference pipeline, which reads through a single parquet builder.
+    #[error(
+        "multi-partition input requires the streaming pipeline; \
+         remove --no-streaming"
+    )]
+    MultiPartitionRequiresStreaming,
     /// An `--accumulate-attribute` column is not present in the input schema.
     #[error("accumulate-attribute column {name:?} not found in input schema")]
     AccumulateColumnMissing {
@@ -794,12 +802,20 @@ pub fn convert_to_overviews(
     output_path: impl AsRef<Path>,
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
-    // Local path or remote URL (s3://, https://, gs:// — #210): remote
-    // objects are read with byte-range requests through the same sync
-    // parquet plumbing, composing with the bbox row-group pruning below so
-    // pruned row groups are never downloaded at all.
-    let source = InputSource::from_path(input_path.as_ref())?;
-    convert_to_overviews_source(&source, output_path.as_ref(), options)
+    // Local path, remote URL (s3://, https://, gs:// — #210), or a
+    // multi-partition directory / glob pattern (v0.7): directories and
+    // globs resolve to an ordered, validated set of local partitions read
+    // as one logical dataset; remote objects are read with byte-range
+    // requests through the same sync parquet plumbing, composing with the
+    // bbox row-group pruning below so pruned row groups are never
+    // downloaded at all.
+    let source = ConvertSource::resolve_path(input_path.as_ref())?;
+    convert_to_overviews_source_strategy(
+        &source,
+        output_path.as_ref(),
+        options,
+        super::stream::Pass2Strategy::Pipelined,
+    )
 }
 
 /// [`convert_to_overviews`] over an already-resolved [`InputSource`] — the
@@ -810,8 +826,9 @@ pub fn convert_to_overviews_source(
     output_path: &Path,
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
+    // `InputSource` clones are cheap handles sharing caches and counters.
     convert_to_overviews_source_strategy(
-        source,
+        &ConvertSource::single(source.clone()),
         output_path,
         options,
         super::stream::Pass2Strategy::Pipelined,
@@ -830,7 +847,7 @@ pub(crate) fn convert_to_overviews_strategy(
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
-    let source = InputSource::from_path(input_path.as_ref())?;
+    let source = ConvertSource::resolve_path(input_path.as_ref())?;
     convert_to_overviews_source_strategy(&source, output_path.as_ref(), options, strategy)
 }
 
@@ -893,7 +910,7 @@ fn decode_and_filter_geometries(
 /// Runs the full option normalization (validation, cluster/accumulate checks,
 /// the partitioning-coalesce-inert rewrite) before dispatching.
 pub(crate) fn convert_to_overviews_source_strategy(
-    source: &InputSource,
+    source: &ConvertSource,
     output_path: &Path,
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
@@ -941,6 +958,14 @@ pub(crate) fn convert_to_overviews_source_strategy(
         return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
     }
 
+    // The in-memory reference path below predates multi-partition input
+    // (v0.7) and reads through one parquet builder; multi sources are
+    // streaming-only.
+    let source_single: &InputSource = match source {
+        ConvertSource::Single(s) => s,
+        ConvertSource::Multi(_) => return Err(ConvertError::MultiPartitionRequiresStreaming),
+    };
+
     let start = Instant::now();
 
     // A numeric sort key and a categorical class ranking are mutually
@@ -951,7 +976,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     // --- Read the input footer, preserving the full property schema. ---------
     // (For a remote source, the footer is range-fetched once and cached.)
-    let builder = source.open()?;
+    let builder = source_single.open()?;
     let input_schema = builder.schema().clone();
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
@@ -1345,8 +1370,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a
-/// conversion; `None` (and silent) for local inputs.
-pub(super) fn log_remote_fetch(source: &InputSource) -> Option<crate::input::FetchStats> {
+/// conversion; `None` (and silent) when no part of the input is remote.
+/// Multi-part sources report counters summed over their remote parts.
+pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::FetchStats> {
     let stats = source.fetch_stats()?;
     let pct = if stats.object_size > 0 {
         100.0 * stats.bytes_fetched as f64 / stats.object_size as f64
@@ -1544,9 +1570,10 @@ pub(super) fn full_file_remote_warning(
 }
 
 /// Emit the #267 nudge for a full-file remote convert, if warranted. Thin
-/// logging wrapper over [`full_file_remote_warning`].
+/// logging wrapper over [`full_file_remote_warning`] (for a multi source,
+/// `object_size` is summed over the remote parts).
 pub(super) fn warn_full_file_remote(
-    source: &InputSource,
+    source: &ConvertSource,
     row_groups_read: usize,
     row_groups_total: usize,
 ) {
@@ -1635,7 +1662,7 @@ fn probe_available_space(dir: &Path) -> Option<u64> {
 /// probe; `spill_dir = None` means the process temp dir, exactly where the
 /// spill file would go.
 pub(super) fn warn_spill_space(
-    source: &InputSource,
+    source: &ConvertSource,
     estimated_spill_bytes: u64,
     spill_dir: Option<&Path>,
 ) {
@@ -2800,6 +2827,254 @@ mod tests {
             }
         }
         out
+    }
+
+    // --- multi-partition input (v0.7) ----------------------------------------
+
+    /// Write a valid GeoParquet partition holding `geoms[range]` with the
+    /// SAME global id/name/rank values [`write_input`] assigns, so the
+    /// concatenation of partitions equals the single file row-for-row.
+    /// `row_group_rows` caps rows per row group (None = single row group).
+    fn write_input_partition(
+        path: &Path,
+        geoms: &[Geometry<f64>],
+        range: std::ops::Range<usize>,
+        row_group_rows: Option<usize>,
+    ) {
+        use parquet::file::properties::WriterProperties;
+        let total = geoms.len();
+        let idx: Vec<usize> = range.collect();
+        let id = Int64Array::from(idx.iter().map(|&i| i as i64).collect::<Vec<_>>());
+        let name = StringArray::from(idx.iter().map(|&i| format!("f{i}")).collect::<Vec<_>>());
+        let rank = Float64Array::from(idx.iter().map(|&i| (total - i) as f64).collect::<Vec<_>>());
+        let part_geoms: Vec<Geometry<f64>> = idx.iter().map(|&i| geoms[i].clone()).collect();
+        let geom_arr = build_geometry_array(&part_geoms);
+        let geom_field = geom_arr.data_type().to_field("geometry", true);
+
+        let fields = vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(Field::new("name", DataType::Utf8, false)),
+            Arc::new(Field::new("rank", DataType::Float64, false)),
+            Arc::new(geom_field),
+        ];
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(id),
+            Arc::new(name),
+            Arc::new(rank),
+            geom_arr.to_array_ref(),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+        let gpq_options = GeoParquetWriterOptionsBuilder::default()
+            .set_encoding(GeoParquetWriterEncoding::WKB)
+            .set_generate_covering(true)
+            .build();
+        let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+        let target_schema = encoder.target_schema();
+        let props = row_group_rows.map(|n| {
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(n))
+                .build()
+        });
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, target_schema, props).unwrap();
+        let encoded = encoder.encode_record_batch(&batch).unwrap();
+        writer.write(&encoded).unwrap();
+        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+        writer.close().unwrap();
+    }
+
+    /// Convert `input` and export to PMTiles; returns the archive bytes.
+    /// PMTiles export is byte-deterministic (unlike the overview parquet
+    /// footer), so multi/single equivalence is asserted on these bytes.
+    fn convert_and_export(input: &Path, workdir: &Path, opts: &ConvertOptions) -> Vec<u8> {
+        use crate::overview::export::{export_pmtiles, ExportOptions};
+        let stem = input
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .replace('.', "_");
+        let overview = workdir.join(format!("{stem}-overview.parquet"));
+        let pmtiles = workdir.join(format!("{stem}.pmtiles"));
+        convert_to_overviews(input, &overview, opts).unwrap();
+        export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
+        std::fs::read(&pmtiles).unwrap()
+    }
+
+    fn multi_test_options() -> ConvertOptions {
+        ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// THE anchor: identical rows as (a) one parquet file and (b) three
+    /// partition files must produce byte-identical PMTiles. All passes see
+    /// the same rows in the same order (winner tables are keyed by global
+    /// row offset), so the outputs match exactly.
+    #[test]
+    fn multi_partition_output_matches_single_file() {
+        let geoms = synthetic_geometries();
+        let n = geoms.len();
+        let dir = tempfile::tempdir().unwrap();
+        let single = dir.path().join("single.parquet");
+        write_input_partition(&single, &geoms, 0..n, None);
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        write_input_partition(&parts.join("part-000.parquet"), &geoms, 0..5, None);
+        write_input_partition(&parts.join("part-001.parquet"), &geoms, 5..9, None);
+        write_input_partition(&parts.join("part-002.parquet"), &geoms, 9..n, None);
+
+        let opts = multi_test_options();
+        let report =
+            convert_to_overviews(&parts, dir.path().join("probe-overview.parquet"), &opts).unwrap();
+        assert_eq!(report.input_features, n);
+        assert_eq!(report.row_groups_total, 3, "one row group per partition");
+
+        let pm_single = convert_and_export(&single, dir.path(), &opts);
+        let pm_multi = convert_and_export(&parts, dir.path(), &opts);
+        assert!(
+            pm_single == pm_multi,
+            "multi-partition output must be byte-identical to single-file \
+             ({} vs {} bytes)",
+            pm_single.len(),
+            pm_multi.len()
+        );
+    }
+
+    /// A 0-row partition mid-set is skipped cleanly: global row offsets are
+    /// unaffected and the output still matches the single-file equivalent.
+    #[test]
+    fn multi_partition_zero_row_part_matches_single_file() {
+        let geoms = synthetic_geometries();
+        let n = geoms.len();
+        let dir = tempfile::tempdir().unwrap();
+        let single = dir.path().join("single.parquet");
+        write_input_partition(&single, &geoms, 0..n, None);
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        write_input_partition(&parts.join("part-000.parquet"), &geoms, 0..5, None);
+        write_input_partition(&parts.join("part-001.parquet"), &geoms, 5..5, None); // 0 rows
+        write_input_partition(&parts.join("part-002.parquet"), &geoms, 5..n, None);
+
+        let opts = multi_test_options();
+        let pm_single = convert_and_export(&single, dir.path(), &opts);
+        let pm_multi = convert_and_export(&parts, dir.path(), &opts);
+        assert!(
+            pm_single == pm_multi,
+            "0-row partition must not shift rows or offsets"
+        );
+    }
+
+    /// bbox row-group pruning (#102) composes with multi-partition input:
+    /// the selection is per part, offsets stay aligned across the pruned
+    /// read, and the output matches the single-file bbox extract.
+    #[test]
+    fn multi_partition_bbox_selection_matches_single_file() {
+        let geoms = synthetic_geometries();
+        let n = geoms.len();
+        let dir = tempfile::tempdir().unwrap();
+        let single = dir.path().join("single.parquet");
+        write_input_partition(&single, &geoms, 0..n, Some(2));
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        write_input_partition(&parts.join("part-000.parquet"), &geoms, 0..6, Some(2));
+        write_input_partition(&parts.join("part-001.parquet"), &geoms, 6..10, Some(2));
+        write_input_partition(&parts.join("part-002.parquet"), &geoms, 10..n, Some(2));
+
+        // Points (x 0..25) and polygons (x -78..-15) only; the lines
+        // (x 40..96) fall outside, so their row groups prune away.
+        let bbox = Some([-100.0, -70.0, 30.0, 20.0]);
+        let opts = ConvertOptions {
+            bbox,
+            ..multi_test_options()
+        };
+        let report =
+            convert_to_overviews(&parts, dir.path().join("probe-overview.parquet"), &opts).unwrap();
+        assert!(
+            report.row_groups_read < report.row_groups_total,
+            "bbox must prune row groups across parts: {}/{}",
+            report.row_groups_read,
+            report.row_groups_total
+        );
+
+        let pm_single = convert_and_export(&single, dir.path(), &opts);
+        let pm_multi = convert_and_export(&parts, dir.path(), &opts);
+        assert!(
+            pm_single == pm_multi,
+            "per-part bbox selection must keep offsets aligned"
+        );
+    }
+
+    /// The in-memory reference path (`--no-streaming`) does not support
+    /// multi-partition input; it must fail with a clear error.
+    #[test]
+    fn multi_partition_requires_streaming_pipeline() {
+        let geoms = synthetic_geometries();
+        let dir = tempfile::tempdir().unwrap();
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        write_input_partition(&parts.join("part-000.parquet"), &geoms, 0..5, None);
+        write_input_partition(
+            &parts.join("part-001.parquet"),
+            &geoms,
+            5..geoms.len(),
+            None,
+        );
+
+        let opts = ConvertOptions {
+            streaming: false,
+            ..multi_test_options()
+        };
+        let err = convert_to_overviews(&parts, dir.path().join("out.parquet"), &opts).unwrap_err();
+        assert!(
+            matches!(err, ConvertError::MultiPartitionRequiresStreaming),
+            "expected MultiPartitionRequiresStreaming, got {err:?}"
+        );
+    }
+
+    /// Partitions disagreeing on CRS are rejected at resolve time with an
+    /// error naming the offending file.
+    #[test]
+    fn multi_partition_crs_mismatch_rejected() {
+        let geoms = synthetic_geometries();
+        let dir = tempfile::tempdir().unwrap();
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        write_input(&parts.join("a.parquet"), &geoms, false, None);
+        // EPSG:32633 in the second partition (also differs in geometry
+        // extension metadata — either check may fire; both name the file).
+        let projjson = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "UTM zone 33N",
+            "id": { "authority": "EPSG", "code": 32633 }
+        });
+        let md = geoarrow::datatypes::Metadata::new(
+            geoarrow::datatypes::Crs::from_projjson(projjson),
+            None,
+        );
+        write_input(&parts.join("b.parquet"), &geoms, false, Some(md));
+
+        let err = convert_to_overviews(
+            &parts,
+            dir.path().join("out.parquet"),
+            &multi_test_options(),
+        )
+        .unwrap_err();
+        match err {
+            ConvertError::Input(crate::input::InputError::IncompatiblePartition {
+                offender,
+                ..
+            }) => {
+                assert!(offender.ends_with("b.parquet"), "offender: {offender}");
+            }
+            other => panic!("expected IncompatiblePartition, got {other:?}"),
+        }
     }
 
     // --- tests --------------------------------------------------------------

@@ -221,6 +221,14 @@ impl ConvertSource {
         self.parts().iter().any(InputSource::is_remote)
     }
 
+    /// Place the remote-input disk spill in `dir` for every part (#272).
+    /// No-op for local parts, which never spill.
+    pub fn set_spill_dir(&self, dir: Option<&Path>) {
+        for part in self.parts() {
+            part.set_spill_dir(dir);
+        }
+    }
+
     /// Human-readable input name: the path/URL for a single source,
     /// `"<root> (N partitions)"` for a multi source.
     pub fn display_name(&self) -> String {
@@ -282,19 +290,26 @@ impl ConvertSource {
         Ok(RowGroupSelection(per_part))
     }
 
-    /// Total *compressed* bytes of the selected row groups — the input-cost
-    /// figure a future full-read guard (#272) will consult.
-    pub fn selected_input_bytes(&self, selection: &RowGroupSelection) -> Result<u64, InputError> {
+    /// Total *compressed* bytes of the selected row groups (`None` = every
+    /// row group of every part) — the projected disk-spill size the #272
+    /// free-space preflight consults. Per-part sums come from the shared
+    /// single-file helper [`crate::input::selected_compressed_bytes`].
+    pub fn selected_input_bytes(
+        &self,
+        selection: Option<&RowGroupSelection>,
+    ) -> Result<u64, InputError> {
         let metas = self.metas()?;
-        debug_assert_eq!(metas.len(), selection.0.len());
+        if let Some(sel) = selection {
+            debug_assert_eq!(metas.len(), sel.0.len());
+        }
         Ok(metas
             .iter()
-            .zip(&selection.0)
-            .map(|(m, groups)| {
-                groups
-                    .iter()
-                    .map(|&g| m.parquet.row_group(g).compressed_size().max(0) as u64)
-                    .sum::<u64>()
+            .enumerate()
+            .map(|(pi, m)| {
+                crate::input::selected_compressed_bytes(
+                    &m.parquet,
+                    selection.map(|s| s.0[pi].as_slice()),
+                )
             })
             .sum())
     }
@@ -620,7 +635,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let props = max_row_group_size.map(|n| {
             WriterProperties::builder()
-                .set_max_row_group_size(n)
+                .set_max_row_group_row_count(Some(n))
                 .build()
         });
         let file = File::create(path).unwrap();
@@ -912,11 +927,14 @@ mod tests {
         };
         assert_eq!(stream_ids(&src, &plan), vec![12, 13]);
 
-        // selected_input_bytes = the one selected group's compressed size.
-        let bytes = src.selected_input_bytes(&sel).unwrap();
+        // selected_input_bytes = the one selected group's compressed size;
+        // None means every row group of every part.
+        let bytes = src.selected_input_bytes(Some(&sel)).unwrap();
         assert!(bytes > 0);
         let all = RowGroupSelection::from_parts(vec![vec![0, 1], vec![0, 1]]);
-        assert!(src.selected_input_bytes(&all).unwrap() > bytes);
+        let all_bytes = src.selected_input_bytes(Some(&all)).unwrap();
+        assert!(all_bytes > bytes);
+        assert_eq!(src.selected_input_bytes(None).unwrap(), all_bytes);
     }
 
     #[test]
