@@ -70,7 +70,7 @@ class TestMultiPartitionInput:
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "o.parquet"
             missing = Path(tmpdir) / "nope.parquet"
-            with pytest.raises((RuntimeError, ValueError), match="nope.parquet"):
+            with pytest.raises((RuntimeError, ValueError), match=r"nope\.parquet"):
                 gpq_tiles.overview(
                     [str(STREAMING_SMALL), str(missing)], str(out), max_zoom=4
                 )
