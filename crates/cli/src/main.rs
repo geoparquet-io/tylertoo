@@ -147,6 +147,11 @@ struct DecodeArgs {
     /// Write the JSON decode report to this path.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
+
+    /// Not supported here (single-file subcommand); accepted so the error
+    /// can point at `overview`/`tiles` instead of clap's generic message.
+    #[arg(long, value_name = "PATH", hide = true)]
+    files_from: Option<PathBuf>,
 }
 
 /// Arguments for `gpq-tiles export-pmtiles`.
@@ -186,6 +191,11 @@ struct ExportPmtilesArgs {
     /// different start vertex.
     #[arg(long)]
     no_simple_clip_fastpath: bool,
+
+    /// Not supported here (single-file subcommand); accepted so the error
+    /// can point at `overview`/`tiles` instead of clap's generic message.
+    #[arg(long, value_name = "PATH", hide = true)]
+    files_from: Option<PathBuf>,
 }
 
 /// Arguments for `gpq-tiles overview`.
@@ -786,6 +796,11 @@ struct ValidateArgs {
     /// GeoParquet overview file to validate.
     #[arg(value_name = "FILE")]
     file: PathBuf,
+
+    /// Not supported here (single-file subcommand); accepted so the error
+    /// can point at `overview`/`tiles` instead of clap's generic message.
+    #[arg(long, value_name = "PATH", hide = true)]
+    files_from: Option<PathBuf>,
 }
 
 /// Arguments for `gpq-tiles tiles` — the one-shot GeoParquet → PMTiles facade.
@@ -1282,6 +1297,9 @@ fn parse_accumulate(spec: &str) -> Result<gpq_tiles_core::overview::cluster::Acc
 fn run_validate(args: ValidateArgs) -> Result<()> {
     use gpq_tiles_core::overview::check::validate_file;
 
+    reject_files_from(args.files_from.as_ref(), "validate")?;
+    require_single_local_file(&args.file, "validate")?;
+
     let report = validate_file(&args.file)
         .map_err(|e| anyhow::anyhow!("could not open '{}': {e}", args.file.display()))?;
 
@@ -1303,16 +1321,55 @@ fn run_validate(args: ValidateArgs) -> Result<()> {
     }
 }
 
-/// Remote (URL) inputs are supported only where the converter reads them
-/// (`overview`, `tiles`); give the other subcommands a helpful error
-/// instead of a confusing `No such file or directory`.
-fn reject_remote_input(input: &std::path::Path, subcommand: &str) -> Result<()> {
-    if input.to_str().is_some_and(|s| s.contains("://")) {
+/// `validate`, `decode`, and `export-pmtiles` read exactly ONE local file.
+/// Multi-partition inputs (directories, globs, `s3://`/`gs://` prefixes,
+/// `--files-from` manifests) and remote URLs are converter features
+/// (`overview`, `tiles`); reject them here with a one-line pointer instead
+/// of an obscure I/O or parquet error.
+fn require_single_local_file(input: &std::path::Path, subcommand: &str) -> Result<()> {
+    let s = input.to_string_lossy();
+    if s.contains("://") {
+        // Query string / fragment stripped: `s3://b/set/?x` is a prefix.
+        let no_meta = s.split(['?', '#']).next().unwrap_or(&s);
+        if no_meta.ends_with('/') {
+            anyhow::bail!(
+                "`gpq-tiles {subcommand}` reads a single local file, but {} is a \
+                 remote prefix; multi-partition input (directories, globs, \
+                 s3://gs:// prefixes, --files-from) is supported by the `overview` \
+                 and `tiles` subcommands",
+                input.display()
+            );
+        }
         anyhow::bail!(
             "`gpq-tiles {subcommand}` does not support remote inputs (got {}); \
              remote URLs (s3://, https://, gs://) are supported by the `overview` \
              and `tiles` subcommands — download the file first (e.g. `aws s3 cp`)",
             input.display()
+        );
+    }
+    let kind = if input.is_dir() {
+        "a directory"
+    } else if s.contains(['*', '?', '[']) {
+        "a glob pattern"
+    } else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "`gpq-tiles {subcommand}` reads a single local file, but {} is {kind}; \
+         multi-partition input (directories, globs, s3://gs:// prefixes, \
+         --files-from) is supported by the `overview` and `tiles` subcommands",
+        input.display()
+    );
+}
+
+/// Reject `--files-from` on single-file subcommands with the same pointer
+/// (clap alone would say only "unexpected argument '--files-from'").
+fn reject_files_from(files_from: Option<&PathBuf>, subcommand: &str) -> Result<()> {
+    if files_from.is_some() {
+        anyhow::bail!(
+            "`gpq-tiles {subcommand}` reads a single local file and does not \
+             support --files-from; multi-partition input is supported by the \
+             `overview` and `tiles` subcommands"
         );
     }
     Ok(())
@@ -1323,7 +1380,8 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    reject_remote_input(&args.input, "export-pmtiles")?;
+    reject_files_from(args.files_from.as_ref(), "export-pmtiles")?;
+    require_single_local_file(&args.input, "export-pmtiles")?;
 
     let opts = ExportOptions {
         layer_name: args.layer_name,
@@ -1384,7 +1442,8 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    reject_remote_input(&args.input, "decode")?;
+    reject_files_from(args.files_from.as_ref(), "decode")?;
+    require_single_local_file(&args.input, "decode")?;
 
     // `--zoom N` is shorthand for `--min-zoom N --max-zoom N` (clap already
     // rejects combining them).
@@ -1454,6 +1513,62 @@ fn format_number(n: u64) -> String {
 mod tests {
     use super::*;
     use gpq_tiles_core::overview::cluster::AccumulateOp;
+
+    // --- single-file-only rejections (v0.7 PR-C) -----------------------------
+
+    /// `validate`/`decode`/`export-pmtiles` are single-file only: a
+    /// directory, glob, or remote-prefix input must fail with a one-line
+    /// error naming the subcommand and pointing at `overview`/`tiles`,
+    /// not an obscure I/O or parquet error.
+    #[test]
+    fn single_file_subcommands_reject_multi_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Directory input.
+        let err = require_single_local_file(dir.path(), "validate")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("validate"), "names the subcommand: {err}");
+        assert!(err.contains("single"), "says single-file only: {err}");
+        assert!(
+            err.contains("overview") && err.contains("tiles"),
+            "points at the multi-partition subcommands: {err}"
+        );
+
+        // Remote prefix (trailing slash).
+        let err =
+            require_single_local_file(std::path::Path::new("s3://bucket/set/"), "export-pmtiles")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("export-pmtiles"), "{err}");
+        assert!(err.contains("overview") && err.contains("tiles"), "{err}");
+
+        // Glob pattern.
+        let err = require_single_local_file(std::path::Path::new("/data/*.parquet"), "decode")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decode"), "{err}");
+        assert!(err.contains("overview") && err.contains("tiles"), "{err}");
+
+        // A plain (single) local file passes.
+        let f = dir.path().join("x.parquet");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(require_single_local_file(&f, "validate").is_ok());
+        // Nonexistent single file also passes (open reports the io error).
+        assert!(require_single_local_file(
+            std::path::Path::new("/no/such/file.parquet"),
+            "validate"
+        )
+        .is_ok());
+
+        // A single remote object keeps the historical download-first pointer.
+        let err =
+            require_single_local_file(std::path::Path::new("s3://bucket/file.parquet"), "validate")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("remote"), "{err}");
+        assert!(err.contains("aws s3 cp"), "{err}");
+    }
 
     #[test]
     fn parse_accumulate_valid_specs() {
