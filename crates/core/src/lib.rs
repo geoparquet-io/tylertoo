@@ -45,6 +45,7 @@ pub mod covering;
 pub mod decode;
 pub mod dedup;
 pub mod input;
+pub mod input_set;
 pub mod ioverlay_clip;
 pub mod mvt;
 pub mod overview;

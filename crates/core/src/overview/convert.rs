@@ -1370,7 +1370,7 @@ pub(super) fn log_remote_fetch(source: &InputSource) -> Option<crate::input::Fet
 /// Detect the input CRS from parsed parquet key-value metadata and map it to
 /// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
-pub(super) fn detect_crs_from_kv(
+pub(crate) fn detect_crs_from_kv(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
 ) -> Result<Crs, ConvertError> {
     let info = crate::quality::crs_info_from_kv_metadata(kv)?;
@@ -1440,7 +1440,7 @@ pub(super) fn bboxes_intersect(a: &[f64; 4], b: &[f64; 4]) -> bool {
 /// pages are touched. Row groups with missing/unparseable covering
 /// statistics are conservatively KEPT (graceful degradation — the exact
 /// per-feature bbox filter downstream guarantees correctness either way).
-pub(super) fn select_input_row_groups(
+pub(crate) fn select_input_row_groups(
     metadata: &parquet::file::metadata::ParquetMetaData,
     bbox_units: &[f64; 4],
 ) -> Vec<usize> {
