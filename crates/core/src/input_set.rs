@@ -30,8 +30,11 @@
 //! match; and an identical detected CRS. Nullability is the one permitted
 //! difference: the exposed schema unions it (any-nullable ⇒ nullable).
 //!
-//! Remote *prefixes* (e.g. `s3://bucket/dataset/`) are rejected with a
-//! clear error for now; remote prefix listing lands later in this release.
+//! `s3://` / `gs://` *prefixes* (e.g. `s3://bucket/dataset/`) are listed
+//! natively (sorted `.parquet` keys, one shared store instance);
+//! `http(s)://` prefixes have no generic listing API and error with a
+//! pointer at `--files-from`, which accepts an explicit ordered manifest
+//! of files/URLs instead.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,8 +103,9 @@ struct PartMeta {
     parquet: Arc<ParquetMetaData>,
 }
 
-/// An ordered set of local parquet partitions with footers loaded and
-/// validated up front (see the module docs for the compatibility rules).
+/// An ordered set of parquet partitions (local files and/or remote
+/// objects) with footers loaded and validated up front (see the module
+/// docs for the compatibility rules).
 #[derive(Debug)]
 pub struct MultiSource {
     /// The original input string (directory path or glob pattern).
@@ -183,10 +187,13 @@ impl ConvertSource {
     ///   filtered to `.parquet` files, sorted, deduplicated;
     /// - remote single-object URL (no trailing slash — including
     ///   extension-less presigned/API URLs) → `Single` (unchanged);
-    /// - remote prefix (path ending `/`) →
-    ///   [`InputError::RemotePrefixUnsupported`] when the `remote` feature
-    ///   is on (for now); without the feature, the standard
-    ///   [`InputError::RemoteDisabled`] as before;
+    /// - `s3://` / `gs://` prefix (path ending `/`) → native object
+    ///   listing: `.parquet` keys sorted by key, `_SUCCESS`/zero-byte/
+    ///   hidden (`.`/`_`) names skipped, one store instance shared by all
+    ///   parts; requires the `remote` feature (without it, the standard
+    ///   [`InputError::RemoteDisabled`] as before);
+    /// - `http(s)://` prefix → [`InputError::RemotePrefixUnsupported`]
+    ///   (no generic listing API; the error points at `--files-from`);
     /// - a single resolved partition collapses to `Single`;
     /// - an empty directory/glob result → [`InputError::NoParquetInputs`].
     pub fn resolve(input: &str) -> Result<Self, InputError> {
@@ -202,9 +209,12 @@ impl ConvertSource {
                 && is_remote_scheme(_scheme)
                 && remote_url_is_prefix(input)
             {
-                return Err(InputError::RemotePrefixUnsupported {
-                    url: input.to_string(),
-                });
+                if _scheme.eq_ignore_ascii_case("http") || _scheme.eq_ignore_ascii_case("https") {
+                    return Err(InputError::RemotePrefixUnsupported {
+                        url: input.to_string(),
+                    });
+                }
+                return Self::from_remote_prefix(input);
             }
             // `file://` maps to a local path, remote objects stay single,
             // unsupported schemes get the standard error — all exactly as
@@ -234,17 +244,102 @@ impl ConvertSource {
     }
 
     /// `Single` for one file, `Multi` for several, a clear error for none.
-    fn from_local_files(input: &str, mut files: Vec<PathBuf>) -> Result<Self, InputError> {
-        match files.len() {
+    fn from_local_files(input: &str, files: Vec<PathBuf>) -> Result<Self, InputError> {
+        Self::from_parts(input, files.into_iter().map(InputSource::Local).collect())
+    }
+
+    /// `Single` for one part, `Multi` for several,
+    /// [`InputError::NoParquetInputs`] for none. `parts` must already be in
+    /// read order (the row-order invariant).
+    fn from_parts(input: &str, mut parts: Vec<InputSource>) -> Result<Self, InputError> {
+        match parts.len() {
             0 => Err(InputError::NoParquetInputs {
                 input: input.to_string(),
             }),
-            1 => Ok(ConvertSource::single(InputSource::Local(files.remove(0)))),
-            _ => Ok(ConvertSource::Multi(MultiSource::from_local_files(
+            1 => Ok(ConvertSource::single(parts.remove(0))),
+            _ => Ok(ConvertSource::Multi(MultiSource::from_sources(
                 input.to_string(),
-                files,
+                parts,
             )?)),
         }
+    }
+
+    /// Resolve an `s3://`/`gs://` prefix by listing the store: every
+    /// visible `.parquet` object under the prefix, sorted by key, all
+    /// sharing ONE store instance (one credential resolution) with sizes
+    /// taken from the listing (no per-part HEADs).
+    #[cfg(feature = "remote")]
+    fn from_remote_prefix(input: &str) -> Result<Self, InputError> {
+        let sources = crate::input::remote::sources_under_prefix(input)?;
+        Self::from_parts(
+            input,
+            sources.into_iter().map(InputSource::Remote).collect(),
+        )
+    }
+
+    /// Build a source from a `--files-from` manifest: one local path or
+    /// remote URL per line, `#`-prefixed comment lines and blank lines
+    /// skipped, entries trimmed. Line order is preserved VERBATIM — never
+    /// sorted — because the converter's row-order invariant keys winner
+    /// tables by global row offset; reordering the manifest reorders the
+    /// dataset. Each line is resolved as a SINGLE file/object (no
+    /// directory, glob, or prefix expansion); mixing local and remote
+    /// entries is allowed (compatibility is validated as usual).
+    pub fn from_manifest(manifest: &Path) -> Result<Self, InputError> {
+        let text = std::fs::read_to_string(manifest).map_err(|e| InputError::ManifestRead {
+            path: manifest.display().to_string(),
+            source: e,
+        })?;
+        let entries: Vec<(String, String)> = manifest_entries(&text)
+            .into_iter()
+            .map(|(line, entry)| {
+                (
+                    format!("line {line} of manifest {}", manifest.display()),
+                    entry.to_string(),
+                )
+            })
+            .collect();
+        Self::from_explicit_list(&manifest.display().to_string(), &entries)
+    }
+
+    /// Build a source from an explicit ordered list of inputs (local paths
+    /// or URLs) — the Python `list[str]` input shape. Order is preserved
+    /// verbatim; each entry is a single file/object (no expansion).
+    pub fn from_input_list<S: AsRef<str>>(inputs: &[S]) -> Result<Self, InputError> {
+        let entries: Vec<(String, String)> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                (
+                    format!("input list entry {}", i + 1),
+                    entry.as_ref().to_string(),
+                )
+            })
+            .collect();
+        Self::from_explicit_list("input list", &entries)
+    }
+
+    /// Shared by [`Self::from_manifest`] and [`Self::from_input_list`]:
+    /// resolve each `(context, entry)` as a single source, requiring local
+    /// entries to exist up front so the error can name the entry instead
+    /// of surfacing as a bare I/O error at footer-load time.
+    fn from_explicit_list(root: &str, entries: &[(String, String)]) -> Result<Self, InputError> {
+        let mut parts = Vec::with_capacity(entries.len());
+        for (context, entry) in entries {
+            let src = InputSource::from_str_input(entry)?;
+            // Without the `remote` feature `Local` is the only variant.
+            #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
+            if let InputSource::Local(p) = &src {
+                if !p.is_file() {
+                    return Err(InputError::MissingListedInput {
+                        context: context.clone(),
+                        input: entry.clone(),
+                    });
+                }
+            }
+            parts.push(src);
+        }
+        Self::from_parts(root, parts)
     }
 
     /// [`ConvertSource::resolve`] for `Path` inputs (non-UTF-8 paths fall
@@ -422,21 +517,61 @@ fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     })
 }
 
-impl MultiSource {
-    /// Build and validate a multi source over local partition files.
-    fn from_local_files(root: String, files: Vec<PathBuf>) -> Result<Self, InputError> {
-        Self::from_sources(root, files.into_iter().map(InputSource::Local).collect())
-    }
+/// Ceiling on concurrent footer loads in [`load_part_metas`]. A remote
+/// footer costs two range requests; loading hundreds of parts serially
+/// pays hundreds of sequential round-trips, while unbounded parallelism
+/// would open one connection per part. Eight in flight keeps a
+/// hundreds-of-parts prefix listing responsive without a connection storm.
+const FOOTER_LOAD_CONCURRENCY: usize = 8;
 
+/// Load every part's footer, in order, with bounded concurrency. Results
+/// are written into per-index slots so the returned order always matches
+/// `parts` regardless of completion order; the first error (by part index)
+/// wins.
+fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = FOOTER_LOAD_CONCURRENCY.min(parts.len());
+    if workers <= 1 {
+        return parts.iter().map(load_part_meta).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<PartMeta, InputError>>>> = (0..parts.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= parts.len() {
+                    break;
+                }
+                let meta = load_part_meta(&parts[i]);
+                *slots[i].lock().expect("footer slot lock") = Some(meta);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("footer slot lock")
+                .expect("every slot filled by a worker")
+        })
+        .collect()
+}
+
+impl MultiSource {
     /// Build a multi source over already-constructed parts: load every
     /// part's footer and validate compatibility against part 0 (see the
     /// module docs). `parts` must be non-empty and already ordered.
+    /// Footer loads run with bounded concurrency
+    /// ([`FOOTER_LOAD_CONCURRENCY`]): a remote footer is two range
+    /// requests, so hundreds of parts would otherwise serialize hundreds
+    /// of round-trips — but must not open hundreds of connections at once
+    /// either.
     pub fn from_sources(root: String, parts: Vec<InputSource>) -> Result<Self, InputError> {
         assert!(!parts.is_empty(), "MultiSource requires at least one part");
-        let metas = parts
-            .iter()
-            .map(load_part_meta)
-            .collect::<Result<Vec<_>, _>>()?;
+        let metas = load_part_metas(&parts)?;
 
         let first_name = parts[0].display_name();
         // The reference CRS: `Ok(crs)` per detect_crs_from_kv, `None` for an
@@ -679,6 +814,20 @@ fn has_glob_meta(input: &str) -> bool {
     input.contains(['*', '?', '['])
 }
 
+/// Parse `--files-from` manifest text into `(1-based line number, entry)`
+/// pairs: entries are trimmed; blank lines and lines whose first non-space
+/// character is `#` are skipped. Order is preserved verbatim (see
+/// [`ConvertSource::from_manifest`]).
+fn manifest_entries(text: &str) -> Vec<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let entry = line.trim();
+            (!entry.is_empty() && !entry.starts_with('#')).then_some((i + 1, entry))
+        })
+        .collect()
+}
+
 /// Whether a remote URL names a *prefix* ("directory"): its path component
 /// — query string and fragment stripped — ends with `/`. Everything else,
 /// including extension-less presigned/API URLs that serve parquet, is a
@@ -905,21 +1054,23 @@ mod tests {
         assert!(!remote_url_is_prefix("s3://bucket/dataset"));
     }
 
-    /// With the `remote` feature compiled in, only trailing-slash URLs are
-    /// rejected as prefixes (before any network touch); everything else
-    /// proceeds to the single-object path.
+    /// http(s) prefixes stay hard errors (generic HTTP has no listing API)
+    /// and the error points at `--files-from`. s3/gs prefixes are listed
+    /// for real now (covered by the InMemory tests below), so they are NOT
+    /// rejected here.
     #[cfg(feature = "remote")]
     #[test]
-    fn resolve_remote_prefix_rejected() {
-        for url in [
-            "s3://bucket/dataset/",
-            "https://example.com/data/",
-            "gs://bucket/prefix/",
-        ] {
+    fn resolve_https_prefix_points_at_files_from() {
+        for url in ["https://example.com/data/", "http://example.com/data/"] {
             let err = ConvertSource::resolve(url).unwrap_err();
             assert!(
                 matches!(err, InputError::RemotePrefixUnsupported { .. }),
                 "{url} → {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--files-from"),
+                "error must point at --files-from: {msg}"
             );
         }
     }
@@ -1209,5 +1360,253 @@ mod tests {
         // Scoped reader threads capture &ConvertSource.
         fn assert_sync<T: Sync>() {}
         assert_sync::<ConvertSource>();
+    }
+
+    // --- --files-from manifest (v0.7 PR-B) ------------------------------------
+
+    /// Comments, blank lines, and surrounding whitespace are skipped;
+    /// entry order is preserved VERBATIM (never sorted) — the row-order
+    /// invariant keys winner tables by global row offset.
+    #[test]
+    fn manifest_entries_skip_comments_and_preserve_order() {
+        let text = "\
+# heading comment
+b.parquet
+
+  # indented comment
+  a.parquet  \n\nz/c.parquet\n";
+        let entries = manifest_entries(text);
+        assert_eq!(
+            entries,
+            vec![(2, "b.parquet"), (5, "a.parquet"), (7, "z/c.parquet")],
+            "order verbatim (b before a), 1-based line numbers"
+        );
+    }
+
+    #[test]
+    fn manifest_multi_source_preserves_line_order() {
+        let dir = tmpdir();
+        // Deliberately list b before a: order must be kept, not sorted.
+        write_standard(&dir.path().join("b.parquet"), vec![0, 1], false);
+        write_standard(&dir.path().join("a.parquet"), vec![2, 3], false);
+        let manifest = dir.path().join("parts.txt");
+        std::fs::write(
+            &manifest,
+            format!(
+                "# two partitions, b first\n{}\n\n{}\n",
+                dir.path().join("b.parquet").display(),
+                dir.path().join("a.parquet").display()
+            ),
+        )
+        .unwrap();
+        let src = ConvertSource::from_manifest(&manifest).unwrap();
+        assert!(matches!(src, ConvertSource::Multi(_)));
+        let plan = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: None,
+        };
+        assert_eq!(stream_ids(&src, &plan), vec![0, 1, 2, 3]);
+    }
+
+    /// A single-entry manifest collapses to `Single`; a `file://` URL line
+    /// proves the URL classification path runs per line (no network).
+    #[test]
+    fn manifest_single_entry_and_file_url() {
+        let dir = tmpdir();
+        let f = dir.path().join("only.parquet");
+        write_standard(&f, vec![7], false);
+        let manifest = dir.path().join("one.txt");
+        std::fs::write(&manifest, format!("file://{}\n", f.display())).unwrap();
+        let src = ConvertSource::from_manifest(&manifest).unwrap();
+        assert!(matches!(src, ConvertSource::Single(_)));
+        let plan = ReadPlan {
+            batch_size: 8,
+            projection: None,
+            row_groups: None,
+        };
+        assert_eq!(stream_ids(&src, &plan), vec![7]);
+    }
+
+    /// A manifest line naming a missing local file errors, naming BOTH the
+    /// line number and the offending path. Lines are single files only —
+    /// a directory line is rejected too (no recursion).
+    #[test]
+    fn manifest_missing_file_names_line_and_path() {
+        let dir = tmpdir();
+        write_standard(&dir.path().join("ok.parquet"), vec![1], false);
+        let manifest = dir.path().join("bad.txt");
+        std::fs::write(
+            &manifest,
+            format!(
+                "{}\n# comment\n{}\n",
+                dir.path().join("ok.parquet").display(),
+                dir.path().join("nope.parquet").display()
+            ),
+        )
+        .unwrap();
+        let err = ConvertSource::from_manifest(&manifest).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("line 3"), "names the manifest line: {msg}");
+        assert!(msg.contains("nope.parquet"), "names the path: {msg}");
+
+        // A directory entry is not a file: same error (no recursion).
+        let manifest2 = dir.path().join("dir.txt");
+        std::fs::write(&manifest2, format!("{}\n", dir.path().display())).unwrap();
+        let err = ConvertSource::from_manifest(&manifest2).unwrap_err();
+        assert!(
+            matches!(err, InputError::MissingListedInput { .. }),
+            "directory lines are rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_empty_or_unreadable_is_a_clear_error() {
+        let dir = tmpdir();
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "# only comments\n\n").unwrap();
+        let err = ConvertSource::from_manifest(&empty).unwrap_err();
+        assert!(matches!(err, InputError::NoParquetInputs { .. }), "{err:?}");
+
+        let err = ConvertSource::from_manifest(&dir.path().join("missing.txt")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing.txt"), "names the manifest: {msg}");
+    }
+
+    /// The Python list-input path: explicit entries, order verbatim, each a
+    /// single file (no recursion), missing entries named by position.
+    #[test]
+    fn input_list_preserves_order_and_validates() {
+        let dir = tmpdir();
+        write_standard(&dir.path().join("b.parquet"), vec![0], false);
+        write_standard(&dir.path().join("a.parquet"), vec![1], false);
+        let list = [
+            dir.path().join("b.parquet").display().to_string(),
+            dir.path().join("a.parquet").display().to_string(),
+        ];
+        let src = ConvertSource::from_input_list(&list).unwrap();
+        let plan = ReadPlan {
+            batch_size: 8,
+            projection: None,
+            row_groups: None,
+        };
+        assert_eq!(stream_ids(&src, &plan), vec![0, 1]);
+
+        let bad = [dir.path().join("nope.parquet").display().to_string()];
+        let err = ConvertSource::from_input_list(&bad).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("entry 1"), "names the entry: {msg}");
+        assert!(msg.contains("nope.parquet"), "names the path: {msg}");
+
+        let none: [String; 0] = [];
+        let err = ConvertSource::from_input_list(&none).unwrap_err();
+        assert!(matches!(err, InputError::NoParquetInputs { .. }), "{err:?}");
+    }
+
+    // --- remote prefix listing (v0.7 PR-B) ------------------------------------
+
+    #[cfg(feature = "remote")]
+    mod remote_listing {
+        use super::*;
+        use crate::input::remote::{list_parquet_under_prefix, RemoteSource};
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectPath;
+        use object_store::ObjectStore;
+
+        /// Seed one InMemory store with `objects` (key → bytes).
+        fn seeded_store(objects: &[(&str, Vec<u8>)]) -> Arc<InMemory> {
+            let store = Arc::new(InMemory::new());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            for (key, bytes) in objects {
+                rt.block_on(store.put(&ObjectPath::from(*key), bytes.clone().into()))
+                    .unwrap();
+            }
+            store
+        }
+
+        fn parquet_bytes(ids: Vec<i64>) -> Vec<u8> {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(ids))],
+            )
+            .unwrap();
+            let mut buf = Vec::new();
+            let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            buf
+        }
+
+        /// The listing finds exactly the `.parquet` keys, sorted by key,
+        /// skipping `_SUCCESS`, zero-byte objects, hidden (`.`/`_`) names —
+        /// including hidden "directory" components below the prefix — and
+        /// keys outside the prefix.
+        #[test]
+        fn listing_filters_and_sorts() {
+            let store = seeded_store(&[
+                ("set/b.parquet", parquet_bytes(vec![1])),
+                ("set/a.parquet", parquet_bytes(vec![2])),
+                ("set/nested/c.parquet", parquet_bytes(vec![3])),
+                ("set/_SUCCESS", vec![]),
+                ("set/_delta_log/d.parquet", parquet_bytes(vec![4])),
+                ("set/.hidden.parquet", parquet_bytes(vec![5])),
+                ("set/zero.parquet", vec![]),
+                ("set/readme.txt", b"hi".to_vec()),
+                ("other/x.parquet", parquet_bytes(vec![6])),
+            ]);
+            let store: Arc<dyn ObjectStore> = store;
+            let listed =
+                list_parquet_under_prefix(&store, &ObjectPath::from("set"), "memory://set/")
+                    .unwrap();
+            let keys: Vec<String> = listed
+                .iter()
+                .map(|p| p.location.as_ref().to_string())
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["set/a.parquet", "set/b.parquet", "set/nested/c.parquet"],
+                "exactly the visible .parquet keys, sorted"
+            );
+            assert!(listed.iter().all(|p| p.size > 0), "sizes from the listing");
+        }
+
+        /// Listed parts stream in key order through a ConvertSource, all
+        /// sharing ONE store instance.
+        #[test]
+        fn listed_parts_stream_in_order() {
+            let store = seeded_store(&[
+                ("set/p1.parquet", parquet_bytes(vec![10, 11])),
+                ("set/p0.parquet", parquet_bytes(vec![0, 1])),
+            ]);
+            let store: Arc<dyn ObjectStore> = store;
+            let listed =
+                list_parquet_under_prefix(&store, &ObjectPath::from("set"), "memory://set/")
+                    .unwrap();
+            let parts: Vec<InputSource> = listed
+                .into_iter()
+                .map(|p| {
+                    InputSource::Remote(RemoteSource::from_store_sized(
+                        Arc::clone(&store),
+                        p.location.clone(),
+                        format!("memory://{}", p.location),
+                        p.size,
+                    ))
+                })
+                .collect();
+            let src = ConvertSource::Multi(
+                MultiSource::from_sources("memory://set/".to_string(), parts).unwrap(),
+            );
+            let plan = ReadPlan {
+                batch_size: 1024,
+                projection: None,
+                row_groups: None,
+            };
+            assert_eq!(stream_ids(&src, &plan), vec![0, 1, 10, 11]);
+            let stats = src.fetch_stats().expect("remote parts have stats");
+            assert!(stats.object_size > 0, "object_size sums the parts");
+        }
     }
 }
