@@ -360,11 +360,16 @@ struct ConvertTuningArgs {
     line_visibility: f64,
 
     /// Polygon visibility gate in GSD multiples: a polygon is eligible only if
-    /// its bbox diagonal >= factor * gsd (default 4.0).
+    /// its bbox diagonal >= factor * gsd (default 2.0).
     ///
     /// BIGGER = more small polygons dropped at coarse levels (sparser);
-    /// SMALLER = more kept. See --line-visibility.
-    #[arg(long, default_value = "4.0", help_heading = "Thinning & visibility")]
+    /// SMALLER = more kept. See --line-visibility. Retuned 4.0 -> 2.0 in the
+    /// #259 coarse-zoom sweep (corpus/SWEEPS.md Decision 6): write-time RDP
+    /// already drops polygons that simplify below the level tolerance, so
+    /// gates above 2.0 starve coarse zooms without making files smaller,
+    /// and gates below ~2.0 mostly admit candidates that RDP drops anyway
+    /// (use --collapse to keep those as representative points).
+    #[arg(long, default_value = "2.0", help_heading = "Thinning & visibility")]
     polygon_visibility: f64,
 
     /// Per-level density drop rate: each coarser level keeps 1/rate of the

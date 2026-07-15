@@ -139,11 +139,20 @@ impl AssignFeature {
 /// Thinning / visibility / sort configuration.
 ///
 /// Defaults: point thinning 4, line 1, polygon 1; line visibility 2,
-/// polygon 4; sort descending. Point/polygon match the cogp-rs
+/// polygon 2; sort descending. Point thinning matches the cogp-rs
 /// reference; line thinning was retuned 2.0 → 1.0 after the 2026-07-02
 /// Portland-roads parameter sweep (corpus/SWEEPS.md): lt=1 keeps
 /// road networks visibly more continuous at coarse zooms, chosen by
-/// maintainer review of the true-scale sweep renders.
+/// maintainer review of the true-scale sweep renders. Polygon
+/// visibility was retuned 4.0 → 2.0 in the 2026-07-15 coarse-zoom
+/// sweep (#259, corpus/SWEEPS.md Decision 6): write-time RDP already
+/// drops polygons whose simplified exterior falls below the level
+/// tolerance (an effective ~2×GSD area gate on real-world shapes), so
+/// the old 4×GSD eligibility gate was strictly stricter than what
+/// survives writing and starved coarse zooms for no benefit — 4→2
+/// gives 3–5× more coarse-level polygons on the Moldova corpus at
+/// +0.1% file size, while values below 2 only admit candidates that
+/// RDP kills anyway (wasted density-budget slots).
 #[derive(Debug, Clone, Copy)]
 pub struct AssignConfig {
     /// Grid-cell multiplier for points (coarser grid ⇒ more aggressive thin).
@@ -181,7 +190,7 @@ impl Default for AssignConfig {
             line_thinning: 1.0,
             polygon_thinning: 1.0,
             line_visibility: 2.0,
-            polygon_visibility: 4.0,
+            polygon_visibility: 2.0,
             sort_direction: SortDirection::Desc,
         }
     }
@@ -990,10 +999,12 @@ mod tests {
         // A polygon whose diagonal is smaller than the polygon visibility gate
         // at coarse levels but larger at the finest level. It should only
         // become eligible (and win) at the finest level.
-        // Level 0 = gsd(2) ~ 9784 m; gate = 4*gsd. Level 2 = gsd(6) ~ 611 m.
+        // Level 0 = gsd(2) ~ 9784 m; gate = 2*gsd (default). Level 2 = gsd(6)
+        // ~ 611 m.
         let g6 = gsd(6);
-        // diagonal ~ 4.5 * gsd(6) in meters → eligible at level 2 (gate 4*gsd6)
-        // but not at coarser levels (gate 4*gsd larger).
+        // diagonal ~ 4.5 * gsd(6) in meters → eligible at level 2 (gate
+        // 2*gsd6 ≈ 2*611) but not at coarser levels (level 1 gate 2*gsd4 ≈
+        // 4892 > 4.5*gsd6 ≈ 2752).
         let side = 4.5 * g6 / std::f64::consts::SQRT_2; // diag = side*sqrt2 = 4.5*gsd6
         let small = poly(0, 0.0, 0.0, side, side);
         let gsds = [gsd(2), gsd(4), gsd(6)];
@@ -1005,26 +1016,41 @@ mod tests {
     }
 
     #[test]
-    fn line_gate_less_strict_than_polygon() {
-        // Same-size line vs polygon: with line_visibility 2 and polygon 4,
-        // a geometry sized between the two gates is eligible as a line but not
-        // as a polygon at a given level.
+    fn per_kind_visibility_gates_are_independent() {
+        // Same-size line vs polygon with explicitly different per-kind gates
+        // (line 2, polygon 4 — the pre-#259 polygon default): a geometry
+        // sized between the two gates is eligible as a line but not as a
+        // polygon at a given level. The default config now sets both gates
+        // to 2.0 (see `default_visibility_gates`), so this pins explicit
+        // values to keep exercising the per-kind independence.
         let g4 = gsd(4);
         let side = 3.0 * g4 / std::f64::consts::SQRT_2; // diag = 3*gsd4
         let mut line = poly(0, 0.0, 0.0, side, side);
         line.kind = FeatureKind::Line;
         let polygon = poly(1, 1e7, 1e7, 1e7 + side, 1e7 + side); // far away cell
         let gsds = [gsd(4), gsd(8)];
-        let out = assign_levels(
-            &[line, polygon],
-            &gsds,
-            &AssignConfig::default(),
-            Crs::Epsg3857,
-        );
+        let cfg = AssignConfig {
+            polygon_visibility: 4.0,
+            ..AssignConfig::default()
+        };
+        let out = assign_levels(&[line, polygon], &gsds, &cfg, Crs::Epsg3857);
         // line: diag 3*gsd4 >= 2*gsd4 → eligible at level 0.
         assert_eq!(out.assignments[0].min_level, 0, "line visible at level 0");
         // polygon: diag 3*gsd4 < 4*gsd4 → gated at level 0, appears finer.
         assert!(out.assignments[1].min_level > 0, "polygon gated at level 0");
+    }
+
+    #[test]
+    fn default_visibility_gates() {
+        // #259: the default polygon gate is 2.0 — the write-time RDP
+        // collapse already imposes an effective ~2×GSD survival bar, so a
+        // 4×GSD eligibility gate only starved coarse levels (see
+        // corpus/SWEEPS.md Decision 6). Line gate stays 2.0 (Portland
+        // sweep), points are never gated.
+        let cfg = AssignConfig::default();
+        assert_eq!(cfg.polygon_visibility, 2.0);
+        assert_eq!(cfg.line_visibility, 2.0);
+        assert_eq!(cfg.visibility_factor(FeatureKind::Point), 0.0);
     }
 
     // ---- sort_key priority incl. null-loses ---------------------------------
@@ -1387,15 +1413,15 @@ mod tests {
 
     #[test]
     fn antimeridian_inflated_bbox_assigned_to_coarsest_level() {
-        // A polygon whose true extent is 0.2° × 0.2° straddling the
+        // A polygon whose true extent is 0.1° × 0.1° straddling the
         // antimeridian. Our bbox math hands assignment the inflated bbox
-        // [-179.9, -0.1, 179.9, 0.1] (diag ≈ 359.8°), so the polygon clears
-        // every visibility gate and wins the coarsest level.
-        let inflated = poly(0, -179.9, -0.1, 179.9, 0.1);
+        // [-179.95, -0.05, 179.95, 0.05] (diag ≈ 359.9°), so the polygon
+        // clears every visibility gate and wins the coarsest level.
+        let inflated = poly(0, -179.95, -0.05, 179.95, 0.05);
         // The same feature's *true* extent, expressed unwrapped past 180°
-        // (diag ≈ 0.28°): gated out of level 0 (gate = 4·gsd(2) ≈ 0.35°),
+        // (diag ≈ 0.14°): gated out of level 0 (gate = 2·gsd(2) ≈ 0.18°),
         // eligible only at the finest level.
-        let true_extent = poly(1, 179.9, -0.1, 180.1, 0.1);
+        let true_extent = poly(1, 179.95, -0.05, 180.05, 0.05);
         let gsds = [gsd(2), gsd(6)];
         let out = assign_levels(
             &[inflated, true_extent],

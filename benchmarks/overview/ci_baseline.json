@@ -3,69 +3,69 @@
     "input_features": 17465,
     "levels": [
       {
-        "feature_count": 1,
+        "feature_count": 40,
         "level": 0,
-        "vertex_count": 5
+        "vertex_count": 173
       },
       {
-        "feature_count": 187,
+        "feature_count": 238,
         "level": 1,
-        "vertex_count": 876
+        "vertex_count": 1094
       },
       {
-        "feature_count": 252,
+        "feature_count": 253,
         "level": 2,
-        "vertex_count": 1517
+        "vertex_count": 1526
       },
       {
         "feature_count": 254,
         "level": 3,
-        "vertex_count": 2377
+        "vertex_count": 2394
       },
       {
         "feature_count": 256,
         "level": 4,
-        "vertex_count": 3749
+        "vertex_count": 3775
       },
       {
         "feature_count": 318,
         "level": 5,
-        "vertex_count": 7290
+        "vertex_count": 7348
       },
       {
         "feature_count": 525,
         "level": 6,
-        "vertex_count": 15989
+        "vertex_count": 16042
       },
       {
         "feature_count": 865,
         "level": 7,
-        "vertex_count": 31450
+        "vertex_count": 31531
       },
       {
         "feature_count": 1428,
         "level": 8,
-        "vertex_count": 56881
+        "vertex_count": 56944
       },
       {
         "feature_count": 2356,
         "level": 9,
-        "vertex_count": 98200
+        "vertex_count": 98323
       },
       {
         "feature_count": 3888,
         "level": 10,
-        "vertex_count": 170612
+        "vertex_count": 170848
       },
       {
         "feature_count": 6415,
         "level": 11,
-        "vertex_count": 319242
+        "vertex_count": 319805
       },
       {
         "feature_count": 10585,
         "level": 12,
-        "vertex_count": 587158
+        "vertex_count": 587192
       },
       {
         "feature_count": 17465,
@@ -73,8 +73,8 @@
         "vertex_count": 1749880
       }
     ],
-    "total_rows": 44795,
-    "total_vertices": 3045226
+    "total_rows": 44886,
+    "total_vertices": 3046875
   },
   "lines": {
     "input_features": 1000,
@@ -142,24 +142,24 @@
         "vertex_count": 4
       },
       {
-        "feature_count": 7,
+        "feature_count": 21,
         "level": 1,
-        "vertex_count": 30
+        "vertex_count": 96
       },
       {
-        "feature_count": 70,
+        "feature_count": 167,
         "level": 2,
-        "vertex_count": 342
+        "vertex_count": 776
       },
       {
-        "feature_count": 307,
+        "feature_count": 355,
         "level": 3,
-        "vertex_count": 1673
+        "vertex_count": 1887
       },
       {
-        "feature_count": 606,
+        "feature_count": 596,
         "level": 4,
-        "vertex_count": 3540
+        "vertex_count": 3467
       },
       {
         "feature_count": 1000,
@@ -167,7 +167,7 @@
         "vertex_count": 6945
       }
     ],
-    "total_rows": 1991,
-    "total_vertices": 12534
+    "total_rows": 2140,
+    "total_vertices": 13175
   }
 }

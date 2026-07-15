@@ -177,3 +177,71 @@ usage confirms no edge-case surprises.
 Raw data: `corpus/data/bench/sweep202/{rg10k,rg25k,rg50k,rg100k,zoom-scaled}/`
 (local), `s3://gpq-tiles-bench/sweep202/` (remote, can be deleted after
 this decision is final).
+
+## Decision 6: `--polygon-visibility 2.0` (retuned from 4.0) + the coarse-zoom dot-fill recipe (issue #259)
+
+**Sweep (2026-07-15):** `--polygon-visibility` ∈ {4 (old default), 2, 1,
+0+`--collapse`} on `polygons-ftw-moldova-large` (631,910 field polygons)
+and `overture-germany-buildings` (59,032,924 footprints, the #250 demo
+fixture), duplicating mode, z0–14, all other knobs default. Reports +
+uncapped PMTiles exports + level renders.
+
+**Root cause first.** The #259 hypothesis was that `--drop-rate` ×
+`--drop-gamma` needed retuning at the coarsest levels. The sweep
+disproves that: on the default Germany run **every level is
+visibility-gate-limited far below its density budget** (z10: 145k written
+vs 7.96M budget; only z13 approaches it), so the budget knobs have no
+coarse-zoom effect at all. Two mechanisms empty coarse zooms for
+small-polygon layers: the assign-time gate (`diag >= pv × GSD`) and the
+write-time RDP collapse (simplified geometry below the 1 × GSD tolerance
+is dropped — an effective ~2 × GSD survival bar on real shapes). The
+#250 demo's `--drop-rate 1.3` merely inflated budget-bound mid zooms
+(+13 % rows on Moldova) without changing coarse fill.
+
+**pv sweep, Moldova (written features; no collapse unless noted):**
+
+| zoom | pv=4 (old) | pv=2 | pv=1 | pv=0 + collapse |
+|--:|--:|--:|--:|--:|
+| 2 | — | — | — | 614 |
+| 3 | — | 3 | 3 | 2,266 |
+| 4 | 36 | 188 | 188 | 4,225 |
+| 5 | 978 | 3,138 | 3,133 | 6,971 |
+| 6 | 8,005 | 10,947 | 10,885 | 11,502 |
+| 7 | 18,859 | 18,819 | 18,758 | 18,979 |
+| 12 | 232,107 | 232,107 | 231,359 | 232,107 |
+
+File size: 267.4 → 267.7 MB (pv 4→2, +0.1 %). **pv=1 ≡ pv=2 in output**
+(188 vs 188 at z4): everything the lower gate admits below ~2 × GSD is
+RDP-collapsed at write time anyway — pv=1 only *wastes* density-budget
+slots on doomed candidates (z12: 231,359 vs 232,107 written). So 2.0 is
+the natural floor while collapse is off.
+
+**Germany buildings, pv 4→2:** z8 917 → 4,257 (4.6×), z9 15k → 48k
+(3.2×), z10 145k → 424k (2.9×), z11 1.14M → 3.05M (2.7×), z12 6.9M →
+18.7M (2.7×); z13/z14 ~unchanged (budget-capped / canonical). Pyramid
+starts z6 instead of z7. Cost: +14.5 % rows, +12.8 % overview bytes
+(11.91 → 13.43 GB), +6.6 % convert wall (242 → 258 s).
+
+**Decision:** ship `--polygon-visibility 2.0`. The old 4.0 gate was
+strictly stricter than what write-time simplification can ever emit —
+it starved z8–z12 for zero benefit. 2.0 aligns the eligibility gate with
+the write-time survival bar (and with the line gate).
+
+**The country view needs the recipe, not a gate.** No gate value can put
+a 20 m building on a z4 map as a polygon. The documented recipe
+(`docs/OVERVIEW_TUNING.md` → "Country-scale dot fill") is
+`--polygon-visibility 0 --collapse` (+ `--max-tile-size 500K` on export,
++ a circle layer in the style): every Germany level populates (z0 = 581
+dots, z4 = 128,886, z6 = 1.07M), z6–z13 land exactly on the budget
+ladder `N/1.65^(14−z)` with visible gamma-fair density structure
+(Ruhr/Berlin denser, rural protected), at +31 % overview bytes / +40 %
+convert wall on Germany and **+0.3 % bytes** on Moldova. Uncapped coarse
+dot tiles reach 12 MB (Germany z6) — hence the 500K cap in the recipe.
+`--collapse` stays opt-in per spec Q4 (§7.5: type collapse MUST be
+producer-opt-in); the demo viewer gained the circle layer, and the
+empty-level WARN now points at the recipe. Tippecanoe fills the same gap
+by default with tiny-polygon *placeholder squares* (type-preserving) —
+recorded as future work in `context/ARCHITECTURE.md` (refs #85/#177,
+#246).
+
+Raw artifacts: `corpus/data/bigbench/sweep_scratch/` (not committed).

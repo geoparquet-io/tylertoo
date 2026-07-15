@@ -271,7 +271,8 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     line_visibility (float, optional): A line is eligible at a level only
 ///         if its bbox diagonal >= factor * gsd. Defaults to 2.0.
 ///     polygon_visibility (float, optional): Same gate for polygons.
-///         Defaults to 4.0.
+///         Defaults to 2.0 (retuned from 4.0 in the #259 coarse-zoom
+///         sweep; see corpus/SWEEPS.md Decision 6).
 ///     drop_rate (float, optional): Per-level density budget drop rate: each
 ///         coarser level keeps 1/rate of the next finer level's budget.
 ///         Defaults to 1.65.
@@ -375,7 +376,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     line_thinning=1.0,
     polygon_thinning=1.0,
     line_visibility=2.0,
-    polygon_visibility=4.0,
+    polygon_visibility=2.0,
     drop_rate=1.65,
     drop_gamma=1.5,
     density_drop=true,

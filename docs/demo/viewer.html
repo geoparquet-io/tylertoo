@@ -86,6 +86,15 @@
           paint: { "fill-color": "#4cc9f0", "fill-opacity": 0.45 } },
         { id: "bld-line", type: "line", source: "buildings", "source-layer": LAYER,
           paint: { "line-color": "#9be7ff", "line-width": 0.3, "line-opacity": 0.5 } },
+        // Coarse-zoom fill (#259): a --collapse conversion represents
+        // sub-GSD buildings as points at coarse levels. A fill layer
+        // silently ignores Point features, so without this layer the
+        // zoomed-out country view renders empty.
+        { id: "bld-dot", type: "circle", source: "buildings", "source-layer": LAYER,
+          filter: ["==", "$type", "Point"],
+          paint: { "circle-color": "#4cc9f0", "circle-opacity": 0.55,
+            "circle-radius": ["interpolate", ["linear"], ["zoom"],
+              2, 0.7, 6, 1.1, 10, 1.8] } },
       ],
     };
 
