@@ -124,9 +124,10 @@ essentials (`--min-zoom`, `--max-zoom`, `--layer-name`, `--tile-buffer`,
 convert-tuning knob from `overview` — quality and memory alike:
 
 ```bash
-# Denser coarse zooms, memory-bounded, in one shot
+# Country-scale dot fill for a dense building layer, memory-bounded,
+# in one shot (see docs/OVERVIEW_TUNING.md, "Country-scale dot fill")
 gpq-tiles input.parquet output.pmtiles --max-zoom 14 \
-  --polygon-visibility 2.0 --collapse --drop-rate 1.3 \
+  --polygon-visibility 0 --collapse --max-tile-size 500K \
   --profile bounded
 ```
 

@@ -30,6 +30,11 @@ interact.
 > - **Mid zooms (≈z9–z12) over-retained (way more features than tippecanoe,
 >   large duplicating files)** → RAISE `--drop-rate` (the density budget); to
 >   disable it entirely use `--no-density-drop`.
+> - **Country-scale view of a dense small-polygon layer (buildings, parcels)
+>   is EMPTY when zoomed out** → the features are sub-GSD at those scales and
+>   no gate value alone can save them; use the
+>   [dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers):
+>   `--polygon-visibility 0 --collapse` (+ a circle layer in your style).
 > - **A rank-ordered cut is emptying sparse rural areas** → RAISE `--drop-gamma`
 >   (protects sparse neighborhoods).
 > - **Conversion is slow / pins one core** → it now reads the input once and
@@ -126,10 +131,23 @@ finer levels once the GSD shrinks below their size). Points are never gated.
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
 | `--line-visibility` | `2.0` | × GSD (min bbox diagonal) | **bigger = sparser** |
-| `--polygon-visibility` | `4.0` | × GSD (min bbox diagonal) | **bigger = sparser** |
+| `--polygon-visibility` | `2.0` | × GSD (min bbox diagonal) | **bigger = sparser** |
 
 Bigger factor ⇒ higher bar ⇒ more small features dropped at coarse levels ⇒
 **sparser**. Smaller ⇒ more small features kept ⇒ **denser**.
+
+The polygon default was retuned 4.0 → 2.0 in the 2026-07-15 coarse-zoom
+sweep (#259, `corpus/SWEEPS.md` Decision 6). The write stage independently
+drops any polygon whose *simplified* geometry falls below the level
+tolerance (`--simplify-factor × GSD` — an effective ~2 × GSD survival bar
+on real-world shapes), so a 4 × GSD eligibility gate was strictly stricter
+than what could ever be written and only starved coarse zooms: on Germany
+buildings, 4.0 → 2.0 gives 2.7–4.6× more features at z8–z12 and starts the
+pyramid one zoom coarser, for +13 % file size and +7 % conversion time.
+Values *below* 2.0 change little on their own — the extra eligible features
+are almost all RDP-collapsed at write time — **unless** `--collapse` keeps
+them as representative points (see the
+[dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)).
 
 ⚠️ **Interaction warning — the gate is multiplied by the GSD.** So it moves with
 `--gsd-base` and with zoom. A polygon visible at one level can be gated out one
@@ -141,14 +159,17 @@ be gated out even if its cell is otherwise empty.
 
 When **every** feature is culled at a coarse level — the normal outcome for
 datasets of small features at world zooms (e.g. country-scale buildings with
-`--min-zoom 0`: no building's bbox clears `4 × gsd(z0)` ≈ 156 km) — that level
+`--min-zoom 0`: no building's bbox clears `2 × gsd(z0)` ≈ 78 km) — that level
 is **omitted from the output and the remaining levels are renumbered** (spec
 §7.3), instead of failing the conversion. You will see a `WARN` like:
 
 ```
-omitting 4 empty level(s) [0, 1, 2, 3] spanning GSD 39135.76–4891.97 m: none of
-the 59032924 input feature(s) are visible at those scales (visibility gates /
-density budget); the output pyramid starts at GSD 2445.98 m (zoom 4)
+omitting 6 empty level(s) [0, 1, 2, 3, 4, 5] spanning GSD 39135.76–1222.99 m:
+none of the 59032924 input feature(s) are visible at those scales (visibility
+gates / density budget); the output pyramid starts at GSD 611.50 m (zoom 6).
+To populate coarse levels, lower --polygon-visibility/--line-visibility, or
+pass --collapse to keep sub-GSD polygons as representative points (see
+docs/OVERVIEW_TUNING.md)
 ```
 
 plus a `note:` line under the CLI level table, and the omitted levels are
@@ -161,9 +182,12 @@ level tolerance). PMTiles export of a clamped file starts at the coarsest
 
 This is expected behavior, not data loss: the features are simply not
 representable at those scales. To *force* coarse levels to be populated,
-lower the gates (`--polygon-visibility` / `--line-visibility`) or coarsen the
-ladder (`--gsd-base`). If **no** level has any rows at all (empty input, or an
-empty `--bbox` selection), the conversion still fails with a hard error.
+lower the gates (`--polygon-visibility` / `--line-visibility`), coarsen the
+ladder (`--gsd-base`), or — for dense small-polygon layers — use the
+[dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)
+(`--polygon-visibility 0 --collapse`). If **no** level has any rows at all
+(empty input, or an empty `--bbox` selection), the conversion still fails
+with a hard error.
 
 ---
 
@@ -224,6 +248,70 @@ least likely case to have acquired a self-intersection; geometry validity is
 not an overviews conformance requirement (OVERVIEWS_SPEC §2). Candidates at
 or below the cap are validated (and repaired) exactly as before. A skipped
 check is counted and summarized at the end of conversion at info level.
+
+---
+
+## Country-scale dot fill for dense polygon layers
+
+A dense layer of *small* polygons (buildings, parcels, field boundaries)
+renders an **empty country view** with type-preserving defaults, no matter
+how the gates are tuned. Two independent mechanisms cull sub-GSD polygons
+at coarse levels:
+
+1. the **visibility gate** (assign time): ineligible below
+   `--polygon-visibility × GSD`;
+2. the **write-time collapse** (simplify time): even an eligible polygon is
+   dropped when its simplified geometry falls below the level tolerance —
+   at z4 the tolerance is ≈ 2.4 km, and no building survives that.
+
+A 20 m building is therefore unrepresentable *as a polygon* at z0–z8; the
+per-feature fix is representing it as something else. That is what
+**`--collapse`** does (spec Q4, opt-in): a below-tolerance polygon becomes a
+**representative point** instead of vanishing. Combining it with a zero
+gate turns the coarse levels into a cell-winner/budget-bounded **dot
+field**:
+
+```bash
+gpq-tiles overview buildings.parquet buildings_overview.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --polygon-visibility 0 --collapse
+
+# One-shot to PMTiles: add tippecanoe's tile cap — uncapped coarse dot
+# tiles on a country-scale layer reach several MB (Germany z6: 12 MB),
+# far past renderer norms; the cap drop-to-fits them to ~500 KB.
+# On multi-GB inputs also pass --profile bounded: the recipe buffers
+# the (now much larger) coarse levels in RAM under the default speed
+# profile (Germany peak RSS 15 -> 29 GB without it).
+gpq-tiles tiles buildings.parquet buildings.pmtiles \
+  --min-zoom 0 --max-zoom 14 \
+  --polygon-visibility 0 --collapse --max-tile-size 500K \
+  --profile bounded
+```
+
+Measured on Overture Germany buildings (59M footprints, z0–14,
+`corpus/SWEEPS.md` Decision 6): every level populates (z0 = 581 dots,
+z4 = 128,886, z6 = 1,074,540), coarse levels z6–z13 land exactly on the
+[density budget](#density-budget---drop-rate---drop-gamma---no-density-drop)
+ladder `N / 1.65^(14−z)` with the gamma-fair spatial spread (Ruhr/Berlin
+visibly denser at z6, rural areas protected), and the overview file grows
++31 % (11.9 → 15.6 GB) with +40 % conversion time. On the Moldova field
+corpus the same recipe costs **+0.3 %** file size.
+
+Two caveats:
+
+- **Style the points.** A `fill` layer silently ignores Point features — a
+  fill-only style renders the same empty country view you started with.
+  Add a small `circle` layer filtered to `["==", "$type", "Point"]` (see
+  `docs/demo/viewer.html`).
+- **Geometry type changes mid-zoom.** The output's `geometry_types` lists
+  the union (e.g. `["Point","Polygon"]`), per spec §7.5; collapse is
+  opt-in precisely so renderers are never surprised by default
+  (spec Q4). Files record the collapse in the `generalization` provenance.
+
+`--drop-rate` / `--drop-gamma` need **no** retuning for this recipe: the
+coarse levels are capped by the existing budget ladder, which is what
+shapes the dot density (the #250 demo's `--drop-rate 1.3` only inflated
+mid-zoom row counts by +13 % without changing the coarse fill).
 
 ---
 
@@ -734,6 +822,7 @@ that. If you force `speed` on a large partitioning run, watch peak RSS.
 | Wrong roads survive (residential instead of highways) at coarse zoom | add `--class-rank road_class:…` or rely on auto-detect (don't pass `--no-auto-rank`) |
 | Coarse level files are too large / slow | RAISE the thinning factors and/or `--simplify-factor`; or LOWER `--gsd-base` |
 | Small buildings vanish too early | LOWER `--polygon-visibility`; or `--collapse` to keep them as points |
+| Country-scale view of a dense building/parcel layer is empty | `--polygon-visibility 0 --collapse` + a circle layer for points ([dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)); cap tiles with `--max-tile-size 500K` on export |
 | Whole map uniformly too sparse or too dense | move `--gsd-base` (up = denser, down = sparser) instead of tuning each family |
 | Mid zooms have far more features than tippecanoe / duplicating files too large | RAISE `--drop-rate` (density budget); or `--no-density-drop` to turn it off |
 | Density cut is stripping sparse rural areas to keep cities | RAISE `--drop-gamma` (sparse-area protection) |

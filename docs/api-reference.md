@@ -41,7 +41,7 @@ Commands:
 | `--coalesce-max-level-rows <N>` | `2000000` | Per-level candidate-line memory guard |
 | `--point-thinning <F>` | `4.0` (`16.0` with `--cluster`) | Point grid cell size = factor × GSD |
 | `--line-thinning <F>` / `--polygon-thinning <F>` | `1.0` / `1.0` | Line/polygon grid cell size = factor × GSD |
-| `--line-visibility <F>` / `--polygon-visibility <F>` | `2.0` / `4.0` | Min bbox diagonal in GSD multiples (hard drop below) |
+| `--line-visibility <F>` / `--polygon-visibility <F>` | `2.0` / `2.0` | Min bbox diagonal in GSD multiples (hard drop below) |
 | `--drop-rate <F>` | `1.65` | Density budget: each coarser level keeps 1/rate of the next finer budget |
 | `--drop-gamma <F>` | `1.5` | Spatial fairness of the budget cut (sparse-area protection) |
 | `--no-density-drop` | off | Disable the density budget entirely |
@@ -173,7 +173,7 @@ report = overview(
     line_thinning: float = 1.0,
     polygon_thinning: float = 1.0,
     line_visibility: float = 2.0,
-    polygon_visibility: float = 4.0,
+    polygon_visibility: float = 2.0,
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
     density_drop: bool = True,

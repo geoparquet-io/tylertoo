@@ -39,7 +39,7 @@ def overview(
     line_thinning: float = 1.0,
     polygon_thinning: float = 1.0,
     line_visibility: float = 2.0,
-    polygon_visibility: float = 4.0,
+    polygon_visibility: float = 2.0,
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
     density_drop: bool = True,

@@ -37,7 +37,7 @@
 //! output is empty, whereas this path decides level omission from the winner
 //! table before simplification. The two only differ when **every** winner of
 //! a level degenerates during simplification — rare under the default knobs
-//! (the assign visibility gates, 2–4 × GSD, are stricter than the simplify
+//! (the assign visibility gates, 2 × GSD, are stricter than the simplify
 //! drop gate at 1 × GSD) but real on dirty data (#211: a sliver with a huge
 //! bbox passes the gate, then collapses). When it happens the writer skips
 //! the level ([`LevelWriteOutcome::SkippedEmpty`]) and this driver records it

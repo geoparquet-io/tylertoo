@@ -56,7 +56,10 @@ gpio convert geojson germany-buildings.parquet \
 4. **default vs tuned is a quality knob, not speed.** The tuned run is
    deliberately larger and slower — `--polygon-visibility 2.0` and
    `--drop-rate 1.3` keep *more* features at coarse zoom for better fill (the
-   swipe above). It is not a performance setting.
+   swipe above). It is not a performance setting. (Since #259,
+   `--polygon-visibility 2.0` **is** the shipped default, and the
+   recommended country-view recipe is `--polygon-visibility 0 --collapse` —
+   see [Overview tuning](OVERVIEW_TUNING.md).)
 
 Full methodology, fairness notes, and hosting instructions are in the
 [demo directory on GitHub](https://github.com/geoparquet-io/gpq-tiles/tree/main/demo).
