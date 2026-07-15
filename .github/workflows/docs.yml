@@ -38,7 +38,7 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
 
       - name: Build documentation
-        run: uvx --with mkdocs-material mkdocs build
+        run: uvx --with mkdocs-material mkdocs build --strict
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

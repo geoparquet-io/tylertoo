@@ -9,7 +9,7 @@ git config core.hooksPath .githooks
 cargo build && cargo check
 ```
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for the day-to-day workflow,
+See [DEVELOPMENT.md](https://github.com/geoparquet-io/gpq-tiles/blob/main/DEVELOPMENT.md) for the day-to-day workflow,
 Python setup, and how to run every CI gate locally.
 
 ## Commit Convention
@@ -34,7 +34,7 @@ Python setup, and how to run every CI gate locally.
    --all-features -- -D warnings`, `cargo machete`, targeted tests,
    and (for Python changes) the ruff/mypy/stubtest/vulture/xenon/pytest
    suite via `uv run`. The full list with commands:
-   [DEVELOPMENT.md → CI Gates](DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
+   [DEVELOPMENT.md → CI Gates](https://github.com/geoparquet-io/gpq-tiles/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
 3. Submit the PR; never bypass the pre-commit hooks (`--no-verify` is
    forbidden).
 

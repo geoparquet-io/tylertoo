@@ -2,17 +2,17 @@
 
 Design decisions and tippecanoe divergences for the **current** system.
 Historical material (the removed per-tile pipeline, execution plans,
-session triage) lives in [`context/archive/`](./archive/README.md).
+session triage) lives in [`context/archive/`](https://github.com/geoparquet-io/gpq-tiles/blob/main/context/archive/README.md).
 
 Related canonical documents:
 
-- **Format**: [`context/OVERVIEWS_SPEC.md`](./OVERVIEWS_SPEC.md) — the
+- **Format**: [`context/OVERVIEWS_SPEC.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/context/OVERVIEWS_SPEC.md) — the
   `geo:overviews` draft spec (single source of truth for the file format).
-- **Tuning**: [`docs/OVERVIEW_TUNING.md`](../docs/OVERVIEW_TUNING.md) — every
+- **Tuning**: [`docs/OVERVIEW_TUNING.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/docs/OVERVIEW_TUNING.md) — every
   generalization knob, its default, and its direction.
-- **Benchmarks**: [`benchmarks/overview/RESULTS.md`](../benchmarks/overview/RESULTS.md)
+- **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/RESULTS.md)
   (storage/access numbers) and
-  [`benchmarks/overview/PROFILE.md`](../benchmarks/overview/PROFILE.md)
+  [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/PROFILE.md)
   (performance methodology + history).
 
 ## Decision Record: Legacy Tiles Pipeline Removed (#177, 2026-07-03)
@@ -40,7 +40,7 @@ What survives:
 
 Consequences: #102 (row-group bbox filtering for the tiles pipeline) lost
 its remaining scope; the legacy pipeline's architecture notes were moved to
-[`context/archive/LEGACY_TILES_ARCHITECTURE.md`](./archive/LEGACY_TILES_ARCHITECTURE.md).
+[`context/archive/LEGACY_TILES_ARCHITECTURE.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/context/archive/LEGACY_TILES_ARCHITECTURE.md).
 
 ## Design Principles
 
