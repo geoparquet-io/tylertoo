@@ -22,7 +22,8 @@ multi-GB inputs, measured on current `main`.
 - **Convert:** `gpq-tiles overview <in> <out> --min-zoom 0 --max-zoom 14`,
   default knobs, wall/RSS/CPU from `/usr/bin/time -v`.
 - Timing is measured reading **local** files. Reading over the network
-  adds re-fetch cost that inflates wall time — see
+  moves ≈1× the object's bytes (the disk spill keeps re-reads local) but
+  still adds fetch latency and a second-pass disk read — see
   [Remote selective read](#remote-selective-read) below.
 
 ## Convert throughput by geometry type
@@ -90,20 +91,36 @@ gpq-tiles overview \
 fetches **52 MB — 0.74 % of the file — in 0.83 s**. No other tiler does
 selective remote extraction like this.
 
-The caveat is the mirror image: a **full-file** remote convert re-fetches
-the input, because the streaming engine re-reads it per level and large
-selections overflow the 256 MiB chunk cache. Measured bytes moved ÷ file
-size, full file vs bbox:
+A **full-file** remote convert re-reads the input several times (the
+assign pass, the coarse-level write pass, and a finest-level canonical
+re-read). Historically each pass re-fetched the input over the network,
+so bytes moved ÷ file size climbed well above 1×. Two fixes closed that
+gap:
 
-| call | bytes moved | ÷ file |
-|---|---:|---:|
-| points-nyc (full) | 30.8 MB | 1.00× |
-| germany-segments (full) | 6.82 GB | 2.67× |
-| germany-buildings (full) | 18.1 GB | 2.59× |
-| fieldmaps-adm4 (full) | 278 GB | 96× |
-| germany-buildings `--bbox` | 52 MB | **0.0074×** |
+| stage | fieldmaps-adm4 (2.90 GB, z0–14) | cause / fix |
+|---|---:|---|
+| before #261 | **96×** | oversized geometry chunk evicted-on-insert, re-fetched per page |
+| after [#261](https://github.com/geoparquet-io/gpq-tiles/issues/261) | **3.0×** | chunk cache sized to the largest row group — no re-fetch *within* a pass, but each pass still re-fetched |
+| after [#219](https://github.com/geoparquet-io/gpq-tiles/issues/219) | **≈1×** | fetched chunks spilled to local disk; later passes drain from disk, so each byte crosses the network once |
 
-So `--bbox` extraction is the remote superpower; for a *whole-file*
-remote conversion, download first (`aws s3 cp` + local convert) or expect
-the re-fetch. Reducing that full-file cost is tracked in
-[#261](https://github.com/geoparquet-io/gpq-tiles/issues/261).
+The ≈1× bound is verified deterministically by an input-level regression
+test (`multi_pass_reads_move_object_once`); a full-corpus wall-clock
+re-measurement (segments/buildings over `http://`) is the pending
+follow-up. `--bbox` extraction remains the remote superpower — pruned row
+groups are never fetched at all (germany-buildings `--bbox`: 52 MB,
+**0.0074×** of the file), and the disk spill only ever holds the chunks
+that would have been fetched once anyway.
+
+The residual full-file cost is now local, not network: the passes still
+re-*read* the spilled bytes from disk (seek latency) and re-*decode*
+them. For latency-sensitive whole-file conversions, downloading first
+(`aws s3 cp` + local convert) still avoids the second-pass disk read; the
+disk spill lives under `TMPDIR`, so point that at fast local disk (not a
+small tmpfs) when converting large remote files.
+
+The converter makes this actionable at runtime: a whole-file remote
+convert of an object ≥ 1 GiB logs a one-line warning
+([#267](https://github.com/geoparquet-io/gpq-tiles/issues/267)) steering
+you to `--bbox` or a download-first workflow and reminding you to place
+`$TMPDIR` on fast disk. `--bbox` extracts stay quiet — they already fetch
+only a fraction of the object.

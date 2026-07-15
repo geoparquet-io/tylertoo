@@ -177,6 +177,9 @@ pub(crate) fn convert_streaming_strategy(
     if selected_row_groups.is_some() {
         log::info!("bbox filter: reading {row_groups_read}/{row_groups_total} input row groups");
     }
+    // #267: nudge toward --bbox / download-first for a large whole-file remote
+    // convert (quiet for local inputs and effective bbox extracts).
+    super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total);
     drop(builder);
 
     if input_schema
