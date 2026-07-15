@@ -20,15 +20,25 @@
 //! object's bytes. [`InputSource::fetch_stats`] exposes request/byte
 //! counters so callers (and tests) can verify that property.
 //!
-//! The streaming pipeline re-reads the input across two passes. Each
-//! [`InputSource::open`] of a remote source reuses a cached parsed footer,
-//! and fetched column chunks stay in a bounded LRU-ish cache
-//! (insertion-order eviction), so within a pass the reader never re-fetches a
-//! chunk. The cache budget is sized to the largest row group's working set
-//! (floored at [`remote::CHUNK_CACHE_MAX_BYTES`]) so that a row group larger
-//! than the floor does not thrash — the fix for the per-page re-fetch of an
-//! oversized column chunk (issue #261). See `docs/remote-reads.md` for the
-//! fetch-count implications.
+//! The streaming pipeline re-reads the input across several passes (assign,
+//! coarse levels, finest streamed last). Each [`InputSource::open`] of a
+//! remote source reuses a cached parsed footer, and fetched column chunks are
+//! served from the cheapest tier that holds them:
+//!
+//! - **L1**, a bounded in-memory cache (insertion-order eviction) sized to the
+//!   largest row group's working set (floored at
+//!   [`remote::CHUNK_CACHE_MAX_BYTES`]), so a row group larger than the floor
+//!   does not thrash — the fix for the per-page re-fetch of an oversized column
+//!   chunk (issue #261);
+//! - **L2**, a local on-disk spill of every chunk ever fetched, so a chunk
+//!   evicted from L1 between passes is drained from local disk instead of the
+//!   network — this bounds remote traffic to ≈1× the object regardless of pass
+//!   or level count (issue #219; without it a full-file remote convert moved
+//!   ~3× the object);
+//! - **L3**, one network range request, taken only on the first touch of a
+//!   chunk.
+//!
+//! See `docs/remote-reads.md` for the fetch-count implications.
 //!
 //! Remote support is compiled behind the `remote` cargo feature; the CLI and
 //! Python bindings enable it by default. Without the feature, URL inputs
@@ -272,6 +282,8 @@ impl ChunkReader for InputReader {
 pub(crate) mod remote {
     //! Remote object-store backend (`remote` feature).
 
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::ops::Range;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -360,6 +372,10 @@ pub(crate) mod remote {
         shared: Arc<SharedState>,
         metadata: OnceLock<ArrowReaderMetadata>,
         cache: Arc<Mutex<ChunkCache>>,
+        /// On-disk overflow for fetched column chunks (issue #219), shared by
+        /// every reader clone across the pipeline's passes so a chunk fetched
+        /// in one pass is drained from local disk in the next.
+        spill: Arc<Mutex<DiskSpill>>,
         /// Floor for the chunk-cache eviction budget. [`Self::open_builder`]
         /// raises the live cap to the largest row group's working set but
         /// never below this. Production uses [`CHUNK_CACHE_MAX_BYTES`]; tests
@@ -435,6 +451,7 @@ pub(crate) mod remote {
                 shared: Arc::new(SharedState::default()),
                 metadata: OnceLock::new(),
                 cache: Arc::new(Mutex::new(ChunkCache::new(cap_base))),
+                spill: Arc::new(Mutex::new(DiskSpill::default())),
                 cap_base,
             })
         }
@@ -516,6 +533,7 @@ pub(crate) mod remote {
                 size: self.size,
                 shared: Arc::clone(&self.shared),
                 cache: Arc::clone(&self.cache),
+                spill: Arc::clone(&self.spill),
             }
         }
 
@@ -638,6 +656,98 @@ pub(crate) mod remote {
     /// batch (issue #261). This constant is just the small-input floor.
     const CHUNK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+    /// On-disk overflow for fetched column chunks (issue #219).
+    ///
+    /// The in-memory [`ChunkCache`] holds only one row group's working set, so
+    /// across the streaming pipeline's multiple passes (assign, coarse levels,
+    /// finest streamed last) a chunk evicted from memory is otherwise
+    /// re-fetched over the network — paying remote bandwidth 2–3× for the bulk
+    /// of the file (measured 3.0× on fieldmaps-adm4). Spilling every fetched
+    /// chunk to a local temp file and draining re-reads from disk bounds remote
+    /// traffic to ≈1× the object, regardless of pass or level count.
+    ///
+    /// The temp file is anonymous ([`tempfile::tempfile`]): it is unlinked on
+    /// creation, so it never appears in the filesystem and the OS reclaims its
+    /// space when the last handle drops. Its directory follows `TMPDIR`; point
+    /// that at real disk if the default temp dir is a small tmpfs.
+    ///
+    /// Best-effort: if the temp file cannot be created or an I/O op fails, the
+    /// spill disables itself (logging once) and the reader falls back to
+    /// network re-fetch — correctness is unaffected, only the re-fetch cost
+    /// returns. Access is serialized by the enclosing `Mutex`; the pipeline's
+    /// passes read the input sequentially, so lock contention is negligible.
+    #[derive(Debug, Default)]
+    struct DiskSpill {
+        /// Lazily created on the first spilled chunk; `None` until then, or
+        /// left `None` after a spill error disables the cache.
+        file: Option<File>,
+        /// `chunk.start` → (offset within the spill file, byte length).
+        index: std::collections::HashMap<u64, (u64, usize)>,
+        /// Append cursor: total bytes written to the spill file so far.
+        write_offset: u64,
+        /// Set after a create/read/write error so we stop touching disk.
+        disabled: bool,
+    }
+
+    impl DiskSpill {
+        /// Serve a previously spilled chunk, if present. `None` means "not
+        /// spilled — fetch it over the network"; a read error disables the
+        /// spill and also returns `None` so the caller falls back to fetch.
+        fn get(&mut self, chunk_start: u64) -> Option<Bytes> {
+            if self.disabled {
+                return None;
+            }
+            let (offset, len) = *self.index.get(&chunk_start)?;
+            let file = self.file.as_mut()?;
+            let mut buf = vec![0u8; len];
+            match file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read_exact(&mut buf))
+            {
+                Ok(()) => Some(Bytes::from(buf)),
+                Err(e) => {
+                    log::warn!("input spill read failed ({e}); falling back to network re-fetch");
+                    self.disabled = true;
+                    None
+                }
+            }
+        }
+
+        /// Record a freshly fetched chunk on disk for later passes. No-op if
+        /// the spill is disabled or already holds this chunk; a create/write
+        /// error disables the spill.
+        fn put(&mut self, chunk_start: u64, data: &Bytes) {
+            if self.disabled || self.index.contains_key(&chunk_start) {
+                return;
+            }
+            if self.file.is_none() {
+                match tempfile::tempfile() {
+                    Ok(f) => self.file = Some(f),
+                    Err(e) => {
+                        log::warn!(
+                            "could not create input spill file ({e}); remote re-reads \
+                             will re-fetch over the network"
+                        );
+                        self.disabled = true;
+                        return;
+                    }
+                }
+            }
+            let offset = self.write_offset;
+            let file = self.file.as_mut().expect("spill file present");
+            if let Err(e) = file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| file.write_all(data))
+            {
+                log::warn!("input spill write failed ({e}); falling back to network re-fetch");
+                self.disabled = true;
+                return;
+            }
+            self.write_offset += data.len() as u64;
+            self.index.insert(chunk_start, (offset, data.len()));
+        }
+    }
+
     /// Per-reader cache of whole column chunks, insertion-ordered for
     /// eviction. This is the "buffered range-fetch adapter": the page reader
     /// asks for a column chunk's bytes in many small pieces (a thrift page
@@ -682,6 +792,7 @@ pub(crate) mod remote {
         size: u64,
         shared: Arc<SharedState>,
         cache: Arc<Mutex<ChunkCache>>,
+        spill: Arc<Mutex<DiskSpill>>,
     }
 
     impl RemoteReader {
@@ -712,15 +823,38 @@ pub(crate) mod remote {
             (start >= chunk.start && end <= chunk.end).then(|| chunk.clone())
         }
 
-        /// Bytes of a whole column chunk, from cache or one range request.
+        /// Bytes of a whole column chunk, served from the cheapest tier that
+        /// holds it: the in-memory cache (L1), the local disk spill (L2, #219),
+        /// or a single network range request (L3). A byte therefore crosses the
+        /// network at most once across the pipeline's passes.
         fn chunk_data(&self, chunk: &Range<u64>) -> Result<Bytes, ParquetError> {
+            // L1: in-memory cache (hot, one row group's working set).
             {
                 let cache = self.cache.lock().expect("chunk cache lock");
                 if let Some((_, data)) = cache.entries.get(&chunk.start) {
                     return Ok(data.clone());
                 }
             }
+            // L2: local disk spill. A hit avoids re-fetching over the network on
+            // a later pass; re-warm L1 so same-pass touches stay in memory.
+            if let Some(data) = self.spill.lock().expect("spill lock").get(chunk.start) {
+                self.cache_insert(chunk, &data);
+                return Ok(data);
+            }
+            // L3: network. Fetch once, then spill the bytes for later passes.
             let data = self.fetch(chunk.clone())?;
+            self.spill
+                .lock()
+                .expect("spill lock")
+                .put(chunk.start, &data);
+            self.cache_insert(chunk, &data);
+            Ok(data)
+        }
+
+        /// Insert a chunk into the in-memory L1 cache, evicting in insertion
+        /// order until the working-set budget (`cap`, sized to the largest row
+        /// group in [`RemoteSource::open_builder`]) is respected.
+        fn cache_insert(&self, chunk: &Range<u64>, data: &Bytes) {
             let mut cache = self.cache.lock().expect("chunk cache lock");
             if !cache.entries.contains_key(&chunk.start) {
                 cache.total += data.len() as u64;
@@ -737,7 +871,6 @@ pub(crate) mod remote {
                     }
                 }
             }
-            Ok(data)
         }
 
         /// Exact-range read for [`parquet::file::reader::ChunkReader::get_bytes`].
@@ -1110,6 +1243,55 @@ mod tests {
                 object_size,
                 stats.bytes_fetched as f64 / object_size as f64,
             );
+        }
+
+        /// #219: across multiple passes over a remote input, each byte must
+        /// move over the network at most once. The streaming converter reads
+        /// the input several times (assign pass, coarse-level pass, finest
+        /// streamed last); the in-memory chunk cache holds only one row group's
+        /// working set, so without a local spill each pass re-fetches the bulk
+        /// of the file (measured 3.0× on fieldmaps-adm4). The disk spill drains
+        /// re-reads from local disk, bounding remote traffic to ≈1× the object
+        /// regardless of pass count. With a `cap_base` far below one row group
+        /// the in-memory cache cannot bridge passes, so only the spill keeps the
+        /// ratio down.
+        #[test]
+        fn multi_pass_reads_move_object_once() {
+            let bytes = multi_row_group_wide_parquet(4096, 3);
+            let object_size = bytes.len() as u64;
+            let source = super::super::test_memory_source_with_cap(bytes, "spill.parquet", 64);
+
+            // Three full in-order passes, mimicking the converter's assign +
+            // coarse-level + finest-streamed-last reads.
+            for _ in 0..3 {
+                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+                assert_eq!(rows, 4096 * 3);
+            }
+
+            let stats = source.fetch_stats().unwrap();
+            assert_eq!(stats.object_size, object_size);
+            // Every column chunk is fetched over the network exactly once; the
+            // second and third passes drain from the local spill. Pre-spill,
+            // three passes moved ≈3× the object.
+            assert!(
+                stats.bytes_fetched <= object_size + object_size / 2,
+                "three passes moved {} bytes for a {}-byte object ({:.1}×) — the \
+                 disk spill must serve re-reads locally (#219)",
+                stats.bytes_fetched,
+                object_size,
+                stats.bytes_fetched as f64 / object_size as f64,
+            );
+
+            // No column-chunk range is fetched twice: re-touches hit the spill.
+            let fetched = source.fetched_ranges().unwrap();
+            let mut seen = std::collections::HashSet::new();
+            for r in &fetched {
+                assert!(
+                    seen.insert((r.start, r.end)),
+                    "range {r:?} fetched over the network more than once (#219)"
+                );
+            }
         }
 
         /// Like [`two_column_multipage_parquet`] but split into `groups` row
