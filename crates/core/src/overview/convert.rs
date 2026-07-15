@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -387,6 +387,14 @@ pub struct ConvertOptions {
     /// identical either way. Default `None` (full-extent conversion,
     /// byte-identical output to a build without this option).
     pub bbox: Option<[f64; 4]>,
+    /// Directory for the remote-input disk spill (#219 / #272). A remote
+    /// convert stages every fetched column chunk in an anonymous temp file
+    /// (growing to ≈1× the touched input bytes) so later passes re-read
+    /// from local disk instead of the network. `None` (default) places it
+    /// under the process temp dir (`$TMPDIR`); set this to use a roomier
+    /// or faster volume instead. The directory must exist (validated up
+    /// front). Local inputs never spill, so this has no effect on them.
+    pub spill_dir: Option<PathBuf>,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -427,6 +435,7 @@ impl Default for ConvertOptions {
             coalesce_max_level_rows: DEFAULT_COALESCE_MAX_LEVEL_ROWS,
             coalesce_junction_angle: DEFAULT_JUNCTION_ANGLE_DEG,
             bbox: None,
+            spill_dir: None,
         }
     }
 }
@@ -766,6 +775,17 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
             "in-flight-batches must be >= 1".to_string(),
         ));
     }
+    // #272: fail fast on a bad spill dir — the spill is best-effort, so a
+    // mid-convert creation failure would only surface as a silent degrade
+    // to network re-fetch.
+    if let Some(dir) = &options.spill_dir {
+        if !dir.is_dir() {
+            return Err(ConvertError::InvalidConfig(format!(
+                "spill-dir {} is not an existing directory",
+                dir.display()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -880,6 +900,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
 ) -> Result<ConvertReport, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
+    // #272: place the remote-input disk spill (#219) where the caller asked
+    // (no-op for local inputs, which never spill).
+    source.set_spill_dir(options.spill_dir.as_deref());
     // Clustering option sanity (Q4), shared by both pipelines: partitioning
     // mode cannot represent per-level counts (see the error's rationale), and
     // aggregation is meaningless without clustering.
@@ -1514,7 +1537,8 @@ pub(super) fn full_file_remote_warning(
          #219) and staged under $TMPDIR. For a region of interest pass --bbox to \
          fetch only the covering row groups (and skip the spill); otherwise \
          downloading first (e.g. `aws s3 cp`) and converting locally avoids the \
-         second-pass disk read. Point $TMPDIR at fast local disk, not a small tmpfs.",
+         second-pass disk read. Point --spill-dir (or $TMPDIR) at fast local disk \
+         with room for it, not a small tmpfs.",
         object_size as f64 / (1024.0 * 1024.0 * 1024.0),
     ))
 }
@@ -1532,6 +1556,95 @@ pub(super) fn warn_full_file_remote(
         row_groups_read,
         row_groups_total,
         object_size,
+    ) {
+        log::warn!("{msg}");
+    }
+}
+
+/// #272 spill-preflight safety margin: warn when the spill volume's free
+/// space is below the projected spill size plus 1/20th (5%) of it — spill
+/// bookkeeping is exact but the volume is shared with everything else the
+/// process (and host) writes during the convert.
+const SPILL_MARGIN_DENOM: u64 = 20;
+
+/// #272 decision + message (pure, so it is unit-testable without touching
+/// a filesystem). Returns the warning to emit when the projected input
+/// spill (≈ the selected input bytes, see
+/// [`crate::input::selected_compressed_bytes`]) plus a 5% safety margin
+/// exceeds `available_bytes` on the spill volume, or `None` when it fits.
+pub(super) fn spill_space_warning(
+    estimated_spill_bytes: u64,
+    available_bytes: u64,
+    spill_dir: &Path,
+) -> Option<String> {
+    let need = estimated_spill_bytes + estimated_spill_bytes / SPILL_MARGIN_DENOM;
+    if available_bytes >= need {
+        return None;
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    Some(format!(
+        "projected input spill (≈{:.1} GiB — the selected input bytes are \
+         staged on local disk so later passes stay off the network, #219) may \
+         not fit: {} has {:.1} GiB free ({:.1} GiB short, including a 5% \
+         margin). If the volume fills mid-convert the spill degrades to \
+         network re-fetch; pass --spill-dir (spill_dir) to place it on a \
+         roomier volume, or free up space first.",
+        gib(estimated_spill_bytes),
+        spill_dir.display(),
+        gib(available_bytes),
+        gib(need - available_bytes),
+    ))
+}
+
+/// #272 preflight gate over [`spill_space_warning`], with the free-space
+/// probe injected so the gating is unit-testable with a fake probe. Only a
+/// remote input spills, so for local inputs (and an empty selection) the
+/// probe is never even called; a failed probe (`None` — unsupported
+/// filesystem, permission error) stays quiet rather than crying wolf.
+pub(super) fn spill_space_check(
+    is_remote: bool,
+    estimated_spill_bytes: u64,
+    spill_dir: &Path,
+    probe: impl FnOnce(&Path) -> Option<u64>,
+) -> Option<String> {
+    if !is_remote || estimated_spill_bytes == 0 {
+        return None;
+    }
+    let available = probe(spill_dir)?;
+    spill_space_warning(estimated_spill_bytes, available, spill_dir)
+}
+
+/// Free bytes available to the current user on the volume holding `dir`
+/// (statvfs / GetDiskFreeSpaceEx via `fs4`), or `None` if the probe fails.
+/// Compiled to a stub without the `remote` feature — nothing spills there,
+/// and [`spill_space_check`] never probes for a local input.
+fn probe_available_space(dir: &Path) -> Option<u64> {
+    #[cfg(feature = "remote")]
+    {
+        fs4::available_space(dir).ok()
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Emit the #272 spill free-space preflight warning, if warranted. Thin
+/// logging wrapper over [`spill_space_check`] with the real filesystem
+/// probe; `spill_dir = None` means the process temp dir, exactly where the
+/// spill file would go.
+pub(super) fn warn_spill_space(
+    source: &InputSource,
+    estimated_spill_bytes: u64,
+    spill_dir: Option<&Path>,
+) {
+    let dir = spill_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    if let Some(msg) = spill_space_check(
+        source.is_remote(),
+        estimated_spill_bytes,
+        &dir,
+        probe_available_space,
     ) {
         log::warn!("{msg}");
     }
@@ -2462,6 +2575,76 @@ mod tests {
         assert!(
             msg.contains("4.0 GiB"),
             "nudge should state the object size: {msg}"
+        );
+    }
+
+    /// #272: the spill free-space preflight warns when the projected spill
+    /// (≈ the selected input bytes, plus a 5% safety margin) exceeds the
+    /// free space on the spill volume — naming the directory, the shortfall,
+    /// and the `--spill-dir` escape hatch.
+    #[test]
+    fn spill_space_warning_names_dir_and_shortfall() {
+        let dir = Path::new("/mnt/scratch");
+        let msg = spill_space_warning(10 << 30, 1 << 30, dir).expect("shortfall should warn");
+        assert!(
+            msg.contains("/mnt/scratch"),
+            "warning names the spill dir: {msg}"
+        );
+        assert!(
+            msg.contains("--spill-dir"),
+            "warning suggests --spill-dir: {msg}"
+        );
+        // need = 10 GiB + 5% = 10.5 GiB; available 1 GiB → 9.5 GiB short.
+        assert!(
+            msg.contains("9.5 GiB"),
+            "warning states the shortfall: {msg}"
+        );
+    }
+
+    /// #272: ample space stays quiet, and the margin boundary is exact —
+    /// available == estimated + 5% is enough, one byte less is not.
+    #[test]
+    fn spill_space_warning_quiet_with_ample_space() {
+        let dir = Path::new("/tmp");
+        assert!(spill_space_warning(1 << 30, 20 << 30, dir).is_none());
+        let est: u64 = 20 << 20;
+        let need = est + est / 20;
+        assert!(spill_space_warning(est, need, dir).is_none());
+        assert!(spill_space_warning(est, need - 1, dir).is_some());
+    }
+
+    /// #272: local inputs never spill, so the free-space probe must not
+    /// even run for them; a failed probe (None) stays quiet rather than
+    /// crying wolf; a zero estimate (empty selection) stays quiet too.
+    #[test]
+    fn spill_space_check_gating() {
+        let dir = Path::new("/tmp");
+        assert!(spill_space_check(false, 10 << 30, dir, |_| panic!(
+            "free-space probe must not run for local inputs"
+        ))
+        .is_none());
+        assert!(spill_space_check(true, 10 << 30, dir, |_| None).is_none());
+        assert!(spill_space_check(true, 0, dir, |_| Some(0)).is_none());
+        assert!(spill_space_check(true, 10 << 30, dir, |_| Some(1)).is_some());
+    }
+
+    /// #272: a configured spill dir must exist — fail fast at option
+    /// validation instead of silently degrading to network re-fetch when
+    /// the spill file cannot be created mid-convert.
+    #[test]
+    fn validate_options_rejects_missing_spill_dir() {
+        let opts = ConvertOptions {
+            spill_dir: Some(std::path::PathBuf::from(
+                "/nonexistent/gpq-tiles-spill-dir-272",
+            )),
+            ..Default::default()
+        };
+        let err = validate_options(&opts).expect_err("missing spill dir must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("spill-dir"), "error names the option: {msg}");
+        assert!(
+            msg.contains("/nonexistent/gpq-tiles-spill-dir-272"),
+            "error names the path: {msg}"
         );
     }
 

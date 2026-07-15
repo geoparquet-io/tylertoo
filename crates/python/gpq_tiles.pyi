@@ -3,6 +3,7 @@
 # Kept honest by CI: `python -m mypy.stubtest gpq_tiles` verifies these
 # signatures against the compiled module on every PR. If you change a
 # #[pyo3(signature = ...)] in crates/python/src/lib.rs, update this file.
+from pathlib import Path
 from typing import Any
 
 __all__ = ["convert", "export_pmtiles", "overview", "validate"]
@@ -56,6 +57,7 @@ def overview(
     bbox: tuple[float, float, float, float] | None = None,
     profile: str = "auto",
     in_flight_batches: int = 4,
+    spill_dir: str | Path | None = None,
 ) -> dict[str, Any]: ...
 def export_pmtiles(
     input: str,

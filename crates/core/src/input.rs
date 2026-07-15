@@ -217,6 +217,42 @@ impl InputSource {
             InputSource::Remote(r) => Some(r.fetched_ranges()),
         }
     }
+
+    /// Place the remote-input disk spill (#219) in `dir` instead of the
+    /// process temp dir (`$TMPDIR`) — issue #272. No-op for local inputs,
+    /// which never spill. Call before reading: chunks already spilled stay
+    /// in the previously created file; only the spill-file creation (lazy,
+    /// on the first spilled chunk) honors the directory.
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
+    pub fn set_spill_dir(&self, dir: Option<&Path>) {
+        #[cfg(feature = "remote")]
+        if let InputSource::Remote(r) = self {
+            r.set_spill_dir(dir);
+        }
+    }
+}
+
+/// Sum of the compressed byte sizes of the selected input row groups — the
+/// bytes a remote convert will touch, and therefore the projected size of
+/// the disk spill (#219): every touched chunk is staged locally exactly
+/// once, so the spill grows to ≈ this number (issue #272 free-space
+/// preflight). `None` selects every row group (a full-file read); indices
+/// out of range are ignored. Single-file shape on purpose (metadata +
+/// selection → bytes): a multi-partition source sums it across parts.
+pub fn selected_compressed_bytes(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    selected_row_groups: Option<&[usize]>,
+) -> u64 {
+    let group_bytes = |i: usize| -> u64 {
+        metadata
+            .row_groups()
+            .get(i)
+            .map_or(0, |rg| rg.compressed_size().max(0) as u64)
+    };
+    match selected_row_groups {
+        None => (0..metadata.num_row_groups()).map(group_bytes).sum(),
+        Some(selected) => selected.iter().map(|&i| group_bytes(i)).sum(),
+    }
 }
 
 /// Return the URL scheme of `input` if it is shaped like `scheme://rest`.
@@ -285,6 +321,7 @@ pub(crate) mod remote {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::ops::Range;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -537,6 +574,14 @@ pub(crate) mod remote {
             }
         }
 
+        /// Place the disk spill's (anonymous) file in `dir` — issue #272,
+        /// see [`InputSource::set_spill_dir`]. Shared by every reader clone.
+        ///
+        /// [`InputSource::set_spill_dir`]: super::InputSource::set_spill_dir
+        pub(crate) fn set_spill_dir(&self, dir: Option<&Path>) {
+            self.spill.lock().expect("spill lock").dir = dir.map(Path::to_path_buf);
+        }
+
         /// Snapshot of the fetch counters.
         pub fn fetch_stats(&self) -> FetchStats {
             FetchStats {
@@ -687,6 +732,10 @@ pub(crate) mod remote {
         write_offset: u64,
         /// Set after a create/read/write error so we stop touching disk.
         disabled: bool,
+        /// Directory for the (anonymous) spill file — `--spill-dir`, issue
+        /// #272. `None` follows the process temp dir (`$TMPDIR`). Honored
+        /// at file creation, i.e. on the first spilled chunk.
+        dir: Option<PathBuf>,
     }
 
     impl DiskSpill {
@@ -721,12 +770,22 @@ pub(crate) mod remote {
                 return;
             }
             if self.file.is_none() {
-                match tempfile::tempfile() {
+                let created = match self.dir.as_deref() {
+                    Some(d) => tempfile::tempfile_in(d),
+                    None => tempfile::tempfile(),
+                };
+                match created {
                     Ok(f) => self.file = Some(f),
                     Err(e) => {
+                        let dir = self
+                            .dir
+                            .clone()
+                            .unwrap_or_else(std::env::temp_dir)
+                            .display()
+                            .to_string();
                         log::warn!(
-                            "could not create input spill file ({e}); remote re-reads \
-                             will re-fetch over the network"
+                            "could not create input spill file in {dir} ({e}); remote \
+                             re-reads will re-fetch over the network"
                         );
                         self.disabled = true;
                         return;
@@ -962,6 +1021,48 @@ pub(crate) mod remote {
             out[..n].copy_from_slice(&self.buf[self.buf_offset..self.buf_offset + n]);
             self.buf_offset += n;
             Ok(n)
+        }
+    }
+
+    #[cfg(test)]
+    mod spill_dir_tests {
+        use super::*;
+
+        /// #272: a configured spill directory is where the spill file is
+        /// created. The file is anonymous (unlinked on creation), so the
+        /// dir is observed through behavior: with a valid dir the put/get
+        /// roundtrip works end to end.
+        #[test]
+        fn disk_spill_writes_into_configured_dir() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut spill = DiskSpill {
+                dir: Some(dir.path().to_path_buf()),
+                ..DiskSpill::default()
+            };
+            spill.put(0, &Bytes::from_static(b"hello spill"));
+            assert_eq!(
+                spill.get(0).as_deref(),
+                Some(&b"hello spill"[..]),
+                "spill roundtrip through the configured dir"
+            );
+        }
+
+        /// #272 counterpart: a nonexistent configured dir makes file
+        /// creation fail, which disables the spill (best-effort, #219) —
+        /// proof the configured dir, not $TMPDIR, is what `put` uses.
+        #[test]
+        fn disk_spill_nonexistent_dir_disables_spill() {
+            let mut spill = DiskSpill {
+                dir: Some(std::path::PathBuf::from(
+                    "/nonexistent/gpq-tiles-spill-dir-272",
+                )),
+                ..DiskSpill::default()
+            };
+            spill.put(0, &Bytes::from_static(b"hello spill"));
+            assert!(
+                spill.get(0).is_none(),
+                "create failure must disable the spill"
+            );
         }
     }
 }
@@ -1292,6 +1393,95 @@ mod tests {
                     "range {r:?} fetched over the network more than once (#219)"
                 );
             }
+        }
+
+        /// #272: `set_spill_dir` threads through [`InputSource`] →
+        /// `RemoteSource` → `DiskSpill`. Observed through behavior: a
+        /// deliberately broken spill dir disables the spill (best-effort,
+        /// #219), so multi-pass reads degrade to per-pass network re-fetch —
+        /// proof the configured dir, not `$TMPDIR`, is what the spill uses
+        /// (with the default dir the same reads stay ≈1×, see
+        /// [`multi_pass_reads_move_object_once`]).
+        #[test]
+        fn spill_dir_reaches_disk_spill_via_source() {
+            let bytes = multi_row_group_wide_parquet(4096, 3);
+            let object_size = bytes.len() as u64;
+            let source = super::super::test_memory_source_with_cap(bytes, "spill-dir.parquet", 64);
+            source.set_spill_dir(Some(Path::new("/nonexistent/gpq-tiles-spill-dir-272")));
+
+            for _ in 0..3 {
+                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+                assert_eq!(rows, 4096 * 3);
+            }
+
+            let stats = source.fetch_stats().unwrap();
+            assert!(
+                stats.bytes_fetched >= 2 * object_size,
+                "spill disabled by the broken dir: three passes must re-fetch \
+                 (moved {} bytes for a {}-byte object) — is the configured dir \
+                 actually reaching DiskSpill?",
+                stats.bytes_fetched,
+                object_size,
+            );
+        }
+
+        /// #272 positive counterpart: with a valid caller-chosen spill dir,
+        /// multi-pass reads keep the #219 ≈1× network bound.
+        #[test]
+        fn valid_spill_dir_keeps_one_pass_bound() {
+            let bytes = multi_row_group_wide_parquet(4096, 3);
+            let object_size = bytes.len() as u64;
+            let source =
+                super::super::test_memory_source_with_cap(bytes, "spill-dir-ok.parquet", 64);
+            let dir = tempfile::tempdir().unwrap();
+            source.set_spill_dir(Some(dir.path()));
+
+            for _ in 0..3 {
+                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+                assert_eq!(rows, 4096 * 3);
+            }
+
+            let stats = source.fetch_stats().unwrap();
+            assert!(
+                stats.bytes_fetched <= object_size + object_size / 2,
+                "three passes moved {} bytes for a {}-byte object ({:.1}×) — the \
+                 spill in the configured dir must serve re-reads locally",
+                stats.bytes_fetched,
+                object_size,
+                stats.bytes_fetched as f64 / object_size as f64,
+            );
+        }
+
+        /// #272: the projected spill size is the Σ compressed bytes of the
+        /// selected row groups, straight from the parquet footer. Signature
+        /// is file-count-agnostic (metadata + selection → u64) so a
+        /// multi-partition source can sum it across parts.
+        #[test]
+        fn selected_compressed_bytes_sums_selection() {
+            let bytes = multi_row_group_wide_parquet(1024, 3);
+            let source = memory_source(bytes, "selected-bytes.parquet");
+            let builder = source.open().unwrap();
+            let md = builder.metadata();
+            let per_group: Vec<u64> = md
+                .row_groups()
+                .iter()
+                .map(|rg| rg.compressed_size() as u64)
+                .collect();
+            assert_eq!(per_group.len(), 3);
+            assert!(per_group.iter().all(|b| *b > 0));
+            assert_eq!(
+                selected_compressed_bytes(md, None),
+                per_group.iter().sum::<u64>(),
+                "no selection = whole file"
+            );
+            assert_eq!(
+                selected_compressed_bytes(md, Some(&[0, 2])),
+                per_group[0] + per_group[2],
+                "selection sums only the selected row groups"
+            );
+            assert_eq!(selected_compressed_bytes(md, Some(&[])), 0);
         }
 
         /// Like [`two_column_multipage_parquet`] but split into `groups` row

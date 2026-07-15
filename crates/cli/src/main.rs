@@ -623,6 +623,19 @@ struct ConvertTuningArgs {
         help_heading = "Memory & performance"
     )]
     in_flight_batches: usize,
+
+    /// Directory for the remote-input spill file (issues #219/#272).
+    ///
+    /// A remote convert stages every fetched column chunk in an anonymous
+    /// temp file — growing to ≈1× the touched input bytes (the whole object
+    /// for a full-file convert; only the covering row groups with --bbox) —
+    /// so later passes re-read from local disk instead of the network. By
+    /// default it lives under the process temp dir ($TMPDIR); point this at
+    /// a volume with enough room (a free-space preflight warns about a
+    /// projected shortfall). The directory must exist. Local inputs never
+    /// spill.
+    #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
+    spill_dir: Option<PathBuf>,
 }
 
 impl ConvertTuningArgs {
@@ -746,6 +759,7 @@ impl ConvertTuningArgs {
             coalesce_max_level_rows: self.coalesce_max_level_rows,
             coalesce_junction_angle: self.coalesce_junction_angle,
             bbox,
+            spill_dir: self.spill_dir.clone(),
         })
     }
 }
