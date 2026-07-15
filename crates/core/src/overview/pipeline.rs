@@ -44,7 +44,7 @@ use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
-use crate::input::InputSource;
+use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
@@ -176,9 +176,9 @@ pub(super) fn run_pass2_buffered(
     writer: &mut OverviewWriter<File>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
-    source: &InputSource,
+    source: &ConvertSource,
     read_batch_size: usize,
-    selected_row_groups: Option<&[usize]>,
+    selected_row_groups: Option<&RowGroupSelection>,
     in_flight: usize,
     backing: SinkBacking,
     out_schema: &Schema,
@@ -196,106 +196,115 @@ pub(super) fn run_pass2_buffered(
     let mut rows = vec![0usize; num_levels];
     let mut verts = vec![0usize; num_levels];
 
-    // Build the single-pass reader here (bbox-selected row groups, #102 — the
-    // same selection both passes use, so global row indices stay aligned), then
-    // hand the owned reader to a dedicated reader thread. A synchronous Parquet
-    // reader driven from a dedicated thread (not the rayon pool) keeps reads
-    // from being head-of-line blocked behind compute work.
-    let mut builder = source.open()?.with_batch_size(read_batch_size.max(1));
-    if let Some(rgs) = selected_row_groups {
-        builder = builder.with_row_groups(rgs.to_vec());
-    }
-    let mut reader = builder.build()?;
+    // Build the single-pass stream here (per-part bbox-selected row groups,
+    // #102 — the same selection both passes use, so global row indices stay
+    // aligned), then hand it to a dedicated reader thread. A synchronous
+    // Parquet reader driven from a dedicated thread (not the rayon pool)
+    // keeps reads from being head-of-line blocked behind compute work. The
+    // stream borrows `source` (multi-partition sources open part i+1 lazily),
+    // so the reader runs on a scoped thread.
+    let mut reader = source.open_stream(&ReadPlan {
+        batch_size: read_batch_size.max(1),
+        projection: None,
+        row_groups: selected_row_groups,
+    })?;
 
     let (tx, rx) = bounded::<ReadMsg>(in_flight.max(1));
-    let reader_handle = std::thread::spawn(move || -> Result<(), ConvertError> {
-        let mut row_offset = 0usize;
-        loop {
-            let t_read = Instant::now();
-            match reader.next() {
-                None => break,
-                Some(Ok(batch)) => {
-                    let read_dur = t_read.elapsed();
-                    let offset = row_offset;
-                    row_offset += batch.num_rows();
-                    if tx
-                        .send(ReadMsg {
-                            row_offset: offset,
-                            batch,
-                            read_dur,
-                        })
-                        .is_err()
-                    {
-                        break; // consumer dropped the receiver (error path)
+    // Consumer state borrowed mutably by the in-scope consumer below.
+    let (rows_ref, verts_ref, sinks_ref) = (&mut rows, &mut verts, &mut sinks);
+    let timers_ref = &timers;
+    std::thread::scope(|scope| -> Result<(), ConvertError> {
+        let reader_handle = scope.spawn(move || -> Result<(), ConvertError> {
+            let mut row_offset = 0usize;
+            loop {
+                let t_read = Instant::now();
+                match reader.next() {
+                    None => break,
+                    Some(Ok(batch)) => {
+                        let read_dur = t_read.elapsed();
+                        let offset = row_offset;
+                        row_offset += batch.num_rows();
+                        if tx
+                            .send(ReadMsg {
+                                row_offset: offset,
+                                batch,
+                                read_dur,
+                            })
+                            .is_err()
+                        {
+                            break; // consumer dropped the receiver (error path)
+                        }
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                }
+            }
+            Ok(())
+        });
+
+        // Consumer: process batches in read order; parallelize within each
+        // batch. Because batches arrive in order and are appended before the
+        // next is pulled, each sink stays in input order without a reorder
+        // buffer.
+        //
+        // Cascading (#218, duplicating default): one call decodes the batch's
+        // member geometries once and folds each feature fine→coarse, so level
+        // k reuses level k+1's output instead of re-simplifying canonical
+        // geometry. Otherwise (cascade off, or partitioning where every
+        // feature lands on exactly one level) fan out per level as before.
+        let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
+        // Heartbeat (#242): a planet-scale pass 2 runs for minutes-to-hours;
+        // without this the phase is silent at info level. Time-based so small
+        // inputs stay quiet.
+        let mut last_progress = Instant::now();
+        let consume: Result<(), ConvertError> = (|| {
+            for msg in rx.iter() {
+                Pass2Timers::add_dur(timers_ref.read_cell(), msg.read_dur);
+                let batch = &msg.batch;
+                let row_offset = msg.row_offset;
+                let per_level: Vec<Option<(RecordBatch, usize)>> = if cascade {
+                    process_batch_cascade(batch, row_offset, ctxs, timers_ref)?
+                } else {
+                    let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = (0
+                        ..num_levels)
+                        .into_par_iter()
+                        .map(|li| process_level_batch(batch, row_offset, &ctxs[li], timers_ref))
+                        .collect();
+                    let mut v = Vec::with_capacity(num_levels);
+                    for res in results {
+                        v.push(res?);
+                    }
+                    v
+                };
+                for (li, out) in per_level.into_iter().enumerate() {
+                    if let Some((out, v)) = out {
+                        rows_ref[li] += out.num_rows();
+                        verts_ref[li] += v;
+                        sinks_ref[li].push(out)?;
                     }
                 }
-                Some(Err(e)) => return Err(e.into()),
-            }
-        }
-        Ok(())
-    });
-
-    // Consumer: process batches in read order; parallelize within each batch.
-    // Because batches arrive in order and are appended before the next is
-    // pulled, each sink stays in input order without a reorder buffer.
-    //
-    // Cascading (#218, duplicating default): one call decodes the batch's
-    // member geometries once and folds each feature fine→coarse, so level k
-    // reuses level k+1's output instead of re-simplifying canonical
-    // geometry. Otherwise (cascade off, or partitioning where every feature
-    // lands on exactly one level) fan out per level as before.
-    let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
-    // Heartbeat (#242): a planet-scale pass 2 runs for minutes-to-hours;
-    // without this the phase is silent at info level. Time-based so small
-    // inputs stay quiet.
-    let mut last_progress = Instant::now();
-    let consume: Result<(), ConvertError> = (|| {
-        for msg in rx.iter() {
-            Pass2Timers::add_dur(timers.read_cell(), msg.read_dur);
-            let batch = &msg.batch;
-            let row_offset = msg.row_offset;
-            let per_level: Vec<Option<(RecordBatch, usize)>> = if cascade {
-                process_batch_cascade(batch, row_offset, ctxs, &timers)?
-            } else {
-                let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = (0
-                    ..num_levels)
-                    .into_par_iter()
-                    .map(|li| process_level_batch(batch, row_offset, &ctxs[li], &timers))
-                    .collect();
-                let mut v = Vec::with_capacity(num_levels);
-                for res in results {
-                    v.push(res?);
-                }
-                v
-            };
-            for (li, out) in per_level.into_iter().enumerate() {
-                if let Some((out, v)) = out {
-                    rows[li] += out.num_rows();
-                    verts[li] += v;
-                    sinks[li].push(out)?;
+                if last_progress.elapsed().as_secs() >= 10 {
+                    last_progress = Instant::now();
+                    log::info!(
+                        "[convert] pass 2: {} input row(s) processed ({} output \
+                         row(s) buffered across {num_levels} level(s))",
+                        row_offset + batch.num_rows(),
+                        rows_ref.iter().sum::<usize>(),
+                    );
                 }
             }
-            if last_progress.elapsed().as_secs() >= 10 {
-                last_progress = Instant::now();
-                log::info!(
-                    "[convert] pass 2: {} input row(s) processed ({} output \
-                     row(s) buffered across {num_levels} level(s))",
-                    row_offset + batch.num_rows(),
-                    rows.iter().sum::<usize>(),
-                );
-            }
-        }
-        Ok(())
-    })();
-    drop(rx); // ensure the reader thread can stop if the consumer errored
+            Ok(())
+        })();
+        drop(rx); // ensure the reader thread can stop if the consumer errored
 
-    // Join the reader before propagating: a reader error is the more likely
-    // root cause and takes precedence over a downstream consume error.
-    match reader_handle.join() {
-        Ok(read_result) => read_result?,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
-    consume?;
+        // Join the reader before propagating: a reader error is the more
+        // likely root cause and takes precedence over a downstream consume
+        // error.
+        match reader_handle.join() {
+            Ok(read_result) => read_result?,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+        consume
+    })?;
 
     // Drain each level's sink into the writer, in level order. An empty
     // buffered level is skipped and renumbered by the writer (#211); the

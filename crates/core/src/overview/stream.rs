@@ -61,11 +61,10 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use arrow_select::take::take;
 use geo::Geometry;
 use geoarrow::array::from_arrow_array;
-use parquet::arrow::ProjectionMask;
 use rayon::prelude::*;
 
 use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
-use crate::input::InputSource;
+use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
 use super::assign::{apply_density_budget, assign_levels, AssignFeature, FeatureKind};
 use super::cluster::{build_cluster_tables, verify_sum_invariant, ClusterEntry, ClusterTables};
@@ -136,7 +135,7 @@ fn log_validation_skips(skips_before: u64) {
 }
 
 pub(crate) fn convert_streaming_strategy(
-    source: &InputSource,
+    source: &ConvertSource,
     output_path: &Path,
     options: &ConvertOptions,
     strategy: Pass2Strategy,
@@ -147,33 +146,35 @@ pub(crate) fn convert_streaming_strategy(
         return Err(ConvertError::RankingConflict);
     }
 
-    // Schema checks (level column, geometry column) — footer-only read.
+    // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
-    // cached across the passes below.)
-    let builder = source.open()?;
-    let input_schema: SchemaRef = builder.schema().clone();
+    // cached across the passes below. For a multi-partition source the
+    // schema is the validated union schema and the key-value metadata is
+    // partition 0's — construction proved all parts agree.)
+    let input_schema: SchemaRef = source.schema()?;
 
     // CRS detection + rejection (spec Q3) — footer metadata only.
-    let crs = super::convert::detect_crs_from_kv(
-        builder.metadata().file_metadata().key_value_metadata(),
-    )?;
+    let kv = source.key_value_metadata()?;
+    let crs = super::convert::detect_crs_from_kv(kv.as_ref())?;
 
     // Regional extract (#102): prune input row groups by bbox covering
     // statistics — footer metadata only, no data pages of skipped groups are
-    // ever read. Both passes read the SAME selection, so the global row
-    // indices addressing the winner tables stay aligned. Groups without
-    // stats are kept; the exact per-feature filter in pass 1 guarantees
-    // identical output either way.
-    let row_groups_total = builder.metadata().num_row_groups();
+    // ever read. The selection is PER PART and every pass reads the same
+    // selection in the same part order, so the global row indices addressing
+    // the winner tables stay aligned. Groups without stats are kept; the
+    // exact per-feature filter in pass 1 guarantees identical output either
+    // way.
+    let row_groups_total = source.num_row_groups_total()?;
     let bbox_units = options
         .bbox
         .map(|b| super::convert::bbox_to_crs_units(&b, crs));
-    let selected_row_groups: Option<Vec<usize>> = bbox_units
-        .as_ref()
-        .map(|bb| super::convert::select_input_row_groups(builder.metadata(), bb));
+    let selected_row_groups: Option<RowGroupSelection> = match bbox_units.as_ref() {
+        Some(bb) => Some(source.select_row_groups(bb)?),
+        None => None,
+    };
     let row_groups_read = selected_row_groups
         .as_ref()
-        .map_or(row_groups_total, Vec::len);
+        .map_or(row_groups_total, RowGroupSelection::total_selected);
     if selected_row_groups.is_some() {
         log::info!("bbox filter: reading {row_groups_read}/{row_groups_total} input row groups");
     }
@@ -182,15 +183,15 @@ pub(crate) fn convert_streaming_strategy(
     super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total);
     // #272: preflight the spill volume. The disk spill (#219) grows to ≈ the
     // selected input bytes — known exactly here, the first moment after
-    // row-group selection — so compare it against the free space where the
-    // spill will live and warn up front (naming the dir and the shortfall)
-    // instead of silently degrading to network re-fetch mid-convert.
+    // row-group selection (summed per part for a multi source) — so compare
+    // it against the free space where the spill will live and warn up front
+    // (naming the dir and the shortfall) instead of silently degrading to
+    // network re-fetch mid-convert.
     super::convert::warn_spill_space(
         source,
-        crate::input::selected_compressed_bytes(builder.metadata(), selected_row_groups.as_deref()),
+        source.selected_input_bytes(selected_row_groups.as_ref())?,
         options.spill_dir.as_deref(),
     );
-    drop(builder);
 
     if input_schema
         .fields()
@@ -222,7 +223,7 @@ pub(crate) fn convert_streaming_strategy(
         geom_idx,
         options,
         &acc_cols,
-        selected_row_groups.as_deref(),
+        selected_row_groups.as_ref(),
         bbox_units.as_ref(),
     )?;
     if skipped_rows > 0 {
@@ -571,7 +572,7 @@ pub(crate) fn convert_streaming_strategy(
                     source,
                     options.read_batch_size,
                     options.in_flight_batches,
-                    selected_row_groups.as_deref(),
+                    selected_row_groups.as_ref(),
                     ctx,
                 )
             })
@@ -592,7 +593,7 @@ pub(crate) fn convert_streaming_strategy(
                     &hints[..n - 1],
                     source,
                     options.read_batch_size,
-                    selected_row_groups.as_deref(),
+                    selected_row_groups.as_ref(),
                     options.in_flight_batches,
                     backing,
                     &out_schema,
@@ -607,7 +608,7 @@ pub(crate) fn convert_streaming_strategy(
                 source,
                 options.read_batch_size,
                 options.in_flight_batches,
-                selected_row_groups.as_deref(),
+                selected_row_groups.as_ref(),
                 &ctxs[n - 1],
             )?);
             stats
@@ -874,12 +875,12 @@ struct Pass1Output {
 /// the per-spec source values (parallel to `acc_cols`). Memory: `O(read
 /// batch)` transient + `O(N)` small per-feature records.
 fn run_pass1(
-    source: &InputSource,
+    source: &ConvertSource,
     input_schema: &Schema,
     geom_idx: usize,
     options: &ConvertOptions,
     acc_cols: &[usize],
-    row_groups: Option<&[usize]>,
+    row_groups: Option<&RowGroupSelection>,
     bbox_units: Option<&[f64; 4]>,
 ) -> Result<Pass1Output, ConvertError> {
     let mut plan = build_rank_plan(input_schema, options)?;
@@ -903,17 +904,13 @@ fn run_pass1(
     // Original schema index → projected batch column index.
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
 
-    let mut builder = source.open()?;
-    let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
     // Regional extract (#102): read only the bbox-selected row groups
-    // (identical selection in pass 2, keeping row indices aligned).
-    if let Some(rgs) = row_groups {
-        builder = builder.with_row_groups(rgs.to_vec());
-    }
-    let reader = builder
-        .with_projection(mask)
-        .with_batch_size(options.read_batch_size.max(1))
-        .build()?;
+    // (identical per-part selection in pass 2, keeping row indices aligned).
+    let reader = source.open_stream(&ReadPlan {
+        batch_size: options.read_batch_size.max(1),
+        projection: Some(&cols),
+        row_groups,
+    })?;
 
     let mut features: Vec<AssignFeature> = Vec::new();
     let mut num_rows = 0usize;
@@ -1245,10 +1242,10 @@ fn write_level_streaming(
     writer: &mut OverviewWriter<File>,
     level_idx: usize,
     hint: usize,
-    source: &InputSource,
+    source: &ConvertSource,
     read_batch_size: usize,
     in_flight: usize,
-    row_groups: Option<&[usize]>,
+    row_groups: Option<&RowGroupSelection>,
     ctx: &LevelStreamCtx<'_>,
 ) -> Result<(LevelWriteOutcome, usize, usize), ConvertError> {
     let rows = Cell::new(0usize);
@@ -1287,14 +1284,14 @@ fn write_level_streaming(
         // `&timers`, `row_groups`, the `usize`s) is `Copy`, so the outer
         // bindings — notably `timers`, read back after the scope — stay valid.
         let producer = scope.spawn(move || -> Result<(), ConvertError> {
-            let mut builder = source.open()?.with_batch_size(read_batch_size.max(1));
-            // Regional extract (#102): read the same bbox-selected row
-            // groups as pass 1, so the winner tables' global row indices
+            // Regional extract (#102): read the same per-part bbox-selected
+            // row groups as pass 1, so the winner tables' global row indices
             // line up.
-            if let Some(rgs) = row_groups {
-                builder = builder.with_row_groups(rgs.to_vec());
-            }
-            let mut reader = builder.build()?;
+            let mut reader = source.open_stream(&ReadPlan {
+                batch_size: read_batch_size.max(1),
+                projection: None,
+                row_groups,
+            })?;
             let mut row_offset = 0usize;
             // Heartbeat (#242): the finest level re-streams the whole
             // input; keep the operator informed on planet-scale files

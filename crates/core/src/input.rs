@@ -98,6 +98,44 @@ pub enum InputError {
     #[cfg(feature = "remote")]
     #[error("{0}")]
     RemoteConfig(String),
+    /// Arrow error surfaced while decoding record batches from a stream.
+    #[error("arrow error: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+    /// A partition of a multi-file input does not match the first partition
+    /// (schema shape, geometry extension metadata, or CRS).
+    #[error("incompatible input partition {offender:?}: {detail} (first partition: {first:?})")]
+    IncompatiblePartition {
+        /// Display name of the reference (first) partition.
+        first: String,
+        /// Display name of the partition that failed validation.
+        offender: String,
+        /// What differs.
+        detail: String,
+    },
+    /// A directory or glob input matched no `.parquet` files.
+    #[error("no .parquet files found for input {input:?}")]
+    NoParquetInputs {
+        /// The original input string (directory path or glob pattern).
+        input: String,
+    },
+    /// A remote URL that is not a single `.parquet` object (a bucket prefix /
+    /// "directory"). Listing remote prefixes lands later in this release.
+    #[error(
+        "remote prefix input {url:?} is not yet supported (single .parquet object \
+         URLs are; remote prefix listing is coming later in this release)"
+    )]
+    RemotePrefixUnsupported {
+        /// The rejected URL.
+        url: String,
+    },
+    /// A glob input string is not a valid glob pattern.
+    #[error("invalid glob pattern {pattern:?}: {message}")]
+    GlobPattern {
+        /// The pattern as supplied.
+        pattern: String,
+        /// The glob crate's error message.
+        message: String,
+    },
 }
 
 /// Byte/request counters for a remote input. `Serialize` so conversion
@@ -113,7 +151,11 @@ pub struct FetchStats {
 }
 
 /// A conversion input: a local parquet file or a remote parquet object.
-#[derive(Debug)]
+///
+/// `Clone` is cheap: the local variant clones a path, the remote variant
+/// clones `Arc` handles — clones share the fetch counters, chunk cache,
+/// disk spill, and cached footer of the original.
+#[derive(Debug, Clone)]
 pub enum InputSource {
     /// A local filesystem path (the historical behavior).
     Local(PathBuf),
@@ -230,6 +272,20 @@ impl InputSource {
             r.set_spill_dir(dir);
         }
     }
+
+    /// Release the in-memory read cache (no-op for local files). For a
+    /// remote source this clears the L1 chunk cache but KEEPS the disk
+    /// spill and the cached footer, so a later touch of the same chunk is
+    /// served from local disk, not the network. Called by multi-partition
+    /// streams on part transitions to bound resident memory to one part's
+    /// working set.
+    pub fn release_read_cache(&self) {
+        match self {
+            InputSource::Local(_) => {}
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => r.release_read_cache(),
+        }
+    }
 }
 
 /// Sum of the compressed byte sizes of the selected input row groups — the
@@ -255,8 +311,16 @@ pub fn selected_compressed_bytes(
     }
 }
 
+/// Whether `scheme` is one of the recognized remote URL schemes.
+#[cfg(feature = "remote")]
+pub(crate) fn is_remote_scheme(scheme: &str) -> bool {
+    REMOTE_SCHEMES
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s))
+}
+
 /// Return the URL scheme of `input` if it is shaped like `scheme://rest`.
-fn url_scheme(input: &str) -> Option<&str> {
+pub(crate) fn url_scheme(input: &str) -> Option<&str> {
     let (scheme, _) = input.split_once("://")?;
     if scheme.is_empty() {
         return None;
@@ -400,7 +464,10 @@ pub(crate) mod remote {
 
     /// A remote parquet object: store handle, resolved location, object
     /// size, fetch counters, and (after the first open) the parsed footer.
-    #[derive(Debug)]
+    ///
+    /// `Clone` shares the counters, caches, spill, and cached footer via the
+    /// inner `Arc`s (a clone is a second handle to the same object).
+    #[derive(Debug, Clone)]
     pub struct RemoteSource {
         url: String,
         store: Arc<dyn ObjectStore>,
@@ -594,6 +661,18 @@ pub(crate) mod remote {
         /// The byte ranges fetched so far, in request order.
         pub fn fetched_ranges(&self) -> Vec<Range<u64>> {
             self.shared.ranges.lock().expect("ranges lock").clone()
+        }
+
+        /// Drop the in-memory (L1) chunk cache. The disk spill (L2) and the
+        /// cached footer are KEPT: a later pass re-reads spilled chunks from
+        /// local disk, never the network. Multi-partition streams call this
+        /// on part transitions so resident memory stays O(one part's row
+        /// group) instead of O(parts × cap) (v0.7 multi-partition input).
+        pub fn release_read_cache(&self) {
+            let mut cache = self.cache.lock().expect("chunk cache lock");
+            cache.entries.clear();
+            cache.order.clear();
+            cache.total = 0;
         }
     }
 

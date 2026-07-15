@@ -19,16 +19,23 @@ use crate::{Error, Result};
 /// Resolve a path to a list of parquet files.
 ///
 /// If the path is a file, returns it as a single-element vector.
-/// If the path is a directory, recursively collects all .parquet files.
+/// If the path is a directory, recursively collects all .parquet files
+/// (sorted; `.`/`_`-prefixed basenames such as `_SUCCESS` are skipped —
+/// the collection lives in [`crate::input_set::list_parquet_files`], shared
+/// with the multi-partition [`crate::input_set::ConvertSource`]).
 pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
     }
 
     if path.is_dir() {
-        let mut files = Vec::new();
-        collect_parquet_files(path, &mut files)?;
-        files.sort(); // Deterministic order
+        let files = crate::input_set::list_parquet_files(path).map_err(|e| {
+            Error::GeoParquetRead(format!(
+                "Failed to read directory {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
         if files.is_empty() {
             return Err(Error::GeoParquetRead(format!(
                 "No .parquet files found in directory: {}",
@@ -42,24 +49,6 @@ pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
         "Path does not exist: {}",
         path.display()
     )))
-}
-
-/// Recursively collect .parquet files from a directory.
-fn collect_parquet_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = std::fs::read_dir(dir).map_err(|e| {
-        Error::GeoParquetRead(format!("Failed to read directory {}: {}", dir.display(), e))
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| Error::GeoParquetRead(e.to_string()))?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_parquet_files(&path, files)?;
-        } else if path.extension().is_some_and(|ext| ext == "parquet") {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Extract geometries from a GeoArrow array into a Vec.
