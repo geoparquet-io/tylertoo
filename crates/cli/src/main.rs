@@ -1024,15 +1024,15 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
 
-    // Derive layer name from the input (or manifest) filename if not given.
+    // Derive the layer name from the input if not given: file stem for a
+    // single file, last path segment for a directory or s3://gs:// prefix,
+    // last literal segment for a glob, manifest stem for --files-from
+    // (core owns the rules — see input_set::derive_layer_name).
     let layer_name = args.layer_name.clone().unwrap_or_else(|| {
         let p = match &spec {
             InputSpec::Path(p) | InputSpec::Manifest(p) => p,
         };
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("layer")
-            .to_string()
+        gpq_tiles_core::input_set::derive_layer_name(&p.to_string_lossy())
     });
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;

@@ -889,6 +889,70 @@ pub(crate) fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, InputError> {
     Ok(files)
 }
 
+/// Default PMTiles layer name derived from a CLI-style input string — the
+/// multi-partition generalization of "the input file's stem":
+///
+/// - single file (local path or nonexistent-yet path) → file stem
+///   (historical behavior; also what a `--files-from` manifest path gives:
+///   the manifest file's stem);
+/// - existing local directory → the directory's last path segment,
+///   verbatim (a dotted directory name is a name, not an extension);
+/// - glob pattern → the deepest literal (wildcard-free) path segment
+///   before the first wildcard segment;
+/// - remote URL (`scheme://…`, query string and fragment stripped):
+///   trailing-slash prefix → last non-empty path segment verbatim
+///   (bucket name for a bucket-root prefix); single object → the key's
+///   last segment's stem;
+/// - anything degenerate (empty, no usable segment) → `"layer"`, the
+///   same fallback the single-file path has always used.
+pub fn derive_layer_name(input: &str) -> String {
+    const FALLBACK: &str = "layer";
+    let stem_of = |p: &Path| p.file_stem().and_then(|s| s.to_str()).map(str::to_string);
+
+    let name = if url_scheme(input).is_some() {
+        let no_fragment = input.split('#').next().unwrap_or(input);
+        let no_query = no_fragment.split('?').next().unwrap_or(no_fragment);
+        let rest = no_query
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(no_query);
+        rest.split('/')
+            .rev()
+            .find(|seg| !seg.is_empty())
+            .and_then(|seg| {
+                if remote_url_is_prefix(input) {
+                    Some(seg.to_string())
+                } else {
+                    stem_of(Path::new(seg))
+                }
+            })
+    } else {
+        let path = Path::new(input);
+        if path.is_dir() {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        } else if !path.is_file() && has_glob_meta(input) {
+            // Deepest literal segment before the first wildcard one.
+            let mut last_literal = None;
+            for comp in path.components() {
+                if let std::path::Component::Normal(seg) = comp {
+                    match seg.to_str() {
+                        Some(s) if !has_glob_meta(s) => last_literal = Some(s.to_string()),
+                        // Wildcard (or non-UTF-8) segment: stop descending.
+                        _ => break,
+                    }
+                }
+            }
+            last_literal
+        } else {
+            stem_of(path)
+        }
+    };
+    name.filter(|n| !n.is_empty())
+        .unwrap_or_else(|| FALLBACK.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1608,5 +1672,81 @@ b.parquet
             let stats = src.fetch_stats().expect("remote parts have stats");
             assert!(stats.object_size > 0, "object_size sums the parts");
         }
+    }
+
+    // --- layer-name derivation (v0.7 PR-C) ------------------------------------
+
+    /// Single files (local or nonexistent-yet paths) keep the historical
+    /// behavior: the file stem, `"layer"` when there is none.
+    #[test]
+    fn layer_name_single_file_is_stem() {
+        assert_eq!(derive_layer_name("/data/buildings.parquet"), "buildings");
+        assert_eq!(derive_layer_name("buildings.parquet"), "buildings");
+        // A --files-from manifest path takes the manifest file's stem.
+        assert_eq!(
+            derive_layer_name("/tmp/portland-roads.txt"),
+            "portland-roads"
+        );
+    }
+
+    /// Directory inputs use the directory's last path segment VERBATIM
+    /// (no extension stripping — a dotted directory name is a name, not
+    /// a file extension), trailing slash tolerated.
+    #[test]
+    fn layer_name_directory_is_last_segment() {
+        let dir = tmpdir();
+        let parts = dir.path().join("nyc_buildings");
+        std::fs::create_dir(&parts).unwrap();
+        assert_eq!(derive_layer_name(parts.to_str().unwrap()), "nyc_buildings");
+
+        let dotted = dir.path().join("buildings.v2");
+        std::fs::create_dir(&dotted).unwrap();
+        assert_eq!(
+            derive_layer_name(&format!("{}/", dotted.display())),
+            "buildings.v2"
+        );
+    }
+
+    /// Glob inputs use the deepest literal (wildcard-free) path segment
+    /// before the first wildcard segment; an all-wildcard pattern falls
+    /// back to `"layer"`.
+    #[test]
+    fn layer_name_glob_uses_last_literal_segment() {
+        assert_eq!(derive_layer_name("/data/parts/*.parquet"), "parts");
+        assert_eq!(derive_layer_name("/data/part-*.parquet"), "data");
+        assert_eq!(derive_layer_name("/data/**/part-?.parquet"), "data");
+        assert_eq!(derive_layer_name("*.parquet"), "layer");
+    }
+
+    /// `s3://`/`gs://` prefixes use the last non-empty path segment of the
+    /// prefix (query string and fragment stripped); a bucket-root prefix
+    /// uses the bucket name.
+    #[test]
+    fn layer_name_remote_prefix_uses_last_segment() {
+        assert_eq!(derive_layer_name("s3://bucket/datasets/roads/"), "roads");
+        assert_eq!(derive_layer_name("gs://bucket/roads/"), "roads");
+        assert_eq!(derive_layer_name("s3://bucket/roads/?list-type=2"), "roads");
+        assert_eq!(derive_layer_name("s3://bucket/"), "bucket");
+    }
+
+    /// Remote single objects behave like local single files: the object
+    /// key's stem, with query string / fragment stripped first.
+    #[test]
+    fn layer_name_remote_object_is_stem() {
+        assert_eq!(derive_layer_name("s3://bucket/data/roads.parquet"), "roads");
+        assert_eq!(
+            derive_layer_name("https://host/dl/roads.parquet?sig=abc"),
+            "roads"
+        );
+        // Extension-less presigned/API URL: last segment verbatim.
+        assert_eq!(derive_layer_name("https://host/api/download/42"), "42");
+    }
+
+    /// Degenerate inputs sanitize to the historical `"layer"` fallback.
+    #[test]
+    fn layer_name_degenerate_falls_back() {
+        assert_eq!(derive_layer_name(""), "layer");
+        assert_eq!(derive_layer_name("s3://"), "layer");
+        assert_eq!(derive_layer_name("/"), "layer");
     }
 }
