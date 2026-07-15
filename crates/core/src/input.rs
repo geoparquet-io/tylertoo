@@ -312,6 +312,7 @@ pub fn selected_compressed_bytes(
 }
 
 /// Whether `scheme` is one of the recognized remote URL schemes.
+#[cfg(feature = "remote")]
 pub(crate) fn is_remote_scheme(scheme: &str) -> bool {
     REMOTE_SCHEMES
         .iter()

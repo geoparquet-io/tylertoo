@@ -962,7 +962,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // (v0.7) and reads through one parquet builder; multi sources are
     // streaming-only.
     let source_single: &InputSource = match source {
-        ConvertSource::Single(s) => s,
+        ConvertSource::Single(s) => s.input(),
         ConvertSource::Multi(_) => return Err(ConvertError::MultiPartitionRequiresStreaming),
     };
 

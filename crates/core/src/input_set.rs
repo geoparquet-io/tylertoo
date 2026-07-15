@@ -42,16 +42,53 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 
-use crate::input::{is_remote_scheme, url_scheme, FetchStats, InputError, InputSource};
+#[cfg(feature = "remote")]
+use crate::input::is_remote_scheme;
+use crate::input::{url_scheme, FetchStats, InputError, InputSource};
 
 /// A resolved conversion input: one parquet file/object, or an ordered set
 /// of local parquet partitions read as one logical dataset.
 #[derive(Debug)]
 pub enum ConvertSource {
     /// A single parquet file or remote object (the historical input shape).
-    Single(InputSource),
+    Single(SingleSource),
     /// An ordered, validated set of local parquet partitions.
     Multi(MultiSource),
+}
+
+/// One parquet file/object plus its lazily cached footer metadata, so the
+/// header phase's accessors (schema, kv metadata, row-group counts,
+/// selection) parse the footer ONCE — matching the pre-v0.7 single-open
+/// header cost.
+#[derive(Debug)]
+pub struct SingleSource {
+    source: InputSource,
+    meta: std::sync::OnceLock<PartMeta>,
+}
+
+impl SingleSource {
+    fn new(source: InputSource) -> Self {
+        SingleSource {
+            source,
+            meta: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The wrapped input.
+    pub fn input(&self) -> &InputSource {
+        &self.source
+    }
+
+    /// Footer metadata, parsed on first access and cached.
+    fn meta(&self) -> Result<&PartMeta, InputError> {
+        if let Some(m) = self.meta.get() {
+            return Ok(m);
+        }
+        let m = load_part_meta(&self.source)?;
+        // A concurrent load may have won the race; either copy is
+        // equivalent (same footer).
+        Ok(self.meta.get_or_init(|| m))
+    }
 }
 
 /// Footer-derived metadata of one partition.
@@ -134,7 +171,7 @@ pub struct SourceStream<'a> {
 impl ConvertSource {
     /// Wrap an already-constructed [`InputSource`] (single file/object).
     pub fn single(source: InputSource) -> Self {
-        ConvertSource::Single(source)
+        ConvertSource::Single(SingleSource::new(source))
     }
 
     /// Resolve a CLI-style input string:
@@ -144,29 +181,40 @@ impl ConvertSource {
     ///   (sorted; `_`/`.`-prefixed basenames such as `_SUCCESS` skipped);
     /// - string containing glob metacharacters (`*?[`) → glob expansion,
     ///   filtered to `.parquet` files, sorted, deduplicated;
-    /// - remote URL ending in `.parquet` → `Single` (unchanged);
-    /// - remote prefix → [`InputError::RemotePrefixUnsupported`] (for now);
+    /// - remote single-object URL (no trailing slash — including
+    ///   extension-less presigned/API URLs) → `Single` (unchanged);
+    /// - remote prefix (path ending `/`) →
+    ///   [`InputError::RemotePrefixUnsupported`] when the `remote` feature
+    ///   is on (for now); without the feature, the standard
+    ///   [`InputError::RemoteDisabled`] as before;
     /// - a single resolved partition collapses to `Single`;
     /// - an empty directory/glob result → [`InputError::NoParquetInputs`].
     pub fn resolve(input: &str) -> Result<Self, InputError> {
-        if let Some(scheme) = url_scheme(input) {
-            if !scheme.eq_ignore_ascii_case("file")
-                && is_remote_scheme(scheme)
-                && !remote_is_parquet_object(input)
+        if let Some(_scheme) = url_scheme(input) {
+            // A remote *prefix* ("directory", trailing `/`) is recognized
+            // only when remote support is compiled in; without the feature
+            // every remote URL fails with the standard `RemoteDisabled`
+            // error exactly as before. Extension-less non-slash URLs
+            // (presigned / API endpoints that serve parquet) are single
+            // objects, matching pre-v0.7 behavior.
+            #[cfg(feature = "remote")]
+            if !_scheme.eq_ignore_ascii_case("file")
+                && is_remote_scheme(_scheme)
+                && remote_url_is_prefix(input)
             {
                 return Err(InputError::RemotePrefixUnsupported {
                     url: input.to_string(),
                 });
             }
-            // `file://` maps to a local path, remote `.parquet` objects stay
-            // single, unsupported schemes get the standard error — all
-            // exactly as before.
-            return Ok(ConvertSource::Single(InputSource::from_str_input(input)?));
+            // `file://` maps to a local path, remote objects stay single,
+            // unsupported schemes get the standard error — all exactly as
+            // before.
+            return Ok(ConvertSource::single(InputSource::from_str_input(input)?));
         }
         let path = Path::new(input);
         if path.is_file() {
             // Existing local file: byte-identical behavior to today.
-            return Ok(ConvertSource::Single(InputSource::Local(
+            return Ok(ConvertSource::single(InputSource::Local(
                 path.to_path_buf(),
             )));
         }
@@ -180,7 +228,7 @@ impl ConvertSource {
         }
         // Nonexistent plain path: keep today's behavior (the io error
         // surfaces at open time).
-        Ok(ConvertSource::Single(InputSource::Local(
+        Ok(ConvertSource::single(InputSource::Local(
             path.to_path_buf(),
         )))
     }
@@ -191,7 +239,7 @@ impl ConvertSource {
             0 => Err(InputError::NoParquetInputs {
                 input: input.to_string(),
             }),
-            1 => Ok(ConvertSource::Single(InputSource::Local(files.remove(0)))),
+            1 => Ok(ConvertSource::single(InputSource::Local(files.remove(0)))),
             _ => Ok(ConvertSource::Multi(MultiSource::from_local_files(
                 input.to_string(),
                 files,
@@ -204,14 +252,14 @@ impl ConvertSource {
     pub fn resolve_path(path: &Path) -> Result<Self, InputError> {
         match path.to_str() {
             Some(s) => Self::resolve(s),
-            None => Ok(ConvertSource::Single(InputSource::from_path(path)?)),
+            None => Ok(ConvertSource::single(InputSource::from_path(path)?)),
         }
     }
 
     /// The underlying parts, in read order (a single source is one part).
     pub fn parts(&self) -> &[InputSource] {
         match self {
-            ConvertSource::Single(s) => std::slice::from_ref(s),
+            ConvertSource::Single(s) => std::slice::from_ref(s.input()),
             ConvertSource::Multi(m) => &m.parts,
         }
     }
@@ -233,7 +281,7 @@ impl ConvertSource {
     /// `"<root> (N partitions)"` for a multi source.
     pub fn display_name(&self) -> String {
         match self {
-            ConvertSource::Single(s) => s.display_name(),
+            ConvertSource::Single(s) => s.input().display_name(),
             ConvertSource::Multi(m) => {
                 format!("{} ({} partitions)", m.root, m.parts.len())
             }
@@ -244,7 +292,7 @@ impl ConvertSource {
     /// validated union schema (nullability OR-ed across parts).
     pub fn schema(&self) -> Result<SchemaRef, InputError> {
         match self {
-            ConvertSource::Single(s) => Ok(load_part_meta(s)?.schema),
+            ConvertSource::Single(s) => Ok(s.meta()?.schema.clone()),
             ConvertSource::Multi(m) => Ok(m.schema.clone()),
         }
     }
@@ -253,7 +301,8 @@ impl ConvertSource {
     /// for CRS detection; construction validated all parts agree).
     pub fn key_value_metadata(&self) -> Result<Option<Vec<KeyValue>>, InputError> {
         match self {
-            ConvertSource::Single(s) => Ok(load_part_meta(s)?
+            ConvertSource::Single(s) => Ok(s
+                .meta()?
                 .parquet
                 .file_metadata()
                 .key_value_metadata()
@@ -354,7 +403,9 @@ impl ConvertSource {
     /// construction), loaded on demand for `Single`.
     fn metas(&self) -> Result<std::borrow::Cow<'_, [PartMeta]>, InputError> {
         match self {
-            ConvertSource::Single(s) => Ok(std::borrow::Cow::Owned(vec![load_part_meta(s)?])),
+            ConvertSource::Single(s) => {
+                Ok(std::borrow::Cow::Borrowed(std::slice::from_ref(s.meta()?)))
+            }
             ConvertSource::Multi(m) => Ok(std::borrow::Cow::Borrowed(&m.metas)),
         }
     }
@@ -391,13 +442,25 @@ impl MultiSource {
         // The reference CRS: `Ok(crs)` per detect_crs_from_kv, `None` for an
         // unsupported/undetectable CRS. Parts must AGREE; supportedness
         // itself is enforced by the pipeline (against part 0), so a set
-        // that consistently carries an unsupported CRS still errors with
+        // that consistently carries one unsupported CRS still errors with
         // the standard UnsupportedCrs message.
         let crs_of = |m: &PartMeta| {
             crate::overview::convert::detect_crs_from_kv(
                 m.parquet.file_metadata().key_value_metadata(),
             )
             .ok()
+        };
+        // Raw CRS descriptor from the `geo` metadata: disambiguates two
+        // *different* unsupported CRSs, which both detect to `None` and
+        // would otherwise "agree" here only to error later naming just
+        // part 0's CRS.
+        let raw_crs_of = |m: &PartMeta| -> String {
+            crate::quality::crs_info_from_kv_metadata(
+                m.parquet.file_metadata().key_value_metadata(),
+            )
+            .ok()
+            .and_then(|info| info.identifier.or(info.name))
+            .unwrap_or_else(|| "unknown".to_string())
         };
         let first_crs = crs_of(&metas[0]);
 
@@ -411,9 +474,23 @@ impl MultiSource {
             let crs = crs_of(meta);
             if crs != first_crs {
                 return Err(incompatible(format!(
-                    "CRS mismatch: partition detects {crs:?} but the first partition \
-                     detects {first_crs:?} (all partitions must share one CRS)"
+                    "CRS mismatch: partition declares {:?} but the first partition \
+                     declares {:?} (all partitions must share one CRS)",
+                    raw_crs_of(meta),
+                    raw_crs_of(&metas[0]),
                 )));
+            }
+            if crs.is_none() {
+                // Both undetectable: still require the RAW declarations to
+                // agree, so the eventual UnsupportedCrs error is truthful.
+                let (a, b) = (raw_crs_of(&metas[0]), raw_crs_of(meta));
+                if a != b {
+                    return Err(incompatible(format!(
+                        "CRS mismatch: partition declares {b:?} but the first \
+                         partition declares {a:?} (all partitions must share \
+                         one CRS)"
+                    )));
+                }
             }
         }
 
@@ -459,12 +536,56 @@ fn validate_schema_shape(first: &Schema, other: &Schema) -> Result<(), String> {
         if f0.metadata() != fi.metadata() {
             return Err(format!(
                 "column {:?} carries different field (extension) metadata than \
-                 the first partition — geometry encoding/CRS metadata must match",
-                fi.name()
+                 the first partition ({}) — geometry encoding/CRS metadata must \
+                 match",
+                fi.name(),
+                describe_metadata_diff(f0.metadata(), fi.metadata())
             ));
         }
     }
     Ok(())
+}
+
+/// Human-readable first difference between two field-metadata maps:
+/// the mismatching key plus a truncated value diff (or which side is
+/// missing the key). Byte-exact comparison can false-reject cross-writer
+/// partitions (e.g. semantically equal PROJJSON serialized differently),
+/// so the error must show the user exactly what to reconcile.
+fn describe_metadata_diff(
+    first: &std::collections::HashMap<String, String>,
+    other: &std::collections::HashMap<String, String>,
+) -> String {
+    fn trunc(s: &str) -> String {
+        const MAX: usize = 80;
+        if s.chars().count() > MAX {
+            let cut: String = s.chars().take(MAX).collect();
+            format!("{cut:?}…")
+        } else {
+            format!("{s:?}")
+        }
+    }
+    let mut keys: Vec<&String> = first.keys().chain(other.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        match (first.get(key), other.get(key)) {
+            (Some(a), Some(b)) if a != b => {
+                return format!(
+                    "key {key:?}: first partition has {} but this partition has {}",
+                    trunc(a),
+                    trunc(b)
+                );
+            }
+            (Some(_), None) => {
+                return format!("key {key:?} is present only in the first partition");
+            }
+            (None, Some(_)) => {
+                return format!("key {key:?} is present only in this partition");
+            }
+            _ => {}
+        }
+    }
+    "maps differ".to_string()
 }
 
 /// Partition 0's schema with nullability OR-ed across all parts
@@ -558,12 +679,17 @@ fn has_glob_meta(input: &str) -> bool {
     input.contains(['*', '?', '['])
 }
 
-/// Whether a remote URL names a single `.parquet` object (query string and
-/// fragment ignored; trailing `/` means prefix).
-fn remote_is_parquet_object(url: &str) -> bool {
+/// Whether a remote URL names a *prefix* ("directory"): its path component
+/// — query string and fragment stripped — ends with `/`. Everything else,
+/// including extension-less presigned/API URLs that serve parquet, is a
+/// single object (the pre-v0.7 classification).
+// Used by `resolve` only when remote support is compiled in; the pure
+// classification is unit-tested under every feature set.
+#[cfg_attr(not(feature = "remote"), allow(dead_code))]
+fn remote_url_is_prefix(url: &str) -> bool {
     let no_fragment = url.split('#').next().unwrap_or(url);
     let no_query = no_fragment.split('?').next().unwrap_or(no_fragment);
-    !no_query.ends_with('/') && no_query.to_ascii_lowercase().ends_with(".parquet")
+    no_query.ends_with('/')
 }
 
 /// Recursively collect `.parquet` files under `dir`, sorted
@@ -760,17 +886,60 @@ mod tests {
         assert!(matches!(err, InputError::NoParquetInputs { .. }), "{err:?}");
     }
 
+    /// Pure prefix classification: ONLY a trailing-slash path is a prefix.
+    /// Extension-less non-slash URLs (presigned / API download endpoints
+    /// that serve parquet) must stay single objects, as on main.
+    #[test]
+    fn remote_prefix_is_trailing_slash_only() {
+        assert!(remote_url_is_prefix("s3://bucket/dataset/"));
+        assert!(remote_url_is_prefix("gs://bucket/prefix/"));
+        assert!(remote_url_is_prefix("https://example.com/data/?list=1"));
+        assert!(remote_url_is_prefix("https://example.com/data/#frag"));
+        assert!(!remote_url_is_prefix("s3://bucket/key.parquet"));
+        assert!(!remote_url_is_prefix(
+            "https://h/k.parquet?X-Amz-Signature=abc"
+        ));
+        assert!(!remote_url_is_prefix(
+            "https://host/api/datasets/42/download"
+        ));
+        assert!(!remote_url_is_prefix("s3://bucket/dataset"));
+    }
+
+    /// With the `remote` feature compiled in, only trailing-slash URLs are
+    /// rejected as prefixes (before any network touch); everything else
+    /// proceeds to the single-object path.
+    #[cfg(feature = "remote")]
     #[test]
     fn resolve_remote_prefix_rejected() {
         for url in [
             "s3://bucket/dataset/",
-            "s3://bucket/dataset",
             "https://example.com/data/",
-            "gs://bucket/prefix",
+            "gs://bucket/prefix/",
         ] {
             let err = ConvertSource::resolve(url).unwrap_err();
             assert!(
                 matches!(err, InputError::RemotePrefixUnsupported { .. }),
+                "{url} → {err:?}"
+            );
+        }
+    }
+
+    /// Without the `remote` feature every remote URL — prefix-shaped or
+    /// not — keeps main's behavior: `RemoteDisabled`, never the misleading
+    /// "prefix listing coming later" message. An extension-less URL
+    /// reaching `RemoteDisabled` also proves it was classified as a single
+    /// object (the prefix arm would have returned earlier).
+    #[cfg(not(feature = "remote"))]
+    #[test]
+    fn remote_disabled_behavior_unchanged() {
+        for url in [
+            "s3://bucket/prefix/",
+            "s3://bucket/key.parquet",
+            "https://host/api/datasets/42/download",
+        ] {
+            let err = ConvertSource::resolve(url).unwrap_err();
+            assert!(
+                matches!(err, InputError::RemoteDisabled(_)),
                 "{url} → {err:?}"
             );
         }
@@ -831,6 +1000,81 @@ mod tests {
             matches!(err, InputError::IncompatiblePartition { .. }),
             "{err:?}"
         );
+    }
+
+    /// Two partitions with *different unsupported* CRSs must be rejected at
+    /// set-construction time (naming both raw values), not "agree on
+    /// undetectable" and error later with only part 0's CRS.
+    #[test]
+    fn different_unsupported_crs_rejected_with_both_values() {
+        let dir = tmpdir();
+        let geo = |epsg: u32| {
+            format!(
+                r#"{{"version":"1.0.0","primary_column":"geometry","columns":{{"geometry":{{"crs":"EPSG:{epsg}"}}}}}}"#
+            )
+        };
+        for (file, epsg) in [("a.parquet", 32633u32), ("b.parquet", 32634u32)] {
+            let path = dir.path().join(file);
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+            )
+            .unwrap();
+            let file = File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                "geo".to_string(),
+                geo(epsg),
+            ));
+            writer.close().unwrap();
+        }
+        let err = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap_err();
+        match err {
+            InputError::IncompatiblePartition {
+                offender, detail, ..
+            } => {
+                assert!(offender.ends_with("b.parquet"), "offender: {offender}");
+                assert!(
+                    detail.contains("32633") && detail.contains("32634"),
+                    "detail must name both raw CRS values: {detail}"
+                );
+            }
+            other => panic!("expected IncompatiblePartition, got {other:?}"),
+        }
+    }
+
+    /// A field-metadata mismatch must say WHAT differs: the key and a
+    /// (truncated) value diff, so cross-writer CRS/encoding differences are
+    /// actionable instead of a bare "metadata differs".
+    #[test]
+    fn metadata_mismatch_detail_names_key_and_values() {
+        let dir = tmpdir();
+        for (file, val) in [("a.parquet", "value-one"), ("b.parquet", "value-two")] {
+            let md: std::collections::HashMap<String, String> =
+                [("ARROW:extension:name".to_string(), val.to_string())].into();
+            write_parquet(
+                &dir.path().join(file),
+                vec![Field::new("id", DataType::Int64, false).with_metadata(md)],
+                vec![Arc::new(Int64Array::from(vec![1i64]))],
+                None,
+            );
+        }
+        let err = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap_err();
+        match err {
+            InputError::IncompatiblePartition { detail, .. } => {
+                assert!(
+                    detail.contains("ARROW:extension:name"),
+                    "detail must name the differing key: {detail}"
+                );
+                assert!(
+                    detail.contains("value-one") && detail.contains("value-two"),
+                    "detail must show both values: {detail}"
+                );
+            }
+            other => panic!("expected IncompatiblePartition, got {other:?}"),
+        }
     }
 
     #[test]
