@@ -13,7 +13,8 @@ Fast GeoParquet → PMTiles converter in Rust.
 - One-shot GeoParquet → PMTiles (`gpq-tiles tiles`, or the bare form)
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
 - Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
-- Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
+- Multi-partition input — a directory, glob, `s3://`/`gs://` prefix, or `--files-from` manifest is read as one dataset ([Multi-Partition Input](docs/multi-partition.md))
+- Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests, bounded to ≈1× the object's bytes — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
 - Spec validation (`gpq-tiles validate`)
 - PMTiles → GeoParquet decoding (`gpq-tiles decode`) — tippecanoe-decode
   semantics, any PMTiles v3 MVT archive
@@ -29,11 +30,23 @@ cargo install gpq-tiles    # CLI
 pip install gpq-tiles      # Python
 ```
 
-## Usage
+Prebuilt CLI binaries (Linux x86_64 gnu/musl, macOS Intel/Apple
+Silicon, Windows x86_64) are attached to each
+[GitHub Release](https://github.com/geoparquet-io/gpq-tiles/releases).
+
+## Quickstart
 
 ```bash
-# One-shot: GeoParquet in, PMTiles out
+# GeoParquet in, PMTiles out
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+```
+
+Drop `output.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to view it.
+The input can also be a directory of partitions, a glob, an
+`s3://`/`gs://` file or prefix, or an `https://` URL:
+
+```bash
+gpq-tiles overview s3://bucket/dataset/ overviews.parquet
 ```
 
 ### The Two-Step Workflow
@@ -86,11 +99,11 @@ from gpq_tiles import overview, export_pmtiles, validate
 overview("input.parquet", "overviews.parquet", min_zoom=0, max_zoom=14)
 validate("overviews.parquet")
 export_pmtiles("overviews.parquet", "output.pmtiles")
-
-# One-shot facade (deprecated in favor of the two-step API)
-from gpq_tiles import convert
-convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 ```
+
+`overview()` also accepts a `list[str]` of parts, and exposes the full
+tuning surface as keyword arguments — see the
+[API Reference](docs/api-reference.md).
 
 ## Documentation
 
@@ -100,6 +113,8 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 - **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API
 - **[Advanced Usage](docs/advanced-usage.md)** — Input optimization, memory, remote reads, CI/CD
 - **[Remote Reads](docs/remote-reads.md)** — Converting directly from s3://, https://, gs:// inputs, and querying overview files in place with DuckDB
+- **[Multi-Partition Input](docs/multi-partition.md)** — Directories, globs, remote prefixes, and --files-from manifests as one dataset
+- **[Known Limitations](docs/limitations.md)** — What gpq-tiles does not do yet, honestly
 - **[Format Spec (draft)](context/OVERVIEWS_SPEC.md)** — The `geo:overviews` format contract
 
 ## Development

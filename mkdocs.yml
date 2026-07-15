@@ -60,8 +60,10 @@ nav:
   - Advanced Usage: advanced-usage.md
   - Remote Reads: remote-reads.md
   - Multi-Partition Input: multi-partition.md
+  - Known Limitations: limitations.md
   - Architecture: architecture.md
   - Overview Tuning: OVERVIEW_TUNING.md
   - Development: development.md
   - Contributing: contributing.md
   - Changelog: changelog.md
+  - "v0.7 Launch Post (draft)": blog/v0.7-launch.md
