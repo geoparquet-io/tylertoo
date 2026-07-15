@@ -47,12 +47,14 @@
 //! [`LevelWriteOutcome::SkippedEmpty`]: super::writer::LevelWriteOutcome::SkippedEmpty
 //! [`ConvertReport::skipped_empty_levels`]: super::convert::ConvertReport::skipped_empty_levels
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::bounded;
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -240,6 +242,8 @@ pub(crate) fn convert_streaming_strategy(
 
     let t_assign = Instant::now();
     let assignment = assign_levels(&features, &level_gsds, &options.assign, crs);
+    let assign_secs = t_assign.elapsed().as_secs_f64();
+    let t_budget = Instant::now();
     let assignment = if options.density.enabled {
         apply_density_budget(
             &assignment,
@@ -253,8 +257,10 @@ pub(crate) fn convert_streaming_strategy(
         assignment
     };
     log::debug!(
-        "[profile] assignment+budget: {:.2}s",
-        t_assign.elapsed().as_secs_f64()
+        "[profile] assignment+budget: {:.2}s (assign {:.2}s + budget {:.2}s)",
+        t_assign.elapsed().as_secs_f64(),
+        assign_secs,
+        t_budget.elapsed().as_secs_f64()
     );
     log::info!(
         "[convert] level assignment complete: {} level(s) in {:.1}s",
@@ -551,6 +557,7 @@ pub(crate) fn convert_streaming_strategy(
                     hints[i],
                     source,
                     options.read_batch_size,
+                    options.in_flight_batches,
                     selected_row_groups.as_deref(),
                     ctx,
                 )
@@ -586,6 +593,7 @@ pub(crate) fn convert_streaming_strategy(
                 hints[n - 1],
                 source,
                 options.read_batch_size,
+                options.in_flight_batches,
                 selected_row_groups.as_deref(),
                 &ctxs[n - 1],
             )?);
@@ -1219,85 +1227,128 @@ impl LevelStreamCtx<'_> {
 /// Stream one level from the input file into the writer. Returns the writer
 /// outcome (a level whose every candidate collapses during simplification is
 /// skipped, #211) plus `(rows_written, vertex_count)`.
+#[allow(clippy::too_many_arguments)]
 fn write_level_streaming(
     writer: &mut OverviewWriter<File>,
     level_idx: usize,
     hint: usize,
     source: &InputSource,
     read_batch_size: usize,
+    in_flight: usize,
     row_groups: Option<&[usize]>,
     ctx: &LevelStreamCtx<'_>,
 ) -> Result<(LevelWriteOutcome, usize, usize), ConvertError> {
-    let mut builder = source.open()?.with_batch_size(read_batch_size.max(1));
-    // Regional extract (#102): read the same bbox-selected row groups as
-    // pass 1, so the winner tables' global row indices line up.
-    if let Some(rgs) = row_groups {
-        builder = builder.with_row_groups(rgs.to_vec());
-    }
-    let mut reader = builder.build()?;
-
-    // `write_level` consumes an infallible batch iterator; errors inside the
-    // stream are parked in `err` (fusing the iterator) and re-raised after.
-    let err: RefCell<Option<ConvertError>> = RefCell::new(None);
     let rows = Cell::new(0usize);
     let vertices = Cell::new(0usize);
-    let mut row_offset = 0usize;
     let timers = Pass2Timers::default();
     let fallbacks_before = full_resolution_fallback_count();
     let t_level = Instant::now();
 
-    // Heartbeat (#242): the finest level re-streams the whole input; keep
-    // the operator informed on planet-scale files (quiet on small ones).
-    let mut last_progress = Instant::now();
-    let batches = std::iter::from_fn(|| loop {
-        if last_progress.elapsed().as_secs() >= 10 {
-            last_progress = Instant::now();
-            log::info!(
-                "[convert] level {level_idx}: {} input row(s) scanned, {} \
-                 row(s) written",
-                row_offset,
-                rows.get(),
-            );
-        }
-        let t_read = Instant::now();
-        let batch = match reader.next() {
-            None => return None,
-            Some(Err(e)) => {
-                *err.borrow_mut() = Some(e.into());
-                return None;
-            }
-            Some(Ok(b)) => b,
-        };
-        Pass2Timers::add(&timers.read, t_read);
-        let offset = row_offset;
-        row_offset += batch.num_rows();
-        match process_level_batch(&batch, offset, ctx, &timers) {
-            Ok(None) => continue, // no members of this level in the batch
-            Ok(Some((out, verts))) => {
-                rows.set(rows.get() + out.num_rows());
-                vertices.set(vertices.get() + verts);
-                return Some(out);
-            }
-            Err(e) => {
-                *err.borrow_mut() = Some(e);
-                return None;
-            }
-        }
-    });
-
-    let res = writer.write_level(level_idx, Some(hint), batches);
-    if let Some(e) = err.borrow_mut().take() {
-        return Err(e); // stream error takes precedence over the writer's
+    // One processed output batch handed from the producer to the writer.
+    struct Processed {
+        batch: RecordBatch,
+        verts: usize,
     }
-    let outcome = res?;
+
+    // Overlap decode→process with the single-threaded parquet writer (#264,
+    // extending the #213 pipeline discipline to the streamed finest level): a
+    // producer thread reads input batches and runs `process_level_batch`
+    // (read + geometry decode + simplify + assemble), pushing finished output
+    // batches over a bounded channel; the writer drains it on this thread.
+    // Batches stay in read order (FIFO channel, single producer), so output —
+    // and therefore row-group boundaries — are byte-identical to a serial
+    // build. Channel depth bounds read/compute run-ahead the same way the
+    // buffered engine's reader channel does.
+    let (tx, rx) = bounded::<Processed>(in_flight.max(1));
+    // Shared by reference into the producer thread (a `&Pass2Timers` is `Copy`,
+    // so the `move` closure copies the borrow and leaves `timers` owned here
+    // for the post-scope read).
+    let timers = &timers;
+    let outcome = std::thread::scope(|scope| -> Result<LevelWriteOutcome, ConvertError> {
+        // Producer: read + process, in order, until EOF or the writer
+        // hangs up. Returns the first stream/processing error, if any.
+        // `move` transfers ownership of `tx` into the thread so it is dropped
+        // when the producer finishes — that disconnect is what fuses the
+        // writer's `rx.recv()` loop below (otherwise `recv` blocks forever and
+        // deadlocks). Everything else the closure touches (`source`, `ctx`,
+        // `&timers`, `row_groups`, the `usize`s) is `Copy`, so the outer
+        // bindings — notably `timers`, read back after the scope — stay valid.
+        let producer = scope.spawn(move || -> Result<(), ConvertError> {
+            let mut builder = source.open()?.with_batch_size(read_batch_size.max(1));
+            // Regional extract (#102): read the same bbox-selected row
+            // groups as pass 1, so the winner tables' global row indices
+            // line up.
+            if let Some(rgs) = row_groups {
+                builder = builder.with_row_groups(rgs.to_vec());
+            }
+            let mut reader = builder.build()?;
+            let mut row_offset = 0usize;
+            // Heartbeat (#242): the finest level re-streams the whole
+            // input; keep the operator informed on planet-scale files
+            // (quiet on small ones).
+            let mut last_progress = Instant::now();
+            loop {
+                if last_progress.elapsed().as_secs() >= 10 {
+                    last_progress = Instant::now();
+                    log::info!(
+                        "[convert] level {level_idx}: {row_offset} input \
+                             row(s) scanned",
+                    );
+                }
+                let t_read = Instant::now();
+                let batch = match reader.next() {
+                    None => return Ok(()),
+                    Some(Err(e)) => return Err(e.into()),
+                    Some(Ok(b)) => b,
+                };
+                Pass2Timers::add(&timers.read, t_read);
+                let offset = row_offset;
+                row_offset += batch.num_rows();
+                match process_level_batch(&batch, offset, ctx, timers)? {
+                    None => continue, // no members of this level in the batch
+                    Some((out, verts)) => {
+                        // Writer gone (its side errored and dropped `rx`):
+                        // stop; the writer's error is reported below.
+                        if tx.send(Processed { batch: out, verts }).is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        });
+
+        // Writer (this thread): drain processed batches in order. Dropping
+        // the producer's `tx` (EOF, error, or writer-gone) fuses `recv`.
+        let batches = std::iter::from_fn(|| match rx.recv() {
+            Ok(msg) => {
+                rows.set(rows.get() + msg.batch.num_rows());
+                vertices.set(vertices.get() + msg.verts);
+                Some(msg.batch)
+            }
+            Err(_) => None,
+        });
+        let res = writer.write_level(level_idx, Some(hint), batches);
+
+        // A producer error takes precedence over the writer's (the writer
+        // may merely observe a truncated stream). `join` cannot panic here:
+        // the closure only returns `Result`.
+        producer
+            .join()
+            .expect("finest-level producer thread panicked")?;
+        Ok(res?)
+    })?;
     let total = t_level.elapsed().as_secs_f64();
     let read_s = Pass2Timers::secs(&timers.read);
     let decode_s = Pass2Timers::secs(&timers.decode);
     let simplify_s = Pass2Timers::secs(&timers.simplify);
     let build_s = Pass2Timers::secs(&timers.build);
+    // Read/decode/simplify/build run on the producer thread and overlap the
+    // writer (#264), so these stage sums are core-seconds that overlap the
+    // `total` wall time — the writer's own cost is roughly
+    // `total - max(producer stages)`, not `total - sum`.
     log::debug!(
         "[profile] level {} ({}, {} rows): total={:.2}s read={:.2}s decode={:.2}s \
-         simplify={:.2}s build={:.2}s write={:.2}s",
+         simplify={:.2}s build={:.2}s (read/decode/simplify/build overlap the writer)",
         level_idx,
         if ctx.verbatim { "verbatim" } else { "simplify" },
         rows.get(),
@@ -1306,7 +1357,6 @@ fn write_level_streaming(
         decode_s,
         simplify_s,
         build_s,
-        (total - (read_s + decode_s + simplify_s + build_s)).max(0.0),
     );
     let fallbacks = full_resolution_fallback_count() - fallbacks_before;
     if fallbacks > 0 {

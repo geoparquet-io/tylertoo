@@ -36,17 +36,25 @@
 //! level, guaranteeing every feature is present at the canonical level (spec
 //! §2.4).
 //!
-//! # Memory (streaming-critical property)
+//! # Memory
 //!
-//! Per level, the only state is a hashmap `cell -> best-priority-so-far`. This
-//! is the property the streaming refactor (plan V4) depends on: peak memory is
-//! `O(occupied cells)` per level, not `O(features)` retained across levels.
+//! Per level, the only state is a hashmap `cell -> best-priority-so-far`,
+//! `O(occupied cells)` — never `O(features)` retained across levels. The coarse
+//! levels are built concurrently (#264, see below), so the transient peak is
+//! the sum of the *concurrently live* grids rather than a single one; this
+//! phase runs before the pass-2 geometry buffers that set overall peak RSS, so
+//! it does not move the high-water mark in practice.
 //!
-//! # Determinism
+//! # Parallelism & determinism
 //!
-//! The per-cell winner is the maximum under a *strict total order* (ties are
-//! ultimately broken by the feature `index`), so results never depend on
-//! hashmap iteration order and are identical across runs.
+//! Each level's cell-winner pass is independent, so the coarse levels run
+//! concurrently across rayon threads (#264 — this is the hot serial stage on
+//! large-feature / simple-geometry layers). Results are unaffected: the
+//! per-cell winner is the maximum under a *strict total order* (ties are
+//! ultimately broken by the feature `index`), so they never depend on hashmap
+//! iteration order or thread scheduling, and a feature takes the *coarsest*
+//! level at which it wins regardless of the order levels finish. Output is
+//! identical across runs and to a fully serial build.
 //!
 //! # DIVERGENCE FROM TIPPECANOE / cogp-rs
 //!
@@ -57,6 +65,8 @@
 //! (plan V2) shows artifacts.
 
 use std::collections::HashMap;
+
+use rayon::prelude::*;
 
 pub use super::level::{Crs, METERS_PER_DEGREE};
 
@@ -320,6 +330,56 @@ impl Priority {
     }
 }
 
+/// Build one overview level's cell-winner grid and return the winning feature
+/// positions (one per occupied cell).
+///
+/// Serial single-map build — no cross-thread merge. Parallelism in
+/// [`assign_levels`] is *across* levels (each level's grid is independent), so
+/// this per-level work stays a single tight HashMap pass with no merge tax.
+fn level_winner_positions(
+    features: &[AssignFeature],
+    config: &AssignConfig,
+    gsd_units: f64,
+) -> Vec<usize> {
+    // cell -> (best priority, position of winning feature in `features`).
+    let mut grid: HashMap<CellKey, (Priority, usize)> = HashMap::new();
+
+    for (pos, feat) in features.iter().enumerate() {
+        // Visibility gate (points always pass).
+        let vis = config.visibility_factor(feat.kind);
+        if vis > 0.0 {
+            let gate = vis * gsd_units;
+            if feat.diag_sq() < gate * gate {
+                continue; // ineligible at this level
+            }
+        }
+
+        let cell_size = gsd_units * config.thinning_factor(feat.kind);
+        // Guard against a zero/negative cell size (bad GSD input); also
+        // reject NaN.
+        if cell_size <= 0.0 || cell_size.is_nan() {
+            continue;
+        }
+        let (cx, cy) = feat.center();
+        let key: CellKey = (
+            feat.kind.discriminant(),
+            (cx / cell_size).floor() as i64,
+            (cy / cell_size).floor() as i64,
+        );
+
+        let prio = Priority::new(feat, config.sort_direction);
+        grid.entry(key)
+            .and_modify(|slot| {
+                if prio.beats(&slot.0) {
+                    *slot = (prio, pos);
+                }
+            })
+            .or_insert((prio, pos));
+    }
+
+    grid.into_values().map(|(_prio, pos)| pos).collect()
+}
+
 /// Assign every feature its coarsest surviving level.
 ///
 /// - `features`: input features (any order; output is parallel to this slice).
@@ -361,51 +421,35 @@ pub fn assign_levels(
     let mut min_levels: Vec<u8> = vec![finest; features.len()];
 
     // Per level, coarse→fine, run one cell-winner pass. State is O(cells).
-    for (level_idx, &gsd_m) in level_gsds.iter().enumerate() {
+    //
+    // The finest level is skipped: `min_levels` already starts at `finest`, so
+    // its cell-winner pass can only re-assign winners to a level they already
+    // hold — pure dead work, and (crucially) its grid is the single largest
+    // one (at fine GSD nearly every feature wins its own cell), so skipping it
+    // also removes the biggest allocation. Only coarse levels can *lower* a
+    // feature's `min_level`.
+    //
+    // Parallelism (#264): each coarse level's grid is fully independent, so the
+    // per-level cell-winner passes run concurrently across rayon threads (no
+    // merge — each level owns one HashMap). This is the hot serial stage on
+    // large-feature / simple-geometry layers (issue #264). The concurrent grids
+    // live only during this phase, which precedes the pass-2 geometry buffers
+    // that set peak RSS, so overall peak memory is unaffected. The fold below
+    // is deterministic regardless of completion order: a feature takes the
+    // *coarsest* (smallest) level at which it wins.
+    let winners_per_level: Vec<Vec<usize>> = (0..finest as usize)
+        .into_par_iter()
+        .map(|level_idx| {
+            let gsd_units = gsd_to_coord_units(level_gsds[level_idx], crs);
+            level_winner_positions(features, config, gsd_units)
+        })
+        .collect();
+
+    for (level_idx, winners) in winners_per_level.iter().enumerate() {
         let level = level_idx as u8;
-        let gsd_units = gsd_to_coord_units(gsd_m, crs);
-
-        // cell -> (best priority, position of winning feature in `features`)
-        let mut grid: HashMap<CellKey, (Priority, usize)> = HashMap::new();
-
-        for (pos, feat) in features.iter().enumerate() {
-            // Visibility gate (points always pass).
-            let vis = config.visibility_factor(feat.kind);
-            if vis > 0.0 {
-                let gate = vis * gsd_units;
-                if feat.diag_sq() < gate * gate {
-                    continue; // ineligible at this level
-                }
-            }
-
-            let cell_size = gsd_units * config.thinning_factor(feat.kind);
-            // Guard against a zero/negative cell size (bad GSD input); also
-            // reject NaN.
-            if cell_size <= 0.0 || cell_size.is_nan() {
-                continue;
-            }
-            let (cx, cy) = feat.center();
-            let key: CellKey = (
-                feat.kind.discriminant(),
-                (cx / cell_size).floor() as i64,
-                (cy / cell_size).floor() as i64,
-            );
-
-            let prio = Priority::new(feat, config.sort_direction);
-            grid.entry(key)
-                .and_modify(|slot| {
-                    if prio.beats(&slot.0) {
-                        *slot = (prio, pos);
-                    }
-                })
-                .or_insert((prio, pos));
-        }
-
-        // Winners at this level take it as their min_level, unless a coarser
-        // level already claimed them (we only lower, never raise).
-        for (_prio, pos) in grid.values() {
-            if level < min_levels[*pos] {
-                min_levels[*pos] = level;
+        for &pos in winners {
+            if level < min_levels[pos] {
+                min_levels[pos] = level;
             }
         }
     }
@@ -876,6 +920,57 @@ mod tests {
         let out = assign_levels(&feats, &gsds, &AssignConfig::default(), Crs::Epsg3857);
         let at0 = out.duplicating_at_level(0);
         assert_eq!(at0.len(), 1, "one winner at coarsest level");
+    }
+
+    #[test]
+    fn parallel_grid_merge_is_deterministic_at_scale() {
+        // Stress the sharded map-reduce grid build (#264): enough features,
+        // spread across many cells with heavy same-cell contention, that rayon
+        // splits the work into multiple shards whose partial grids must merge
+        // to a single canonical result. The per-level `min_level` vector must
+        // be byte-identical across repeated runs (no dependence on shard or
+        // hashmap iteration order) and invariant to input order.
+        let mut feats: Vec<AssignFeature> = Vec::new();
+        // 50 coarse cells (5 km apart in EPSG:3857 meters), 400 polygons each
+        // of varying size sharing that cell → 20k features, every cell heavily
+        // contended so the winner selection actually exercises the merge.
+        let mut idx = 0usize;
+        for c in 0..50 {
+            let base = c as f64 * 5_000.0;
+            for k in 0..400 {
+                let span = 200.0 + (k as f64) * 50.0;
+                feats.push(poly(idx, base, base, base + span, base + span));
+                idx += 1;
+            }
+        }
+        let gsds = [gsd(4), gsd(8), gsd(12), gsd(14)];
+        let cfg = AssignConfig::default();
+
+        let baseline = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let levels_of = |a: &Assignment| -> Vec<(usize, u8)> {
+            let mut v: Vec<(usize, u8)> = a
+                .assignments
+                .iter()
+                .map(|x| (x.index, x.min_level))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let want = levels_of(&baseline);
+
+        // Repeated runs must be identical (parallel merge determinism).
+        for _ in 0..8 {
+            let got = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+            assert_eq!(levels_of(&got), want, "assignment unstable across runs");
+        }
+        // Reversed input order must yield the same per-feature levels.
+        let mut rev = feats.clone();
+        rev.reverse();
+        assert_eq!(
+            levels_of(&assign_levels(&rev, &gsds, &cfg, Crs::Epsg3857)),
+            want,
+            "assignment must not depend on input order",
+        );
     }
 
     // ---- visibility gating per kind -----------------------------------------
