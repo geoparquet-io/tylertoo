@@ -61,14 +61,16 @@ What to know:
   on a city extract). The cache budget is sized to the largest row
   group's working set (floored at 256 MiB), so a single row group whose
   column chunks exceed the floor — e.g. a multi-GB geometry chunk — is
-  no longer evicted mid-read and re-fetched per page (issue #261). What
-  remains is the multi-pass baseline: a full-file conversion reads the
-  input a few times — the assign pass, the write pass, and (at higher
-  zoom) a finest-level canonical re-read — so a full-file remote
-  conversion moves a small constant multiple of the object's bytes.
-  Measured on fieldmaps-adm4 (2.90 GB, z0–14): **96× before #261, 3.0×
-  after**. Eliminating the finest-level re-read to approach ~1× is
-  tracked in #219; if the residual matters today, download first.
+  no longer evicted mid-read and re-fetched per page (issue #261).
+  Beyond the in-memory cache, every fetched chunk is also spilled to a
+  local temp file, so a chunk evicted between passes — the assign pass,
+  the write pass, and (at higher zoom) a finest-level canonical re-read —
+  is drained from local disk rather than re-fetched over the network.
+  This bounds a full-file remote conversion to ≈1× the object's bytes
+  regardless of pass or level count (issue #219). Measured on
+  fieldmaps-adm4 (2.90 GB, z0–14): **96× before #261, 3.0× after #261,
+  ≈1× after #219**. The spill file lives under `TMPDIR`; point that at
+  real disk if your default temp dir is a small tmpfs.
 - **Latency vs bytes** — requests are issued sequentially, so on a
   fast link a plain `aws s3 cp` + local convert can still win on wall
   time (92 MB corpus file, residential fiber: ~3 s download+convert

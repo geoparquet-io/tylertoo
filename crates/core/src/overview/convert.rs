@@ -1482,6 +1482,61 @@ pub(super) fn warn_antimeridian_suspects(count: usize) {
     }
 }
 
+/// Object-size threshold above which a *full-file* remote convert emits the
+/// #267 download-first nudge. Below ~1 GiB the local spill footprint and the
+/// second-pass disk read are cheap enough not to warrant a warning.
+pub(super) const FULL_FILE_REMOTE_WARN_BYTES: u64 = 1 << 30;
+
+/// #267 decision + message (pure, so it is unit-testable without capturing
+/// logs). Returns the one-line nudge to emit, or `None` to stay quiet.
+///
+/// Fires only for a *whole-file* remote convert of a large object: the disk
+/// spill (#219) already bounds network traffic to ≈1× the object, but a
+/// full-file remote convert still stages ≈the object's bytes under `$TMPDIR`
+/// and re-reads them from disk on the second pass. For a region of interest,
+/// `--bbox` fetches only the covering row groups and skips the spill entirely,
+/// so we point the user there (or to a download-first workflow). Stays quiet
+/// for local inputs (OS page cache), for effective bbox extracts (fewer row
+/// groups read than the file holds), and for objects below the threshold.
+pub(super) fn full_file_remote_warning(
+    is_remote: bool,
+    row_groups_read: usize,
+    row_groups_total: usize,
+    object_size: u64,
+) -> Option<String> {
+    if !is_remote || row_groups_read < row_groups_total || object_size < FULL_FILE_REMOTE_WARN_BYTES
+    {
+        return None;
+    }
+    Some(format!(
+        "full-file remote convert of a {:.1} GiB object: it is fetched once over \
+         the network (≈1× — the local spill keeps later passes off the network, \
+         #219) and staged under $TMPDIR. For a region of interest pass --bbox to \
+         fetch only the covering row groups (and skip the spill); otherwise \
+         downloading first (e.g. `aws s3 cp`) and converting locally avoids the \
+         second-pass disk read. Point $TMPDIR at fast local disk, not a small tmpfs.",
+        object_size as f64 / (1024.0 * 1024.0 * 1024.0),
+    ))
+}
+
+/// Emit the #267 nudge for a full-file remote convert, if warranted. Thin
+/// logging wrapper over [`full_file_remote_warning`].
+pub(super) fn warn_full_file_remote(
+    source: &InputSource,
+    row_groups_read: usize,
+    row_groups_total: usize,
+) {
+    let object_size = source.fetch_stats().map_or(0, |s| s.object_size);
+    if let Some(msg) = full_file_remote_warning(
+        source.is_remote(),
+        row_groups_read,
+        row_groups_total,
+        object_size,
+    ) {
+        log::warn!("{msg}");
+    }
+}
+
 /// Whether a decoded geometry can participate in level assignment: it must
 /// carry at least one coordinate and every coordinate must be finite.
 ///
@@ -2383,6 +2438,32 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use crate::batch_processor::extract_geometries_from_array;
+
+    /// #267: the download-first nudge fires only for a large *whole-file*
+    /// remote convert, and stays quiet for local inputs, effective bbox
+    /// extracts, and small objects.
+    #[test]
+    fn full_file_remote_warning_gated_on_large_unpruned_remote() {
+        const BIG: u64 = 4 << 30; // 4 GiB, above the 1 GiB threshold
+                                  // Local input: re-reads hit the OS page cache — never warn.
+        assert!(full_file_remote_warning(false, 8, 8, BIG).is_none());
+        // Effective bbox extract (fewer row groups read): never warn.
+        assert!(full_file_remote_warning(true, 2, 8, BIG).is_none());
+        // Small remote object: below threshold — never warn.
+        assert!(full_file_remote_warning(true, 8, 8, 100 << 20).is_none());
+        // Just below the threshold: still quiet.
+        assert!(full_file_remote_warning(true, 8, 8, FULL_FILE_REMOTE_WARN_BYTES - 1).is_none());
+        // At the threshold: warns (guard is a strict `<`).
+        assert!(full_file_remote_warning(true, 8, 8, FULL_FILE_REMOTE_WARN_BYTES).is_some());
+        // Large full-file remote: warns, and the nudge names the cheaper paths.
+        let msg = full_file_remote_warning(true, 8, 8, BIG)
+            .expect("large full-file remote convert should warn");
+        assert!(msg.contains("--bbox"), "nudge should mention --bbox: {msg}");
+        assert!(
+            msg.contains("4.0 GiB"),
+            "nudge should state the object size: {msg}"
+        );
+    }
 
     // --- synthetic GeoParquet input builders --------------------------------
 
