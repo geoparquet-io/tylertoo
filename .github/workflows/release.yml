@@ -6,7 +6,9 @@
 # Developer workflow:
 # 1. Accumulate changes via normal PR merges
 # 2. When ready to release: uv run cz bump --changelog && git push --tags
-# 3. Tag push triggers this workflow → publishes to crates.io, PyPI, GitHub
+# 3. Tag push triggers this workflow → publishes to crates.io, PyPI, and a
+#    GitHub Release with prebuilt CLI binaries (linux gnu/musl, macOS
+#    x86_64/aarch64, windows) and release notes extracted from CHANGELOG.md
 name: Release
 
 on:
@@ -24,6 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      release_exists: ${{ steps.release_check.outputs.release_exists }}
     steps:
       # Credentials stay persisted here on purpose: this job pushes the
       # release tag back to the repo in the manual-dispatch recovery path.
@@ -95,16 +101,179 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Create GitHub Release
-        if: steps.release_check.outputs.release_exists == 'false'
+  # Prebuilt CLI binaries for users without a Rust toolchain (cargo install
+  # needs Rust 1.75+ AND protoc — real friction for the GIS audience).
+  # Hand-rolled matrix rather than cargo-dist: cargo-dist wants to own the
+  # tag → release lifecycle, which conflicts with the recovery-mode logic in
+  # release-rust and the crates.io/PyPI publishing already living here.
+  build-binaries:
+    name: Build binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            # Cross-compiled from the arm64 runner: Intel macOS runners are
+            # retired, and clang + the universal macOS SDK cross-compile
+            # x86_64 from arm64 natively.
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc
+
+      - name: Install musl toolchain
+        # zstd-sys, aws-lc-sys, etc. need a musl-targeting C compiler
+        # (musl-gcc). The tree is rustls-based — no openssl to vendor.
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Extract version from Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Build release binary
+        shell: bash
         env:
-          TAG: ${{ steps.version.outputs.tag }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --package gpq-tiles --target "$TARGET"
+
+      - name: Smoke test binary
+        # x86_64-apple-darwin is cross-compiled on the arm64 runner; running
+        # it would depend on Rosetta being present, so it is not smoke-tested.
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "./target/$TARGET/release/gpq-tiles" --version
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          STAGE="gpq-tiles-$VERSION-$TARGET"
+          mkdir -p "dist/$STAGE"
+          cp "target/$TARGET/release/gpq-tiles" README.md LICENSE "dist/$STAGE/"
+          tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
+          rm -r "dist/${STAGE:?}"
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $stage = "gpq-tiles-$env:VERSION-$env:TARGET"
+          New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
+          Copy-Item "target/$env:TARGET/release/gpq-tiles.exe" "dist/$stage/"
+          Copy-Item README.md, LICENSE "dist/$stage/"
+          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          Remove-Item -Recurse "dist/$stage"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  # Creates the GitHub Release with binaries attached and the tagged
+  # version's CHANGELOG.md section as the release body. Runs only after
+  # crates.io publishing succeeds (same ordering as before, when release
+  # creation was the last step of release-rust) and only when the release
+  # does not already exist (recovery-mode re-runs skip it, as before).
+  github-release:
+    name: Create GitHub Release
+    needs: [release-rust, build-binaries]
+    if: needs.release-rust.outputs.release_exists == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        env:
+          VERSION: ${{ needs.release-rust.outputs.version }}
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz *.zip > "gpq-tiles-$VERSION-checksums.txt"
+          cat "gpq-tiles-$VERSION-checksums.txt"
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG: ${{ needs.release-rust.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
+          # Section headings look like "## v0.6.0 (2026-03-11)"; also accept
+          # a bare "## v0.7.0". $2 is the version token either way.
+          awk -v ver="$TAG" '
+            /^## / { if (found) exit; if ($2 == ver) { found=1; next } }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::warning::No CHANGELOG.md section found for $TAG, falling back to link"
+            echo "See [CHANGELOG](https://github.com/$REPO/blob/main/CHANGELOG.md) for details." > release-notes.md
+          fi
+          echo "Release notes:"
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          TAG: ${{ needs.release-rust.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           gh release create "$TAG" \
+            --verify-tag \
             --title "$TAG" \
-            --notes "See [CHANGELOG](https://github.com/$REPO/blob/main/CHANGELOG.md) for details."
+            --notes-file release-notes.md \
+            dist/*
 
   build-wheels:
     name: Build wheels (${{ matrix.os }})
