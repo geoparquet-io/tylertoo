@@ -824,6 +824,52 @@ pub(crate) mod remote {
 
     /// Map an object-store error, attaching the input URL.
     fn store_error(url: &str, source: object_store::Error) -> InputError {
+        store_error_with_hint(url, source, custom_endpoint_configured())
+    }
+
+    /// Whether a custom (non-AWS) S3 endpoint is configured via the env
+    /// vars `AmazonS3Builder::from_env` honors.
+    fn custom_endpoint_configured() -> bool {
+        std::env::var_os("AWS_ENDPOINT_URL").is_some() || std::env::var_os("AWS_ENDPOINT").is_some()
+    }
+
+    /// Whether `text` (an object-store error rendering) looks like an S3
+    /// signature/authorization failure — the shape an anonymous
+    /// S3-compatible endpoint produces when ambient AWS credentials sign
+    /// requests it cannot verify.
+    fn looks_like_signature_error(text: &str) -> bool {
+        const MARKERS: [&str; 5] = [
+            "403",
+            "forbidden",
+            "invalidaccesskeyid",
+            "signaturedoesnotmatch",
+            "accessdenied",
+        ];
+        let lower = text.to_ascii_lowercase();
+        MARKERS.iter().any(|m| lower.contains(m))
+    }
+
+    /// [`store_error`] with the endpoint check injected (test seam). With a
+    /// custom endpoint configured, a signature/authorization-style failure
+    /// appends the `AWS_SKIP_SIGNATURE=true` hint — string-level, in the
+    /// Display path only (the error types are unchanged): resolved AWS
+    /// credentials are signed into every request, and an anonymous
+    /// S3-compatible endpoint rejects them with exactly this error shape.
+    fn store_error_with_hint(
+        url: &str,
+        source: object_store::Error,
+        custom_endpoint: bool,
+    ) -> InputError {
+        if custom_endpoint {
+            let text = source.to_string();
+            if looks_like_signature_error(&text) {
+                return InputError::RemoteConfig(format!(
+                    "remote input error for {url}: {text} — if this S3-compatible \
+                     endpoint serves anonymous (unsigned) requests, retry with \
+                     AWS_SKIP_SIGNATURE=true"
+                ));
+            }
+        }
         InputError::Remote {
             url: url.to_string(),
             source,
@@ -1288,6 +1334,57 @@ pub(crate) mod remote {
                 spill.get(0).is_none(),
                 "create failure must disable the spill"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod hint_tests {
+        use super::*;
+
+        fn signature_shaped_error() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "S3",
+                source: "Client error with status 403 Forbidden: \
+                         <Code>InvalidAccessKeyId</Code>"
+                    .into(),
+            }
+        }
+
+        /// PR-C: a signature/authorization-style failure against a custom
+        /// S3-compatible endpoint appends the AWS_SKIP_SIGNATURE hint in
+        /// the error text (string-level; the error types are unchanged).
+        #[test]
+        fn signature_error_on_custom_endpoint_appends_skip_signature_hint() {
+            let msg = store_error_with_hint("s3://b/k.parquet", signature_shaped_error(), true)
+                .to_string();
+            assert!(
+                msg.contains("AWS_SKIP_SIGNATURE=true"),
+                "hint appended: {msg}"
+            );
+            assert!(msg.contains("s3://b/k.parquet"), "keeps the URL: {msg}");
+            assert!(msg.contains("403"), "keeps the original error: {msg}");
+        }
+
+        /// Without a custom endpoint the error is untouched (the hint is
+        /// specific to S3-compatible endpoints like anonymous data hosts).
+        #[test]
+        fn signature_error_without_custom_endpoint_is_unchanged() {
+            let msg = store_error_with_hint("s3://b/k.parquet", signature_shaped_error(), false)
+                .to_string();
+            assert!(!msg.contains("AWS_SKIP_SIGNATURE"), "no hint: {msg}");
+            assert!(msg.contains("403"), "original error preserved: {msg}");
+        }
+
+        /// A non-signature failure (e.g. object not found) never grows the
+        /// hint, custom endpoint or not.
+        #[test]
+        fn non_signature_error_never_hints() {
+            let not_found = object_store::Error::NotFound {
+                path: "k.parquet".to_string(),
+                source: "no such key".into(),
+            };
+            let msg = store_error_with_hint("s3://b/k.parquet", not_found, true).to_string();
+            assert!(!msg.contains("AWS_SKIP_SIGNATURE"), "no hint: {msg}");
         }
     }
 }

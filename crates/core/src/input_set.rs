@@ -322,23 +322,25 @@ impl ConvertSource {
     /// Shared by [`Self::from_manifest`] and [`Self::from_input_list`]:
     /// resolve each `(context, entry)` as a single source, requiring local
     /// entries to exist up front so the error can name the entry instead
-    /// of surfacing as a bare I/O error at footer-load time.
+    /// of surfacing as a bare I/O error at footer-load time. Remote entries
+    /// connect (one HEAD each) under bounded concurrency
+    /// ([`LIST_CONNECT_CONCURRENCY`]); entry order is preserved verbatim
+    /// in the resulting parts (the row-order invariant).
     fn from_explicit_list(root: &str, entries: &[(String, String)]) -> Result<Self, InputError> {
-        let mut parts = Vec::with_capacity(entries.len());
-        for (context, entry) in entries {
+        let parts = resolve_list_entries(entries, |context, entry| {
             let src = InputSource::from_str_input(entry)?;
             // Without the `remote` feature `Local` is the only variant.
             #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
             if let InputSource::Local(p) = &src {
                 if !p.is_file() {
                     return Err(InputError::MissingListedInput {
-                        context: context.clone(),
-                        input: entry.clone(),
+                        context: context.to_string(),
+                        input: entry.to_string(),
                     });
                 }
             }
-            parts.push(src);
-        }
+            Ok(src)
+        })?;
         Self::from_parts(root, parts)
     }
 
@@ -814,6 +816,58 @@ fn has_glob_meta(input: &str) -> bool {
     input.contains(['*', '?', '['])
 }
 
+/// Entry-resolution concurrency for explicit lists (`--files-from`
+/// manifests, Python input lists). Remote entries cost one connect (HEAD)
+/// each, so hundreds of manifest lines would otherwise serialize hundreds
+/// of round-trips; matches [`FOOTER_LOAD_CONCURRENCY`].
+const LIST_CONNECT_CONCURRENCY: usize = 8;
+
+/// Resolve every `(context, entry)` pair with `resolve` under bounded
+/// concurrency ([`LIST_CONNECT_CONCURRENCY`]). Results are written into
+/// per-index slots, so the returned vector always matches `entries` order
+/// regardless of completion order — the row-order invariant — and the
+/// first error (by entry index) wins.
+fn resolve_list_entries<F>(
+    entries: &[(String, String)],
+    resolve: F,
+) -> Result<Vec<InputSource>, InputError>
+where
+    F: Fn(&str, &str) -> Result<InputSource, InputError> + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = LIST_CONNECT_CONCURRENCY.min(entries.len());
+    if workers <= 1 {
+        return entries
+            .iter()
+            .map(|(context, entry)| resolve(context, entry))
+            .collect();
+    }
+    let next = AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<InputSource, InputError>>>> = (0..entries.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= entries.len() {
+                    break;
+                }
+                let (context, entry) = &entries[i];
+                *slots[i].lock().expect("entry slot lock") = Some(resolve(context, entry));
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("entry slot lock")
+                .expect("every slot filled by a worker")
+        })
+        .collect()
+}
+
 /// Parse `--files-from` manifest text into `(1-based line number, entry)`
 /// pairs: entries are trimmed; blank lines and lines whose first non-space
 /// character is `#` are skipped. Order is preserved verbatim (see
@@ -887,6 +941,70 @@ pub(crate) fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, InputError> {
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+/// Default PMTiles layer name derived from a CLI-style input string — the
+/// multi-partition generalization of "the input file's stem":
+///
+/// - single file (local path or nonexistent-yet path) → file stem
+///   (historical behavior; also what a `--files-from` manifest path gives:
+///   the manifest file's stem);
+/// - existing local directory → the directory's last path segment,
+///   verbatim (a dotted directory name is a name, not an extension);
+/// - glob pattern → the deepest literal (wildcard-free) path segment
+///   before the first wildcard segment;
+/// - remote URL (`scheme://…`, query string and fragment stripped):
+///   trailing-slash prefix → last non-empty path segment verbatim
+///   (bucket name for a bucket-root prefix); single object → the key's
+///   last segment's stem;
+/// - anything degenerate (empty, no usable segment) → `"layer"`, the
+///   same fallback the single-file path has always used.
+pub fn derive_layer_name(input: &str) -> String {
+    const FALLBACK: &str = "layer";
+    let stem_of = |p: &Path| p.file_stem().and_then(|s| s.to_str()).map(str::to_string);
+
+    let name = if url_scheme(input).is_some() {
+        let no_fragment = input.split('#').next().unwrap_or(input);
+        let no_query = no_fragment.split('?').next().unwrap_or(no_fragment);
+        let rest = no_query
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(no_query);
+        rest.split('/')
+            .rev()
+            .find(|seg| !seg.is_empty())
+            .and_then(|seg| {
+                if remote_url_is_prefix(input) {
+                    Some(seg.to_string())
+                } else {
+                    stem_of(Path::new(seg))
+                }
+            })
+    } else {
+        let path = Path::new(input);
+        if path.is_dir() {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        } else if !path.is_file() && has_glob_meta(input) {
+            // Deepest literal segment before the first wildcard one.
+            let mut last_literal = None;
+            for comp in path.components() {
+                if let std::path::Component::Normal(seg) = comp {
+                    match seg.to_str() {
+                        Some(s) if !has_glob_meta(s) => last_literal = Some(s.to_string()),
+                        // Wildcard (or non-UTF-8) segment: stop descending.
+                        _ => break,
+                    }
+                }
+            }
+            last_literal
+        } else {
+            stem_of(path)
+        }
+    };
+    name.filter(|n| !n.is_empty())
+        .unwrap_or_else(|| FALLBACK.to_string())
 }
 
 #[cfg(test)]
@@ -1608,5 +1726,177 @@ b.parquet
             let stats = src.fetch_stats().expect("remote parts have stats");
             assert!(stats.object_size > 0, "object_size sums the parts");
         }
+
+        /// PR-C: explicit-list (manifest / input-list) entries resolve under
+        /// bounded parallelism, but the resulting parts MUST preserve entry
+        /// order VERBATIM (the row-order invariant) — never completion or
+        /// lexicographic order.
+        #[test]
+        fn explicit_list_parallel_connect_preserves_order() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Condvar, Mutex as StdMutex};
+
+            let store = seeded_store(&[
+                ("m/a.parquet", parquet_bytes(vec![10])),
+                ("m/b.parquet", parquet_bytes(vec![0, 1])),
+                ("m/c.parquet", parquet_bytes(vec![20])),
+            ]);
+            let store: Arc<dyn ObjectStore> = store;
+
+            // Deliberately NOT lexicographic: c, a, b.
+            let entries: Vec<(String, String)> = ["m/c.parquet", "m/a.parquet", "m/b.parquet"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, key)| (format!("entry {}", i + 1), key.to_string()))
+                .collect();
+
+            // Overlap detector: the first resolver call blocks until a
+            // second one is in flight (or a generous timeout passes), so a
+            // serial implementation fails the `overlapped` assertion while
+            // a parallel one passes deterministically.
+            let in_flight = StdMutex::new(0usize);
+            let cv = Condvar::new();
+            let overlapped = AtomicBool::new(false);
+
+            let resolved = resolve_list_entries(&entries, |_context, entry| {
+                {
+                    let mut n = in_flight.lock().unwrap();
+                    *n += 1;
+                    if *n >= 2 {
+                        overlapped.store(true, Ordering::SeqCst);
+                        cv.notify_all();
+                    } else {
+                        let (guard, _) = cv
+                            .wait_timeout_while(n, std::time::Duration::from_secs(10), |_| {
+                                !overlapped.load(Ordering::SeqCst)
+                            })
+                            .unwrap();
+                        drop(guard);
+                    }
+                }
+                Ok(InputSource::Remote(RemoteSource::from_store(
+                    Arc::clone(&store),
+                    ObjectPath::from(entry),
+                    format!("memory://{entry}"),
+                )?))
+            })
+            .unwrap();
+            assert!(
+                overlapped.load(Ordering::SeqCst),
+                "entry connects must overlap (bounded parallelism), not run serially"
+            );
+
+            let src = ConvertSource::from_parts("list", resolved).unwrap();
+            let plan = ReadPlan {
+                batch_size: 1024,
+                projection: None,
+                row_groups: None,
+            };
+            assert_eq!(
+                stream_ids(&src, &plan),
+                vec![20, 10, 0, 1],
+                "parts follow entry order verbatim"
+            );
+        }
+
+        /// Parallel completion order must not change WHICH error surfaces:
+        /// the first failing entry by INDEX wins.
+        #[test]
+        fn explicit_list_first_error_by_index_wins() {
+            let entries: Vec<(String, String)> = (1..=4)
+                .map(|i| (format!("entry {i}"), format!("e{i}")))
+                .collect();
+            let err = resolve_list_entries(&entries, |context, entry| {
+                if entry == "e2" || entry == "e4" {
+                    return Err(InputError::MissingListedInput {
+                        context: context.to_string(),
+                        input: entry.to_string(),
+                    });
+                }
+                Ok(InputSource::Local(PathBuf::from(entry)))
+            })
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("entry 2"),
+                "first failing entry by index wins: {msg}"
+            );
+        }
+    }
+
+    // --- layer-name derivation (v0.7 PR-C) ------------------------------------
+
+    /// Single files (local or nonexistent-yet paths) keep the historical
+    /// behavior: the file stem, `"layer"` when there is none.
+    #[test]
+    fn layer_name_single_file_is_stem() {
+        assert_eq!(derive_layer_name("/data/buildings.parquet"), "buildings");
+        assert_eq!(derive_layer_name("buildings.parquet"), "buildings");
+        // A --files-from manifest path takes the manifest file's stem.
+        assert_eq!(
+            derive_layer_name("/tmp/portland-roads.txt"),
+            "portland-roads"
+        );
+    }
+
+    /// Directory inputs use the directory's last path segment VERBATIM
+    /// (no extension stripping — a dotted directory name is a name, not
+    /// a file extension), trailing slash tolerated.
+    #[test]
+    fn layer_name_directory_is_last_segment() {
+        let dir = tmpdir();
+        let parts = dir.path().join("nyc_buildings");
+        std::fs::create_dir(&parts).unwrap();
+        assert_eq!(derive_layer_name(parts.to_str().unwrap()), "nyc_buildings");
+
+        let dotted = dir.path().join("buildings.v2");
+        std::fs::create_dir(&dotted).unwrap();
+        assert_eq!(
+            derive_layer_name(&format!("{}/", dotted.display())),
+            "buildings.v2"
+        );
+    }
+
+    /// Glob inputs use the deepest literal (wildcard-free) path segment
+    /// before the first wildcard segment; an all-wildcard pattern falls
+    /// back to `"layer"`.
+    #[test]
+    fn layer_name_glob_uses_last_literal_segment() {
+        assert_eq!(derive_layer_name("/data/parts/*.parquet"), "parts");
+        assert_eq!(derive_layer_name("/data/part-*.parquet"), "data");
+        assert_eq!(derive_layer_name("/data/**/part-?.parquet"), "data");
+        assert_eq!(derive_layer_name("*.parquet"), "layer");
+    }
+
+    /// `s3://`/`gs://` prefixes use the last non-empty path segment of the
+    /// prefix (query string and fragment stripped); a bucket-root prefix
+    /// uses the bucket name.
+    #[test]
+    fn layer_name_remote_prefix_uses_last_segment() {
+        assert_eq!(derive_layer_name("s3://bucket/datasets/roads/"), "roads");
+        assert_eq!(derive_layer_name("gs://bucket/roads/"), "roads");
+        assert_eq!(derive_layer_name("s3://bucket/roads/?list-type=2"), "roads");
+        assert_eq!(derive_layer_name("s3://bucket/"), "bucket");
+    }
+
+    /// Remote single objects behave like local single files: the object
+    /// key's stem, with query string / fragment stripped first.
+    #[test]
+    fn layer_name_remote_object_is_stem() {
+        assert_eq!(derive_layer_name("s3://bucket/data/roads.parquet"), "roads");
+        assert_eq!(
+            derive_layer_name("https://host/dl/roads.parquet?sig=abc"),
+            "roads"
+        );
+        // Extension-less presigned/API URL: last segment verbatim.
+        assert_eq!(derive_layer_name("https://host/api/download/42"), "42");
+    }
+
+    /// Degenerate inputs sanitize to the historical `"layer"` fallback.
+    #[test]
+    fn layer_name_degenerate_falls_back() {
+        assert_eq!(derive_layer_name(""), "layer");
+        assert_eq!(derive_layer_name("s3://"), "layer");
+        assert_eq!(derive_layer_name("/"), "layer");
     }
 }

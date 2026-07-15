@@ -82,14 +82,11 @@ fn convert(
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
 
-    // Derive layer name from input filename if not provided.
-    let layer_name = layer_name.unwrap_or_else(|| {
-        input_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("layer")
-            .to_string()
-    });
+    // Derive the layer name from the input if not provided: file stem for a
+    // single file, last path segment for a directory or s3://gs:// prefix,
+    // last literal segment for a glob (core owns the rules).
+    let layer_name =
+        layer_name.unwrap_or_else(|| gpq_tiles_core::input_set::derive_layer_name(input));
 
     let options = ConvertOptions {
         levels: LevelPlan::ZoomRange { min_zoom, max_zoom },

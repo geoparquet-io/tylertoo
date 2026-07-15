@@ -15,7 +15,15 @@ The `overview` and `tiles` subcommands (and the Python `overview()` /
 `gs://` URLs as the *input* path. The converter reads the object with
 HTTP byte-range requests through the same synchronous parquet pipeline
 used for local files: footer first, then each column chunk of each row
-group it actually needs. Nothing is staged to disk.
+group it actually needs. Fetched chunks are staged in a temporary
+spill file (see the fetch-behavior note below) so re-reads never
+touch the network twice; the input itself is never downloaded whole
+up front.
+
+An `s3://` or `gs://` URL ending in `/` is treated as a *prefix* and
+listed to its `.parquet` objects — see
+[Multi-Partition Input](multi-partition.md) for prefix semantics,
+filtering, ordering, and `--files-from` manifests.
 
 ```bash
 # Full remote conversion

@@ -59,6 +59,7 @@ nav:
   - API Reference: api-reference.md
   - Advanced Usage: advanced-usage.md
   - Remote Reads: remote-reads.md
+  - Multi-Partition Input: multi-partition.md
   - Architecture: architecture.md
   - Overview Tuning: OVERVIEW_TUNING.md
   - Development: development.md
