@@ -54,6 +54,17 @@ command.
 sane row-group sizing — `gpio` produces exactly that, and it is what keeps
 gpq-tiles fast on large files.
 
+**Reserved column names are auto-renamed.** The overview format adds a `level`
+column (and, with `--cluster` / line coalescing, `point_count` /
+`coalesced_count`). If your data already has a property with one of those names
+— Overture Maps buildings carry a `level` (floor number), admin data often has
+`LEVEL` — gpq-tiles does **not** reject the file. It renames the colliding
+property by appending `_` (e.g. `level` → `level_`), prints a warning, and keeps
+its own column authoritative. The match is case-insensitive (so `LEVEL` is
+handled too), and any `--sort-key` / `--class-rank` / `--accumulate-attribute`
+that named the renamed column is rewritten to follow it. No preprocessing
+needed.
+
 ## The Two-Step Workflow (Recommended)
 
 The product is the **overview GeoParquet file**: one file that embeds

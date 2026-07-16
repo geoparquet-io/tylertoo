@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
 use geo::{BoundingRect, Geometry};
@@ -624,9 +624,6 @@ pub enum ConvertError {
         /// The rejected CRS identifier.
         crs: String,
     },
-    /// The input already contains a `level` column (§4.1).
-    #[error("input already contains a '{LEVEL_COLUMN}' column; not an overview source")]
-    LevelColumnPresent,
     /// The input has no geometry column.
     #[error("input has no geometry column")]
     NoGeometryColumn,
@@ -999,22 +996,22 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // --- Read the input footer, preserving the full property schema. ---------
     // (For a remote source, the footer is range-fetched once and cached.)
     let builder = source_single.open()?;
-    let input_schema = builder.schema().clone();
+    // `read_schema` matches the raw batches read below; `input_schema` is the
+    // possibly-renamed schema used for every downstream (name-based) lookup.
+    let read_schema = builder.schema().clone();
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
     let crs = detect_crs_from_kv(builder.metadata().file_metadata().key_value_metadata())?;
 
-    // Reject an input that already carries a `level` column (§4.1).
-    // Case-insensitive: DuckDB resolves identifiers case-insensitively,
-    // so a source `LEVEL` column would silently shadow ours in
-    // `WHERE level = k` (V1 finding F2).
-    if input_schema
-        .fields()
-        .iter()
-        .any(|f| f.name().eq_ignore_ascii_case(LEVEL_COLUMN))
-    {
-        return Err(ConvertError::LevelColumnPresent);
-    }
+    // Reserved-column collisions (#288): rename any input column named `level`
+    // / `point_count` / `coalesced_count` (case-insensitive) out of the way
+    // rather than reject the file, keeping the reserved output columns
+    // authoritative. `options` is cloned so by-name ranking/accumulate options
+    // can be rewritten to the renamed columns. The rename preserves column
+    // order, so `read_schema` and `input_schema` share indices.
+    let mut options = options.clone();
+    let (input_schema, _renames) = resolve_reserved_column_collisions(&read_schema, &mut options);
+    let options = &options;
 
     let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
     let geom_field = input_schema.field(geom_idx).clone();
@@ -1045,7 +1042,8 @@ pub(crate) fn convert_to_overviews_source_strategy(
     for batch in reader {
         batches.push(batch?);
     }
-    let full = concat_batches(&input_schema, &batches)?;
+    // Concat with `read_schema` (the raw batches carry the original names).
+    let full = concat_batches(&read_schema, &batches)?;
 
     // Decode geometries once (in-memory v1), row-aligned. Rows with a null,
     // empty, or non-finite geometry cannot participate in level assignment:
@@ -1054,6 +1052,15 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // never shift attributes onto a neighboring row's geometry).
     let (full, geometries) =
         decode_and_filter_geometries(full, geom_idx, &geom_field, bbox_units.as_ref())?;
+
+    // Apply the reserved-column renames (#288) to the in-memory table. Columns
+    // are positional, so re-associating them with the renamed schema is a
+    // metadata-only relabel (a no-op when nothing collided).
+    let full = if Arc::ptr_eq(&input_schema, &read_schema) {
+        full
+    } else {
+        RecordBatch::try_new(input_schema.clone(), full.columns().to_vec())?
+    };
     let num_features = full.num_rows();
 
     // Resolve the cell-winner ranking (Q1): explicit sort key / explicit class
@@ -1865,6 +1872,9 @@ pub(super) fn validate_cluster_schema(
     if !options.cluster {
         return Ok(Vec::new());
     }
+    // Backstop: both pipelines run `resolve_reserved_column_collisions` first,
+    // which renames any colliding `point_count` away (#288), so this normally
+    // never fires — it guards a direct caller that skipped the resolver.
     if schema
         .fields()
         .iter()
@@ -2052,6 +2062,10 @@ pub(super) fn validate_coalesce_schema(
     if !options.coalesce_lines {
         return Ok(());
     }
+    // Backstop: both pipelines run `resolve_reserved_column_collisions` first,
+    // which renames any colliding `coalesced_count` away (#288), so this
+    // normally never fires — it guards a direct caller that skipped the
+    // resolver.
     if schema
         .fields()
         .iter()
@@ -2060,6 +2074,127 @@ pub(super) fn validate_coalesce_schema(
         return Err(ConvertError::CoalescedCountColumnPresent);
     }
     Ok(())
+}
+
+// ============================================================================
+// Reserved-column collision handling (#288) — shared by both pipelines
+// ============================================================================
+
+/// The output columns the overview writer reserves for a given conversion.
+/// `level` is always appended (§4.1); `point_count` and `coalesced_count` are
+/// appended only when clustering / coalescing are enabled, so they are reserved
+/// only in those modes — mirroring [`validate_cluster_schema`] /
+/// [`validate_coalesce_schema`].
+fn reserved_output_columns(options: &ConvertOptions) -> Vec<&'static str> {
+    let mut names = vec![LEVEL_COLUMN];
+    if options.cluster {
+        names.push(POINT_COUNT_COLUMN);
+    }
+    if options.coalesce_lines {
+        names.push(COALESCED_COUNT_COLUMN);
+    }
+    names
+}
+
+/// Rename any input column that collides (case-insensitively) with a reserved
+/// overview output column, so real-world data whose properties happen to be
+/// named `level` (Overture buildings' floor number), `LEVEL` (admin data),
+/// `point_count`, etc. converts instead of being rejected (#288). Each
+/// colliding column is renamed by appending `_`, looping until the name is
+/// unique against both the existing columns and the reserved names. The
+/// reserved output column stays authoritative.
+///
+/// The rename is metadata-only and **order-preserving** — type, nullability,
+/// and field metadata are kept, and columns are not reordered — so every
+/// downstream index- and projection-based path (which addresses columns
+/// positionally) stays valid against the raw input. Any by-name option that
+/// referenced a renamed column (`sort_key`, `class_ranking.column`,
+/// `accumulate[].column`) is rewritten in `options` to the new name so it still
+/// resolves. A `log::warn!` is emitted per rename.
+///
+/// Returns the rewritten schema — the same `Arc` when nothing collided, so
+/// callers can cheaply detect the no-op via [`Arc::ptr_eq`] — and the applied
+/// `(old, new)` renames.
+pub(super) fn resolve_reserved_column_collisions(
+    input_schema: &SchemaRef,
+    options: &mut ConvertOptions,
+) -> (SchemaRef, Vec<(String, String)>) {
+    let reserved = reserved_output_columns(options);
+    let match_reserved = |name: &str| -> Option<&'static str> {
+        reserved
+            .iter()
+            .copied()
+            .find(|r| name.eq_ignore_ascii_case(r))
+    };
+
+    let mut taken: HashSet<String> = input_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().to_ascii_lowercase())
+        .collect();
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let mut new_fields: Vec<Arc<Field>> = Vec::with_capacity(input_schema.fields().len());
+
+    for field in input_schema.fields() {
+        let name = field.name();
+        let Some(reserved_name) = match_reserved(name) else {
+            new_fields.push(field.clone());
+            continue;
+        };
+        // Append `_` until the candidate collides with no existing column and
+        // no reserved name. `_` can never introduce a `geom`/`geometry`
+        // substring, so geometry detection stays unaffected.
+        let mut candidate = format!("{name}_");
+        while taken.contains(&candidate.to_ascii_lowercase())
+            || match_reserved(&candidate).is_some()
+        {
+            candidate.push('_');
+        }
+        taken.insert(candidate.to_ascii_lowercase());
+        log::warn!(
+            "input column {name:?} collides with the reserved overview column \
+             {reserved_name:?}; renaming the input column to {candidate:?} in \
+             the output (the reserved {reserved_name:?} column is authoritative)"
+        );
+        renames.push((name.to_string(), candidate.clone()));
+        new_fields.push(Arc::new(
+            Field::new(candidate, field.data_type().clone(), field.is_nullable())
+                .with_metadata(field.metadata().clone()),
+        ));
+    }
+
+    if renames.is_empty() {
+        return (input_schema.clone(), renames);
+    }
+
+    // A by-name option that pointed at a renamed column must follow the rename,
+    // or a supported invocation (`--sort-key level`) would fail with
+    // `*ColumnMissing` (or, for coalesce grouping, panic) downstream.
+    let remap = |col: &str| -> Option<String> {
+        renames
+            .iter()
+            .find(|(old, _)| col.eq_ignore_ascii_case(old))
+            .map(|(_, new)| new.clone())
+    };
+    if let Some(new) = options.sort_key.as_deref().and_then(remap) {
+        options.sort_key = Some(new);
+    }
+    if let Some(cr) = options.class_ranking.as_mut() {
+        if let Some(new) = remap(&cr.column) {
+            cr.column = new;
+        }
+    }
+    for spec in &mut options.accumulate {
+        if let Some(new) = remap(&spec.column) {
+            spec.column = new;
+        }
+    }
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        input_schema.metadata().clone(),
+    ));
+    (schema, renames)
 }
 
 /// The writer schema with the trailing `coalesced_count` INT32 NOT NULL
@@ -2784,9 +2919,22 @@ mod tests {
         b.finish()
     }
 
+    /// Field names of an overview output file, in schema order.
+    fn output_column_names(path: &Path) -> Vec<String> {
+        let file = std::fs::File::open(path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
     /// Write a valid GeoParquet file (WKB, covering) with id/name/rank props and
     /// the given geometries. `extra_level_col` injects a `level` Int32 column to
-    /// exercise the rejection path. `crs_projjson` overrides the geometry CRS.
+    /// exercise the reserved-column auto-rename path (#288). `crs_projjson`
+    /// overrides the geometry CRS.
     fn write_input(
         path: &Path,
         geoms: &[Geometry<f64>],
@@ -3393,17 +3541,119 @@ mod tests {
     }
 
     #[test]
-    fn rejects_existing_level_column() {
+    fn renames_existing_level_column() {
+        // #288: an input `level` property must be auto-renamed (not rejected)
+        // so flagship data (Overture buildings' floor-number `level`) converts.
+        // The reserved `level` output column stays authoritative; the source
+        // column becomes `level_`.
         let geoms = synthetic_geometries();
         let tin = tempfile::NamedTempFile::new().unwrap();
         let tout = tempfile::NamedTempFile::new().unwrap();
         write_input(tin.path(), &geoms, true, None);
 
         let opts = ConvertOptions::default();
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+        convert_to_overviews(tin.path(), tout.path(), &opts)
+            .expect("colliding `level` column must be auto-renamed, not rejected");
+
+        // Output validates and carries exactly one authoritative `level` column
+        // plus the renamed source column `level_`.
+        let report = crate::overview::check::validate_file(tout.path()).unwrap();
         assert!(
-            matches!(err, ConvertError::LevelColumnPresent),
-            "expected LevelColumnPresent, got {err:?}"
+            report.is_valid(),
+            "failures: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let names = output_column_names(tout.path());
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("level"))
+                .count(),
+            1,
+            "exactly one authoritative `level` column, names={names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "level_"),
+            "renamed source column `level_` present, names={names:?}"
+        );
+    }
+
+    #[test]
+    fn resolver_renames_and_loops_suffix() {
+        // `level` collides; `level_` already exists → the suffix loop keeps
+        // appending until free (`level__`). Order and other columns are kept.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("level", DataType::Int32, false),
+            Field::new("level_", DataType::Int32, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]));
+        let mut opts = ConvertOptions::default();
+        let (out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        assert_eq!(renames, vec![("level".to_string(), "level__".to_string())]);
+        let names: Vec<_> = out.fields().iter().map(|f| f.name().clone()).collect();
+        assert_eq!(names, vec!["id", "level__", "level_", "geometry"]);
+    }
+
+    #[test]
+    fn resolver_rewrites_option_column_references() {
+        // A `--sort-key` that named the (case-insensitive) reserved column must
+        // follow the rename, or ranking would fail with SortKeyColumnMissing.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("level", DataType::Int32, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]));
+        let mut opts = ConvertOptions {
+            sort_key: Some("LEVEL".to_string()),
+            ..Default::default()
+        };
+        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        assert_eq!(renames.len(), 1);
+        assert_eq!(opts.sort_key.as_deref(), Some("level_"));
+    }
+
+    #[test]
+    fn resolver_noop_when_no_collision() {
+        // No reserved-name collision → same `Arc` returned (cheap no-op) and no
+        // renames.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]));
+        let mut opts = ConvertOptions::default();
+        let (out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        assert!(renames.is_empty());
+        assert!(Arc::ptr_eq(&out, &schema));
+    }
+
+    #[test]
+    fn resolver_reserves_count_columns_only_when_enabled() {
+        // `point_count` is a normal passthrough property unless clustering is
+        // on; likewise `coalesced_count` needs coalescing.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("point_count", DataType::Int64, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]));
+        // Clustering off, coalescing off → no collision.
+        let mut off = ConvertOptions {
+            cluster: false,
+            coalesce_lines: false,
+            ..Default::default()
+        };
+        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut off);
+        assert!(
+            renames.is_empty(),
+            "point_count is a passthrough without --cluster"
+        );
+        // Clustering on → reserved, so renamed.
+        let mut on = ConvertOptions {
+            cluster: true,
+            ..Default::default()
+        };
+        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut on);
+        assert_eq!(
+            renames,
+            vec![("point_count".to_string(), "point_count_".to_string())]
         );
     }
 
@@ -4593,9 +4843,10 @@ mod tests {
     }
 
     #[test]
-    fn cluster_rejects_existing_point_count_column() {
-        // An input already carrying a `point_count` column is rejected when
-        // clustering (case-insensitively), but accepted when clustering is off.
+    fn cluster_renames_existing_point_count_column() {
+        // #288: an input already carrying a `point_count` column (case-
+        // insensitively) is auto-renamed when clustering, and is an ordinary
+        // passthrough property when clustering is off.
         let geoms = grid_points(10);
         let n = geoms.len();
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4629,7 +4880,7 @@ mod tests {
         }
 
         let tout = tempfile::NamedTempFile::new().unwrap();
-        let err = convert_to_overviews(
+        convert_to_overviews(
             tin.path(),
             tout.path(),
             &ConvertOptions {
@@ -4637,11 +4888,29 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap_err();
-        assert!(matches!(err, ConvertError::PointCountColumnPresent));
+        .expect("colliding `Point_Count` column must be auto-renamed, not rejected");
+        let names = output_column_names(tout.path());
+        assert!(
+            names.iter().any(|n| n == "Point_Count_"),
+            "renamed source column present, names={names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("point_count"))
+                .count(),
+            1,
+            "one authoritative `point_count`, names={names:?}"
+        );
 
-        // Without clustering the column is an ordinary property.
+        // Without clustering the column is an ordinary passthrough property
+        // (kept verbatim, no reserved column added).
         convert_to_overviews(tin.path(), tout.path(), &ConvertOptions::default()).unwrap();
+        let names = output_column_names(tout.path());
+        assert!(
+            names.iter().any(|n| n == "Point_Count"),
+            "passthrough column kept verbatim, names={names:?}"
+        );
     }
 
     #[test]
@@ -4896,9 +5165,10 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_rejects_existing_coalesced_count_column() {
-        // An input already carrying a `coalesced_count` column is rejected
-        // when coalescing (case-insensitively), accepted when off.
+    fn coalesce_renames_existing_coalesced_count_column() {
+        // #288: an input already carrying a `coalesced_count` column (case-
+        // insensitively) is auto-renamed when coalescing, and is an ordinary
+        // passthrough property when coalescing is off.
         let geoms = fragment_chain_geoms(2);
         let n = geoms.len();
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4933,7 +5203,7 @@ mod tests {
 
         let tout = tempfile::NamedTempFile::new().unwrap();
         for streaming in [true, false] {
-            let err = convert_to_overviews(
+            convert_to_overviews(
                 tin.path(),
                 tout.path(),
                 &ConvertOptions {
@@ -4942,13 +5212,17 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap_err();
+            .unwrap_or_else(|e| {
+                panic!("streaming={streaming}: `Coalesced_Count` must be auto-renamed, got {e}")
+            });
+            let names = output_column_names(tout.path());
             assert!(
-                matches!(err, ConvertError::CoalescedCountColumnPresent),
-                "streaming={streaming}: got {err:?}"
+                names.iter().any(|n| n == "Coalesced_Count_"),
+                "streaming={streaming}: renamed source column present, names={names:?}"
             );
         }
-        // With coalescing disabled the column is an ordinary property.
+        // With coalescing disabled the column is an ordinary passthrough
+        // property (kept verbatim).
         convert_to_overviews(
             tin.path(),
             tout.path(),
@@ -4958,6 +5232,11 @@ mod tests {
             },
         )
         .unwrap();
+        let names = output_column_names(tout.path());
+        assert!(
+            names.iter().any(|n| n == "Coalesced_Count"),
+            "passthrough column kept verbatim, names={names:?}"
+        );
     }
 
     #[test]

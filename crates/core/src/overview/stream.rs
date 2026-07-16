@@ -75,9 +75,10 @@ use super::convert::{
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
     count_vertices, extract_class_ranks, extract_sort_keys, feature_kind, fill_level_bytes,
     find_geometry_column, geometry_bbox, mixed_geometry_field, overture_road_ranking,
-    record_level_outcome, usable_geometry, validate_cluster_schema, validate_coalesce_schema,
-    warn_plan_skipped_levels, ClassRanking, CoalesceTable, ConvertError, ConvertOptions,
-    ConvertReport, GroupInterner, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    record_level_outcome, resolve_reserved_column_collisions, usable_geometry,
+    validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, ClassRanking,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, SkippedLevelReport,
+    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipeline;
@@ -85,9 +86,7 @@ use super::simplify::{
     full_resolution_fallback_count, simplify_cascade, simplify_for_level, validation_skip_count,
     Simplified, SimplifyOptions,
 };
-use super::writer::{
-    LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, LEVEL_COLUMN,
-};
+use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
 /// Row-indexed winner-table sentinel for rows with no feature (null, empty,
 /// or non-finite geometry — skipped in pass 1). It matches no level in either
@@ -229,13 +228,18 @@ pub(crate) fn convert_streaming_strategy(
     // passes below read from the spill, not the network.
     stage_input_pass0(source, selected_row_groups.as_ref(), row_groups_read);
 
-    if input_schema
-        .fields()
-        .iter()
-        .any(|f| f.name().eq_ignore_ascii_case(LEVEL_COLUMN))
-    {
-        return Err(ConvertError::LevelColumnPresent);
-    }
+    // Reserved-column collisions (#288): rename any input column named `level`
+    // / `point_count` / `coalesced_count` (case-insensitive) instead of
+    // rejecting the file, keeping the reserved output columns authoritative.
+    // The rename preserves column order, so the projection indices pass 1
+    // computes against `input_schema` stay valid against the raw file, and pass
+    // 2 relabels non-geometry columns positionally into the renamed source
+    // schema (`build_source_schema`). `options` is cloned so by-name
+    // ranking/accumulate options can be rewritten to the renamed columns.
+    let mut options = options.clone();
+    let (input_schema, _renames) = resolve_reserved_column_collisions(&input_schema, &mut options);
+    let options = &options;
+
     let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
     let geom_field = input_schema.field(geom_idx).clone();
 

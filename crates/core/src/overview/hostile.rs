@@ -35,7 +35,7 @@ use super::reader::{OverviewReader, ReaderError};
 /// Write a GeoParquet file with `id` (Int64), `name` (Utf8) property columns
 /// and the given (possibly null) geometries. `covering` toggles bbox covering
 /// generation; `extra_col` injects an additional Int32 column with the given
-/// name (reserved-column rejection tests).
+/// name (reserved-column auto-rename tests, #288).
 fn write_input(
     path: &Path,
     geoms: &[Option<Geometry<f64>>],
@@ -690,40 +690,81 @@ fn coalesce_nan_knobs_rejected() {
 // Class 7: pre-existing reserved columns (verify-only; case-insensitive)
 // ============================================================================
 
+/// Field names of an overview output file, in schema order.
+fn output_column_names(path: &Path) -> Vec<String> {
+    let file = std::fs::File::open(path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect()
+}
+
 #[test]
-fn reserved_columns_rejected_case_insensitive() {
-    // `LEVEL` (any casing) is always rejected.
-    let tin = tempfile::NamedTempFile::new().unwrap();
-    let tout = tempfile::NamedTempFile::new().unwrap();
-    write_input(tin.path(), &spread_points(3), true, Some("LEVEL"));
+fn reserved_columns_auto_renamed_case_insensitive() {
+    // #288: a source property colliding (case-insensitively) with a reserved
+    // overview column is auto-renamed (suffix `_`), not rejected, so real-world
+    // data — Overture buildings' `level`, admin `LEVEL` — converts out of the
+    // box. The reserved output column stays authoritative. Verified for all
+    // three reserved columns, across both pipelines.
+
+    // `LEVEL` (any casing) is always reserved.
     for streaming in [true, false] {
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &spread_points(3), true, Some("LEVEL"));
+        convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
+            .unwrap_or_else(|e| panic!("streaming={streaming}: expected auto-rename, got {e}"));
+        let names = output_column_names(tout.path());
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("level"))
+                .count(),
+            1,
+            "streaming={streaming}: one authoritative `level`, names={names:?}"
+        );
         assert!(
-            matches!(err, ConvertError::LevelColumnPresent),
-            "streaming={streaming}: got: {err}"
+            names.iter().any(|n| n == "LEVEL_"),
+            "streaming={streaming}: renamed source column present, names={names:?}"
         );
     }
 
-    // `Point_Count` is rejected when clustering is enabled.
+    // `Point_Count` is renamed when clustering is enabled.
     let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(3), true, Some("Point_Count"));
     let o = ConvertOptions {
         cluster: true,
         ..opts(true)
     };
-    let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+    convert_to_overviews(tin.path(), tout.path(), &o).expect("Point_Count auto-renamed");
+    let names = output_column_names(tout.path());
     assert!(
-        matches!(err, ConvertError::PointCountColumnPresent),
-        "got: {err}"
+        names.iter().any(|n| n == "Point_Count_"),
+        "renamed source column present, names={names:?}"
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| n.eq_ignore_ascii_case("point_count"))
+            .count(),
+        1,
+        "one authoritative `point_count`, names={names:?}"
     );
 
-    // `COALESCED_COUNT` is rejected when coalescing is enabled (the default).
+    // `COALESCED_COUNT` is renamed when coalescing is enabled (the default).
     let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(3), true, Some("COALESCED_COUNT"));
-    let err = convert_to_overviews(tin.path(), tout.path(), &opts(true)).unwrap_err();
+    convert_to_overviews(tin.path(), tout.path(), &opts(true))
+        .expect("COALESCED_COUNT auto-renamed");
+    let names = output_column_names(tout.path());
     assert!(
-        matches!(err, ConvertError::CoalescedCountColumnPresent),
-        "got: {err}"
+        names.iter().any(|n| n == "COALESCED_COUNT_"),
+        "renamed source column present, names={names:?}"
     );
 }
 
