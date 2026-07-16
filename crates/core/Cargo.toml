@@ -48,6 +48,7 @@ crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 tracing = { workspace = true }
+memory-stats = { workspace = true }
 flate2 = "1"
 brotli = "8"
 zstd = "0.13"

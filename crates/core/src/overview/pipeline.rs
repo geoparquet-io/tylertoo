@@ -60,42 +60,155 @@ pub(super) enum SinkBacking {
     Spill,
 }
 
+/// Estimated in-RAM bytes per buffered output ROW, by mode. `Auto` multiplies
+/// this by `buffered_rows` (the count the pass-2 engine holds — every level but
+/// the streamed finest) to size the RAM-vs-spill choice against available RAM.
+///
+/// Duplicating buffers only the geometrically-decayed COARSE levels, each
+/// holding *simplified* geometry, so its rows are light. Partitioning buffers
+/// every feature exactly once at FULL resolution, so its rows are heavier.
+/// These are deliberately rough, upper-ish estimates: they steer only the
+/// backing choice and never change output bytes.
+const DUPLICATING_BYTES_PER_ROW: u64 = 256;
+const PARTITIONING_BYTES_PER_ROW: u64 = 2_048;
+
+/// Fraction of *available* system RAM the estimated buffered-output set may
+/// occupy before `Auto` spills to a temp file instead of holding it in RAM.
+const AUTO_RAM_FRACTION: f64 = 0.6;
+
+/// Budget used when available RAM cannot be probed (non-Linux, or
+/// `/proc/meminfo` unreadable): a fixed, conservative ceiling so `Auto` still
+/// spills very large buffered sets rather than assuming unlimited RAM.
+const AUTO_FALLBACK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Buffered-row count above which `Auto` always spills partitioning's
+/// full-resolution geometry, regardless of the RAM estimate. Preserves the
+/// pre-#294 partitioning safety floor as a strict lower bound (partitioning
+/// spills at least as often as before; the RAM gate can only make it spill
+/// sooner).
+const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
+
+/// Estimated peak RAM (bytes) the pass-2 sink would hold if `buffered_rows`
+/// output rows of `mode` were kept in RAM. Saturating, so absurd counts never
+/// overflow (they simply clamp to a "definitely spill" value).
+fn estimate_buffered_bytes(mode: Mode, buffered_rows: usize) -> u64 {
+    let per_row = match mode {
+        Mode::Duplicating => DUPLICATING_BYTES_PER_ROW,
+        Mode::Partitioning => PARTITIONING_BYTES_PER_ROW,
+    };
+    (buffered_rows as u64).saturating_mul(per_row)
+}
+
+/// The RAM budget `Auto` compares the estimate against: a fraction of available
+/// system RAM, or a fixed fallback when RAM cannot be determined.
+fn auto_budget_bytes(available_ram_bytes: Option<u64>) -> u64 {
+    match available_ram_bytes {
+        Some(ram) => ((ram as f64) * AUTO_RAM_FRACTION) as u64,
+        None => AUTO_FALLBACK_BUDGET_BYTES,
+    }
+}
+
+/// Workload-driven backing choice for [`MemoryProfile::Auto`] (#294).
+///
+/// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds a
+/// fraction of available RAM — a function of `feature_count × level_count ×
+/// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
+/// mode-only rule. Partitioning additionally keeps its historical absolute
+/// row ceiling, so it spills at least as often as before.
+fn auto_backing(mode: Mode, buffered_rows: usize, available_ram_bytes: Option<u64>) -> SinkBacking {
+    let estimate = estimate_buffered_bytes(mode, buffered_rows);
+    let budget = auto_budget_bytes(available_ram_bytes);
+    let ram_gate_spill = estimate > budget;
+    let abs_gate_spill =
+        matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
+    if ram_gate_spill || abs_gate_spill {
+        SinkBacking::Spill
+    } else {
+        SinkBacking::Ram
+    }
+}
+
+/// Available system RAM in bytes for the `Auto` budget.
+///
+/// Order of precedence:
+/// 1. `TYLERTOO_AUTO_MEM_LIMIT_BYTES` env override (ops / testing knob — treat
+///    the box as having this many bytes of available RAM);
+/// 2. Linux `/proc/meminfo` `MemAvailable`;
+/// 3. `None` (caller falls back to [`AUTO_FALLBACK_BUDGET_BYTES`]).
+fn available_memory_bytes() -> Option<u64> {
+    if let Ok(v) = std::env::var("TYLERTOO_AUTO_MEM_LIMIT_BYTES") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            return Some(n);
+        }
+    }
+    read_proc_mem_available()
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_mem_available() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        // Format: "MemAvailable:   12345678 kB"
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_proc_mem_available() -> Option<u64> {
+    None
+}
+
 /// Resolve the [`MemoryProfile`] (including [`MemoryProfile::Auto`]) to a
 /// concrete [`SinkBacking`], logging the decision.
 ///
 /// `buffered_rows` is the total winner count of the levels the engine buffers
-/// (all but the streamed finest level). `Auto` keeps duplicating mode in RAM
-/// (it buffers only the small, geometrically-decayed coarse levels) and keeps
-/// partitioning mode in RAM only while the buffered set is small — partitioning
-/// buffers full-resolution geometry, so a large buffered set spills. An
+/// (all but the streamed finest level). For `Auto` the choice is workload-based
+/// (#294): the estimated buffered output (`f(buffered_rows, mode)`) is compared
+/// against a fraction of *available* RAM, so large duplicating runs prefer the
+/// bounded spill path instead of the old unconditional RAM buffering. An
 /// explicit profile always wins.
 pub(super) fn resolve_backing(
     profile: MemoryProfile,
     mode: Mode,
     buffered_rows: usize,
 ) -> SinkBacking {
-    /// Buffered-row count above which `Auto` spills partitioning's
-    /// full-resolution geometry instead of holding it in RAM.
-    const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
-
-    let backing = match profile {
-        MemoryProfile::Speed => SinkBacking::Ram,
-        MemoryProfile::Bounded => SinkBacking::Spill,
-        MemoryProfile::Auto => match mode {
-            Mode::Duplicating => SinkBacking::Ram,
-            Mode::Partitioning => {
-                if buffered_rows > PARTITIONING_SPILL_ROWS {
-                    SinkBacking::Spill
-                } else {
-                    SinkBacking::Ram
-                }
-            }
-        },
-    };
-    log::debug!(
-        "pass2 memory profile {profile:?} + {mode:?} (buffered ~{buffered_rows} rows) → {backing:?}"
-    );
-    backing
+    match profile {
+        MemoryProfile::Speed => {
+            log::debug!(
+                "pass2 memory profile Speed + {mode:?} (buffered ~{buffered_rows} rows) → Ram"
+            );
+            SinkBacking::Ram
+        }
+        MemoryProfile::Bounded => {
+            log::debug!(
+                "pass2 memory profile Bounded + {mode:?} (buffered ~{buffered_rows} rows) → Spill"
+            );
+            SinkBacking::Spill
+        }
+        MemoryProfile::Auto => {
+            let available = available_memory_bytes();
+            let backing = auto_backing(mode, buffered_rows, available);
+            let estimate = estimate_buffered_bytes(mode, buffered_rows);
+            let budget = auto_budget_bytes(available);
+            let avail_mib = available.map_or_else(
+                || "unknown".to_string(),
+                |b| format!("{} MiB", b / (1024 * 1024)),
+            );
+            // Info-level: the auto decision drives peak RAM and is the primary
+            // diagnostic for #294 / #295 (paired with the [rss] phase logs).
+            log::info!(
+                "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
+                 est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
+                estimate / (1024 * 1024),
+                budget / (1024 * 1024),
+            );
+            backing
+        }
+    }
 }
 
 /// A message from the reader thread: one raw input batch, its cumulative row
@@ -355,5 +468,106 @@ fn drain_sink(
             }
             Ok(res?)
         }
+    }
+}
+
+#[cfg(test)]
+mod backing_tests {
+    use super::*;
+    use crate::overview::level::{MemoryProfile, Mode};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn explicit_profiles_ignore_workload() {
+        // Speed is always RAM, Bounded always Spill — regardless of size/mode.
+        assert!(matches!(
+            resolve_backing(MemoryProfile::Speed, Mode::Duplicating, 10_000_000_000),
+            SinkBacking::Ram
+        ));
+        assert!(matches!(
+            resolve_backing(MemoryProfile::Bounded, Mode::Duplicating, 1),
+            SinkBacking::Spill
+        ));
+    }
+
+    #[test]
+    fn auto_duplicating_small_stays_in_ram() {
+        // A tiny buffered set is safe in RAM on a normal box.
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 10_000, Some(54 * GIB)),
+            SinkBacking::Ram
+        ));
+    }
+
+    #[test]
+    fn auto_duplicating_large_spills() {
+        // The #294 fix: a large duplicating buffered set flips to Spill instead
+        // of the old unconditional RAM. 300M rows * 256 B = 76.8 GiB > 0.6*54.
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 300_000_000, Some(54 * GIB)),
+            SinkBacking::Spill
+        ));
+    }
+
+    #[test]
+    fn auto_decision_scales_with_available_ram() {
+        // Identical workload flips on available RAM, not a fixed fraction of it.
+        let rows = 50_000_000; // 50M * 256 B = 12.8 GiB estimate
+        assert!(
+            matches!(
+                auto_backing(Mode::Duplicating, rows, Some(4 * GIB)),
+                SinkBacking::Spill
+            ),
+            "small box must spill"
+        );
+        assert!(
+            matches!(
+                auto_backing(Mode::Duplicating, rows, Some(256 * GIB)),
+                SinkBacking::Ram
+            ),
+            "huge box may keep it in RAM"
+        );
+    }
+
+    #[test]
+    fn auto_partitioning_preserves_row_ceiling() {
+        // Even with effectively unlimited RAM, partitioning still spills above
+        // the historical 2M-row floor (strict superset of pre-#294 behavior).
+        assert!(matches!(
+            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB)),
+            SinkBacking::Spill
+        ));
+        assert!(matches!(
+            auto_backing(Mode::Partitioning, 100_000, Some(54 * GIB)),
+            SinkBacking::Ram
+        ));
+    }
+
+    #[test]
+    fn auto_uses_fallback_budget_when_ram_unknown() {
+        // Unknown RAM → conservative fixed budget, still spilling huge sets.
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 100_000_000, None),
+            SinkBacking::Spill
+        ));
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 1_000, None),
+            SinkBacking::Ram
+        ));
+    }
+
+    #[test]
+    fn estimate_scales_with_mode_and_rows() {
+        assert_eq!(estimate_buffered_bytes(Mode::Duplicating, 1_000), 256_000);
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Partitioning, 1_000),
+            2_048_000
+        );
+        // Saturating: no overflow panic on absurd counts.
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Duplicating, usize::MAX),
+            u64::MAX
+        );
     }
 }
