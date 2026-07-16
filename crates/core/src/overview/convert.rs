@@ -4538,7 +4538,15 @@ mod tests {
             convert_to_overviews_strategy(input, serial_out.path(), base, Pass2Strategy::Serial)
                 .unwrap();
 
-            for profile in [MemoryProfile::Speed, MemoryProfile::Bounded] {
+            // Auto included (#294): its workload-based backing choice must not
+            // change output — on this tiny input it resolves to RAM, matching
+            // Speed; the pipeline unit tests cover the large-input Spill flip,
+            // and the Bounded case proves the Spill round-trip is lossless.
+            for profile in [
+                MemoryProfile::Speed,
+                MemoryProfile::Bounded,
+                MemoryProfile::Auto,
+            ] {
                 let opts = ConvertOptions {
                     profile,
                     ..base.clone()
