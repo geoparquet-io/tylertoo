@@ -64,13 +64,18 @@ pub(super) enum SinkBacking {
 /// this by `buffered_rows` (the count the pass-2 engine holds — every level but
 /// the streamed finest) to size the RAM-vs-spill choice against available RAM.
 ///
-/// Duplicating buffers only the geometrically-decayed COARSE levels, each
-/// holding *simplified* geometry, so its rows are light. Partitioning buffers
-/// every feature exactly once at FULL resolution, so its rows are heavier.
-/// These are deliberately rough, upper-ish estimates: they steer only the
-/// backing choice and never change output bytes.
-const DUPLICATING_BYTES_PER_ROW: u64 = 256;
-const PARTITIONING_BYTES_PER_ROW: u64 = 2_048;
+/// A buffered row is a whole retained feature (geometry + properties as Arrow
+/// arrays), NOT a coordinate — so the cost is dominated by geometry vertex
+/// count. Measured pass-2 sink cost per buffered row (2026-07, RSS delta of the
+/// pass2 sink phase ÷ `buffered_rows`): germany-segments lines ≈ 9.6 KiB,
+/// fieldmaps-adm4 polygons ≈ 6.3 KiB, moldova polygons ≈ 16 KiB. An earlier
+/// 256 B/row guess undercounted the real cost ~25× and let `auto` keep a
+/// 3.4 GiB sink in RAM on a simulated 2 GiB box (issue #294's exact failure).
+/// These constants are set to ~8 KiB (duplicating) / ~16 KiB (partitioning,
+/// full-resolution geometry) — biased high so `auto` prefers the (near-free on
+/// nvme) spill path over OOM. They steer only the backing choice, never output.
+const DUPLICATING_BYTES_PER_ROW: u64 = 8_192;
+const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
 
 /// Fraction of *available* system RAM the estimated buffered-output set may
 /// occupy before `Auto` spills to a temp file instead of holding it in RAM.
@@ -503,9 +508,9 @@ mod backing_tests {
     #[test]
     fn auto_duplicating_large_spills() {
         // The #294 fix: a large duplicating buffered set flips to Spill instead
-        // of the old unconditional RAM. 300M rows * 256 B = 76.8 GiB > 0.6*54.
+        // of the old unconditional RAM. 10M rows * 8 KiB = 80 GiB > 0.6*54.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 300_000_000, Some(54 * GIB)),
+            auto_backing(Mode::Duplicating, 10_000_000, Some(54 * GIB)),
             SinkBacking::Spill
         ));
     }
@@ -513,7 +518,7 @@ mod backing_tests {
     #[test]
     fn auto_decision_scales_with_available_ram() {
         // Identical workload flips on available RAM, not a fixed fraction of it.
-        let rows = 50_000_000; // 50M * 256 B = 12.8 GiB estimate
+        let rows = 5_000_000; // 5M * 8 KiB = 40 GiB estimate
         assert!(
             matches!(
                 auto_backing(Mode::Duplicating, rows, Some(4 * GIB)),
@@ -559,10 +564,10 @@ mod backing_tests {
 
     #[test]
     fn estimate_scales_with_mode_and_rows() {
-        assert_eq!(estimate_buffered_bytes(Mode::Duplicating, 1_000), 256_000);
+        assert_eq!(estimate_buffered_bytes(Mode::Duplicating, 1_000), 8_192_000);
         assert_eq!(
             estimate_buffered_bytes(Mode::Partitioning, 1_000),
-            2_048_000
+            16_384_000
         );
         // Saturating: no overflow panic on absurd counts.
         assert_eq!(
