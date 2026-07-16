@@ -55,6 +55,7 @@ nav:
   - Getting Started: getting-started.md
   - Demo (Germany buildings): demo.md
   - Performance: performance.md
+  - Profiling: PROFILING.md
   - Decoding PMTiles: decode.md
   - API Reference: api-reference.md
   - Advanced Usage: advanced-usage.md
