@@ -134,6 +134,38 @@ fn log_validation_skips(skips_before: u64) {
     }
 }
 
+/// Pass 0 (#286/#287): stage the selected row groups to local disk up front so
+/// the two passes below read from the spill, not the network.
+///
+/// A row group's column chunks are a contiguous span, so each is fetched as ONE
+/// coalesced range request (several in flight per part) and spilled. This
+/// removes the per-column-chunk serial re-fetch (#287) and the cold pass-2
+/// re-fetch of the property columns pass 1's projection skips (#286).
+/// Best-effort and no-op for local input: a staging error is logged and the
+/// passes fall back to the reader's lazy network path (the same bytes, just
+/// uncoalesced), so staging never regresses correctness.
+fn stage_input_pass0(
+    source: &ConvertSource,
+    selected_row_groups: Option<&RowGroupSelection>,
+    row_groups_read: usize,
+) {
+    if !source.is_remote() {
+        return;
+    }
+    let t_stage = Instant::now();
+    match source.stage_selected(selected_row_groups) {
+        Ok(()) => log::info!(
+            "[convert] staged {row_groups_read} selected row group(s) to local \
+             disk in {:.1}s",
+            t_stage.elapsed().as_secs_f64()
+        ),
+        Err(e) => log::warn!(
+            "[convert] input staging failed ({e}); passes will read over the \
+             network (uncoalesced)"
+        ),
+    }
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -192,6 +224,10 @@ pub(crate) fn convert_streaming_strategy(
         source.selected_input_bytes(selected_row_groups.as_ref())?,
         options.spill_dir.as_deref(),
     );
+
+    // Pass 0 (#286/#287): stage the selected row groups to local disk so both
+    // passes below read from the spill, not the network.
+    stage_input_pass0(source, selected_row_groups.as_ref(), row_groups_read);
 
     if input_schema
         .fields()

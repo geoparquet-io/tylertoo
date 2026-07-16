@@ -60,20 +60,26 @@ What to know:
   (`gpio sort hilbert --add-bbox`, modest `--row-group-size`) is what
   makes the few-percent extract real; a file with 4 giant row groups
   cannot be pruned finer than quarters.
-- **Fetch behavior** — one range request per selected column chunk
-  (the page reader's many small reads are served from a whole-chunk
-  buffer), plus the footer. The parsed footer and a cache of fetched
-  column chunks are held per conversion, so the streaming pipeline's
-  per-pass re-reads are refetch-free within a pass (measured: the
-  default streaming pipeline and `--no-streaming` move identical bytes
-  on a city extract). The cache budget is sized to the largest row
-  group's working set (floored at 256 MiB), so a single row group whose
-  column chunks exceed the floor — e.g. a multi-GB geometry chunk — is
-  no longer evicted mid-read and re-fetched per page (issue #261).
-  Beyond the in-memory cache, every fetched chunk is also spilled to a
-  local temp file, so a chunk evicted between passes — the assign pass,
-  the write pass, and (at higher zoom) a finest-level canonical re-read —
-  is drained from local disk rather than re-fetched over the network.
+- **Fetch behavior** — before the passes run, a remote convert **stages**
+  the selected row groups to the local spill (issues #286/#287). A row
+  group's column chunks are a *contiguous* byte span, so each selected row
+  group is fetched as **one** coalesced range request — several in flight
+  at once, bounded by a memory budget — and sliced into a per-column-chunk
+  buffer both passes then read from local disk (plus the footer, fetched
+  once). This replaces the earlier pattern of one small range request per
+  column chunk issued serially per pass, and in particular means pass 2 no
+  longer re-fetches, cold, the property columns pass 1's geometry+ranking
+  projection skipped (#286). The parsed footer and an in-memory cache of
+  fetched chunks are still held per conversion, so per-pass re-reads are
+  refetch-free within a pass (measured: the default streaming pipeline and
+  `--no-streaming` move identical bytes on a city extract). The cache
+  budget is sized to the largest row group's working set (floored at
+  256 MiB), so a single row group whose column chunks exceed the floor —
+  e.g. a multi-GB geometry chunk — is not evicted mid-read and re-fetched
+  per page (issue #261). Every staged chunk is written to a local temp
+  file, so a chunk touched across passes — the assign pass, the write
+  pass, and (at higher zoom) a finest-level canonical re-read — is drained
+  from local disk rather than re-fetched over the network.
   This bounds a full-file remote conversion to ≈1× the object's bytes
   regardless of pass or level count (issue #219). Measured on
   fieldmaps-adm4 (2.90 GB, z0–14): **96× before #261, 3.0× after #261,
@@ -89,12 +95,14 @@ What to know:
   mid-convert (or the file can't be created), the spill disables itself
   with a log line and later passes fall back to network re-fetch —
   correctness is preserved, only the ≈1× bound degrades.
-- **Latency vs bytes** — requests are issued sequentially, so on a
-  fast link a plain `aws s3 cp` + local convert can still win on wall
-  time (92 MB corpus file, residential fiber: ~3 s download+convert
-  vs ~9 s remote-direct). Remote-direct wins on bytes moved (5.6×
-  less on that extract), on slow/metered links, and whenever you
-  don't want the full file on disk.
+- **Latency vs bytes** — staging issues several range requests in
+  parallel and coalesces each row group into one, so per-request
+  round-trip latency no longer dominates on high-TTFB hosts (issues
+  #286/#287). On a fast link a plain `aws s3 cp` + local convert can
+  still win on wall time (92 MB corpus file, residential fiber: ~3 s
+  download+convert vs ~9 s remote-direct). Remote-direct wins on bytes
+  moved (5.6× less on that extract), on slow/metered links, and whenever
+  you don't want the full file on disk.
 - **Remote output is out of scope** — write locally, then
   `aws s3 cp`.
 - Rust builds: remote input lives behind the `remote` cargo feature of

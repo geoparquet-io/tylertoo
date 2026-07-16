@@ -309,6 +309,21 @@ impl InputSource {
             InputSource::Remote(r) => r.release_read_cache(),
         }
     }
+
+    /// Stage the selected row groups to the local disk spill up front (pass
+    /// 0, #286/#287), coalescing each row group into one parallel range
+    /// request so the later passes read entirely from disk. No-op for local
+    /// inputs (the OS page cache already serves re-reads). `selected` (`None`
+    /// = all) must match the row groups the passes will read, so pruned groups
+    /// are never fetched and total traffic stays ≈1× (#219).
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
+    pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
+        match self {
+            InputSource::Local(_) => Ok(()),
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => r.stage_row_groups(selected),
+        }
+    }
 }
 
 /// Sum of the compressed byte sizes of the selected input row groups — the
@@ -795,6 +810,142 @@ pub(crate) mod remote {
             self.spill.lock().expect("spill lock").dir = dir.map(Path::to_path_buf);
         }
 
+        /// Parse (and cache) the footer, returning the shared metadata.
+        /// Mirrors the load in [`Self::open_builder`] so staging (pass 0) does
+        /// not depend on a builder open; the header phase has usually loaded
+        /// it already, in which case this is a cheap clone with no fetch.
+        fn load_footer(&self) -> Result<ArrowReaderMetadata, InputError> {
+            if let Some(md) = self.metadata.get() {
+                return Ok(md.clone());
+            }
+            let reader = InputReader::Remote(self.reader());
+            let md = ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new())?;
+            let _ = self.metadata.set(md.clone());
+            Ok(md)
+        }
+
+        /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
+        /// up front — ONE coalesced range request per row group, several in
+        /// flight at once — so both later passes read entirely from local
+        /// disk.
+        ///
+        /// A row group's column chunks form a contiguous byte span, so each
+        /// row group is fetched as a single large GET and sliced back into the
+        /// per-column-chunk spill entries the reader's L2 path already serves
+        /// from ([`RemoteReader::chunk_data`]). This removes the two
+        /// latency-bound patterns the demo hit: the per-column-chunk, per-pass
+        /// serial re-fetch (#287, reader kept ~1 request in flight), and in
+        /// particular pass 2's cold re-fetch of the property columns that pass
+        /// 1's geometry+ranking projection skipped (#286, ~10 small serial
+        /// range requests per row group).
+        ///
+        /// `selected` (`None` = every row group) is the SAME per-part bbox
+        /// row-group selection the passes read, so pruned row groups are still
+        /// never touched and total network traffic stays ≈1× the object
+        /// (#219); no speculative over-fetch. Each span counts as one request
+        /// so callers observe the coalesced pattern. Best-effort by
+        /// construction: a chunk that fails to spill (spill disabled / out of
+        /// space, #272) simply falls back to the reader's network path on
+        /// first touch, so a spill write is never fatal — only an actual fetch
+        /// error, which the passes would hit anyway, is surfaced.
+        pub(crate) fn stage_row_groups(
+            &self,
+            selected: Option<&[usize]>,
+        ) -> Result<(), InputError> {
+            let metadata = self.load_footer()?;
+            let row_groups = metadata.metadata().row_groups();
+
+            let indices: Vec<usize> = match selected {
+                Some(sel) => sel.to_vec(),
+                None => (0..row_groups.len()).collect(),
+            };
+            let plan: Vec<StagedRowGroup> = indices
+                .into_iter()
+                .filter_map(|i| row_groups.get(i))
+                .filter_map(|rg| {
+                    let mut start = u64::MAX;
+                    let mut end = 0u64;
+                    let mut chunks = Vec::with_capacity(rg.columns().len());
+                    for col in rg.columns() {
+                        let (s, len) = col.byte_range();
+                        start = start.min(s);
+                        end = end.max(s + len);
+                        chunks.push((s, len as usize));
+                    }
+                    (end > start).then_some(StagedRowGroup {
+                        span: start..end,
+                        chunks,
+                    })
+                })
+                .collect();
+            if plan.is_empty() {
+                return Ok(());
+            }
+
+            // Bound in-flight (resident) spans by the memory budget: holding
+            // one row group transiently matches the L1 cache ceiling, so never
+            // hold more than the budget's worth at once.
+            let max_span = plan
+                .iter()
+                .map(|r| r.span.end - r.span.start)
+                .max()
+                .unwrap_or(0);
+            let concurrency = match max_span {
+                0 => 1,
+                s => ((STAGE_MEM_BUDGET / s).max(1) as usize).min(STAGE_MAX_CONCURRENCY),
+            };
+
+            let store = Arc::clone(&self.store);
+            let location = self.location.clone();
+            let spill = Arc::clone(&self.spill);
+            let shared = Arc::clone(&self.shared);
+
+            runtime().block_on(async move {
+                use futures_util::stream::StreamExt;
+                let mut inflight = futures_util::stream::iter(plan.into_iter().map(|rg| {
+                    let store = Arc::clone(&store);
+                    let location = location.clone();
+                    async move {
+                        let bytes = store
+                            .get_range(&location, rg.span.clone())
+                            .await
+                            .map_err(|e| ParquetError::External(Box::new(e)))?;
+                        Ok::<(StagedRowGroup, Bytes), ParquetError>((rg, bytes))
+                    }
+                }))
+                .buffer_unordered(concurrency);
+
+                while let Some(result) = inflight.next().await {
+                    let (rg, bytes) = result?;
+                    // Count the coalesced request (mirrors `fetch`).
+                    shared.requests.fetch_add(1, Ordering::Relaxed);
+                    shared
+                        .bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    shared
+                        .ranges
+                        .lock()
+                        .expect("ranges lock")
+                        .push(rg.span.clone());
+                    // Slice into per-column-chunk spill entries. Guard the
+                    // slice bounds: a well-behaved store returns exactly the
+                    // requested span, but a short read must fall back to the
+                    // reader's network path (skip spilling), never panic.
+                    let base = rg.span.start;
+                    let mut spill = spill.lock().expect("spill lock");
+                    for (chunk_start, len) in rg.chunks {
+                        let off = (chunk_start - base) as usize;
+                        if off + len <= bytes.len() {
+                            spill.put(chunk_start, &bytes.slice(off..off + len));
+                        }
+                    }
+                }
+                Ok::<(), ParquetError>(())
+            })?;
+
+            Ok(())
+        }
+
         /// Snapshot of the fetch counters.
         pub fn fetch_stats(&self) -> FetchStats {
             FetchStats {
@@ -971,6 +1122,28 @@ pub(crate) mod remote {
     /// bigger than the cache thrashes, re-fetching an evicted chunk on the next
     /// batch (issue #261). This constant is just the small-input floor.
     const CHUNK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Staging (pass 0, #286/#287) concurrency ceiling: at most this many
+    /// row-group spans are fetched — and thus resident — at once. The live
+    /// concurrency is the lesser of this and [`STAGE_MEM_BUDGET`] divided by
+    /// the largest span, so a file of huge row groups never holds more than
+    /// the budget's worth of in-flight spans in memory.
+    const STAGE_MAX_CONCURRENCY: usize = 8;
+
+    /// Transient-memory budget bounding staging concurrency. One row group's
+    /// working set is already the in-memory chunk-cache ceiling (#261 sizes
+    /// the cache to the largest row group), so reuse that figure: staging
+    /// never holds more than a budget's worth of in-flight spans at once.
+    const STAGE_MEM_BUDGET: u64 = CHUNK_CACHE_MAX_BYTES;
+
+    /// One selected row group's staging plan: its contiguous byte span and
+    /// the `(chunk_start, len)` of every column chunk inside it — keyed
+    /// exactly how the L2 spill and [`RemoteReader::chunk_data`] look chunks
+    /// up (`chunk.start`), so a staged slice is a drop-in L2 hit.
+    struct StagedRowGroup {
+        span: Range<u64>,
+        chunks: Vec<(u64, usize)>,
+    }
 
     /// On-disk overflow for fetched column chunks (issue #219).
     ///

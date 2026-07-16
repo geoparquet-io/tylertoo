@@ -5505,6 +5505,66 @@ mod tests {
             assert!(report_remote.remote_fetch.is_some());
         }
 
+        /// #286 + #287: a full remote convert must COALESCE its data-page
+        /// fetches to ~one range request per selected row group. A row
+        /// group's column chunks are a contiguous byte span, so staging that
+        /// span up front (in parallel) turns the whole conversion's reads
+        /// into one request per row group — instead of a separate serial
+        /// request per column chunk per pass (#287), and in particular
+        /// instead of pass 2 re-fetching, cold, the property columns that
+        /// pass 1's geometry-only projection skipped (#286).
+        #[test]
+        fn remote_convert_coalesces_fetches_to_one_request_per_row_group() {
+            let geoms = synthetic_geometries();
+            let n = geoms.len();
+            // Several row groups, each carrying property columns (id, name,
+            // rank) that pass 1's geometry+ranking projection does not fully
+            // read — the #286 pass-2 re-fetch shape.
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            write_input_partition(tin.path(), &geoms, 0..n, Some(2));
+            let bytes = std::fs::read(tin.path()).unwrap();
+            let rg = row_group_spans(&bytes).len();
+            assert!(rg >= 3, "test needs several row groups, got {rg}");
+
+            let opts = ConvertOptions::default();
+
+            // Reference: the local convert of the identical bytes.
+            let tout_local = tempfile::NamedTempFile::new().unwrap();
+            convert_to_overviews(tin.path(), tout_local.path(), &opts).unwrap();
+            let local_ids = read_all_ids(&OverviewReader::open(tout_local.path()).unwrap());
+
+            let source = test_memory_source(bytes, "staged.parquet");
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let report = convert_to_overviews_source(&source, tout.path(), &opts).unwrap();
+
+            // Staging must not change the output.
+            assert_eq!(
+                read_all_ids(&OverviewReader::open(tout.path()).unwrap()),
+                local_ids,
+                "staged remote convert must match the local convert row-for-row"
+            );
+
+            let stats = report.remote_fetch.expect("remote stats in report");
+            // THE property: one coalesced request per selected row group, plus
+            // a small fixed footer/metadata overhead — NOT ~one request per
+            // column chunk per pass.
+            const FOOTER_SLACK: u64 = 4;
+            assert!(
+                stats.requests <= rg as u64 + FOOTER_SLACK,
+                "expected ~1 request per row group (<= {} for {rg} row groups); \
+                 got {} — fetches not coalesced (#287) or properties re-fetched (#286)",
+                rg as u64 + FOOTER_SLACK,
+                stats.requests,
+            );
+            // Coalescing must not over-fetch: still ≈1× the object (#219).
+            assert!(
+                stats.bytes_fetched <= stats.object_size + stats.object_size / 2,
+                "staging must stay ≈1× the object: {} of {} bytes",
+                stats.bytes_fetched,
+                stats.object_size,
+            );
+        }
+
         // --- multi-partition remote input (v0.7 PR-B) ------------------------
 
         /// Partition bytes for `geoms[range]`, via the shared local writer.
@@ -5581,6 +5641,49 @@ mod tests {
                 summed.object_size, object_total,
                 "ConvertReport.remote_fetch.object_size sums the parts"
             );
+        }
+
+        /// #286 + #287 across the multi-partition path (the demo scenario):
+        /// each remote part must coalesce ITS OWN selected row groups to ~one
+        /// range request per row group, so a prefix of N partitions pays one
+        /// TTFB per row group — not ~one per column chunk per pass.
+        #[test]
+        fn multi_part_remote_coalesces_per_part_row_groups() {
+            let geoms = synthetic_geometries();
+            let n = geoms.len();
+            // Each partition carries several row groups (2 rows each) with
+            // property columns (id, name, rank) that pass 1 skips — the #286
+            // shape, per part.
+            let p0 = partition_bytes(&geoms, 0..5, Some(2));
+            let p1 = partition_bytes(&geoms, 5..9, Some(2));
+            let p2 = partition_bytes(&geoms, 9..n, Some(2));
+            let rg = [&p0, &p1, &p2].map(|b| row_group_spans(b).len());
+            assert!(
+                rg.iter().all(|&r| r >= 2),
+                "each part needs several row groups: {rg:?}"
+            );
+
+            let (source, parts) = crate::input::test_memory_multi_source(vec![
+                ("p0.parquet", p0),
+                ("p1.parquet", p1),
+                ("p2.parquet", p2),
+            ]);
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            convert_to_overviews_sources(&source, tout.path(), &multi_test_options()).unwrap();
+
+            const FOOTER_SLACK: u64 = 4;
+            for (i, part) in parts.iter().enumerate() {
+                let stats = part.fetch_stats().expect("remote part has stats");
+                assert!(
+                    stats.requests <= rg[i] as u64 + FOOTER_SLACK,
+                    "part {i}: expected ~1 request per row group (<= {} for {} \
+                     row groups); got {} — not coalesced (#287) or properties \
+                     re-fetched (#286)",
+                    rg[i] as u64 + FOOTER_SLACK,
+                    rg[i],
+                    stats.requests,
+                );
+            }
         }
 
         /// bbox pruning an ENTIRE part: its row groups are pruned at the
