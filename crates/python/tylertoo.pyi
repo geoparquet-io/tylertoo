@@ -68,5 +68,6 @@ def export_pmtiles(
     extent: int = 4096,
     tile_size_limit: int | None = None,
     simple_clip_fastpath: bool = True,
+    partition_wave: int = 0,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...

@@ -60,6 +60,21 @@ fn parse_in_flight_batches(s: &str) -> Result<usize, String> {
     }
 }
 
+/// Parse `--partition-wave`: `auto` (→ the core-sized sentinel
+/// [`tylertoo_core::overview::export::PARTITION_WAVE_AUTO`]) or an explicit
+/// positive integer. See [`tylertoo_core::overview::export::resolve_partition_wave`]
+/// for how the sentinel is expanded at export start.
+fn parse_partition_wave(s: &str) -> Result<usize, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(tylertoo_core::overview::export::PARTITION_WAVE_AUTO);
+    }
+    match s.parse::<usize>() {
+        Ok(0) => Err("partition-wave must be `auto` or >= 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("expected `auto` or a positive integer, got `{s}`")),
+    }
+}
+
 /// Parse a --bbox argument: xmin,ymin,xmax,ymax (lon/lat degrees).
 fn parse_bbox(s: &str) -> Result<[f64; 4]> {
     let parts: Vec<&str> = s.split(',').collect();
@@ -205,6 +220,15 @@ struct ExportPmtilesArgs {
     /// different start vertex.
     #[arg(long)]
     no_simple_clip_fastpath: bool,
+
+    /// Partitions processed per band read during export (the export
+    /// concurrency knob). `auto` (the default) sizes this to the machine's
+    /// available cores (clamped to 6..=16); pass an explicit integer to
+    /// override. Wider waves keep more cores busy at proportionally more peak
+    /// memory (one wave of partitions resident). The chosen width and detected
+    /// core count are logged at export start.
+    #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
+    partition_wave: usize,
 
     /// Not supported here (single-file subcommand); accepted so the error
     /// can point at `overview`/`tiles` instead of clap's generic message.
@@ -891,6 +915,15 @@ struct TilesArgs {
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
 
+    /// Partitions processed per band read during the export phase (the export
+    /// concurrency knob). `auto` (the default) sizes this to the machine's
+    /// available cores (clamped to 6..=16); pass an explicit integer to
+    /// override. Wider waves keep more cores busy at proportionally more peak
+    /// memory (one wave of partitions resident). The chosen width and detected
+    /// core count are logged at export start.
+    #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
+    partition_wave: usize,
+
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
     verbose: bool,
@@ -1112,6 +1145,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         extent: 4096,
         tile_size_limit: args.max_tile_size,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
+        partition_wave: args.partition_wave,
     };
     let export_report = export_pmtiles(overview_tmp.path(), &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -1407,6 +1441,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         extent: 4096,
         tile_size_limit: args.tile_size_limit,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
+        partition_wave: args.partition_wave,
     };
 
     println!(
@@ -1738,6 +1773,55 @@ mod tests {
         assert_eq!(a.tuning.profile, "bounded");
         assert!(a.tuning.cluster);
         assert!(a.tuning.no_coalesce_lines);
+    }
+
+    #[test]
+    fn parse_partition_wave_accepts_auto_and_positive() {
+        // `auto` maps to the core-sized sentinel; case-insensitive.
+        assert_eq!(
+            parse_partition_wave("auto").unwrap(),
+            tylertoo_core::overview::export::PARTITION_WAVE_AUTO
+        );
+        assert_eq!(parse_partition_wave("AUTO").unwrap(), 0);
+        // Explicit positive integers pass through (6 keeps the old behavior).
+        assert_eq!(parse_partition_wave("6").unwrap(), 6);
+        assert_eq!(parse_partition_wave("32").unwrap(), 32);
+        // Explicit 0 is rejected (use `auto`); non-numeric is rejected.
+        assert!(parse_partition_wave("0").is_err());
+        assert!(parse_partition_wave("banana").is_err());
+    }
+
+    #[test]
+    fn tiles_partition_wave_defaults_auto_and_overrides() {
+        // Default is the auto sentinel (0) on the one-shot command.
+        let default = parse_tiles(&[]);
+        assert_eq!(
+            default.partition_wave,
+            tylertoo_core::overview::export::PARTITION_WAVE_AUTO
+        );
+        // Explicit override is honoured verbatim.
+        let overridden = parse_tiles(&["--partition-wave", "6"]);
+        assert_eq!(overridden.partition_wave, 6);
+    }
+
+    #[test]
+    fn export_pmtiles_partition_wave_defaults_auto_and_overrides() {
+        let parse_export = |flags: &[&str]| -> ExportPmtilesArgs {
+            let mut argv = vec!["tylertoo", "export-pmtiles", "in.parquet", "out.pmtiles"];
+            argv.extend_from_slice(flags);
+            match Cli::try_parse_from(argv)
+                .expect("export-pmtiles args should parse")
+                .command
+            {
+                Command::ExportPmtiles(a) => a,
+                other => panic!("expected export-pmtiles subcommand, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            parse_export(&[]).partition_wave,
+            tylertoo_core::overview::export::PARTITION_WAVE_AUTO
+        );
+        assert_eq!(parse_export(&["--partition-wave", "12"]).partition_wave, 12);
     }
 
     #[test]

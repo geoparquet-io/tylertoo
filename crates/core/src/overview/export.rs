@@ -16,7 +16,7 @@
 //!    at level `k`'s zoom".
 //! 3. **Partition pass**: split the zoom's tiles into contiguous ascending
 //!    `(x, y)` ranges of roughly [`DEFAULT_PARTITION_TARGET`] members each, then
-//!    process them in **waves** of [`PARTITION_WAVE`] partitions. Each wave
+//!    process them in **waves** of [`resolve_partition_wave`] partitions. Each wave
 //!    reads the band **once** (row groups pruned to the wave's combined bbox),
 //!    splits every feature into its tiles with a **top-down recursive quadtree
 //!    cascade** (see [`feature_tile_members`]) — each feature clipped once per
@@ -45,7 +45,7 @@
 //! ## Memory ceiling
 //!
 //! Peak working set is `O(one wave of partitions + writer state)` (waves are
-//! [`PARTITION_WAVE`] partitions processed concurrently): each in-flight
+//! [`resolve_partition_wave`] partitions processed concurrently): each in-flight
 //! partition holds its (feature × intersecting-tile) clipped members plus its
 //! encoded tiles, bounded by the partition target — **not** the zoom band's
 //! feature count.
@@ -135,6 +135,15 @@ pub struct ExportOptions {
     /// vertex, so disable it (`--no-simple-clip-fastpath`) only when byte-stable
     /// tile output is required.
     pub simple_clip_fastpath: bool,
+    /// Number of partitions processed per band read (the export concurrency
+    /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
+    /// expands to the machine's available parallelism (clamped to
+    /// `[PARTITION_WAVE_MIN, PARTITION_WAVE_MAX]`) at export start; any explicit
+    /// positive value is honoured verbatim. Wider waves keep more cores busy at
+    /// proportionally more peak memory (`O(partition_wave)` partitions
+    /// resident) and read a wider combined-bbox band per wave. Output is
+    /// byte-identical for every value — the wave is a scheduling concern only.
+    pub partition_wave: usize,
 }
 
 impl Default for ExportOptions {
@@ -145,6 +154,7 @@ impl Default for ExportOptions {
             extent: DEFAULT_EXTENT,
             tile_size_limit: None,
             simple_clip_fastpath: true,
+            partition_wave: PARTITION_WAVE_AUTO,
         }
     }
 }
@@ -264,15 +274,76 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> u8 {
 /// holding the whole zoom in memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
-/// Number of partitions grouped into one wave. A wave reads the level band
-/// **once** (row groups pruned to the wave's combined bbox), decodes it a single
-/// time, and routes the decoded features to its partitions — so a level costs
-/// `ceil(P / PARTITION_WAVE)` band reads instead of one per partition (issue
-/// #228). Peak memory stays at O(`PARTITION_WAVE` partitions), and one shared
-/// decode per wave (rather than one per partition) also lowers the peak. Waves
-/// complete in order, so the writer still receives tiles in ascending `(x, y)`
-/// order.
-const PARTITION_WAVE: usize = 6;
+/// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing
+/// from the machine's available parallelism (see [`resolve_partition_wave`]).
+/// This is the library default so an export uses the cores it is given without
+/// the caller having to know the box (#293).
+pub const PARTITION_WAVE_AUTO: usize = 0;
+
+/// Lower clamp for the auto-sized partition wave. Matches the historical
+/// hard-coded width (#228): auto never schedules *narrower* than the tuned
+/// baseline, so a small box behaves exactly as before.
+pub const PARTITION_WAVE_MIN: usize = 6;
+
+/// Upper clamp for the auto-sized partition wave.
+///
+/// The wave width is the export's peak-memory knob: each in-flight partition
+/// holds its clipped geometries + encoded tiles resident, so peak memory is
+/// `O(PARTITION_WAVE partitions)` (see the wave doc below). Auto-sizing to raw
+/// core count would let a many-core box widen the wave without bound and
+/// balloon the export memory transient that #295 is already tracking — going
+/// from the old width of 6 to 16 already lifts the resident wave set ~2.7×. We
+/// therefore cap auto at 16: it saturates the 16-core target box the issue was
+/// filed from (16-wide waves, ~2× fewer serial waves at z12–z14) while holding
+/// the memory transient to a known, bounded multiple of the old baseline.
+///
+/// A fixed cap is deliberately preferred over a `/proc/meminfo`-derived RAM
+/// budget here: the latter is Linux-only, non-deterministic run-to-run, and
+/// would couple export scheduling to transient free memory. Bounding the
+/// dataset-scaled memory peak is #295's job; this knob should stay a simple,
+/// portable, deterministic scheduling cap. Power users who want a wider wave
+/// (and accept the memory cost) can still pass an explicit value, which is
+/// honoured verbatim past this cap.
+pub const PARTITION_WAVE_MAX: usize = 16;
+
+/// Resolve a requested partition-wave width to a concrete value.
+///
+/// [`PARTITION_WAVE_AUTO`] (0) auto-sizes from
+/// [`std::thread::available_parallelism`], clamped to
+/// `[PARTITION_WAVE_MIN, PARTITION_WAVE_MAX]`; any explicit positive value is
+/// honoured verbatim (uncapped — the caller opted in to the memory cost).
+///
+/// The output is a **scheduling** parameter only: it sets how many partitions
+/// are processed per band read, never which features land in which tile or the
+/// order tiles reach the writer. Every wave width therefore produces a
+/// byte-identical archive (pinned by `export_wave_width_is_byte_invariant` and
+/// the partition-invariance / frozen-hash tests).
+pub fn resolve_partition_wave(requested: usize) -> usize {
+    if requested == PARTITION_WAVE_AUTO {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(PARTITION_WAVE_MIN)
+            .clamp(PARTITION_WAVE_MIN, PARTITION_WAVE_MAX)
+    } else {
+        requested
+    }
+}
+
+/// Resolve the partition-wave width (auto-sizing from available cores when the
+/// caller left it at [`PARTITION_WAVE_AUTO`]) and log the chosen width alongside
+/// the detected core count once at export start, so export core utilization is
+/// observable rather than a mystery (#293) — mirrors the pass-2 parallelism
+/// log line in the convert streaming path.
+fn resolve_and_log_partition_wave(requested: usize) -> usize {
+    let wave = resolve_partition_wave(requested);
+    log::info!(
+        "[export] partition wave: {wave} partition(s) per band read ({} core(s) detected)",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
+    );
+    wave
+}
 
 /// Arrow batch size for the partition read passes (the parquet reader default
 /// of 1024 rows makes the per-batch parallel clip sections too small to load-
@@ -324,6 +395,10 @@ fn export_pmtiles_with_partition_target(
     let num_levels = reader.num_levels();
     let min_zoom = zoom_for_level(&meta, 0);
     let max_zoom = zoom_for_level(&meta, num_levels - 1);
+
+    // Resolve the partition-wave width once (auto-sizes from available cores
+    // when the caller left it at PARTITION_WAVE_AUTO) and surface it (#293).
+    let partition_wave = resolve_and_log_partition_wave(options.partition_wave);
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
@@ -397,12 +472,12 @@ fn export_pmtiles_with_partition_target(
         let mut tile_feature_count = 0usize;
         let mut oversized = 0usize;
         let mut write_secs = 0f64;
-        let total_waves = partitions.len().div_ceil(PARTITION_WAVE);
+        let total_waves = partitions.len().div_ceil(partition_wave);
         // Within-level progress (#229): a long finest level is where runs get
         // stuck, so emit a throttled wave counter. If it advances the level is
         // slow; if it freezes the level is stuck — diagnosable in minutes.
         let mut last_wave_log = Instant::now();
-        for (wave_idx, wave) in partitions.chunks(PARTITION_WAVE).enumerate() {
+        for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
             let results: Vec<Vec<EncodedTile>> = process_wave(&ctx, wave)?;
             let t_write = Instant::now();
             for tiles in &results {
@@ -806,7 +881,7 @@ fn plan_partitions(
 /// `(x, y)` order.
 ///
 /// This replaces the old per-partition re-read (issue #228): instead of `P`
-/// independent band reads + decodes per level, a wave of `PARTITION_WAVE`
+/// independent band reads + decodes per level, a wave of `partition_wave`
 /// partitions shares a single read + decode. Byte-identical to the per-partition
 /// path — each partition receives exactly the members with key in its
 /// `[key_lo, key_hi]` window (a tile's clipped geometry is window-independent),
@@ -2008,6 +2083,62 @@ mod tests {
         assert_eq!(r_many.total_tiles, r_one.total_tiles);
         assert_eq!(r_many.total_tile_features, r_one.total_tile_features);
         assert_eq!(r_many.oversized_tiles, r_one.oversized_tiles);
+    }
+
+    #[test]
+    fn resolve_partition_wave_auto_and_explicit() {
+        // Auto (0) sizes from available parallelism, clamped to [MIN, MAX].
+        let auto = resolve_partition_wave(PARTITION_WAVE_AUTO);
+        assert!(
+            (PARTITION_WAVE_MIN..=PARTITION_WAVE_MAX).contains(&auto),
+            "auto wave {auto} outside [{PARTITION_WAVE_MIN}, {PARTITION_WAVE_MAX}]"
+        );
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(PARTITION_WAVE_MIN);
+        assert_eq!(
+            auto,
+            cores.clamp(PARTITION_WAVE_MIN, PARTITION_WAVE_MAX),
+            "auto must equal core count clamped to the configured range"
+        );
+        // Explicit values pass through verbatim, including above the auto cap.
+        assert_eq!(resolve_partition_wave(1), 1);
+        assert_eq!(resolve_partition_wave(6), 6);
+        assert_eq!(
+            resolve_partition_wave(PARTITION_WAVE_MAX + 100),
+            PARTITION_WAVE_MAX + 100
+        );
+    }
+
+    /// The archive must be byte-identical regardless of wave width: the wave is
+    /// a scheduling parameter (how many partitions share a band read), never a
+    /// change to tile membership or write order. A narrow explicit wave (1) and
+    /// a wide one (16) must produce exactly the same bytes — this is the
+    /// equivalence gate for #293's auto-scaling default.
+    #[test]
+    fn export_wave_width_is_byte_invariant() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(tin.path());
+        let t_narrow = tempfile::NamedTempFile::new().unwrap();
+        let t_wide = tempfile::NamedTempFile::new().unwrap();
+        let narrow = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let wide = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 16,
+            ..Default::default()
+        };
+        // Force many partitions so multiple waves actually form at both widths.
+        export_pmtiles_with_partition_target(tin.path(), t_narrow.path(), &narrow, 1).unwrap();
+        export_pmtiles_with_partition_target(tin.path(), t_wide.path(), &wide, 1).unwrap();
+        assert_eq!(
+            std::fs::read(t_narrow.path()).unwrap(),
+            std::fs::read(t_wide.path()).unwrap(),
+            "archive bytes diverge between wave widths 1 and 16"
+        );
     }
 
     // --- recursive splitter equivalence (issue #226) -------------------------
