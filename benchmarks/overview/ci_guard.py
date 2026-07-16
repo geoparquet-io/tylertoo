@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic convert-regression guard for CI.
 
-Runs `gpq-tiles overview` on the fixtures-v1 test inputs and checks the
+Runs `tylertoo overview` on the fixtures-v1 test inputs and checks the
 *structural* shape of the output against a committed baseline:
 per-level feature and vertex counts, total rows, total vertices, input
 features. These are deterministic functions of the input + knobs.
@@ -17,7 +17,7 @@ Usage:
   ci_guard.py --update    # regenerate the baseline (run after intended changes)
 
 Env:
-  GPQ_BIN        release binary (default target/release/gpq-tiles)
+  GPQ_BIN        release binary (default target/release/tylertoo)
   FIXTURE_DIR    input dir (default tests/fixtures/realdata)
 """
 import json
@@ -27,7 +27,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BIN = os.environ.get("GPQ_BIN", os.path.join(ROOT, "target/release/gpq-tiles"))
+BIN = os.environ.get("GPQ_BIN", os.path.join(ROOT, "target/release/tylertoo"))
 FIXTURES = os.environ.get("FIXTURE_DIR", os.path.join(ROOT, "tests/fixtures/realdata"))
 BASELINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_baseline.json")
 

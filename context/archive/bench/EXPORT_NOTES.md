@@ -1,7 +1,7 @@
 # `export-pmtiles` — E0 export notes
 
 Batch PMTiles export **from** an overview GeoParquet file
-(`gpq-tiles export-pmtiles <overviews.parquet> <out.pmtiles>`). This is the
+(`tylertoo export-pmtiles <overviews.parquet> <out.pmtiles>`). This is the
 replacement for the shelved tile pipeline, not a revival of it: the overview
 file already holds thinned / simplified / ranked / Hilbert-ordered features per
 level, so export is mechanical and single-pass — no global external sort, no

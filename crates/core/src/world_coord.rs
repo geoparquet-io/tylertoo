@@ -44,7 +44,7 @@ pub const MAX_LATITUDE: f64 = 85.05112878;
 /// # Examples
 ///
 /// ```
-/// use gpq_tiles_core::world_coord::{WorldCoord, lng_lat_to_world, WORLD_HALF};
+/// use tylertoo_core::world_coord::{WorldCoord, lng_lat_to_world, WORLD_HALF};
 ///
 /// // Null Island (0, 0) in geographic coordinates
 /// let coord = lng_lat_to_world(0.0, 0.0);
@@ -146,7 +146,7 @@ impl WorldCoord {
 /// # Examples
 ///
 /// ```
-/// use gpq_tiles_core::world_coord::{lng_lat_to_world, WORLD_HALF};
+/// use tylertoo_core::world_coord::{lng_lat_to_world, WORLD_HALF};
 ///
 /// // Null Island
 /// let coord = lng_lat_to_world(0.0, 0.0);
@@ -191,7 +191,7 @@ pub fn lng_lat_to_world(lng: f64, lat: f64) -> WorldCoord {
 /// # Examples
 ///
 /// ```
-/// use gpq_tiles_core::world_coord::{lng_lat_to_world, world_to_lng_lat};
+/// use tylertoo_core::world_coord::{lng_lat_to_world, world_to_lng_lat};
 ///
 /// let coord = lng_lat_to_world(-73.985428, 40.748817); // NYC
 /// let (lng, lat) = world_to_lng_lat(coord);
@@ -302,8 +302,8 @@ impl WorldBounds {
     /// # Examples
     ///
     /// ```
-    /// use gpq_tiles_core::world_coord::WorldBounds;
-    /// use gpq_tiles_core::tile::TileCoord;
+    /// use tylertoo_core::world_coord::WorldBounds;
+    /// use tylertoo_core::tile::TileCoord;
     ///
     /// // Zoom 0: single tile covers entire world
     /// let bounds = WorldBounds::from_tile(&TileCoord::new(0, 0, 0));

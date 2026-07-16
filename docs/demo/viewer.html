@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>gpq-tiles demo — Germany buildings</title>
+  <title>tylertoo demo — Germany buildings</title>
   <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
 
   <!-- Pinned CDN deps. PMTiles range reads need the host to serve Range + CORS. -->
@@ -33,7 +33,7 @@
 <body>
   <div id="map"></div>
   <div id="panel">
-    <h1>Germany buildings — gpq-tiles</h1>
+    <h1>Germany buildings — tylertoo</h1>
     <p>59M Overture building footprints, GeoParquet → PMTiles in one native step
        (tuned). Rendered on CARTO Dark Matter.</p>
     <div class="views">
@@ -51,7 +51,7 @@
     // Tuned Germany-buildings PMTiles on Source Cooperative (Range + CORS).
     // Override at runtime with ?pmtiles=<url>.
     const DEFAULT_PMTILES =
-      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/germany-buildings-gpq-tuned.pmtiles";
+      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/tylertoo-demo/germany-buildings-gpq-tuned.pmtiles";
 
     const VIEWS = {
       germany: { center: [10.45, 51.16], zoom: 5.4 },
@@ -78,7 +78,7 @@
         carto: { type: "raster", tiles: CARTO, tileSize: 256, maxzoom: 20,
           attribution: '&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>' },
         buildings: { type: "vector", url,
-          attribution: 'Buildings: <a href="https://overturemaps.org">Overture</a> via gpq-tiles' },
+          attribution: 'Buildings: <a href="https://overturemaps.org">Overture</a> via tylertoo' },
       },
       layers: [
         { id: "carto", type: "raster", source: "carto" },

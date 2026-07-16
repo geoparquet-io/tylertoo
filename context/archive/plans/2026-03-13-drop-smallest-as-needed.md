@@ -80,7 +80,7 @@ fn test_polygon_pixel_area_world_with_hole() {
 
 **Step 2: Run test to verify it fails**
 
-Run: `cargo test --package gpq-tiles-core test_polygon_pixel_area_world -- --nocapture`
+Run: `cargo test --package tylertoo-core test_polygon_pixel_area_world -- --nocapture`
 
 Expected: FAIL with "cannot find function `polygon_pixel_area_world`"
 
@@ -137,7 +137,7 @@ pub fn polygon_pixel_area_world(
 
 **Step 4: Run test to verify it passes**
 
-Run: `cargo test --package gpq-tiles-core test_polygon_pixel_area_world -- --nocapture`
+Run: `cargo test --package tylertoo-core test_polygon_pixel_area_world -- --nocapture`
 
 Expected: PASS
 
@@ -201,7 +201,7 @@ fn test_linestring_pixel_area_world_multipart() {
 
 **Step 2: Run test to verify it fails**
 
-Run: `cargo test --package gpq-tiles-core test_linestring_pixel_area_world -- --nocapture`
+Run: `cargo test --package tylertoo-core test_linestring_pixel_area_world -- --nocapture`
 
 Expected: FAIL with "cannot find function `linestring_pixel_area_world`"
 
@@ -246,7 +246,7 @@ pub fn linestring_pixel_area_world(
 
 **Step 4: Run test to verify it passes**
 
-Run: `cargo test --package gpq-tiles-core test_linestring_pixel_area_world -- --nocapture`
+Run: `cargo test --package tylertoo-core test_linestring_pixel_area_world -- --nocapture`
 
 Expected: PASS
 
@@ -313,13 +313,13 @@ fn test_geometry_pixel_area_world_all_types() {
 
 **Step 2: Run test to verify it fails**
 
-Run: `cargo test --package gpq-tiles-core test_geometry_pixel_area_world_all_types -- --nocapture`
+Run: `cargo test --package tylertoo-core test_geometry_pixel_area_world_all_types -- --nocapture`
 
 Expected: FAIL with "cannot find function `geometry_pixel_area_world`"
 
 **Step 3: Check WorldClippedGeometry enum structure**
 
-Run: `cargo doc --package gpq-tiles-core --open` and search for `WorldClippedGeometry`, or:
+Run: `cargo doc --package tylertoo-core --open` and search for `WorldClippedGeometry`, or:
 
 ```rust
 // Check crates/core/src/geometry.rs for the enum definition
@@ -382,7 +382,7 @@ pub fn geometry_pixel_area_world(
 
 **Step 5: Run test to verify it passes**
 
-Run: `cargo test --package gpq-tiles-core test_geometry_pixel_area_world_all_types -- --nocapture`
+Run: `cargo test --package tylertoo-core test_geometry_pixel_area_world_all_types -- --nocapture`
 
 Expected: PASS
 
@@ -404,7 +404,7 @@ git commit -m "feat(core): add geometry_pixel_area_world dispatcher for all type
 
 **Step 1: Find TilerConfig struct**
 
-Run: `cargo doc --package gpq-tiles-core --open` or read `crates/core/src/pipeline.rs` around line 195
+Run: `cargo doc --package tylertoo-core --open` or read `crates/core/src/pipeline.rs` around line 195
 
 **Step 2: Add field to TilerConfig**
 
@@ -457,7 +457,7 @@ pub fn with_drop_smallest_threshold(mut self, threshold: f64) -> Self {
 
 **Step 5: Verify it compiles**
 
-Run: `cargo build --package gpq-tiles-core`
+Run: `cargo build --package tylertoo-core`
 
 Expected: SUCCESS
 
@@ -509,7 +509,7 @@ if args.drop_smallest_as_needed {
 
 **Step 3: Test CLI parsing**
 
-Run: `cargo run --package gpq-tiles -- --help | grep -A 3 "drop-smallest"`
+Run: `cargo run --package tylertoo -- --help | grep -A 3 "drop-smallest"`
 
 Expected: Help text for both flags displayed
 
@@ -566,7 +566,7 @@ Expected: SUCCESS
 
 **Step 4: Test Python help**
 
-Run: `cd crates/python && uv run python -c "import gpq_tiles; help(gpq_tiles.convert)" | grep drop_smallest`
+Run: `cd crates/python && uv run python -c "import tylertoo; help(tylertoo.convert)" | grep drop_smallest`
 
 Expected: Parameter documentation displayed
 
@@ -641,7 +641,7 @@ fn test_drop_smallest_filters_tiny_features() {
 
 **Step 2: Run test to verify it fails**
 
-Run: `cargo test --package gpq-tiles-core test_drop_smallest_filters_tiny_features -- --nocapture`
+Run: `cargo test --package tylertoo-core test_drop_smallest_filters_tiny_features -- --nocapture`
 
 Expected: FAIL with assertion error (all 3 features present)
 
@@ -668,7 +668,7 @@ use crate::feature_drop::geometry_pixel_area_world;
 
 **Step 5: Run test to verify it passes**
 
-Run: `cargo test --package gpq-tiles-core test_drop_smallest_filters_tiny_features -- --nocapture`
+Run: `cargo test --package tylertoo-core test_drop_smallest_filters_tiny_features -- --nocapture`
 
 Expected: PASS
 
@@ -706,7 +706,7 @@ if config.drop_smallest_as_needed {
 
 **Step 3: Verify it compiles**
 
-Run: `cargo build --package gpq-tiles-core`
+Run: `cargo build --package tylertoo-core`
 
 Expected: SUCCESS
 
@@ -744,7 +744,7 @@ if config.drop_smallest_as_needed {
 
 **Step 3: Verify all tests pass**
 
-Run: `cargo test --package gpq-tiles-core`
+Run: `cargo test --package tylertoo-core`
 
 Expected: All tests PASS
 
@@ -824,7 +824,7 @@ fn test_geometry_pixel_area_world_zoom_scaling() {
 
 **Step 2: Run tests**
 
-Run: `cargo test --package gpq-tiles-core feature_drop -- --nocapture`
+Run: `cargo test --package tylertoo-core feature_drop -- --nocapture`
 
 Expected: All tests PASS
 
@@ -926,7 +926,7 @@ fn create_mixed_size_features() -> Vec<String> {
 
 **Step 2: Run test to verify behavior**
 
-Run: `cargo test --package gpq-tiles-core test_drop_smallest_visual_comparison -- --nocapture`
+Run: `cargo test --package tylertoo-core test_drop_smallest_visual_comparison -- --nocapture`
 
 Expected: PASS with reduction percentage printed
 
@@ -1007,7 +1007,7 @@ Features with `pixel_area < threshold` are dropped from the tile.
 
 **Step 2: Verify markdown renders correctly**
 
-Run: `cargo doc --package gpq-tiles-core --open` and check if ARCHITECTURE.md is linked
+Run: `cargo doc --package tylertoo-core --open` and check if ARCHITECTURE.md is linked
 
 **Step 3: Commit**
 
@@ -1037,7 +1037,7 @@ Add after the density dropping example:
 Drop the smallest features first when tiles are dense (tippecanoe parity):
 
 ```bash
-gpq-tiles input.parquet output.pmtiles \
+tylertoo input.parquet output.pmtiles \
   --drop-smallest-as-needed \
   --drop-smallest-threshold 4.0  # square pixels (default)
 ```
@@ -1064,13 +1064,13 @@ git commit -m "docs: add drop-smallest-as-needed CLI example"
 
 **Step 1: Run all core tests**
 
-Run: `cargo test --package gpq-tiles-core`
+Run: `cargo test --package tylertoo-core`
 
 Expected: All tests PASS
 
 **Step 2: Run CLI tests**
 
-Run: `cargo test --package gpq-tiles`
+Run: `cargo test --package tylertoo`
 
 Expected: All tests PASS
 
@@ -1098,7 +1098,7 @@ Create a test file and run:
 
 ```bash
 # Assuming you have a test.parquet file
-cargo run --release --package gpq-tiles -- test.parquet output.pmtiles \
+cargo run --release --package tylertoo -- test.parquet output.pmtiles \
   --min-zoom 8 --max-zoom 12 \
   --drop-smallest-as-needed \
   --drop-smallest-threshold 4.0
@@ -1173,7 +1173,7 @@ See `context/ARCHITECTURE.md` for details.
 ## Example Usage
 
 ```bash
-gpq-tiles buildings.parquet tiles.pmtiles \
+tylertoo buildings.parquet tiles.pmtiles \
   --drop-smallest-as-needed \
   --drop-smallest-threshold 4.0
 ```

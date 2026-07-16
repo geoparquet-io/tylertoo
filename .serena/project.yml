@@ -1,5 +1,5 @@
 # the name by which the project can be referenced within Serena/when chatting with the LLM.
-project_name: "gpq-tiles"
+project_name: "tylertoo"
 
 # list of languages for which language servers are started (LSP backend only); choose from:
 #   ada                 al                  angular             ansible             bash

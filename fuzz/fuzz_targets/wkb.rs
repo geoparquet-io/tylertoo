@@ -5,5 +5,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = gpq_tiles_core::wkb::wkb_to_geometry(data);
+    let _ = tylertoo_core::wkb::wkb_to_geometry(data);
 });

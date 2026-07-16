@@ -1,6 +1,6 @@
-# Type stubs for the gpq_tiles pyo3 extension module.
+# Type stubs for the tylertoo pyo3 extension module.
 #
-# Kept honest by CI: `python -m mypy.stubtest gpq_tiles` verifies these
+# Kept honest by CI: `python -m mypy.stubtest tylertoo` verifies these
 # signatures against the compiled module on every PR. If you change a
 # #[pyo3(signature = ...)] in crates/python/src/lib.rs, update this file.
 from pathlib import Path

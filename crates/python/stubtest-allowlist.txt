@@ -1,7 +1,7 @@
 # mypy.stubtest allowlist.
 #
 # maturin wraps the compiled extension in a generated package:
-#   gpq_tiles/__init__.py  ->  from .gpq_tiles import *
-# The inner gpq_tiles.gpq_tiles submodule is an implementation detail of that
-# wrapping; the public surface is fully described by gpq_tiles.pyi.
-gpq_tiles.gpq_tiles
+#   tylertoo/__init__.py  ->  from .tylertoo import *
+# The inner tylertoo.tylertoo submodule is an implementation detail of that
+# wrapping; the public surface is fully described by tylertoo.pyi.
+tylertoo.tylertoo

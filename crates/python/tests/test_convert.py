@@ -1,4 +1,4 @@
-"""Tests for the gpq_tiles.convert() facade.
+"""Tests for the tylertoo.convert() facade.
 
 convert() no longer runs the removed legacy per-tile pipeline: it chains
 overview() (convert, default knobs) into a temporary GeoParquet file and
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-import gpq_tiles
+import tylertoo
 
 # Path to test fixtures (relative to workspace root)
 FIXTURES_DIR = Path(__file__).parent.parent.parent.parent / "tests" / "fixtures"
@@ -26,18 +26,18 @@ class TestConvertFunction:
 
     def test_convert_exists(self):
         """Verify convert function is exported."""
-        assert hasattr(gpq_tiles, "convert")
-        assert callable(gpq_tiles.convert)
+        assert hasattr(tylertoo, "convert")
+        assert callable(tylertoo.convert)
 
     def test_convert_has_docstring(self):
         """Verify convert function has documentation."""
-        assert gpq_tiles.convert.__doc__ is not None
-        assert "GeoParquet" in gpq_tiles.convert.__doc__
-        assert "PMTiles" in gpq_tiles.convert.__doc__
+        assert tylertoo.convert.__doc__ is not None
+        assert "GeoParquet" in tylertoo.convert.__doc__
+        assert "PMTiles" in tylertoo.convert.__doc__
 
     def test_convert_docstring_mentions_facade(self):
         """The docstring must direct users to overview()/export_pmtiles()."""
-        doc = gpq_tiles.convert.__doc__
+        doc = tylertoo.convert.__doc__
         assert doc is not None
         assert "overview" in doc
         assert "export_pmtiles" in doc
@@ -46,7 +46,7 @@ class TestConvertFunction:
         """Test that convert() has expected default parameters."""
         # This will fail with TypeError if required args are missing
         with pytest.raises(TypeError) as exc_info:
-            gpq_tiles.convert()  # type: ignore[call-arg]
+            tylertoo.convert()  # type: ignore[call-arg]
 
         # Should complain about missing input/output, not other params
         error_msg = str(exc_info.value)
@@ -62,7 +62,7 @@ class TestConvertErrors:
             output = Path(tmpdir) / "output.pmtiles"
 
             with pytest.raises(Exception) as exc_info:
-                gpq_tiles.convert(
+                tylertoo.convert(
                     input="/nonexistent/path/to/file.parquet",
                     output=str(output),
                 )
@@ -76,7 +76,7 @@ class TestConvertErrors:
             output = Path(tmpdir) / "output.pmtiles"
 
             with pytest.raises(Exception):
-                gpq_tiles.convert(
+                tylertoo.convert(
                     input="/nonexistent/file.parquet",
                     output=str(output),
                     min_zoom=10,
@@ -103,7 +103,7 @@ class TestConvertErrors:
             output = Path(tmpdir) / "output.pmtiles"
 
             with pytest.raises(TypeError):
-                gpq_tiles.convert(
+                tylertoo.convert(
                     input="/some/input.parquet",
                     output=str(output),
                     **removed_kwarg,
@@ -125,7 +125,7 @@ class TestConvertIntegration:
             output = Path(tmpdir) / "output.pmtiles"
 
             # Should complete without error
-            gpq_tiles.convert(
+            tylertoo.convert(
                 input=str(input_file),
                 output=str(output),
                 min_zoom=0,
@@ -143,7 +143,7 @@ class TestConvertIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "output.pmtiles"
 
-            gpq_tiles.convert(
+            tylertoo.convert(
                 input=str(input_file),
                 output=str(output),
                 min_zoom=6,
@@ -159,7 +159,7 @@ class TestConvertIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "output.pmtiles"
 
-            gpq_tiles.convert(
+            tylertoo.convert(
                 input=str(input_file),
                 output=str(output),
                 min_zoom=0,
@@ -180,7 +180,7 @@ class TestConvertIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "output.pmtiles"
 
-            gpq_tiles.convert(
+            tylertoo.convert(
                 input=str(input_file),
                 output=str(output),
                 min_zoom=0,
@@ -197,7 +197,7 @@ class TestConvertIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "output.pmtiles"
 
-            gpq_tiles.convert(
+            tylertoo.convert(
                 input=str(input_file),
                 output=str(output),
                 min_zoom=0,
@@ -218,7 +218,7 @@ class TestConvertIntegration:
             output = Path(tmpdir) / "missing-subdir" / "output.pmtiles"
 
             with pytest.raises(Exception):
-                gpq_tiles.convert(
+                tylertoo.convert(
                     input=str(input_file),
                     output=str(output),
                 )

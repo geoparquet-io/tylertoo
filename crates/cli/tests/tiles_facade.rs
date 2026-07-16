@@ -8,8 +8,8 @@ use std::process::Command;
 /// spec version byte 3.
 const PMTILES_MAGIC: &[u8] = b"PMTiles\x03";
 
-fn gpq_tiles_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_gpq-tiles")
+fn tylertoo_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_tylertoo")
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn tiles_facade_produces_valid_pmtiles() {
     let dir = tempfile::tempdir().expect("tempdir");
     let output = dir.path().join("out.pmtiles");
 
-    let status = Command::new(gpq_tiles_bin())
+    let status = Command::new(tylertoo_bin())
         .args([
             "tiles",
             fixture.to_str().unwrap(),
@@ -34,7 +34,7 @@ fn tiles_facade_produces_valid_pmtiles() {
             "6",
         ])
         .status()
-        .expect("run gpq-tiles tiles");
+        .expect("run tylertoo tiles");
     assert!(status.success(), "tiles facade exited with {status}");
 
     let bytes = std::fs::read(&output).expect("read output pmtiles");
@@ -74,7 +74,7 @@ fn bare_invocation_rewrites_to_tiles() {
     let output = dir.path().join("bare.pmtiles");
 
     // No `tiles` subcommand: the backward-compatible bare form.
-    let status = Command::new(gpq_tiles_bin())
+    let status = Command::new(tylertoo_bin())
         .args([
             fixture.to_str().unwrap(),
             output.to_str().unwrap(),
@@ -82,7 +82,7 @@ fn bare_invocation_rewrites_to_tiles() {
             "5",
         ])
         .status()
-        .expect("run gpq-tiles (bare)");
+        .expect("run tylertoo (bare)");
     assert!(status.success(), "bare invocation exited with {status}");
 
     let bytes = std::fs::read(&output).expect("read output pmtiles");
@@ -100,23 +100,23 @@ fn spill_dir_flag_reaches_convert_options() {
 
     for subcommand in ["overview", "tiles"] {
         let out = dir.path().join(format!("{subcommand}-out"));
-        let output = Command::new(gpq_tiles_bin())
+        let output = Command::new(tylertoo_bin())
             .args([
                 subcommand,
                 input.to_str().unwrap(),
                 out.to_str().unwrap(),
                 "--spill-dir",
-                "/nonexistent/gpq-tiles-spill-dir-272",
+                "/nonexistent/tylertoo-spill-dir-272",
             ])
             .output()
-            .expect("run gpq-tiles");
+            .expect("run tylertoo");
         assert!(
             !output.status.success(),
             "{subcommand}: nonexistent --spill-dir must be rejected"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("spill-dir") && stderr.contains("/nonexistent/gpq-tiles-spill-dir-272"),
+            stderr.contains("spill-dir") && stderr.contains("/nonexistent/tylertoo-spill-dir-272"),
             "{subcommand}: error should name the option and path, got: {stderr}"
         );
     }

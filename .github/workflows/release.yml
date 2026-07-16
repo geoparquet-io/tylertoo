@@ -86,18 +86,18 @@ jobs:
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
 
-      - name: Publish gpq-tiles-core to crates.io
+      - name: Publish tylertoo-core to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
-        run: cargo publish --package gpq-tiles-core
+        run: cargo publish --package tylertoo-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Publish gpq-tiles (CLI) to crates.io
+      - name: Publish tylertoo (CLI) to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
         run: |
-          # Wait for crates.io to index gpq-tiles-core
+          # Wait for crates.io to index tylertoo-core
           sleep 30
-          cargo publish --package gpq-tiles
+          cargo publish --package tylertoo
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -169,7 +169,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --package gpq-tiles --target "$TARGET"
+        run: cargo build --release --package tylertoo --target "$TARGET"
 
       - name: Smoke test binary
         # x86_64-apple-darwin is cross-compiled on the arm64 runner; running
@@ -179,7 +179,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          "./target/$TARGET/release/gpq-tiles" --version
+          "./target/$TARGET/release/tylertoo" --version
 
       - name: Package archive (Unix)
         if: runner.os != 'Windows'
@@ -187,9 +187,9 @@ jobs:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          STAGE="gpq-tiles-$VERSION-$TARGET"
+          STAGE="tylertoo-$VERSION-$TARGET"
           mkdir -p "dist/$STAGE"
-          cp "target/$TARGET/release/gpq-tiles" README.md LICENSE "dist/$STAGE/"
+          cp "target/$TARGET/release/tylertoo" README.md LICENSE "dist/$STAGE/"
           tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
           rm -r "dist/${STAGE:?}"
 
@@ -200,9 +200,9 @@ jobs:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $stage = "gpq-tiles-$env:VERSION-$env:TARGET"
+          $stage = "tylertoo-$env:VERSION-$env:TARGET"
           New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
-          Copy-Item "target/$env:TARGET/release/gpq-tiles.exe" "dist/$stage/"
+          Copy-Item "target/$env:TARGET/release/tylertoo.exe" "dist/$stage/"
           Copy-Item README.md, LICENSE "dist/$stage/"
           Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
           Remove-Item -Recurse "dist/$stage"
@@ -243,8 +243,8 @@ jobs:
           VERSION: ${{ needs.release-rust.outputs.version }}
         run: |
           cd dist
-          sha256sum -- *.tar.gz *.zip > "gpq-tiles-$VERSION-checksums.txt"
-          cat "gpq-tiles-$VERSION-checksums.txt"
+          sha256sum -- *.tar.gz *.zip > "tylertoo-$VERSION-checksums.txt"
+          cat "tylertoo-$VERSION-checksums.txt"
 
       - name: Extract release notes from CHANGELOG.md
         env:

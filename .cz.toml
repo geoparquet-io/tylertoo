@@ -5,8 +5,8 @@ tag_format = "v$version"
 version_files = [
     # Workspace version (first match)
     "Cargo.toml:^version",
-    # gpq-tiles-core dependency in workspace.dependencies
-    "Cargo.toml:gpq-tiles-core.*version",
+    # tylertoo-core dependency in workspace.dependencies
+    "Cargo.toml:tylertoo-core.*version",
     # Python package version
     "crates/python/pyproject.toml:^version",
 ]

@@ -1,6 +1,6 @@
-//! CLI for gpq-tiles - Convert GeoParquet to PMTiles
+//! CLI for tylertoo - Convert GeoParquet to PMTiles
 //!
-//! This is a thin wrapper around the gpq-tiles-core library.
+//! This is a thin wrapper around the tylertoo-core library.
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -69,12 +69,12 @@ fn parse_bbox(s: &str) -> Result<[f64; 4]> {
 
 /// Top-level CLI: a default (bare) tile pipeline plus subcommands.
 ///
-/// `gpq-tiles input.parquet output.pmtiles` still works (bare tile pipeline);
-/// `gpq-tiles tiles ...` is the explicit form, and `overview` / `validate`
+/// `tylertoo input.parquet output.pmtiles` still works (bare tile pipeline);
+/// `tylertoo tiles ...` is the explicit form, and `overview` / `validate`
 /// are the GeoParquet-overview subcommands.
 #[derive(Parser, Debug)]
 #[command(
-    name = "gpq-tiles",
+    name = "tylertoo",
     about = "Convert GeoParquet to PMTiles vector tiles and multi-resolution overviews",
     version
 )]
@@ -97,7 +97,7 @@ enum Command {
     Decode(DecodeArgs),
 }
 
-/// Arguments for `gpq-tiles decode`.
+/// Arguments for `tylertoo decode`.
 ///
 /// The output is the TILED representation, not the original source data:
 /// geometries are simplified per zoom, clipped to (buffered) tile bounds,
@@ -154,10 +154,10 @@ struct DecodeArgs {
     files_from: Option<PathBuf>,
 }
 
-/// Arguments for `gpq-tiles export-pmtiles`.
+/// Arguments for `tylertoo export-pmtiles`.
 #[derive(Parser, Debug)]
 struct ExportPmtilesArgs {
-    /// Input overview GeoParquet file (produced by `gpq-tiles overview`).
+    /// Input overview GeoParquet file (produced by `tylertoo overview`).
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -198,7 +198,7 @@ struct ExportPmtilesArgs {
     files_from: Option<PathBuf>,
 }
 
-/// Arguments for `gpq-tiles overview`.
+/// Arguments for `tylertoo overview`.
 #[derive(Parser, Debug)]
 struct OverviewArgs {
     /// Input GeoParquet (EPSG:4326 or EPSG:3857): a local file, a directory
@@ -670,16 +670,16 @@ impl ConvertTuningArgs {
     /// `mode`, the `levels` plan, `bbox`, and `cogp_compat` and passes them in.
     fn build_convert_options(
         &self,
-        mode: gpq_tiles_core::overview::level::Mode,
-        levels: gpq_tiles_core::overview::convert::LevelPlan,
+        mode: tylertoo_core::overview::level::Mode,
+        levels: tylertoo_core::overview::convert::LevelPlan,
         bbox: Option<[f64; 4]>,
         cogp_compat: bool,
-    ) -> Result<gpq_tiles_core::overview::convert::ConvertOptions> {
-        use gpq_tiles_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
-        use gpq_tiles_core::overview::convert::ConvertOptions;
-        use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
-        use gpq_tiles_core::overview::simplify::SimplifyOptions;
-        use gpq_tiles_core::overview::writer::RowGroupSizePolicy;
+    ) -> Result<tylertoo_core::overview::convert::ConvertOptions> {
+        use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
+        use tylertoo_core::overview::convert::ConvertOptions;
+        use tylertoo_core::overview::level::{MemoryProfile, Mode};
+        use tylertoo_core::overview::simplify::SimplifyOptions;
+        use tylertoo_core::overview::writer::RowGroupSizePolicy;
 
         let profile = match self.profile.as_str() {
             "auto" => MemoryProfile::Auto,
@@ -699,7 +699,7 @@ impl ConvertTuningArgs {
         // Cluster-conditional default: with --cluster, absorbed points are
         // summarized (point_count), so the sparser 16.0 grid is the better look.
         let point_thinning = self.point_thinning.unwrap_or(if self.cluster {
-            gpq_tiles_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
+            tylertoo_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
         } else {
             AssignConfig::default().point_thinning
         });
@@ -790,7 +790,7 @@ impl ConvertTuningArgs {
     }
 }
 
-/// Arguments for `gpq-tiles validate`.
+/// Arguments for `tylertoo validate`.
 #[derive(Parser, Debug)]
 struct ValidateArgs {
     /// GeoParquet overview file to validate.
@@ -803,7 +803,7 @@ struct ValidateArgs {
     files_from: Option<PathBuf>,
 }
 
-/// Arguments for `gpq-tiles tiles` — the one-shot GeoParquet → PMTiles facade.
+/// Arguments for `tylertoo tiles` — the one-shot GeoParquet → PMTiles facade.
 ///
 /// This is a thin wrapper that runs `overview` (convert) into a temporary
 /// GeoParquet file and then `export-pmtiles` from it. The full convert-tuning
@@ -845,7 +845,7 @@ struct TilesArgs {
 
     /// Regional extract: only convert features whose bbox intersects this
     /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). See --bbox in
-    /// `gpq-tiles overview --help` for details.
+    /// `tylertoo overview --help` for details.
     #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
     bbox: Option<String>,
 
@@ -888,8 +888,8 @@ fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    // Backward-compatible bare invocation: `gpq-tiles input.parquet out.pmtiles`
-    // is rewritten to `gpq-tiles tiles input.parquet out.pmtiles` when the first
+    // Backward-compatible bare invocation: `tylertoo input.parquet out.pmtiles`
+    // is rewritten to `tylertoo tiles input.parquet out.pmtiles` when the first
     // positional token is not a known subcommand (and not --help/--version).
     let cli = Cli::parse_from(rewrite_bare_args(std::env::args_os()));
 
@@ -921,7 +921,7 @@ where
     ];
     let argv: Vec<std::ffi::OsString> = args.into_iter().collect();
 
-    // Nothing to rewrite for a bare `gpq-tiles` (clap prints help/usage).
+    // Nothing to rewrite for a bare `tylertoo` (clap prints help/usage).
     if argv.len() <= 1 {
         return argv;
     }
@@ -1008,10 +1008,10 @@ fn resolve_io(
 fn run_convert(
     spec: &InputSpec,
     output: &std::path::Path,
-    options: &gpq_tiles_core::overview::convert::ConvertOptions,
-) -> Result<gpq_tiles_core::overview::convert::ConvertReport> {
-    use gpq_tiles_core::input_set::ConvertSource;
-    use gpq_tiles_core::overview::convert::{
+    options: &tylertoo_core::overview::convert::ConvertOptions,
+) -> Result<tylertoo_core::overview::convert::ConvertReport> {
+    use tylertoo_core::input_set::ConvertSource;
+    use tylertoo_core::overview::convert::{
         convert_to_overviews, convert_to_overviews_sources, ConvertError,
     };
 
@@ -1024,16 +1024,16 @@ fn run_convert(
     .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
 }
 
-/// Run `gpq-tiles tiles`: the one-shot GeoParquet → PMTiles facade.
+/// Run `tylertoo tiles`: the one-shot GeoParquet → PMTiles facade.
 ///
 /// Chains the two product pipelines through a temporary overview file:
 /// `overview` (convert, with default knobs) → `export-pmtiles`. The temp
 /// file lives next to the output (same filesystem) and is removed on both
 /// success and failure via [`tempfile::NamedTempFile`]'s drop guard.
 fn run_tiles(args: TilesArgs) -> Result<()> {
-    use gpq_tiles_core::overview::convert::LevelPlan;
-    use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
-    use gpq_tiles_core::overview::level::Mode;
+    use tylertoo_core::overview::convert::LevelPlan;
+    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::overview::level::Mode;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1047,7 +1047,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         let p = match &spec {
             InputSpec::Path(p) | InputSpec::Manifest(p) => p,
         };
-        gpq_tiles_core::input_set::derive_layer_name(&p.to_string_lossy())
+        tylertoo_core::input_set::derive_layer_name(&p.to_string_lossy())
     });
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
@@ -1071,7 +1071,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
     let overview_tmp = tempfile::Builder::new()
-        .prefix(".gpq-tiles-overview-")
+        .prefix(".tylertoo-overview-")
         .suffix(".parquet")
         .tempfile_in(&tmp_dir)
         .context("failed to create temporary overview file")?;
@@ -1123,10 +1123,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run `gpq-tiles overview`: build a multi-resolution overview GeoParquet file.
+/// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
 fn run_overview(args: OverviewArgs) -> Result<()> {
-    use gpq_tiles_core::overview::convert::LevelPlan;
-    use gpq_tiles_core::overview::level::Mode;
+    use tylertoo_core::overview::convert::LevelPlan;
+    use tylertoo_core::overview::level::Mode;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1223,8 +1223,8 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
 /// `unknown_rank` (the priority for present-but-unlisted values) is derived as
 /// `min(listed ranks) - 1.0`, so unknown classes always lose to every listed
 /// value while still beating null/missing values (which lose to any rank).
-fn parse_class_rank(spec: &str) -> Result<gpq_tiles_core::overview::convert::ClassRanking> {
-    use gpq_tiles_core::overview::convert::ClassRanking;
+fn parse_class_rank(spec: &str) -> Result<tylertoo_core::overview::convert::ClassRanking> {
+    use tylertoo_core::overview::convert::ClassRanking;
 
     let (column, rest) = spec.split_once(':').ok_or_else(|| {
         anyhow::anyhow!(
@@ -1270,8 +1270,8 @@ fn parse_class_rank(spec: &str) -> Result<gpq_tiles_core::overview::convert::Cla
 
 /// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
 /// `sum`, `max`, `min`, `mean` (case-insensitive).
-fn parse_accumulate(spec: &str) -> Result<gpq_tiles_core::overview::cluster::AccumulateSpec> {
-    use gpq_tiles_core::overview::cluster::{AccumulateOp, AccumulateSpec};
+fn parse_accumulate(spec: &str) -> Result<tylertoo_core::overview::cluster::AccumulateSpec> {
+    use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
 
     let (column, op) = spec.rsplit_once(':').ok_or_else(|| {
         anyhow::anyhow!("invalid --accumulate-attribute '{spec}': expected COL:OP (missing ':')")
@@ -1293,9 +1293,9 @@ fn parse_accumulate(spec: &str) -> Result<gpq_tiles_core::overview::cluster::Acc
     })
 }
 
-/// Run `gpq-tiles validate`: check a GeoParquet overview file (spec §6.2).
+/// Run `tylertoo validate`: check a GeoParquet overview file (spec §6.2).
 fn run_validate(args: ValidateArgs) -> Result<()> {
-    use gpq_tiles_core::overview::check::validate_file;
+    use tylertoo_core::overview::check::validate_file;
 
     reject_files_from(args.files_from.as_ref(), "validate")?;
     require_single_local_file(&args.file, "validate")?;
@@ -1333,7 +1333,7 @@ fn require_single_local_file(input: &std::path::Path, subcommand: &str) -> Resul
         let no_meta = s.split(['?', '#']).next().unwrap_or(&s);
         if no_meta.ends_with('/') {
             anyhow::bail!(
-                "`gpq-tiles {subcommand}` reads a single local file, but {} is a \
+                "`tylertoo {subcommand}` reads a single local file, but {} is a \
                  remote prefix; multi-partition input (directories, globs, \
                  s3://gs:// prefixes, --files-from) is supported by the `overview` \
                  and `tiles` subcommands",
@@ -1341,7 +1341,7 @@ fn require_single_local_file(input: &std::path::Path, subcommand: &str) -> Resul
             );
         }
         anyhow::bail!(
-            "`gpq-tiles {subcommand}` does not support remote inputs (got {}); \
+            "`tylertoo {subcommand}` does not support remote inputs (got {}); \
              remote URLs (s3://, https://, gs://) are supported by the `overview` \
              and `tiles` subcommands — download the file first (e.g. `aws s3 cp`)",
             input.display()
@@ -1355,7 +1355,7 @@ fn require_single_local_file(input: &std::path::Path, subcommand: &str) -> Resul
         return Ok(());
     };
     anyhow::bail!(
-        "`gpq-tiles {subcommand}` reads a single local file, but {} is {kind}; \
+        "`tylertoo {subcommand}` reads a single local file, but {} is {kind}; \
          multi-partition input (directories, globs, s3://gs:// prefixes, \
          --files-from) is supported by the `overview` and `tiles` subcommands",
         input.display()
@@ -1367,7 +1367,7 @@ fn require_single_local_file(input: &std::path::Path, subcommand: &str) -> Resul
 fn reject_files_from(files_from: Option<&PathBuf>, subcommand: &str) -> Result<()> {
     if files_from.is_some() {
         anyhow::bail!(
-            "`gpq-tiles {subcommand}` reads a single local file and does not \
+            "`tylertoo {subcommand}` reads a single local file and does not \
              support --files-from; multi-partition input is supported by the \
              `overview` and `tiles` subcommands"
         );
@@ -1376,7 +1376,7 @@ fn reject_files_from(files_from: Option<&PathBuf>, subcommand: &str) -> Result<(
 }
 
 fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
-    use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1435,10 +1435,10 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run `gpq-tiles decode`: PMTiles → GeoParquet (thin facade over
-/// `gpq_tiles_core::decode::decode_pmtiles`).
+/// Run `tylertoo decode`: PMTiles → GeoParquet (thin facade over
+/// `tylertoo_core::decode::decode_pmtiles`).
 fn run_decode(args: DecodeArgs) -> Result<()> {
-    use gpq_tiles_core::decode::{decode_pmtiles, DecodeOptions};
+    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1483,7 +1483,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
     );
     println!(
         "  note: output is the tiled representation (simplified, clipped, \
-         duplicated across zooms); see `gpq-tiles decode --help`"
+         duplicated across zooms); see `tylertoo decode --help`"
     );
 
     if let Some(path) = &args.report {
@@ -1512,7 +1512,7 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpq_tiles_core::overview::cluster::AccumulateOp;
+    use tylertoo_core::overview::cluster::AccumulateOp;
 
     // --- single-file-only rejections (v0.7 PR-C) -----------------------------
 
@@ -1602,7 +1602,7 @@ mod tests {
     #[test]
     fn files_from_parses_on_both_subcommands() {
         let cli =
-            Cli::try_parse_from(["gpq-tiles", "tiles", "--files-from", "m.txt", "out.pmtiles"])
+            Cli::try_parse_from(["tylertoo", "tiles", "--files-from", "m.txt", "out.pmtiles"])
                 .expect("tiles --files-from should parse");
         let Command::Tiles(a) = cli.command else {
             panic!("expected tiles");
@@ -1612,7 +1612,7 @@ mod tests {
         assert_eq!(out, PathBuf::from("out.pmtiles"));
 
         let cli = Cli::try_parse_from([
-            "gpq-tiles",
+            "tylertoo",
             "overview",
             "--files-from",
             "m.txt",
@@ -1632,7 +1632,7 @@ mod tests {
     #[test]
     fn files_from_conflicts_with_positional_input() {
         let cli = Cli::try_parse_from([
-            "gpq-tiles",
+            "tylertoo",
             "overview",
             "--files-from",
             "m.txt",
@@ -1650,11 +1650,11 @@ mod tests {
         );
 
         // Without --files-from, INPUT/OUTPUT stay clap-required.
-        assert!(Cli::try_parse_from(["gpq-tiles", "overview"]).is_err());
-        assert!(Cli::try_parse_from(["gpq-tiles", "tiles", "only-one"]).is_err());
+        assert!(Cli::try_parse_from(["tylertoo", "overview"]).is_err());
+        assert!(Cli::try_parse_from(["tylertoo", "tiles", "only-one"]).is_err());
 
         // With --files-from but no positional at all: OUTPUT is missing.
-        let cli = Cli::try_parse_from(["gpq-tiles", "tiles", "--files-from", "m.txt"])
+        let cli = Cli::try_parse_from(["tylertoo", "tiles", "--files-from", "m.txt"])
             .expect("parses; resolve_io names the missing OUTPUT");
         let Command::Tiles(a) = cli.command else {
             panic!("expected tiles");
@@ -1665,7 +1665,7 @@ mod tests {
 
     /// Parse a `tiles` invocation and return its args (INPUT/OUTPUT are dummies).
     fn parse_tiles(flags: &[&str]) -> TilesArgs {
-        let mut argv = vec!["gpq-tiles", "tiles", "in.parquet", "out.pmtiles"];
+        let mut argv = vec!["tylertoo", "tiles", "in.parquet", "out.pmtiles"];
         argv.extend_from_slice(flags);
         match Cli::try_parse_from(argv)
             .expect("tiles args should parse")
@@ -1718,8 +1718,8 @@ mod tests {
 
     #[test]
     fn tiles_build_convert_options_threads_tuning() {
-        use gpq_tiles_core::overview::convert::LevelPlan;
-        use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
+        use tylertoo_core::overview::convert::LevelPlan;
+        use tylertoo_core::overview::level::{MemoryProfile, Mode};
 
         let a = parse_tiles(&[
             "--polygon-visibility",
@@ -1751,8 +1751,8 @@ mod tests {
 
     #[test]
     fn build_convert_options_enforces_shared_validation() {
-        use gpq_tiles_core::overview::convert::LevelPlan;
-        use gpq_tiles_core::overview::level::Mode;
+        use tylertoo_core::overview::convert::LevelPlan;
+        use tylertoo_core::overview::level::Mode;
 
         let levels = || LevelPlan::ZoomRange {
             min_zoom: 0,

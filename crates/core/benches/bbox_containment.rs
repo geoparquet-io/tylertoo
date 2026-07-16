@@ -4,14 +4,14 @@
 // skips clipping when a feature's bounding box is fully contained within
 // tile bounds.
 //
-// Run with: cargo bench --package gpq-tiles-core -- bbox_containment
+// Run with: cargo bench --package tylertoo-core -- bbox_containment
 
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{BoundingRect, Coord, Geometry, LineString, MultiPolygon, Polygon};
-use gpq_tiles_core::clip::clip_geometry;
-use gpq_tiles_core::tile::TileBounds;
+use tylertoo_core::clip::clip_geometry;
+use tylertoo_core::tile::TileBounds;
 
 /// Generate small building-like polygons (typical size: 10-30m)
 /// These should benefit greatly from bbox containment optimization at high zoom
@@ -369,7 +369,7 @@ fn bench_optimization_comparison(c: &mut Criterion) {
 
     // Comparison: force clipping even when fully inside (simulates no optimization)
     // Note: This uses the underlying clip_polygon_sh which still has some optimizations
-    use gpq_tiles_core::sutherland_hodgman::clip_polygon_sh;
+    use tylertoo_core::sutherland_hodgman::clip_polygon_sh;
 
     group.bench_function("without_bbox_optimization", |b| {
         b.iter(|| {

@@ -7,7 +7,7 @@
 //! that binary is available (skipped gracefully otherwise).
 //!
 //! Run with:
-//!   cargo test --package gpq-tiles-core --test decode_roundtrip -- --nocapture
+//!   cargo test --package tylertoo-core --test decode_roundtrip -- --nocapture
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -28,10 +28,10 @@ use geoparquet::writer::{
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 
-use gpq_tiles_core::batch_processor::extract_geometries_from_array;
-use gpq_tiles_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
-use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::batch_processor::extract_geometries_from_array;
+use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
+use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
 
 const MIN_ZOOM: u8 = 4;
 const MAX_ZOOM: u8 = 14;

@@ -1,10 +1,10 @@
 # Layout benchmark: duplicating vs partitioning vs partitioning + geom_overview
 
-**Date:** 2026-07-06. Prepared for the gpq-tiles / geoparquet-overviews
+**Date:** 2026-07-06. Prepared for the tylertoo / geoparquet-overviews
 (Youssef Harby) alignment discussion.
 
 The question under test: the two drafts differ in how a file stores its
-coarse levels. gpq-tiles `geo:overviews` offers **duplicating** (each level
+coarse levels. tylertoo `geo:overviews` offers **duplicating** (each level
 is a complete, self-contained simplified rendering; a reader fetches exactly
 one level) and **partitioning** (every feature exactly once, verbatim
 geometry, at its coarsest meaningful level; a reader fetches a cumulative
@@ -91,9 +91,9 @@ the accepted price of pre-baked levels.
 |---|---|
 | Dataset | 5,279,151 Overture building polygons, central Germany (bbox 7.8, 49.5, 10.2, 51.6), carved from the bigbench Germany extract |
 | Input file | `buildings-de-central.parquet`, 591 MB, gpio-optimized (Hilbert sort, bbox covering, zstd) — comparable to the 5.65 M-building file in Youssef's published README numbers |
-| gpq-tiles | 0.6.0 (workspace @ 319d147), `overview --mode {duplicating,partitioning} --min-zoom 0 --max-zoom 14`, defaults otherwise |
+| tylertoo | 0.6.0 (workspace @ 319d147), `overview --mode {duplicating,partitioning} --min-zoom 0 --max-zoom 14`, defaults otherwise |
 | gpo | yharby/geoparquet-overviews @ a269b3b, `gpo convert` defaults (3 bands, 16 MB row groups, zstd-15, bbox + native GEOMETRY types + page index) |
-| Remote store | `s3://gpq-tiles-bench/layoutbench/` (us-east-2), benchmarked from a residential connection, cold reads, 3-run medians |
+| Remote store | `s3://tylertoo-bench/layoutbench/` (us-east-2), benchmarked from a residential connection, cold reads, 3-run medians |
 | Scripts | `bench_layout_reads.py` (viewer-pattern range reads), `bench_layout_sql.py` (DuckDB over S3); results in `layout_read_results.json` / `layout_sql_results.json` |
 
 Known confounds, kept because they are each converter's real defaults:
@@ -107,8 +107,8 @@ vs gpo's 3 bands.
 
 | | wall | peak RSS | output | rows out |
 |---|---|---|---|---|
-| gpq-tiles duplicating | **32 s** | **1.3 GB** | 1,067 MB (1.80× input) | 9,136,026 (5.28 M exact + 3.86 M simplified copies) |
-| gpq-tiles partitioning | **23 s** | **1.3 GB** | 665 MB (1.12×) | 5,279,151 |
+| tylertoo duplicating | **32 s** | **1.3 GB** | 1,067 MB (1.80× input) | 9,136,026 (5.28 M exact + 3.86 M simplified copies) |
+| tylertoo partitioning | **23 s** | **1.3 GB** | 665 MB (1.12×) | 5,279,151 |
 | gpo | 139 s | 7.0 GB | 567 MB (0.96×) | 5,279,151 (+ geom_overview on coarse bands) |
 | column-per-zoom (prototype) | 10.6 s pivot from the dup file (DuckDB) | 9.5 GB (pivot, unoptimized) | 882 MB (1.49×) | 5,279,151 (+ 7 zoom-geometry columns) |
 
@@ -188,7 +188,7 @@ Readings:
 
 ## 4. Viewer compatibility (Youssef's TypeScript viewer, our files)
 
-Fork: local clone @ a269b3b, branch `gpq-tiles-compat`.
+Fork: local clone @ a269b3b, branch `tylertoo-compat`.
 
 **Unpatched:** the viewer looks up the literal `overviews` footer key,
 doesn't find ours (`geo:overviews`), and falls back to plain-GeoParquet
@@ -425,10 +425,10 @@ uv run --project ~/Documents/dev/geoparquet-io gpio sort hilbert \
   --add-bbox --geoparquet-version 1.1 --compression zstd --overwrite
 
 # conversions
-target/release/gpq-tiles overview --mode duplicating \
+target/release/tylertoo overview --mode duplicating \
   --min-zoom 0 --max-zoom 14 buildings-de-central.parquet \
   buildings-de-central.dup.parquet
-target/release/gpq-tiles overview --mode partitioning \
+target/release/tylertoo overview --mode partitioning \
   --min-zoom 0 --max-zoom 14 buildings-de-central.parquet \
   buildings-de-central.part.parquet
 uvx --from "git+https://github.com/yharby/geoparquet-overviews\
@@ -439,7 +439,7 @@ uvx --from "git+https://github.com/yharby/geoparquet-overviews\
 # into per-zoom columns; run from corpus/data/layoutbench/)
 duckdb < benchmarks/layout/make_cpz.sql
 
-# benchmarks (uploads assumed at s3://gpq-tiles-bench/layoutbench/)
+# benchmarks (uploads assumed at s3://tylertoo-bench/layoutbench/)
 uv run --with pyarrow --with requests \
   python3 benchmarks/layout/bench_layout_reads.py
 uv run python3 benchmarks/layout/bench_layout_sql.py

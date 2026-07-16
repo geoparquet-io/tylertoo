@@ -1,9 +1,9 @@
-site_name: gpq-tiles
+site_name: tylertoo
 site_description: Fast GeoParquet → PMTiles converter in Rust
 site_author: Nissim Lebovits
-site_url: https://geoparquet-io.github.io/gpq-tiles/
-repo_name: geoparquet-io/gpq-tiles
-repo_url: https://github.com/geoparquet-io/gpq-tiles
+site_url: https://geoparquet-io.github.io/tylertoo/
+repo_name: geoparquet-io/tylertoo
+repo_url: https://github.com/geoparquet-io/tylertoo
 edit_uri: edit/main/docs/
 
 theme:
@@ -32,8 +32,8 @@ theme:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/geoparquet-io/gpq-tiles
-      name: gpq-tiles on GitHub
+      link: https://github.com/geoparquet-io/tylertoo
+      name: tylertoo on GitHub
 
 plugins:
   - search

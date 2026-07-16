@@ -3,12 +3,12 @@
 # verify.sh - V1 correctness suite for the GeoParquet overview pipeline.
 #
 # For every gpio-optimized corpus dataset (corpus/data/gpio/*.parquet) this:
-#   1. runs `gpq-tiles overview` in BOTH modes (duplicating + partitioning)
+#   1. runs `tylertoo overview` in BOTH modes (duplicating + partitioning)
 #      into corpus/data/overviews/, capturing wall time + peak RSS and a
 #      --report JSON, using the dataset's tippecanoe zoom range from
 #      manifest.json (default 0..14).
 #   2. runs the correctness checks per output file:
-#        - `gpq-tiles validate` (exit 0)
+#        - `tylertoo validate` (exit 0)
 #        - DuckDB spatial: opens as parquet; count at canonical level ==
 #          input (duplicating) / total == input (partitioning); a
 #          bbox+level predicate returns plausible results; WKB decode works.
@@ -37,7 +37,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 MANIFEST="$HERE/manifest.json"
 GPIO="$HERE/data/gpio"
 OUT="$HERE/data/overviews"
-BIN="${GPQ_BIN:-$ROOT/target/release/gpq-tiles}"
+BIN="${GPQ_BIN:-$ROOT/target/release/tylertoo}"
 RESULTS_TSV="$OUT/results.tsv"
 RESULTS_MD="$HERE/V1_RESULTS.md"
 
@@ -313,7 +313,7 @@ done
   echo "Binary: \`$BIN\` (\`$("$BIN" --version 2>/dev/null)\`)."
   echo "Datasets: gpio-optimized corpus under \`corpus/data/gpio/\`."
   echo "Every dataset converted in BOTH modes with its manifest tippecanoe"
-  echo "zoom range (default 0..14); checked with \`gpq-tiles validate\`,"
+  echo "zoom range (default 0..14); checked with \`tylertoo validate\`,"
   echo "DuckDB (spatial ext) and GDAL \`ogrinfo\`."
   echo
   echo "## Summary (dataset x mode)"

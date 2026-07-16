@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "gpq-tiles overview test corpus. Datasets per geometry class (point/line/polygon/monster) at small/medium/large scale tiers. Scripts only; data never committed.",
+  "description": "tylertoo overview test corpus. Datasets per geometry class (point/line/polygon/monster) at small/medium/large scale tiers. Scripts only; data never committed.",
   "overture": {
     "release": "2026-06-17.0",
     "bucket": "s3://overturemaps-us-west-2/release",

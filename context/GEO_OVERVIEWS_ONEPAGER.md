@@ -2,7 +2,7 @@
 
 *One-pager for the GeoParquet spec maintainers. Draft 2026-07-03 — for
 Nissim's review before sending. Working code, spec, and benchmarks:
-https://github.com/geoparquet-io/gpq-tiles/pull/168*
+https://github.com/geoparquet-io/tylertoo/pull/168*
 
 ## The gap
 
@@ -57,7 +57,7 @@ Overture-derived parcels)
   `export-pmtiles` derives a PMTiles from the overview file in
   seconds (Portland z2–14: 5s, 244 MB RSS) — the tileset becomes a
   cheap projection of the canonical file, not a drifting sibling.
-- Validator (`gpq-tiles validate`) enforces every layout/metadata
+- Validator (`tylertoo validate`) enforces every layout/metadata
   conformance rule; correctness suite passes on all datasets ×
   both modes incl. byte-determinism and canonical fidelity.
 

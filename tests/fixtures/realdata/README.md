@@ -1,6 +1,6 @@
 # Real-World Test Fixtures
 
-Production data samples for testing gpq-tiles tiling performance.
+Production data samples for testing tylertoo tiling performance.
 
 ## Fixtures
 
@@ -31,7 +31,7 @@ Download fixtures from the release:
 gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
 ```
 
-Or manually from: https://github.com/geoparquet-io/gpq-tiles/releases/tag/fixtures-v1
+Or manually from: https://github.com/geoparquet-io/tylertoo/releases/tag/fixtures-v1
 
 ## Large Benchmark Files (Manual Download)
 
@@ -45,7 +45,7 @@ To run the regression benchmark:
 
 ```bash
 # Place adm2_polygons.parquet in this directory, then:
-cargo test --release -p gpq-tiles-core --test large_polygon_regression -- --nocapture
+cargo test --release -p tylertoo-core --test large_polygon_regression -- --nocapture
 ```
 
 The test automatically skips if the file is not present.

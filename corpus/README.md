@@ -1,4 +1,4 @@
-# gpq-tiles overview test corpus
+# tylertoo overview test corpus
 
 Reproducible test datasets + golden references for evaluating
 GeoParquet-embedded multi-resolution **overviews** (quality metrics in

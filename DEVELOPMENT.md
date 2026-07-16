@@ -1,6 +1,6 @@
 # Development Guide
 
-Quick reference for working on gpq-tiles.
+Quick reference for working on tylertoo.
 
 ## Initial Setup
 
@@ -43,14 +43,14 @@ parallelism). Run targeted tests:
 
 ```bash
 # A specific test
-cargo test --package gpq-tiles-core \
+cargo test --package tylertoo-core \
   overview::assign::tests::some_test -- --nocapture
 
 # A module
-cargo test --package gpq-tiles-core overview::cluster:: -- --nocapture
+cargo test --package tylertoo-core overview::cluster:: -- --nocapture
 
 # The CLI facade integration test
-cargo test --package gpq-tiles --test tiles_facade
+cargo test --package tylertoo --test tiles_facade
 ```
 
 CI runs the full matrix (`cargo test --all-features -- --skip
@@ -59,8 +59,8 @@ large_polygon_regression` on ubuntu/macos × stable/beta) — let it.
 ### Benchmarks
 
 ```bash
-cargo bench --package gpq-tiles-core --bench clipping
-cargo bench --package gpq-tiles-core --bench bbox_containment
+cargo bench --package tylertoo-core --bench clipping
+cargo bench --package tylertoo-core --bench bbox_containment
 open target/criterion/report/index.html
 ```
 
@@ -97,7 +97,7 @@ cargo build --features dhat-heap
 # Coverage (informational; CI uploads to codecov)
 cargo install cargo-tarpaulin   # once (CI uses a prebuilt binary)
 cargo tarpaulin --out xml --all-features --workspace \
-  --exclude gpq-tiles-python
+  --exclude tylertoo-python
 ```
 
 Some thresholds are **ratchets** set at current-code level and marked
@@ -116,8 +116,8 @@ uv run maturin develop          # build the extension module
 uv run ruff check .             # strict 16-group ruleset
 uv run ruff format --check .
 uv run mypy                     # strict typing
-uv run python -m mypy.stubtest gpq_tiles \
-  --allowlist stubtest-allowlist.txt   # gpq_tiles.pyi matches the built module
+uv run python -m mypy.stubtest tylertoo \
+  --allowlist stubtest-allowlist.txt   # tylertoo.pyi matches the built module
 uv run vulture                  # dead code
 uv run xenon --max-absolute C --max-modules A --max-average A tests
 uv run pytest tests/ -v
@@ -129,7 +129,7 @@ uv run pip-audit -r /tmp/requirements.txt --disable-pip
 ```
 
 If you change a `#[pyo3(signature = ...)]` in
-`crates/python/src/lib.rs`, update `crates/python/gpq_tiles.pyi` —
+`crates/python/src/lib.rs`, update `crates/python/tylertoo.pyi` —
 stubtest will fail otherwise.
 
 ### Workflows
@@ -141,7 +141,7 @@ uvx zizmor --min-severity low .github/workflows
 
 ### Version consistency
 
-`Cargo.toml` (workspace version + the `gpq-tiles-core` dependency
+`Cargo.toml` (workspace version + the `tylertoo-core` dependency
 version), `crates/python/pyproject.toml`, and `.cz.toml` must agree.
 The pre-commit hook and a CI job both enforce it; `uv run cz bump`
 from the repo root is the only supported way to move versions (see
@@ -154,7 +154,7 @@ crates/
 ├── core/     # ALL logic: overview/ (the product) + shared infrastructure
 ├── cli/      # Thin argument parsing → core (tiles facade, overview,
 │             # validate, export-pmtiles)
-└── python/   # pyo3 bindings → core (+ gpq_tiles.pyi stubs)
+└── python/   # pyo3 bindings → core (+ tylertoo.pyi stubs)
 ```
 
 The full module map and design rationale live in
@@ -167,7 +167,7 @@ cd crates/python
 
 uv sync --group dev             # create venv + install dev deps
 uv run maturin develop          # build + install the extension in-place
-uv run python -c "import gpq_tiles; print(gpq_tiles.__doc__)"
+uv run python -c "import tylertoo; print(tylertoo.__doc__)"
 uv run pytest tests/ -v
 
 # Build a release wheel (lands in target/wheels/)
@@ -178,11 +178,11 @@ uv run maturin build --release
 
 ```bash
 # Pipeline phase timing / diagnostics
-RUST_LOG=gpq_tiles_core::overview=debug \
-  cargo run --package gpq-tiles -- overview in.parquet out.parquet
+RUST_LOG=tylertoo_core::overview=debug \
+  cargo run --package tylertoo -- overview in.parquet out.parquet
 
 # Backtrace on a failing test
-RUST_BACKTRACE=1 cargo test --package gpq-tiles-core <test-name>
+RUST_BACKTRACE=1 cargo test --package tylertoo-core <test-name>
 ```
 
 ### Common Issues
@@ -198,7 +198,7 @@ RUST_BACKTRACE=1 cargo test --package gpq-tiles-core <test-name>
 `tests/fixtures/...`
 
 **Problem**: stubtest fails after a binding change
-**Solution**: Update `crates/python/gpq_tiles.pyi` to match the new
+**Solution**: Update `crates/python/tylertoo.pyi` to match the new
 `#[pyo3(signature)]`
 
 ## Dependency Updates

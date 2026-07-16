@@ -5,7 +5,7 @@ tables below carry the post-H1 numbers — see the dated revision note after
 Headline findings for the before→after deltas). These are the first published numbers comparing the
 access and storage efficiency of **overview GeoParquet** (COG-style
 multi-resolution levels embedded in one GeoParquet file, produced by
-`gpq-tiles overview`) against the status-quo web-map deployment
+`tylertoo overview`) against the status-quo web-map deployment
 (**gpio-optimized GeoParquet source + a tippecanoe PMTiles derivative**)
 and against **COGP** (Kanahiro `cogp-rs`, thinning-only, no
 simplification). Method transparency is the point: every number below is
@@ -87,7 +87,7 @@ the original run; only the physical layout changed.
 
 | tool | version |
 |---|---|
-| gpq-tiles | 0.6.0 (branch `feat/geoparquet-overviews`, Q1 ranking + Q2 density budget + H1 layout fix) |
+| tylertoo | 0.6.0 (branch `feat/geoparquet-overviews`, Q1 ranking + Q2 density budget + H1 layout fix) |
 | tippecanoe | v2.49.0 |
 | DuckDB | v1.4.1 (Andium), httpfs + spatial |
 | gpio (geoparquet-io) | 1.1.0b1 |
@@ -509,7 +509,7 @@ tables via `format_duckdb_knobs.py`; recipe in
 > (convert ~55 s / ~320 MB peak RSS on the same file) and the change
 > history are in [`PROFILE.md`](./PROFILE.md).
 
-`gpq-tiles overview` (duplicating, default knobs, z0..14, reads GeoParquet
+`tylertoo overview` (duplicating, default knobs, z0..14, reads GeoParquet
 natively) vs the golden tippecanoe workflow `gpio convert geojson <src> |
 tippecanoe -P <recorded flags>`. Both wrapped in `/usr/bin/time -v`. The
 tippecanoe column **includes** the mandatory GeoParquet→GeoJSON decode
@@ -598,7 +598,7 @@ apples-to-apples**, and saying so is more useful than a clean-looking table.
 
 ```bash
 # 0. release binary (once)
-cargo build --release --package gpq-tiles
+cargo build --release --package tylertoo
 
 # 1. regenerate overview files (both modes) + storage + conversion + access
 benchmarks/overview/run_all.sh

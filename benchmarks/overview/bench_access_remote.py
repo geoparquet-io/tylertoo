@@ -26,7 +26,7 @@ Run:
   uv run --with pmtiles --with requests python3 bench_access_remote.py
 
 Env:
-  BENCH_BUCKET      (default gpq-tiles-bench)
+  BENCH_BUCKET      (default tylertoo-bench)
   BENCH_REGION      (default us-east-2)
   BENCH_AWS_PROFILE (default nissim-admin)
   BENCH_RUNS        (default 3; medians reported)
@@ -52,7 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 DATA_ROOT = os.path.join(ROOT, "corpus", "data")
 
-BUCKET = os.environ.get("BENCH_BUCKET", "gpq-tiles-bench")
+BUCKET = os.environ.get("BENCH_BUCKET", "tylertoo-bench")
 REGION = os.environ.get("BENCH_REGION", "us-east-2")
 PROFILE = os.environ.get("BENCH_AWS_PROFILE", "nissim-admin")
 N_RUNS = int(os.environ.get("BENCH_RUNS", "3"))

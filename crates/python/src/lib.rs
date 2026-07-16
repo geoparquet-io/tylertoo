@@ -1,25 +1,25 @@
-//! Python bindings for gpq-tiles
+//! Python bindings for tylertoo
 //!
-//! This module exposes the gpq-tiles-core functionality to Python via pyo3.
+//! This module exposes the tylertoo-core functionality to Python via pyo3.
 
-use gpq_tiles_core::input_set::ConvertSource;
-use gpq_tiles_core::overview::assign::{
-    AssignConfig, DensityBudgetConfig, SortDirection, CLUSTER_POINT_THINNING_DEFAULT,
-};
-use gpq_tiles_core::overview::check::validate_file;
-use gpq_tiles_core::overview::cluster::{AccumulateOp, AccumulateSpec};
-use gpq_tiles_core::overview::convert::{
-    convert_to_overviews, convert_to_overviews_sources, ClassRanking, ConvertError, ConvertOptions,
-    ConvertReport, LevelPlan,
-};
-use gpq_tiles_core::overview::export::{export_pmtiles as export_pmtiles_core, ExportOptions};
-use gpq_tiles_core::overview::level::{MemoryProfile, Mode};
-use gpq_tiles_core::overview::simplify::SimplifyOptions;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use tylertoo_core::input_set::ConvertSource;
+use tylertoo_core::overview::assign::{
+    AssignConfig, DensityBudgetConfig, SortDirection, CLUSTER_POINT_THINNING_DEFAULT,
+};
+use tylertoo_core::overview::check::validate_file;
+use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
+use tylertoo_core::overview::convert::{
+    convert_to_overviews, convert_to_overviews_sources, ClassRanking, ConvertError, ConvertOptions,
+    ConvertReport, LevelPlan,
+};
+use tylertoo_core::overview::export::{export_pmtiles as export_pmtiles_core, ExportOptions};
+use tylertoo_core::overview::level::{MemoryProfile, Mode};
+use tylertoo_core::overview::simplify::SimplifyOptions;
 
 /// Convert GeoParquet to PMTiles in one shot (overview facade).
 ///
@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 ///     RuntimeError: The conversion or export failed.
 ///
 /// Example:
-///     >>> from gpq_tiles import convert
+///     >>> from tylertoo import convert
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
@@ -86,7 +86,7 @@ fn convert(
     // single file, last path segment for a directory or s3://gs:// prefix,
     // last literal segment for a glob (core owns the rules).
     let layer_name =
-        layer_name.unwrap_or_else(|| gpq_tiles_core::input_set::derive_layer_name(input));
+        layer_name.unwrap_or_else(|| tylertoo_core::input_set::derive_layer_name(input));
 
     let options = ConvertOptions {
         levels: LevelPlan::ZoomRange { min_zoom, max_zoom },
@@ -109,7 +109,7 @@ fn convert(
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
     let overview_tmp = tempfile::Builder::new()
-        .prefix(".gpq-tiles-overview-")
+        .prefix(".tylertoo-overview-")
         .suffix(".parquet")
         .tempfile_in(&tmp_dir)
         .map_err(|e| {
@@ -204,7 +204,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 
 /// Build a multi-resolution GeoParquet overview file (COG-style vector overviews).
 ///
-/// This is the Python equivalent of ``gpq-tiles overview`` with the full CLI
+/// This is the Python equivalent of ``tylertoo overview`` with the full CLI
 /// knob surface and identical defaults. The pipeline reads a (gpio-sorted)
 /// GeoParquet file, thins features per level with grid cell-winner selection,
 /// applies the per-level density budget, simplifies geometry in world space,
@@ -358,7 +358,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         CRS, writer errors).
 ///
 /// Example:
-///     >>> from gpq_tiles import overview
+///     >>> from tylertoo import overview
 ///     >>> report = overview("moldova.parquet", "moldova-overviews.parquet",
 ///     ...                   min_zoom=0, max_zoom=10)
 ///     >>> report = overview("nyc-trees.parquet", "nyc-trees-overviews.parquet",
@@ -636,7 +636,7 @@ fn overview(
 
 /// Export an overview GeoParquet file to a PMTiles archive.
 ///
-/// Python equivalent of ``gpq-tiles export-pmtiles``: each overview level
+/// Python equivalent of ``tylertoo export-pmtiles``: each overview level
 /// becomes one Web Mercator zoom of MVT tiles (gzip-compressed).
 ///
 /// Args:
@@ -668,7 +668,7 @@ fn overview(
 ///         CRS, I/O errors).
 ///
 /// Example:
-///     >>> from gpq_tiles import export_pmtiles
+///     >>> from tylertoo import export_pmtiles
 ///     >>> report = export_pmtiles("moldova-overviews.parquet", "moldova.pmtiles",
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
@@ -724,7 +724,7 @@ fn export_pmtiles(
 
 /// Validate a GeoParquet overview file against the overviews spec checklist.
 ///
-/// Python equivalent of ``gpq-tiles validate``: runs every structural
+/// Python equivalent of ``tylertoo validate``: runs every structural
 /// conformance check (footer metadata, level column, row-group banding, bbox
 /// covering, provenance blocks, ...) and returns the structured results
 /// instead of raising on failure.
@@ -741,7 +741,7 @@ fn export_pmtiles(
 ///         not be parsed (validation never started).
 ///
 /// Example:
-///     >>> from gpq_tiles import validate
+///     >>> from tylertoo import validate
 ///     >>> result = validate("moldova-overviews.parquet")
 ///     >>> assert result["valid"], [c for c in result["checks"] if not c["passed"]]
 #[pyfunction]
@@ -766,11 +766,11 @@ fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
     Ok(dict.into())
 }
 
-/// gpq_tiles: Fast GeoParquet to PMTiles converter
+/// tylertoo: Fast GeoParquet to PMTiles converter
 ///
-/// This module provides Python bindings for the gpq-tiles Rust library.
+/// This module provides Python bindings for the tylertoo Rust library.
 #[pymodule]
-fn gpq_tiles(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;
     m.add_function(wrap_pyfunction!(export_pmtiles, m)?)?;

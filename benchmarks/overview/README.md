@@ -15,7 +15,7 @@ live in [`PROFILE.md`](./PROFILE.md); this README is the operator's guide.
    for the overview read protocol (DuckDB httpfs, `WHERE level = k AND bbox
    overlap`) vs the PMTiles tile-range protocol, over a byte-range HTTP
    server that logs every response's byte count.
-3. **Conversion cost** — wall time + peak RSS of `gpq-tiles overview` vs the
+3. **Conversion cost** — wall time + peak RSS of `tylertoo overview` vs the
    `gpio convert geojson | tippecanoe` pipeline on the same input.
 
 ## Datasets
@@ -54,7 +54,7 @@ Only the scripts, `viewports.json`, `RESULTS.md`, and the small
 
 ```bash
 # release binary (once)
-cargo build --release --package gpq-tiles
+cargo build --release --package tylertoo
 
 # everything (regenerates overview files first; Moldova dup ~11 min)
 benchmarks/overview/run_all.sh

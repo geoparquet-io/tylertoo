@@ -24,7 +24,7 @@ Non-WGS84 input is rejected with the exact command to fix it.
 
 ## Antimeridian-Crossing Geometry
 
-gpq-tiles stores your geometry exactly as written — it never reprojects,
+tylertoo stores your geometry exactly as written — it never reprojects,
 clips, or splits it. That is the right default, but it has one sharp
 edge: features that cross the antimeridian (the ±180° longitude line).
 
@@ -49,7 +49,7 @@ If you convert such a file as-is, three things go wrong:
   spans nearly all longitudes, so every viewport query at that latitude
   fetches the feature's row group. Spatial filtering stops helping.
 
-gpq-tiles detects this and warns — once per conversion, with a count of
+tylertoo detects this and warns — once per conversion, with a count of
 affected features — but deliberately does **not** modify your geometry:
 
 ```text
@@ -83,10 +83,10 @@ converts in ~320 MB peak RSS). Two knobs, both content-neutral:
 
 ```bash
 # Tighter memory bound (e.g. monster multipolygons, small machines)
-gpq-tiles overview big.parquet out.parquet --read-batch-size 1024
+tylertoo overview big.parquet out.parquet --read-batch-size 1024
 
 # Reference in-memory pipeline (small inputs only; O(dataset) memory)
-gpq-tiles overview small.parquet out.parquet --no-streaming
+tylertoo overview small.parquet out.parquet --no-streaming
 ```
 
 For very large exports where pass-2 output buffering is the pressure,
@@ -117,10 +117,10 @@ Overview files are designed to be queried over HTTP range requests
   and `level` column always keep pruning stats. Opt in only if remote
   clients push predicates on property columns.
 
-Measured effects: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/RESULTS.md)
+Measured effects: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/RESULTS.md)
 (the H1 revision note).
 
-## Reading Overview Files Without gpq-tiles
+## Reading Overview Files Without tylertoo
 
 The file is plain GeoParquet 1.1 with a `level` INT32 column and a
 `geo:overviews` footer key:
@@ -139,7 +139,7 @@ overview files directly on object storage — the DuckDB secret setup,
 recommended session settings, and the level+bbox viewport query — see
 [Remote Reads](remote-reads.md). The broader consumption guide
 (GeoPandas, browser demo) is tracked in
-[#175](https://github.com/geoparquet-io/gpq-tiles/issues/175).
+[#175](https://github.com/geoparquet-io/tylertoo/issues/175).
 
 ## Export Details
 
@@ -165,7 +165,7 @@ vertex counts, drops per mechanism, per-zoom tile stats, oversized-tile
 counts. Useful for regression-checking a tuning change:
 
 ```bash
-gpq-tiles overview in.parquet out.parquet --report report.json
+tylertoo overview in.parquet out.parquet --report report.json
 jq '.levels[] | {level, features, vertices}' report.json
 ```
 
@@ -173,11 +173,11 @@ jq '.levels[] | {level, features, vertices}' report.json
 
 ```bash
 # Spec validation (footer, level banding, canonical fidelity, invariants)
-gpq-tiles validate overviews.parquet
+tylertoo validate overviews.parquet
 
 # Phase-level timing/diagnostics from the pipeline
-RUST_LOG=gpq_tiles_core::overview=debug \
-  gpq-tiles overview in.parquet out.parquet
+RUST_LOG=tylertoo_core::overview=debug \
+  tylertoo overview in.parquet out.parquet
 
 # Inspect exported tiles
 pmtiles show output.pmtiles
@@ -207,15 +207,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install gpq-tiles
-        run: cargo install gpq-tiles
+      - name: Install tylertoo
+        run: cargo install tylertoo
 
       - name: Build overviews + tiles
         run: |
-          gpq-tiles overview data/input.parquet output/overviews.parquet \
+          tylertoo overview data/input.parquet output/overviews.parquet \
             --min-zoom 0 --max-zoom 14
-          gpq-tiles validate output/overviews.parquet
-          gpq-tiles export-pmtiles output/overviews.parquet output/tiles.pmtiles
+          tylertoo validate output/overviews.parquet
+          tylertoo export-pmtiles output/overviews.parquet output/tiles.pmtiles
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create streaming test fixtures for gpq-tiles.
+"""Create streaming test fixtures for tylertoo.
 
 Run with: uv run python scripts/create_streaming_fixtures.py
 

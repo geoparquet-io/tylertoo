@@ -6,7 +6,7 @@ Reproduce the conversions with the release binary:
 
 ```bash
 for lt in 1 2 4; do for sf in 0.5 1.0 2.0; do
-  gpq-tiles overview \
+  tylertoo overview \
     corpus/data/gpio/lines-portland-medium.parquet \
     corpus/data/sweep/lt${lt}_sf${sf}.parquet \
     --mode duplicating --min-zoom 0 --max-zoom 14 \

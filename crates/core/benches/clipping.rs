@@ -3,19 +3,19 @@
 // Compares Sutherland-Hodgman (tile clipping) vs i_overlay (general boolean ops)
 // on polygons of varying complexity.
 //
-// Run with: cargo bench --package gpq-tiles-core -- clipping
+// Run with: cargo bench --package tylertoo-core -- clipping
 
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, LineString, Polygon};
-use gpq_tiles_core::clip::clip_geometry;
-use gpq_tiles_core::ioverlay_clip::clip_polygon_ioverlay;
-use gpq_tiles_core::sutherland_hodgman::clip_polygon_sh;
-use gpq_tiles_core::tile::TileBounds;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use tylertoo_core::clip::clip_geometry;
+use tylertoo_core::ioverlay_clip::clip_polygon_ioverlay;
+use tylertoo_core::sutherland_hodgman::clip_polygon_sh;
+use tylertoo_core::tile::TileBounds;
 
 /// Path to the Antarctica polygon fixture (316k coords, real-world case)
 const ANTARCTICA_FIXTURE: &str = "../../tests/fixtures/realdata/antarctica-polygon.wkb";

@@ -5,8 +5,8 @@ geom_overview) — viewer-style range reads against real S3.
 Three files, same 5.28M-building dataset (Overture Germany central subset),
 each written by its converter's buildings-appropriate settings:
 
-  dup   gpq-tiles overview --mode duplicating  z0-14   (geo:overviews key)
-  part  gpq-tiles overview --mode partitioning z0-14   (geo:overviews key)
+  dup   tylertoo overview --mode duplicating  z0-14   (geo:overviews key)
+  part  tylertoo overview --mode partitioning z0-14   (geo:overviews key)
   gpo   yharby gpo convert, defaults: 3 bands + geom_overview (overviews key)
 
 Read model (identical policy for all three, so the *layout* is what is
@@ -49,7 +49,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 LOCAL = os.path.join(ROOT, "corpus", "data", "layoutbench")
 
-BUCKET = os.environ.get("BENCH_BUCKET", "gpq-tiles-bench")
+BUCKET = os.environ.get("BENCH_BUCKET", "tylertoo-bench")
 REGION = os.environ.get("BENCH_REGION", "us-east-2")
 PROFILE = os.environ.get("BENCH_AWS_PROFILE", "default")
 PREFIX = os.environ.get("BENCH_PREFIX", "layoutbench")

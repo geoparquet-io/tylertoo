@@ -66,7 +66,7 @@ Note: Decoded GeoJSON uses tile-local coordinates (0-4096 extent), not geographi
 
 ## Current Comparison (Phase 3 Complete)
 
-| Zoom | Tippecanoe | gpq-tiles (default) | gpq-tiles (density drop) |
+| Zoom | Tippecanoe | tylertoo (default) | tylertoo (density drop) |
 |------|------------|---------------------|--------------------------|
 | Z8 | 97 | 76 | 9-34 (varies by cell_size) |
 | Z10 | 484 | 392 | N/A (disabled at high zoom) |

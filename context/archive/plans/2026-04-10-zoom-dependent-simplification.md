@@ -40,7 +40,7 @@ fn test_tiler_config_simplify_factor() {
 **Step 2: Run test to verify it fails**
 
 ```bash
-cargo test --package gpq-tiles-core test_tiler_config_simplify_factor -- --nocapture
+cargo test --package tylertoo-core test_tiler_config_simplify_factor -- --nocapture
 ```
 
 Expected: FAIL with "no field `simplify_factor` on type `TilerConfig`"
@@ -88,7 +88,7 @@ After the existing builder methods (around line 600), add:
 **Step 6: Run test to verify it passes**
 
 ```bash
-cargo test --package gpq-tiles-core test_tiler_config_simplify_factor -- --nocapture
+cargo test --package tylertoo-core test_tiler_config_simplify_factor -- --nocapture
 ```
 
 Expected: PASS
@@ -153,7 +153,7 @@ fn test_is_on_tile_boundary() {
 **Step 2: Run test to verify it fails**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_is_on_tile_boundary -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_is_on_tile_boundary -- --nocapture
 ```
 
 Expected: FAIL with "cannot find function `is_on_tile_boundary`"
@@ -197,7 +197,7 @@ pub fn is_on_tile_boundary(
 **Step 4: Run test to verify it passes**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_is_on_tile_boundary -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_is_on_tile_boundary -- --nocapture
 ```
 
 Expected: PASS
@@ -265,7 +265,7 @@ fn test_simplify_world_linestring_preserve_boundaries() {
 **Step 2: Run test to verify it fails**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_simplify_world_linestring_preserve_boundaries -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_simplify_world_linestring_preserve_boundaries -- --nocapture
 ```
 
 Expected: FAIL with "cannot find function `simplify_world_linestring_preserve_boundaries`"
@@ -357,7 +357,7 @@ pub fn simplify_world_linestring_preserve_boundaries(
 **Step 4: Run test to verify it passes**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_simplify_world_linestring_preserve_boundaries -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_simplify_world_linestring_preserve_boundaries -- --nocapture
 ```
 
 Expected: PASS
@@ -428,7 +428,7 @@ fn test_simplify_world_ring_preserve_boundaries() {
 **Step 2: Run test to verify it fails**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_simplify_world_ring_preserve_boundaries -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_simplify_world_ring_preserve_boundaries -- --nocapture
 ```
 
 Expected: FAIL with "cannot find function `simplify_world_ring_preserve_boundaries`"
@@ -484,7 +484,7 @@ pub fn simplify_world_ring_preserve_boundaries(
 **Step 4: Run test to verify it passes**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_simplify_world_ring_preserve_boundaries -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_simplify_world_ring_preserve_boundaries -- --nocapture
 ```
 
 Expected: PASS
@@ -551,7 +551,7 @@ fn test_simplify_geometry_for_tile() {
 **Step 2: Run test to verify it fails**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_simplify_geometry_for_tile -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_simplify_geometry_for_tile -- --nocapture
 ```
 
 Expected: FAIL with "cannot find function `simplify_geometry_for_tile`"
@@ -691,7 +691,7 @@ pub fn simplify_geometry_for_tile(
 **Step 4: Run test to verify it passes**
 
 ```bash
-cargo test --package gpq-tiles-core simplify::tests::test_simplify_geometry_for_tile -- --nocapture
+cargo test --package tylertoo-core simplify::tests::test_simplify_geometry_for_tile -- --nocapture
 ```
 
 Expected: PASS
@@ -737,7 +737,7 @@ pub use simplify::{
 **Step 3: Run cargo check**
 
 ```bash
-cargo check --package gpq-tiles-core
+cargo check --package tylertoo-core
 ```
 
 Expected: No errors
@@ -846,7 +846,7 @@ For each call site, pass `config.simplify_factor` as the last argument.
 **Step 6: Run cargo check**
 
 ```bash
-cargo check --package gpq-tiles-core
+cargo check --package tylertoo-core
 ```
 
 Expected: No errors (all call sites updated)
@@ -918,7 +918,7 @@ let config = if args.simplify {
 **Step 3: Run cargo check**
 
 ```bash
-cargo check --package gpq-tiles
+cargo check --package tylertoo
 ```
 
 Expected: No errors
@@ -926,7 +926,7 @@ Expected: No errors
 **Step 4: Test CLI help**
 
 ```bash
-cargo run --package gpq-tiles -- --help | grep -A3 simplify
+cargo run --package tylertoo -- --help | grep -A3 simplify
 ```
 
 Expected: Shows --simplify and --simplify-factor flags with descriptions
@@ -941,8 +941,8 @@ Enable zoom-dependent geometry simplification from the command line.
 --simplify enables the feature, --simplify-factor controls aggressiveness.
 
 Usage:
-  gpq-tiles input.parquet output.pmtiles --simplify
-  gpq-tiles input.parquet output.pmtiles --simplify --simplify-factor 0.5
+  tylertoo input.parquet output.pmtiles --simplify
+  tylertoo input.parquet output.pmtiles --simplify --simplify-factor 0.5
 
 Refs: #156"
 ```
@@ -1051,7 +1051,7 @@ fn test_simplification_reduces_tile_size() {
 **Step 2: Run integration test**
 
 ```bash
-cargo test --package gpq-tiles-core test_simplification_reduces_tile_size -- --nocapture
+cargo test --package tylertoo-core test_simplification_reduces_tile_size -- --nocapture
 ```
 
 Expected: PASS (or skip if fixture unavailable)
@@ -1087,13 +1087,13 @@ zoom-dependent simplification can dramatically reduce tile sizes at low zoom lev
 
 ```bash
 # Enable with default settings (1 pixel tolerance)
-gpq-tiles roads.parquet roads.pmtiles --simplify
+tylertoo roads.parquet roads.pmtiles --simplify
 
 # Custom tolerance (more aggressive)
-gpq-tiles roads.parquet roads.pmtiles --simplify --simplify-factor 2.0
+tylertoo roads.parquet roads.pmtiles --simplify --simplify-factor 2.0
 
 # Preserve more detail
-gpq-tiles roads.parquet roads.pmtiles --simplify --simplify-factor 0.5
+tylertoo roads.parquet roads.pmtiles --simplify --simplify-factor 0.5
 ```
 
 ### How It Works
@@ -1115,7 +1115,7 @@ preventing visible seams between adjacent tiles.
 
 ```bash
 # Simplify + adaptive dropping for maximum size reduction
-gpq-tiles roads.parquet roads.pmtiles \
+tylertoo roads.parquet roads.pmtiles \
   --simplify \
   --drop-smallest-as-needed \
   --max-tile-size 500K
@@ -1161,8 +1161,8 @@ Refs: #156"
 **Step 1: Run full test suite for affected modules**
 
 ```bash
-cargo test --package gpq-tiles-core simplify:: -- --nocapture
-cargo test --package gpq-tiles-core test_tiler_config -- --nocapture
+cargo test --package tylertoo-core simplify:: -- --nocapture
+cargo test --package tylertoo-core test_tiler_config -- --nocapture
 ```
 
 **Step 2: Run cargo fmt**
@@ -1174,20 +1174,20 @@ cargo fmt --all
 **Step 3: Run cargo clippy**
 
 ```bash
-cargo clippy --package gpq-tiles-core --package gpq-tiles -- -D warnings
+cargo clippy --package tylertoo-core --package tylertoo -- -D warnings
 ```
 
 **Step 4: Build release to verify optimization**
 
 ```bash
-cargo build --release --package gpq-tiles
+cargo build --release --package tylertoo
 ```
 
 **Step 5: Manual test with real data (if available)**
 
 ```bash
 # Test with Canada roads or similar linear dataset
-cargo run --release --package gpq-tiles -- \
+cargo run --release --package tylertoo -- \
   /path/to/roads.parquet \
   /tmp/roads-simplified.pmtiles \
   --simplify \

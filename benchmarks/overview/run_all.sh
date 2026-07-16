@@ -16,7 +16,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BIN="${GPQ_BIN:-$ROOT/target/release/gpq-tiles}"
+BIN="${GPQ_BIN:-$ROOT/target/release/tylertoo}"
 GPIO="$ROOT/corpus/data/gpio"
 OUT="$ROOT/corpus/data/bench/overviews"
 PORT="${BENCH_PORT:-8899}"
@@ -24,7 +24,7 @@ mkdir -p "$OUT" "$ROOT/corpus/data/bench/logs"
 
 DATASETS="points-nyc-medium lines-portland-medium polygons-portland-medium polygons-ftw-moldova-large"
 
-[ -x "$BIN" ] || { echo "build the release binary first: cargo build --release --package gpq-tiles" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "build the release binary first: cargo build --release --package tylertoo" >&2; exit 1; }
 
 echo "== step 1: regenerate overview files =="
 for id in $DATASETS; do

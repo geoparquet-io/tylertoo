@@ -1,16 +1,16 @@
 # Integer Coordinate System Migration Plan
 
-**Issue:** [#85 - feat: Implement tippecanoe-style tiny polygon accumulation](https://github.com/geoparquet-io/gpq-tiles/issues/85)
+**Issue:** [#85 - feat: Implement tippecanoe-style tiny polygon accumulation](https://github.com/geoparquet-io/tylertoo/issues/85)
 **Date:** 2026-03-10
 **Status:** Phase 0 Implementation
 
 ## Executive Summary
 
-This document outlines the parallelization strategy for migrating gpq-tiles from floating-point geographic coordinates (f64 lat/lng) to 32-bit integer world coordinates, matching tippecanoe's approach for improved precision and performance.
+This document outlines the parallelization strategy for migrating tylertoo from floating-point geographic coordinates (f64 lat/lng) to 32-bit integer world coordinates, matching tippecanoe's approach for improved precision and performance.
 
 ## Background
 
-### Current State (gpq-tiles)
+### Current State (tylertoo)
 - Coordinates: `f64` geographic (longitude/latitude in degrees)
 - Conversion: Geographic → tile-local integers only at MVT encoding time
 - Types: `TileCoord { x: u32, y: u32, z: u8 }`, `TileBounds { lng_min/max, lat_min/max: f64 }`
@@ -263,6 +263,6 @@ With coordination overhead and merge conflict resolution, realistic wall-clock t
 
 ## References
 
-- [Issue #85](https://github.com/geoparquet-io/gpq-tiles/issues/85) - Original issue
+- [Issue #85](https://github.com/geoparquet-io/tylertoo/issues/85) - Original issue
 - [tippecanoe geometry.hpp](https://github.com/felt/tippecanoe/blob/main/geometry.hpp) - Reference implementation
 - [tippecanoe projection.cpp](https://github.com/felt/tippecanoe/blob/main/projection.cpp) - Coordinate conversion

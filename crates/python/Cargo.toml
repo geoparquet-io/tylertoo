@@ -1,6 +1,6 @@
 [package]
-name = "gpq-tiles-python"
-description = "Python bindings for gpq-tiles"
+name = "tylertoo-python"
+description = "Python bindings for tylertoo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,11 +10,11 @@ repository.workspace = true
 homepage.workspace = true
 
 [lib]
-name = "gpq_tiles"
+name = "tylertoo"
 crate-type = ["cdylib"]
 
 [dependencies]
-gpq-tiles-core = { workspace = true, features = ["remote"] }
+tylertoo-core = { workspace = true, features = ["remote"] }
 pyo3 = { workspace = true }
 tempfile = "3"
 

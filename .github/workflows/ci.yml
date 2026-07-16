@@ -62,13 +62,13 @@ jobs:
 
           # Extract versions
           WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          CORE_DEP_VERSION=$(grep 'gpq-tiles-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          CORE_DEP_VERSION=$(grep 'tylertoo-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
           PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           CZ_VERSION=$(grep '^version = ' .cz.toml | sed 's/version = "\(.*\)"/\1/')
 
           echo "Versions found:"
           echo "  Cargo.toml workspace.package.version: $WORKSPACE_VERSION"
-          echo "  Cargo.toml gpq-tiles-core dependency: $CORE_DEP_VERSION"
+          echo "  Cargo.toml tylertoo-core dependency: $CORE_DEP_VERSION"
           echo "  pyproject.toml version:               $PYTHON_VERSION"
           echo "  .cz.toml version:                     $CZ_VERSION"
 
@@ -280,8 +280,8 @@ jobs:
       - name: mypy (strict)
         run: uv run mypy
 
-      - name: stubtest (gpq_tiles.pyi matches the built module)
-        run: uv run python -m mypy.stubtest gpq_tiles --allowlist stubtest-allowlist.txt
+      - name: stubtest (tylertoo.pyi matches the built module)
+        run: uv run python -m mypy.stubtest tylertoo --allowlist stubtest-allowlist.txt
 
       - name: vulture (dead code)
         run: uv run vulture
@@ -338,7 +338,7 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Generate coverage
-        run: cargo tarpaulin --out xml --all-features --workspace --exclude gpq-tiles-python
+        run: cargo tarpaulin --out xml --all-features --workspace --exclude tylertoo-python
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6

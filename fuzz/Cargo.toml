@@ -1,5 +1,5 @@
 [package]
-name = "gpq-tiles-fuzz"
+name = "tylertoo-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-gpq-tiles-core = { path = "../crates/core" }
+tylertoo-core = { path = "../crates/core" }
 
 [[bin]]
 name = "footer_json"

@@ -1,18 +1,18 @@
-# gpq-tiles Architecture
+# tylertoo Architecture
 
 Design decisions and tippecanoe divergences for the **current** system.
 Historical material (the removed per-tile pipeline, execution plans,
-session triage) lives in [`context/archive/`](https://github.com/geoparquet-io/gpq-tiles/blob/main/context/archive/README.md).
+session triage) lives in [`context/archive/`](https://github.com/geoparquet-io/tylertoo/blob/main/context/archive/README.md).
 
 Related canonical documents:
 
-- **Format**: [`context/OVERVIEWS_SPEC.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/context/OVERVIEWS_SPEC.md) — the
+- **Format**: [`context/OVERVIEWS_SPEC.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/OVERVIEWS_SPEC.md) — the
   `geo:overviews` draft spec (single source of truth for the file format).
-- **Tuning**: [`docs/OVERVIEW_TUNING.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/docs/OVERVIEW_TUNING.md) — every
+- **Tuning**: [`docs/OVERVIEW_TUNING.md`](https://github.com/geoparquet-io/tylertoo/blob/main/docs/OVERVIEW_TUNING.md) — every
   generalization knob, its default, and its direction.
-- **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/RESULTS.md)
+- **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/RESULTS.md)
   (storage/access numbers) and
-  [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/PROFILE.md)
+  [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md)
   (performance methodology + history).
 
 ## Decision Record: Legacy Tiles Pipeline Removed (#177, 2026-07-03)
@@ -28,7 +28,7 @@ work had already been excised.
 
 What survives:
 
-- **The `tiles` CLI subcommand** (and the bare `gpq-tiles in.parquet
+- **The `tiles` CLI subcommand** (and the bare `tylertoo in.parquet
   out.pmtiles` form) as a ~90-line facade: overview convert into a temporary
   GeoParquet file → export-pmtiles to the requested output. One-shot
   "GeoParquet in, PMTiles out" UX is preserved; the legacy tuning flags are
@@ -40,7 +40,7 @@ What survives:
 
 Consequences: #102 (row-group bbox filtering for the tiles pipeline) lost
 its remaining scope; the legacy pipeline's architecture notes were moved to
-[`context/archive/LEGACY_TILES_ARCHITECTURE.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/context/archive/LEGACY_TILES_ARCHITECTURE.md).
+[`context/archive/LEGACY_TILES_ARCHITECTURE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/archive/LEGACY_TILES_ARCHITECTURE.md).
 
 ## Design Principles
 
@@ -159,7 +159,7 @@ final archive is **byte-identical** whether or not any checkpoints were taken
 
 ### Validate (`overview/check.rs`)
 
-`gpq-tiles validate` checks a file against spec §6.2: footer schema, level
+`tylertoo validate` checks a file against spec §6.2: footer schema, level
 banding/row-group alignment, canonical fidelity, monotonicity, cluster
 `point_count` sum invariant (§12.1), coalescing `coalesced_count` rules
 (§13), bbox covering.
@@ -254,7 +254,7 @@ guarded instead by the `clip.rs` `fastpath_*_render_equivalent` tests.
 
 ## Input Contract: gpio-Optimized GeoParquet
 
-The converter assumes (and `gpq-tiles` recommends) input prepared with
+The converter assumes (and `tylertoo` recommends) input prepared with
 [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io): WGS84
 (EPSG:4326 — enforced, with a helpful error otherwise), Hilbert-sorted,
 bbox-covered, sane row-group sizing. Hilbert order within each level comes
@@ -299,7 +299,7 @@ crates/core/src/
 ├── overview/           # THE PRODUCT: GeoParquet multi-resolution overviews
 │   ├── mod.rs          #   Subtree docs
 │   ├── assign.rs       #   Per-level cell-winner thinning + density budget
-│   ├── check.rs        #   Spec §6.2 validation (gpq-tiles validate)
+│   ├── check.rs        #   Spec §6.2 validation (tylertoo validate)
 │   ├── cluster.rs      #   Point clustering + attribute accumulation (§12)
 │   ├── coalesce.rs     #   Line network coalescing (§13)
 │   ├── convert.rs      #   convert_to_overviews() orchestration

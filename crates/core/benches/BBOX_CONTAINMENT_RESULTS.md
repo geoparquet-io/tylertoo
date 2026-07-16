@@ -101,7 +101,7 @@ Both checks are O(1) and vastly cheaper than Sutherland-Hodgman clipping (O(n) i
 
 **Tippecanoe:** Always clips in tile coordinate space (integer arithmetic)
 
-**gpq-tiles:** Performs bbox checks in geographic coordinate space before converting to tile coordinates
+**tylertoo:** Performs bbox checks in geographic coordinate space before converting to tile coordinates
 
 This is a performance optimization that maintains identical output while avoiding coordinate conversion for features that don't need clipping.
 
@@ -119,13 +119,13 @@ This is a performance optimization that maintains identical output while avoidin
 
 ```bash
 # Full benchmark (takes ~5-10 minutes)
-cargo bench --package gpq-tiles-core --bench bbox_containment
+cargo bench --package tylertoo-core --bench bbox_containment
 
 # Quick benchmark (reduced sample count)
-cargo bench --package gpq-tiles-core --bench bbox_containment -- --quick
+cargo bench --package tylertoo-core --bench bbox_containment -- --quick
 
 # Specific test group
-cargo bench --package gpq-tiles-core --bench bbox_containment -- comparison
+cargo bench --package tylertoo-core --bench bbox_containment -- comparison
 ```
 
 ## Conclusions
@@ -155,4 +155,4 @@ Potential areas for further improvement:
 ---
 
 **Last updated:** 2026-03-13  
-**Benchmark version:** gpq-tiles-core v0.6.0
+**Benchmark version:** tylertoo-core v0.6.0

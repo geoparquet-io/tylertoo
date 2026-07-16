@@ -99,7 +99,7 @@ new pin needed beyond the bbox pin (F1).
 
 ## Decision
 
-### (a) Is splitting warranted in gpq-tiles? **No.**
+### (a) Is splitting warranted in tylertoo? **No.**
 
 - The degradations are real (F2/F3) but they are **input-data defects
   under the spec's own contract**: §7.2 already says geometries MUST NOT

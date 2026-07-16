@@ -64,7 +64,7 @@ We're taking a **GeoParquet-native predictive approach** that leverages row grou
 3. If oversized: adjust mingap/minextent thresholds, retry
 4. Repeat 1-10+ times per dense tile
 
-| Aspect | Tippecanoe | gpq-tiles (this design) |
+| Aspect | Tippecanoe | tylertoo (this design) |
 |--------|------------|-------------------------|
 | **Trigger** | Post-encode size check | Pre-compute from metadata |
 | **Lookup** | Linear scan O(n) | Spatial grid O(1) |
@@ -405,13 +405,13 @@ pub enum AttributeMode {
 **CLI usage:**
 ```bash
 # Attributes without accumulators are dropped (default)
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed
 
 # Keep first feature's attributes for unconfigured
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-attrs=keep-first
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-attrs=keep-first
 
 # Require all attributes to have accumulators
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-attrs=strict -aC sum:population -aC concat:name
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-attrs=strict -aC sum:population -aC concat:name
 ```
 
 ## Integration with Existing Code
@@ -507,19 +507,19 @@ impl Default for CoalesceConfig {
 
 ```bash
 # Enable coalescing (uses adaptive threshold)
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed
 
 # Custom percentile (more aggressive)
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-percentile 75
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-percentile 75
 
 # Set minimum density trigger
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-min-density 200
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-min-density 200
 
 # Combine with attribute accumulation
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed -aC sum:population -aC concat:name
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed -aC sum:population -aC concat:name
 
 # Keep unconfigured attributes from first feature
-gpq-tiles input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-attrs=keep-first
+tylertoo input.parquet output.pmtiles --coalesce-densest-as-needed --coalesce-attrs=keep-first
 ```
 
 ## Expected Performance

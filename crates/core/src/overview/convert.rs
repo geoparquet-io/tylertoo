@@ -2390,7 +2390,7 @@ pub(super) fn build_generalization(
         })
         .collect();
     Generalization {
-        engine: format!("gpq-tiles {}", env!("CARGO_PKG_VERSION")),
+        engine: format!("tylertoo {}", env!("CARGO_PKG_VERSION")),
         // Only record the base when it deviates from the default: a default run
         // then produces a byte-identical footer to before this knob existed
         // (the levels[].gsd already imply the default base, §5.2 / Q6).
@@ -2854,7 +2854,7 @@ mod tests {
     fn validate_options_rejects_missing_spill_dir() {
         let opts = ConvertOptions {
             spill_dir: Some(std::path::PathBuf::from(
-                "/nonexistent/gpq-tiles-spill-dir-272",
+                "/nonexistent/tylertoo-spill-dir-272",
             )),
             ..Default::default()
         };
@@ -2862,7 +2862,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("spill-dir"), "error names the option: {msg}");
         assert!(
-            msg.contains("/nonexistent/gpq-tiles-spill-dir-272"),
+            msg.contains("/nonexistent/tylertoo-spill-dir-272"),
             "error names the path: {msg}"
         );
     }
@@ -6221,7 +6221,7 @@ mod tests {
             // gpio-optimized (Hilbert-sorted, bbox covering, 20k-row row
             // groups) copy of the NYC corpus input; row-group granularity
             // bounds the minimum fetch, so finer groups mean bigger savings.
-            const URL: &str = "s3://gpq-tiles-bench/corpus/points-nyc-medium.rg20k.parquet";
+            const URL: &str = "s3://tylertoo-bench/corpus/points-nyc-medium.rg20k.parquet";
             let source = match InputSource::from_str_input(URL) {
                 Ok(s) => s,
                 Err(e) => {

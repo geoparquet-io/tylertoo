@@ -21,7 +21,7 @@ Run:
   uv run --with pyarrow --with requests python3 bench_parallel.py
 
 Env:
-  BENCH_BUCKET      (default gpq-tiles-bench)
+  BENCH_BUCKET      (default tylertoo-bench)
   BENCH_REGION      (default us-east-2)
   BENCH_AWS_PROFILE (default nissim-admin)
   BENCH_RUNS        (default 3; medians reported)
@@ -37,7 +37,7 @@ from parallel_reader import ParallelReader, make_session
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-BUCKET = os.environ.get("BENCH_BUCKET", "gpq-tiles-bench")
+BUCKET = os.environ.get("BENCH_BUCKET", "tylertoo-bench")
 REGION = os.environ.get("BENCH_REGION", "us-east-2")
 PROFILE = os.environ.get("BENCH_AWS_PROFILE", "nissim-admin")
 N_RUNS = int(os.environ.get("BENCH_RUNS", "3"))

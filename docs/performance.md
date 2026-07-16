@@ -1,16 +1,16 @@
 # Performance
 
-gpq-tiles converts GeoParquet into multi-resolution overviews and
+tylertoo converts GeoParquet into multi-resolution overviews and
 PMTiles. This page characterises how that conversion scales on real
 multi-GB inputs, measured on current `main`.
 
 - Raw numbers and methodology history:
-  [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/PROFILE.md).
+  [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md).
 - Head-to-head against the GeoJSON → tippecanoe pipeline: see the
   [Demo](demo.md) (Germany buildings, 59 M features: **13 m 11 s** vs the
   incumbent pipeline failing at 57 m 30 s). We don't chase feature-level
   tippecanoe parity — the demo settles the comparison; this page is about
-  how gpq-tiles scales on its own terms.
+  how tylertoo scales on its own terms.
 
 ## How these were measured
 
@@ -19,7 +19,7 @@ multi-GB inputs, measured on current `main`.
   fieldmaps extracts. Optimising the input is not optional — Hilbert
   ordering and right-sized row groups are what make the numbers below (and
   the remote pruning further down) possible.
-- **Convert:** `gpq-tiles overview <in> <out> --min-zoom 0 --max-zoom 14`,
+- **Convert:** `tylertoo overview <in> <out> --min-zoom 0 --max-zoom 14`,
   default knobs, wall/RSS/CPU from `/usr/bin/time -v`.
 - Timing is measured reading **local** files. Reading over the network
   moves ≈1× the object's bytes (the disk spill keeps re-reads local) but
@@ -81,7 +81,7 @@ overlapping the box are ever fetched — nothing else is downloaded. See
 Extracting a Berlin slice from the 6.99 GB Germany buildings file:
 
 ```bash
-gpq-tiles overview \
+tylertoo overview \
   s3://…/germany-buildings.parquet \
   berlin.parquet \
   --bbox 13.35,52.48,13.47,52.55 \
@@ -100,8 +100,8 @@ gap:
 | stage | fieldmaps-adm4 (2.90 GB, z0–14) | cause / fix |
 |---|---:|---|
 | before #261 | **96×** | oversized geometry chunk evicted-on-insert, re-fetched per page |
-| after [#261](https://github.com/geoparquet-io/gpq-tiles/issues/261) | **3.0×** | chunk cache sized to the largest row group — no re-fetch *within* a pass, but each pass still re-fetched |
-| after [#219](https://github.com/geoparquet-io/gpq-tiles/issues/219) | **≈1×** | fetched chunks spilled to local disk; later passes drain from disk, so each byte crosses the network once |
+| after [#261](https://github.com/geoparquet-io/tylertoo/issues/261) | **3.0×** | chunk cache sized to the largest row group — no re-fetch *within* a pass, but each pass still re-fetched |
+| after [#219](https://github.com/geoparquet-io/tylertoo/issues/219) | **≈1×** | fetched chunks spilled to local disk; later passes drain from disk, so each byte crosses the network once |
 
 The ≈1× bound is verified deterministically by an input-level regression
 test (`multi_pass_reads_move_object_once`); a full-corpus wall-clock
@@ -117,18 +117,18 @@ them. For latency-sensitive whole-file conversions, downloading first
 (`aws s3 cp` + local convert) still avoids the second-pass disk read; the
 disk spill lives under `TMPDIR` by default, and `--spill-dir <path>`
 (Python: `spill_dir=`,
-[#272](https://github.com/geoparquet-io/gpq-tiles/issues/272)) moves it
+[#272](https://github.com/geoparquet-io/tylertoo/issues/272)) moves it
 to a volume of your choosing — fast local disk, not a small tmpfs, when
 converting large remote files.
 
 The converter makes this actionable at runtime. A whole-file remote
 convert of an object ≥ 1 GiB logs a one-line warning
-([#267](https://github.com/geoparquet-io/gpq-tiles/issues/267)) steering
+([#267](https://github.com/geoparquet-io/tylertoo/issues/267)) steering
 you to `--bbox` or a download-first workflow and reminding you to place
 the spill on fast disk. And because the spill grows to ≈1× the *touched*
 input bytes — a number known exactly from the parquet footer once the
 `--bbox` row-group selection is made — the converter also preflights the
-spill volume ([#272](https://github.com/geoparquet-io/gpq-tiles/issues/272)):
+spill volume ([#272](https://github.com/geoparquet-io/tylertoo/issues/272)):
 if the projected spill (plus a 5% margin) exceeds the free space where
 the spill will live, it warns up front, naming the directory and the
 shortfall, instead of letting the spill silently degrade to network

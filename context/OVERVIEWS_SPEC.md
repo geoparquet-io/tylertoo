@@ -286,7 +286,7 @@ the file that a validator MUST enforce.
 
 ```
 Provenance := {
-  "engine":       string,      // e.g. "gpq-tiles 0.6.0"
+  "engine":       string,      // e.g. "tylertoo 0.6.0"
   "gsd_base":     number,      // OPTIONAL: non-default tile-band base
                                // used to derive levels[].gsd (§5.2);
                                // absent when the default 1024 was used
@@ -335,13 +335,13 @@ emit different coarse-level coordinates, so a producer that cascades
 SHOULD record `"cascade": true`. It asserts no structural fact
 (informative, no validator rule); canonical fidelity (§2.4) is
 unaffected because the canonical level is never simplified. Producer-side default values for these mechanisms
-are an implementation concern, not fixed by this spec (for gpq-tiles
+are an implementation concern, not fixed by this spec (for tylertoo
 they are documented in `docs/OVERVIEW_TUNING.md`, with the code
 constants as the source of truth).
 
 Writers conforming to v0.2.0 MUST serialize `ranks` as a JSON object
 map as shown above (not an array of pairs). (Implementation note,
-informative: gpq-tiles emits the object map as of PR #190; its reader
+informative: tylertoo emits the object map as of PR #190; its reader
 additionally accepts the legacy array-of-pairs shape written by
 earlier versions.)
 
@@ -358,7 +358,7 @@ earlier versions.)
     { "row_group_end": 14, "gsd": 611.50,  "zoom": 6 }
   ],
   "generalization": {
-    "engine": "gpq-tiles 0.6.0",
+    "engine": "tylertoo 0.6.0",
     "levels": [
       { "simplify_tolerance_m": 4000, "thinning_factor": 4.0,
         "visibility_gate_m": 9784, "geometry_types": ["Point","Polygon"] },
@@ -716,7 +716,7 @@ This spec explicitly does NOT address:
 - **New geometry encodings, CRS models, or tile-matrix-set semantics.**
 - **Mandating a specific thinning/simplification algorithm.** The spec
   constrains layout and metadata; the generalization engine is
-  implementation-defined (gpq-tiles supplies one).
+  implementation-defined (tylertoo supplies one).
 - **Topology-aware network merging beyond §13.** Line coalescing (§13)
   chains touching segments; it does not build a routable graph or
   guarantee planarity.
@@ -882,7 +882,7 @@ that level's grid, instead of them simply vanishing:
   of the winner that absorbed it. A feature whose cell winner is
   itself removed after absorption (e.g. by a density budget) MUST be
   re-assigned to a surviving point row of the same level — which
-  survivor is implementation-defined (gpq-tiles: the nearest) — so no
+  survivor is implementation-defined (tylertoo: the nearest) — so no
   feature is ever dropped from the count or counted twice.
 - **Sum invariant (normative).** Consequently, at every level, the
   sum of `point_count` over the level's point rows MUST equal the
@@ -970,7 +970,7 @@ mode.
 
 ### 12.6 Implementation note (informative)
 
-gpq-tiles implements this extension behind the opt-in `--cluster`
+tylertoo implements this extension behind the opt-in `--cluster`
 flag, with optional accumulation via `--accumulate-attribute COL:OP`;
 enabling clustering also changes the engine's point-thinning default
 (a sparser grid is harmless when losers are summarized rather than
@@ -1086,7 +1086,7 @@ structurally — the named column exists as INT32 NOT NULL, all values
 are `>= 1` (checkable via row-group statistics), and the canonical
 band's values are exactly `1`.
 
-(Implementation note, informative: gpq-tiles emits all four
+(Implementation note, informative: tylertoo emits all four
 parameter members as of PR #190.)
 
 ### 13.5 Partitioning mode is excluded (normative)
@@ -1107,7 +1107,7 @@ no `coalescing` provenance) rather than fail; it SHOULD reject an
 
 ### 13.6 Implementation note (informative)
 
-gpq-tiles enables coalescing by default (opt-out via
+tylertoo enables coalescing by default (opt-out via
 `--no-coalesce-lines`) with junction continuation off (strict
 degree-2 chaining, per maintainer render review) and a snap tolerance
 of `1.0` GSD. To bound memory, levels whose candidate line count

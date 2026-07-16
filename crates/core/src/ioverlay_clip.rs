@@ -203,8 +203,8 @@ fn contour_to_linestring(contour: &IOverlayContour) -> Option<LineString<f64>> {
 /// # Example
 ///
 /// ```ignore
-/// use gpq_tiles_core::ioverlay_clip::clip_polygon_ioverlay;
-/// use gpq_tiles_core::tile::TileBounds;
+/// use tylertoo_core::ioverlay_clip::clip_polygon_ioverlay;
+/// use tylertoo_core::tile::TileBounds;
 /// use geo::Polygon;
 ///
 /// let poly = create_polygon();

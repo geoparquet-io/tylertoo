@@ -1040,7 +1040,7 @@ impl PmtilesWriter {
         let fields_json = self.build_fields_json();
         let tilestats_json = self.build_tilestats_json();
         let metadata = format!(
-            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"gpq-tiles"}}"#,
+            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"tylertoo"}}"#,
             self.layer_name, min_z, max_z, fields_json, tilestats_json
         );
         let compressed_metadata =
@@ -1179,8 +1179,8 @@ impl StreamingWriteStats {
 /// # Example
 ///
 /// ```no_run
-/// use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
-/// use gpq_tiles_core::compression::Compression;
+/// use tylertoo_core::pmtiles_writer::StreamingPmtilesWriter;
+/// use tylertoo_core::compression::Compression;
 /// use std::path::Path;
 ///
 /// let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
@@ -1240,7 +1240,7 @@ impl StreamingPmtilesWriter {
             .as_nanos();
         let pid = std::process::id();
         let tid = std::thread::current().id();
-        let temp_path = temp_dir.join(format!("gpq-tiles-{}-{}-{:?}.tmp", timestamp, pid, tid));
+        let temp_path = temp_dir.join(format!("tylertoo-{}-{}-{:?}.tmp", timestamp, pid, tid));
 
         let file = File::create(&temp_path)?;
         let temp_file = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
@@ -1654,7 +1654,7 @@ impl StreamingPmtilesWriter {
         let tilestats_json = self.build_tilestats_json();
 
         format!(
-            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"gpq-tiles"}}"#,
+            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"tylertoo"}}"#,
             self.layer_name, min_z, max_z, fields_json, tilestats_json
         )
     }

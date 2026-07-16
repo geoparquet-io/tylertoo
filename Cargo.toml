@@ -12,14 +12,14 @@ edition = "2021"
 rust-version = "1.75"
 authors = ["Nissim Lebovits <nlebovits@pm.me>"]
 license = "Apache-2.0"
-repository = "https://github.com/geoparquet-io/gpq-tiles"
-homepage = "https://github.com/geoparquet-io/gpq-tiles"
+repository = "https://github.com/geoparquet-io/tylertoo"
+homepage = "https://github.com/geoparquet-io/tylertoo"
 keywords = ["geoparquet", "pmtiles", "vector-tiles", "mvt", "geospatial"]
 categories = ["science", "data-structures", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-gpq-tiles-core = { path = "crates/core", version = "0.6.0" }
+tylertoo-core = { path = "crates/core", version = "0.6.0" }
 
 # Core geospatial dependencies
 geoarrow = "0.8"

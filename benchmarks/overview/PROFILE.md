@@ -17,8 +17,8 @@ vertices, duplicating mode, z0–14 (12 emitted levels), release build,
 
 | Command | Wall | Peak RSS |
 |---|---:|---:|
-| `gpq-tiles overview` (convert) | **~55 s** | **~320 MB** |
-| `gpq-tiles export-pmtiles` | **~59 s** | **~2.4 GB** |
+| `tylertoo overview` (convert) | **~55 s** | **~320 MB** |
+| `tylertoo export-pmtiles` | **~59 s** | **~2.4 GB** |
 
 Full pipeline (GeoParquet → overview file → PMTiles) < 2 min.
 
@@ -28,12 +28,12 @@ Full pipeline (GeoParquet → overview file → PMTiles) < 2 min.
   commands to `run_conversion.sh`.
 - **Phase breakdown**: `std::time::Instant` accumulators in
   `crates/core/src/overview/stream.rs` and `export.rs`, logged at
-  `RUST_LOG=gpq_tiles_core::overview=debug` (instrumentation is
+  `RUST_LOG=tylertoo_core::overview=debug` (instrumentation is
   retained behind that log level).
 - **Heap**: `cargo build --release --features dhat-heap` (see
   `docs/PROFILING.md`).
 - **Output equivalence**: every perf change was gated on footer/row
-  equivalence and all `gpq-tiles validate` checks passing.
+  equivalence and all `tylertoo validate` checks passing.
 
 ## History (all 2026-07-03, chronological)
 
@@ -174,7 +174,7 @@ bbox `[5.87, 47.27, 15.04, 55.06]`.
 | overture-germany-buildings | Overture buildings/building (polygons) | 59,032,924 | 5.09 GiB | 6.51 GiB | 3:22.6 | 18.1 GiB |
 | overture-germany-segments | Overture transportation/segment (lines) | 19,243,535 | 1.96 GiB | 2.38 GiB | 1:21.6 | 5.8 GiB |
 
-### Conversion results (`gpq-tiles overview`, default knobs, z0–14)
+### Conversion results (`tylertoo overview`, default knobs, z0–14)
 
 DNFs are results, not gaps — see findings.
 

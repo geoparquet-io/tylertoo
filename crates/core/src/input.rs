@@ -80,7 +80,7 @@ pub enum InputError {
     /// A remote URL was supplied but the crate was built without `remote`.
     #[cfg(not(feature = "remote"))]
     #[error(
-        "remote input {0:?} requires gpq-tiles-core's `remote` feature (the official \
+        "remote input {0:?} requires tylertoo-core's `remote` feature (the official \
          CLI and Python builds enable it; rebuild with `--features remote`)"
     )]
     RemoteDisabled(String),
@@ -1498,7 +1498,7 @@ pub(crate) mod remote {
         fn disk_spill_nonexistent_dir_disables_spill() {
             let mut spill = DiskSpill {
                 dir: Some(std::path::PathBuf::from(
-                    "/nonexistent/gpq-tiles-spill-dir-272",
+                    "/nonexistent/tylertoo-spill-dir-272",
                 )),
                 ..DiskSpill::default()
             };
@@ -1797,7 +1797,7 @@ mod tests {
         /// loudly) when the network is unavailable.
         #[test]
         fn https_public_object_integration() {
-            const URL: &str = "https://github.com/geoparquet-io/gpq-tiles/releases/download/fixtures-v1/fieldmaps-boundaries.parquet";
+            const URL: &str = "https://github.com/geoparquet-io/tylertoo/releases/download/fixtures-v1/fieldmaps-boundaries.parquet";
             let source = match InputSource::from_str_input(URL) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1952,7 +1952,7 @@ mod tests {
             let bytes = multi_row_group_wide_parquet(4096, 3);
             let object_size = bytes.len() as u64;
             let source = super::super::test_memory_source_with_cap(bytes, "spill-dir.parquet", 64);
-            source.set_spill_dir(Some(Path::new("/nonexistent/gpq-tiles-spill-dir-272")));
+            source.set_spill_dir(Some(Path::new("/nonexistent/tylertoo-spill-dir-272")));
 
             for _ in 0..3 {
                 let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
@@ -2069,7 +2069,7 @@ mod tests {
         /// 256 MiB floor. Run with:
         ///
         /// ```text
-        /// cargo test -p gpq-tiles-core --features remote --lib \
+        /// cargo test -p tylertoo-core --features remote --lib \
         ///   remote_tests::bench_remote_refetch_ratio -- --ignored --nocapture
         /// ```
         #[test]
