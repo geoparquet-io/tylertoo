@@ -44,6 +44,7 @@ pub mod compression;
 pub mod covering;
 pub mod decode;
 pub mod dedup;
+pub mod fs_probe;
 pub mod input;
 pub mod input_set;
 pub mod ioverlay_clip;
