@@ -56,7 +56,7 @@ def overview(
     read_batch_size: int = 8192,
     bbox: tuple[float, float, float, float] | None = None,
     profile: str = "auto",
-    in_flight_batches: int = 4,
+    in_flight_batches: int = 0,
     spill_dir: str | Path | None = None,
 ) -> dict[str, Any]: ...
 def export_pmtiles(

@@ -52,7 +52,7 @@ Commands:
 | `--no-streaming` | off (streaming ON) | Revert to the in-memory reference pipeline |
 | `--read-batch-size <N>` | `8192` | Rows per Arrow read batch (streaming) |
 | `--profile <MODE>` | `auto` | Pass-2 buffering: `speed` (in-RAM), `bounded` (spill to temp Arrow IPC), `auto` (per mode + size). Output is byte-identical across profiles |
-| `--in-flight-batches <N>` | `4` | Read/compute overlap depth in pass 2 (higher = better core use, proportionally more peak memory) |
+| `--in-flight-batches <N\|auto>` | `auto` | Read/compute overlap depth in pass 2. `auto` sizes to available cores (clamped 4–16); higher = better core use, proportionally more peak memory. Resolved depth + core count logged at pass-2 start |
 | `--spill-dir <PATH>` | `$TMPDIR` | Directory for the remote-input spill file (≈1× the touched input bytes; a free-space preflight warns on a projected shortfall). Must exist; local inputs never spill |
 | `--report <PATH>` | — | Write the JSON conversion report |
 
@@ -190,7 +190,7 @@ report = overview(
     read_batch_size: int = 8192,
     bbox: tuple[float, float, float, float] | None = None,
     profile: str = "auto",
-    in_flight_batches: int = 4,
+    in_flight_batches: int = 0,
     spill_dir: str | os.PathLike | None = None,
 ) -> dict  # the JSON conversion report
 ```
