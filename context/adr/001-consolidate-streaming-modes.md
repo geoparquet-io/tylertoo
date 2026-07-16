@@ -64,10 +64,10 @@ let config = TilerConfig::new(0, 14)
 
 ```bash
 # Before
-gpq-tiles input.parquet output.pmtiles --streaming-mode external-sort --no-parallel
+tylertoo input.parquet output.pmtiles --streaming-mode external-sort --no-parallel
 
 # After
-gpq-tiles input.parquet output.pmtiles --deterministic
+tylertoo input.parquet output.pmtiles --deterministic
 ```
 
 ## Consequences

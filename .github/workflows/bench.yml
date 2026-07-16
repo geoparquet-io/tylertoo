@@ -130,7 +130,7 @@ jobs:
           key: ${{ runner.os }}-cargo-guard-target-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Build release binary
-        run: cargo build --release --package gpq-tiles
+        run: cargo build --release --package tylertoo
 
       - name: Convert regression guard (structural, deterministic)
         run: python3 benchmarks/overview/ci_guard.py --check

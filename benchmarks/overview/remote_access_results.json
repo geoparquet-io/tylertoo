@@ -1,5 +1,5 @@
 {
-  "bucket": "gpq-tiles-bench",
+  "bucket": "tylertoo-bench",
   "region": "us-east-2",
   "runs": 3,
   "datasets": {

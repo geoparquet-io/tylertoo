@@ -9,7 +9,7 @@ export RUST_BACKTRACE=1
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BIN="$ROOT/target/release/gpq-tiles"
+BIN="$ROOT/target/release/tylertoo"
 DATAROOT="$ROOT/corpus/data"
 OUT="$HERE/sweep_out"
 SCRATCH="$ROOT/corpus/data/bigbench/sweep_scratch"

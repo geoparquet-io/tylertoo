@@ -3,7 +3,7 @@
 Two independent capabilities live on this page:
 
 1. [**Converting directly from remote GeoParquet**](#converting-directly-from-remote-geoparquet)
-   — `gpq-tiles overview s3://bucket/file.parquet out.parquet` (native,
+   — `tylertoo overview s3://bucket/file.parquet out.parquet` (native,
    issue #210).
 2. [**Querying overview files in place with DuckDB**](#reading-overviews-from-object-storage-with-duckdb)
    — the client-side recipe for files you have already published.
@@ -27,11 +27,11 @@ filtering, ordering, and `--files-from` manifests.
 
 ```bash
 # Full remote conversion
-gpq-tiles overview s3://bucket/country.parquet overviews.parquet
+tylertoo overview s3://bucket/country.parquet overviews.parquet
 
 # The headline: a regional extract composing with --bbox row-group
 # pruning (#102) — pruned row groups are NEVER downloaded.
-gpq-tiles overview s3://bucket/country.parquet city.parquet \
+tylertoo overview s3://bucket/country.parquet city.parquet \
     --bbox 28.75,46.95,28.95,47.10
 ```
 
@@ -106,7 +106,7 @@ What to know:
 - **Remote output is out of scope** — write locally, then
   `aws s3 cp`.
 - Rust builds: remote input lives behind the `remote` cargo feature of
-  `gpq-tiles-core` (off by default for the bare library; the CLI and
+  `tylertoo-core` (off by default for the bare library; the CLI and
   Python builds enable it).
 
 ## Reading Overviews from Object Storage with DuckDB
@@ -114,16 +114,16 @@ What to know:
 Overview GeoParquet is designed to be queried in place over HTTP range
 requests: a viewport query touches **0.14–6.5 % of the file**, whatever
 the file size (measured against real S3 in
-[`benchmarks/overview/RESULTS.md` §2b](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/RESULTS.md)).
+[`benchmarks/overview/RESULTS.md` §2b](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/RESULTS.md)).
 This page is the evidence-based DuckDB client recipe for that read
 path: the one-time secret setup, the settings that measurably help, the
 ones that don't, and what a warm session actually behaves like.
 
 All numbers below are from the issue
-[#203](https://github.com/geoparquet-io/gpq-tiles/issues/203) knob
+[#203](https://github.com/geoparquet-io/tylertoo/issues/203) knob
 sweep (DuckDB v1.4.1, S3 `us-east-2`, 3-run medians on the same bucket,
 viewports, and harness as the §2b baseline; raw data in
-[`benchmarks/overview/duckdb_knobs_results.json`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/duckdb_knobs_results.json),
+[`benchmarks/overview/duckdb_knobs_results.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/duckdb_knobs_results.json),
 harness `bench_duckdb_knobs.py`).
 
 ### One-time setup

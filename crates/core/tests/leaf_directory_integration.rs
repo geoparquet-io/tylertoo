@@ -74,7 +74,7 @@ fn test_cli_produces_valid_leaf_directories() {
             "run",
             "--release",
             "--package",
-            "gpq-tiles",
+            "tylertoo",
             "--",
             fixture_path.to_str().unwrap(),
             output_path.to_str().unwrap(),
@@ -126,9 +126,9 @@ fn test_cli_produces_valid_leaf_directories() {
 #[test]
 fn test_root_directory_always_fits_in_16kb() {
     // Property test: generate archives of various sizes and verify root always fits
-    use gpq_tiles_core::compression::Compression;
-    use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
-    use gpq_tiles_core::tile::TileBounds;
+    use tylertoo_core::compression::Compression;
+    use tylertoo_core::pmtiles_writer::StreamingPmtilesWriter;
+    use tylertoo_core::tile::TileBounds;
 
     let test_cases = [
         ("tiny", 10),

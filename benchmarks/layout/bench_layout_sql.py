@@ -32,7 +32,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BUCKET = os.environ.get("BENCH_BUCKET", "gpq-tiles-bench")
+BUCKET = os.environ.get("BENCH_BUCKET", "tylertoo-bench")
 REGION = os.environ.get("BENCH_REGION", "us-east-2")
 PROFILE = os.environ.get("BENCH_AWS_PROFILE", "default")
 PREFIX = os.environ.get("BENCH_PREFIX", "layoutbench")

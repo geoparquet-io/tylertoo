@@ -766,7 +766,7 @@ mod tests {
 
     // These tests require actual GeoParquet files with covering metadata.
     // They are marked as #[ignore] and can be run with:
-    // cargo test --package gpq-tiles-core covering -- --ignored
+    // cargo test --package tylertoo-core covering -- --ignored
 
     #[test]
     #[ignore]

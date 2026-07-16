@@ -1953,6 +1953,11 @@ mod tests {
     /// changed polygon command bytes; the hash was re-captured from the
     /// fixed encoder. The anchor still guards the export restructure — the
     /// partition-invariance test alongside it is unchanged.
+    ///
+    /// REPIN (rename gpq-tiles → tylertoo): the archive metadata embeds
+    /// `"generator":"tylertoo"` (was `"gpq-tiles"`) — the only output-bound
+    /// byte change from the rename, so the hash was re-captured on the same
+    /// fixture. The export logic is unchanged.
     #[test]
     fn export_archive_matches_pre_refactor_reference() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -1967,7 +1972,7 @@ mod tests {
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            "a108f1607d994a92",
+            "390f2b1c51a8a29c",
             "archive bytes diverged from the pre-refactor reference"
         );
     }

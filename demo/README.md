@@ -1,4 +1,4 @@
-# gpq-tiles demo — Germany buildings
+# tylertoo demo — Germany buildings
 
 End-to-end **GeoParquet → PMTiles** on real Overture data (Germany buildings,
 59,032,924 features), head-to-head against the geoparquet-io recommended pipeline
@@ -14,7 +14,7 @@ The tuned Germany-buildings PMTiles is published to **Source Cooperative** and
 rendered live (tuned only — the default archive differs only marginally):
 
 ```
-s3://us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/
+s3://us-west-2.opendata.source.coop/nlebovits/tylertoo-demo/
   germany-buildings-gpq-tuned.pmtiles     # rendered in the viewer
   germany-buildings-gpq-default.pmtiles   # benchmark artifact
 ```
@@ -22,7 +22,7 @@ s3://us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/
 Public URL (serves HTTP **Range** + **CORS**, which PMTiles requires):
 
 ```
-https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/germany-buildings-gpq-tuned.pmtiles
+https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/tylertoo-demo/germany-buildings-gpq-tuned.pmtiles
 ```
 
 The viewer (`docs/demo/viewer.html`) renders the buildings over
@@ -34,7 +34,7 @@ with `?pmtiles=<url>`.
 ```bash
 export AWS_PROFILE=source-coop
 aws s3 cp germany-buildings-gpq-tuned.pmtiles \
-  s3://us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/ \
+  s3://us-west-2.opendata.source.coop/nlebovits/tylertoo-demo/ \
   --content-type application/octet-stream
 ```
 

@@ -1,13 +1,13 @@
 //! Debug test to find which tile(s) cause i_overlay issues (if any).
 //!
-//! Run with: cargo test --release -p gpq-tiles-core --test debug_antarctica -- --nocapture
+//! Run with: cargo test --release -p tylertoo-core --test debug_antarctica -- --nocapture
 
 use geo::MultiPolygon;
-use gpq_tiles_core::ioverlay_clip::clip_multipolygon_ioverlay;
-use gpq_tiles_core::tile::TileBounds;
 use std::fs::File;
 use std::io::Read;
 use std::time::{Duration, Instant};
+use tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay;
+use tylertoo_core::tile::TileBounds;
 
 /// Convert tile coordinates to geographic bounds
 fn tile_to_bounds(x: u32, y: u32, zoom: u32) -> TileBounds {
@@ -46,7 +46,7 @@ fn load_antarctica() -> Option<MultiPolygon<f64>> {
 }
 
 #[test]
-#[ignore] // Run explicitly with: cargo test --release -p gpq-tiles-core --test debug_antarctica -- --ignored --nocapture
+#[ignore] // Run explicitly with: cargo test --release -p tylertoo-core --test debug_antarctica -- --ignored --nocapture
 fn find_problematic_tiles() {
     let mp = match load_antarctica() {
         Some(mp) => mp,

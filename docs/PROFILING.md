@@ -1,8 +1,8 @@
-# Profiling gpq-tiles
+# Profiling tylertoo
 
 How to measure where time and memory go. The recorded performance
 history of the pipeline (what was measured, what was fixed) lives in
-[`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/gpq-tiles/blob/main/benchmarks/overview/PROFILE.md).
+[`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md).
 
 ## Phase Timing (built in)
 
@@ -11,11 +11,11 @@ per-level read/decode, simplification, write; export clip/encode/write)
 behind the `log` debug level:
 
 ```bash
-RUST_LOG=gpq_tiles_core::overview=debug \
-  gpq-tiles overview input.parquet output.parquet
+RUST_LOG=tylertoo_core::overview=debug \
+  tylertoo overview input.parquet output.parquet
 
-RUST_LOG=gpq_tiles_core::overview=debug \
-  gpq-tiles export-pmtiles output.parquet tiles.pmtiles
+RUST_LOG=tylertoo_core::overview=debug \
+  tylertoo export-pmtiles output.parquet tiles.pmtiles
 ```
 
 For end-to-end wall time and peak RSS, wrap the release binary in GNU
@@ -23,7 +23,7 @@ time:
 
 ```bash
 cargo build --release
-/usr/bin/time -v ./target/release/gpq-tiles overview \
+/usr/bin/time -v ./target/release/tylertoo overview \
   input.parquet output.parquet --min-zoom 0 --max-zoom 14
 ```
 
@@ -37,7 +37,7 @@ cargo install flamegraph
 
 # Profile a conversion (requires perf; may need
 # kernel.perf_event_paranoid <= 1)
-cargo flamegraph --release --package gpq-tiles -- \
+cargo flamegraph --release --package tylertoo -- \
   overview input.parquet output.parquet
 ```
 
@@ -54,7 +54,7 @@ Heap profiling is feature-gated (zero overhead in normal builds):
 cargo build --release --features dhat-heap
 
 # Run your workload; dhat-heap.json is written on exit
-./target/release/gpq-tiles overview input.parquet output.parquet
+./target/release/tylertoo overview input.parquet output.parquet
 ls dhat-heap.json
 ```
 
@@ -76,7 +76,7 @@ Compare before/after a change:
 
 ```bash
 mv dhat-heap.json dhat-heap-before.json
-./target/release/gpq-tiles overview input.parquet output.parquet
+./target/release/tylertoo overview input.parquet output.parquet
 # diff dhat-heap-before.json vs dhat-heap.json in the viewer
 ```
 
@@ -92,7 +92,7 @@ Micro-benchmarks for the clipping hot path live in
 `crates/core/benches/` (`clipping`, `bbox_containment`):
 
 ```bash
-cargo bench --package gpq-tiles-core --bench clipping
+cargo bench --package tylertoo-core --bench clipping
 open target/criterion/report/index.html
 ```
 

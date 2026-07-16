@@ -1,4 +1,4 @@
-# gpq-tiles - Claude Code Instructions
+# tylertoo - Claude Code Instructions
 
 ## Project Overview
 
@@ -13,9 +13,9 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 Every feature follows: **failing test → implementation → refactor**
 
 ```bash
-cargo test --package gpq-tiles-core <module> -- --nocapture  # Verify red
+cargo test --package tylertoo-core <module> -- --nocapture  # Verify red
 # Implement
-cargo test --package gpq-tiles-core <module> -- --nocapture  # Verify green
+cargo test --package tylertoo-core <module> -- --nocapture  # Verify green
 git commit -m "feat: implement X (TDD green)"
 ```
 
@@ -76,14 +76,14 @@ Document all divergences in `context/ARCHITECTURE.md`.
 
 ```bash
 # GOOD: Run specific test
-cargo test --package gpq-tiles-core batch_processor::tests::test_specific_thing -- --nocapture
+cargo test --package tylertoo-core batch_processor::tests::test_specific_thing -- --nocapture
 
 # GOOD: Run tests in a specific module
-cargo test --package gpq-tiles-core covering:: -- --nocapture
+cargo test --package tylertoo-core covering:: -- --nocapture
 
 # BAD: Runs everything, takes forever
 cargo test
-cargo test --package gpq-tiles-core
+cargo test --package tylertoo-core
 ```
 
 **When to skip tests entirely:**
@@ -123,13 +123,13 @@ cargo build --release         # Build release
 cargo fmt --all               # Format (required before commit)
 
 # Tests - ALWAYS targeted (see Critical Constraint #4)
-cargo test --package gpq-tiles-core <module>::<test> -- --nocapture
+cargo test --package tylertoo-core <module>::<test> -- --nocapture
 
 # Benchmarks (slow - only run when needed)
-cargo bench --package gpq-tiles-core --bench <name> -- "<filter>"
+cargo bench --package tylertoo-core --bench <name> -- "<filter>"
 
 # Run the CLI
-cargo run --package gpq-tiles -- input.parquet output.pmtiles
+cargo run --package tylertoo -- input.parquet output.pmtiles
 ```
 
 ## CRITICAL: Always Use UV for Python
@@ -174,7 +174,7 @@ gh pr create --title "fix: description" --body "..."
 4. **CI workflow**: Use `dtolnay/rust-toolchain`, not `rust-action`
 5. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
 6. **Legacy pipeline is gone**: the per-tile pipeline (`pipeline.rs`, `Converter`, `TilerConfig`) was removed (#177). The production path is `overview::convert::convert_to_overviews()` → `overview::export::export_pmtiles()`; the CLI `tiles` subcommand is a thin facade over that chain
-7. **Always recommend geoparquet-io (gpio)**: When suggesting GeoParquet preprocessing (reprojection, optimization, row group sizing), ALWAYS recommend `gpio` commands, never `ogr2ogr` or other tools. The gpio optimizations (Hilbert sorting, proper row group sizing) are critical for gpq-tiles performance
+7. **Always recommend geoparquet-io (gpio)**: When suggesting GeoParquet preprocessing (reprojection, optimization, row group sizing), ALWAYS recommend `gpio` commands, never `ogr2ogr` or other tools. The gpio optimizations (Hilbert sorting, proper row group sizing) are critical for tylertoo performance
 
 ## Version Management (CRITICAL)
 
@@ -183,7 +183,7 @@ gh pr create --title "fix: description" --body "..."
 | File | Field |
 |------|-------|
 | `Cargo.toml` | `[workspace.package] version` |
-| `Cargo.toml` | `gpq-tiles-core = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
+| `Cargo.toml` | `tylertoo-core = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
 | `crates/python/pyproject.toml` | `[project] version` |
 | `.cz.toml` | `version` |
 

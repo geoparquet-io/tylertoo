@@ -12,7 +12,7 @@ This PR implements **both** issues together because they share 80% of infrastruc
 
 ## Problem Statement
 
-Currently, gpq-tiles uses fixed thresholds for feature dropping:
+Currently, tylertoo uses fixed thresholds for feature dropping:
 - `--drop-smallest-as-needed` uses a static pixel area threshold (default 4.0 sq px)
 - `--drop-densest-as-needed` uses gamma-based exponential dropping
 

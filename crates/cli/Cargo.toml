@@ -1,5 +1,5 @@
 [package]
-name = "gpq-tiles"
+name = "tylertoo"
 description = "CLI tool for converting GeoParquet to PMTiles vector tiles"
 readme = "README.md"
 version.workspace = true
@@ -14,14 +14,14 @@ categories.workspace = true
 
 [features]
 default = []
-dhat-heap = ["gpq-tiles-core/dhat-heap", "dhat"]
+dhat-heap = ["tylertoo-core/dhat-heap", "dhat"]
 
 [[bin]]
-name = "gpq-tiles"
+name = "tylertoo"
 path = "src/main.rs"
 
 [dependencies]
-gpq-tiles-core = { workspace = true, features = ["remote"] }
+tylertoo-core = { workspace = true, features = ["remote"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }

@@ -1,21 +1,25 @@
-# gpq-tiles
+# tylertoo
 
-[![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
-[![Crates.io](https://img.shields.io/crates/v/gpq-tiles?color=blue)](https://crates.io/crates/gpq-tiles)
-[![PyPI](https://img.shields.io/pypi/v/gpq-tiles?color=blue)](https://pypi.org/project/gpq-tiles/)
+[![CI](https://github.com/geoparquet-io/tylertoo/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/tylertoo/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/geoparquet-io/tylertoo/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/tylertoo)
+[![Crates.io](https://img.shields.io/crates/v/tylertoo?color=blue)](https://crates.io/crates/tylertoo)
+[![PyPI](https://img.shields.io/pypi/v/tylertoo?color=blue)](https://pypi.org/project/tylertoo/)
 
 Fast GeoParquet → PMTiles converter in Rust.
 
+**tylertoo** takes its name from ["Tippecanoe and Tyler Too"](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too),
+the 1840 U.S. campaign slogan. It's a nod to [tippecanoe](https://github.com/felt/tippecanoe),
+the vector-tile tool this project measures itself against — tylertoo runs alongside it.
+
 **Features:**
-- COG-style multi-resolution **overviews embedded in GeoParquet** (`gpq-tiles overview`) — the file stays valid, exact, SQL-queryable GeoParquet
-- PMTiles export from an overview file (`gpq-tiles export-pmtiles`)
-- One-shot GeoParquet → PMTiles (`gpq-tiles tiles`, or the bare form)
+- COG-style multi-resolution **overviews embedded in GeoParquet** (`tylertoo overview`) — the file stays valid, exact, SQL-queryable GeoParquet
+- PMTiles export from an overview file (`tylertoo export-pmtiles`)
+- One-shot GeoParquet → PMTiles (`tylertoo tiles`, or the bare form)
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
 - Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
 - Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
-- Spec validation (`gpq-tiles validate`)
-- PMTiles → GeoParquet decoding (`gpq-tiles decode`) — tippecanoe-decode
+- Spec validation (`tylertoo validate`)
+- PMTiles → GeoParquet decoding (`tylertoo decode`) — tippecanoe-decode
   semantics, any PMTiles v3 MVT archive
 
 > **⚠️ Work in Progress**:
@@ -25,15 +29,15 @@ Fast GeoParquet → PMTiles converter in Rust.
 ## Install
 
 ```bash
-cargo install gpq-tiles    # CLI
-pip install gpq-tiles      # Python
+cargo install tylertoo    # CLI
+pip install tylertoo      # Python
 ```
 
 ## Usage
 
 ```bash
 # One-shot: GeoParquet in, PMTiles out
-gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+tylertoo input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 ```
 
 ### The Two-Step Workflow
@@ -42,14 +46,14 @@ The overview GeoParquet file is the interesting artifact — keep it:
 
 ```bash
 # 1. Embed multi-resolution levels in a GeoParquet file
-gpq-tiles overview input.parquet overviews.parquet \
+tylertoo overview input.parquet overviews.parquet \
   --min-zoom 0 --max-zoom 14
 
 # 2. Validate against the spec
-gpq-tiles validate overviews.parquet
+tylertoo validate overviews.parquet
 
 # 3. Export a PMTiles archive for map rendering
-gpq-tiles export-pmtiles overviews.parquet output.pmtiles
+tylertoo export-pmtiles overviews.parquet output.pmtiles
 ```
 
 All tuning knobs live on `overview` / `export-pmtiles` — see
@@ -60,7 +64,7 @@ rendered corpus sweeps and are meant to look right out of the box.
 
 ```bash
 # Extract one zoom of any PMTiles v3 vector archive as GeoParquet
-gpq-tiles decode input.pmtiles output.parquet --zoom 14
+tylertoo decode input.pmtiles output.parquet --zoom 14
 ```
 
 The output is the **tiled representation** (simplified, clipped, duplicated
@@ -81,14 +85,14 @@ gpio convert reproject input.parquet prepared.parquet \
 ### Python
 
 ```python
-from gpq_tiles import overview, export_pmtiles, validate
+from tylertoo import overview, export_pmtiles, validate
 
 overview("input.parquet", "overviews.parquet", min_zoom=0, max_zoom=14)
 validate("overviews.parquet")
 export_pmtiles("overviews.parquet", "output.pmtiles")
 
 # One-shot facade (deprecated in favor of the two-step API)
-from gpq_tiles import convert
+from tylertoo import convert
 convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 ```
 
@@ -105,7 +109,7 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 ## Development
 
 ```bash
-git clone https://github.com/geoparquet-io/gpq-tiles.git && cd gpq-tiles
+git clone https://github.com/geoparquet-io/tylertoo.git && cd tylertoo
 git config core.hooksPath .githooks
 cargo build && cargo check
 ```

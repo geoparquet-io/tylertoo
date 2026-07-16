@@ -1,6 +1,6 @@
 //! Tests for clipping invalid/problematic geometries.
 //!
-//! These tests verify that gpq-tiles handles edge-case geometries correctly.
+//! These tests verify that tylertoo handles edge-case geometries correctly.
 //! The test fixtures come from chrieke/geojson-invalid-geometry.
 //!
 //! # TDD Baseline
@@ -10,10 +10,10 @@
 //! i_overlay fallback (issue #94), they should PASS.
 
 use geo::{Coord, Geometry, LineString, Polygon};
-use gpq_tiles_core::clip::clip_geometry;
-use gpq_tiles_core::tile::TileBounds;
 use std::fs;
 use std::path::PathBuf;
+use tylertoo_core::clip::clip_geometry;
+use tylertoo_core::tile::TileBounds;
 
 /// Helper to load a GeoJSON polygon from the test fixtures
 fn load_geojson_polygon(fixture_path: &str) -> Polygon<f64> {

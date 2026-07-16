@@ -253,7 +253,7 @@ pub fn validate_wgs84(path: &Path) -> Result<()> {
 
     Err(Error::GeoParquetRead(format!(
         "Input file uses CRS {}.\n\
-         gpq-tiles requires WGS84 (EPSG:4326) coordinates.\n\n\
+         tylertoo requires WGS84 (EPSG:4326) coordinates.\n\n\
          Reproject with geoparquet-io:\n  \
          gpio convert reproject {} reprojected.parquet -d EPSG:4326",
         crs_desc, filename

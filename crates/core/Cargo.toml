@@ -1,5 +1,5 @@
 [package]
-name = "gpq-tiles-core"
+name = "tylertoo-core"
 description = "Core library for converting GeoParquet to PMTiles vector tiles"
 readme = "README.md"
 version.workspace = true

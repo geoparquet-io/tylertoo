@@ -38,7 +38,7 @@
 //! the whole file adds only a few seconds). Crank locally with:
 //!
 //! ```text
-//! PROPTEST_CASES=4096 cargo test --package gpq-tiles-core \
+//! PROPTEST_CASES=4096 cargo test --package tylertoo-core \
 //!     --test overview_property_tests
 //! ```
 
@@ -47,12 +47,12 @@ use std::collections::HashMap;
 use geo::{Geometry, LineString, MultiLineString, Point};
 use proptest::prelude::*;
 
-use gpq_tiles_core::overview::assign::{
+use tylertoo_core::overview::assign::{
     apply_density_budget, assign_levels, AssignConfig, AssignFeature, Assignment, Crs,
     DensityBudgetConfig, FeatureKind, SortDirection, MIN_DENSITY_LEVEL_FEATURES,
 };
-use gpq_tiles_core::overview::cluster::{build_cluster_tables, verify_sum_invariant, AccumulateOp};
-use gpq_tiles_core::overview::coalesce::{coalesce_level_lines, CoalesceInput, CoalesceParams};
+use tylertoo_core::overview::cluster::{build_cluster_tables, verify_sum_invariant, AccumulateOp};
+use tylertoo_core::overview::coalesce::{coalesce_level_lines, CoalesceInput, CoalesceParams};
 
 /// Default proptest cases per property, overridable via `PROPTEST_CASES`.
 const DEFAULT_CASES: u32 = 64;

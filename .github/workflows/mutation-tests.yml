@@ -70,9 +70,9 @@ jobs:
           tool: cargo-mutants
 
       - name: Run mutation tests on core
-        # NB: package name is gpq-tiles-core (the old gpq2tiles-core spelling
+        # NB: package name is tylertoo-core (the old gpq2tiles-core spelling
         # made every scheduled run fail at startup).
-        run: cargo mutants --package gpq-tiles-core --output mutants.out
+        run: cargo mutants --package tylertoo-core --output mutants.out
 
       - name: Upload mutation report
         if: always()

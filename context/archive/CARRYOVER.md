@@ -20,7 +20,7 @@ This document audits every module in `crates/core/src/` and maps each to a
   (0–4096 pixel extent, per-`TileCoord` transforms, per-tile budgets) that
   must be stripped and replaced with world-space / per-level equivalents.
 - **SHELVE** — inherently tile/MVT/PMTiles-specific; kept intact for the
-  future `gpq-tiles serve` MVT bridge (Plan E1), not imported into the
+  future `tylertoo serve` MVT bridge (Plan E1), not imported into the
   overview path.
 - **DEAD** — candidate for removal (none recommended yet; the tile pipeline
   is being shelved, not deleted).
@@ -30,7 +30,7 @@ per-level grid cell-winner thinning → per-level geometry simplification in
 **world space** (tolerance from level GSD) → level-banded GeoParquet writer.
 No tile clipping. No MVT encoding. No PMTiles.
 
-Compile status: **`cargo check --package gpq-tiles-core` passes clean** (no
+Compile status: **`cargo check --package tylertoo-core` passes clean** (no
 warnings blocking). The two `#[ignore]`d tests (`covering.rs`,
 `pipeline.rs`) are large-file tests needing multi-GB downloads, **not**
 broken tests. `DIVERGENCE FROM TIPPECANOE` comments are design docs, not bug
@@ -488,9 +488,9 @@ Hook-in points:
   Leave the existing tile `Converter` and re-exports untouched (serve bridge).
 - **CLI (`crates/cli/src/main.rs`)**: currently a single flat `Args` clap
   `Parser` (no subcommands, ~888 lines). Introduce a subcommand layer:
-  `gpq-tiles overview <in> <out> [--min-zoom/--max-zoom | --gsd] [--mode
+  `tylertoo overview <in> <out> [--min-zoom/--max-zoom | --gsd] [--mode
   duplicating|partitioning] [--sort-key] [--thinning/visibility factors]`
-  (P5) and `gpq-tiles validate <file>` (P4), keeping the existing tile flags
+  (P5) and `tylertoo validate <file>` (P4), keeping the existing tile flags
   under a `tiles` subcommand (or default) for the serve bridge. This is the
   one place the flat-`Args` structure must be refactored.
 - **Python (`crates/python`)**: E3, wraps `convert_to_overview`/reader — no

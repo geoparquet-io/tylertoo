@@ -8,16 +8,16 @@ directly and read them as one logical dataset:
 
 ```bash
 # A directory of partitions (recursive)
-gpq-tiles overview parts/ overviews.parquet
+tylertoo overview parts/ overviews.parquet
 
 # A glob pattern (quote it so the shell doesn't expand it)
-gpq-tiles tiles "parts/**/*.parquet" tiles.pmtiles
+tylertoo tiles "parts/**/*.parquet" tiles.pmtiles
 
 # An s3:// or gs:// prefix (note the trailing slash)
-gpq-tiles overview s3://bucket/dataset/ overviews.parquet
+tylertoo overview s3://bucket/dataset/ overviews.parquet
 
 # An explicit ordered manifest
-gpq-tiles overview --files-from manifest.txt overviews.parquet
+tylertoo overview --files-from manifest.txt overviews.parquet
 ```
 
 `validate`, `decode`, and `export-pmtiles` are single-file
@@ -124,7 +124,7 @@ In Python, pass a `list[str]` to `overview()` for the same explicit
 ordered-parts shape:
 
 ```python
-from gpq_tiles import overview
+from tylertoo import overview
 
 overview(["part-0.parquet", "s3://bucket/part-1.parquet"], "out.parquet")
 ```

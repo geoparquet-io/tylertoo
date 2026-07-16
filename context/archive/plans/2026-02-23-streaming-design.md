@@ -6,13 +6,13 @@
 
 ## Summary
 
-Enable gpq-tiles to process GeoParquet files larger than available memory by streaming row groups instead of loading all geometries into a Vec.
+Enable tylertoo to process GeoParquet files larger than available memory by streaming row groups instead of loading all geometries into a Vec.
 
 ## Core Insight
 
 GeoParquet row groups are the natural streaming unit. Each row group (typically 50-100MB) has geographic locality when Hilbert-sorted, touching a bounded set of tiles. We process one row group at a time, bucket features by tile, encode, and flush.
 
-**Key simplification:** If input files are poorly formatted, users can optimize with geoparquet-io tools first. gpq-tiles doesn't need to solve external sorting—it detects and warns.
+**Key simplification:** If input files are poorly formatted, users can optimize with geoparquet-io tools first. tylertoo doesn't need to solve external sorting—it detects and warns.
 
 ## Architecture
 
@@ -238,7 +238,7 @@ curl -o tests/fixtures/large/adm3_polygons.parquet \
   https://data.fieldmaps.io/edge-matched/humanitarian/intl/adm3_polygons.parquet
 
 # Run the ignored test
-cargo test --package gpq-tiles-core test_large_file_memory_bounded -- --ignored
+cargo test --package tylertoo-core test_large_file_memory_bounded -- --ignored
 ```
 
 **Do not commit this file** - it's 2.7GB. Add `tests/fixtures/large/` to `.gitignore`.

@@ -2,7 +2,7 @@
 #
 # run_conversion.sh - conversion-cost table: wall time + peak RSS.
 #
-#   overview  : `gpq-tiles overview` (duplicating, default knobs, z0..14)
+#   overview  : `tylertoo overview` (duplicating, default knobs, z0..14)
 #               reading the gpio GeoParquet NATIVELY.
 #   tippecanoe: the documented golden workflow -- `gpio convert geojson
 #               <src> | tippecanoe -P <recorded flags>` -- since tippecanoe
@@ -21,7 +21,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BIN="${GPQ_BIN:-$ROOT/target/release/gpq-tiles}"
+BIN="${GPQ_BIN:-$ROOT/target/release/tylertoo}"
 GPIO="$ROOT/corpus/data/gpio"
 OVOUT="$ROOT/corpus/data/bench/overviews"
 GOLD="$ROOT/corpus/data/goldens/tippecanoe"

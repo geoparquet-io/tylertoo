@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V2 quality-evaluation render harness for gpq-tiles overviews.
+"""V2 quality-evaluation render harness for tylertoo overviews.
 
 For every DUPLICATING-mode overview file in corpus/data/overviews/ this
 script renders one PNG per level (the full dataset extent) and, where a
@@ -624,7 +624,7 @@ def write_index(contact, metrics):
     out = os.path.join(RENDER, "index.html")
     h = []
     h.append("<!doctype html><html><head><meta charset='utf-8'>")
-    h.append("<title>gpq-tiles V2 render contact sheet</title>")
+    h.append("<title>tylertoo V2 render contact sheet</title>")
     h.append(
         "<style>body{font-family:system-ui,sans-serif;margin:24px;"
         "background:#f7f7f8;color:#111}h1{font-size:22px}"
@@ -638,7 +638,7 @@ def write_index(contact, metrics):
         "padding:40px;text-align:center;border:1px dashed #ccc}"
         "</style></head><body>"
     )
-    h.append("<h1>gpq-tiles overviews — V2 quality contact sheet</h1>")
+    h.append("<h1>tylertoo overviews — V2 quality contact sheet</h1>")
     h.append(
         "<p class='meta'>Left = our duplicating-mode overview level. "
         "Right = tippecanoe golden decoded at the matching zoom, same extent. "
@@ -699,7 +699,7 @@ def write_truescale(tcontact, metrics):
     out = os.path.join(RENDER, "truescale.html")
     h = []
     h.append("<!doctype html><html><head><meta charset='utf-8'>")
-    h.append("<title>gpq-tiles true-scale contact sheet</title>")
+    h.append("<title>tylertoo true-scale contact sheet</title>")
     h.append(
         "<style>body{font-family:system-ui,sans-serif;margin:24px;"
         "background:#f7f7f8;color:#111}h1{font-size:22px}"
@@ -713,7 +713,7 @@ def write_truescale(tcontact, metrics):
         "padding:20px;text-align:center;border:1px dashed #ccc}"
         "</style></head><body>"
     )
-    h.append("<h1>gpq-tiles overviews — true-scale contact sheet</h1>")
+    h.append("<h1>tylertoo overviews — true-scale contact sheet</h1>")
     h.append(
         "<p class='meta'>Each image is rendered at the pixel size the dataset "
         "extent actually occupies on screen at that level's Web Mercator zoom "

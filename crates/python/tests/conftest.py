@@ -1,4 +1,4 @@
-"""Pytest configuration for gpq_tiles tests."""
+"""Pytest configuration for tylertoo tests."""
 
 
 def pytest_configure(config):

@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "gpq-tiles"
+name = "tylertoo"
 version = "0.6.0"
 description = "Fast GeoParquet to PMTiles converter"
 readme = "README.md"
@@ -27,8 +27,8 @@ classifiers = [
 requires-python = ">=3.9"
 
 [project.urls]
-Homepage = "https://github.com/geoparquet-io/gpq-tiles"
-Repository = "https://github.com/geoparquet-io/gpq-tiles"
+Homepage = "https://github.com/geoparquet-io/tylertoo"
+Repository = "https://github.com/geoparquet-io/tylertoo"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov", "ruff"]
@@ -83,7 +83,7 @@ ignore = []
 [tool.ruff.lint.per-file-ignores]
 # The stub mirrors the pyo3 signatures verbatim; `input` is part of the
 # public API (renaming it would break keyword callers).
-"gpq_tiles.pyi" = ["A002"]
+"tylertoo.pyi" = ["A002"]
 # Tests: magic-value comparisons are the point of golden assertions, and a
 # handful of API-surface tests deliberately assert "raises *something*".
 "tests/**" = ["PLR2004", "B017", "PT011"]
@@ -93,7 +93,7 @@ ignore = []
 python_version = "3.10"
 # Strict mode, relaxed only for untyped test functions: mypy currently checks
 # tests/ exclusively (the shipped code is a Rust extension module typed via
-# the gpq_tiles.pyi stub, which `mypy.stubtest` verifies against the built
+# the tylertoo.pyi stub, which `mypy.stubtest` verifies against the built
 # module in CI). If pure-Python source is ever added, give it its own
 # fully-strict override.
 strict = true

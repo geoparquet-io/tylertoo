@@ -1,5 +1,5 @@
 #!/bin/sh
-# Pre-commit hook for gpq-tiles
+# Pre-commit hook for tylertoo
 # Runs cargo fmt, clippy, version consistency check, and syncs READMEs before allowing commit
 
 set -e
@@ -25,7 +25,7 @@ echo "Clippy check passed!"
 # Check version consistency across workspace
 echo "Checking version consistency..."
 WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-CORE_DEP_VERSION=$(grep 'gpq-tiles-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+CORE_DEP_VERSION=$(grep 'tylertoo-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
 PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
 
 VERSION_ERROR=0
@@ -34,7 +34,7 @@ if [ -n "$CORE_DEP_VERSION" ] && [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]
     echo ""
     echo "ERROR: Cargo version mismatch!"
     echo "  workspace.package.version = $WORKSPACE_VERSION"
-    echo "  gpq-tiles-core dependency = $CORE_DEP_VERSION"
+    echo "  tylertoo-core dependency = $CORE_DEP_VERSION"
     VERSION_ERROR=1
 fi
 

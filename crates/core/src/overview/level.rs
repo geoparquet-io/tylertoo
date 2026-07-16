@@ -142,7 +142,7 @@ pub enum MemoryProfile {
 /// OPTIONAL, informative per-level generalization provenance (§3.5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Generalization {
-    /// Engine identifier, e.g. `"gpq-tiles 0.6.0"`.
+    /// Engine identifier, e.g. `"tylertoo 0.6.0"`.
     pub engine: String,
     /// OPTIONAL GSD tile-band base used to derive per-level GSDs from zooms
     /// (spec §5.2 / Q6; the cogp-rs `base` knob). Absent when the default
@@ -296,7 +296,7 @@ pub struct RankingProvenance {
     /// Serialized as a JSON object map (spec §3.5 v0.2.0), e.g.
     /// `{"motorway": 5, "primary": 4}`. Deserialization additionally
     /// accepts the legacy array-of-pairs shape (`[["motorway", 5.0], …]`)
-    /// emitted by gpq-tiles ≤ the 0.1.0/interim footers, so older files
+    /// emitted by tylertoo ≤ the 0.1.0/interim footers, so older files
     /// keep reading; only the map shape is ever written.
     #[serde(
         default,
@@ -312,7 +312,7 @@ pub struct RankingProvenance {
 
 /// Deserialize [`RankingProvenance::ranks`], accepting both the v0.2.0
 /// object-map shape (`{"motorway": 5.0}`) and the legacy array-of-pairs
-/// shape (`[["motorway", 5.0]]`) that pre-alignment gpq-tiles footers
+/// shape (`[["motorway", 5.0]]`) that pre-alignment tylertoo footers
 /// carry. Only the map shape is ever serialized.
 fn deserialize_ranks<'de, D>(deserializer: D) -> Result<Option<BTreeMap<String, f64>>, D::Error>
 where
@@ -925,7 +925,7 @@ mod tests {
         // preserves mode / column / ranks / unknown_rank (§3.5, additive).
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
-            engine: "gpq-tiles test".to_string(),
+            engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
             levels: vec![],
@@ -966,7 +966,7 @@ mod tests {
             "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
             "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
             "generalization": {
-                "engine": "gpq-tiles 0.5.0",
+                "engine": "tylertoo 0.5.0",
                 "levels": [],
                 "ranking": {
                     "mode": "class-ranking",
@@ -995,7 +995,7 @@ mod tests {
         // and a generalization block without the key deserializes to None.
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
-            engine: "gpq-tiles test".to_string(),
+            engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
             levels: vec![],
@@ -1021,7 +1021,7 @@ mod tests {
             "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
             "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
             "generalization": {
-                "engine": "gpq-tiles 0.1.0",
+                "engine": "tylertoo 0.1.0",
                 "levels": []
             }
         }"#;
@@ -1034,7 +1034,7 @@ mod tests {
         // A coalescing block survives JSON round-trip; absent key → None.
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
-            engine: "gpq-tiles test".to_string(),
+            engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
             levels: vec![],
@@ -1073,7 +1073,7 @@ mod tests {
         let src = r#"{
             "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
             "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
-            "generalization": { "engine": "gpq-tiles 0.1.0", "levels": [] }
+            "generalization": { "engine": "tylertoo 0.1.0", "levels": [] }
         }"#;
         let m = OverviewsMeta::from_json(src).unwrap();
         assert!(m.generalization.unwrap().coalescing.is_none());
@@ -1088,7 +1088,7 @@ mod tests {
             "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
             "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
             "generalization": {
-                "engine": "gpq-tiles 0.5.0", "levels": [],
+                "engine": "tylertoo 0.5.0", "levels": [],
                 "coalescing": {
                     "enabled": true,
                     "snap_tolerance_gsd_factor": 1.0,
@@ -1111,7 +1111,7 @@ mod tests {
         // A clustering block survives JSON round-trip; absent key → None.
         let mut meta = duplicating_example();
         meta.generalization = Some(Generalization {
-            engine: "gpq-tiles test".to_string(),
+            engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
             levels: vec![],
@@ -1142,7 +1142,7 @@ mod tests {
         let src = r#"{
             "version": "0.1.0", "mode": "duplicating", "canonical_level": 0,
             "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
-            "generalization": { "engine": "gpq-tiles 0.1.0", "levels": [] }
+            "generalization": { "engine": "tylertoo 0.1.0", "levels": [] }
         }"#;
         let m = OverviewsMeta::from_json(src).unwrap();
         assert!(m.generalization.unwrap().clustering.is_none());
@@ -1158,7 +1158,7 @@ mod tests {
             "canonical_level": 0,
             "levels": [ { "row_group_end": 0, "gsd": 611.50, "zoom": 6 } ],
             "generalization": {
-                "engine": "gpq-tiles 0.1.0",
+                "engine": "tylertoo 0.1.0",
                 "levels": [
                     { "simplify_tolerance_m": 0, "thinning_factor": 1.0,
                       "visibility_gate_m": 0, "geometry_types": [] }

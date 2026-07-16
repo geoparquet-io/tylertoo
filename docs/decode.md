@@ -1,28 +1,28 @@
 # Decoding PMTiles back to GeoParquet
 
-`gpq-tiles decode` converts a PMTiles vector-tile archive into a GeoParquet
+`tylertoo decode` converts a PMTiles vector-tile archive into a GeoParquet
 file, following the model of `tippecanoe-decode`. It works on any PMTiles v3
-MVT archive (not just ones produced by gpq-tiles) and supports all four spec
+MVT archive (not just ones produced by tylertoo) and supports all four spec
 compression codecs (none, gzip, brotli, zstd) for directories and tiles.
 
 ```bash
 # Everything, all zooms (large: every feature, every tile, every zoom)
-gpq-tiles decode input.pmtiles output.parquet
+tylertoo decode input.pmtiles output.parquet
 
 # Extract a single zoom (recommended for most use cases)
-gpq-tiles decode input.pmtiles output.parquet --zoom 14
+tylertoo decode input.pmtiles output.parquet --zoom 14
 
 # Zoom range
-gpq-tiles decode input.pmtiles output.parquet --min-zoom 10 --max-zoom 14
+tylertoo decode input.pmtiles output.parquet --min-zoom 10 --max-zoom 14
 
 # One MVT layer only
-gpq-tiles decode input.pmtiles output.parquet --layer buildings
+tylertoo decode input.pmtiles output.parquet --layer buildings
 
 # Machine-readable summary
-gpq-tiles decode input.pmtiles output.parquet --zoom 14 --report report.json
+tylertoo decode input.pmtiles output.parquet --zoom 14 --report report.json
 ```
 
-Rust API: `gpq_tiles_core::decode::decode_pmtiles(input, output, &DecodeOptions)`.
+Rust API: `tylertoo_core::decode::decode_pmtiles(input, output, &DecodeOptions)`.
 
 ## What you get — and what you don't
 

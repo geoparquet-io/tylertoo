@@ -47,8 +47,8 @@ let config = TilerConfig::new(0, 14)
 
 **CLI:**
 ```bash
-gpq-tiles input.parquet output.pmtiles --drop-densest-as-needed
-gpq-tiles input.parquet output.pmtiles --gamma=2.0
+tylertoo input.parquet output.pmtiles --drop-densest-as-needed
+tylertoo input.parquet output.pmtiles --gamma=2.0
 ```
 
 **Gamma values:**
@@ -144,7 +144,7 @@ Fixed thresholds for feature dropping (`--drop-smallest-as-needed`, `--drop-dens
 
 ### Solution
 
-When `--max-tile-size` or `--max-tile-features` is set, gpq-tiles automatically adjusts thresholds:
+When `--max-tile-size` or `--max-tile-features` is set, tylertoo automatically adjusts thresholds:
 
 1. **Encode** tile with current threshold
 2. **Check** if tile exceeds limits
@@ -172,7 +172,7 @@ This implementation matches tippecanoe's algorithm:
 
 ### Divergences from Tippecanoe
 
-| Aspect | Tippecanoe | gpq-tiles | Reason |
+| Aspect | Tippecanoe | tylertoo | Reason |
 |--------|------------|-----------|--------|
 | Zoom retry | Re-encodes entire zoom when threshold increases | Forward propagation only | Simplicity; full retry planned for follow-up |
 | Sample storage | Global arrays | Per-tile samplers | Rust ownership model |
@@ -181,13 +181,13 @@ This implementation matches tippecanoe's algorithm:
 
 ```bash
 # Limit tile size to 500KB
-gpq-tiles input.parquet output.pmtiles --max-tile-size 500K --drop-densest-as-needed
+tylertoo input.parquet output.pmtiles --max-tile-size 500K --drop-densest-as-needed
 
 # Limit features per tile to 10,000
-gpq-tiles input.parquet output.pmtiles --max-tile-features 10000 --drop-smallest-as-needed
+tylertoo input.parquet output.pmtiles --max-tile-features 10000 --drop-smallest-as-needed
 
 # Both limits (most restrictive wins)
-gpq-tiles input.parquet output.pmtiles \
+tylertoo input.parquet output.pmtiles \
     --max-tile-size 500K \
     --max-tile-features 10000 \
     --drop-densest-as-needed \
@@ -266,7 +266,7 @@ At low zoom levels, many small features (building footprints, parcels) become su
 **CLI Usage:**
 
 ```bash
-gpq-tiles input.parquet output.pmtiles \
+tylertoo input.parquet output.pmtiles \
   --accumulate population:sum \
   --accumulate names:comma \
   --accumulate max_height:max
@@ -275,8 +275,8 @@ gpq-tiles input.parquet output.pmtiles \
 **API Usage:**
 
 ```rust
-use gpq_tiles_core::accumulator::{AccumulatorConfig, AccumulatorOp};
-use gpq_tiles_core::pipeline::TilerConfig;
+use tylertoo_core::accumulator::{AccumulatorConfig, AccumulatorOp};
+use tylertoo_core::pipeline::TilerConfig;
 
 let mut acc_config = AccumulatorConfig::new();
 acc_config.set_operation("population", AccumulatorOp::Sum);
@@ -321,7 +321,7 @@ let config = TilerConfig::new(0, 14)
 **CLI Usage:**
 
 ```bash
-gpq-tiles input.parquet output.pmtiles \
+tylertoo input.parquet output.pmtiles \
   --cluster-distance=50 \
   --cluster-maxzoom=12 \
   --accumulate count:sum
@@ -330,7 +330,7 @@ gpq-tiles input.parquet output.pmtiles \
 **API Usage:**
 
 ```rust
-use gpq_tiles_core::pipeline::TilerConfig;
+use tylertoo_core::pipeline::TilerConfig;
 
 let config = TilerConfig::new(0, 14)
     .with_cluster(50, 12);  // 50px distance, max zoom 12
@@ -389,7 +389,7 @@ Default: Hilbert (matches tippecanoe's `-ah` flag).
 
 Validated against tippecanoe v2.49.0 using `open-buildings.parquet` (~1000 buildings):
 
-| Zoom | Tippecanoe | gpq-tiles | Ratio |
+| Zoom | Tippecanoe | tylertoo | Ratio |
 |------|------------|-----------|-------|
 | Z10 | 484 | 392 | 0.81x |
 | Z8 | 97 | 76 | 0.78x |
@@ -492,9 +492,9 @@ The `StreamingPmtilesWriter` solves the memory problem for **output** (tiles):
 **Usage:**
 
 ```rust
-use gpq_tiles_core::pipeline::{generate_tiles_to_writer, TilerConfig};
-use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
-use gpq_tiles_core::compression::Compression;
+use tylertoo_core::pipeline::{generate_tiles_to_writer, TilerConfig};
+use tylertoo_core::pmtiles_writer::StreamingPmtilesWriter;
+use tylertoo_core::compression::Compression;
 
 // Create streaming writer
 let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;

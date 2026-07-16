@@ -1,4 +1,4 @@
-"""Tests for the gpq_tiles overview pipeline bindings.
+"""Tests for the tylertoo overview pipeline bindings.
 
 Covers overview(), export_pmtiles(), and validate(): API surface, knob
 plumbing (one happy-path test per knob group), error propagation, and
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-import gpq_tiles
+import tylertoo
 
 FIXTURES_DIR = Path(__file__).parent.parent.parent.parent / "tests" / "fixtures"
 REALDATA_DIR = FIXTURES_DIR / "realdata"
@@ -33,10 +33,10 @@ class TestRemoteInput:
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "o.parquet"
             with pytest.raises(RuntimeError, match="s3://"):
-                gpq_tiles.overview("ftp://example.com/x.parquet", str(out))
+                tylertoo.overview("ftp://example.com/x.parquet", str(out))
 
     def test_docstring_mentions_remote_urls(self):
-        doc = gpq_tiles.overview.__doc__
+        doc = tylertoo.overview.__doc__
         assert doc is not None
         assert "s3://" in doc
 
@@ -57,8 +57,8 @@ class TestMultiPartitionInput:
         with tempfile.TemporaryDirectory() as tmpdir:
             single = Path(tmpdir) / "single.parquet"
             double = Path(tmpdir) / "double.parquet"
-            r1 = gpq_tiles.overview(str(STREAMING_SMALL), str(single), max_zoom=4)
-            r2 = gpq_tiles.overview(
+            r1 = tylertoo.overview(str(STREAMING_SMALL), str(single), max_zoom=4)
+            r2 = tylertoo.overview(
                 [str(STREAMING_SMALL), str(STREAMING_SMALL)],
                 str(double),
                 max_zoom=4,
@@ -71,49 +71,49 @@ class TestMultiPartitionInput:
             out = Path(tmpdir) / "o.parquet"
             missing = Path(tmpdir) / "nope.parquet"
             with pytest.raises((RuntimeError, ValueError), match=r"nope\.parquet"):
-                gpq_tiles.overview(
+                tylertoo.overview(
                     [str(STREAMING_SMALL), str(missing)], str(out), max_zoom=4
                 )
 
     def test_input_wrong_type_is_type_error(self):
         with pytest.raises(TypeError, match=r"list\[str\]"):
-            gpq_tiles.overview(123, "/tmp/o.parquet")  # type: ignore[arg-type]
+            tylertoo.overview(123, "/tmp/o.parquet")  # type: ignore[arg-type]
 
     def test_empty_list_is_an_error(self):
         with pytest.raises((RuntimeError, ValueError)):
-            gpq_tiles.overview([], "/tmp/o.parquet")
+            tylertoo.overview([], "/tmp/o.parquet")
 
 
 class TestOverviewApi:
     """API-surface tests for overview() (no fixture needed)."""
 
     def test_overview_exists(self):
-        assert hasattr(gpq_tiles, "overview")
-        assert callable(gpq_tiles.overview)
+        assert hasattr(tylertoo, "overview")
+        assert callable(tylertoo.overview)
 
     def test_overview_has_docstring(self):
-        doc = gpq_tiles.overview.__doc__
+        doc = tylertoo.overview.__doc__
         assert doc is not None
         assert "overview" in doc.lower()
         assert "GeoParquet" in doc
 
     def test_overview_requires_input_output(self):
         with pytest.raises(TypeError):
-            gpq_tiles.overview()  # type: ignore[call-arg]
+            tylertoo.overview()  # type: ignore[call-arg]
 
     def test_overview_invalid_mode(self):
         with pytest.raises(ValueError, match=r"[Ii]nvalid mode"):
-            gpq_tiles.overview("/nonexistent.parquet", "/tmp/out.parquet", mode="bogus")
+            tylertoo.overview("/nonexistent.parquet", "/tmp/out.parquet", mode="bogus")
 
     def test_overview_invalid_sort_direction(self):
         with pytest.raises(ValueError, match="sort_direction"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet", "/tmp/out.parquet", sort_direction="sideways"
             )
 
     def test_overview_sort_key_and_class_rank_conflict(self):
         with pytest.raises(ValueError, match="mutually exclusive"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 sort_key="population",
@@ -123,7 +123,7 @@ class TestOverviewApi:
 
     def test_overview_class_ranks_without_column(self):
         with pytest.raises(ValueError, match="class_rank"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 class_ranks={"motorway": 5.0},
@@ -131,7 +131,7 @@ class TestOverviewApi:
 
     def test_overview_class_rank_column_without_ranks(self):
         with pytest.raises(ValueError, match="class_rank"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 class_rank_column="road_class",
@@ -139,7 +139,7 @@ class TestOverviewApi:
 
     def test_overview_empty_class_ranks(self):
         with pytest.raises(ValueError, match="class_ranks"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 class_rank_column="road_class",
@@ -148,7 +148,7 @@ class TestOverviewApi:
 
     def test_overview_accumulate_requires_cluster(self):
         with pytest.raises(ValueError, match="cluster"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 accumulate_attributes={"population": "sum"},
@@ -156,7 +156,7 @@ class TestOverviewApi:
 
     def test_overview_invalid_accumulate_op(self):
         with pytest.raises(ValueError, match="op"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 cluster=True,
@@ -165,7 +165,7 @@ class TestOverviewApi:
 
     def test_overview_cluster_requires_duplicating(self):
         with pytest.raises(ValueError, match="duplicating"):
-            gpq_tiles.overview(
+            tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 mode="partitioning",
@@ -178,48 +178,48 @@ class TestOverviewApi:
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "out.parquet"
             with pytest.raises(ValueError, match="level"):
-                gpq_tiles.overview(str(BUILDINGS), str(out), gsds=[100.0, 200.0])
+                tylertoo.overview(str(BUILDINGS), str(out), gsds=[100.0, 200.0])
 
     @needs_buildings
     def test_overview_invalid_zoom_range(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "out.parquet"
             with pytest.raises(ValueError, match="level"):
-                gpq_tiles.overview(str(BUILDINGS), str(out), min_zoom=8, max_zoom=2)
+                tylertoo.overview(str(BUILDINGS), str(out), min_zoom=8, max_zoom=2)
 
     def test_overview_nonexistent_input(self):
         with pytest.raises(RuntimeError):
-            gpq_tiles.overview("/nonexistent/input.parquet", "/tmp/out.parquet")
+            tylertoo.overview("/nonexistent/input.parquet", "/tmp/out.parquet")
 
 
 class TestExportPmtilesApi:
     def test_export_pmtiles_exists(self):
-        assert hasattr(gpq_tiles, "export_pmtiles")
-        assert callable(gpq_tiles.export_pmtiles)
+        assert hasattr(tylertoo, "export_pmtiles")
+        assert callable(tylertoo.export_pmtiles)
 
     def test_export_pmtiles_has_docstring(self):
-        doc = gpq_tiles.export_pmtiles.__doc__
+        doc = tylertoo.export_pmtiles.__doc__
         assert doc is not None
         assert "PMTiles" in doc
 
     def test_export_pmtiles_nonexistent_input(self):
         with pytest.raises(RuntimeError):
-            gpq_tiles.export_pmtiles("/nonexistent.parquet", "/tmp/out.pmtiles")
+            tylertoo.export_pmtiles("/nonexistent.parquet", "/tmp/out.pmtiles")
 
 
 class TestValidateApi:
     def test_validate_exists(self):
-        assert hasattr(gpq_tiles, "validate")
-        assert callable(gpq_tiles.validate)
+        assert hasattr(tylertoo, "validate")
+        assert callable(tylertoo.validate)
 
     def test_validate_has_docstring(self):
-        doc = gpq_tiles.validate.__doc__
+        doc = tylertoo.validate.__doc__
         assert doc is not None
         assert "check" in doc.lower()
 
     def test_validate_nonexistent_file(self):
         with pytest.raises(RuntimeError):
-            gpq_tiles.validate("/nonexistent.parquet")
+            tylertoo.validate("/nonexistent.parquet")
 
 
 @needs_buildings
@@ -228,7 +228,7 @@ class TestOverviewIntegration:
 
     def _overview(self, tmpdir, **kwargs):
         out = Path(tmpdir) / "overview.parquet"
-        report = gpq_tiles.overview(str(BUILDINGS), str(out), **kwargs)
+        report = tylertoo.overview(str(BUILDINGS), str(out), **kwargs)
         assert out.exists()
         return out, report
 
@@ -255,7 +255,7 @@ class TestOverviewIntegration:
             assert report["levels"][-1]["feature_count"] == report["input_features"]
 
             # Output must pass the spec conformance checklist.
-            result = gpq_tiles.validate(str(out))
+            result = tylertoo.validate(str(out))
             assert result["valid"] is True
             assert len(result["checks"]) > 0
             assert all(c["passed"] for c in result["checks"])
@@ -301,7 +301,7 @@ class TestOverviewIntegration:
             assert report["mode"] == "partitioning"
             # Partitioning: each feature appears exactly once.
             assert report["total_rows"] == report["input_features"]
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_thinning_and_visibility_knobs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -337,7 +337,7 @@ class TestOverviewIntegration:
     def test_overview_sort_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out, _ = self._overview(tmpdir, max_zoom=4, sort_key="area_in_meters")
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_sort_key_ascending(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -347,18 +347,18 @@ class TestOverviewIntegration:
                 sort_key="area_in_meters",
                 sort_direction="asc",
             )
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_sort_key_missing_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "overview.parquet"
             with pytest.raises(ValueError, match="not found"):
-                gpq_tiles.overview(str(BUILDINGS), str(out), sort_key="no_such_column")
+                tylertoo.overview(str(BUILDINGS), str(out), sort_key="no_such_column")
 
     def test_overview_no_auto_rank(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out, _ = self._overview(tmpdir, max_zoom=4, no_auto_rank=True)
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_density_budget_knobs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -375,13 +375,13 @@ class TestOverviewIntegration:
                 cluster=True,
                 accumulate_attributes={"area_in_meters": "sum"},
             )
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_accumulate_missing_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "overview.parquet"
             with pytest.raises(ValueError, match="not found"):
-                gpq_tiles.overview(
+                tylertoo.overview(
                     str(BUILDINGS),
                     str(out),
                     cluster=True,
@@ -398,12 +398,12 @@ class TestOverviewIntegration:
                 coalesce_junction_angle=30.0,
                 coalesce_max_level_rows=100_000,
             )
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_no_coalesce(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out, _ = self._overview(tmpdir, max_zoom=4, coalesce_lines=False)
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_streaming_off_matches_streaming_on(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -427,14 +427,14 @@ class TestOverviewIntegration:
             out, _ = self._overview(
                 tmpdir, max_zoom=4, row_group_size=500, full_column_stats=True
             )
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_cogp_compat(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out, _ = self._overview(
                 tmpdir, mode="partitioning", max_zoom=4, cogp_compat=True
             )
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
 
 @needs_roads
@@ -444,19 +444,19 @@ class TestOverviewClassRankIntegration:
     def test_overview_class_rank(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "overview.parquet"
-            gpq_tiles.overview(
+            tylertoo.overview(
                 str(ROADS),
                 str(out),
                 max_zoom=4,
                 class_rank_column="geometry_type",
                 class_ranks={"LineString": 3.0, "MultiLineString": 2.0},
             )
-            assert gpq_tiles.validate(str(out))["valid"] is True
+            assert tylertoo.validate(str(out))["valid"] is True
 
     def test_overview_class_rank_unknown_override(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "overview.parquet"
-            gpq_tiles.overview(
+            tylertoo.overview(
                 str(ROADS),
                 str(out),
                 max_zoom=4,
@@ -470,7 +470,7 @@ class TestOverviewClassRankIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "overview.parquet"
             with pytest.raises(ValueError, match="not found"):
-                gpq_tiles.overview(
+                tylertoo.overview(
                     str(ROADS),
                     str(out),
                     class_rank_column="no_such_column",
@@ -485,14 +485,14 @@ class TestExportPmtilesIntegration:
         # polygon_visibility=0 keeps every level populated for the tiny
         # building footprints, so the export covers the full zoom range.
         kwargs.setdefault("polygon_visibility", 0.0)
-        gpq_tiles.overview(str(BUILDINGS), str(out), min_zoom=11, max_zoom=14, **kwargs)
+        tylertoo.overview(str(BUILDINGS), str(out), min_zoom=11, max_zoom=14, **kwargs)
         return out
 
     def test_export_defaults_and_report(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ovr = self._make_overview(tmpdir)
             pm = Path(tmpdir) / "out.pmtiles"
-            report = gpq_tiles.export_pmtiles(str(ovr), str(pm))
+            report = tylertoo.export_pmtiles(str(ovr), str(pm))
 
             assert pm.exists()
             assert pm.stat().st_size > 0
@@ -510,7 +510,7 @@ class TestExportPmtilesIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             ovr = self._make_overview(tmpdir)
             pm = Path(tmpdir) / "out.pmtiles"
-            report = gpq_tiles.export_pmtiles(
+            report = tylertoo.export_pmtiles(
                 str(ovr),
                 str(pm),
                 layer_name="buildings",
@@ -525,7 +525,7 @@ class TestExportPmtilesIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             pm = Path(tmpdir) / "out.pmtiles"
             with pytest.raises(RuntimeError):
-                gpq_tiles.export_pmtiles(str(BUILDINGS), str(pm))
+                tylertoo.export_pmtiles(str(BUILDINGS), str(pm))
 
 
 @needs_buildings
@@ -533,9 +533,9 @@ class TestValidateIntegration:
     def test_validate_structure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ovr = Path(tmpdir) / "overview.parquet"
-            gpq_tiles.overview(str(BUILDINGS), str(ovr), max_zoom=3)
+            tylertoo.overview(str(BUILDINGS), str(ovr), max_zoom=3)
 
-            result = gpq_tiles.validate(str(ovr))
+            result = tylertoo.validate(str(ovr))
             assert set(result.keys()) == {"valid", "checks"}
             assert isinstance(result["valid"], bool)
             for check in result["checks"]:
@@ -545,6 +545,6 @@ class TestValidateIntegration:
 
     def test_validate_rejects_plain_geoparquet(self):
         """A plain (non-overview) GeoParquet file must fail validation."""
-        result = gpq_tiles.validate(str(BUILDINGS))
+        result = tylertoo.validate(str(BUILDINGS))
         assert result["valid"] is False
         assert any(not c["passed"] for c in result["checks"])

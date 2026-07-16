@@ -23,7 +23,7 @@ Dataset: `corpus/data/gpio/polygons-ftw-moldova-large.parquet`
 V3 `run_conversion.sh` recipe):
 
 ```bash
-/usr/bin/time -v target/release/gpq-tiles overview \
+/usr/bin/time -v target/release/tylertoo overview \
   corpus/data/gpio/polygons-ftw-moldova-large.parquet \
   out.parquet --mode duplicating \
   --min-zoom 0 --max-zoom 14 [--no-streaming]
@@ -52,7 +52,7 @@ Both runs on the same release build, same machine, sequential
 - `geo` (GeoParquet 1.1) footer JSON: **byte-identical**.
 - Rows: 1,583,053 across 12 emitted levels in both; row groups: 167 in
   both; per-level feature and vertex counts identical at every level.
-- Both files pass all 9 `gpq-tiles validate` checks.
+- Both files pass all 9 `tylertoo validate` checks.
 - Compressed level bytes differ marginally (e.g. canonical 97.25 vs
   97.33 MiB): the streaming writer encodes many read-batch-sized
   batches per row group instead of one level-sized batch, which
@@ -148,7 +148,7 @@ Input `corpus/data/bench/h3/moldova.dup.stream.parquet` (632k
 polygons, duplicating z0–14), command:
 
 ```bash
-/usr/bin/time -v target/release/gpq-tiles \
+/usr/bin/time -v target/release/tylertoo \
   export-pmtiles \
   corpus/data/bench/h3/moldova.dup.stream.parquet \
   out.pmtiles --layer-name fields
@@ -180,4 +180,4 @@ load; best-of-pairs shown:
   restructure is wall-neutral and memory is the win.
 - Debug-level `[profile]` instrumentation now also logs per-partition
   `rows_read / members / collect / sort+encode` (kept, like the H3(c)
-  instrumentation, behind `RUST_LOG=gpq_tiles_core::overview=debug`).
+  instrumentation, behind `RUST_LOG=tylertoo_core::overview=debug`).

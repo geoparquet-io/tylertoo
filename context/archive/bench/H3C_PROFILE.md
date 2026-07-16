@@ -7,7 +7,7 @@ machine, release build.
 
 Method: `std::time::Instant` phase accumulators in
 `crates/core/src/overview/stream.rs` and `export.rs`, logged at
-`RUST_LOG=gpq_tiles_core::overview=debug` (instrumentation retained behind that
+`RUST_LOG=tylertoo_core::overview=debug` (instrumentation retained behind that
 log level), plus `/usr/bin/time -v` and live `ps`/`/proc/<pid>/task` sampling.
 `perf` was unavailable (`perf_event_paranoid=4`, no sudo); the simplify
 decomposition below came from a throwaway micro-benchmark on real Moldova
@@ -175,13 +175,13 @@ Amdahl ceilings assume 16 cores and the measured serial shares.
 
 ```bash
 cargo build --release
-RUST_LOG=gpq_tiles_core::overview=debug \
-  /usr/bin/time -v target/release/gpq-tiles overview \
+RUST_LOG=tylertoo_core::overview=debug \
+  /usr/bin/time -v target/release/tylertoo overview \
   corpus/data/gpio/polygons-ftw-moldova-large.parquet \
   /tmp/moldova.dup.parquet \
   --mode duplicating --min-zoom 0 --max-zoom 14
-RUST_LOG=gpq_tiles_core::overview=debug \
-  /usr/bin/time -v target/release/gpq-tiles export-pmtiles \
+RUST_LOG=tylertoo_core::overview=debug \
+  /usr/bin/time -v target/release/tylertoo export-pmtiles \
   /tmp/moldova.dup.parquet /tmp/moldova.pmtiles \
   --layer-name fields
 ```
@@ -218,7 +218,7 @@ Baselines are the H3 artifacts in `corpus/data/bench/h3/` (same commands).
 | `export-pmtiles` | 288.5 s | **58.8 s** | **4.9×** | 2.16 GB | 2.38 GB |
 
 CPU utilization: convert 557 %, export 828 % (of 1600 %). Output validation:
-all 9 `gpq-tiles validate` checks pass; export reports **0 oversized tiles**
+all 9 `tylertoo validate` checks pass; export reports **0 oversized tiles**
 (17,372 tiles in both runs).
 
 ### Output size drop (the fallback fix, intended)

@@ -1,6 +1,6 @@
-# gpq-tiles fuzz targets
+# tylertoo fuzz targets
 
-`cargo-fuzz` targets for the untrusted-bytes surfaces of `gpq-tiles-core`
+`cargo-fuzz` targets for the untrusted-bytes surfaces of `tylertoo-core`
 (issue #187). This crate is a **standalone workspace** — it is not a member
 of the root workspace and never affects `cargo build/check/test --workspace`
 or per-PR CI time.

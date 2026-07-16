@@ -175,7 +175,7 @@ it can be promoted to the default in a subsequent release once real-world
 usage confirms no edge-case surprises.
 
 Raw data: `corpus/data/bench/sweep202/{rg10k,rg25k,rg50k,rg100k,zoom-scaled}/`
-(local), `s3://gpq-tiles-bench/sweep202/` (remote, can be deleted after
+(local), `s3://tylertoo-bench/sweep202/` (remote, can be deleted after
 this decision is final).
 
 ## Decision 6: `--polygon-visibility 2.0` (retuned from 4.0) + the coarse-zoom dot-fill recipe (issue #259)

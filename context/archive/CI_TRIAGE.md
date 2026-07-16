@@ -23,7 +23,7 @@ That both resolves the Test-job failure and shrinks the suite; see
 | Check (clippy) | "Run clippy" | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Check (unit) | "Run unit tests" | `cargo test --lib --all-features` |
 | Test (ubuntu, stable) | "Run all tests (excluding slow regression tests)" | `cargo test --all-features -- --skip large_polygon_regression` |
-| Coverage | "Generate coverage" | `cargo tarpaulin --out xml --all-features --workspace --exclude gpq-tiles-python` |
+| Coverage | "Generate coverage" | `cargo tarpaulin --out xml --all-features --workspace --exclude tylertoo-python` |
 | Security Audit | "Run security audit" | `cargo audit` |
 
 Note: the local RTK proxy mangles `cargo clippy ... -- -D warnings` (splits
@@ -134,8 +134,8 @@ the breaking changes touch this crate's API surface: the binding uses only
 The migration was therefore a **pure version bump** — no source changes beyond
 updating two stale "PyO3 0.28" code comments. `maturin`/`pyproject.toml` needed
 no change (`maturin>=1.0,<2.0` supports pyo3 0.29; no `pyo3-build-config` pin).
-Verified: `cargo check -p gpq-tiles-python` ✓, `cargo clippy -p
-gpq-tiles-python --all-targets --all-features -- -D warnings` ✓, `uv run maturin
+Verified: `cargo check -p tylertoo-python` ✓, `cargo clippy -p
+tylertoo-python --all-targets --all-features -- -D warnings` ✓, `uv run maturin
 develop` ✓ (built cp311 wheel against pyo3 0.29), `uv run pytest` 31 passed (the
 11 failures are pre-existing `streaming_mode`/`parallel_tiles`/`parallel_geoms`
 kwarg-mismatch tests unrelated to pyo3 — those kwargs are not in the `convert()`

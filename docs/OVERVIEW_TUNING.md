@@ -1,6 +1,6 @@
 # Overview Generalization Tuning
 
-`gpq-tiles overview` turns a GeoParquet file into a multi-resolution
+`tylertoo overview` turns a GeoParquet file into a multi-resolution
 [overview file](architecture.md) — several precomputed generalizations of the
 dataset at increasing detail (levels `0` = coarsest … `L-1` = finest /
 canonical). Two families of knobs control how much detail each coarse level
@@ -272,7 +272,7 @@ gate turns the coarse levels into a cell-winner/budget-bounded **dot
 field**:
 
 ```bash
-gpq-tiles overview buildings.parquet buildings_overview.parquet \
+tylertoo overview buildings.parquet buildings_overview.parquet \
   --min-zoom 0 --max-zoom 14 \
   --polygon-visibility 0 --collapse
 
@@ -282,7 +282,7 @@ gpq-tiles overview buildings.parquet buildings_overview.parquet \
 # On multi-GB inputs also pass --profile bounded: the recipe buffers
 # the (now much larger) coarse levels in RAM under the default speed
 # profile (Germany peak RSS 15 -> 29 GB without it).
-gpq-tiles tiles buildings.parquet buildings.pmtiles \
+tylertoo tiles buildings.parquet buildings.pmtiles \
   --min-zoom 0 --max-zoom 14 \
   --polygon-visibility 0 --collapse --max-tile-size 500K \
   --profile bounded
@@ -453,7 +453,7 @@ becomes the `OP` over itself + everything it absorbed at that level. Ops:
 `sum`, `max`, `min`, `mean`. Examples:
 
 ```bash
-gpq-tiles overview places.parquet places_overview.parquet \
+tylertoo overview places.parquet places_overview.parquet \
   --min-zoom 0 --max-zoom 14 \
   --cluster \
   --accumulate-attribute population:sum \
@@ -481,7 +481,7 @@ Notes:
 
 Clustering is recorded in the footer `geo:overviews` →
 `generalization.clustering` provenance (`enabled`, `point_count_column`,
-`accumulated: [{column, op}]`); `gpq-tiles validate` checks that the column
+`accumulated: [{column, op}]`); `tylertoo validate` checks that the column
 exists as INT64 NOT NULL and that canonical-level values are all 1.
 
 ---
@@ -520,11 +520,11 @@ run:
 
 ```bash
 # Coalescing is on by default (auto class ranking groups by road class):
-gpq-tiles overview roads.parquet roads_overview.parquet \
+tylertoo overview roads.parquet roads_overview.parquet \
   --min-zoom 0 --max-zoom 14
 
 # Opt out (pre-Q3 behavior, no coalesced_count column):
-gpq-tiles overview roads.parquet roads_overview.parquet \
+tylertoo overview roads.parquet roads_overview.parquet \
   --min-zoom 0 --max-zoom 14 --no-coalesce-lines
 ```
 
@@ -590,7 +590,7 @@ coalescing matters least. This is the streaming pipeline's one deliberate
 Coalescing is recorded in the footer `geo:overviews` →
 `generalization.coalescing` provenance (`enabled`,
 `snap_tolerance_gsd_factor`, `junction_angle`, `max_level_rows`,
-`coalesced_count_column` — the complete knob set, spec §13.4); `gpq-tiles
+`coalesced_count_column` — the complete knob set, spec §13.4); `tylertoo
 validate` checks that the column exists as INT32 NOT NULL, all values are
 >= 1, and canonical-level values are all 1.
 
@@ -725,7 +725,7 @@ a city from a country-wide file without processing the whole dataset.
 
 ```bash
 # Tile just Antananarivo from a Madagascar-wide file
-gpq-tiles overview madagascar.parquet antananarivo.parquet \
+tylertoo overview madagascar.parquet antananarivo.parquet \
   --bbox 47.4,-19.0,47.6,-18.8 \
   --min-zoom 0 --max-zoom 14
 ```

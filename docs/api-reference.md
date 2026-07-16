@@ -1,6 +1,6 @@
 # API Reference
 
-The authoritative flag reference is `gpq-tiles <subcommand> --help`; the
+The authoritative flag reference is `tylertoo <subcommand> --help`; the
 tables below summarize it. Knob semantics (directions, interactions,
 why the defaults are what they are) live in
 [Overview Tuning](OVERVIEW_TUNING.md).
@@ -8,7 +8,7 @@ why the defaults are what they are) live in
 ## CLI
 
 ```bash
-gpq-tiles <COMMAND>
+tylertoo <COMMAND>
 
 Commands:
   tiles           GeoParquet → PMTiles one-shot (facade; also the bare form)
@@ -18,7 +18,7 @@ Commands:
   decode          Decode a PMTiles v3 vector archive back to GeoParquet
 ```
 
-### `gpq-tiles overview <INPUT> <OUTPUT>`
+### `tylertoo overview <INPUT> <OUTPUT>`
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -56,7 +56,7 @@ Commands:
 | `--spill-dir <PATH>` | `$TMPDIR` | Directory for the remote-input spill file (≈1× the touched input bytes; a free-space preflight warns on a projected shortfall). Must exist; local inputs never spill |
 | `--report <PATH>` | — | Write the JSON conversion report |
 
-### `gpq-tiles export-pmtiles <INPUT> <OUTPUT>`
+### `tylertoo export-pmtiles <INPUT> <OUTPUT>`
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -69,13 +69,13 @@ Commands:
 Tiles are gzip-compressed (the PMTiles-viewer-safe default; there is no
 compression knob).
 
-### `gpq-tiles validate <FILE>`
+### `tylertoo validate <FILE>`
 
 Checks an overview file against spec §6.2 (footer schema, level banding,
 canonical fidelity, cluster/coalescing column invariants, bbox covering).
 Exit code 0 on pass.
 
-### `gpq-tiles tiles <INPUT> <OUTPUT>` (and the bare form)
+### `tylertoo tiles <INPUT> <OUTPUT>` (and the bare form)
 
 One-shot facade: overview convert → temporary GeoParquet → export-pmtiles.
 
@@ -95,7 +95,7 @@ line coalescing, and the memory/performance flags (`--profile`,
 `--read-batch-size`, `--in-flight-batches`, `--no-streaming`) — is also
 accepted here and threads through to the overview stage unchanged, so a
 one-shot `tiles` run is equivalent to the two-step chain with the same
-flags. `gpq-tiles tiles --help` groups them under headings. Overview
+flags. `tylertoo tiles --help` groups them under headings. Overview
 **format** options that have no PMTiles meaning (`--mode`, `--gsd`,
 `--cogp-compat`, `--report`) stay on `overview`.
 
@@ -121,7 +121,7 @@ The only reason to do so is **byte-stable tile output**: the fast path is
 render-equivalent but not byte-identical to the fallback (rotation only), so
 downstream consumers that hash raw tile bytes will see different hashes.
 
-### `gpq-tiles decode <INPUT> <OUTPUT>`
+### `tylertoo decode <INPUT> <OUTPUT>`
 
 Decode a PMTiles v3 vector archive back to GeoParquet (tippecanoe-decode
 semantics). The output is the **tiled** representation — simplified,
@@ -137,19 +137,19 @@ guarantee; `zoom`/`layer`/`mvt_id` columns carry provenance for filtering.
 
 See [Decoding PMTiles](decode.md) for output columns and limitations.
 Decode has no Python binding; it is CLI- and Rust-only
-(`gpq_tiles_core::decode::decode_pmtiles` / `DecodeOptions`).
+(`tylertoo_core::decode::decode_pmtiles` / `DecodeOptions`).
 
 ---
 
 ## Python API
 
-Type stubs ship with the wheel (`gpq_tiles.pyi`, verified against the
+Type stubs ship with the wheel (`tylertoo.pyi`, verified against the
 built module by `mypy.stubtest` in CI).
 
 ### `overview()`
 
 ```python
-from gpq_tiles import overview
+from tylertoo import overview
 
 report = overview(
     input: str,
@@ -203,7 +203,7 @@ Parameters mirror the CLI flags above one-to-one (booleans instead of
 ### `export_pmtiles()`
 
 ```python
-from gpq_tiles import export_pmtiles
+from tylertoo import export_pmtiles
 
 report = export_pmtiles(
     input: str,
@@ -220,7 +220,7 @@ report = export_pmtiles(
 ### `validate()`
 
 ```python
-from gpq_tiles import validate
+from tylertoo import validate
 
 result = validate(file: str) -> dict  # per-check pass/fail report
 ```
@@ -228,7 +228,7 @@ result = validate(file: str) -> dict  # per-check pass/fail report
 ### `convert()` (deprecated facade)
 
 ```python
-from gpq_tiles import convert
+from tylertoo import convert
 
 convert(
     input: str,
@@ -250,14 +250,14 @@ for conversion failures (missing file, invalid GeoParquet, wrong CRS).
 
 ---
 
-## Rust API (`gpq-tiles-core`)
+## Rust API (`tylertoo-core`)
 
 The production entry points are in the `overview` module:
 
 ```rust
-use gpq_tiles_core::overview::convert::{convert_to_overviews, ConvertOptions, ConvertReport};
-use gpq_tiles_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
-use gpq_tiles_core::overview::check::validate_file;
+use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, ConvertReport};
+use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+use tylertoo_core::overview::check::validate_file;
 use std::path::Path;
 
 // GeoParquet → overview GeoParquet
@@ -275,7 +275,7 @@ let validation = validate_file("overviews.parquet")?;
 ```
 
 `ConvertOptions` / `ExportOptions` fields correspond to the CLI flags;
-see the rustdoc (`cargo doc --package gpq-tiles-core --open`) for the
+see the rustdoc (`cargo doc --package tylertoo-core --open`) for the
 full structs, report types, and error enums (`ConvertError`,
 `ExportError`, `CheckError`).
 

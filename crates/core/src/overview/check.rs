@@ -1077,7 +1077,7 @@ mod tests {
             .collect();
         let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
         opts.generalization = Some(Generalization {
-            engine: "gpq-tiles test".to_string(),
+            engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
             levels: vec![],
@@ -1275,7 +1275,7 @@ mod tests {
             .collect();
         let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
         opts.generalization = Some(Generalization {
-            engine: "gpq-tiles test".to_string(),
+            engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
             levels: vec![],
