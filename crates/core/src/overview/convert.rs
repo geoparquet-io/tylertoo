@@ -1745,6 +1745,138 @@ pub(super) fn feature_kind(g: &Geometry<f64>) -> FeatureKind {
     }
 }
 
+/// Accumulator for [`scan_feature`]: min/max over the bounding-rect coord set
+/// plus a finiteness/non-empty tally over *all* coords.
+#[derive(Debug)]
+struct FeatureScan {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+    /// A bounding-rect coord was seen (exterior of polygons; every coord of
+    /// other kinds). When false the bbox is undefined ([`geometry_bbox`] → 0s).
+    bbox_seen: bool,
+    /// Any coord at all was seen (matches `usable_geometry`'s non-empty test).
+    any_coord: bool,
+    /// Every coord seen so far is finite (matches `usable_geometry`).
+    finite: bool,
+}
+
+impl FeatureScan {
+    fn new() -> Self {
+        FeatureScan {
+            min_x: f64::INFINITY,
+            min_y: f64::INFINITY,
+            max_x: f64::NEG_INFINITY,
+            max_y: f64::NEG_INFINITY,
+            bbox_seen: false,
+            any_coord: false,
+            finite: true,
+        }
+    }
+
+    /// A coord that counts for BOTH the bounding box and the finiteness tally
+    /// (i.e. a coord `bounding_rect` would include: points, line vertices,
+    /// polygon *exterior* rings).
+    #[inline]
+    fn note_bbox(&mut self, c: geo::Coord<f64>) {
+        self.any_coord = true;
+        if !c.x.is_finite() || !c.y.is_finite() {
+            self.finite = false;
+            return;
+        }
+        self.bbox_seen = true;
+        if c.x < self.min_x {
+            self.min_x = c.x;
+        }
+        if c.y < self.min_y {
+            self.min_y = c.y;
+        }
+        if c.x > self.max_x {
+            self.max_x = c.x;
+        }
+        if c.y > self.max_y {
+            self.max_y = c.y;
+        }
+    }
+
+    /// A coord that counts for finiteness/non-empty only, NOT the bbox —
+    /// polygon *interior* rings, which `bounding_rect` ignores but
+    /// `usable_geometry` (via `coords_iter`) includes.
+    #[inline]
+    fn note_finite_only(&mut self, c: geo::Coord<f64>) {
+        self.any_coord = true;
+        if !c.x.is_finite() || !c.y.is_finite() {
+            self.finite = false;
+        }
+    }
+
+    fn bbox(&self) -> [f64; 4] {
+        if self.bbox_seen {
+            [self.min_x, self.min_y, self.max_x, self.max_y]
+        } else {
+            // Matches `geometry_bbox` when `bounding_rect` is `None`.
+            [0.0, 0.0, 0.0, 0.0]
+        }
+    }
+}
+
+/// Walk `g` into `scan`, distinguishing bbox-contributing coords (exterior
+/// rings) from finiteness-only coords (polygon interiors), recursing through
+/// geometry collections. Mirrors `bounding_rect`'s coord set and
+/// `coords_iter`'s coord set exactly.
+fn scan_geometry_into(g: &Geometry<f64>, scan: &mut FeatureScan) {
+    use geo::coords_iter::CoordsIter;
+    let scan_polygon = |poly: &geo::Polygon<f64>, scan: &mut FeatureScan| {
+        for c in poly.exterior().coords_iter() {
+            scan.note_bbox(c);
+        }
+        for ring in poly.interiors() {
+            for c in ring.coords_iter() {
+                scan.note_finite_only(c);
+            }
+        }
+    };
+    match g {
+        Geometry::Polygon(poly) => scan_polygon(poly, scan),
+        Geometry::MultiPolygon(mp) => {
+            for poly in &mp.0 {
+                scan_polygon(poly, scan);
+            }
+        }
+        Geometry::GeometryCollection(gc) => {
+            for child in &gc.0 {
+                scan_geometry_into(child, scan);
+            }
+        }
+        // Every other kind's `bounding_rect` set == its `coords_iter` set.
+        other => {
+            for c in other.coords_iter() {
+                scan.note_bbox(c);
+            }
+        }
+    }
+}
+
+/// Fused single-traversal replacement for `usable_geometry` + `geometry_bbox`
+/// + `feature_kind` used by the streaming pass-1 scan (#274).
+///
+/// Returns `None` for a geometry `usable_geometry` would reject (empty or any
+/// non-finite coord), otherwise `(feature_kind(g), geometry_bbox(g))`. It is
+/// byte-equivalent to calling those three functions in sequence — the bbox is
+/// exterior-only for polygons, finiteness spans all coords — but walks the
+/// decoded geometry once instead of twice (`usable_geometry` iterated every
+/// coord, then `bounding_rect` iterated the exterior again). The
+/// `scan_feature_matches_components` proptest pins the equivalence.
+pub(super) fn scan_feature(g: &Geometry<f64>) -> Option<(FeatureKind, [f64; 4])> {
+    let mut scan = FeatureScan::new();
+    scan_geometry_into(g, &mut scan);
+    if !scan.finite || !scan.any_coord {
+        return None;
+    }
+    Some((feature_kind(g), scan.bbox()))
+}
+
 /// Count coordinates (vertices) in a geometry.
 pub(super) fn count_vertices(g: &Geometry<f64>) -> usize {
     use geo::coords_iter::CoordsIter;
@@ -2729,6 +2861,61 @@ pub(super) fn fill_level_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #274: proptest pinning `scan_feature` byte-equivalent to the three
+    /// functions it fuses (`usable_geometry` + `geometry_bbox` + `feature_kind`).
+    /// Generates points/lines/polygons/multis with holes and occasional
+    /// non-finite/empty coords, exercising every parity edge (exterior-only
+    /// polygon bbox, all-coords finiteness, empty-exterior → 0-bbox).
+    mod scan_feature_props {
+        use super::super::{feature_kind, geometry_bbox, scan_feature, usable_geometry};
+        use geo::{Geometry, LineString, MultiLineString, MultiPolygon, Point, Polygon};
+        use proptest::prelude::*;
+
+        fn any_f64() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                8 => -1.0e6f64..1.0e6f64,
+                1 => Just(f64::NAN),
+                1 => prop_oneof![Just(f64::INFINITY), Just(f64::NEG_INFINITY)],
+            ]
+        }
+        fn any_coord() -> impl Strategy<Value = geo::Coord<f64>> {
+            (any_f64(), any_f64()).prop_map(|(x, y)| geo::Coord { x, y })
+        }
+        fn any_ring() -> impl Strategy<Value = LineString<f64>> {
+            proptest::collection::vec(any_coord(), 0..6).prop_map(LineString::new)
+        }
+        fn any_polygon() -> impl Strategy<Value = Polygon<f64>> {
+            (any_ring(), proptest::collection::vec(any_ring(), 0..3))
+                .prop_map(|(ext, ints)| Polygon::new(ext, ints))
+        }
+        fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
+            prop_oneof![
+                any_coord().prop_map(|c| Geometry::Point(Point::from(c))),
+                proptest::collection::vec(any_coord(), 0..5)
+                    .prop_map(|cs| Geometry::MultiPoint(cs.into_iter().map(Point::from).collect())),
+                any_ring().prop_map(Geometry::LineString),
+                proptest::collection::vec(any_ring(), 0..3)
+                    .prop_map(|ls| Geometry::MultiLineString(MultiLineString::new(ls))),
+                any_polygon().prop_map(Geometry::Polygon),
+                proptest::collection::vec(any_polygon(), 0..3)
+                    .prop_map(|ps| Geometry::MultiPolygon(MultiPolygon::new(ps))),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn scan_feature_matches_components(g in any_geometry()) {
+                let expected = if usable_geometry(&g) {
+                    Some((feature_kind(&g), geometry_bbox(&g)))
+                } else {
+                    None
+                };
+                prop_assert_eq!(scan_feature(&g), expected);
+            }
+        }
+    }
+
     use crate::overview::check::validate_file;
     use crate::overview::level::gsd;
     use crate::overview::reader::OverviewReader;

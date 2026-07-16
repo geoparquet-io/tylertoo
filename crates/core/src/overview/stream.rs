@@ -73,12 +73,12 @@ use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
-    count_vertices, extract_class_ranks, extract_sort_keys, feature_kind, fill_level_bytes,
-    find_geometry_column, geometry_bbox, mixed_geometry_field, overture_road_ranking,
-    record_level_outcome, resolve_reserved_column_collisions, usable_geometry,
-    validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, ClassRanking,
-    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, SkippedLevelReport,
-    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    count_vertices, extract_class_ranks, extract_sort_keys, fill_level_bytes, find_geometry_column,
+    mixed_geometry_field, overture_road_ranking, record_level_outcome,
+    resolve_reserved_column_collisions, scan_feature, validate_cluster_schema,
+    validate_coalesce_schema, warn_plan_skipped_levels, ClassRanking, CoalesceTable, ConvertError,
+    ConvertOptions, ConvertReport, GroupInterner, SkippedLevelReport, KNOWN_ROAD_CLASSES,
+    ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipeline;
@@ -988,7 +988,15 @@ fn run_pass1(
         // skipped row must never shift attributes onto a neighbor's geometry).
         let base = num_rows;
         for (i, gopt) in geoms_buf.iter().enumerate() {
-            let Some(g) = gopt.as_ref().filter(|g| usable_geometry(g)) else {
+            let Some(g) = gopt.as_ref() else {
+                skipped_rows += 1;
+                continue;
+            };
+            // #274: a single geometry walk yields the usable filter, bbox, and
+            // kind (was `usable_geometry` + `geometry_bbox` + `feature_kind`,
+            // which traversed the coords twice). `None` == unusable (empty or
+            // non-finite), identical to the old `usable_geometry` reject.
+            let Some((kind, fbbox)) = scan_feature(g) else {
                 skipped_rows += 1;
                 continue;
             };
@@ -996,13 +1004,11 @@ fn run_pass1(
             // produces no AssignFeature — its winner-table slot stays at the
             // UNASSIGNED sentinel, so pass 2 drops the row too. The row index
             // still advances (row-keyed tables stay aligned).
-            let fbbox = geometry_bbox(g);
             if let Some(bb) = bbox_units {
                 if !super::convert::bboxes_intersect(&fbbox, bb) {
                     continue;
                 }
             }
-            let kind = feature_kind(g);
             if matches!(kind, FeatureKind::Point) {
                 point_count += 1;
             }
