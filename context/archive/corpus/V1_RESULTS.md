@@ -211,7 +211,7 @@ only one present and the metadata points at it. Verified by unit test
 `preexisting_bbox_covering_is_not_duplicated` and end-to-end here (no
 `bbox_1` in any output; covering matches simplified geometry).
 
-### F2 (OPEN, design) — `level` column name vs. source `LEVEL` attribute
+### F2 (RESOLVED — auto-rename, #288) — `level` column name vs. source `LEVEL` attribute
 
 The spec mandates a column named exactly `level` (§4.1). The writer only
 rejects a source column named `level` **case-sensitively**, so a source
@@ -221,10 +221,22 @@ through and coexists with the overview `level`. Footer/parquet readers
 level = <canonical>` binds to the *original* `LEVEL` attribute and
 returns wrong/zero rows — silently defeating the spec's one-predicate
 analysis contract (§5.3). Only `monster-admin` is affected in this corpus.
-This is a design decision (error out? auto-rename the clashing source
-column? spec guidance?), not a local writer bug, so it is documented
-rather than fixed. `verify.sh` works around it by using DuckDB's
-disambiguated `level_1` and flags the collision in the notes.
+
+**Resolved (#288):** the design question ("error out? auto-rename the
+clashing source column? spec guidance?") was decided in favor of
+**auto-rename**. Real-world data will inevitably carry short generic
+property names (`level` = Overture buildings' floor number, `LEVEL` =
+admin data), and rejecting the flagship public dataset outright was not
+acceptable. The engine now renames any input column colliding
+(case-insensitively) with a reserved overview column — `level` always,
+`point_count`/`coalesced_count` when clustering/coalescing — by appending
+`_` until free (e.g. `level` → `level_`), emitting a warning and keeping
+the reserved output column authoritative. Any `--sort-key` /
+`--class-rank` / `--accumulate-attribute` naming the renamed column is
+rewritten to follow it. The writer's case-insensitive reject remains a
+backstop (it never sees a colliding column now). The normative §4.1
+wording is being folded into the `geo:overviews` spec-alignment thread
+rather than amended here.
 
 ### F3 (INFORMATIONAL) — vertex-count non-monotonicity
 
