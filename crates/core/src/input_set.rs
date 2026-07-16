@@ -475,6 +475,33 @@ impl ConvertSource {
         total
     }
 
+    /// Stage every part's selected row groups to local disk up front (pass 0,
+    /// #286/#287) so the streaming passes read from disk, not the network.
+    ///
+    /// Each remote part coalesces its selected row groups into one parallel
+    /// range request per row group (a row group is a contiguous byte span);
+    /// local parts are no-ops. Parts are staged in order so resident memory
+    /// stays bounded by one part's in-flight spans. `selection` (`None` = all
+    /// row groups) is the per-part bbox pruning the passes will honor, so
+    /// pruned groups are never fetched and total network traffic stays ≈1×
+    /// the input (#219). Errors are the caller's to handle; the streaming
+    /// pipeline treats staging as best-effort (a network error here is one the
+    /// passes would hit anyway).
+    pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
+        let parts = self.parts();
+        if let Some(sel) = selection {
+            debug_assert_eq!(
+                sel.0.len(),
+                parts.len(),
+                "row-group selection must cover every part"
+            );
+        }
+        for (i, part) in parts.iter().enumerate() {
+            part.stage_row_groups(selection.map(|s| s.0[i].as_slice()))?;
+        }
+        Ok(())
+    }
+
     /// Open a sequential batch stream over all parts (see [`SourceStream`]).
     pub fn open_stream(&self, plan: &ReadPlan<'_>) -> Result<SourceStream<'_>, InputError> {
         let parts = self.parts();

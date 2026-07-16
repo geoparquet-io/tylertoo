@@ -68,6 +68,18 @@ verbatim (spec §2.4).
 
 **Streaming is the default** (`stream.rs`, two passes):
 
+0. **Pass 0 (remote input only)** stages the selected row groups to the local
+   disk spill up front (#286/#287). A row group's column chunks are a
+   *contiguous* byte span, so each selected row group is fetched as **one**
+   coalesced range request (several in flight per part, bounded by a
+   memory budget) and sliced back into the per-column-chunk spill entries the
+   reader already serves from. Both passes below then read entirely from local
+   disk. This removes the two latency-bound patterns high-TTFB hosts exposed:
+   the reader keeping ~1 range request in flight per column chunk per pass
+   (#287), and pass 2 re-fetching, cold, the property columns pass 1's
+   geometry+ranking projection skipped (#286). Only selected row groups are
+   staged, so pruned groups are still never touched and total network traffic
+   stays ≈1× the object (#219); local inputs skip pass 0 entirely.
 1. **Pass 1** streams the input once, keeping only a small per-feature record
    (bbox, kind, ranking key). Level assignment + density budget run over
    those records to produce per-level **winner tables** (~1 byte/feature).
