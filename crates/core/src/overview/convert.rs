@@ -1353,6 +1353,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     writer_opts.row_group_size_policy = options.row_group_size_policy;
     writer_opts.full_column_stats = options.full_column_stats;
     writer_opts.cogp_compat_key = options.cogp_compat_key;
+    writer_opts.encode_concurrency = encode_concurrency_for(options.profile);
     writer_opts.generalization = Some(build_generalization(
         &emitted_gsds,
         crs,
@@ -1518,6 +1519,24 @@ pub(super) fn bbox_to_crs_units(bbox: &[f64; 4], crs: Crs) -> [f64; 4] {
 /// [`crate::covering::RowGroupBounds::intersects`]).
 pub(super) fn bboxes_intersect(a: &[f64; 4], b: &[f64; 4]) -> bool {
     a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
+}
+
+/// Row-group encode concurrency for the overview writer (#296), derived from
+/// the memory profile. The writer holds `O(concurrency × row_group)` extra
+/// memory, so `bounded` caps it while still overlapping several row groups;
+/// `speed`/`auto` use the full Rayon pool (row groups within a level bound the
+/// effective parallelism anyway). Never zero.
+pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
+    /// Cap on in-flight row-group encodes under the `bounded` profile, keeping
+    /// the writer's extra memory to a few row groups while still breaking the
+    /// single-threaded ceiling.
+    const BOUNDED_ENCODE_CONCURRENCY_CAP: usize = 4;
+
+    let threads = rayon::current_num_threads().max(1);
+    match profile {
+        MemoryProfile::Bounded => threads.min(BOUNDED_ENCODE_CONCURRENCY_CAP),
+        MemoryProfile::Speed | MemoryProfile::Auto => threads,
+    }
 }
 
 /// Row groups of the input whose bbox covering statistics intersect

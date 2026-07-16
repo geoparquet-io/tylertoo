@@ -1,21 +1,40 @@
 //! Level-banded GeoParquet overview writer (spec §4, §6.1).
 //!
-//! [`OverviewWriter`] wraps a [`parquet::arrow::ArrowWriter`] and a
+//! [`OverviewWriter`] drives a low-level [`parquet::file::writer::SerializedFileWriter`]
+//! (obtained from a [`parquet::arrow::ArrowWriter`] via
+//! [`ArrowWriter::into_serialized_writer`]) and a
 //! [`geoparquet::writer::GeoParquetRecordBatchEncoder`]. The caller drives it
 //! **coarse → fine**, one level at a time; the writer:
 //!
 //! 1. appends a NOT NULL `Int32` `level` column set to the level index to every
 //!    batch (§4.1),
-//! 2. writes the batches and forces a row-group boundary at the end of each
-//!    level via [`ArrowWriter::flush`] (§4.2), recording the level's
-//!    `row_group_end`,
+//! 2. GeoParquet-encodes the batches (in read order, on the calling thread) and
+//!    slices them into level-sized row groups, forcing a row-group boundary at
+//!    the end of each level (§4.2) and recording the level's `row_group_end`,
 //! 3. on [`OverviewWriter::finish`], writes the GeoParquet 1.1 `geo` metadata
 //!    (with bbox covering, §4.4) plus the `geo:overviews` footer key (§3), and
 //!    optionally the COGP-compatibility key (§3.1).
 //!
+//! ## Parallel row-group encoding (#296)
+//!
+//! Parquet column-chunk encoding + ZSTD compression is the single-threaded
+//! ceiling both convert pass 2 and export bind against (#264). The row-group
+//! boundaries are decided serially here (identical slicing to a serial build,
+//! carrying `in_rg` across batches), but each completed row group's Arrow →
+//! Parquet column encoding is dispatched to a Rayon task via
+//! [`ArrowRowGroupWriterFactory::create_column_writers`] + [`compute_leaves`].
+//! Up to `encode_concurrency` row groups encode concurrently; a serial stage
+//! appends the finished [`ArrowColumnChunk`]s to the file **in submission
+//! order** ([`SerializedFileWriter::next_row_group`]). Parallelism changes
+//! **when** encoding happens, never **what** or in **what order** it lands, so
+//! the on-disk row-group layout and per-row content are identical to a serial
+//! build. Memory stays `O(encode_concurrency × row_group)` — a handful of row
+//! groups in flight, never `O(file)`.
+//!
 //! The writer does **not** sort, thin, or simplify: it trusts the caller to
 //! feed correctly ordered, already-generalized per-level batches (P1/P2).
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -24,10 +43,16 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use crossbeam_channel::{bounded, Receiver};
+use parquet::arrow::arrow_writer::{
+    compute_leaves, ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
+use parquet::errors::ParquetError;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::ColumnPath;
 
 use geoparquet::writer::{
@@ -116,6 +141,17 @@ pub struct OverviewWriterOptions {
     pub version: String,
     /// OPTIONAL generalization provenance (§3.5).
     pub generalization: Option<Generalization>,
+    /// Maximum number of row groups whose Arrow → Parquet column encoding
+    /// (dictionary/RLE/delta + ZSTD compression) may run concurrently on the
+    /// Rayon pool (#296). `1` = fully serial (one row group in flight, the
+    /// pre-#296 behavior and the equivalence reference). Higher values overlap
+    /// the encode of independently-formed row groups to break the
+    /// single-threaded parquet-writer ceiling; the on-disk layout is identical
+    /// because boundaries are decided serially and chunks are appended in
+    /// submission order. Peak extra memory is `O(encode_concurrency ×
+    /// row_group)`. Default `1`; the convert paths raise it from the memory
+    /// profile.
+    pub encode_concurrency: usize,
 }
 
 impl OverviewWriterOptions {
@@ -132,6 +168,7 @@ impl OverviewWriterOptions {
             cogp_compat_key: false,
             version: SPEC_VERSION.to_string(),
             generalization: None,
+            encode_concurrency: 1,
         }
     }
 }
@@ -214,7 +251,20 @@ pub enum LevelWriteOutcome {
 
 /// A level-banded GeoParquet overview writer.
 pub struct OverviewWriter<W: Write + Send> {
-    writer: ArrowWriter<W>,
+    /// Low-level parquet file writer. Row groups are appended one at a time
+    /// (serially, in order) from pre-encoded [`ArrowColumnChunk`]s; the encode
+    /// itself runs on the Rayon pool (#296).
+    writer: SerializedFileWriter<W>,
+    /// Factory for a new row group's per-column Arrow writers, derived from the
+    /// same target schema + properties the [`ArrowWriter`] would have used.
+    rg_factory: ArrowRowGroupWriterFactory,
+    /// The GeoParquet-encoded target schema (WKB geometry + generated covering).
+    /// Held so the parallel encode tasks can map columns to leaves via
+    /// [`compute_leaves`].
+    target_schema: SchemaRef,
+    /// Count of row groups appended to the file so far. Replaces the
+    /// `ArrowWriter::flushed_row_groups().len()` bookkeeping.
+    row_groups_written: usize,
     encoder: GeoParquetRecordBatchEncoder,
     /// Source schema augmented with the trailing `level` column (the schema the
     /// batches passed to [`GeoParquetRecordBatchEncoder::encode_record_batch`]
@@ -234,6 +284,11 @@ pub struct OverviewWriter<W: Write + Send> {
     /// Index of the next level expected by [`Self::write_level`].
     next_level_idx: usize,
 }
+
+/// One in-flight row-group encode: the receiver delivers the finished column
+/// chunks (or the encode error) from the Rayon task. `None` on the channel
+/// (sender dropped without sending) means the encode task panicked.
+type EncodeResult = Result<Vec<ArrowColumnChunk>, ParquetError>;
 
 impl OverviewWriter<File> {
     /// Create an overview writer that writes to `path`.
@@ -322,10 +377,19 @@ impl<W: Write + Send> OverviewWriter<W> {
         let target_schema = encoder.target_schema();
 
         let props = build_writer_properties(&options, &geometry_columns, &augmented_schema)?;
-        let writer = ArrowWriter::try_new(sink, target_schema, Some(props))?;
+        // Build an ArrowWriter exactly as before (so the parquet schema, writer
+        // properties, and embedded `ARROW:schema` footer key are byte-for-byte
+        // what a serial ArrowWriter would produce), then lower it to a
+        // `SerializedFileWriter` + `ArrowRowGroupWriterFactory` so we can encode
+        // row groups off-thread and append them ourselves (#296).
+        let arrow_writer = ArrowWriter::try_new(sink, target_schema.clone(), Some(props))?;
+        let (writer, rg_factory) = arrow_writer.into_serialized_writer()?;
 
         Ok(Self {
             writer,
+            rg_factory,
+            target_schema,
+            row_groups_written: 0,
             encoder,
             augmented_schema,
             options,
@@ -376,12 +440,12 @@ impl<W: Write + Send> OverviewWriter<W> {
             });
         }
 
-        let rg_before = self.writer.flushed_row_groups().len();
+        let rg_before = self.row_groups_written;
 
-        // Rows per row group for THIS level (§4.2, §4.5). The underlying
-        // `ArrowWriter` never splits on its own (its `max_row_group_size` is set
-        // to `usize::MAX` in `build_writer_properties`); we drive every row-group
-        // boundary here by slicing each encoded batch to `target` and flushing.
+        // Rows per row group for THIS level (§4.2, §4.5). The parquet writer
+        // never splits on its own (its `max_row_group_size` is set to
+        // `usize::MAX` in `build_writer_properties`); we drive every row-group
+        // boundary here by slicing each encoded batch to `target`.
         let cap = effective_rg_cap(
             self.options.max_row_group_size,
             self.options.row_group_size_policy,
@@ -389,9 +453,16 @@ impl<W: Write + Send> OverviewWriter<W> {
             self.options.levels.last().and_then(|l| l.zoom),
         );
         let target = rg_row_target(cap, level_row_hint);
+        let concurrency = self.options.encode_concurrency.max(1);
 
-        // Rows accumulated into the current (not-yet-flushed) row group.
+        // Rows accumulated into the current (not-yet-submitted) row group, and
+        // that row group's encoded (target-schema) slices in read order.
         let mut in_rg: usize = 0;
+        let mut cur_rg: Vec<RecordBatch> = Vec::new();
+        // Bounded FIFO of row groups whose column encoding is running on the
+        // Rayon pool. Draining the front (oldest) preserves submission order,
+        // so the on-disk row-group sequence is identical to a serial build.
+        let mut inflight: VecDeque<Receiver<EncodeResult>> = VecDeque::new();
 
         // The PHYSICAL level index this level will occupy in the output file:
         // the count of levels actually written so far. It trails `level_idx`
@@ -413,39 +484,50 @@ impl<W: Write + Send> OverviewWriter<W> {
             columns.push(Arc::new(level_array));
             let augmented = RecordBatch::try_new(self.augmented_schema.clone(), columns)?;
 
+            // GeoParquet encode (WKB + covering) stays serial and in read order:
+            // the per-batch output is order-independent, but the file-level
+            // covering accumulated in `into_keyvalue` is order-sensitive, and
+            // this is the cheap step — the parquet column encode below is the
+            // parallelized bottleneck (#296).
             let encoded = self
                 .encoder
                 .encode_record_batch(&augmented)
                 .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
 
             // Slice the encoded batch so row-group boundaries fall exactly on
-            // `target`-row multiples (carrying `in_rg` across batches).
+            // `target`-row multiples (carrying `in_rg` across batches) — the
+            // exact slicing a serial build performs.
             let n = encoded.num_rows();
             let mut offset = 0usize;
             while offset < n {
                 let take = (target - in_rg).min(n - offset);
-                self.writer.write(&encoded.slice(offset, take))?;
+                cur_rg.push(encoded.slice(offset, take));
                 in_rg += take;
                 offset += take;
                 if in_rg >= target {
-                    self.writer.flush()?;
+                    self.submit_row_group(&mut inflight, std::mem::take(&mut cur_rg), concurrency)?;
                     in_rg = 0;
                 }
             }
         }
 
-        // Close the final partial row group so the level ends exactly on a
+        // Submit the final partial row group so the level ends exactly on a
         // boundary (§4.2). If `in_rg == 0` the boundary already fell on the last
-        // flush, so a trailing flush would create a spurious empty row group.
+        // submission, so submitting again would create a spurious empty group.
         if in_rg > 0 {
-            self.writer.flush()?;
+            self.submit_row_group(&mut inflight, std::mem::take(&mut cur_rg), concurrency)?;
         }
 
-        let rg_after = self.writer.flushed_row_groups().len();
+        // Drain every remaining in-flight encode, appending in submission order.
+        while let Some(rx) = inflight.pop_front() {
+            self.drain_encoded(rx)?;
+        }
+
+        let rg_after = self.row_groups_written;
         if rg_after <= rg_before {
             // Empty level: omit it entirely and renumber (§7.3). No rows were
-            // written (a partial row group would have been flushed above), so
-            // the file carries no trace of it; only the bookkeeping moves on.
+            // written, so the file carries no trace of it; only the bookkeeping
+            // moves on.
             self.next_level_idx += 1;
             return Ok(LevelWriteOutcome::SkippedEmpty);
         }
@@ -454,6 +536,54 @@ impl<W: Write + Send> OverviewWriter<W> {
         self.written_spec_indices.push(level_idx);
         self.next_level_idx += 1;
         Ok(LevelWriteOutcome::Written)
+    }
+
+    /// Dispatch one complete row group's column encoding to the Rayon pool,
+    /// bounding the in-flight set to `concurrency` (draining the oldest first
+    /// when full). The heavy Arrow → Parquet encode + ZSTD compression runs in
+    /// the spawned task; only cheap column-writer allocation happens here.
+    fn submit_row_group(
+        &mut self,
+        inflight: &mut VecDeque<Receiver<EncodeResult>>,
+        batches: Vec<RecordBatch>,
+        concurrency: usize,
+    ) -> Result<(), WriterError> {
+        // Backpressure: never let more than `concurrency` row groups sit in
+        // flight, bounding peak memory to O(concurrency × row_group).
+        while inflight.len() >= concurrency {
+            if let Some(rx) = inflight.pop_front() {
+                self.drain_encoded(rx)?;
+            }
+        }
+        // The row-group ordinal this group will occupy once appended (rows
+        // already written + those ahead of it in flight). Only consulted by the
+        // parquet encryptor, which is disabled here, but kept correct.
+        let rg_index = self.row_groups_written + inflight.len();
+        let writers = self.rg_factory.create_column_writers(rg_index)?;
+        let target_schema = self.target_schema.clone();
+        let (tx, rx) = bounded::<EncodeResult>(1);
+        rayon::spawn(move || {
+            let _ = tx.send(encode_row_group(writers, batches, &target_schema));
+        });
+        inflight.push_back(rx);
+        Ok(())
+    }
+
+    /// Wait for one in-flight row group's encode to finish and append its
+    /// column chunks to the file as the next row group (serial, in order).
+    fn drain_encoded(&mut self, rx: Receiver<EncodeResult>) -> Result<(), WriterError> {
+        let chunks = rx.recv().map_err(|_| {
+            WriterError::Parquet(ParquetError::General(
+                "parallel row-group encode task panicked".to_string(),
+            ))
+        })??;
+        let mut rg_writer = self.writer.next_row_group()?;
+        for chunk in chunks {
+            chunk.append_to_row_group(&mut rg_writer)?;
+        }
+        rg_writer.close()?;
+        self.row_groups_written += 1;
+        Ok(())
     }
 
     /// Finalize the file: write the `geo` and `geo:overviews` footer keys (plus
@@ -476,7 +606,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             });
         }
 
-        let num_row_groups = self.writer.flushed_row_groups().len() as i64;
+        let num_row_groups = self.row_groups_written as i64;
         let meta = self.build_meta();
         // Sanity: the writer's own output must satisfy the structural invariants.
         meta.validate(num_row_groups)?;
@@ -548,6 +678,39 @@ impl<W: Write + Send> OverviewWriter<W> {
             generalization,
         }
     }
+}
+
+/// Encode one row group's Arrow columns into Parquet [`ArrowColumnChunk`]s
+/// (dictionary/RLE/delta + ZSTD compression) — the CPU-heavy step run on the
+/// Rayon pool (#296). `batches` are the row group's target-schema slices in row
+/// order; `target_schema` maps each column to its leaf writer(s) via
+/// [`compute_leaves`].
+///
+/// Columns are encoded serially within a row group (the WKB geometry column
+/// dominates and is a single leaf, so intra-group column parallelism would not
+/// help); the win comes from many row groups encoding concurrently. Feeding
+/// batch-by-batch, resetting the writer iterator per batch, matches how
+/// `ArrowRowGroupWriter` feeds the same writers internally, so the produced
+/// column chunks — and their row order — are identical to a serial encode.
+fn encode_row_group(
+    mut writers: Vec<ArrowColumnWriter>,
+    batches: Vec<RecordBatch>,
+    target_schema: &Schema,
+) -> Result<Vec<ArrowColumnChunk>, ParquetError> {
+    for batch in &batches {
+        // One writer per leaf column, consumed in field → leaf order (the order
+        // `create_column_writers` built them in).
+        let mut writer_iter = writers.iter_mut();
+        for (col_idx, field) in target_schema.fields().iter().enumerate() {
+            for leaf in compute_leaves(field, batch.column(col_idx))? {
+                writer_iter
+                    .next()
+                    .expect("one ArrowColumnWriter per leaf column")
+                    .write(&leaf)?;
+            }
+        }
+    }
+    writers.into_iter().map(|w| w.close()).collect()
 }
 
 /// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
@@ -805,6 +968,108 @@ mod tests {
             out.extend(col.values().iter().copied());
         }
         out
+    }
+
+    /// Read `(rows_per_row_group, [(level, id) per row in file order])` — the
+    /// structural + content fingerprint that must be invariant to encode
+    /// concurrency (the parquet footer bytes are not deterministic, so a raw
+    /// byte compare is invalid; #296).
+    fn layout_and_rows(path: &std::path::Path) -> (Vec<i64>, Vec<(i32, i64)>) {
+        let file = File::open(path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let md = builder.metadata().clone();
+        let rows_per_rg: Vec<i64> = (0..md.num_row_groups())
+            .map(|i| md.row_group(i).num_rows())
+            .collect();
+
+        let reader = builder.build().unwrap();
+        let mut rows = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let level = batch
+                .column(batch.schema().index_of(LEVEL_COLUMN).unwrap())
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let id = batch
+                .column(batch.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((level.value(i), id.value(i)));
+            }
+        }
+        (rows_per_rg, rows)
+    }
+
+    /// #296: parallel row-group encoding (`encode_concurrency > 1`) must produce
+    /// output structurally identical to the serial reference (`= 1`): identical
+    /// row-group boundaries (rows per group), identical rows in identical order,
+    /// across multiple levels each split into several row groups. Parallelism
+    /// changes *when* a row group is encoded, never *what* is written or *where*
+    /// the boundaries fall.
+    #[test]
+    fn parallel_encoding_matches_serial() {
+        let schema = Arc::new(source_schema());
+
+        // 3 levels, small row-group cap so every level splits into several
+        // groups (target = 4 rows/group with the hint), exercising the ordered
+        // in-flight drain and cross-level accumulation of `in_rg`.
+        let level_ids: [Vec<i64>; 3] = [
+            (0..10).collect(),
+            (100..123).collect(),
+            (1000..1017).collect(),
+        ];
+
+        let write_with = |concurrency: usize| -> tempfile::NamedTempFile {
+            let mut opts = duplicating_options();
+            opts.max_row_group_size = 4;
+            opts.encode_concurrency = concurrency;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for (level, ids) in level_ids.iter().enumerate() {
+                // Feed each level in several small batches to exercise the
+                // slice/carry logic across batch boundaries.
+                let batches: Vec<RecordBatch> = ids
+                    .chunks(3)
+                    .map(|chunk| source_batch(&schema, chunk))
+                    .collect();
+                let outcome = writer
+                    .write_level(level, Some(ids.len()), batches.into_iter())
+                    .unwrap();
+                assert_eq!(outcome, LevelWriteOutcome::Written);
+            }
+            writer.finish().unwrap();
+            tmp
+        };
+
+        let serial = write_with(1);
+        let (serial_layout, serial_rows) = layout_and_rows(serial.path());
+
+        // Sanity: the fixture actually splits into many row groups (so the
+        // parallel path exercises multiple concurrent + ordered encodes), and
+        // every declared row landed exactly once.
+        let total: i64 = level_ids.iter().map(|v| v.len() as i64).sum();
+        assert_eq!(serial_layout.iter().sum::<i64>(), total);
+        assert!(
+            serial_layout.len() >= 8,
+            "fixture should split into many row groups, got {}",
+            serial_layout.len()
+        );
+
+        for concurrency in [2usize, 4, 8] {
+            let parallel = write_with(concurrency);
+            let (layout, rows) = layout_and_rows(parallel.path());
+            assert_eq!(
+                layout, serial_layout,
+                "encode_concurrency={concurrency}: row-group layout differs from serial"
+            );
+            assert_eq!(
+                rows, serial_rows,
+                "encode_concurrency={concurrency}: row content/order differs from serial"
+            );
+        }
     }
 
     #[test]
