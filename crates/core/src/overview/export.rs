@@ -91,6 +91,7 @@ use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, tiles_for_bbox, BboxTileRanges, TileBounds, TileCoord};
 
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
+use super::pipeline::available_memory_bytes;
 use super::reader::{OverviewReader, ReaderError};
 use super::writer::LEVEL_COLUMN;
 
@@ -137,12 +138,16 @@ pub struct ExportOptions {
     pub simple_clip_fastpath: bool,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
-    /// expands to the machine's available parallelism (clamped to
-    /// `[PARTITION_WAVE_MIN, PARTITION_WAVE_MAX]`) at export start; any explicit
-    /// positive value is honoured verbatim. Wider waves keep more cores busy at
-    /// proportionally more peak memory (`O(partition_wave)` partitions
-    /// resident) and read a wider combined-bbox band per wave. Output is
-    /// byte-identical for every value — the wave is a scheduling concern only.
+    /// expands at export start via the memory-budget preflight (#303): the
+    /// machine's available parallelism, capped by how many estimated
+    /// per-partition transients fit in a fraction of available RAM, floored
+    /// at [`PARTITION_WAVE_MIN`] (falls back to the fixed
+    /// [`PARTITION_WAVE_FALLBACK_MAX`] cap when RAM cannot be probed). Any
+    /// explicit positive value is honoured verbatim. Wider waves keep more
+    /// cores busy at proportionally more peak memory (`O(partition_wave)`
+    /// partitions resident) and read a wider combined-bbox band per wave.
+    /// Output is byte-identical for every value — the wave is a scheduling
+    /// concern only.
     pub partition_wave: usize,
 }
 
@@ -285,33 +290,82 @@ pub const PARTITION_WAVE_AUTO: usize = 0;
 /// baseline, so a small box behaves exactly as before.
 pub const PARTITION_WAVE_MIN: usize = 6;
 
-/// Upper clamp for the auto-sized partition wave.
+/// Upper clamp for the auto-sized partition wave **when available RAM cannot
+/// be probed** (non-Linux without the env override, unreadable
+/// `/proc/meminfo`).
 ///
-/// The wave width is the export's peak-memory knob: each in-flight partition
-/// holds its clipped geometries + encoded tiles resident, so peak memory is
-/// `O(PARTITION_WAVE partitions)` (see the wave doc below). Auto-sizing to raw
-/// core count would let a many-core box widen the wave without bound and
-/// balloon the export memory transient that #295 is already tracking — going
-/// from the old width of 6 to 16 already lifts the resident wave set ~2.7×. We
-/// therefore cap auto at 16: it saturates the 16-core target box the issue was
-/// filed from (16-wide waves, ~2× fewer serial waves at z12–z14) while holding
-/// the memory transient to a known, bounded multiple of the old baseline.
+/// This is #293's original fixed cap: it saturates a 16-core box while
+/// bounding the wave transient to a known multiple of the old width-6
+/// baseline (measured 1.44× RSS on germany-segments). Where a RAM signal
+/// *is* available, the memory-budget preflight (#303) replaces this cap —
+/// see [`resolve_partition_wave`] — so a >16-core box with RAM to spare
+/// widens past it on `auto`. Explicit values are never clamped by it.
+pub const PARTITION_WAVE_FALLBACK_MAX: usize = 16;
+
+/// Fraction of *available* system RAM the resident wave transient may claim
+/// in the auto preflight (#303).
 ///
-/// A fixed cap is deliberately preferred over a `/proc/meminfo`-derived RAM
-/// budget here: the latter is Linux-only, non-deterministic run-to-run, and
-/// would couple export scheduling to transient free memory. Bounding the
-/// dataset-scaled memory peak is #295's job; this knob should stay a simple,
-/// portable, deterministic scheduling cap. Power users who want a wider wave
-/// (and accept the memory cost) can still pass an explicit value, which is
-/// honoured verbatim past this cap.
-pub const PARTITION_WAVE_MAX: usize = 16;
+/// Deliberately lower than the convert-side `AUTO_RAM_FRACTION` (0.6): the
+/// wave transient sits *on top of* export baseline state the estimate does
+/// not model (scan accumulators, decode buffers, PMTiles writer directory),
+/// so the budget leaves headroom for that baseline. Bias is toward not
+/// OOMing — a too-narrow wave only costs wall clock.
+const EXPORT_WAVE_RAM_FRACTION: f64 = 0.5;
+
+/// Conservative estimate of one wave slot's transient memory cost (one
+/// in-flight partition: its clipped `(feature × tile)` members plus encoded
+/// tiles), at the default [`DEFAULT_PARTITION_TARGET`].
+///
+/// Measured (2026-07, #293 benchmark, germany-segments 19.2M-feature z14
+/// band): widening 6 → 16 lifted peak RSS 588 → 848 MiB, i.e. ~26 MiB per
+/// wave slot. Biased ~2.5× high — mirroring #294's calibration bias — so the
+/// preflight under-widens rather than OOMs on datasets with fatter members
+/// (partitions stop at *at least* the target, and a single giant feature can
+/// overshoot it).
+const PARTITION_SLOT_TRANSIENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The widest wave the memory budget allows: how many
+/// [`PARTITION_SLOT_TRANSIENT_BYTES`] slots fit in
+/// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM, or
+/// [`PARTITION_WAVE_FALLBACK_MAX`] when RAM is unknown (the portable,
+/// deterministic #293 behaviour where no probe exists).
+fn memory_safe_wave(available_ram_bytes: Option<u64>) -> usize {
+    match available_ram_bytes {
+        Some(ram) => {
+            let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
+            (budget / PARTITION_SLOT_TRANSIENT_BYTES) as usize
+        }
+        None => PARTITION_WAVE_FALLBACK_MAX,
+    }
+}
+
+/// The auto partition-wave decision (#303): pure so it is unit-testable
+/// across the core-count × RAM grid, mirroring #294's `auto_backing`.
+///
+/// `max(PARTITION_WAVE_MIN, min(cores, memory_safe_wave))` — cores are the
+/// useful upper bound (a wave wider than the core count gains nothing), the
+/// memory-safe wave keeps the transient inside the RAM budget, and the floor
+/// preserves the historical width-6 baseline (its worst-case transient is
+/// small and known-safe, and narrower waves only lose throughput).
+fn auto_partition_wave(cores: usize, available_ram_bytes: Option<u64>) -> usize {
+    cores
+        .min(memory_safe_wave(available_ram_bytes))
+        .max(PARTITION_WAVE_MIN)
+}
 
 /// Resolve a requested partition-wave width to a concrete value.
 ///
-/// [`PARTITION_WAVE_AUTO`] (0) auto-sizes from
-/// [`std::thread::available_parallelism`], clamped to
-/// `[PARTITION_WAVE_MIN, PARTITION_WAVE_MAX]`; any explicit positive value is
-/// honoured verbatim (uncapped — the caller opted in to the memory cost).
+/// [`PARTITION_WAVE_AUTO`] (0) runs the memory-budget preflight (#303): the
+/// width is the machine's [`std::thread::available_parallelism`], capped by
+/// how many per-partition transients (estimated
+/// [`PARTITION_SLOT_TRANSIENT_BYTES`] each) fit in
+/// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM (probe shared with the
+/// convert-side `--profile auto`: `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
+/// then `/proc/meminfo` `MemAvailable`), floored at [`PARTITION_WAVE_MIN`].
+/// When RAM cannot be probed the cap falls back to
+/// [`PARTITION_WAVE_FALLBACK_MAX`], reproducing #293's fixed clamp. Any
+/// explicit positive value is honoured verbatim (uncapped — the caller opted
+/// in to the memory cost).
 ///
 /// The output is a **scheduling** parameter only: it sets how many partitions
 /// are processed per band read, never which features land in which tile or the
@@ -320,28 +374,43 @@ pub const PARTITION_WAVE_MAX: usize = 16;
 /// the partition-invariance / frozen-hash tests).
 pub fn resolve_partition_wave(requested: usize) -> usize {
     if requested == PARTITION_WAVE_AUTO {
-        std::thread::available_parallelism()
+        let cores = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(PARTITION_WAVE_MIN)
-            .clamp(PARTITION_WAVE_MIN, PARTITION_WAVE_MAX)
+            .unwrap_or(PARTITION_WAVE_MIN);
+        auto_partition_wave(cores, available_memory_bytes())
     } else {
         requested
     }
 }
 
-/// Resolve the partition-wave width (auto-sizing from available cores when the
-/// caller left it at [`PARTITION_WAVE_AUTO`]) and log the chosen width alongside
-/// the detected core count once at export start, so export core utilization is
-/// observable rather than a mystery (#293) — mirrors the pass-2 parallelism
-/// log line in the convert streaming path.
+/// Resolve the partition-wave width (running the #303 memory preflight when
+/// the caller left it at [`PARTITION_WAVE_AUTO`]) and log the chosen width
+/// alongside the inputs that produced it (detected cores, memory-safe cap,
+/// available RAM) once at export start, so both export core utilization
+/// (#293) and the preflight decision (#303) are observable — mirrors the
+/// `[convert] pass2 auto` decision log line.
 fn resolve_and_log_partition_wave(requested: usize) -> usize {
     let wave = resolve_partition_wave(requested);
-    log::info!(
-        "[export] partition wave: {wave} partition(s) per band read ({} core(s) detected)",
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(0)
-    );
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    if requested == PARTITION_WAVE_AUTO {
+        let available = available_memory_bytes();
+        let avail_str = available.map_or_else(
+            || "unknown".to_string(),
+            |b| format!("{} MiB", b / (1024 * 1024)),
+        );
+        log::info!(
+            "[export] partition wave: {wave} partition(s) per band read \
+             (auto: {cores} core(s), memory-safe cap {}, avail {avail_str})",
+            memory_safe_wave(available),
+        );
+    } else {
+        log::info!(
+            "[export] partition wave: {wave} partition(s) per band read \
+             (explicit; {cores} core(s) detected)"
+        );
+    }
     wave
 }
 
@@ -2085,28 +2154,62 @@ mod tests {
         assert_eq!(r_many.oversized_tiles, r_one.oversized_tiles);
     }
 
+    /// The auto memory preflight (#303): pure decision function, exercised
+    /// across the RAM/core grid the way #294's `auto_backing` tests are.
+    #[test]
+    fn auto_partition_wave_memory_preflight() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        // Plenty of RAM: cores drive the width — including past the old fixed
+        // 16 cap (the whole point of #303).
+        assert_eq!(auto_partition_wave(64, Some(256 * GIB)), 64);
+        assert_eq!(auto_partition_wave(24, Some(256 * GIB)), 24);
+        // The #293 target box (16 cores / 54 GiB) resolves exactly as before.
+        assert_eq!(auto_partition_wave(16, Some(54 * GIB)), 16);
+        // Tight RAM caps below the core count:
+        // 4 GiB avail → 2 GiB wave budget → 32 slots of 64 MiB.
+        assert_eq!(auto_partition_wave(64, Some(4 * GIB)), 32);
+        // 2 GiB avail → 1 GiB budget → 16 slots.
+        assert_eq!(auto_partition_wave(64, Some(2 * GIB)), 16);
+        // 1 GiB avail → 512 MiB budget → 8 slots.
+        assert_eq!(auto_partition_wave(64, Some(GIB)), 8);
+        // Very tight RAM floors at MIN, never below (historical width; its
+        // worst-case transient is small and known-safe).
+        assert_eq!(auto_partition_wave(16, Some(256 * MIB)), PARTITION_WAVE_MIN);
+        assert_eq!(auto_partition_wave(16, Some(0)), PARTITION_WAVE_MIN);
+        // Small boxes keep the floor regardless of RAM.
+        assert_eq!(auto_partition_wave(2, Some(256 * GIB)), PARTITION_WAVE_MIN);
+        // RAM unknown (non-Linux, unreadable /proc/meminfo): fall back to the
+        // #293 fixed cap — portable and deterministic where no probe exists.
+        assert_eq!(auto_partition_wave(64, None), PARTITION_WAVE_FALLBACK_MAX);
+        assert_eq!(auto_partition_wave(8, None), 8);
+        assert_eq!(auto_partition_wave(2, None), PARTITION_WAVE_MIN);
+    }
+
     #[test]
     fn resolve_partition_wave_auto_and_explicit() {
-        // Auto (0) sizes from available parallelism, clamped to [MIN, MAX].
+        // Auto (0) runs the memory preflight against the real probes; the
+        // result must match the pure decision function fed the same inputs
+        // and never fall below the floor.
         let auto = resolve_partition_wave(PARTITION_WAVE_AUTO);
         assert!(
-            (PARTITION_WAVE_MIN..=PARTITION_WAVE_MAX).contains(&auto),
-            "auto wave {auto} outside [{PARTITION_WAVE_MIN}, {PARTITION_WAVE_MAX}]"
+            auto >= PARTITION_WAVE_MIN,
+            "auto wave {auto} below floor {PARTITION_WAVE_MIN}"
         );
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(PARTITION_WAVE_MIN);
         assert_eq!(
             auto,
-            cores.clamp(PARTITION_WAVE_MIN, PARTITION_WAVE_MAX),
-            "auto must equal core count clamped to the configured range"
+            auto_partition_wave(cores, available_memory_bytes()),
+            "auto must equal the preflight decision on this box's cores + RAM"
         );
-        // Explicit values pass through verbatim, including above the auto cap.
+        // Explicit values pass through verbatim, including above any auto cap.
         assert_eq!(resolve_partition_wave(1), 1);
         assert_eq!(resolve_partition_wave(6), 6);
         assert_eq!(
-            resolve_partition_wave(PARTITION_WAVE_MAX + 100),
-            PARTITION_WAVE_MAX + 100
+            resolve_partition_wave(PARTITION_WAVE_FALLBACK_MAX + 100),
+            PARTITION_WAVE_FALLBACK_MAX + 100
         );
     }
 

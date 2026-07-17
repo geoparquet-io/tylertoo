@@ -661,10 +661,14 @@ fn overview(
 ///         Defaults to True; set False for byte-stable tile output.
 ///     partition_wave (int, optional): Partitions processed per band read
 ///         during export (the export concurrency knob). Defaults to 0, which
-///         auto-sizes to the machine's available cores (clamped to 6..=16);
-///         pass an explicit positive integer to override. Wider waves keep
-///         more cores busy at proportionally more peak memory. Output is
-///         byte-identical for every value (the wave is a scheduling concern).
+///         auto-sizes via a memory-budget preflight: the machine's core
+///         count, capped by how many estimated per-partition transients fit
+///         in a fraction of available RAM (floor 6; fixed cap 16 only when
+///         RAM cannot be probed; override the RAM figure with the
+///         TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive
+///         integer to override. Wider waves keep more cores busy at
+///         proportionally more peak memory. Output is byte-identical for
+///         every value (the wave is a scheduling concern).
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
