@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>tylertoo demo — Germany buildings</title>
+  <title>tylertoo demo — Brazil field boundaries</title>
   <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
 
   <!-- Pinned CDN deps. PMTiles range reads need the host to serve Range + CORS. -->
@@ -33,14 +33,15 @@
 <body>
   <div id="map"></div>
   <div id="panel">
-    <h1>Germany buildings — tylertoo</h1>
-    <p>59M Overture building footprints, GeoParquet → PMTiles in one native step
-       (tuned). Rendered on CARTO Dark Matter.</p>
+    <h1>Brazil field boundaries — tylertoo</h1>
+    <p>55.5M Fields of The World boundaries, cloud-native GeoParquet → PMTiles in
+       one native workflow (z1–14). Rendered on CARTO Dark Matter.</p>
     <div class="views">
-      <button data-view="germany">Germany</button>
-      <button data-view="berlin">Berlin</button>
-      <button data-view="hamburg">Hamburg</button>
-      <button data-view="munich">Munich</button>
+      <button data-view="brazil">Brazil</button>
+      <button data-view="matogrosso">Mato Grosso</button>
+      <button data-view="saopaulo">São Paulo</button>
+      <button data-view="riograndedosul">Rio Grande do Sul</button>
+      <button data-view="bahia">Bahia (west)</button>
     </div>
   </div>
   <div id="err"></div>
@@ -48,18 +49,19 @@
   <script>
     "use strict";
 
-    // Tuned Germany-buildings PMTiles on Source Cooperative (Range + CORS).
+    // Brazil field-boundaries PMTiles on Source Cooperative (Range + CORS).
     // Override at runtime with ?pmtiles=<url>.
     const DEFAULT_PMTILES =
-      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/tylertoo-demo/germany-buildings-gpq-tuned.pmtiles";
+      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-field-boundaries.pmtiles";
 
     const VIEWS = {
-      germany: { center: [10.45, 51.16], zoom: 5.4 },
-      berlin:  { center: [13.405, 52.52], zoom: 11.5 },
-      hamburg: { center: [9.993, 53.551], zoom: 11.5 },
-      munich:  { center: [11.582, 48.135], zoom: 11.5 },
+      brazil:         { center: [-53.00, -14.34], zoom: 4.0 },
+      matogrosso:     { center: [-55.90, -12.60], zoom: 6.5 },
+      saopaulo:       { center: [-48.50, -21.50], zoom: 7.0 },
+      riograndedosul: { center: [-53.20, -29.50], zoom: 6.5 },
+      bahia:          { center: [-45.90, -12.40], zoom: 6.5 },
     };
-    const LAYER = "buildings"; // MVT source-layer name
+    const LAYER = "overview"; // MVT source-layer name (tylertoo default)
 
     function showErr(m) { const e = document.getElementById("err"); e.style.display = "block"; e.textContent = m; }
 
@@ -77,28 +79,19 @@
       sources: {
         carto: { type: "raster", tiles: CARTO, tileSize: 256, maxzoom: 20,
           attribution: '&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>' },
-        buildings: { type: "vector", url,
-          attribution: 'Buildings: <a href="https://overturemaps.org">Overture</a> via tylertoo' },
+        fields: { type: "vector", url,
+          attribution: 'Field boundaries: <a href="https://fieldsofthe.world">Fields of The World</a> via tylertoo' },
       },
       layers: [
         { id: "carto", type: "raster", source: "carto" },
-        { id: "bld-fill", type: "fill", source: "buildings", "source-layer": LAYER,
-          paint: { "fill-color": "#4cc9f0", "fill-opacity": 0.45 } },
-        { id: "bld-line", type: "line", source: "buildings", "source-layer": LAYER,
-          paint: { "line-color": "#9be7ff", "line-width": 0.3, "line-opacity": 0.5 } },
-        // Coarse-zoom fill (#259): a --collapse conversion represents
-        // sub-GSD buildings as points at coarse levels. A fill layer
-        // silently ignores Point features, so without this layer the
-        // zoomed-out country view renders empty.
-        { id: "bld-dot", type: "circle", source: "buildings", "source-layer": LAYER,
-          filter: ["==", "$type", "Point"],
-          paint: { "circle-color": "#4cc9f0", "circle-opacity": 0.55,
-            "circle-radius": ["interpolate", ["linear"], ["zoom"],
-              2, 0.7, 6, 1.1, 10, 1.8] } },
+        { id: "field-fill", type: "fill", source: "fields", "source-layer": LAYER,
+          paint: { "fill-color": "#4cc9f0", "fill-opacity": 0.35 } },
+        { id: "field-line", type: "line", source: "fields", "source-layer": LAYER,
+          paint: { "line-color": "#9be7ff", "line-width": 0.3, "line-opacity": 0.55 } },
       ],
     };
 
-    const start = VIEWS.germany;
+    const start = VIEWS.brazil;
     const map = new maplibregl.Map({ container: "map", style,
       center: start.center, zoom: start.zoom, hash: true, maxZoom: 16 });
     map.addControl(new maplibregl.NavigationControl(), "bottom-right");
