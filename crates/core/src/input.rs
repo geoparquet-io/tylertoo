@@ -1182,6 +1182,23 @@ pub(crate) mod remote {
         dir: Option<PathBuf>,
     }
 
+    /// #273: the warning to emit when `dir` (the resolved spill directory)
+    /// lives on a RAM-backed filesystem, or `None` when it is real disk or
+    /// detection is unavailable (best-effort). Spilling to tmpfs/ramfs trades
+    /// network bytes for memory pressure, defeating the spill and risking OOM.
+    /// Split out so the wording is unit-testable without capturing a logger.
+    fn ram_backed_spill_warning(dir: &Path) -> Option<String> {
+        (crate::fs_probe::is_ram_backed(dir) == Some(true)).then(|| {
+            format!(
+                "input spill directory {} is on a RAM-backed filesystem \
+                 (tmpfs/ramfs); spilling there consumes memory instead of disk \
+                 and can OOM on large inputs — point --spill-dir (or $TMPDIR) at \
+                 a real-disk location",
+                dir.display()
+            )
+        })
+    }
+
     impl DiskSpill {
         /// Serve a previously spilled chunk, if present. `None` means "not
         /// spilled — fetch it over the network"; a read error disables the
@@ -1214,6 +1231,13 @@ pub(crate) mod remote {
                 return;
             }
             if self.file.is_none() {
+                // #273: warn once (the spill file is created exactly once) when
+                // the resolved directory is RAM-backed. `tempfile()` follows
+                // `std::env::temp_dir()` ($TMPDIR or /tmp) when no dir is set.
+                let resolved = self.dir.clone().unwrap_or_else(std::env::temp_dir);
+                if let Some(msg) = ram_backed_spill_warning(&resolved) {
+                    log::warn!("{msg}");
+                }
                 let created = match self.dir.as_deref() {
                     Some(d) => tempfile::tempfile_in(d),
                     None => tempfile::tempfile(),
@@ -1506,6 +1530,44 @@ pub(crate) mod remote {
             assert!(
                 spill.get(0).is_none(),
                 "create failure must disable the spill"
+            );
+        }
+
+        /// #273: a RAM-backed spill directory produces a warning naming the
+        /// directory and pointing at `--spill-dir`. `/dev/shm` is tmpfs on
+        /// essentially every Linux system.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn ram_backed_dir_warns_naming_dir_and_flag() {
+            let shm = std::path::Path::new("/dev/shm");
+            if !shm.exists() {
+                eprintln!("skipping ram_backed_dir_warns: /dev/shm absent");
+                return;
+            }
+            let msg = ram_backed_spill_warning(shm)
+                .expect("/dev/shm must produce a RAM-backed spill warning");
+            assert!(msg.contains("/dev/shm"), "names the directory: {msg}");
+            assert!(msg.contains("--spill-dir"), "suggests --spill-dir: {msg}");
+            assert!(
+                msg.contains("RAM-backed"),
+                "explains the RAM-backed hazard: {msg}"
+            );
+        }
+
+        /// #273 counterpart: a real-disk directory is not flagged, so the
+        /// spill path stays silent and functional.
+        #[test]
+        fn real_disk_dir_does_not_warn() {
+            let dir = tempfile::tempdir().unwrap();
+            // Best-effort: on a machine whose $TMPDIR is tmpfs this could be
+            // Some(_); guard on the detection result to stay non-flaky.
+            if crate::fs_probe::is_ram_backed(dir.path()) == Some(true) {
+                eprintln!("skipping real_disk_dir_does_not_warn: tempdir is tmpfs");
+                return;
+            }
+            assert!(
+                ram_backed_spill_warning(dir.path()).is_none(),
+                "a non-RAM-backed dir must not warn"
             );
         }
     }
