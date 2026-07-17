@@ -55,6 +55,7 @@ def overview(
     streaming: bool = True,
     read_batch_size: int = 8192,
     bbox: tuple[float, float, float, float] | None = None,
+    filter: str | None = None,
     profile: str = "auto",
     in_flight_batches: int = 0,
     spill_dir: str | Path | None = None,
