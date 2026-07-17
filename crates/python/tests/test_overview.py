@@ -350,20 +350,18 @@ class TestOverviewIntegration:
             assert report["input_features"] > 0
 
     def test_overview_collapse_square_conflicts_with_collapse(self):
-        import pytest
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="mutually exclusive"):
-                self._overview(
-                    tmpdir, max_zoom=4, collapse=True, collapse_square=True
-                )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="mutually exclusive"),
+        ):
+            self._overview(tmpdir, max_zoom=4, collapse=True, collapse_square=True)
 
     def test_overview_representation_rejects_bad_spec(self):
-        import pytest
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="representation"):
-                self._overview(tmpdir, max_zoom=4, representation="0-2:blob")
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="representation"),
+        ):
+            self._overview(tmpdir, max_zoom=4, representation="0-2:blob")
 
     def test_overview_sort_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
