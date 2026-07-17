@@ -1776,6 +1776,39 @@ mod tests {
         assert_eq!(unbounded.assignments, mid.assignments);
     }
 
+    /// #306 × #317: the wave schedule is pure scheduling under banding too —
+    /// a 1-byte budget (one level per wave, serialized) must produce the
+    /// identical banded assignment as the unbounded single-wave build.
+    #[test]
+    fn bounded_waves_match_unbounded_banded_assignment() {
+        let mut feats: Vec<AssignFeature> = Vec::new();
+        for i in 0..200 {
+            let base = (i % 20) as f64 * 0.01;
+            feats.push(poly(
+                i,
+                base,
+                base,
+                base + 0.0005 + (i as f64) * 1e-6,
+                base + 0.0005,
+            ));
+        }
+        let gsds = [gsd(2), gsd(5), gsd(8), gsd(12)];
+        let cfg = AssignConfig::default();
+        let reprs = [
+            Representation::Point,
+            Representation::Point,
+            Representation::Square,
+            Representation::Geometry,
+        ];
+        let unbounded = assign_levels_banded(&feats, &gsds, &cfg, Crs::Epsg4326, &reprs);
+        let bounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg4326, 1, &reprs);
+        assert_eq!(unbounded.assignments, bounded.assignments);
+        assert!(
+            unbounded.assignments.iter().any(|a| a.min_level == 0),
+            "point band must admit coarse winners"
+        );
+    }
+
     // ---- zoom-band point representation (#317) ------------------------------
 
     #[test]
