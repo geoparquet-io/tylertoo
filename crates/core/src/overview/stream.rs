@@ -165,6 +165,21 @@ fn stage_input_pass0(
     }
 }
 
+/// Resolve the pass-2 in-flight depth (auto-sizing from available cores when
+/// the caller left it at [`super::convert::IN_FLIGHT_BATCHES_AUTO`]) and log
+/// the chosen depth alongside the detected core count, so pass-2 core
+/// utilization is observable rather than a mystery (#264).
+fn resolve_and_log_in_flight_batches(requested: usize) -> usize {
+    let in_flight = super::convert::resolve_in_flight_batches(requested);
+    log::info!(
+        "[convert] pass 2 parallelism: {in_flight} read batch(es) in flight ({} core(s) detected)",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
+    );
+    in_flight
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -599,6 +614,10 @@ pub(crate) fn convert_streaming_strategy(
     // `(outcome, rows, vertices)` per emitted level, in level order. The
     // outcome distinguishes a written level from one the writer skipped because
     // every candidate collapsed during simplification (#211).
+    // Resolve the in-flight depth once (auto-sizes from available cores when
+    // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
+    let in_flight_batches = resolve_and_log_in_flight_batches(options.in_flight_batches);
+
     let level_stats: Vec<(LevelWriteOutcome, usize, usize)> = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
         Pass2Strategy::Serial => ctxs
@@ -611,7 +630,7 @@ pub(crate) fn convert_streaming_strategy(
                     hints[i],
                     source,
                     options.read_batch_size,
-                    options.in_flight_batches,
+                    in_flight_batches,
                     selected_row_groups.as_ref(),
                     ctx,
                 )
@@ -634,7 +653,7 @@ pub(crate) fn convert_streaming_strategy(
                     source,
                     options.read_batch_size,
                     selected_row_groups.as_ref(),
-                    options.in_flight_batches,
+                    in_flight_batches,
                     backing,
                     &out_schema,
                 )?
@@ -647,7 +666,7 @@ pub(crate) fn convert_streaming_strategy(
                 hints[n - 1],
                 source,
                 options.read_batch_size,
-                options.in_flight_batches,
+                in_flight_batches,
                 selected_row_groups.as_ref(),
                 &ctxs[n - 1],
             )?);

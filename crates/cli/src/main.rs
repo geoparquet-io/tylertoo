@@ -46,6 +46,20 @@ fn parse_size_bytes(s: &str) -> Result<usize, String> {
     })
 }
 
+/// Parse `--in-flight-batches`: `auto` (→ the core-sized sentinel 0) or an
+/// explicit positive integer. See [`resolve_in_flight_batches`] for how the
+/// sentinel is expanded at pass-2 setup.
+fn parse_in_flight_batches(s: &str) -> Result<usize, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(tylertoo_core::overview::convert::IN_FLIGHT_BATCHES_AUTO);
+    }
+    match s.parse::<usize>() {
+        Ok(0) => Err("in-flight-batches must be `auto` or >= 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("expected `auto` or a positive integer, got `{s}`")),
+    }
+}
+
 /// Parse a --bbox argument: xmin,ymin,xmax,ymax (lon/lat degrees).
 fn parse_bbox(s: &str) -> Result<[f64; 4]> {
     let parts: Vec<&str> = s.split(',').collect();
@@ -639,13 +653,17 @@ struct ConvertTuningArgs {
     /// Read batches allowed in flight through the pass-2 pipeline at once
     /// (read/compute-overlap knob; bounded-channel depth).
     ///
-    /// Higher improves core utilization on long-pole geometries at
-    /// proportionally more peak memory (in-flight-batches × read-batch-size rows
-    /// resident). No effect with --no-streaming.
+    /// `auto` (the default) sizes this to the machine's available cores
+    /// (clamped to 4..=16); pass an explicit integer to override. Higher
+    /// improves core utilization on long-pole geometries at proportionally
+    /// more peak memory (in-flight-batches × read-batch-size rows resident).
+    /// The chosen depth and detected core count are logged at pass-2 start.
+    /// No effect with --no-streaming.
     #[arg(
         long,
-        value_name = "N",
-        default_value = "4",
+        value_name = "N|auto",
+        default_value = "auto",
+        value_parser = parse_in_flight_batches,
         help_heading = "Memory & performance"
     )]
     in_flight_batches: usize,
@@ -1683,6 +1701,21 @@ mod tests {
         // A plain integer is raw bytes — keeps pre-reconciliation invocations working.
         assert_eq!(parse_size_bytes("500000").unwrap(), 500_000);
         assert!(parse_size_bytes("banana").is_err());
+    }
+
+    #[test]
+    fn parse_in_flight_batches_accepts_auto_and_positive() {
+        // `auto` maps to the core-sized sentinel; case-insensitive.
+        assert_eq!(
+            parse_in_flight_batches("auto").unwrap(),
+            tylertoo_core::overview::convert::IN_FLIGHT_BATCHES_AUTO
+        );
+        assert_eq!(parse_in_flight_batches("AUTO").unwrap(), 0);
+        // Explicit positive integers pass through.
+        assert_eq!(parse_in_flight_batches("8").unwrap(), 8);
+        // Explicit 0 is rejected (use `auto`); non-numeric is rejected.
+        assert!(parse_in_flight_batches("0").is_err());
+        assert!(parse_in_flight_batches("banana").is_err());
     }
 
     #[test]

@@ -329,7 +329,8 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     in_flight_batches (int, optional): Read batches allowed in flight through
 ///         the pass-2 pipeline at once (read/compute-overlap knob). Higher
 ///         improves core utilization at proportionally more peak memory.
-///         Defaults to 4.
+///         Defaults to 0, which auto-sizes to the machine's available cores
+///         (clamped to 4..=16); pass an explicit positive integer to override.
 ///     spill_dir (str or os.PathLike, optional): Directory for the
 ///         remote-input spill file. A remote convert stages every fetched
 ///         chunk on local disk (≈1x the touched input bytes) so later passes
@@ -404,7 +405,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     read_batch_size=8192,
     bbox=None,
     profile="auto",
-    in_flight_batches=4,
+    in_flight_batches=0,
     spill_dir=None,
 ))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability

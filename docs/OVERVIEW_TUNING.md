@@ -690,7 +690,7 @@ Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
 | `--read-batch-size N` | `8192` | rows per read batch | **bigger = faster-ish, more memory** |
 | `--no-streaming` | off | flag | revert to the one-pass in-memory pipeline |
 | `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles---profile---in-flight-batches) |
-| `--in-flight-batches N` | `4` | read batches in flight | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches) |
+| `--in-flight-batches N\|auto` | `auto` | read batches in flight (auto = cores, clamped 4–16) | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches) |
 
 **`--read-batch-size`** bounds the transient working set of both passes: each
 batch is decoded, filtered, simplified, and written before the next is read.

@@ -93,9 +93,11 @@ For very large exports where pass-2 output buffering is the pressure,
 `--profile bounded` spills buffered tiles to temporary Arrow IPC files
 instead of holding them in RAM (`auto`, the default, picks `speed` or
 `bounded` per mode and estimated size — output is byte-identical either
-way). `--in-flight-batches <N>` (default 4) trades peak memory for
+way). `--in-flight-batches <N|auto>` (default `auto`, which sizes to the
+machine's available cores clamped to 4–16) trades peak memory for
 read/compute overlap: higher keeps more read batches resident but improves
-core utilization on long-pole geometries.
+core utilization on long-pole geometries. The resolved depth and detected
+core count are logged at pass-2 start.
 
 Line coalescing holds one level's candidate lines in memory; datasets
 with more lines than `--coalesce-max-level-rows` (default 2,000,000)

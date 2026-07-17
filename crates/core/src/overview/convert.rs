@@ -323,10 +323,13 @@ pub struct ConvertOptions {
     pub profile: MemoryProfile,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once (bounded-channel depth / read-compute overlap
-    /// knob). Default [`DEFAULT_IN_FLIGHT_BATCHES`]. Higher improves core
-    /// utilization on long-pole geometries at proportionally more peak memory
-    /// (`in_flight_batches × read_batch_size` rows resident). No effect when
-    /// `streaming` is `false`.
+    /// knob). Default [`IN_FLIGHT_BATCHES_AUTO`], which
+    /// [`resolve_in_flight_batches`] expands to the machine's available
+    /// parallelism (clamped to `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`)
+    /// at pass-2 setup; any explicit positive value is honoured verbatim.
+    /// Higher improves core utilization on long-pole geometries at
+    /// proportionally more peak memory (`in_flight_batches × read_batch_size`
+    /// rows resident). No effect when `streaming` is `false`.
     pub in_flight_batches: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -401,10 +404,42 @@ pub struct ConvertOptions {
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
 
-/// Default number of read batches in flight through the pass-2 pipeline
-/// (#213). Four keeps a few cores fed on long-pole geometries while bounding
-/// resident batches to `4 × read_batch_size` rows.
-pub const DEFAULT_IN_FLIGHT_BATCHES: usize = 4;
+/// Sentinel value for [`ConvertOptions::in_flight_batches`] requesting
+/// automatic sizing from the machine's available parallelism (see
+/// [`resolve_in_flight_batches`]). This is the library default so a convert
+/// uses the cores it is given without the caller having to know the box.
+pub const IN_FLIGHT_BATCHES_AUTO: usize = 0;
+
+/// Lower clamp for auto-sized in-flight batches. Keeps a few cores fed even
+/// on a small box, and matches the historical hard default (#213).
+pub const IN_FLIGHT_BATCHES_MIN: usize = 4;
+
+/// Upper clamp for auto-sized in-flight batches. The single-threaded parquet
+/// writer (#264 follow-up) caps the achievable speedup, so pushing in-flight
+/// past this only grows the resident batch set (`in_flight × read_batch_size`
+/// rows) without a matching throughput gain. Power users can still pass a
+/// larger explicit value.
+pub const IN_FLIGHT_BATCHES_MAX: usize = 16;
+
+/// Resolve a requested in-flight-batches value to a concrete depth.
+///
+/// [`IN_FLIGHT_BATCHES_AUTO`] (0) auto-sizes from
+/// [`std::thread::available_parallelism`], clamped to
+/// `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`; any explicit positive
+/// value is honoured verbatim (uncapped — the caller opted in to the memory
+/// cost). Output is byte-identical for every value: in-flight depth only sets
+/// read/compute overlap, never level assignment or write order (see the
+/// `pipelined_in_flight_matches_reference` equivalence test).
+pub fn resolve_in_flight_batches(requested: usize) -> usize {
+    if requested == IN_FLIGHT_BATCHES_AUTO {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(IN_FLIGHT_BATCHES_MIN)
+            .clamp(IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX)
+    } else {
+        requested
+    }
+}
 
 impl Default for ConvertOptions {
     fn default() -> Self {
@@ -428,7 +463,7 @@ impl Default for ConvertOptions {
             streaming: true,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             profile: MemoryProfile::Auto,
-            in_flight_batches: DEFAULT_IN_FLIGHT_BATCHES,
+            in_flight_batches: IN_FLIGHT_BATCHES_AUTO,
             cluster: false,
             accumulate: Vec::new(),
             coalesce_lines: true,
@@ -779,11 +814,9 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
             )));
         }
     }
-    if options.in_flight_batches == 0 {
-        return Err(ConvertError::InvalidConfig(
-            "in-flight-batches must be >= 1".to_string(),
-        ));
-    }
+    // in_flight_batches == 0 is the IN_FLIGHT_BATCHES_AUTO sentinel (resolved
+    // to available parallelism at pass-2 setup), not an error. Any explicit
+    // positive value is honoured verbatim, so there is nothing to reject here.
     // #272: fail fast on a bad spill dir — the spill is best-effort, so a
     // mid-convert creation failure would only surface as a silent degrade
     // to network re-fetch.
@@ -4374,7 +4407,10 @@ mod tests {
         };
 
         let reference = convert(7, 1);
-        for (rbs, ifb) in [(64usize, 4usize), (4096, 8)] {
+        // ifb = 0 is the IN_FLIGHT_BATCHES_AUTO sentinel: it must produce the
+        // same output as any explicit depth (auto only changes overlap, not
+        // level assignment or write order).
+        for (rbs, ifb) in [(64usize, 4usize), (4096, 8), (8192, 0)] {
             let candidate = convert(rbs, ifb);
             assert_outputs_equivalent(
                 reference.path(),
@@ -4382,6 +4418,31 @@ mod tests {
                 &format!("read_batch_size={rbs} in_flight_batches={ifb}"),
             );
         }
+    }
+
+    #[test]
+    fn resolve_in_flight_batches_auto_and_explicit() {
+        // Auto (0) sizes from available parallelism, clamped to [MIN, MAX].
+        let auto = resolve_in_flight_batches(IN_FLIGHT_BATCHES_AUTO);
+        assert!(
+            (IN_FLIGHT_BATCHES_MIN..=IN_FLIGHT_BATCHES_MAX).contains(&auto),
+            "auto in-flight {auto} outside [{IN_FLIGHT_BATCHES_MIN}, {IN_FLIGHT_BATCHES_MAX}]"
+        );
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(IN_FLIGHT_BATCHES_MIN);
+        assert_eq!(
+            auto,
+            cores.clamp(IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX),
+            "auto must equal core count clamped to the configured range"
+        );
+        // Explicit values pass through verbatim, including above the auto cap.
+        assert_eq!(resolve_in_flight_batches(1), 1);
+        assert_eq!(resolve_in_flight_batches(7), 7);
+        assert_eq!(
+            resolve_in_flight_batches(IN_FLIGHT_BATCHES_MAX + 100),
+            IN_FLIGHT_BATCHES_MAX + 100
+        );
     }
 
     #[test]
