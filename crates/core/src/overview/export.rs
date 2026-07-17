@@ -47,8 +47,13 @@
 //! Peak working set is `O(one wave of partitions + writer state)` (waves are
 //! [`resolve_partition_wave`] partitions processed concurrently): each in-flight
 //! partition holds its (feature × intersecting-tile) clipped members plus its
-//! encoded tiles, bounded by the partition target — **not** the zoom band's
-//! feature count.
+//! encoded tiles. That per-partition transient is usually bounded by the
+//! partition target — **not** the zoom band's feature count — but a single
+//! dense tile that overshoots the target is one partition whose members are
+//! *unbounded* by it. On `auto` the wave width is therefore sized per level from
+//! the densest planned partition ([`memory_safe_level_wave`], #311), narrowing
+//! (down to serial if need be) so a dense finest zoom stays within RAM instead
+//! of OOM-killing the run.
 //! The scan pass keeps only per-tile member counts (`O(#tiles)`), and the
 //! PMTiles writer streams tile bytes to a temp file, keeping only directory
 //! entries. There is **no** per-zoom or global accumulation.
@@ -312,17 +317,32 @@ pub const PARTITION_WAVE_FALLBACK_MAX: usize = 16;
 /// OOMing — a too-narrow wave only costs wall clock.
 const EXPORT_WAVE_RAM_FRACTION: f64 = 0.5;
 
-/// Conservative estimate of one wave slot's transient memory cost (one
-/// in-flight partition: its clipped `(feature × tile)` members plus encoded
-/// tiles), at the default [`DEFAULT_PARTITION_TARGET`].
+/// Flat fallback estimate of one wave slot's transient memory cost, used **only
+/// by the upfront ceiling** [`memory_safe_wave`] and when the data-aware
+/// per-level estimate ([`memory_safe_level_wave`], #311) cannot be computed
+/// (finest-level row size unknown).
 ///
 /// Measured (2026-07, #293 benchmark, germany-segments 19.2M-feature z14
 /// band): widening 6 → 16 lifted peak RSS 588 → 848 MiB, i.e. ~26 MiB per
-/// wave slot. Biased ~2.5× high — mirroring #294's calibration bias — so the
-/// preflight under-widens rather than OOMs on datasets with fatter members
-/// (partitions stop at *at least* the target, and a single giant feature can
-/// overshoot it).
+/// wave slot. It was calibrated on **lines** and does **not** generalize: on
+/// dense finest-zoom polygon data a single dense tile is one partition holding
+/// millions of members, so the true per-slot transient runs ~120× this (#311,
+/// Brazil field boundaries: ~7.5 GiB/slot). That is why the binding memory
+/// guard is now the per-level [`memory_safe_level_wave`], which sizes from the
+/// densest planned partition's actual member count; this constant survives only
+/// as the coarse upfront ceiling and the last-resort fallback.
 const PARTITION_SLOT_TRANSIENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// In-memory inflation applied to the finest level's mean **stored**
+/// (uncompressed Parquet) bytes/row to estimate a resident clipped **member**'s
+/// cost (#311).
+///
+/// A member holds a decoded `geo::Geometry<f64>` (16 B/coord, no column
+/// compression, `Vec` capacity slack) and is briefly co-resident with its
+/// gzip-encoded MVT copy in the same wave, so 2× the stored size is a
+/// deliberately high bias — which is what we want, since a too-narrow wave only
+/// costs wall clock while an OOM loses the whole run.
+const MEMBER_MEMORY_INFLATION: u64 = 2;
 
 /// The widest wave the memory budget allows: how many
 /// [`PARTITION_SLOT_TRANSIENT_BYTES`] slots fit in
@@ -351,6 +371,52 @@ fn auto_partition_wave(cores: usize, available_ram_bytes: Option<u64>) -> usize 
     cores
         .min(memory_safe_wave(available_ram_bytes))
         .max(PARTITION_WAVE_MIN)
+}
+
+/// The memory-safe wave width for a **single level** (#311), the fix for the
+/// flat [`PARTITION_SLOT_TRANSIENT_BYTES`] under-count that OOM-killed dense
+/// exports on `auto`.
+///
+/// Where the upfront [`memory_safe_wave`] sizes from a flat per-slot constant,
+/// this uses the level's *actual* densest planned partition:
+/// `max(partition.members) × mean_member_bytes × [`MEMBER_MEMORY_INFLATION`]`
+/// directly estimates the largest partition's resident geometry volume. This
+/// captures the real driver — a single dense tile that overshoots
+/// [`DEFAULT_PARTITION_TARGET`] is one partition, wholly unbounded by the target
+/// — which the flat constant ignores entirely.
+///
+/// The result is clamped to `ceiling` (the auto/core-sized upper bound, so this
+/// never *widens* a wave) but is deliberately allowed to fall **below**
+/// [`PARTITION_WAVE_MIN`], down to 1: on pathologically dense data, memory
+/// safety outranks the historical throughput floor (a serial wave that finishes
+/// beats an OOM that never does).
+///
+/// Falls back to `ceiling` (prior behaviour) when the per-member size is unknown
+/// (empty finest level) or RAM cannot be probed — the same conditions under
+/// which the flat preflight already governed.
+fn memory_safe_level_wave(
+    ceiling: usize,
+    partitions: &[Partition],
+    mean_member_bytes: Option<u64>,
+    available_ram_bytes: Option<u64>,
+) -> usize {
+    let (Some(mean), Some(ram)) = (mean_member_bytes.filter(|&b| b > 0), available_ram_bytes)
+    else {
+        return ceiling;
+    };
+    let max_members = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+    if max_members == 0 {
+        return ceiling;
+    }
+    // Saturating throughout: an absurd member count or byte size clamps the
+    // per-slot estimate to "definitely serial" (wave 1) rather than overflowing.
+    let per_slot = (max_members as u64)
+        .saturating_mul(mean)
+        .saturating_mul(MEMBER_MEMORY_INFLATION)
+        .max(1);
+    let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
+    let safe = (budget / per_slot).max(1) as usize;
+    ceiling.min(safe)
 }
 
 /// Resolve a requested partition-wave width to a concrete value.
@@ -465,9 +531,19 @@ fn export_pmtiles_with_partition_target(
     let min_zoom = zoom_for_level(&meta, 0);
     let max_zoom = zoom_for_level(&meta, num_levels - 1);
 
-    // Resolve the partition-wave width once (auto-sizes from available cores
-    // when the caller left it at PARTITION_WAVE_AUTO) and surface it (#293).
-    let partition_wave = resolve_and_log_partition_wave(options.partition_wave);
+    // Resolve the partition-wave *ceiling* once (auto-sizes from available cores
+    // when the caller left it at PARTITION_WAVE_AUTO) and surface it (#293). On
+    // `auto` this is only an upper bound: each level narrows it further from its
+    // own densest partition (#311) — see the per-level `memory_safe_level_wave`
+    // below. An explicit `--partition-wave N` is honoured verbatim and never
+    // narrowed (the caller opted into the memory cost).
+    let ceiling_wave = resolve_and_log_partition_wave(options.partition_wave);
+    let auto_wave = options.partition_wave == PARTITION_WAVE_AUTO;
+    // Data-aware per-member size signal for the #311 guard: the finest level's
+    // mean uncompressed row bytes, read once from the Parquet metadata. Probe
+    // RAM once too so every level sizes against the same budget.
+    let mean_member_bytes = reader.finest_level_mean_row_bytes();
+    let available_ram = available_memory_bytes();
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
@@ -522,6 +598,30 @@ fn export_pmtiles_with_partition_target(
         // Split the zoom's tiles into contiguous ascending (x, y) ranges of
         // roughly `partition_target` members each.
         let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
+
+        // Per-level memory guard (#311): on `auto`, narrow the wave from THIS
+        // level's densest planned partition so a dense finest zoom does not OOM
+        // the whole run. Explicit waves are honoured verbatim.
+        let partition_wave = if auto_wave {
+            let w =
+                memory_safe_level_wave(ceiling_wave, &partitions, mean_member_bytes, available_ram);
+            if w < ceiling_wave {
+                let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+                let budget_mib = available_ram
+                    .map(|r| ((r as f64 * EXPORT_WAVE_RAM_FRACTION) as u64) / (1024 * 1024))
+                    .unwrap_or(0);
+                log::info!(
+                    "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
+                     (densest partition {densest} members × ~{} B/member × {MEMBER_MEMORY_INFLATION}, \
+                     {budget_mib} MiB budget) — #311 density guard",
+                    level_idx + 1,
+                    mean_member_bytes.unwrap_or(0),
+                );
+            }
+            w
+        } else {
+            ceiling_wave
+        };
 
         // Pass 2: process partitions in ascending tile order, streaming each
         // finished partition's encoded tiles straight to the writer. To hide
@@ -2184,6 +2284,90 @@ mod tests {
         assert_eq!(auto_partition_wave(64, None), PARTITION_WAVE_FALLBACK_MAX);
         assert_eq!(auto_partition_wave(8, None), 8);
         assert_eq!(auto_partition_wave(2, None), PARTITION_WAVE_MIN);
+    }
+
+    /// Build a partition list from raw member counts (bbox/keys are irrelevant
+    /// to the memory-safe sizing, which only reads `.members`).
+    fn partitions_with_members(counts: &[usize]) -> Vec<Partition> {
+        counts
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| Partition {
+                key_lo: i as u64,
+                key_hi: i as u64,
+                bbox: TileBounds::new(0.0, 0.0, 0.0, 0.0),
+                members: m,
+            })
+            .collect()
+    }
+
+    /// The data-aware per-level guard (#311): sizes from the *densest* planned
+    /// partition, not a flat constant, and may drop below the throughput floor
+    /// when memory demands it.
+    #[test]
+    fn memory_safe_level_wave_uses_densest_partition() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        // Sparse level: small partitions × modest members → the estimate is far
+        // under budget, so the ceiling is preserved untouched.
+        let sparse = partitions_with_members(&[32_768, 30_000, 31_000]);
+        assert_eq!(
+            memory_safe_level_wave(16, &sparse, Some(512), Some(54 * GIB)),
+            16,
+            "a sparse level must not narrow below the ceiling"
+        );
+
+        // Dense level: one tile overshoots the target into a 6.5M-member
+        // partition of ~600 B/member. per-slot ≈ 6.5M × 600 × 2 ≈ 7.3 GiB;
+        // budget = 0.5 × 54 GiB = 27 GiB → 3 slots. This is the Brazil case that
+        // OOM'd at wave 16, now capped to a safe 3.
+        let dense = partitions_with_members(&[6_500_000, 100, 200]);
+        assert_eq!(
+            memory_safe_level_wave(16, &dense, Some(600), Some(54 * GIB)),
+            3,
+        );
+
+        // Extreme density can fall *below* PARTITION_WAVE_MIN, all the way to a
+        // serial wave — memory safety outranks the historical floor.
+        // Result 1 is deliberately below PARTITION_WAVE_MIN (6): the memory
+        // guard bypasses the throughput floor rather than OOM.
+        let extreme = partitions_with_members(&[60_000_000, 100]);
+        assert_eq!(
+            memory_safe_level_wave(16, &extreme, Some(600), Some(54 * GIB)),
+            1,
+        );
+
+        // The clamp is one-directional: a roomy budget never widens past the
+        // ceiling the caller already chose.
+        assert_eq!(
+            memory_safe_level_wave(4, &sparse, Some(512), Some(256 * GIB)),
+            4,
+        );
+
+        // Fallbacks preserve prior behaviour: unknown member size (empty finest
+        // level), unmeasurable RAM, or an empty partition list all return the
+        // ceiling verbatim.
+        assert_eq!(
+            memory_safe_level_wave(16, &dense, None, Some(54 * GIB)),
+            16,
+            "unknown member size falls back to the ceiling"
+        );
+        assert_eq!(
+            memory_safe_level_wave(16, &dense, Some(0), Some(54 * GIB)),
+            16,
+            "a degenerate zero member size falls back to the ceiling"
+        );
+        assert_eq!(
+            memory_safe_level_wave(16, &dense, Some(600), None),
+            16,
+            "unprobeable RAM falls back to the ceiling"
+        );
+        assert_eq!(
+            memory_safe_level_wave(16, &[], Some(600), Some(54 * GIB)),
+            16,
+            "an empty level falls back to the ceiling"
+        );
     }
 
     #[test]

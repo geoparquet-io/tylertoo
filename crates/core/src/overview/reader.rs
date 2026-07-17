@@ -122,6 +122,37 @@ impl OverviewReader {
         self.metadata.num_row_groups()
     }
 
+    /// Mean **uncompressed** bytes per row in the finest (highest-index) level's
+    /// row-group band, read straight from the Parquet metadata (no scan, no
+    /// decode).
+    ///
+    /// This is the data-aware per-member size signal the export memory preflight
+    /// (#311) multiplies by the densest partition's member count to size a
+    /// per-partition transient — replacing the flat 64 MiB assumption that
+    /// OOM-killed dense finest-zoom exports. The finest level is chosen because
+    /// it carries full-resolution geometry and is where the export OOMs; its
+    /// stored bytes/row (geoarrow native `f64` coordinates + properties, no
+    /// column compression) is a high-biased proxy for a resident clipped
+    /// member's cost, which suits a preflight that must bias narrow.
+    ///
+    /// Returns `None` when the finest level has no rows (empty file) so callers
+    /// fall back to the calibrated constant rather than dividing by zero.
+    pub fn finest_level_mean_row_bytes(&self) -> Option<u64> {
+        let finest = self.num_levels().checked_sub(1)?;
+        let (start, end) = self.level_band(finest).ok()?;
+        let mut bytes: u64 = 0;
+        let mut rows: i64 = 0;
+        for rg in start..=end {
+            let rgm = self.metadata.row_group(rg);
+            bytes = bytes.saturating_add(rgm.total_byte_size().max(0) as u64);
+            rows = rows.saturating_add(rgm.num_rows());
+        }
+        if rows <= 0 {
+            return None;
+        }
+        Some(bytes / rows as u64)
+    }
+
     /// The Arrow schema of the file (including the `level` column).
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
@@ -435,6 +466,37 @@ mod tests {
         assert_eq!(reader.meta().levels[0].row_group_end, 0);
         assert_eq!(reader.meta().levels[1].row_group_end, 1);
         assert_eq!(reader.meta().levels[2].row_group_end, 2);
+    }
+
+    #[test]
+    fn finest_level_mean_row_bytes_reports_finest_band() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // 3 levels; the finest (level 2) carries 6 rows in its own band.
+        write_fixture(
+            tmp.path(),
+            Mode::Duplicating,
+            &[vec![0, 2], vec![0, 1, 2, 3], vec![0, 1, 2, 3, 4, 5]],
+            10_000,
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+
+        // The signal is present and positive — a real file always has geometry
+        // bytes per row, so callers never fall back to the flat constant here.
+        let mean = reader.finest_level_mean_row_bytes().unwrap();
+        assert!(mean > 0, "finest-level mean row bytes must be positive");
+
+        // It is computed over the *finest* band only: it equals that band's
+        // summed uncompressed bytes divided by its row count, which we can
+        // recompute independently from the same metadata.
+        let (start, end) = reader.level_band(reader.num_levels() - 1).unwrap();
+        let mut bytes = 0u64;
+        let mut rows = 0i64;
+        for rg in start..=end {
+            let rgm = reader.metadata.row_group(rg);
+            bytes += rgm.total_byte_size().max(0) as u64;
+            rows += rgm.num_rows();
+        }
+        assert_eq!(mean, bytes / rows as u64);
     }
 
     #[test]
