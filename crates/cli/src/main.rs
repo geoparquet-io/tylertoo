@@ -222,11 +222,15 @@ struct ExportPmtilesArgs {
     no_simple_clip_fastpath: bool,
 
     /// Partitions processed per band read during export (the export
-    /// concurrency knob). `auto` (the default) sizes this to the machine's
-    /// available cores (clamped to 6..=16); pass an explicit integer to
-    /// override. Wider waves keep more cores busy at proportionally more peak
-    /// memory (one wave of partitions resident). The chosen width and detected
-    /// core count are logged at export start.
+    /// concurrency knob). `auto` (the default) preflights a memory budget:
+    /// the machine's core count, capped by how many estimated per-partition
+    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
+    /// only when RAM cannot be probed; override the RAM figure with
+    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// Wider waves keep more cores busy at proportionally more peak memory
+    /// (one wave of partitions resident). The chosen width and the preflight
+    /// inputs are logged at export start. Output is byte-identical for every
+    /// value.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
@@ -918,11 +922,15 @@ struct TilesArgs {
     tile_buffer: u32,
 
     /// Partitions processed per band read during the export phase (the export
-    /// concurrency knob). `auto` (the default) sizes this to the machine's
-    /// available cores (clamped to 6..=16); pass an explicit integer to
-    /// override. Wider waves keep more cores busy at proportionally more peak
-    /// memory (one wave of partitions resident). The chosen width and detected
-    /// core count are logged at export start.
+    /// concurrency knob). `auto` (the default) preflights a memory budget:
+    /// the machine's core count, capped by how many estimated per-partition
+    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
+    /// only when RAM cannot be probed; override the RAM figure with
+    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// Wider waves keep more cores busy at proportionally more peak memory
+    /// (one wave of partitions resident). The chosen width and the preflight
+    /// inputs are logged at export start. Output is byte-identical for every
+    /// value.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 

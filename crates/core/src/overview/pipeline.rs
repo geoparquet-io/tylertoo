@@ -133,14 +133,18 @@ fn auto_backing(mode: Mode, buffered_rows: usize, available_ram_bytes: Option<u6
     }
 }
 
-/// Available system RAM in bytes for the `Auto` budget.
+/// Available system RAM in bytes for auto memory budgets — the convert-side
+/// `Auto` profile (#294) and the export-side partition-wave preflight (#303)
+/// share this probe so both honour the same override and fallback semantics.
 ///
 /// Order of precedence:
 /// 1. `TYLERTOO_AUTO_MEM_LIMIT_BYTES` env override (ops / testing knob — treat
 ///    the box as having this many bytes of available RAM);
 /// 2. Linux `/proc/meminfo` `MemAvailable`;
-/// 3. `None` (caller falls back to [`AUTO_FALLBACK_BUDGET_BYTES`]).
-fn available_memory_bytes() -> Option<u64> {
+/// 3. `None` (callers fall back to a fixed conservative budget — see
+///    [`AUTO_FALLBACK_BUDGET_BYTES`] and
+///    [`super::export::PARTITION_WAVE_FALLBACK_MAX`]).
+pub(super) fn available_memory_bytes() -> Option<u64> {
     if let Ok(v) = std::env::var("TYLERTOO_AUTO_MEM_LIMIT_BYTES") {
         if let Ok(n) = v.trim().parse::<u64>() {
             return Some(n);
