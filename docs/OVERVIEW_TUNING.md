@@ -905,7 +905,16 @@ engine involved):
 - Literals: numbers (`0.8`, `-2`, `1e6`), single-quoted strings (`'it''s'`
   escapes a quote), `TRUE`/`FALSE`. Keywords are case-insensitive.
 - Columns: bare identifiers, or `"double quoted"` for names with spaces.
-  Supported column types: numeric (int/uint/float), string, boolean.
+  Supported column types: numeric (int/uint/float), string, boolean,
+  timestamp.
+- Timestamp columns compare against single-quoted datetime strings:
+  `time >= '2025-01-01'`, `time < '2025-06-01 12:30:00'`, or full RFC 3339
+  with an offset. Timezone-less literals are read as UTC (Arrow timestamps
+  store a UTC instant regardless of the column's display timezone), and a
+  malformed datetime errors at startup, not mid-run. Statistics pushdown
+  works when the file stores timestamps as INT64 (modern writers); legacy
+  INT96 timestamps (older Spark) expose no statistics, so those predicates
+  filter exactly but prune nothing.
 
 **Null semantics** are SQL three-valued logic: a comparison or `IN` over a
 NULL value is UNKNOWN, `AND`/`OR`/`NOT` combine with Kleene logic, and a row

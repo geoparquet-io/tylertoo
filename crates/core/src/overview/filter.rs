@@ -53,7 +53,7 @@ use std::collections::HashMap;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Schema, TimeUnit};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
@@ -76,7 +76,7 @@ pub enum FilterError {
     /// The referenced column has a type the filter cannot evaluate.
     #[error(
         "--filter column {name:?} has unsupported type {data_type} \
-         (supported: numeric, string, boolean)"
+         (supported: numeric, string, boolean, timestamp)"
     )]
     UnsupportedColumnType {
         /// The column name.
@@ -99,6 +99,20 @@ pub enum FilterError {
     BooleanOrdering {
         /// The column name.
         name: String,
+    },
+    /// A string literal compared against a timestamp column failed to parse
+    /// as a datetime.
+    #[error(
+        "--filter: cannot parse {literal:?} as a datetime for timestamp column {name:?} \
+         (accepted: '2025-01-01', '2025-01-01 12:30:00', RFC 3339): {msg}"
+    )]
+    TimestampLiteral {
+        /// The column name.
+        name: String,
+        /// The offending literal source text.
+        literal: String,
+        /// The underlying parse error.
+        msg: String,
     },
 }
 
@@ -128,6 +142,11 @@ pub enum Literal {
     String(String),
     /// `TRUE` / `FALSE`.
     Bool(bool),
+    /// A datetime literal as epoch nanoseconds (UTC). Never produced by the
+    /// parser: binding coerces a string literal compared against a timestamp
+    /// column into this form (`'2025-01-01'`, `'2025-01-01 12:30:00'`,
+    /// RFC 3339 with offset, ...). Timezone-less literals are read as UTC.
+    Timestamp(i64),
 }
 
 impl Literal {
@@ -136,6 +155,7 @@ impl Literal {
             Literal::Number(v) => format!("number {v}"),
             Literal::String(s) => format!("string {s:?}"),
             Literal::Bool(b) => format!("boolean {b}"),
+            Literal::Timestamp(ns) => format!("timestamp {ns}ns"),
         }
     }
 }
@@ -540,6 +560,10 @@ enum ColKind {
     Num,
     Str,
     Bool,
+    /// Timestamp column of the given Arrow unit. Timezone metadata is
+    /// irrelevant to filtering: Arrow timestamps store an epoch instant, and
+    /// datetime literals are read as UTC.
+    Ts(TimeUnit),
 }
 
 impl ColKind {
@@ -548,6 +572,7 @@ impl ColKind {
             ColKind::Num => "numeric",
             ColKind::Str => "string",
             ColKind::Bool => "boolean",
+            ColKind::Ts(_) => "timestamp",
         }
     }
 }
@@ -566,11 +591,23 @@ fn column_kind(dt: &DataType) -> Option<ColKind> {
         | DataType::Float64 => Some(ColKind::Num),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some(ColKind::Str),
         DataType::Boolean => Some(ColKind::Bool),
+        DataType::Timestamp(unit, _) => Some(ColKind::Ts(*unit)),
         DataType::Dictionary(_, inner) => match inner.as_ref() {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some(ColKind::Str),
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Nanoseconds per unit tick, for widening a unit value into epoch nanos.
+/// Comparisons happen in `i128` so the widening can never overflow.
+fn ts_factor(unit: TimeUnit) -> i128 {
+    match unit {
+        TimeUnit::Second => 1_000_000_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Nanosecond => 1,
     }
 }
 
@@ -735,28 +772,36 @@ fn bind_expr(
         })
     };
 
-    let check_literal = |col: &BoundCol, lit: &Literal| -> Result<(), FilterError> {
-        let ok = matches!(
-            (col.kind, lit),
+    // Type-check a literal against its column, coercing datetime strings
+    // compared to timestamp columns into `Literal::Timestamp` epoch nanos
+    // (so a malformed date errors here, at bind time, not per batch).
+    let coerce_literal = |col: &BoundCol, lit: &Literal| -> Result<Literal, FilterError> {
+        match (col.kind, lit) {
             (ColKind::Num, Literal::Number(_))
-                | (ColKind::Str, Literal::String(_))
-                | (ColKind::Bool, Literal::Bool(_))
-        );
-        if ok {
-            Ok(())
-        } else {
-            Err(FilterError::TypeMismatch {
+            | (ColKind::Str, Literal::String(_))
+            | (ColKind::Bool, Literal::Bool(_)) => Ok(lit.clone()),
+            (ColKind::Ts(_), Literal::String(s)) => {
+                match arrow_cast::parse::string_to_timestamp_nanos(s) {
+                    Ok(ns) => Ok(Literal::Timestamp(ns)),
+                    Err(e) => Err(FilterError::TimestampLiteral {
+                        name: col.parquet_name.clone(),
+                        literal: s.clone(),
+                        msg: e.to_string(),
+                    }),
+                }
+            }
+            _ => Err(FilterError::TypeMismatch {
                 name: col.parquet_name.clone(),
                 kind: col.kind.name(),
                 literal: lit.describe(),
-            })
+            }),
         }
     };
 
     match expr {
         FilterExpr::Compare { column, op, value } => {
             let col = bind_col(column, columns)?;
-            check_literal(&col, value)?;
+            let value = coerce_literal(&col, value)?;
             if col.kind == ColKind::Bool && !matches!(op, CmpOp::Eq | CmpOp::Ne) {
                 return Err(FilterError::BooleanOrdering {
                     name: col.parquet_name,
@@ -765,7 +810,7 @@ fn bind_expr(
             Ok(BoundExpr::Compare {
                 col,
                 op: *op,
-                value: value.clone(),
+                value,
             })
         }
         FilterExpr::In {
@@ -774,12 +819,13 @@ fn bind_expr(
             negated,
         } => {
             let col = bind_col(column, columns)?;
-            for v in values {
-                check_literal(&col, v)?;
-            }
+            let values = values
+                .iter()
+                .map(|v| coerce_literal(&col, v))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(BoundExpr::In {
                 col,
-                values: values.clone(),
+                values,
                 negated: *negated,
             })
         }
@@ -882,6 +928,32 @@ fn str_mask(col: &dyn Array, f: &dyn Fn(&str) -> bool) -> Vec<Option<bool>> {
     }
 }
 
+/// Per-row raw `i64` values of a timestamp column (any unit), `None` for
+/// nulls or a non-timestamp array (unreachable after bind-time checking).
+fn ts_values(col: &dyn Array) -> Vec<Option<i64>> {
+    use arrow_array::types::{
+        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType,
+    };
+    let n = col.len();
+    fn read<T: arrow_array::ArrowPrimitiveType<Native = i64>>(
+        col: &dyn Array,
+        n: usize,
+    ) -> Vec<Option<i64>> {
+        let a = col.as_primitive::<T>();
+        (0..n)
+            .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+            .collect()
+    }
+    match col.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => read::<TimestampSecondType>(col, n),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => read::<TimestampMillisecondType>(col, n),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => read::<TimestampMicrosecondType>(col, n),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => read::<TimestampNanosecondType>(col, n),
+        _ => vec![None; n],
+    }
+}
+
 fn eval_expr(
     expr: &BoundExpr,
     batch: &RecordBatch,
@@ -902,6 +974,14 @@ fn eval_expr(
                     let a = arr.as_boolean();
                     (0..a.len())
                         .map(|i| (!a.is_null(i)).then(|| cmp_ord(&a.value(i), *op, lit)))
+                        .collect()
+                }
+                (ColKind::Ts(unit), Literal::Timestamp(lit)) => {
+                    let f = ts_factor(unit);
+                    let lit = *lit as i128;
+                    ts_values(arr.as_ref())
+                        .into_iter()
+                        .map(|v| v.map(|v| cmp_ord(&(v as i128 * f), *op, &lit)))
                         .collect()
                 }
                 // Bind-time type checking makes this unreachable.
@@ -949,6 +1029,20 @@ fn eval_expr(
                     let a = arr.as_boolean();
                     (0..a.len())
                         .map(|i| (!a.is_null(i)).then(|| lits.contains(&a.value(i))))
+                        .collect()
+                }
+                ColKind::Ts(unit) => {
+                    let f = ts_factor(unit);
+                    let lits: Vec<i128> = values
+                        .iter()
+                        .filter_map(|l| match l {
+                            Literal::Timestamp(ns) => Some(*ns as i128),
+                            _ => None,
+                        })
+                        .collect();
+                    ts_values(arr.as_ref())
+                        .into_iter()
+                        .map(|v| v.map(|v| lits.contains(&(v as i128 * f))))
                         .collect()
                 }
             };
@@ -1105,6 +1199,24 @@ fn rg_can_match(expr: &BoundExpr, rg: &RowGroupMetaData, chunk_idx: &HashMap<&st
                 Some((min, max)) => range_can_match_ord(&min, &max, op, l),
                 None => true,
             },
+            // Timestamp stats are physical Int64 in the column's own unit
+            // (INT96 legacy chunks expose no stats and stay conservative);
+            // widen both sides to i128 epoch nanos for an exact comparison.
+            Literal::Timestamp(l) => match (col.kind, stats) {
+                (ColKind::Ts(unit), Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
+                    (Some(min), Some(max)) => {
+                        let f = ts_factor(unit);
+                        range_can_match_ord(
+                            &(*min as i128 * f),
+                            &(*max as i128 * f),
+                            op,
+                            &(*l as i128),
+                        )
+                    }
+                    _ => true,
+                },
+                _ => true,
+            },
         }
     };
 
@@ -1159,8 +1271,11 @@ fn rg_can_match(expr: &BoundExpr, rg: &RowGroupMetaData, chunk_idx: &HashMap<&st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-    use arrow_schema::Field;
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow_schema::{Field, TimeUnit};
     use std::sync::Arc;
 
     // ---- parser ----------------------------------------------------------
@@ -1581,6 +1696,176 @@ mod tests {
         assert_eq!(selected("crop != 'soy'", &meta), vec![1, 3]);
         // NOT (...) is conservative: keeps everything.
         assert_eq!(selected("NOT (crop = 'soy')", &meta), vec![0, 1, 2, 3]);
+    }
+
+    // ---- timestamps ------------------------------------------------------
+
+    /// Epoch microseconds for 2024-01-01T00:00:00Z / 2025-01-01T00:00:00Z.
+    const T2024_US: i64 = 1_704_067_200_000_000;
+    const T2025_US: i64 = 1_735_689_600_000_000;
+
+    fn ts_batch(unit: TimeUnit, tz: Option<&str>) -> RecordBatch {
+        let dt = DataType::Timestamp(unit, tz.map(|s| s.into()));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", dt.clone(), true),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let div = match unit {
+            TimeUnit::Second => 1_000_000,
+            TimeUnit::Millisecond => 1_000,
+            TimeUnit::Microsecond => 1,
+            TimeUnit::Nanosecond => 1, // multiplied below instead
+        };
+        let mul = if unit == TimeUnit::Nanosecond {
+            1_000
+        } else {
+            1
+        };
+        let vals: Vec<Option<i64>> = vec![
+            Some(T2024_US / div * mul),
+            Some(T2025_US / div * mul),
+            None,
+            Some(T2025_US / div * mul),
+        ];
+        let time: ArrayRef = match unit {
+            TimeUnit::Second => Arc::new(TimestampSecondArray::from(vals).with_data_type(dt)),
+            TimeUnit::Millisecond => {
+                Arc::new(TimestampMillisecondArray::from(vals).with_data_type(dt))
+            }
+            TimeUnit::Microsecond => {
+                Arc::new(TimestampMicrosecondArray::from(vals).with_data_type(dt))
+            }
+            TimeUnit::Nanosecond => {
+                Arc::new(TimestampNanosecondArray::from(vals).with_data_type(dt))
+            }
+        };
+        let label: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("field"),
+            Some("field"),
+            Some("other"),
+            Some("other"),
+        ]));
+        RecordBatch::try_new(schema, vec![time, label]).unwrap()
+    }
+
+    fn eval_ts(src: &str, unit: TimeUnit, tz: Option<&str>) -> Vec<Option<bool>> {
+        let batch = ts_batch(unit, tz);
+        let expr = parse_filter(src).unwrap();
+        let bound = BoundFilter::bind(&expr, &batch.schema(), &[]).unwrap();
+        bound.eval_mask(&batch, &|i| i)
+    }
+
+    #[test]
+    fn eval_timestamp_comparisons_all_units() {
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            assert_eq!(
+                eval_ts("time >= '2025-01-01'", unit, None),
+                vec![Some(false), Some(true), None, Some(true)],
+                "unit {unit:?}"
+            );
+            assert_eq!(
+                eval_ts("time < '2025-01-01 00:00:00'", unit, None),
+                vec![Some(true), Some(false), None, Some(false)],
+                "unit {unit:?}"
+            );
+            assert_eq!(
+                eval_ts("time = '2024-01-01T00:00:00Z'", unit, None),
+                vec![Some(true), Some(false), None, Some(false)],
+                "unit {unit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_timestamp_tz_column_and_composition() {
+        // A tz-annotated column stores the same UTC epoch; literals are UTC.
+        assert_eq!(
+            eval_ts(
+                "time >= '2025-01-01' AND label = 'field'",
+                TimeUnit::Microsecond,
+                Some("UTC"),
+            ),
+            // Row 2: UNKNOWN (null time) AND FALSE (label mismatch) = FALSE.
+            vec![Some(false), Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            eval_ts(
+                "time IN ('2024-01-01', '2026-01-01')",
+                TimeUnit::Microsecond,
+                None,
+            ),
+            vec![Some(true), Some(false), None, Some(false)]
+        );
+        assert_eq!(
+            eval_ts("time IS NULL", TimeUnit::Microsecond, None),
+            vec![Some(false), Some(false), Some(true), Some(false)]
+        );
+    }
+
+    #[test]
+    fn bind_timestamp_errors() {
+        let batch = ts_batch(TimeUnit::Microsecond, None);
+        let schema = batch.schema();
+        // A numeric literal against a timestamp column is a type mismatch.
+        let num = parse_filter("time > 5").unwrap();
+        assert!(matches!(
+            BoundFilter::bind(&num, &schema, &[]),
+            Err(FilterError::TypeMismatch { .. })
+        ));
+        // An unparseable datetime string errors at bind time, not eval time.
+        let bad = parse_filter("time > 'not-a-date'").unwrap();
+        assert!(BoundFilter::bind(&bad, &schema, &[]).is_err());
+    }
+
+    /// Parquet file with a Timestamp(micros) column, one row group per value.
+    fn ts_stats_file(rows: &[Option<i64>]) -> (tempfile::NamedTempFile, ParquetMetaData) {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let dt = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let schema = Arc::new(Schema::new(vec![Field::new("time", dt.clone(), true)]));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        let time: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(rows.to_vec()).with_data_type(dt));
+        let batch = RecordBatch::try_new(schema, vec![time]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let f = std::fs::File::open(file.path()).unwrap();
+        let reader = parquet::file::reader::SerializedFileReader::new(f).unwrap();
+        use parquet::file::reader::FileReader;
+        let meta = reader.metadata().clone();
+        (file, meta)
+    }
+
+    #[test]
+    fn pushdown_prunes_by_timestamp_min_max() {
+        let (_f, meta) = ts_stats_file(&[Some(T2024_US), Some(T2025_US), None]);
+        assert_eq!(meta.num_row_groups(), 3);
+        let schema = Schema::new(vec![Field::new(
+            "time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]);
+        let sel = |src: &str| {
+            let expr = parse_filter(src).unwrap();
+            let bound = BoundFilter::bind(&expr, &schema, &[]).unwrap();
+            bound.select_row_groups(&meta)
+        };
+        // >= 2025: the 2024 row group and the all-null one are pruned.
+        assert_eq!(sel("time >= '2025-01-01'"), vec![1]);
+        assert_eq!(sel("time < '2025-01-01'"), vec![0]);
+        assert_eq!(sel("time IS NULL"), vec![2]);
     }
 
     #[test]
