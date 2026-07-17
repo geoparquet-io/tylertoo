@@ -68,8 +68,11 @@ wall time:
 | germany-buildings | speed | 3:58 | 14.8 GiB |
 | germany-buildings | bounded | 4:00 | **10.5 GiB** |
 
-−29 % peak RSS for a 2-second wall difference. Use `bounded` when RSS
-headroom matters more than the last few percent of throughput.
+−29 % peak RSS for a 2-second wall difference. The default `--profile
+auto` estimates the buffered output from the feature and level counts and
+picks `bounded` automatically once it would exceed a fraction of available
+RAM (set `TYLERTOO_AUTO_MEM_LIMIT_BYTES` to model a smaller box); pass
+`--profile bounded` to force it, or `speed` to force RAM buffering.
 
 ## Remote selective read
 

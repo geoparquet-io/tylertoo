@@ -638,10 +638,12 @@ struct ConvertTuningArgs {
     ///
     /// `speed` buffers each output level's rows in RAM (fastest; peak RAM grows
     /// with buffered output). `bounded` spills them to temporary Arrow IPC
-    /// files (memory-capped; slight temp-I/O cost). `auto` (default) picks per
-    /// mode + estimated size — duplicating → speed, partitioning → bounded, and
-    /// any run whose estimated buffered output exceeds a budget → bounded.
-    /// Output is byte-identical across profiles. No effect with --no-streaming.
+    /// files (memory-capped; slight temp-I/O cost). `auto` (default) is
+    /// workload-based: it estimates buffered output from feature and level
+    /// counts and spills when that exceeds a fraction of available RAM, so large
+    /// duplicating runs prefer bounded instead of risking OOM (override the RAM
+    /// figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical
+    /// across profiles. No effect with --no-streaming.
     #[arg(
         long,
         default_value = "auto",

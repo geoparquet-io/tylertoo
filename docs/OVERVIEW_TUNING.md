@@ -40,8 +40,10 @@ interact.
 > - **Conversion is slow / pins one core** → it now reads the input once and
 >   uses all cores; RAISE `--in-flight-batches` for more read/compute overlap.
 > - **Conversion runs out of memory in `speed` mode** → `--profile bounded`
->   (spills each level to temp files; `--profile auto`, the default, picks this
->   for you on large partitioning runs). Output is byte-identical either way.
+>   (spills each level to temp files; `--profile auto`, the default, now does
+>   this for you when the estimated buffered output exceeds a fraction of
+>   available RAM — large duplicating *and* partitioning runs both spill).
+>   Output is byte-identical either way.
 
 ---
 
@@ -279,9 +281,10 @@ tylertoo overview buildings.parquet buildings_overview.parquet \
 # One-shot to PMTiles: add tippecanoe's tile cap — uncapped coarse dot
 # tiles on a country-scale layer reach several MB (Germany z6: 12 MB),
 # far past renderer norms; the cap drop-to-fits them to ~500 KB.
-# On multi-GB inputs also pass --profile bounded: the recipe buffers
-# the (now much larger) coarse levels in RAM under the default speed
-# profile (Germany peak RSS 15 -> 29 GB without it).
+# On multi-GB inputs the recipe buffers the (now much larger) coarse
+# levels; the default --profile auto estimates this and spills when it
+# would exceed a fraction of available RAM (Germany peak RSS 15 -> 29 GB
+# if forced to speed). Pass --profile bounded to force spilling.
 tylertoo tiles buildings.parquet buildings.pmtiles \
   --min-zoom 0 --max-zoom 14 \
   --polygon-visibility 0 --collapse --max-tile-size 500K \

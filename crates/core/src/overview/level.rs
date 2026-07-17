@@ -125,10 +125,13 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryProfile {
-    /// Resolve per mode + estimated output size at convert entry (duplicating →
-    /// [`Speed`](Self::Speed), partitioning → [`Bounded`](Self::Bounded); any
-    /// run whose estimated buffered output exceeds a memory budget flips to
-    /// `Bounded`). The resolved choice is logged. This is the default.
+    /// Resolve the backing from the *workload* at convert entry (#294): the
+    /// estimated buffered output (`f(buffered_rows, mode)`) is compared against
+    /// a fraction of available system RAM. Small runs stay in RAM (like
+    /// [`Speed`](Self::Speed)); runs whose estimate exceeds the budget spill
+    /// (like [`Bounded`](Self::Bounded)), so large duplicating converts prefer
+    /// the bounded path instead of risking OOM. Partitioning additionally keeps
+    /// a fixed row ceiling. The resolved choice is logged. This is the default.
     #[default]
     Auto,
     /// Buffer each output level's rows in RAM before writing. Fastest; peak RAM

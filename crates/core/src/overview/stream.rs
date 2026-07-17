@@ -180,6 +180,82 @@ fn resolve_and_log_in_flight_batches(requested: usize) -> usize {
     in_flight
 }
 
+/// Current process resident-set size (RSS) in MiB, if the platform exposes it.
+fn current_rss_mib() -> Option<f64> {
+    memory_stats::memory_stats().map(|m| m.physical_mem as f64 / (1024.0 * 1024.0))
+}
+
+/// Log the process RSS at a convert-phase boundary (#295 instrumentation) and
+/// fold it into the running peak. Silent when the platform can't report RSS.
+///
+/// These `[rss] <phase>` lines pinpoint which phase dominates peak memory —
+/// pass-1 winner tables (O(dataset)) vs the pass-2 output sink (bounded by the
+/// #294 auto profile) — and validate the auto backing choice on real runs.
+fn log_phase_rss(phase: &str, peak_mib: &mut f64) {
+    if let Some(rss) = current_rss_mib() {
+        if rss > *peak_mib {
+            *peak_mib = rss;
+        }
+        log::info!("[rss] {phase}: {rss:.0} MiB");
+    }
+}
+
+/// Split the resolved level plan into emitted levels (have winners) and skipped
+/// levels (no winners → omitted per §7.3 / #211 auto-clamp). `counts[l]` is the
+/// winner count for planned level `l`.
+fn partition_emitted_levels(
+    level_specs: &[(f64, Option<u8>)],
+    counts: &[usize],
+) -> (Vec<EmitLevel>, Vec<SkippedLevelReport>) {
+    let skipped = level_specs
+        .iter()
+        .enumerate()
+        .filter(|&(l, _)| counts[l] == 0)
+        .map(|(l, &(gsd, zoom))| SkippedLevelReport {
+            planned_level: l,
+            gsd,
+            zoom,
+        })
+        .collect();
+    let emitted = level_specs
+        .iter()
+        .enumerate()
+        .filter(|&(l, _)| counts[l] > 0)
+        .map(|(l, &(gsd, zoom))| EmitLevel {
+            orig: l as u8,
+            gsd,
+            zoom,
+            hint: counts[l],
+        })
+        .collect();
+    (emitted, skipped)
+}
+
+/// Build the three writer schemas (identical to the in-memory path):
+/// `source` (base), `cluster` (+ `point_count` when clustering, Q4), and `out`
+/// (+ `coalesced_count` when coalescing, Q3). All three are needed downstream,
+/// so they are returned together.
+fn build_level_schemas(
+    input_schema: &Schema,
+    geom_idx: usize,
+    geom_name: &str,
+    options: &ConvertOptions,
+) -> (Schema, Schema, Schema) {
+    let geom_out_field = mixed_geometry_field(geom_name);
+    let source_schema = build_source_schema(input_schema, geom_idx, geom_out_field);
+    let cluster_schema = if options.cluster {
+        append_point_count_field(&source_schema)
+    } else {
+        source_schema.clone()
+    };
+    let out_schema = if options.coalesce_lines {
+        append_coalesced_count_field(&cluster_schema)
+    } else {
+        cluster_schema.clone()
+    };
+    (source_schema, cluster_schema, out_schema)
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -187,6 +263,10 @@ pub(crate) fn convert_streaming_strategy(
     strategy: Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
     let start = Instant::now();
+    // #295: peak-RSS-by-phase instrumentation. Each phase boundary logs process
+    // RSS; the max is reported at the end so a single run shows both the peak
+    // and which phase produced it.
+    let mut peak_rss_mib = 0.0f64;
 
     if options.sort_key.is_some() && options.class_ranking.is_some() {
         return Err(ConvertError::RankingConflict);
@@ -304,6 +384,7 @@ pub(crate) fn convert_streaming_strategy(
         "[profile] pass1 stream+scan: {:.2}s",
         t_pass1.elapsed().as_secs_f64()
     );
+    log_phase_rss("pass1 scan", &mut peak_rss_mib);
 
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
@@ -336,6 +417,9 @@ pub(crate) fn convert_streaming_strategy(
         level_gsds.len(),
         t_assign.elapsed().as_secs_f64()
     );
+    // Pass-1 winner tables (bboxes/kinds/sort-keys for every feature across all
+    // levels) are the O(dataset) peak candidate flagged in #295.
+    log_phase_rss("assignment+budget (winner tables)", &mut peak_rss_mib);
 
     // The feature-parallel winner table (coarsest level per FEATURE, in
     // `features` order) feeds the cluster stage and the per-level counts.
@@ -446,48 +530,18 @@ pub(crate) fn convert_streaming_strategy(
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.
-    let mut skipped: Vec<SkippedLevelReport> = level_specs
-        .iter()
-        .enumerate()
-        .filter(|&(l, _)| counts[l] == 0)
-        .map(|(l, &(gsd, zoom))| SkippedLevelReport {
-            planned_level: l,
-            gsd,
-            zoom,
-        })
-        .collect();
-    let emitted: Vec<EmitLevel> = level_specs
-        .iter()
-        .enumerate()
-        .filter(|&(l, _)| counts[l] > 0)
-        .map(|(l, &(gsd, zoom))| EmitLevel {
-            orig: l as u8,
-            gsd,
-            zoom,
-            hint: counts[l],
-        })
-        .collect();
+    let (emitted, mut skipped) = partition_emitted_levels(&level_specs, &counts);
     if emitted.is_empty() {
         return Err(ConvertError::NoData);
     }
     warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
 
     // --- Writer setup (identical to the in-memory path). ---------------------
-    let geom_name = geom_field.name().clone();
-    let geom_out_field = mixed_geometry_field(&geom_name);
-    let source_schema = build_source_schema(&input_schema, geom_idx, geom_out_field);
-    // Writer schema: base + point_count when clustering (Q4) + coalesced_count
+    // Writer schemas: base + point_count when clustering (Q4) + coalesced_count
     // when coalescing (Q3).
-    let cluster_schema = if options.cluster {
-        append_point_count_field(&source_schema)
-    } else {
-        source_schema.clone()
-    };
-    let out_schema = if options.coalesce_lines {
-        append_coalesced_count_field(&cluster_schema)
-    } else {
-        cluster_schema.clone()
-    };
+    let geom_name = geom_field.name().clone();
+    let (source_schema, cluster_schema, out_schema) =
+        build_level_schemas(&input_schema, geom_idx, &geom_name, options);
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()
@@ -514,6 +568,9 @@ pub(crate) fn convert_streaming_strategy(
         .collect();
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
+    // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
+    // the pass-2 output sink builds on (its ceiling is the #294 auto choice).
+    log_phase_rss("pre-pass2 (winner tables freed)", &mut peak_rss_mib);
     let t_pass2 = Instant::now();
 
     // Prebuild every non-verbatim level's coalesce chain table up front, in
@@ -708,6 +765,7 @@ pub(crate) fn convert_streaming_strategy(
         "[profile] pass2 total: {:.2}s",
         t_pass2.elapsed().as_secs_f64()
     );
+    log_phase_rss("pass2 (output sink)", &mut peak_rss_mib);
 
     let t_finish = Instant::now();
     let meta = writer.finish()?;
@@ -715,6 +773,8 @@ pub(crate) fn convert_streaming_strategy(
         "[profile] writer.finish: {:.2}s",
         t_finish.elapsed().as_secs_f64()
     );
+    log_phase_rss("writer.finish", &mut peak_rss_mib);
+    log::info!("[rss] convert peak: {peak_rss_mib:.0} MiB");
     fill_level_bytes(output_path, &meta, &mut level_reports)?;
 
     let total_rows: usize = level_reports.iter().map(|l| l.feature_count).sum();
