@@ -60,9 +60,11 @@ pub(super) enum SinkBacking {
     Spill,
 }
 
-/// Estimated in-RAM bytes per buffered output ROW, by mode. `Auto` multiplies
-/// this by `buffered_rows` (the count the pass-2 engine holds — every level but
-/// the streamed finest) to size the RAM-vs-spill choice against available RAM.
+/// FALLBACK estimated in-RAM bytes per buffered output ROW, by mode, used when
+/// pass 1 could not measure the input's geometry sizes (empty input). `Auto`
+/// multiplies the per-row estimate by `buffered_rows` (the count the pass-2
+/// engine holds — every level but the streamed finest) to size the RAM-vs-spill
+/// choice against available RAM.
 ///
 /// A buffered row is a whole retained feature (geometry + properties as Arrow
 /// arrays), NOT a coordinate — so the cost is dominated by geometry vertex
@@ -76,6 +78,42 @@ pub(super) enum SinkBacking {
 /// nvme) spill path over OOM. They steer only the backing choice, never output.
 const DUPLICATING_BYTES_PER_ROW: u64 = 8_192;
 const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
+
+/// Measured-path per-row model (#305): `per_row = SINK_ROW_OVERHEAD_BYTES +
+/// factor(mode) × avg_geom_bytes`, where `avg_geom_bytes` is pass 1's measured
+/// average in-memory Arrow byte size of the encoded geometry column per input
+/// row. Pass 1 already decodes every geometry, so the measurement is free (one
+/// buffer-size sum per batch) and replaces the one-size-fits-all constants
+/// above with the input's actual geometry weight — the dominant, wildly
+/// dataset-dependent term (corpus range: ~30 B/row for points to ~11.5 KiB/row
+/// for fieldmaps-adm4 boundary polygons).
+///
+/// Calibration (against the #294 RSS measurements above and corpus footers):
+///
+/// - `SINK_ROW_OVERHEAD_BYTES` (4 KiB) covers everything that is NOT input
+///   geometry: property columns (≤ ~80 B/row on the measured corpora), Arrow
+///   offsets/validity, and per-batch allocation slack — which dominates when
+///   geometries are tiny.
+/// - `DUPLICATING_GEOM_FACTOR` (×2): buffered duplicating rows hold
+///   *simplified* copies (≤ input size, near-full-resolution only at the
+///   finest buffered level), so ×2 over the encoded input size is the
+///   deliberate high-bias margin (spills are near-free; OOM is not). Known
+///   under-count: line coalescing (Q3) merges many input rows into fewer,
+///   larger buffered rows — the per-row term misses the merge factor, but the
+///   row COUNT shrinks far more (germany-segments: ~19 M input rows → ~123 K
+///   buffered rows), so the product stays small in absolute terms.
+/// - `PARTITIONING_GEOM_FACTOR` (×4): partitioning buffers full-resolution
+///   geometry at every buffered level; keep the historical 2× ratio over
+///   duplicating from the fallback constants.
+///
+/// Sanity vs the #294 measurements: fieldmaps-adm4 duplicating estimates
+/// ~27 KiB/row vs 6.3 KiB measured (bias high — safe); moldova partitioning
+/// ~8 KiB/row vs 16 KiB RSS-measured (RSS deltas overcount true need via
+/// allocator slack; content is ~1 KiB/row). Like the fallback constants, the
+/// model steers only the backing choice, never output bytes.
+const SINK_ROW_OVERHEAD_BYTES: u64 = 4_096;
+const DUPLICATING_GEOM_FACTOR: u64 = 2;
+const PARTITIONING_GEOM_FACTOR: u64 = 4;
 
 /// Fraction of *available* system RAM the estimated buffered-output set may
 /// occupy before `Auto` spills to a temp file instead of holding it in RAM.
@@ -94,12 +132,24 @@ const AUTO_FALLBACK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 
 /// Estimated peak RAM (bytes) the pass-2 sink would hold if `buffered_rows`
-/// output rows of `mode` were kept in RAM. Saturating, so absurd counts never
-/// overflow (they simply clamp to a "definitely spill" value).
-fn estimate_buffered_bytes(mode: Mode, buffered_rows: usize) -> u64 {
-    let per_row = match mode {
-        Mode::Duplicating => DUPLICATING_BYTES_PER_ROW,
-        Mode::Partitioning => PARTITIONING_BYTES_PER_ROW,
+/// output rows of `mode` were kept in RAM. `avg_geom_bytes` is pass 1's
+/// measured average encoded-geometry size per input row (#305); `None` (or a
+/// degenerate 0) falls back to the calibrated per-mode constants. Saturating,
+/// so absurd counts never overflow (they simply clamp to a "definitely spill"
+/// value).
+fn estimate_buffered_bytes(mode: Mode, buffered_rows: usize, avg_geom_bytes: Option<u64>) -> u64 {
+    let per_row = match avg_geom_bytes {
+        Some(avg) if avg > 0 => {
+            let factor = match mode {
+                Mode::Duplicating => DUPLICATING_GEOM_FACTOR,
+                Mode::Partitioning => PARTITIONING_GEOM_FACTOR,
+            };
+            SINK_ROW_OVERHEAD_BYTES.saturating_add(factor.saturating_mul(avg))
+        }
+        _ => match mode {
+            Mode::Duplicating => DUPLICATING_BYTES_PER_ROW,
+            Mode::Partitioning => PARTITIONING_BYTES_PER_ROW,
+        },
     };
     (buffered_rows as u64).saturating_mul(per_row)
 }
@@ -120,8 +170,13 @@ fn auto_budget_bytes(available_ram_bytes: Option<u64>) -> u64 {
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
 /// mode-only rule. Partitioning additionally keeps its historical absolute
 /// row ceiling, so it spills at least as often as before.
-fn auto_backing(mode: Mode, buffered_rows: usize, available_ram_bytes: Option<u64>) -> SinkBacking {
-    let estimate = estimate_buffered_bytes(mode, buffered_rows);
+fn auto_backing(
+    mode: Mode,
+    buffered_rows: usize,
+    available_ram_bytes: Option<u64>,
+    avg_geom_bytes: Option<u64>,
+) -> SinkBacking {
+    let estimate = estimate_buffered_bytes(mode, buffered_rows, avg_geom_bytes);
     let budget = auto_budget_bytes(available_ram_bytes);
     let ram_gate_spill = estimate > budget;
     let abs_gate_spill =
@@ -180,6 +235,7 @@ pub(super) fn resolve_backing(
     profile: MemoryProfile,
     mode: Mode,
     buffered_rows: usize,
+    avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
     match profile {
         MemoryProfile::Speed => {
@@ -196,18 +252,22 @@ pub(super) fn resolve_backing(
         }
         MemoryProfile::Auto => {
             let available = available_memory_bytes();
-            let backing = auto_backing(mode, buffered_rows, available);
-            let estimate = estimate_buffered_bytes(mode, buffered_rows);
+            let backing = auto_backing(mode, buffered_rows, available, avg_geom_bytes);
+            let estimate = estimate_buffered_bytes(mode, buffered_rows, avg_geom_bytes);
             let budget = auto_budget_bytes(available);
             let avail_mib = available.map_or_else(
                 || "unknown".to_string(),
                 |b| format!("{} MiB", b / (1024 * 1024)),
             );
+            let geom = avg_geom_bytes.filter(|&b| b > 0).map_or_else(
+                || "unmeasured (calibrated constants)".to_string(),
+                |b| format!("measured avg geom {b} B/row"),
+            );
             // Info-level: the auto decision drives peak RAM and is the primary
             // diagnostic for #294 / #295 (paired with the [rss] phase logs).
             log::info!(
                 "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
-                 est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
+                 {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
                 estimate / (1024 * 1024),
                 budget / (1024 * 1024),
             );
@@ -487,11 +547,16 @@ mod backing_tests {
     fn explicit_profiles_ignore_workload() {
         // Speed is always RAM, Bounded always Spill — regardless of size/mode.
         assert!(matches!(
-            resolve_backing(MemoryProfile::Speed, Mode::Duplicating, 10_000_000_000),
+            resolve_backing(
+                MemoryProfile::Speed,
+                Mode::Duplicating,
+                10_000_000_000,
+                None
+            ),
             SinkBacking::Ram
         ));
         assert!(matches!(
-            resolve_backing(MemoryProfile::Bounded, Mode::Duplicating, 1),
+            resolve_backing(MemoryProfile::Bounded, Mode::Duplicating, 1, None),
             SinkBacking::Spill
         ));
     }
@@ -500,7 +565,7 @@ mod backing_tests {
     fn auto_duplicating_small_stays_in_ram() {
         // A tiny buffered set is safe in RAM on a normal box.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000, Some(54 * GIB)),
+            auto_backing(Mode::Duplicating, 10_000, Some(54 * GIB), None),
             SinkBacking::Ram
         ));
     }
@@ -510,7 +575,7 @@ mod backing_tests {
         // The #294 fix: a large duplicating buffered set flips to Spill instead
         // of the old unconditional RAM. 10M rows * 8 KiB = 80 GiB > 0.6*54.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000_000, Some(54 * GIB)),
+            auto_backing(Mode::Duplicating, 10_000_000, Some(54 * GIB), None),
             SinkBacking::Spill
         ));
     }
@@ -521,14 +586,14 @@ mod backing_tests {
         let rows = 5_000_000; // 5M * 8 KiB = 40 GiB estimate
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(4 * GIB)),
+                auto_backing(Mode::Duplicating, rows, Some(4 * GIB), None),
                 SinkBacking::Spill
             ),
             "small box must spill"
         );
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(256 * GIB)),
+                auto_backing(Mode::Duplicating, rows, Some(256 * GIB), None),
                 SinkBacking::Ram
             ),
             "huge box may keep it in RAM"
@@ -540,11 +605,11 @@ mod backing_tests {
         // Even with effectively unlimited RAM, partitioning still spills above
         // the historical 2M-row floor (strict superset of pre-#294 behavior).
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB)),
+            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), None),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 100_000, Some(54 * GIB)),
+            auto_backing(Mode::Partitioning, 100_000, Some(54 * GIB), None),
             SinkBacking::Ram
         ));
     }
@@ -553,26 +618,120 @@ mod backing_tests {
     fn auto_uses_fallback_budget_when_ram_unknown() {
         // Unknown RAM → conservative fixed budget, still spilling huge sets.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 100_000_000, None),
+            auto_backing(Mode::Duplicating, 100_000_000, None, None),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000, None),
+            auto_backing(Mode::Duplicating, 1_000, None, None),
             SinkBacking::Ram
         ));
     }
 
     #[test]
     fn estimate_scales_with_mode_and_rows() {
-        assert_eq!(estimate_buffered_bytes(Mode::Duplicating, 1_000), 8_192_000);
         assert_eq!(
-            estimate_buffered_bytes(Mode::Partitioning, 1_000),
+            estimate_buffered_bytes(Mode::Duplicating, 1_000, None),
+            8_192_000
+        );
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Partitioning, 1_000, None),
             16_384_000
         );
         // Saturating: no overflow panic on absurd counts.
         assert_eq!(
-            estimate_buffered_bytes(Mode::Duplicating, usize::MAX),
+            estimate_buffered_bytes(Mode::Duplicating, usize::MAX, None),
             u64::MAX
         );
+    }
+
+    // --- #305: pass-1 measured geometry sizes drive the per-row estimate. ---
+
+    #[test]
+    fn measured_estimate_is_overhead_plus_geometry_margin() {
+        // per_row = 4 KiB overhead + 2× (duplicating) / 4× (partitioning) the
+        // measured average encoded-geometry bytes.
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Duplicating, 1_000, Some(1_000)),
+            6_096_000 // (4096 + 2*1000) * 1000
+        );
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Partitioning, 1_000, Some(1_000)),
+            8_096_000 // (4096 + 4*1000) * 1000
+        );
+        // Saturating with a measurement too.
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Duplicating, usize::MAX, Some(1)),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn measured_zero_falls_back_to_constants() {
+        // A degenerate measurement (0 bytes/row) is treated as unmeasured.
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Duplicating, 1_000, Some(0)),
+            8_192_000
+        );
+        assert_eq!(
+            estimate_buffered_bytes(Mode::Partitioning, 1_000, Some(0)),
+            16_384_000
+        );
+    }
+
+    #[test]
+    fn measured_tiny_geometry_keeps_ram_where_constant_spills() {
+        // 5M duplicating rows on a 54 GiB box: the calibrated constant
+        // (8 KiB/row → 38 GiB) exceeds the 32.4 GiB budget and spills, but a
+        // measured tiny-geometry corpus (points/small lines, ~100 B/row →
+        // ~4.3 KiB/row → 20 GiB) fits and stays in RAM.
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), None),
+            SinkBacking::Spill
+        ));
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), Some(100)),
+            SinkBacking::Ram
+        ));
+    }
+
+    #[test]
+    fn measured_huge_geometry_spills_where_constant_kept_ram() {
+        // 1M duplicating rows, 25 GiB available (budget 15 GiB): the constant
+        // (8 KiB/row → 7.6 GiB) keeps RAM, but an adm4-like measured average
+        // (11 534 B/row → ~27 KiB/row → 25 GiB) correctly flips to Spill.
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), None),
+            SinkBacking::Ram
+        ));
+        assert!(matches!(
+            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), Some(11_534)),
+            SinkBacking::Spill
+        ));
+    }
+
+    #[test]
+    fn measured_partitioning_small_geometry_keeps_ram() {
+        // 1M partitioning rows, 20 GiB available (budget 12 GiB): the constant
+        // (16 KiB/row → 15.3 GiB) spills, but a moldova-like measured average
+        // (983 B/row → ~8 KiB/row → 7.5 GiB) fits and stays in RAM. Below the
+        // 2M-row ceiling, so only the RAM gate is in play.
+        assert!(matches!(
+            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), None),
+            SinkBacking::Spill
+        ));
+        assert!(matches!(
+            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), Some(983)),
+            SinkBacking::Ram
+        ));
+    }
+
+    #[test]
+    fn partitioning_row_ceiling_ignores_measurement() {
+        // The historical 2M-row partitioning floor holds even when measurement
+        // says the geometries are tiny.
+        assert!(matches!(
+            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), Some(8)),
+            SinkBacking::Spill
+        ));
     }
 }
