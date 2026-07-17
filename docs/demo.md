@@ -1,69 +1,78 @@
-# Demo: Germany buildings, GeoParquet → PMTiles
+# Demo: Brazil field boundaries, cloud-native GeoParquet → PMTiles
 
-A real, end-to-end run of the native **GeoParquet → PMTiles** path on
-**Overture Germany buildings — 59,032,924 features** — measured head-to-head
-against the current geoparquet-io recommended pipeline (GeoJSON → tippecanoe),
-with the resulting tiles hosted and rendered below.
+A full-country tiling run of the native **GeoParquet → PMTiles** path on
+**[Fields of The World](https://fieldsofthe.world/) field boundaries for
+Brazil — 55,499,514 features** — read *directly* from GeoParquet on
+[Source Cooperative](https://source.coop/) and tiled to a complete **z1–14**
+pyramid, hosted and rendered below.
+
+There is no established tool that produces this archive. Tippecanoe — the
+standard vector tiler — does not read GeoParquet, and the documented workaround
+(serialize everything to GeoJSON first) does not survive 55 million features.
+tylertoo reads the cloud-native source and writes the pyramid in one workflow.
 
 ## Explore the tiles
 
-All 59M building footprints, rendered live from the PMTiles archive on
-[CARTO Dark Matter](https://carto.com/basemaps/). Pan and zoom (z2–14), or jump
-to a city with the buttons.
+All 55.5M field boundaries, rendered live from the PMTiles archive on
+[CARTO Dark Matter](https://carto.com/basemaps/). Pan and zoom (z1–14), or jump
+to one of Brazil's agricultural heartlands with the buttons.
 
-<iframe src="viewer.html" title="tylertoo Germany buildings PMTiles viewer"
+<iframe src="viewer.html" title="tylertoo Brazil field boundaries PMTiles viewer"
         style="width:100%; height:560px; border:1px solid var(--md-default-fg-color--lightest); border-radius:8px;"
         loading="lazy"></iframe>
 
 <a class="md-button" href="viewer.html">Open the map full-screen →</a>
 
 Tiles are served from [Source Cooperative](https://source.coop/) with HTTP Range
-+ CORS (`nlebovits/tylertoo-demo`).
++ CORS (`nlebovits/gpq-tiles-demo`).
 
-## Measured results
+## The measured run
 
-Same gpio-optimized GeoParquet feeds both pipelines. 16-core machine; zoom
-`z0–14`, layer `buildings`, 500K per-tile cap matched across pipelines.
+Full remote → PMTiles round trip on a 16-core machine, `--partition-wave auto`,
+zoom `z1–14`. The input is 27 per-state GeoParquet files (6.1 GiB) read over
+HTTPS — nothing downloaded by hand first.
 
-| pipeline | wall time | peak RSS | intermediate on disk | PMTiles out | tiles |
-|---|---|---|---|---|---|
-| **tylertoo** (default) | **13m 11s** | 14.8 GiB | **none** | 4.69 GB | 267,421 |
-| **tylertoo** (tuned) | 18m 20s | 17.3 GiB | **none** | 6.28 GB | 267,917 |
-| gpio → tippecanoe (`-P`, documented) | **failed at 57m 30s** | 7.2 GiB | 19.1 GB GeoJSON | aborted (z0–8 only) | — |
+| stage | wall | peak RSS | output |
+|---|---|---|---|
+| **convert** (incl. 6.1 GiB remote read) | 23m 25s | 23.9 GiB | 18 GB overview GeoParquet (14 levels) |
+| **export** (`--partition-wave auto`) | 21m 07s | **1.74 GiB** | **8.4 GiB** PMTiles, 1,075,458 tiles |
+| **total** | **44m 41s** | — | z1–14, 147M tile-features, 0 oversized |
 
 ```bash
-# tylertoo — native, one step, no intermediate
-tylertoo tiles germany-buildings.parquet out.pmtiles \
-  --min-zoom 0 --max-zoom 14 --layer-name buildings --max-tile-size 500K
-# tuned adds:  --polygon-visibility 2.0 --collapse --drop-rate 1.3 --profile bounded
+# 1. Build the multi-resolution overview straight from remote GeoParquet.
+tylertoo overview --files-from brazil-manifest.txt \
+  --min-zoom 1 --max-zoom 14 brazil-ov-z14.parquet
 
-# incumbent — GeoParquet → GeoJSON stream → tippecanoe
-gpio convert geojson germany-buildings.parquet \
-  | tippecanoe -P -Z0 -z14 -l buildings -o out.pmtiles
+# 2. Export the PMTiles archive.
+tylertoo export-pmtiles brazil-ov-z14.parquet \
+  brazil-field-boundaries.pmtiles --partition-wave auto
 ```
 
-## What the numbers say
+## What the run shows
 
-1. **Native beats the round-trip by an order of magnitude.** tylertoo produces
-   a complete z0–14 archive in **13m 11s** with **no intermediate file**.
-2. **Generating the intermediate alone costs more than the whole native run.**
-   `gpio convert geojson` took **32m 44s** to emit a **19.1 GB** GeoJSON stream —
-   2.5× tylertoo' entire end-to-end time — before tippecanoe writes a tile.
-3. **The documented incumbent one-liner fails on this data.** With `tippecanoe -P`
-   as documented, tippecanoe hit dense building tiles over the 500K limit at z8
-   and **aborted** (exit 100). It only finishes if you add
-   `--drop-densest-as-needed`; tylertoo applies a drop-to-fit budget by default.
-4. **default vs tuned is a quality knob, not speed.** The tuned run is
-   deliberately larger and slower — `--polygon-visibility 2.0` and
-   `--drop-rate 1.3` keep *more* features at coarse zoom for better fill (the
-   swipe above). It is not a performance setting. (Since #259,
-   `--polygon-visibility 2.0` **is** the shipped default, and the
-   recommended country-view recipe is `--polygon-visibility 0 --collapse` —
-   see [Overview tuning](OVERVIEW_TUNING.md).)
+1. **No existing tool takes this path.** Tippecanoe does not ingest GeoParquet;
+   the documented geoparquet-io route is `gpio convert geojson … | tippecanoe`,
+   which serializes the entire dataset to GeoJSON before tiling. tylertoo reads
+   the GeoParquet — local *or* remote — with no GeoJSON in the loop.
+2. **The GeoJSON detour doesn't survive this scale.** On the comparable Germany
+   buildings run (59M features), *generating the intermediate alone* took
+   32m 44s and 19.1 GB on disk before tippecanoe wrote a tile — and the
+   documented one-liner then aborted on dense tiles. Brazil is the same order of
+   magnitude; the intermediate would be larger.
+3. **Cloud-native source, cloud-native read.** The FTW predictions live as
+   GeoParquet on Source Cooperative. tylertoo read all 27 state files over HTTPS
+   (a full-country run fetches the object once, ~1×, spilling locally so later
+   passes never re-hit the network; a regional `--bbox` fetches only the
+   covering row groups). No "download, then convert, then tile" preamble.
+4. **Deep pyramid, flat memory.** The archive spans z1–14 — one whole-country
+   tile up to 754k tiles at z14 — and export peaked at **1.74 GiB**. At z14 the
+   features spread across 754k tiles (~80 per tile), so no single tile
+   concentrates the dataset and memory stays flat regardless of depth.
 
-Full methodology, fairness notes, and hosting instructions are in the
+Full methodology, per-zoom breakdown, and hosting instructions are in the
 [demo directory on GitHub](https://github.com/geoparquet-io/tylertoo/tree/main/demo).
 
 !!! note "Clipping/simplification differ from tippecanoe by design"
-    This compares *pipelines and their output*, not byte-identical tiling. See
-    [Architecture](architecture.md) for the documented divergences.
+    This demonstrates the *native GeoParquet pipeline and its output*, not
+    byte-identical tiling. See [Architecture](architecture.md) for the
+    documented divergences.
