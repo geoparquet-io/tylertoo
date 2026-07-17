@@ -38,18 +38,24 @@
 //!
 //! # Memory
 //!
-//! Per level, the only state is a hashmap `cell -> best-priority-so-far`,
+//! Per level, the only state is a hashmap `cell -> winner-position-so-far`,
 //! `O(occupied cells)` — never `O(features)` retained across levels. The coarse
 //! levels are built concurrently (#264, see below), so the transient peak is
-//! the sum of the *concurrently live* grids rather than a single one; this
-//! phase runs before the pass-2 geometry buffers that set overall peak RSS, so
-//! it does not move the high-water mark in practice.
+//! the sum of the *concurrently live* grids. On large simple-geometry layers
+//! that sum IS the whole-convert peak RSS (#295/#300: 5.9 GiB on
+//! germany-segments, ~24 GiB at Brazil scale), so it is **bounded** (#306):
+//! grid footprints are estimated up front and levels are scheduled in
+//! memory-budgeted waves ([`assign_levels_bounded`]), trading cross-wave
+//! concurrency for a capped peak when the budget binds. Grid entries store
+//! only the winner position (priorities are recomputed on contest), roughly
+//! halving per-entry cost.
 //!
 //! # Parallelism & determinism
 //!
 //! Each level's cell-winner pass is independent, so the coarse levels run
 //! concurrently across rayon threads (#264 — this is the hot serial stage on
-//! large-feature / simple-geometry layers). Results are unaffected: the
+//! large-feature / simple-geometry layers), within the memory-bounded waves
+//! described above (#306). Results are unaffected: the
 //! per-cell winner is the maximum under a *strict total order* (ties are
 //! ultimately broken by the feature `index`), so they never depend on hashmap
 //! iteration order or thread scheduling, and a feature takes the *coarsest*
@@ -350,8 +356,14 @@ fn level_winner_positions(
     config: &AssignConfig,
     gsd_units: f64,
 ) -> Vec<usize> {
-    // cell -> (best priority, position of winning feature in `features`).
-    let mut grid: HashMap<CellKey, (Priority, usize)> = HashMap::new();
+    // cell -> position of the winning feature in `features` (#306: the grid is
+    // the dominant pass-1 allocation, so the entry stores ONLY the winner
+    // position — the incumbent's Priority is recomputed on each contest instead
+    // of cached. Priority::new is a handful of arithmetic ops + a murmur
+    // finalizer, so the recompute is noise next to the hash-map probe, while
+    // dropping the cached 40-byte Priority shrinks each entry from 72 to 32
+    // bytes (~55% off the grid, the structure the level count multiplies).
+    let mut grid: HashMap<CellKey, usize> = HashMap::new();
 
     for (pos, feat) in features.iter().enumerate() {
         // Visibility gate (points always pass).
@@ -376,17 +388,109 @@ fn level_winner_positions(
             (cy / cell_size).floor() as i64,
         );
 
-        let prio = Priority::new(feat, config.sort_direction);
         grid.entry(key)
             .and_modify(|slot| {
-                if prio.beats(&slot.0) {
-                    *slot = (prio, pos);
+                let challenger = Priority::new(feat, config.sort_direction);
+                let incumbent = Priority::new(&features[*slot], config.sort_direction);
+                if challenger.beats(&incumbent) {
+                    *slot = pos;
                 }
             })
-            .or_insert((prio, pos));
+            .or_insert(pos);
     }
 
-    grid.into_values().map(|(_prio, pos)| pos).collect()
+    grid.into_values().collect()
+}
+
+/// Estimated retained bytes per occupied winner-grid cell (#306).
+///
+/// A compacted grid entry is a `(CellKey, usize)` bucket (32 bytes payload);
+/// hashbrown adds control bytes and up to 2× capacity slack from power-of-two
+/// growth, and each winner also occupies one `usize` slot in the per-level
+/// winner vec. 96 bytes covers all of that with margin — biased HIGH (the #294
+/// convention: an overestimate merely serializes a wave earlier; an
+/// underestimate defeats the memory bound). Steers scheduling only, never
+/// output.
+const GRID_ENTRY_EST_BYTES: u64 = 96;
+
+/// Extent of the feature centers (grid keys are derived from centers) and
+/// per-kind feature counts — the two inputs of the per-level grid estimate.
+/// Empty input yields a zero extent and zero counts.
+fn center_extent_and_kind_counts(features: &[AssignFeature]) -> ((f64, f64), [usize; 3]) {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut counts = [0usize; 3];
+    for feat in features {
+        let (cx, cy) = feat.center();
+        min_x = min_x.min(cx);
+        min_y = min_y.min(cy);
+        max_x = max_x.max(cx);
+        max_y = max_y.max(cy);
+        counts[feat.kind.discriminant() as usize] += 1;
+    }
+    if features.is_empty() {
+        return ((0.0, 0.0), counts);
+    }
+    ((max_x - min_x, max_y - min_y), counts)
+}
+
+/// Estimated peak bytes of one level's winner grid (#306): per kind present,
+/// occupied cells ≤ min(kind count, cells the center extent spans at that
+/// kind's cell size), times [`GRID_ENTRY_EST_BYTES`]. The visibility gate can
+/// only shrink the eligible set, so ignoring it keeps the estimate biased high.
+fn estimate_level_grid_bytes(
+    config: &AssignConfig,
+    gsd_units: f64,
+    extent: (f64, f64),
+    kind_counts: &[usize; 3],
+) -> u64 {
+    let kinds = [FeatureKind::Point, FeatureKind::Line, FeatureKind::Polygon];
+    let mut entries: u64 = 0;
+    for kind in kinds {
+        let count = kind_counts[kind.discriminant() as usize];
+        if count == 0 {
+            continue;
+        }
+        let cell = gsd_units * config.thinning_factor(kind);
+        if cell <= 0.0 || cell.is_nan() {
+            continue; // such features are skipped by the grid pass too
+        }
+        // +1.0: an extent spanning k full cells touches k+1 cell columns.
+        let cells = ((extent.0 / cell).floor() + 1.0) * ((extent.1 / cell).floor() + 1.0);
+        let capped = if cells.is_finite() && cells < count as f64 {
+            cells as u64
+        } else {
+            count as u64
+        };
+        entries = entries.saturating_add(capped);
+    }
+    entries.saturating_mul(GRID_ENTRY_EST_BYTES)
+}
+
+/// Pack coarse levels (order preserved, coarse→fine) into contiguous waves
+/// whose summed grid estimates fit `budget_bytes` (#306). Greedy: a wave always
+/// holds at least one level (a level's grid cannot be split), so an oversized
+/// level gets a wave of its own — fully serialized, the tightest bound this
+/// scheme can give. With a large budget the result is a single wave, i.e. the
+/// pre-#306 all-levels-concurrent build.
+fn plan_level_waves(estimates: &[u64], budget_bytes: u64) -> Vec<std::ops::Range<usize>> {
+    let mut waves = Vec::new();
+    let mut start = 0usize;
+    let mut sum = 0u64;
+    for (i, &est) in estimates.iter().enumerate() {
+        if i > start && sum.saturating_add(est) > budget_bytes {
+            waves.push(start..i);
+            start = i;
+            sum = 0;
+        }
+        sum = sum.saturating_add(est);
+    }
+    if start < estimates.len() {
+        waves.push(start..estimates.len());
+    }
+    waves
 }
 
 /// Assign every feature its coarsest surviving level.
@@ -400,11 +504,45 @@ fn level_winner_positions(
 /// Returns per-feature `min_level`. If `level_gsds` is empty, `num_levels` is 0
 /// and every feature is assigned `min_level = 0` (degenerate; callers should
 /// pass at least one level).
+///
+/// This variant places no bound on concurrent grid memory (single wave —
+/// the pre-#306 behavior). Production paths pass a RAM budget through
+/// [`assign_levels_bounded`]; the two produce identical assignments.
 pub fn assign_levels(
     features: &[AssignFeature],
     level_gsds: &[f64],
     config: &AssignConfig,
     crs: Crs,
+) -> Assignment {
+    assign_levels_bounded(features, level_gsds, config, crs, u64::MAX)
+}
+
+/// [`assign_levels`] with a cap on the transient winner-grid memory (#306).
+///
+/// The #264 design builds every coarse level's cell-winner grid concurrently,
+/// so the transient peak scales with `level_count × grid size` — the pass-1
+/// peak the `[rss]` instrumentation pinned in #300 (5.9 GiB on
+/// germany-segments; the ~24 GiB Brazil-scale peak of #295). This variant
+/// schedules the levels in **memory-bounded waves**: per-level grid footprints
+/// are estimated up front ([`estimate_level_grid_bytes`], biased high), levels
+/// are greedily packed coarse→fine into waves whose summed estimate fits
+/// `grid_budget_bytes` ([`plan_level_waves`]), and each wave's winners are
+/// folded into `min_levels` and freed before the next wave starts. Peak grid
+/// memory is `O(max wave)` instead of `O(sum of all levels)`.
+///
+/// Tradeoff (documented in #306): when the budget binds, levels in different
+/// waves no longer run concurrently — on a roomy box the plan is a single wave
+/// and #264's parallelism (and wall time) is untouched; on a constrained box
+/// waves shrink toward one-level-per-wave, degrading gracefully to the serial
+/// pre-#264 build rather than an OOM. The wave schedule is pure scheduling:
+/// the assignment is **identical** for every budget (a feature takes the
+/// coarsest level at which it wins, a fold that is order-independent).
+pub fn assign_levels_bounded(
+    features: &[AssignFeature],
+    level_gsds: &[f64],
+    config: &AssignConfig,
+    crs: Crs,
+    grid_budget_bytes: u64,
 ) -> Assignment {
     let num_levels_usize = level_gsds.len();
     let num_levels = num_levels_usize.min(u8::MAX as usize) as u8;
@@ -438,29 +576,51 @@ pub fn assign_levels(
     // also removes the biggest allocation. Only coarse levels can *lower* a
     // feature's `min_level`.
     //
-    // Parallelism (#264): each coarse level's grid is fully independent, so the
-    // per-level cell-winner passes run concurrently across rayon threads (no
-    // merge — each level owns one HashMap). This is the hot serial stage on
-    // large-feature / simple-geometry layers (issue #264). The concurrent grids
-    // live only during this phase, which precedes the pass-2 geometry buffers
-    // that set peak RSS, so overall peak memory is unaffected. The fold below
-    // is deterministic regardless of completion order: a feature takes the
-    // *coarsest* (smallest) level at which it wins.
-    let winners_per_level: Vec<Vec<usize>> = (0..finest as usize)
-        .into_par_iter()
-        .map(|level_idx| {
-            let gsd_units = gsd_to_coord_units(level_gsds[level_idx], crs);
-            level_winner_positions(features, config, gsd_units)
-        })
+    // Parallelism (#264) + memory bound (#306): each coarse level's grid is
+    // fully independent, so the per-level cell-winner passes run concurrently
+    // across rayon threads WITHIN a wave (no merge — each level owns one
+    // HashMap). The wave plan caps how many grids are live at once; each
+    // wave's winner vecs are folded and dropped before the next wave
+    // allocates. The fold is deterministic regardless of completion order: a
+    // feature takes the *coarsest* (smallest) level at which it wins.
+    let gsd_units: Vec<f64> = level_gsds[..finest as usize]
+        .iter()
+        .map(|&g| gsd_to_coord_units(g, crs))
         .collect();
+    let (extent, kind_counts) = center_extent_and_kind_counts(features);
+    let estimates: Vec<u64> = gsd_units
+        .iter()
+        .map(|&g| estimate_level_grid_bytes(config, g, extent, &kind_counts))
+        .collect();
+    let waves = plan_level_waves(&estimates, grid_budget_bytes);
+    if waves.len() > 1 {
+        let total_mib = estimates.iter().copied().sum::<u64>() / (1024 * 1024);
+        let budget_mib = grid_budget_bytes / (1024 * 1024);
+        log::info!(
+            "[assign] winner grids est {total_mib} MiB exceed the {budget_mib} MiB \
+             budget: building {} coarse level(s) in {} memory-bounded wave(s) (#306)",
+            estimates.len(),
+            waves.len()
+        );
+    }
 
-    for (level_idx, winners) in winners_per_level.iter().enumerate() {
-        let level = level_idx as u8;
-        for &pos in winners {
-            if level < min_levels[pos] {
-                min_levels[pos] = level;
+    for wave in waves {
+        let winners_per_level: Vec<Vec<usize>> = wave
+            .clone()
+            .into_par_iter()
+            .map(|level_idx| level_winner_positions(features, config, gsd_units[level_idx]))
+            .collect();
+
+        for (offset, winners) in winners_per_level.iter().enumerate() {
+            let level = (wave.start + offset) as u8;
+            for &pos in winners {
+                if level < min_levels[pos] {
+                    min_levels[pos] = level;
+                }
             }
         }
+        // `winners_per_level` (and the wave's grids, already dropped inside
+        // `level_winner_positions`) are freed here, before the next wave.
     }
 
     let assignments = features
@@ -1465,5 +1625,98 @@ mod tests {
             "PIN: genuine prime-meridian feature is displaced to the finest \
              level by the antimeridian feature's inflated priority"
         );
+    }
+
+    // ---- #306: memory-bounded winner-grid waves -----------------------------
+
+    #[test]
+    fn plan_waves_single_when_under_budget() {
+        // Everything fits in one wave → identical to the pre-#306 all-at-once
+        // parallel build.
+        assert_eq!(plan_level_waves(&[100, 200, 300], 1_000), vec![0..3]);
+        // Exactly at budget still fits.
+        assert_eq!(plan_level_waves(&[100, 200, 300], 600), vec![0..3]);
+        // No levels → no waves.
+        assert!(plan_level_waves(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn plan_waves_splits_preserving_order_with_min_one_level() {
+        // Budget smaller than any single level: one wave per level (a level
+        // never splits — its grid must be materialized whole).
+        assert_eq!(
+            plan_level_waves(&[500, 500, 500], 100),
+            vec![0..1, 1..2, 2..3]
+        );
+        // Mixed sizes: greedy coarse→fine packing, order preserved.
+        assert_eq!(
+            plan_level_waves(&[100, 100, 300, 50], 250),
+            vec![0..2, 2..3, 3..4]
+        );
+        // Saturating: absurd estimates never panic; a finite budget splits them.
+        assert_eq!(
+            plan_level_waves(&[u64::MAX, u64::MAX], u64::MAX - 1),
+            vec![0..1, 1..2]
+        );
+    }
+
+    #[test]
+    fn grid_estimate_caps_entries_at_feature_count() {
+        // A tiny cell over a huge extent would imply astronomically many cells,
+        // but a grid can never hold more entries than there are features.
+        let cfg = AssignConfig::default();
+        let est = estimate_level_grid_bytes(&cfg, 1.0, (1e12, 1e12), &[1_000, 0, 0]);
+        assert_eq!(est, 1_000 * GRID_ENTRY_EST_BYTES);
+        // No features → no grid.
+        assert_eq!(
+            estimate_level_grid_bytes(&cfg, 1.0, (1e12, 1e12), &[0, 0, 0]),
+            0
+        );
+    }
+
+    #[test]
+    fn grid_estimate_extent_bound_binds_at_coarse_levels() {
+        // A coarse cell over a small extent bounds the grid by cell count, not
+        // feature count: 1M points in a 10×10-cell extent ≈ ~121 cells.
+        let cfg = AssignConfig {
+            point_thinning: 1.0,
+            ..AssignConfig::default()
+        };
+        let est = estimate_level_grid_bytes(&cfg, 100.0, (1_000.0, 1_000.0), &[1_000_000, 0, 0]);
+        assert_eq!(est, 121 * GRID_ENTRY_EST_BYTES);
+        let fine = estimate_level_grid_bytes(&cfg, 10.0, (1_000.0, 1_000.0), &[1_000_000, 0, 0]);
+        assert!(fine > est, "finer GSD ⇒ more cells ⇒ larger estimate");
+    }
+
+    #[test]
+    fn bounded_waves_match_unbounded_assignment() {
+        // A scattered mix of kinds and sizes across several levels. A 1-byte
+        // grid budget forces one level per wave (fully serialized build); the
+        // resulting assignment must be identical to the unbounded single-wave
+        // build — the wave schedule is pure scheduling, never policy.
+        let mut feats: Vec<AssignFeature> = Vec::new();
+        let mut idx = 0usize;
+        for c in 0..40 {
+            let base = c as f64 * 7_000.0;
+            for k in 0..25 {
+                let span = 150.0 + (k as f64) * 400.0;
+                feats.push(poly(idx, base, base, base + span, base + span));
+                idx += 1;
+                feats.push(point(idx, base + k as f64 * 31.0, base + k as f64 * 17.0));
+                idx += 1;
+            }
+        }
+        let gsds = [gsd(2), gsd(5), gsd(8), gsd(11), gsd(14)];
+        let cfg = AssignConfig::default();
+
+        let unbounded = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let bounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, 1);
+        assert_eq!(unbounded.assignments, bounded.assignments);
+        assert_eq!(unbounded.num_levels, bounded.num_levels);
+
+        // An intermediate budget (some multi-level waves) must also match.
+        let mid_budget = 200 * GRID_ENTRY_EST_BYTES;
+        let mid = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, mid_budget);
+        assert_eq!(unbounded.assignments, mid.assignments);
     }
 }
