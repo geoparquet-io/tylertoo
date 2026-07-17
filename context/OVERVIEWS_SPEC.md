@@ -302,6 +302,19 @@ Provenance := {
                                // not from canonical geometry; absent
                                // when levels were simplified from
                                // canonical geometry directly
+  "collapse":     string,      // OPTIONAL: below-tolerance polygon
+                               // disposition when not the drop
+                               // default: "point" (representative
+                               // point, Q4 opt-in) or "square"
+                               // (area-dithered ~1×GSD placeholder
+                               // square, type-preserving); absent
+                               // when collapsed polygons were dropped
+  "representation": [ {        // OPTIONAL: zoom-band representation
+      "zooms": [number, number],  // inclusive [lo, hi] zoom range
+      "repr":  string             // "point" | "square" | "geom"
+  } ],                         // absent when no bands were requested;
+                               // levels[].geometry_types remains the
+                               // normative per-level type signal
   "ranking":      Ranking,     // OPTIONAL: cell-winner priority source
   "density_drop": DensityDrop, // OPTIONAL: per-level feature budget
   "clustering":   Clustering,  // OPTIONAL: point clustering (§12.4)
@@ -697,6 +710,24 @@ collapsing) — renderers should not be surprised by a geometry type
 switching mid-zoom unless the producer asked for it. When enabled it
 SHOULD be documented via the `generalization` provenance (§3.5).
 (Resolved Q4, §11.)
+
+Two producer behaviors are conforming refinements of this rule:
+
+- **Zoom-banded collapse**: type collapse MAY be *unconditional within a
+  contiguous coarse zoom band* (every polygonal feature of the band's
+  levels carried as its representative point) rather than tied to the
+  visibility gate — e.g. levels z0–7 all points, z8+ full geometry, in
+  one file. This is still Q4 geometry-type collapse and therefore still
+  opt-in; the bands SHOULD be recorded in
+  `generalization.representation` (§3.5) and the type union rules above
+  apply unchanged.
+- **Placeholder squares** (below-tolerance polygons replaced by small
+  synthetic squares, e.g. area-dithered ~1×GSD squares at the
+  representative point) are **not** geometry-type collapse: the emitted
+  geometry is still a Polygon, `geometry_types` is unchanged, and the Q4
+  opt-in requirement does not apply. Producers SHOULD still record the
+  disposition (`generalization.collapse: "square"`, §3.5) because the
+  coordinates are synthetic.
 
 ---
 

@@ -206,6 +206,8 @@ tolerance = simplify_factor * gsd(level)          (meters, then CRS-converted)
 |------|---------|-------|-----------|
 | `--simplify-factor` | `1.0` | × GSD (RDP tolerance) | **bigger = cruder + lighter** |
 | `--collapse` | off | flag | below-gate polygons become a representative point instead of dropping |
+| `--collapse-square` | off | flag | below-gate polygons become an area-dithered ~1×GSD placeholder square (type-preserving) |
+| `--representation` | none (all `geom`) | `LO-HI:KIND,…` | per-zoom-band representation: `geom`, `point`, or `square` |
 | `--no-cascade` | off (cascading **on**) | flag | disables cascading simplification, reproducing pre-cascade output byte-for-byte |
 
 - **LOWER `--simplify-factor` = smoother / less aggressive** = more vertices
@@ -315,6 +317,119 @@ Two caveats:
 coarse levels are capped by the existing budget ladder, which is what
 shapes the dot density (the #250 demo's `--drop-rate 1.3` only inflated
 mid-zoom row counts by +13 % without changing the coarse fill).
+
+---
+
+## Zoom-band representation: `--representation` (#317) and placeholder squares: `--collapse-square` (#279)
+
+The dot-fill recipe above changes the representation of below-tolerance
+polygons **globally**. Two further knobs give you (a) full per-zoom-band
+control and (b) a **type-preserving** alternative to points.
+
+### `--representation LO-HI:KIND,…` — the band selector
+
+One run, one archive, different representations per zoom band — no
+two-archive merge:
+
+```bash
+# Dots zoomed out, full polygons zoomed in, in ONE PMTiles:
+tylertoo tiles buildings.parquet buildings.pmtiles \
+  --min-zoom 0 --max-zoom 14 \
+  --representation "0-7:point,8-14:geom"
+
+# Tippecanoe-style placeholder squares at coarse zooms instead:
+tylertoo tiles buildings.parquet buildings.pmtiles \
+  --min-zoom 0 --max-zoom 14 \
+  --representation "0-7:square"
+```
+
+`KIND` per band:
+
+- **`point`** — every polygonal feature in the band becomes its
+  **representative point** (centroid, falling back to bbox center then
+  first vertex for degenerate rings) — unconditionally, whatever its size.
+  In-band polygons **bypass the visibility gate** (a dot is always
+  visible) and thin on the **point grid** (`--point-thinning`), so the
+  band renders as a dot field with genuine coverage. Style with a
+  `circle` layer (fill layers ignore points).
+- **`square`** — normal simplification, but **below-tolerance** polygons
+  emit an area-dithered ~1×GSD **placeholder square** (see
+  `--collapse-square` below) instead of dropping. Visible polygons are
+  untouched, the level stays all-`Polygon` (type-preserving — plain fill
+  styles keep working). In-band polygons bypass the visibility gate (the
+  tiny ones are exactly what the dither must see) but keep the polygon
+  thinning grid.
+- **`geom`** — the normal path (default for zooms not listed in any
+  band). Below-tolerance polygons follow the global disposition
+  (drop / `--collapse` / `--collapse-square`).
+
+Rules (validated at convert entry): duplicating mode with a zoom-range
+plan only (`--gsd` plans carry no zooms to band on); bands must not
+overlap; a non-`geom` band must end **before** `--max-zoom` (the canonical
+level is always verbatim, spec §2.4); and `point` bands must be contiguous
+from the coarsest planned zoom — the cascade's point passes through every
+coarser level regardless, so a "polygons coarser than the point band"
+request is not representable and is rejected rather than silently ignored.
+
+With cascading (default on), a feature entering a point band collapses at
+the band's **finest** level and every coarser band level reuses that same
+point. Lines and native points are unaffected by every band kind; bands
+combine freely with clustering, coalescing, and the density budget (which
+caps band levels exactly like any other level).
+
+The requested bands are recorded in the footer provenance
+(`generalization.representation: [{"zooms": [0,7], "repr": "point"}, …]`).
+
+### `--collapse-square` — tippecanoe tiny-polygon squares as the global disposition
+
+`--collapse-square` is the third **below-tolerance disposition**, next to
+the drop default and `--collapse`-to-point: a polygon that collapses below
+the level tolerance is replaced by a `tol × tol` square (`tol =
+simplify-factor × GSD`, CRS-converted) centered on its representative
+point. This is tippecanoe's **tiny-polygon reduction** — the
+primary-reference behavior for keeping dense small-polygon layers
+(buildings, parcels) visible at coarse zooms with **no style changes**:
+squares are polygons, `geometry_types` stays `["Polygon"]`, and there is
+no spec-Q4 geometry-type opt-in involved.
+
+**Area dithering.** Emitting *every* tiny polygon as a full-tolerance
+square would massively inflate apparent area. Instead a polygon of area
+`A < tol²` survives with probability `A / tol²`, so the **expected emitted
+area equals the true area** — dense city blocks emit many squares,
+isolated barns mostly none, and aggregate density stays truthful.
+MultiPolygon parts dither individually (per-part density, like
+tippecanoe's ring-by-ring reduction).
+
+The dither is **deterministic**: the decision is a hash of the feature's
+anchor coordinates, so the same input produces byte-identical output
+across runs, engines (in-memory / streaming / pipelined), and thread
+counts. Under cascading, a kept square's anchor is its own center, so
+coarser levels re-dither it against the same hash draw with a shrinking
+keep probability — survival is monotone fine→coarse.
+
+Divergences from tippecanoe (see `context/ARCHITECTURE.md`):
+
+- tippecanoe accumulates area **serially per tile** and emits a square
+  each time the accumulator crosses the threshold (exact); overview
+  levels have no tile scope and require order-independence, so we dither
+  **per feature** (exact in expectation).
+- area removed by cell-winner thinning or the density budget is **not**
+  accumulated — a thinned feature contributes no square. Tippecanoe's
+  drop-rate similarly removes features before its accumulator sees them,
+  but the two pipelines thin differently, so the surviving-area sets
+  differ.
+
+Like `--collapse`, the global flag changes only the write-time
+disposition, not *eligibility*: the assign-time visibility gate still
+keeps most tiny polygons out of coarse levels. For a full tiny-polygon
+fill, either combine it with `--polygon-visibility 0` (the dot-fill
+recipe, squares instead of points) or use a `square` band — bands bypass
+the gate in-band automatically.
+
+Opt-in for now: the drop default is unchanged pending the #259-fixture
+sweep (#279 tracks the default decision). Recorded in the footer
+provenance as `generalization.collapse: "square"` (`--collapse` records
+`"point"`).
 
 ---
 
