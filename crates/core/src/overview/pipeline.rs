@@ -170,7 +170,7 @@ fn auto_budget_bytes(available_ram_bytes: Option<u64>) -> u64 {
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
 /// mode-only rule. Partitioning additionally keeps its historical absolute
 /// row ceiling, so it spills at least as often as before.
-fn auto_backing(
+pub(super) fn auto_backing(
     mode: Mode,
     buffered_rows: usize,
     available_ram_bytes: Option<u64>,
