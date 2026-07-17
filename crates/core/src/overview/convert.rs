@@ -65,9 +65,12 @@ use super::coalesce::{
 use super::level::{
     gsd_with_base, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance, Crs,
     DensityProvenance, Generalization, GeneralizationLevel, MemoryProfile, Mode, RankingProvenance,
-    GSD_TILE_BASE, METERS_PER_DEGREE,
+    RepresentationBandProvenance, GSD_TILE_BASE, METERS_PER_DEGREE,
 };
-use super::simplify::{simplify_cascade, simplify_for_level, Simplified, SimplifyOptions};
+use super::simplify::{
+    simplify_cascade, simplify_for_level, simplify_step, CascadeStep, CollapseMode, Representation,
+    Simplified, SimplifyOptions,
+};
 use super::writer::{
     LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy,
     WriterError, LEVEL_COLUMN,
@@ -279,6 +282,23 @@ pub struct ConvertOptions {
     pub no_auto_rank: bool,
     /// Per-level simplification options (duplicating mode only).
     pub simplify: SimplifyOptions,
+    /// Zoom-band representation selector (#317 / #279): per-zoom-band
+    /// [`Representation`] overrides — e.g. `0-7:point, 8-14:geom` renders
+    /// polygonal features as representative points (centroid) at z0–7 and
+    /// full geometry at z8–14 in ONE archive, no two-archive merge;
+    /// `0-7:square` emits tippecanoe-style area-dithered placeholder squares
+    /// for below-tolerance polygons in the band. Zooms not covered by a band
+    /// default to [`Representation::Geometry`]. Duplicating mode with a
+    /// [`LevelPlan::ZoomRange`] plan only; bands must not overlap, a
+    /// non-geometry band must end strictly before `max_zoom` (the canonical
+    /// level stays verbatim, spec §2.4), and every zoom coarser than a
+    /// `point` zoom must also be `point` (the cascade's point passes through
+    /// coarser levels regardless). Within a `point` band, polygons bypass
+    /// the visibility gate (a dot is always visible) and thin on the
+    /// point-thinning grid; within a `square` band they bypass the gate but
+    /// keep the polygon grid. Lines and genuine points are unaffected by
+    /// every band kind. Default empty (all levels `geom`).
+    pub representation: Vec<RepresentationBand>,
     /// Per-level density budget applied after cell-winner thinning (Q2). Default
     /// enabled; disable via `--no-density-drop` to reproduce pre-Q2 behavior.
     pub density: DensityBudgetConfig,
@@ -466,6 +486,7 @@ impl Default for ConvertOptions {
             class_ranking: None,
             no_auto_rank: false,
             simplify: SimplifyOptions::default(),
+            representation: Vec::new(),
             density: DensityBudgetConfig::default(),
             gsd_base: GSD_TILE_BASE,
             cogp_compat_key: false,
@@ -837,6 +858,89 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     if let Some(f) = &options.filter {
         super::filter::parse_filter(f)?;
     }
+    // Zoom-band representation selector (#317 / #279).
+    if !options.representation.is_empty() {
+        if matches!(options.mode, Mode::Partitioning)
+            && options
+                .representation
+                .iter()
+                .any(|b| b.repr != Representation::Geometry)
+        {
+            return Err(ConvertError::InvalidConfig(
+                "representation bands require duplicating mode: partitioning places \
+                 each feature exactly once with geometry verbatim (spec §2.3), which \
+                 a point or square representation cannot satisfy"
+                    .to_string(),
+            ));
+        }
+        let (plan_min, plan_max) = match &options.levels {
+            LevelPlan::ZoomRange { min_zoom, max_zoom } => (*min_zoom, *max_zoom),
+            LevelPlan::Gsds(_) => {
+                return Err(ConvertError::InvalidConfig(
+                    "representation bands require a zoom-range level plan \
+                     (--min-zoom/--max-zoom); an explicit --gsd plan carries no \
+                     per-level zooms to band on"
+                        .to_string(),
+                ));
+            }
+        };
+        for band in &options.representation {
+            let (lo, hi, repr) = (band.min_zoom, band.max_zoom, band.repr);
+            let kw = repr.as_str();
+            if lo > hi {
+                return Err(ConvertError::InvalidConfig(format!(
+                    "representation band {lo}-{hi}:{kw} must satisfy LO <= HI"
+                )));
+            }
+            if lo < plan_min || hi > plan_max {
+                return Err(ConvertError::InvalidConfig(format!(
+                    "representation band {lo}-{hi}:{kw} lies outside the level plan \
+                     ({plan_min}-{plan_max})"
+                )));
+            }
+            if repr != Representation::Geometry && hi >= plan_max {
+                return Err(ConvertError::InvalidConfig(format!(
+                    "representation band {lo}-{hi}:{kw} must end before the plan's \
+                     max zoom ({plan_max}): the canonical (finest) level reproduces \
+                     source geometry verbatim (spec §2.4)"
+                )));
+            }
+        }
+        // Overlap: each zoom may be claimed by at most one band.
+        let mut claimed: Vec<Option<Representation>> =
+            vec![None; plan_max as usize - plan_min as usize + 1];
+        for band in &options.representation {
+            for z in band.min_zoom..=band.max_zoom {
+                let slot = &mut claimed[(z - plan_min) as usize];
+                if slot.is_some() {
+                    return Err(ConvertError::InvalidConfig(format!(
+                        "representation bands overlap at zoom {z}"
+                    )));
+                }
+                *slot = Some(band.repr);
+            }
+        }
+        // Point-prefix rule: every zoom coarser than a point zoom is a point
+        // zoom. The cascade fold's point passes through coarser levels
+        // untouched whatever they declare, so anything else would silently
+        // not do what the spec string says.
+        let mut seen_non_point_coarser = false;
+        for slot in &claimed {
+            match slot {
+                Some(Representation::Point) => {
+                    if seen_non_point_coarser {
+                        return Err(ConvertError::InvalidConfig(
+                            "point bands must start at the plan's min zoom and be \
+                             contiguous from the coarsest level: a coarser non-point \
+                             level would still receive the cascaded point"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => seen_non_point_coarser = true,
+            }
+        }
+    }
     // in_flight_batches == 0 is the IN_FLIGHT_BATCHES_AUTO sentinel (resolved
     // to available parallelism at pass-2 setup), not an error. Any explicit
     // positive value is honoured verbatim, so there is nothing to reject here.
@@ -852,6 +956,94 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
         }
     }
     Ok(())
+}
+
+/// One zoom band of the representation selector (#317 / #279): levels whose
+/// zoom lies in `min_zoom..=max_zoom` (inclusive) take `repr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepresentationBand {
+    /// Coarsest zoom of the band (inclusive).
+    pub min_zoom: u8,
+    /// Finest zoom of the band (inclusive).
+    pub max_zoom: u8,
+    /// Representation applied at the band's levels.
+    pub repr: Representation,
+}
+
+/// The [`Representation`] for a zoom under a set of bands (unclaimed zooms
+/// default to [`Representation::Geometry`]).
+pub(super) fn representation_for_zoom(
+    bands: &[RepresentationBand],
+    zoom: Option<u8>,
+) -> Representation {
+    let Some(z) = zoom else {
+        return Representation::Geometry;
+    };
+    bands
+        .iter()
+        .find(|b| b.min_zoom <= z && z <= b.max_zoom)
+        .map(|b| b.repr)
+        .unwrap_or_default()
+}
+
+/// Parse a representation spec string (#317 / #279): comma-separated
+/// `LO-HI:KIND` (or `Z:KIND`) entries, e.g. `0-7:point,8-14:geom` or
+/// `0-5:square`. KIND is one of `geom` (alias `geometry`), `point`,
+/// `square`. Shared by the CLI and the Python bindings so the grammar has a
+/// single definition; structural validity against the level plan is checked
+/// later by convert-entry validation.
+pub fn parse_representation_spec(spec: &str) -> Result<Vec<RepresentationBand>, String> {
+    let mut bands = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (range, kind) = part.split_once(':').ok_or_else(|| {
+            format!("representation entry {part:?} must be LO-HI:KIND (e.g. 0-7:point)")
+        })?;
+        let repr = match kind.trim() {
+            "geom" | "geometry" => Representation::Geometry,
+            "point" => Representation::Point,
+            "square" => Representation::Square,
+            other => {
+                return Err(format!(
+                    "unknown representation {other:?} (expected geom, point, or square)"
+                ))
+            }
+        };
+        let range = range.trim();
+        let (lo, hi) = match range.split_once('-') {
+            Some((lo, hi)) => (lo.trim(), hi.trim()),
+            None => (range, range),
+        };
+        let parse_zoom = |s: &str| {
+            s.parse::<u8>()
+                .map_err(|_| format!("invalid zoom {s:?} in representation entry {part:?}"))
+        };
+        bands.push(RepresentationBand {
+            min_zoom: parse_zoom(lo)?,
+            max_zoom: parse_zoom(hi)?,
+            repr,
+        });
+    }
+    if bands.is_empty() {
+        return Err("representation spec is empty".to_string());
+    }
+    Ok(bands)
+}
+
+/// Per-level [`Representation`] (#317 / #279), parallel to `level_specs`
+/// (the resolved plan). Levels without a zoom (explicit-GSD plans) are never
+/// banded; [`validate_options`] rejects that combination up front.
+pub(super) fn level_representations(
+    level_specs: &[(f64, Option<u8>)],
+    bands: &[RepresentationBand],
+) -> Vec<Representation> {
+    level_specs
+        .iter()
+        .map(|&(_, zoom)| representation_for_zoom(bands, zoom))
+        .collect()
 }
 
 pub fn convert_to_overviews(
@@ -1198,12 +1390,16 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     // #306: cap the transient winner-grid memory at the profile-derived RAM
     // budget (`speed` stays unbounded). Pure scheduling — output-identical.
+    // Zoom-band representation selector (#317 / #279): per-level
+    // representations, parallel to the plan.
+    let level_reprs = level_representations(&level_specs, &options.representation);
     let assignment = assign_levels_bounded(
         &features,
         &level_gsds,
         &options.assign,
         crs,
         super::pipeline::pass1_grid_budget_bytes(options.profile),
+        &level_reprs,
     );
     // Q2: layer the per-level density budget on top of cell-winner thinning.
     // When disabled this is an identity, so `--no-density-drop` reproduces the
@@ -1317,11 +1513,17 @@ pub(crate) fn convert_to_overviews_source_strategy(
         // through the fine→coarse GSD chain ending at this level, so this
         // level consumes the next-finer level's output. Same chain the
         // streaming ctxs build — the paths stay in lockstep.
-        let cascade_chain: Vec<f64> = if options.simplify.cascade && !verbatim {
-            level_specs[level..finest]
-                .iter()
+        // Zoom-band point representation (#317): this level's representation,
+        // and the chain steps carry each contributing level's representation
+        // so the fold pointifies at the band boundary (see `simplify_cascade`).
+        let repr = level_reprs[level];
+        let cascade_chain: Vec<CascadeStep> = if options.simplify.cascade && !verbatim {
+            (level..finest)
                 .rev()
-                .map(|&(g, _)| g)
+                .map(|li| CascadeStep {
+                    gsd_meters: level_specs[li].0,
+                    repr: level_reprs[li],
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1344,7 +1546,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
                     continue;
                 }
                 let simplified = if cascade_chain.is_empty() {
-                    simplify_for_level(&geometries[i], gsd_m, crs, &options.simplify)
+                    simplify_step(&geometries[i], gsd_m, crs, &options.simplify, repr)
                 } else {
                     simplify_cascade(&geometries[i], &cascade_chain, crs, &options.simplify)
                 };
@@ -2700,6 +2902,38 @@ pub(super) fn build_generalization(
         } else {
             None
         },
+        // Recorded only when a below-tolerance collapse disposition other
+        // than the drop default was requested (`--collapse` /
+        // `--collapse-square`, #279); a default run emits a byte-identical
+        // footer to before this field existed.
+        collapse: match options.simplify.collapse {
+            CollapseMode::Drop => None,
+            mode => Some(
+                match mode {
+                    CollapseMode::Point => "point",
+                    CollapseMode::Square => "square",
+                    CollapseMode::Drop => unreachable!(),
+                }
+                .to_string(),
+            ),
+        },
+        // Recorded only when zoom-band representation overrides were
+        // requested (#317 / #279); a band-free run emits a byte-identical
+        // footer to before this feature existed.
+        representation: if options.representation.is_empty() {
+            None
+        } else {
+            Some(
+                options
+                    .representation
+                    .iter()
+                    .map(|b| RepresentationBandProvenance {
+                        zooms: [b.min_zoom, b.max_zoom],
+                        repr: b.repr.as_str().to_string(),
+                    })
+                    .collect(),
+            )
+        },
         ranking: Some(ranking),
         // Record the density budget only when it was applied; a disabled run
         // omits the block so its footer matches pre-Q2 output.
@@ -3709,6 +3943,371 @@ mod tests {
 
         // level column consistent with footer bands (validator covers this).
         assert!(validate_file(tout.path()).unwrap().is_valid());
+    }
+
+    // ---- zoom-band representation selector (#317 / #279) --------------------
+
+    /// Polygon fixtures spanning sizes from "visible at every zoom" down to
+    /// tiny, scattered so they don't all share thinning cells.
+    fn polygon_fixture() -> Vec<Geometry<f64>> {
+        let mut geoms = Vec::new();
+        for i in 0..12 {
+            let cx = -150.0 + i as f64 * 25.0;
+            let cy = -60.0 + (i % 5) as f64 * 27.0;
+            // Halves from 20 degrees down to 0.002 degrees.
+            let half = 20.0 / (3f64).powi(i % 9);
+            let ext = LineString::from(vec![
+                (cx - half, cy - half),
+                (cx + half, cy - half),
+                (cx + half, cy + half),
+                (cx - half, cy + half),
+                (cx - half, cy - half),
+            ]);
+            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+        }
+        geoms
+    }
+
+    fn band(min_zoom: u8, max_zoom: u8, repr: Representation) -> RepresentationBand {
+        RepresentationBand {
+            min_zoom,
+            max_zoom,
+            repr,
+        }
+    }
+
+    /// THE #317 acceptance anchor: one convert yields an archive whose point-
+    /// band levels contain ONLY points while the finer levels keep polygons —
+    /// no two-archive merge.
+    #[test]
+    fn representation_point_band_points_coarse_polygons_fine() {
+        let geoms = polygon_fixture();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            representation: vec![band(2, 5, Representation::Point)],
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert!(validate_file(tout.path()).unwrap().is_valid());
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        for (idx, lvl) in report.levels.iter().enumerate() {
+            let rows = read_level_rows(&reader, idx);
+            assert!(!rows.is_empty());
+            let zoom = lvl.zoom.expect("zoom-range plan records zooms");
+            if zoom <= 5 {
+                for (id, _, _, g) in &rows {
+                    assert!(
+                        matches!(g, Geometry::Point(_)),
+                        "level z{zoom} feature {id} must be a Point, got {g:?}"
+                    );
+                }
+            } else {
+                assert!(
+                    rows.iter().any(|(_, _, _, g)| matches!(
+                        g,
+                        Geometry::Polygon(_) | Geometry::MultiPolygon(_)
+                    )),
+                    "level z{zoom} must keep polygons"
+                );
+            }
+        }
+        // Canonical is verbatim.
+        let canonical = read_level_rows(&reader, report.levels.len() - 1);
+        assert_eq!(canonical.len(), geoms.len());
+        for (i, (_, _, _, g)) in canonical.iter().enumerate() {
+            assert_eq!(g, &geoms[i]);
+        }
+
+        // Point-band levels have full coverage: the visibility gate is
+        // bypassed, so the coarsest level carries a dot per surviving
+        // thinning cell — more features than the gate-limited polygon run.
+        let plain = ConvertOptions {
+            representation: Vec::new(),
+            ..opts.clone()
+        };
+        let tout2 = tempfile::NamedTempFile::new().unwrap();
+        let plain_report = convert_to_overviews(tin.path(), tout2.path(), &plain).unwrap();
+        assert!(
+            report.levels[0].feature_count >= plain_report.levels[0].feature_count,
+            "point band must not lose coarse coverage vs the gated polygon run"
+        );
+
+        // Provenance recorded (§3.5).
+        let gen = reader
+            .meta()
+            .generalization
+            .as_ref()
+            .expect("generalization block present");
+        let bands = gen.representation.as_ref().expect("bands recorded");
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].zooms, [2, 5]);
+        assert_eq!(bands[0].repr, "point");
+        assert!(gen.collapse.is_none(), "no global collapse requested");
+    }
+
+    /// Streaming and in-memory pipelines produce identical per-level rows
+    /// for a point-band conversion (the #218-style engine equivalence).
+    #[test]
+    fn representation_point_band_streaming_matches_in_memory() {
+        let geoms = polygon_fixture();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            representation: vec![band(2, 4, Representation::Point)],
+            ..Default::default()
+        };
+        let t_stream = tempfile::NamedTempFile::new().unwrap();
+        let t_mem = tempfile::NamedTempFile::new().unwrap();
+        let r1 = convert_to_overviews(tin.path(), t_stream.path(), &base).unwrap();
+        let mem = ConvertOptions {
+            streaming: false,
+            ..base
+        };
+        let r2 = convert_to_overviews(tin.path(), t_mem.path(), &mem).unwrap();
+        assert_eq!(r1.levels.len(), r2.levels.len());
+
+        let rd1 = OverviewReader::open(t_stream.path()).unwrap();
+        let rd2 = OverviewReader::open(t_mem.path()).unwrap();
+        for lvl in 0..r1.levels.len() {
+            assert_eq!(
+                read_level_rows(&rd1, lvl),
+                read_level_rows(&rd2, lvl),
+                "level {lvl} rows must match across engines"
+            );
+        }
+    }
+
+    /// #279: a square band keeps the level type-uniform (`Polygon` only) —
+    /// visible polygons simplified, below-tolerance ones dithered into
+    /// placeholder squares instead of vanishing.
+    #[test]
+    fn representation_square_band_type_preserving() {
+        // Many tiny polygons clustered plus a few large ones.
+        let mut geoms = polygon_fixture();
+        for i in 0..30 {
+            let cx = 10.0 + (i % 6) as f64 * 0.02;
+            let cy = 20.0 + (i / 6) as f64 * 0.02;
+            let half = 0.004;
+            let ext = LineString::from(vec![
+                (cx - half, cy - half),
+                (cx + half, cy - half),
+                (cx + half, cy + half),
+                (cx - half, cy + half),
+                (cx - half, cy - half),
+            ]);
+            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+        }
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            representation: vec![band(4, 7, Representation::Square)],
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert!(validate_file(tout.path()).unwrap().is_valid());
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        for (idx, lvl) in report.levels.iter().enumerate() {
+            let zoom = lvl.zoom.unwrap();
+            let rows = read_level_rows(&reader, idx);
+            for (id, _, _, g) in &rows {
+                assert!(
+                    matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)),
+                    "square band is type-preserving; level z{zoom} feature {id} \
+                     is {g:?}"
+                );
+            }
+        }
+
+        // At the band's levels, at least one emitted geometry is an exact
+        // GSD-sized placeholder square (5-coordinate ring, side = level
+        // tolerance in degrees).
+        let z4_rows = read_level_rows(&reader, 0);
+        let tol_deg = report.levels[0].gsd / METERS_PER_DEGREE;
+        let squares = z4_rows
+            .iter()
+            .filter(|(_, _, _, g)| match g {
+                Geometry::Polygon(p) => {
+                    let r = geo::BoundingRect::bounding_rect(p).unwrap();
+                    p.exterior().0.len() == 5
+                        && (r.width() - tol_deg).abs() < 1e-9
+                        && (r.height() - tol_deg).abs() < 1e-9
+                }
+                _ => false,
+            })
+            .count();
+        assert!(
+            squares > 0,
+            "band level must contain dithered placeholder squares"
+        );
+
+        let gen = reader.meta().generalization.as_ref().unwrap();
+        let bands = gen.representation.as_ref().unwrap();
+        assert_eq!(bands[0].repr, "square");
+    }
+
+    /// #279 global disposition: `--collapse-square` emits placeholder
+    /// squares wherever the drop default would have dropped, at every level,
+    /// and records `"square"` provenance.
+    #[test]
+    fn collapse_square_global_disposition() {
+        let geoms = polygon_fixture();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Square,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert!(validate_file(tout.path()).unwrap().is_valid());
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        // Type-preserving everywhere.
+        for idx in 0..report.levels.len() {
+            for (_, _, _, g) in read_level_rows(&reader, idx) {
+                assert!(matches!(
+                    g,
+                    Geometry::Polygon(_) | Geometry::MultiPolygon(_)
+                ));
+            }
+        }
+        let gen = reader.meta().generalization.as_ref().unwrap();
+        assert_eq!(gen.collapse.as_deref(), Some("square"));
+        assert!(gen.representation.is_none());
+    }
+
+    #[test]
+    fn representation_validation_rejects_bad_bands() {
+        let mk = |mode: Mode, levels: LevelPlan, bands: Vec<RepresentationBand>| ConvertOptions {
+            mode,
+            levels,
+            representation: bands,
+            ..Default::default()
+        };
+        let zr = |lo: u8, hi: u8| LevelPlan::ZoomRange {
+            min_zoom: lo,
+            max_zoom: hi,
+        };
+
+        // Partitioning rejected.
+        let err = validate_options(&mk(
+            Mode::Partitioning,
+            zr(0, 6),
+            vec![band(0, 3, Representation::Point)],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::InvalidConfig(_)), "{err}");
+
+        // Explicit-GSD plan rejected.
+        let err = validate_options(&mk(
+            Mode::Duplicating,
+            LevelPlan::Gsds(vec![1000.0, 100.0]),
+            vec![band(0, 3, Representation::Point)],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::InvalidConfig(_)), "{err}");
+
+        // Band covering the canonical zoom rejected.
+        let err = validate_options(&mk(
+            Mode::Duplicating,
+            zr(0, 6),
+            vec![band(0, 6, Representation::Point)],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::InvalidConfig(_)), "{err}");
+
+        // Overlapping bands rejected.
+        let err = validate_options(&mk(
+            Mode::Duplicating,
+            zr(0, 8),
+            vec![
+                band(0, 3, Representation::Point),
+                band(3, 5, Representation::Square),
+            ],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::InvalidConfig(_)), "{err}");
+
+        // Non-prefix point band rejected (coarser geom levels would still
+        // receive the cascaded point).
+        let err = validate_options(&mk(
+            Mode::Duplicating,
+            zr(0, 8),
+            vec![band(3, 5, Representation::Point)],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::InvalidConfig(_)), "{err}");
+
+        // Mid-plan square band is fine (disposition only, type-preserving).
+        validate_options(&mk(
+            Mode::Duplicating,
+            zr(0, 8),
+            vec![band(3, 5, Representation::Square)],
+        ))
+        .expect("mid-plan square band is valid");
+
+        // Point prefix + square continuation is fine.
+        validate_options(&mk(
+            Mode::Duplicating,
+            zr(0, 8),
+            vec![
+                band(0, 3, Representation::Point),
+                band(4, 6, Representation::Square),
+            ],
+        ))
+        .expect("point prefix + square band is valid");
+    }
+
+    #[test]
+    fn parse_representation_spec_grammar() {
+        let bands = parse_representation_spec("0-7:point,8-14:geom").unwrap();
+        assert_eq!(bands.len(), 2);
+        assert_eq!(bands[0], band(0, 7, Representation::Point));
+        assert_eq!(bands[1], band(8, 14, Representation::Geometry));
+
+        let bands = parse_representation_spec(" 0-5 : square ").unwrap();
+        assert_eq!(bands, vec![band(0, 5, Representation::Square)]);
+
+        // Single-zoom entry and the "geometry" alias.
+        let bands = parse_representation_spec("3:geometry").unwrap();
+        assert_eq!(bands, vec![band(3, 3, Representation::Geometry)]);
+
+        assert!(parse_representation_spec("").is_err());
+        assert!(parse_representation_spec("0-7").is_err());
+        assert!(parse_representation_spec("0-7:blob").is_err());
+        assert!(parse_representation_spec("x-7:point").is_err());
     }
 
     #[test]

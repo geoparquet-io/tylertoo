@@ -75,6 +75,7 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 pub use super::level::{Crs, METERS_PER_DEGREE};
+pub use super::simplify::Representation;
 
 /// Geometry kind, for per-kind thinning and visibility gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +356,7 @@ fn level_winner_positions(
     features: &[AssignFeature],
     config: &AssignConfig,
     gsd_units: f64,
+    repr: Representation,
 ) -> Vec<usize> {
     // cell -> position of the winning feature in `features` (#306: the grid is
     // the dominant pass-1 allocation, so the entry stores ONLY the winner
@@ -366,8 +368,28 @@ fn level_winner_positions(
     let mut grid: HashMap<CellKey, usize> = HashMap::new();
 
     for (pos, feat) in features.iter().enumerate() {
+        // Zoom-band representation (#317 / #279): at a point-band level a
+        // polygon is *rendered* as a representative point, so it gates and
+        // thins like one — no visibility gate (a dot is always visible) and
+        // the point grid factor. It keeps its own (Polygon) grid, so
+        // polygons-as-points never compete with genuine point features for
+        // cells. At a square-band level a polygon stays a polygon (its
+        // below-tolerance disposition is a dithered placeholder square), so
+        // it keeps the polygon thinning grid, but the visibility gate is
+        // bypassed too — the tiny polygons are exactly the ones the dither
+        // must see, and area lost to the gate would silently deflate the
+        // aggregate-area invariant.
+        let effective_kind = match repr {
+            Representation::Point if feat.kind == FeatureKind::Polygon => FeatureKind::Point,
+            _ => feat.kind,
+        };
+
         // Visibility gate (points always pass).
-        let vis = config.visibility_factor(feat.kind);
+        let vis = if repr == Representation::Square && feat.kind == FeatureKind::Polygon {
+            0.0
+        } else {
+            config.visibility_factor(effective_kind)
+        };
         if vis > 0.0 {
             let gate = vis * gsd_units;
             if feat.diag_sq() < gate * gate {
@@ -375,7 +397,7 @@ fn level_winner_positions(
             }
         }
 
-        let cell_size = gsd_units * config.thinning_factor(feat.kind);
+        let cell_size = gsd_units * config.thinning_factor(effective_kind);
         // Guard against a zero/negative cell size (bad GSD input); also
         // reject NaN.
         if cell_size <= 0.0 || cell_size.is_nan() {
@@ -514,10 +536,40 @@ pub fn assign_levels(
     config: &AssignConfig,
     crs: Crs,
 ) -> Assignment {
-    assign_levels_bounded(features, level_gsds, config, crs, u64::MAX)
+    assign_levels_bounded(features, level_gsds, config, crs, u64::MAX, &[])
 }
 
-/// [`assign_levels`] with a cap on the transient winner-grid memory (#306).
+/// [`assign_levels`] with a zoom-band representation selector (#317).
+///
+/// `level_reprs` is parallel to `level_gsds` (missing tail entries read as
+/// [`Representation::Geometry`]): [`Representation::Point`] marks a
+/// point-band level, where polygon features gate and thin as points — the
+/// polygon visibility gate is bypassed (their point representation is always
+/// visible) and the point-thinning grid factor applies;
+/// [`Representation::Square`] bypasses the gate but keeps the polygon grid.
+/// Lines and genuine points are unaffected at every level.
+///
+/// Boundary-zoom note: winning a point-band cell lowers a polygon's
+/// `min_level` like any other win, so in duplicating mode a small polygon
+/// admitted to the band is also a *member* of the finer polygon levels down
+/// to canonical. Write-time simplification still applies its 1×GSD
+/// visibility gate there, so sub-visible polygons drop from those finer
+/// levels' output (or collapse per the disposition); per the #259 sweep
+/// (corpus/SWEEPS.md Decision 6), polygons between the 1×GSD write gate and
+/// the 2×GSD assign gate are mostly killed by RDP anyway.
+pub fn assign_levels_banded(
+    features: &[AssignFeature],
+    level_gsds: &[f64],
+    config: &AssignConfig,
+    crs: Crs,
+    level_reprs: &[Representation],
+) -> Assignment {
+    assign_levels_bounded(features, level_gsds, config, crs, u64::MAX, level_reprs)
+}
+
+/// [`assign_levels`] with a cap on the transient winner-grid memory (#306)
+/// and a zoom-band representation selector (#317; see
+/// [`assign_levels_banded`] for the `level_reprs` semantics).
 ///
 /// The #264 design builds every coarse level's cell-winner grid concurrently,
 /// so the transient peak scales with `level_count × grid size` — the pass-1
@@ -543,6 +595,7 @@ pub fn assign_levels_bounded(
     config: &AssignConfig,
     crs: Crs,
     grid_budget_bytes: u64,
+    level_reprs: &[Representation],
 ) -> Assignment {
     let num_levels_usize = level_gsds.len();
     let num_levels = num_levels_usize.min(u8::MAX as usize) as u8;
@@ -608,7 +661,10 @@ pub fn assign_levels_bounded(
         let winners_per_level: Vec<Vec<usize>> = wave
             .clone()
             .into_par_iter()
-            .map(|level_idx| level_winner_positions(features, config, gsd_units[level_idx]))
+            .map(|level_idx| {
+                let repr = level_reprs.get(level_idx).copied().unwrap_or_default();
+                level_winner_positions(features, config, gsd_units[level_idx], repr)
+            })
             .collect();
 
         for (offset, winners) in winners_per_level.iter().enumerate() {
@@ -1710,13 +1766,167 @@ mod tests {
         let cfg = AssignConfig::default();
 
         let unbounded = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
-        let bounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, 1);
+        let bounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, 1, &[]);
         assert_eq!(unbounded.assignments, bounded.assignments);
         assert_eq!(unbounded.num_levels, bounded.num_levels);
 
         // An intermediate budget (some multi-level waves) must also match.
         let mid_budget = 200 * GRID_ENTRY_EST_BYTES;
-        let mid = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, mid_budget);
+        let mid = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, mid_budget, &[]);
         assert_eq!(unbounded.assignments, mid.assignments);
+    }
+
+    // ---- zoom-band point representation (#317) ------------------------------
+
+    #[test]
+    fn banded_point_levels_bypass_polygon_visibility_gate() {
+        // A polygon far below the coarse level's visibility gate: normally
+        // stuck at the finest level, but eligible at a point-band level
+        // (where it is rendered as a dot).
+        let small = poly(0, 0.0, 0.0, 0.001, 0.001);
+        let gsds = [gsd(2), gsd(12)];
+        let cfg = AssignConfig::default();
+
+        let plain = assign_levels(&[small], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            plain.assignments[0].min_level, 1,
+            "precondition: gated out of the coarse level without a band"
+        );
+
+        let banded = assign_levels_banded(
+            &[small],
+            &gsds,
+            &cfg,
+            Crs::Epsg4326,
+            &[Representation::Point, Representation::Geometry],
+        );
+        assert_eq!(
+            banded.assignments[0].min_level, 0,
+            "point-band level must admit the sub-gate polygon"
+        );
+    }
+
+    #[test]
+    fn banded_empty_flags_match_plain_assign() {
+        let feats = [
+            poly(0, 0.0, 0.0, 5.0, 5.0),
+            poly(1, 10.0, 10.0, 10.001, 10.001),
+        ];
+        let gsds = [gsd(2), gsd(6), gsd(12)];
+        let cfg = AssignConfig::default();
+        assert_eq!(
+            assign_levels(&feats, &gsds, &cfg, Crs::Epsg4326).assignments,
+            assign_levels_banded(&feats, &gsds, &cfg, Crs::Epsg4326, &[]).assignments
+        );
+        assert_eq!(
+            assign_levels(&feats, &gsds, &cfg, Crs::Epsg4326).assignments,
+            assign_levels_banded(
+                &feats,
+                &gsds,
+                &cfg,
+                Crs::Epsg4326,
+                &[Representation::Geometry; 3]
+            )
+            .assignments
+        );
+    }
+
+    #[test]
+    fn banded_point_levels_thin_polygons_on_point_grid() {
+        // Two small polygons in the same point-thinning cell at the coarse
+        // level: with the band, only ONE wins the cell (the other stays
+        // finer) — proof the point grid (point_thinning factor) applies
+        // rather than every polygon passing the bypassed gate.
+        let a = poly(0, 0.0, 0.0, 0.002, 0.002);
+        let b = poly(1, 0.003, 0.003, 0.004, 0.004);
+        let gsds = [gsd(2), gsd(12)];
+        let cfg = AssignConfig::default();
+        let out = assign_levels_banded(
+            &[a, b],
+            &gsds,
+            &cfg,
+            Crs::Epsg4326,
+            &[Representation::Point, Representation::Geometry],
+        );
+        let coarse = out.assignments.iter().filter(|x| x.min_level == 0).count();
+        assert_eq!(
+            coarse, 1,
+            "one winner per point-grid cell at the band level"
+        );
+        // The larger polygon (bigger diag) wins the cell.
+        assert_eq!(out.assignments[0].min_level, 0);
+        assert_eq!(out.assignments[1].min_level, 1);
+    }
+
+    #[test]
+    fn banded_square_levels_bypass_gate_on_polygon_grid() {
+        // Two sub-gate polygons ~0.15 deg apart: different polygon-thinning
+        // cells (1×gsd(2) ≈ 0.088 deg) but the SAME point-thinning cell
+        // (4×gsd(2) ≈ 0.35 deg). A square band must admit BOTH — gate
+        // bypassed, but thinning on the polygon grid, not the point grid.
+        let a = poly(0, 0.0, 0.0, 0.001, 0.001);
+        let b = poly(1, 0.15, 0.0, 0.151, 0.001);
+        let gsds = [gsd(2), gsd(12)];
+        let cfg = AssignConfig::default();
+
+        let plain = assign_levels(&[a, b], &gsds, &cfg, Crs::Epsg4326);
+        assert!(
+            plain.assignments.iter().all(|x| x.min_level == 1),
+            "precondition: both gated out of the coarse level without a band"
+        );
+
+        let square_band = assign_levels_banded(
+            &[a, b],
+            &gsds,
+            &cfg,
+            Crs::Epsg4326,
+            &[Representation::Square, Representation::Geometry],
+        );
+        assert!(
+            square_band.assignments.iter().all(|x| x.min_level == 0),
+            "square band must admit both tiny polygons (polygon grid cells \
+             differ): {:?}",
+            square_band.assignments
+        );
+
+        let point_band = assign_levels_banded(
+            &[a, b],
+            &gsds,
+            &cfg,
+            Crs::Epsg4326,
+            &[Representation::Point, Representation::Geometry],
+        );
+        assert_eq!(
+            point_band
+                .assignments
+                .iter()
+                .filter(|x| x.min_level == 0)
+                .count(),
+            1,
+            "point band thins the same pair on the coarser point grid"
+        );
+    }
+
+    #[test]
+    fn banded_lines_and_points_unaffected() {
+        // A sub-gate line stays gated at a point-band level: the band selects
+        // the POLYGON representation only.
+        let line = AssignFeature {
+            index: 0,
+            bbox: [0.0, 0.0, 0.001, 0.001],
+            kind: FeatureKind::Line,
+            sort_key: None,
+        };
+        let gsds = [gsd(2), gsd(12)];
+        let cfg = AssignConfig::default();
+        let plain = assign_levels(&[line], &gsds, &cfg, Crs::Epsg4326);
+        let banded = assign_levels_banded(
+            &[line],
+            &gsds,
+            &cfg,
+            Crs::Epsg4326,
+            &[Representation::Point, Representation::Geometry],
+        );
+        assert_eq!(plain.assignments, banded.assignments);
     }
 }

@@ -167,6 +167,25 @@ pub struct Generalization {
     /// readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cascade: Option<bool>,
+    /// OPTIONAL below-tolerance collapse disposition (§3.5, additive;
+    /// informative; #279). `"point"` when sub-visibility polygons were
+    /// collapsed to representative points (`--collapse`, spec Q4 opt-in) or
+    /// `"square"` when they emitted area-dithered ~1×GSD placeholder squares
+    /// (`--collapse-square`, tippecanoe tiny-polygon reduction). Absent when
+    /// they were dropped (the default) or on files written before this field
+    /// existed; readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapse: Option<String>,
+    /// OPTIONAL zoom-band representation provenance (§3.5, additive;
+    /// informative; #317 / #279). One entry per requested band: the
+    /// inclusive `[lo, hi]` zoom range and the representation keyword
+    /// (`"point"`, `"square"`, or `"geom"`). Absent when no bands were
+    /// requested (`--representation` not passed) or on files written before
+    /// this field existed; readers MUST tolerate its absence. The per-level
+    /// `geometry_types` union remains the normative signal that a level's
+    /// geometry type differs from the primary declared type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representation: Option<Vec<RepresentationBandProvenance>>,
     /// OPTIONAL cell-winner ranking provenance (§3.5, additive; informative).
     ///
     /// Records how the assignment engine broke ties for which feature wins a
@@ -333,6 +352,16 @@ where
             RanksShape::LegacyPairs(pairs) => pairs.into_iter().collect(),
         }),
     )
+}
+
+/// One zoom band of the representation-selector provenance (§3.5; #317 /
+/// #279).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepresentationBandProvenance {
+    /// Inclusive `[lo, hi]` zoom range of the band.
+    pub zooms: [u8; 2],
+    /// Representation keyword: `"point"`, `"square"`, or `"geom"`.
+    pub repr: String,
 }
 
 /// One entry of the [`Generalization`] provenance block (§3.5).
@@ -931,6 +960,8 @@ mod tests {
             engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
+            collapse: None,
+            representation: None,
             levels: vec![],
             ranking: Some(RankingProvenance {
                 mode: "auto-overture-roads".to_string(),
@@ -1001,6 +1032,8 @@ mod tests {
             engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
+            collapse: None,
+            representation: None,
             levels: vec![],
             ranking: None,
             density_drop: Some(DensityProvenance {
@@ -1040,6 +1073,8 @@ mod tests {
             engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
+            collapse: None,
+            representation: None,
             levels: vec![],
             ranking: None,
             density_drop: None,
@@ -1117,6 +1152,8 @@ mod tests {
             engine: "tylertoo test".to_string(),
             gsd_base: None,
             cascade: None,
+            collapse: None,
+            representation: None,
             levels: vec![],
             ranking: None,
             density_drop: None,
