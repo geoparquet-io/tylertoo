@@ -1,115 +1,172 @@
-# Results — Brazil field boundaries, cloud-native GeoParquet → PMTiles
+# Results — Brazil 2025 field predictions, filtered from a 630 GiB global collection
 
-A full-country tiling run on **[Fields of The World](https://fieldsofthe.world/)
-field boundaries for Brazil — 55,499,514 features** — read *directly* from
-GeoParquet on [Source Cooperative](https://source.coop/) and tiled to a complete
-**z1–14** PMTiles pyramid.
+A full-pyramid tiling run that starts from the **global** [Fields of The
+World](https://fieldsofthe.world/) predictions collection on
+[Source Cooperative](https://source.coop/) — **629.6 GiB of GeoParquet, 8.2
+billion rows in 1,000 Spark part files** — and produces a **z0–14 PMTiles
+pyramid of Brazil's 2025 growing-season field predictions** in one native
+workflow: remote read, attribute + time filter, spatial subset, centroid
+low-zoom band, polygon high-zoom band.
 
-This is not a head-to-head speed table like the [Germany buildings
-demo](../docs/demo.md). It is a **capability** result: there is no established
-tool that produces this archive, because the standard vector tiler
-(tippecanoe) does not read GeoParquet, and the documented workaround does not
-survive this scale.
+The previous demo tiled a curated per-country file set. This one showcases the
+harder, more realistic shape of the problem: the data you want is a **slice of
+a huge cloud-native collection** — one class (`label = 'field'`), one vintage
+(the 2025 prediction run), one country's extent — and no curated extract
+exists. tylertoo carves the slice and builds the pyramid in a single command
+pair, without downloading the collection or materializing an intermediate.
 
 ## Setup
 
-- **Input:** 27 per-state GeoParquet files (`BR_AC.parquet` … `BR_TO.parquet`,
-  6.1 GiB total) under the FTW predictions collection on Source Cooperative,
-  read over HTTPS — nothing downloaded by hand first.
+- **Input:** the FTW predictions `results/` collection — 1,000
+  `part-*.snappy.parquet` files (629.6 GiB, 8,217,195,679 rows) written by
+  Spark. Columns: `geometry`, `time` (prediction vintage; INT96 timestamp),
+  `label` (`field` / `field_boundaries` / `non_field_background`), `bbox`.
+  52 files intersect the Brazil bbox; those URLs are listed in
+  [`brazil-2025-manifest.txt`](./brazil-2025-manifest.txt).
 - **Machine:** 16 cores, 54 GiB RAM.
-- **Build:** tylertoo 0.6.0 (release), `--partition-wave auto`.
-- **Workflow:** the two-step overview path —
-  `overview` (build a multi-resolution GeoParquet overview) →
-  `export-pmtiles` (write the archive). The overview is a real, reusable
-  artifact (18 GB GeoParquet), not a throwaway intermediate.
-
-## Numbers
-
-Full remote → PMTiles round trip: **44 min 41 s**, peak RSS **1.74 GiB** at
-export, no OOM.
-
-| stage | wall | peak RSS | output |
-|---|---|---|---|
-| **convert** (incl. 6.1 GiB remote read) | 23 m 25 s | 23.9 GiB¹ | `brazil-ov-z14.parquet` — 18 GB, 55.5M feats → 138M rows × 14 levels |
-| **export-pmtiles** (`--partition-wave auto`) | 21 m 07 s | **1.74 GiB** | `brazil-field-boundaries.pmtiles` — **8.4 GiB**, 1,075,458 tiles |
-| **total** | **44 m 41 s** | — | z1–14, 147,016,988 tile-features, 0 oversized |
-
-¹ Convert peak measured by `/usr/bin/time -v` (Maximum resident set size). The
-overview builder auto-selected **spill mode** here — its in-memory estimate for
-holding all 138M output rows was ~456 GiB, far over budget, so output was
-streamed to disk. Steady-state RSS sat far lower; 23.9 GiB is the transient peak.
-
-### Per-zoom tile breakdown
-
-```
-  z 1:         1 tiles               2 feats
-  z 2:         1 tiles             167 feats
-  z 3:         3 tiles           2,004 feats
-  z 4:         6 tiles          14,820 feats
-  z 5:        13 tiles          99,497 feats
-  z 6:        38 tiles         432,582 feats
-  z 7:       119 tiles       1,286,509 feats
-  z 8:       412 tiles       2,593,341 feats
-  z 9:     1,461 tiles       4,517,577 feats
-  z10:     5,237 tiles       7,615,854 feats
-  z11:    18,730 tiles      12,745,628 feats
-  z12:    66,511 tiles      21,348,208 feats
-  z13:   228,808 tiles      35,843,132 feats
-  z14:   754,118 tiles      60,517,667 feats
-```
+- **Build:** tylertoo 0.6.0 (release) + this PR's timestamp-filter and
+  null-CRS support.
+- **Workflow:** `overview` (build the multi-resolution overview straight from
+  the remote slice) → `export-pmtiles`.
 
 Commands:
 
 ```bash
-# 1. Build the multi-resolution overview straight from remote GeoParquet.
-#    (--files-from lists the 27 state URLs on Source Cooperative.)
-tylertoo overview --files-from brazil-manifest.txt \
-  --min-zoom 1 --max-zoom 14 \
-  brazil-ov-z14.parquet
+# 1. Multi-resolution overview from the remote collection slice:
+#    Brazil bbox, 2025 vintage, fields only, centroids at z0-7.
+tylertoo overview \
+  --files-from brazil-2025-manifest.txt \
+  --bbox="-74.1,-34.0,-34.7,5.4" \
+  --filter "label = 'field' AND time >= '2025-01-01'" \
+  --min-zoom 0 --max-zoom 14 \
+  --representation "0-7:point" \
+  --report convert-report.json \
+  brazil-2025-fields-ov-z14.parquet
 
 # 2. Export the PMTiles archive.
-tylertoo export-pmtiles brazil-ov-z14.parquet \
-  brazil-field-boundaries.pmtiles \
-  --partition-wave auto
+tylertoo export-pmtiles brazil-2025-fields-ov-z14.parquet \
+  brazil-2025-fields.pmtiles \
+  --report export-report.json
 ```
+
+## Numbers
+
+| stage | wall | peak RSS | output |
+|---|---|---|---|
+| **convert** (incl. 40.7 GiB remote read) | 1 h 11 m 56 s | 9.6 GiB | `brazil-2025-fields-ov-z14.parquet` — 14.1 GB, 43.9 M feats → 109.3 M rows × 15 levels |
+| **export-pmtiles** | 11 m 44 s | **1.54 GiB** | `brazil-2025-fields.pmtiles` — **4.5 GiB**, 1,647,927 tiles |
+| **total** | **1 h 23 m 40 s** | — | z0–14, 116,504,741 tile-features, 0 oversized |
+
+Convert detail:
+
+- **Selectivity:** 426,316,880 rows scanned in the 52 covering files →
+  **43,903,999 features kept** (10.3%) by
+  `label = 'field' AND time >= '2025-01-01'` + the Brazil bbox. The other
+  ~382 M rows are the 2024 vintage, the `field_boundaries` /
+  `non_field_background` classes, and out-of-bbox neighbors.
+- **Remote read:** 457 range requests, 43.75 GB fetched (≈1.0× the 52
+  objects' 43.75 GB — the local spill keeps passes 2+ off the network). The
+  other 948 part files (589 GiB) were never touched.
+- **Convert wall breakdown:** 43 m staging download (network-bound at
+  ~16 MB/s) + 28 m 43 s scan/assign/write.
+
+### Per-level overview breakdown
+
+`--representation "0-7:point"` makes z0–7 **representative points** (one
+vertex per feature) and z8–14 full polygons — "dots zoomed out, polygons
+zoomed in" in a single archive:
+
+```
+level  zoom  features     vertices       what
+    0     0        634          634      points
+    1     1      2,295        2,295      points
+    2     2      8,053        8,053      points
+    3     3     28,456       28,456      points
+    4     4     99,797       99,797      points
+    5     5    335,189      335,189      points
+    6     6    799,158      799,158      points
+    7     7  1,318,610    1,318,610      points
+    8     8  1,672,801   19,355,924      polygons
+    9     9  3,210,003   44,569,519      polygons
+   10    10  5,655,496   96,611,166      polygons
+   11    11  9,599,791  205,429,019      polygons
+   12    12 16,045,516  455,049,658      polygons
+   13    13 26,608,484 1,212,022,634     polygons
+   14    14 43,903,999 1,580,669,610     polygons (canonical, verbatim)
+```
+
+A point is always visible, so the point band bypasses the polygon visibility
+gate — z0 renders 634 dots where the previous polygon-only demo's z0 was
+empty.
 
 ## What the numbers say
 
-**1. No existing tool takes this path.** Tippecanoe is the de-facto standard for
-building vector PMTiles, and it does not ingest GeoParquet. The documented
-geoparquet-io route is `gpio convert geojson … | tippecanoe`, i.e. serialize the
-whole dataset to GeoJSON first. tylertoo reads the GeoParquet — local *or*
-remote — and writes the pyramid in one workflow, with no GeoJSON in the loop.
+**1. The filter is the feature.** No curated "Brazil 2025 fields" file
+exists. The slice lives inside a 630 GiB, 8.2-billion-row global collection,
+interleaved with two other classes and a second vintage. `--filter` (new in
+#321, timestamp support added here) + `--bbox` carve it out *during* the
+tiling read — no DuckDB pre-pass, no intermediate extract, no download of the
+other 948 files.
 
-**2. The GeoJSON detour doesn't survive this scale.** On the comparably-sized
-Germany buildings run (59M features), *generating the GeoJSON intermediate
-alone* took 32 m 44 s and 19.1 GB on disk — before tippecanoe wrote a single
-tile — and the documented one-liner then aborted on dense tiles. Brazil is the
-same order of magnitude (55.5M features), and the intermediate would be larger,
-not smaller.
+**2. One archive serves dots and polygons.** `--representation "0-7:point"`
+(new in #322) writes centroids for the coarse band and polygons from z8 up.
+Renderers get the graduated-dot overview and the parcel-level detail from the
+same PMTiles file, with a two-line style split (`circle` layer for points,
+`fill` for polygons).
 
-**3. The source is cloud-native, and so is the read.** The FTW predictions live
-as GeoParquet on Source Cooperative. tylertoo read all 27 state files over HTTPS
-(a full-country run fetches the whole object once, ~1×, spilling locally so later
-passes never re-hit the network; a regional `--bbox` fetches only the covering
-row groups). There is no "download 6 GiB, then convert, then tile" preamble.
+**3. Cloud-native end to end, at collection scale.** The read touched 6.9%
+of the collection's bytes (43.75 GB of 630 GiB) — the 52 files whose footers
+said they could contain Brazil. Row-group *pruning inside* those files did not
+fire because the FTW files carry no GeoParquet 1.1 `covering` metadata (see
+Findings); with it, the transfer would drop another ~18%.
 
-**4. Deep pyramid, bounded memory.** The archive spans z1–14 — from a single
-whole-country tile up to 754k tiles at z14 — with export peaking at **1.74 GiB**.
-At z14 the 55.5M features spread across 754k tiles (~80 features/tile), so no
-single tile concentrates the dataset; memory stays flat regardless of depth.
+**4. Bounded memory at every stage.** Convert auto-selected spill mode (its
+in-RAM estimate for 109 M buffered output rows was ~315 GiB); peak RSS stayed
+at 9.6 GiB against 54 GiB of RAM. Export streamed all 15 levels at a peak of
+**1.54 GiB**.
+
+## Findings (upstream + tooling)
+
+Running this surfaced four things worth recording:
+
+1. **`--filter` lacked timestamp support** — the `results/` collection keys
+   vintage on a `time` timestamp column, which the filter (built in #321
+   against numeric/string/boolean columns) could not compare. This PR adds
+   timestamp columns (all four Arrow units, datetime string literals, exact
+   i128 comparison, INT64-stats pushdown).
+2. **Spark writes `"crs": null`** — per the GeoParquet spec an *omitted* crs
+   defaults to OGC:CRS84 while an explicit *null* means "no CRS assigned",
+   and tylertoo refused the file. Real writers (Spark/Sedona, hence FTW) emit
+   null on plain lon/lat data, so tylertoo now assumes CRS84 with a warning
+   when the declared bbox is plausible in degrees. *Upstream note:* FTW's
+   writer should omit the key (or write the CRS84 PROJJSON) instead of null.
+3. **No `covering` metadata → no row-group pruning.** The files carry tight
+   per-row-group `bbox` column statistics that would let `--bbox` skip ~18%
+   of the transfer at the parquet-footer level, but without the GeoParquet
+   1.1 `covering` key tylertoo cannot trust the column and reads every row
+   group of the covering files (the exact per-feature filter still applies).
+   *Upstream note:* adding `covering` to the FTW geo metadata is a one-line
+   writer change that would make every bbox consumer cheaper.
+4. **INT96 timestamps defeat statistics pushdown.** Spark's legacy INT96
+   encoding exposes no usable min/max, so the `time >= '2025-01-01'`
+   predicate filters exactly but prunes nothing. INT64 timestamps (Spark
+   `outputTimestampType=TIMESTAMP_MICROS`) would let the vintage predicate
+   skip row groups too.
 
 ## Methodology
 
-- Wall time: `/usr/bin/time -v` per stage; total is start-to-finish wall clock.
+- Wall time: `/usr/bin/time -v` per stage; total is start-to-finish wall.
 - Peak RSS: `time -v` maximum-RSS per stage.
+- Filter correctness: the canonical level's 43,903,999 features were
+  cross-checked against DuckDB
+  (`label='field' AND year(time)=2025` + bbox predicate over the same 52
+  files); a single-file smoke run matched DuckDB exactly (1,811,936 = 1,811,936).
 - Tile / feature counts: the `export-pmtiles` JSON report and the PMTiles v3
-  header (`addressed tiles count`); cross-checked by decoding the z6 band back
-  to GeoParquet (`tylertoo decode --zoom 6`) → 432,582 features from 38 tiles.
+  header.
 - Clipping and simplification differ from tippecanoe by design (see
-  [`context/ARCHITECTURE.md`](../context/ARCHITECTURE.md)); this demonstrates a
-  *pipeline and its output*, not byte-identical tiling.
+  [`context/ARCHITECTURE.md`](../context/ARCHITECTURE.md)); this demonstrates
+  a *pipeline and its output*, not byte-identical tiling.
 
-The archive is hosted on Source Cooperative and rendered live on the docs site —
-see [`docs/demo.md`](../docs/demo.md) and the viewer at
+The archive is hosted on Source Cooperative and rendered live on the docs
+site — see [`docs/demo.md`](../docs/demo.md) and the viewer at
 [`docs/demo/viewer.html`](../docs/demo/viewer.html).
