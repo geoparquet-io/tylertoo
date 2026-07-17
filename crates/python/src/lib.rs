@@ -14,12 +14,12 @@ use tylertoo_core::overview::assign::{
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
 use tylertoo_core::overview::convert::{
-    convert_to_overviews, convert_to_overviews_sources, ClassRanking, ConvertError, ConvertOptions,
-    ConvertReport, LevelPlan,
+    convert_to_overviews, convert_to_overviews_sources, parse_representation_spec, ClassRanking,
+    ConvertError, ConvertOptions, ConvertReport, LevelPlan,
 };
 use tylertoo_core::overview::export::{export_pmtiles as export_pmtiles_core, ExportOptions};
 use tylertoo_core::overview::level::{MemoryProfile, Mode};
-use tylertoo_core::overview::simplify::SimplifyOptions;
+use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 
 /// Convert GeoParquet to PMTiles in one shot (overview facade).
 ///
@@ -260,6 +260,17 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         higher = cruder and lighter. Defaults to 1.0.
 ///     collapse (bool, optional): Collapse below-visibility polygons to a
 ///         representative point instead of dropping them. Defaults to False.
+///     collapse_square (bool, optional): Collapse below-visibility polygons
+///         to a ~1xGSD area-dithered placeholder square at the
+///         representative point (tippecanoe tiny-polygon reduction;
+///         type-preserving, so fill styles keep working). Mutually exclusive
+///         with collapse. Defaults to False.
+///     representation (str, optional): Zoom-band representation selector:
+///         comma-separated "LO-HI:KIND" bands (KIND: geom, point, square),
+///         e.g. "0-7:point,8-14:geom". Point bands render ALL polygonal
+///         features as centroids; square bands emit dithered placeholder
+///         squares for below-tolerance polygons. Requires a zoom-range plan
+///         and duplicating mode. Defaults to None (all levels geom).
 ///     cascade (bool, optional): Cascading simplification (duplicating mode
 ///         only): simplify each coarser level from the next-finer level's
 ///         already-simplified output (tippecanoe-style) and repair invalid
@@ -395,6 +406,8 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     no_auto_rank=false,
     simplify_factor=1.0,
     collapse=false,
+    collapse_square=false,
+    representation=None,
     cascade=true,
     point_thinning=None,
     line_thinning=1.0,
@@ -439,6 +452,8 @@ fn overview(
     no_auto_rank: bool,
     simplify_factor: f64,
     collapse: bool,
+    collapse_square: bool,
+    representation: Option<String>,
     cascade: bool,
     point_thinning: Option<f64>,
     line_thinning: f64,
@@ -535,6 +550,27 @@ fn overview(
         }
     };
 
+    // Below-tolerance collapse disposition (#279) + zoom-band representation
+    // selector (#317); mirrors the CLI flags. Structural validity of the
+    // bands against the level plan is enforced by core convert validation.
+    if collapse && collapse_square {
+        return Err(PyErr::new::<PyValueError, _>(
+            "collapse and collapse_square are mutually exclusive",
+        ));
+    }
+    let collapse_mode = if collapse_square {
+        CollapseMode::Square
+    } else if collapse {
+        CollapseMode::Point
+    } else {
+        CollapseMode::Drop
+    };
+    let representation_bands = match &representation {
+        Some(spec) => parse_representation_spec(spec)
+            .map_err(|e| PyErr::new::<PyValueError, _>(format!("representation: {e}")))?,
+        None => Vec::new(),
+    };
+
     // Clustering flags (mirrors the CLI's pre-checks; also enforced in core).
     let accumulate_attributes = accumulate_attributes.unwrap_or_default();
     if !accumulate_attributes.is_empty() && !cluster {
@@ -586,9 +622,10 @@ fn overview(
         no_auto_rank,
         simplify: SimplifyOptions {
             factor: simplify_factor,
-            collapse,
+            collapse: collapse_mode,
             cascade,
         },
+        representation: representation_bands,
         density: DensityBudgetConfig {
             enabled: density_drop,
             drop_rate,
