@@ -1400,6 +1400,9 @@ fn write_level_streaming(
 ) -> Result<(LevelWriteOutcome, usize, usize), ConvertError> {
     let rows = Cell::new(0usize);
     let vertices = Cell::new(0usize);
+    // Writer-thread time spent blocked waiting on the producer; the writer's
+    // own busy time is `total - recv_wait` ([profile] logging).
+    let recv_wait_ns = Cell::new(0u64);
     let timers = Pass2Timers::default();
     let fallbacks_before = full_resolution_fallback_count();
     let t_level = Instant::now();
@@ -1479,13 +1482,20 @@ fn write_level_streaming(
 
         // Writer (this thread): drain processed batches in order. Dropping
         // the producer's `tx` (EOF, error, or writer-gone) fuses `recv`.
-        let batches = std::iter::from_fn(|| match rx.recv() {
-            Ok(msg) => {
-                rows.set(rows.get() + msg.batch.num_rows());
-                vertices.set(vertices.get() + msg.verts);
-                Some(msg.batch)
+        let batches = std::iter::from_fn(|| {
+            let t_wait = Instant::now();
+            match rx.recv() {
+                Ok(msg) => {
+                    recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                    rows.set(rows.get() + msg.batch.num_rows());
+                    vertices.set(vertices.get() + msg.verts);
+                    Some(msg.batch)
+                }
+                Err(_) => {
+                    recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                    None
+                }
             }
-            Err(_) => None,
         });
         let res = writer.write_level(level_idx, Some(hint), batches);
 
@@ -1506,9 +1516,11 @@ fn write_level_streaming(
     // writer (#264), so these stage sums are core-seconds that overlap the
     // `total` wall time — the writer's own cost is roughly
     // `total - max(producer stages)`, not `total - sum`.
+    let writer_busy = total - Duration::from_nanos(recv_wait_ns.get()).as_secs_f64();
     log::debug!(
         "[profile] level {} ({}, {} rows): total={:.2}s read={:.2}s decode={:.2}s \
-         simplify={:.2}s build={:.2}s (read/decode/simplify/build overlap the writer)",
+         simplify={:.2}s build={:.2}s writer_busy={:.2}s (read/decode/simplify/build \
+         overlap the writer)",
         level_idx,
         if ctx.verbatim { "verbatim" } else { "simplify" },
         rows.get(),
@@ -1517,6 +1529,7 @@ fn write_level_streaming(
         decode_s,
         simplify_s,
         build_s,
+        writer_busy,
     );
     let fallbacks = full_resolution_fallback_count() - fallbacks_before;
     if fallbacks > 0 {
