@@ -956,7 +956,7 @@ struct LevelPlan {
 /// to half the ceiling; the fill's buffered transient is therefore bounded
 /// regardless of input size, while flushes stay large enough to keep the spill
 /// file's segments chunky.
-const MEMBER_STORE_RAM_BUDGET: usize = 256 * 1024 * 1024;
+const MEMBER_STORE_RAM_BUDGET: usize = 128 * 1024 * 1024;
 
 /// Bounded-channel depth between the band reader thread and the clip/route
 /// consumer of the single-read fill — the read/compute overlap and
