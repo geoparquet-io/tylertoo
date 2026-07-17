@@ -18,6 +18,7 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
 - Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
 - Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
+- Attribute filtering (`--filter` / `--where`) — tile only the features matching a SQL-WHERE-style predicate (`"confidence > 0.8"`, `"crop IN ('soy', 'corn')"`), with parquet row-group statistics pushdown so non-matching row groups are never read (or fetched, on remote input); composes with `--bbox` ([Tuning guide](docs/OVERVIEW_TUNING.md#attribute-filter---filter----where))
 - Spec validation (`tylertoo validate`)
 - PMTiles → GeoParquet decoding (`tylertoo decode`) — tippecanoe-decode
   semantics, any PMTiles v3 MVT archive

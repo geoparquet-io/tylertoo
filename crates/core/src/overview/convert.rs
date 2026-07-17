@@ -391,6 +391,18 @@ pub struct ConvertOptions {
     /// identical either way. Default `None` (full-extent conversion,
     /// byte-identical output to a build without this option).
     pub bbox: Option<[f64; 4]>,
+    /// Attribute filter (#315): a SQL-WHERE-style predicate over the input's
+    /// property columns (`--filter` / `--where`), e.g. `confidence > 0.8`,
+    /// `crop_type IN ('soy', 'corn') AND note IS NOT NULL`. Evaluated during
+    /// the pass-1 scan with SQL three-valued null semantics (a row is kept
+    /// only when the predicate is TRUE), so it composes with
+    /// [`bbox`](Self::bbox) and feeds the same downstream pipeline. Input row
+    /// groups whose parquet column statistics prove the predicate cannot
+    /// match are skipped at the footer level (no data pages read — on remote
+    /// input those byte ranges are never fetched); row groups without usable
+    /// statistics degrade gracefully to the exact per-row evaluation. See
+    /// [`super::filter`] for the grammar. Default `None` (no filtering).
+    pub filter: Option<String>,
     /// Directory for the remote-input disk spill (#219 / #272). A remote
     /// convert stages every fetched column chunk in an anonymous temp file
     /// (growing to ≈1× the touched input bytes) so later passes re-read
@@ -471,6 +483,7 @@ impl Default for ConvertOptions {
             coalesce_max_level_rows: DEFAULT_COALESCE_MAX_LEVEL_ROWS,
             coalesce_junction_angle: DEFAULT_JUNCTION_ANGLE_DEG,
             bbox: None,
+            filter: None,
             spill_dir: None,
         }
     }
@@ -692,6 +705,10 @@ pub enum ConvertError {
     /// non-positive where a positive finite value is required).
     #[error("invalid option: {0}")]
     InvalidConfig(String),
+    /// The attribute filter (#315) failed to parse or bind against the input
+    /// schema (unknown column, type mismatch, unsupported column type).
+    #[error(transparent)]
+    Filter(#[from] super::filter::FilterError),
     /// `--cluster` was requested in partitioning mode. A partitioning row is
     /// read at MANY display zooms (prefix reads, §2.3) but exists at exactly
     /// one level, so a single stored `point_count` cannot reflect "that
@@ -814,6 +831,12 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
             )));
         }
     }
+    // Attribute filter (#315): fail fast on a syntactically invalid
+    // expression, before any input is opened. Binding (unknown column /
+    // type mismatch) happens later, once the schema is known.
+    if let Some(f) = &options.filter {
+        super::filter::parse_filter(f)?;
+    }
     // in_flight_batches == 0 is the IN_FLIGHT_BATCHES_AUTO sentinel (resolved
     // to available parallelism at pass-2 setup), not an error. Any explicit
     // positive value is honoured verbatim, so there is nothing to reject here.
@@ -914,6 +937,7 @@ fn decode_and_filter_geometries(
     geom_idx: usize,
     geom_field: &Field,
     bbox_units: Option<&[f64; 4]>,
+    filter_mask: Option<&[Option<bool>]>,
 ) -> Result<(RecordBatch, Vec<Geometry<f64>>), ConvertError> {
     let geom_array: Arc<dyn GeoArrowArray> =
         from_arrow_array(full.column(geom_idx).as_ref(), geom_field)
@@ -923,16 +947,26 @@ fn decode_and_filter_geometries(
     let mut geom_skipped = 0usize;
     let keep: Vec<bool> = geom_opts
         .iter()
-        .map(|g| match g.as_ref().filter(|g| usable_geometry(g)) {
-            // Regional extract (#102): drop features whose bbox misses the
-            // requested region exactly, independent of row-group pruning.
-            // (map_or, not is_none_or: the latter is stable only since Rust
-            // 1.82 and the crate MSRV is 1.75.)
-            #[allow(clippy::unnecessary_map_or)]
-            Some(g) => bbox_units.map_or(true, |bb| bboxes_intersect(&geometry_bbox(g), bb)),
-            None => {
-                geom_skipped += 1;
-                false
+        .enumerate()
+        .map(|(i, g)| {
+            // Attribute filter (#315): a row is kept only when the predicate
+            // evaluated TRUE (SQL-UNKNOWN drops, like FALSE).
+            if let Some(mask) = filter_mask {
+                if mask[i] != Some(true) {
+                    return false;
+                }
+            }
+            match g.as_ref().filter(|g| usable_geometry(g)) {
+                // Regional extract (#102): drop features whose bbox misses the
+                // requested region exactly, independent of row-group pruning.
+                // (map_or, not is_none_or: the latter is stable only since Rust
+                // 1.82 and the crate MSRV is 1.75.)
+                #[allow(clippy::unnecessary_map_or)]
+                Some(g) => bbox_units.map_or(true, |bb| bboxes_intersect(&geometry_bbox(g), bb)),
+                None => {
+                    geom_skipped += 1;
+                    false
+                }
             }
         })
         .collect();
@@ -1043,8 +1077,12 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // can be rewritten to the renamed columns. The rename preserves column
     // order, so `read_schema` and `input_schema` share indices.
     let mut options = options.clone();
-    let (input_schema, _renames) = resolve_reserved_column_collisions(&read_schema, &mut options);
+    let (input_schema, renames) = resolve_reserved_column_collisions(&read_schema, &mut options);
     let options = &options;
+
+    // Attribute filter (#315): parse + bind against the (possibly renamed)
+    // input schema. Syntax was already validated in `validate_options`.
+    let bound_filter = bind_attribute_filter(options, &input_schema, &renames)?;
 
     let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
     let geom_field = input_schema.field(geom_idx).clone();
@@ -1054,17 +1092,23 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // Coalescing schema check (Q3).
     validate_coalesce_schema(&input_schema, options)?;
 
-    // Regional extract (#102): prune input row groups by bbox covering
-    // statistics (footer-only), before any data pages are read. Groups
-    // without stats are kept; the exact per-feature filter below guarantees
-    // identical output either way.
+    // Regional extract (#102) + attribute filter (#315): prune input row
+    // groups by footer statistics (bbox covering stats / per-column
+    // min-max-null stats), before any data pages are read. The two prunings
+    // compose by intersection. Groups without stats are kept; the exact
+    // per-feature filters below guarantee identical output either way.
     let row_groups_total = builder.metadata().num_row_groups();
     let bbox_units = options.bbox.map(|b| bbox_to_crs_units(&b, crs));
-    let (builder, row_groups_read) = match &bbox_units {
-        Some(bb) => {
-            let sel = select_input_row_groups(builder.metadata(), bb);
+    let combined_sel = select_input_row_groups_combined(
+        builder.metadata(),
+        bbox_units.as_ref(),
+        bound_filter.as_ref(),
+    );
+    let (builder, row_groups_read) = match combined_sel {
+        Some(sel) => {
             let n = sel.len();
-            log::info!("bbox filter: reading {n}/{row_groups_total} input row groups");
+            let what = pruning_label(bbox_units.is_some(), bound_filter.is_some());
+            log::info!("{what} filter: reading {n}/{row_groups_total} input row groups");
             (builder.with_row_groups(sel), n)
         }
         None => (builder, row_groups_total),
@@ -1083,8 +1127,18 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // they are dropped, from the batch and the geometry vec together, so every
     // downstream index stays aligned (H4: an interleaved null geometry must
     // never shift attributes onto a neighboring row's geometry).
-    let (full, geometries) =
-        decode_and_filter_geometries(full, geom_idx, &geom_field, bbox_units.as_ref())?;
+    // Attribute filter (#315): evaluate the predicate over the full table
+    // once (identity projection — the raw batch carries the full schema, and
+    // the #288 rename is order-preserving so indices line up).
+    let filter_mask: Option<Vec<Option<bool>>> =
+        bound_filter.as_ref().map(|f| f.eval_mask(&full, &|i| i));
+    let (full, geometries) = decode_and_filter_geometries(
+        full,
+        geom_idx,
+        &geom_field,
+        bbox_units.as_ref(),
+        filter_mask.as_deref(),
+    )?;
 
     // Apply the reserved-column renames (#288) to the in-memory table. Columns
     // are positional, so re-associating them with the renamed schema is a
@@ -1565,6 +1619,51 @@ pub(crate) fn select_input_row_groups(
             None => true, // no stats — must read to stay correct
         })
         .collect()
+}
+
+/// Parse + bind [`ConvertOptions::filter`] (#315) against the (possibly
+/// reserved-renamed, #288) input schema. `Ok(None)` when no filter is set.
+pub(super) fn bind_attribute_filter(
+    options: &ConvertOptions,
+    input_schema: &Schema,
+    renames: &[(String, String)],
+) -> Result<Option<super::filter::BoundFilter>, ConvertError> {
+    let Some(src) = options.filter.as_deref() else {
+        return Ok(None);
+    };
+    let expr = super::filter::parse_filter(src)?;
+    Ok(Some(super::filter::BoundFilter::bind(
+        &expr,
+        input_schema,
+        renames,
+    )?))
+}
+
+/// Log label for the active footer-statistics prunings.
+pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
+    match (bbox, filter) {
+        (true, true) => "bbox+attribute",
+        (true, false) => "bbox",
+        _ => "attribute",
+    }
+}
+
+/// Combined single-file footer-statistics row-group selection: bbox covering
+/// pruning (#102) intersected with attribute-filter statistics pushdown
+/// (#315). `None` when neither pruning is active (read everything).
+fn select_input_row_groups_combined(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    bbox_units: Option<&[f64; 4]>,
+    filter: Option<&super::filter::BoundFilter>,
+) -> Option<Vec<usize>> {
+    let bbox_sel: Option<Vec<usize>> = bbox_units.map(|bb| select_input_row_groups(metadata, bb));
+    let filter_sel: Option<Vec<usize>> = filter.map(|f| f.select_row_groups(metadata));
+    match (bbox_sel, filter_sel) {
+        (Some(a), Some(b)) => Some(a.into_iter().filter(|i| b.contains(i)).collect()),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// Find the primary geometry column index (name `geometry`, else first `geom*`).
@@ -5928,6 +6027,224 @@ mod tests {
     }
 
     // ========================================================================
+    // Attribute filter tests (#315)
+    // ========================================================================
+
+    /// One fixture row: `((x, y), confidence, crop)`.
+    type AttrRow = ((f64, f64), Option<f64>, Option<&'static str>);
+
+    /// Multi-row-group input with attribute columns: one row per row group at
+    /// `(x, y)` with `id` = row-group index, plus a nullable `confidence`
+    /// Float64 and a nullable `crop` Utf8 column. One row per row group makes
+    /// per-row-group column statistics exact, so pushdown pruning can bite.
+    fn write_multi_rg_attr_input(path: &Path, rows: &[AttrRow]) {
+        use parquet::file::properties::WriterProperties;
+
+        let geoms: Vec<Geometry<f64>> = rows
+            .iter()
+            .map(|&((x, y), _, _)| Geometry::Point(Point::new(x, y)))
+            .collect();
+        let n = geoms.len();
+        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+        let confidence =
+            arrow_array::Float64Array::from(rows.iter().map(|(_, c, _)| *c).collect::<Vec<_>>());
+        let crop =
+            arrow_array::StringArray::from(rows.iter().map(|(_, _, s)| *s).collect::<Vec<_>>());
+        let geom_arr = build_geometry_array(&geoms);
+        let geom_field = geom_arr.data_type().to_field("geometry", true);
+        let fields = vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(Field::new("confidence", DataType::Float64, true)),
+            Arc::new(Field::new("crop", DataType::Utf8, true)),
+            Arc::new(geom_field),
+        ];
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(id),
+            Arc::new(confidence),
+            Arc::new(crop),
+            geom_arr.to_array_ref(),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+        let gpq_options = GeoParquetWriterOptionsBuilder::default()
+            .set_encoding(GeoParquetWriterEncoding::WKB)
+            .set_generate_covering(true)
+            .build();
+        let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+        let target_schema = encoder.target_schema();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
+        let mut encoder = encoder;
+        let encoded = encoder.encode_record_batch(&batch).unwrap();
+        writer.write(&encoded).unwrap();
+        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+        writer.close().unwrap();
+    }
+
+    /// Rows: (0,0)/0.1/soy, (10,10)/0.9/corn, (20,20)/0.85/soy, (30,30)/null/rice.
+    fn attr_rows() -> Vec<AttrRow> {
+        vec![
+            ((0.0, 0.0), Some(0.1), Some("soy")),
+            ((10.0, 10.0), Some(0.9), Some("corn")),
+            ((20.0, 20.0), Some(0.85), Some("soy")),
+            ((30.0, 30.0), None, Some("rice")),
+        ]
+    }
+
+    fn attr_opts() -> ConvertOptions {
+        ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// `--filter "confidence > 0.8"` keeps only the matching features
+    /// (null confidence drops per SQL three-valued logic) AND prunes the
+    /// non-matching row groups via column statistics — in both the streaming
+    /// and in-memory engines.
+    #[test]
+    fn attribute_filter_matches_posthoc_and_prunes_row_groups() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_attr_input(tin.path(), &attr_rows());
+
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                filter: Some("confidence > 0.8".to_string()),
+                streaming,
+                ..attr_opts()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            assert_eq!(report.row_groups_total, 4, "streaming={streaming}");
+            // RG0 (0.1) and RG3 (all-null) are provably non-matching by stats.
+            assert_eq!(
+                report.row_groups_read, 2,
+                "stats pushdown did not fire (streaming={streaming})"
+            );
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![1, 2], "streaming={streaming}");
+        }
+    }
+
+    /// `--filter` composes with `--bbox`: row-group selections intersect and
+    /// the per-feature filters both apply.
+    #[test]
+    fn attribute_filter_composes_with_bbox() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_attr_input(tin.path(), &attr_rows());
+
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                // bbox keeps (10,10) and (20,20); filter keeps 0.9 and 0.85;
+                // combined with bbox tightened to exclude (20,20): only id=1.
+                bbox: Some([9.0, 9.0, 11.0, 11.0]),
+                filter: Some("confidence > 0.8".to_string()),
+                streaming,
+                ..attr_opts()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            assert_eq!(
+                report.row_groups_read, 1,
+                "bbox+filter selection must intersect (streaming={streaming})"
+            );
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![1], "streaming={streaming}");
+        }
+    }
+
+    /// String equality / IN, IS NULL, and OR-composition semantics.
+    #[test]
+    fn attribute_filter_string_in_and_null_semantics() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_attr_input(tin.path(), &attr_rows());
+
+        for streaming in [true, false] {
+            // IN over strings.
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                filter: Some("crop IN ('corn', 'rice')".to_string()),
+                streaming,
+                ..attr_opts()
+            };
+            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![1, 3], "IN (streaming={streaming})");
+
+            // IS NULL keeps exactly the null-confidence row.
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                filter: Some("confidence IS NULL".to_string()),
+                streaming,
+                ..attr_opts()
+            };
+            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![3], "IS NULL (streaming={streaming})");
+
+            // Three-valued OR: null confidence is rescued by the crop arm.
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                filter: Some("confidence > 0.8 OR crop = 'rice'".to_string()),
+                streaming,
+                ..attr_opts()
+            };
+            convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![1, 2, 3], "OR (streaming={streaming})");
+        }
+    }
+
+    /// Filter errors: bad syntax fails in validation, an unknown column and
+    /// a type mismatch fail at bind — all before any output is written.
+    #[test]
+    fn attribute_filter_error_paths() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_attr_input(tin.path(), &attr_rows());
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let bad_syntax = ConvertOptions {
+            filter: Some("confidence >".to_string()),
+            ..attr_opts()
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &bad_syntax).unwrap_err();
+        assert!(matches!(err, ConvertError::Filter(_)), "got {err:?}");
+
+        let unknown = ConvertOptions {
+            filter: Some("nope = 1".to_string()),
+            ..attr_opts()
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &unknown).unwrap_err();
+        assert!(
+            matches!(err, ConvertError::Filter(_)) && err.to_string().contains("unknown column"),
+            "got {err:?}"
+        );
+
+        let mismatch = ConvertOptions {
+            filter: Some("crop > 3".to_string()),
+            ..attr_opts()
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &mismatch).unwrap_err();
+        assert!(matches!(err, ConvertError::Filter(_)), "got {err:?}");
+
+        // A filter matching nothing surfaces as NoData, like an empty bbox.
+        let none = ConvertOptions {
+            filter: Some("confidence > 99".to_string()),
+            ..attr_opts()
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &none).unwrap_err();
+        assert!(matches!(err, ConvertError::NoData), "got {err:?}");
+    }
+
+    // ========================================================================
     // Remote input tests (#210)
     // ========================================================================
 
@@ -6030,6 +6347,54 @@ mod tests {
         #[test]
         fn bbox_extract_in_memory_fetches_only_selected_row_groups() {
             assert_bbox_extract_fetches_only_selected(false);
+        }
+
+        /// The #315 headline property: a `--filter` convert over a remote
+        /// file must fetch data pages ONLY from the row groups whose column
+        /// statistics permit a match — pruned groups' byte ranges are never
+        /// downloaded at all (fetched-bytes reduction).
+        #[test]
+        fn attribute_filter_remote_fetches_only_matching_row_groups() {
+            // 4 single-row row groups; `confidence > 0.8` stats-selects only
+            // rg 1 (0.9) and rg 2 (0.85); rg 0 (0.1) and rg 3 (null) prune.
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            write_multi_rg_attr_input(tin.path(), &attr_rows());
+            let bytes = std::fs::read(tin.path()).unwrap();
+            let spans = row_group_spans(&bytes);
+            assert_eq!(spans.len(), 4);
+
+            let source = test_memory_source(bytes, "attrs.parquet");
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                filter: Some("confidence > 0.8".to_string()),
+                ..attr_opts()
+            };
+            let report = convert_to_overviews_source(&source, tout.path(), &opts).unwrap();
+
+            assert_eq!(report.row_groups_total, 4);
+            assert_eq!(report.row_groups_read, 2, "filter pushdown must fire");
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![1, 2]);
+
+            // No fetched range may touch a pruned row group's data pages.
+            let fetched = source.fetched_ranges().unwrap();
+            assert!(!fetched.is_empty());
+            for (i, span) in spans.iter().enumerate() {
+                if i == 1 || i == 2 {
+                    continue;
+                }
+                for r in &fetched {
+                    assert!(
+                        r.end <= span.start || r.start >= span.end,
+                        "fetched range {r:?} overlaps PRUNED row group {i} ({span:?})"
+                    );
+                }
+            }
+            let stats = report.remote_fetch.expect("remote stats in report");
+            assert!(
+                stats.bytes_fetched < stats.object_size,
+                "filter extract must move fewer bytes than the object: {stats:?}"
+            );
         }
 
         /// A full (no-bbox) remote conversion must produce the same result as

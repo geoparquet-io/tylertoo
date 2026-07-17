@@ -328,6 +328,21 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Ranking")]
     no_auto_rank: bool,
 
+    /// Attribute filter: only convert features matching this SQL-WHERE-style
+    /// predicate over the input's property columns, e.g.
+    /// "confidence > 0.8", "crop_type IN ('soy', 'corn')",
+    /// "note IS NOT NULL AND (class = 'a' OR class = 'b')".
+    /// Supports =, !=, <, <=, >, >=, IN (...), IS [NOT] NULL, AND/OR/NOT,
+    /// parentheses, 'string' and numeric literals, and "quoted column"
+    /// names; nulls follow SQL three-valued logic (a row is kept only when
+    /// the predicate is TRUE). Evaluated during the pass-1 scan, so it
+    /// composes with --bbox; input row groups whose parquet column
+    /// statistics preclude any match are skipped at the footer level (on
+    /// remote input those byte ranges are never fetched). Aliased as
+    /// --where. See docs/OVERVIEW_TUNING.md.
+    #[arg(long, value_name = "EXPR", alias = "where", help_heading = "Filtering")]
+    filter: Option<String>,
+
     /// GSD tile-band base for the zoom→GSD mapping: gsd(z) = 40075016.69 /
     /// base / 2^z (spec §5.2, cogp-rs default 1024).
     ///
@@ -833,6 +848,7 @@ impl ConvertTuningArgs {
             coalesce_max_level_rows: self.coalesce_max_level_rows,
             coalesce_junction_angle: self.coalesce_junction_angle,
             bbox,
+            filter: self.filter.clone(),
             spill_dir: self.spill_dir.clone(),
         })
     }
