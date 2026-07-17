@@ -8,9 +8,10 @@
 //!
 //! 1. appends a NOT NULL `Int32` `level` column set to the level index to every
 //!    batch (§4.1),
-//! 2. GeoParquet-encodes the batches (in read order, on the calling thread) and
-//!    slices them into level-sized row groups, forcing a row-group boundary at
-//!    the end of each level (§4.2) and recording the level's `row_group_end`,
+//! 2. GeoParquet-encodes the batches (in read order; on the calling thread when
+//!    `encode_concurrency == 1`, pipelined onto the Rayon pool otherwise, #304)
+//!    and slices them into level-sized row groups, forcing a row-group boundary
+//!    at the end of each level (§4.2) and recording the level's `row_group_end`,
 //! 3. on [`OverviewWriter::finish`], writes the GeoParquet 1.1 `geo` metadata
 //!    (with bbox covering, §4.4) plus the `geo:overviews` footer key (§3), and
 //!    optionally the COGP-compatibility key (§3.1).
@@ -30,6 +31,23 @@
 //! the on-disk row-group layout and per-row content are identical to a serial
 //! build. Memory stays `O(encode_concurrency × row_group)` — a handful of row
 //! groups in flight, never `O(file)`.
+//!
+//! ## Parallel GeoParquet WKB encoding (#304)
+//!
+//! After #296 the remaining writer-side serial floor was the GeoParquet WKB
+//! encode + bbox-covering generation itself. When `encode_concurrency > 1`
+//! that stage is pipelined too: each incoming batch is split into chunks of at
+//! most [`WKB_ENCODE_CHUNK_ROWS`] rows and each chunk is WKB-encoded on the
+//! Rayon pool by a **task-local** [`GeoParquetRecordBatchEncoder`]. The encode
+//! is a pure per-row transform, so chunk outputs are identical to a serial
+//! encode; the only cross-batch encoder state — the file-level `geo` covering
+//! (per-column bbox union + geometry-type set) — is returned by each task and
+//! folded on the writer thread **in submission order** ([`fold_geo_metadata`]),
+//! so the accumulated covering is deterministic and equal to the serial
+//! accumulation. Encoded chunks drain in submission order through the same
+//! bounded FIFO discipline as row groups, so row-group boundaries and row
+//! order never change. Extra memory is `O(encode_concurrency × chunk)` on top
+//! of the #296 bound.
 //!
 //! The writer does **not** sort, thin, or simplify: it trusts the caller to
 //! feed correctly ordered, already-generalized per-level batches (P1/P2).
@@ -55,6 +73,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::ColumnPath;
 
+use geoparquet::metadata::GeoParquetMetadata;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
@@ -72,6 +91,14 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 /// Default maximum row-group size in rows (§4.5, configurable).
 pub const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 10_000;
+
+/// Maximum rows per parallel WKB-encode chunk (#304). Incoming batches are
+/// split at this grain before being dispatched to the Rayon pool, so even the
+/// buffered engine's one-batch-per-level shape parallelizes, and one in-flight
+/// chunk stays a bounded slice of memory. The WKB encode is a pure per-row
+/// transform, so the chunk grain never affects file content — only when the
+/// encode of each row runs.
+pub const WKB_ENCODE_CHUNK_ROWS: usize = 10_000;
 
 /// Per-level specification supplied by the caller (coarse → fine).
 #[derive(Debug, Clone)]
@@ -151,6 +178,11 @@ pub struct OverviewWriterOptions {
     /// submission order. Peak extra memory is `O(encode_concurrency ×
     /// row_group)`. Default `1`; the convert paths raise it from the memory
     /// profile.
+    ///
+    /// When `> 1` the GeoParquet WKB encode + covering generation is pipelined
+    /// onto the pool at the same concurrency (#304): up to `encode_concurrency`
+    /// WKB chunks of at most [`WKB_ENCODE_CHUNK_ROWS`] rows encode alongside
+    /// the in-flight row groups, adding `O(encode_concurrency × chunk)` memory.
     pub encode_concurrency: usize,
 }
 
@@ -265,7 +297,19 @@ pub struct OverviewWriter<W: Write + Send> {
     /// Count of row groups appended to the file so far. Replaces the
     /// `ArrowWriter::flushed_row_groups().len()` bookkeeping.
     row_groups_written: usize,
+    /// Shared GeoParquet encoder used by the **serial** path
+    /// (`encode_concurrency == 1`): it both encodes batches and accumulates the
+    /// file-level `geo` covering across them. The parallel path (#304) encodes
+    /// with task-local encoders instead and folds their covering contributions
+    /// into [`Self::geo_meta_acc`]; this encoder then only supplies
+    /// `target_schema` at construction.
     encoder: GeoParquetRecordBatchEncoder,
+    /// File-level `geo` metadata accumulated by the parallel WKB-encode path
+    /// (#304): each task-local encoder's bbox/geometry-type contribution is
+    /// folded here on the writer thread, in submission order. `None` until the
+    /// first parallel-encoded chunk lands (and always `None` on the serial
+    /// path, whose accumulation lives in [`Self::encoder`]).
+    geo_meta_acc: Option<GeoParquetMetadata>,
     /// Source schema augmented with the trailing `level` column (the schema the
     /// batches passed to [`GeoParquetRecordBatchEncoder::encode_record_batch`]
     /// must have).
@@ -289,6 +333,26 @@ pub struct OverviewWriter<W: Write + Send> {
 /// chunks (or the encode error) from the Rayon task. `None` on the channel
 /// (sender dropped without sending) means the encode task panicked.
 type EncodeResult = Result<Vec<ArrowColumnChunk>, ParquetError>;
+
+/// One in-flight WKB-encode chunk (#304): the GeoParquet-encoded batch plus
+/// the task-local encoder's `geo` covering contribution (per-column bbox +
+/// geometry types), to be folded on the writer thread in submission order.
+/// The error is stringly-typed because `GeoArrowError` is produced inside the
+/// Rayon task.
+type WkbEncodeResult = Result<(RecordBatch, GeoParquetMetadata), String>;
+
+/// Mutable per-level row-group assembly state threaded through the batch
+/// loop: the target rows per row group, the encode concurrency, the rows
+/// accumulated into the current (not-yet-submitted) row group, that group's
+/// encoded slices in read order, and the bounded FIFO of in-flight row-group
+/// encodes (#296).
+struct RgAssembly {
+    target: usize,
+    concurrency: usize,
+    in_rg: usize,
+    cur_rg: Vec<RecordBatch>,
+    inflight: VecDeque<Receiver<EncodeResult>>,
+}
 
 impl OverviewWriter<File> {
     /// Create an overview writer that writes to `path`.
@@ -391,6 +455,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             target_schema,
             row_groups_written: 0,
             encoder,
+            geo_meta_acc: None,
             augmented_schema,
             options,
             drop_indices,
@@ -455,71 +520,84 @@ impl<W: Write + Send> OverviewWriter<W> {
         let target = rg_row_target(cap, level_row_hint);
         let concurrency = self.options.encode_concurrency.max(1);
 
-        // Rows accumulated into the current (not-yet-submitted) row group, and
-        // that row group's encoded (target-schema) slices in read order.
-        let mut in_rg: usize = 0;
-        let mut cur_rg: Vec<RecordBatch> = Vec::new();
-        // Bounded FIFO of row groups whose column encoding is running on the
-        // Rayon pool. Draining the front (oldest) preserves submission order,
-        // so the on-disk row-group sequence is identical to a serial build.
-        let mut inflight: VecDeque<Receiver<EncodeResult>> = VecDeque::new();
+        let mut asm = RgAssembly {
+            target,
+            concurrency,
+            in_rg: 0,
+            cur_rg: Vec::new(),
+            inflight: VecDeque::new(),
+        };
 
         // The PHYSICAL level index this level will occupy in the output file:
         // the count of levels actually written so far. It trails `level_idx`
         // once an empty level has been skipped (§7.3 renumbering).
         let physical_idx = self.level_row_group_ends.len();
 
-        for batch in batches {
-            let num_rows = batch.num_rows();
-            let level_array = Int32Array::from(vec![physical_idx as i32; num_rows]);
-
-            // Drop the colliding covering column(s) (§4.4), then append `level`.
-            let mut columns: Vec<_> = batch
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !self.drop_indices.contains(i))
-                .map(|(_, c)| c.clone())
-                .collect();
-            columns.push(Arc::new(level_array));
-            let augmented = RecordBatch::try_new(self.augmented_schema.clone(), columns)?;
-
-            // GeoParquet encode (WKB + covering) stays serial and in read order:
-            // the per-batch output is order-independent, but the file-level
-            // covering accumulated in `into_keyvalue` is order-sensitive, and
-            // this is the cheap step — the parquet column encode below is the
-            // parallelized bottleneck (#296).
-            let encoded = self
-                .encoder
-                .encode_record_batch(&augmented)
-                .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
-
-            // Slice the encoded batch so row-group boundaries fall exactly on
-            // `target`-row multiples (carrying `in_rg` across batches) — the
-            // exact slicing a serial build performs.
-            let n = encoded.num_rows();
-            let mut offset = 0usize;
-            while offset < n {
-                let take = (target - in_rg).min(n - offset);
-                cur_rg.push(encoded.slice(offset, take));
-                in_rg += take;
-                offset += take;
-                if in_rg >= target {
-                    self.submit_row_group(&mut inflight, std::mem::take(&mut cur_rg), concurrency)?;
-                    in_rg = 0;
+        if concurrency > 1 {
+            // Pipelined GeoParquet WKB encode (#304): chunks encode on the
+            // Rayon pool with task-local encoders; this thread drains them in
+            // submission order, folding each chunk's covering contribution
+            // before slicing its rows into row groups, so both the file
+            // content and the accumulated `geo` covering are identical to the
+            // serial path.
+            let mut wkb_inflight: VecDeque<Receiver<WkbEncodeResult>> = VecDeque::new();
+            for batch in batches {
+                // A zero-row batch moves no rows, no covering, and no
+                // row-group boundary — skip it. (The serial path feeds it to
+                // the shared encoder, where it is a covering no-op as well.)
+                if batch.num_rows() == 0 {
+                    continue;
                 }
+                let augmented = self.augment_batch(&batch, physical_idx)?;
+                let n = augmented.num_rows();
+                let mut offset = 0usize;
+                while offset < n {
+                    let take = WKB_ENCODE_CHUNK_ROWS.min(n - offset);
+                    self.submit_wkb_encode(
+                        &mut wkb_inflight,
+                        augmented.slice(offset, take),
+                        &mut asm,
+                    )?;
+                    offset += take;
+                }
+            }
+            // Drain every remaining WKB chunk, still in submission order.
+            while let Some(rx) = wkb_inflight.pop_front() {
+                self.drain_wkb_encoded(rx, &mut asm)?;
+            }
+        } else {
+            // Serial reference path: the shared encoder both encodes and
+            // accumulates the file-level covering, in read order.
+            for batch in batches {
+                // Skip empty batches, exactly as the parallel path does. Beyond
+                // saving a no-op encode, this keeps the two paths' file-level
+                // `geo` bbox identical: the encoder folds each batch's bounds
+                // into the file bbox, and an empty batch's bounds are NaN, which
+                // would poison the accumulated bbox to null. (Per-row covering
+                // columns are unaffected either way, so tile bounds never were.)
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let augmented = self.augment_batch(&batch, physical_idx)?;
+                let encoded = self
+                    .encoder
+                    .encode_record_batch(&augmented)
+                    .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+                self.slice_into_row_groups(encoded, &mut asm)?;
             }
         }
 
         // Submit the final partial row group so the level ends exactly on a
         // boundary (§4.2). If `in_rg == 0` the boundary already fell on the last
         // submission, so submitting again would create a spurious empty group.
-        if in_rg > 0 {
-            self.submit_row_group(&mut inflight, std::mem::take(&mut cur_rg), concurrency)?;
+        if asm.in_rg > 0 {
+            let cur = std::mem::take(&mut asm.cur_rg);
+            asm.in_rg = 0;
+            self.submit_row_group(&mut asm, cur)?;
         }
 
         // Drain every remaining in-flight encode, appending in submission order.
-        while let Some(rx) = inflight.pop_front() {
+        while let Some(rx) = asm.inflight.pop_front() {
             self.drain_encoded(rx)?;
         }
 
@@ -538,34 +616,125 @@ impl<W: Write + Send> OverviewWriter<W> {
         Ok(LevelWriteOutcome::Written)
     }
 
+    /// Append the NOT NULL `level` column (§4.1) — set to the level's physical
+    /// index — after dropping any colliding pre-existing covering column(s)
+    /// (§4.4). Pure per-batch shaping; no encoding happens here.
+    fn augment_batch(
+        &self,
+        batch: &RecordBatch,
+        physical_idx: usize,
+    ) -> Result<RecordBatch, WriterError> {
+        let num_rows = batch.num_rows();
+        let level_array = Int32Array::from(vec![physical_idx as i32; num_rows]);
+        let mut columns: Vec<_> = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.drop_indices.contains(i))
+            .map(|(_, c)| c.clone())
+            .collect();
+        columns.push(Arc::new(level_array));
+        Ok(RecordBatch::try_new(
+            self.augmented_schema.clone(),
+            columns,
+        )?)
+    }
+
+    /// Slice an encoded batch so row-group boundaries fall exactly on
+    /// `target`-row multiples (carrying `in_rg` across batches) — the exact
+    /// slicing a serial build performs.
+    fn slice_into_row_groups(
+        &mut self,
+        encoded: RecordBatch,
+        asm: &mut RgAssembly,
+    ) -> Result<(), WriterError> {
+        let n = encoded.num_rows();
+        let mut offset = 0usize;
+        while offset < n {
+            let take = (asm.target - asm.in_rg).min(n - offset);
+            asm.cur_rg.push(encoded.slice(offset, take));
+            asm.in_rg += take;
+            offset += take;
+            if asm.in_rg >= asm.target {
+                let cur = std::mem::take(&mut asm.cur_rg);
+                asm.in_rg = 0;
+                self.submit_row_group(asm, cur)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dispatch one chunk's GeoParquet WKB encode + covering generation to the
+    /// Rayon pool (#304), bounding the in-flight set to the encode concurrency
+    /// — draining the oldest first when full, which is what folds covering
+    /// contributions in submission order.
+    fn submit_wkb_encode(
+        &mut self,
+        wkb_inflight: &mut VecDeque<Receiver<WkbEncodeResult>>,
+        chunk: RecordBatch,
+        asm: &mut RgAssembly,
+    ) -> Result<(), WriterError> {
+        // Backpressure: never more than `concurrency` WKB chunks in flight,
+        // bounding this stage's extra memory to O(concurrency × chunk).
+        while wkb_inflight.len() >= asm.concurrency {
+            if let Some(rx) = wkb_inflight.pop_front() {
+                self.drain_wkb_encoded(rx, asm)?;
+            }
+        }
+        let augmented_schema = self.augmented_schema.clone();
+        let (tx, rx) = bounded::<WkbEncodeResult>(1);
+        rayon::spawn(move || {
+            let _ = tx.send(wkb_encode_chunk(&augmented_schema, &chunk));
+        });
+        wkb_inflight.push_back(rx);
+        Ok(())
+    }
+
+    /// Wait for one in-flight WKB chunk, fold its covering contribution into
+    /// the accumulated `geo` metadata (in submission order — the FIFO drain
+    /// order), and slice its rows into row groups.
+    fn drain_wkb_encoded(
+        &mut self,
+        rx: Receiver<WkbEncodeResult>,
+        asm: &mut RgAssembly,
+    ) -> Result<(), WriterError> {
+        let (encoded, geo_meta) = rx
+            .recv()
+            .map_err(|_| WriterError::GeoParquet("parallel WKB encode task panicked".to_string()))?
+            .map_err(WriterError::GeoParquet)?;
+        let encoded = align_to_target_schema(encoded, &self.target_schema)?;
+        fold_geo_metadata(&mut self.geo_meta_acc, geo_meta).map_err(WriterError::GeoParquet)?;
+        self.slice_into_row_groups(encoded, asm)
+    }
+
     /// Dispatch one complete row group's column encoding to the Rayon pool,
-    /// bounding the in-flight set to `concurrency` (draining the oldest first
-    /// when full). The heavy Arrow → Parquet encode + ZSTD compression runs in
-    /// the spawned task; only cheap column-writer allocation happens here.
+    /// bounding the in-flight set to the encode concurrency (draining the
+    /// oldest first when full). The heavy Arrow → Parquet encode + ZSTD
+    /// compression runs in the spawned task; only cheap column-writer
+    /// allocation happens here.
     fn submit_row_group(
         &mut self,
-        inflight: &mut VecDeque<Receiver<EncodeResult>>,
+        asm: &mut RgAssembly,
         batches: Vec<RecordBatch>,
-        concurrency: usize,
     ) -> Result<(), WriterError> {
         // Backpressure: never let more than `concurrency` row groups sit in
         // flight, bounding peak memory to O(concurrency × row_group).
-        while inflight.len() >= concurrency {
-            if let Some(rx) = inflight.pop_front() {
+        while asm.inflight.len() >= asm.concurrency {
+            if let Some(rx) = asm.inflight.pop_front() {
                 self.drain_encoded(rx)?;
             }
         }
         // The row-group ordinal this group will occupy once appended (rows
         // already written + those ahead of it in flight). Only consulted by the
         // parquet encryptor, which is disabled here, but kept correct.
-        let rg_index = self.row_groups_written + inflight.len();
+        let rg_index = self.row_groups_written + asm.inflight.len();
         let writers = self.rg_factory.create_column_writers(rg_index)?;
         let target_schema = self.target_schema.clone();
         let (tx, rx) = bounded::<EncodeResult>(1);
         rayon::spawn(move || {
             let _ = tx.send(encode_row_group(writers, batches, &target_schema));
         });
-        inflight.push_back(rx);
+        asm.inflight.push_back(rx);
         Ok(())
     }
 
@@ -611,12 +780,18 @@ impl<W: Write + Send> OverviewWriter<W> {
         // Sanity: the writer's own output must satisfy the structural invariants.
         meta.validate(num_row_groups)?;
 
-        // GeoParquet 1.1 `geo` metadata (covering + geometry types). Consumes
-        // the encoder; done before other field borrows of `self`.
-        let geo_kv = self
-            .encoder
-            .into_keyvalue()
-            .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+        // GeoParquet 1.1 `geo` metadata (covering + geometry types). The
+        // parallel WKB path (#304) folds per-chunk contributions into
+        // `geo_meta_acc`; the serial path accumulates inside the shared
+        // encoder. A writer only ever populates one of the two (the encode
+        // concurrency is fixed at construction).
+        let geo_kv = match self.geo_meta_acc.take() {
+            Some(geo_meta) => KeyValue::new("geo".to_string(), serde_json::to_string(&geo_meta)?),
+            None => self
+                .encoder
+                .into_keyvalue()
+                .map_err(|e| WriterError::GeoParquet(e.to_string()))?,
+        };
         self.writer.append_key_value_metadata(geo_kv);
 
         // `geo:overviews` footer key (§3).
@@ -711,6 +886,106 @@ fn encode_row_group(
         }
     }
     writers.into_iter().map(|w| w.close()).collect()
+}
+
+/// One WKB-encode task (#304): GeoParquet-encode one chunk with a task-local
+/// encoder, returning the encoded rows plus the chunk's `geo` covering
+/// contribution for the writer thread to fold in submission order. Runs on
+/// the Rayon pool.
+fn wkb_encode_chunk(augmented_schema: &SchemaRef, chunk: &RecordBatch) -> WkbEncodeResult {
+    // Identical options to the writer's shared encoder ([`OverviewWriter::try_new`]),
+    // so every task-local encoder derives the identical target schema and
+    // per-column encoding. The encode itself is a pure per-row transform (WKB
+    // bytes + covering bbox per row), so chunk outputs match a serial encode.
+    let gpq_options = GeoParquetWriterOptionsBuilder::default()
+        .set_encoding(GeoParquetWriterEncoding::WKB)
+        .set_generate_covering(true)
+        .build();
+    let mut encoder = GeoParquetRecordBatchEncoder::try_new(augmented_schema, &gpq_options)
+        .map_err(|e| e.to_string())?;
+    let encoded = encoder
+        .encode_record_batch(chunk)
+        .map_err(|e| e.to_string())?;
+    Ok((encoded, encoder.into_geoparquet_metadata()))
+}
+
+/// Re-align an encoded chunk to the writer's target schema, if needed.
+///
+/// Task-local encoders rebuild the output schema from scratch; with a single
+/// geometry column the result is identical to the writer's, but with several
+/// geometry columns the generated covering columns can be appended in a
+/// different order (`HashMap` iteration inside the geoparquet metadata
+/// builder). Row-group encoding maps columns to parquet leaves positionally
+/// against the writer's `target_schema`, so reorder by (unique) field name
+/// when the layouts differ.
+fn align_to_target_schema(
+    encoded: RecordBatch,
+    target: &SchemaRef,
+) -> Result<RecordBatch, WriterError> {
+    if encoded.schema().as_ref() == target.as_ref() {
+        return Ok(encoded);
+    }
+    let src = encoded.schema();
+    let columns = target
+        .fields()
+        .iter()
+        .map(|f| Ok(encoded.column(src.index_of(f.name())?).clone()))
+        .collect::<Result<Vec<_>, arrow_schema::ArrowError>>()?;
+    Ok(RecordBatch::try_new(target.clone(), columns)?)
+}
+
+/// Fold one chunk's `geo` covering contribution into the accumulator (#304):
+/// per-column bbox union (element-wise min over the first half, max over the
+/// second — the same update [`GeoParquetMetadata::try_update`] performs) and
+/// geometry-type set union — exactly the two pieces of state the serial
+/// encoder accumulates across batches. All other fields (encoding, CRS,
+/// covering paths, edges) are constants of the schema + options, identical in
+/// every chunk's metadata; the first fold seeds them.
+fn fold_geo_metadata(
+    acc: &mut Option<GeoParquetMetadata>,
+    other: GeoParquetMetadata,
+) -> Result<(), String> {
+    let acc = match acc {
+        None => {
+            *acc = Some(other);
+            return Ok(());
+        }
+        Some(acc) => acc,
+    };
+    for (name, other_col) in other.columns {
+        let col = acc
+            .columns
+            .get_mut(&name)
+            .ok_or_else(|| format!("geo metadata column {name} missing from accumulator"))?;
+        col.geometry_types.extend(other_col.geometry_types);
+        match (col.bbox.as_mut(), other_col.bbox) {
+            (Some(a), Some(b)) => {
+                if a.len() != b.len() {
+                    return Err(format!(
+                        "geo bbox dimension mismatch for column {name}: {} vs {}",
+                        a.len(),
+                        b.len()
+                    ));
+                }
+                // `[mins..., maxs...]`: length 4 = `[xmin, ymin, xmax, ymax]`,
+                // length 6 = `[xmin, ymin, zmin, xmax, ymax, zmax]`.
+                let half = a.len() / 2;
+                for i in 0..half {
+                    if b[i] < a[i] {
+                        a[i] = b[i];
+                    }
+                }
+                for i in half..a.len() {
+                    if b[i] > a[i] {
+                        a[i] = b[i];
+                    }
+                }
+            }
+            (None, Some(b)) => col.bbox = Some(b),
+            (_, None) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
@@ -1069,6 +1344,256 @@ mod tests {
                 rows, serial_rows,
                 "encode_concurrency={concurrency}: row content/order differs from serial"
             );
+        }
+    }
+
+    /// Parse the `geo` footer key of a written file.
+    /// Parse the raw `geo` footer JSON into an untyped `serde_json::Value`.
+    ///
+    /// Deliberately NOT the crate's `GeoParquetMetadata`: when a covering is
+    /// generated the encoder leaves the file-level `bbox` as NaN, which
+    /// serializes to JSON `null` and does not round-trip back through
+    /// `GeoParquetMetadata`'s `Vec<f64>` bbox. The real per-row bounds live in
+    /// the `covering` columns; comparing the raw JSON keeps the footer check
+    /// faithful to exactly what is written.
+    fn geo_footer(path: &std::path::Path) -> serde_json::Value {
+        let file = File::open(path).unwrap();
+        let md = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        let kv = md
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == "geo")
+            .expect("geo footer key present")
+            .clone();
+        serde_json::from_str(kv.value.as_ref().unwrap()).unwrap()
+    }
+
+    /// A column's `geometry_types` from a raw footer `Value`, sorted (the set
+    /// has no deterministic JSON order).
+    fn footer_geometry_types(footer: &serde_json::Value, column: &str) -> Vec<String> {
+        let mut types: Vec<String> = footer["columns"][column]["geometry_types"]
+            .as_array()
+            .expect("geometry_types array")
+            .iter()
+            .map(|t| t.as_str().expect("geometry type string").to_string())
+            .collect();
+        types.sort();
+        types
+    }
+
+    /// Structural equality of two `geo` footers. The JSON strings are not
+    /// byte-comparable (`geometry_types` serializes a `HashSet`, whose order
+    /// varies run to run even for a serial build), so compare field-wise with
+    /// set semantics for the geometry types.
+    fn assert_geo_footer_eq(a: &serde_json::Value, b: &serde_json::Value, ctx: &str) {
+        // The raw JSON is not byte-comparable: `geometry_types` serializes a
+        // `HashSet` whose order varies run to run even for a serial build.
+        // Canonicalize each column's `geometry_types` to a sorted array, then
+        // compare the whole footer — version, primary_column, and every
+        // column's encoding, geometry_types, bbox (`[null; 4]` on both, since
+        // the covering carries the real bounds), covering, crs, and edges.
+        fn canonicalize(v: &serde_json::Value) -> serde_json::Value {
+            let mut v = v.clone();
+            if let Some(cols) = v.get_mut("columns").and_then(|c| c.as_object_mut()) {
+                for col in cols.values_mut() {
+                    if let Some(types) =
+                        col.get_mut("geometry_types").and_then(|t| t.as_array_mut())
+                    {
+                        types.sort_by(|x, y| x.as_str().cmp(&y.as_str()));
+                    }
+                }
+            }
+            v
+        }
+        assert_eq!(
+            canonicalize(a),
+            canonicalize(b),
+            "{ctx}: geo footer differs"
+        );
+    }
+
+    fn geo_meta_from_json(json: &str) -> GeoParquetMetadata {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Sorted string forms of a column's geometry types (the set has no
+    /// deterministic iteration order).
+    fn sorted_geometry_types(meta: &GeoParquetMetadata, column: &str) -> Vec<String> {
+        let mut types: Vec<String> = meta.columns[column]
+            .geometry_types
+            .iter()
+            .map(|t| {
+                serde_json::to_value(t)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        types.sort();
+        types
+    }
+
+    /// #304: folding per-chunk geo metadata must union bboxes (min/max) and
+    /// geometry-type sets exactly as the serial encoder's cross-batch
+    /// accumulation does.
+    #[test]
+    fn fold_geo_metadata_unions_bbox_and_geometry_types() {
+        let a = geo_meta_from_json(
+            r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["Point"],"bbox":[0.0,-1.0,2.0,3.0]}}}"#,
+        );
+        let b = geo_meta_from_json(
+            r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["Polygon","Point"],"bbox":[-5.0,0.0,1.0,7.0]}}}"#,
+        );
+
+        let mut acc: Option<GeoParquetMetadata> = None;
+        fold_geo_metadata(&mut acc, a).unwrap();
+        fold_geo_metadata(&mut acc, b).unwrap();
+        let acc = acc.unwrap();
+
+        assert_eq!(
+            acc.columns["geometry"].bbox.as_deref(),
+            Some(&[-5.0, -1.0, 2.0, 7.0][..]),
+            "2D bbox union is element-wise min/min/max/max"
+        );
+        assert_eq!(
+            sorted_geometry_types(&acc, "geometry"),
+            ["Point", "Polygon"]
+        );
+    }
+
+    /// #304: fold edge cases — first fold seeds the accumulator; a missing
+    /// bbox on either side never erases the other; 3D (length-6) bboxes union
+    /// as mins-then-maxs; mismatched bbox lengths are an error.
+    #[test]
+    fn fold_geo_metadata_edge_cases() {
+        let with_bbox = |bbox: &str| {
+            geo_meta_from_json(&format!(
+                r#"{{"version":"1.1.0","primary_column":"geometry","columns":{{"geometry":{{"encoding":"WKB","geometry_types":[],"bbox":{bbox}}}}}}}"#,
+            ))
+        };
+        let without_bbox = geo_meta_from_json(
+            r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":[]}}}"#,
+        );
+
+        // (Some, None) keeps the accumulated bbox.
+        let mut acc = None;
+        fold_geo_metadata(&mut acc, with_bbox("[0.0,0.0,1.0,1.0]")).unwrap();
+        fold_geo_metadata(&mut acc, without_bbox.clone()).unwrap();
+        assert_eq!(
+            acc.as_ref().unwrap().columns["geometry"].bbox.as_deref(),
+            Some(&[0.0, 0.0, 1.0, 1.0][..])
+        );
+
+        // (None, Some) adopts the incoming bbox.
+        let mut acc = None;
+        fold_geo_metadata(&mut acc, without_bbox).unwrap();
+        fold_geo_metadata(&mut acc, with_bbox("[0.0,0.0,1.0,1.0]")).unwrap();
+        assert_eq!(
+            acc.as_ref().unwrap().columns["geometry"].bbox.as_deref(),
+            Some(&[0.0, 0.0, 1.0, 1.0][..])
+        );
+
+        // 3D bbox: [xmin, ymin, zmin, xmax, ymax, zmax] — first half mins,
+        // second half maxs.
+        let mut acc = None;
+        fold_geo_metadata(&mut acc, with_bbox("[0.0,0.0,0.0,1.0,1.0,1.0]")).unwrap();
+        fold_geo_metadata(&mut acc, with_bbox("[-1.0,2.0,-3.0,0.5,4.0,0.0]")).unwrap();
+        assert_eq!(
+            acc.as_ref().unwrap().columns["geometry"].bbox.as_deref(),
+            Some(&[-1.0, 0.0, -3.0, 1.0, 4.0, 1.0][..])
+        );
+
+        // Mismatched bbox lengths cannot be unioned.
+        let mut acc = None;
+        fold_geo_metadata(&mut acc, with_bbox("[0.0,0.0,1.0,1.0]")).unwrap();
+        assert!(fold_geo_metadata(&mut acc, with_bbox("[0.0,0.0,0.0,1.0,1.0,1.0]")).is_err());
+    }
+
+    /// #304: parallel WKB encoding (`encode_concurrency > 1` moves the
+    /// GeoParquet WKB encode + covering generation onto the Rayon pool) must
+    /// be structurally identical to the serial reference: same row-group
+    /// layout, same rows in the same order, same `geo` footer (file bbox,
+    /// geometry types, covering) and same `geo:overviews` metadata. Per-chunk
+    /// covering stats are folded on the writer thread in submission order.
+    #[test]
+    fn parallel_wkb_encode_matches_serial_footer() {
+        let schema = Arc::new(source_schema());
+
+        // Level 0: several small batches plus an EMPTY batch mid-stream (the
+        // serial encoder sees empty batches too; the parallel path must not
+        // diverge). Level 1: ONE batch larger than WKB_ENCODE_CHUNK_ROWS —
+        // the buffered engine's one-batch-per-level shape — so the pipelined
+        // path must split it into several concurrent encode chunks.
+        let l0: Vec<i64> = (0..10).collect();
+        let l1: Vec<i64> = (0..(WKB_ENCODE_CHUNK_ROWS as i64 * 2 + 137)).collect();
+
+        let write_with = |concurrency: usize| -> (tempfile::NamedTempFile, OverviewsMeta) {
+            let mut opts = OverviewWriterOptions::new(
+                Mode::Duplicating,
+                vec![
+                    LevelSpec::new(gsd(2), Some(2)),
+                    LevelSpec::new(gsd(6), Some(6)),
+                ],
+            );
+            opts.max_row_group_size = 4096;
+            opts.encode_concurrency = concurrency;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+
+            let mut batches: Vec<RecordBatch> =
+                l0.chunks(3).map(|c| source_batch(&schema, c)).collect();
+            batches.insert(1, source_batch(&schema, &[]));
+            assert_eq!(
+                writer
+                    .write_level(0, Some(l0.len()), batches.into_iter())
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            assert_eq!(
+                writer
+                    .write_level(
+                        1,
+                        Some(l1.len()),
+                        std::iter::once(source_batch(&schema, &l1))
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+            let meta = writer.finish().unwrap();
+            (tmp, meta)
+        };
+
+        let (serial, serial_meta) = write_with(1);
+        let (serial_layout, serial_rows) = layout_and_rows(serial.path());
+        let serial_geo = geo_footer(serial.path());
+
+        // Sanity: level 1 spans multiple row groups AND multiple encode
+        // chunks, and the fixture carries a mixed-type column (Point +
+        // Polygon) with a generated covering.
+        assert!(
+            serial_layout.len() >= 4,
+            "fixture should split into several row groups, got {}",
+            serial_layout.len()
+        );
+        assert_eq!(footer_geometry_types(&serial_geo, "geometry").len(), 2);
+        // The per-row covering (not the file-level bbox, left null when a
+        // covering is generated) carries the real bounds.
+        assert!(serial_geo["columns"]["geometry"]["covering"].is_object());
+
+        for concurrency in [2usize, 8] {
+            let ctx = format!("encode_concurrency={concurrency}");
+            let (parallel, meta) = write_with(concurrency);
+            let (layout, rows) = layout_and_rows(parallel.path());
+            assert_eq!(layout, serial_layout, "{ctx}: row-group layout differs");
+            assert_eq!(rows, serial_rows, "{ctx}: row content/order differs");
+            assert_eq!(meta, serial_meta, "{ctx}: geo:overviews metadata differs");
+            assert_geo_footer_eq(&serial_geo, &geo_footer(parallel.path()), &ctx);
         }
     }
 
