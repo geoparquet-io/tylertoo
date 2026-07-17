@@ -708,6 +708,12 @@ struct ConvertTuningArgs {
     /// a volume with enough room (a free-space preflight warns about a
     /// projected shortfall). The directory must exist. Local inputs never
     /// spill.
+    ///
+    /// On `tiles` this directory also hosts the removed-after-export
+    /// intermediate overview (#314) — at least input-sized, with its own
+    /// free-space preflight — unless --keep-overview is given (then the
+    /// intermediate goes to that path instead). Location precedence for
+    /// the intermediate: --spill-dir, $TMPDIR, the output directory.
     #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     spill_dir: Option<PathBuf>,
 }
@@ -949,6 +955,17 @@ struct TilesArgs {
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
+    /// Write the intermediate overview GeoParquet to PATH and RETAIN it,
+    /// instead of a temp file removed after the export — one run then yields
+    /// both artifacts: the reusable multi-resolution overview (queryable,
+    /// re-exportable, see `tylertoo overview`) and the PMTiles. The PMTiles
+    /// output is identical either way. Without this flag the intermediate is
+    /// written to --spill-dir if given, else $TMPDIR if set, else the output
+    /// directory, and deleted once the export finishes (see the note on the
+    /// materialized intermediate under --spill-dir).
+    #[arg(long, value_name = "PATH")]
+    keep_overview: Option<PathBuf>,
+
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
     verbose: bool,
@@ -1100,12 +1117,6 @@ fn run_convert(
     .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
 }
 
-/// Run `tylertoo tiles`: the one-shot GeoParquet → PMTiles facade.
-///
-/// Chains the two product pipelines through a temporary overview file:
-/// `overview` (convert, with default knobs) → `export-pmtiles`. The temp
-/// file lives next to the output (same filesystem) and is removed on both
-/// success and failure via [`tempfile::NamedTempFile`]'s drop guard.
 /// Resolve the level plan shared by `overview` and `tiles`: an explicit
 /// `--gsd` list (comma-separated meters, strictly decreasing) overrides the
 /// `--min-zoom`/`--max-zoom` range. Kept in one place so the two commands
@@ -1130,6 +1141,135 @@ fn resolve_level_plan(
     }
 }
 
+/// Where the removed-after-export intermediate overview of a `tiles` run
+/// lives (#314): `--spill-dir` if given (one knob for everything tylertoo
+/// puts on scratch disk), else an explicitly-set non-empty `$TMPDIR`, else
+/// next to the output (same filesystem as the final artifact), else the
+/// process temp dir. Pure — the env value is injected — so the precedence
+/// is unit-testable.
+fn resolve_intermediate_dir(
+    spill_dir: Option<&std::path::Path>,
+    tmpdir_env: Option<&std::ffi::OsStr>,
+    output: &std::path::Path,
+) -> PathBuf {
+    if let Some(dir) = spill_dir {
+        return dir.to_path_buf();
+    }
+    if let Some(tmpdir) = tmpdir_env.filter(|t| !t.is_empty()) {
+        return PathBuf::from(tmpdir);
+    }
+    output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Lower-bound estimate of the intermediate overview's size for the #314
+/// free-space preflight: the local input bytes. A duplicating overview
+/// embeds the finest level verbatim on top of the coarse levels, so it is
+/// at least input-sized. Local file → its size; local directory → sum of
+/// its top-level `.parquet` entries; `--files-from` manifest → sum of the
+/// entries that resolve as local files. Remote/glob shapes return `None`
+/// (the preflight stays quiet rather than guessing).
+fn estimate_local_input_bytes(spec: &InputSpec) -> Option<u64> {
+    fn file_len(p: &std::path::Path) -> Option<u64> {
+        std::fs::metadata(p)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+    }
+    match spec {
+        InputSpec::Path(p) => {
+            let meta = std::fs::metadata(p).ok()?;
+            if meta.is_file() {
+                return Some(meta.len());
+            }
+            if !meta.is_dir() {
+                return None;
+            }
+            let sum: u64 = std::fs::read_dir(p)
+                .ok()?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+                .filter_map(|e| file_len(&e.path()))
+                .sum();
+            (sum > 0).then_some(sum)
+        }
+        InputSpec::Manifest(m) => {
+            let text = std::fs::read_to_string(m).ok()?;
+            let sum: u64 = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter_map(|l| file_len(std::path::Path::new(l)))
+                .sum();
+            (sum > 0).then_some(sum)
+        }
+    }
+}
+
+/// #314 preflight safety margin, matching the remote-spill preflight
+/// (#272): warn when free space is below the estimate plus 1/20th (5%).
+const INTERMEDIATE_MARGIN_DENOM: u64 = 20;
+
+/// #314 free-space preflight decision + message (pure, unit-testable).
+/// Returns the warning to emit when the estimated intermediate overview
+/// (a lower bound — the local input bytes) plus a 5% margin exceeds
+/// `available_bytes` on the volume holding `dir`, or `None` when it fits
+/// (or the estimate is unknown/zero).
+fn intermediate_space_warning(
+    estimated_bytes: u64,
+    available_bytes: u64,
+    dir: &std::path::Path,
+) -> Option<String> {
+    if estimated_bytes == 0 {
+        return None;
+    }
+    let need = estimated_bytes + estimated_bytes / INTERMEDIATE_MARGIN_DENOM;
+    if available_bytes >= need {
+        return None;
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    Some(format!(
+        "the intermediate overview `tiles` materializes (≥ ~{:.1} GiB — a \
+         duplicating overview is at least as large as the input, whose local \
+         size is the estimate) may not fit: {} has {:.1} GiB free ({:.1} GiB \
+         short, including a 5% margin). Point --spill-dir (or --keep-overview) \
+         at a roomier volume, or free up space first.",
+        gib(estimated_bytes),
+        dir.display(),
+        gib(available_bytes),
+        gib(need - available_bytes),
+    ))
+}
+
+/// Emit the #314 intermediate free-space preflight warning, if warranted:
+/// probe the volume holding `dir` and compare against the local-input-bytes
+/// estimate. Quiet when either side is unknowable (remote input, exotic
+/// filesystem) rather than crying wolf.
+fn warn_intermediate_space(spec: &InputSpec, dir: &std::path::Path) {
+    let Some(estimated) = estimate_local_input_bytes(spec) else {
+        return;
+    };
+    let Ok(available) = fs4::available_space(dir) else {
+        return;
+    };
+    if let Some(msg) = intermediate_space_warning(estimated, available, dir) {
+        log::warn!("{msg}");
+    }
+}
+
+/// Run `tylertoo tiles`: the one-shot GeoParquet → PMTiles facade.
+///
+/// Chains the two product pipelines through a materialized intermediate
+/// overview file (`overview` convert → `export-pmtiles`) — this is NOT
+/// zero-disk. The intermediate is retained at `--keep-overview PATH` when
+/// given; otherwise it is a temp file (in `--spill-dir` / `$TMPDIR` / the
+/// output directory, in that order) removed on both success and failure
+/// via [`tempfile::NamedTempFile`]'s drop guard. Its path and size are
+/// always logged, and a free-space preflight warns when the chosen volume
+/// looks too small for it (#314).
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
     use tylertoo_core::overview::level::Mode;
@@ -1159,20 +1299,69 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
 
-    // Intermediate overview file next to the output (same filesystem);
-    // NamedTempFile removes it on drop — success or failure alike.
-    let tmp_dir = output
+    // Intermediate overview file (#314): retained at --keep-overview when
+    // given; otherwise a temp file in --spill-dir / $TMPDIR / the output
+    // directory, removed on drop — success or failure alike.
+    let (overview_path, overview_tmp): (PathBuf, Option<tempfile::NamedTempFile>) =
+        match &args.keep_overview {
+            Some(path) => {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    anyhow::ensure!(
+                        parent.is_dir(),
+                        "--keep-overview directory {} does not exist",
+                        parent.display()
+                    );
+                }
+                (path.clone(), None)
+            }
+            None => {
+                let dir = resolve_intermediate_dir(
+                    args.tuning.spill_dir.as_deref(),
+                    std::env::var_os("TMPDIR").as_deref(),
+                    &output,
+                );
+                let tmp = tempfile::Builder::new()
+                    .prefix(".tylertoo-overview-")
+                    .suffix(".parquet")
+                    .tempfile_in(&dir)
+                    .with_context(|| {
+                        format!(
+                            "failed to create the intermediate overview file in {} \
+                             (location precedence: --spill-dir, $TMPDIR, the output \
+                             directory)",
+                            dir.display()
+                        )
+                    })?;
+                (tmp.path().to_path_buf(), Some(tmp))
+            }
+        };
+
+    // #314 free-space preflight: the intermediate is at least input-sized,
+    // so warn up front when the chosen volume looks too small.
+    let overview_dir = overview_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    let overview_tmp = tempfile::Builder::new()
-        .prefix(".tylertoo-overview-")
-        .suffix(".parquet")
-        .tempfile_in(&tmp_dir)
-        .context("failed to create temporary overview file")?;
+        .unwrap_or_else(|| PathBuf::from("."));
+    warn_intermediate_space(&spec, &overview_dir);
 
-    let convert_report = run_convert(&spec, overview_tmp.path(), &options)?;
+    let convert_report = run_convert(&spec, &overview_path, &options)?;
+
+    // #314: the disk cost of the one-shot facade must not be silent — name
+    // the intermediate's path and size, and its fate.
+    let overview_bytes = std::fs::metadata(&overview_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    println!(
+        "  intermediate overview: {} ({}{})",
+        overview_path.display(),
+        HumanBytes(overview_bytes),
+        if overview_tmp.is_some() {
+            ", removed after export; --keep-overview PATH retains it"
+        } else {
+            ", retained"
+        }
+    );
 
     if args.verbose {
         println!(
@@ -1192,7 +1381,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
     };
-    let export_report = export_pmtiles(overview_tmp.path(), &output, &export_opts)
+    let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
 
     if args.verbose {
@@ -1818,6 +2007,123 @@ mod tests {
         assert_eq!(a.tuning.profile, "bounded");
         assert!(a.tuning.cluster);
         assert!(a.tuning.no_coalesce_lines);
+    }
+
+    // --- #314 ergonomic one-step: --keep-overview + intermediate location ----
+
+    /// `--keep-overview` parses to a path on `tiles` and defaults to off.
+    #[test]
+    fn tiles_keep_overview_flag_parses() {
+        assert!(parse_tiles(&[]).keep_overview.is_none());
+        let a = parse_tiles(&["--keep-overview", "ov.parquet"]);
+        assert_eq!(a.keep_overview, Some(PathBuf::from("ov.parquet")));
+    }
+
+    /// Intermediate-overview directory precedence (#314): `--spill-dir`
+    /// beats an explicitly-set `$TMPDIR`, which beats the output's own
+    /// directory; a bare output filename with no `$TMPDIR` falls back to
+    /// the process temp dir.
+    #[test]
+    fn resolve_intermediate_dir_precedence() {
+        use std::ffi::OsStr;
+        let out = std::path::Path::new("/data/out/tiles.pmtiles");
+
+        // --spill-dir wins over everything.
+        assert_eq!(
+            resolve_intermediate_dir(
+                Some(std::path::Path::new("/spill")),
+                Some(OsStr::new("/tmpdir")),
+                out
+            ),
+            PathBuf::from("/spill")
+        );
+        // $TMPDIR (explicitly set, non-empty) beats the output directory.
+        assert_eq!(
+            resolve_intermediate_dir(None, Some(OsStr::new("/tmpdir")), out),
+            PathBuf::from("/tmpdir")
+        );
+        // An empty $TMPDIR is ignored.
+        assert_eq!(
+            resolve_intermediate_dir(None, Some(OsStr::new("")), out),
+            PathBuf::from("/data/out")
+        );
+        // Default: next to the output (same filesystem as the final artifact).
+        assert_eq!(
+            resolve_intermediate_dir(None, None, out),
+            PathBuf::from("/data/out")
+        );
+        // Bare output filename: process temp dir fallback.
+        assert_eq!(
+            resolve_intermediate_dir(None, None, std::path::Path::new("tiles.pmtiles")),
+            std::env::temp_dir()
+        );
+    }
+
+    /// #314 free-space preflight: quiet when the estimated intermediate
+    /// (plus the 5% margin) fits, a warning naming the directory, the
+    /// shortfall, and the `--spill-dir` escape hatch when it does not.
+    #[test]
+    fn intermediate_space_warning_thresholds() {
+        let dir = std::path::Path::new("/some/volume");
+        let gib = 1024u64 * 1024 * 1024;
+
+        // Fits comfortably: no warning.
+        assert!(intermediate_space_warning(10 * gib, 11 * gib, dir).is_none());
+        // Exactly the estimate + 5% margin still fits.
+        let est = 20 * gib;
+        assert!(intermediate_space_warning(est, est + est / 20, dir).is_none());
+        // One byte short of the margin: warn, naming dir and remedies.
+        let msg =
+            intermediate_space_warning(est, est + est / 20 - 1, dir).expect("shortfall must warn");
+        assert!(msg.contains("/some/volume"), "names the directory: {msg}");
+        assert!(msg.contains("--spill-dir"), "names the remedy: {msg}");
+        assert!(msg.contains("--keep-overview"), "names the remedy: {msg}");
+        // Zero estimate (unknown/empty input): never warns.
+        assert!(intermediate_space_warning(0, 0, dir).is_none());
+    }
+
+    /// The intermediate size estimate is the local input bytes: file size
+    /// for a file, the sum of top-level .parquet sizes for a directory,
+    /// the sum of existing local manifest entries for --files-from.
+    #[test]
+    fn estimate_local_input_bytes_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.parquet");
+        let f2 = dir.path().join("b.parquet");
+        std::fs::write(&f1, vec![0u8; 100]).unwrap();
+        std::fs::write(&f2, vec![0u8; 50]).unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), vec![0u8; 999]).unwrap();
+
+        // Single file.
+        assert_eq!(
+            estimate_local_input_bytes(&InputSpec::Path(f1.clone())),
+            Some(100)
+        );
+        // Directory: only .parquet entries count.
+        assert_eq!(
+            estimate_local_input_bytes(&InputSpec::Path(dir.path().to_path_buf())),
+            Some(150)
+        );
+        // Nonexistent / remote-looking path: quiet None.
+        assert_eq!(
+            estimate_local_input_bytes(&InputSpec::Path(PathBuf::from("s3://bucket/x.parquet"))),
+            None
+        );
+        // Manifest: sum of existing local entries; comments/blanks skipped.
+        let manifest = dir.path().join("m.txt");
+        std::fs::write(
+            &manifest,
+            format!(
+                "# comment\n{}\n\n{}\ns3://bucket/remote.parquet\n",
+                f1.display(),
+                f2.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            estimate_local_input_bytes(&InputSpec::Manifest(manifest)),
+            Some(150)
+        );
     }
 
     #[test]

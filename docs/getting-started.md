@@ -65,11 +65,63 @@ handled too), and any `--sort-key` / `--class-rank` / `--accumulate-attribute`
 that named the renamed column is rewritten to follow it. No preprocessing
 needed.
 
-## The Two-Step Workflow (Recommended)
+## One-Shot Conversion (Recommended)
 
-The product is the **overview GeoParquet file**: one file that embeds
+The fastest way from GeoParquet to a map:
+
+```bash
+tylertoo input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+# equivalently: tylertoo tiles input.parquet output.pmtiles ...
+```
+
+This runs the overview convert into an intermediate GeoParquet file, then
+exports it to PMTiles. Beyond the essentials (`--min-zoom`, `--max-zoom`,
+`--gsd`, `--layer-name`, `--tile-buffer`, `--max-tile-size`, `--report`,
+`--verbose`), the one-shot command also accepts every convert-tuning knob
+from `overview` — quality and memory alike:
+
+```bash
+# Country-scale dot fill for a dense building layer, memory-bounded,
+# in one shot (see docs/OVERVIEW_TUNING.md, "Country-scale dot fill")
+tylertoo input.parquet output.pmtiles --max-zoom 14 \
+  --polygon-visibility 0 --collapse --max-tile-size 500K \
+  --profile bounded
+```
+
+A `tiles` run is equivalent to the two-step `overview` + `export-pmtiles`
+chain with the same flags. See `tylertoo tiles --help` (flags are grouped
+by heading) and the [API reference](api-reference.md) for the full set.
+
+**It is not zero-disk.** `tiles` materializes the full multi-resolution
+overview on disk before exporting — at least as large as your input (the
+finest level embeds your data verbatim; country-scale runs can reach tens
+of GB). The run always logs the intermediate's path and size, and a
+free-space preflight warns up front when the chosen volume looks too
+small for it.
+
+- `--keep-overview overviews.parquet` writes the intermediate there and
+  **retains** it, so one run yields both artifacts — the reusable
+  multi-resolution overview file and the PMTiles. The PMTiles output is
+  identical either way.
+- Without it, the intermediate is a temp file — placed in `--spill-dir`
+  if given, else `$TMPDIR` if set, else the output's directory — and is
+  removed once the export finishes (on failure too).
+
+## The Two-Step Workflow
+
+The real product is the **overview GeoParquet file**: one file that embeds
 COG-style multi-resolution levels alongside your exact source data. PMTiles
-is an *export* of it.
+is an *export* of it. Prefer the explicit two-step over `tiles` when you
+want to:
+
+- **validate** the overview against the spec before exporting,
+- **iterate on export flags** (layer name, tile size cap, buffer) without
+  re-running the expensive convert each time,
+- use overview-only **format options** (`--mode partitioning`,
+  `--cogp-compat`) that have no PMTiles meaning,
+- **query the overview directly** (DuckDB, GeoPandas) as the primary
+  artifact — though `tiles --keep-overview` covers the simple
+  "I want both files" case in one run.
 
 ```bash
 # 1. Build the overview file (levels for zooms 0..14)
@@ -119,32 +171,6 @@ tylertoo export-pmtiles overviews.parquet output.pmtiles \
   --layer-name roads \       # MVT layer name (default: "overview")
   --tile-size-limit 500000   # optional per-tile byte cap
 ```
-
-## One-Shot Conversion
-
-When you only want the PMTiles and don't care about the intermediate file:
-
-```bash
-tylertoo input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
-# equivalently: tylertoo tiles input.parquet output.pmtiles ...
-```
-
-This runs overview convert into a temporary file, then export. Beyond the
-essentials (`--min-zoom`, `--max-zoom`, `--layer-name`, `--tile-buffer`,
-`--max-tile-size`, `--verbose`), the one-shot command also accepts every
-convert-tuning knob from `overview` — quality and memory alike:
-
-```bash
-# Country-scale dot fill for a dense building layer, memory-bounded,
-# in one shot (see docs/OVERVIEW_TUNING.md, "Country-scale dot fill")
-tylertoo input.parquet output.pmtiles --max-zoom 14 \
-  --polygon-visibility 0 --collapse --max-tile-size 500K \
-  --profile bounded
-```
-
-A `tiles` run is equivalent to the two-step `overview` + `export-pmtiles`
-chain with the same flags. See `tylertoo tiles --help` (flags are grouped
-by heading) and the [API reference](api-reference.md) for the full set.
 
 ## Python
 
