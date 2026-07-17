@@ -52,7 +52,7 @@ use serde::Serialize;
 use crate::batch_processor::extract_geometries_opt_from_array;
 
 use super::assign::{
-    apply_density_budget, assign_levels, AssignConfig, AssignFeature, DensityBudgetConfig,
+    apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, DensityBudgetConfig,
     FeatureKind, SUPERCELL_GSD_FACTOR,
 };
 use super::cluster::{
@@ -1142,7 +1142,15 @@ pub(crate) fn convert_to_overviews_source_strategy(
         .count();
     warn_antimeridian_suspects(antimeridian_suspect_features);
 
-    let assignment = assign_levels(&features, &level_gsds, &options.assign, crs);
+    // #306: cap the transient winner-grid memory at the profile-derived RAM
+    // budget (`speed` stays unbounded). Pure scheduling — output-identical.
+    let assignment = assign_levels_bounded(
+        &features,
+        &level_gsds,
+        &options.assign,
+        crs,
+        super::pipeline::pass1_grid_budget_bytes(options.profile),
+    );
     // Q2: layer the per-level density budget on top of cell-winner thinning.
     // When disabled this is an identity, so `--no-density-drop` reproduces the
     // pre-Q2 assignment (and, since no density_drop provenance is emitted, a

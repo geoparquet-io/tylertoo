@@ -9,7 +9,7 @@
 //!   [`ConvertOptions::read_batch_size`] rows, geometry + ranking columns
 //!   only): per feature it keeps only the bbox, [`FeatureKind`], and sort key
 //!   — a small [`AssignFeature`] — plus the incremental state for Q1 ranking
-//!   auto-detection. [`assign_levels`] and [`apply_density_budget`] then run
+//!   auto-detection. [`assign_levels_bounded`] and [`apply_density_budget`] then run
 //!   over those (the assign engine's own state is `O(occupied cells)` per
 //!   level), producing the **winner table**: one `min_level` byte per feature.
 //! - **Pass 2** re-reads the (seekable) input once **per level**, coarse →
@@ -66,7 +66,7 @@ use rayon::prelude::*;
 use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
 use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
-use super::assign::{apply_density_budget, assign_levels, AssignFeature, FeatureKind};
+use super::assign::{apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind};
 use super::cluster::{build_cluster_tables, verify_sum_invariant, ClusterEntry, ClusterTables};
 use super::coalesce::CoalesceInput;
 use super::convert::{
@@ -392,7 +392,15 @@ pub(crate) fn convert_streaming_strategy(
     let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
 
     let t_assign = Instant::now();
-    let assignment = assign_levels(&features, &level_gsds, &options.assign, crs);
+    // #306: cap the transient winner-grid memory (the pass-1 peak #300's [rss]
+    // logs pinned) at the profile-derived RAM budget; `speed` stays unbounded.
+    let assignment = assign_levels_bounded(
+        &features,
+        &level_gsds,
+        &options.assign,
+        crs,
+        super::pipeline::pass1_grid_budget_bytes(options.profile),
+    );
     let assign_secs = t_assign.elapsed().as_secs_f64();
     let t_budget = Instant::now();
     let assignment = if options.density.enabled {

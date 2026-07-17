@@ -801,6 +801,22 @@ compute stage and the write stage**:
   estimate, budget) is logged; `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the
   detected available RAM.
 
+The profile also governs the **pass-1 level-assignment grids** (#306). Level
+assignment builds one cell-winner grid per coarse level, concurrently across
+cores (#264); on large simple-geometry layers the concurrently-live grids are
+the whole-convert RSS peak (germany-segments: 5.9 GiB; ~24 GiB at Brazil
+scale — see the `[rss]` phase logs). Under `bounded` and `auto` the grids'
+footprints are estimated up front and the levels are built in
+**memory-budgeted waves** against the same fraction-of-available-RAM budget
+(and the same `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override): when the estimate
+exceeds the budget, levels are grouped so only one wave's grids are live at a
+time — trading cross-level parallelism for a bounded peak, degrading in the
+limit to a serial per-level build rather than an OOM. A one-line
+`[assign] winner grids …` log reports the split when it happens; on a roomy
+box the plan is a single wave and nothing changes. `speed` opts out
+(unbounded grids, maximum parallelism). As with everything in this section,
+the wave schedule never changes the output.
+
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
 | `--profile speed\|bounded\|auto` | `auto` | preset | `speed` = fastest, most RAM; `bounded` = capped RAM, temp I/O |

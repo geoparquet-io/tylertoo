@@ -188,6 +188,22 @@ fn auto_backing(
     }
 }
 
+/// RAM budget for the pass-1 winner-grid waves (#306), by memory profile.
+///
+/// `bounded` and `auto` cap the concurrently-live per-level grids at the same
+/// fraction-of-available-RAM budget the pass-2 sink decision uses (#294) —
+/// honouring the `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override and the conservative
+/// fallback when RAM cannot be probed. `speed` opts out (unbounded, the
+/// pre-#306 behavior): by contract it trades RAM for wall time, and any wave
+/// split can serialize grid builds. The budget steers scheduling only — the
+/// assignment is identical for every value.
+pub(super) fn pass1_grid_budget_bytes(profile: MemoryProfile) -> u64 {
+    match profile {
+        MemoryProfile::Speed => u64::MAX,
+        MemoryProfile::Bounded | MemoryProfile::Auto => auto_budget_bytes(available_memory_bytes()),
+    }
+}
+
 /// Available system RAM in bytes for auto memory budgets — the convert-side
 /// `Auto` profile (#294) and the export-side partition-wave preflight (#303)
 /// share this probe so both honour the same override and fallback semantics.
