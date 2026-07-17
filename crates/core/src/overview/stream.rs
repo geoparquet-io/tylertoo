@@ -352,6 +352,7 @@ pub(crate) fn convert_streaming_strategy(
         coalesce: coalesce_scratch,
         num_rows,
         skipped_rows,
+        geom_bytes,
     } = run_pass1(
         source,
         &input_schema,
@@ -698,7 +699,17 @@ pub(crate) fn convert_streaming_strategy(
         // finest (verbatim, largest) level last straight into the writer.
         Pass2Strategy::Pipelined => {
             let buffered_rows: usize = hints[..n - 1].iter().sum();
-            let backing = pipeline::resolve_backing(options.profile, options.mode, buffered_rows);
+            // #305: pass 1's measured average encoded-geometry size per input
+            // row sizes the RAM-vs-spill estimate (falls back to calibrated
+            // constants on an empty scan). Same decision timing as before —
+            // pass 1 has always completed by this point (the assign barrier).
+            let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
+            let backing = pipeline::resolve_backing(
+                options.profile,
+                options.mode,
+                buffered_rows,
+                avg_geom_bytes,
+            );
             log::info!(
                 "[convert] pass 2: building {n} overview level(s) from a \
                  single read (finest level streamed last)"
@@ -987,6 +998,12 @@ struct Pass1Output {
     num_rows: usize,
     /// Rows skipped for a null, empty, or non-finite geometry (H4).
     skipped_rows: usize,
+    /// Total in-memory Arrow byte size of the encoded geometry column across
+    /// every scanned batch (#305). `geom_bytes / num_rows` is the measured
+    /// average encoded-geometry size per input row that sizes the pass-2
+    /// RAM-vs-spill decision; near-free to collect (one buffer-size sum per
+    /// batch — no re-encode).
+    geom_bytes: u64,
 }
 
 /// Pass 1: stream the input (geometry + ranking/accumulate columns only) and
@@ -1034,6 +1051,7 @@ fn run_pass1(
 
     let mut features: Vec<AssignFeature> = Vec::new();
     let mut num_rows = 0usize;
+    let mut geom_bytes = 0u64;
     let mut skipped_rows = 0usize;
     let mut point_count = 0usize;
     let mut explicit_keys: Vec<Option<f64>> = Vec::new();
@@ -1105,6 +1123,11 @@ fn run_pass1(
             });
         }
         num_rows += geoms_buf.len();
+        // #305: measure the encoded geometry column's in-memory size so the
+        // pass-2 RAM-vs-spill estimate can use this input's actual average
+        // geometry weight instead of a one-size-fits-all constant. O(#buffers)
+        // per batch — no per-row work, no re-encode.
+        geom_bytes += batch.column(gcol_idx).get_array_memory_size() as u64;
 
         match &mut plan {
             RankPlan::ExplicitSort { idx, .. } => {
@@ -1253,6 +1276,7 @@ fn run_pass1(
         coalesce,
         num_rows,
         skipped_rows,
+        geom_bytes,
     })
 }
 

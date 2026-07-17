@@ -788,11 +788,18 @@ compute stage and the write stage**:
   Slightly slower (temp read/write) but memory-safe for very large / wide
   inputs. Best for partitioning mode on multi-GB inputs, or memory-constrained
   machines.
-- **`auto`** (default) picks per mode and buffered size: duplicating always uses
-  `speed` (it buffers only the small, geometrically-decayed coarse levels);
-  partitioning uses `speed` while the buffered set is small and `bounded` once it
-  grows large (partitioning buffers full-resolution geometry). The chosen profile
-  is logged.
+- **`auto`** (default) picks from the workload: it estimates the buffered
+  output as `buffered rows × per-row cost` and spills (`bounded`) when the
+  estimate exceeds a fraction (0.6) of *available* RAM, keeping RAM (`speed`)
+  otherwise. The per-row cost is derived from pass 1's measured average
+  encoded-geometry size for **this input** (geometry weight dominates a
+  buffered row and varies ~400× across datasets — points vs. boundary
+  polygons), with a deliberate high bias toward the near-free spill path;
+  calibrated constants (~8 KiB/row duplicating, ~16 KiB/row partitioning)
+  are the fallback when nothing was scanned. Partitioning additionally keeps
+  its historical 2M-buffered-row spill floor. The decision (measured average,
+  estimate, budget) is logged; `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the
+  detected available RAM.
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
