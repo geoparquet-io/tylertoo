@@ -334,6 +334,35 @@ class TestOverviewIntegration:
             _, fine = self._overview(tmpdir, max_zoom=4, simplify_factor=0.1)
         assert crude["total_vertices"] <= fine["total_vertices"]
 
+    def test_overview_collapse_square_and_representation(self):
+        # #279: type-preserving placeholder squares as the global disposition.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out, _ = self._overview(
+                tmpdir, max_zoom=4, collapse_square=True, polygon_visibility=0.0
+            )
+            assert tylertoo.validate(str(out))["valid"] is True
+        # #317: zoom-band representation selector (points coarse, geom fine).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out, report = self._overview(
+                tmpdir, min_zoom=0, max_zoom=4, representation="0-2:point"
+            )
+            assert tylertoo.validate(str(out))["valid"] is True
+            assert report["input_features"] > 0
+
+    def test_overview_collapse_square_conflicts_with_collapse(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="mutually exclusive"),
+        ):
+            self._overview(tmpdir, max_zoom=4, collapse=True, collapse_square=True)
+
+    def test_overview_representation_rejects_bad_spec(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="representation"),
+        ):
+            self._overview(tmpdir, max_zoom=4, representation="0-2:blob")
+
     def test_overview_sort_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out, _ = self._overview(tmpdir, max_zoom=4, sort_key="area_in_meters")

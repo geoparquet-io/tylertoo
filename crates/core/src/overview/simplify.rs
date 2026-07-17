@@ -103,16 +103,39 @@ const MIN_POLYGON_RING_POINTS: usize = 4;
 /// Minimum number of coordinates for a non-degenerate line.
 const MIN_LINESTRING_POINTS: usize = 2;
 
+/// Disposition of a polygon / multipolygon that collapses below the level
+/// tolerance (visibility gate, exterior collapse, or sub-tolerance area).
+///
+/// Three dispositions (#279):
+/// - [`Drop`](CollapseMode::Drop) (default): the feature is omitted.
+/// - [`Point`](CollapseMode::Point) (`--collapse`, spec Q4 opt-in): replaced
+///   by a representative [`Point`]. Changes the geometry type.
+/// - [`Square`](CollapseMode::Square) (`--collapse-square`): replaced by a
+///   ~1×tolerance placeholder **square** anchored at the representative
+///   point, area-dithered so aggregate area stays truthful (tippecanoe's
+///   tiny-polygon reduction). Type-preserving — `geometry_types` stays
+///   `["Polygon"]`, so fill-styled renderers need no style changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollapseMode {
+    /// Omit the collapsed feature (default).
+    #[default]
+    Drop,
+    /// Replace with a representative point (centroid; spec Q4 opt-in).
+    Point,
+    /// Replace with an area-dithered ~1×tolerance placeholder square
+    /// (tippecanoe tiny-polygon reduction, #279).
+    Square,
+}
+
 /// Options controlling per-level simplification.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SimplifyOptions {
     /// Tolerance multiplier: `tolerance = factor * gsd`. See
     /// [`DEFAULT_SIMPLIFY_FACTOR`].
     pub factor: f64,
-    /// Opt-in geometry-type collapse (spec Q4, default **off**). When `true`,
-    /// a polygon / multipolygon that collapses below the visibility gate is
-    /// replaced by a representative [`Point`] instead of being dropped.
-    pub collapse: bool,
+    /// Disposition of polygons that collapse below the visibility gate
+    /// (default [`CollapseMode::Drop`]; see [`CollapseMode`]).
+    pub collapse: CollapseMode,
     /// Cascading simplification (#218, default **on**). When `true`:
     ///
     /// - conversion paths derive each coarser level from the next-finer
@@ -134,7 +157,7 @@ impl Default for SimplifyOptions {
     fn default() -> Self {
         Self {
             factor: DEFAULT_SIMPLIFY_FACTOR,
-            collapse: false,
+            collapse: CollapseMode::Drop,
             cascade: true,
         }
     }
@@ -226,15 +249,23 @@ pub fn simplify_for_level(
         Geometry::Polygon(poly) => simplify_polygon_impl(poly, tol, opts.collapse, opts.cascade),
 
         Geometry::MultiPolygon(mp) => {
-            // Simplify each part with collapse disabled: a collapsed *part* is
-            // dropped, never turned into a Point (a MultiPolygon cannot hold
-            // one). Whole-feature collapse is decided after. A repaired part
-            // (cascade path) may itself be a MultiPolygon; its parts are
-            // flattened in.
+            // Per-part disposition: a collapsed *part* is dropped (never
+            // turned into a Point — a MultiPolygon cannot hold one; whole-
+            // feature Point collapse is decided after), EXCEPT under
+            // `CollapseMode::Square` (#279), where each collapsed part is
+            // area-dithered into its own placeholder square — matching
+            // tippecanoe, which reduces tiny polygons ring-by-ring, so a
+            // dense multipolygon block keeps per-part density instead of
+            // collapsing to a single square. A repaired part (cascade path)
+            // may itself be a MultiPolygon; its parts are flattened in.
+            let part_mode = match opts.collapse {
+                CollapseMode::Square => CollapseMode::Square,
+                _ => CollapseMode::Drop,
+            };
             let kept: Vec<Polygon<f64>> =
                 mp.0.iter()
                     .flat_map(
-                        |p| match simplify_polygon_impl(p, tol, false, opts.cascade) {
+                        |p| match simplify_polygon_impl(p, tol, part_mode, opts.cascade) {
                             Simplified::Keep(Geometry::Polygon(poly)) => vec![poly],
                             Simplified::Keep(Geometry::MultiPolygon(parts)) => parts.0,
                             _ => Vec::new(),
@@ -243,13 +274,15 @@ pub fn simplify_for_level(
                     .collect();
             if !kept.is_empty() {
                 Simplified::Keep(Geometry::MultiPolygon(MultiPolygon::new(kept)))
-            } else if opts.collapse {
-                match mp.centroid() {
-                    Some(pt) => Simplified::Keep(Geometry::Point(pt)),
-                    None => Simplified::Dropped,
-                }
             } else {
-                Simplified::Dropped
+                match opts.collapse {
+                    // Every part had its own dither under Square; nothing more.
+                    CollapseMode::Drop | CollapseMode::Square => Simplified::Dropped,
+                    CollapseMode::Point => match mp.centroid() {
+                        Some(pt) => Simplified::Keep(Geometry::Point(pt)),
+                        None => Simplified::Dropped,
+                    },
+                }
             }
         }
 
@@ -259,39 +292,230 @@ pub fn simplify_for_level(
     }
 }
 
+/// Per-level feature representation (zoom-band representation selector,
+/// #317 / #279).
+///
+/// Kept an enum (never a boolean) in options, contexts, and cascade steps so
+/// further dispositions slot in without another plumbing change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Representation {
+    /// Full (simplified) geometry — the normal path. Below-tolerance
+    /// polygons follow the global [`CollapseMode`].
+    #[default]
+    Geometry,
+    /// Polygonal features are replaced by their representative point
+    /// (centroid; see [`simplify_step`]) — unconditionally, whatever their
+    /// size. Lines and points are unaffected.
+    Point,
+    /// Normal simplification, but below-tolerance polygons emit an
+    /// area-dithered ~1×GSD placeholder square instead of dropping
+    /// ([`CollapseMode::Square`], tippecanoe tiny-polygon reduction, #279).
+    /// Type-preserving; above-tolerance polygons are unaffected.
+    Square,
+}
+
+impl Representation {
+    /// The spec / CLI keyword for this representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Representation::Geometry => "geom",
+            Representation::Point => "point",
+            Representation::Square => "square",
+        }
+    }
+}
+
+/// One step of a cascading fine→coarse simplification chain (#218, #317).
+///
+/// A step is a level's GSD plus its [`Representation`]: a
+/// [`Representation::Point`] step marks a zoom-band point level (#317) at
+/// which polygonal features are replaced by their representative point
+/// instead of being simplified.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CascadeStep {
+    /// The step level's GSD in meters.
+    pub gsd_meters: f64,
+    /// The step level's feature representation (#317).
+    pub repr: Representation,
+}
+
+impl CascadeStep {
+    /// A normal (full-geometry) cascade step.
+    pub fn geom(gsd_meters: f64) -> Self {
+        Self {
+            gsd_meters,
+            repr: Representation::Geometry,
+        }
+    }
+
+    /// A zoom-band point-representation step (#317).
+    pub fn point(gsd_meters: f64) -> Self {
+        Self {
+            gsd_meters,
+            repr: Representation::Point,
+        }
+    }
+
+    /// A zoom-band placeholder-square step (#279).
+    pub fn square(gsd_meters: f64) -> Self {
+        Self {
+            gsd_meters,
+            repr: Representation::Square,
+        }
+    }
+}
+
+/// Representative point for a *polygonal* geometry (zoom-band point
+/// representation, #317). Returns `None` for non-polygonal input — points
+/// pass through and lines keep their normal simplification path, so the
+/// caller falls back to [`simplify_for_level`].
+///
+/// Point flavor: **centroid**, falling back to the bbox center and then the
+/// first vertex for degenerate (zero-area) rings — the same flavor as the
+/// `--collapse` path ([`collapse_polygon`]; `assign.rs` notes centroid is the
+/// closest to cartographic convention). Unlike `--collapse` the fallback
+/// chain is applied to MultiPolygons too: a point-band level must never
+/// silently lose a feature to a degenerate centroid. `Dropped` only when the
+/// geometry has no coordinates at all.
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's
+/// `--convert-polygons-to-label-points` emits one label point *per
+/// intersecting tile* and applies at every zoom; per-zoom representation
+/// switching there requires building two tilesets and merging with
+/// `tile-join`. Overview levels are tile-free (a level is a parquet row
+/// band), so a per-tile point is not representable here — we emit one
+/// deterministic per-feature centroid, and the zoom band replaces the
+/// two-archive merge. Planetiler exposes centroid / point-on-surface /
+/// innermost-point per layer; centroid is its cheapest default and matches
+/// our existing collapse flavor.
+fn polygonal_representative_point(geom: &Geometry<f64>) -> Option<Simplified> {
+    match geom {
+        Geometry::Polygon(poly) => Some(collapse_polygon(poly, CollapseMode::Point, 0.0)),
+        Geometry::MultiPolygon(mp) => {
+            let pt = mp
+                .centroid()
+                .or_else(|| mp.bounding_rect().map(|r| r.center().into()))
+                .or_else(|| {
+                    mp.0.first()
+                        .and_then(|p| p.exterior().0.first())
+                        .map(|c| Point::new(c.x, c.y))
+                });
+            Some(match pt {
+                Some(p) => Simplified::Keep(Geometry::Point(p)),
+                None => Simplified::Dropped,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Simplify one feature's geometry for a level, honoring the level's
+/// [`Representation`] (#317).
+///
+/// [`Representation::Geometry`] is exactly [`simplify_for_level`]. On a
+/// [`Representation::Point`] level (a zoom-band point level), polygonal
+/// geometry is replaced by its representative point
+/// ([`polygonal_representative_point`]) — unconditionally, with no
+/// visibility gating (a dot is always visible) — while points pass through
+/// and lines keep the normal simplification path. On a
+/// [`Representation::Square`] level (#279), simplification is normal but
+/// below-tolerance polygons emit area-dithered placeholder squares
+/// ([`squarify_polygon`]) instead of following the global [`CollapseMode`].
+pub fn simplify_step(
+    geom: &Geometry<f64>,
+    gsd_meters: f64,
+    crs: Crs,
+    opts: &SimplifyOptions,
+    repr: Representation,
+) -> Simplified {
+    match repr {
+        Representation::Geometry => simplify_for_level(geom, gsd_meters, crs, opts),
+        Representation::Point => {
+            if let Some(out) = polygonal_representative_point(geom) {
+                return out;
+            }
+            simplify_for_level(geom, gsd_meters, crs, opts)
+        }
+        // Square (#279): normal simplification with the below-tolerance
+        // disposition forced to area-dithered placeholder squares at this
+        // level — above-tolerance polygons are unaffected (type-preserving).
+        Representation::Square => {
+            let opts = SimplifyOptions {
+                collapse: CollapseMode::Square,
+                ..*opts
+            };
+            simplify_for_level(geom, gsd_meters, crs, &opts)
+        }
+    }
+}
+
 /// Cascading simplification (#218): fold a geometry through a fine→coarse
-/// chain of level GSDs, feeding each coarser level the previous level's
+/// chain of level steps, feeding each coarser level the previous level's
 /// already-simplified output instead of re-simplifying canonical geometry.
 ///
-/// `gsds_fine_to_coarse` lists the GSDs of every non-canonical level from
-/// the finest (first) down to the target level (last). The fold is a pure
-/// function of `(geom, chain, crs, opts)` — independent of engine, batch
-/// boundaries, and neighboring features — so every conversion path
-/// (in-memory, serial streaming, pipelined) computes identical results for
-/// identical inputs.
+/// `steps_fine_to_coarse` lists every non-canonical level from the finest
+/// (first) down to the target level (last), each with its GSD and
+/// representation ([`CascadeStep`]). The fold is a pure function of
+/// `(geom, chain, crs, opts)` — independent of engine, batch boundaries, and
+/// neighboring features — so every conversion path (in-memory, serial
+/// streaming, pipelined) computes identical results for identical inputs.
 ///
-/// Dropping is monotone along the chain: tolerances grow while the working
-/// geometry's extent can only shrink (RDP keeps a vertex subset), so a
-/// feature dropped at a fine step can never survive a coarser one — the fold
-/// short-circuits on the first [`Simplified::Dropped`].
+/// Zoom-band representation (#317 / #279): at the first `Point` step (the
+/// band's finest level) a polygonal feature collapses to its representative
+/// point; coarser steps then pass the point through untouched, so every
+/// point-band level shares the same point. `Square` steps dither the
+/// below-tolerance survivors of the previous step into placeholder squares.
+///
+/// Along a pure-geometry chain, dropping is monotone: tolerances grow while
+/// the working geometry's extent can only shrink (RDP keeps a vertex
+/// subset), so a feature dropped at a fine [`Representation::Geometry`] step
+/// stays dropped at every coarser geometry step. `Point` and `Square` steps,
+/// however, **revive from canonical geometry**: a feature whose geometry
+/// cascade died at a finer level is still a *member* of the coarser band
+/// level, and the band's whole purpose is to represent exactly those
+/// too-small-for-geometry features — so a `Point` step emits the canonical
+/// geometry's representative point, and a `Square` step dithers the
+/// canonical geometry's area. (Without this, cascading would silently empty
+/// the band: a 20 m building drops at the first coarse geometry step long
+/// before the fold reaches z0–7.) Revival stays deterministic and
+/// engine-independent — it is a pure function of the canonical geometry and
+/// the step.
 ///
 /// An empty chain is the identity (bit-identical clone), matching
 /// [`simplify_for_level`]'s canonical path at zero tolerance.
 pub fn simplify_cascade(
     geom: &Geometry<f64>,
-    gsds_fine_to_coarse: &[f64],
+    steps_fine_to_coarse: &[CascadeStep],
     crs: Crs,
     opts: &SimplifyOptions,
 ) -> Simplified {
     let mut current: Option<Geometry<f64>> = None;
-    for &gsd in gsds_fine_to_coarse {
-        let input = current.as_ref().unwrap_or(geom);
-        match simplify_for_level(input, gsd, crs, opts) {
-            Simplified::Keep(g) => current = Some(g),
-            Simplified::Dropped => return Simplified::Dropped,
+    let mut alive = true;
+    let mut result = Simplified::Keep(geom.clone());
+    for step in steps_fine_to_coarse {
+        let out = if !alive && step.repr == Representation::Geometry {
+            // Monotone along geometry steps: once dropped, stays dropped.
+            Simplified::Dropped
+        } else {
+            // Alive: cascade the previous step's output. Not alive (Point /
+            // Square step): revive from canonical geometry.
+            let input = if alive {
+                current.as_ref().unwrap_or(geom)
+            } else {
+                geom
+            };
+            simplify_step(input, step.gsd_meters, crs, opts, step.repr)
+        };
+        match &out {
+            Simplified::Keep(g) => {
+                current = Some(g.clone());
+                alive = true;
+            }
+            Simplified::Dropped => alive = false,
         }
+        result = out;
     }
-    Simplified::Keep(current.unwrap_or_else(|| geom.clone()))
+    result
 }
 
 // ============================================================================
@@ -445,11 +669,11 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
 fn simplify_polygon_impl(
     poly: &Polygon<f64>,
     tol: f64,
-    collapse: bool,
+    mode: CollapseMode,
     repair: bool,
 ) -> Simplified {
     if polygon_diag(poly) < tol {
-        return collapse_polygon(poly, collapse);
+        return collapse_polygon(poly, mode, tol);
     }
 
     // Gates are level properties, so they stay at `tol` even when the RDP
@@ -482,7 +706,7 @@ fn simplify_polygon_impl(
         if candidate.exterior().0.len() < MIN_POLYGON_RING_POINTS
             || candidate.unsigned_area() < min_area
         {
-            return collapse_polygon(poly, collapse);
+            return collapse_polygon(poly, mode, tol);
         }
 
         if polygon_unchanged(&candidate, poly) || capped_is_valid(&candidate) {
@@ -502,7 +726,7 @@ fn simplify_polygon_impl(
             return Simplified::Keep(repaired);
         }
         // Repair left nothing above the gates (self-canceling sliver).
-        return collapse_polygon(poly, collapse);
+        return collapse_polygon(poly, mode, tol);
     }
 
     // Every retry self-intersected: keep the original geometry rather than
@@ -536,21 +760,113 @@ fn repair_candidate(candidate: &Polygon<f64>, tol: f64, min_area: f64) -> Option
     }
 }
 
-/// Resolve a collapsed polygon: drop by default, or (opt-in) a representative
-/// [`Point`] at the polygon centroid (spec Q4, default off).
-fn collapse_polygon(poly: &Polygon<f64>, collapse: bool) -> Simplified {
-    if !collapse {
-        return Simplified::Dropped;
-    }
-    // Prefer the true centroid; fall back to the bbox center, then the first
-    // vertex, for degenerate (zero-area) rings whose centroid is undefined.
-    let pt = poly
-        .centroid()
+/// Representative point of a polygon: the centroid, falling back to the bbox
+/// center, then the first vertex, for degenerate (zero-area) rings whose
+/// centroid is undefined. `None` only when the ring has no coordinates.
+fn polygon_anchor(poly: &Polygon<f64>) -> Option<Point<f64>> {
+    poly.centroid()
         .or_else(|| poly.bounding_rect().map(|r| r.center().into()))
-        .or_else(|| poly.exterior().0.first().map(|c| Point::new(c.x, c.y)));
-    match pt {
-        Some(p) => Simplified::Keep(Geometry::Point(p)),
-        None => Simplified::Dropped,
+        .or_else(|| poly.exterior().0.first().map(|c| Point::new(c.x, c.y)))
+}
+
+/// Deterministic per-feature dither value, uniform in `[0, 1)`, keyed on the
+/// anchor point's coordinate bit patterns (splitmix64 finalizer).
+///
+/// # Why a per-feature hash instead of tippecanoe's accumulator
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's tiny-polygon reduction
+/// (clip.cpp, `tiny_polygon` handling; the legacy per-tile pipeline's #85
+/// port did the same) walks the features of a tile **serially**,
+/// accumulating sub-threshold area and emitting a placeholder square each
+/// time the accumulator crosses the threshold. That is exact but
+/// order-dependent — unusable here, where three engines (in-memory, serial
+/// streaming, pipelined) with different batch boundaries and rayon schedules
+/// must produce byte-identical output, and levels have no tile scope to
+/// accumulate over. We instead dither **per feature**: a polygon of area `a`
+/// below the threshold `T = tol²` survives as a `tol × tol` square with
+/// probability `a / T`, decided by this deterministic hash of its anchor
+/// coordinates. Expected emitted area equals the true area (`(a/T)·T = a`),
+/// so aggregate density stays truthful exactly like tippecanoe's
+/// accumulator in expectation — dense blocks emit many squares, isolated
+/// barns mostly none — while the decision is a pure function of the feature,
+/// independent of engine, ordering, and parallelism. A kept square's anchor
+/// is its own center, so re-dithering it at a coarser cascade step reuses
+/// the same `u` against a smaller `a/T` — survival is monotone fine→coarse,
+/// matching the cascade's drop monotonicity.
+fn dither_u01(x: f64, y: f64) -> f64 {
+    let mut z = x.to_bits() ^ y.to_bits().rotate_left(32);
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Top 53 bits → exact f64 in [0, 1).
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// A `tol × tol` placeholder square (closed 5-coordinate ring, CCW) centered
+/// at `anchor` — the #279 tiny-polygon placeholder.
+fn placeholder_square(anchor: Point<f64>, tol: f64) -> Polygon<f64> {
+    let h = tol * 0.5;
+    let (cx, cy) = (anchor.x(), anchor.y());
+    Polygon::new(
+        LineString::new(vec![
+            geo::Coord {
+                x: cx - h,
+                y: cy - h,
+            },
+            geo::Coord {
+                x: cx + h,
+                y: cy - h,
+            },
+            geo::Coord {
+                x: cx + h,
+                y: cy + h,
+            },
+            geo::Coord {
+                x: cx - h,
+                y: cy + h,
+            },
+            geo::Coord {
+                x: cx - h,
+                y: cy - h,
+            },
+        ]),
+        vec![],
+    )
+}
+
+/// Area-dithered placeholder square for a below-tolerance polygon (#279):
+/// survives as a `tol × tol` square at the polygon's representative point
+/// with probability `min(1, area / tol²)` (see [`dither_u01`]).
+fn squarify_polygon(poly: &Polygon<f64>, tol: f64) -> Simplified {
+    let Some(anchor) = polygon_anchor(poly) else {
+        return Simplified::Dropped;
+    };
+    let threshold = tol * tol;
+    let p = if threshold > 0.0 {
+        (poly.unsigned_area() / threshold).min(1.0)
+    } else {
+        0.0
+    };
+    if dither_u01(anchor.x(), anchor.y()) < p {
+        Simplified::Keep(Geometry::Polygon(placeholder_square(anchor, tol)))
+    } else {
+        Simplified::Dropped
+    }
+}
+
+/// Resolve a collapsed polygon per the [`CollapseMode`] (#279): drop by
+/// default, a representative [`Point`] at the polygon centroid (spec Q4,
+/// `--collapse`), or an area-dithered placeholder square
+/// (`--collapse-square`, [`squarify_polygon`]).
+fn collapse_polygon(poly: &Polygon<f64>, mode: CollapseMode, tol: f64) -> Simplified {
+    match mode {
+        CollapseMode::Drop => Simplified::Dropped,
+        CollapseMode::Point => match polygon_anchor(poly) {
+            Some(p) => Simplified::Keep(Geometry::Point(p)),
+            None => Simplified::Dropped,
+        },
+        CollapseMode::Square => squarify_polygon(poly, tol),
     }
 }
 
@@ -859,7 +1175,7 @@ mod tests {
 
         // Opt-in collapse: representative point near the square's center.
         let collapse_opts = SimplifyOptions {
-            collapse: true,
+            collapse: CollapseMode::Point,
             ..Default::default()
         };
         match simplify_for_level(&poly, 5000.0, Crs::Epsg3857, &collapse_opts) {
@@ -1001,6 +1317,11 @@ mod tests {
         assert!(SimplifyOptions::default().cascade);
     }
 
+    /// Full-geometry cascade steps from plain GSDs (test shorthand).
+    fn geom_steps(gsds: &[f64]) -> Vec<CascadeStep> {
+        gsds.iter().map(|&g| CascadeStep::geom(g)).collect()
+    }
+
     #[test]
     fn test_cascade_empty_chain_is_identity() {
         let g = Geometry::LineString(wiggly_line(50, 10.0));
@@ -1015,7 +1336,7 @@ mod tests {
         let g = Geometry::LineString(wiggly_line(200, 30.0));
         let opts = SimplifyOptions::default();
         assert_eq!(
-            simplify_cascade(&g, &[100.0], Crs::Epsg3857, &opts),
+            simplify_cascade(&g, &geom_steps(&[100.0]), Crs::Epsg3857, &opts),
             simplify_for_level(&g, 100.0, Crs::Epsg3857, &opts)
         );
     }
@@ -1028,7 +1349,7 @@ mod tests {
         let canonical_set: Vec<Coord<f64>> = canonical.0.clone();
         let g = Geometry::LineString(canonical);
         let opts = SimplifyOptions::default();
-        match simplify_cascade(&g, &[25.0, 50.0, 100.0], Crs::Epsg3857, &opts) {
+        match simplify_cascade(&g, &geom_steps(&[25.0, 50.0, 100.0]), Crs::Epsg3857, &opts) {
             Simplified::Keep(Geometry::LineString(out)) => {
                 assert!(out.0.len() < canonical_set.len(), "chain must simplify");
                 for c in &out.0 {
@@ -1052,9 +1373,329 @@ mod tests {
         ]));
         let opts = SimplifyOptions::default();
         assert_eq!(
-            simplify_cascade(&tiny, &[1000.0, 5000.0], Crs::Epsg3857, &opts),
+            simplify_cascade(&tiny, &geom_steps(&[1000.0, 5000.0]), Crs::Epsg3857, &opts),
             Simplified::Dropped
         );
+    }
+
+    // ---- zoom-band point representation (#317) ------------------------------
+
+    #[test]
+    fn test_simplify_step_point_repr_polygon_to_centroid() {
+        let opts = SimplifyOptions::default();
+        // A LARGE polygon (well above every gate) still becomes a point on a
+        // point-representation step — the band is unconditional, not tied to
+        // the visibility gate like --collapse.
+        let poly = Geometry::Polygon(square(1000.0, 2000.0, 5000.0));
+        match simplify_step(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Point) {
+            Simplified::Keep(Geometry::Point(pt)) => {
+                assert!((pt.x() - 1000.0).abs() < 1e-9);
+                assert!((pt.y() - 2000.0).abs() < 1e-9);
+            }
+            other => panic!("expected Keep(Point), got {other:?}"),
+        }
+        // point_repr = false is exactly simplify_for_level.
+        assert_eq!(
+            simplify_step(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Geometry),
+            simplify_for_level(&poly, 100.0, Crs::Epsg3857, &opts)
+        );
+    }
+
+    #[test]
+    fn test_simplify_step_point_repr_multipolygon_to_centroid() {
+        let opts = SimplifyOptions::default();
+        let mp = Geometry::MultiPolygon(MultiPolygon::new(vec![
+            square(0.0, 0.0, 1000.0),
+            square(4000.0, 0.0, 1000.0),
+        ]));
+        match simplify_step(&mp, 100.0, Crs::Epsg3857, &opts, Representation::Point) {
+            Simplified::Keep(Geometry::Point(pt)) => {
+                assert!((pt.x() - 2000.0).abs() < 1e-9, "centroid x, got {}", pt.x());
+                assert!(pt.y().abs() < 1e-9);
+            }
+            other => panic!("expected Keep(Point), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_simplify_step_point_repr_sub_gate_polygon_kept_as_point() {
+        // A polygon far below the visibility gate is DROPPED by normal
+        // simplification but KEPT as a point on a point step: a dot is
+        // always visible.
+        let opts = SimplifyOptions::default();
+        let tiny = Geometry::Polygon(square(50.0, 50.0, 10.0));
+        assert_eq!(
+            simplify_for_level(&tiny, 5000.0, Crs::Epsg3857, &opts),
+            Simplified::Dropped
+        );
+        assert!(matches!(
+            simplify_step(&tiny, 5000.0, Crs::Epsg3857, &opts, Representation::Point),
+            Simplified::Keep(Geometry::Point(_))
+        ));
+    }
+
+    #[test]
+    fn test_simplify_step_point_repr_lines_and_points_unaffected() {
+        let opts = SimplifyOptions::default();
+        // Lines keep the normal simplification path (the band selects the
+        // POLYGON representation only).
+        let line = Geometry::LineString(wiggly_line(200, 50.0));
+        assert_eq!(
+            simplify_step(&line, 100.0, Crs::Epsg3857, &opts, Representation::Point),
+            simplify_for_level(&line, 100.0, Crs::Epsg3857, &opts)
+        );
+        // Points pass through untouched.
+        let p = Geometry::Point(Point::new(3.0, 4.0));
+        assert_eq!(
+            simplify_step(&p, 5000.0, Crs::Epsg3857, &opts, Representation::Point),
+            Simplified::Keep(p.clone())
+        );
+    }
+
+    #[test]
+    fn test_cascade_point_band_shares_one_point_across_coarser_steps() {
+        let opts = SimplifyOptions::default();
+        // Chain fine→coarse: two geometry steps, then the band boundary
+        // (point step), then a coarser point step. The polygon collapses at
+        // the boundary and the SAME point flows through the coarser step.
+        let poly = Geometry::Polygon(square(500.0, -300.0, 5000.0));
+        let steps = [
+            CascadeStep::geom(50.0),
+            CascadeStep::geom(100.0),
+            CascadeStep::point(200.0),
+            CascadeStep::point(400.0),
+        ];
+        let at_boundary = simplify_cascade(&poly, &steps[..3], Crs::Epsg3857, &opts);
+        let at_coarser = simplify_cascade(&poly, &steps, Crs::Epsg3857, &opts);
+        match (&at_boundary, &at_coarser) {
+            (Simplified::Keep(Geometry::Point(a)), Simplified::Keep(Geometry::Point(b))) => {
+                assert_eq!(a, b, "band levels must share the boundary point");
+            }
+            other => panic!("expected two Keep(Point), got {other:?}"),
+        }
+    }
+
+    /// THE cascade-revival anchor (#317): a polygon too small to survive the
+    /// fine geometry steps must still appear at the coarse point-band step,
+    /// derived from canonical geometry — otherwise cascading silently
+    /// empties the band (the open-buildings failure mode).
+    #[test]
+    fn test_cascade_point_step_revives_dropped_geometry() {
+        let opts = SimplifyOptions::default();
+        // 20 m square at (500, 700): dropped by the 5 km geometry step.
+        let poly = Geometry::Polygon(square(500.0, 700.0, 10.0));
+        let steps = [
+            CascadeStep::geom(5_000.0),
+            CascadeStep::point(10_000.0),
+            CascadeStep::point(20_000.0),
+        ];
+        assert_eq!(
+            simplify_cascade(&poly, &steps[..1], Crs::Epsg3857, &opts),
+            Simplified::Dropped,
+            "precondition: geometry step drops the tiny polygon"
+        );
+        for chain in [&steps[..2], &steps[..3]] {
+            match simplify_cascade(&poly, chain, Crs::Epsg3857, &opts) {
+                Simplified::Keep(Geometry::Point(pt)) => {
+                    assert!((pt.x() - 500.0).abs() < 1e-9);
+                    assert!((pt.y() - 700.0).abs() < 1e-9);
+                }
+                other => panic!("point step must revive from canonical, got {other:?}"),
+            }
+        }
+    }
+
+    /// Same revival for square steps: the dither sees the canonical
+    /// geometry's area even when the geometry cascade died earlier.
+    #[test]
+    fn test_cascade_square_step_revives_dropped_geometry() {
+        let opts = SimplifyOptions::default();
+        // Scan anchors for one the dither keeps (deterministic per anchor).
+        let mut revived = 0;
+        for i in 0..300 {
+            let (cx, cy) = (i as f64 * 7_919.0, i as f64 * 3_571.0);
+            let poly = Geometry::Polygon(square(cx, cy, 2_000.0));
+            let steps = [CascadeStep::geom(5_000.0), CascadeStep::square(8_000.0)];
+            assert_eq!(
+                simplify_cascade(&poly, &steps[..1], Crs::Epsg3857, &opts),
+                Simplified::Dropped,
+                "precondition: geometry step drops it"
+            );
+            match simplify_cascade(&poly, &steps, Crs::Epsg3857, &opts) {
+                Simplified::Keep(Geometry::Polygon(sq)) => {
+                    let r = sq.bounding_rect().unwrap();
+                    assert!((r.width() - 8_000.0).abs() < 1e-6, "side = step tol");
+                    revived += 1;
+                }
+                Simplified::Dropped => {}
+                other => panic!("expected Keep(Polygon) or Dropped, got {other:?}"),
+            }
+        }
+        assert!(revived > 0, "some anchors must dither through");
+        assert!(revived < 300, "not all (p = 16e6/64e6 = 0.25 per anchor)");
+    }
+
+    // ---- tiny-polygon placeholder squares (#279) ---------------------------
+
+    /// Survivors of a Square-mode collapse must be `tol × tol` squares
+    /// centered at the source polygon's centroid.
+    #[test]
+    fn test_square_collapse_emits_gsd_square_at_anchor() {
+        let tol = 5000.0; // gsd 5000 m, factor 1.0, EPSG:3857
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..Default::default()
+        };
+        // Scan candidate anchors until the dither keeps one (deterministic
+        // per anchor, so this loop is stable run-to-run).
+        let mut checked = 0;
+        for i in 0..200 {
+            let (cx, cy) = (1000.0 + i as f64 * 3137.0, -2000.0 + i as f64 * 911.0);
+            // Area = (2·1000)² = 4e6; threshold = tol² = 2.5e7 → p ≈ 0.16.
+            let poly = Geometry::Polygon(square(cx, cy, 1000.0));
+            match simplify_for_level(&poly, tol, Crs::Epsg3857, &opts) {
+                Simplified::Keep(Geometry::Polygon(sq)) => {
+                    let ring = &sq.exterior().0;
+                    assert_eq!(ring.len(), 5, "closed 5-coordinate square ring");
+                    let r = sq.bounding_rect().unwrap();
+                    assert!((r.width() - tol).abs() < 1e-6, "side = tol");
+                    assert!((r.height() - tol).abs() < 1e-6, "side = tol");
+                    let c = r.center();
+                    assert!((c.x - cx).abs() < 1e-6 && (c.y - cy).abs() < 1e-6);
+                    assert!((sq.unsigned_area() - tol * tol).abs() < 1e-3);
+                    checked += 1;
+                }
+                Simplified::Dropped => {}
+                other => panic!("expected Keep(Polygon) or Dropped, got {other:?}"),
+            }
+        }
+        assert!(checked > 0, "at least one anchor must survive the dither");
+        assert!(checked < 200, "not every anchor may survive (p ≈ 0.16)");
+    }
+
+    /// Deterministic: the same feature always gets the same dither decision.
+    #[test]
+    fn test_square_collapse_deterministic() {
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..Default::default()
+        };
+        for i in 0..50 {
+            let poly = Geometry::Polygon(square(i as f64 * 731.0, i as f64 * 197.0, 500.0));
+            let a = simplify_for_level(&poly, 5000.0, Crs::Epsg3857, &opts);
+            let b = simplify_for_level(&poly, 5000.0, Crs::Epsg3857, &opts);
+            assert_eq!(a, b);
+        }
+    }
+
+    /// Expected emitted area equals true area: over many features of area
+    /// `p·tol²`, about `p·N` survive, each contributing `tol²` — so total
+    /// emitted area ≈ total true area (tippecanoe's accumulator invariant,
+    /// in expectation).
+    #[test]
+    fn test_square_collapse_preserves_aggregate_area_statistically() {
+        let tol = 5000.0;
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..Default::default()
+        };
+        let n = 4000;
+        let half = 1250.0; // area (2·1250)² = 6.25e6, p = 0.25
+        let mut true_area = 0.0;
+        let mut emitted_area = 0.0;
+        for i in 0..n {
+            let (cx, cy) = (i as f64 * 17_077.0, (i % 613) as f64 * 12_923.0);
+            let poly = square(cx, cy, half);
+            true_area += poly.unsigned_area();
+            if let Simplified::Keep(Geometry::Polygon(sq)) =
+                simplify_for_level(&Geometry::Polygon(poly), tol, Crs::Epsg3857, &opts)
+            {
+                emitted_area += sq.unsigned_area();
+            }
+        }
+        let ratio = emitted_area / true_area;
+        assert!(
+            (0.85..1.15).contains(&ratio),
+            "aggregate area must be preserved in expectation, ratio = {ratio}"
+        );
+    }
+
+    /// Above-tolerance polygons are untouched by Square mode.
+    #[test]
+    fn test_square_collapse_leaves_visible_polygons_alone() {
+        let big = Geometry::Polygon(square(0.0, 0.0, 50_000.0));
+        let drop_opts = SimplifyOptions::default();
+        let square_opts = SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..Default::default()
+        };
+        assert_eq!(
+            simplify_for_level(&big, 1000.0, Crs::Epsg3857, &square_opts),
+            simplify_for_level(&big, 1000.0, Crs::Epsg3857, &drop_opts)
+        );
+    }
+
+    /// Under Square mode, each collapsed MultiPolygon part dithers its own
+    /// square (per-part density), and every emitted part is a Polygon —
+    /// the geometry type never changes.
+    #[test]
+    fn test_square_collapse_multipolygon_per_part() {
+        let tol = 5000.0;
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..Default::default()
+        };
+        // 40 tiny parts of p ≈ 0.64 each: expect several survivors.
+        let parts: Vec<Polygon<f64>> = (0..40)
+            .map(|i| square(i as f64 * 40_000.0, i as f64 * 23_000.0, 2000.0))
+            .collect();
+        let mp = Geometry::MultiPolygon(MultiPolygon::new(parts));
+        match simplify_for_level(&mp, tol, Crs::Epsg3857, &opts) {
+            Simplified::Keep(Geometry::MultiPolygon(out)) => {
+                assert!(out.0.len() > 1, "several parts should dither through");
+                assert!(out.0.len() < 40, "some parts should dither out");
+                for p in &out.0 {
+                    let r = p.bounding_rect().unwrap();
+                    assert!((r.width() - tol).abs() < 1e-6);
+                }
+            }
+            other => panic!("expected Keep(MultiPolygon), got {other:?}"),
+        }
+    }
+
+    /// Representation::Square in a cascade: a square kept at the band's
+    /// finest level re-dithers deterministically at coarser steps (same
+    /// anchor ⇒ same u), so survival is monotone and engine-independent.
+    #[test]
+    fn test_square_step_and_cascade_consistency() {
+        let opts = SimplifyOptions::default();
+        let poly = Geometry::Polygon(square(731.0, -1911.0, 800.0));
+        // Direct step vs single-step cascade must agree.
+        let direct = simplify_step(&poly, 5000.0, Crs::Epsg3857, &opts, Representation::Square);
+        let steps = [CascadeStep {
+            gsd_meters: 5000.0,
+            repr: Representation::Square,
+        }];
+        assert_eq!(
+            direct,
+            simplify_cascade(&poly, &steps, Crs::Epsg3857, &opts)
+        );
+        // Monotone: if dropped at the fine square step, a longer chain
+        // through a coarser square step is dropped too.
+        let chain = [
+            CascadeStep {
+                gsd_meters: 5000.0,
+                repr: Representation::Square,
+            },
+            CascadeStep {
+                gsd_meters: 10_000.0,
+                repr: Representation::Square,
+            },
+        ];
+        let coarser = simplify_cascade(&poly, &chain, Crs::Epsg3857, &opts);
+        if matches!(direct, Simplified::Dropped) {
+            assert_eq!(coarser, Simplified::Dropped, "drops are monotone");
+        }
     }
 
     // ---- multi-geometry part dropping -------------------------------------
@@ -1184,7 +1825,7 @@ mod tests {
         // so the candidate stays comfortably above the cap.
         let poly = padded_bowtie(1_200);
         assert!(poly.exterior().0.len() > MAX_VALIDATION_VERTS);
-        match simplify_polygon_impl(&poly, 0.01, false, true) {
+        match simplify_polygon_impl(&poly, 0.01, CollapseMode::Drop, true) {
             Simplified::Keep(g @ Geometry::Polygon(_)) => {
                 let Geometry::Polygon(ref out) = g else {
                     unreachable!()
@@ -1213,7 +1854,7 @@ mod tests {
         // and even-odd repaired, materializing the (5,5) crossing vertex.
         let poly = padded_bowtie(40);
         assert!(poly.exterior().0.len() <= MAX_VALIDATION_VERTS);
-        match simplify_polygon_impl(&poly, 0.01, false, true) {
+        match simplify_polygon_impl(&poly, 0.01, CollapseMode::Drop, true) {
             Simplified::Keep(g) => {
                 assert!(
                     has_crossing_vertex(&g),

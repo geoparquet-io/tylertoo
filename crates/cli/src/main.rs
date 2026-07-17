@@ -381,9 +381,44 @@ struct ConvertTuningArgs {
     simplify_factor: f64,
 
     /// Collapse below-visibility polygons to a representative point instead of
-    /// dropping them (spec Q4 opt-in).
+    /// dropping them (spec Q4 opt-in). Changes the geometry type at coarse
+    /// levels (fill-styled renderers silently ignore points — add a circle
+    /// layer, or use --collapse-square to stay type-preserving).
     #[arg(long, help_heading = "Generalization")]
     collapse: bool,
+
+    /// Collapse below-visibility polygons to a ~1xGSD placeholder SQUARE at
+    /// the representative point instead of dropping them (tippecanoe
+    /// tiny-polygon reduction; opt-in).
+    ///
+    /// Squares are area-dithered: a polygon of area A below the level
+    /// threshold T = (simplify-factor * gsd)^2 survives as a T-area square
+    /// with probability A/T, so aggregate area stays truthful — dense city
+    /// blocks read denser than isolated barns. Type-preserving (the output
+    /// stays Polygon), so plain fill styles keep working, unlike --collapse.
+    /// Deterministic per feature (same input -> same output, engine- and
+    /// thread-independent). See docs/OVERVIEW_TUNING.md.
+    #[arg(long, conflicts_with = "collapse", help_heading = "Generalization")]
+    collapse_square: bool,
+
+    /// Zoom-band representation selector: comma-separated LO-HI:KIND bands,
+    /// e.g. "0-7:point,8-14:geom" or "0-5:square". KIND is geom, point, or
+    /// square.
+    ///
+    /// point: ALL polygonal features in the band become representative
+    /// points (centroid) — "dots zoomed out, polygons zoomed in" in ONE
+    /// archive, no two-archive merge. In-band polygons bypass the visibility
+    /// gate (a dot is always visible) and thin on the point grid.
+    /// square: below-tolerance polygons in the band emit area-dithered
+    /// ~1xGSD placeholder squares (see --collapse-square) instead of
+    /// dropping; visible polygons are untouched. geom: normal (the default
+    /// for unlisted zooms). Bands must not overlap, non-geom bands must end
+    /// before --max-zoom (the canonical level is always verbatim), and point
+    /// bands must be contiguous from the coarsest zoom. Requires a zoom-range
+    /// plan (not --gsd) and duplicating mode. Lines and native points are
+    /// unaffected by every band kind. See docs/OVERVIEW_TUNING.md.
+    #[arg(long, value_name = "SPEC", help_heading = "Generalization")]
+    representation: Option<String>,
 
     /// Disable cascading simplification (#218) and reproduce the pre-cascade
     /// output byte-for-byte.
@@ -745,9 +780,9 @@ impl ConvertTuningArgs {
         cogp_compat: bool,
     ) -> Result<tylertoo_core::overview::convert::ConvertOptions> {
         use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
-        use tylertoo_core::overview::convert::ConvertOptions;
+        use tylertoo_core::overview::convert::{parse_representation_spec, ConvertOptions};
         use tylertoo_core::overview::level::{MemoryProfile, Mode};
-        use tylertoo_core::overview::simplify::SimplifyOptions;
+        use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
         use tylertoo_core::overview::writer::RowGroupSizePolicy;
 
         let profile = match self.profile.as_str() {
@@ -821,6 +856,14 @@ impl ConvertTuningArgs {
         }
         let coalesce_lines = !self.no_coalesce_lines;
 
+        // Zoom-band representation selector (#317 / #279); structural
+        // validity against the plan is enforced by core convert validation.
+        let representation = match &self.representation {
+            Some(spec) => parse_representation_spec(spec)
+                .map_err(|e| anyhow::anyhow!("--representation: {e}"))?,
+            None => Vec::new(),
+        };
+
         Ok(ConvertOptions {
             mode,
             levels,
@@ -830,9 +873,18 @@ impl ConvertTuningArgs {
             no_auto_rank: self.no_auto_rank,
             simplify: SimplifyOptions {
                 factor: self.simplify_factor,
-                collapse: self.collapse,
+                // --collapse and --collapse-square are mutually exclusive
+                // (clap conflicts_with); both default off = drop (#279).
+                collapse: if self.collapse_square {
+                    CollapseMode::Square
+                } else if self.collapse {
+                    CollapseMode::Point
+                } else {
+                    CollapseMode::Drop
+                },
                 cascade: !self.no_cascade,
             },
+            representation,
             density: DensityBudgetConfig {
                 enabled: !self.no_density_drop,
                 drop_rate: self.drop_rate,
@@ -2142,6 +2194,117 @@ mod tests {
         );
     }
 
+    /// #317 / #279: the representation selector and the square disposition
+    /// are reachable on BOTH `overview` and the one-shot `tiles` facade, and
+    /// they build the right core options.
+    #[test]
+    fn representation_and_collapse_square_flags() {
+        use tylertoo_core::overview::convert::{LevelPlan, RepresentationBand};
+        use tylertoo_core::overview::level::Mode;
+        use tylertoo_core::overview::simplify::{CollapseMode, Representation};
+
+        let a = parse_tiles(&["--representation", "0-7:point,8-13:geom"]);
+        assert_eq!(
+            a.tuning.representation.as_deref(),
+            Some("0-7:point,8-13:geom")
+        );
+
+        let b = parse_tiles(&["--collapse-square"]);
+        assert!(b.tuning.collapse_square);
+
+        // --collapse and --collapse-square conflict.
+        assert!(Cli::try_parse_from([
+            "tylertoo",
+            "tiles",
+            "in.parquet",
+            "out.pmtiles",
+            "--collapse",
+            "--collapse-square",
+        ])
+        .is_err());
+
+        // build_convert_options maps both through to core.
+        let opts = b
+            .tuning
+            .build_convert_options(
+                Mode::Duplicating,
+                LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 14,
+                },
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(opts.simplify.collapse, CollapseMode::Square);
+
+        let opts = a
+            .tuning
+            .build_convert_options(
+                Mode::Duplicating,
+                LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 14,
+                },
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            opts.representation,
+            vec![
+                RepresentationBand {
+                    min_zoom: 0,
+                    max_zoom: 7,
+                    repr: Representation::Point
+                },
+                RepresentationBand {
+                    min_zoom: 8,
+                    max_zoom: 13,
+                    repr: Representation::Geometry
+                },
+            ]
+        );
+        assert_eq!(opts.simplify.collapse, CollapseMode::Drop);
+
+        // A malformed spec is a CLI-level error.
+        let bad = parse_tiles(&["--representation", "0-7:blob"]);
+        assert!(bad
+            .tuning
+            .build_convert_options(
+                Mode::Duplicating,
+                LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 14,
+                },
+                None,
+                false,
+            )
+            .is_err());
+    }
+
+    /// The same flags parse on the two-step `overview` subcommand.
+    #[test]
+    fn overview_accepts_representation_flags() {
+        let argv = [
+            "tylertoo",
+            "overview",
+            "in.parquet",
+            "out.parquet",
+            "--representation",
+            "0-5:square",
+            "--max-zoom",
+            "12",
+        ];
+        let cli = Cli::try_parse_from(argv).expect("overview should accept --representation");
+        match cli.command {
+            Command::Overview(a) => {
+                assert_eq!(a.tuning.representation.as_deref(), Some("0-5:square"));
+            }
+            other => panic!("expected overview subcommand, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_partition_wave_accepts_auto_and_positive() {
         // `auto` maps to the core-sized sentinel; case-insensitive.
@@ -2228,7 +2391,10 @@ mod tests {
             .expect("valid tuning should build options");
 
         assert_eq!(opts.assign.polygon_visibility, 2.0);
-        assert!(opts.simplify.collapse);
+        assert_eq!(
+            opts.simplify.collapse,
+            tylertoo_core::overview::simplify::CollapseMode::Point
+        );
         assert_eq!(opts.density.drop_rate, 1.3);
         assert!(matches!(opts.profile, MemoryProfile::Bounded));
     }

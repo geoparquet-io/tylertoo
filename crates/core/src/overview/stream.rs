@@ -83,8 +83,8 @@ use super::convert::{
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipeline;
 use super::simplify::{
-    full_resolution_fallback_count, simplify_cascade, simplify_for_level, validation_skip_count,
-    Simplified, SimplifyOptions,
+    full_resolution_fallback_count, simplify_cascade, simplify_step, validation_skip_count,
+    CascadeStep, Representation, Simplified, SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
@@ -432,12 +432,16 @@ pub(crate) fn convert_streaming_strategy(
     let t_assign = Instant::now();
     // #306: cap the transient winner-grid memory (the pass-1 peak #300's [rss]
     // logs pinned) at the profile-derived RAM budget; `speed` stays unbounded.
+    // Zoom-band representation selector (#317 / #279): per-level
+    // representations, parallel to the plan.
+    let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
     let assignment = assign_levels_bounded(
         &features,
         &level_gsds,
         &options.assign,
         crs,
         super::pipeline::pass1_grid_budget_bytes(options.profile),
+        &level_reprs,
     );
     let assign_secs = t_assign.elapsed().as_secs_f64();
     let t_budget = Instant::now();
@@ -660,17 +664,26 @@ pub(crate) fn convert_streaming_strategy(
     // built from the emitted plan, so the Serial fold, the pipelined
     // incremental fold, and the in-memory path all step through the same GSD
     // sequence. Empty when cascading does not apply to the level.
-    let cascade_chains: Vec<Vec<f64>> = emitted
+    // Zoom-band representation selector (#317 / #279): each level's
+    // Representation from its zoom. Steps carry each contributing level's
+    // representation so the fold pointifies / squarifies at the right band
+    // level (see `simplify_cascade`).
+    let repr_of =
+        |zoom: Option<u8>| super::convert::representation_for_zoom(&options.representation, zoom);
+    let cascade_chains: Vec<Vec<CascadeStep>> = emitted
         .iter()
         .map(|e| {
             let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
             if !duplicating || verbatim || !options.simplify.cascade {
                 return Vec::new();
             }
-            let mut chain: Vec<f64> = emitted
+            let mut chain: Vec<CascadeStep> = emitted
                 .iter()
                 .filter(|f| (f.orig as usize) < finest && f.orig >= e.orig)
-                .map(|f| f.gsd)
+                .map(|f| CascadeStep {
+                    gsd_meters: f.gsd,
+                    repr: repr_of(f.zoom),
+                })
                 .collect();
             chain.reverse();
             chain
@@ -692,6 +705,7 @@ pub(crate) fn convert_streaming_strategy(
                 duplicating,
                 verbatim,
                 gsd_m: e.gsd,
+                repr: repr_of(e.zoom),
                 crs,
                 simplify: &options.simplify,
                 cluster_enabled: options.cluster,
@@ -1425,6 +1439,10 @@ pub(super) struct LevelStreamCtx<'a> {
     duplicating: bool,
     verbatim: bool,
     gsd_m: f64,
+    /// Zoom-band representation (#317 / #279): how this level renders
+    /// polygonal features (full geometry, representative points, or
+    /// dithered placeholder squares for the below-tolerance ones).
+    repr: Representation,
     crs: Crs,
     simplify: &'a SimplifyOptions,
     /// Clustering (Q4): append `point_count` + rewrite accumulate columns.
@@ -1443,12 +1461,12 @@ pub(super) struct LevelStreamCtx<'a> {
     /// member count); `None` at verbatim levels or when coalescing is
     /// off/guard-skipped.
     coalesce_table: Option<&'a CoalesceTable>,
-    /// Cascading simplification (#218): fine→coarse GSD chain ending at this
-    /// level (`[gsd_finest-1, …, gsd_this]`), fed to
+    /// Cascading simplification (#218): fine→coarse step chain ending at
+    /// this level (`[step_finest-1, …, step_this]`), fed to
     /// [`simplify_cascade`]. Empty when cascading does not apply (cascade
     /// off, partitioning, or verbatim level) — the level then simplifies
-    /// canonical geometry directly with `gsd_m`.
-    cascade_chain: &'a [f64],
+    /// canonical geometry directly with `gsd_m` / `point_repr`.
+    cascade_chain: &'a [CascadeStep],
 }
 
 impl LevelStreamCtx<'_> {
@@ -1697,7 +1715,7 @@ pub(super) fn process_level_batch(
                 } else if !ctx.cascade_chain.is_empty() {
                     simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify)
                 } else {
-                    simplify_for_level(g, ctx.gsd_m, ctx.crs, ctx.simplify)
+                    simplify_step(g, ctx.gsd_m, ctx.crs, ctx.simplify, ctx.repr)
                 }
             })
             .collect();
@@ -1799,7 +1817,11 @@ pub(super) fn process_batch_cascade(
         .iter()
         .enumerate()
         .all(|(li, c)| c.cascade_chain.len() == ctxs.len() - li
-            && c.cascade_chain.last() == Some(&c.gsd_m)));
+            && c.cascade_chain.last()
+                == Some(&CascadeStep {
+                    gsd_meters: c.gsd_m,
+                    repr: c.repr,
+                })));
     // Coalesce-table presence is uniform across buffered levels (tables are
     // built for every non-verbatim level or none); the superset selection
     // below relies on it.
@@ -1843,8 +1865,24 @@ pub(super) fn process_batch_cascade(
 
     // --- Per-feature incremental fold, fine→coarse, parallel over features.
     // folds[pos][d] is the result at ctxs[len-1-d]; entries stop at the
-    // feature's coarsest member level, or earlier on Dropped (drops are
-    // monotone fine→coarse, so a missing depth reads as dropped).
+    // feature's coarsest member level, or earlier once Dropped with only
+    // Geometry ctxs remaining (drops are monotone along geometry steps, so
+    // a missing depth reads as dropped). Point / Square ctxs (#317 / #279)
+    // REVIVE from canonical geometry — see `simplify_cascade`, whose fold
+    // this mirrors step-for-step so Serial and Pipelined stay identical.
+    //
+    // has_band_upto[li]: whether any ctx at index <= li (i.e. this level or
+    // a coarser one) carries a non-Geometry representation — the condition
+    // under which a dropped fold must keep walking instead of breaking.
+    let has_band_upto: Vec<bool> = {
+        let mut v = Vec::with_capacity(ctxs.len());
+        let mut any = false;
+        for c in ctxs.iter() {
+            any = any || c.repr != Representation::Geometry;
+            v.push(any);
+        }
+        v
+    };
     let t_simplify = Instant::now();
     let folds: Vec<Vec<Simplified>> = geoms
         .par_iter()
@@ -1853,19 +1891,33 @@ pub(super) fn process_batch_cascade(
             let ml = finest.min_levels[row_offset + i];
             let mut out: Vec<Simplified> = Vec::with_capacity(ctxs.len());
             let mut current: Option<Geometry<f64>> = None;
-            for ctx in ctxs.iter().rev() {
+            let mut alive = true;
+            for (li, ctx) in ctxs.iter().enumerate().rev() {
                 if ml > ctx.orig_level {
                     break; // duplicating membership is a contiguous fine suffix
                 }
-                let input = current.as_ref().unwrap_or(g);
-                match simplify_for_level(input, ctx.gsd_m, ctx.crs, ctx.simplify) {
+                if !alive && !has_band_upto[li] {
+                    break; // only geometry ctxs remain: dropped stays dropped
+                }
+                let step = if !alive && ctx.repr == Representation::Geometry {
+                    Simplified::Dropped
+                } else {
+                    let input = if alive {
+                        current.as_ref().unwrap_or(g)
+                    } else {
+                        g // revive from canonical (Point / Square band)
+                    };
+                    simplify_step(input, ctx.gsd_m, ctx.crs, ctx.simplify, ctx.repr)
+                };
+                match step {
                     Simplified::Keep(s) => {
                         out.push(Simplified::Keep(s.clone()));
                         current = Some(s);
+                        alive = true;
                     }
                     Simplified::Dropped => {
                         out.push(Simplified::Dropped);
-                        break;
+                        alive = false;
                     }
                 }
             }
