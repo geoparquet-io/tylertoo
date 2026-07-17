@@ -99,6 +99,8 @@ fn convert(
         extent: 4096,
         tile_size_limit,
         simple_clip_fastpath,
+        // Convenience wrapper: use the core auto default (core-sized wave).
+        partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -657,6 +659,12 @@ fn overview(
 ///         Faster fine-zoom polygon export; output is render-equivalent on
 ///         simple rings but stores them rotated to a different start vertex.
 ///         Defaults to True; set False for byte-stable tile output.
+///     partition_wave (int, optional): Partitions processed per band read
+///         during export (the export concurrency knob). Defaults to 0, which
+///         auto-sizes to the machine's available cores (clamped to 6..=16);
+///         pass an explicit positive integer to override. Wider waves keep
+///         more cores busy at proportionally more peak memory. Output is
+///         byte-identical for every value (the wave is a scheduling concern).
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
@@ -674,7 +682,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=None, simple_clip_fastpath=true))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=None, simple_clip_fastpath=true, partition_wave=0))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -685,6 +693,7 @@ fn export_pmtiles(
     extent: u32,
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
+    partition_wave: usize,
 ) -> PyResult<Py<PyDict>> {
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
@@ -692,6 +701,7 @@ fn export_pmtiles(
         extent,
         tile_size_limit,
         simple_clip_fastpath,
+        partition_wave,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
