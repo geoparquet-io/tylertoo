@@ -891,6 +891,13 @@ struct TilesArgs {
     #[arg(long, default_value = "14")]
     max_zoom: u8,
 
+    /// Explicit comma-separated GSD list (meters, strictly decreasing).
+    /// Overrides --min-zoom/--max-zoom when set — the same semantics as
+    /// `tylertoo overview --gsd`, so the absolute-GSD ladder is reachable in
+    /// one step.
+    #[arg(long, value_name = "GSDS")]
+    gsd: Option<String>,
+
     /// Regional extract: only convert features whose bbox intersects this
     /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). See --bbox in
     /// `tylertoo overview --help` for details.
@@ -933,6 +940,14 @@ struct TilesArgs {
     /// value.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
+
+    /// Write a JSON report to this path: a combined object with a `convert`
+    /// section (the overview build, matching `overview --report`) and an
+    /// `export` section (the PMTiles export, matching `export-pmtiles
+    /// --report`), so the one-step run captures both halves the two-step
+    /// chain would.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
 
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
@@ -1091,8 +1106,31 @@ fn run_convert(
 /// `overview` (convert, with default knobs) → `export-pmtiles`. The temp
 /// file lives next to the output (same filesystem) and is removed on both
 /// success and failure via [`tempfile::NamedTempFile`]'s drop guard.
-fn run_tiles(args: TilesArgs) -> Result<()> {
+/// Resolve the level plan shared by `overview` and `tiles`: an explicit
+/// `--gsd` list (comma-separated meters, strictly decreasing) overrides the
+/// `--min-zoom`/`--max-zoom` range. Kept in one place so the two commands
+/// can never drift on how GSD ladders are parsed.
+fn resolve_level_plan(
+    gsd: Option<&str>,
+    min_zoom: u8,
+    max_zoom: u8,
+) -> Result<tylertoo_core::overview::convert::LevelPlan> {
     use tylertoo_core::overview::convert::LevelPlan;
+
+    match gsd {
+        Some(gsd_str) => {
+            let gsds = gsd_str
+                .split(',')
+                .map(|s| s.trim().parse::<f64>())
+                .collect::<std::result::Result<Vec<f64>, _>>()
+                .map_err(|e| anyhow::anyhow!("invalid --gsd list '{}': {}", gsd_str, e))?;
+            Ok(LevelPlan::Gsds(gsds))
+        }
+        None => Ok(LevelPlan::ZoomRange { min_zoom, max_zoom }),
+    }
+}
+
+fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
     use tylertoo_core::overview::level::Mode;
 
@@ -1116,10 +1154,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // Overviews for PMTiles are always duplicating (partitioning can't be
     // exported to per-tile MVT). Every other convert knob comes from the
     // shared tuning set, so `tiles` matches the two-step overview → export.
-    let levels = LevelPlan::ZoomRange {
-        min_zoom: args.min_zoom,
-        max_zoom: args.max_zoom,
-    };
+    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
     let options = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
@@ -1182,12 +1217,25 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         convert_report.duration_secs + export_report.duration_secs
     );
 
+    // A combined report so the one-step run captures both halves the two-step
+    // chain would write (`overview --report` + `export-pmtiles --report`).
+    if let Some(report_path) = &args.report {
+        let combined = serde_json::json!({
+            "convert": convert_report,
+            "export": export_report,
+        });
+        let json =
+            serde_json::to_string_pretty(&combined).context("failed to serialize tiles report")?;
+        std::fs::write(report_path, json)
+            .with_context(|| format!("failed to write report to {}", report_path.display()))?;
+        println!("  report written to {}", report_path.display());
+    }
+
     Ok(())
 }
 
 /// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
 fn run_overview(args: OverviewArgs) -> Result<()> {
-    use tylertoo_core::overview::convert::LevelPlan;
     use tylertoo_core::overview::level::Mode;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -1200,20 +1248,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
     };
 
-    // Explicit --gsd list overrides the zoom range.
-    let levels = if let Some(gsd_str) = &args.gsd {
-        let gsds = gsd_str
-            .split(',')
-            .map(|s| s.trim().parse::<f64>())
-            .collect::<std::result::Result<Vec<f64>, _>>()
-            .map_err(|e| anyhow::anyhow!("invalid --gsd list '{}': {}", gsd_str, e))?;
-        LevelPlan::Gsds(gsds)
-    } else {
-        LevelPlan::ZoomRange {
-            min_zoom: args.min_zoom,
-            max_zoom: args.max_zoom,
-        }
-    };
+    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
@@ -1910,5 +1945,106 @@ mod tests {
             .tuning
             .build_convert_options(Mode::Duplicating, levels(), None, false)
             .is_ok());
+    }
+
+    // --- #316: tuning parity between `tiles` and the two-step chain ----------
+
+    #[test]
+    fn resolve_level_plan_gsd_overrides_zoom_range() {
+        use tylertoo_core::overview::convert::LevelPlan;
+
+        // No --gsd → the zoom range is used verbatim.
+        match resolve_level_plan(None, 2, 11).unwrap() {
+            LevelPlan::ZoomRange { min_zoom, max_zoom } => {
+                assert_eq!((min_zoom, max_zoom), (2, 11));
+            }
+            other => panic!("expected ZoomRange, got {other:?}"),
+        }
+
+        // An explicit list wins, is parsed in order, and tolerates whitespace.
+        match resolve_level_plan(Some("1000, 500 ,250"), 0, 14).unwrap() {
+            LevelPlan::Gsds(gsds) => assert_eq!(gsds, vec![1000.0, 500.0, 250.0]),
+            other => panic!("expected Gsds, got {other:?}"),
+        }
+
+        // A malformed list errors, naming the flag.
+        let err = resolve_level_plan(Some("1000,banana"), 0, 14).unwrap_err();
+        assert!(err.to_string().contains("--gsd"), "names the flag: {err}");
+    }
+
+    #[test]
+    fn tiles_gsd_and_report_flags_thread_through() {
+        use tylertoo_core::overview::convert::LevelPlan;
+
+        // --gsd on `tiles` reaches the same absolute-GSD ladder as `overview`.
+        let a = parse_tiles(&["--gsd", "800,400,200"]);
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+            LevelPlan::Gsds(gsds) => assert_eq!(gsds, vec![800.0, 400.0, 200.0]),
+            other => panic!("expected Gsds, got {other:?}"),
+        }
+
+        // Without --gsd the min/max zoom range still drives the plan.
+        let a = parse_tiles(&["--min-zoom", "3", "--max-zoom", "10"]);
+        assert!(a.gsd.is_none());
+
+        // --report is accepted and captured as a path.
+        let a = parse_tiles(&["--report", "out/report.json"]);
+        assert_eq!(a.report, Some(PathBuf::from("out/report.json")));
+    }
+
+    /// Guards against future drift: every non-hidden long flag on `overview`
+    /// or `export-pmtiles` must be reachable on the one-step `tiles` command,
+    /// or be an explicitly allow-listed structural exception. `--spill-dir`,
+    /// `--gsd`, and `--report` are covered here by virtue of being present.
+    #[test]
+    fn tiles_has_parity_with_two_step_flags() {
+        use clap::CommandFactory;
+        use std::collections::BTreeSet;
+
+        /// Non-hidden long spellings a command accepts (primary + visible aliases).
+        fn longs(cmd: &clap::Command) -> BTreeSet<String> {
+            let mut set = BTreeSet::new();
+            for arg in cmd.get_arguments() {
+                if arg.is_hide_set() {
+                    continue;
+                }
+                if let Some(long) = arg.get_long() {
+                    set.insert(long.to_string());
+                }
+                if let Some(aliases) = arg.get_visible_aliases() {
+                    set.extend(aliases.into_iter().map(str::to_string));
+                }
+            }
+            set
+        }
+
+        let tiles_longs = longs(&TilesArgs::command());
+
+        // Flags on `overview`/`export-pmtiles` intentionally NOT mirrored on
+        // `tiles`, each for a structural reason:
+        //   mode / cogp-compat -> `tiles` is always duplicating (partitioning
+        //                         can't be exported to per-tile MVT), so the
+        //                         mode knob and its partitioning-only footer
+        //                         key are meaningless here.
+        //   tile-size-limit    -> reachable on `tiles` as --max-tile-size (the
+        //                         two are hidden aliases of each other), so the
+        //                         cap IS present, just under the other spelling.
+        let allow: BTreeSet<&str> = ["mode", "cogp-compat", "tile-size-limit"]
+            .into_iter()
+            .collect();
+
+        let mut missing: Vec<String> = longs(&OverviewArgs::command())
+            .into_iter()
+            .chain(longs(&ExportPmtilesArgs::command()))
+            .filter(|long| !tiles_longs.contains(long) && !allow.contains(long.as_str()))
+            .collect();
+        missing.sort();
+        missing.dedup();
+
+        assert!(
+            missing.is_empty(),
+            "flags on overview/export-pmtiles not surfaced on `tiles` — add each \
+             to TilesArgs, or to the allow-list with a documented reason: {missing:?}"
+        );
     }
 }
