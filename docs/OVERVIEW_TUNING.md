@@ -760,6 +760,69 @@ reprojects the bbox internally.
 
 ---
 
+## Attribute filter: `--filter` / `--where`
+
+`--filter <EXPR>` (aliased as `--where`) converts only the features matching a
+SQL-WHERE-style predicate over the input's property columns — the attribute
+analogue of `--bbox`, and it composes with it. Available on both `overview`
+and the one-shot `tiles` facade.
+
+```bash
+# Only high-confidence field boundaries, straight from the source file
+tylertoo tiles fields.parquet fields.pmtiles \
+  --filter "confidence > 0.8" --max-zoom 14
+
+# Composes with --bbox and richer predicates
+tylertoo overview brazil.parquet subset.parquet \
+  --bbox -48.0,-16.0,-47.0,-15.0 \
+  --where "crop_type IN ('soy', 'corn') AND confidence >= 0.5"
+```
+
+**Expression language** (small built-in recursive-descent parser — no SQL
+engine involved):
+
+- Comparisons: `=` (or `==`), `!=` (or `<>`), `<`, `<=`, `>`, `>=`, with the
+  column on the left: `confidence > 0.8`, `country = 'BRA'`, `active = true`.
+- Membership: `col IN (v1, v2, ...)`, `col NOT IN (...)`.
+- Null tests: `col IS NULL`, `col IS NOT NULL`.
+- Boolean composition: `AND`, `OR`, `NOT`, parentheses. `OR` binds loosest,
+  then `AND`, then `NOT`.
+- Literals: numbers (`0.8`, `-2`, `1e6`), single-quoted strings (`'it''s'`
+  escapes a quote), `TRUE`/`FALSE`. Keywords are case-insensitive.
+- Columns: bare identifiers, or `"double quoted"` for names with spaces.
+  Supported column types: numeric (int/uint/float), string, boolean.
+
+**Null semantics** are SQL three-valued logic: a comparison or `IN` over a
+NULL value is UNKNOWN, `AND`/`OR`/`NOT` combine with Kleene logic, and a row
+is kept only when the whole predicate is TRUE. So `confidence > 0.8` drops
+null-confidence rows — and so does `NOT (confidence > 0.8)`. Use
+`IS NULL` / `IS NOT NULL` to test nulls explicitly.
+
+Like `--bbox`, the filter is two-stage:
+
+1. **Row-group pruning** (statistics-based): row groups whose parquet column
+   chunk statistics (min/max/null-count) prove the predicate cannot match are
+   skipped at the footer level — their data pages are never read, and on
+   remote input those byte ranges are never fetched. `AND` intersects the
+   prunable sets, `OR` unions them; `NOT (...)` subtrees and columns without
+   usable statistics conservatively keep the row group.
+2. **Exact per-row evaluation** during the pass-1 scan guarantees identical
+   output whether or not pruning fired.
+
+| Knob | Default | Units | Effect |
+|------|---------|-------|--------|
+| `--filter EXPR` (alias `--where`) | — | predicate | only features where EXPR is TRUE; omit = no filtering |
+
+**Interactions**: the filter runs before level assignment, ranking, density
+budgets, clustering, and coalescing — dropped features simply never enter the
+pipeline, exactly as if the input had been pre-filtered (`ConvertReport.
+input_features` counts only survivors). Check `row_groups_read` vs
+`row_groups_total` to see whether statistics pruning fired; sorting the input
+by a filtered column (or lowering `--row-group-size`) tightens per-row-group
+statistics and prunes more.
+
+---
+
 ## Performance profiles: `--profile`, `--in-flight-batches`
 
 Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),

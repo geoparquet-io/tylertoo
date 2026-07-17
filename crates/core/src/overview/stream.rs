@@ -256,6 +256,30 @@ fn build_level_schemas(
     (source_schema, cluster_schema, out_schema)
 }
 
+/// Combined per-part footer-statistics row-group selection for the streaming
+/// path: bbox covering pruning (#102) intersected with attribute-filter
+/// statistics pushdown (#315). `None` when neither pruning is active.
+fn select_row_groups_streaming(
+    source: &ConvertSource,
+    bbox_units: Option<&[f64; 4]>,
+    filter: Option<&super::filter::BoundFilter>,
+) -> Result<Option<RowGroupSelection>, ConvertError> {
+    let bbox_selection: Option<RowGroupSelection> = match bbox_units {
+        Some(bb) => Some(source.select_row_groups(bb)?),
+        None => None,
+    };
+    let filter_selection: Option<RowGroupSelection> = match filter {
+        Some(f) => Some(source.select_row_groups_matching(f)?),
+        None => None,
+    };
+    Ok(match (bbox_selection, filter_selection) {
+        (Some(a), Some(b)) => Some(a.intersect(&b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    })
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -283,26 +307,40 @@ pub(crate) fn convert_streaming_strategy(
     let kv = source.key_value_metadata()?;
     let crs = super::convert::detect_crs_from_kv(kv.as_ref())?;
 
-    // Regional extract (#102): prune input row groups by bbox covering
-    // statistics — footer metadata only, no data pages of skipped groups are
-    // ever read. The selection is PER PART and every pass reads the same
-    // selection in the same part order, so the global row indices addressing
-    // the winner tables stay aligned. Groups without stats are kept; the
-    // exact per-feature filter in pass 1 guarantees identical output either
-    // way.
+    // Reserved-column collisions (#288) are resolved BEFORE row-group
+    // selection so the attribute filter (#315) can bind against the final
+    // (possibly renamed) schema; the rename is metadata-only and never
+    // affects the footer statistics either pruning path reads. See the
+    // full #288 rationale on the block below.
+    let mut options = options.clone();
+    let (input_schema, renames) = resolve_reserved_column_collisions(&input_schema, &mut options);
+    let options = &options;
+
+    // Attribute filter (#315): parse + bind against the input schema.
+    // Syntax was already validated in `validate_options`; binding resolves
+    // column names to indices and type-checks literals.
+    let bound_filter = super::convert::bind_attribute_filter(options, &input_schema, &renames)?;
+
+    // Regional extract (#102) + attribute filter (#315): prune input row
+    // groups by footer statistics — bbox covering stats for `--bbox`,
+    // per-column min/max/null-count stats for `--filter` — before any data
+    // pages are read. The two prunings compose by intersection. The
+    // selection is PER PART and every pass reads the same selection in the
+    // same part order, so the global row indices addressing the winner
+    // tables stay aligned. Groups without stats are kept; the exact
+    // per-feature filters in pass 1 guarantee identical output either way.
     let row_groups_total = source.num_row_groups_total()?;
     let bbox_units = options
         .bbox
         .map(|b| super::convert::bbox_to_crs_units(&b, crs));
-    let selected_row_groups: Option<RowGroupSelection> = match bbox_units.as_ref() {
-        Some(bb) => Some(source.select_row_groups(bb)?),
-        None => None,
-    };
+    let selected_row_groups =
+        select_row_groups_streaming(source, bbox_units.as_ref(), bound_filter.as_ref())?;
     let row_groups_read = selected_row_groups
         .as_ref()
         .map_or(row_groups_total, RowGroupSelection::total_selected);
     if selected_row_groups.is_some() {
-        log::info!("bbox filter: reading {row_groups_read}/{row_groups_total} input row groups");
+        let what = super::convert::pruning_label(options.bbox.is_some(), bound_filter.is_some());
+        log::info!("{what} filter: reading {row_groups_read}/{row_groups_total} input row groups");
     }
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
@@ -323,17 +361,16 @@ pub(crate) fn convert_streaming_strategy(
     // passes below read from the spill, not the network.
     stage_input_pass0(source, selected_row_groups.as_ref(), row_groups_read);
 
-    // Reserved-column collisions (#288): rename any input column named `level`
-    // / `point_count` / `coalesced_count` (case-insensitive) instead of
-    // rejecting the file, keeping the reserved output columns authoritative.
-    // The rename preserves column order, so the projection indices pass 1
-    // computes against `input_schema` stay valid against the raw file, and pass
-    // 2 relabels non-geometry columns positionally into the renamed source
-    // schema (`build_source_schema`). `options` is cloned so by-name
-    // ranking/accumulate options can be rewritten to the renamed columns.
-    let mut options = options.clone();
-    let (input_schema, _renames) = resolve_reserved_column_collisions(&input_schema, &mut options);
-    let options = &options;
+    // (Reserved-column collisions, #288, were resolved above, before the
+    // row-group selection: any input column named `level` / `point_count` /
+    // `coalesced_count` (case-insensitive) is renamed instead of rejecting
+    // the file, keeping the reserved output columns authoritative. The
+    // rename preserves column order, so the projection indices pass 1
+    // computes against `input_schema` stay valid against the raw file, and
+    // pass 2 relabels non-geometry columns positionally into the renamed
+    // source schema (`build_source_schema`). `options` was cloned so
+    // by-name ranking/accumulate options could be rewritten to the renamed
+    // columns.)
 
     let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
     let geom_field = input_schema.field(geom_idx).clone();
@@ -361,6 +398,7 @@ pub(crate) fn convert_streaming_strategy(
         &acc_cols,
         selected_row_groups.as_ref(),
         bbox_units.as_ref(),
+        bound_filter.as_ref(),
     )?;
     if skipped_rows > 0 {
         log::warn!(
@@ -1019,21 +1057,20 @@ struct Pass1Output {
 /// ranking provenance block (§3.5), and — when clustering with aggregation —
 /// the per-spec source values (parallel to `acc_cols`). Memory: `O(read
 /// batch)` transient + `O(N)` small per-feature records.
-fn run_pass1(
-    source: &ConvertSource,
-    input_schema: &Schema,
+/// The sorted, deduplicated column projection pass 1 reads: geometry +
+/// ranking candidates + accumulate columns (Q4) + attribute-filter columns
+/// (#315).
+fn pass1_projection(
     geom_idx: usize,
-    options: &ConvertOptions,
+    plan: &RankPlan,
     acc_cols: &[usize],
-    row_groups: Option<&RowGroupSelection>,
-    bbox_units: Option<&[f64; 4]>,
-) -> Result<Pass1Output, ConvertError> {
-    let mut plan = build_rank_plan(input_schema, options)?;
-
-    // Project only the columns pass 1 needs: geometry + ranking candidates +
-    // accumulate columns (Q4).
+    filter: Option<&super::filter::BoundFilter>,
+) -> Vec<usize> {
     let mut cols: Vec<usize> = vec![geom_idx];
-    match &plan {
+    if let Some(f) = filter {
+        cols.extend(f.columns().iter().copied());
+    }
+    match plan {
         RankPlan::ExplicitSort { idx, .. } | RankPlan::ExplicitClass { idx, .. } => cols.push(*idx),
         RankPlan::Auto { roads, confidence } => {
             cols.extend(roads.iter().map(|r| r.idx));
@@ -1046,6 +1083,23 @@ fn run_pass1(
     cols.extend(acc_cols.iter().copied());
     cols.sort_unstable();
     cols.dedup();
+    cols
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pass1(
+    source: &ConvertSource,
+    input_schema: &Schema,
+    geom_idx: usize,
+    options: &ConvertOptions,
+    acc_cols: &[usize],
+    row_groups: Option<&RowGroupSelection>,
+    bbox_units: Option<&[f64; 4]>,
+    filter: Option<&super::filter::BoundFilter>,
+) -> Result<Pass1Output, ConvertError> {
+    let mut plan = build_rank_plan(input_schema, options)?;
+
+    let cols = pass1_projection(geom_idx, &plan, acc_cols, filter);
     // Original schema index → projected batch column index.
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
 
@@ -1087,6 +1141,12 @@ fn run_pass1(
         geoms_buf.clear();
         extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)?;
 
+        // Attribute filter (#315): evaluate the predicate over the projected
+        // batch once. A row whose result is not TRUE (FALSE or SQL-UNKNOWN)
+        // produces no AssignFeature — exactly like a bbox miss below — while
+        // the row index still advances, keeping row-keyed tables aligned.
+        let filter_mask: Option<Vec<Option<bool>>> = filter.map(|f| f.eval_mask(&batch, &proj));
+
         // `AssignFeature::index` is the GLOBAL ROW index: pass 2 addresses the
         // winner tables by raw row position. Rows with a null, empty, or
         // non-finite geometry produce no feature but still advance the row
@@ -1094,6 +1154,14 @@ fn run_pass1(
         // skipped row must never shift attributes onto a neighbor's geometry).
         let base = num_rows;
         for (i, gopt) in geoms_buf.iter().enumerate() {
+            // Attribute filter (#315): keep only rows where the predicate is
+            // TRUE. The row index still advances (row-keyed tables stay
+            // aligned); the slot stays UNASSIGNED so pass 2 drops it too.
+            if let Some(mask) = &filter_mask {
+                if mask[i] != Some(true) {
+                    continue;
+                }
+            }
             let Some(g) = gopt.as_ref() else {
                 skipped_rows += 1;
                 continue;

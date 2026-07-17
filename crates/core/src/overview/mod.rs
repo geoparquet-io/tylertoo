@@ -17,6 +17,7 @@ pub mod cluster;
 pub mod coalesce;
 pub mod convert;
 pub mod export;
+pub mod filter;
 #[cfg(test)]
 mod hostile;
 pub mod level;

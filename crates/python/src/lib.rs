@@ -324,6 +324,16 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         their data pages (inputs without covering stats read everything
 ///         and rely on the exact per-feature filter). Defaults to None
 ///         (full extent).
+///     filter (str, optional): Attribute filter — a SQL-WHERE-style
+///         predicate over the input's property columns, e.g.
+///         ``"confidence > 0.8"`` or ``"crop IN ('soy', 'corn')"``.
+///         Supports ``=, !=, <, <=, >, >=``, ``IN (...)``,
+///         ``IS [NOT] NULL``, ``AND``/``OR``/``NOT``, and parentheses;
+///         nulls follow SQL three-valued logic (a row is kept only when
+///         the predicate is TRUE). Composes with ``bbox``; input row
+///         groups whose parquet column statistics preclude any match are
+///         skipped without reading their data pages. Defaults to None
+///         (no filtering).
 ///     profile (str, optional): Memory/throughput profile for the single-read
 ///         pass-2 engine: "speed" (buffer output in RAM), "bounded" (spill to
 ///         temporary Arrow IPC files), or "auto" (pick per mode + estimated
@@ -406,6 +416,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     streaming=true,
     read_batch_size=8192,
     bbox=None,
+    filter=None,
     profile="auto",
     in_flight_batches=0,
     spill_dir=None,
@@ -449,6 +460,7 @@ fn overview(
     streaming: bool,
     read_batch_size: usize,
     bbox: Option<(f64, f64, f64, f64)>,
+    filter: Option<String>,
     profile: &str,
     in_flight_batches: usize,
     spill_dir: Option<PathBuf>,
@@ -598,6 +610,7 @@ fn overview(
         coalesce_max_level_rows,
         coalesce_junction_angle,
         bbox: bbox.map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]),
+        filter,
         spill_dir,
     };
 

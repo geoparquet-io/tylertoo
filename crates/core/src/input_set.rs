@@ -142,6 +142,21 @@ impl RowGroupSelection {
     pub fn total_selected(&self) -> usize {
         self.0.iter().map(Vec::len).sum()
     }
+
+    /// Per-part intersection with `other` (#315): a row group survives only
+    /// when both selections keep it, so the bbox covering pruning and the
+    /// attribute-filter statistics pruning compose. Both selections must
+    /// come from the same source (same part count and order).
+    pub fn intersect(&self, other: &RowGroupSelection) -> RowGroupSelection {
+        debug_assert_eq!(self.0.len(), other.0.len());
+        let parts = self
+            .0
+            .iter()
+            .zip(&other.0)
+            .map(|(a, b)| a.iter().copied().filter(|i| b.contains(i)).collect())
+            .collect();
+        RowGroupSelection(parts)
+    }
 }
 
 /// How to read a [`ConvertSource`]: batch size, optional root-column
@@ -432,6 +447,23 @@ impl ConvertSource {
             .metas()?
             .iter()
             .map(|m| crate::overview::convert::select_input_row_groups(&m.parquet, bbox_units))
+            .collect();
+        Ok(RowGroupSelection(per_part))
+    }
+
+    /// Per-part attribute-filter row-group selection (#315): applies the
+    /// bound filter's column-statistics pushdown
+    /// ([`crate::overview::filter::BoundFilter::select_row_groups`]) to each
+    /// part independently. Conservative — groups without usable statistics
+    /// are kept.
+    pub fn select_row_groups_matching(
+        &self,
+        filter: &crate::overview::filter::BoundFilter,
+    ) -> Result<RowGroupSelection, InputError> {
+        let per_part = self
+            .metas()?
+            .iter()
+            .map(|m| filter.select_row_groups(&m.parquet))
             .collect();
         Ok(RowGroupSelection(per_part))
     }
