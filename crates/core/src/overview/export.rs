@@ -32,6 +32,16 @@
 //!    per zoom — the historical order — so the archive's tile-data layout,
 //!    deduplication, and directory are unchanged.
 //!
+//!    In **partitioning** mode the per-level wave read walks the accumulating
+//!    row-group prefix (§5.1), so a coarse row group would be re-read and
+//!    re-decoded by every finer level once per wave. Pass 2 therefore switches
+//!    to a **single-read fan-out** there (issue #235, the pass-2 analogue of
+//!    the #233 scan fix): one reader pass streams every band once, clips each
+//!    feature at every including level's zoom, and buffers the members in a
+//!    RAM/spill-backed [`MemberStore`] that the same wave loop drains — see
+//!    the "Pass-2 single-read fan-out" section below. Duplicating bands are
+//!    self-contained, so the per-level wave read stays.
+//!
 //! ## What this deliberately does NOT do (per `context/archive/CARRYOVER.md`)
 //!
 //! - **No global cross-zoom external sort / per-tile fan-out.** Tiling is done
@@ -58,6 +68,14 @@
 //! PMTiles writer streams tile bytes to a temp file, keeping only directory
 //! entries. There is **no** per-zoom or global accumulation.
 //!
+//! The partitioning single-read path (#235) buffers every level's clipped
+//! members between its fill and drain phases, but its **RAM** ceiling is
+//! unchanged: the auto RAM-vs-spill policy shared with the converter's pass-2
+//! sinks ([`auto_backing`]) keeps small buffered sets in RAM and spills large
+//! ones to a temp file, the fill's in-RAM buckets are capped at
+//! [`MEMBER_STORE_RAM_BUDGET`], and the drain holds one wave of partitions at
+//! a time — the same `O(one wave)` ceiling as the per-level read path.
+//!
 //! ## Tile-boundary duplication (expected MVT semantics)
 //!
 //! The overview *format* stores each feature once per level (no clipping). The
@@ -69,6 +87,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,12 +100,14 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema};
+use crossbeam_channel::bounded;
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
 use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArray;
 use prost::Message;
 use rayon::prelude::*;
 use serde::Serialize;
+use tempfile::NamedTempFile;
 
 use crate::batch_processor::extract_geometries_from_array;
 use crate::clip::{clip_geometry_simple, geometry_is_simple};
@@ -96,7 +118,7 @@ use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, tiles_for_bbox, BboxTileRanges, TileBounds, TileCoord};
 
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
-use super::pipeline::available_memory_bytes;
+use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
 use super::reader::{OverviewReader, ReaderError};
 use super::writer::LEVEL_COLUMN;
 
@@ -520,6 +542,29 @@ fn export_pmtiles_with_partition_target(
     options: &ExportOptions,
     partition_target: usize,
 ) -> Result<ExportReport, ExportError> {
+    export_pmtiles_impl(
+        input_path,
+        output_path,
+        options,
+        partition_target,
+        false,
+        None,
+    )
+}
+
+/// Full implementation with the #235 test knobs: `force_legacy_pass2` pins the
+/// pre-#235 per-level wave-read pass 2 (the byte-identity oracle the
+/// single-read fan-out is tested against; also the production duplicating
+/// path), and `backing_override` forces the member store's RAM/spill backing
+/// instead of the auto decision. Production callers pass `(false, None)`.
+fn export_pmtiles_impl(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    options: &ExportOptions,
+    partition_target: usize,
+    force_legacy_pass2: bool,
+    backing_override: Option<SinkBacking>,
+) -> Result<ExportReport, ExportError> {
     let start = Instant::now();
     let input_path = input_path.as_ref();
 
@@ -592,36 +637,91 @@ fn export_pmtiles_with_partition_target(
 
     let mut zooms: Vec<ZoomReport> = Vec::with_capacity(num_levels);
 
-    for (level_idx, scan) in scans.iter().enumerate() {
-        let zoom = zoom_for_level(&meta, level_idx);
+    // Plan every level's partitions and wave width up front. The partitioning
+    // single-read fill (#235) routes members by (level, partition, wave), so
+    // the drain loop below must consume the exact same plan it was filled
+    // against; hoisting the planning out of the level loop guarantees that.
+    let plans: Vec<LevelPlan> = scans
+        .iter()
+        .enumerate()
+        .map(|(level_idx, scan)| {
+            let zoom = zoom_for_level(&meta, level_idx);
 
-        // Split the zoom's tiles into contiguous ascending (x, y) ranges of
-        // roughly `partition_target` members each.
-        let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
+            // Split the zoom's tiles into contiguous ascending (x, y) ranges
+            // of roughly `partition_target` members each.
+            let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
 
-        // Per-level memory guard (#311): on `auto`, narrow the wave from THIS
-        // level's densest planned partition so a dense finest zoom does not OOM
-        // the whole run. Explicit waves are honoured verbatim.
-        let partition_wave = if auto_wave {
-            let w =
-                memory_safe_level_wave(ceiling_wave, &partitions, mean_member_bytes, available_ram);
-            if w < ceiling_wave {
-                let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-                let budget_mib = available_ram
-                    .map(|r| ((r as f64 * EXPORT_WAVE_RAM_FRACTION) as u64) / (1024 * 1024))
-                    .unwrap_or(0);
-                log::info!(
-                    "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
-                     (densest partition {densest} members × ~{} B/member × {MEMBER_MEMORY_INFLATION}, \
-                     {budget_mib} MiB budget) — #311 density guard",
-                    level_idx + 1,
-                    mean_member_bytes.unwrap_or(0),
+            // Per-level memory guard (#311): on `auto`, narrow the wave from
+            // THIS level's densest planned partition so a dense finest zoom
+            // does not OOM the whole run. Explicit waves are honoured verbatim.
+            let wave = if auto_wave {
+                let w = memory_safe_level_wave(
+                    ceiling_wave,
+                    &partitions,
+                    mean_member_bytes,
+                    available_ram,
                 );
+                if w < ceiling_wave {
+                    let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+                    let budget_mib = available_ram
+                        .map(|r| ((r as f64 * EXPORT_WAVE_RAM_FRACTION) as u64) / (1024 * 1024))
+                        .unwrap_or(0);
+                    log::info!(
+                        "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
+                         (densest partition {densest} members × ~{} B/member × {MEMBER_MEMORY_INFLATION}, \
+                         {budget_mib} MiB budget) — #311 density guard",
+                        level_idx + 1,
+                        mean_member_bytes.unwrap_or(0),
+                    );
+                }
+                w
+            } else {
+                ceiling_wave
+            };
+            LevelPlan {
+                zoom,
+                partitions,
+                wave,
             }
-            w
-        } else {
-            ceiling_wave
-        };
+        })
+        .collect();
+
+    // Pass 2 read strategy (#235): in partitioning mode a level's render set
+    // is the accumulating row-group prefix (§5.1), so the legacy per-level
+    // wave read re-reads and re-decodes every coarse row group once per finer
+    // level per wave. Instead read every band exactly once, clip each feature
+    // at every including level's zoom during that single pass, and buffer the
+    // clipped members in a per-(level, wave) store whose RAM footprint is
+    // bounded by the same auto RAM-vs-spill policy as the converter's pass-2
+    // sinks. Duplicating bands are self-contained — the per-level wave read
+    // already touches each row group for exactly one level — so the legacy
+    // path is kept there (and as the tests' byte-identity oracle).
+    let single_read = matches!(reader.mode(), Mode::Partitioning) && !force_legacy_pass2;
+    let mut store = if single_read {
+        let buffered_rows: usize = scans.iter().map(|s| s.feature_count).sum();
+        let backing = backing_override.unwrap_or_else(|| {
+            let b = auto_backing(
+                Mode::Partitioning,
+                buffered_rows,
+                available_ram,
+                mean_member_bytes,
+            );
+            log::info!(
+                "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \
+                 member row(s) across {num_levels} level(s) → {b:?}"
+            );
+            b
+        });
+        Some(fill_member_store(&reader, crs, &plans, options, backing)?)
+    } else {
+        None
+    };
+
+    for (level_idx, plan) in plans.iter().enumerate() {
+        let scan = &scans[level_idx];
+        let zoom = plan.zoom;
+        let partitions = &plan.partitions;
+        let partition_wave = plan.wave;
 
         // Pass 2: process partitions in ascending tile order, streaming each
         // finished partition's encoded tiles straight to the writer. To hide
@@ -647,7 +747,10 @@ fn export_pmtiles_with_partition_target(
         // slow; if it freezes the level is stuck — diagnosable in minutes.
         let mut last_wave_log = Instant::now();
         for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
-            let results: Vec<Vec<EncodedTile>> = process_wave(&ctx, wave)?;
+            let results: Vec<Vec<EncodedTile>> = match store.as_mut() {
+                Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options)?,
+                None => process_wave(&ctx, wave)?,
+            };
             let t_write = Instant::now();
             for tiles in &results {
                 for t in tiles {
@@ -804,6 +907,713 @@ struct LevelCtx<'a> {
     crs: Crs,
     zoom: u8,
     opts: &'a ExportOptions,
+}
+
+/// One level's precomputed pass-2 plan: its Web Mercator zoom, its planned
+/// partitions, and its resolved wave width. Computed once before pass 2 so the
+/// partitioning single-read fill (#235) and the drain loop agree exactly on
+/// partition boundaries and wave chunking.
+struct LevelPlan {
+    zoom: u8,
+    partitions: Vec<Partition>,
+    wave: usize,
+}
+
+// ============================================================================
+// Pass-2 single-read fan-out for partitioning mode (issue #235)
+// ============================================================================
+//
+// In partitioning mode a level's render set is the accumulating row-group
+// prefix `0..=end_k` (spec §5.1), so the legacy pass 2 — one bbox-pruned
+// prefix read per wave per level — re-reads and re-decodes a coarse row group
+// once per finer level per wave. The machinery below reads each band exactly
+// once (the pass-2 analogue of #233's scan fix), clips every feature at every
+// including level's zoom during that single pass, and buffers the clipped
+// members in a per-(level, wave) [`MemberStore`] until the drain loop encodes
+// them in the historical level/partition/tile order.
+//
+// **Byte identity.** A tile member's clipped geometry is key-window
+// independent (pinned by `recursive_split_is_partition_range_invariant`), so
+// clipping once over the full key range and routing by key yields the same
+// members the per-wave range-restricted clips produced. Within-tile order is
+// carried by `seq` — here the global row index in band order, which restricts
+// to exactly the relative order the legacy pruned prefix reads yielded — and
+// `encode_members` sorts by the unique `(key, seq)` before grouping, so buffer
+// and spill order are irrelevant. The drain replays the identical ascending
+// (level, partition, tile) write order.
+//
+// **Memory.** The store's RAM footprint follows the converter's pass-2 sink
+// policy ([`auto_backing`]): small buffered sets stay in RAM; large ones spill
+// member records to one temp file. Under spill backing the in-RAM buckets are
+// bounded by [`MEMBER_STORE_RAM_BUDGET`] during the fill (largest buckets are
+// flushed first, in whole segments, so spill I/O stays chunky and sequential),
+// and every bucket is flushed at fill end. The drain then holds only one
+// wave's members at a time — the same `O(one wave of partitions)` ceiling as
+// the legacy path.
+
+/// In-RAM ceiling (estimated bytes) for the member store's not-yet-flushed
+/// buckets under spill backing. Crossing it flushes the largest buckets down
+/// to half the ceiling; the fill's buffered transient is therefore bounded
+/// regardless of input size, while flushes stay large enough to keep the spill
+/// file's segments chunky.
+const MEMBER_STORE_RAM_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Bounded-channel depth between the band reader thread and the clip/route
+/// consumer of the single-read fill — the read/compute overlap and
+/// backpressure knob, mirroring `overview/pipeline.rs`.
+const SINGLE_READ_IN_FLIGHT: usize = 4;
+
+fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Coordinates spill as raw IEEE-754 bit patterns (`to_bits`/`from_bits`), so
+/// the round-trip is bit-exact — including negative zero — and the re-encoded
+/// MVT bytes cannot drift through the spill.
+fn put_coord(buf: &mut Vec<u8>, c: geo::Coord<f64>) {
+    put_u64(buf, c.x.to_bits());
+    put_u64(buf, c.y.to_bits());
+}
+
+fn put_line_string(buf: &mut Vec<u8>, ls: &geo::LineString<f64>) {
+    put_u32(buf, ls.0.len() as u32);
+    for c in &ls.0 {
+        put_coord(buf, *c);
+    }
+}
+
+fn put_polygon(buf: &mut Vec<u8>, p: &geo::Polygon<f64>) {
+    put_u32(buf, 1 + p.interiors().len() as u32);
+    put_line_string(buf, p.exterior());
+    for r in p.interiors() {
+        put_line_string(buf, r);
+    }
+}
+
+/// Serialize one geometry for the member spill (tag byte + payload). Covers
+/// every [`Geometry`] variant so clip pass-throughs of any decoded input shape
+/// survive the spill.
+fn encode_geometry(buf: &mut Vec<u8>, g: &Geometry<f64>) {
+    match g {
+        Geometry::Point(p) => {
+            buf.push(0);
+            put_coord(buf, p.0);
+        }
+        Geometry::Line(l) => {
+            buf.push(1);
+            put_coord(buf, l.start);
+            put_coord(buf, l.end);
+        }
+        Geometry::LineString(ls) => {
+            buf.push(2);
+            put_line_string(buf, ls);
+        }
+        Geometry::Polygon(p) => {
+            buf.push(3);
+            put_polygon(buf, p);
+        }
+        Geometry::MultiPoint(mp) => {
+            buf.push(4);
+            put_u32(buf, mp.0.len() as u32);
+            for p in &mp.0 {
+                put_coord(buf, p.0);
+            }
+        }
+        Geometry::MultiLineString(mls) => {
+            buf.push(5);
+            put_u32(buf, mls.0.len() as u32);
+            for ls in &mls.0 {
+                put_line_string(buf, ls);
+            }
+        }
+        Geometry::MultiPolygon(mp) => {
+            buf.push(6);
+            put_u32(buf, mp.0.len() as u32);
+            for p in &mp.0 {
+                put_polygon(buf, p);
+            }
+        }
+        Geometry::GeometryCollection(gc) => {
+            buf.push(7);
+            put_u32(buf, gc.0.len() as u32);
+            for g in &gc.0 {
+                encode_geometry(buf, g);
+            }
+        }
+        Geometry::Rect(r) => {
+            buf.push(8);
+            put_coord(buf, r.min());
+            put_coord(buf, r.max());
+        }
+        Geometry::Triangle(t) => {
+            buf.push(9);
+            put_coord(buf, t.v1());
+            put_coord(buf, t.v2());
+            put_coord(buf, t.v3());
+        }
+    }
+}
+
+/// Serialize one member: key, seq, properties, geometry. Property floats spill
+/// as bit patterns for the same exactness guarantee as coordinates.
+fn encode_member(buf: &mut Vec<u8>, m: &Member) {
+    put_u64(buf, m.key);
+    put_u64(buf, m.seq);
+    put_u32(buf, m.props.len() as u32);
+    for (name, v) in m.props.iter() {
+        put_u32(buf, name.len() as u32);
+        buf.extend_from_slice(name.as_bytes());
+        match v {
+            PropertyValue::String(s) => {
+                buf.push(0);
+                put_u32(buf, s.len() as u32);
+                buf.extend_from_slice(s.as_bytes());
+            }
+            PropertyValue::Float(f) => {
+                buf.push(1);
+                put_u32(buf, f.to_bits());
+            }
+            PropertyValue::Double(d) => {
+                buf.push(2);
+                put_u64(buf, d.to_bits());
+            }
+            PropertyValue::Int(i) => {
+                buf.push(3);
+                put_u64(buf, *i as u64);
+            }
+            PropertyValue::UInt(u) => {
+                buf.push(4);
+                put_u64(buf, *u);
+            }
+            PropertyValue::Bool(b) => {
+                buf.push(5);
+                buf.push(*b as u8);
+            }
+        }
+    }
+    encode_geometry(buf, &m.geom);
+}
+
+/// The "spill decode failed" error: the temp file is written and read by this
+/// process only, so any mismatch is a bug (or disk corruption), never user
+/// input.
+fn spill_corrupt() -> ExportError {
+    ExportError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "member spill decode: truncated or corrupt record",
+    ))
+}
+
+/// Bounds-checked reader over one spill segment's bytes.
+struct SpillCursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SpillCursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        SpillCursor { buf, pos: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ExportError> {
+        let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len());
+        let Some(end) = end else {
+            return Err(spill_corrupt());
+        };
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8, ExportError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, ExportError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64, ExportError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn coord(&mut self) -> Result<geo::Coord<f64>, ExportError> {
+        let x = f64::from_bits(self.u64()?);
+        let y = f64::from_bits(self.u64()?);
+        Ok(geo::coord! { x: x, y: y })
+    }
+
+    fn line_string(&mut self) -> Result<geo::LineString<f64>, ExportError> {
+        let n = self.u32()? as usize;
+        let mut coords = Vec::with_capacity(n);
+        for _ in 0..n {
+            coords.push(self.coord()?);
+        }
+        Ok(geo::LineString(coords))
+    }
+
+    fn polygon(&mut self) -> Result<geo::Polygon<f64>, ExportError> {
+        let rings = self.u32()? as usize;
+        if rings == 0 {
+            return Err(spill_corrupt());
+        }
+        let exterior = self.line_string()?;
+        let mut interiors = Vec::with_capacity(rings - 1);
+        for _ in 1..rings {
+            interiors.push(self.line_string()?);
+        }
+        Ok(geo::Polygon::new(exterior, interiors))
+    }
+
+    fn string(&mut self) -> Result<String, ExportError> {
+        let n = self.u32()? as usize;
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| spill_corrupt())
+    }
+}
+
+fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportError> {
+    Ok(match cur.u8()? {
+        0 => Geometry::Point(geo::Point(cur.coord()?)),
+        1 => Geometry::Line(geo::Line::new(cur.coord()?, cur.coord()?)),
+        2 => Geometry::LineString(cur.line_string()?),
+        3 => Geometry::Polygon(cur.polygon()?),
+        4 => {
+            let n = cur.u32()? as usize;
+            let mut pts = Vec::with_capacity(n);
+            for _ in 0..n {
+                pts.push(geo::Point(cur.coord()?));
+            }
+            Geometry::MultiPoint(geo::MultiPoint(pts))
+        }
+        5 => {
+            let n = cur.u32()? as usize;
+            let mut lines = Vec::with_capacity(n);
+            for _ in 0..n {
+                lines.push(cur.line_string()?);
+            }
+            Geometry::MultiLineString(geo::MultiLineString(lines))
+        }
+        6 => {
+            let n = cur.u32()? as usize;
+            let mut polys = Vec::with_capacity(n);
+            for _ in 0..n {
+                polys.push(cur.polygon()?);
+            }
+            Geometry::MultiPolygon(geo::MultiPolygon(polys))
+        }
+        7 => {
+            let n = cur.u32()? as usize;
+            let mut geoms = Vec::with_capacity(n);
+            for _ in 0..n {
+                geoms.push(decode_geometry(cur)?);
+            }
+            Geometry::GeometryCollection(geo::GeometryCollection(geoms))
+        }
+        8 => Geometry::Rect(geo::Rect::new(cur.coord()?, cur.coord()?)),
+        9 => Geometry::Triangle(geo::Triangle::new(cur.coord()?, cur.coord()?, cur.coord()?)),
+        _ => return Err(spill_corrupt()),
+    })
+}
+
+fn decode_member(cur: &mut SpillCursor<'_>) -> Result<Member, ExportError> {
+    let key = cur.u64()?;
+    let seq = cur.u64()?;
+    let n_props = cur.u32()? as usize;
+    let mut props = Vec::with_capacity(n_props);
+    for _ in 0..n_props {
+        let name = cur.string()?;
+        let value = match cur.u8()? {
+            0 => PropertyValue::String(cur.string()?),
+            1 => PropertyValue::Float(f32::from_bits(cur.u32()?)),
+            2 => PropertyValue::Double(f64::from_bits(cur.u64()?)),
+            3 => PropertyValue::Int(cur.u64()? as i64),
+            4 => PropertyValue::UInt(cur.u64()?),
+            5 => PropertyValue::Bool(cur.u8()? != 0),
+            _ => return Err(spill_corrupt()),
+        };
+        props.push((name, value));
+    }
+    let geom = decode_geometry(cur)?;
+    Ok(Member {
+        key,
+        seq,
+        geom,
+        props: Arc::new(props),
+    })
+}
+
+/// Rough in-RAM cost of one buffered member, for the fill-phase budget only
+/// (never output-bound): struct + `Vec` headers, 16 B per coordinate, and the
+/// property payload (spilled per member, so counted per member).
+fn member_bytes_estimate(m: &Member) -> usize {
+    48 + m.geom.coords_count() * 16
+        + m.props
+            .iter()
+            .map(|(n, v)| {
+                24 + n.len()
+                    + match v {
+                        PropertyValue::String(s) => s.len(),
+                        _ => 8,
+                    }
+            })
+            .sum::<usize>()
+}
+
+/// The single spill file behind a [`MemberStore`]: bucket flushes append
+/// length-indexed segments; `segments[level][wave]` records each segment's
+/// `(offset, len)` in append order.
+struct MemberSpill {
+    writer: BufWriter<File>,
+    read: File,
+    /// Keeps the anonymous temp file alive (unlinked on drop).
+    _temp: NamedTempFile,
+    offset: u64,
+    segments: Vec<Vec<Vec<(u64, u64)>>>,
+}
+
+/// Per-(level, wave) buffered tile members for the partitioning single-read
+/// pass 2 (#235), with RAM or spill backing. See the section comment above for
+/// the ordering and memory arguments.
+struct MemberStore {
+    /// `[level][wave]` in-RAM member buckets.
+    buckets: Vec<Vec<Vec<Member>>>,
+    /// Estimated bytes held by each in-RAM bucket.
+    bucket_bytes: Vec<Vec<usize>>,
+    /// Total estimated bytes across all in-RAM buckets.
+    buffered_bytes: usize,
+    /// Present under spill backing only.
+    spill: Option<MemberSpill>,
+}
+
+impl MemberStore {
+    fn new(plans: &[LevelPlan], backing: SinkBacking) -> Result<Self, ExportError> {
+        let shape: Vec<usize> = plans
+            .iter()
+            .map(|p| p.partitions.len().div_ceil(p.wave.max(1)))
+            .collect();
+        let buckets = shape
+            .iter()
+            .map(|&w| (0..w).map(|_| Vec::new()).collect())
+            .collect();
+        let bucket_bytes = shape.iter().map(|&w| vec![0usize; w]).collect();
+        let spill = match backing {
+            SinkBacking::Ram => None,
+            SinkBacking::Spill => {
+                let temp = NamedTempFile::new()?;
+                let writer = BufWriter::new(temp.reopen()?);
+                let read = temp.reopen()?;
+                Some(MemberSpill {
+                    writer,
+                    read,
+                    _temp: temp,
+                    offset: 0,
+                    segments: shape
+                        .iter()
+                        .map(|&w| (0..w).map(|_| Vec::new()).collect())
+                        .collect(),
+                })
+            }
+        };
+        Ok(MemberStore {
+            buckets,
+            bucket_bytes,
+            buffered_bytes: 0,
+            spill,
+        })
+    }
+
+    fn push(&mut self, level: usize, wave: usize, m: Member) -> Result<(), ExportError> {
+        let est = member_bytes_estimate(&m);
+        self.buckets[level][wave].push(m);
+        self.bucket_bytes[level][wave] += est;
+        self.buffered_bytes += est;
+        if self.spill.is_some() && self.buffered_bytes > MEMBER_STORE_RAM_BUDGET {
+            self.flush_largest_until(MEMBER_STORE_RAM_BUDGET / 2)?;
+        }
+        Ok(())
+    }
+
+    /// Flush the largest in-RAM buckets (whole segments — chunky, sequential
+    /// spill writes) until the buffered estimate drops to `floor`.
+    fn flush_largest_until(&mut self, floor: usize) -> Result<(), ExportError> {
+        while self.buffered_bytes > floor {
+            let mut best = (0usize, 0usize, 0usize);
+            for (li, level) in self.bucket_bytes.iter().enumerate() {
+                for (wi, &b) in level.iter().enumerate() {
+                    if b > best.2 {
+                        best = (li, wi, b);
+                    }
+                }
+            }
+            if best.2 == 0 {
+                break;
+            }
+            self.flush_bucket(best.0, best.1)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize one bucket's members as a single appended spill segment and
+    /// clear the bucket.
+    fn flush_bucket(&mut self, level: usize, wave: usize) -> Result<(), ExportError> {
+        use std::io::Write;
+        let members = std::mem::take(&mut self.buckets[level][wave]);
+        let bytes = std::mem::take(&mut self.bucket_bytes[level][wave]);
+        self.buffered_bytes -= bytes;
+        if members.is_empty() {
+            return Ok(());
+        }
+        let spill = self
+            .spill
+            .as_mut()
+            .expect("flush_bucket requires spill backing");
+        let mut buf = Vec::with_capacity(bytes + 16);
+        put_u64(&mut buf, members.len() as u64);
+        for m in &members {
+            encode_member(&mut buf, m);
+        }
+        spill.writer.write_all(&buf)?;
+        spill.segments[level][wave].push((spill.offset, buf.len() as u64));
+        spill.offset += buf.len() as u64;
+        Ok(())
+    }
+
+    /// Finish the fill phase. Under spill backing every remaining bucket is
+    /// flushed (the store was chosen *because* the buffered set is large; the
+    /// tail is negligible and this keeps the drain's RAM at one wave) and the
+    /// writer is flushed so `take_wave` reads observe every segment.
+    fn finish_fill(&mut self) -> Result<(), ExportError> {
+        use std::io::Write;
+        if self.spill.is_some() {
+            for li in 0..self.buckets.len() {
+                for wi in 0..self.buckets[li].len() {
+                    self.flush_bucket(li, wi)?;
+                }
+            }
+            self.spill
+                .as_mut()
+                .expect("spill checked above")
+                .writer
+                .flush()?;
+        }
+        Ok(())
+    }
+
+    /// Take one wave's members out of the store: spill segments (in append
+    /// order) followed by any in-RAM remainder. Member order is irrelevant to
+    /// the output — `encode_members` sorts by the unique `(key, seq)`.
+    fn take_wave(&mut self, level: usize, wave: usize) -> Result<Vec<Member>, ExportError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut out = Vec::new();
+        if let Some(spill) = self.spill.as_mut() {
+            for &(off, len) in &spill.segments[level][wave] {
+                spill.read.seek(SeekFrom::Start(off))?;
+                let mut buf = vec![0u8; len as usize];
+                spill.read.read_exact(&mut buf)?;
+                let mut cur = SpillCursor::new(&buf);
+                let n = cur.u64()? as usize;
+                out.reserve(n);
+                for _ in 0..n {
+                    out.push(decode_member(&mut cur)?);
+                }
+                if !cur.is_empty() {
+                    return Err(spill_corrupt());
+                }
+            }
+            spill.segments[level][wave] = Vec::new();
+        }
+        let bytes = std::mem::take(&mut self.bucket_bytes[level][wave]);
+        self.buffered_bytes -= bytes;
+        out.append(&mut self.buckets[level][wave]);
+        Ok(out)
+    }
+}
+
+/// The single-read fill (#235): a dedicated reader thread streams every band
+/// once, in band order, over a bounded channel (mirroring
+/// `overview/pipeline.rs`); the consumer decodes each batch once and fans its
+/// clipped members to every level whose render set includes the band — in
+/// partitioning mode, band `j` feeds levels `{j..N}`.
+fn fill_member_store(
+    reader: &OverviewReader,
+    crs: Crs,
+    plans: &[LevelPlan],
+    opts: &ExportOptions,
+    backing: SinkBacking,
+) -> Result<MemberStore, ExportError> {
+    let num_levels = plans.len();
+    let mut store = MemberStore::new(plans, backing)?;
+    let t_fill = Instant::now();
+    let mut seq = 0u64;
+    let (tx, rx) = bounded::<(usize, RecordBatch)>(SINGLE_READ_IN_FLIGHT);
+    let store_ref = &mut store;
+    let seq_ref = &mut seq;
+    std::thread::scope(|scope| -> Result<(), ExportError> {
+        let reader_handle = scope.spawn(move || -> Result<(), ExportError> {
+            for band in 0..num_levels {
+                let band_reader = reader.read_band_with_batch_size(band, EXPORT_BATCH_SIZE)?;
+                for batch in band_reader {
+                    if tx.send((band, batch?)).is_err() {
+                        return Ok(()); // consumer dropped the receiver (error path)
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        // Consumer: batches arrive in band order (bands are contiguous
+        // ascending row groups), so the running `seq` is the global file row
+        // index — the band-order sequence every level's within-tile ordering
+        // derives from.
+        let consume: Result<(), ExportError> = (|| {
+            for (band, batch) in rx.iter() {
+                fanout_batch_members(&batch, band, crs, plans, opts, seq_ref, store_ref)?;
+            }
+            Ok(())
+        })();
+        drop(rx);
+
+        match reader_handle.join() {
+            Ok(read_result) => read_result?,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+        consume
+    })?;
+    store.finish_fill()?;
+    log::info!(
+        "[export] pass2 fill (#235): {seq} row(s) read once and fanned across \
+         {num_levels} level(s) in {:.2}s",
+        t_fill.elapsed().as_secs_f64(),
+    );
+    Ok(store)
+}
+
+/// Decode one band batch and fan its members out: clip every feature (in
+/// parallel) at each including level's zoom over the **full** key range, then
+/// route each member to its `(level, partition wave)` bucket. The legacy
+/// analogue is [`collect_wave_members`]; see the section comment for why the
+/// results are byte-identical.
+fn fanout_batch_members(
+    batch: &RecordBatch,
+    band: usize,
+    crs: Crs,
+    plans: &[LevelPlan],
+    opts: &ExportOptions,
+    seq: &mut u64,
+    store: &mut MemberStore,
+) -> Result<(), ExportError> {
+    let schema = batch.schema();
+    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
+    let geom_field = schema.field(geom_idx).clone();
+    let garr: Arc<dyn GeoArrowArray> =
+        from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
+            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
+    extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
+    if matches!(crs, Crs::Epsg3857) {
+        geoms = geoms.par_iter().map(reproject_3857_to_4326).collect();
+    }
+
+    // Band `j` belongs to every level `k >= j`'s render set (partitioning
+    // prefix). A level with no planned partitions sized no tiles, so no
+    // feature in its render set can emit members — skip it (routing into an
+    // empty plan would be unreachable anyway).
+    let targets: Vec<usize> = (band..plans.len())
+        .filter(|&k| !plans[k].partitions.is_empty())
+        .collect();
+    // `[target][row]` -> the row's `(key, clipped geometry)` members at that
+    // target level.
+    type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
+    let mut per_level: Vec<RowMembers> = targets
+        .iter()
+        .map(|&k| {
+            geoms
+                .par_iter()
+                .map(|g| feature_tile_members(g, plans[k].zoom, opts, 0, u64::MAX))
+                .collect()
+        })
+        .collect();
+    drop(geoms);
+
+    if per_level.iter().all(|rows| rows.iter().all(Vec::is_empty)) {
+        *seq += batch.num_rows() as u64;
+        return Ok(());
+    }
+
+    // Extract property columns once per batch; materialize per-feature props
+    // only for rows that produced members at any level, shared across the
+    // row's members via `Arc` (as the legacy path does per wave).
+    let prop_cols = property_columns(&schema, geom_idx);
+    let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
+        Vec::with_capacity(prop_cols.len());
+    for &(idx, ref name) in &prop_cols {
+        extracted.push((name.clone(), extract_property_column(batch.column(idx))));
+    }
+    for row in 0..batch.num_rows() {
+        if per_level.iter().all(|rows| rows[row].is_empty()) {
+            *seq += 1;
+            continue;
+        }
+        let mut props = Vec::with_capacity(extracted.len());
+        for (name, col) in &extracted {
+            if let Some(v) = &col[row] {
+                props.push((name.clone(), v.clone()));
+            }
+        }
+        let props = Arc::new(props);
+        for (ti, &k) in targets.iter().enumerate() {
+            let items = std::mem::take(&mut per_level[ti][row]);
+            let plan = &plans[k];
+            for (key, geom) in items {
+                let pidx = route_partition(&plan.partitions, key);
+                let wave = pidx / plan.wave.max(1);
+                store.push(
+                    k,
+                    wave,
+                    Member {
+                        key,
+                        seq: *seq,
+                        geom,
+                        props: Arc::clone(&props),
+                    },
+                )?;
+            }
+        }
+        *seq += 1;
+    }
+    Ok(())
+}
+
+/// Pass-2 drain for one wave under the single-read path: take the wave's
+/// buffered members, bucket them per partition (exactly as
+/// [`collect_wave_members`] routes), and encode each partition as
+/// [`process_wave`] would — same parallel section, same ascending output
+/// order.
+fn encode_wave_from_store(
+    store: &mut MemberStore,
+    level_idx: usize,
+    wave_idx: usize,
+    wave: &[Partition],
+    zoom: u8,
+    opts: &ExportOptions,
+) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
+    let members = store.take_wave(level_idx, wave_idx)?;
+    let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
+    for m in members {
+        buckets[route_partition(wave, m.key)].push(m);
+    }
+    buckets
+        .into_par_iter()
+        .map(|members| encode_members(members, zoom, opts))
+        .collect::<Result<_, _>>()
 }
 
 /// Scan **every** level in a single streaming read of the file (issue #233).
@@ -3022,6 +3832,271 @@ mod tests {
             limited_count < full_count,
             "valve must drop features ({limited_count} !< {full_count})"
         );
+    }
+
+    // --- #235: partitioning single-read fan-out pass 2 -----------------------
+
+    /// Round-trip exactness of the member spill codec: key, seq, every
+    /// [`PropertyValue`] variant, and every [`Geometry`] variant, verified
+    /// bit-exactly (via re-encoded bytes, since `PartialEq` would call
+    /// `-0.0 == 0.0` equal and hide a sign flip through the spill).
+    #[test]
+    fn member_spill_codec_roundtrip_is_exact() {
+        use geo::{
+            coord, GeometryCollection, Line, MultiLineString, MultiPoint, MultiPolygon, Rect,
+            Triangle,
+        };
+        let poly = geo::Polygon::new(
+            LineString::from(vec![
+                (0.0, 0.0),
+                (4.0, 0.0),
+                (4.0, 4.0),
+                (0.0, 4.0),
+                (0.0, 0.0),
+            ]),
+            vec![LineString::from(vec![
+                (1.0, 1.0),
+                (2.0, 1.0),
+                (2.0, 2.0),
+                (1.0, 2.0),
+                (1.0, 1.0),
+            ])],
+        );
+        let geoms: Vec<Geometry<f64>> = vec![
+            Geometry::Point(Point::new(-0.0, std::f64::consts::PI)),
+            Geometry::Line(Line::new(
+                coord! { x: -1.5, y: 2.5 },
+                coord! { x: 3.25, y: -4.75 },
+            )),
+            Geometry::LineString(LineString::from(vec![(1.1, 2.2), (3.3, 4.4)])),
+            Geometry::Polygon(poly.clone()),
+            Geometry::MultiPoint(MultiPoint::from(vec![
+                Point::new(1.0, 2.0),
+                Point::new(-3.0, -4.0),
+            ])),
+            Geometry::MultiLineString(MultiLineString::new(vec![LineString::from(vec![
+                (0.0, 1.0),
+                (2.0, 3.0),
+            ])])),
+            Geometry::MultiPolygon(MultiPolygon::new(vec![poly.clone()])),
+            Geometry::GeometryCollection(GeometryCollection::from(vec![
+                Geometry::Point(Point::new(9.0, 9.0)),
+                Geometry::Polygon(poly),
+            ])),
+            Geometry::Rect(Rect::new(
+                coord! { x: 0.0, y: 0.0 },
+                coord! { x: 1.0, y: 1.0 },
+            )),
+            Geometry::Triangle(Triangle::new(
+                coord! { x: 0.0, y: 0.0 },
+                coord! { x: 1.0, y: 0.0 },
+                coord! { x: 0.0, y: 1.0 },
+            )),
+        ];
+        let props: Vec<(String, PropertyValue)> = vec![
+            ("s".to_string(), PropertyValue::String("héllo".to_string())),
+            ("f".to_string(), PropertyValue::Float(-0.0f32)),
+            ("d".to_string(), PropertyValue::Double(f64::MIN_POSITIVE)),
+            ("i".to_string(), PropertyValue::Int(-42)),
+            ("u".to_string(), PropertyValue::UInt(u64::MAX)),
+            ("b".to_string(), PropertyValue::Bool(true)),
+        ];
+        for (i, g) in geoms.into_iter().enumerate() {
+            let m = Member {
+                key: tile_key(7, 11) + i as u64,
+                seq: u64::MAX - i as u64,
+                geom: g,
+                props: Arc::new(props.clone()),
+            };
+            let mut buf = Vec::new();
+            encode_member(&mut buf, &m);
+            let mut cur = SpillCursor::new(&buf);
+            let back = decode_member(&mut cur).unwrap();
+            assert!(cur.is_empty(), "trailing bytes after decode (geometry {i})");
+            assert_eq!(back.key, m.key);
+            assert_eq!(back.seq, m.seq);
+            assert_eq!(*back.props, *m.props);
+            let mut buf2 = Vec::new();
+            encode_member(&mut buf2, &back);
+            assert_eq!(buf, buf2, "re-encoded member bytes differ (geometry {i})");
+        }
+    }
+
+    /// The member store's spill path: bucket flushes append segments to one
+    /// temp file; `take_wave` reads a wave's segments back in append order
+    /// (plus any RAM remainder), returning exactly the members pushed to it.
+    #[test]
+    fn member_store_spill_segments_roundtrip() {
+        // One level, two single-partition waves (wave width 1).
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10, 10]),
+            wave: 1,
+        }];
+        let mut store = MemberStore::new(&plans, SinkBacking::Spill).unwrap();
+        let mk = |key: u64, seq: u64| Member {
+            key,
+            seq,
+            geom: Geometry::Point(Point::new(seq as f64, -1.0)),
+            props: Arc::new(vec![("id".to_string(), PropertyValue::Int(seq as i64))]),
+        };
+        store.push(0, 0, mk(0, 0)).unwrap();
+        store.push(0, 1, mk(1, 1)).unwrap();
+        // Force a mid-fill flush so wave 0 spans two spill segments.
+        store.flush_bucket(0, 0).unwrap();
+        store.push(0, 0, mk(0, 2)).unwrap();
+        store.finish_fill().unwrap();
+
+        let w0 = store.take_wave(0, 0).unwrap();
+        let w1 = store.take_wave(0, 1).unwrap();
+        assert_eq!(w0.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(w1.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1]);
+        assert!(w0.iter().all(|m| m.key == 0));
+        assert!(w1.iter().all(|m| m.key == 1));
+        assert_eq!(w0[0].props[0].1, PropertyValue::Int(0));
+    }
+
+    /// Rich 3-level **partitioning** fixture for the #235 byte-equality tests:
+    /// per-band mixes of points, seam-crossing lines, and multi-tile polygons
+    /// with tiny row groups so bands span several row groups and coarse
+    /// features genuinely fan into finer levels' render sets.
+    fn partitioning_equivalence_fixture(path: &Path) {
+        let wide = Geometry::LineString(LineString::from(vec![
+            (-100.0, 10.0),
+            (-80.0, 12.0),
+            (-60.0, 8.0),
+            (-40.0, 11.0),
+        ]));
+        let concave = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-100.0, 25.0),
+                (-98.0, 25.0),
+                (-98.0, 27.0),
+                (-99.0, 25.5),
+                (-100.0, 27.0),
+                (-100.0, 25.0),
+            ]),
+            vec![],
+        ));
+        let big_box = Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (-20.0, -20.0),
+                (20.0, -20.0),
+                (20.0, 20.0),
+                (-20.0, 20.0),
+                (-20.0, -20.0),
+            ]),
+            vec![],
+        ));
+        let mut coords = Vec::new();
+        for k in 0..200 {
+            coords.push((30.0 + k as f64 * 0.3, -20.0 + (k as f64 * 0.1).sin()));
+        }
+        let wiggly = Geometry::LineString(LineString::from(coords));
+        write_partitioning_fixture(
+            path,
+            &[
+                // Level 0 (z2): spread points + a continent-scale polygon.
+                (
+                    vec![0, 1, 2],
+                    vec![
+                        Geometry::Point(Point::new(-120.0, 40.0)),
+                        Geometry::Point(Point::new(120.0, -40.0)),
+                        big_box,
+                    ],
+                ),
+                // Level 1 (z4): a seam-crossing line + points + concave poly.
+                (
+                    vec![3, 4, 5, 6],
+                    vec![
+                        wide,
+                        Geometry::Point(Point::new(0.0, 0.0)),
+                        Geometry::Point(Point::new(-119.5, 39.5)),
+                        concave,
+                    ],
+                ),
+                // Level 2 (z6): dense line + clustered points.
+                (
+                    vec![7, 8, 9, 10],
+                    vec![
+                        wiggly,
+                        Geometry::Point(Point::new(-118.0, 34.0)),
+                        Geometry::Point(Point::new(2.0, 48.0)),
+                        Geometry::Point(Point::new(-117.5, 33.8)),
+                    ],
+                ),
+            ],
+        );
+    }
+
+    /// #235: the partitioning single-read fan-out pass 2 must produce a
+    /// byte-identical archive (and equal report) to the legacy per-level
+    /// wave-read pass 2 it replaces — under both member-store backings, and
+    /// with a tiny partition target plus explicit narrow waves so many
+    /// partitions and multiple waves per level actually form.
+    #[test]
+    fn partitioning_single_read_pass2_matches_legacy() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        partitioning_equivalence_fixture(tin.path());
+        for (target, wave) in [(1usize, 1usize), (1, 3), (DEFAULT_PARTITION_TARGET, 2)] {
+            let opts = ExportOptions {
+                layer_name: "ref".to_string(),
+                partition_wave: wave,
+                ..Default::default()
+            };
+            let t_legacy = tempfile::NamedTempFile::new().unwrap();
+            let r_legacy =
+                export_pmtiles_impl(tin.path(), t_legacy.path(), &opts, target, true, None)
+                    .unwrap();
+            let legacy_bytes = std::fs::read(t_legacy.path()).unwrap();
+            for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+                let t_new = tempfile::NamedTempFile::new().unwrap();
+                let r_new = export_pmtiles_impl(
+                    tin.path(),
+                    t_new.path(),
+                    &opts,
+                    target,
+                    false,
+                    Some(backing),
+                )
+                .unwrap();
+                assert_eq!(
+                    std::fs::read(t_new.path()).unwrap(),
+                    legacy_bytes,
+                    "single-read ({backing:?}, target {target}, wave {wave}) \
+                     archive diverges from legacy pass 2"
+                );
+                assert_eq!(r_new.zooms, r_legacy.zooms);
+                assert_eq!(r_new.total_tiles, r_legacy.total_tiles);
+                assert_eq!(r_new.total_tile_features, r_legacy.total_tile_features);
+                assert_eq!(r_new.oversized_tiles, r_legacy.oversized_tiles);
+            }
+        }
+    }
+
+    /// #235: the production partitioning path (auto backing) is partition- and
+    /// wave-invariant, mirroring `partitioned_export_is_partition_invariant`
+    /// for the new pass 2.
+    #[test]
+    fn partitioning_export_is_partition_invariant() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        partitioning_equivalence_fixture(tin.path());
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            ..Default::default()
+        };
+        let t_many = tempfile::NamedTempFile::new().unwrap();
+        let t_one = tempfile::NamedTempFile::new().unwrap();
+        let r_many =
+            export_pmtiles_with_partition_target(tin.path(), t_many.path(), &opts, 1).unwrap();
+        let r_one = export_pmtiles(tin.path(), t_one.path(), &opts).unwrap();
+        assert_eq!(
+            std::fs::read(t_many.path()).unwrap(),
+            std::fs::read(t_one.path()).unwrap(),
+            "partitioning archives diverge across partition targets"
+        );
+        assert_eq!(r_many.zooms, r_one.zooms);
+        assert_eq!(r_many.total_tiles, r_one.total_tiles);
     }
 
     #[test]
