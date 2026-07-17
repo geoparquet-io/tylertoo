@@ -36,13 +36,24 @@ pip install tylertoo      # Python
 ## Usage
 
 ```bash
-# One-shot: GeoParquet in, PMTiles out
+# One-shot: GeoParquet in, PMTiles out (recommended)
 tylertoo input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+
+# Keep the reusable multi-resolution overview file too — one run, both artifacts
+tylertoo input.parquet output.pmtiles --max-zoom 14 \
+  --keep-overview overviews.parquet
 ```
+
+The one-shot form materializes an intermediate overview GeoParquet before
+exporting (at least input-sized — it is **not** zero-disk). Its path and
+size are logged, `--spill-dir` / `$TMPDIR` control where it lives, and a
+free-space preflight warns when the volume looks too small.
 
 ### The Two-Step Workflow
 
-The overview GeoParquet file is the interesting artifact — keep it:
+The overview GeoParquet file is the interesting artifact — build it
+explicitly when you want to validate it, query it, or re-export with
+different flags without re-converting:
 
 ```bash
 # 1. Embed multi-resolution levels in a GeoParquet file
@@ -56,7 +67,8 @@ tylertoo validate overviews.parquet
 tylertoo export-pmtiles overviews.parquet output.pmtiles
 ```
 
-All tuning knobs live on `overview` / `export-pmtiles` — see
+Every tuning knob is available on the one-shot `tiles` command as well as
+on `overview` / `export-pmtiles` — see
 [Overview Tuning](docs/OVERVIEW_TUNING.md). Defaults are calibrated on
 rendered corpus sweeps and are meant to look right out of the box.
 
@@ -98,7 +110,7 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 
 ## Documentation
 
-- **[Getting Started](docs/getting-started.md)** — Installation, basic usage, the two-step workflow
+- **[Getting Started](docs/getting-started.md)** — Installation, one-shot conversion, the two-step workflow
 - **[Overview Tuning](docs/OVERVIEW_TUNING.md)** — Every generalization knob explained
 - **[Decoding PMTiles](docs/decode.md)** — PMTiles → GeoParquet, limitations included
 - **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API

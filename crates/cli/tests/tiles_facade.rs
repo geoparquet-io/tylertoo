@@ -89,6 +89,119 @@ fn bare_invocation_rewrites_to_tiles() {
     assert_eq!(&bytes[..PMTILES_MAGIC.len()], PMTILES_MAGIC);
 }
 
+/// #314: `tiles --keep-overview PATH` retains the intermediate overview at
+/// PATH, logs its path + size, and produces a PMTiles archive byte-identical
+/// to running the two-step `overview` → `export-pmtiles` chain by hand.
+#[test]
+fn tiles_keep_overview_retains_and_matches_two_step() {
+    let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+    if !fixture.exists() {
+        eprintln!("Skipping: fixture not found");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let one_step_out = dir.path().join("one-step.pmtiles");
+    let kept_overview = dir.path().join("kept-overview.parquet");
+
+    // One-shot with --keep-overview (fixed layer name so both runs match).
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            one_step_out.to_str().unwrap(),
+            "--max-zoom",
+            "5",
+            "--layer-name",
+            "parity",
+            "--keep-overview",
+            kept_overview.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run tylertoo tiles --keep-overview");
+    assert!(
+        output.status.success(),
+        "tiles --keep-overview exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The intermediate is retained and is a parquet file.
+    let overview_bytes = std::fs::read(&kept_overview).expect("kept overview must exist");
+    assert_eq!(&overview_bytes[..4], b"PAR1", "kept overview is parquet");
+
+    // The disk cost is not silent: path + size are logged.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("intermediate overview:")
+            && stdout.contains("kept-overview.parquet")
+            && stdout.contains("retained"),
+        "stdout should name the intermediate's path, size, and fate: {stdout}"
+    );
+
+    // Two-step by hand: overview (duplicating, same zooms) → export-pmtiles.
+    let two_step_overview = dir.path().join("two-step-overview.parquet");
+    let two_step_out = dir.path().join("two-step.pmtiles");
+    let status = Command::new(tylertoo_bin())
+        .args([
+            "overview",
+            fixture.to_str().unwrap(),
+            two_step_overview.to_str().unwrap(),
+            "--max-zoom",
+            "5",
+        ])
+        .status()
+        .expect("run tylertoo overview");
+    assert!(status.success(), "overview exited with {status}");
+    let status = Command::new(tylertoo_bin())
+        .args([
+            "export-pmtiles",
+            two_step_overview.to_str().unwrap(),
+            two_step_out.to_str().unwrap(),
+            "--layer-name",
+            "parity",
+        ])
+        .status()
+        .expect("run tylertoo export-pmtiles");
+    assert!(status.success(), "export-pmtiles exited with {status}");
+
+    // PMTiles export is byte-deterministic, so the acceptance bar is exact
+    // byte identity between the one-step and two-step outputs.
+    let one_step = std::fs::read(&one_step_out).expect("read one-step pmtiles");
+    let two_step = std::fs::read(&two_step_out).expect("read two-step pmtiles");
+    assert_eq!(&one_step[..8], PMTILES_MAGIC);
+    assert_eq!(
+        one_step, two_step,
+        "one-step --keep-overview PMTiles must be byte-identical to the two-step chain"
+    );
+}
+
+/// #314: a nonexistent --keep-overview directory fails fast with an error
+/// naming the flag, before any conversion work.
+#[test]
+fn tiles_keep_overview_rejects_missing_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.parquet");
+    std::fs::write(&input, b"not really parquet").unwrap();
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            input.to_str().unwrap(),
+            dir.path().join("out.pmtiles").to_str().unwrap(),
+            "--keep-overview",
+            "/nonexistent/tylertoo-314/ov.parquet",
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("keep-overview") && stderr.contains("/nonexistent/tylertoo-314"),
+        "error should name the flag and path, got: {stderr}"
+    );
+}
+
 /// #272: `--spill-dir` parses on both convert subcommands and reaches
 /// `ConvertOptions` — a nonexistent directory is rejected by core option
 /// validation (which runs before any input I/O, so no fixture is needed).

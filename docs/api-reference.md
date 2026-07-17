@@ -53,7 +53,7 @@ Commands:
 | `--read-batch-size <N>` | `8192` | Rows per Arrow read batch (streaming) |
 | `--profile <MODE>` | `auto` | Pass-2 buffering: `speed` (in-RAM), `bounded` (spill to temp Arrow IPC), `auto` (per mode + size). Output is byte-identical across profiles |
 | `--in-flight-batches <N\|auto>` | `auto` | Read/compute overlap depth in pass 2. `auto` sizes to available cores (clamped 4–16); higher = better core use, proportionally more peak memory. Resolved depth + core count logged at pass-2 start |
-| `--spill-dir <PATH>` | `$TMPDIR` | Directory for the remote-input spill file (≈1× the touched input bytes; a free-space preflight warns on a projected shortfall). Must exist; local inputs never spill |
+| `--spill-dir <PATH>` | `$TMPDIR` | Directory for the remote-input spill file (≈1× the touched input bytes; a free-space preflight warns on a projected shortfall). Must exist; local inputs never spill. On `tiles` it also hosts the removed-after-export intermediate overview (#314) unless `--keep-overview` is given |
 | `--report <PATH>` | — | Write the JSON conversion report |
 
 ### `tylertoo export-pmtiles <INPUT> <OUTPUT>`
@@ -77,11 +77,17 @@ Exit code 0 on pass.
 
 ### `tylertoo tiles <INPUT> <OUTPUT>` (and the bare form)
 
-One-shot facade: overview convert → temporary GeoParquet → export-pmtiles.
+One-shot facade: overview convert → intermediate GeoParquet →
+export-pmtiles. The intermediate overview is materialized on disk (at
+least input-sized — not zero-disk); its path and size are logged, and a
+free-space preflight warns when the chosen volume looks too small (#314).
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--min-zoom <N>` / `--max-zoom <N>` | `0` / `14` | Zoom range (feeds the overview level plan) |
+| `--gsd <GSDS>` | — | Explicit comma-separated GSD ladder (meters, strictly decreasing); overrides the zoom range |
+| `--keep-overview <PATH>` | — | Write the intermediate overview to PATH and retain it (one run, both artifacts); PMTiles output is identical either way |
+| `--report <PATH>` | — | Combined JSON report: a `convert` section and an `export` section |
 | `--bbox <XMIN,YMIN,XMAX,YMAX>` | — | Regional extract (lon/lat degrees); see `overview --bbox` |
 | `--layer-name <NAME>` | derived from input filename | MVT layer name |
 | `--tile-buffer <PX>` | `8` | Per-tile edge buffer in tile pixels (seam continuity) |
@@ -96,8 +102,12 @@ line coalescing, and the memory/performance flags (`--profile`,
 accepted here and threads through to the overview stage unchanged, so a
 one-shot `tiles` run is equivalent to the two-step chain with the same
 flags. `tylertoo tiles --help` groups them under headings. Overview
-**format** options that have no PMTiles meaning (`--mode`, `--gsd`,
-`--cogp-compat`, `--report`) stay on `overview`.
+**format** options that have no PMTiles meaning (`--mode`,
+`--cogp-compat`) stay on `overview`.
+
+Without `--keep-overview`, the intermediate is a temp file — placed in
+`--spill-dir` if given, else `$TMPDIR` if set, else the output's
+directory — and is removed after the export (on failure too).
 
 #### `--no-simple-clip-fastpath` (#239)
 
