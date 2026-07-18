@@ -184,9 +184,35 @@ pub fn crs_info_from_kv_metadata(
             Ok(CrsInfo::wgs84())
         }
         Some(Value::Null) => {
-            // Explicitly null CRS means "no CRS" (engineering coordinates)
-            // We'll treat this as unknown and let the caller decide
-            Ok(CrsInfo::unknown())
+            // Explicit null means "no CRS assigned" (spec-distinct from an
+            // omitted key = OGC:CRS84), but real-world writers (Spark/Sedona,
+            // e.g. the FTW predictions collection) emit it on lon/lat data.
+            // Assume CRS84 unless the declared bbox proves the coordinates
+            // can't be degrees.
+            let bbox_plausible_degrees = column_meta
+                .get("bbox")
+                .and_then(Value::as_array)
+                .filter(|b| b.len() >= 4)
+                .map(|b| {
+                    let v: Vec<f64> = b.iter().filter_map(Value::as_f64).collect();
+                    v.len() >= 4 && v[0] >= -180.0 && v[2] <= 180.0 && v[1] >= -90.0 && v[3] <= 90.0
+                })
+                // No (or malformed) bbox: nothing to check against — match
+                // the missing-geo-metadata precedent and assume.
+                .unwrap_or(true);
+            if bbox_plausible_degrees {
+                tracing::warn!(
+                    "GeoParquet 'crs' is explicitly null (no CRS assigned); \
+                     assuming OGC:CRS84 (lon/lat WGS84)"
+                );
+                Ok(CrsInfo::wgs84())
+            } else {
+                tracing::warn!(
+                    "GeoParquet 'crs' is explicitly null and the declared bbox \
+                     is outside lon/lat degree ranges; treating CRS as unknown"
+                );
+                Ok(CrsInfo::unknown())
+            }
         }
         Some(Value::String(crs_str)) => {
             // Simple CRS identifier (e.g., "EPSG:4326")
@@ -262,6 +288,64 @@ pub fn validate_wgs84(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kv_with_geo(geo: &Value) -> Vec<parquet::file::metadata::KeyValue> {
+        vec![parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        )]
+    }
+
+    #[test]
+    fn test_crs_null_with_lonlat_bbox_assumes_crs84() {
+        // Spark/Sedona writers emit "crs": null on lon/lat data (e.g. the FTW
+        // predictions collection). Explicit null means "no CRS assigned"
+        // (unlike an omitted key = OGC:CRS84), so assume CRS84 only when the
+        // declared bbox is plausible in degrees.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Polygon"],
+                "bbox": [-179.99, -56.93, -61.52, 0.004],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84, "null CRS with degree-range bbox → CRS84");
+    }
+
+    #[test]
+    fn test_crs_null_with_projected_bbox_stays_unknown() {
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "bbox": [366882.0, 5237430.0, 973200.0, 6100100.0],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(
+            !info.is_wgs84,
+            "null CRS with out-of-degree-range bbox must stay unknown"
+        );
+    }
+
+    #[test]
+    fn test_crs_null_without_bbox_assumes_crs84() {
+        // No bbox to check against — match the file-without-geo-metadata
+        // precedent (assume WGS84 with a warning).
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": null}}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84);
+    }
 
     #[test]
     fn test_is_wgs84_identifier() {

@@ -40,6 +40,7 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-select = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-cast = { workspace = true }
 geo = { workspace = true }
 geozero = { workspace = true }
 prost = { workspace = true }

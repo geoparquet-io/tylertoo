@@ -49,10 +49,10 @@
   <script>
     "use strict";
 
-    // Brazil field-boundaries PMTiles on Source Cooperative (Range + CORS).
+    // Brazil 2025 field-predictions PMTiles on Source Cooperative (Range + CORS).
     // Override at runtime with ?pmtiles=<url>.
     const DEFAULT_PMTILES =
-      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-field-boundaries.pmtiles";
+      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-2025-fields.pmtiles";
 
     const VIEWS = {
       brazil:         { center: [-53.00, -14.34], zoom: 4.0 },
@@ -84,6 +84,13 @@
       },
       layers: [
         { id: "carto", type: "raster", source: "carto" },
+        // z0-7 tiles carry representative POINTS (--representation "0-7:point");
+        // z8+ carry the polygons. Fill/line styles silently ignore points, so
+        // the low-zoom band gets its own circle layer.
+        { id: "field-dot", type: "circle", source: "fields", "source-layer": LAYER,
+          filter: ["==", ["geometry-type"], "Point"],
+          paint: { "circle-color": "#4cc9f0", "circle-opacity": 0.75,
+                   "circle-radius": ["interpolate", ["linear"], ["zoom"], 0, 0.7, 7, 1.6] } },
         { id: "field-fill", type: "fill", source: "fields", "source-layer": LAYER,
           paint: { "fill-color": "#4cc9f0", "fill-opacity": 0.35 } },
         { id: "field-line", type: "line", source: "fields", "source-layer": LAYER,

@@ -334,7 +334,9 @@ struct ConvertTuningArgs {
     /// "note IS NOT NULL AND (class = 'a' OR class = 'b')".
     /// Supports =, !=, <, <=, >, >=, IN (...), IS [NOT] NULL, AND/OR/NOT,
     /// parentheses, 'string' and numeric literals, and "quoted column"
-    /// names; nulls follow SQL three-valued logic (a row is kept only when
+    /// names; timestamp columns compare against 'YYYY-MM-DD' /
+    /// 'YYYY-MM-DD HH:MM:SS' / RFC 3339 datetime strings (read as UTC);
+    /// nulls follow SQL three-valued logic (a row is kept only when
     /// the predicate is TRUE). Evaluated during the pass-1 scan, so it
     /// composes with --bbox; input row groups whose parquet column
     /// statistics preclude any match are skipped at the footer level (on
