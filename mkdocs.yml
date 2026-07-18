@@ -53,7 +53,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
-  - Demo (Germany buildings): demo.md
+  - Demo (Brazil 2025 fields): demo.md
   - Performance: performance.md
   - Profiling: PROFILING.md
   - Decoding PMTiles: decode.md
