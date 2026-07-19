@@ -46,9 +46,11 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 ///     max_zoom (int, optional): Maximum (finest) zoom level. Defaults to 14.
 ///     layer_name (str, optional): Override the MVT layer name (defaults to
 ///         the input filename stem).
-///     tile_size_limit (int, optional): Per-tile MVT size limit in bytes.
-///         A tile exceeding it sheds its lowest-priority features. Defaults
-///         to None (no limit).
+///     tile_size_limit (int, optional): Per-tile MVT size cap in bytes. A tile
+///         exceeding it sheds features in a single pass (largest-first for
+///         polygons/lines; a uniform spatial stride for point tiles). Defaults
+///         to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable
+///         the cap.
 ///     simple_clip_fastpath (bool, optional): Skip the i_overlay boundary-bridge
 ///         fallback for features whose rings are already simple (issue #239).
 ///         Faster fine-zoom polygon export; output is render-equivalent on
@@ -67,7 +69,7 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=None, simple_clip_fastpath=true))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
     py: Python<'_>,
@@ -97,7 +99,8 @@ fn convert(
         layer_name,
         tile_buffer: 8,
         extent: 4096,
-        tile_size_limit,
+        // 0 (or None) disables the cap; any positive value is the byte limit.
+        tile_size_limit: tile_size_limit.filter(|&n| n > 0),
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
@@ -701,9 +704,11 @@ fn overview(
 ///         (feature seam continuity). Defaults to 8.
 ///     extent (int, optional): MVT tile extent (tile-local resolution).
 ///         Defaults to 4096.
-///     tile_size_limit (int, optional): Per-tile MVT size limit in bytes.
-///         A tile exceeding it sheds its lowest-priority (smallest) features
-///         in a single non-iterative drop pass. Defaults to None (no limit).
+///     tile_size_limit (int, optional): Per-tile MVT size cap in bytes. A tile
+///         exceeding it sheds features in a single non-iterative drop pass
+///         (largest-first for polygons/lines; a uniform spatial stride for
+///         point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass
+///         0 (or None) to disable the cap.
 ///     simple_clip_fastpath (bool, optional): Skip the i_overlay boundary-bridge
 ///         fallback for features whose rings are already simple (issue #239).
 ///         Faster fine-zoom polygon export; output is render-equivalent on
@@ -736,7 +741,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=None, simple_clip_fastpath=true, partition_wave=0))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -753,7 +758,8 @@ fn export_pmtiles(
         layer_name: layer_name.to_string(),
         tile_buffer,
         extent,
-        tile_size_limit,
+        // 0 (or None) disables the cap; any positive value is the byte limit.
+        tile_size_limit: tile_size_limit.filter(|&n| n > 0),
         simple_clip_fastpath,
         partition_wave,
     };

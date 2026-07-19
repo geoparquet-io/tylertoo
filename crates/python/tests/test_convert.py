@@ -190,6 +190,24 @@ class TestConvertIntegration:
 
             assert output.exists()
 
+    @pytest.mark.parametrize("off_value", [0, None])
+    def test_convert_tile_size_limit_off_switch(self, off_value):
+        """tile_size_limit=0 (or None) disables the default 500 KiB cap (#280)."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            tylertoo.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                tile_size_limit=off_value,
+            )
+
+            assert output.exists()
+
     def test_convert_cleans_up_temp_overview(self):
         """The intermediate overview file must not be left next to the output."""
         input_file = REALDATA_DIR / "open-buildings.parquet"
