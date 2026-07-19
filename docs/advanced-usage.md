@@ -153,8 +153,11 @@ recommended session settings, and the level+bbox viewport query — see
   overzoom beyond it.
 - **Tile size:** `--tile-size-limit SIZE` (accepts `500K`, `1M`, or raw
   bytes; `--max-tile-size` on `tiles` is the same knob) is a single,
-  non-iterative drop pass per oversized tile — the overview density
-  budget is the real sizing mechanism; the limit is a backstop.
+  non-iterative drop pass per oversized tile — largest-first for
+  polygon/line tiles, a uniform spatial stride for point tiles (so dot
+  survivors stay spread, not clumped). Defaults to `500K` (tippecanoe
+  parity, #280); pass `0` to disable it. The overview density budget is
+  the real sizing mechanism; the cap is a backstop.
 - **Border duplication:** a feature spanning a tile seam appears in
   every tile it touches, so per-zoom exported feature totals slightly
   exceed the level counts (~0–7%).

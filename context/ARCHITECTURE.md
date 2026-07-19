@@ -133,9 +133,14 @@ through byte-identical; seam-crossers match modulo float/ring-normalization
 noise. The recursion is bounded by the same `tile_ranges_for_bbox` math
 `tiles_for_bbox` uses, so the emitted tile set is unchanged.
 
-The one safety valve is `--tile-size-limit`: an oversized tile gets a
-**single, non-iterative** drop pass shedding its largest-geometry features,
-then is re-encoded once.
+The one safety valve is `--tile-size-limit` (default `500K`, tippecanoe
+parity — issue #280; `0` disables it): an oversized tile gets a **single,
+non-iterative** drop pass, then is re-encoded once. Which features survive
+depends on the tile's geometry (`select_kept_members`): polygon/line tiles
+keep their largest-vertex features (the visual signal); point-dominated
+tiles — where vertex count carries no signal — instead keep a uniform stride
+across member (Hilbert) order, so the surviving dots stay spatially spread
+rather than clumped in one corner.
 
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in

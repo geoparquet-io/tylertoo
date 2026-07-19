@@ -46,6 +46,14 @@ fn parse_size_bytes(s: &str) -> Result<usize, String> {
     })
 }
 
+/// Map a per-tile size-cap CLI value to [`ExportOptions::tile_size_limit`]:
+/// `0` (the off switch, e.g. `--max-tile-size 0`) becomes `None` (cap disabled);
+/// any positive byte count becomes `Some(n)`. The default `500K` therefore caps;
+/// `0` opts out. See issue #280.
+fn size_limit_opt(n: usize) -> Option<usize> {
+    (n > 0).then_some(n)
+}
+
 /// Parse `--in-flight-batches`: `auto` (→ the core-sized sentinel 0) or an
 /// explicit positive integer. See [`resolve_in_flight_batches`] for how the
 /// sentinel is expanded at pass-2 setup.
@@ -202,12 +210,14 @@ struct ExportPmtilesArgs {
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
 
-    /// Optional per-tile MVT size limit (e.g., "500K", "1M", or raw bytes).
-    /// When a tile exceeds it, a single non-iterative drop pass sheds the
-    /// lowest-priority (smallest) features for that tile only. Omit to enforce
-    /// no limit. Aliased as --max-tile-size for parity with the `tiles` command.
-    #[arg(long, value_name = "SIZE", alias = "max-tile-size", value_parser = parse_size_bytes)]
-    tile_size_limit: Option<usize>,
+    /// Per-tile MVT size cap (e.g., "500K", "1M", or raw bytes). When a tile
+    /// exceeds it, a single non-iterative drop pass sheds features for that tile
+    /// only (largest-first for polygons/lines; a uniform spatial stride for
+    /// point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to
+    /// disable the cap. Aliased as --max-tile-size for parity with the `tiles`
+    /// command.
+    #[arg(long, value_name = "SIZE", alias = "max-tile-size", default_value = "500K", value_parser = parse_size_bytes)]
+    tile_size_limit: usize,
 
     /// Write the JSON export report to this path.
     #[arg(long, value_name = "PATH")]
@@ -985,11 +995,13 @@ struct TilesArgs {
     layer_name: Option<String>,
 
     /// Maximum tile size (e.g., "500K", "1M", or raw bytes). When a tile
-    /// exceeds this limit, the export sheds its lowest-priority features in a
-    /// single non-iterative pass. Aliased as --tile-size-limit for parity with
+    /// exceeds this limit, the export sheds features in a single non-iterative
+    /// pass (largest-first for polygons/lines; a uniform spatial stride for
+    /// point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to
+    /// disable the cap. Aliased as --tile-size-limit for parity with
     /// `export-pmtiles`.
-    #[arg(long, value_name = "SIZE", alias = "tile-size-limit", value_parser = parse_size_bytes)]
-    max_tile_size: Option<usize>,
+    #[arg(long, value_name = "SIZE", alias = "tile-size-limit", default_value = "500K", value_parser = parse_size_bytes)]
+    max_tile_size: usize,
 
     /// Disable the simple-clip fast path (issue #239), forcing the i_overlay
     /// boundary-bridge fallback on every polygon clip. The fast path is on by
@@ -1447,7 +1459,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         layer_name,
         tile_buffer: args.tile_buffer,
         extent: 4096,
-        tile_size_limit: args.max_tile_size,
+        tile_size_limit: size_limit_opt(args.max_tile_size),
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
     };
@@ -1743,7 +1755,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         layer_name: args.layer_name,
         tile_buffer: args.tile_buffer,
         extent: 4096,
-        tile_size_limit: args.tile_size_limit,
+        tile_size_limit: size_limit_opt(args.tile_size_limit),
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
     };
@@ -2030,6 +2042,18 @@ mod tests {
         {
             Command::Tiles(a) => *a,
             other => panic!("expected tiles subcommand, got {other:?}"),
+        }
+    }
+
+    fn parse_export(flags: &[&str]) -> ExportPmtilesArgs {
+        let mut argv = vec!["tylertoo", "export-pmtiles", "in.parquet", "out.pmtiles"];
+        argv.extend_from_slice(flags);
+        match Cli::try_parse_from(argv)
+            .expect("export-pmtiles args should parse")
+            .command
+        {
+            Command::ExportPmtiles(a) => a,
+            other => panic!("expected export-pmtiles subcommand, got {other:?}"),
         }
     }
 
@@ -2361,8 +2385,20 @@ mod tests {
         // The two spellings are aliases and both accept human-readable sizes.
         let a = parse_tiles(&["--max-tile-size", "500K"]);
         let b = parse_tiles(&["--tile-size-limit", "500K"]);
-        assert_eq!(a.max_tile_size, Some(500 * 1024));
+        assert_eq!(a.max_tile_size, 500 * 1024);
         assert_eq!(a.max_tile_size, b.max_tile_size);
+    }
+
+    #[test]
+    fn tile_size_cap_defaults_to_500k_and_zero_disables() {
+        // #280: the per-tile cap is on by default at 500K on both commands.
+        assert_eq!(parse_tiles(&[]).max_tile_size, 500 * 1024);
+        assert_eq!(parse_export(&[]).tile_size_limit, 500 * 1024);
+
+        // `0` is the off switch: the CLI value maps to `None` (cap disabled).
+        assert_eq!(parse_tiles(&["--max-tile-size", "0"]).max_tile_size, 0);
+        assert_eq!(size_limit_opt(0), None);
+        assert_eq!(size_limit_opt(500 * 1024), Some(500 * 1024));
     }
 
     #[test]

@@ -280,9 +280,11 @@ tylertoo overview buildings.parquet buildings_overview.parquet \
   --min-zoom 0 --max-zoom 14 \
   --polygon-visibility 0 --collapse
 
-# One-shot to PMTiles: add tippecanoe's tile cap — uncapped coarse dot
+# One-shot to PMTiles. The 500K tile cap is on by default (tippecanoe
+# parity, #280) — shown explicitly here for clarity. Uncapped coarse dot
 # tiles on a country-scale layer reach several MB (Germany z6: 12 MB),
-# far past renderer norms; the cap drop-to-fits them to ~500 KB.
+# far past renderer norms; the cap drop-to-fits them to ~500 KB (keeping a
+# spatially even stride of the dots). Pass --max-tile-size 0 to opt out.
 # On multi-GB inputs the recipe buffers the (now much larger) coarse
 # levels; the default --profile auto estimates this and spills when it
 # would exceed a fraction of available RAM (Germany peak RSS 15 -> 29 GB
@@ -1035,7 +1037,7 @@ that. If you force `speed` on a large partitioning run, watch peak RSS.
 | Wrong roads survive (residential instead of highways) at coarse zoom | add `--class-rank road_class:…` or rely on auto-detect (don't pass `--no-auto-rank`) |
 | Coarse level files are too large / slow | RAISE the thinning factors and/or `--simplify-factor`; or LOWER `--gsd-base` |
 | Small buildings vanish too early | LOWER `--polygon-visibility`; or `--collapse` to keep them as points |
-| Country-scale view of a dense building/parcel layer is empty | `--polygon-visibility 0 --collapse` + a circle layer for points ([dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)); cap tiles with `--max-tile-size 500K` on export |
+| Country-scale view of a dense building/parcel layer is empty | `--polygon-visibility 0 --collapse` + a circle layer for points ([dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)); the `500K` tile cap that keeps coarse dot tiles sane is on by default (#280) |
 | Whole map uniformly too sparse or too dense | move `--gsd-base` (up = denser, down = sparser) instead of tuning each family |
 | Mid zooms have far more features than tippecanoe / duplicating files too large | RAISE `--drop-rate` (density budget); or `--no-density-drop` to turn it off |
 | Density cut is stripping sparse rural areas to keep cities | RAISE `--drop-gamma` (sparse-area protection) |

@@ -62,7 +62,7 @@ Commands:
 |------|---------|-------------|
 | `--layer-name <NAME>` | `overview` | MVT layer name written into every tile |
 | `--tile-buffer <PX>` | `8` | Per-tile edge buffer in tile pixels (seam continuity) |
-| `--tile-size-limit <SIZE>` | — | Optional per-tile MVT cap, e.g. `500K`, `1M`, or raw bytes (single non-iterative drop pass). Aliased `--max-tile-size` |
+| `--tile-size-limit <SIZE>` | `500K` | Per-tile MVT cap, e.g. `500K`, `1M`, or raw bytes (single non-iterative drop pass — largest-first for polygons/lines, uniform spatial stride for point tiles). `0` disables the cap. Aliased `--max-tile-size` |
 | `--no-simple-clip-fastpath` | off (fast path on) | Disable the simple-clip fast path (#239), forcing the i_overlay boundary-bridge fallback on every polygon clip. Pass only when byte-stable tile output is required — see the note below |
 | `--report <PATH>` | — | Write the JSON export report |
 
@@ -91,7 +91,7 @@ free-space preflight warns when the chosen volume looks too small (#314).
 | `--bbox <XMIN,YMIN,XMAX,YMAX>` | — | Regional extract (lon/lat degrees); see `overview --bbox` |
 | `--layer-name <NAME>` | derived from input filename | MVT layer name |
 | `--tile-buffer <PX>` | `8` | Per-tile edge buffer in tile pixels (seam continuity) |
-| `--max-tile-size <SIZE>` | — | Per-tile byte cap, e.g. `500K`, `1M`, or raw bytes. Aliased `--tile-size-limit` |
+| `--max-tile-size <SIZE>` | `500K` | Per-tile byte cap, e.g. `500K`, `1M`, or raw bytes. `0` disables the cap. Aliased `--tile-size-limit` |
 | `--no-simple-clip-fastpath` | off (fast path on) | Disable the simple-clip fast path (#239), forcing the i_overlay fallback on every polygon clip; see the note below |
 | `-v, --verbose` | off | Per-level / per-zoom breakdowns |
 
@@ -222,7 +222,7 @@ report = export_pmtiles(
     layer_name: str = "overview",
     tile_buffer: int = 8,
     extent: int = 4096,
-    tile_size_limit: int | None = None,
+    tile_size_limit: int | None = 512000,  # 500 KiB; 0 or None disables the cap
     simple_clip_fastpath: bool = True,  # #239, default on; see CLI note
 ) -> dict  # the JSON export report
 ```
@@ -246,7 +246,7 @@ convert(
     min_zoom: int = 0,
     max_zoom: int = 14,
     layer_name: str | None = None,
-    tile_size_limit: int | None = None,
+    tile_size_limit: int | None = 512000,  # 500 KiB; 0 or None disables the cap
     simple_clip_fastpath: bool = True,  # #239, default on; see CLI note
 ) -> None
 ```

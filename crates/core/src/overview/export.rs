@@ -129,6 +129,13 @@ const DEFAULT_EXTENT: u32 = 4096;
 /// use 8 to match the tile pipeline's historical default).
 const DEFAULT_TILE_BUFFER_PX: u32 = 8;
 
+/// Default per-tile MVT size cap, in bytes (500 KiB — matches what `500K`
+/// parses to and tippecanoe's on-by-default 500K bar; issue #280). A tile whose
+/// encoded MVT exceeds this trips the single-pass drop valve (see
+/// [`ExportOptions::tile_size_limit`]). Set `tile_size_limit` to `None` (CLI:
+/// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable the cap.
+pub const DEFAULT_TILE_SIZE_LIMIT: usize = 500 * 1024;
+
 /// Web Mercator projected half-extent in meters (EPSG:3857 axis range is
 /// `±WEBMERC_HALF_M`). Used only to reproject a 3857 overview to lon/lat so the
 /// (geographic) tile grid math applies.
@@ -145,12 +152,16 @@ pub struct ExportOptions {
     pub tile_buffer: u32,
     /// MVT tile extent (integer tile-local resolution). Default 4096.
     pub extent: u32,
-    /// Optional per-tile MVT size limit in **bytes**. When set, a tile whose
-    /// encoded size exceeds the limit triggers the single, non-iterative safety
-    /// valve: its lowest-priority features (ranked by geometry size — see the
-    /// module docs on why the assignment sort key is not recoverable per-row)
-    /// are dropped in one pass and the tile is re-encoded once. When `None`, no
-    /// size limit is enforced and `oversized_tiles` is always 0.
+    /// Per-tile MVT size limit in **bytes**. When `Some(limit)` with
+    /// `limit > 0`, a tile whose encoded size exceeds the limit triggers the
+    /// single, non-iterative safety valve: [`select_kept_members`] chooses which
+    /// features survive (largest-first for sized geometries, uniform spatial
+    /// stride for point-dominated tiles — see that function) and the tile is
+    /// re-encoded once. When `None` (or `Some(0)`), no size limit is enforced
+    /// and `oversized_tiles` is always 0.
+    ///
+    /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (500 KiB — tippecanoe
+    /// parity, issue #280).
     pub tile_size_limit: Option<usize>,
     /// Skip the i_overlay boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
@@ -184,7 +195,7 @@ impl Default for ExportOptions {
             layer_name: "overview".to_string(),
             tile_buffer: DEFAULT_TILE_BUFFER_PX,
             extent: DEFAULT_EXTENT,
-            tile_size_limit: None,
+            tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
         }
@@ -2546,15 +2557,16 @@ fn encode_tile(
     let data = build_mvt(members.iter(), tb, opts);
 
     match opts.tile_size_limit {
-        Some(limit) if data.len() > limit && members.len() > 1 => {
-            // Single, non-iterative drop pass: rank members by geometry size
-            // (coordinate count) descending — the biggest features carry the
-            // tile's visual signal — and keep a proportional prefix.
-            let mut ranked: Vec<&Member> = members.iter().collect();
-            ranked.sort_by_key(|m| std::cmp::Reverse(m.geom.coords_count()));
+        // `limit > 0` so `Some(0)` is a no-op off switch (the CLI/Python `0`
+        // disable value never reaches here as `Some`, but guard the core API too).
+        Some(limit) if limit > 0 && data.len() > limit && members.len() > 1 => {
+            // Single, non-iterative drop pass. Keep a proportional count and let
+            // `select_kept_members` decide *which* features survive.
             let keep_frac = limit as f64 / data.len() as f64;
             let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
-            let data = build_mvt(ranked.iter().take(keep).copied(), tb, opts);
+            let kept = select_kept_members(members, keep);
+            let keep = kept.len();
+            let data = build_mvt(kept, tb, opts);
             log::warn!(
                 "oversized tile ({} bytes > {limit} limit): dropped {} of {} features (one pass)",
                 data.len(),
@@ -2567,6 +2579,42 @@ fn encode_tile(
             let count = members.len();
             (data, count, false)
         }
+    }
+}
+
+/// Choose which `keep` of `members` survive the oversized-tile drop pass.
+///
+/// The single-pass valve has exactly one per-feature ranking signal — geometry
+/// vertex count — and that signal is degenerate for point tiles, so there are
+/// two regimes:
+///
+/// * **Sized geometries** (lines / polygons): keep the `keep` largest by
+///   coordinate count. The biggest features carry the tile's visual signal;
+///   this is the pre-#280 behaviour and is byte-identical to it.
+/// * **Point-dominated tiles** (every member ≤ 1 coordinate — the #259 dot-fill
+///   recipe collapses dense polygons to centroid points): vertex count carries
+///   no signal, so a size-ranked prefix would just keep whichever points happen
+///   to sort first and clump them in one corner. Instead keep a uniform stride
+///   across member order. Overview rows are Hilbert-sorted (§ writer), so a
+///   tile's members arrive in space-filling-curve order; an even stride
+///   therefore spreads the survivors across the tile — the same spatially
+///   uniform thinning tippecanoe achieves by dropping every Nth feature in
+///   sequence.
+///
+/// `keep` is clamped to `1..=members.len()`.
+fn select_kept_members(members: &[Member], keep: usize) -> Vec<&Member> {
+    let n = members.len();
+    let keep = keep.clamp(1, n);
+    let point_like = members.iter().all(|m| m.geom.coords_count() <= 1);
+    if point_like {
+        // Evenly spaced indices 0, n/keep, 2n/keep, … — strictly increasing and
+        // in-bounds because keep ≤ n.
+        (0..keep).map(|i| &members[i * n / keep]).collect()
+    } else {
+        let mut ranked: Vec<&Member> = members.iter().collect();
+        ranked.sort_by_key(|m| std::cmp::Reverse(m.geom.coords_count()));
+        ranked.truncate(keep);
+        ranked
     }
 }
 
@@ -3812,8 +3860,13 @@ mod tests {
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let feats = read_level_features(&reader, 1, Crs::Epsg4326).unwrap();
 
-        // No limit: no oversized tiles.
-        let none = encode_level_tiles(&feats, 6, &ExportOptions::default());
+        // No limit (explicit `None`, since the default is now 500 KiB): no
+        // oversized tiles.
+        let no_limit = ExportOptions {
+            tile_size_limit: None,
+            ..Default::default()
+        };
+        let none = encode_level_tiles(&feats, 6, &no_limit);
         assert!(none.iter().all(|t| !t.oversized));
         let full_count: usize = none.iter().map(|t| t.feature_count).sum();
 
@@ -3832,6 +3885,84 @@ mod tests {
             limited_count < full_count,
             "valve must drop features ({limited_count} !< {full_count})"
         );
+    }
+
+    /// #280: the per-tile cap is on by default at 500 KiB (== what `500K`
+    /// parses to; tippecanoe parity), not disabled.
+    #[test]
+    fn default_export_caps_tiles_at_500_kib() {
+        assert_eq!(DEFAULT_TILE_SIZE_LIMIT, 500 * 1024);
+        assert_eq!(
+            ExportOptions::default().tile_size_limit,
+            Some(DEFAULT_TILE_SIZE_LIMIT)
+        );
+    }
+
+    /// Build a bare point [`Member`] at `(x, y)` for the drop-valve unit tests.
+    fn point_member(x: f64, y: f64, seq: u64) -> Member {
+        Member {
+            key: 0,
+            seq,
+            geom: Geometry::Point(Point::new(x, y)),
+            props: Arc::new(Vec::new()),
+        }
+    }
+
+    /// #280 spatial fairness: on a point-dominated tile, vertex count carries no
+    /// ranking signal, so the valve must keep a uniform stride across member
+    /// (≈ Hilbert) order — not a first-N prefix that would clump survivors.
+    #[test]
+    fn drop_valve_point_tile_keeps_uniform_stride() {
+        let members: Vec<Member> = (0..10).map(|i| point_member(i as f64, 0.0, i)).collect();
+        let kept = select_kept_members(&members, 5);
+        let xs: Vec<f64> = kept
+            .iter()
+            .map(|m| match &m.geom {
+                Geometry::Point(p) => p.x(),
+                _ => unreachable!("built points"),
+            })
+            .collect();
+        // Even stride 0,2,4,6,8 — spread across the tile — not the prefix 0..5.
+        assert_eq!(xs, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
+    }
+
+    /// Sized geometries keep the largest-by-vertex-count survivors (pre-#280
+    /// behaviour, unchanged): the biggest features carry the tile's visual
+    /// signal.
+    #[test]
+    fn drop_valve_sized_tile_keeps_largest() {
+        let members: Vec<Member> = (1..=5)
+            .map(|n| {
+                let coords: Vec<(f64, f64)> = (0..n).map(|k| (k as f64, 0.0)).collect();
+                Member {
+                    key: 0,
+                    seq: n as u64,
+                    geom: Geometry::LineString(LineString::from(coords)),
+                    props: Arc::new(Vec::new()),
+                }
+            })
+            .collect();
+        let kept = select_kept_members(&members, 2);
+        let counts: Vec<usize> = kept.iter().map(|m| m.geom.coords_count()).collect();
+        assert_eq!(counts, vec![5, 4]);
+    }
+
+    /// `Some(0)` is the core off switch (CLI `--max-tile-size 0` / Python
+    /// `tile_size_limit=0` map to it): the valve must never fire, no matter how
+    /// dense the tile.
+    #[test]
+    fn size_limit_zero_disables_valve() {
+        let members: Vec<Member> = (0..64)
+            .map(|i| point_member(-100.0 + i as f64 * 0.001, 40.0, i))
+            .collect();
+        let tb = TileCoord::new(0, 0, 0).bounds();
+        let opts = ExportOptions {
+            tile_size_limit: Some(0),
+            ..Default::default()
+        };
+        let (_data, count, oversized) = encode_tile(&members, &tb, &opts);
+        assert!(!oversized, "Some(0) must disable the cap");
+        assert_eq!(count, members.len());
     }
 
     // --- #235: partitioning single-read fan-out pass 2 -----------------------

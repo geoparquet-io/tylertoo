@@ -236,7 +236,8 @@ dots, z4 = 128,886, z6 = 1.07M), z6–z13 land exactly on the budget
 ladder `N/1.65^(14−z)` with visible gamma-fair density structure
 (Ruhr/Berlin denser, rural protected), at +31 % overview bytes / +40 %
 convert wall on Germany and **+0.3 % bytes** on Moldova. Uncapped coarse
-dot tiles reach 12 MB (Germany z6) — hence the 500K cap in the recipe.
+dot tiles reach 12 MB (Germany z6) — hence the 500K cap in the recipe,
+now the default (#280), applied as a spatially even stride of the dots.
 `--collapse` stays opt-in per spec Q4 (§7.5: type collapse MUST be
 producer-opt-in); the demo viewer gained the circle layer, and the
 empty-level WARN now points at the recipe. Tippecanoe fills the same gap
