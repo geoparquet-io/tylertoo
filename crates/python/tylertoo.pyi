@@ -14,7 +14,7 @@ def convert(
     min_zoom: int = 0,
     max_zoom: int = 14,
     layer_name: str | None = None,
-    tile_size_limit: int | None = None,
+    tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
 ) -> None: ...
 def overview(
@@ -69,7 +69,7 @@ def export_pmtiles(
     layer_name: str = "overview",
     tile_buffer: int = 8,
     extent: int = 4096,
-    tile_size_limit: int | None = None,
+    tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
     partition_wave: int = 0,
 ) -> dict[str, Any]: ...
