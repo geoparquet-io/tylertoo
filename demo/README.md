@@ -5,8 +5,11 @@
 2025 growing season, carved out of the global `results/` collection on Source
 Cooperative *during the tiling read* — `--filter "label = 'field' AND
 time >= '2025-01-01'"` + `--bbox` — and tiled to a complete z0–14 pyramid
-with **centroids at z0–7 and polygons at z8–14** in a single archive
-(`--representation "0-7:point"`). No established tool takes this path:
+with **dots at z0–5 and polygons progressively taking over from z6** in a
+single archive — tuned (`--representation "0-5:point,6-14:geom" --collapse
+--polygon-visibility 0 --simplify-factor 4`) so each field stays a visible dot
+until it is a ≥1 px polygon and **nothing disappears mid-zoom**. No established
+tool takes this path:
 tippecanoe does not read GeoParquet, let alone filter a remote collection
 while tiling it.
 
@@ -27,15 +30,16 @@ s3://us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/
 Public URL (serves HTTP **Range** + **CORS**, which PMTiles requires):
 
 ```
-https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-2025-fields.pmtiles
+https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-2025-fields-v2.pmtiles
 ```
 
 The viewer (`docs/demo/viewer.html`) renders over
 [CARTO Dark Matter](https://carto.com/basemaps/) and defaults to that URL;
 override with `?pmtiles=<url>`. The MVT source-layer is `overview` (tylertoo's
-default). z0–7 tiles carry **points**, so the style needs a `circle` layer
-next to the polygon `fill`/`line` layers — fill-only styles render the low
-zooms blank.
+default). z0–5 tiles carry **points**, and z6–13 carry a mix of points (fields
+still too small to draw) and polygons, so the style needs a `circle` layer next
+to the polygon `fill`/`line` layers — fill-only styles render the low zooms
+blank.
 
 ### Re-uploading
 
@@ -67,8 +71,11 @@ once (~1×, spilled locally) and never touched the other 948.
 
 ## Notes
 
-The z0–7 point band bypasses the polygon visibility gate (a dot is always
-visible), so even z0 renders — the previous polygon-only pyramid's z0 was
-empty. Clipping and simplification differ from tippecanoe by design — see
+The z0–5 point band bypasses the polygon visibility gate (a dot is always
+visible), so even z0 renders — a polygon-only pyramid's z0 was empty. From z6
+`--collapse --polygon-visibility 0` keeps every field represented (as a dot
+until it is a ≥1 px polygon), so the visible feature count rises at every zoom
+instead of dropping at the point→polygon boundary. Clipping and simplification
+differ from tippecanoe by design — see
 [`context/ARCHITECTURE.md`](../context/ARCHITECTURE.md). This demonstrates a
 *pipeline and its output*, not byte-identical tiling.
