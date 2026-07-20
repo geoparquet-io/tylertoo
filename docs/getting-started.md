@@ -13,6 +13,23 @@ input here is a single 4.5 GB GeoParquet file of those 43.9 million features, so
 the timing and memory numbers below sit at the scale your own country-sized data
 will hit.
 
+## See it in action
+
+Here is the archive this tutorial builds, rendered live from the PMTiles file on
+[Source Cooperative](https://source.coop/). Zoomed out you see the centroid band;
+from z8 the actual field polygons take over. Pan and zoom, or jump to one of
+Brazil's agricultural heartlands with the buttons — the whole archive is a single
+file served over HTTP range requests, no tile server behind it.
+
+<iframe src="../demo/viewer.html" title="tylertoo Brazil 2025 field predictions PMTiles viewer"
+        style="width:100%; height:560px; border:1px solid var(--md-default-fg-color--lightest); border-radius:8px;"
+        loading="lazy"></iframe>
+
+<a class="md-button" href="../demo/viewer.html">Open the map full-screen →</a>
+
+By the end of this tutorial you will have produced your own `brazil.pmtiles`,
+which drops into exactly this viewer.
+
 ## Installing tylertoo
 
 tylertoo ships as a CLI binary and a Python package. Both drive the same
@@ -107,9 +124,11 @@ tylertoo overview \
 
 The full run covers all 43.9 million features across the fifteen levels from z0
 to z14, so expect minutes, not the seconds a `--bbox` preview takes. For a
-measured run at this scale, the [Brazil 2025 demo](demo.md) reports about 1 h
-12 m to convert and 11 m to export on 16 cores. That run also reads its 40.7 GiB
-of input remotely and filters it while tiling, work a prepared local file skips.
+measured run at this scale, the flagship Brazil 2025 run reports about 1 h 12 m
+to convert and 11 m to export on 16 cores — roughly 1 h 24 m end to end,
+producing 116.5 million tile-features with none oversized. That run also reads
+its 40.7 GiB of input remotely and filters it while tiling, work a prepared local
+file skips.
 
 Peak memory tracks the largest row group, not the size of the file. In the demo,
 export streamed all fifteen levels at a 1.56 GiB peak, and convert held to
@@ -167,12 +186,13 @@ tylertoo export-pmtiles \
 A PMTiles archive is a single file served over HTTP range requests, so any
 PMTiles-aware viewer renders it without a running tile server.
 
-The [Brazil 2025 demo](demo.md) renders a finished version live from Source
+The [live map above](#see-it-in-action) renders a finished version from Source
 Cooperative, a 3.4 GiB archive of 1,649,201 tiles holding all 43.9 million
-predictions. It shows what tuned output looks like across zoom. Dots render from
-z0 to z5, and from z6 the field polygons take over, each field staying a dot
-until it is large enough to draw. That dot-to-polygon handoff comes from tuning
-flags this tutorial leaves at their defaults.
+predictions. It shows what tuned output looks like across zoom, and it is a
+single archive that serves both representations: dots render from z0 to z5, and
+from z6 the field polygons take over, each field staying a dot until it is large
+enough to draw. That dot-to-polygon handoff comes from tuning flags this tutorial
+leaves at their defaults.
 
 Your own `brazil.pmtiles` drops into the same MapLibre and PMTiles setup, or any
 other PMTiles viewer.

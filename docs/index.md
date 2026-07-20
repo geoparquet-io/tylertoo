@@ -18,7 +18,8 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
   a thin facade over the two steps above.
 - **`tylertoo validate`** — check an overview file against the spec.
 - **`tylertoo decode`** — decode any PMTiles vector-tile archive back to
-  GeoParquet (the tiled representation; see [Decoding PMTiles](decode.md)).
+  GeoParquet (the tiled representation; see
+  [Decoding PMTiles](diving-deeper/decoding.md)).
 
 ## Quick Example
 
@@ -43,12 +44,9 @@ export_pmtiles("overviews.parquet", "output.pmtiles")
 
 ## Next Steps
 
-- [Getting Started](getting-started.md) — Installation and basic usage
-- [Diving Deeper](diving-deeper/index.md) — Input prep, zoom tuning, remote/multi-file input, bounded memory
-- [Reference](reference/index.md) — Generated CLI, Python, and Rust API surface
-- [Decoding PMTiles](decode.md) — PMTiles → GeoParquet, limitations included
-- [Overview Tuning](OVERVIEW_TUNING.md) — Every generalization knob explained
-- [Architecture](architecture.md) — Design decisions and internals
+- [Getting Started](getting-started.md) — Install, then tile a country from a live cloud collection.
+- [Diving Deeper](diving-deeper/index.md) — Input prep, zoom tuning, remote/multi-file input, bounded memory, decoding, tippecanoe.
+- [Reference](reference/index.md) — CLI, Python, and Rust API surface.
 
 ## License
 

@@ -171,7 +171,7 @@ none of the 59032924 input feature(s) are visible at those scales (visibility
 gates / density budget); the output pyramid starts at GSD 611.50 m (zoom 6).
 To populate coarse levels, lower --polygon-visibility/--line-visibility, or
 pass --collapse to keep sub-GSD polygons as representative points (see
-docs/OVERVIEW_TUNING.md)
+context/OVERVIEW_TUNING.md)
 ```
 
 plus a `note:` line under the CLI level table, and the omitted levels are

@@ -68,7 +68,7 @@ sheds most of its storage overhead. **Q2** adds a per-level feature **budget** o
 top of cell-winner thinning: `budget(L) = N / drop_rate^(finest − L)`, dropping
 the lowest-priority survivors (Q1 rank order) per **super-cell** (spatial
 fairness, gamma) until each level meets its budget. Canonical is never dropped.
-See `docs/OVERVIEW_TUNING.md` (density-budget section) for the mechanism, its
+See `context/OVERVIEW_TUNING.md` (density-budget section) for the mechanism, its
 tippecanoe analogs (drop-rate / gamma dot-dropping), and knobs.
 
 ### Calibration

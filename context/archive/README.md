@@ -6,7 +6,7 @@ development phase. Internal cross-references between archived files
 use their original (pre-archive) paths.
 
 Current-state documentation lives in `context/ARCHITECTURE.md`,
-`context/OVERVIEWS_SPEC.md`, `docs/OVERVIEW_TUNING.md`, and the
+`context/OVERVIEWS_SPEC.md`, `context/OVERVIEW_TUNING.md`, and the
 top-level README / DEVELOPMENT / CONTRIBUTING docs.
 
 ## Index

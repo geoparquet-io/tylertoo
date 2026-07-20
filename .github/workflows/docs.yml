@@ -37,8 +37,24 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
       - name: Build documentation
-        run: uvx --with mkdocs-material mkdocs build --strict
+        # The Python API reference is rendered by mkdocstrings from the
+        # tylertoo.pyi stub. griffe reads the stub STATICALLY (the compiled .so
+        # is never imported), but it must resolve `tylertoo` on the import path,
+        # so we build+install the extension (maturin packages the stub as
+        # tylertoo/__init__.pyi). --strict doubles as a docs lint: broken links,
+        # missing nav pages, or mkdocstrings resolution failures fail the build.
+        run: |
+          uv venv
+          uv pip install \
+            mkdocs-material 'mkdocstrings[python]' mkdocs-redirects black
+          uv pip install ./crates/python
+          uv run mkdocs build --strict
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
