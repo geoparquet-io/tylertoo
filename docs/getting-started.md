@@ -1,220 +1,192 @@
-# Getting Started
+# Getting started
 
-## Installation
+By the end of this tutorial you will have:
 
-### CLI (Cargo)
+- A tuned PMTiles web map built from one country's field polygons.
+- A `geo:overviews` GeoParquet file you can inspect and re-export.
+- A working mental model of the two-step overview → export workflow.
+
+This tutorial tiles Brazil's 2025 field boundaries, the 43.9-million-polygon
+Brazil slice of the Fields of The World predictions collection on Source
+Cooperative. That full collection holds 8.2 billion rows across 629.6 GiB. The
+input here is a single 4.5 GB GeoParquet file of those 43.9 million features, so
+the timing and memory numbers below sit at the scale your own country-sized data
+will hit.
+
+## Installing tylertoo
+
+tylertoo ships as a CLI binary and a Python package. Both drive the same
+engine, so the choice is about where your pipeline lives. Shell scripts and
+Makefiles reach for the CLI. Notebook and Airflow-style workflows import the
+Python package.
+
+This tutorial uses the CLI throughout. Every command below has a Python
+equivalent with the same options.
 
 ```bash
-cargo install tylertoo
+cargo install tylertoo    # CLI (used in this tutorial)
+pip install tylertoo      # Python bindings (same engine, importable)
 ```
 
-**Prerequisites:** Rust 1.75+, protoc
+A version check confirms the install before you feed it a 4.5 GB file.
 
 ```bash
-# macOS
-brew install protobuf
-
-# Ubuntu/Debian
-apt install protobuf-compiler
+tylertoo --version
 ```
 
-### Python
+## Preparing your GeoParquet input
+
+tylertoo reads lon/lat WGS84 GeoParquet. It runs fastest when the file is also
+gpio-optimized, with features ordered by spatial locality and packed into large
+row groups. The raw Brazil file is valid GeoParquet but unsorted, so one
+preparation pass pays for itself across every zoom level that follows.
+
+### Inspecting the raw file
+
+`gpio inspect` reports the input's CRS, row-group layout, and spatial order
+before you commit to a run. On the raw Brazil file it shows OGC:CRS84, 355 row
+groups averaging 13 MB, and a poor spatial overlap ratio. Those last two are
+what the next step fixes.
 
 ```bash
-pip install tylertoo
+# Source file: Fields of The World results/ collection on Source Cooperative.
+gpio inspect brazil-2025-fields.parquet
 ```
 
-### From Source
+### Sorting and resizing row groups
+
+Hilbert sorting reorders features so that geographic neighbors sit near each
+other on disk. Resizing row groups to 128 MB packs those neighbors into the
+units tylertoo streams. Together they let each tile read a handful of row groups
+instead of scanning the file, which is what keeps memory bounded and throughput
+high later on.
+
+The Brazil file arrives already in WGS84, so this pass sorts and repacks without
+touching coordinates. A file in another projection would need `gpio` to
+reproject it first.
 
 ```bash
-git clone https://github.com/geoparquet-io/tylertoo.git
-cd tylertoo
-cargo build --release
+# Hilbert-sort and resize row groups in one pass.
+gpio sort hilbert \
+  brazil-2025-fields.parquet \
+  brazil-sorted.parquet \
+  --row-group-size-mb 128 \
+  --overwrite
 ```
 
-## Input Requirements
+## Building an overview file
 
-**tylertoo requires WGS84 (EPSG:4326) coordinates.** If your GeoParquet file
-uses a projected CRS (e.g., UTM, British National Grid), reproject first with
-[geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
+`tylertoo overview` builds a multi-resolution pyramid and writes it inside a
+single GeoParquet file. Each zoom level holds a thinned, simplified copy of your
+features sized for that scale, so the overview grows to several times the input
+size. The Brazil demo's is 9.9 GB across fifteen levels. The output is not an
+opaque tile blob. It stays a GeoParquet file you can open, query, and re-export,
+which is why the two-step workflow keeps it as a first-class artifact.
+
+The `--max-zoom` flag defaults to 6, enough for a continental overview but too
+coarse for street-level detail. A web map that zooms to individual fields needs
+it raised. This tutorial uses 14, the finest level the Brazil demo ships.
+
+### Previewing one region
+
+Before committing minutes to the whole country, carve out one region with
+`--bbox`. tylertoo reads only the row groups whose bounds intersect the box, so
+a São Paulo-sized window finishes in seconds and shows you the representation
+early. The bounds are lon/lat, ordered `xmin,ymin,xmax,ymax`.
 
 ```bash
-# Reproject to WGS84 with geoparquet-io (recommended)
-gpio convert reproject input.parquet output.parquet -d EPSG:4326
-
-# Optimize for performance at the same time
-gpio convert reproject input.parquet output.parquet \
-  -d EPSG:4326 --hilbert --row-group-size 100000
+# Optional first look: extract the São Paulo area to finish in seconds.
+tylertoo overview \
+  brazil-sorted.parquet \
+  sp-preview-ov.parquet \
+  --min-zoom 0 --max-zoom 12 \
+  --bbox -48,-24,-46,-22
 ```
 
-If you forget, tylertoo errors with the detected CRS and the reprojection
-command.
+### Building the full pyramid
 
-**Why gpio?** The converter assumes Hilbert-sorted, bbox-covered input with
-sane row-group sizing — `gpio` produces exactly that, and it is what keeps
-tylertoo fast on large files.
+The full run covers all 43.9 million features across the fifteen levels from z0
+to z14, so expect minutes, not the seconds a `--bbox` preview takes. For a
+measured run at this scale, the [Brazil 2025 demo](demo.md) reports about 1 h
+12 m to convert and 11 m to export on 16 cores. That run also reads its 40.7 GiB
+of input remotely and filters it while tiling, work a prepared local file skips.
 
-**Reserved column names are auto-renamed.** The overview format adds a `level`
-column (and, with `--cluster` / line coalescing, `point_count` /
-`coalesced_count`). If your data already has a property with one of those names
-— Overture Maps buildings carry a `level` (floor number), admin data often has
-`LEVEL` — tylertoo does **not** reject the file. It renames the colliding
-property by appending `_` (e.g. `level` → `level_`), prints a warning, and keeps
-its own column authoritative. The match is case-insensitive (so `LEVEL` is
-handled too), and any `--sort-key` / `--class-rank` / `--accumulate-attribute`
-that named the renamed column is rewritten to follow it. No preprocessing
-needed.
-
-## One-Shot Conversion (Recommended)
-
-The fastest way from GeoParquet to a map:
+Peak memory tracks the largest row group, not the size of the file. In the demo,
+export streamed all fifteen levels at a 1.56 GiB peak, and convert held to
+9.6 GiB while reading 40.7 GiB over the network. A 4.5 GB input tiles without a
+4.5 GB footprint, and the bound holds when the input dwarfs RAM.
 
 ```bash
-tylertoo input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
-# equivalently: tylertoo tiles input.parquet output.pmtiles ...
-```
-
-This runs the overview convert into an intermediate GeoParquet file, then
-exports it to PMTiles. Beyond the essentials (`--min-zoom`, `--max-zoom`,
-`--gsd`, `--layer-name`, `--tile-buffer`, `--max-tile-size`, `--report`,
-`--verbose`), the one-shot command also accepts every convert-tuning knob
-from `overview` — quality and memory alike:
-
-```bash
-# Country-scale dot fill for a dense building layer, memory-bounded,
-# in one shot (see docs/OVERVIEW_TUNING.md, "Country-scale dot fill")
-tylertoo input.parquet output.pmtiles --max-zoom 14 \
-  --polygon-visibility 0 --collapse --max-tile-size 500K \
-  --profile bounded
-```
-
-A `tiles` run is equivalent to the two-step `overview` + `export-pmtiles`
-chain with the same flags. See `tylertoo tiles --help` (flags are grouped
-by heading) and the [API reference](api-reference.md) for the full set.
-
-**It is not zero-disk.** `tiles` materializes the full multi-resolution
-overview on disk before exporting — at least as large as your input (the
-finest level embeds your data verbatim; country-scale runs can reach tens
-of GB). The run always logs the intermediate's path and size, and a
-free-space preflight warns up front when the chosen volume looks too
-small for it.
-
-- `--keep-overview overviews.parquet` writes the intermediate there and
-  **retains** it, so one run yields both artifacts — the reusable
-  multi-resolution overview file and the PMTiles. The PMTiles output is
-  identical either way.
-- Without it, the intermediate is a temp file — placed in `--spill-dir`
-  if given, else `$TMPDIR` if set, else the output's directory — and is
-  removed once the export finishes (on failure too).
-
-## The Two-Step Workflow
-
-The real product is the **overview GeoParquet file**: one file that embeds
-COG-style multi-resolution levels alongside your exact source data. PMTiles
-is an *export* of it. Prefer the explicit two-step over `tiles` when you
-want to:
-
-- **validate** the overview against the spec before exporting,
-- **iterate on export flags** (layer name, tile size cap, buffer) without
-  re-running the expensive convert each time,
-- use overview-only **format options** (`--mode partitioning`,
-  `--cogp-compat`) that have no PMTiles meaning,
-- **query the overview directly** (DuckDB, GeoPandas) as the primary
-  artifact — though `tiles --keep-overview` covers the simple
-  "I want both files" case in one run.
-
-```bash
-# 1. Build the overview file (levels for zooms 0..14)
-tylertoo overview input.parquet overviews.parquet \
+tylertoo overview \
+  brazil-sorted.parquet \
+  brazil-ov.parquet \
   --min-zoom 0 --max-zoom 14
-
-# 2. Check it against the spec
-tylertoo validate overviews.parquet
-
-# 3. Export a PMTiles archive for map rendering
-tylertoo export-pmtiles overviews.parquet output.pmtiles
 ```
 
-The overview file remains valid GeoParquet 1.1: query it with DuckDB,
-GeoPandas, or anything else (`WHERE level = k` selects one resolution;
-the finest level is your data, verbatim).
+## Validating the overview against the spec
 
-Sensible defaults are chosen from rendered corpus sweeps (auto-detected
-class ranking for Overture roads/places, line coalescing on, density
-budget on). Every knob is documented in
-[Overview Tuning](OVERVIEW_TUNING.md).
-
-### Useful overview options
+`tylertoo validate` checks the overview against the `geo:overviews`
+specification, section 6.2. It confirms that the level metadata, the
+zoom-to-resolution mapping, and the per-level structure agree with what a
+spec-aware reader expects. A file that passes can move downstream without
+further inspection.
 
 ```bash
-# Point data: clustering with counts for graduated-dot rendering
-tylertoo overview places.parquet places_ov.parquet \
-  --min-zoom 0 --max-zoom 14 \
-  --cluster --accumulate-attribute population:sum
-
-# Roads: explicit class ranking (auto-detected for Overture schemas)
-tylertoo overview roads.parquet roads_ov.parquet \
-  --min-zoom 0 --max-zoom 14 \
-  --class-rank road_class:motorway=5,primary=4,residential=2
-
-# Partitioning mode: each feature stored once (COGP-compatible prefix reads)
-tylertoo overview input.parquet out.parquet --mode partitioning
-
-# Write a JSON conversion report
-tylertoo overview input.parquet out.parquet --report report.json
+tylertoo validate brazil-ov.parquet
 ```
 
-### Useful export options
+### Querying it as plain GeoParquet
+
+Validation aside, the overview is still a plain GeoParquet file. Any Arrow- or
+Parquet-aware tool reads it, DuckDB included. The count below returns every
+feature across every level, a quick check that the file materialized.
 
 ```bash
-tylertoo export-pmtiles overviews.parquet output.pmtiles \
-  --layer-name roads \       # MVT layer name (default: "overview")
-  --tile-size-limit 500000   # optional per-tile byte cap
+duckdb -c "SELECT COUNT(*) FROM 'brazil-ov.parquet';"
 ```
 
-## Python
+## Exporting a PMTiles archive
 
-```python
-from tylertoo import overview, export_pmtiles, validate, convert
+`tylertoo export-pmtiles` reads the overview and writes a PMTiles archive, one
+clipped vector tile per tile coordinate. No geometry is recomputed here. The
+levels built during overview become the tiles served to the map.
 
-# Two-step (full knob surface; see the API reference)
-report = overview(
-    "places.parquet", "places_ov.parquet",
-    min_zoom=0, max_zoom=14,
-    cluster=True,
-    accumulate_attributes={"population": "sum"},
-)
-result = validate("places_ov.parquet")
-export_pmtiles("places_ov.parquet", "places.pmtiles", layer_name="places")
+Each tile carries one MVT layer, named `overview` by default. Set `--layer-name`
+to whatever your map style's `source-layer` expects. This tutorial names it
+`fields` so the style can target the data by name.
 
-# One-shot facade (deprecated in favor of the two-step API)
-convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
+```bash
+tylertoo export-pmtiles \
+  brazil-ov.parquet \
+  brazil.pmtiles \
+  --layer-name fields
 ```
 
-## Rust
+## Viewing the tiles
 
-```rust
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions};
-use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-use std::path::Path;
+A PMTiles archive is a single file served over HTTP range requests, so any
+PMTiles-aware viewer renders it without a running tile server.
 
-let opts = ConvertOptions::default(); // duplicating mode, z0..6
-let report = convert_to_overviews(
-    Path::new("input.parquet"),
-    Path::new("overviews.parquet"),
-    &opts,
-)?;
+The [Brazil 2025 demo](demo.md) renders a finished version live from Source
+Cooperative, a 3.4 GiB archive of 1,649,201 tiles holding all 43.9 million
+predictions. It shows what tuned output looks like across zoom. Dots render from
+z0 to z5, and from z6 the field polygons take over, each field staying a dot
+until it is large enough to draw. That dot-to-polygon handoff comes from tuning
+flags this tutorial leaves at their defaults.
 
-let export_opts = ExportOptions::default();
-export_pmtiles(
-    Path::new("overviews.parquet"),
-    Path::new("output.pmtiles"),
-    &export_opts,
-)?;
+Your own `brazil.pmtiles` drops into the same MapLibre and PMTiles setup, or any
+other PMTiles viewer.
+
+## Converting in one step
+
+The bare form runs overview and export back to back, from prepared input
+straight to tiles. It is the fast path when you want the archive and nothing
+else.
+
+```bash
+tylertoo brazil-sorted.parquet brazil.pmtiles
 ```
 
-## Next Steps
-
-- [Overview Tuning](OVERVIEW_TUNING.md) — what every knob does
-- [API Reference](api-reference.md) — full CLI/Python/Rust surface
-- [Advanced Usage](advanced-usage.md) — input optimization, memory, debugging
+The two-step form earns its extra command when you want the overview file
+itself, whether to validate it, query it, or export it more than once with
+different layer names or tile-size limits.

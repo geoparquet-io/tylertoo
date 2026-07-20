@@ -132,6 +132,14 @@ enum Command {
     ExportPmtiles(ExportPmtilesArgs),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
+    /// Emit the full CLI reference as Markdown (docs generator, hidden).
+    ///
+    /// Compiled only under the `gen-docs` feature; used by CI to regenerate
+    /// `docs/reference/cli.md` and diff-guard the committed copy. Not part
+    /// of the production binary.
+    #[cfg(feature = "gen-docs")]
+    #[command(hide = true)]
+    GenReferenceDocs,
 }
 
 /// Arguments for `tylertoo decode`.
@@ -1074,7 +1082,31 @@ fn main() -> Result<()> {
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Decode(args) => run_decode(args),
         Command::Tiles(args) => run_tiles(*args),
+        #[cfg(feature = "gen-docs")]
+        Command::GenReferenceDocs => {
+            print!("{}", gen_reference_markdown());
+            Ok(())
+        }
     }
+}
+
+/// Render the whole clap command tree as Markdown for the CLI reference page.
+///
+/// Single source of truth is the `#[command]`/`#[arg]` help strings on the
+/// clap types in this file — the reference is generated, never hand-edited.
+#[cfg(feature = "gen-docs")]
+fn gen_reference_markdown() -> String {
+    let options = clap_markdown::MarkdownOptions::new()
+        .title("CLI reference".to_string())
+        .show_footer(false)
+        .show_table_of_contents(true);
+    let body = clap_markdown::help_markdown_custom::<Cli>(&options);
+    format!(
+        "<!-- GENERATED FILE — do not edit by hand.\n     \
+         Regenerate: cargo run -p tylertoo --features gen-docs -- \
+         gen-reference-docs > docs/reference/cli.md\n     \
+         CI fails if this file drifts from the clap definitions. -->\n\n{body}"
+    )
 }
 
 /// Insert an implicit `tiles` subcommand for the backward-compatible bare form.
@@ -1086,12 +1118,16 @@ fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    const SUBCOMMANDS: [&str; 6] = [
+    // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
+    // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
+    // rejects it as unknown (correct); when on, it routes to the docs generator.
+    const SUBCOMMANDS: [&str; 7] = [
         "tiles",
         "overview",
         "validate",
         "export-pmtiles",
         "decode",
+        "gen-reference-docs",
         "help",
     ];
     let argv: Vec<std::ffi::OsString> = args.into_iter().collect();

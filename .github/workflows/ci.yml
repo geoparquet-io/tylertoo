@@ -8,6 +8,9 @@
 #   Test            full test matrix (ubuntu/macos x stable/beta)
 #   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
+#   Reference Docs  the committed CLI + Python reference (docs/reference/)
+#                   still match regeneration from source (clap help strings +
+#                   pyo3 docstrings); fails on drift
 #   Coverage        cargo-tarpaulin -> codecov
 #   Profiling       dhat-heap feature keeps compiling
 #   Security Audit  cargo-audit + cargo-deny (advisories/licenses/bans/sources)
@@ -295,6 +298,66 @@ jobs:
         run: |
           uv export --no-emit-project --format requirements-txt -o /tmp/requirements.txt
           uv run pip-audit -r /tmp/requirements.txt --disable-pip
+
+  # Generated reference docs stay in sync with source. The CLI reference is
+  # rendered from the clap help strings (via the hidden gen-docs feature) and
+  # the Python reference from the pyo3 docstrings on the compiled module. Both
+  # are committed under docs/reference/; this job regenerates them and
+  # fails if the committed copies drift, so the source doc-comments remain the
+  # single source of truth.
+  reference-docs:
+    name: Reference Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-reference-docs-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: crates/python/uv.lock
+
+      - name: Regenerate CLI reference
+        run: |
+          cargo run -p tylertoo --features gen-docs -- gen-reference-docs \
+            > docs/reference/cli.md
+
+      - name: Build extension and regenerate Python reference
+        working-directory: crates/python
+        run: |
+          uv sync --locked
+          uv run --no-sync --with docstring-parser==0.18.0 \
+            python scripts/gen_reference.py > ../../docs/reference/python.md
+
+      - name: Fail if reference docs drifted
+        run: |
+          if ! git diff --exit-code -- docs/reference/cli.md docs/reference/python.md; then
+            echo "::error::Reference docs are stale — regenerate and commit:"
+            echo "  cargo run -p tylertoo --features gen-docs -- gen-reference-docs > docs/reference/cli.md"
+            echo "  cd crates/python && uv run --no-sync --with docstring-parser==0.18.0 python scripts/gen_reference.py > ../../docs/reference/python.md"
+            exit 1
+          fi
 
   # Coverage reporting
   coverage:

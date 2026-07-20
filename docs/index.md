@@ -44,12 +44,10 @@ export_pmtiles("overviews.parquet", "output.pmtiles")
 ## Next Steps
 
 - [Getting Started](getting-started.md) — Installation and basic usage
+- [Diving Deeper](diving-deeper/index.md) — Input prep, zoom tuning, remote/multi-file input, bounded memory
+- [Reference](reference/index.md) — Generated CLI, Python, and Rust API surface
 - [Decoding PMTiles](decode.md) — PMTiles → GeoParquet, limitations included
 - [Overview Tuning](OVERVIEW_TUNING.md) — Every generalization knob explained
-- [API Reference](api-reference.md) — CLI flags, Python API, Rust API
-- [Advanced Usage](advanced-usage.md) — Input optimization, memory, export
-- [Remote Reads](remote-reads.md) — Converting directly from s3://, https://, gs:// inputs, and querying overview files in place with DuckDB
-- [Multi-Partition Input](multi-partition.md) — Directories, globs, s3://gs:// prefixes, and --files-from manifests as one dataset
 - [Architecture](architecture.md) — Design decisions and internals
 
 ## License
