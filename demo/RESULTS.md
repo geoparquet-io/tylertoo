@@ -131,6 +131,17 @@ keeps every field eligible (nothing is gated out), and `--collapse` +
 A field's lifecycle is therefore *absent → dot → polygon → verbatim*, never
 reversing.
 
+**Fine-zoom dots and the LOD style.** Brazil's fields are small — median bbox
+diagonal ≈ 53 m — so a large share stay **sub-pixel** (a field is only a ≥1 px
+polygon once it clears ~38 m at z12, ~76 m at z11). Keeping every field visible
+across zoom (no disappearance) therefore *requires* those still-sub-pixel fields
+to render as dots well into the mid zooms — ~30 % of z12 features are such dots.
+That is correct in the tiles (each becomes a polygon by z13–z14), but a constant
+dot symbol would swamp the fine-zoom view, so the demo style **tapers the dot
+size and opacity from ~z10** — the polygons (fields past 1 px) become the map and
+the remaining tiny-field dots recede to a faint stipple. This is presentation
+only; the tiles are unchanged.
+
 ## What the numbers say
 
 **1. The filter is the feature.** No curated "Brazil 2025 fields" file
