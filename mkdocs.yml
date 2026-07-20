@@ -24,6 +24,7 @@ theme:
   features:
     - navigation.top
     - navigation.sections
+    - navigation.indexes
     - search.suggest
     - search.highlight
     - content.code.copy
@@ -53,16 +54,24 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Diving Deeper:
+      - diving-deeper/index.md
+      - Preparing input for tiling: diving-deeper/preparing-input.md
+      - Working with the overview file: diving-deeper/overview-file.md
+      - Tuning what appears at each zoom: diving-deeper/tuning-zoom.md
+      - Tiling remote and multi-file inputs: diving-deeper/remote-and-multi-file.md
+      - Keeping memory bounded: diving-deeper/bounded-memory.md
+      - How tylertoo relates to tippecanoe: diving-deeper/tippecanoe.md
+  - Reference:
+      - reference/index.md
+      - CLI: reference/cli.md
+      - Python: reference/python.md
+      - Rust: reference/rust.md
   - Demo (Brazil 2025 fields): demo.md
-  - Performance: performance.md
-  - Profiling: PROFILING.md
-  - Decoding PMTiles: decode.md
-  - API Reference: api-reference.md
-  - Advanced Usage: advanced-usage.md
-  - Remote Reads: remote-reads.md
-  - Multi-Partition Input: multi-partition.md
-  - Architecture: architecture.md
   - Overview Tuning: OVERVIEW_TUNING.md
+  - Decoding PMTiles: decode.md
+  - Architecture: architecture.md
+  - Profiling: PROFILING.md
   - Development: development.md
   - Contributing: contributing.md
   - Changelog: changelog.md

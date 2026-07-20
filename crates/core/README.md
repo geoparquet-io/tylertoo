@@ -17,7 +17,7 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 - One-shot GeoParquet → PMTiles (`tylertoo tiles`, or the bare form)
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
 - Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
-- Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/remote-reads.md))
+- Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/diving-deeper/remote-and-multi-file.md))
 - Attribute filtering (`--filter` / `--where`) — tile only the features matching a SQL-WHERE-style predicate (`"confidence > 0.8"`, `"crop IN ('soy', 'corn')"`), with parquet row-group statistics pushdown so non-matching row groups are never read (or fetched, on remote input); composes with `--bbox` ([Tuning guide](docs/OVERVIEW_TUNING.md#attribute-filter---filter----where))
 - Spec validation (`tylertoo validate`)
 - PMTiles → GeoParquet decoding (`tylertoo decode`) — tippecanoe-decode
@@ -112,11 +112,10 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 ## Documentation
 
 - **[Getting Started](docs/getting-started.md)** — Installation, one-shot conversion, the two-step workflow
+- **[Diving Deeper](docs/diving-deeper/index.md)** — Input prep, zoom tuning, remote/multi-file input, bounded memory
+- **[Reference](docs/reference/index.md)** — Generated CLI, Python, and Rust API surface
 - **[Overview Tuning](docs/OVERVIEW_TUNING.md)** — Every generalization knob explained
 - **[Decoding PMTiles](docs/decode.md)** — PMTiles → GeoParquet, limitations included
-- **[API Reference](docs/api-reference.md)** — CLI flags, Python API, Rust API
-- **[Advanced Usage](docs/advanced-usage.md)** — Input optimization, memory, remote reads, CI/CD
-- **[Remote Reads](docs/remote-reads.md)** — Converting directly from s3://, https://, gs:// inputs, and querying overview files in place with DuckDB
 - **[Format Spec (draft)](context/OVERVIEWS_SPEC.md)** — The `geo:overviews` format contract
 
 ## Development
