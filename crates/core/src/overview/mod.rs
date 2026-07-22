@@ -18,6 +18,7 @@ pub mod coalesce;
 pub mod convert;
 pub mod export;
 pub mod filter;
+pub mod h3agg;
 #[cfg(test)]
 mod hostile;
 pub mod level;

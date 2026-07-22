@@ -422,8 +422,8 @@ struct ConvertTuningArgs {
     collapse_square: bool,
 
     /// Zoom-band representation selector: comma-separated LO-HI:KIND bands,
-    /// e.g. "0-7:point,8-14:geom" or "0-5:square". KIND is geom, point, or
-    /// square.
+    /// e.g. "0-7:point,8-14:geom", "0-5:square", or "0-5:h3,6-14:geom". KIND is
+    /// geom, point, square, or h3.
     ///
     /// point: ALL polygonal features in the band become representative
     /// points (centroid) — "dots zoomed out, polygons zoomed in" in ONE
