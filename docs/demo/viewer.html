@@ -33,9 +33,10 @@
 <body>
   <div id="map"></div>
   <div id="panel">
-    <h1>Brazil field boundaries — tylertoo</h1>
-    <p>55.5M Fields of The World boundaries, cloud-native GeoParquet → PMTiles in
-       one native workflow (z1–14). Rendered on CARTO Dark Matter.</p>
+    <h1>Brazil 2025 field predictions — tylertoo</h1>
+    <p>43.9M Fields of The World predictions, filtered from a 630 GiB collection to
+       GeoParquet → PMTiles in one native workflow (z0–14): dots zoomed out,
+       polygons zoomed in. Rendered on CARTO Dark Matter.</p>
     <div class="views">
       <button data-view="brazil">Brazil</button>
       <button data-view="matogrosso">Mato Grosso</button>
@@ -52,7 +53,7 @@
     // Brazil 2025 field-predictions PMTiles on Source Cooperative (Range + CORS).
     // Override at runtime with ?pmtiles=<url>.
     const DEFAULT_PMTILES =
-      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-2025-fields.pmtiles";
+      "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-2025-fields-v2.pmtiles";
 
     const VIEWS = {
       brazil:         { center: [-53.00, -14.34], zoom: 4.0 },
@@ -84,17 +85,32 @@
       },
       layers: [
         { id: "carto", type: "raster", source: "carto" },
-        // z0-7 tiles carry representative POINTS (--representation "0-7:point");
-        // z8+ carry the polygons. Fill/line styles silently ignore points, so
-        // the low-zoom band gets its own circle layer.
+        // Representation transition (v2, monotonic). z0-5 are an explicit point
+        // band; from z6 a collapse-filled polygon band takes over, where each
+        // field stays a representative POINT until it is large enough to draw as
+        // a >=1px polygon (--collapse --polygon-visibility 0 --simplify-factor 4).
+        // Points and polygons therefore COEXIST z6-13 and the map never loses a
+        // field as you zoom in — a field goes dot -> polygon, never dot -> gone.
+        // Fill/line styles ignore points, so points get their own circle layer.
+        // Brazil fields are tiny (median ~53 m diagonal), so a large share stay
+        // sub-pixel — and therefore dots — well into the mid zooms. The dot
+        // symbol carries the coarse/mid zooms, then TAPERS in size + opacity so
+        // that from ~z10 the polygons (fields that have crossed 1 px) read as
+        // the map and the remaining tiny-field dots recede to a faint stipple
+        // rather than swamping the fine-zoom view. The tiles are unchanged
+        // (every field still present at every zoom); this is LOD styling only.
         { id: "field-dot", type: "circle", source: "fields", "source-layer": LAYER,
           filter: ["==", ["geometry-type"], "Point"],
-          paint: { "circle-color": "#4cc9f0", "circle-opacity": 0.75,
-                   "circle-radius": ["interpolate", ["linear"], ["zoom"], 0, 0.7, 7, 1.6] } },
+          paint: { "circle-color": "#4cc9f0",
+                   "circle-opacity": ["interpolate", ["linear"], ["zoom"],
+                     5, 0.85, 9, 0.65, 11, 0.35, 12, 0.2, 13.5, 0.08],
+                   "circle-radius":  ["interpolate", ["linear"], ["zoom"],
+                     0, 0.8, 5, 1.6, 8, 1.4, 10, 0.85, 11, 0.55, 12, 0.32, 14, 0.12] } },
         { id: "field-fill", type: "fill", source: "fields", "source-layer": LAYER,
           paint: { "fill-color": "#4cc9f0", "fill-opacity": 0.35 } },
         { id: "field-line", type: "line", source: "fields", "source-layer": LAYER,
-          paint: { "line-color": "#9be7ff", "line-width": 0.3, "line-opacity": 0.55 } },
+          paint: { "line-color": "#9be7ff", "line-opacity": 0.6,
+                   "line-width": ["interpolate", ["linear"], ["zoom"], 8, 0.3, 12, 0.7, 14, 1.1] } },
       ],
     };
 
