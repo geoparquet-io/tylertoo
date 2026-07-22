@@ -232,7 +232,7 @@ fn partition_emitted_levels(
 }
 
 /// Build the three writer schemas (identical to the in-memory path):
-/// `source` (base), `cluster` (+ `point_count` when clustering, Q4), and `out`
+/// `source` (h3_count), `cluster` (+ `point_count` when clustering, Q4), and `out`
 /// (+ `coalesced_count` when coalescing, Q3). All three are needed downstream,
 /// so they are returned together.
 fn build_level_schemas(
@@ -243,7 +243,20 @@ fn build_level_schemas(
 ) -> (Schema, Schema, Schema) {
     let geom_out_field = mixed_geometry_field(geom_name);
     let source_schema = build_source_schema(input_schema, geom_idx, geom_out_field);
-    let cluster_schema = if options.cluster {
+    // H3 aggregate bands (#332): cell rows carry NULL for every source
+    // attribute and reuse `point_count` as the cell feature count, so the
+    // schema must relax source-column nullability and include `point_count`
+    // exactly as clustering does.
+    let has_h3 = options
+        .representation
+        .iter()
+        .any(|b| b.repr == super::simplify::Representation::H3);
+    let source_schema = if has_h3 {
+        super::convert::relax_source_nullability(&source_schema, geom_idx)
+    } else {
+        source_schema
+    };
+    let cluster_schema = if options.cluster || has_h3 {
         append_point_count_field(&source_schema)
     } else {
         source_schema.clone()
@@ -280,6 +293,7 @@ fn select_row_groups_streaming(
     })
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -588,17 +602,34 @@ pub(crate) fn convert_streaming_strategy(
     warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
 
     // --- Writer setup (identical to the in-memory path). ---------------------
-    // Writer schemas: base + point_count when clustering (Q4) + coalesced_count
+    // Writer schemas: h3_count + point_count when clustering (Q4) + coalesced_count
     // when coalescing (Q3).
     let geom_name = geom_field.name().clone();
     let (source_schema, cluster_schema, out_schema) =
         build_level_schemas(&input_schema, geom_idx, &geom_name, options);
 
-    let writer_levels: Vec<LevelSpec> = emitted
+    // H3 levels are counted from `level_specs` (the full zoom plan), not `emitted`
+    // (which omits levels with no assigned features — exactly the coarse H3 zooms
+    // where features are too small to pass the visibility gate).
+    let h3_count = level_specs
         .iter()
-        .map(|e| LevelSpec::new(e.gsd, e.zoom))
+        .take_while(|(_, zoom)| {
+            super::convert::representation_for_zoom(&options.representation, *zoom)
+                == super::simplify::Representation::H3
+        })
+        .count();
+
+    // H3 levels (0..h3_count) + geom levels from emitted.
+    let writer_levels: Vec<LevelSpec> = level_specs[..h3_count]
+        .iter()
+        .map(|(gsd, zoom)| LevelSpec::new(*gsd, *zoom))
+        .chain(emitted.iter().map(|e| LevelSpec::new(e.gsd, e.zoom)))
         .collect();
-    let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
+    let emitted_gsds: Vec<f64> = level_specs[..h3_count]
+        .iter()
+        .map(|(gsd, _)| *gsd)
+        .chain(emitted.iter().map(|e| e.gsd))
+        .collect();
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
     writer_opts.row_group_size_policy = options.row_group_size_policy;
@@ -617,6 +648,35 @@ pub(crate) fn convert_streaming_strategy(
     let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
         .filter(|&c| c != geom_idx)
         .collect();
+
+    // --- H3 aggregate levels (#332): write the coarse cell prefix directly. ---
+    // H3 bands are a validated contiguous coarse prefix (levels `0..h3_count`).
+    // Their rows are cell aggregates binning ALL features, independent of the
+    // per-feature level assignment used by the geom levels. We iterate over
+    // `level_specs` (the full zoom plan), not `emitted` (which omits levels
+    // with no assigned features — exactly the coarse H3 zooms where features
+    // are too small to pass the visibility gate). `h3_count == 0` (no H3 bands)
+    // leaves the geom path byte-identical to before.
+    let mut h3_stats: Vec<(LevelWriteOutcome, usize, usize)> = Vec::with_capacity(h3_count);
+    if h3_count > 0 {
+        let h3_points = super::h3agg::rep_points_lonlat(&features, crs);
+        for (level_idx, (gsd, _)) in level_specs[..h3_count].iter().enumerate() {
+            let res = super::level::h3_res_for_gsd(*gsd);
+            let rows = super::h3agg::aggregate_h3_cells(h3_points.iter().copied(), res);
+            let mut batch = super::convert::build_h3_level_batch(&cluster_schema, geom_idx, &rows)?;
+            if options.coalesce_lines {
+                // Cell rows never coalesce (table None ⇒ all 1); the index slice
+                // only carries the row count.
+                let idx = vec![0usize; rows.len()];
+                batch = super::convert::apply_coalesced_count(batch, &out_schema, &idx, None)?;
+            }
+            let n_cells = batch.num_rows();
+            // feature_count = Σ point_count = input features binned, not cell count.
+            let n_features: usize = rows.iter().map(|r| r.count as usize).sum();
+            let outcome = writer.write_level(level_idx, Some(n_cells), std::iter::once(batch))?;
+            h3_stats.push((outcome, n_features, 0));
+        }
+    }
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
@@ -708,7 +768,10 @@ pub(crate) fn convert_streaming_strategy(
                 repr: repr_of(e.zoom),
                 crs,
                 simplify: &options.simplify,
-                cluster_enabled: options.cluster,
+                // H3 (#332) reuses the `point_count` column for geom levels too
+                // (filled 1, since `cluster_table` is None when clustering is
+                // off), so every level's schema matches the H3 cell batches.
+                cluster_enabled: options.cluster || h3_count > 0,
                 // Canonical level: singleton clusters, columns verbatim (§2.4).
                 cluster_table: cluster_tables
                     .as_ref()
@@ -737,7 +800,10 @@ pub(crate) fn convert_streaming_strategy(
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
     let in_flight_batches = resolve_and_log_in_flight_batches(options.in_flight_batches);
 
-    let level_stats: Vec<(LevelWriteOutcome, usize, usize)> = match strategy {
+    // The geom pipeline handles ALL of `emitted` (0..n), but writes to level indices
+    // `h3_count..h3_count+n` because the H3 prefix occupies 0..h3_count. When
+    // `h3_count == 0` (no H3 bands), this reduces to the original 0..n behavior.
+    let geom_stats: Vec<(LevelWriteOutcome, usize, usize)> = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
         Pass2Strategy::Serial => ctxs
             .iter()
@@ -745,7 +811,7 @@ pub(crate) fn convert_streaming_strategy(
             .map(|(i, ctx)| {
                 write_level_streaming(
                     &mut writer,
-                    i,
+                    h3_count + i, // offset by H3 prefix
                     hints[i],
                     source,
                     options.read_batch_size,
@@ -755,8 +821,8 @@ pub(crate) fn convert_streaming_strategy(
                 )
             })
             .collect::<Result<_, _>>()?,
-        // Production: buffer levels 0..n-1 from a single read, then stream the
-        // finest (verbatim, largest) level last straight into the writer.
+        // Production: buffer the non-finest geom levels from a single read, then
+        // stream the finest (verbatim, largest) level last into the writer.
         Pass2Strategy::Pipelined => {
             let buffered_rows: usize = hints[..n - 1].iter().sum();
             // #305: pass 1's measured average encoded-geometry size per input
@@ -771,8 +837,9 @@ pub(crate) fn convert_streaming_strategy(
                 avg_geom_bytes,
             );
             log::info!(
-                "[convert] pass 2: building {n} overview level(s) from a \
-                 single read (finest level streamed last)"
+                "[convert] pass 2: building {} geom overview level(s) from a \
+                 single read (finest level streamed last)",
+                n
             );
             let mut stats = if n > 1 {
                 pipeline::run_pass2_buffered(
@@ -785,13 +852,14 @@ pub(crate) fn convert_streaming_strategy(
                     in_flight_batches,
                     backing,
                     &out_schema,
+                    h3_count, // base_level offset for writer indices
                 )?
             } else {
                 Vec::new()
             };
             stats.push(write_level_streaming(
                 &mut writer,
-                n - 1,
+                h3_count + n - 1, // offset by H3 prefix
                 hints[n - 1],
                 source,
                 options.read_batch_size,
@@ -804,17 +872,33 @@ pub(crate) fn convert_streaming_strategy(
     };
     log_validation_skips(validation_skips_before);
 
-    // Fold each emitted level's write outcome into the shared bookkeeping
-    // (#211): `record_level_outcome` appends a renumbered `LevelReport` for a
-    // written level, or — for a level the writer omitted because every
-    // candidate collapsed during simplification — warns and records the plan in
-    // `skipped`, exactly like a plan-time omission.
-    let mut level_reports = Vec::with_capacity(emitted.len());
-    for (e, (outcome, rows, vertices)) in emitted.iter().zip(level_stats) {
+    // Fold each level's write outcome into the shared bookkeeping (#211):
+    // `record_level_outcome` appends a renumbered `LevelReport` for a written
+    // level, or — for a level the writer omitted because every candidate
+    // collapsed during simplification — warns and records the plan in `skipped`.
+    // H3 levels come from `level_specs[..h3_count]`; geom levels from `emitted`.
+    let mut level_reports = Vec::with_capacity(h3_count + emitted.len());
+    for (i, (outcome, rows, vertices)) in h3_stats.into_iter().enumerate() {
+        let (gsd, zoom) = level_specs[i];
         record_level_outcome(
             outcome,
             SkippedLevelReport {
-                planned_level: e.orig as usize,
+                planned_level: i,
+                gsd,
+                zoom,
+            },
+            rows, // hint = rows for H3 (all features binned)
+            rows,
+            vertices,
+            &mut level_reports,
+            &mut skipped,
+        );
+    }
+    for (e, (outcome, rows, vertices)) in emitted.iter().zip(geom_stats) {
+        record_level_outcome(
+            outcome,
+            SkippedLevelReport {
+                planned_level: h3_count + e.orig as usize,
                 gsd: e.gsd,
                 zoom: e.zoom,
             },
@@ -1166,7 +1250,7 @@ fn run_pass1(
         // non-finite geometry produce no feature but still advance the row
         // index, so every row-keyed table stays aligned (H4 hardening; a
         // skipped row must never shift attributes onto a neighbor's geometry).
-        let base = num_rows;
+        let h3_count = num_rows;
         for (i, gopt) in geoms_buf.iter().enumerate() {
             // Attribute filter (#315): keep only rows where the predicate is
             // TRUE. The row index still advances (row-keyed tables stay
@@ -1201,12 +1285,12 @@ fn run_pass1(
                 point_count += 1;
             }
             if collect_lines && matches!(kind, FeatureKind::Line) {
-                line_rows.push(base + i);
+                line_rows.push(h3_count + i);
                 line_feat_pos.push(features.len());
                 line_geoms.push(g.clone());
             }
             features.push(AssignFeature {
-                index: base + i,
+                index: h3_count + i,
                 bbox: fbbox,
                 kind,
                 sort_key: None, // filled below once the ranking tier resolves
@@ -1269,7 +1353,7 @@ fn run_pass1(
 
     // Resolve the tier (same order + logging as the in-memory path). The
     // third element is the all-row class-group vector for coalescing, present
-    // only for the class-based tiers (matches `coalesce_group_column`).
+    // only for the class-h3_countd tiers (matches `coalesce_group_column`).
     type Resolved = (
         Option<Vec<Option<f64>>>,
         RankingProvenance,

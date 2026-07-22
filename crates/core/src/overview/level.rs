@@ -85,6 +85,64 @@ pub fn gsd(z: u8) -> f64 {
     gsd_with_base(z, GSD_TILE_BASE)
 }
 
+/// The 16 H3 resolutions, coarse (0) → fine (15), for edge-length scanning.
+const H3_RESOLUTIONS: [h3o::Resolution; 16] = [
+    h3o::Resolution::Zero,
+    h3o::Resolution::One,
+    h3o::Resolution::Two,
+    h3o::Resolution::Three,
+    h3o::Resolution::Four,
+    h3o::Resolution::Five,
+    h3o::Resolution::Six,
+    h3o::Resolution::Seven,
+    h3o::Resolution::Eight,
+    h3o::Resolution::Nine,
+    h3o::Resolution::Ten,
+    h3o::Resolution::Eleven,
+    h3o::Resolution::Twelve,
+    h3o::Resolution::Thirteen,
+    h3o::Resolution::Fourteen,
+    h3o::Resolution::Fifteen,
+];
+
+/// Pick the H3 resolution whose average hexagon edge length best matches a
+/// target ground sample distance (#332 auto per-zoom resolution).
+///
+/// H3 aggregate overview levels are param-free (like the `point`/`square`
+/// representation bands): each banded zoom auto-selects a resolution so coarse
+/// zooms get large hexagons and each finer zoom densifies, smoothly handing off
+/// to real geometry at the geom band. The match is nearest in **log-ratio** of
+/// [`h3o::Resolution::edge_length_m`] to `gsd_m`, which treats "hexagon twice
+/// the GSD" and "hexagon half the GSD" as equally far — the natural metric for
+/// a quantity that scales geometrically with zoom. A non-finite or non-positive
+/// `gsd_m` falls back to the coarsest resolution.
+///
+/// This is a deliberately simple geometric heuristic; a count- or
+/// tile-size-driven refinement (gpio's `--auto`) can layer on later without
+/// changing the band grammar.
+pub fn h3_res_for_gsd(gsd_m: f64) -> h3o::Resolution {
+    if !gsd_m.is_finite() || gsd_m <= 0.0 {
+        return h3o::Resolution::Zero;
+    }
+    let target = gsd_m.ln();
+    let mut best = h3o::Resolution::Zero;
+    let mut best_dist = f64::INFINITY;
+    for res in H3_RESOLUTIONS {
+        let dist = (res.edge_length_m().ln() - target).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = res;
+        }
+    }
+    best
+}
+
+/// [`h3_res_for_gsd`] for a Web Mercator zoom under a given tile-band `base`
+/// (the same `base` that drives [`gsd_with_base`]).
+pub fn h3_res_for_zoom(z: u8, base: f64) -> h3o::Resolution {
+    h3_res_for_gsd(gsd_with_base(z, base))
+}
+
 /// Inverse of [`gsd`]: the (fractional) Web Mercator zoom for a target GSD.
 ///
 /// `z = log2(40_075_016.69 / 1024 / gsd)`. Returns a float; callers that need
@@ -706,6 +764,39 @@ mod tests {
                 },
             ],
             generalization: None,
+        }
+    }
+
+    #[test]
+    fn h3_res_for_gsd_monotonic_ladder() {
+        // Finer zoom (smaller GSD) must never select a coarser H3 resolution:
+        // the auto ladder densifies monotonically as you zoom in.
+        let mut prev = u8::from(h3_res_for_zoom(0, GSD_TILE_BASE));
+        for z in 1u8..=15 {
+            let res = u8::from(h3_res_for_zoom(z, GSD_TILE_BASE));
+            assert!(res >= prev, "z={z}: res {res} coarser than previous {prev}");
+            prev = res;
+        }
+    }
+
+    #[test]
+    fn h3_res_for_gsd_matches_nearest_edge_length() {
+        // An exact H3 edge length maps to that resolution (log-ratio distance
+        // is zero at the anchor, positive at every neighbour).
+        for res in H3_RESOLUTIONS {
+            assert_eq!(
+                u8::from(h3_res_for_gsd(res.edge_length_m())),
+                u8::from(res),
+                "edge length of res {} should map back to itself",
+                u8::from(res)
+            );
+        }
+    }
+
+    #[test]
+    fn h3_res_for_gsd_degenerate_input_is_coarsest() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(h3_res_for_gsd(bad), h3o::Resolution::Zero, "gsd={bad}");
         }
     }
 

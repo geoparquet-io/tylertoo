@@ -269,7 +269,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         type-preserving, so fill styles keep working). Mutually exclusive
 ///         with collapse. Defaults to False.
 ///     representation (str, optional): Zoom-band representation selector:
-///         comma-separated "LO-HI:KIND" bands (KIND: geom, point, square),
+///         comma-separated "LO-HI:KIND" bands (KIND: geom, point, square, h3),
 ///         e.g. "0-7:point,8-14:geom". Point bands render ALL polygonal
 ///         features as centroids; square bands emit dithered placeholder
 ///         squares for below-tolerance polygons. Requires a zoom-range plan

@@ -380,6 +380,10 @@ pub(super) fn run_pass2_buffered(
     in_flight: usize,
     backing: SinkBacking,
     out_schema: &Schema,
+    // Absolute writer level index of this buffered set's first level (#332):
+    // H3 aggregate levels are written directly by the driver as a coarse
+    // prefix, so the buffered geom levels start at `base_level`, not 0.
+    base_level: usize,
 ) -> Result<Vec<(LevelWriteOutcome, usize, usize)>, ConvertError> {
     let num_levels = ctxs.len();
     debug_assert_eq!(num_levels, hints.len());
@@ -510,7 +514,7 @@ pub(super) fn run_pass2_buffered(
     let mut outcomes = Vec::with_capacity(num_levels);
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
-        outcomes.push(drain_sink(writer, li, hints[li], sink)?);
+        outcomes.push(drain_sink(writer, base_level + li, hints[li], sink)?);
     }
 
     timers.log_engine_summary(t_engine.elapsed().as_secs_f64(), rows.iter().sum());
