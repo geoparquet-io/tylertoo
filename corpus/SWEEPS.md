@@ -3,7 +3,7 @@
 Single home for the corpus sweeps that set the engine's default knob
 values. Each section states the decision, the evidence, and where the
 renders/artifacts live. The knobs themselves are documented in
-`docs/OVERVIEW_TUNING.md`; the code constants live in
+`context/OVERVIEW_TUNING.md`; the code constants live in
 `crates/core/src/overview/assign.rs` and the CLI arg defaults in
 `crates/cli/src/main.rs`.
 
@@ -229,7 +229,7 @@ the write-time survival bar (and with the line gate).
 
 **The country view needs the recipe, not a gate.** No gate value can put
 a 20 m building on a z4 map as a polygon. The documented recipe
-(`docs/OVERVIEW_TUNING.md` → "Country-scale dot fill") is
+(`context/OVERVIEW_TUNING.md` → "Country-scale dot fill") is
 `--polygon-visibility 0 --collapse` (+ `--max-tile-size 500K` on export,
 + a circle layer in the style): every Germany level populates (z0 = 581
 dots, z4 = 128,886, z6 = 1.07M), z6–z13 land exactly on the budget

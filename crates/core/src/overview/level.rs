@@ -72,7 +72,7 @@ impl Crs {
 /// `gsd(z, base) = 40_075_016.69 / base / 2^z`. The `base` is the cogp-rs
 /// CLI-configurable knob (spec Q6): a larger base yields smaller GSDs at every
 /// zoom (finer detail retained / less thinning), a smaller base yields larger
-/// GSDs (coarser / more thinning). See `docs/OVERVIEW_TUNING.md`.
+/// GSDs (coarser / more thinning). See `context/OVERVIEW_TUNING.md`.
 pub fn gsd_with_base(z: u8, base: f64) -> f64 {
     WEBMERC_CIRCUMFERENCE_M / base / 2f64.powi(z as i32)
 }

@@ -49,9 +49,25 @@ a remote run downloads its data about once.
 range. The same command that tiles a local file tiles a remote one; only the
 path changes.
 
+```bash
+# Tile straight from object storage — no full download.
+tylertoo overview \
+  s3://gpq-tiles-demo/brazil-2025-fields.parquet \
+  brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14
+```
+
 **`s3://…/` and `gs://…/` prefixes.** A trailing slash lists the `.parquet`
 objects under the prefix and tiles them as one dataset, for a bucket laid out as
 many partition objects.
+
+```bash
+# A trailing slash tiles every .parquet under the prefix as one dataset.
+tylertoo overview \
+  s3://gpq-tiles-demo/brazil-partitions/ \
+  brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14
+```
 
 ### Extracting one region
 
@@ -60,6 +76,15 @@ intersects the box, in lon/lat degrees. Row groups outside the box are pruned at
 the footer, so a city-sized window from a country file reads a fraction of the
 data and, on remote input, downloads a fraction of the bytes. The tutorial's São
 Paulo preview is this knob used to finish in seconds.
+
+```bash
+# Carve the São Paulo window straight out of the remote country file.
+tylertoo overview \
+  s3://gpq-tiles-demo/brazil-2025-fields.parquet \
+  sp-preview-ov.parquet \
+  --min-zoom 0 --max-zoom 12 \
+  --bbox -48,-24,-46,-22
+```
 
 ### Filtering by attribute
 
@@ -73,6 +98,20 @@ preclude a match, the row group is skipped at the footer like `--bbox`, and it
 composes with `--bbox` for a combined spatial-and-attribute extract straight from
 the source file.
 
+```bash
+# Attribute pushdown: only 2025 field predictions, filtered while tiling.
+tylertoo overview \
+  s3://gpq-tiles-demo/brazil-2025-fields.parquet \
+  brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --filter "label = 'field' AND time >= '2025-01-01'"
+
+# Composes with --bbox and richer predicates.
+tylertoo overview brazil-sorted.parquet subset-ov.parquet \
+  --bbox -48.0,-16.0,-47.0,-15.0 \
+  --where "crop_type IN ('soy', 'corn') AND confidence >= 0.5"
+```
+
 ### Combining many partition files
 
 **`--files-from <manifest>`.** Converts the files listed in a manifest, one local
@@ -81,6 +120,16 @@ must be a single `.parquet` file, not a directory or glob, and local and remote
 entries may be mixed. The line order defines the dataset row order, so the
 manifest is both the input list and the ordering contract. Usage places the
 manifest before the single positional output.
+
+```bash
+# manifest.txt: one .parquet path or URL per line, '#' comments allowed.
+#   s3://gpq-tiles-demo/BR_north.parquet
+#   s3://gpq-tiles-demo/BR_south.parquet
+tylertoo overview \
+  --files-from manifest.txt \
+  brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14
+```
 
 **Directory or glob input.** A partition set given as a positional path, for the
 common case where the partitions sit together on disk and their listing order is

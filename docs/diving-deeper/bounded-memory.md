@@ -61,12 +61,26 @@ proportionally more peak memory; smaller batches bound memory tighter. The
 default keeps per-batch transients in the tens of megabytes even for
 vertex-heavy polygons.
 
+```bash
+# Bound memory tighter on a constrained machine or for monster geometries.
+tylertoo overview brazil-sorted.parquet brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --read-batch-size 1024
+```
+
 ### Choosing a memory profile
 
 **`--profile auto|speed|bounded`.** Selects how pass 2 handles buffered output,
 per the profile decision above. `auto` is the default and the safe choice for
 large duplicating runs, which it steers toward `bounded` rather than risking an
 out-of-memory kill.
+
+```bash
+# Force spilling to temp files, capping RAM regardless of output size.
+tylertoo overview brazil-sorted.parquet brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --profile bounded
+```
 
 **`TYLERTOO_AUTO_MEM_LIMIT_BYTES`.** Overrides the available-RAM figure that
 `auto` reads when it cannot probe the machine, or when you want to reserve
@@ -87,6 +101,25 @@ prints at pass-2 start.
 for roughly the touched input size. A free-space preflight warns about a
 projected shortfall. The directory must exist. Local inputs never spill.
 
+```bash
+# Stage a big remote convert onto a roomy volume, not $TMPDIR.
+tylertoo overview \
+  s3://gpq-tiles-demo/brazil-2025-fields.parquet \
+  brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --spill-dir /mnt/scratch
+```
+
+Phase timings and per-stage peak-RSS (`[rss]`, `[assign]`) print at debug log
+level, which is how you see which stage set the memory ceiling.
+
+```bash
+# Watch phase timing and peak-RSS while a run executes.
+RUST_LOG=tylertoo_core=debug \
+tylertoo overview brazil-sorted.parquet brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14
+```
+
 **`$TMPDIR`.** The default spill location when `--spill-dir` is unset. The
 caveat is that a small or full `$TMPDIR` volume turns a remote convert's stage
 write into a failure, so on a big remote run, set `--spill-dir` to somewhere you
@@ -99,3 +132,12 @@ per band. `auto` preflights a memory budget from the core count and available
 RAM. Override it with an explicit integer to cap memory harder on a shared
 machine, or to push utilization on a dedicated one. The output is byte-identical
 for every value.
+
+```bash
+# Cap export at two resident partitions per band on a shared box.
+tylertoo export-pmtiles \
+  brazil-ov.parquet \
+  brazil.pmtiles \
+  --layer-name fields \
+  --partition-wave 2
+```

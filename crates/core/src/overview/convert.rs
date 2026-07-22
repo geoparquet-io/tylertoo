@@ -570,7 +570,7 @@ pub(super) fn warn_plan_skipped_levels(
          feature(s) are visible at those scales (visibility gates / density budget); the \
          output pyramid starts at GSD {:.2} m{}. To populate coarse levels, lower \
          --polygon-visibility/--line-visibility, or pass --collapse to keep sub-GSD \
-         polygons as representative points (see docs/OVERVIEW_TUNING.md)",
+         polygons as representative points (see context/OVERVIEW_TUNING.md)",
         skipped.len(),
         ids.join(", "),
         gsd_max,
@@ -601,7 +601,7 @@ pub(super) fn record_level_outcome(
                 "level planned at GSD {:.2} m{} became empty after simplification \
                  (all {} candidate feature(s) collapsed); omitted from the output pyramid. \
                  Pass --collapse to keep sub-GSD polygons as representative points at \
-                 coarse levels (see docs/OVERVIEW_TUNING.md)",
+                 coarse levels (see context/OVERVIEW_TUNING.md)",
                 planned.gsd,
                 planned
                     .zoom
