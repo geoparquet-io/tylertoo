@@ -1021,10 +1021,16 @@ impl PmtilesWriter {
             }
         }
 
-        // Encode and compress directory using configured internal compression
-        let dir_bytes = encode_directory(&entries);
-        let compressed_dir = compression::compress(&dir_bytes, self.internal_compression)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to compress directory: {}", e)))?;
+        // Split into a root directory plus leaf directories when the entries do
+        // not fit the spec's 16 KiB root budget. Writing one oversized root
+        // instead produces an archive that readers reject outright: go-pmtiles
+        // reads the first 16 KiB and panics slicing past it. This only bites
+        // above a few thousand tiles, which is why it went unnoticed while this
+        // writer was exercised solely by small tests.
+        let layout = make_root_leaves(&entries, self.internal_compression)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to build directories: {}", e)))?;
+        let compressed_dir = layout.root_bytes;
+        let leaves_bytes = layout.leaves_bytes;
 
         // JSON metadata with vector_layers and tilestats
         let min_z = if self.min_zoom == 255 {
@@ -1052,7 +1058,11 @@ impl PmtilesWriter {
         let root_dir_length = compressed_dir.len() as u64;
         let metadata_offset = root_dir_offset + root_dir_length;
         let metadata_length = compressed_metadata.len() as u64;
-        let tile_data_offset = metadata_offset + metadata_length;
+        // Leaf directories sit between the metadata and the tile data, and
+        // `DirEntry::offset` for a leaf is relative to leaf_dirs_offset.
+        let leaf_dirs_offset = metadata_offset + metadata_length;
+        let leaf_dirs_length = leaves_bytes.len() as u64;
+        let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
         let tile_data_length = tile_data_buf.len() as u64;
 
         // Build header
@@ -1061,8 +1071,16 @@ impl PmtilesWriter {
             root_dir_length,
             json_metadata_offset: metadata_offset,
             json_metadata_length: metadata_length,
-            leaf_dirs_offset: 0, // No leaf directories (simple archive)
-            leaf_dirs_length: 0,
+            // Zeroed when there are no leaves, matching StreamingPmtilesWriter
+            // (and `test_small_archive_no_leaf_directories`, which pins that
+            // convention for the streaming path). The two writers should
+            // describe an identical archive identically.
+            leaf_dirs_offset: if leaf_dirs_length > 0 {
+                leaf_dirs_offset
+            } else {
+                0
+            },
+            leaf_dirs_length,
             tile_data_offset,
             tile_data_length,
             addressed_tiles_count: self.tiles.len() as u64,
@@ -1105,6 +1123,9 @@ impl PmtilesWriter {
         writer
             .write_all(&compressed_metadata)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
+        writer
+            .write_all(&leaves_bytes)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e)))?;
         writer
             .write_all(&tile_data_buf)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile data: {}", e)))?;
@@ -1704,6 +1725,115 @@ impl Drop for StreamingPmtilesWriter {
 
 #[cfg(test)]
 mod tests {
+
+    /// An archive whose directory outgrows the spec's 16 KiB root budget must
+    /// spill into leaf directories. Writing one oversized root instead makes a
+    /// file readers reject: go-pmtiles reads the first 16 KiB of root and
+    /// panics slicing past it ("slice bounds out of range [:48771] with
+    /// capacity 16384" on a 23,559-tile pyramid). Only tiny archives were ever
+    /// written through this path, so it stayed hidden.
+    #[test]
+    fn large_archive_spills_into_leaf_directories() {
+        let mut writer = PmtilesWriter::new();
+        // Matching the scale that exposed this: tens of thousands of tiles, so
+        // the entry offsets and lengths do not delta-encode down to nothing.
+        // z8 is 256x256, comfortably more than 24,000 addresses.
+        // Gapped addresses, all distinct: a real pyramid's tiles are sparse, so
+        // the tile-id deltas are large and the directory does not compress to
+        // nothing the way a solid block of sequential ids would.
+        // Irregular lengths from a tiny LCG, so the entry offsets are the
+        // uneven numbers a real archive has. A regular pattern gzips down to
+        // nothing and never reaches the budget this test is about.
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..40_000u32 {
+            let (x, y) = ((i % 200) * 20, (i / 200) * 20);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Pre-compressed, the path a band merge uses: it also skips 40k
+            // gzip calls that would make this test take half a minute.
+            let len = 64 + (rng >> 33) as usize % 4096;
+            writer
+                .add_tile_compressed(14, x, y, vec![(i % 251) as u8; len])
+                .unwrap();
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writer.write_to_file(tmp.path()).unwrap();
+
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            header.root_dir_length <= 16384,
+            "root directory must fit the spec budget, got {}",
+            header.root_dir_length
+        );
+        assert!(
+            header.leaf_dirs_length > 0,
+            "an archive too big for one root must have leaf directories"
+        );
+        // Sections must not overlap: leaves sit between metadata and tile data.
+        assert_eq!(
+            header.leaf_dirs_offset,
+            header.json_metadata_offset + header.json_metadata_length
+        );
+        assert_eq!(
+            header.tile_data_offset,
+            header.leaf_dirs_offset + header.leaf_dirs_length
+        );
+
+        // Structure is not the point -- READABILITY is. The bug this fixes
+        // produced a file whose header looked perfectly reasonable, which is
+        // exactly why it survived: a wrong leaf-offset base would satisfy every
+        // assertion above and still hand a reader garbage. So walk the
+        // directories the way a reader does and check the bytes come back.
+        let read_dir = |raw: &[u8]| -> Vec<DirEntry> {
+            let plain = compression::decompress(raw, header.internal_compression).unwrap();
+            decode_directory(&plain).expect("directory must decode")
+        };
+        let root = read_dir(
+            &bytes[header.root_dir_offset as usize
+                ..(header.root_dir_offset + header.root_dir_length) as usize],
+        );
+        assert!(
+            root.iter().any(|e| e.run_length == 0),
+            "a spilled archive's root must contain at least one leaf pointer"
+        );
+
+        let mut found: HashMap<u64, Vec<u8>> = HashMap::new();
+        for e in &root {
+            let leaves = if e.run_length == 0 {
+                // A leaf pointer: `offset` is relative to leaf_dirs_offset.
+                let start = (header.leaf_dirs_offset + e.offset) as usize;
+                read_dir(&bytes[start..start + e.length as usize])
+            } else {
+                vec![e.clone()]
+            };
+            for le in leaves {
+                let start = (header.tile_data_offset + le.offset) as usize;
+                found.insert(
+                    le.tile_id,
+                    bytes[start..start + le.length as usize].to_vec(),
+                );
+            }
+        }
+        assert_eq!(found.len(), 40_000, "every tile must be addressable");
+
+        // Spot-check content at both ends and the middle. The payload is a run
+        // of `(i % 251)` bytes, so a mis-resolved pointer gives a wrong byte.
+        for i in [0u32, 1, 19_899, 39_998, 39_999] {
+            let (x, y) = ((i % 200) * 20, (i / 200) * 20);
+            let data = found
+                .get(&tile_id(14, x, y))
+                .unwrap_or_else(|| panic!("tile {i} (z14/{x}/{y}) not found"));
+            let want = (i % 251) as u8;
+            assert!(
+                data.iter().all(|&b| b == want),
+                "tile {i} (z14/{x}/{y}) resolved to the wrong bytes: \
+                 expected all {want}, got {:?}..",
+                &data[..data.len().min(8)]
+            );
+        }
+    }
     use super::*;
     use std::fs;
 
