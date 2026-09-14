@@ -1148,12 +1148,13 @@ where
     // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
     // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
     // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 7] = [
+    const SUBCOMMANDS: [&str; 8] = [
         "tiles",
         "overview",
         "validate",
         "export-pmtiles",
         "decode",
+        "pyramid",
         "gen-reference-docs",
         "help",
     ];
