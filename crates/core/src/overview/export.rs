@@ -95,10 +95,11 @@ use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{Array, RecordBatch};
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Schema};
 use crossbeam_channel::bounded;
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
@@ -2755,6 +2756,13 @@ fn property_columns(schema: &Schema, geom_idx: usize) -> Vec<(usize, String)> {
 }
 
 /// MVT-encodable Arrow scalar types.
+///
+/// MVT's value union is string/float/double/int/uint/bool — it has no temporal
+/// type and no decimal. That is a reason to *encode* those, not to drop them:
+/// a dropped column is silent data loss, and a time column is usually the axis
+/// the map is read along. Temporal types render as ISO 8601 strings (the
+/// tippecanoe convention) and decimals as doubles; see
+/// [`extract_property_column`].
 fn is_supported_scalar(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -2771,6 +2779,23 @@ fn is_supported_scalar(dt: &DataType) -> bool {
             | DataType::UInt64
             | DataType::Float32
             | DataType::Float64
+    ) || is_temporal_scalar(dt)
+        || matches!(dt, DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
+}
+
+/// Arrow types rendered as ISO 8601 strings rather than numbers.
+///
+/// Rendering is delegated to `arrow_cast`'s own formatter, so the text matches
+/// what every other Arrow consumer shows for the same value instead of a
+/// hand-rolled variant of it.
+fn is_temporal_scalar(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+            | DataType::Time32(_)
+            | DataType::Time64(_)
     )
 }
 
@@ -2786,6 +2811,9 @@ fn field_metadata(schema: &Schema, geom_idx: Option<usize>) -> HashMap<String, S
         let ty = match f.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 => "String",
             DataType::Boolean => "Boolean",
+            // Temporal values reach the tile as ISO 8601 text, so the field
+            // must be advertised as what a client will actually read.
+            dt if is_temporal_scalar(dt) => "String",
             dt if is_supported_scalar(dt) => "Number",
             _ => continue,
         };
@@ -2851,6 +2879,62 @@ fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyV
         DataType::UInt64 => prim!(UInt64Type, UInt, u64),
         DataType::Float32 => prim!(Float32Type, Float, f32),
         DataType::Float64 => prim!(Float64Type, Double, f64),
+        // Decimals are numbers; the MVT double is the only numeric value wide
+        // enough to carry one, so scale it out rather than drop the column.
+        // A decimal too large for f64 saturates, which is the same loss every
+        // other f64 consumer takes and still beats dropping the value.
+        DataType::Decimal128(_, scale) => {
+            let a = col.as_primitive::<Decimal128Type>();
+            let f = 10f64.powi(i32::from(*scale));
+            (0..n)
+                .map(|i| (!a.is_null(i)).then(|| PropertyValue::Double(a.value(i) as f64 / f)))
+                .collect()
+        }
+        // 256-bit decimals do not fit an i128 fast path, so let arrow render
+        // the scaled text and parse that. Slower per value, but this is a rare
+        // type and arrow already owns the scaling rules.
+        DataType::Decimal256(_, _) => {
+            let opts = FormatOptions::default();
+            match ArrayFormatter::try_new(col, &opts) {
+                Ok(fmt) => (0..n)
+                    .map(|i| {
+                        (!col.is_null(i)).then(|| {
+                            PropertyValue::Double(
+                                fmt.value(i).to_string().parse().unwrap_or(f64::NAN),
+                            )
+                        })
+                    })
+                    .collect(),
+                Err(_) => vec![None; n],
+            }
+        }
+        // MVT has no temporal type. Render with arrow_cast's own formatter so
+        // the text matches what every other Arrow consumer shows, instead of
+        // dropping the column and taking the time axis with it.
+        //
+        // DIVERGENCE FROM TIPPECANOE: tippecanoe has no opinion here -- it
+        // passes through whatever text its input already held, which for a
+        // DuckDB-written parquet is `2026-09-14 12:34:56`. We emit arrow's
+        // rendering, `2026-09-14T12:34:56`: RFC 3339, unambiguous about the
+        // separator, and identical to what `tylertoo decode` and every other
+        // Arrow reader will show for the same value. Matching the space form
+        // would mean re-implementing arrow's formatter to be less correct.
+        dt if is_temporal_scalar(dt) => {
+            let opts = FormatOptions::default().with_null("");
+            match ArrayFormatter::try_new(col, &opts) {
+                Ok(fmt) => (0..n)
+                    .map(|i| {
+                        (!col.is_null(i)).then(|| PropertyValue::String(fmt.value(i).to_string()))
+                    })
+                    .collect(),
+                // A formatter this cannot build is a type we do not understand;
+                // fall back to dropping rather than guessing at a rendering.
+                Err(e) => {
+                    log::warn!("cannot format {dt:?} column as text, dropping it: {e}");
+                    vec![None; n]
+                }
+            }
+        }
         _ => vec![None; n],
     }
 }
@@ -3686,6 +3770,71 @@ mod tests {
             assert!(!scan.tile_counts.is_empty());
             assert!(scan.bounds.is_some());
         }
+    }
+
+    /// MVT has no temporal value type, so a DATE or TIMESTAMP column has to be
+    /// encoded as something — and "nothing" is the one choice that loses data
+    /// without saying so. These were dropped outright: absent from every
+    /// feature and from `vector_layers.fields`, with no warning. A fire
+    /// archive whose `acq_date` silently vanishes looks complete and has no
+    /// time axis.
+    #[test]
+    fn temporal_and_decimal_columns_survive_as_properties() {
+        use arrow_array::{Date32Array, Decimal128Array, TimestampMicrosecondArray};
+
+        // 2026-09-14 = 20710 days after the Unix epoch.
+        let dates = Date32Array::from(vec![Some(20710), None]);
+        let got = extract_property_column(&dates);
+        assert_eq!(
+            got[0],
+            Some(PropertyValue::String("2026-09-14".to_string())),
+            "DATE must render as an ISO date"
+        );
+        assert_eq!(got[1], None, "null stays null");
+
+        // 2026-09-14T12:34:56Z in microseconds.
+        let ts = TimestampMicrosecondArray::from(vec![Some(1_789_389_296_000_000), None]);
+        let got = extract_property_column(&ts);
+        let rendered = match &got[0] {
+            Some(PropertyValue::String(s)) => s.clone(),
+            other => panic!("TIMESTAMP must render as a string, got {other:?}"),
+        };
+        assert!(
+            rendered.starts_with("2026-09-14T12:34:56"),
+            "TIMESTAMP must render as ISO 8601, got {rendered:?}"
+        );
+        assert_eq!(got[1], None);
+
+        // DECIMAL is a number, not a string: 1.50 at scale 2.
+        let dec = Decimal128Array::from(vec![Some(150_i128), None])
+            .with_precision_and_scale(4, 2)
+            .unwrap();
+        let got = extract_property_column(&dec);
+        match got[0] {
+            Some(PropertyValue::Double(v)) => assert!(
+                (v - 1.5).abs() < 1e-9,
+                "DECIMAL(4,2) 150 must be 1.5, got {v}"
+            ),
+            ref other => panic!("DECIMAL must render as a double, got {other:?}"),
+        }
+        assert_eq!(got[1], None);
+    }
+
+    /// A column the export cannot encode must not be advertised in
+    /// `vector_layers.fields` either, and one it can must be.
+    #[test]
+    fn temporal_and_decimal_columns_are_advertised_in_field_metadata() {
+        use arrow_schema::{Field, TimeUnit};
+
+        let schema = Schema::new(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("dec", DataType::Decimal128(10, 3), true),
+        ]);
+        let meta = field_metadata(&schema, None);
+        assert_eq!(meta.get("d").map(String::as_str), Some("String"));
+        assert_eq!(meta.get("ts").map(String::as_str), Some("String"));
+        assert_eq!(meta.get("dec").map(String::as_str), Some("Number"));
     }
 
     #[test]
