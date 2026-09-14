@@ -618,7 +618,7 @@ fn export_pmtiles_impl(
     // includes it. O(#tiles) memory per level; the per-level `LevelScan`s are
     // byte-identical to independent per-level scans.
     let t_scan = Instant::now();
-    let scans = scan_all_levels(&reader, crs, &meta)?;
+    let scans = scan_all_levels(&reader, crs, &meta, options)?;
     log::info!(
         "[export] scan complete: {num_levels} levels, single read, {:.2}s",
         t_scan.elapsed().as_secs_f64()
@@ -1651,6 +1651,7 @@ fn scan_all_levels(
     reader: &OverviewReader,
     crs: Crs,
     meta: &OverviewsMeta,
+    opts: &ExportOptions,
 ) -> Result<Vec<LevelScan>, ExportError> {
     let num_levels = reader.num_levels();
     let partitioning = matches!(reader.mode(), Mode::Partitioning);
@@ -1677,7 +1678,8 @@ fn scan_all_levels(
             for k in j..=last {
                 let scan = &mut scans[k];
                 scan.feature_count += bboxes.len();
-                let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zooms[k]);
+                let (batch_bounds, batch_counts) =
+                    size_bboxes(&bboxes, zooms[k], buffer_deg_at_zoom(zooms[k], opts));
                 if let Some(b) = batch_bounds {
                     match &mut scan.bounds {
                         Some(acc) => acc.expand(&b),
@@ -1737,6 +1739,7 @@ fn decode_batch_bboxes(
 fn size_bboxes(
     bboxes: &[Option<TileBounds>],
     zoom: u8,
+    buffer_deg: f64,
 ) -> (Option<TileBounds>, HashMap<u64, usize>) {
     bboxes
         .par_iter()
@@ -1748,7 +1751,12 @@ fn size_bboxes(
                         Some(acc) => acc.expand(bbox),
                         None => bounds = Some(*bbox),
                     }
-                    for tc in tiles_for_bbox(bbox, zoom) {
+                    // Counts must match what `feature_tile_members` will emit,
+                    // which keys off the buffer-expanded bbox; the accumulated
+                    // `bounds` above stay the true extent, since they become the
+                    // archive's advertised bbox.
+                    let widened = expand_bbox(bbox, buffer_deg);
+                    for tc in tiles_for_bbox(&widened, zoom) {
                         *counts.entry(tile_key(tc.x, tc.y)).or_insert(0) += 1;
                     }
                 }
@@ -1792,6 +1800,7 @@ fn scan_level(
     level_idx: usize,
     crs: Crs,
     zoom: u8,
+    opts: &ExportOptions,
 ) -> Result<LevelScan, ExportError> {
     let batch_reader = reader.read_level_with_batch_size(level_idx, None, EXPORT_BATCH_SIZE)?;
     let mut scan = LevelScan {
@@ -1802,7 +1811,8 @@ fn scan_level(
     for batch in batch_reader {
         let bboxes = decode_batch_bboxes(&batch?, crs)?;
         scan.feature_count += bboxes.len();
-        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom);
+        let (batch_bounds, batch_counts) =
+            size_bboxes(&bboxes, zoom, buffer_deg_at_zoom(zoom, opts));
         if let Some(b) = batch_bounds {
             match &mut scan.bounds {
                 Some(acc) => acc.expand(&b),
@@ -2063,8 +2073,12 @@ fn feature_tile_members(
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
     // Target leaf-tile ranges at `zoom` — the authority for which tiles this
-    // feature belongs to (shared with `tiles_for_bbox`).
-    let ranges = tile_ranges_for_bbox(&bbox, zoom);
+    // feature belongs to. Derived from the BUFFER-EXPANDED bbox so a feature
+    // sitting in a neighbouring tile's buffer is a member of that tile; the
+    // bare `bbox` is still what the containment fast paths test against, and
+    // candidates that turn out not to intersect the buffered tile are dropped
+    // by the clip below.
+    let ranges = tile_ranges_for_bbox(&expand_bbox(&bbox, buffer_deg_at_zoom(zoom, opts)), zoom);
     let mut out = Vec::new();
 
     // Dispatch on the *direct* path's cost — the ticket's own model,
@@ -2095,6 +2109,7 @@ fn feature_tile_members(
             opts,
             key_lo,
             key_hi,
+            &ranges,
             assume_simple,
             &mut out,
         );
@@ -2118,6 +2133,35 @@ fn feature_tile_members(
         );
     }
     out
+}
+
+/// Longitude degrees corresponding to the edge buffer at `zoom`, under the same
+/// convention the clip uses (`tile_width * buffer_px / extent`, applied to both
+/// axes — see [`bbox_within_buffered`]).
+///
+/// Tile MEMBERSHIP must be computed from the buffer-expanded bbox, not the bare
+/// one: a feature lying outside a tile but inside its buffer still has to reach
+/// that tile, or the neighbour has nothing to draw the overlapping part from and
+/// the feature is sliced at the seam. Points showed this most starkly — with the
+/// bare bbox every point lands in exactly one tile and a symbol straddling a
+/// seam renders as a half circle.
+#[inline]
+fn buffer_deg_at_zoom(zoom: u8, opts: &ExportOptions) -> f64 {
+    let tile_width = 360.0 / f64::from(1u32 << zoom);
+    tile_width * f64::from(opts.tile_buffer) / f64::from(opts.extent)
+}
+
+/// `bbox` grown by `buffer` on every side, clamped to the valid lon/lat domain
+/// so the expansion cannot manufacture a wrapped (`lng_min > lng_max`) bbox and
+/// flip [`tile_ranges_for_bbox`] onto its antimeridian branch.
+#[inline]
+fn expand_bbox(bbox: &TileBounds, buffer: f64) -> TileBounds {
+    TileBounds::new(
+        (bbox.lng_min - buffer).max(-180.0),
+        (bbox.lat_min - buffer).max(-90.0),
+        (bbox.lng_max + buffer).min(180.0),
+        (bbox.lat_max + buffer).min(90.0),
+    )
 }
 
 /// Direct-path cost budget, in `tiles_spanned × vertices` clip-vertex ops. At
@@ -2165,10 +2209,11 @@ fn feature_tile_members_direct(
     opts: &ExportOptions,
     key_lo: u64,
     key_hi: u64,
+    ranges: &BboxTileRanges,
     assume_simple: bool,
     out: &mut Vec<(u64, Geometry<f64>)>,
 ) {
-    for tc in tiles_for_bbox(bbox, zoom) {
+    for tc in tiles_in_ranges(ranges, zoom) {
         let key = tile_key(tc.x, tc.y);
         if key < key_lo || key > key_hi {
             continue;
@@ -2187,6 +2232,17 @@ fn feature_tile_members_direct(
             out.push((key, clipped));
         }
     }
+}
+
+/// Every leaf tile in `ranges` at `zoom`, both x-bands when the bbox wraps.
+/// The enumeration authority for the direct path, so it and the cascade (which
+/// prunes on the same `ranges`) agree on the leaf set by construction.
+fn tiles_in_ranges(ranges: &BboxTileRanges, zoom: u8) -> impl Iterator<Item = TileCoord> + '_ {
+    let bands = std::iter::once(ranges.x).chain(ranges.x2);
+    bands.flat_map(move |(x0, x1)| {
+        (x0..=x1)
+            .flat_map(move |x| (ranges.y.0..=ranges.y.1).map(move |y| TileCoord::new(x, y, zoom)))
+    })
 }
 
 /// The deepest tile whose subtree contains every tile the feature covers — the
@@ -2438,6 +2494,7 @@ fn members_direct_vec(
         return Vec::new();
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    let ranges = tile_ranges_for_bbox(&expand_bbox(&bbox, buffer_deg_at_zoom(zoom, opts)), zoom);
     let assume_simple = geometry_is_simple(geom);
     let mut out = Vec::new();
     feature_tile_members_direct(
@@ -2447,6 +2504,7 @@ fn members_direct_vec(
         opts,
         key_lo,
         key_hi,
+        &ranges,
         assume_simple,
         &mut out,
     );
@@ -3428,6 +3486,39 @@ mod tests {
         }
     }
 
+    /// A feature just inside a neighbouring tile's edge buffer must be a member
+    /// of that tile too, or the neighbour has nothing to draw the overlapping
+    /// part from and the feature is sliced at the seam. `--tile-buffer` is
+    /// documented as "carried across tile seams so features don't clip at
+    /// boundaries", which only holds if buffer widens tile MEMBERSHIP and not
+    /// just the clip rectangle of tiles the feature already occupies.
+    ///
+    /// The z1 seam is at lng 0. A point a hair east of it is inside tile (1,0)
+    /// once that tile is grown by its 8px buffer, so both tiles must carry it.
+    /// tippecanoe emits it in both.
+    #[test]
+    fn point_in_neighbour_buffer_is_a_member_of_that_tile() {
+        let opts = ExportOptions::default();
+        let zoom = 1;
+        // Buffer in degrees at z1 under the clip's own convention:
+        // tile_width * buffer_px / extent = 180 * 8 / 4096 ≈ 0.3516°.
+        let buffer_deg =
+            (360.0 / 2f64.powi(zoom as i32)) * opts.tile_buffer as f64 / opts.extent as f64;
+        let east_of_seam = buffer_deg / 2.0; // inside (1,0)'s buffer, inside (1,1) proper
+        let geom = Geometry::Point(geo::Point::new(east_of_seam, 10.0));
+
+        let keys = members_by_key(feature_tile_members(&geom, zoom, &opts, 0, u64::MAX));
+        let west = tile_key(0, 0);
+        let east = tile_key(1, 0);
+        assert!(keys.contains_key(&east), "must be in its own tile (1,0,0)");
+        assert!(
+            keys.contains_key(&west),
+            "point {east_of_seam}° is within tile (1,0,0)'s {buffer_deg}° buffer but was \
+             not made a member of it; emitted tiles: {:?}",
+            keys.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Splitting the key space into partitions must not change the union of
     /// emitted tiles or their bytes: the key-range prune plus the exact leaf
     /// key guard must partition the feature's tiles cleanly (no drops, dups, or
@@ -3667,7 +3758,8 @@ mod tests {
         let num_levels = reader.num_levels();
         assert_eq!(num_levels, 3);
 
-        let scans = scan_all_levels(&reader, Crs::Epsg4326, &meta).unwrap();
+        let opts = ExportOptions::default();
+        let scans = scan_all_levels(&reader, Crs::Epsg4326, &meta, &opts).unwrap();
         assert_eq!(scans.len(), num_levels);
 
         // Feature counts must equal the accumulating prefix sizes (3, 3+4, 3+4+5).
@@ -3677,7 +3769,7 @@ mod tests {
 
         for (level_idx, scan) in scans.iter().enumerate() {
             let zoom = zoom_for_level(&meta, level_idx);
-            let oracle = scan_level(&reader, level_idx, Crs::Epsg4326, zoom).unwrap();
+            let oracle = scan_level(&reader, level_idx, Crs::Epsg4326, zoom, &opts).unwrap();
             assert_eq!(
                 *scan, oracle,
                 "fan-out scan differs from per-level prefix scan at level {level_idx}"
