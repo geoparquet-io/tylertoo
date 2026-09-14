@@ -129,6 +129,25 @@ const DEFAULT_EXTENT: u32 = 4096;
 /// use 8 to match the tile pipeline's historical default).
 const DEFAULT_TILE_BUFFER_PX: u32 = 8;
 
+/// Nominal tile size in pixels — the denominator that makes `tile_buffer` mean
+/// "tile pixels", the unit tippecanoe's `--buffer` uses and the one this crate
+/// documents.
+///
+/// Not [`ExportOptions::extent`]: extent is the MVT coordinate resolution
+/// (4096), a different quantity that happens to also divide the tile. Dividing
+/// by it made the buffer `extent/256` = 16x narrower than the number said, so
+/// the default 8 "pixels" was half a pixel and seam continuity was effectively
+/// off. A raised extent silently narrowed the buffer further, which is the
+/// clearest sign it was the wrong denominator.
+const NOMINAL_TILE_PIXELS: f64 = 256.0;
+
+/// The tile buffer as a fraction of one tile's width, from `tile_buffer` in
+/// tile pixels.
+#[inline]
+fn buffer_fraction(opts: &ExportOptions) -> f64 {
+    f64::from(opts.tile_buffer) / NOMINAL_TILE_PIXELS
+}
+
 /// Default per-tile MVT size cap, in bytes (500 KiB — matches what `500K`
 /// parses to and tippecanoe's on-by-default 500K bar; issue #280). A tile whose
 /// encoded MVT exceeds this trips the single-pass drop valve (see
@@ -2148,7 +2167,7 @@ fn feature_tile_members(
 #[inline]
 fn buffer_deg_at_zoom(zoom: u8, opts: &ExportOptions) -> f64 {
     let tile_width = 360.0 / f64::from(1u32 << zoom);
-    tile_width * f64::from(opts.tile_buffer) / f64::from(opts.extent)
+    tile_width * buffer_fraction(opts)
 }
 
 /// `bbox` grown by `buffer` on every side, clamped to the valid lon/lat domain
@@ -2219,7 +2238,7 @@ fn feature_tile_members_direct(
             continue;
         }
         let tb = tc.bounds();
-        let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
+        let buffer_deg = tb.width() * buffer_fraction(opts);
         if bbox_within_buffered(bbox, &tb, buffer_deg) {
             out.push((key, geom.clone()));
         } else if let Some(clipped) = clip_geometry_simple(
@@ -2323,7 +2342,7 @@ fn split_feature_into_tiles(
     }
 
     let tb = node.bounds();
-    let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
+    let buffer_deg = tb.width() * buffer_fraction(opts);
 
     if node.z == zoom {
         // Leaf tile. The prune above already proved this tile is in the
@@ -2525,7 +2544,9 @@ fn members_recursive_vec(
         return Vec::new();
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-    let ranges = tile_ranges_for_bbox(&bbox, zoom);
+    // Same widening as `feature_tile_members`, or the oracle compares the
+    // cascade over a narrower tile set than the direct path walks.
+    let ranges = tile_ranges_for_bbox(&expand_bbox(&bbox, buffer_deg_at_zoom(zoom, opts)), zoom);
     let root = covering_tile(&ranges, zoom);
     let assume_simple = geometry_is_simple(geom);
     let mut out = Vec::new();
@@ -3128,11 +3149,16 @@ mod tests {
             ..Default::default()
         };
         let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
-        assert_eq!(report.total_tiles, 12);
+        // 12 before the tile-buffer fix. The buffer is now the tile pixels it
+        // always claimed to be (8 px = 128 MVT units, not 8), and membership
+        // comes from the buffer-expanded bbox, so one more tile carries seam
+        // overlap and every seam-adjacent tile's bytes change. Re-blessed
+        // deliberately -- this reference guards against UNINTENDED byte drift.
+        assert_eq!(report.total_tiles, 13);
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            "390f2b1c51a8a29c",
+            "c548b186be24a0f2",
             "archive bytes diverged from the pre-refactor reference"
         );
     }
@@ -3486,6 +3512,39 @@ mod tests {
         }
     }
 
+    /// `tile_buffer` is documented — and named — in TILE PIXELS, the unit
+    /// tippecanoe's `--buffer` uses. It was divided by `extent`, the MVT
+    /// coordinate resolution, making the real buffer 16x narrower than the
+    /// number said (the default 8 "pixels" was half a pixel) and coupling it to
+    /// a knob that has nothing to do with it: raising `extent` narrowed the
+    /// buffer.
+    ///
+    /// Pinned in MVT units so the expected value is legible: 8 px of a nominal
+    /// 256 px tile is 1/32 of the tile, which at extent 4096 is 128 units.
+    #[test]
+    fn tile_buffer_is_tile_pixels_not_extent_units() {
+        let opts = ExportOptions::default();
+        assert_eq!(opts.tile_buffer, 8);
+        assert_eq!(opts.extent, 4096);
+
+        let in_mvt_units = buffer_fraction(&opts) * f64::from(opts.extent);
+        assert!(
+            (in_mvt_units - 128.0).abs() < 1e-9,
+            "8 tile pixels must be 128 MVT units at extent 4096, got {in_mvt_units}"
+        );
+
+        // Raising the extent must not change how wide the buffer is on the
+        // ground — it only changes how finely that width is expressed.
+        let finer = ExportOptions {
+            extent: 8192,
+            ..Default::default()
+        };
+        assert!(
+            (buffer_fraction(&finer) - buffer_fraction(&opts)).abs() < 1e-12,
+            "extent must not affect the buffer width"
+        );
+    }
+
     /// A feature just inside a neighbouring tile's edge buffer must be a member
     /// of that tile too, or the neighbour has nothing to draw the overlapping
     /// part from and the feature is sliced at the seam. `--tile-buffer` is
@@ -3502,8 +3561,7 @@ mod tests {
         let zoom = 1;
         // Buffer in degrees at z1 under the clip's own convention:
         // tile_width * buffer_px / extent = 180 * 8 / 4096 ≈ 0.3516°.
-        let buffer_deg =
-            (360.0 / 2f64.powi(zoom as i32)) * opts.tile_buffer as f64 / opts.extent as f64;
+        let buffer_deg = (360.0 / 2f64.powi(zoom as i32)) * f64::from(opts.tile_buffer) / 256.0;
         let east_of_seam = buffer_deg / 2.0; // inside (1,0)'s buffer, inside (1,1) proper
         let geom = Geometry::Point(geo::Point::new(east_of_seam, 10.0));
 
@@ -3847,7 +3905,7 @@ mod tests {
         let tiles = encode_level_tiles(&feats, 4, &opts);
         assert!(tiles.len() >= 2, "wide line must span multiple tiles");
         let extent = opts.extent as i32;
-        let slack = extent * opts.tile_buffer as i32 / opts.extent as i32 + 4;
+        let slack = extent * opts.tile_buffer as i32 / 256 + 4;
         for t in &tiles {
             let decoded = decode_tile(&t.data);
             for f in &decoded.layers[0].features {
@@ -3918,7 +3976,9 @@ mod tests {
         let tiles = encode_level_tiles(&feats, 4, &opts);
         assert!(tiles.len() >= 2, "seam-crossing line must span tiles");
         let extent = opts.extent as i32;
-        let slack = (opts.tile_buffer as i32) + 4;
+        // The buffer is in TILE PIXELS; in MVT units that is
+        // buffer_px * extent / 256 (128 units for the default 8 px at 4096).
+        let slack = opts.tile_buffer as i32 * extent / 256 + 4;
         for t in &tiles {
             let decoded = decode_tile(&t.data);
             for f in &decoded.layers[0].features {
