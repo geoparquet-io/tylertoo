@@ -992,7 +992,7 @@ pub(crate) fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, InputError> {
     })?;
     let mut files = Vec::new();
     for entry in paths {
-        let path = entry.map_err(|e| InputError::Io(e.into_error()))?;
+        let path = entry.map_err(|e| InputError::Io(e.into()))?;
         if path.is_file() && path.extension().is_some_and(|ext| ext == "parquet") {
             files.push(path);
         }
