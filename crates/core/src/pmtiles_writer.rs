@@ -696,6 +696,10 @@ pub struct PmtilesWriter {
     dedup_enabled: bool,
     /// Deduplication cache for tracking seen tiles
     dedup_cache: DeduplicationCache,
+    /// Verbatim `vector_layers` array, when the archive holds more than the one
+    /// layer `layer_name`/`fields` can describe (a merged band pyramid). When
+    /// set it replaces the single-layer entry the writer would otherwise build.
+    vector_layers_json: Option<String>,
 }
 
 impl PmtilesWriter {
@@ -717,6 +721,7 @@ impl PmtilesWriter {
             internal_compression: Compression::Gzip,
             dedup_enabled: false,
             dedup_cache: DeduplicationCache::new(),
+            vector_layers_json: None,
         }
     }
 
@@ -738,6 +743,7 @@ impl PmtilesWriter {
             internal_compression: compression,
             dedup_enabled: false,
             dedup_cache: DeduplicationCache::new(),
+            vector_layers_json: None,
         }
     }
 
@@ -779,6 +785,15 @@ impl PmtilesWriter {
     /// Set the layer name for vector_layers metadata
     pub fn set_layer_name(&mut self, name: &str) {
         self.layer_name = name.to_string();
+    }
+
+    /// Replace the whole `vector_layers` array with a verbatim JSON array.
+    ///
+    /// A single-layer archive is described by `layer_name` + `fields`; a merged
+    /// band pyramid has several layers, each with its own zoom range and field
+    /// set, which that pair cannot express.
+    pub fn set_vector_layers_json(&mut self, json: String) {
+        self.vector_layers_json = Some(json);
     }
 
     /// Set field metadata for vector_layers.fields
@@ -1043,11 +1058,20 @@ impl PmtilesWriter {
         } else {
             self.max_zoom
         };
-        let fields_json = self.build_fields_json();
         let tilestats_json = self.build_tilestats_json();
+        let vector_layers = match &self.vector_layers_json {
+            Some(json) => json.clone(),
+            None => format!(
+                r#"[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}]"#,
+                self.layer_name,
+                min_z,
+                max_z,
+                self.build_fields_json()
+            ),
+        };
         let metadata = format!(
-            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"tylertoo"}}"#,
-            self.layer_name, min_z, max_z, fields_json, tilestats_json
+            r#"{{"vector_layers":{},{}"format":"pbf","generator":"tylertoo"}}"#,
+            vector_layers, tilestats_json
         );
         let compressed_metadata =
             compression::compress(metadata.as_bytes(), self.internal_compression)
