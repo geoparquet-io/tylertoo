@@ -23,6 +23,7 @@ remote = [
     "dep:tokio",
     "dep:aws-config",
     "dep:aws-credential-types",
+    "dep:aws-smithy-types",
     "dep:async-trait",
     "dep:futures-util",
     "dep:url",
@@ -62,6 +63,14 @@ object_store = { version = "0.12", features = ["aws", "gcp", "http"], optional =
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+# Pinned below 1.7.0: aws-smithy-types 1.7.0 added a variant to its
+# non_exhaustive `Document` enum, which aws-smithy-json 0.63.0 -- the version
+# aws-config 1.12 still requires -- does not handle, so a fresh resolution of
+# the `remote` feature fails to compile upstream (E0004/E0308 inside
+# aws-smithy-json). Not our code, but Cargo.lock is gitignored, so every CI run
+# re-resolves and picks up the break.
+# TODO: drop this pin once aws-config requires aws-smithy-json >= 0.64.
+aws-smithy-types = { version = "=1.6.3", optional = true }
 async-trait = { version = "0.1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
@@ -92,3 +101,8 @@ harness = false
 
 [lints]
 workspace = true
+
+# aws-smithy-types is a version-pin only (see the comment beside it); no code
+# in this crate references it directly.
+[package.metadata.cargo-machete]
+ignored = ["aws-smithy-types"]
