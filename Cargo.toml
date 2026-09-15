@@ -9,7 +9,11 @@ members = [
 [workspace.package]
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.75"
+# Dependency-driven, not a policy choice: geoarrow/geoparquet 0.9 declare 1.95,
+# and cargo refuses to build a dependency whose rust-version exceeds ours. The
+# MSRV CI job verifies this number by building with exactly this toolchain, so
+# it cannot drift the way "1.75" silently did (by then the real floor was 1.95).
+rust-version = "1.95"
 authors = ["Nissim Lebovits <nlebovits@pm.me>"]
 license = "Apache-2.0"
 repository = "https://github.com/geoparquet-io/tylertoo"

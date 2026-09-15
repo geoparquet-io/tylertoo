@@ -2619,16 +2619,9 @@ fn encode_members(
 ) -> Result<Vec<EncodedTile>, ExportError> {
     members.par_sort_unstable_by_key(|m| (m.key, m.seq));
 
-    // Group boundaries (manual scan: `slice::chunk_by` needs Rust 1.77, MSRV
-    // is 1.75).
-    let mut groups: Vec<&[Member]> = Vec::new();
-    let mut start = 0usize;
-    for i in 1..=members.len() {
-        if i == members.len() || members[i].key != members[start].key {
-            groups.push(&members[start..i]);
-            start = i;
-        }
-    }
+    // Runs of equal key. `members` is sorted by key above, so consecutive
+    // grouping is total grouping.
+    let groups: Vec<&[Member]> = members.chunk_by(|a, b| a.key == b.key).collect();
 
     // Encode AND gzip-compress every tile in the parallel section, so the serial
     // writer loop only dedups and appends bytes (issue #227). Compression must
@@ -2921,7 +2914,7 @@ fn is_temporal_scalar(dt: &DataType) -> bool {
         // `vector_layers.fields` and then emit null for every value, which is
         // worse than dropping the column, because the archive then promises a
         // field that is not on a single feature.
-        DataType::Timestamp(_, tz) => tz.as_ref().map_or(true, |tz| utc_equivalent_tz(tz)),
+        DataType::Timestamp(_, tz) => tz.as_ref().is_none_or(|tz| utc_equivalent_tz(tz)),
         _ => false,
     }
 }

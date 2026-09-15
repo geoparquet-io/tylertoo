@@ -421,7 +421,7 @@ fn nearest_present(
     for r in 1..=max_r {
         for (dx, dy) in ring_offsets(r) {
             if let Some(&w) = present.get(&(cell_key.0 + dx, cell_key.1 + dy)) {
-                if best.map_or(true, |b| better(w, b)) {
+                if best.is_none_or(|b| better(w, b)) {
                     best = Some(w);
                 }
             }
