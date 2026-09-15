@@ -1,8 +1,10 @@
 # Reference
 
-Complete, lookup-oriented API surface. Every page here is **generated from the
-source** (CLI help strings, Python docstrings, Rust doc-comments) and kept in
-sync by CI, so it cannot drift from the implementation.
+Complete, lookup-oriented API surface. Every page here is **derived from the
+source** and kept honest by CI, so it cannot drift from the implementation: the
+CLI page is generated from the clap definitions and diff-guarded; the Python
+page is rendered by mkdocstrings from the stubtest-verified type stub; the Rust
+page points at the crate's rustdoc.
 
 - [CLI reference](cli.md) — every `tylertoo` subcommand, argument, and option,
   with defaults and possible values.

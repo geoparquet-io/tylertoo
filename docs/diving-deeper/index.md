@@ -22,6 +22,8 @@ so read the ones that match what you are doing.
 - [How tylertoo relates to tippecanoe](tippecanoe.md) — a factual capability
   comparison: what each tool does, what only tylertoo does, and which
   quality-ladder concepts are shared.
+- [Decoding PMTiles back to GeoParquet](decoding.md) — `tylertoo decode`, its
+  zoom/layer selectors, and why a tiles-to-GeoParquet round trip is lossy.
 
 For the exhaustive list of every flag and option, see the
 [Reference](../reference/cli.md).

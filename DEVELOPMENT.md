@@ -65,7 +65,7 @@ open target/criterion/report/index.html
 ```
 
 The corpus-scale benchmarks (storage/access/conversion) are scripted in
-`benchmarks/overview/`; profiling is documented in `docs/PROFILING.md`.
+`benchmarks/overview/`; profiling is documented in `context/PROFILING.md`.
 
 ## CI Gates — and How to Run Them Locally
 

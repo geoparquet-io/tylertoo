@@ -22,7 +22,7 @@ ordering and bbox covering statistics to read only the row groups a tile or a
 `--bbox`/`--filter` touches, including byte ranges on remote input, where a
 GeoJSON stream carries no spatial index to skip or seek on. Both tools are
 compiled native code, so the leverage is the data path, not the language. The
-demo page carries the measured numbers.
+[Getting Started](../getting-started.md) tutorial carries the measured numbers.
 
 **Overviews embed levels inside the input format.** tippecanoe generalizes in
 tile space, per tile, at encode time, and writes the result into tiles. tylertoo

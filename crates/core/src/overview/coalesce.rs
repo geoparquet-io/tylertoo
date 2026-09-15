@@ -93,7 +93,7 @@ pub const DEFAULT_SNAP_GSD_FACTOR: f64 = 1.0;
 pub const DEFAULT_JUNCTION_ANGLE_DEG: f64 = 0.0;
 
 /// Default per-level candidate-row ceiling above which coalescing is
-/// skipped (bounded-memory guard; see `docs/OVERVIEW_TUNING.md`). Chaining
+/// skipped (bounded-memory guard; see `context/OVERVIEW_TUNING.md`). Chaining
 /// needs the level's line geometries in memory at once; levels larger than
 /// this are near-canonical, where segments are individually visible and
 /// coalescing matters least.

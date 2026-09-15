@@ -349,7 +349,7 @@ SHOULD record `"cascade": true`. It asserts no structural fact
 (informative, no validator rule); canonical fidelity (§2.4) is
 unaffected because the canonical level is never simplified. Producer-side default values for these mechanisms
 are an implementation concern, not fixed by this spec (for tylertoo
-they are documented in `docs/OVERVIEW_TUNING.md`, with the code
+they are documented in `context/OVERVIEW_TUNING.md`, with the code
 constants as the source of truth).
 
 Writers conforming to v0.2.0 MUST serialize `ranks` as a JSON object
@@ -1006,7 +1006,7 @@ flag, with optional accumulation via `--accumulate-attribute COL:OP`;
 enabling clustering also changes the engine's point-thinning default
 (a sparser grid is harmless when losers are summarized rather than
 discarded). Engine defaults and tuning guidance live in
-`docs/OVERVIEW_TUNING.md`; they are implementation choices, not
+`context/OVERVIEW_TUNING.md`; they are implementation choices, not
 requirements of this spec.
 
 ---
@@ -1147,7 +1147,7 @@ exceeds a ceiling skip coalescing while still emitting the
 the schema stable — such a file is conformant, since §13.2 permits
 all-`1` values, and the ceiling itself is recorded as
 `max_level_rows` (§13.4). Engine defaults and tuning guidance live in
-`docs/OVERVIEW_TUNING.md`; they are implementation choices, not
+`context/OVERVIEW_TUNING.md`; they are implementation choices, not
 requirements of this spec.
 
 ---

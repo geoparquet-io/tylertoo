@@ -25,6 +25,8 @@ theme:
     - navigation.top
     - navigation.sections
     - navigation.indexes
+    - navigation.tracking
+    - toc.follow
     - search.suggest
     - search.highlight
     - content.code.copy
@@ -38,12 +40,44 @@ extra:
 
 plugins:
   - search
+  - redirects:
+      # Keep old URLs alive after the docs overhaul moved these pages.
+      redirect_maps:
+        demo.md: getting-started.md
+        decode.md: diving-deeper/decoding.md
+        OVERVIEW_TUNING.md: diving-deeper/tuning-zoom.md
+        architecture.md: https://github.com/geoparquet-io/tylertoo/blob/main/context/ARCHITECTURE.md
+        PROFILING.md: https://github.com/geoparquet-io/tylertoo/blob/main/context/PROFILING.md
+  - mkdocstrings:
+      handlers:
+        python:
+          # tylertoo is a compiled pyo3 module. The typed signatures AND the
+          # Google-style docstrings both live in crates/python/tylertoo.pyi,
+          # which maturin packages as tylertoo/__init__.pyi. griffe reads that
+          # stub STATICALLY (allow_inspection: false — the .so is never
+          # imported), so the docs job installs the package (see docs.yml) only
+          # to put the stub on the import path. The stub is CI-guarded against
+          # the compiled module by `mypy.stubtest`.
+          options:
+            allow_inspection: false
+            docstring_style: google
+            docstring_section_style: list
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            show_source: false
+            show_root_heading: true
+            show_symbol_type_toc: true
+            line_length: 72
+          inventories:
+            - https://docs.python.org/3/objects.inv
 
 markdown_extensions:
   - admonition
   - attr_list
   - md_in_html
   - pymdownx.superfences
+  - pymdownx.details
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.highlight
@@ -56,22 +90,19 @@ nav:
   - Getting Started: getting-started.md
   - Diving Deeper:
       - diving-deeper/index.md
-      - Preparing input for tiling: diving-deeper/preparing-input.md
-      - Working with the overview file: diving-deeper/overview-file.md
+      - Preparing input: diving-deeper/preparing-input.md
+      - The overview file: diving-deeper/overview-file.md
       - Tuning what appears at each zoom: diving-deeper/tuning-zoom.md
-      - Tiling remote and multi-file inputs: diving-deeper/remote-and-multi-file.md
+      - Remote & multi-file input: diving-deeper/remote-and-multi-file.md
       - Keeping memory bounded: diving-deeper/bounded-memory.md
-      - How tylertoo relates to tippecanoe: diving-deeper/tippecanoe.md
+      - Decoding tiles back to GeoParquet: diving-deeper/decoding.md
+      - Compared to tippecanoe: diving-deeper/tippecanoe.md
   - Reference:
       - reference/index.md
       - CLI: reference/cli.md
       - Python: reference/python.md
       - Rust: reference/rust.md
-  - Demo (Brazil 2025 fields): demo.md
-  - Overview Tuning: OVERVIEW_TUNING.md
-  - Decoding PMTiles: decode.md
-  - Architecture: architecture.md
-  - Profiling: PROFILING.md
-  - Development: development.md
-  - Contributing: contributing.md
+  - Contributing:
+      - contributing.md
+      - development.md
   - Changelog: changelog.md

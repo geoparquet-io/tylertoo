@@ -56,14 +56,32 @@ conversion.
 arrives in another CRS. `gpio inspect` reports the current CRS, so you know
 whether this step applies before you run it.
 
+```bash
+# Only when a file is not already EPSG:4326 or EPSG:3857.
+gpio convert reproject \
+  fields-utm.parquet \
+  fields-wgs84.parquet \
+  -d EPSG:4326
+```
+
 ### Checking a file before you tile it
 
 **`gpio inspect <file>`.** Reports the CRS, the row-group count and average
 size, and the spatial overlap ratio. Reading these three before a long run
 tells you which of the preparation steps below the file needs.
 
+```bash
+# CRS, row-group layout, and spatial overlap ratio.
+gpio inspect brazil-2025-fields.parquet
+```
+
 **`gpio check <file>`.** A pass/fail read of the same best-practice signals,
 for scripting a gate into a pipeline rather than eyeballing the numbers.
+
+```bash
+# Non-zero exit if the file misses a best-practice signal.
+gpio check brazil-2025-fields.parquet
+```
 
 ### Ordering features by spatial locality
 
@@ -80,3 +98,13 @@ streaming target in the same pass as the sort. This is the knob that sets the
 converter's memory floor, so a value inside the 64–256 MB band keeps peak RSS
 bounded without fragmenting reads. Pair it with `--overwrite` to replace an
 existing output.
+
+```bash
+# Hilbert-sort and repack row groups in one pass; the result is
+# the brazil-sorted.parquet every later example feeds to tylertoo.
+gpio sort hilbert \
+  brazil-2025-fields.parquet \
+  brazil-sorted.parquet \
+  --row-group-size-mb 128 \
+  --overwrite
+```

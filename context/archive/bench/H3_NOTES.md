@@ -65,7 +65,7 @@ Both runs on the same release build, same machine, sequential
 | `--no-streaming` | off (streaming on) | revert to the in-memory reference pipeline |
 | `--read-batch-size ROWS` | 8192 | rows per Arrow read batch in both passes; bounds the transient working set |
 
-Documented in `docs/OVERVIEW_TUNING.md` § "Memory / streaming knobs".
+Documented in `context/OVERVIEW_TUNING.md` § "Memory / streaming knobs".
 
 ## Residual memory + behavior notes
 

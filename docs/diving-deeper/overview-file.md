@@ -50,6 +50,14 @@ right level for a viewport.
 multi-resolution pyramid into one file. The remaining flags shape the ladder it
 builds.
 
+```bash
+# Build the z0–z14 pyramid into one GeoParquet file.
+tylertoo overview \
+  brazil-sorted.parquet \
+  brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14
+```
+
 **`--min-zoom` / `--max-zoom`.** The zoom range the ladder spans. `--max-zoom`
 sets the canonical level and defaults to 6, coarse enough for a continental
 view; a street-level map raises it, as the tutorial's 14 did.
@@ -61,11 +69,36 @@ overrides the zoom range when set.
 **`--mode duplicating|partitioning`.** Chooses how levels materialize, per the
 duplicating-versus-partitioning decision above.
 
+```bash
+# Place each feature once instead of repeating it per level.
+tylertoo overview \
+  brazil-sorted.parquet \
+  brazil-ov.parquet \
+  --min-zoom 0 --max-zoom 14 \
+  --mode partitioning
+```
+
 ### Reading the level structure
 
 **The `level` column.** The band each row belongs to. Every query against an
 overview narrows to a resolution through it, so `SELECT count(*) ... GROUP BY
 level` is the fastest way to see the pyramid's shape.
+
+```bash
+# Feature count per level — the pyramid's shape at a glance.
+duckdb -c "SELECT level, count(*) AS features
+           FROM 'brazil-ov.parquet'
+           GROUP BY level ORDER BY level;"
+```
+
+Pull one level out to its own file with the same `WHERE level = N` selector,
+for inspecting a single band or feeding a coarser resolution downstream.
+
+```bash
+# Extract just the coarsest band to its own GeoParquet file.
+duckdb -c "COPY (SELECT * FROM 'brazil-ov.parquet' WHERE level = 0)
+           TO 'brazil-level0.parquet' (FORMAT PARQUET);"
+```
 
 **The `geo:overviews` footer metadata.** The per-level zoom-to-GSD record. Read
 it to map a `level` value onto the resolution it represents.
@@ -82,14 +115,35 @@ specification, section 6.2: the level metadata, the zoom-to-resolution mapping,
 and the per-level structure. A file that passes agrees with what a spec-aware
 reader expects, so it moves downstream without further inspection.
 
+```bash
+# Confirm the overview conforms to the geo:overviews spec.
+tylertoo validate brazil-ov.parquet
+```
+
 ### Re-exporting without recomputing geometry
 
 **`tylertoo export-pmtiles <ov> <out>`.** Reads the levels as they are and packs
 them into tiles. No geometry is recomputed at export, so the levels you built
 during convert become the tiles served to the map.
 
+```bash
+# Pack the built levels into a PMTiles archive.
+tylertoo export-pmtiles \
+  brazil-ov.parquet \
+  brazil.pmtiles \
+  --layer-name fields
+```
+
 **Re-exporting with different options.** Because the overview is the durable
 artifact, one build supports many exports. Change `--layer-name` to match a
 different map style, or set a tile-size limit for a different renderer, without
 rebuilding the pyramid. This is the payoff that justifies keeping the overview
 as a first-class file rather than collapsing the workflow into one step.
+
+```bash
+# Same overview, a second archive with a different layer name.
+tylertoo export-pmtiles \
+  brazil-ov.parquet \
+  brazil-basemap.pmtiles \
+  --layer-name basemap
+```
