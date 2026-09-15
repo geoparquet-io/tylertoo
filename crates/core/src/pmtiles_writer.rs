@@ -1248,6 +1248,10 @@ pub struct StreamingPmtilesWriter {
     layer_name: String,
     /// Field metadata
     fields: HashMap<String, String>,
+    /// Verbatim `vector_layers` array, when the archive holds more than the one
+    /// layer `layer_name`/`fields` can describe (a merged band pyramid). When
+    /// set it replaces the single-layer entry the writer would otherwise build.
+    vector_layers_json: Option<String>,
     /// Compression for tile data
     tile_compression: Compression,
     /// Compression for internal data (directories, metadata)
@@ -1295,6 +1299,7 @@ impl StreamingPmtilesWriter {
             bounds: TileBounds::empty(),
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
+            vector_layers_json: None,
             tile_compression: compression,
             internal_compression: compression,
             stats: StreamingWriteStats::default(),
@@ -1316,6 +1321,17 @@ impl StreamingPmtilesWriter {
     /// Set field metadata.
     pub fn set_fields(&mut self, fields: HashMap<String, String>) {
         self.fields = fields;
+    }
+
+    /// Replace the whole `vector_layers` array with a verbatim JSON array.
+    ///
+    /// A single-layer archive is described by `layer_name` + `fields`; a merged
+    /// band pyramid has several layers, each with its own zoom range and field
+    /// set, which that pair cannot express. Honoured by the one metadata
+    /// assembler (`build_metadata_json`) both `checkpoint` and `finalize` use,
+    /// so a checkpointed archive and the final one cannot disagree.
+    pub fn set_vector_layers_json(&mut self, json: String) {
+        self.vector_layers_json = Some(json);
     }
 
     /// Set geographic bounds.
@@ -1695,12 +1711,21 @@ impl StreamingPmtilesWriter {
             self.max_zoom
         };
 
-        let fields_json = self.build_fields_json();
         let tilestats_json = self.build_tilestats_json();
+        let vector_layers = match &self.vector_layers_json {
+            Some(json) => json.clone(),
+            None => format!(
+                r#"[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}]"#,
+                self.layer_name,
+                min_z,
+                max_z,
+                self.build_fields_json()
+            ),
+        };
 
         format!(
-            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"tylertoo"}}"#,
-            self.layer_name, min_z, max_z, fields_json, tilestats_json
+            r#"{{"vector_layers":{},{}"format":"pbf","generator":"tylertoo"}}"#,
+            vector_layers, tilestats_json
         )
     }
 

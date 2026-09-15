@@ -160,6 +160,8 @@ pub struct PyramidArgs {
     /// several bands may share one layer name (the usual case: a coarse and a
     /// fine aggregate that are the same layer to a client). Zoom ranges must
     /// not overlap -- two bands claiming one zoom write the same tile ids.
+    /// ARCHIVE may not contain a `:`, which the spec cannot tell apart from the
+    /// LAYER separator; rename the file or point at it through a symlink.
     #[arg(long = "band", required = true, value_name = "LO-HI:ARCHIVE[:LAYER]")]
     pub bands: Vec<String>,
 
@@ -1868,8 +1870,8 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run `tylertoo decode`: PMTiles → GeoParquet (thin facade over
-/// `tylertoo_core::decode::decode_pmtiles`).
+/// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
+/// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
     use tylertoo_core::pyramid::{merge_bands, validate_bands, Band};
 
@@ -1895,14 +1897,21 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         }
     }
 
-    let pairs: Vec<_> = bands.iter().map(|b| (b.clone(), b.input.clone())).collect();
     let report =
-        merge_bands(&pairs, &args.output).map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+        merge_bands(&bands, &args.output).map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
 
     for (layer, lo, hi, n) in &report.per_band_tiles {
         println!(
             "  z{lo}-{hi} -> layer {layer:?}: {} tiles",
             format_number(*n as u64)
+        );
+    }
+    if report.skipped > 0 {
+        // Almost always a --minzoom/--maxzoom that disagrees with --band, so
+        // this belongs on stdout next to the counts, not only in the log.
+        println!(
+            "  ! {} tile(s) dropped: outside the declared band zoom ranges",
+            format_number(report.skipped as u64)
         );
     }
     println!(
@@ -1914,6 +1923,8 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run `tylertoo decode`: PMTiles → GeoParquet (thin facade over
+/// `tylertoo_core::decode::decode_pmtiles`).
 fn run_decode(args: DecodeArgs) -> Result<()> {
     use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
 
