@@ -115,7 +115,7 @@ use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
 use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
-use crate::tile::{tile_ranges_for_bbox, tiles_for_bbox, BboxTileRanges, TileBounds, TileCoord};
+use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord};
 
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
 use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
@@ -128,6 +128,25 @@ const DEFAULT_EXTENT: u32 = 4096;
 /// Default per-tile edge buffer, in tile pixels (tippecanoe default is 5; we
 /// use 8 to match the tile pipeline's historical default).
 const DEFAULT_TILE_BUFFER_PX: u32 = 8;
+
+/// Nominal tile size in pixels — the denominator that makes `tile_buffer` mean
+/// "tile pixels", the unit tippecanoe's `--buffer` uses and the one this crate
+/// documents.
+///
+/// Not [`ExportOptions::extent`]: extent is the MVT coordinate resolution
+/// (4096), a different quantity that happens to also divide the tile. Dividing
+/// by it made the buffer `extent/256` = 16x narrower than the number said, so
+/// the default 8 "pixels" was half a pixel and seam continuity was effectively
+/// off. A raised extent silently narrowed the buffer further, which is the
+/// clearest sign it was the wrong denominator.
+const NOMINAL_TILE_PIXELS: f64 = 256.0;
+
+/// The tile buffer as a fraction of one tile's width, from `tile_buffer` in
+/// tile pixels.
+#[inline]
+fn buffer_fraction(opts: &ExportOptions) -> f64 {
+    f64::from(opts.tile_buffer) / NOMINAL_TILE_PIXELS
+}
 
 /// Default per-tile MVT size cap, in bytes (500 KiB — matches what `500K`
 /// parses to and tippecanoe's on-by-default 500K bar; issue #280). A tile whose
@@ -618,7 +637,7 @@ fn export_pmtiles_impl(
     // includes it. O(#tiles) memory per level; the per-level `LevelScan`s are
     // byte-identical to independent per-level scans.
     let t_scan = Instant::now();
-    let scans = scan_all_levels(&reader, crs, &meta)?;
+    let scans = scan_all_levels(&reader, crs, &meta, options)?;
     log::info!(
         "[export] scan complete: {num_levels} levels, single read, {:.2}s",
         t_scan.elapsed().as_secs_f64()
@@ -1651,6 +1670,7 @@ fn scan_all_levels(
     reader: &OverviewReader,
     crs: Crs,
     meta: &OverviewsMeta,
+    opts: &ExportOptions,
 ) -> Result<Vec<LevelScan>, ExportError> {
     let num_levels = reader.num_levels();
     let partitioning = matches!(reader.mode(), Mode::Partitioning);
@@ -1677,7 +1697,7 @@ fn scan_all_levels(
             for k in j..=last {
                 let scan = &mut scans[k];
                 scan.feature_count += bboxes.len();
-                let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zooms[k]);
+                let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zooms[k], opts);
                 if let Some(b) = batch_bounds {
                     match &mut scan.bounds {
                         Some(acc) => acc.expand(&b),
@@ -1737,6 +1757,7 @@ fn decode_batch_bboxes(
 fn size_bboxes(
     bboxes: &[Option<TileBounds>],
     zoom: u8,
+    opts: &ExportOptions,
 ) -> (Option<TileBounds>, HashMap<u64, usize>) {
     bboxes
         .par_iter()
@@ -1748,7 +1769,12 @@ fn size_bboxes(
                         Some(acc) => acc.expand(bbox),
                         None => bounds = Some(*bbox),
                     }
-                    for tc in tiles_for_bbox(bbox, zoom) {
+                    // Counts must match what `feature_tile_members` will emit,
+                    // so both go through `member_ranges`; the accumulated
+                    // `bounds` above stay the true extent, since they become the
+                    // archive's advertised bbox.
+                    let ranges = member_ranges(bbox, zoom, opts);
+                    for tc in tiles_in_ranges(&ranges, zoom) {
                         *counts.entry(tile_key(tc.x, tc.y)).or_insert(0) += 1;
                     }
                 }
@@ -1792,6 +1818,7 @@ fn scan_level(
     level_idx: usize,
     crs: Crs,
     zoom: u8,
+    opts: &ExportOptions,
 ) -> Result<LevelScan, ExportError> {
     let batch_reader = reader.read_level_with_batch_size(level_idx, None, EXPORT_BATCH_SIZE)?;
     let mut scan = LevelScan {
@@ -1802,7 +1829,7 @@ fn scan_level(
     for batch in batch_reader {
         let bboxes = decode_batch_bboxes(&batch?, crs)?;
         scan.feature_count += bboxes.len();
-        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom);
+        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom, opts);
         if let Some(b) = batch_bounds {
             match &mut scan.bounds {
                 Some(acc) => acc.expand(&b),
@@ -2046,11 +2073,11 @@ fn collect_wave_members(
 ///
 /// ## Identical leaf set
 ///
-/// The recursion is bounded by [`tile_ranges_for_bbox`] — the same range math
-/// [`tiles_for_bbox`] uses — so the emitted key set equals
-/// `tiles_for_bbox(feature_bbox) ∩ [key_lo, key_hi]` exactly. That keeps the
-/// scan pass's per-tile counts valid (every emitted key lies in a planned
-/// partition) and the archive's tile set unchanged.
+/// The recursion is bounded by [`member_ranges`] — the same helper the scan
+/// pass uses — so the emitted key set equals
+/// `member_ranges(feature_bbox, zoom, opts) ∩ [key_lo, key_hi]`, minus the
+/// candidates the clip rejects. That keeps the scan pass's per-tile counts
+/// valid: every emitted key lies in a planned partition.
 fn feature_tile_members(
     geom: &Geometry<f64>,
     zoom: u8,
@@ -2063,8 +2090,12 @@ fn feature_tile_members(
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
     // Target leaf-tile ranges at `zoom` — the authority for which tiles this
-    // feature belongs to (shared with `tiles_for_bbox`).
-    let ranges = tile_ranges_for_bbox(&bbox, zoom);
+    // feature belongs to. Derived from the BUFFER-EXPANDED bbox so a feature
+    // sitting in a neighbouring tile's buffer is a member of that tile; the
+    // bare `bbox` is still what the containment fast paths test against, and
+    // candidates that turn out not to intersect the buffered tile are dropped
+    // by the clip below.
+    let ranges = member_ranges(&bbox, zoom, opts);
     let mut out = Vec::new();
 
     // Dispatch on the *direct* path's cost — the ticket's own model,
@@ -2095,6 +2126,7 @@ fn feature_tile_members(
             opts,
             key_lo,
             key_hi,
+            &ranges,
             assume_simple,
             &mut out,
         );
@@ -2118,6 +2150,83 @@ fn feature_tile_members(
         );
     }
     out
+}
+
+/// Longitude degrees corresponding to the edge buffer at `zoom`, under the same
+/// convention the clip uses (`tile_width * buffer_px / 256`, applied to both
+/// axes — see [`bbox_within_buffered`]).
+///
+/// DIVERGENCE FROM TIPPECANOE: this single degree value is applied to BOTH
+/// axes, so it is exactly `buffer_px` only on the x axis. Because a Mercator
+/// tile's latitude span shrinks as `cos(lat)` while its longitude span does
+/// not, the vertical buffer is effectively `buffer_px * sec(lat)` pixels —
+/// 8 px at the equator, ~16 px at 60°, ~92 px at 85°. Tippecanoe buffers in
+/// tile pixels on both axes. The over-draw is bounded (it stays under one tile
+/// height below ~88.2° latitude, outside the Mercator domain) and it errs
+/// towards carrying more geometry across the seam rather than less, so it is
+/// documented rather than fixed here: a per-axis buffer has to be threaded
+/// through `bbox_within_buffered` and `clip_geometry_simple` too, which moves
+/// tile bytes again. See `context/ARCHITECTURE.md`.
+///
+/// Tile MEMBERSHIP must be computed from the buffer-expanded bbox, not the bare
+/// one: a feature lying outside a tile but inside its buffer still has to reach
+/// that tile, or the neighbour has nothing to draw the overlapping part from and
+/// the feature is sliced at the seam. Points showed this most starkly — with the
+/// bare bbox every point lands in exactly one tile and a symbol straddling a
+/// seam renders as a half circle.
+#[inline]
+fn buffer_deg_at_zoom(zoom: u8, opts: &ExportOptions) -> f64 {
+    let tile_width = 360.0 / f64::from(1u32 << zoom);
+    tile_width * buffer_fraction(opts)
+}
+
+/// `bbox` grown by `buffer` on every side, clamped to the valid lon/lat domain
+/// so the expansion cannot manufacture a wrapped (`lng_min > lng_max`) bbox and
+/// flip [`tile_ranges_for_bbox`] onto its antimeridian branch.
+///
+/// Clamping each edge independently is NOT enough. `lng_min` floored at -180
+/// and `lng_max` capped at +180 cross over for a bbox lying wholly outside the
+/// domain — a point at lng 180.5, say, which a dataset using the 0..360
+/// convention is full of. The result reads as wrapped, and
+/// `tile_ranges_for_bbox` then hands back every tile column at the zoom:
+/// 16,385 of them at z14, per feature, for a feature that ends up in none of
+/// them. So the edges are re-ordered back after clamping.
+///
+/// Antimeridian seam continuity is deliberately out of scope: a feature at lng
+/// 179.99 does NOT become a member of tile x=0. Fixing that needs wrap-aware
+/// membership throughout, not a wider bbox.
+#[inline]
+fn expand_bbox(bbox: &TileBounds, buffer: f64) -> TileBounds {
+    // A bbox that was ALREADY wrapped on the way in must stay wrapped; only a
+    // wrap newly manufactured by the clamp is collapsed.
+    let was_wrapped = bbox.lng_min > bbox.lng_max;
+    let mut lng_min = (bbox.lng_min - buffer).clamp(-180.0, 180.0);
+    let lng_max = (bbox.lng_max + buffer).clamp(-180.0, 180.0);
+    if !was_wrapped && lng_min > lng_max {
+        // Wholly outside the domain: collapse onto the edge it was clamped to
+        // rather than claiming the world.
+        lng_min = lng_max;
+    }
+    TileBounds::new(
+        lng_min,
+        (bbox.lat_min - buffer).clamp(-90.0, 90.0),
+        lng_max,
+        (bbox.lat_max + buffer).clamp(-90.0, 90.0),
+    )
+}
+
+/// The leaf-tile ranges a feature with `bbox` belongs to at `zoom` — the buffer
+/// widening applied in ONE place.
+///
+/// The scan (`size_bboxes`, which plans the partitions) and the emit
+/// (`feature_tile_members`, which fills them) must agree on this set exactly:
+/// the export requires every emitted key to land in a planned partition, and
+/// `route_partition` only `debug_assert!`s that, so a release build would
+/// silently write tiles out of key order instead of failing. Sharing one helper
+/// makes them agree by construction rather than by matching edits.
+#[inline]
+fn member_ranges(bbox: &TileBounds, zoom: u8, opts: &ExportOptions) -> BboxTileRanges {
+    tile_ranges_for_bbox(&expand_bbox(bbox, buffer_deg_at_zoom(zoom, opts)), zoom)
 }
 
 /// Direct-path cost budget, in `tiles_spanned × vertices` clip-vertex ops. At
@@ -2165,16 +2274,17 @@ fn feature_tile_members_direct(
     opts: &ExportOptions,
     key_lo: u64,
     key_hi: u64,
+    ranges: &BboxTileRanges,
     assume_simple: bool,
     out: &mut Vec<(u64, Geometry<f64>)>,
 ) {
-    for tc in tiles_for_bbox(bbox, zoom) {
+    for tc in tiles_in_ranges(ranges, zoom) {
         let key = tile_key(tc.x, tc.y);
         if key < key_lo || key > key_hi {
             continue;
         }
         let tb = tc.bounds();
-        let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
+        let buffer_deg = tb.width() * buffer_fraction(opts);
         if bbox_within_buffered(bbox, &tb, buffer_deg) {
             out.push((key, geom.clone()));
         } else if let Some(clipped) = clip_geometry_simple(
@@ -2187,6 +2297,17 @@ fn feature_tile_members_direct(
             out.push((key, clipped));
         }
     }
+}
+
+/// Every leaf tile in `ranges` at `zoom`, both x-bands when the bbox wraps.
+/// The enumeration authority for the direct path, so it and the cascade (which
+/// prunes on the same `ranges`) agree on the leaf set by construction.
+fn tiles_in_ranges(ranges: &BboxTileRanges, zoom: u8) -> impl Iterator<Item = TileCoord> + '_ {
+    let bands = std::iter::once(ranges.x).chain(ranges.x2);
+    bands.flat_map(move |(x0, x1)| {
+        (x0..=x1)
+            .flat_map(move |x| (ranges.y.0..=ranges.y.1).map(move |y| TileCoord::new(x, y, zoom)))
+    })
 }
 
 /// The deepest tile whose subtree contains every tile the feature covers — the
@@ -2267,7 +2388,7 @@ fn split_feature_into_tiles(
     }
 
     let tb = node.bounds();
-    let buffer_deg = tb.width() * opts.tile_buffer as f64 / opts.extent as f64;
+    let buffer_deg = tb.width() * buffer_fraction(opts);
 
     if node.z == zoom {
         // Leaf tile. The prune above already proved this tile is in the
@@ -2438,6 +2559,7 @@ fn members_direct_vec(
         return Vec::new();
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    let ranges = member_ranges(&bbox, zoom, opts);
     let assume_simple = geometry_is_simple(geom);
     let mut out = Vec::new();
     feature_tile_members_direct(
@@ -2447,6 +2569,7 @@ fn members_direct_vec(
         opts,
         key_lo,
         key_hi,
+        &ranges,
         assume_simple,
         &mut out,
     );
@@ -2467,7 +2590,9 @@ fn members_recursive_vec(
         return Vec::new();
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-    let ranges = tile_ranges_for_bbox(&bbox, zoom);
+    // Same widening as `feature_tile_members`, or the oracle compares the
+    // cascade over a narrower tile set than the direct path walks.
+    let ranges = member_ranges(&bbox, zoom, opts);
     let root = covering_tile(&ranges, zoom);
     let assume_simple = geometry_is_simple(geom);
     let mut out = Vec::new();
@@ -3070,12 +3195,54 @@ mod tests {
             ..Default::default()
         };
         let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
-        assert_eq!(report.total_tiles, 12);
+        // 12 before the tile-buffer fix. The buffer is now the tile pixels it
+        // always claimed to be (8 px = 128 MVT units, not 8), and membership
+        // comes from the buffer-expanded bbox, so one more tile carries seam
+        // overlap and every seam-adjacent tile's bytes change. Re-blessed
+        // deliberately -- this reference guards against UNINTENDED byte drift.
+        assert_eq!(report.total_tiles, 13);
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            "390f2b1c51a8a29c",
+            "c548b186be24a0f2",
             "archive bytes diverged from the pre-refactor reference"
+        );
+
+        // A hash only says "not what it was". Assert the new count is RIGHT,
+        // not merely different: each counted tile must really be in the archive
+        // and carry at least one feature, so the extra tile is genuine seam
+        // overlap rather than an empty one conjured by over-wide membership.
+        use crate::compression;
+        use crate::pmtiles_writer::{decode_directory, tile_id_to_zxy, Header};
+        let header = Header::from_bytes(&bytes).unwrap();
+        let root = compression::decompress(
+            &bytes[header.root_dir_offset as usize
+                ..(header.root_dir_offset + header.root_dir_length) as usize],
+            header.internal_compression,
+        )
+        .unwrap();
+        let entries = decode_directory(&root).expect("root directory must decode");
+        assert!(
+            entries.iter().all(|e| e.run_length > 0),
+            "13 tiles must fit the root directory; this walk does not follow leaves"
+        );
+        let mut seen = 0usize;
+        for e in &entries {
+            let start = (header.tile_data_offset + e.offset) as usize;
+            let raw = &bytes[start..start + e.length as usize];
+            let plain = compression::decompress(raw, header.tile_compression).unwrap();
+            let decoded = decode_tile(&plain);
+            let features: usize = decoded.layers.iter().map(|l| l.features.len()).sum();
+            let zxy = tile_id_to_zxy(e.tile_id).unwrap();
+            assert!(
+                features > 0,
+                "tile {zxy:?} was emitted with no features -- membership is too wide"
+            );
+            seen += e.run_length as usize;
+        }
+        assert_eq!(
+            seen, 13,
+            "every counted tile must be addressable in the archive"
         );
     }
 
@@ -3428,6 +3595,196 @@ mod tests {
         }
     }
 
+    /// `tile_buffer` is documented — and named — in TILE PIXELS, the unit
+    /// tippecanoe's `--buffer` uses. It was divided by `extent`, the MVT
+    /// coordinate resolution, making the real buffer 16x narrower than the
+    /// number said (the default 8 "pixels" was half a pixel) and coupling it to
+    /// a knob that has nothing to do with it: raising `extent` narrowed the
+    /// buffer.
+    ///
+    /// Pinned in MVT units so the expected value is legible: 8 px of a nominal
+    /// 256 px tile is 1/32 of the tile, which at extent 4096 is 128 units.
+    #[test]
+    fn tile_buffer_is_tile_pixels_not_extent_units() {
+        let opts = ExportOptions::default();
+        assert_eq!(opts.tile_buffer, 8);
+        assert_eq!(opts.extent, 4096);
+
+        let in_mvt_units = buffer_fraction(&opts) * f64::from(opts.extent);
+        assert!(
+            (in_mvt_units - 128.0).abs() < 1e-9,
+            "8 tile pixels must be 128 MVT units at extent 4096, got {in_mvt_units}"
+        );
+
+        // Raising the extent must not change how wide the buffer is on the
+        // ground — it only changes how finely that width is expressed.
+        let finer = ExportOptions {
+            extent: 8192,
+            ..Default::default()
+        };
+        assert!(
+            (buffer_fraction(&finer) - buffer_fraction(&opts)).abs() < 1e-12,
+            "extent must not affect the buffer width"
+        );
+    }
+
+    /// A feature just inside a neighbouring tile's edge buffer must be a member
+    /// of that tile too, or the neighbour has nothing to draw the overlapping
+    /// part from and the feature is sliced at the seam. `--tile-buffer` is
+    /// documented as "carried across tile seams so features don't clip at
+    /// boundaries", which only holds if buffer widens tile MEMBERSHIP and not
+    /// just the clip rectangle of tiles the feature already occupies.
+    ///
+    /// The z1 seam is at lng 0, with tile (0,0) to its west and (1,0) to its
+    /// east. A point just east of the seam is inside (0,0) once that tile is
+    /// grown by its 8 px buffer, so both tiles must carry it. tippecanoe emits
+    /// it in both. A point comfortably beyond the buffer must NOT be in (0,0) —
+    /// without that half the assertion passes for any buffer at all, including
+    /// a wildly too-wide one.
+    #[test]
+    fn point_in_neighbour_buffer_is_a_member_of_that_tile() {
+        let opts = ExportOptions::default();
+        let zoom = 1;
+        // Buffer in degrees at z1: tile_width * buffer_px / 256
+        // = 180 * 8 / 256 = 5.625°.
+        let buffer_deg = buffer_deg_at_zoom(zoom, &opts);
+        let west = tile_key(0, 0);
+        let east = tile_key(1, 0);
+
+        // Inside (0,0)'s buffer, and inside (1,0) proper.
+        let inside = 0.9 * buffer_deg;
+        let keys = members_by_key(feature_tile_members(
+            &Geometry::Point(geo::Point::new(inside, 10.0)),
+            zoom,
+            &opts,
+            0,
+            u64::MAX,
+        ));
+        assert!(keys.contains_key(&east), "must be in its own tile (1,0)");
+        assert!(
+            keys.contains_key(&west),
+            "point {inside}° is within tile (0,0)'s {buffer_deg}° buffer but was \
+             not made a member of it; emitted tiles: {:?}",
+            keys.keys().collect::<Vec<_>>()
+        );
+
+        // Beyond the buffer: (1,0) only. Pins the buffer's WIDTH, not just that
+        // some widening happens.
+        let outside = 1.5 * buffer_deg;
+        let keys = members_by_key(feature_tile_members(
+            &Geometry::Point(geo::Point::new(outside, 10.0)),
+            zoom,
+            &opts,
+            0,
+            u64::MAX,
+        ));
+        assert!(keys.contains_key(&east), "must be in its own tile (1,0)");
+        assert!(
+            !keys.contains_key(&west),
+            "point {outside}° is {buffer_deg}° beyond tile (0,0) and must not be \
+             a member of it; emitted tiles: {:?}",
+            keys.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A bbox lying wholly outside the lon/lat domain must not come back from
+    /// [`expand_bbox`] looking wrapped.
+    ///
+    /// Clamping each edge on its own crosses them over — `lng_min` floored at
+    /// -180, `lng_max` capped at +180 — and `tile_ranges_for_bbox` reads
+    /// `lng_min > lng_max` as an antimeridian crossing and returns EVERY tile
+    /// column: 16,385 of them at z14, for a feature that belongs to none. A
+    /// dataset on the 0..360 convention, or one stray Pacific point at lng
+    /// 180.001, is enough. It fires at `--tile-buffer 0` too, so the defect is
+    /// in the clamp rather than the buffer width.
+    #[test]
+    fn out_of_domain_bbox_does_not_claim_every_tile_column() {
+        for tile_buffer in [0, 8, 128] {
+            let opts = ExportOptions {
+                tile_buffer,
+                ..Default::default()
+            };
+            for zoom in [1u8, 10, 14] {
+                for lng in [180.5, -180.5] {
+                    let bbox = TileBounds::new(lng, -17.0, lng, -17.0);
+                    let widened = expand_bbox(&bbox, buffer_deg_at_zoom(zoom, &opts));
+                    assert!(
+                        widened.lng_min <= widened.lng_max,
+                        "expand_bbox manufactured a wrapped bbox at lng {lng}, z{zoom}, \
+                         buffer {tile_buffer}: {widened:?}"
+                    );
+                    let ranges = member_ranges(&bbox, zoom, &opts);
+                    assert!(
+                        ranges.x2.is_none(),
+                        "out-of-domain bbox at lng {lng}, z{zoom}, buffer {tile_buffer} \
+                         took the antimeridian branch: {ranges:?}"
+                    );
+                    let span = u64::from(ranges.x.1 - ranges.x.0 + 1);
+                    assert!(
+                        span <= 2,
+                        "out-of-domain bbox at lng {lng}, z{zoom}, buffer {tile_buffer} \
+                         claims {span} tile columns"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A bbox that arrives ALREADY wrapped must stay wrapped — the collapse
+    /// above is only for a wrap the clamp itself manufactured.
+    #[test]
+    fn genuinely_wrapped_bbox_survives_expansion() {
+        let opts = ExportOptions::default();
+        let bbox = TileBounds::new(170.0, 0.0, -170.0, 10.0);
+        let widened = expand_bbox(&bbox, buffer_deg_at_zoom(4, &opts));
+        assert!(
+            widened.lng_min > widened.lng_max,
+            "a genuinely wrapped bbox must not be collapsed: {widened:?}"
+        );
+    }
+
+    /// The scan pass plans the partitions and the emit pass fills them; the
+    /// export requires every emitted key to land in a planned partition, and
+    /// `route_partition` only `debug_assert!`s it, so in release a mismatch
+    /// silently writes tiles out of key order. Both sides go through
+    /// `member_ranges`; this pins that they agree.
+    #[test]
+    fn scan_counts_cover_every_emitted_member_key() {
+        use std::collections::HashSet;
+        for tile_buffer in [0, 8, 64] {
+            let opts = ExportOptions {
+                tile_buffer,
+                ..Default::default()
+            };
+            for zoom in [1u8, 4, 9] {
+                let geoms = [
+                    Geometry::Point(geo::Point::new(0.05, 10.0)),
+                    Geometry::Point(geo::Point::new(-179.9, -80.0)),
+                    Geometry::Point(geo::Point::new(179.9, 84.0)),
+                    Geometry::LineString(geo::LineString::from(vec![(-20.0, -10.0), (25.0, 30.0)])),
+                ];
+                let bboxes: Vec<Option<TileBounds>> = geoms
+                    .iter()
+                    .map(|g| {
+                        g.bounding_rect()
+                            .map(|r| TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y))
+                    })
+                    .collect();
+                let (_, counts) = size_bboxes(&bboxes, zoom, &opts);
+                let planned: HashSet<u64> = counts.keys().copied().collect();
+                for g in &geoms {
+                    for (key, _) in feature_tile_members(g, zoom, &opts, 0, u64::MAX) {
+                        assert!(
+                            planned.contains(&key),
+                            "emitted key {key} at z{zoom} buffer {tile_buffer} was not \
+                             planned by the scan pass"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Splitting the key space into partitions must not change the union of
     /// emitted tiles or their bytes: the key-range prune plus the exact leaf
     /// key guard must partition the feature's tiles cleanly (no drops, dups, or
@@ -3667,7 +4024,8 @@ mod tests {
         let num_levels = reader.num_levels();
         assert_eq!(num_levels, 3);
 
-        let scans = scan_all_levels(&reader, Crs::Epsg4326, &meta).unwrap();
+        let opts = ExportOptions::default();
+        let scans = scan_all_levels(&reader, Crs::Epsg4326, &meta, &opts).unwrap();
         assert_eq!(scans.len(), num_levels);
 
         // Feature counts must equal the accumulating prefix sizes (3, 3+4, 3+4+5).
@@ -3677,7 +4035,7 @@ mod tests {
 
         for (level_idx, scan) in scans.iter().enumerate() {
             let zoom = zoom_for_level(&meta, level_idx);
-            let oracle = scan_level(&reader, level_idx, Crs::Epsg4326, zoom).unwrap();
+            let oracle = scan_level(&reader, level_idx, Crs::Epsg4326, zoom, &opts).unwrap();
             assert_eq!(
                 *scan, oracle,
                 "fan-out scan differs from per-level prefix scan at level {level_idx}"
@@ -3755,7 +4113,7 @@ mod tests {
         let tiles = encode_level_tiles(&feats, 4, &opts);
         assert!(tiles.len() >= 2, "wide line must span multiple tiles");
         let extent = opts.extent as i32;
-        let slack = extent * opts.tile_buffer as i32 / opts.extent as i32 + 4;
+        let slack = extent * opts.tile_buffer as i32 / 256 + 4;
         for t in &tiles {
             let decoded = decode_tile(&t.data);
             for f in &decoded.layers[0].features {
@@ -3826,7 +4184,9 @@ mod tests {
         let tiles = encode_level_tiles(&feats, 4, &opts);
         assert!(tiles.len() >= 2, "seam-crossing line must span tiles");
         let extent = opts.extent as i32;
-        let slack = (opts.tile_buffer as i32) + 4;
+        // The buffer is in TILE PIXELS; in MVT units that is
+        // buffer_px * extent / 256 (128 units for the default 8 px at 4096).
+        let slack = opts.tile_buffer as i32 * extent / 256 + 4;
         for t in &tiles {
             let decoded = decode_tile(&t.data);
             for f in &decoded.layers[0].features {
