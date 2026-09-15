@@ -33,13 +33,17 @@ Commands:
 
 ```bash
 # 1. Multi-resolution overview from the remote collection slice:
-#    Brazil bbox, 2025 vintage, fields only, centroids at z0-7.
+#    Brazil bbox, 2025 vintage, fields only. Dots z0-5; from z6 each field
+#    stays a representative point until it is a >=1px polygon
+#    (--collapse --polygon-visibility 0), and --simplify-factor 4 aligns that
+#    dot->polygon handoff with pixel-visibility so nothing disappears mid-zoom.
 tylertoo overview \
   --files-from brazil-2025-manifest.txt \
   --bbox="-74.1,-34.0,-34.7,5.4" \
   --filter "label = 'field' AND time >= '2025-01-01'" \
   --min-zoom 0 --max-zoom 14 \
-  --representation "0-7:point" \
+  --representation "0-5:point,6-14:geom" \
+  --collapse --polygon-visibility 0 --simplify-factor 4 \
   --report convert-report.json \
   brazil-2025-fields-ov-z14.parquet
 
@@ -53,9 +57,19 @@ tylertoo export-pmtiles brazil-2025-fields-ov-z14.parquet \
 
 | stage | wall | peak RSS | output |
 |---|---|---|---|
-| **convert** (incl. 40.7 GiB remote read) | 1 h 11 m 56 s | 9.6 GiB | `brazil-2025-fields-ov-z14.parquet` — 14.1 GB, 43.9 M feats → 109.3 M rows × 15 levels |
-| **export-pmtiles** | 11 m 44 s | **1.54 GiB** | `brazil-2025-fields.pmtiles` — **4.5 GiB**, 1,647,927 tiles |
-| **total** | **1 h 23 m 40 s** | — | z0–14, 116,504,741 tile-features, 0 oversized |
+| **convert** (remote read + filter of 40.7 GiB) | 1 h 11 m 56 s | 9.6 GiB | 43.9 M features filtered *during* the read → tuned overview (`brazil-2025-fields-ov-z14.parquet` — 9.9 GB, 110.7 M rows × 15 levels) |
+| **export-pmtiles** | 10 m 52 s | **1.56 GiB** | `brazil-2025-fields.pmtiles` — **3.4 GiB**, 1,649,201 tiles |
+| **total** | — | — | z0–14, 117,659,919 tile-features, 0 oversized |
+
+> **Tuning note.** These figures are for the tuned representation (dots z0–5;
+> from z6 each field stays a dot until it is a ≥1 px polygon), which fixes a
+> mid-zoom disappearance in the first cut of this demo (see *Monotonic
+> representation* below). The `convert` row is the original measured remote run
+> that carved the 43.9 M-feature slice; because Source Cooperative was
+> intermittently closing connections during the update, the tuned tiling was
+> regenerated from that run's canonical (verbatim) geometry — output-identical
+> to re-running the remote command with the tuned flags. `export` and the
+> per-level counts below are from the tuned run.
 
 Convert detail:
 
@@ -72,32 +86,61 @@ Convert detail:
 
 ### Per-level overview breakdown
 
-`--representation "0-7:point"` makes z0–7 **representative points** (one
-vertex per feature) and z8–14 full polygons — "dots zoomed out, polygons
-zoomed in" in a single archive:
+The tuned representation makes z0–5 an explicit **dot** band and z6–14 a
+collapse-filled polygon band: within z6–14 each field is written as a
+representative **point** until it grows to a ≥1 px polygon
+(`--collapse --polygon-visibility 0 --simplify-factor 4`). Dots and polygons
+therefore coexist through the mid zooms, and the per-level count rises
+monotonically — no field ever disappears as you zoom in:
 
 ```
-level  zoom  features     vertices       what
-    0     0        634          634      points
-    1     1      2,295        2,295      points
-    2     2      8,053        8,053      points
-    3     3     28,456       28,456      points
-    4     4     99,797       99,797      points
-    5     5    335,189      335,189      points
-    6     6    799,158      799,158      points
-    7     7  1,318,610    1,318,610      points
-    8     8  1,672,801   19,355,924      polygons
-    9     9  3,210,003   44,569,519      polygons
-   10    10  5,655,496   96,611,166      polygons
-   11    11  9,599,791  205,429,019      polygons
-   12    12 16,045,516  455,049,658      polygons
-   13    13 26,608,484 1,212,022,634     polygons
-   14    14 43,903,999 1,580,669,610     polygons (canonical, verbatim)
+level  zoom  features         dots      polygons
+    0     0        634          634             0
+    1     1      2,295        2,295             0
+    2     2      8,053        8,053             0
+    3     3     28,456       28,456             0
+    4     4     99,797       99,797             0
+    5     5    335,189      335,189             0
+    6     6    799,158      781,050        18,108
+    7     7  1,318,610    1,212,990       105,620
+    8     8  2,175,707    1,748,444       427,263
+    9     9  3,589,917    2,460,828     1,129,089
+   10    10  5,923,362    3,426,984     2,496,378
+   11    11  9,773,548    4,383,733     5,389,815
+   12    12 16,126,354    4,939,065    11,187,289
+   13    13 26,608,484    4,570,385    22,038,099
+   14    14 43,903,999            0    43,903,999   (canonical, verbatim)
 ```
 
-A point is always visible, so the point band bypasses the polygon visibility
-gate — z0 renders 634 dots where the previous polygon-only demo's z0 was
-empty.
+Every written polygon is ≥1 px at its level (0 sub-pixel polygons at every
+zoom), so the *visible* feature count equals the total at every level. The dot
+population peaks around z11–z12 and then recedes as fields become large enough
+to render as polygons — the smooth per-field dot→polygon handoff. z0 still
+renders 634 dots where the original polygon-only demo's z0 was empty.
+
+### Monotonic representation (the fix)
+
+The first cut of this demo used `--representation "0-7:point"`: dots z0–7, then
+a hard switch to polygons at z8. Because a typical field is ~150 m across and
+does not become a ≥1 px polygon until ~z10–z11, that switch dropped medium
+fields at z8 (the visibility gate culled everything below ~306 m) and they only
+reappeared several zooms deeper — "fields go away when you zoom in, then come
+back." The tuned config removes the cliff two ways: `--polygon-visibility 0`
+keeps every field eligible (nothing is gated out), and `--collapse` +
+`--simplify-factor 4` keep a field as a visible dot until it is a ≥1 px polygon.
+A field's lifecycle is therefore *absent → dot → polygon → verbatim*, never
+reversing.
+
+**Fine-zoom dots and the LOD style.** Brazil's fields are small — median bbox
+diagonal ≈ 53 m — so a large share stay **sub-pixel** (a field is only a ≥1 px
+polygon once it clears ~38 m at z12, ~76 m at z11). Keeping every field visible
+across zoom (no disappearance) therefore *requires* those still-sub-pixel fields
+to render as dots well into the mid zooms — ~30 % of z12 features are such dots.
+That is correct in the tiles (each becomes a polygon by z13–z14), but a constant
+dot symbol would swamp the fine-zoom view, so the demo style **tapers the dot
+size and opacity from ~z10** — the polygons (fields past 1 px) become the map and
+the remaining tiny-field dots recede to a faint stipple. This is presentation
+only; the tiles are unchanged.
 
 ## What the numbers say
 
@@ -108,11 +151,13 @@ interleaved with two other classes and a second vintage. `--filter` (new in
 tiling read — no DuckDB pre-pass, no intermediate extract, no download of the
 other 948 files.
 
-**2. One archive serves dots and polygons.** `--representation "0-7:point"`
-(new in #322) writes centroids for the coarse band and polygons from z8 up.
+**2. One archive serves dots and polygons, and nothing disappears.** A tuned
+representation (`--representation "0-5:point,6-14:geom" --collapse
+--polygon-visibility 0 --simplify-factor 4`) writes dots at z0–5 and, from z6,
+keeps each field a dot until it is large enough to draw as a ≥1 px polygon.
 Renderers get the graduated-dot overview and the parcel-level detail from the
-same PMTiles file, with a two-line style split (`circle` layer for points,
-`fill` for polygons).
+same PMTiles file, with a two-line style split (`circle` for points, `fill` for
+polygons), and the visible feature count rises at every zoom.
 
 **3. Cloud-native end to end, at collection scale.** The read touched 6.9%
 of the collection's bytes (43.75 GB of 630 GiB) — the 52 files whose footers
@@ -123,7 +168,7 @@ Findings); with it, the transfer would drop another ~18%.
 **4. Bounded memory at every stage.** Convert auto-selected spill mode (its
 in-RAM estimate for 109 M buffered output rows was ~315 GiB); peak RSS stayed
 at 9.6 GiB against 54 GiB of RAM. Export streamed all 15 levels at a peak of
-**1.54 GiB**.
+**1.56 GiB**.
 
 ## Findings (upstream + tooling)
 
