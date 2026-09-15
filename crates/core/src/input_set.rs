@@ -1688,7 +1688,7 @@ b.parquet
         use crate::input::remote::{list_parquet_under_prefix, RemoteSource};
         use object_store::memory::InMemory;
         use object_store::path::Path as ObjectPath;
-        use object_store::ObjectStore;
+        use object_store::{ObjectStore, ObjectStoreExt};
 
         /// Seed one InMemory store with `objects` (key → bytes).
         fn seeded_store(objects: &[(&str, Vec<u8>)]) -> Arc<InMemory> {

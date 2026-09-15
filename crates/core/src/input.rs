@@ -432,7 +432,11 @@ pub(crate) mod remote {
     use object_store::gcp::GoogleCloudStorageBuilder;
     use object_store::http::HttpBuilder;
     use object_store::path::Path as ObjectPath;
-    use object_store::{ClientOptions, CredentialProvider, ObjectStore, ObjectStoreScheme};
+    // ObjectStoreExt: object_store 0.14 moved `get_range` and `head` off the
+    // base trait onto an extension trait.
+    use object_store::{
+        ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, ObjectStoreScheme,
+    };
     use parquet::arrow::arrow_reader::{
         ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
     };
@@ -1631,7 +1635,7 @@ pub(crate) mod remote {
 pub(crate) fn test_memory_source(bytes: Vec<u8>, name: &str) -> InputSource {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
     use std::sync::Arc;
 
     let store = Arc::new(InMemory::new());
@@ -1659,7 +1663,7 @@ pub(crate) fn test_memory_multi_source(
     use crate::input_set::{ConvertSource, MultiSource};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
-    use object_store::ObjectStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
 
     let store = Arc::new(InMemory::new());
@@ -1707,7 +1711,7 @@ pub(crate) fn test_memory_source_with_cap(
 ) -> InputSource {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
     use std::sync::Arc;
 
     let store = Arc::new(InMemory::new());
