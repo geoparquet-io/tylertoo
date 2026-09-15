@@ -1151,10 +1151,7 @@ fn decode_and_filter_geometries(
             match g.as_ref().filter(|g| usable_geometry(g)) {
                 // Regional extract (#102): drop features whose bbox misses the
                 // requested region exactly, independent of row-group pruning.
-                // (map_or, not is_none_or: the latter is stable only since Rust
-                // 1.82 and the crate MSRV is 1.75.)
-                #[allow(clippy::unnecessary_map_or)]
-                Some(g) => bbox_units.map_or(true, |bb| bboxes_intersect(&geometry_bbox(g), bb)),
+                Some(g) => bbox_units.is_none_or(|bb| bboxes_intersect(&geometry_bbox(g), bb)),
                 None => {
                     geom_skipped += 1;
                     false
@@ -2769,7 +2766,7 @@ impl GroupInterner {
         match col.data_type() {
             DataType::Utf8 => intern!(col.as_string::<i32>()),
             DataType::LargeUtf8 => intern!(col.as_string::<i64>()),
-            _ => out.extend(std::iter::repeat(Self::NULL_GROUP).take(col.len())),
+            _ => out.extend(std::iter::repeat_n(Self::NULL_GROUP, col.len())),
         }
     }
 }

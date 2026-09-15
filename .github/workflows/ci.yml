@@ -441,6 +441,52 @@ jobs:
       - name: Build with dhat-heap feature
         run: cargo build --release --features dhat-heap
 
+  # Build on exactly the declared MSRV. The `rust-version` in Cargo.toml is a
+  # published compatibility promise, and nothing else in CI exercises it --
+  # stable and beta both satisfy any plausible value -- so it silently rotted
+  # to "1.75" while the real floor had moved to 1.95. The toolchain is read
+  # FROM Cargo.toml rather than pinned here, so the two cannot disagree: bump
+  # the manifest and this job follows.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::could not read rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $version"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.toml') }}
+
+      # --all-features so the optional `remote` stack (object_store, aws-*) is
+      # covered too; that is where the MSRV floor actually comes from.
+      - name: Check on the declared MSRV
+        run: cargo check --workspace --all-targets --all-features
+
   # Security audit: advisories on every PR, plus full supply-chain policy
   # (licenses, bans, sources) via cargo-deny. The weekly security.yml run
   # catches new advisories between PRs.
