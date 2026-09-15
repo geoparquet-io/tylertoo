@@ -33,8 +33,8 @@ arrow-select = "59"
 arrow-ipc = "59"
 arrow-cast = "59"
 arrow-buffer = "59"
-geo = "0.32"
-geozero = { version = "0.14", features = ["with-wkb", "with-geo"] }
+geo = "0.33"
+geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
 
 # Protobuf for MVT encoding
 prost = "0.14"
