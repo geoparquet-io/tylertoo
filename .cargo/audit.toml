@@ -5,13 +5,7 @@
 # justification living in deny.toml next to the entry.
 
 [advisories]
-ignore = [
-    # quick-xml < 0.41 XML-parsing DoS pathologies; transitive via
-    # object_store's S3/GCS support (remote input, #210). quick-xml there
-    # only parses XML responses from the configured storage endpoint, not
-    # attacker-supplied documents. No object_store release reaches the
-    # quick-xml >=0.41 fix (0.14.0 pins ^0.40.1). See deny.toml for the
-    # full rationale; re-evaluate on object_store bump.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-]
+# object_store 0.14 reaches quick-xml 0.41 and drops rustls-pemfile, so the
+# exceptions this file used to carry (RUSTSEC-2026-0194/0195, RUSTSEC-2025-0134)
+# are all resolved rather than waived.
+ignore = []
