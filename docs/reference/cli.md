@@ -14,6 +14,7 @@ This document contains the help content for the `tylertoo` command-line program.
 * [`tylertoo validate`↴](#tylertoo-validate)
 * [`tylertoo export-pmtiles`↴](#tylertoo-export-pmtiles)
 * [`tylertoo decode`↴](#tylertoo-decode)
+* [`tylertoo pyramid`↴](#tylertoo-pyramid)
 
 ## `tylertoo`
 
@@ -30,6 +31,7 @@ Top-level CLI: a default (bare) tile pipeline plus subcommands.
 * `validate` — Validate a GeoParquet overview file against the spec (§6.2)
 * `export-pmtiles` — Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `decode` — Decode a PMTiles vector-tile archive back to GeoParquet
+* `pyramid` — Merge per-band PMTiles archives into one multi-band pyramid (issue #345)
 
 
 
@@ -445,6 +447,23 @@ does not reproduce A. See docs/decode.md for details.
 * `--max-zoom <MAX_ZOOM>` — Maximum zoom level to decode
 * `--layer <NAME>` — Only decode features from this MVT layer
 * `--report <PATH>` — Write the JSON decode report to this path
+
+
+
+## `tylertoo pyramid`
+
+Merge per-band PMTiles archives into one multi-band pyramid (issue #345)
+
+**Usage:** `tylertoo pyramid [OPTIONS] --band <LO-HI:ARCHIVE[:LAYER]> <OUTPUT>`
+
+###### **Arguments:**
+
+* `<OUTPUT>` — Output PMTiles archive
+
+###### **Options:**
+
+* `--band <LO-HI:ARCHIVE[:LAYER]>` — A band: `LO-HI:ARCHIVE[:LAYER]`, repeatable. ARCHIVE is a PMTiles file already tiled for that zoom range. LAYER defaults to the file stem, and several bands may share one layer name (the usual case: a coarse and a fine aggregate that are the same layer to a client). Zoom ranges must not overlap -- two bands claiming one zoom write the same tile ids. ARCHIVE may not contain a `:`, which the spec cannot tell apart from the LAYER separator; rename the file or point at it through a symlink
+* `-f`, `--force` — Overwrite the output if it exists
 
 
 

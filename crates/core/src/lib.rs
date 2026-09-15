@@ -51,6 +51,7 @@ pub mod ioverlay_clip;
 pub mod mvt;
 pub mod overview;
 pub mod pmtiles_writer;
+pub mod pyramid;
 pub mod quality;
 pub mod sutherland_hodgman;
 pub mod tile;

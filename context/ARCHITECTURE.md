@@ -329,6 +329,8 @@ crates/core/src/
 ├── world_coord.rs      # Integer world-coordinate space
 ├── mvt.rs              # MVT encoding
 ├── decode.rs           # PMTiles → GeoParquet decoding (#112)
+├── pyramid.rs          # Multi-band pyramids: merge per-band PMTiles archives
+│                       # with disjoint zoom ranges into one archive (#345)
 ├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)
 ├── compression.rs      # gzip/brotli/zstd compression
 ├── dedup.rs            # Tile deduplication (XXH3)
@@ -336,7 +338,7 @@ crates/core/src/
 └── wkb.rs              # WKB round-trip helpers
 
 crates/cli/src/main.rs  # Subcommands: tiles (facade), overview, validate,
-                        # export-pmtiles
+                        # export-pmtiles, decode, pyramid
 crates/python/src/lib.rs # pyo3 bindings: convert (facade), overview,
                         # export_pmtiles, validate
 ```

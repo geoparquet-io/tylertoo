@@ -132,6 +132,8 @@ enum Command {
     ExportPmtiles(ExportPmtilesArgs),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
+    /// Merge per-band PMTiles archives into one multi-band pyramid (issue #345).
+    Pyramid(PyramidArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
     /// Compiled only under the `gen-docs` feature; used by CI to regenerate
@@ -140,6 +142,32 @@ enum Command {
     #[cfg(feature = "gen-docs")]
     #[command(hide = true)]
     GenReferenceDocs,
+}
+
+/// Arguments for `tylertoo pyramid`.
+///
+/// Step two of a two-step, the way `overview` -> `export-pmtiles` is: tile each
+/// band with `tylertoo tiles` restricted to that band's zoom range, then merge
+/// the archives here. A one-shot form that takes the GeoParquet inputs directly
+/// is the obvious follow-up; this exists to make the pyramid *shape* reachable.
+#[derive(Parser, Debug)]
+pub struct PyramidArgs {
+    /// Output PMTiles archive.
+    pub output: PathBuf,
+
+    /// A band: `LO-HI:ARCHIVE[:LAYER]`, repeatable. ARCHIVE is a PMTiles file
+    /// already tiled for that zoom range. LAYER defaults to the file stem, and
+    /// several bands may share one layer name (the usual case: a coarse and a
+    /// fine aggregate that are the same layer to a client). Zoom ranges must
+    /// not overlap -- two bands claiming one zoom write the same tile ids.
+    /// ARCHIVE may not contain a `:`, which the spec cannot tell apart from the
+    /// LAYER separator; rename the file or point at it through a symlink.
+    #[arg(long = "band", required = true, value_name = "LO-HI:ARCHIVE[:LAYER]")]
+    pub bands: Vec<String>,
+
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    pub force: bool,
 }
 
 /// Arguments for `tylertoo decode`.
@@ -1081,6 +1109,7 @@ fn main() -> Result<()> {
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Decode(args) => run_decode(args),
+        Command::Pyramid(args) => run_pyramid(args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
         Command::GenReferenceDocs => {
@@ -1121,12 +1150,13 @@ where
     // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
     // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
     // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 7] = [
+    const SUBCOMMANDS: [&str; 8] = [
         "tiles",
         "overview",
         "validate",
         "export-pmtiles",
         "decode",
+        "pyramid",
         "gen-reference-docs",
         "help",
     ];
@@ -1837,6 +1867,59 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
         println!("  report → {}", path.display());
     }
+    Ok(())
+}
+
+/// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
+/// facade over `tylertoo_core::pyramid::merge_bands`).
+fn run_pyramid(args: PyramidArgs) -> Result<()> {
+    use tylertoo_core::pyramid::{merge_bands, validate_bands, Band};
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    if args.output.exists() && !args.force {
+        anyhow::bail!(
+            "{} exists (use --force to overwrite)",
+            args.output.display()
+        );
+    }
+
+    let bands = args
+        .bands
+        .iter()
+        .map(|s| Band::parse(s).map_err(|e| anyhow::anyhow!(e)))
+        .collect::<Result<Vec<_>>>()?;
+    validate_bands(&bands).map_err(|e| anyhow::anyhow!(e))?;
+
+    for b in &bands {
+        if !b.input.exists() {
+            anyhow::bail!("band archive not found: {}", b.input.display());
+        }
+    }
+
+    let report =
+        merge_bands(&bands, &args.output).map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+
+    for (layer, lo, hi, n) in &report.per_band_tiles {
+        println!(
+            "  z{lo}-{hi} -> layer {layer:?}: {} tiles",
+            format_number(*n as u64)
+        );
+    }
+    if report.skipped > 0 {
+        // Almost always a --minzoom/--maxzoom that disagrees with --band, so
+        // this belongs on stdout next to the counts, not only in the log.
+        println!(
+            "  ! {} tile(s) dropped: outside the declared band zoom ranges",
+            format_number(report.skipped as u64)
+        );
+    }
+    println!(
+        "✓ Merged {} band(s) → {} ({} tiles)",
+        bands.len(),
+        args.output.display(),
+        format_number(report.total_tiles as u64)
+    );
     Ok(())
 }
 
