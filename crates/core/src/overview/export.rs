@@ -2789,14 +2789,49 @@ fn is_supported_scalar(dt: &DataType) -> bool {
 /// what every other Arrow consumer shows for the same value instead of a
 /// hand-rolled variant of it.
 fn is_temporal_scalar(dt: &DataType) -> bool {
+    match dt {
+        DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) => true,
+        // A timezone is only supported if we can render it -- see
+        // `utc_equivalent_tz`. Claiming otherwise would advertise the field in
+        // `vector_layers.fields` and then emit null for every value, which is
+        // worse than dropping the column, because the archive then promises a
+        // field that is not on a single feature.
+        DataType::Timestamp(_, tz) => tz.as_ref().map_or(true, |tz| utc_equivalent_tz(tz)),
+        _ => false,
+    }
+}
+
+/// Whether a timestamp's timezone is one we can render without a tz database.
+///
+/// `arrow-array` only understands named zones when its (implicit, undocumented)
+/// `chrono-tz` feature is on, which pulls in the whole IANA database; without
+/// it `ArrayFormatter::try_new` fails outright for anything but a numeric
+/// offset. That matters because parquet's `TIMESTAMP` carries a single
+/// `isAdjustedToUTC` bool, which the parquet crate maps to literally
+/// `Some("UTC")` -- so the tz-aware case is the COMMON one, not an exotic one,
+/// and dropping it would take the time axis with it.
+///
+/// Every timestamp reaching the export comes from an overview parquet file, so
+/// the tz is always `None` or a UTC spelling. Those we normalise to the fixed
+/// offset `+00:00`, which arrow renders identically (`...Z`) with no extra
+/// dependency. A genuine named zone cannot arrive by that route; if one ever
+/// does it is not advertised and not encoded, exactly as before this change.
+fn utc_equivalent_tz(tz: &str) -> bool {
     matches!(
-        dt,
-        DataType::Date32
-            | DataType::Date64
-            | DataType::Timestamp(_, _)
-            | DataType::Time32(_)
-            | DataType::Time64(_)
+        tz.trim(),
+        "UTC" | "utc" | "Utc" | "Z" | "z" | "+00:00" | "-00:00" | "00:00"
     )
+}
+
+/// The datatype to format a temporal array as: a UTC-equivalent timestamp is
+/// restated with a numeric offset so arrow will render it without `chrono-tz`.
+fn formattable_temporal_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Timestamp(unit, Some(tz)) if utc_equivalent_tz(tz) => {
+            DataType::Timestamp(*unit, Some("+00:00".into()))
+        }
+        other => other.clone(),
+    }
 }
 
 /// Field-type metadata (`name -> "String"|"Number"|"Boolean"`) for the archive
@@ -2879,15 +2914,38 @@ fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyV
         DataType::UInt64 => prim!(UInt64Type, UInt, u64),
         DataType::Float32 => prim!(Float32Type, Float, f32),
         DataType::Float64 => prim!(Float64Type, Double, f64),
-        // Decimals are numbers; the MVT double is the only numeric value wide
-        // enough to carry one, so scale it out rather than drop the column.
-        // A decimal too large for f64 saturates, which is the same loss every
-        // other f64 consumer takes and still beats dropping the value.
+        // Decimals are numbers, so scale them out rather than drop the column.
+        //
+        // An unscaled decimal (scale <= 0) is an integer, and `DECIMAL(38,0)` is
+        // a common carrier for IDs and parcel numbers -- routing one through f64
+        // would silently round it past 53 bits, turning an ID into a different
+        // ID. Those go out as an MVT int when they fit one. Everything else
+        // becomes a double, the only MVT numeric wide enough; past 53 bits of
+        // significand that loses precision (an `i128 as f64` rounds -- it is far
+        // too small to reach infinity), which is the same loss every other f64
+        // consumer takes and still beats dropping the value.
         DataType::Decimal128(_, scale) => {
             let a = col.as_primitive::<Decimal128Type>();
-            let f = 10f64.powi(i32::from(*scale));
+            let scale = i32::from(*scale);
+            let f = 10f64.powi(scale);
             (0..n)
-                .map(|i| (!a.is_null(i)).then(|| PropertyValue::Double(a.value(i) as f64 / f)))
+                .map(|i| {
+                    (!a.is_null(i)).then(|| {
+                        let raw = a.value(i);
+                        let exact = (scale <= 0)
+                            .then(|| {
+                                10i128
+                                    .checked_pow((-scale) as u32)
+                                    .and_then(|m| raw.checked_mul(m))
+                            })
+                            .flatten()
+                            .and_then(|v| i64::try_from(v).ok());
+                        match exact {
+                            Some(v) => PropertyValue::Int(v),
+                            None => PropertyValue::Double(raw as f64 / f),
+                        }
+                    })
+                })
                 .collect()
         }
         // 256-bit decimals do not fit an i128 fast path, so let arrow render
@@ -2898,11 +2956,15 @@ fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyV
             match ArrayFormatter::try_new(col, &opts) {
                 Ok(fmt) => (0..n)
                     .map(|i| {
-                        (!col.is_null(i)).then(|| {
-                            PropertyValue::Double(
-                                fmt.value(i).to_string().parse().unwrap_or(f64::NAN),
-                            )
-                        })
+                        // Arrow's decimal display is always `-?\d+(\.\d+)?`, so
+                        // the parse does not fail in practice. If it ever did,
+                        // drop the value rather than manufacture a NaN: a NaN
+                        // encodes into the tile fine but renders any downstream
+                        // tile-to-GeoJSON step invalid.
+                        (!col.is_null(i))
+                            .then(|| fmt.value(i).to_string().parse().ok())
+                            .flatten()
+                            .map(PropertyValue::Double)
                     })
                     .collect(),
                 Err(_) => vec![None; n],
@@ -2915,25 +2977,48 @@ fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyV
         // DIVERGENCE FROM TIPPECANOE: tippecanoe has no opinion here -- it
         // passes through whatever text its input already held, which for a
         // DuckDB-written parquet is `2026-09-14 12:34:56`. We emit arrow's
-        // rendering, `2026-09-14T12:34:56`: RFC 3339, unambiguous about the
-        // separator, and identical to what `tylertoo decode` and every other
-        // Arrow reader will show for the same value. Matching the space form
-        // would mean re-implementing arrow's formatter to be less correct.
+        // rendering, `2026-09-14T12:34:56` (or `...Z` when the column is
+        // UTC-stamped): ISO 8601, unambiguous about the separator, and
+        // identical to what `tylertoo decode` and every other Arrow reader will
+        // show for the same value. Only the tz-stamped form carries an offset,
+        // so only that one is also RFC 3339. Matching the space form would mean
+        // re-implementing arrow's formatter to be less correct.
+        //
+        // `Date32` renders as `2026-09-14` and `Date64` as `2026-09-14T00:00:00`
+        // -- arrow's own distinction, kept deliberately. Truncating `Date64`
+        // would discard a time component the type is allowed to carry, and
+        // parquet's DATE always decodes to `Date32`, so the split is unreachable
+        // from the tiling path anyway.
         dt if is_temporal_scalar(dt) => {
-            let opts = FormatOptions::default().with_null("");
-            match ArrayFormatter::try_new(col, &opts) {
+            // Nulls are filtered below, so `FormatOptions`' null rendering is
+            // never consulted.
+            let opts = FormatOptions::default();
+            let retyped: Option<arrow_array::ArrayRef> = match formattable_temporal_type(dt) {
+                t if t == *dt => None,
+                t => col
+                    .to_data()
+                    .into_builder()
+                    .data_type(t)
+                    .build()
+                    .ok()
+                    .map(arrow_array::make_array),
+            };
+            let target: &dyn Array = retyped.as_deref().unwrap_or(col);
+            let out = match ArrayFormatter::try_new(target, &opts) {
                 Ok(fmt) => (0..n)
                     .map(|i| {
                         (!col.is_null(i)).then(|| PropertyValue::String(fmt.value(i).to_string()))
                     })
                     .collect(),
-                // A formatter this cannot build is a type we do not understand;
-                // fall back to dropping rather than guessing at a rendering.
+                // Unreachable: `is_temporal_scalar` only admits types arrow can
+                // format, and `field_metadata` gates on the same predicate, so
+                // an un-formattable column is never selected or advertised.
                 Err(e) => {
                     log::warn!("cannot format {dt:?} column as text, dropping it: {e}");
                     vec![None; n]
                 }
-            }
+            };
+            out
         }
         _ => vec![None; n],
     }
@@ -3818,6 +3903,225 @@ mod tests {
             ref other => panic!("DECIMAL must render as a double, got {other:?}"),
         }
         assert_eq!(got[1], None);
+    }
+
+    /// A UTC-stamped TIMESTAMP is the COMMON parquet shape, not an exotic one:
+    /// parquet records a single `isAdjustedToUTC` bool, which the parquet crate
+    /// maps to literally `Some("UTC")`, so every tz-aware column arrives spelled
+    /// that way.
+    ///
+    /// arrow refuses to format a NAMED zone without its `chrono-tz` feature, so
+    /// the first cut of this change advertised such a column as a String field
+    /// and then emitted null for every value -- strictly worse than dropping it,
+    /// because the archive promised a field that was on no feature at all.
+    #[test]
+    fn utc_stamped_timestamps_encode_rather_than_vanishing() {
+        use arrow_array::TimestampMicrosecondArray;
+        use arrow_schema::{Field, TimeUnit};
+
+        let dt = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let ts = TimestampMicrosecondArray::from(vec![Some(1_789_389_296_000_000), None])
+            .with_data_type(dt.clone());
+
+        let got = extract_property_column(&ts);
+        let rendered = match &got[0] {
+            Some(PropertyValue::String(s)) => s.clone(),
+            other => panic!("UTC-stamped TIMESTAMP must render as a string, got {other:?}"),
+        };
+        assert!(
+            rendered.starts_with("2026-09-14T12:34:56"),
+            "expected an ISO 8601 rendering, got {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('Z') || rendered.contains('+'),
+            "a tz-stamped value must carry its offset, got {rendered:?}"
+        );
+        assert_eq!(got[1], None, "null stays null");
+
+        let schema = Schema::new(vec![Field::new("acq", dt, true)]);
+        assert_eq!(
+            field_metadata(&schema, None).get("acq").map(String::as_str),
+            Some("String")
+        );
+        assert_eq!(property_columns(&schema, usize::MAX).len(), 1);
+    }
+
+    /// The selected-columns predicate and the extraction arms must agree: a
+    /// column advertised in `vector_layers.fields` has to be fillable. A named
+    /// timezone is not renderable without a tz database, so it must be neither
+    /// selected nor advertised -- dropping it is honest, promising it is not.
+    #[test]
+    fn unrenderable_timezone_is_neither_selected_nor_advertised() {
+        use arrow_schema::{Field, TimeUnit};
+
+        let dt = DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into()));
+        assert!(
+            !is_supported_scalar(&dt),
+            "a named zone must not be claimed"
+        );
+
+        let schema = Schema::new(vec![Field::new("local", dt, true)]);
+        assert!(!field_metadata(&schema, None).contains_key("local"));
+        assert!(property_columns(&schema, usize::MAX).is_empty());
+    }
+
+    /// An unscaled DECIMAL is an integer, and `DECIMAL(38,0)` is a common
+    /// carrier for IDs. Routing one through f64 rounds it past 53 bits, turning
+    /// an ID into a different ID, so exact values go out as MVT ints.
+    #[test]
+    fn unscaled_decimals_stay_exact() {
+        use arrow_array::Decimal128Array;
+
+        let id = 9_007_199_254_740_993_i128; // 2^53 + 1: not representable in f64
+        let dec = Decimal128Array::from(vec![Some(id), None])
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let got = extract_property_column(&dec);
+        assert_eq!(
+            got[0],
+            Some(PropertyValue::Int(9_007_199_254_740_993)),
+            "an unscaled decimal must survive exactly, not round through f64"
+        );
+        assert_eq!(got[1], None);
+
+        // Negative scale is arrow's `unscaled * 10^-scale`: 150 at scale -3 is
+        // 150000, still an exact integer.
+        let neg = Decimal128Array::from(vec![Some(150_i128)])
+            .with_precision_and_scale(10, -3)
+            .unwrap();
+        assert_eq!(
+            extract_property_column(&neg)[0],
+            Some(PropertyValue::Int(150_000))
+        );
+
+        // Too big for i64 falls back to the lossy double rather than dropping.
+        let huge = Decimal128Array::from(vec![Some(i128::MAX)])
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        assert!(matches!(
+            extract_property_column(&huge)[0],
+            Some(PropertyValue::Double(_))
+        ));
+    }
+
+    /// `Decimal256` has no i128 fast path, so it goes through arrow's text.
+    #[test]
+    fn decimal256_encodes_as_a_double() {
+        use arrow_array::Decimal256Array;
+        use arrow_buffer::i256;
+
+        let dec = Decimal256Array::from(vec![Some(i256::from_i128(150)), None])
+            .with_precision_and_scale(40, 2)
+            .unwrap();
+        let got = extract_property_column(&dec);
+        match got[0] {
+            Some(PropertyValue::Double(v)) => {
+                assert!(
+                    (v - 1.5).abs() < 1e-9,
+                    "DECIMAL256(40,2) 150 must be 1.5, got {v}"
+                );
+            }
+            ref other => panic!("DECIMAL256 must render as a double, got {other:?}"),
+        }
+        assert_eq!(got[1], None);
+    }
+
+    /// The remaining temporal spellings all render, and all as strings.
+    #[test]
+    fn date64_and_time_columns_render_as_iso_text() {
+        use arrow_array::{Date64Array, Time32SecondArray, Time64MicrosecondArray};
+
+        // 2026-09-14T00:00:00 in milliseconds.
+        let d64 = Date64Array::from(vec![Some(1_789_344_000_000)]);
+        assert_eq!(
+            extract_property_column(&d64)[0],
+            Some(PropertyValue::String("2026-09-14T00:00:00".to_string())),
+            "Date64 keeps arrow's datetime rendering -- truncating would discard \
+             a time component the type may legitimately carry"
+        );
+
+        let t32 = Time32SecondArray::from(vec![Some(45_296)]);
+        assert_eq!(
+            extract_property_column(&t32)[0],
+            Some(PropertyValue::String("12:34:56".to_string()))
+        );
+
+        let t64 = Time64MicrosecondArray::from(vec![Some(45_296_000_000)]);
+        match &extract_property_column(&t64)[0] {
+            Some(PropertyValue::String(s)) => assert!(s.starts_with("12:34:56"), "got {s:?}"),
+            other => panic!("Time64 must render as a string, got {other:?}"),
+        }
+    }
+
+    /// End to end: a DATE and a UTC TIMESTAMP written into an overview file
+    /// must come back out of a decoded tile as properties.
+    ///
+    /// The unit tests above pin `extract_property_column` and `field_metadata`
+    /// in isolation; this one pins that the two actually meet in the tile. The
+    /// original bug was invisible at the unit level precisely because nothing
+    /// checked the whole path.
+    #[test]
+    fn temporal_properties_reach_a_decoded_tile() {
+        use arrow_array::{Date32Array, TimestampMicrosecondArray};
+        use arrow_schema::TimeUnit;
+
+        let tz = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("acq_date", DataType::Date32, false),
+            Field::new("acq_ts", tz.clone(), false),
+            geometry_field(),
+        ]));
+        let geoms = vec![Geometry::Point(Point::new(-120.0, 40.0))];
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut opts =
+            OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
+        opts.max_row_group_size = 10_000;
+        let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+        let rb = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Date32Array::from(vec![20710])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![1_789_389_296_000_000]).with_data_type(tz),
+                ),
+                Arc::new(build_geometry_array(&geoms).to_array_ref()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            writer.write_level(0, Some(1), std::iter::once(rb)).unwrap(),
+            LevelWriteOutcome::Written
+        );
+        writer.finish().unwrap();
+
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        let feats = read_level_features(&reader, 0, Crs::Epsg4326).unwrap();
+        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default());
+        assert_eq!(tiles.len(), 1);
+
+        let decoded = decode_tile(&tiles[0].data);
+        let layer = &decoded.layers[0];
+        for want in ["acq_date", "acq_ts"] {
+            assert!(
+                layer.keys.iter().any(|k| k == want),
+                "{want} never reached the tile; keys were {:?}",
+                layer.keys
+            );
+        }
+        let strings: Vec<&str> = layer
+            .values
+            .iter()
+            .filter_map(|v| v.string_value.as_deref())
+            .collect();
+        assert!(
+            strings.contains(&"2026-09-14"),
+            "DATE value missing from the tile: {strings:?}"
+        );
+        assert!(
+            strings.iter().any(|v| v.starts_with("2026-09-14T12:34:56")),
+            "TIMESTAMP value missing from the tile: {strings:?}"
+        );
     }
 
     /// A column the export cannot encode must not be advertised in

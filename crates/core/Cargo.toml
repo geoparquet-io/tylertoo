@@ -87,6 +87,8 @@ libc = "0.2"
 prost-build = { workspace = true }
 
 [dev-dependencies]
+# Only for constructing i256 test values (Decimal256 coverage).
+arrow-buffer = { workspace = true }
 criterion = { version = "0.8", features = ["html_reports"] }
 serde_json = "1"
 proptest = { workspace = true }
