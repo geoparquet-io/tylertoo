@@ -940,6 +940,45 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
                 _ => seen_non_point_coarser = true,
             }
         }
+        // H3 aggregate bands (#332). H3 replaces the coarse zooms with cell
+        // aggregates that hand off to real geometry as you zoom in, so it must
+        // be a contiguous prefix from the plan's min zoom (like point), and —
+        // for v1 — it is not composable with the point/square per-feature
+        // bands, which have incompatible per-feature semantics.
+        let has_h3 = options
+            .representation
+            .iter()
+            .any(|b| b.repr == Representation::H3);
+        if has_h3 {
+            if options
+                .representation
+                .iter()
+                .any(|b| matches!(b.repr, Representation::Point | Representation::Square))
+            {
+                return Err(ConvertError::InvalidConfig(
+                    "h3 bands cannot be combined with point or square bands: H3 \
+                     aggregates whole cells whereas point/square transform each \
+                     feature individually"
+                        .to_string(),
+                ));
+            }
+            let mut seen_non_h3_coarser = false;
+            for slot in &claimed {
+                match slot {
+                    Some(Representation::H3) => {
+                        if seen_non_h3_coarser {
+                            return Err(ConvertError::InvalidConfig(
+                                "h3 bands must start at the plan's min zoom and be \
+                                 contiguous from the coarsest level: H3 aggregates the \
+                                 zoomed-out view and hands off to geometry as you zoom in"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    _ => seen_non_h3_coarser = true,
+                }
+            }
+        }
     }
     // in_flight_batches == 0 is the IN_FLIGHT_BATCHES_AUTO sentinel (resolved
     // to available parallelism at pass-2 setup), not an error. Any explicit
@@ -986,12 +1025,13 @@ pub(super) fn representation_for_zoom(
         .unwrap_or_default()
 }
 
-/// Parse a representation spec string (#317 / #279): comma-separated
-/// `LO-HI:KIND` (or `Z:KIND`) entries, e.g. `0-7:point,8-14:geom` or
-/// `0-5:square`. KIND is one of `geom` (alias `geometry`), `point`,
-/// `square`. Shared by the CLI and the Python bindings so the grammar has a
-/// single definition; structural validity against the level plan is checked
-/// later by convert-entry validation.
+/// Parse a representation spec string (#317 / #279 / #332): comma-separated
+/// `LO-HI:KIND` (or `Z:KIND`) entries, e.g. `0-7:point,8-14:geom`,
+/// `0-5:square`, or `0-5:h3,6-14:geom`. KIND is one of `geom` (alias
+/// `geometry`), `point`, `square`, or `h3` (H3 aggregate cells; resolution is
+/// auto-derived per zoom). Shared by the CLI and the Python bindings so the
+/// grammar has a single definition; structural validity against the level plan
+/// is checked later by convert-entry validation.
 pub fn parse_representation_spec(spec: &str) -> Result<Vec<RepresentationBand>, String> {
     let mut bands = Vec::new();
     for part in spec.split(',') {
@@ -1006,9 +1046,10 @@ pub fn parse_representation_spec(spec: &str) -> Result<Vec<RepresentationBand>, 
             "geom" | "geometry" => Representation::Geometry,
             "point" => Representation::Point,
             "square" => Representation::Square,
+            "h3" => Representation::H3,
             other => {
                 return Err(format!(
-                    "unknown representation {other:?} (expected geom, point, or square)"
+                    "unknown representation {other:?} (expected geom, point, square, or h3)"
                 ))
             }
         };
@@ -1187,6 +1228,7 @@ fn decode_and_filter_geometries(
 /// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
 /// Runs the full option normalization (validation, cluster/accumulate checks,
 /// the partitioning-coalesce-inert rewrite) before dispatching.
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -1594,9 +1636,31 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // same type so RecordBatch assembly matches.
     let geom_out_field = mixed_geometry_field(&geom_name);
     let source_schema = build_source_schema(&input_schema, geom_idx, geom_out_field.clone());
-    // Writer schema: base + point_count when clustering (Q4) + coalesced_count
-    // when coalescing (Q3).
-    let cluster_schema = if options.cluster {
+    // H3 aggregate bands (#332) reuse the `point_count` column as the cell
+    // feature count, so its presence is implied by H3 just as it is by
+    // clustering. Precompute every feature's representative point once (bbox
+    // center → lon/lat) for the per-level cell binning.
+    let has_h3 = options
+        .representation
+        .iter()
+        .any(|b| b.repr == Representation::H3);
+    let h3_points: Vec<(f64, f64)> = if has_h3 {
+        super::h3agg::rep_points_lonlat(&features, crs)
+    } else {
+        Vec::new()
+    };
+    // H3 cell rows carry NULL for every source attribute (a cell is an
+    // aggregate, not a feature), so those columns must be nullable in the
+    // output schema. Geometry and generated columns are untouched; geom-level
+    // rows keep their real (non-null) values in the now-nullable columns.
+    let source_schema = if has_h3 {
+        relax_source_nullability(&source_schema, geom_idx)
+    } else {
+        source_schema
+    };
+    // Writer schema: base + point_count when clustering (Q4) or H3 (#332) +
+    // coalesced_count when coalescing (Q3).
+    let cluster_schema = if options.cluster || has_h3 {
         append_point_count_field(&source_schema)
     } else {
         source_schema.clone()
@@ -1634,27 +1698,62 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     let mut level_reports = Vec::with_capacity(emitted.len());
     for (level_idx, e) in emitted.iter().enumerate() {
-        let mut batch = build_level_batch(
-            &source_schema,
-            &full,
-            &non_geom_cols,
-            geom_idx,
-            &e.indices,
-            &e.geoms,
-        )?;
-        if let Some(tables) = &cluster_tables {
-            // Canonical level: singleton clusters, columns verbatim (§2.4).
-            let table = (e.orig != finest).then(|| &tables[e.orig]);
-            batch = apply_cluster_columns(batch, &cluster_schema, &e.indices, table, &acc_cols)?;
-        }
+        let repr = representation_for_zoom(&options.representation, e.zoom);
+        // Row count hint and the index slice that drives the coalesced_count
+        // append: an H3 level emits one row per occupied cell, a geom level one
+        // per surviving feature.
+        // H3 levels report Σ point_count (input features binned), not cell count.
+        let (mut batch, coalesce_idx, feature_count): (RecordBatch, Vec<usize>, usize) =
+            if repr == Representation::H3 {
+                // #332: replace this coarse level's features with H3 cell
+                // aggregates. Binning is over the whole dataset's rep points at
+                // the level's auto-derived resolution — independent of the
+                // per-feature level assignment used by the geom levels.
+                let res = super::level::h3_res_for_gsd(e.gsd);
+                let rows = super::h3agg::aggregate_h3_cells(h3_points.iter().copied(), res);
+                let n_features: usize = rows.iter().map(|r| r.count as usize).sum();
+                let idx = vec![0usize; rows.len()];
+                (
+                    build_h3_level_batch(&cluster_schema, geom_idx, &rows)?,
+                    idx,
+                    n_features,
+                )
+            } else {
+                let mut b = build_level_batch(
+                    &source_schema,
+                    &full,
+                    &non_geom_cols,
+                    geom_idx,
+                    &e.indices,
+                    &e.geoms,
+                )?;
+                // point_count: cluster table when clustering; all-1 when the
+                // column exists only because H3 is present elsewhere.
+                if cluster_tables.is_some() || has_h3 {
+                    let table = cluster_tables
+                        .as_ref()
+                        .filter(|_| e.orig != finest)
+                        .map(|t| &t[e.orig]);
+                    b = apply_cluster_columns(b, &cluster_schema, &e.indices, table, &acc_cols)?;
+                }
+                let n = e.indices.len();
+                (b, e.indices.clone(), n)
+            };
         if options.coalesce_lines {
             // Canonical level (and guard-skipped runs): table is None ⇒ all 1.
-            batch = apply_coalesced_count(batch, &out_schema, &e.indices, e.coalesce.as_ref())?;
+            // H3 cell rows always coalesce to 1 (table None, correct length).
+            let table = if repr == Representation::H3 {
+                None
+            } else {
+                e.coalesce.as_ref()
+            };
+            batch = apply_coalesced_count(batch, &out_schema, &coalesce_idx, table)?;
         }
+        let level_rows = batch.num_rows();
         // SkippedEmpty is unreachable here (every emitted level has >= 1
         // feature), but the bookkeeping stays aligned with the streaming path.
-        let outcome =
-            writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
+        let outcome = writer.write_level(level_idx, Some(level_rows), std::iter::once(batch))?;
+        // H3 levels report Σ point_count (input features binned) as feature_count.
         record_level_outcome(
             outcome,
             SkippedLevelReport {
@@ -1662,8 +1761,8 @@ pub(crate) fn convert_to_overviews_source_strategy(
                 gsd: e.gsd,
                 zoom: e.zoom,
             },
-            e.indices.len(),
-            e.indices.len(),
+            level_rows,
+            feature_count,
             e.vertex_count,
             &mut level_reports,
             &mut skipped,
@@ -2343,6 +2442,72 @@ pub(super) fn build_level_batch(
     }
     Ok(RecordBatch::try_new(
         Arc::new(source_schema.clone()),
+        columns,
+    )?)
+}
+
+/// Mark every non-geometry source column nullable (#332). H3 aggregate cells
+/// carry no per-feature attributes, so the output schema must permit NULLs in
+/// those columns; geometry keeps its own field verbatim. Widening nullability
+/// is safe for the geom levels, whose columns still hold their real values.
+pub(super) fn relax_source_nullability(schema: &Schema, geom_idx: usize) -> Schema {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if i == geom_idx || f.is_nullable() {
+                f.clone()
+            } else {
+                Arc::new(f.as_ref().clone().with_nullable(true))
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+/// Build an H3 aggregate level's output batch (#332), shaped to `cluster_schema`
+/// (source columns + `point_count`).
+///
+/// Every source attribute column is NULL — an H3 cell is an aggregate, not a
+/// feature, so it carries no per-feature values (v1 aggregates only a count).
+/// The geometry column holds the cell boundary polygons and `point_count` holds
+/// each cell's feature count, reusing the clustering column so the count rides
+/// the existing writer + MVT-property plumbing with no new schema. The caller
+/// applies [`apply_coalesced_count`] afterwards exactly as for a geom level.
+pub(super) fn build_h3_level_batch(
+    cluster_schema: &Schema,
+    geom_idx: usize,
+    rows: &[super::h3agg::H3CellRow],
+) -> Result<RecordBatch, ConvertError> {
+    use arrow_array::{new_null_array, Int64Array};
+
+    let n = rows.len();
+    let point_count_idx = cluster_schema.fields().len() - 1;
+    debug_assert_eq!(
+        cluster_schema.field(point_count_idx).name(),
+        super::cluster::POINT_COUNT_COLUMN,
+        "H3 batch expects point_count as the last cluster_schema column"
+    );
+
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(cluster_schema.fields().len());
+    for (i, field) in cluster_schema.fields().iter().enumerate() {
+        if i == geom_idx {
+            let typ = GeometryType::new(Default::default());
+            let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+            b.extend_from_iter(rows.iter().map(|r| Some(&r.geometry)));
+            columns.push(b.finish().to_array_ref());
+        } else if i == point_count_idx {
+            columns.push(Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.count).collect::<Vec<_>>(),
+            )));
+        } else {
+            // Aggregate cells carry no per-feature attribute values.
+            columns.push(new_null_array(field.data_type(), n));
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(cluster_schema.clone()),
         columns,
     )?)
 }
@@ -4054,6 +4219,166 @@ mod tests {
         assert!(gen.collapse.is_none(), "no global collapse requested");
     }
 
+    /// THE #332 acceptance anchor (in-memory path): an H3 band yields coarse
+    /// levels of hexagon cells carrying a `point_count`, while the finer levels
+    /// keep the real polygons — one archive, no merge. Cell counts partition
+    /// the input exactly (Σ point_count == feature count).
+    #[test]
+    fn representation_h3_band_cells_coarse_polygons_fine() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+
+        let geoms = polygon_fixture();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 6,
+            },
+            representation: vec![
+                band(0, 3, Representation::H3),
+                band(4, 6, Representation::Geometry),
+            ],
+            streaming: false, // exercise the in-memory pipeline
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+        assert!(validate_file(tout.path()).unwrap().is_valid());
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        for (idx, lvl) in report.levels.iter().enumerate() {
+            let zoom = lvl.zoom.expect("zoom-range plan records zooms");
+            if zoom <= 3 {
+                // H3 levels: every geometry is a hexagon cell (Polygon /
+                // MultiPolygon) and the per-cell counts sum to the input size.
+                let mut total: i64 = 0;
+                let mut any = false;
+                for batch in reader.read_level(idx, None).unwrap() {
+                    let batch = batch.unwrap();
+                    let gcol = batch.column(batch.schema().index_of("geometry").unwrap());
+                    let field = batch
+                        .schema()
+                        .field(batch.schema().index_of("geometry").unwrap())
+                        .clone();
+                    let garr: Arc<dyn GeoArrowArray> =
+                        from_arrow_array(gcol.as_ref(), &field).unwrap();
+                    let mut gvec = Vec::new();
+                    extract_geometries_from_array(garr.as_ref(), &mut gvec).unwrap();
+                    for g in &gvec {
+                        assert!(
+                            matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)),
+                            "H3 level z{zoom} must be cell polygons, got {g:?}"
+                        );
+                        any = true;
+                    }
+                    let pc = batch
+                        .column(batch.schema().index_of("point_count").unwrap())
+                        .as_primitive::<Int64Type>()
+                        .clone();
+                    for i in 0..pc.len() {
+                        total += pc.value(i);
+                    }
+                }
+                assert!(any, "H3 level z{zoom} produced no cells");
+                assert_eq!(
+                    total,
+                    geoms.len() as i64,
+                    "H3 level z{zoom}: Σ point_count must equal the feature count"
+                );
+            } else {
+                // Geom levels keep real polygons and count 1 per feature.
+                let rows = read_level_rows(&reader, idx);
+                assert!(
+                    rows.iter().any(|(_, _, _, g)| matches!(
+                        g,
+                        Geometry::Polygon(_) | Geometry::MultiPolygon(_)
+                    )),
+                    "geom level z{zoom} must keep polygons"
+                );
+            }
+        }
+
+        // Canonical (finest) level is verbatim: the original polygons, in order.
+        let canonical = read_level_rows(&reader, report.levels.len() - 1);
+        assert_eq!(canonical.len(), geoms.len());
+        for (i, (_, _, _, g)) in canonical.iter().enumerate() {
+            assert_eq!(g, &geoms[i]);
+        }
+    }
+
+    /// #332: the streaming pipeline (default) writes the H3 cell prefix directly
+    /// and pipelines the geom suffix. Same invariants as the in-memory anchor:
+    /// coarse levels are hexagon cells whose counts partition the input, finer
+    /// levels keep polygons, canonical verbatim. Runs both pass-2 strategies.
+    #[test]
+    fn representation_h3_band_streaming_produces_cells() {
+        use super::super::stream::Pass2Strategy;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+
+        for strategy in [Pass2Strategy::Pipelined, Pass2Strategy::Serial] {
+            let geoms = polygon_fixture();
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_input(tin.path(), &geoms, false, None);
+
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                representation: vec![
+                    band(0, 3, Representation::H3),
+                    band(4, 6, Representation::Geometry),
+                ],
+                streaming: true,
+                ..Default::default()
+            };
+            let report =
+                convert_to_overviews_strategy(tin.path(), tout.path(), &opts, strategy).unwrap();
+            assert!(validate_file(tout.path()).unwrap().is_valid());
+
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            for (idx, lvl) in report.levels.iter().enumerate() {
+                let zoom = lvl.zoom.unwrap();
+                if zoom <= 3 {
+                    let mut total: i64 = 0;
+                    for batch in reader.read_level(idx, None).unwrap() {
+                        let batch = batch.unwrap();
+                        let pc = batch
+                            .column(batch.schema().index_of("point_count").unwrap())
+                            .as_primitive::<Int64Type>()
+                            .clone();
+                        for i in 0..pc.len() {
+                            total += pc.value(i);
+                        }
+                    }
+                    assert_eq!(
+                        total,
+                        geoms.len() as i64,
+                        "H3 level z{zoom}: \u{3a3} point_count must equal feature count"
+                    );
+                } else {
+                    let rows = read_level_rows(&reader, idx);
+                    assert!(
+                        rows.iter().any(|(_, _, _, g)| matches!(
+                            g,
+                            Geometry::Polygon(_) | Geometry::MultiPolygon(_)
+                        )),
+                        "geom level z{zoom} must keep polygons"
+                    );
+                }
+            }
+            let canonical = read_level_rows(&reader, report.levels.len() - 1);
+            assert_eq!(canonical.len(), geoms.len());
+        }
+    }
+
     /// Streaming and in-memory pipelines produce identical per-level rows
     /// for a point-band conversion (the #218-style engine equivalence).
     #[test]
@@ -4303,6 +4628,11 @@ mod tests {
         // Single-zoom entry and the "geometry" alias.
         let bands = parse_representation_spec("3:geometry").unwrap();
         assert_eq!(bands, vec![band(3, 3, Representation::Geometry)]);
+
+        // H3 aggregate band (#332), param-free like point/square.
+        let bands = parse_representation_spec("0-5:h3,6-14:geom").unwrap();
+        assert_eq!(bands[0], band(0, 5, Representation::H3));
+        assert_eq!(bands[1], band(6, 14, Representation::Geometry));
 
         assert!(parse_representation_spec("").is_err());
         assert!(parse_representation_spec("0-7").is_err());

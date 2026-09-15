@@ -2886,7 +2886,7 @@ fn detect_crs(path: &Path) -> Result<Crs, ExportError> {
 
 /// Reproject one EPSG:3857 point (meters) to EPSG:4326 (lon/lat degrees).
 #[inline]
-fn webmerc_to_lnglat(x: f64, y: f64) -> (f64, f64) {
+pub(super) fn webmerc_to_lnglat(x: f64, y: f64) -> (f64, f64) {
     let lng = x / WEBMERC_HALF_M * 180.0;
     let lat = (2.0 * (y / WEBMERC_HALF_M * std::f64::consts::PI).exp().atan()
         - std::f64::consts::FRAC_PI_2)

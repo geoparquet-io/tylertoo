@@ -312,6 +312,15 @@ pub enum Representation {
     /// ([`CollapseMode::Square`], tippecanoe tiny-polygon reduction, #279).
     /// Type-preserving; above-tolerance polygons are unaffected.
     Square,
+    /// **Row-collapsing** H3 aggregate (#332): at this level every feature is
+    /// binned into the H3 cell covering its representative point and each
+    /// occupied cell becomes one row (cell boundary polygon + feature `count`).
+    /// Unlike the other variants this changes row cardinality, so H3 levels are
+    /// produced by [`super::h3agg`] rather than the per-feature simplify path —
+    /// [`simplify_step`] never runs on an H3 level. The band's H3 resolution is
+    /// auto-derived from the level GSD ([`super::level::h3_res_for_gsd`]); all
+    /// geometry kinds participate.
+    H3,
 }
 
 impl Representation {
@@ -321,6 +330,7 @@ impl Representation {
             Representation::Geometry => "geom",
             Representation::Point => "point",
             Representation::Square => "square",
+            Representation::H3 => "h3",
         }
     }
 }
@@ -446,6 +456,13 @@ pub fn simplify_step(
             };
             simplify_for_level(geom, gsd_meters, crs, &opts)
         }
+        // H3 (#332) levels are row-collapsing: the convert driver discards the
+        // per-feature geometry and replaces the whole level with H3 cell
+        // aggregates (`h3agg`). The per-level geometry pass still runs over
+        // every level's features generically before that replacement, so this
+        // arm is reached with output that is thrown away — simplify plainly and
+        // cheaply; the result is never written.
+        Representation::H3 => simplify_for_level(geom, gsd_meters, crs, opts),
     }
 }
 
