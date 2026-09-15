@@ -307,14 +307,17 @@ struct ReadMsg {
 /// One level's ordered output buffer.
 enum LevelSink {
     Ram(Vec<RecordBatch>),
-    Spill(SpillState),
+    // Boxed: arrow 59 grew `StreamWriter`, taking `SpillState` past clippy's
+    // large_enum_variant threshold, so every Ram variant would otherwise carry
+    // the spill variant's footprint.
+    Spill(Box<SpillState>),
 }
 
 impl LevelSink {
     fn new(backing: SinkBacking, out_schema: &Schema) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
-            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema)?),
+            SinkBacking::Spill => LevelSink::Spill(Box::new(SpillState::new(out_schema)?)),
         })
     }
 
