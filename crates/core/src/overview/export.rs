@@ -3373,7 +3373,11 @@ mod tests {
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            "c548b186be24a0f2",
+            // RE-BLESSED: `leaf_dirs_offset` in the 127-byte header changed
+            // from 0 to the leaf section's position, because go-pmtiles
+            // rejects a zero there. Eight header bytes; no tile data moved,
+            // and the per-tile assertions below are unchanged.
+            "0dfdf8a0bb941a0c",
             "archive bytes diverged from the pre-refactor reference"
         );
 

@@ -1071,15 +1071,9 @@ impl PmtilesWriter {
             root_dir_length,
             json_metadata_offset: metadata_offset,
             json_metadata_length: metadata_length,
-            // Zeroed when there are no leaves, matching StreamingPmtilesWriter
-            // (and `test_small_archive_no_leaf_directories`, which pins that
-            // convention for the streaming path). The two writers should
-            // describe an identical archive identically.
-            leaf_dirs_offset: if leaf_dirs_length > 0 {
-                leaf_dirs_offset
-            } else {
-                0
-            },
+            // Always the section position, never 0 -- even with no leaves. See
+            // the note on `leaf_dirs_offset` in `StreamingPmtilesWriter`.
+            leaf_dirs_offset,
             leaf_dirs_length,
             tile_data_offset,
             tile_data_length,
@@ -1540,11 +1534,17 @@ impl StreamingPmtilesWriter {
             root_dir_length,
             json_metadata_offset: metadata_offset,
             json_metadata_length: metadata_length,
-            leaf_dirs_offset: if leaf_dirs_length > 0 {
-                leaf_dirs_offset
-            } else {
-                0
-            },
+            // Always the section position, never 0.
+            //
+            // go-pmtiles REJECTS an archive whose leaf-directory offset is 0:
+            //
+            //     Failed to verify archive, Leaf directories offset=0 must not be 0
+            //
+            // Pointing it at the (empty) leaf section instead -- which is where
+            // leaves would start, between the metadata and the tile data --
+            // verifies clean. Zeroing it affected every small archive written
+            // through this path, which is the production one.
+            leaf_dirs_offset,
             leaf_dirs_length,
             tile_data_offset,
             tile_data_length,
@@ -3107,15 +3107,29 @@ mod tests {
         let leaf_dirs_offset = u64::from_le_bytes(data[40..48].try_into().unwrap());
         let leaf_dirs_length = u64::from_le_bytes(data[48..56].try_into().unwrap());
 
-        // Small archive should have no leaf directories
-        assert_eq!(
-            leaf_dirs_offset, 0,
-            "Small archive should not have leaf directories"
-        );
+        // A small archive has no leaf directories...
         assert_eq!(
             leaf_dirs_length, 0,
             "Small archive should not have leaf directories"
         );
+        // ...but its OFFSET must still point at the (empty) leaf section rather
+        // than being zeroed. This test previously asserted 0, which is what
+        // made every small archive this writer produced fail go-pmtiles:
+        //
+        //     Failed to verify archive, Leaf directories offset=0 must not be 0
+        //
+        // The section sits between the metadata and the tile data, so with no
+        // leaves it is an empty span at the end of the metadata -- which is
+        // also where the tile data begins.
+        let metadata_offset = u64::from_le_bytes(data[24..32].try_into().unwrap());
+        let metadata_length = u64::from_le_bytes(data[32..40].try_into().unwrap());
+        let tile_data_offset = u64::from_le_bytes(data[56..64].try_into().unwrap());
+        assert_ne!(
+            leaf_dirs_offset, 0,
+            "leaf_dirs_offset must never be 0 -- go-pmtiles rejects the archive"
+        );
+        assert_eq!(leaf_dirs_offset, metadata_offset + metadata_length);
+        assert_eq!(leaf_dirs_offset, tile_data_offset);
 
         let _ = fs::remove_file(output_path);
     }
