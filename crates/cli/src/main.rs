@@ -2205,6 +2205,34 @@ mod tests {
         }
     }
 
+    /// #361: the flag has to actually reach `ExportOptions` on both commands.
+    /// `FromStr` coverage alone would pass with the flag wired to nothing.
+    #[test]
+    fn feature_order_flag_reaches_both_commands() {
+        let column = |name: &str, descending| FeatureOrder::Column {
+            name: name.to_string(),
+            descending,
+        };
+
+        assert_eq!(parse_tiles(&[]).feature_order, FeatureOrder::Input);
+        assert_eq!(parse_export(&[]).feature_order, FeatureOrder::Input);
+
+        assert_eq!(
+            parse_tiles(&["--feature-order", "level:desc"]).feature_order,
+            column("level", true)
+        );
+        assert_eq!(
+            parse_export(&["--feature-order", "level"]).feature_order,
+            column("level", false)
+        );
+
+        // A bad direction is rejected at parse time rather than silently
+        // sorting by a column that does not exist.
+        let mut argv = vec!["tylertoo", "tiles", "in.parquet", "out.pmtiles"];
+        argv.extend_from_slice(&["--feature-order", "level:dsc"]);
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+
     #[test]
     fn parse_size_bytes_accepts_suffixed_and_raw() {
         assert_eq!(parse_size_bytes("500K").unwrap(), 500 * 1024);
