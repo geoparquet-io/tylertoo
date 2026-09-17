@@ -209,6 +209,9 @@ pub struct ExportOptions {
     /// Output is byte-identical for every value — the wave is a scheduling
     /// concern only.
     pub partition_wave: usize,
+    /// Within-tile feature order (#361). Defaults to [`FeatureOrder::Input`],
+    /// the order tylertoo has always emitted.
+    pub feature_order: FeatureOrder,
 }
 
 impl Default for ExportOptions {
@@ -220,6 +223,7 @@ impl Default for ExportOptions {
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
+            feature_order: FeatureOrder::default(),
         }
     }
 }
@@ -631,6 +635,17 @@ fn export_pmtiles_impl(
     // file's own rename provenance so a standalone `export-pmtiles` on an
     // overview written by an earlier run restores names just as `tiles` does.
     let published = PublishedNames::from_meta(reader.meta(), reader.schema());
+
+    // #361: a `--feature-order` column that names nothing is a no-op, and an
+    // indistinguishable one — every member's key is `Missing`, so they all
+    // compare equal and the stable sort leaves input order. A typo therefore
+    // looks exactly like success.
+    //
+    // Checked against the PUBLISHED names (#359), which is what makes
+    // `--feature-order level` work on an input whose own `level` column was
+    // renamed to clear the reserved one: the source name is restored on
+    // export, so that is the key the tile carries and the key to sort on.
+    warn_if_order_column_is_absent(reader.schema(), &published, &options.feature_order);
     writer.set_fields(field_metadata(
         reader.schema(),
         geometry_index(reader.schema()),
@@ -2640,12 +2655,219 @@ fn members_recursive_vec(
     out
 }
 
+/// Within-tile feature order (#361).
+///
+/// MVT does not define draw order, but renderers paint features in the order
+/// the tile lists them, so this *is* the paint order for any style that does
+/// not override it (`fill-sort-key` and friends). Neither tylertoo nor
+/// tippecanoe specified one before, which made a tiler swap a silent visual
+/// change; naming it makes it something a caller can depend on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FeatureOrder {
+    /// Input row order — the overview file's row order, which is the source
+    /// file's row order restricted to the rows the level kept. This is what
+    /// tylertoo has always emitted and stays the default.
+    #[default]
+    Input,
+    /// Ascending (or descending) by an MVT property, ties broken by input
+    /// order so the result is fully determined.
+    Column {
+        /// Property name as it appears in the tile.
+        name: String,
+        /// Sort high → low instead of low → high.
+        descending: bool,
+    },
+}
+
+impl std::str::FromStr for FeatureOrder {
+    type Err = String;
+
+    /// `input` | `<column>` | `<column>:asc` | `<column>:desc`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "input" {
+            return Ok(Self::Input);
+        }
+        let (name, descending) = match s.rsplit_once(':') {
+            Some((n, "asc")) => (n, false),
+            Some((n, "desc")) => (n, true),
+            // A trailing `:something-else` is a mistyped direction far more
+            // often than a column whose name contains a colon; say so rather
+            // than silently sorting by a column that does not exist.
+            Some((_, other)) => {
+                return Err(format!(
+                    "unknown sort direction {other:?}: expected `asc` or `desc` \
+                     (as in `--feature-order level:desc`)"
+                ))
+            }
+            None => (s, false),
+        };
+        if name.is_empty() {
+            return Err("expected `input` or a column name, e.g. `level:desc`".to_string());
+        }
+        Ok(Self::Column {
+            name: name.to_string(),
+            descending,
+        })
+    }
+}
+
+/// A member's sort key for [`FeatureOrder::Column`].
+///
+/// Numeric property variants collapse to one `f64` class so a column read as
+/// `Int` in one batch and `Double` in another does not split into two
+/// incomparable groups. `Missing` sorts first (painted underneath): a feature
+/// the style cannot rank should not be promoted above ones it can.
+///
+/// The variant order *is* the class order — `Missing` < `Number` < `Text` —
+/// and [`OrderKey::cmp`] is a genuine total order, which the caller's
+/// `sort_by` requires. Deferring to `f64`'s *partial* order and calling an
+/// incomparable pair equal would not be one: with `1.0 == NaN`, `NaN == 2.0`
+/// and `1.0 < 2.0`, equality is not transitive, and the standard library
+/// detects that and panics. So a NaN — how plenty of sources spell nodata in
+/// a float column — never reaches `Number`; [`OrderKey::of`] files it under
+/// `Missing`, which is what it is: a value the style cannot rank.
+enum OrderKey<'a> {
+    Missing,
+    Number(f64),
+    Text(&'a str),
+}
+
+impl<'a> OrderKey<'a> {
+    fn of(m: &'a Member, name: &str) -> Self {
+        let Some((_, v)) = m.props.iter().find(|(k, _)| k == name) else {
+            return Self::Missing;
+        };
+        match v {
+            PropertyValue::String(s) => Self::Text(s),
+            PropertyValue::Float(f) => Self::number(*f as f64),
+            PropertyValue::Double(d) => Self::number(*d),
+            PropertyValue::Int(i) => Self::number(*i as f64),
+            PropertyValue::UInt(u) => Self::number(*u as f64),
+            PropertyValue::Bool(b) => Self::number(*b as u8 as f64),
+        }
+    }
+
+    /// `Number`, except that a NaN is unrankable and files under `Missing`.
+    /// Keeping the invariant here means `cmp` has no incomparable case left.
+    fn number(v: f64) -> Self {
+        if v.is_nan() {
+            Self::Missing
+        } else {
+            Self::Number(v)
+        }
+    }
+
+    /// A total order, so `sort_by` is well-defined: classes rank
+    /// `Missing` < `Number` < `Text`, numbers by value (`total_cmp`, which is
+    /// total by construction and needs no NaN case given the invariant above),
+    /// text lexicographically. Equal keys are left to the caller's stable sort,
+    /// which resolves them by input order.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Missing, Self::Missing) => Ordering::Equal,
+            (Self::Missing, _) => Ordering::Less,
+            (_, Self::Missing) => Ordering::Greater,
+            (Self::Number(a), Self::Number(b)) => a.total_cmp(b),
+            (Self::Number(_), Self::Text(_)) => Ordering::Less,
+            (Self::Text(_), Self::Number(_)) => Ordering::Greater,
+            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+        }
+    }
+}
+
+/// Warn when `order` names a column the layer does not publish.
+///
+/// Checked against the published property names rather than the raw schema, so
+/// it stays right for a column whose name was restored from the rename
+/// provenance (#359) and for one that is deliberately not exported.
+fn warn_if_order_column_is_absent(
+    schema: &Schema,
+    published: &PublishedNames,
+    order: &FeatureOrder,
+) {
+    let FeatureOrder::Column { name, .. } = order else {
+        return;
+    };
+    if !order_column_is_absent(schema, published, order) {
+        return;
+    }
+    log::warn!(
+        "--feature-order names {name:?}, which this layer does not publish, so \
+         the order is unchanged (input row order). Available: {}",
+        published_property_names(schema, published).join(", ")
+    );
+}
+
+/// Whether `order` names a column the layer will not publish. `false` for
+/// [`FeatureOrder::Input`], which names nothing.
+fn order_column_is_absent(
+    schema: &Schema,
+    published: &PublishedNames,
+    order: &FeatureOrder,
+) -> bool {
+    let FeatureOrder::Column { name, .. } = order else {
+        return false;
+    };
+    !published_property_names(schema, published)
+        .iter()
+        .any(|n| n == name)
+}
+
+/// The MVT property keys this schema will advertise.
+fn published_property_names(schema: &Schema, published: &PublishedNames) -> Vec<String> {
+    let Some(geom_idx) = geometry_index(schema) else {
+        return Vec::new(); // the export will fail for its own reasons
+    };
+    property_columns(schema, geom_idx, published)
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect()
+}
+
+/// Order members for encoding: tile-major always, then within each tile by
+/// `order`.
+///
+/// The `(key, seq)` sort is load-bearing beyond aesthetics — `encode_members`
+/// groups tiles by scanning runs of equal `key`, so members must stay
+/// contiguous per tile. A within-tile reorder therefore runs as a second,
+/// per-run pass rather than as a different global sort key.
+/// Compare two members of one tile under a [`FeatureOrder::Column`] request.
+///
+/// The column decides, and `seq` — the source row index — breaks ties, so the
+/// result is a strict order rather than merely a consistent one: the output is
+/// fully determined even when the caller's sort is unstable or the input was
+/// not already in `seq` order (which is the case after the oversized-tile
+/// valve has ranked by vertex count). `descending` reverses the column only;
+/// tied features keep input order either way.
+fn compare_by_feature_order(
+    a: &Member,
+    b: &Member,
+    name: &str,
+    descending: bool,
+) -> std::cmp::Ordering {
+    let ord = OrderKey::of(a, name).cmp(&OrderKey::of(b, name));
+    let ord = if descending { ord.reverse() } else { ord };
+    ord.then_with(|| a.seq.cmp(&b.seq))
+}
+
+fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
+    members.par_sort_unstable_by_key(|m| (m.key, m.seq));
+    let FeatureOrder::Column { name, descending } = order else {
+        return;
+    };
+    // `chunk_by_mut` yields the same runs `encode_members` will group on.
+    for tile in members.chunk_by_mut(|a, b| a.key == b.key) {
+        tile.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+    }
+}
+
 fn encode_members(
     mut members: Vec<Member>,
     zoom: u8,
     opts: &ExportOptions,
 ) -> Result<Vec<EncodedTile>, ExportError> {
-    members.par_sort_unstable_by_key(|m| (m.key, m.seq));
+    sort_members_for_encode(&mut members, &opts.feature_order);
 
     // Runs of equal key. `members` is sorted by key above, so consecutive
     // grouping is total grouping.
@@ -2711,7 +2933,7 @@ fn encode_tile(
             // `select_kept_members` decide *which* features survive.
             let keep_frac = limit as f64 / data.len() as f64;
             let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
-            let kept = select_kept_members(members, keep);
+            let kept = shed_to_fit(members, keep, opts);
             let keep = kept.len();
             let data = build_mvt(kept, tb, opts);
             log::warn!(
@@ -2727,6 +2949,24 @@ fn encode_tile(
             (data, count, false)
         }
     }
+}
+
+/// The survivors of the oversized-tile valve, **in the order they are drawn**.
+///
+/// Two separate decisions, deliberately kept apart: [`select_kept_members`]
+/// decides *which* features survive, ranking sized geometry by vertex count;
+/// this then restores the caller's draw order over them. Emitting the
+/// selection ranking as the draw order would silently override a pinned
+/// `--feature-order` — and only on oversized tiles, i.e. exactly the dense
+/// ones a caller pins an order for. The default [`FeatureOrder::Input`] keeps
+/// the vertex-count order, which is the pre-#280 behaviour and byte-identical
+/// to it.
+fn shed_to_fit<'a>(members: &'a [Member], keep: usize, opts: &ExportOptions) -> Vec<&'a Member> {
+    let mut kept = select_kept_members(members, keep);
+    if let FeatureOrder::Column { name, descending } = &opts.feature_order {
+        kept.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+    }
+    kept
 }
 
 /// Choose which `keep` of `members` survive the oversized-tile drop pass.
@@ -4984,6 +5224,246 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Within-tile feature order (#361)
+    // ========================================================================
+
+    fn ordered_member(seq: u64, level: f64) -> Member {
+        Member {
+            key: 0,
+            seq,
+            geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)),
+            props: Arc::new(vec![("level".to_string(), PropertyValue::Double(level))]),
+        }
+    }
+
+    /// Draw order within a tile, as the renderer sees it: `build_mvt` emits
+    /// features in iteration order, so this is the paint sequence.
+    fn paint_order(members: Vec<Member>, order: &FeatureOrder) -> Vec<u64> {
+        let mut m = members;
+        sort_members_for_encode(&mut m, order);
+        m.iter().map(|x| x.seq).collect()
+    }
+
+    /// The default is input order, which is what tylertoo has always done and
+    /// what the file's row order already encodes. Pinning it in a test makes
+    /// the guarantee something callers can rely on rather than an accident.
+    #[test]
+    fn default_feature_order_is_input_row_order() {
+        let members = vec![
+            ordered_member(7, 0.5),
+            ordered_member(2, 0.2),
+            ordered_member(5, 0.35),
+        ];
+        assert_eq!(paint_order(members, &FeatureOrder::Input), vec![2, 5, 7]);
+    }
+
+    /// #361: styling a nested stack needs the small hot cores painted last.
+    /// Ascending on the ramp column does that without every downstream style
+    /// having to carry a `fill-sort-key` workaround.
+    #[test]
+    fn column_feature_order_sorts_ascending_within_the_tile() {
+        let members = vec![
+            ordered_member(0, 0.5),
+            ordered_member(1, 0.2),
+            ordered_member(2, 0.425),
+            ordered_member(3, 0.275),
+        ];
+        let order = FeatureOrder::Column {
+            name: "level".to_string(),
+            descending: false,
+        };
+        // 0.2, 0.275, 0.425, 0.5 → the cores (0.5) end up on top.
+        assert_eq!(paint_order(members, &order), vec![1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn column_feature_order_sorts_descending_when_asked() {
+        let members = vec![
+            ordered_member(0, 0.5),
+            ordered_member(1, 0.2),
+            ordered_member(2, 0.425),
+        ];
+        let order = FeatureOrder::Column {
+            name: "level".to_string(),
+            descending: true,
+        };
+        assert_eq!(paint_order(members, &order), vec![0, 2, 1]);
+    }
+
+    /// Ties keep input order, so the result is fully determined — two runs of
+    /// the same build produce byte-identical tiles.
+    #[test]
+    fn column_feature_order_breaks_ties_by_input_order() {
+        let members = vec![
+            ordered_member(9, 0.2),
+            ordered_member(4, 0.2),
+            ordered_member(6, 0.2),
+        ];
+        let order = FeatureOrder::Column {
+            name: "level".to_string(),
+            descending: false,
+        };
+        assert_eq!(paint_order(members, &order), vec![4, 6, 9]);
+    }
+
+    /// A feature missing the column sorts before every value that has one
+    /// (painted underneath), rather than being dropped or aborting the export.
+    #[test]
+    fn features_missing_the_order_column_sort_first() {
+        let mut bare = ordered_member(0, 0.0);
+        bare.props = Arc::new(Vec::new());
+        let members = vec![ordered_member(1, 0.5), bare, ordered_member(2, 0.2)];
+        let order = FeatureOrder::Column {
+            name: "level".to_string(),
+            descending: false,
+        };
+        assert_eq!(paint_order(members, &order), vec![0, 2, 1]);
+    }
+
+    /// A NaN in the ordering column must not abort the export.
+    ///
+    /// Treating an incomparable pair as *equal* does not give a total order:
+    /// with `1.0 == NaN` and `NaN == 2.0` but `1.0 < 2.0`, equality is not
+    /// transitive, and `slice::sort_by` is documented to panic when it detects
+    /// that ("user-provided comparison function does not correctly implement a
+    /// total order"). A NaN is ordinary in a float column read from parquet —
+    /// it is how plenty of sources spell nodata — so `--feature-order` must
+    /// give it a defined place instead.
+    #[test]
+    fn nan_in_the_order_column_does_not_abort_the_sort() {
+        // Enough members, with NaN interleaved, to reach the merge path where
+        // the standard library checks the comparator's consistency.
+        let members: Vec<Member> = (0..64)
+            .map(|i| {
+                ordered_member(
+                    i,
+                    if i.is_multiple_of(3) {
+                        f64::NAN
+                    } else {
+                        (64 - i) as f64
+                    },
+                )
+            })
+            .collect();
+        let order = FeatureOrder::Column {
+            name: "level".to_string(),
+            descending: false,
+        };
+        let painted = paint_order(members, &order);
+        assert_eq!(painted.len(), 64, "no feature may be lost");
+
+        // The ranked features must still come out ranked. NaN joins the
+        // unrankable features underneath, so every NaN precedes every number.
+        let level_of = |seq: u64| {
+            if seq.is_multiple_of(3) {
+                f64::NAN
+            } else {
+                (64 - seq) as f64
+            }
+        };
+        let ranked: Vec<f64> = painted
+            .iter()
+            .map(|s| level_of(*s))
+            .filter(|v| !v.is_nan())
+            .collect();
+        assert!(
+            ranked.windows(2).all(|w| w[0] <= w[1]),
+            "the comparable values must be ascending, got {ranked:?}"
+        );
+        let first_number = painted.iter().position(|s| !level_of(*s).is_nan()).unwrap();
+        assert!(
+            painted[..first_number]
+                .iter()
+                .all(|s| level_of(*s).is_nan()),
+            "NaN sorts with the unrankable features, underneath"
+        );
+    }
+
+    /// Ordering is per tile: a sort must never move a member across tile keys,
+    /// or `encode_members`' run-grouping would silently split tiles.
+    #[test]
+    fn column_feature_order_never_reorders_across_tiles() {
+        let mk = |key: u64, seq: u64, level: f64| Member {
+            key,
+            seq,
+            geom: Geometry::Point(Point::new(0.0, 0.0)),
+            props: Arc::new(vec![("level".to_string(), PropertyValue::Double(level))]),
+        };
+        // Tile 1's low value must not migrate ahead of tile 0's high value.
+        let mut members = vec![mk(1, 0, 0.1), mk(0, 1, 0.9), mk(0, 2, 0.2)];
+        sort_members_for_encode(
+            &mut members,
+            &FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: false,
+            },
+        );
+        let keys: Vec<u64> = members.iter().map(|m| m.key).collect();
+        assert_eq!(keys, vec![0, 0, 1], "tiles must stay grouped and ascending");
+        assert_eq!(
+            members.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![2, 1, 0],
+            "sorting applies within each tile, not across the whole level"
+        );
+    }
+
+    /// Mixed numeric property types compare by numeric value, not by variant:
+    /// a column read as Int in one batch and Double in another must not split
+    /// into two ordering classes.
+    #[test]
+    fn numeric_order_keys_compare_across_property_variants() {
+        let mk = |seq: u64, v: PropertyValue| Member {
+            key: 0,
+            seq,
+            geom: Geometry::Point(Point::new(0.0, 0.0)),
+            props: Arc::new(vec![("n".to_string(), v)]),
+        };
+        let members = vec![
+            mk(0, PropertyValue::Int(10)),
+            mk(1, PropertyValue::Double(2.5)),
+            mk(2, PropertyValue::UInt(7)),
+        ];
+        let order = FeatureOrder::Column {
+            name: "n".to_string(),
+            descending: false,
+        };
+        assert_eq!(paint_order(members, &order), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn feature_order_parses_the_cli_spellings() {
+        assert_eq!(
+            "input".parse::<FeatureOrder>().unwrap(),
+            FeatureOrder::Input
+        );
+        assert_eq!(
+            "level".parse::<FeatureOrder>().unwrap(),
+            FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: false
+            }
+        );
+        assert_eq!(
+            "level:desc".parse::<FeatureOrder>().unwrap(),
+            FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: true
+            }
+        );
+        assert_eq!(
+            "level:asc".parse::<FeatureOrder>().unwrap(),
+            FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: false
+            }
+        );
+        // An unknown direction is a typo, not a column named `level:dsc`.
+        assert!("level:dsc".parse::<FeatureOrder>().is_err());
+        assert!("".parse::<FeatureOrder>().is_err());
+        assert!(":asc".parse::<FeatureOrder>().is_err());
+    }
+
     /// #280 spatial fairness: on a point-dominated tile, vertex count carries no
     /// ranking signal, so the valve must keep a uniform stride across member
     /// (≈ Hilbert) order — not a first-N prefix that would clump survivors.
@@ -5021,6 +5501,147 @@ mod tests {
         let kept = select_kept_members(&members, 2);
         let counts: Vec<usize> = kept.iter().map(|m| m.geom.coords_count()).collect();
         assert_eq!(counts, vec![5, 4]);
+    }
+
+    /// A `--feature-order` column the layer does not publish is a silent
+    /// no-op — every key is `Missing`, so everything ties and the stable sort
+    /// leaves input order, which is indistinguishable from success. A typo
+    /// must therefore say something.
+    #[test]
+    fn absent_order_column_is_reported() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("elevation", DataType::Float64, true),
+            Field::new("level", DataType::Int32, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let column = |n: &str| FeatureOrder::Column {
+            name: n.to_string(),
+            descending: false,
+        };
+
+        let plain = PublishedNames::identity();
+        assert!(!order_column_is_absent(
+            &schema,
+            &plain,
+            &column("elevation")
+        ));
+        assert!(
+            order_column_is_absent(&schema, &plain, &column("elevatoin")),
+            "a misspelled column must be detectable"
+        );
+        // The default never warns.
+        assert!(!order_column_is_absent(
+            &schema,
+            &plain,
+            &FeatureOrder::Input
+        ));
+
+        // The check is against PUBLISHED names, not schema names: the reserved
+        // `level` column is dropped from tile properties, so ordering by it
+        // would silently do nothing.
+        assert!(order_column_is_absent(&schema, &plain, &column("level")));
+    }
+
+    /// The two features have to agree on which name to sort by.
+    ///
+    /// #359 restores a source column that was renamed to clear the reserved
+    /// `level`, so the tile advertises `level` while the schema still says
+    /// `level_`. `--feature-order level` must therefore resolve — this is the
+    /// flag's headline case (nested contour bands), and checking the schema
+    /// instead of the published names would reject exactly it.
+    #[test]
+    fn order_column_resolves_against_the_restored_source_name() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("level_", DataType::Float64, true),
+            Field::new("level", DataType::Int32, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let published = PublishedNames::from_renames(
+            &BTreeMap::from([("level_".to_string(), "level".to_string())]),
+            &schema,
+        );
+        let column = |n: &str| FeatureOrder::Column {
+            name: n.to_string(),
+            descending: false,
+        };
+
+        assert!(
+            !order_column_is_absent(&schema, &published, &column("level")),
+            "the restored source name is what the tile carries"
+        );
+        assert!(
+            order_column_is_absent(&schema, &published, &column("level_")),
+            "the internal name is not published, so sorting by it would no-op"
+        );
+    }
+
+    /// The oversized-tile valve must not become the draw order.
+    ///
+    /// `select_kept_members` ranks sized geometry by vertex count to choose
+    /// *which* features survive. That ranking is a selection signal; emitting
+    /// the survivors in it silently overrides a pinned `--feature-order`, and
+    /// it does so precisely on the dense tiles a caller pinned an order for.
+    /// Here vertex count runs with `level`, so "largest first" is the exact
+    /// inverse of the requested ascending order and the two are
+    /// distinguishable.
+    #[test]
+    fn oversized_valve_keeps_the_requested_feature_order() {
+        let members: Vec<Member> = (1..=5u64)
+            .map(|i| {
+                let coords: Vec<(f64, f64)> = (0..i * 10)
+                    .map(|v| (v as f64 * 1e-6, v as f64 * 1e-6))
+                    .collect();
+                Member {
+                    key: 0,
+                    seq: i,
+                    geom: Geometry::LineString(coords.into_iter().collect()),
+                    props: Arc::new(vec![("level".to_string(), PropertyValue::Double(i as f64))]),
+                }
+            })
+            .collect();
+
+        let ordered = ExportOptions {
+            feature_order: FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: false,
+            },
+            ..ExportOptions::default()
+        };
+        let kept = shed_to_fit(&members, 3, &ordered);
+        let levels: Vec<u64> = kept.iter().map(|m| m.seq).collect();
+        assert_eq!(
+            levels,
+            vec![3, 4, 5],
+            "the three largest survive, but they must be painted in ascending \
+             `level` order, not in the valve's largest-first ranking"
+        );
+
+        // Descending is the valve's own order here, so it must come back
+        // reversed relative to the ascending case rather than untouched.
+        let desc = ExportOptions {
+            feature_order: FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: true,
+            },
+            ..ExportOptions::default()
+        };
+        let kept: Vec<u64> = shed_to_fit(&members, 3, &desc)
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(kept, vec![5, 4, 3]);
+
+        // The default is unchanged: the valve's largest-first ranking stands,
+        // which is the pre-#280 behaviour this must stay byte-identical to.
+        let kept: Vec<u64> = shed_to_fit(&members, 3, &ExportOptions::default())
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(kept, vec![5, 4, 3], "default order must not change");
     }
 
     /// `Some(0)` is the core off switch (CLI `--max-tile-size 0` / Python

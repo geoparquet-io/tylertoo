@@ -577,3 +577,35 @@ class TestValidateIntegration:
         result = tylertoo.validate(str(BUILDINGS))
         assert result["valid"] is False
         assert any(not c["passed"] for c in result["checks"])
+
+
+@needs_buildings
+class TestFeatureOrder:
+    """#361: the `feature_order` kwarg is parsed in Python, not just in Rust.
+
+    A bad spelling must be rejected at the binding rather than silently
+    falling back to input order, which is what "sort by a column that does
+    not exist" would look like to a caller.
+    """
+
+    def test_rejects_an_unknown_sort_direction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.pmtiles"
+            with pytest.raises((ValueError, RuntimeError), match="asc"):
+                tylertoo.export_pmtiles(
+                    str(BUILDINGS), str(out), feature_order="level:dsc"
+                )
+
+    def test_rejects_an_empty_column_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.pmtiles"
+            with pytest.raises((ValueError, RuntimeError)):
+                tylertoo.export_pmtiles(str(BUILDINGS), str(out), feature_order=":asc")
+
+    @pytest.mark.parametrize("spec", ["input", "level", "level:asc", "level:desc"])
+    def test_accepts_the_documented_spellings(self, spec):
+        """Every spelling the docstring advertises must run to completion."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.pmtiles"
+            tylertoo.convert(str(BUILDINGS), str(out), max_zoom=1, feature_order=spec)
+            assert out.stat().st_size > 0

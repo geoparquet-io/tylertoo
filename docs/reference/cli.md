@@ -66,6 +66,11 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--partition-wave <N|auto>` — Partitions processed per band read during the export phase (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
 
   Default value: `auto`
+* `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order (#361): `input` (default) or a property name, optionally `:asc` / `:desc`.
+
+   MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a nested choropleth usually wants — with ties kept in input order so output stays deterministic.
+
+  Default value: `input`
 * `--report <PATH>` — Write a JSON report to this path: a combined object with a `convert` section (the overview build, matching `overview --report`) and an `export` section (the PMTiles export, matching `export-pmtiles --report`), so the one-step run captures both halves the two-step chain would
 * `--keep-overview <PATH>` — Write the intermediate overview GeoParquet to PATH and RETAIN it, instead of a temp file removed after the export — one run then yields both artifacts: the reusable multi-resolution overview (queryable, re-exportable, see `tylertoo overview`) and the PMTiles. The PMTiles output is identical either way. Without this flag the intermediate is written to --spill-dir if given, else $TMPDIR if set, else the output directory, and deleted once the export finishes (see the note on the materialized intermediate under --spill-dir)
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
@@ -414,6 +419,11 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--partition-wave <N|auto>` — Partitions processed per band read during export (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
 
   Default value: `auto`
+* `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order (#361): `input` (default) or a property name, optionally `:asc` / `:desc`.
+
+   MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a nested choropleth usually wants — with ties kept in input order so output stays deterministic.
+
+  Default value: `input`
 
 
 
