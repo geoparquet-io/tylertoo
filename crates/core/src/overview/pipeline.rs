@@ -40,7 +40,7 @@ use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::Schema;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
@@ -48,6 +48,7 @@ use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
+use super::pipe::scoped_pipe;
 use super::stream::{process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers};
 use super::writer::{LevelWriteOutcome, OverviewWriter};
 
@@ -410,12 +411,13 @@ pub(super) fn run_pass2_buffered(
         row_groups: selected_row_groups,
     })?;
 
-    let (tx, rx) = bounded::<ReadMsg>(in_flight.max(1));
-    // Consumer state borrowed mutably by the in-scope consumer below.
+    // Consumer state borrowed mutably by the consumer closure below.
     let (rows_ref, verts_ref, sinks_ref) = (&mut rows, &mut verts, &mut sinks);
     let timers_ref = &timers;
-    std::thread::scope(|scope| -> Result<(), ConvertError> {
-        let reader_handle = scope.spawn(move || -> Result<(), ConvertError> {
+    let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
+    scoped_pipe(
+        in_flight,
+        |tx: &Sender<ReadMsg>| -> Result<(), ConvertError> {
             let mut row_offset = 0usize;
             loop {
                 let t_read = Instant::now();
@@ -440,8 +442,7 @@ pub(super) fn run_pass2_buffered(
                 }
             }
             Ok(())
-        });
-
+        },
         // Consumer: process batches in read order; parallelize within each
         // batch. Because batches arrive in order and are appended before the
         // next is pulled, each sink stays in input order without a reorder
@@ -452,12 +453,11 @@ pub(super) fn run_pass2_buffered(
         // k reuses level k+1's output instead of re-simplifying canonical
         // geometry. Otherwise (cascade off, or partitioning where every
         // feature lands on exactly one level) fan out per level as before.
-        let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
-        // Heartbeat (#242): a planet-scale pass 2 runs for minutes-to-hours;
-        // without this the phase is silent at info level. Time-based so small
-        // inputs stay quiet.
-        let mut last_progress = Instant::now();
-        let consume: Result<(), ConvertError> = (|| {
+        |rx: Receiver<ReadMsg>| -> Result<(), ConvertError> {
+            // Heartbeat (#242): a planet-scale pass 2 runs for
+            // minutes-to-hours; without this the phase is silent at info
+            // level. Time-based so small inputs stay quiet.
+            let mut last_progress = Instant::now();
             for msg in rx.iter() {
                 Pass2Timers::add_dur(timers_ref.read_cell(), msg.read_dur);
                 let batch = &msg.batch;
@@ -494,18 +494,8 @@ pub(super) fn run_pass2_buffered(
                 }
             }
             Ok(())
-        })();
-        drop(rx); // ensure the reader thread can stop if the consumer errored
-
-        // Join the reader before propagating: a reader error is the more
-        // likely root cause and takes precedence over a downstream consume
-        // error.
-        match reader_handle.join() {
-            Ok(read_result) => read_result?,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-        consume
-    })?;
+        },
+    )?;
 
     // Drain each level's sink into the writer, in level order. An empty
     // buffered level is skipped and renumbered by the writer (#211); the

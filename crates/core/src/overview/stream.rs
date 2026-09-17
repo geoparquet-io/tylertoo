@@ -54,7 +54,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::bounded;
+use crossbeam_channel::{Receiver, Sender};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -81,6 +81,7 @@ use super::convert::{
     KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
+use super::pipe::scoped_pipe;
 use super::pipeline;
 use super::simplify::{
     full_resolution_fallback_count, simplify_cascade, simplify_step, validation_skip_count,
@@ -1516,21 +1517,18 @@ fn write_level_streaming(
     // and therefore row-group boundaries — are byte-identical to a serial
     // build. Channel depth bounds read/compute run-ahead the same way the
     // buffered engine's reader channel does.
-    let (tx, rx) = bounded::<Processed>(in_flight.max(1));
     // Shared by reference into the producer thread (a `&Pass2Timers` is `Copy`,
-    // so the `move` closure copies the borrow and leaves `timers` owned here
+    // so the producer closure copies the borrow and leaves `timers` owned here
     // for the post-scope read).
     let timers = &timers;
-    let outcome = std::thread::scope(|scope| -> Result<LevelWriteOutcome, ConvertError> {
+    let outcome = scoped_pipe(
+        in_flight,
         // Producer: read + process, in order, until EOF or the writer
         // hangs up. Returns the first stream/processing error, if any.
-        // `move` transfers ownership of `tx` into the thread so it is dropped
-        // when the producer finishes — that disconnect is what fuses the
-        // writer's `rx.recv()` loop below (otherwise `recv` blocks forever and
-        // deadlocks). Everything else the closure touches (`source`, `ctx`,
-        // `&timers`, `row_groups`, the `usize`s) is `Copy`, so the outer
-        // bindings — notably `timers`, read back after the scope — stay valid.
-        let producer = scope.spawn(move || -> Result<(), ConvertError> {
+        // Everything the closure touches (`source`, `ctx`, `&timers`,
+        // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
+        // notably `timers`, read back afterwards — stay valid.
+        |tx: &Sender<Processed>| -> Result<(), ConvertError> {
             // Regional extract (#102): read the same per-part bbox-selected
             // row groups as pass 1, so the winner tables' global row indices
             // line up.
@@ -1564,43 +1562,38 @@ fn write_level_streaming(
                 match process_level_batch(&batch, offset, ctx, timers)? {
                     None => continue, // no members of this level in the batch
                     Some((out, verts)) => {
-                        // Writer gone (its side errored and dropped `rx`):
-                        // stop; the writer's error is reported below.
+                        // Writer gone (it errored and dropped the receiver):
+                        // stop; the writer's error is reported by the caller.
                         if tx.send(Processed { batch: out, verts }).is_err() {
                             return Ok(());
                         }
                     }
                 }
             }
-        });
-
+        },
         // Writer (this thread): drain processed batches in order. Dropping
-        // the producer's `tx` (EOF, error, or writer-gone) fuses `recv`.
-        let batches = std::iter::from_fn(|| {
-            let t_wait = Instant::now();
-            match rx.recv() {
-                Ok(msg) => {
-                    recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
-                    rows.set(rows.get() + msg.batch.num_rows());
-                    vertices.set(vertices.get() + msg.verts);
-                    Some(msg.batch)
+        // the producer's sender (EOF, error, or writer-gone) fuses `recv`;
+        // `scoped_pipe` owns the mirror-image guarantee that this receiver is
+        // dropped before the producer is joined (#362).
+        |rx: Receiver<Processed>| -> Result<LevelWriteOutcome, ConvertError> {
+            let batches = std::iter::from_fn(|| {
+                let t_wait = Instant::now();
+                match rx.recv() {
+                    Ok(msg) => {
+                        recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                        rows.set(rows.get() + msg.batch.num_rows());
+                        vertices.set(vertices.get() + msg.verts);
+                        Some(msg.batch)
+                    }
+                    Err(_) => {
+                        recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
+                        None
+                    }
                 }
-                Err(_) => {
-                    recv_wait_ns.set(recv_wait_ns.get() + t_wait.elapsed().as_nanos() as u64);
-                    None
-                }
-            }
-        });
-        let res = writer.write_level(level_idx, Some(hint), batches);
-
-        // A producer error takes precedence over the writer's (the writer
-        // may merely observe a truncated stream). `join` cannot panic here:
-        // the closure only returns `Result`.
-        producer
-            .join()
-            .expect("finest-level producer thread panicked")?;
-        Ok(res?)
-    })?;
+            });
+            Ok(writer.write_level(level_idx, Some(hint), batches)?)
+        },
+    )?;
     let total = t_level.elapsed().as_secs_f64();
     let read_s = Pass2Timers::secs(&timers.read);
     let decode_s = Pass2Timers::secs(&timers.decode);

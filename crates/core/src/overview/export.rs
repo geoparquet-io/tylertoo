@@ -101,7 +101,7 @@ use arrow_array::types::{
 use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Schema};
-use crossbeam_channel::bounded;
+use crossbeam_channel::{Receiver, Sender};
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
 use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArray;
@@ -119,6 +119,7 @@ use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord};
 
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
+use super::pipe::scoped_pipe;
 use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
 use super::reader::{OverviewReader, ReaderError};
 use super::writer::LEVEL_COLUMN;
@@ -1484,11 +1485,11 @@ fn fill_member_store(
     let mut store = MemberStore::new(plans, backing)?;
     let t_fill = Instant::now();
     let mut seq = 0u64;
-    let (tx, rx) = bounded::<(usize, RecordBatch)>(SINGLE_READ_IN_FLIGHT);
     let store_ref = &mut store;
     let seq_ref = &mut seq;
-    std::thread::scope(|scope| -> Result<(), ExportError> {
-        let reader_handle = scope.spawn(move || -> Result<(), ExportError> {
+    scoped_pipe(
+        SINGLE_READ_IN_FLIGHT,
+        |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for band in 0..num_levels {
                 let band_reader = reader.read_band_with_batch_size(band, EXPORT_BATCH_SIZE)?;
                 for batch in band_reader {
@@ -1498,26 +1499,18 @@ fn fill_member_store(
                 }
             }
             Ok(())
-        });
-
+        },
         // Consumer: batches arrive in band order (bands are contiguous
         // ascending row groups), so the running `seq` is the global file row
         // index — the band-order sequence every level's within-tile ordering
         // derives from.
-        let consume: Result<(), ExportError> = (|| {
+        |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for (band, batch) in rx.iter() {
                 fanout_batch_members(&batch, band, crs, plans, opts, seq_ref, store_ref)?;
             }
             Ok(())
-        })();
-        drop(rx);
-
-        match reader_handle.join() {
-            Ok(read_result) => read_result?,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-        consume
-    })?;
+        },
+    )?;
     store.finish_fill()?;
     log::info!(
         "[export] pass2 fill (#235): {seq} row(s) read once and fanned across \

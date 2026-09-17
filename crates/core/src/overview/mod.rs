@@ -21,6 +21,7 @@ pub mod filter;
 #[cfg(test)]
 mod hostile;
 pub mod level;
+mod pipe;
 mod pipeline;
 pub mod reader;
 pub mod simplify;
