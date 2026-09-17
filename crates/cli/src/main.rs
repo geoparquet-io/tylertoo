@@ -463,8 +463,8 @@ struct ConvertTuningArgs {
     ///
     /// Cheat sheet: coarse levels look too crude/blocky → LOWER
     /// --simplify-factor. See docs/OVERVIEW_TUNING.md.
-    #[arg(long, default_value = "1.0", help_heading = "Generalization")]
-    simplify_factor: f64,
+    #[arg(long, help_heading = "Generalization")]
+    simplify_factor: Option<f64>,
 
     /// Collapse below-visibility polygons to a representative point instead of
     /// dropping them (spec Q4 opt-in). Changes the geometry type at coarse
@@ -539,15 +539,15 @@ struct ConvertTuningArgs {
     /// See --point-thinning; this is the roads/line knob. Default retuned
     /// 2.0 -> 1.0 after the Portland sweep (corpus/SWEEPS.md): 1.0
     /// keeps road networks visibly more continuous at coarse zooms.
-    #[arg(long, default_value = "1.0", help_heading = "Thinning & visibility")]
-    line_thinning: f64,
+    #[arg(long, help_heading = "Thinning & visibility")]
+    line_thinning: Option<f64>,
 
     /// Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
     ///
     /// BIGGER = SPARSER, SMALLER = denser. Polygons thin least by default
     /// (1.0) since they tile space rather than cluster.
-    #[arg(long, default_value = "1.0", help_heading = "Thinning & visibility")]
-    polygon_thinning: f64,
+    #[arg(long, help_heading = "Thinning & visibility")]
+    polygon_thinning: Option<f64>,
 
     /// Line visibility gate in GSD multiples: a line is eligible at a level
     /// only if its bbox diagonal >= factor * gsd (default 2.0).
@@ -555,8 +555,8 @@ struct ConvertTuningArgs {
     /// This is a hard drop, not a thin: BIGGER = more small lines dropped at
     /// coarse levels (sparser); SMALLER = more small lines kept. The gate is
     /// multiplied by the level GSD, so --gsd-base moves it too.
-    #[arg(long, default_value = "2.0", help_heading = "Thinning & visibility")]
-    line_visibility: f64,
+    #[arg(long, help_heading = "Thinning & visibility")]
+    line_visibility: Option<f64>,
 
     /// Polygon visibility gate in GSD multiples: a polygon is eligible only if
     /// its bbox diagonal >= factor * gsd (default 2.0).
@@ -568,8 +568,8 @@ struct ConvertTuningArgs {
     /// gates above 2.0 starve coarse zooms without making files smaller,
     /// and gates below ~2.0 mostly admit candidates that RDP drops anyway
     /// (use --collapse to keep those as representative points).
-    #[arg(long, default_value = "2.0", help_heading = "Thinning & visibility")]
-    polygon_visibility: f64,
+    #[arg(long, help_heading = "Thinning & visibility")]
+    polygon_visibility: Option<f64>,
 
     /// Per-level density drop rate: each coarser level keeps 1/rate of the
     /// next finer level's feature budget (default 1.65).
@@ -886,20 +886,34 @@ impl ConvertTuningArgs {
             }
         };
 
+        // `--verbatim` supplies DEFAULTS, it does not override. Each knob
+        // falls back to 0 (off) under the flag and to its ladder default
+        // otherwise, so an explicitly-passed value always wins and
+        // `--verbatim --simplify-factor 0.5` means what the docs say it means.
+        // Applying it wholesale after the fact would silently discard the
+        // override — the same mistake `--max-tile-size` already avoids.
+        let ladder = AssignConfig::default();
+        let tuned = |explicit: Option<f64>, default: f64| {
+            explicit.unwrap_or(if self.verbatim { 0.0 } else { default })
+        };
+
         // Cluster-conditional default: with --cluster, absorbed points are
         // summarized (point_count), so the sparser 16.0 grid is the better look.
-        let point_thinning = self.point_thinning.unwrap_or(if self.cluster {
-            tylertoo_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
-        } else {
-            AssignConfig::default().point_thinning
-        });
+        let point_thinning = tuned(
+            self.point_thinning,
+            if self.cluster {
+                tylertoo_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
+            } else {
+                ladder.point_thinning
+            },
+        );
 
         let assign = AssignConfig {
             point_thinning,
-            line_thinning: self.line_thinning,
-            polygon_thinning: self.polygon_thinning,
-            line_visibility: self.line_visibility,
-            polygon_visibility: self.polygon_visibility,
+            line_thinning: tuned(self.line_thinning, ladder.line_thinning),
+            polygon_thinning: tuned(self.polygon_thinning, ladder.polygon_thinning),
+            line_visibility: tuned(self.line_visibility, ladder.line_visibility),
+            polygon_visibility: tuned(self.polygon_visibility, ladder.polygon_visibility),
             sort_direction: SortDirection::Desc,
         };
 
@@ -915,6 +929,13 @@ impl ConvertTuningArgs {
         // Clustering flags (Q4; also enforced in core).
         if !self.accumulate_attribute.is_empty() && !self.cluster {
             anyhow::bail!("--accumulate-attribute requires --cluster");
+        }
+        if self.verbatim && mode == Mode::Partitioning {
+            anyhow::bail!(
+                "--verbatim requires --mode duplicating: partitioning places each \
+                 feature at exactly one level, so with thinning off every feature \
+                 lands in the coarsest level and every finer level is empty"
+            );
         }
         if self.cluster && mode == Mode::Partitioning {
             anyhow::bail!(
@@ -940,7 +961,7 @@ impl ConvertTuningArgs {
                  chain cannot satisfy"
             );
         }
-        let coalesce_lines = !self.no_coalesce_lines;
+        let coalesce_lines = !self.no_coalesce_lines && !self.verbatim;
 
         // Zoom-band representation selector (#317 / #279); structural
         // validity against the plan is enforced by core convert validation.
@@ -958,7 +979,10 @@ impl ConvertTuningArgs {
             class_ranking,
             no_auto_rank: self.no_auto_rank,
             simplify: SimplifyOptions {
-                factor: self.simplify_factor,
+                factor: tuned(
+                    self.simplify_factor,
+                    tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR,
+                ),
                 // --collapse and --collapse-square are mutually exclusive
                 // (clap conflicts_with); both default off = drop (#279).
                 collapse: if self.collapse_square {
@@ -972,7 +996,9 @@ impl ConvertTuningArgs {
             },
             representation,
             density: DensityBudgetConfig {
-                enabled: !self.no_density_drop,
+                // No positive spelling exists for either, so `--verbatim`
+                // cannot be overriding an explicit request here.
+                enabled: !self.no_density_drop && !self.verbatim,
                 drop_rate: self.drop_rate,
                 gamma: self.drop_gamma,
             },
@@ -996,16 +1022,23 @@ impl ConvertTuningArgs {
             spill_dir: self.spill_dir.clone(),
         };
 
-        // Applied last so it wins over the ladder defaults, and logged because
-        // "no features were dropped" is a surprising thing to infer from a
-        // quiet run.
+        // Logged because "no features were dropped" is a surprising thing to
+        // infer from a quiet run — and the message has to tell the truth about
+        // a composed run, where an override means the output is NOT verbatim.
         if self.verbatim {
-            log::info!(
-                "[convert] --verbatim: generalization off (no thinning, no \
-                 visibility gates, no simplification, no density budget, no \
-                 line coalescing); every level reproduces the input"
-            );
-            return Ok(options.verbatim());
+            if options.is_verbatim() {
+                log::info!(
+                    "[convert] --verbatim: generalization off (no thinning, no \
+                     visibility gates, no simplification, no density budget, no \
+                     line coalescing); every level reproduces the input"
+                );
+            } else {
+                log::info!(
+                    "[convert] --verbatim with overrides: generalization is off \
+                     except where you set it explicitly, so some features or \
+                     vertices may still be dropped"
+                );
+            }
         }
         Ok(options)
     }
@@ -2267,7 +2300,11 @@ mod tests {
             "--cluster",
             "--no-coalesce-lines",
         ]);
-        assert_eq!(a.tuning.polygon_visibility, 2.0);
+        // `Some` rather than a bare 2.0: the knob records whether it was
+        // given, so an explicit 2.0 is distinguishable from silence. That is
+        // what lets --verbatim supply a different default without clobbering
+        // an override.
+        assert_eq!(a.tuning.polygon_visibility, Some(2.0));
         assert!(a.tuning.collapse);
         assert_eq!(a.tuning.drop_rate, 1.3);
         assert_eq!(a.tuning.profile, "bounded");
@@ -2628,6 +2665,127 @@ mod tests {
             )
             .unwrap();
         assert!(!opts.is_verbatim());
+    }
+
+    /// Build convert options for `tiles` with the given flags, on a plain
+    /// duplicating z0-6 plan.
+    fn verbatim_opts(flags: &[&str]) -> tylertoo_core::overview::convert::ConvertOptions {
+        parse_tiles(flags)
+            .tuning
+            .build_convert_options(
+                tylertoo_core::overview::level::Mode::Duplicating,
+                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                None,
+                false,
+            )
+            .unwrap()
+    }
+
+    /// Verbatim in partitioning mode produces an empty pyramid, so it is
+    /// rejected rather than silently emitted.
+    ///
+    /// Partitioning writes each feature at exactly its `min_level`; with
+    /// thinning off every feature wins level 0, so the whole dataset lands in
+    /// the coarsest level and every finer level is omitted as empty — with a
+    /// warning that blames the visibility gates, which is doubly misleading.
+    #[test]
+    fn verbatim_is_rejected_in_partitioning_mode() {
+        let err = parse_tiles(&["--verbatim"])
+            .tuning
+            .build_convert_options(
+                tylertoo_core::overview::level::Mode::Partitioning,
+                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                None,
+                false,
+            )
+            .expect_err("verbatim + partitioning must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--verbatim requires --mode duplicating"),
+            "{msg}"
+        );
+
+        // Duplicating is fine, and partitioning without --verbatim is fine.
+        assert!(parse_tiles(&["--verbatim"])
+            .tuning
+            .build_convert_options(
+                tylertoo_core::overview::level::Mode::Duplicating,
+                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                None,
+                false,
+            )
+            .is_ok());
+        assert!(parse_tiles(&[])
+            .tuning
+            .build_convert_options(
+                tylertoo_core::overview::level::Mode::Partitioning,
+                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                None,
+                false,
+            )
+            .is_ok());
+    }
+
+    /// `--verbatim` is a set of DEFAULTS, not an override.
+    ///
+    /// The whole documented point of the flag is that it composes — "apply it
+    /// and override afterwards for nearly-verbatim". If it is applied last and
+    /// wholesale, `--verbatim --simplify-factor 0.5` silently means
+    /// `--simplify-factor 0`, which is the opposite of what the docs promise
+    /// and gives no sign it ignored you.
+    #[test]
+    fn explicit_tuning_flags_win_over_verbatim() {
+        let opts = verbatim_opts(&[
+            "--verbatim",
+            "--simplify-factor",
+            "0.5",
+            "--polygon-thinning",
+            "2.0",
+            "--line-visibility",
+            "3.0",
+        ]);
+        assert_eq!(opts.simplify.factor, 0.5, "explicit --simplify-factor");
+        assert_eq!(
+            opts.assign.polygon_thinning, 2.0,
+            "explicit --polygon-thinning"
+        );
+        assert_eq!(
+            opts.assign.line_visibility, 3.0,
+            "explicit --line-visibility"
+        );
+
+        // Everything NOT named still goes to the verbatim default.
+        assert_eq!(opts.assign.point_thinning, 0.0);
+        assert_eq!(opts.assign.line_thinning, 0.0);
+        assert_eq!(opts.assign.polygon_visibility, 0.0);
+        assert!(!opts.density.enabled);
+
+        // And bare --verbatim still zeroes the lot.
+        let bare = verbatim_opts(&["--verbatim"]);
+        assert_eq!(bare.simplify.factor, 0.0);
+        assert_eq!(bare.assign.polygon_thinning, 0.0);
+        assert_eq!(bare.assign.line_visibility, 0.0);
+
+        // A default run is unchanged.
+        let plain = verbatim_opts(&[]);
+        assert_eq!(plain.simplify.factor, 1.0);
+        assert_eq!(plain.assign.polygon_thinning, 1.0);
+        assert_eq!(plain.assign.line_visibility, 2.0);
+        assert_eq!(plain.assign.polygon_visibility, 2.0);
+        assert_eq!(plain.assign.line_thinning, 1.0);
+        assert_eq!(plain.assign.point_thinning, 4.0);
     }
 
     #[test]

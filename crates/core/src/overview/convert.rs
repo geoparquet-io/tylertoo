@@ -804,6 +804,21 @@ pub enum ConvertError {
          represented without double counting"
     )]
     ClusterPartitioningUnsupported,
+    /// Verbatim tiling was requested in partitioning mode, where it degenerates.
+    ///
+    /// Partitioning places each feature at exactly its `min_level` (§2.3), and
+    /// `min_level` is the coarsest level whose thinning grid the feature wins.
+    /// With thinning off every feature wins at level 0, so the entire dataset
+    /// lands in the coarsest level and every finer level is emitted empty —
+    /// the opposite of "every level reproduces the input". Duplicating mode is
+    /// what makes verbatim meaningful, because it writes each feature at every
+    /// level it is visible at.
+    #[error(
+        "--verbatim requires duplicating mode: partitioning places each feature at \
+         exactly one level, so with thinning off every feature lands in the coarsest \
+         level and every finer level is empty"
+    )]
+    VerbatimPartitioningUnsupported,
     /// `--accumulate-attribute` was supplied without `--cluster`.
     #[error("--accumulate-attribute requires --cluster")]
     AccumulateWithoutCluster,
@@ -1246,6 +1261,31 @@ fn decode_and_filter_geometries(
     Ok((filtered, geoms))
 }
 
+/// Option combinations that no pipeline can honour, checked once for both.
+///
+/// These are rejections rather than silent adjustments: each one would
+/// otherwise produce a structurally valid file that is not what was asked for,
+/// which is harder to notice than an error.
+fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError> {
+    // Q4: a partitioning-mode feature has one row read across many zoom
+    // prefixes, so a per-level point_count cannot be represented.
+    if options.cluster && matches!(options.mode, Mode::Partitioning) {
+        return Err(ConvertError::ClusterPartitioningUnsupported);
+    }
+    // Verbatim degenerates in partitioning mode rather than doing nothing:
+    // every feature wins level 0, and partitioning writes it there and nowhere
+    // else. Rejecting beats emitting a pyramid whose finer levels are all
+    // empty and whose warning blames the visibility gates.
+    if options.is_verbatim() && matches!(options.mode, Mode::Partitioning) {
+        return Err(ConvertError::VerbatimPartitioningUnsupported);
+    }
+    // Aggregation is meaningless without clustering.
+    if !options.accumulate.is_empty() && !options.cluster {
+        return Err(ConvertError::AccumulateWithoutCluster);
+    }
+    Ok(())
+}
+
 /// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
 /// Runs the full option normalization (validation, cluster/accumulate checks,
 /// the partitioning-coalesce-inert rewrite) before dispatching.
@@ -1260,15 +1300,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // #272: place the remote-input disk spill (#219) where the caller asked
     // (no-op for local inputs, which never spill).
     source.set_spill_dir(options.spill_dir.as_deref());
-    // Clustering option sanity (Q4), shared by both pipelines: partitioning
-    // mode cannot represent per-level counts (see the error's rationale), and
-    // aggregation is meaningless without clustering.
-    if options.cluster && matches!(options.mode, Mode::Partitioning) {
-        return Err(ConvertError::ClusterPartitioningUnsupported);
-    }
-    if !options.accumulate.is_empty() && !options.cluster {
-        return Err(ConvertError::AccumulateWithoutCluster);
-    }
+    check_mode_combinations(options)?;
     // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
     // chain is a new geometry replacing several source rows, which the
     // feature-once/verbatim contract of §2.3 cannot represent, and removing

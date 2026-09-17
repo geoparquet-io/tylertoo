@@ -94,8 +94,6 @@ Generate PMTiles vector tiles (the default pipeline)
    Controls how much per-feature vertex detail each coarse level sheds. LOWER = smoother/less aggressive = more vertices kept = crisper but heavier levels; HIGHER = cruder = fewer vertices = lighter levels. The canonical (finest) level is always verbatim regardless. A line/polygon whose bbox diagonal is below the tolerance is dropped entirely, so a very high factor also thins features, not just vertices.
 
    Cheat sheet: coarse levels look too crude/blocky → LOWER --simplify-factor. See docs/OVERVIEW_TUNING.md.
-
-  Default value: `1.0`
 * `--collapse` — Collapse below-visibility polygons to a representative point instead of dropping them (spec Q4 opt-in). Changes the geometry type at coarse levels (fill-styled renderers silently ignore points — add a circle layer, or use --collapse-square to stay type-preserving)
 * `--collapse-square` — Collapse below-visibility polygons to a ~1xGSD placeholder SQUARE at the representative point instead of dropping them (tippecanoe tiny-polygon reduction; opt-in).
 
@@ -116,23 +114,15 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--line-thinning <LINE_THINNING>` — Line thinning factor: grid cell size = factor * gsd (default 1.0).
 
    BIGGER = SPARSER (fewer lines survive per level), SMALLER = denser. See --point-thinning; this is the roads/line knob. Default retuned 2.0 -> 1.0 after the Portland sweep (corpus/SWEEPS.md): 1.0 keeps road networks visibly more continuous at coarse zooms.
-
-  Default value: `1.0`
 * `--polygon-thinning <POLYGON_THINNING>` — Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
 
    BIGGER = SPARSER, SMALLER = denser. Polygons thin least by default (1.0) since they tile space rather than cluster.
-
-  Default value: `1.0`
 * `--line-visibility <LINE_VISIBILITY>` — Line visibility gate in GSD multiples: a line is eligible at a level only if its bbox diagonal >= factor * gsd (default 2.0).
 
    This is a hard drop, not a thin: BIGGER = more small lines dropped at coarse levels (sparser); SMALLER = more small lines kept. The gate is multiplied by the level GSD, so --gsd-base moves it too.
-
-  Default value: `2.0`
 * `--polygon-visibility <POLYGON_VISIBILITY>` — Polygon visibility gate in GSD multiples: a polygon is eligible only if its bbox diagonal >= factor * gsd (default 2.0).
 
    BIGGER = more small polygons dropped at coarse levels (sparser); SMALLER = more kept. See --line-visibility. Retuned 4.0 -> 2.0 in the #259 coarse-zoom sweep (corpus/SWEEPS.md Decision 6): write-time RDP already drops polygons that simplify below the level tolerance, so gates above 2.0 starve coarse zooms without making files smaller, and gates below ~2.0 mostly admit candidates that RDP drops anyway (use --collapse to keep those as representative points).
-
-  Default value: `2.0`
 * `--drop-rate <F>` — Per-level density drop rate: each coarser level keeps 1/rate of the next finer level's feature budget (default 1.65).
 
    This is the Q2 knob that stops mid-zoom counts plateauing at ~everything. Cell-winner thinning stops binding once its grid cell is smaller than the typical feature spacing, so from ~z9 up every feature survives and coarse levels over-retain (Portland roads: ours/tippecanoe ≈ 2–3x at z9–z11). After cell-winner thinning, each level is capped at a budget that decays geometrically toward coarse zooms — budget(L) = N / rate^(finest−L), where N is the input feature count — and the lowest-priority survivors (same class-rank → size → hash order as the cell-winner, spec Q1) are dropped until the level meets its budget. Levels already sparser than their budget (the coarse zooms) are untouched, so this only bites the mid-zoom plateau. BIGGER rate = coarser levels shed harder (sparser mid zooms, smaller files); SMALLER = gentler. The default 1.65 is smaller than tippecanoe's nominal 2.5 because our budget anchors on the full canonical count N (every feature appears at the finest level), not a per-tile basezoom count. The canonical (finest) level is never dropped. See docs/OVERVIEW_TUNING.md and corpus/SWEEPS.md.
@@ -270,8 +260,6 @@ Build a multi-resolution overview GeoParquet file
    Controls how much per-feature vertex detail each coarse level sheds. LOWER = smoother/less aggressive = more vertices kept = crisper but heavier levels; HIGHER = cruder = fewer vertices = lighter levels. The canonical (finest) level is always verbatim regardless. A line/polygon whose bbox diagonal is below the tolerance is dropped entirely, so a very high factor also thins features, not just vertices.
 
    Cheat sheet: coarse levels look too crude/blocky → LOWER --simplify-factor. See docs/OVERVIEW_TUNING.md.
-
-  Default value: `1.0`
 * `--collapse` — Collapse below-visibility polygons to a representative point instead of dropping them (spec Q4 opt-in). Changes the geometry type at coarse levels (fill-styled renderers silently ignore points — add a circle layer, or use --collapse-square to stay type-preserving)
 * `--collapse-square` — Collapse below-visibility polygons to a ~1xGSD placeholder SQUARE at the representative point instead of dropping them (tippecanoe tiny-polygon reduction; opt-in).
 
@@ -292,23 +280,15 @@ Build a multi-resolution overview GeoParquet file
 * `--line-thinning <LINE_THINNING>` — Line thinning factor: grid cell size = factor * gsd (default 1.0).
 
    BIGGER = SPARSER (fewer lines survive per level), SMALLER = denser. See --point-thinning; this is the roads/line knob. Default retuned 2.0 -> 1.0 after the Portland sweep (corpus/SWEEPS.md): 1.0 keeps road networks visibly more continuous at coarse zooms.
-
-  Default value: `1.0`
 * `--polygon-thinning <POLYGON_THINNING>` — Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
 
    BIGGER = SPARSER, SMALLER = denser. Polygons thin least by default (1.0) since they tile space rather than cluster.
-
-  Default value: `1.0`
 * `--line-visibility <LINE_VISIBILITY>` — Line visibility gate in GSD multiples: a line is eligible at a level only if its bbox diagonal >= factor * gsd (default 2.0).
 
    This is a hard drop, not a thin: BIGGER = more small lines dropped at coarse levels (sparser); SMALLER = more small lines kept. The gate is multiplied by the level GSD, so --gsd-base moves it too.
-
-  Default value: `2.0`
 * `--polygon-visibility <POLYGON_VISIBILITY>` — Polygon visibility gate in GSD multiples: a polygon is eligible only if its bbox diagonal >= factor * gsd (default 2.0).
 
    BIGGER = more small polygons dropped at coarse levels (sparser); SMALLER = more kept. See --line-visibility. Retuned 4.0 -> 2.0 in the #259 coarse-zoom sweep (corpus/SWEEPS.md Decision 6): write-time RDP already drops polygons that simplify below the level tolerance, so gates above 2.0 starve coarse zooms without making files smaller, and gates below ~2.0 mostly admit candidates that RDP drops anyway (use --collapse to keep those as representative points).
-
-  Default value: `2.0`
 * `--drop-rate <F>` — Per-level density drop rate: each coarser level keeps 1/rate of the next finer level's feature budget (default 1.65).
 
    This is the Q2 knob that stops mid-zoom counts plateauing at ~everything. Cell-winner thinning stops binding once its grid cell is smaller than the typical feature spacing, so from ~z9 up every feature survives and coarse levels over-retain (Portland roads: ours/tippecanoe ≈ 2–3x at z9–z11). After cell-winner thinning, each level is capped at a budget that decays geometrically toward coarse zooms — budget(L) = N / rate^(finest−L), where N is the input feature count — and the lowest-priority survivors (same class-rank → size → hash order as the cell-winner, spec Q1) are dropped until the level meets its budget. Levels already sparser than their budget (the coarse zooms) are untouched, so this only bites the mid-zoom plateau. BIGGER rate = coarser levels shed harder (sparser mid zooms, smaller files); SMALLER = gentler. The default 1.65 is smaller than tippecanoe's nominal 2.5 because our budget anchors on the full canonical count N (every feature appears at the finest level), not a per-tile basezoom count. The canonical (finest) level is never dropped. See docs/OVERVIEW_TUNING.md and corpus/SWEEPS.md.

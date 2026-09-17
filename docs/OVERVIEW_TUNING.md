@@ -118,7 +118,8 @@ $ tylertoo tiles cells.parquet out.pmtiles --min-zoom 0 --max-zoom 5 --verbatim
 ```
 
 It is exactly equivalent to setting every ladder knob by hand — byte-identical
-output — and exists because that is five flags of ceremony for one intention:
+output — and exists because that is eight flags of ceremony for one
+intention:
 
 ```bash
 --no-density-drop --no-coalesce-lines --simplify-factor 0 --point-thinning 0 --line-thinning 0 --polygon-thinning 0 --polygon-visibility 0 --line-visibility 0
@@ -128,14 +129,30 @@ Reach for it when the input is a **DGGS or cell aggregate**, is **pre-levelled**
 by an upstream tool, or is **one band of a pyramid** (see `tylertoo pyramid`)
 where a different input already owns the coarser zooms.
 
-What it does *not* touch: mode, the level plan, CRS, row-group layout, and an
-explicit `--cluster`. Apply it and then override individual knobs afterwards if
-you want *nearly* verbatim — `--verbatim --simplify-factor 0.5` keeps every
-feature but still simplifies geometry.
+What it does *not* touch: mode, the level plan, CRS, row-group layout, an
+explicit `--cluster`, and `--representation` (a point or square band still
+replaces polygons with centroids or dithered placeholders — the one
+generalizing knob left on, inert unless you ask for it).
+
+`--verbatim` supplies **defaults**, it does not override: any knob you set
+explicitly wins, so `--verbatim --simplify-factor 0.5` keeps every feature but
+still simplifies geometry. When you do override something, the run says so
+rather than claiming the output is verbatim.
+
+It requires `--mode duplicating`. Partitioning writes each feature at exactly
+one level, so with thinning off every feature lands in the coarsest level and
+every finer level comes out empty; that is rejected rather than produced.
 
 On `tiles` it also disables the per-tile size cap, since a valve that sheds
 features to fit a byte budget is not verbatim either. Pass `--max-tile-size`
 explicitly to put a cap back; an explicit value always wins.
+
+⚠️ **The two-step form does not inherit that.** `tylertoo overview --verbatim`
+followed by `tylertoo export-pmtiles` still applies the export's own 500K cap
+and sheds features from oversized tiles — the flag is convert-side, and the
+export reads a file, not your flags. Pass `--tile-size-limit 0` to
+`export-pmtiles` (that is the export spelling; `--max-tile-size` is the `tiles`
+one) when every feature must reach a tile.
 
 ### `0` is the off switch
 
