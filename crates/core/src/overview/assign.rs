@@ -1142,7 +1142,7 @@ mod tests {
 
     // ---- entry-zoom ladder (#364) -------------------------------------------
 
-    /// The motivating failure: concentric contours where the strongest signal
+    /// The motivating failure: nested polygons where the strongest signal
     /// is the *smallest* ring. Without a ladder the visibility gate drops the
     /// tiny strong core at coarse levels and keeps the big weak ring — exactly
     /// backwards for the map.

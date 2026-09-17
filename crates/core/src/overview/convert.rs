@@ -2917,7 +2917,7 @@ pub(super) fn resolve_reserved_column_collisions(
         }
     }
     // #364: the motivating ladder column is literally named `level` (#359's
-    // reporter and #364's are the same contour dataset), so a ladder is the
+    // reporter and #364's are the same dataset), so a ladder is the
     // single most likely option to name a reserved column.
     if let Some(spec) = options.entry_zoom.as_mut() {
         if let Some(new) = remap(&spec.column) {

@@ -975,11 +975,11 @@ fn verbatim_is_recognizable_and_leaves_other_options_alone() {
 // Entry-zoom ladder: attribute-driven entry, overriding the gate (#364)
 // ============================================================================
 
-/// Concentric bands: the strongest magnitude is the physically *smallest*
+/// Nested polygons: the highest value sits on the physically *smallest*
 /// ring, which is exactly the case geometry-ranked thinning gets backwards.
-/// Returns `(geometries, magnitudes)` in row order.
+/// Returns `(geometries, values)` in row order.
 fn nested_bands(sites: usize) -> (Vec<Option<Geometry<f64>>>, Vec<f64>) {
-    let mags = [0.2f64, 0.275, 0.35, 0.425, 0.5];
+    let mags = [100.0f64, 250.0, 600.0, 1500.0, 5000.0];
     let mut geoms = Vec::new();
     let mut values = Vec::new();
     for s in 0..sites {
@@ -1004,14 +1004,14 @@ fn nested_bands(sites: usize) -> (Vec<Option<Geometry<f64>>>, Vec<f64>) {
     (geoms, values)
 }
 
-/// Write nested-band input with the magnitudes in a `magnitude` column.
+/// Write nested-polygon input with the values in a `magnitude` column.
 fn write_banded_input(path: &Path, sites: usize) -> Vec<f64> {
     let (geoms, values) = nested_bands(sites);
     super::testutil::write_input_with_f64(path, &geoms, "magnitude", &values);
     values
 }
 
-/// Count how many rows at each level carry a magnitude at or above `min_mag`.
+/// Count how many rows at each level carry a value at or above `min_mag`.
 fn level_strong_counts(path: &Path, min_mag: f64) -> Vec<usize> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::Float64Type;
@@ -1056,9 +1056,9 @@ fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
             ..opts(streaming)
         };
         convert_to_overviews(tin.path(), tout.path(), &control).unwrap();
-        let before = level_strong_counts(tout.path(), 0.5);
+        let before = level_strong_counts(tout.path(), 5000.0);
 
-        // Ladder: strongest magnitude enters at the coarsest level.
+        // Ladder: the highest value enters at the coarsest level.
         let tin2 = tempfile::NamedTempFile::new().unwrap();
         let tout2 = tempfile::NamedTempFile::new().unwrap();
         write_banded_input(tin2.path(), 8);
@@ -1078,11 +1078,11 @@ fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
             ..opts(streaming)
         };
         convert_to_overviews(tin2.path(), tout2.path(), &laddered).unwrap();
-        let after = level_strong_counts(tout2.path(), 0.5);
+        let after = level_strong_counts(tout2.path(), 5000.0);
 
         assert_eq!(
             before[0], 0,
-            "streaming={streaming}: precondition — the gate drops every 0.5 \
+            "streaming={streaming}: precondition — the gate drops every top-value \
              core at the coarsest level without a ladder (got {before:?})"
         );
         // Deterministic: 8 sites, so all 8 cores. `> 0` would pass with seven
@@ -1090,7 +1090,7 @@ fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
         assert_eq!(
             after,
             vec![8; after.len()],
-            "streaming={streaming}: the ladder must admit EVERY 0.5 core at \
+            "streaming={streaming}: the ladder must admit EVERY top-value shape at \
              every level (before={before:?})"
         );
         validate_file(tout2.path()).unwrap();
@@ -1117,8 +1117,8 @@ fn entry_zoom_ladder_is_identical_across_pipelines() {
         };
         convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
         per_engine.push((
-            level_strong_counts(tout.path(), 0.5),
-            level_strong_counts(tout.path(), 0.2),
+            level_strong_counts(tout.path(), 5000.0),
+            level_strong_counts(tout.path(), 100.0),
         ));
     }
     assert_eq!(
@@ -1135,7 +1135,7 @@ fn entry_zoom_ladder_is_identical_across_pipelines() {
     assert_eq!(
         *strong,
         vec![6; strong.len()],
-        "the strongest magnitude enters at the coarsest level and stays"
+        "the highest value enters at the coarsest level and stays"
     );
     assert_eq!(
         all[0], 6,
@@ -1177,15 +1177,15 @@ fn entry_zoom_ladder_agrees_across_pipelines_when_rows_are_rejected() {
             }),
             // Excludes the strongest band, so the rows carrying the top
             // distinct value never become features. If the ladder still sees
-            // that value, it spends rung 0 on a magnitude that is not in the
+            // that value, it spends rung 0 on a value that is not in the
             // output and every surviving band enters one zoom too late.
-            filter: Some("magnitude < 0.45".to_string()),
+            filter: Some("magnitude < 2000".to_string()),
             ..opts(streaming)
         };
         convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
         per_engine.push((
-            level_strong_counts(tout.path(), 0.425),
-            level_strong_counts(tout.path(), 0.2),
+            level_strong_counts(tout.path(), 1500.0),
+            level_strong_counts(tout.path(), 100.0),
         ));
     }
     assert_eq!(
