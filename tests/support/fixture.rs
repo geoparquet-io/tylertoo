@@ -30,17 +30,31 @@ const FIXTURE_RELEASE: &str = "fixtures-v1";
 ///
 /// `None` is always accompanied by a printed explanation naming the remedy,
 /// so a skipped test says why it skipped instead of passing in silence.
+///
+/// **On CI it does not skip — it fails.** Skipping is a convenience for a
+/// working copy without the fixtures; on CI, which downloads them as a build
+/// step, an unusable fixture means that step or its cache is broken, and the
+/// coverage is gone. #369 is what that costs: the leaf-directory guard
+/// resolved its path against the wrong directory and skipped *every CI run
+/// for six months* while reporting `ok`. A guard whose designed outcome is
+/// silence would reintroduce exactly that, so `CI` (always set by GitHub
+/// Actions) turns the skip back into a failure.
 pub fn realdata(name: &str) -> Option<PathBuf> {
     let path = workspace_root().join("tests/fixtures/realdata").join(name);
     match usability(&path) {
         Ok(()) => Some(path),
         Err(why) => {
-            eprintln!(
-                "Skipping: {} {why}\n  Fetch the fixtures with:\n    \
+            let remedy = format!(
+                "{} {why}\n  Fetch the fixtures with:\n    \
                  gh release download {FIXTURE_RELEASE} \
                  --dir tests/fixtures/realdata/ --clobber",
                 path.display(),
             );
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "fixture unusable, and CI must not skip real-data coverage: {remedy}"
+            );
+            eprintln!("Skipping: {remedy}");
             None
         }
     }

@@ -70,7 +70,7 @@ fn verify_with_pmtiles_cli(path: &Path) -> bool {
 /// same invariant: the CLI was only ever a way to reach this chain, as the
 /// sibling property test below already assumes.
 #[test]
-fn test_conversion_produces_valid_leaf_directories() {
+fn test_real_data_conversion_keeps_the_root_directory_small() {
     use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
 
@@ -103,7 +103,7 @@ fn test_conversion_produces_valid_leaf_directories() {
 
     let (root_dir_length, leaf_dirs_offset, leaf_dirs_length) = read_pmtiles_header(output.path());
     eprintln!(
-        "Integration test: root_dir_length={}, leaf_dirs_offset={}, leaf_dirs_length={}",
+        "Real-data conversion: root_dir_length={}, leaf_dirs_offset={}, leaf_dirs_length={}",
         root_dir_length, leaf_dirs_offset, leaf_dirs_length
     );
 
@@ -114,6 +114,16 @@ fn test_conversion_produces_valid_leaf_directories() {
         root_dir_length,
         MAX_ROOT_DIR_SIZE
     );
+
+    // This fixture at z0-10 stays under the spill threshold, so it produces no
+    // leaf directories at all (`leaf_dirs_length == 0`) and the assertion above
+    // is about a root that was never under pressure. That is still worth
+    // guarding — it is the real-data end of #88 — but the *spill* half of the
+    // invariant is covered by the synthetic cases in
+    // `test_root_directory_always_fits_in_16kb`, which do reach the leaf path.
+    // Hence the name: this is the real-data root-size check, not a leaf check.
+    // Raising max_zoom until leaves appear would cover both here, at a cost in
+    // runtime this suite has so far avoided.
 
     assert!(
         verify_with_pmtiles_cli(output.path()),
@@ -148,8 +158,15 @@ fn test_root_directory_always_fits_in_16kb() {
             writer.add_tile(12, x as u32, y as u32, &data).unwrap();
         }
 
-        let output_path = Path::new("/tmp/test-root-size.pmtiles");
-        let _ = fs::remove_file(output_path);
+        // A tempfile, not a fixed `/tmp` name: two concurrent `cargo test`
+        // runs on one machine (or several worktrees of this repo) would
+        // otherwise write the same path and read each other's output.
+        let out = tempfile::Builder::new()
+            .prefix("tylertoo-root-size-")
+            .suffix(".pmtiles")
+            .tempfile()
+            .expect("temp output");
+        let output_path = out.path();
         writer.finalize(output_path).unwrap();
 
         let (root_dir_length, _leaf_dirs_offset, leaf_dirs_length) =
@@ -167,7 +184,5 @@ fn test_root_directory_always_fits_in_16kb() {
             root_dir_length,
             MAX_ROOT_DIR_SIZE
         );
-
-        let _ = fs::remove_file(output_path);
     }
 }
