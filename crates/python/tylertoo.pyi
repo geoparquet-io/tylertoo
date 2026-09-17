@@ -16,6 +16,7 @@ def convert(
     layer_name: str | None = None,
     tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
+    feature_order: str = "input",
 ) -> None: ...
 def overview(
     input: str | list[str],
@@ -72,5 +73,6 @@ def export_pmtiles(
     tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
     partition_wave: int = 0,
+    feature_order: str = "input",
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
