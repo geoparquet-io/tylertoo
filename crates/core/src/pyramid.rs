@@ -43,15 +43,27 @@ pub struct Band {
 }
 
 impl Band {
+    /// Web Mercator zoom ceiling. Beyond this the tile grid no longer fits the
+    /// arithmetic downstream (`1u32 << zoom`), which overflows at z32 — a debug
+    /// panic, and silently wrong tile buffers in release. Rejecting here costs
+    /// an error message; accepting costs a full band conversion first.
+    const MAX_ZOOM: u8 = 30;
+
     /// Parse `LO-HI:PATH[:LAYER]`. The layer is optional and defaults to the
-    /// input's file stem. The zoom range is split off first and the layer last.
+    /// input's file stem.
     ///
-    /// A path containing `:` is ambiguous — `0-5:C:/data/x.pmtiles` splits into
-    /// path `C` and layer `/data/x.pmtiles`, and nothing in the grammar can
-    /// tell that apart from a genuine three-part spec. Rather than guess, a
-    /// parsed layer that looks like a path fragment (it contains `/` or `\`) is
-    /// rejected with an explanation. Layer names are MVT layer ids and do not
-    /// contain path separators, so nothing legitimate is refused.
+    /// The zoom range is split off first. What remains is the path, *unless*
+    /// its last colon-separated segment is a bare layer token — no `/`, `\` or
+    /// `:` — in which case that is the layer. Paths legitimately contain
+    /// colons: `s3://bucket/x.parquet`, `https://host/x.parquet`,
+    /// `C:\data\x.parquet`. Splitting on the last colon unconditionally
+    /// mangled every one of those, and remote sources are genuinely supported
+    /// downstream, so the grammar has to admit them.
+    ///
+    /// One extra rule closes `C:data.parquet`, where the last segment *is* a
+    /// bare token: a single-ASCII-letter candidate path is a Windows drive, so
+    /// the whole remainder is the path. All of this is pure string work — no
+    /// filesystem access, so it behaves the same for a glob or a URL.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (range, rest) = spec
             .split_once(':')
@@ -70,30 +82,85 @@ impl Band {
         if min_zoom > max_zoom {
             return Err(format!("band {spec:?}: min zoom above max zoom"));
         }
-        let (path, layer) = match rest.rsplit_once(':') {
-            Some((p, l)) if !l.is_empty() && !p.is_empty() => (p.to_string(), l.to_string()),
-            _ => {
-                let p = rest.to_string();
-                let stem = Path::new(&p)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "layer".to_string());
-                (p, stem)
-            }
-        };
-        if layer.contains('/') || layer.contains('\\') {
+        if max_zoom > Self::MAX_ZOOM {
             return Err(format!(
-                "band {spec:?}: parsed layer name {layer:?} contains a path separator, so the \
-                 archive path appears to contain a ':'. A ':' in the path is not supported by \
-                 --band; rename the archive or point at it through a symlink."
+                "band {spec:?}: max zoom {max_zoom} is above the supported ceiling {}",
+                Self::MAX_ZOOM
             ));
         }
+
+        // A trailing colon is an empty layer name, not part of the path.
+        // Falling through would silently keep the colon in the path.
+        if rest.trim_end().ends_with(':') {
+            return Err(format!("band {spec:?}: empty layer name"));
+        }
+        let (path, layer) = match rest.rsplit_once(':') {
+            // A bare final segment is a layer name, unless what precedes it is
+            // a lone drive letter.
+            Some((p, l)) if is_bare_layer_token(l) && !p.is_empty() && !is_drive_letter(p) => {
+                (p.trim(), Some(l.trim().to_string()))
+            }
+            _ => (rest.trim(), None),
+        };
+        if path.is_empty() {
+            return Err(format!("band {spec:?}: empty input path"));
+        }
+        let layer = match layer {
+            Some(l) if l.is_empty() => return Err(format!("band {spec:?}: empty layer name")),
+            Some(l) => l,
+            None => default_layer_for(path).ok_or_else(|| {
+                format!(
+                    "band {spec:?}: cannot derive a layer name from {path:?}; \
+                     append :LAYER"
+                )
+            })?,
+        };
+
         Ok(Band {
             input: PathBuf::from(path),
             layer,
             min_zoom,
             max_zoom,
         })
+    }
+}
+
+/// Whether `s` could be an MVT layer id rather than the tail of a path.
+/// Layer ids do not contain path separators or colons.
+fn is_bare_layer_token(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && !s.contains(['/', '\\', ':'])
+}
+
+/// A single ASCII letter — i.e. a Windows drive designator, not a path.
+fn is_drive_letter(s: &str) -> bool {
+    let s = s.trim();
+    s.len() == 1 && s.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// The layer name implied by an input path: its file stem.
+///
+/// `None` when the stem carries glob metacharacters, which would otherwise
+/// produce a layer literally called `*` — a working archive whose layer every
+/// client has to reference as `"source-layer": "*"`. A glob's parent directory
+/// is the useful name, and failing that the caller is asked for one.
+fn default_layer_for(path: &str) -> Option<String> {
+    // Strip a Windows drive prefix first: on Unix, `Path` has no notion of one,
+    // so `C:data.parquet` would otherwise yield the stem `C:data` — a layer id
+    // with a colon in it.
+    let path = match path.split_once(':') {
+        Some((drive, rest)) if is_drive_letter(drive) && !rest.is_empty() => rest,
+        _ => path,
+    };
+    let p = Path::new(path);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned());
+    match stem {
+        Some(s) if !s.is_empty() && !s.contains(['*', '?', '[']) => Some(s),
+        _ => p
+            .parent()
+            .and_then(Path::file_name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty() && !s.contains(['*', '?', '['])),
     }
 }
 
@@ -147,6 +214,19 @@ pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
                 "bands overlap at zoom {}: {}-{} and {}-{}",
                 w[1].min_zoom, w[0].min_zoom, w[0].max_zoom, w[1].min_zoom, w[1].max_zoom
             ));
+        }
+        // A gap is legal — the caller may not want those zooms — but it is
+        // rarely deliberate, and the merged archive cannot express it: the
+        // header and `vector_layers` span min..max, so a client honouring
+        // maxzoom renders the gap blank instead of overzooming the band below.
+        if w[1].min_zoom > w[0].max_zoom + 1 {
+            log::warn!(
+                "no band covers z{}-{}: the merged archive still advertises \
+                 those zooms (its range spans every band), so clients will \
+                 request them and get nothing",
+                w[0].max_zoom + 1,
+                w[1].min_zoom - 1
+            );
         }
     }
     Ok(())
@@ -924,15 +1004,76 @@ mod tests {
         assert!(Band::parse("nope:a.parquet").is_err());
     }
 
-    /// A ':' in the path splits in the wrong place: `0-5:C:/data/x.pmtiles`
-    /// used to yield path "C" and layer "/data/x.pmtiles", failing much later
-    /// with a baffling "band archive not found: C". Refuse it up front.
+    /// The grammar, as a table — the thing that was missing.
+    ///
+    /// Every earlier test asserted on hand-built `Band` structs or on
+    /// `classify_band_input` directly, so nothing exercised the real entry
+    /// point. That is why `s3://` URLs and globs were broken while their unit
+    /// tests passed: a colon is legal in a path, and splitting on the last one
+    /// mangled every URL and drive letter.
     #[test]
-    fn colon_in_path_is_rejected_not_mangled() {
-        let err = Band::parse("0-5:C:/data/x.pmtiles").unwrap_err();
-        assert!(err.contains("path separator"), "{err}");
-        let err = Band::parse("0-9:/data/2024:06/x.pmtiles").unwrap_err();
-        assert!(err.contains("path separator"), "{err}");
+    fn band_spec_grammar() {
+        let ok = |spec: &str| Band::parse(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        // Paths that contain colons, with and without an explicit layer.
+        let b = ok("0-5:s3://bucket/cells.parquet");
+        assert_eq!(b.input, PathBuf::from("s3://bucket/cells.parquet"));
+        assert_eq!(b.layer, "cells");
+
+        let b = ok("0-5:s3://bucket/cells.parquet:aggregate");
+        assert_eq!(b.input, PathBuf::from("s3://bucket/cells.parquet"));
+        assert_eq!(b.layer, "aggregate");
+
+        assert_eq!(
+            ok("0-5:https://host/x.parquet").input,
+            PathBuf::from("https://host/x.parquet")
+        );
+        assert_eq!(
+            ok("0-9:/data/2024:06/x.pmtiles").input,
+            PathBuf::from("/data/2024:06/x.pmtiles")
+        );
+
+        // Windows: a drive letter is a path, not a layer, both spellings.
+        assert_eq!(
+            ok("0-5:C:/data/x.pmtiles").input,
+            PathBuf::from("C:/data/x.pmtiles")
+        );
+        let b = ok("0-5:C:data.parquet");
+        assert_eq!(b.input, PathBuf::from("C:data.parquet"), "drive-relative");
+        assert_eq!(b.layer, "data");
+
+        // The ordinary three-part form still splits.
+        let b = ok("6-8:cells_r8.parquet:aggregate");
+        assert_eq!(b.input, PathBuf::from("cells_r8.parquet"));
+        assert_eq!(b.layer, "aggregate");
+
+        // A glob must not become a layer called "*".
+        let b = ok("0-5:/data/cells/*.parquet");
+        assert_eq!(b.layer, "cells", "glob falls back to the directory name");
+        assert_eq!(ok("0-5:/data/cells/").layer, "cells", "directory input");
+
+        // Whitespace is trimmed on both sides of the split.
+        let b = ok("0-5: x.parquet : agg ");
+        assert_eq!(b.input, PathBuf::from("x.parquet"));
+        assert_eq!(b.layer, "agg");
+
+        // Rejections.
+        for bad in [
+            "0-5",             // no path
+            "x:y.parquet",     // no range
+            "5-0:x.parquet",   // reversed
+            "0-300:x.parquet", // not a u8
+            "-1-5:x.parquet",  // negative
+            "0-5:",            // empty path
+            "0-5:x.parquet:",  // empty layer
+            "0-31:x.parquet",  // above the zoom ceiling
+            "0-32:x.parquet",  // the overflow threshold itself
+        ] {
+            assert!(Band::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+
+        // The ceiling is inclusive at 30.
+        assert_eq!(ok("0-30:x.parquet").max_zoom, 30);
     }
 
     // --- merge tests ---------------------------------------------------

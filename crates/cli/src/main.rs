@@ -2000,9 +2000,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
     use tylertoo_core::overview::convert::ConvertOptions;
     use tylertoo_core::overview::export::ExportOptions;
-    use tylertoo_core::pyramid::{
-        build_pyramid, classify_band_input, validate_bands, Band, BandSource, PyramidOptions,
-    };
+    use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band, PyramidOptions};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -2020,12 +2018,20 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     validate_bands(&bands).map_err(|e| anyhow::anyhow!(e))?;
 
-    // A source band may be a glob, a directory or a remote URL, none of which
-    // `exists()` answers usefully; only a local archive is checked here, and
-    // core reports an unreadable source with the reader's own error.
+    // Report a missing band input here, naming it, rather than letting the
+    // reader fail later with a bare "No such file or directory" and no path.
+    //
+    // This cannot be a `classify_band_input` check: that returns `Archive` only
+    // when the file opens, so a missing path always classifies as `Source` and
+    // the kind tells us nothing about whether it exists. What it can be is a
+    // plain existence test, skipped for the three spellings where `exists()`
+    // has no useful answer — a remote URL, a glob, and anything else the
+    // reader resolves itself.
     for b in &bands {
-        if !b.input.exists() && classify_band_input(&b.input) == BandSource::Archive {
-            anyhow::bail!("band archive not found: {}", b.input.display());
+        let spelled = b.input.to_string_lossy();
+        let deferred = spelled.contains("://") || spelled.contains(['*', '?', '[']);
+        if !deferred && !b.input.exists() {
+            anyhow::bail!("band input not found: {}", b.input.display());
         }
     }
 
