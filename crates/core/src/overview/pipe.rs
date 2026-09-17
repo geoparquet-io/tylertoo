@@ -22,6 +22,17 @@
 //! the consumer is *handed* the `Receiver`, so it is dropped when the consumer
 //! returns, whatever path it returns by. Forgetting the drop is not
 //! expressible.
+//!
+//! "Whatever path" includes an **unwind**, which is why this is a fix for all
+//! three engines rather than just `stream.rs`. The two siblings dropped `rx`
+//! on the consumer's *error* path only; because the channel was bound outside
+//! `thread::scope`, a consumer **panic** left `rx` alive in the enclosing
+//! frame, and `thread::scope`'s join-on-drop then waited on a producer parked
+//! in `send` — the same indefinite hang, reached by panic instead of by error.
+//! Both consumers run rayon work over hostile geometry (see `overview/hostile`
+//! and the clip paths they call), so that is a live path, not a theoretical
+//! one. Handing the receiver to the consumer makes the callee frame own it, so
+//! the unwind drops it before the join is reached.
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -40,9 +51,18 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 ///   flattened into an error.
 ///
 /// The consumer receives the [`Receiver`] by value. Dropping it — which
-/// happens when `consume` returns, including on its error path — disconnects
-/// the channel and releases a producer blocked in `send`, which is what makes
-/// the subsequent join finite. See the module docs.
+/// happens when `consume` returns, by any path including an error return or an
+/// unwind — disconnects the channel and releases a producer blocked in `send`,
+/// which is what makes the subsequent join finite. See the module docs.
+///
+/// # Contract on `produce`
+///
+/// **A `SendError` means the consumer hung up, and `produce` must treat it as
+/// a clean stop — `break` or `return Ok(())`, never `?`.** Producer errors take
+/// precedence, so a producer that maps `SendError` into its own error replaces
+/// the consumer's real error with a bogus "channel closed", which is the very
+/// class of masked failure #362 was about. All three call sites do this
+/// correctly; the idiomatic-looking `tx.send(x).map_err(…)?` does not.
 pub(super) fn scoped_pipe<T, E, R, P, C>(depth: usize, produce: P, consume: C) -> Result<R, E>
 where
     T: Send,
@@ -141,6 +161,44 @@ mod tests {
             res.1 < 10_000,
             "producer should have been released early, sent {} items",
             res.1
+        );
+    }
+
+    /// The other half of #362, and the half the sibling engines also had: a
+    /// consumer that **panics** rather than erroring. The producer is blocked
+    /// in `send`, so if the receiver outlives the unwind the join never
+    /// returns and the panic is never reported — a hang in place of a
+    /// diagnosable crash. Handing `rx` to the consumer means the unwind drops
+    /// it, so the panic propagates.
+    #[test]
+    fn consumer_panic_releases_a_blocked_producer() {
+        let caught = within("consumer_panic_releases_a_blocked_producer", || {
+            std::panic::catch_unwind(|| {
+                scoped_pipe::<usize, (), (), _, _>(
+                    2,
+                    |tx| {
+                        for i in 0..10_000 {
+                            if tx.send(i).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    },
+                    |rx| {
+                        let _ = rx.recv();
+                        panic!("consumer exploded");
+                    },
+                )
+            })
+        });
+        let payload = caught.expect_err("the consumer's panic must propagate");
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .unwrap_or_else(|| payload.downcast_ref::<String>().map_or("", String::as_str));
+        assert_eq!(
+            msg, "consumer exploded",
+            "the consumer's own panic must be what surfaces"
         );
     }
 
