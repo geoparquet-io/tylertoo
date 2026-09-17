@@ -2927,15 +2927,28 @@ impl PublishedNames {
             .map(|f| f.name().to_ascii_lowercase())
             .collect();
 
-        let restored = renames
-            .iter()
-            .filter(|(renamed, _)| {
-                // Only touch columns this file actually has.
-                schema.column_with_name(renamed).is_some()
-            })
-            .filter(|(_, source)| !occupied.contains(&source.to_ascii_lowercase()))
-            .map(|(renamed, source)| (renamed.clone(), source.clone()))
-            .collect::<HashMap<_, _>>();
+        // Fold rather than filter: each accepted restoration *takes* its source
+        // name, so the next one sees it. Two columns can be renamed away from
+        // one source name — `resolve_reserved_column_collisions` iterates
+        // fields, not distinct names, so an input carrying two columns both
+        // called `level` yields `{"level_": "level", "level__": "level"}` —
+        // and restoring both would put the same key on a feature twice, which
+        // is worse than the renamed name and worse than what `main` produces
+        // for that input. `HashSet::insert` returning false covers the
+        // already-a-column case and the already-restored case in one check.
+        // `renames` is a `BTreeMap`, so which of the two wins is deterministic.
+        let mut occupied = occupied;
+        let mut restored: HashMap<String, String> = HashMap::new();
+        for (renamed, source) in renames {
+            // Only touch columns this file actually has.
+            if schema.column_with_name(renamed).is_none() {
+                continue;
+            }
+            if !occupied.insert(source.to_ascii_lowercase()) {
+                continue;
+            }
+            restored.insert(renamed.clone(), source.clone());
+        }
 
         for (renamed, source) in &restored {
             log::info!(
@@ -4494,6 +4507,47 @@ mod tests {
             vec!["point_count_", "point_count"],
             "restoring onto a live exported column would merge two columns"
         );
+    }
+
+    /// Two columns renamed away from the SAME source name: at most one may be
+    /// restored onto it.
+    ///
+    /// `resolve_reserved_column_collisions` iterates fields rather than
+    /// distinct names, so an input carrying two columns both called `level`
+    /// yields `{"level_": "level", "level__": "level"}` in the provenance.
+    /// Restoring both would put `level` on a feature twice — a malformed tile,
+    /// and strictly worse than `main`, which publishes the two distinct
+    /// renamed names. The guard therefore has to close over the names it has
+    /// already handed out, not just over the schema's.
+    #[test]
+    fn two_renames_onto_one_source_name_restore_at_most_one() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("level_", DataType::Float64, true),
+            Field::new("level__", DataType::Float64, true),
+            Field::new("level", DataType::Int32, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let published = PublishedNames::from_renames(
+            &BTreeMap::from([
+                ("level_".to_string(), "level".to_string()),
+                ("level__".to_string(), "level".to_string()),
+            ]),
+            &schema,
+        );
+
+        let names: Vec<String> = property_columns(&schema, 3, &published)
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(
+            names.iter().filter(|n| *n == "level").count(),
+            1,
+            "the source name may be published once, not twice: {names:?}"
+        );
+        // `renames` is a BTreeMap, so which one wins is deterministic.
+        assert_eq!(names, vec!["level", "level__"]);
     }
 
     /// No provenance (a file written before #359, or a run that renamed

@@ -290,9 +290,17 @@ of *this file* — a reserved column is authoritative here, so both must
 coexist — and not of the data it came from. A consumer that does not
 carry a reserved column forward MAY therefore publish the renamed
 column under its recorded source name; it MUST NOT do so when that
-name is already taken by a column it is publishing. Renderers of
-overview files (tylertoo's PMTiles export drops `level` from tile
-properties and restores a source `level`) are the motivating case.
+name is already taken by a column it is publishing, nor when it has
+already restored another column onto that name (two columns MAY be
+renamed away from one reserved name, so the map's values need not be
+distinct). Renderers of overview files (tylertoo's PMTiles export
+drops `level` from tile properties and restores a source `level`) are
+the motivating case.
+
+This does not make `renamed_columns` normative, so the two exceptions
+above stand: a reader that ignores the member entirely still produces
+a valid result, merely one that keeps the renamed name. The MUST NOT
+binds only a consumer that chooses to act on the member.
 
 ```
 Provenance := {
