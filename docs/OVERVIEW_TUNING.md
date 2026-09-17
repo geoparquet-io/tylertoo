@@ -805,7 +805,9 @@ Details that make the result reproducible:
 - **Numeric types compare as numbers.** A column read as an integer in one
   row group and a double in another is one ordering class, not two.
 - **A feature missing the property sorts first** (painted underneath) rather
-  than being dropped.
+  than being dropped. A `NaN` is treated the same way: it is a value no style
+  can rank, so it joins the unrankable features underneath rather than taking
+  an arbitrary place among the numbers.
 - **Sorting is independent of the oversized-tile valve.** When
   `--max-tile-size` is in force, which features survive is decided by
   `select_kept_members` (largest-first, or a uniform spatial stride on

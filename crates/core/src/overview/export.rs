@@ -2706,7 +2706,15 @@ impl std::str::FromStr for FeatureOrder {
 /// `Int` in one batch and `Double` in another does not split into two
 /// incomparable groups. `Missing` sorts first (painted underneath): a feature
 /// the style cannot rank should not be promoted above ones it can.
-#[derive(PartialEq, PartialOrd)]
+///
+/// The variant order *is* the class order — `Missing` < `Number` < `Text` —
+/// and [`OrderKey::cmp`] is a genuine total order, which the caller's
+/// `sort_by` requires. Deferring to `f64`'s *partial* order and calling an
+/// incomparable pair equal would not be one: with `1.0 == NaN`, `NaN == 2.0`
+/// and `1.0 < 2.0`, equality is not transitive, and the standard library
+/// detects that and panics. So a NaN — how plenty of sources spell nodata in
+/// a float column — never reaches `Number`; [`OrderKey::of`] files it under
+/// `Missing`, which is what it is: a value the style cannot rank.
 enum OrderKey<'a> {
     Missing,
     Number(f64),
@@ -2720,19 +2728,40 @@ impl<'a> OrderKey<'a> {
         };
         match v {
             PropertyValue::String(s) => Self::Text(s),
-            PropertyValue::Float(f) => Self::Number(*f as f64),
-            PropertyValue::Double(d) => Self::Number(*d),
-            PropertyValue::Int(i) => Self::Number(*i as f64),
-            PropertyValue::UInt(u) => Self::Number(*u as f64),
-            PropertyValue::Bool(b) => Self::Number(*b as u8 as f64),
+            PropertyValue::Float(f) => Self::number(*f as f64),
+            PropertyValue::Double(d) => Self::number(*d),
+            PropertyValue::Int(i) => Self::number(*i as f64),
+            PropertyValue::UInt(u) => Self::number(*u as f64),
+            PropertyValue::Bool(b) => Self::number(*b as u8 as f64),
         }
     }
 
-    /// Total order over the partial one: NaN (and any other incomparable
-    /// pair) falls back to equal, which the caller's stable sort then resolves
-    /// by input order. Never panics on hostile numeric data.
+    /// `Number`, except that a NaN is unrankable and files under `Missing`.
+    /// Keeping the invariant here means `cmp` has no incomparable case left.
+    fn number(v: f64) -> Self {
+        if v.is_nan() {
+            Self::Missing
+        } else {
+            Self::Number(v)
+        }
+    }
+
+    /// A total order, so `sort_by` is well-defined: classes rank
+    /// `Missing` < `Number` < `Text`, numbers by value (`total_cmp`, which is
+    /// total by construction and needs no NaN case given the invariant above),
+    /// text lexicographically. Equal keys are left to the caller's stable sort,
+    /// which resolves them by input order.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Missing, Self::Missing) => Ordering::Equal,
+            (Self::Missing, _) => Ordering::Less,
+            (_, Self::Missing) => Ordering::Greater,
+            (Self::Number(a), Self::Number(b)) => a.total_cmp(b),
+            (Self::Number(_), Self::Text(_)) => Ordering::Less,
+            (Self::Text(_), Self::Number(_)) => Ordering::Greater,
+            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+        }
     }
 }
 
@@ -2743,6 +2772,25 @@ impl<'a> OrderKey<'a> {
 /// groups tiles by scanning runs of equal `key`, so members must stay
 /// contiguous per tile. A within-tile reorder therefore runs as a second,
 /// per-run pass rather than as a different global sort key.
+/// Compare two members of one tile under a [`FeatureOrder::Column`] request.
+///
+/// The column decides, and `seq` — the source row index — breaks ties, so the
+/// result is a strict order rather than merely a consistent one: the output is
+/// fully determined even when the caller's sort is unstable or the input was
+/// not already in `seq` order (which is the case after the oversized-tile
+/// valve has ranked by vertex count). `descending` reverses the column only;
+/// tied features keep input order either way.
+fn compare_by_feature_order(
+    a: &Member,
+    b: &Member,
+    name: &str,
+    descending: bool,
+) -> std::cmp::Ordering {
+    let ord = OrderKey::of(a, name).cmp(&OrderKey::of(b, name));
+    let ord = if descending { ord.reverse() } else { ord };
+    ord.then_with(|| a.seq.cmp(&b.seq))
+}
+
 fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
     members.par_sort_unstable_by_key(|m| (m.key, m.seq));
     let FeatureOrder::Column { name, descending } = order else {
@@ -2750,15 +2798,7 @@ fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
     };
     // `chunk_by_mut` yields the same runs `encode_members` will group on.
     for tile in members.chunk_by_mut(|a, b| a.key == b.key) {
-        // Stable, so equal keys keep the `seq` order established above.
-        tile.sort_by(|a, b| {
-            let ord = OrderKey::of(a, name).cmp(&OrderKey::of(b, name));
-            if *descending {
-                ord.reverse()
-            } else {
-                ord
-            }
-        });
+        tile.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
     }
 }
 
@@ -2833,7 +2873,7 @@ fn encode_tile(
             // `select_kept_members` decide *which* features survive.
             let keep_frac = limit as f64 / data.len() as f64;
             let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
-            let kept = select_kept_members(members, keep);
+            let kept = shed_to_fit(members, keep, opts);
             let keep = kept.len();
             let data = build_mvt(kept, tb, opts);
             log::warn!(
@@ -2849,6 +2889,24 @@ fn encode_tile(
             (data, count, false)
         }
     }
+}
+
+/// The survivors of the oversized-tile valve, **in the order they are drawn**.
+///
+/// Two separate decisions, deliberately kept apart: [`select_kept_members`]
+/// decides *which* features survive, ranking sized geometry by vertex count;
+/// this then restores the caller's draw order over them. Emitting the
+/// selection ranking as the draw order would silently override a pinned
+/// `--feature-order` — and only on oversized tiles, i.e. exactly the dense
+/// ones a caller pins an order for. The default [`FeatureOrder::Input`] keeps
+/// the vertex-count order, which is the pre-#280 behaviour and byte-identical
+/// to it.
+fn shed_to_fit<'a>(members: &'a [Member], keep: usize, opts: &ExportOptions) -> Vec<&'a Member> {
+    let mut kept = select_kept_members(members, keep);
+    if let FeatureOrder::Column { name, descending } = &opts.feature_order {
+        kept.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+    }
+    kept
 }
 
 /// Choose which `keep` of `members` survive the oversized-tile drop pass.
@@ -5203,6 +5261,65 @@ mod tests {
         assert_eq!(paint_order(members, &order), vec![0, 2, 1]);
     }
 
+    /// A NaN in the ordering column must not abort the export.
+    ///
+    /// Treating an incomparable pair as *equal* does not give a total order:
+    /// with `1.0 == NaN` and `NaN == 2.0` but `1.0 < 2.0`, equality is not
+    /// transitive, and `slice::sort_by` is documented to panic when it detects
+    /// that ("user-provided comparison function does not correctly implement a
+    /// total order"). A NaN is ordinary in a float column read from parquet —
+    /// it is how plenty of sources spell nodata — so `--feature-order` must
+    /// give it a defined place instead.
+    #[test]
+    fn nan_in_the_order_column_does_not_abort_the_sort() {
+        // Enough members, with NaN interleaved, to reach the merge path where
+        // the standard library checks the comparator's consistency.
+        let members: Vec<Member> = (0..64)
+            .map(|i| {
+                ordered_member(
+                    i,
+                    if i.is_multiple_of(3) {
+                        f64::NAN
+                    } else {
+                        (64 - i) as f64
+                    },
+                )
+            })
+            .collect();
+        let order = FeatureOrder::Column {
+            name: "level".to_string(),
+            descending: false,
+        };
+        let painted = paint_order(members, &order);
+        assert_eq!(painted.len(), 64, "no feature may be lost");
+
+        // The ranked features must still come out ranked. NaN joins the
+        // unrankable features underneath, so every NaN precedes every number.
+        let level_of = |seq: u64| {
+            if seq.is_multiple_of(3) {
+                f64::NAN
+            } else {
+                (64 - seq) as f64
+            }
+        };
+        let ranked: Vec<f64> = painted
+            .iter()
+            .map(|s| level_of(*s))
+            .filter(|v| !v.is_nan())
+            .collect();
+        assert!(
+            ranked.windows(2).all(|w| w[0] <= w[1]),
+            "the comparable values must be ascending, got {ranked:?}"
+        );
+        let first_number = painted.iter().position(|s| !level_of(*s).is_nan()).unwrap();
+        assert!(
+            painted[..first_number]
+                .iter()
+                .all(|s| level_of(*s).is_nan()),
+            "NaN sorts with the unrankable features, underneath"
+        );
+    }
+
     /// Ordering is per tile: a sort must never move a member across tile keys,
     /// or `encode_members`' run-grouping would silently split tiles.
     #[test]
@@ -5324,6 +5441,71 @@ mod tests {
         let kept = select_kept_members(&members, 2);
         let counts: Vec<usize> = kept.iter().map(|m| m.geom.coords_count()).collect();
         assert_eq!(counts, vec![5, 4]);
+    }
+
+    /// The oversized-tile valve must not become the draw order.
+    ///
+    /// `select_kept_members` ranks sized geometry by vertex count to choose
+    /// *which* features survive. That ranking is a selection signal; emitting
+    /// the survivors in it silently overrides a pinned `--feature-order`, and
+    /// it does so precisely on the dense tiles a caller pinned an order for.
+    /// Here vertex count runs with `level`, so "largest first" is the exact
+    /// inverse of the requested ascending order and the two are
+    /// distinguishable.
+    #[test]
+    fn oversized_valve_keeps_the_requested_feature_order() {
+        let members: Vec<Member> = (1..=5u64)
+            .map(|i| {
+                let coords: Vec<(f64, f64)> = (0..i * 10)
+                    .map(|v| (v as f64 * 1e-6, v as f64 * 1e-6))
+                    .collect();
+                Member {
+                    key: 0,
+                    seq: i,
+                    geom: Geometry::LineString(coords.into_iter().collect()),
+                    props: Arc::new(vec![("level".to_string(), PropertyValue::Double(i as f64))]),
+                }
+            })
+            .collect();
+
+        let ordered = ExportOptions {
+            feature_order: FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: false,
+            },
+            ..ExportOptions::default()
+        };
+        let kept = shed_to_fit(&members, 3, &ordered);
+        let levels: Vec<u64> = kept.iter().map(|m| m.seq).collect();
+        assert_eq!(
+            levels,
+            vec![3, 4, 5],
+            "the three largest survive, but they must be painted in ascending \
+             `level` order, not in the valve's largest-first ranking"
+        );
+
+        // Descending is the valve's own order here, so it must come back
+        // reversed relative to the ascending case rather than untouched.
+        let desc = ExportOptions {
+            feature_order: FeatureOrder::Column {
+                name: "level".to_string(),
+                descending: true,
+            },
+            ..ExportOptions::default()
+        };
+        let kept: Vec<u64> = shed_to_fit(&members, 3, &desc)
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(kept, vec![5, 4, 3]);
+
+        // The default is unchanged: the valve's largest-first ranking stands,
+        // which is the pre-#280 behaviour this must stay byte-identical to.
+        let kept: Vec<u64> = shed_to_fit(&members, 3, &ExportOptions::default())
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(kept, vec![5, 4, 3], "default order must not change");
     }
 
     /// `Some(0)` is the core off switch (CLI `--max-tile-size 0` / Python
