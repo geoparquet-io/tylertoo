@@ -627,13 +627,6 @@ fn export_pmtiles_impl(
     let mean_member_bytes = reader.finest_level_mean_row_bytes();
     let available_ram = available_memory_bytes();
 
-    // #361: a `--feature-order` column that names nothing is a no-op, and an
-    // indistinguishable one — every member's key is `Missing`, so they all
-    // compare equal and the stable sort leaves input order. A typo therefore
-    // looks exactly like success. Say so once, up front, against the names the
-    // tiles will actually advertise.
-    warn_if_order_column_is_absent(reader.schema(), &options.feature_order);
-
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
@@ -642,6 +635,17 @@ fn export_pmtiles_impl(
     // file's own rename provenance so a standalone `export-pmtiles` on an
     // overview written by an earlier run restores names just as `tiles` does.
     let published = PublishedNames::from_meta(reader.meta(), reader.schema());
+
+    // #361: a `--feature-order` column that names nothing is a no-op, and an
+    // indistinguishable one — every member's key is `Missing`, so they all
+    // compare equal and the stable sort leaves input order. A typo therefore
+    // looks exactly like success.
+    //
+    // Checked against the PUBLISHED names (#359), which is what makes
+    // `--feature-order level` work on an input whose own `level` column was
+    // renamed to clear the reserved one: the source name is restored on
+    // export, so that is the key the tile carries and the key to sort on.
+    warn_if_order_column_is_absent(reader.schema(), &published, &options.feature_order);
     writer.set_fields(field_metadata(
         reader.schema(),
         geometry_index(reader.schema()),
@@ -2777,35 +2781,45 @@ impl<'a> OrderKey<'a> {
 /// Checked against the published property names rather than the raw schema, so
 /// it stays right for a column whose name was restored from the rename
 /// provenance (#359) and for one that is deliberately not exported.
-fn warn_if_order_column_is_absent(schema: &Schema, order: &FeatureOrder) {
+fn warn_if_order_column_is_absent(
+    schema: &Schema,
+    published: &PublishedNames,
+    order: &FeatureOrder,
+) {
     let FeatureOrder::Column { name, .. } = order else {
         return;
     };
-    if !order_column_is_absent(schema, order) {
+    if !order_column_is_absent(schema, published, order) {
         return;
     }
     log::warn!(
         "--feature-order names {name:?}, which this layer does not publish, so \
          the order is unchanged (input row order). Available: {}",
-        published_property_names(schema).join(", ")
+        published_property_names(schema, published).join(", ")
     );
 }
 
 /// Whether `order` names a column the layer will not publish. `false` for
 /// [`FeatureOrder::Input`], which names nothing.
-fn order_column_is_absent(schema: &Schema, order: &FeatureOrder) -> bool {
+fn order_column_is_absent(
+    schema: &Schema,
+    published: &PublishedNames,
+    order: &FeatureOrder,
+) -> bool {
     let FeatureOrder::Column { name, .. } = order else {
         return false;
     };
-    !published_property_names(schema).iter().any(|n| n == name)
+    !published_property_names(schema, published)
+        .iter()
+        .any(|n| n == name)
 }
 
 /// The MVT property keys this schema will advertise.
-fn published_property_names(schema: &Schema) -> Vec<String> {
+fn published_property_names(schema: &Schema, published: &PublishedNames) -> Vec<String> {
     let Some(geom_idx) = geometry_index(schema) else {
         return Vec::new(); // the export will fail for its own reasons
     };
-    property_columns(schema, geom_idx)
+    property_columns(schema, geom_idx, published)
         .into_iter()
         .map(|(_, n)| n)
         .collect()
@@ -5507,20 +5521,62 @@ mod tests {
             descending: false,
         };
 
-        assert!(!order_column_is_absent(&schema, &column("elevation")));
+        let plain = PublishedNames::identity();
+        assert!(!order_column_is_absent(
+            &schema,
+            &plain,
+            &column("elevation")
+        ));
         assert!(
-            order_column_is_absent(&schema, &column("elevatoin")),
+            order_column_is_absent(&schema, &plain, &column("elevatoin")),
             "a misspelled column must be detectable"
         );
         // The default never warns.
-        assert!(!order_column_is_absent(&schema, &FeatureOrder::Input));
+        assert!(!order_column_is_absent(
+            &schema,
+            &plain,
+            &FeatureOrder::Input
+        ));
 
         // The check is against PUBLISHED names, not schema names: the reserved
         // `level` column is dropped from tile properties, so ordering by it
-        // would silently do nothing and must warn. (Once a *source* column has
-        // been restored onto that name, it is published and this flips —
-        // which is the point of checking the published side.)
-        assert!(order_column_is_absent(&schema, &column("level")));
+        // would silently do nothing.
+        assert!(order_column_is_absent(&schema, &plain, &column("level")));
+    }
+
+    /// The two features have to agree on which name to sort by.
+    ///
+    /// #359 restores a source column that was renamed to clear the reserved
+    /// `level`, so the tile advertises `level` while the schema still says
+    /// `level_`. `--feature-order level` must therefore resolve — this is the
+    /// flag's headline case (nested contour bands), and checking the schema
+    /// instead of the published names would reject exactly it.
+    #[test]
+    fn order_column_resolves_against_the_restored_source_name() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("level_", DataType::Float64, true),
+            Field::new("level", DataType::Int32, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let published = PublishedNames::from_renames(
+            &BTreeMap::from([("level_".to_string(), "level".to_string())]),
+            &schema,
+        );
+        let column = |n: &str| FeatureOrder::Column {
+            name: n.to_string(),
+            descending: false,
+        };
+
+        assert!(
+            !order_column_is_absent(&schema, &published, &column("level")),
+            "the restored source name is what the tile carries"
+        );
+        assert!(
+            order_column_is_absent(&schema, &published, &column("level_")),
+            "the internal name is not published, so sorting by it would no-op"
+        );
     }
 
     /// The oversized-tile valve must not become the draw order.
