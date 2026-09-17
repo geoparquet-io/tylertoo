@@ -17,9 +17,18 @@ use tylertoo_core::overview::convert::{
     convert_to_overviews, convert_to_overviews_sources, parse_representation_spec, ClassRanking,
     ConvertError, ConvertOptions, ConvertReport, LevelPlan,
 };
-use tylertoo_core::overview::export::{export_pmtiles as export_pmtiles_core, ExportOptions};
+use tylertoo_core::overview::export::{
+    export_pmtiles as export_pmtiles_core, ExportOptions, FeatureOrder,
+};
 use tylertoo_core::overview::level::{MemoryProfile, Mode};
 use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
+
+/// Parse the `feature_order` kwarg into the core enum, surfacing a bad
+/// spelling as a Python `ValueError` rather than a panic (#361).
+fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
+    s.parse::<FeatureOrder>()
+        .map_err(pyo3::exceptions::PyValueError::new_err)
+}
 
 /// Convert GeoParquet to PMTiles in one shot (overview facade).
 ///
@@ -56,6 +65,12 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 ///         Faster fine-zoom polygon export; output is render-equivalent on
 ///         simple rings but stores them rotated to a different start vertex.
 ///         Defaults to True; set False for byte-stable tile output.
+///     feature_order (str, optional): Within-tile feature order (#361):
+///         "input" (default) or a property name, optionally suffixed
+///         ":asc" / ":desc". Renderers paint features in the order the tile
+///         lists them, so this is the paint order for any style that does not
+///         override it. "input" emits source row order; naming a column sorts
+///         within each tile by that property, ties kept in input order.
 ///
 /// Returns:
 ///     None
@@ -69,7 +84,7 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
     py: Python<'_>,
@@ -80,6 +95,7 @@ fn convert(
     layer_name: Option<String>,
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
+    feature_order: &str,
 ) -> PyResult<()> {
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
@@ -104,6 +120,7 @@ fn convert(
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
+        feature_order: parse_feature_order(feature_order)?,
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -724,6 +741,12 @@ fn overview(
 ///         integer to override. Wider waves keep more cores busy at
 ///         proportionally more peak memory. Output is byte-identical for
 ///         every value (the wave is a scheduling concern).
+///     feature_order (str, optional): Within-tile feature order (#361):
+///         "input" (default) or a property name, optionally suffixed
+///         ":asc" / ":desc". Renderers paint features in the order the tile
+///         lists them, so this is the paint order for any style that does not
+///         override it. "input" emits source row order; naming a column sorts
+///         within each tile by that property, ties kept in input order.
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
@@ -741,7 +764,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input"))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -753,6 +776,7 @@ fn export_pmtiles(
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
     partition_wave: usize,
+    feature_order: &str,
 ) -> PyResult<Py<PyDict>> {
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
@@ -762,6 +786,7 @@ fn export_pmtiles(
         tile_size_limit: tile_size_limit.filter(|&n| n > 0),
         simple_clip_fastpath,
         partition_wave,
+        feature_order: parse_feature_order(feature_order)?,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

@@ -88,7 +88,7 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 ## `export_pmtiles`
 
 ```python
-export_pmtiles(input, output, *, layer_name='overview', tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=True, partition_wave=0)
+export_pmtiles(input, output, *, layer_name='overview', tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=True, partition_wave=0, feature_order='input')
 ```
 
 Export an overview GeoParquet file to a PMTiles archive.
@@ -105,6 +105,7 @@ Python equivalent of `tylertoo export-pmtiles`: each overview level becomes one 
 * `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single non-iterative drop pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
 * `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.
 * `partition_wave` (`int`) — Partitions processed per band read during export (the export concurrency knob). Defaults to 0, which auto-sizes via a memory-budget preflight: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with the TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive integer to override. Wider waves keep more cores busy at proportionally more peak memory. Output is byte-identical for every value (the wave is a scheduling concern).
+* `feature_order` (`str`) — Within-tile feature order (#361): "input" (default) or a property name, optionally suffixed ":asc" / ":desc". Renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. "input" emits source row order; naming a column sorts within each tile by that property, ties kept in input order.
 
 ###### **Returns:**
 
@@ -156,7 +157,7 @@ Python equivalent of `tylertoo validate`: runs every structural conformance chec
 ## `convert`
 
 ```python
-convert(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True)
+convert(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input')
 ```
 
 Convert GeoParquet to PMTiles in one shot (overview facade).
@@ -174,6 +175,7 @@ The legacy keyword arguments `drop_density`, `compression`, `include`, `exclude`
 * `layer_name` (`str`) — Override the MVT layer name (defaults to the input filename stem).
 * `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
 * `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.
+* `feature_order` (`str`) — Within-tile feature order (#361): "input" (default) or a property name, optionally suffixed ":asc" / ":desc". Renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. "input" emits source row order; naming a column sorts within each tile by that property, ties kept in input order.
 
 ###### **Returns:**
 
