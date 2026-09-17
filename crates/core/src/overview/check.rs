@@ -1094,6 +1094,7 @@ mod tests {
                 }],
             }),
             coalescing: None,
+            renamed_columns: None,
         });
 
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
@@ -1293,6 +1294,7 @@ mod tests {
                 max_level_rows: Some(2_000_000),
                 coalesced_count_column: "coalesced_count".to_string(),
             }),
+            renamed_columns: None,
         });
 
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();

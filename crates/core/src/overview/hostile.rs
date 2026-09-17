@@ -768,6 +768,92 @@ fn reserved_columns_auto_renamed_case_insensitive() {
     );
 }
 
+/// #359: the rename that #288 applies is a property of the intermediate
+/// overview file, not of the data. The overview GeoParquet must keep it (both
+/// `level` columns coexist there, and the reserved one is authoritative), but
+/// the PMTiles export drops tylertoo's `level` from MVT entirely — so by
+/// tile-writing time the source name is free and must be given back.
+///
+/// Publishing `level_` instead is silent: a style keyed on `level` finds no
+/// such property, paints every feature at the ramp's base, and reads as a
+/// rendering bug rather than a tiler one.
+#[test]
+fn renamed_source_column_is_restored_in_the_exported_archive() {
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tov = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &spread_points(6), true, Some("level"));
+        convert_to_overviews(tin.path(), tov.path(), &opts(streaming)).unwrap();
+
+        // The intermediate file keeps the rename — the collision is real here.
+        let names = output_column_names(tov.path());
+        assert!(
+            names.iter().any(|n| n == "level_") && names.iter().any(|n| n == "level"),
+            "streaming={streaming}: both columns must coexist in the overview \
+             file, names={names:?}"
+        );
+
+        // ...and records why, so a later standalone `export-pmtiles` on this
+        // file can restore the name without the converting process's state.
+        let renames = OverviewReader::open(tov.path())
+            .unwrap()
+            .meta()
+            .generalization
+            .as_ref()
+            .and_then(|g| g.renamed_columns.clone())
+            .unwrap_or_else(|| panic!("streaming={streaming}: no rename provenance"));
+        assert_eq!(
+            renames.get("level_").map(String::as_str),
+            Some("level"),
+            "streaming={streaming}: provenance must map output -> source"
+        );
+
+        // The archive advertises the source name, not the internal one.
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(tov.path(), tout.path(), &ExportOptions::default()).unwrap();
+        let fields = archive_layer_fields(tout.path());
+        assert!(
+            fields.contains(&"level".to_string()),
+            "streaming={streaming}: the source name must be published, got {fields:?}"
+        );
+        assert!(
+            !fields.contains(&"level_".to_string()),
+            "streaming={streaming}: the internal name must not leak, got {fields:?}"
+        );
+    }
+}
+
+/// The `vector_layers[].fields` keys of a PMTiles archive's JSON metadata.
+fn archive_layer_fields(path: &Path) -> Vec<String> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+    // PMTiles v3 header: the JSON metadata offset/length live at bytes 24..40.
+    let off = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
+    let json =
+        crate::compression::decompress(&buf[off..off + len], crate::compression::Compression::Gzip)
+            .expect("archive metadata is gzip");
+    let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let mut out: Vec<String> = v["vector_layers"]
+        .as_array()
+        .expect("vector_layers")
+        .iter()
+        .flat_map(|l| {
+            l["fields"]
+                .as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 // ============================================================================
 // Class 8: zero-row levels after thinning (empty-level omission, all routes)
 // ============================================================================

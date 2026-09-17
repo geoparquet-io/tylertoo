@@ -218,6 +218,24 @@ pub struct Generalization {
     /// written before this field existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coalescing: Option<CoalescingProvenance>,
+    /// OPTIONAL reserved-column rename provenance (§3.5, additive;
+    /// informative; #288 / #359).
+    ///
+    /// Maps each **renamed output column** to the **source column name** it
+    /// was moved aside from, when an input column collided with a reserved
+    /// overview column (`level`, and `point_count` / `coalesced_count` in the
+    /// modes that append them). The rename is a necessary property of *this
+    /// file* — the reserved column is authoritative here — but it is not a
+    /// property of the data, so a reader that does not carry the reserved
+    /// column forward (the PMTiles export drops `level` from MVT properties)
+    /// can restore the name the caller's data actually had.
+    ///
+    /// Direction is output → source, so restoration is a direct lookup on a
+    /// schema field name. Absent when nothing was renamed, which keeps the
+    /// footer of every such run byte-identical to before this field existed;
+    /// readers MUST tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_columns: Option<BTreeMap<String, String>>,
 }
 
 /// How line coalescing was applied for a conversion (Q3, spec §13 draft).
@@ -952,6 +970,50 @@ mod tests {
     }
 
     #[test]
+    fn renamed_columns_provenance_roundtrips_and_is_omitted_when_absent() {
+        // #359: a source column moved aside for a reserved overview column
+        // (#288) is recorded in the provenance so a reader — notably the
+        // PMTiles export — can publish it under the name the data actually
+        // had. Additive and informative: absent on every run that renamed
+        // nothing, keeping those footers byte-identical.
+        let mut meta = duplicating_example();
+        meta.generalization = Some(Generalization {
+            engine: "tylertoo test".to_string(),
+            gsd_base: None,
+            cascade: None,
+            collapse: None,
+            representation: None,
+            levels: vec![],
+            ranking: None,
+            density_drop: None,
+            clustering: None,
+            coalescing: None,
+            renamed_columns: None,
+        });
+        let json = meta.to_json().unwrap();
+        assert!(
+            !json.contains("renamed_columns"),
+            "absent renames must not appear in the footer, got {json}"
+        );
+
+        let g = meta.generalization.as_mut().unwrap();
+        g.renamed_columns = Some(BTreeMap::from([
+            ("level_".to_string(), "level".to_string()),
+            ("point_count_".to_string(), "point_count".to_string()),
+        ]));
+        let json = meta.to_json().unwrap();
+        // House style for provenance maps (§3.5): a JSON object, not pairs.
+        assert!(
+            json.contains(r#""renamed_columns":{"level_":"level","point_count_":"point_count"}"#),
+            "renamed_columns must serialize as an object map, got {json}"
+        );
+        let parsed = OverviewsMeta::from_json(&json).unwrap();
+        assert_eq!(meta, parsed);
+        let r = parsed.generalization.unwrap().renamed_columns.unwrap();
+        assert_eq!(r.get("level_").map(String::as_str), Some("level"));
+    }
+
+    #[test]
     fn ranking_provenance_roundtrip_class_ranking() {
         // A class-ranking generalization block survives JSON round-trip and
         // preserves mode / column / ranks / unknown_rank (§3.5, additive).
@@ -975,6 +1037,7 @@ mod tests {
             density_drop: None,
             clustering: None,
             coalescing: None,
+            renamed_columns: None,
         });
         let json = meta.to_json().unwrap();
         // v0.2.0 (§3.5): ranks serialize as a JSON object map, NOT pairs.
@@ -1043,6 +1106,7 @@ mod tests {
             }),
             clustering: None,
             coalescing: None,
+            renamed_columns: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
@@ -1086,6 +1150,7 @@ mod tests {
                 max_level_rows: Some(2_000_000),
                 coalesced_count_column: "coalesced_count".to_string(),
             }),
+            renamed_columns: None,
         });
         let json = meta.to_json().unwrap();
         // §13.4 (v0.2.0): all five members present when emitted.
@@ -1166,6 +1231,7 @@ mod tests {
                 }],
             }),
             coalescing: None,
+            renamed_columns: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();

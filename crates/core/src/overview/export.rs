@@ -87,6 +87,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -626,9 +627,14 @@ fn export_pmtiles_impl(
     // schema (property columns, level/covering excluded).
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
     writer.set_layer_name(&options.layer_name);
+    // #359: which name each column is published under. Derived once from the
+    // file's own rename provenance so a standalone `export-pmtiles` on an
+    // overview written by an earlier run restores names just as `tiles` does.
+    let published = PublishedNames::from_meta(reader.meta(), reader.schema());
     writer.set_fields(field_metadata(
         reader.schema(),
         geometry_index(reader.schema()),
+        &published,
     ));
 
     // Pass 1 (scan), **all levels in one streaming read of the file** (issue
@@ -744,7 +750,16 @@ fn export_pmtiles_impl(
             );
             b
         });
-        Some(fill_member_store(&reader, crs, &plans, options, backing)?)
+        Some(fill_member_store(
+            &reader,
+            &FanoutCtx {
+                crs,
+                plans: &plans,
+                opts: options,
+                published: &published,
+            },
+            backing,
+        )?)
     } else {
         None
     };
@@ -768,6 +783,7 @@ fn export_pmtiles_impl(
             crs,
             zoom,
             opts: options,
+            published: &published,
         };
         let mut tile_count = 0usize;
         let mut tile_feature_count = 0usize;
@@ -939,6 +955,22 @@ struct LevelCtx<'a> {
     crs: Crs,
     zoom: u8,
     opts: &'a ExportOptions,
+    /// MVT key per schema column (#359); identity unless the file records a
+    /// reserved-column rename whose source name is free again.
+    published: &'a PublishedNames,
+}
+
+/// The per-export constants the single-read fan-out reads for every batch:
+/// the file CRS, the level plans, the caller's export options, and the MVT
+/// key mapping (#359). Grouped because they are fixed for the whole fill —
+/// only the batch, its band, and the running sequence/sink vary. Mirrors
+/// [`LevelCtx`] for the legacy per-wave path.
+#[derive(Clone, Copy)]
+struct FanoutCtx<'a> {
+    crs: Crs,
+    plans: &'a [LevelPlan],
+    opts: &'a ExportOptions,
+    published: &'a PublishedNames,
 }
 
 /// One level's precomputed pass-2 plan: its Web Mercator zoom, its planned
@@ -1476,11 +1508,10 @@ impl MemberStore {
 /// partitioning mode, band `j` feeds levels `{j..N}`.
 fn fill_member_store(
     reader: &OverviewReader,
-    crs: Crs,
-    plans: &[LevelPlan],
-    opts: &ExportOptions,
+    ctx: &FanoutCtx<'_>,
     backing: SinkBacking,
 ) -> Result<MemberStore, ExportError> {
+    let plans = ctx.plans;
     let num_levels = plans.len();
     let mut store = MemberStore::new(plans, backing)?;
     let t_fill = Instant::now();
@@ -1506,7 +1537,7 @@ fn fill_member_store(
         // derives from.
         |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for (band, batch) in rx.iter() {
-                fanout_batch_members(&batch, band, crs, plans, opts, seq_ref, store_ref)?;
+                fanout_batch_members(&batch, band, ctx, seq_ref, store_ref)?;
             }
             Ok(())
         },
@@ -1528,12 +1559,16 @@ fn fill_member_store(
 fn fanout_batch_members(
     batch: &RecordBatch,
     band: usize,
-    crs: Crs,
-    plans: &[LevelPlan],
-    opts: &ExportOptions,
+    ctx: &FanoutCtx<'_>,
     seq: &mut u64,
     store: &mut MemberStore,
 ) -> Result<(), ExportError> {
+    let FanoutCtx {
+        crs,
+        plans,
+        opts,
+        published,
+    } = *ctx;
     let schema = batch.schema();
     let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
     let geom_field = schema.field(geom_idx).clone();
@@ -1575,7 +1610,7 @@ fn fanout_batch_members(
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members at any level, shared across the
     // row's members via `Arc` (as the legacy path does per wave).
-    let prop_cols = property_columns(&schema, geom_idx);
+    let prop_cols = property_columns(&schema, geom_idx, published);
     let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
         Vec::with_capacity(prop_cols.len());
     for &(idx, ref name) in &prop_cols {
@@ -2010,7 +2045,7 @@ fn collect_wave_members(
 
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members.
-    let prop_cols = property_columns(&schema, geom_idx);
+    let prop_cols = property_columns(&schema, geom_idx, ctx.published);
     let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
         Vec::with_capacity(prop_cols.len());
     for &(idx, ref name) in &prop_cols {
@@ -2812,7 +2847,7 @@ fn decode_batch(batch: &RecordBatch, crs: Crs, out: &mut Vec<Feature>) -> Result
     extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
 
     // Pre-extract every exportable property column once.
-    let prop_cols = property_columns(&schema, geom_idx);
+    let prop_cols = property_columns(&schema, geom_idx, &PublishedNames::identity());
     let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
         Vec::with_capacity(prop_cols.len());
     for &(idx, ref name) in &prop_cols {
@@ -2849,10 +2884,100 @@ fn geometry_index(schema: &Schema) -> Option<usize> {
         })
 }
 
-/// The `(index, name)` of every exportable property column: everything that is
-/// not the geometry column, not the `level` column, and whose type is a
-/// supported MVT scalar (struct/list covering columns are skipped).
-fn property_columns(schema: &Schema, geom_idx: usize) -> Vec<(usize, String)> {
+/// The MVT property key each overview-file column is published under (#359).
+///
+/// A source column that collided with a reserved overview column was renamed
+/// on the way into the overview GeoParquet (`level` → `level_`, #288), because
+/// in *that* file the reserved column is authoritative and both must coexist.
+/// The PMTiles export carries no `level` property — it is asserted out of MVT
+/// — so by tile-writing time the source name is free again and the reason for
+/// the move has lapsed. Publishing the internal name instead hands the caller
+/// a property their data never had, and a style keyed on the real name paints
+/// nothing, with no error to point at.
+///
+/// Restoration is conditional, not automatic: a rename is undone only when its
+/// source name is not already published by another column. `point_count` and
+/// `coalesced_count` *are* real MVT properties in the modes that append them,
+/// so a column moved aside from one of those keeps the renamed name — merging
+/// two columns into one key would be worse than the wrong name.
+#[derive(Debug, Clone, Default)]
+struct PublishedNames {
+    /// Schema field name → published key, for the columns that differ.
+    /// Empty for the identity mapping, which is the overwhelmingly common
+    /// case (nothing collided, or the file predates the provenance).
+    restored: HashMap<String, String>,
+}
+
+impl PublishedNames {
+    /// Every column keeps its schema name.
+    fn identity() -> Self {
+        Self::default()
+    }
+
+    /// Resolve publication names for `schema` from a file's `renamed_columns`
+    /// provenance (output name → source name; see [`Generalization`]).
+    fn from_renames(renames: &BTreeMap<String, String>, schema: &Schema) -> Self {
+        // Names already spoken for by a column that will publish under its own
+        // schema name. `level` is excluded because the export drops it, which
+        // is precisely what frees the name for restoration.
+        let occupied: HashSet<String> = schema
+            .fields()
+            .iter()
+            .filter(|f| !f.name().eq_ignore_ascii_case(LEVEL_COLUMN))
+            .map(|f| f.name().to_ascii_lowercase())
+            .collect();
+
+        let restored = renames
+            .iter()
+            .filter(|(renamed, _)| {
+                // Only touch columns this file actually has.
+                schema.column_with_name(renamed).is_some()
+            })
+            .filter(|(_, source)| !occupied.contains(&source.to_ascii_lowercase()))
+            .map(|(renamed, source)| (renamed.clone(), source.clone()))
+            .collect::<HashMap<_, _>>();
+
+        for (renamed, source) in &restored {
+            log::info!(
+                "[export] publishing overview column {renamed:?} under its \
+                 source name {source:?} (it was renamed on convert to clear \
+                 the reserved overview column, #288/#359)"
+            );
+        }
+        Self { restored }
+    }
+
+    /// Build from an overview file's footer metadata; identity when the file
+    /// carries no rename provenance.
+    fn from_meta(meta: &OverviewsMeta, schema: &Schema) -> Self {
+        match meta
+            .generalization
+            .as_ref()
+            .and_then(|g| g.renamed_columns.as_ref())
+        {
+            Some(renames) => Self::from_renames(renames, schema),
+            None => Self::identity(),
+        }
+    }
+
+    /// The MVT key for a schema field name.
+    fn publish<'a>(&'a self, schema_name: &'a str) -> &'a str {
+        self.restored
+            .get(schema_name)
+            .map_or(schema_name, String::as_str)
+    }
+}
+
+/// The `(index, published name)` of every exportable property column:
+/// everything that is not the geometry column, not the `level` column, and
+/// whose type is a supported MVT scalar (struct/list covering columns are
+/// skipped). The index addresses the real schema column; the name is what the
+/// tile advertises, which differs when a rename is restored ([`PublishedNames`]).
+fn property_columns(
+    schema: &Schema,
+    geom_idx: usize,
+    published: &PublishedNames,
+) -> Vec<(usize, String)> {
     schema
         .fields()
         .iter()
@@ -2862,7 +2987,7 @@ fn property_columns(schema: &Schema, geom_idx: usize) -> Vec<(usize, String)> {
                 && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
                 && is_supported_scalar(f.data_type())
         })
-        .map(|(i, f)| (i, f.name().clone()))
+        .map(|(i, f)| (i, published.publish(f.name()).to_string()))
         .collect()
 }
 
@@ -2947,7 +3072,11 @@ fn formattable_temporal_type(dt: &DataType) -> DataType {
 
 /// Field-type metadata (`name -> "String"|"Number"|"Boolean"`) for the archive
 /// `vector_layers.fields` block.
-fn field_metadata(schema: &Schema, geom_idx: Option<usize>) -> HashMap<String, String> {
+fn field_metadata(
+    schema: &Schema,
+    geom_idx: Option<usize>,
+    published: &PublishedNames,
+) -> HashMap<String, String> {
     let geom_idx = geom_idx.unwrap_or(usize::MAX);
     let mut out = HashMap::new();
     for (i, f) in schema.fields().iter().enumerate() {
@@ -2963,7 +3092,7 @@ fn field_metadata(schema: &Schema, geom_idx: Option<usize>) -> HashMap<String, S
             dt if is_supported_scalar(dt) => "Number",
             _ => continue,
         };
-        out.insert(f.name().clone(), ty.to_string());
+        out.insert(published.publish(f.name()).to_string(), ty.to_string());
     }
     out
 }
@@ -4288,10 +4417,100 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("acq", dt, true)]);
         assert_eq!(
-            field_metadata(&schema, None).get("acq").map(String::as_str),
+            field_metadata(&schema, None, &PublishedNames::identity())
+                .get("acq")
+                .map(String::as_str),
             Some("String")
         );
-        assert_eq!(property_columns(&schema, usize::MAX).len(), 1);
+        assert_eq!(
+            property_columns(&schema, usize::MAX, &PublishedNames::identity()).len(),
+            1
+        );
+    }
+
+    /// #359: a source column moved aside for a reserved overview column is
+    /// published under the name the caller's data actually had. The reserved
+    /// `level` column never reaches MVT properties, so by tile-writing time
+    /// the name is free and the reason for the move no longer applies — a
+    /// renderer styling on `level` must find `level`, not `level_`.
+    #[test]
+    fn renamed_source_column_is_published_under_its_source_name() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("level_", DataType::Float64, true),
+            Field::new(LEVEL_COLUMN, DataType::UInt8, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let published = PublishedNames::from_renames(
+            &BTreeMap::from([("level_".to_string(), "level".to_string())]),
+            &schema,
+        );
+
+        let cols = property_columns(&schema, 3, &published);
+        let names: Vec<&str> = cols.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "level"],
+            "the renamed column must publish as `level`, and tylertoo's own \
+             `level` must still be excluded"
+        );
+        // The index still addresses the real (renamed) schema column.
+        assert_eq!(cols[1].0, 1);
+
+        let fields = field_metadata(&schema, Some(3), &published);
+        assert_eq!(fields.get("level").map(String::as_str), Some("Number"));
+        assert!(
+            !fields.contains_key("level_"),
+            "the internal name must not be advertised: {fields:?}"
+        );
+    }
+
+    /// Restoration is only safe while the source name is actually free. With
+    /// clustering on, `point_count` IS an exported property, so restoring a
+    /// moved-aside `point_count_` onto it would collide two columns into one
+    /// MVT key. The move still applies here, so the renamed name stands.
+    #[test]
+    fn rename_is_not_restored_when_the_source_name_is_still_occupied() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("point_count_", DataType::Int64, true),
+            Field::new("point_count", DataType::Int64, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let published = PublishedNames::from_renames(
+            &BTreeMap::from([("point_count_".to_string(), "point_count".to_string())]),
+            &schema,
+        );
+
+        let names: Vec<String> = property_columns(&schema, 2, &published)
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["point_count_", "point_count"],
+            "restoring onto a live exported column would merge two columns"
+        );
+    }
+
+    /// No provenance (a file written before #359, or a run that renamed
+    /// nothing) publishes every column under its schema name.
+    #[test]
+    fn absent_rename_provenance_publishes_schema_names() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("level_", DataType::Float64, true),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let names: Vec<String> = property_columns(&schema, 1, &PublishedNames::identity())
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(names, vec!["level_"]);
     }
 
     /// The selected-columns predicate and the extraction arms must agree: a
@@ -4309,8 +4528,8 @@ mod tests {
         );
 
         let schema = Schema::new(vec![Field::new("local", dt, true)]);
-        assert!(!field_metadata(&schema, None).contains_key("local"));
-        assert!(property_columns(&schema, usize::MAX).is_empty());
+        assert!(!field_metadata(&schema, None, &PublishedNames::identity()).contains_key("local"));
+        assert!(property_columns(&schema, usize::MAX, &PublishedNames::identity()).is_empty());
     }
 
     /// An unscaled DECIMAL is an integer, and `DECIMAL(38,0)` is a common
@@ -4483,7 +4702,7 @@ mod tests {
             Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("dec", DataType::Decimal128(10, 3), true),
         ]);
-        let meta = field_metadata(&schema, None);
+        let meta = field_metadata(&schema, None, &PublishedNames::identity());
         assert_eq!(meta.get("d").map(String::as_str), Some("String"));
         assert_eq!(meta.get("ts").map(String::as_str), Some("String"));
         assert_eq!(meta.get("dec").map(String::as_str), Some("Number"));

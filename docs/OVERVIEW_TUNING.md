@@ -716,6 +716,53 @@ validate` checks that the column exists as INT32 NOT NULL, all values are
 
 ---
 
+## Reserved column names
+
+tylertoo appends its own columns to the intermediate overview GeoParquet, and
+those names are reserved. A source column whose name collides (comparison is
+case-insensitive) is **renamed** by appending `_`, looping until the name is
+free — `level` → `level_`, `LEVEL` → `LEVEL_`, `level_` → `level__`. The
+reserved column is authoritative.
+
+| Reserved name | Reserved when | Reaches MVT? |
+|---|---|---|
+| `level` | always | **no** — dropped from tile properties |
+| `point_count` | `--cluster` | yes |
+| `coalesced_count` | line coalescing (on by default) | yes |
+
+A rename is logged at `warn`:
+
+```
+input column "level" collides with the reserved overview column "level";
+renaming the input column to "level_" in the output
+```
+
+**In PMTiles output the source name is given back where it is free** (#359).
+Because tylertoo's own `level` never reaches MVT properties, a source `level`
+is published in tiles as `level` — the rename stays an implementation detail of
+the intermediate GeoParquet, which is the only place the collision is real:
+
+```
+overview.parquet:   level_ (your data)  +  level (tylertoo's)
+out.pmtiles:        level  (your data)
+```
+
+This also holds for a standalone `export-pmtiles` run on an overview file
+written earlier: the rename is recorded in the file footer
+(`geo:overviews.generalization.renamed_columns`, output name → source name), so
+the export does not need the converting run's state.
+
+Restoration is conditional. `point_count` and `coalesced_count` *are* real MVT
+properties in the modes that append them, so a column moved aside from one of
+those keeps its renamed name — merging two columns into one tile property would
+be worse than the wrong name. Only names that are genuinely free are restored.
+
+By-name options follow the rename automatically (`--sort-key level`,
+`class_ranking.column`, `--accumulate-attribute`, `--filter`), so you do not
+need to spell the renamed name yourself.
+
+---
+
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
 These do not change *which* features or vertices survive — geometry and

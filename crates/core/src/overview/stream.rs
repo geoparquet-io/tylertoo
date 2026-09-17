@@ -611,6 +611,7 @@ pub(crate) fn convert_streaming_strategy(
         crs,
         options,
         ranking_provenance,
+        &renames,
     ));
 
     let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
