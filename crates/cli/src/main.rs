@@ -455,12 +455,13 @@ struct ConvertTuningArgs {
 
     /// Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
     ///
-    /// Thinning ranks on geometry, which is backwards for nested-band data:
-    /// concentric contours carry their strongest signal in the physically
-    /// SMALLEST ring, so coarse levels keep the big weak rings and drop the
-    /// small strong cores. --sort-key cannot fix that — it chooses between
-    /// features competing for a cell, and the visibility gate has already
-    /// dropped the small ones on size.
+    /// Thinning ranks on geometry, which is backwards whenever a dataset's
+    /// most important features are its physically smallest — a population
+    /// density layer, say, where dense urban tracts are tiny next to sparse
+    /// rural ones. Coarse levels then keep the big low-value polygons and drop
+    /// the small high-value ones. --sort-key cannot fix that: it chooses
+    /// between features competing for a cell, and the visibility gate has
+    /// already dropped the small ones on size.
     ///
     /// A ladder ranks COL's DISTINCT values descending and gives each rank an
     /// entry zoom one --ladder-step apart, starting at --min-zoom. A feature
@@ -469,9 +470,9 @@ struct ConvertTuningArgs {
     /// finest level still carries every feature.
     ///
     /// Ranking DISTINCT values (SQL DENSE_RANK) rather than the values
-    /// themselves keeps the ladder scale-free — mapping a raw magnitude onto
-    /// the zoom range strands everything in the upper zooms whenever the
-    /// values occupy a narrow part of their nominal scale.
+    /// themselves keeps the ladder scale-free — mapping a raw value onto the
+    /// zoom range strands everything in the upper zooms whenever the values
+    /// occupy a narrow part of their nominal scale.
     ///
     /// Implies --collapse unless you pass --collapse-square, so a promoted
     /// feature that simplifies below its level's tolerance survives as a
@@ -493,7 +494,7 @@ struct ConvertTuningArgs {
 
     /// Explicit entry zooms, for full control over the rungs:
     /// `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g.
-    /// `--entry-zoom "level:0.5=8,0.425=9,0.35=10,0.275=11,0.2=12"`.
+    /// `--entry-zoom "density:5000=4,1000=6,200=8"`.
     ///
     /// Same semantics as --magnitude-ladder but the rungs are placed by hand
     /// rather than derived. Values the spec does not list get no entry zoom
@@ -2935,31 +2936,31 @@ mod tests {
 
         let ok = |spec: &str| parse_entry_zoom(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
 
-        let s = ok("level:0.5=8,0.425=9,0.2=12");
-        assert_eq!(s.column, "level");
+        let s = ok("density:5000=4,1000=6,200=8");
+        assert_eq!(s.column, "density");
         match &s.kind {
             EntryZoomKind::Explicit(pairs) => {
-                assert_eq!(pairs, &[(0.5, 8), (0.425, 9), (0.2, 12)]);
+                assert_eq!(pairs, &[(5000.0, 4), (1000.0, 6), (200.0, 8)]);
             }
             other => panic!("expected explicit rungs, got {other:?}"),
         }
 
         // Whitespace and a trailing comma are tolerated.
-        let s = ok("level: 0.5 = 8 , 0.2 = 12 ,");
+        let s = ok("density: 5000 = 4 , 200 = 8 ,");
         match &s.kind {
-            EntryZoomKind::Explicit(pairs) => assert_eq!(pairs, &[(0.5, 8), (0.2, 12)]),
+            EntryZoomKind::Explicit(pairs) => assert_eq!(pairs, &[(5000.0, 4), (200.0, 8)]),
             other => panic!("{other:?}"),
         }
 
         for bad in [
-            "level",         // no ':'
-            ":0.5=8",        // empty column
-            "level:",        // no pairs
-            "level:0.5",     // missing '='
-            "level:x=8",     // value not a number
-            "level:0.5=z",   // zoom not a number
-            "level:0.5=-1",  // negative zoom
-            "level:0.5=999", // beyond u8
+            "density",          // no ':'
+            ":5000=4",          // empty column
+            "density:",         // no pairs
+            "density:5000",     // missing '='
+            "density:x=4",      // value not a number
+            "density:5000=z",   // zoom not a number
+            "density:5000=-1",  // negative zoom
+            "density:5000=999", // beyond u8
         ] {
             assert!(parse_entry_zoom(bad).is_err(), "{bad:?} must be rejected");
         }

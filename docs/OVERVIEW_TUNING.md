@@ -575,14 +575,15 @@ provenance as `generalization.collapse: "square"` (`--collapse` records
 
 Everything in the next section decides *which of the features competing for a
 cell wins*. It runs **after** the visibility gate, which has already dropped
-features for being small. For nested-band data that ordering is backwards.
+features for being small. That ordering is backwards whenever a dataset's most
+important features are also its physically smallest.
 
-Concentric contours carry their strongest signal in the physically **smallest**
-ring: the outer ring is the weakest level and the innermost the strongest. So a
-coarse level keeps the big weak rings and hides the small strong cores —
-precisely the opposite of what the map should show zoomed out. `--sort-key`
-helps where features survive to compete, but cannot reach a feature the gate
-removed first.
+A population-density choropleth is the everyday case: the dense urban tracts
+carrying the highest values are tiny next to the sparse rural ones. A coarse
+level therefore keeps the large low-value polygons and hides the small
+high-value ones — precisely the opposite of what the map should show zoomed
+out. `--sort-key` helps where features survive to compete, but cannot reach a
+feature the gate removed first.
 
 A **ladder** answers a different question: not "which of these wins a cell" but
 "how early may this feature appear at all". Each distinct value of a column
@@ -592,30 +593,30 @@ before it, **exempt from the visibility gate and from thinning** throughout.
 ```bash
 # Derive it: distinct values ranked descending, one zoom apart from --min-zoom
 tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 6 \
-  --magnitude-ladder level
+  --magnitude-ladder density
 
-# ...or place the rungs by hand
-tylertoo tiles in.parquet out.pmtiles \
-  --entry-zoom "level:0.5=8,0.425=9,0.35=10,0.275=11,0.2=12"
+# ...or place the rungs by hand. Rungs must fall inside the zoom range, and
+# each names a value the column actually carries.
+tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 8 \
+  --entry-zoom "density:5000=0,1000=3,200=6"
 ```
 
-Measured on 700 concentric contours (140 sites × 5 magnitudes), counting
-features present at each zoom:
-
-| zoom | | 0.2 | 0.275 | 0.35 | 0.425 | **0.5** |
-|---|---|---|---|---|---|---|
-| z0 | `--sort-key level` | 0 | 140 | 0 | 0 | **0** |
-| z0 | `--magnitude-ladder level` | 0 | 0 | 0 | 0 | **140** |
-
-Without a ladder the strongest magnitude does not appear at all until z6. With
-one it is the *only* thing at z0, and each weaker rank joins a zoom later — the
-staircase the ladder exists to produce.
+With five distinct values over `--min-zoom 0 --max-zoom 6` and the default
+step, counting features present at each zoom, the derived ladder gives a clean
+staircase: the strongest rank is the only thing at z0, and each weaker rank
+joins one zoom later. Without a ladder the strongest values do not appear at
+all until the gate stops removing them — typically the finest zooms, because
+they are the smallest features in the layer.
 
 Ranking **distinct values** (SQL `DENSE_RANK`) rather than the values
-themselves keeps the ladder scale-free. Mapping a raw magnitude linearly onto
-the zoom range strands every rung in the upper zooms whenever the values occupy
-a narrow part of their nominal scale, which real data usually does — the
-motivating set is 0.2–0.5 of a nominal 0–1.
+themselves keeps the ladder scale-free. Mapping a raw value linearly onto the
+zoom range strands every rung in the upper zooms whenever the values occupy a
+narrow part of their nominal scale, which real data usually does.
+
+More distinct values than the zoom range has room for is fine: the ranks that
+would fall past the finest zoom get no rung, and those features keep the
+ordinary gate and thinning rather than being pinned to the finest level. The
+run says how many were left out.
 
 `--ladder-step N` widens the spacing. A value the ladder does not cover (null,
 or unlisted in an explicit spec) gets no entry zoom and takes the ordinary
@@ -638,15 +639,16 @@ admitted, and both matter in practice:
   ranks the way the ladder does. tylertoo warns when a ladder runs with the
   budget on and no sort key.
 
-With the budget off, the staircase is exact:
+With the budget off, the staircase is exact — each rank appears at its own
+zoom and at none before it, and every rank already admitted stays:
 
 ```
-zoom       0.2   0.275    0.35   0.425     0.5
-z0           0       0       0       0     140
-z1           0       0       0     140     140
-z2           0       0     165     165     165
-z3           0     192     176     176     176
-z4         250     192     176     160     160
+zoom     rank 4  rank 3  rank 2  rank 1  rank 0   (0 = highest value)
+z0            0       0       0       0     140
+z1            0       0       0     140     140
+z2            0       0     165     165     165
+z3            0     192     176     176     176
+z4          250     192     176     160     160
 ```
 
 ### Relation to tippecanoe
@@ -992,7 +994,7 @@ render differently against a differently-ordered archive of the same data.
 
 **tylertoo's default is input row order**, exactly: the overview file's row
 order, which is the source file's row order restricted to the rows each level
-kept. Measured across z12–z14 on a nested-contour fixture, the within-tile
+kept. Measured across z12–z14 on a nested-polygon fixture, the within-tile
 sequence has zero inversions against source row order at every zoom.
 
 **Do not assume tippecanoe matches it.** Tippecanoe's order is incidental
@@ -1013,10 +1015,11 @@ tylertoo tiles in.parquet out.pmtiles --feature-order level:desc
 
 Accepted on both `tiles` and `export-pmtiles`.
 
-Sorting by a column is the fix for the nested-choropleth case: five concentric
-contour bands where the small hot cores must land on top. `--feature-order
-level` does in the archive what `"fill-sort-key": ["get", "level"]` does in
-every downstream style, so consumers do not each have to know.
+Sorting by a column is the fix for any nested-polygon choropleth, where the
+small high-value shapes sit inside larger low-value ones and must land on top.
+`--feature-order level` does in the archive what
+`"fill-sort-key": ["get", "level"]` does in every downstream style, so
+consumers do not each have to know.
 
 Details that make the result reproducible:
 

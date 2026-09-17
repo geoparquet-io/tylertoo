@@ -88,11 +88,11 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
 * `--magnitude-ladder <COL>` — Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
 
-   Thinning ranks on geometry, which is backwards for nested-band data: concentric contours carry their strongest signal in the physically SMALLEST ring, so coarse levels keep the big weak rings and drop the small strong cores. --sort-key cannot fix that — it chooses between features competing for a cell, and the visibility gate has already dropped the small ones on size.
+   Thinning ranks on geometry, which is backwards whenever a dataset's most important features are its physically smallest — a population density layer, say, where dense urban tracts are tiny next to sparse rural ones. Coarse levels then keep the big low-value polygons and drop the small high-value ones. --sort-key cannot fix that: it chooses between features competing for a cell, and the visibility gate has already dropped the small ones on size.
 
    A ladder ranks COL's DISTINCT values descending and gives each rank an entry zoom one --ladder-step apart, starting at --min-zoom. A feature appears from its entry zoom inward and not before, exempt from the visibility gate and from thinning throughout. Nothing is deleted: the finest level still carries every feature.
 
-   Ranking DISTINCT values (SQL DENSE_RANK) rather than the values themselves keeps the ladder scale-free — mapping a raw magnitude onto the zoom range strands everything in the upper zooms whenever the values occupy a narrow part of their nominal scale.
+   Ranking DISTINCT values (SQL DENSE_RANK) rather than the values themselves keeps the ladder scale-free — mapping a raw value onto the zoom range strands everything in the upper zooms whenever the values occupy a narrow part of their nominal scale.
 
    Implies --collapse unless you pass --collapse-square, so a promoted feature that simplifies below its level's tolerance survives as a representative point rather than being dropped again.
 
@@ -100,7 +100,7 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--ladder-step <N>` — Zooms between consecutive --magnitude-ladder rungs (default 1)
 
   Default value: `1`
-* `--entry-zoom <SPEC>` — Explicit entry zooms, for full control over the rungs: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g. `--entry-zoom "level:0.5=8,0.425=9,0.35=10,0.275=11,0.2=12"`.
+* `--entry-zoom <SPEC>` — Explicit entry zooms, for full control over the rungs: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g. `--entry-zoom "density:5000=4,1000=6,200=8"`.
 
    Same semantics as --magnitude-ladder but the rungs are placed by hand rather than derived. Values the spec does not list get no entry zoom and take the ordinary gate. Mutually exclusive with --magnitude-ladder.
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key
@@ -273,11 +273,11 @@ Build a multi-resolution overview GeoParquet file
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
 * `--magnitude-ladder <COL>` — Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
 
-   Thinning ranks on geometry, which is backwards for nested-band data: concentric contours carry their strongest signal in the physically SMALLEST ring, so coarse levels keep the big weak rings and drop the small strong cores. --sort-key cannot fix that — it chooses between features competing for a cell, and the visibility gate has already dropped the small ones on size.
+   Thinning ranks on geometry, which is backwards whenever a dataset's most important features are its physically smallest — a population density layer, say, where dense urban tracts are tiny next to sparse rural ones. Coarse levels then keep the big low-value polygons and drop the small high-value ones. --sort-key cannot fix that: it chooses between features competing for a cell, and the visibility gate has already dropped the small ones on size.
 
    A ladder ranks COL's DISTINCT values descending and gives each rank an entry zoom one --ladder-step apart, starting at --min-zoom. A feature appears from its entry zoom inward and not before, exempt from the visibility gate and from thinning throughout. Nothing is deleted: the finest level still carries every feature.
 
-   Ranking DISTINCT values (SQL DENSE_RANK) rather than the values themselves keeps the ladder scale-free — mapping a raw magnitude onto the zoom range strands everything in the upper zooms whenever the values occupy a narrow part of their nominal scale.
+   Ranking DISTINCT values (SQL DENSE_RANK) rather than the values themselves keeps the ladder scale-free — mapping a raw value onto the zoom range strands everything in the upper zooms whenever the values occupy a narrow part of their nominal scale.
 
    Implies --collapse unless you pass --collapse-square, so a promoted feature that simplifies below its level's tolerance survives as a representative point rather than being dropped again.
 
@@ -285,7 +285,7 @@ Build a multi-resolution overview GeoParquet file
 * `--ladder-step <N>` — Zooms between consecutive --magnitude-ladder rungs (default 1)
 
   Default value: `1`
-* `--entry-zoom <SPEC>` — Explicit entry zooms, for full control over the rungs: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g. `--entry-zoom "level:0.5=8,0.425=9,0.35=10,0.275=11,0.2=12"`.
+* `--entry-zoom <SPEC>` — Explicit entry zooms, for full control over the rungs: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g. `--entry-zoom "density:5000=4,1000=6,200=8"`.
 
    Same semantics as --magnitude-ladder but the rungs are placed by hand rather than derived. Values the spec does not list get no entry zoom and take the ordinary gate. Mutually exclusive with --magnitude-ladder.
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key

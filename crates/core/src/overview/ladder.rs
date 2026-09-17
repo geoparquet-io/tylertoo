@@ -3,16 +3,16 @@
 //! Every thinning mechanism in [`super::assign`] ranks on *geometry*: the
 //! visibility gate drops a feature whose bbox diagonal is below a multiple of
 //! the level GSD, and cell-winner thinning keeps one feature per grid cell.
-//! For nested-band data that is backwards. Concentric change contours carry
-//! their strongest signal in the **physically smallest** ring, so a coarse
-//! level keeps the big weak outer rings and drops the small strong cores —
-//! the opposite of what the map should show zoomed out.
+//! Both are backwards whenever a dataset's most important features are its
+//! physically smallest. In a population-density layer the dense urban tracts
+//! are tiny next to sparse rural ones, so a coarse level keeps the large
+//! low-value polygons and drops the small high-value ones — the opposite of
+//! what the map should show zoomed out.
 //!
 //! `--sort-key` cannot close this: it chooses between features *competing for
-//! a cell*, and the gate has already dropped the small ones on size. Measured
-//! on 3.1M contour polygons (#364), ranking lifts high-magnitude survivors
-//! 6.6x at z8 but only reaches 3 of 181 at z6, because a 0.5 contour is metres
-//! across and never survives to compete.
+//! a cell*, and the gate has already dropped the small ones on size. A
+//! high-value feature that is a few metres across never survives to compete at
+//! all, so no amount of re-ranking the survivors brings it back.
 //!
 //! A ladder answers a different question — not "which of these wins a cell"
 //! but "how early may this feature appear at all". Each distinct value of a
@@ -65,7 +65,7 @@ impl EntryZoomLadder {
     ///
     /// Ranking over *distinct values* rather than the values themselves — SQL
     /// `DENSE_RANK`, as the reference pipeline does — is what makes the ladder
-    /// scale-free. Mapping a raw magnitude linearly onto the zoom range
+    /// scale-free. Mapping a raw value linearly onto the zoom range
     /// strands everything in the upper zooms whenever the values occupy a
     /// narrow part of their nominal scale, which real data usually does: the
     /// motivating set is 0.2-0.5 of a nominal 0-1.
@@ -234,7 +234,7 @@ pub fn build_ladder(
 /// Relative tolerance for matching a hand-written rung against column data.
 ///
 /// A value stored as `f32` widens to an `f64` that is not bit-equal to the
-/// decimal a caller types: `0.425_f32` becomes `0.42500001192092896`. The
+/// decimal a caller types: `0.3_f32` becomes `0.30000001192092896`. The
 /// widening error is bounded by `2^-24` (~6e-8) relative, so a 1e-6 window
 /// admits it with three orders of magnitude to spare while staying far tighter
 /// than any spacing a human writes between rungs.
@@ -327,21 +327,21 @@ mod tests {
 
     /// #364 S1: an explicit rung must match a value stored as `f32`.
     ///
-    /// `0.425_f32` widens to `0.42500001192092896_f64`, which is not
-    /// bit-equal to the `0.425_f64` a caller types. Matching rungs with
-    /// `total_cmp` therefore matched nothing on a Float32 column — the common
-    /// storage for contour and magnitude data — and the PR's own documented
-    /// example silently fell back to gate-and-thin for every rung except the
-    /// ones that happen to be exact in binary (0.5 is, 0.425 and 0.2 are not).
+    /// `0.3_f32` widens to `0.30000001192092896_f64`, which is not bit-equal
+    /// to the `0.3_f64` a caller types. Matching rungs with `total_cmp`
+    /// therefore matched nothing on a Float32 column — a common storage choice
+    /// for measured values — so a hand-written spec silently fell back to
+    /// gate-and-thin for every rung except the ones that happen to be exact in
+    /// binary (0.5 is; 0.3 and 0.1 are not).
     #[test]
     fn explicit_rungs_match_values_widened_from_f32() {
-        let column: Vec<Option<f64>> = [0.5f32, 0.425, 0.2, 0.425]
+        let column: Vec<Option<f64>> = [0.5f32, 0.3, 0.1, 0.3]
             .iter()
             .map(|v| Some(*v as f64))
             .collect();
         let spec = EntryZoomSpec {
             column: "level".to_string(),
-            kind: EntryZoomKind::Explicit(vec![(0.5, 8), (0.425, 9), (0.2, 12)]),
+            kind: EntryZoomKind::Explicit(vec![(0.5, 8), (0.3, 9), (0.1, 12)]),
         };
         let ladder = build_ladder(&spec, &column, &[Some(8), Some(10), Some(12)]).unwrap();
         let got: Vec<Option<u8>> = column.iter().map(|v| ladder.entry_zoom(*v)).collect();
@@ -382,17 +382,18 @@ mod tests {
         }
     }
 
-    /// The motivating case (#364): five contour magnitudes, strongest first,
+    /// The motivating shape (#364): five distinct values, strongest first,
     /// one zoom apart. The ladder must invert the size ordering that the
     /// visibility gate would otherwise impose.
     #[test]
     fn dense_rank_places_the_strongest_value_earliest() {
-        let l = EntryZoomLadder::dense_rank([0.2, 0.275, 0.35, 0.425, 0.5], 8, 1, 14).unwrap();
-        assert_eq!(l.entry_zoom(Some(0.5)), Some(8));
-        assert_eq!(l.entry_zoom(Some(0.425)), Some(9));
-        assert_eq!(l.entry_zoom(Some(0.35)), Some(10));
-        assert_eq!(l.entry_zoom(Some(0.275)), Some(11));
-        assert_eq!(l.entry_zoom(Some(0.2)), Some(12));
+        let l =
+            EntryZoomLadder::dense_rank([100.0, 250.0, 600.0, 1500.0, 5000.0], 8, 1, 14).unwrap();
+        assert_eq!(l.entry_zoom(Some(5000.0)), Some(8));
+        assert_eq!(l.entry_zoom(Some(1500.0)), Some(9));
+        assert_eq!(l.entry_zoom(Some(600.0)), Some(10));
+        assert_eq!(l.entry_zoom(Some(250.0)), Some(11));
+        assert_eq!(l.entry_zoom(Some(100.0)), Some(12));
     }
 
     /// Ranks come from *distinct* values, not from the values' positions on
@@ -401,7 +402,7 @@ mod tests {
     /// which is the failure the reference pipeline calls out.
     #[test]
     fn ladder_is_scale_free_over_a_narrow_value_range() {
-        let narrow_vals = [0.5, 0.425, 0.35, 0.275, 0.2]; // descending
+        let narrow_vals = [0.5, 0.45, 0.4, 0.35, 0.3]; // descending
         let wide_vals = [1e6, 90_000.0, 5000.0, 100.0, 1.0]; // descending
         let narrow = EntryZoomLadder::dense_rank(narrow_vals, 0, 1, 14).unwrap();
         let wide = EntryZoomLadder::dense_rank(wide_vals, 0, 1, 14).unwrap();
@@ -507,10 +508,10 @@ mod tests {
 
     #[test]
     fn explicit_rungs_are_honoured_verbatim() {
-        let l = EntryZoomLadder::explicit([(0.5, 8), (0.425, 9), (0.2, 12)]).unwrap();
-        assert_eq!(l.entry_zoom(Some(0.5)), Some(8));
-        assert_eq!(l.entry_zoom(Some(0.2)), Some(12));
-        assert_eq!(l.entry_zoom(Some(0.35)), None, "unlisted values are free");
+        let l = EntryZoomLadder::explicit([(5000.0, 8), (1000.0, 9), (200.0, 12)]).unwrap();
+        assert_eq!(l.entry_zoom(Some(5000.0)), Some(8));
+        assert_eq!(l.entry_zoom(Some(200.0)), Some(12));
+        assert_eq!(l.entry_zoom(Some(600.0)), None, "unlisted values are free");
     }
 
     #[test]
