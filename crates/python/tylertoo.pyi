@@ -28,6 +28,8 @@ def overview(
     gsds: list[float] | None = None,
     gsd_base: float = 1024.0,
     sort_key: str | None = None,
+    magnitude_ladder: str | None = None,
+    ladder_step: int = 1,
     sort_direction: str = "desc",
     class_rank_column: str | None = None,
     class_ranks: dict[str, float] | None = None,

@@ -496,6 +496,7 @@ mod tests {
             bbox: [x, y, x, y],
             kind: FeatureKind::Point,
             sort_key: None,
+            entry_level: None,
         }
     }
 
@@ -747,12 +748,14 @@ mod tests {
                 bbox: [0.0, 0.0, 50_000.0, 50_000.0],
                 kind: FeatureKind::Polygon,
                 sort_key: None,
+                entry_level: None,
             },
             AssignFeature {
                 index: 3,
                 bbox: [0.0, 0.0, 60_000.0, 60_000.0],
                 kind: FeatureKind::Line,
                 sort_key: None,
+                entry_level: None,
             },
         ];
         feats[0].sort_key = Some(1.0);
@@ -803,6 +806,7 @@ mod tests {
             bbox: [0.0, 0.0, 50_000.0, 50_000.0],
             kind: FeatureKind::Polygon,
             sort_key: None,
+            entry_level: None,
         };
         let t = build_cluster_tables(&[poly], &[0], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
         assert!(t.iter().all(|m| m.is_empty()));
@@ -857,6 +861,7 @@ mod tests {
             bbox: [0.0, 0.0, 50_000.0, 50_000.0],
             kind: FeatureKind::Polygon,
             sort_key: None,
+            entry_level: None,
         };
         let gsds = [gsd(2), gsd(6)];
         let cfg = AssignConfig::default();

@@ -571,6 +571,93 @@ provenance as `generalization.collapse: "square"` (`--collapse` records
 
 ---
 
+## Attribute-driven entry zoom: `--magnitude-ladder`, `--entry-zoom`
+
+Everything in the next section decides *which of the features competing for a
+cell wins*. It runs **after** the visibility gate, which has already dropped
+features for being small. For nested-band data that ordering is backwards.
+
+Concentric contours carry their strongest signal in the physically **smallest**
+ring: the outer ring is the weakest level and the innermost the strongest. So a
+coarse level keeps the big weak rings and hides the small strong cores —
+precisely the opposite of what the map should show zoomed out. `--sort-key`
+helps where features survive to compete, but cannot reach a feature the gate
+removed first.
+
+A **ladder** answers a different question: not "which of these wins a cell" but
+"how early may this feature appear at all". Each distinct value of a column
+gets an *entry zoom*; a feature appears from its entry zoom inward and at none
+before it, **exempt from the visibility gate and from thinning** throughout.
+
+```bash
+# Derive it: distinct values ranked descending, one zoom apart from --min-zoom
+tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 6 \
+  --magnitude-ladder level
+
+# ...or place the rungs by hand
+tylertoo tiles in.parquet out.pmtiles \
+  --entry-zoom "level:0.5=8,0.425=9,0.35=10,0.275=11,0.2=12"
+```
+
+Measured on 700 concentric contours (140 sites × 5 magnitudes), counting
+features present at each zoom:
+
+| zoom | | 0.2 | 0.275 | 0.35 | 0.425 | **0.5** |
+|---|---|---|---|---|---|---|
+| z0 | `--sort-key level` | 0 | 140 | 0 | 0 | **0** |
+| z0 | `--magnitude-ladder level` | 0 | 0 | 0 | 0 | **140** |
+
+Without a ladder the strongest magnitude does not appear at all until z6. With
+one it is the *only* thing at z0, and each weaker rank joins a zoom later — the
+staircase the ladder exists to produce.
+
+Ranking **distinct values** (SQL `DENSE_RANK`) rather than the values
+themselves keeps the ladder scale-free. Mapping a raw magnitude linearly onto
+the zoom range strands every rung in the upper zooms whenever the values occupy
+a narrow part of their nominal scale, which real data usually does — the
+motivating set is 0.2–0.5 of a nominal 0–1.
+
+`--ladder-step N` widens the spacing. A value the ladder does not cover (null,
+or unlisted in an explicit spec) gets no entry zoom and takes the ordinary
+gate, so a partly populated column degrades to today's behaviour instead of
+hiding rows.
+
+### Two mechanisms can still undo a ladder
+
+The ladder governs **admission**. Two later stages can remove a feature it
+admitted, and both matter in practice:
+
+- **Simplification.** A feature admitted to a coarse level is still dropped
+  there if its geometry simplifies below that level's tolerance — the usual
+  case for small-but-strong features. `--magnitude-ladder` and `--entry-zoom`
+  therefore **imply `--collapse`**, so such a feature survives as a
+  representative point. `--collapse-square` overrides.
+- **The density budget**, which caps each level and sheds its lowest-priority
+  survivors *by size* — the same inversion the ladder corrects. Pair with
+  `--no-density-drop`, or with `--sort-key` on the same column so the budget
+  ranks the way the ladder does. tylertoo warns when a ladder runs with the
+  budget on and no sort key.
+
+With the budget off, the staircase is exact:
+
+```
+zoom       0.2   0.275    0.35   0.425     0.5
+z0           0       0       0       0     140
+z1           0       0       0     140     140
+z2           0       0     165     165     165
+z3           0     192     176     176     176
+z4         250     192     176     160     160
+```
+
+### Relation to tippecanoe
+
+This is tippecanoe's per-feature `tippecanoe.minzoom`, the one attribute-driven
+thinning lever it offers. tippecanoe takes the minzoom as an input attribute;
+`--magnitude-ladder` additionally *derives* one from a column, which is what
+callers were doing by hand upstream of it.
+
+---
+
 ## Ranking: which feature wins a cell
 
 When several features compete for one grid cell, the **winner** is the

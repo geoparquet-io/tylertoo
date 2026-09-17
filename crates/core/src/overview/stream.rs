@@ -1081,8 +1081,12 @@ fn pass1_projection(
     plan: &RankPlan,
     acc_cols: &[usize],
     filter: Option<&super::filter::BoundFilter>,
+    ladder_col: Option<usize>,
 ) -> Vec<usize> {
     let mut cols: Vec<usize> = vec![geom_idx];
+    // Entry-zoom ladder (#364): pass 1 decides the level, so its column has
+    // to be read here even though nothing else in pass 1 looks at it.
+    cols.extend(ladder_col);
     if let Some(f) = filter {
         cols.extend(f.columns().iter().copied());
     }
@@ -1115,7 +1119,23 @@ fn run_pass1(
 ) -> Result<Pass1Output, ConvertError> {
     let mut plan = build_rank_plan(input_schema, options)?;
 
-    let cols = pass1_projection(geom_idx, &plan, acc_cols, filter);
+    // Entry-zoom ladder column (#364), resolved by name against the (already
+    // #288-renamed) schema so a `--magnitude-ladder level` on a source that
+    // also has a reserved `level` still finds the caller's column.
+    let ladder_col = options
+        .entry_zoom
+        .as_ref()
+        .map(|spec| {
+            input_schema.index_of(&spec.column).map_err(|_| {
+                ConvertError::InvalidConfig(format!(
+                    "entry-zoom column {:?} not found in the input schema",
+                    spec.column
+                ))
+            })
+        })
+        .transpose()?;
+
+    let cols = pass1_projection(geom_idx, &plan, acc_cols, filter, ladder_col);
     // Original schema index → projected batch column index.
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
 
@@ -1135,6 +1155,8 @@ fn run_pass1(
     let mut explicit_keys: Vec<Option<f64>> = Vec::new();
     let mut confidence_keys: Vec<Option<f64>> = Vec::new();
     let mut acc_values: Vec<Vec<Option<f64>>> = vec![Vec::new(); acc_cols.len()];
+    // Entry-zoom ladder column values (#364), row-indexed.
+    let mut ladder_values: Vec<Option<f64>> = Vec::new();
     let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::new();
     // Coalescing (Q3): line rows + geometries, and — for an explicit class
     // ranking — the interned per-row class groups. `line_feat_pos` holds each
@@ -1212,6 +1234,7 @@ fn run_pass1(
                 bbox: fbbox,
                 kind,
                 sort_key: None, // filled below once the ranking tier resolves
+                entry_level: None,
             });
         }
         num_rows += geoms_buf.len();
@@ -1252,6 +1275,11 @@ fn run_pass1(
         // Accumulate columns (Q4): per-spec source values, in row order.
         for (s, &idx) in acc_cols.iter().enumerate() {
             acc_values[s].extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
+        }
+
+        // Entry-zoom ladder (#364): row-indexed, like the ranking keys above.
+        if let Some(idx) = ladder_col {
+            ladder_values.extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
         }
     }
 
@@ -1346,6 +1374,21 @@ fn run_pass1(
         debug_assert_eq!(keys.len(), num_rows);
         for f in features.iter_mut() {
             f.sort_key = keys[f.index];
+        }
+    }
+
+    // Entry-zoom ladder (#364). Row-indexed like the ranking keys, and
+    // resolved against the same level plan the buffered pipeline uses, so both
+    // engines place a feature identically.
+    if options.entry_zoom.is_some() {
+        debug_assert_eq!(ladder_values.len(), num_rows);
+        let level_specs = options.levels.resolve(options.gsd_base)?;
+        if let Some(entry) =
+            super::convert::resolve_entry_levels(options, &ladder_values, &level_specs)?
+        {
+            for f in features.iter_mut() {
+                f.entry_level = entry[f.index];
+            }
         }
     }
 

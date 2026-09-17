@@ -122,6 +122,21 @@ pub struct AssignFeature {
     /// Optional priority key; features *with* a key always out-rank features
     /// without one (nulls lose).
     pub sort_key: Option<f64>,
+    /// Optional attribute-driven **entry level** (#364): the coarsest level
+    /// index at which this feature may appear, from a magnitude ladder
+    /// ([`super::ladder`]).
+    ///
+    /// `Some(l)` is authoritative in both directions — the feature appears at
+    /// every level from `l` inward and at none before it, exempt from the
+    /// visibility gate and from cell-winner thinning throughout. It is
+    /// therefore excluded from the winner grids entirely: an exempt feature
+    /// must not also occupy a cell and suppress a feature that does have to
+    /// compete for one.
+    ///
+    /// `None` means "no ladder opinion" — the ordinary gate and thinning
+    /// decide, so a partially populated ladder column degrades to the existing
+    /// behaviour rather than hiding rows.
+    pub entry_level: Option<u8>,
 }
 
 impl AssignFeature {
@@ -387,6 +402,13 @@ fn level_winner_positions(
             _ => feat.kind,
         };
 
+        // Ladder features (#364) never enter a grid: their level is decided by
+        // the attribute, and letting them win cells would suppress features
+        // that genuinely have to compete for one.
+        if feat.entry_level.is_some() {
+            continue;
+        }
+
         // Visibility gate (points always pass).
         let vis = if repr == Representation::Square && feat.kind == FeatureKind::Polygon {
             0.0
@@ -642,6 +664,27 @@ pub fn assign_levels_bounded(
     // coarser cell falls through to the canonical (finest) level (spec §2.4).
     let mut min_levels: Vec<u8> = vec![finest; features.len()];
 
+    // Attribute-driven entry levels (#364) are authoritative: they replace the
+    // gate/thinning outcome rather than refining it, in both directions. A
+    // strong-but-tiny feature is admitted at a level the gate would have
+    // dropped it from, and a weak-but-large one is held back from a level it
+    // would otherwise have won — which is the whole point, since the geometry
+    // ranking is backwards for this data. Applied before the winner passes so
+    // the fold below (which only ever *lowers*) cannot move a ladder feature.
+    let laddered = features.iter().filter(|f| f.entry_level.is_some()).count();
+    if laddered > 0 {
+        for (pos, feat) in features.iter().enumerate() {
+            if let Some(entry) = feat.entry_level {
+                min_levels[pos] = entry.min(finest);
+            }
+        }
+        log::info!(
+            "[assign] entry-zoom ladder (#364): {laddered} of {} feature(s) take an \
+             attribute-driven level, exempt from visibility gates and thinning",
+            features.len()
+        );
+    }
+
     // Per level, coarse→fine, run one cell-winner pass. State is O(cells).
     //
     // The finest level is skipped: `min_levels` already starts at `finest`, so
@@ -692,6 +735,8 @@ pub fn assign_levels_bounded(
         for (offset, winners) in winners_per_level.iter().enumerate() {
             let level = (wave.start + offset) as u8;
             for &pos in winners {
+                // Ladder features are not in any winner set (skipped above),
+                // so this fold cannot touch them.
                 if level < min_levels[pos] {
                     min_levels[pos] = level;
                 }
@@ -1081,6 +1126,7 @@ mod tests {
             bbox: [x, y, x, y],
             kind: FeatureKind::Point,
             sort_key: None,
+            entry_level: None,
         }
     }
 
@@ -1090,7 +1136,150 @@ mod tests {
             bbox: [xmin, ymin, xmax, ymax],
             kind: FeatureKind::Polygon,
             sort_key: None,
+            entry_level: None,
         }
+    }
+
+    // ---- entry-zoom ladder (#364) -------------------------------------------
+
+    /// The motivating failure: concentric contours where the strongest signal
+    /// is the *smallest* ring. Without a ladder the visibility gate drops the
+    /// tiny strong core at coarse levels and keeps the big weak ring — exactly
+    /// backwards for the map.
+    #[test]
+    fn ladder_admits_a_tiny_feature_the_visibility_gate_would_drop() {
+        let gsds = [gsd(2), gsd(4), gsd(6)];
+        let cfg = AssignConfig {
+            polygon_visibility: 2.0, // the gate that removes the core
+            ..Default::default()
+        };
+
+        // A metres-wide core at the centre of a degrees-wide weak ring.
+        let mut core = poly(0, 0.0, 0.0, 0.00005, 0.00005);
+        let ring = poly(1, -2.0, -2.0, 2.0, 2.0);
+
+        // Control: the gate drops the core to the canonical level.
+        let control = assign_levels(&[core.clone(), ring.clone()], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            control.assignments[0].min_level, 2,
+            "without a ladder the tiny core is gated out of every coarse level"
+        );
+
+        // Ladder: the core enters at the coarsest level regardless of size.
+        core.entry_level = Some(0);
+        let laddered = assign_levels(&[core, ring], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            laddered.assignments[0].min_level, 0,
+            "an entry level must override the visibility gate"
+        );
+    }
+
+    /// The ladder is authoritative in both directions. A big weak feature that
+    /// would win a coarse cell is held back to its entry level — that is the
+    /// half that stops the weak outer rings covering the map zoomed out.
+    #[test]
+    fn ladder_holds_back_a_large_feature_that_would_otherwise_win_early() {
+        let gsds = [gsd(2), gsd(4), gsd(6)];
+        let cfg = AssignConfig::default();
+
+        let mut ring = poly(0, -2.0, -2.0, 2.0, 2.0);
+        let control = assign_levels(&[ring.clone()], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(control.assignments[0].min_level, 0, "large: wins level 0");
+
+        ring.entry_level = Some(2);
+        let laddered = assign_levels(&[ring], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            laddered.assignments[0].min_level, 2,
+            "an entry level must also delay a feature the grid would admit"
+        );
+    }
+
+    /// A laddered feature must not occupy a grid cell: it is exempt from the
+    /// contest, so it cannot suppress a feature that has to win one.
+    #[test]
+    fn ladder_features_do_not_consume_cells_from_competitors() {
+        let gsds = [gsd(2), gsd(6)];
+        let cfg = AssignConfig::default();
+
+        // Two points close enough to share a coarse cell. `a` outranks `b`.
+        let mut a = point(0, 10.0, 10.0);
+        a.sort_key = Some(100.0);
+        let mut b = point(1, 10.0001, 10.0001);
+        b.sort_key = Some(1.0);
+
+        // Control: they contest one cell and `b` loses the coarse level.
+        let control = assign_levels(&[a.clone(), b.clone()], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(control.assignments[0].min_level, 0);
+        assert_eq!(control.assignments[1].min_level, 1, "b loses the cell");
+
+        // With `a` on the ladder it leaves the grid, so `b` wins the cell it
+        // was previously denied — and `a` still appears, by its entry level.
+        a.entry_level = Some(0);
+        let laddered = assign_levels(&[a, b], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(laddered.assignments[0].min_level, 0, "a: by ladder");
+        assert_eq!(
+            laddered.assignments[1].min_level, 0,
+            "b should now win the cell a vacated"
+        );
+    }
+
+    /// A partially populated ladder column must not hide the rows it does not
+    /// cover: features without an entry level take the ordinary path.
+    #[test]
+    fn features_without_an_entry_level_keep_the_ordinary_behaviour() {
+        let gsds = [gsd(2), gsd(4), gsd(6)];
+        let cfg = AssignConfig::default();
+
+        let big = poly(0, -2.0, -2.0, 2.0, 2.0);
+        let mut laddered = poly(1, 40.0, 40.0, 44.0, 44.0);
+        laddered.entry_level = Some(2);
+
+        let out = assign_levels(&[big, laddered], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            out.assignments[0].min_level, 0,
+            "the unlabelled feature is unaffected by another feature's ladder"
+        );
+        assert_eq!(out.assignments[1].min_level, 2);
+    }
+
+    /// An entry level past the finest level clamps rather than producing a
+    /// level index that does not exist.
+    #[test]
+    fn entry_level_beyond_the_finest_clamps() {
+        let gsds = [gsd(2), gsd(4)];
+        let cfg = AssignConfig::default();
+        let mut p = point(0, 5.0, 5.0);
+        p.entry_level = Some(200);
+        let out = assign_levels(&[p], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            out.assignments[0].min_level, 1,
+            "clamped to the finest level"
+        );
+    }
+
+    /// The memory-bounded wave scheduler must not change a laddered
+    /// assignment: entry levels are applied outside the winner passes, so
+    /// every budget agrees.
+    #[test]
+    fn ladder_assignment_is_identical_under_every_grid_budget() {
+        let gsds = [gsd(2), gsd(4), gsd(6)];
+        let cfg = AssignConfig::default();
+        let feats: Vec<AssignFeature> = (0..40)
+            .map(|i| {
+                let mut f = poly(i, i as f64 * 0.5, 0.0, i as f64 * 0.5 + 0.2, 0.2);
+                if i % 3 == 0 {
+                    f.entry_level = Some((i % 3) as u8);
+                }
+                f
+            })
+            .collect();
+
+        let unbounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg4326, u64::MAX, &[]);
+        let one_wave = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg4326, 1, &[]);
+        assert_eq!(
+            unbounded.assignments, one_wave.assignments,
+            "the wave plan is scheduling only; it must not move a feature"
+        );
     }
 
     // ---- empty input --------------------------------------------------------
@@ -1971,6 +2160,7 @@ mod tests {
             bbox: [0.0, 0.0, 0.001, 0.001],
             kind: FeatureKind::Line,
             sort_key: None,
+            entry_level: None,
         };
         let gsds = [gsd(2), gsd(12)];
         let cfg = AssignConfig::default();

@@ -20,6 +20,7 @@ use tylertoo_core::overview::convert::{
 use tylertoo_core::overview::export::{
     export_pmtiles as export_pmtiles_core, ExportOptions, FeatureOrder,
 };
+use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 use tylertoo_core::overview::level::{MemoryProfile, Mode};
 use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 
@@ -261,6 +262,17 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     sort_key (str, optional): Numeric column used as the cell-winner
 ///         priority key (higher wins by default; see sort_direction).
 ///         Mutually exclusive with class_rank_column.
+///     magnitude_ladder (str, optional): Column whose value decides each
+///         feature's ENTRY ZOOM (#364). Its distinct values are ranked
+///         descending and placed one ``ladder_step`` apart from the coarsest
+///         zoom; a feature appears from its entry zoom inward and not before,
+///         exempt from the visibility gate and from thinning. Use when the
+///         strongest signal is carried by the physically smallest feature,
+///         where geometry-ranked thinning is backwards. Pair with
+///         ``collapse=True`` and ``density_drop=False`` so a promoted feature
+///         is not deleted again by simplification or the per-level budget.
+///     ladder_step (int, optional): Zooms between consecutive
+///         ``magnitude_ladder`` rungs. Defaults to 1.
 ///     sort_direction (str, optional): "desc" (larger sort_key wins, default)
 ///         or "asc" (smaller wins, e.g. rank columns where 1 is best).
 ///     class_rank_column (str, optional): String column carrying categorical
@@ -419,6 +431,8 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     gsds=None,
     gsd_base=1024.0,
     sort_key=None,
+    magnitude_ladder=None,
+    ladder_step=1,
     sort_direction="desc",
     class_rank_column=None,
     class_ranks=None,
@@ -465,6 +479,8 @@ fn overview(
     gsds: Option<Vec<f64>>,
     gsd_base: f64,
     sort_key: Option<String>,
+    magnitude_ladder: Option<&str>,
+    ladder_step: u8,
     sort_direction: &str,
     class_rank_column: Option<String>,
     class_ranks: Option<BTreeMap<String, f64>>,
@@ -638,6 +654,10 @@ fn overview(
             sort_direction,
         },
         sort_key,
+        entry_zoom: magnitude_ladder.map(|column| EntryZoomSpec {
+            column: column.to_string(),
+            kind: EntryZoomKind::DenseRank { step: ladder_step },
+        }),
         class_ranking,
         no_auto_rank,
         simplify: SimplifyOptions {

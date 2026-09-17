@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::path::PathBuf;
 use tylertoo_core::overview::export::FeatureOrder;
+use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
 /// Parse human-readable memory size (e.g., "8G", "16G", "512M") to bytes.
 fn parse_memory_size(s: &str) -> Result<usize, String> {
@@ -451,6 +452,59 @@ struct ConvertTuningArgs {
     /// exclusive with --class-rank.
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
     sort_key: Option<String>,
+
+    /// Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
+    ///
+    /// Thinning ranks on geometry, which is backwards for nested-band data:
+    /// concentric contours carry their strongest signal in the physically
+    /// SMALLEST ring, so coarse levels keep the big weak rings and drop the
+    /// small strong cores. --sort-key cannot fix that — it chooses between
+    /// features competing for a cell, and the visibility gate has already
+    /// dropped the small ones on size.
+    ///
+    /// A ladder ranks COL's DISTINCT values descending and gives each rank an
+    /// entry zoom one --ladder-step apart, starting at --min-zoom. A feature
+    /// appears from its entry zoom inward and not before, exempt from the
+    /// visibility gate and from thinning throughout. Nothing is deleted: the
+    /// finest level still carries every feature.
+    ///
+    /// Ranking DISTINCT values (SQL DENSE_RANK) rather than the values
+    /// themselves keeps the ladder scale-free — mapping a raw magnitude onto
+    /// the zoom range strands everything in the upper zooms whenever the
+    /// values occupy a narrow part of their nominal scale.
+    ///
+    /// Implies --collapse unless you pass --collapse-square, so a promoted
+    /// feature that simplifies below its level's tolerance survives as a
+    /// representative point rather than being dropped again.
+    ///
+    /// Mutually exclusive with --entry-zoom.
+    #[arg(long, value_name = "COL", help_heading = "Ranking")]
+    magnitude_ladder: Option<String>,
+
+    /// Zooms between consecutive --magnitude-ladder rungs (default 1).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "1",
+        help_heading = "Ranking",
+        requires = "magnitude_ladder"
+    )]
+    ladder_step: u8,
+
+    /// Explicit entry zooms, for full control over the rungs:
+    /// `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g.
+    /// `--entry-zoom "level:0.5=8,0.425=9,0.35=10,0.275=11,0.2=12"`.
+    ///
+    /// Same semantics as --magnitude-ladder but the rungs are placed by hand
+    /// rather than derived. Values the spec does not list get no entry zoom
+    /// and take the ordinary gate. Mutually exclusive with --magnitude-ladder.
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help_heading = "Ranking",
+        conflicts_with = "magnitude_ladder"
+    )]
+    entry_zoom: Option<String>,
 
     /// Categorical class ranking (higher priority wins a cell). Format:
     /// `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g.
@@ -979,6 +1033,19 @@ impl ConvertTuningArgs {
             None => None,
         };
 
+        // Entry-zoom ladder (#364): derived from a column, or spelled out.
+        // clap enforces that the two are mutually exclusive.
+        let entry_zoom = match (&self.magnitude_ladder, &self.entry_zoom) {
+            (Some(col), _) => Some(EntryZoomSpec {
+                column: col.clone(),
+                kind: EntryZoomKind::DenseRank {
+                    step: self.ladder_step,
+                },
+            }),
+            (None, Some(spec)) => Some(parse_entry_zoom(spec)?),
+            (None, None) => None,
+        };
+
         // Clustering flags (Q4; also enforced in core).
         if !self.accumulate_attribute.is_empty() && !self.cluster {
             anyhow::bail!("--accumulate-attribute requires --cluster");
@@ -1029,6 +1096,7 @@ impl ConvertTuningArgs {
             levels,
             assign,
             sort_key: self.sort_key.clone(),
+            entry_zoom: entry_zoom.clone(),
             class_ranking,
             no_auto_rank: self.no_auto_rank,
             simplify: SimplifyOptions {
@@ -1038,9 +1106,15 @@ impl ConvertTuningArgs {
                 ),
                 // --collapse and --collapse-square are mutually exclusive
                 // (clap conflicts_with); both default off = drop (#279).
+                //
+                // A magnitude ladder implies --collapse (#364): the ladder
+                // admits a small-but-strong feature to a coarse level, and the
+                // drop default would then delete it there for simplifying
+                // below that level's tolerance — undoing the promotion the
+                // caller asked for. An explicit --collapse-square still wins.
                 collapse: if self.collapse_square {
                     CollapseMode::Square
-                } else if self.collapse {
+                } else if self.collapse || entry_zoom.is_some() {
                     CollapseMode::Point
                 } else {
                     CollapseMode::Drop
@@ -1803,6 +1877,47 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse an `--entry-zoom` spec: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` (#364).
+///
+/// Mirrors [`parse_class_rank`]'s grammar so the two read alike; the payload
+/// differs (a zoom, not a priority) because a rung places a feature rather
+/// than ordering it.
+fn parse_entry_zoom(spec: &str) -> Result<tylertoo_core::overview::ladder::EntryZoomSpec> {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let (column, rest) = spec.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "--entry-zoom {spec:?}: expected COLUMN:VALUE=ZOOM,VALUE=ZOOM,... \
+             (e.g. \"level:0.5=8,0.2=12\")"
+        )
+    })?;
+    if column.is_empty() {
+        anyhow::bail!("--entry-zoom {spec:?}: empty column name");
+    }
+    let mut rungs = Vec::new();
+    for pair in rest.split(',').filter(|p| !p.trim().is_empty()) {
+        let (value, zoom) = pair.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--entry-zoom {spec:?}: expected VALUE=ZOOM, got {pair:?}")
+        })?;
+        let value: f64 = value
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--entry-zoom {spec:?}: {value:?} is not a number"))?;
+        let zoom: u8 = zoom
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--entry-zoom {spec:?}: {zoom:?} is not a zoom level"))?;
+        rungs.push((value, zoom));
+    }
+    if rungs.is_empty() {
+        anyhow::bail!("--entry-zoom {spec:?}: no VALUE=ZOOM pairs");
+    }
+    Ok(EntryZoomSpec {
+        column: column.to_string(),
+        kind: EntryZoomKind::Explicit(rungs),
+    })
 }
 
 /// Parse a `--class-rank` spec: `COLUMN:VALUE=RANK,VALUE=RANK,...`.
