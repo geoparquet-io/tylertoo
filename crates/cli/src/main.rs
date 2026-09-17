@@ -379,18 +379,23 @@ struct ConvertTuningArgs {
     /// instead of showing what they sum to.
     ///
     /// Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0
-    /// with every thinning factor and visibility gate at 0, which was
-    /// previously the only way there. Reach for it when the input is already
-    /// the right resolution for the zooms you are asking for: DGGS/cell
-    /// aggregates, pre-levelled input, or one band of a pyramid.
+    /// with every thinning factor and visibility gate at 0 — a flag set that
+    /// was not even reachable before, since a thinning factor of 0 used to be
+    /// rejected. Reach for it when the input is already the right resolution
+    /// for the zooms you are asking for: DGGS/cell aggregates, pre-levelled
+    /// input, or one band of a pyramid.
+    ///
+    /// Requires --mode duplicating: partitioning writes each feature at one
+    /// level, so with thinning off everything lands in the coarsest level.
     ///
     /// On `tiles` it also disables the per-tile size cap (an unbounded
     /// --max-tile-size), since a valve that sheds features to fit a byte
     /// budget is not verbatim either; pass --max-tile-size explicitly to put
-    /// a cap back.
+    /// a cap back. The two-step form does NOT inherit that — pass
+    /// --tile-size-limit 0 to export-pmtiles.
     ///
-    /// Composes with the rest: apply it and then override individual knobs
-    /// afterwards for NEARLY verbatim.
+    /// Supplies DEFAULTS rather than overriding: any knob you set explicitly
+    /// wins, so --verbatim --simplify-factor 0.5 is NEARLY verbatim.
     #[arg(long, help_heading = "Thinning & visibility")]
     verbatim: bool,
 

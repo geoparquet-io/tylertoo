@@ -73,11 +73,13 @@ Generate PMTiles vector tiles (the default pipeline)
 
    The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.
 
-   Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0 with every thinning factor and visibility gate at 0, which was previously the only way there. Reach for it when the input is already the right resolution for the zooms you are asking for: DGGS/cell aggregates, pre-levelled input, or one band of a pyramid.
+   Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0 with every thinning factor and visibility gate at 0 — a flag set that was not even reachable before, since a thinning factor of 0 used to be rejected. Reach for it when the input is already the right resolution for the zooms you are asking for: DGGS/cell aggregates, pre-levelled input, or one band of a pyramid.
 
-   On `tiles` it also disables the per-tile size cap (an unbounded --max-tile-size), since a valve that sheds features to fit a byte budget is not verbatim either; pass --max-tile-size explicitly to put a cap back.
+   Requires --mode duplicating: partitioning writes each feature at one level, so with thinning off everything lands in the coarsest level.
 
-   Composes with the rest: apply it and then override individual knobs afterwards for NEARLY verbatim.
+   On `tiles` it also disables the per-tile size cap (an unbounded --max-tile-size), since a valve that sheds features to fit a byte budget is not verbatim either; pass --max-tile-size explicitly to put a cap back. The two-step form does NOT inherit that — pass --tile-size-limit 0 to export-pmtiles.
+
+   Supplies DEFAULTS rather than overriding: any knob you set explicitly wins, so --verbatim --simplify-factor 0.5 is NEARLY verbatim.
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key
 * `--no-auto-rank` — Disable auto-detection of well-known schemas (Overture roads `class`/ `road_class`, Overture places `confidence`)
@@ -239,11 +241,13 @@ Build a multi-resolution overview GeoParquet file
 
    The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.
 
-   Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0 with every thinning factor and visibility gate at 0, which was previously the only way there. Reach for it when the input is already the right resolution for the zooms you are asking for: DGGS/cell aggregates, pre-levelled input, or one band of a pyramid.
+   Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0 with every thinning factor and visibility gate at 0 — a flag set that was not even reachable before, since a thinning factor of 0 used to be rejected. Reach for it when the input is already the right resolution for the zooms you are asking for: DGGS/cell aggregates, pre-levelled input, or one band of a pyramid.
 
-   On `tiles` it also disables the per-tile size cap (an unbounded --max-tile-size), since a valve that sheds features to fit a byte budget is not verbatim either; pass --max-tile-size explicitly to put a cap back.
+   Requires --mode duplicating: partitioning writes each feature at one level, so with thinning off everything lands in the coarsest level.
 
-   Composes with the rest: apply it and then override individual knobs afterwards for NEARLY verbatim.
+   On `tiles` it also disables the per-tile size cap (an unbounded --max-tile-size), since a valve that sheds features to fit a byte budget is not verbatim either; pass --max-tile-size explicitly to put a cap back. The two-step form does NOT inherit that — pass --tile-size-limit 0 to export-pmtiles.
+
+   Supplies DEFAULTS rather than overriding: any knob you set explicitly wins, so --verbatim --simplify-factor 0.5 is NEARLY verbatim.
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key
 * `--no-auto-rank` — Disable auto-detection of well-known schemas (Overture roads `class`/ `road_class`, Overture places `confidence`)

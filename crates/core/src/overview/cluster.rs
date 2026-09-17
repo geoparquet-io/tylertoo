@@ -213,6 +213,19 @@ pub fn build_cluster_tables(
         .map(|f| Priority::new(f, config.sort_direction))
         .collect();
 
+    // Thinning off (`--verbatim`, or `--point-thinning 0`) makes every cell
+    // guard below fail, so no cluster table is built and every `point_count`
+    // defaults to 1. That answer is CORRECT — with no thinning every point
+    // survives at every level, so every cluster genuinely is a singleton — but
+    // the run still appends the column and records `clustering.enabled: true`
+    // in the footer, which overstates what happened. Say so rather than
+    // leaving the caller to infer it from a column of 1s.
+    if config.point_thinning == 0.0 {
+        log::warn!(
+            "--cluster with point thinning off: every point survives at every              level, so every cluster is a singleton and every point_count is 1.              The point_count column and the clustering provenance are still              written. Set --point-thinning above 0 to actually cluster."
+        );
+    }
+
     // Non-canonical levels only: at the finest level every point is present,
     // every cluster is a singleton, and rows pass through verbatim.
     for level in 0..finest {
