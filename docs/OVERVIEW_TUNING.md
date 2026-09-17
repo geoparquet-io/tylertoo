@@ -85,6 +85,87 @@ the footer `levels[].gsd` already imply `1024`, so default output is unchanged).
 
 ---
 
+## Switching the ladder off entirely: `--verbatim`
+
+Everything below this heading generalizes: thinning, visibility gates,
+simplification, the density budget, coalescing. That is right when the coarse
+level should be a *coarser drawing of the same features* — a road network, a
+building footprint layer.
+
+It is wrong when the input is already the right resolution for the zooms you
+are asking for. An H3 r6 cell is not a simplified r7 cell; it is their parent,
+and its count is their sum. Run a cell aggregate through the gates and the
+gates ask "is this feature big enough to see" when the question is "what do
+these cells sum to" — so a coarse level shows *some* cells and silently omits
+the rest:
+
+```
+$ tylertoo tiles cells.parquet out.pmtiles --min-zoom 0 --max-zoom 5
+WARN omitting 1 empty level(s) [0] … none of the 3399 input feature(s)
+     are visible at those scales (visibility gates / density budget)
+  z2  (level 0):  757 features      ← 3,399 cells in, 757 drawn
+  z3  (level 1): 1446 features
+```
+
+`--verbatim` turns the whole ladder off, so every level reproduces the input:
+
+```
+$ tylertoo tiles cells.parquet out.pmtiles --min-zoom 0 --max-zoom 5 --verbatim
+  z0  (level 0): 3399 features
+  z1  (level 1): 3399 features
+  z2  (level 2): 3399 features
+  …
+```
+
+It is exactly equivalent to setting every ladder knob by hand — byte-identical
+output — and exists because that is eight flags of ceremony for one
+intention:
+
+```bash
+--no-density-drop --no-coalesce-lines --simplify-factor 0 --point-thinning 0 --line-thinning 0 --polygon-thinning 0 --polygon-visibility 0 --line-visibility 0
+```
+
+Reach for it when the input is a **DGGS or cell aggregate**, is **pre-levelled**
+by an upstream tool, or is **one band of a pyramid** (see `tylertoo pyramid`)
+where a different input already owns the coarser zooms.
+
+What it does *not* touch: mode, the level plan, CRS, row-group layout, an
+explicit `--cluster`, and `--representation` (a point or square band still
+replaces polygons with centroids or dithered placeholders — the one
+generalizing knob left on, inert unless you ask for it).
+
+`--verbatim` supplies **defaults**, it does not override: any knob you set
+explicitly wins, so `--verbatim --simplify-factor 0.5` keeps every feature but
+still simplifies geometry. When you do override something, the run says so
+rather than claiming the output is verbatim.
+
+It requires `--mode duplicating`. Partitioning writes each feature at exactly
+one level, so with thinning off every feature lands in the coarsest level and
+every finer level comes out empty; that is rejected rather than produced.
+
+On `tiles` it also disables the per-tile size cap, since a valve that sheds
+features to fit a byte budget is not verbatim either. Pass `--max-tile-size`
+explicitly to put a cap back; an explicit value always wins.
+
+⚠️ **The two-step form does not inherit that.** `tylertoo overview --verbatim`
+followed by `tylertoo export-pmtiles` still applies the export's own 500K cap
+and sheds features from oversized tiles — the flag is convert-side, and the
+export reads a file, not your flags. Pass `--tile-size-limit 0` to
+`export-pmtiles` (that is the export spelling; `--max-tile-size` is the `tiles`
+one) when every feature must reach a tile.
+
+### `0` is the off switch
+
+Every thinning factor accepts `0`, meaning **no thinning**: each feature is its
+own grid cell, so every feature that passes the gates survives. Previously `0`
+was rejected (`must be a finite value > 0`) and callers used `1e-9` to
+approximate it; that workaround is no longer needed, and `0` is exact rather
+than dependent on float resolution to separate neighbouring cells.
+
+Negative and non-finite factors remain errors.
+
+---
+
 ## Feature thinning: `--point/line/polygon-thinning`
 
 Thinning keeps **one winning feature per grid cell** per level (the winner is

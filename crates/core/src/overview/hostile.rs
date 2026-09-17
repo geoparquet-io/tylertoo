@@ -623,12 +623,20 @@ fn gsd_base_extremes_rejected() {
     }
 }
 
+/// Negative, NaN and infinite thinning factors are meaningless and rejected.
+///
+/// `0` is NOT in this list any more: it is the documented off switch
+/// (#345/#360, see [`zero_thinning_is_the_off_switch_not_an_error`]). It used
+/// to be rejected because a zero cell size made the grid pass *skip* every
+/// feature — the opposite of what a caller means by "no thinning" — which
+/// forced a `1e-9` workaround. The grid pass now treats a zero factor as "every
+/// feature is its own cell", so the value means what it reads like.
 #[test]
-fn thinning_zero_negative_nan_rejected() {
+fn thinning_negative_nan_rejected() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(3), true, None);
-    for bad in [0.0, -4.0, f64::NAN, f64::INFINITY] {
+    for bad in [-4.0, f64::NAN, f64::INFINITY] {
         for knob in 0..3 {
             let mut o = opts(true);
             match knob {
@@ -642,6 +650,18 @@ fn thinning_zero_negative_nan_rejected() {
                 "thinning knob {knob}={bad}: got: {err}"
             );
         }
+    }
+
+    // Every kind's factor accepts 0 individually, not just via --verbatim.
+    for knob in 0..3 {
+        let mut o = opts(true);
+        match knob {
+            0 => o.assign.point_thinning = 0.0,
+            1 => o.assign.line_thinning = 0.0,
+            _ => o.assign.polygon_thinning = 0.0,
+        }
+        convert_to_overviews(tin.path(), tout.path(), &o)
+            .unwrap_or_else(|e| panic!("thinning knob {knob}=0 must be accepted: {e}"));
     }
 }
 
@@ -852,6 +872,157 @@ fn archive_layer_fields(path: &Path) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+// ============================================================================
+// Verbatim disposition: tile the input exactly as given (#345 / #360)
+// ============================================================================
+
+/// A grid of small, uniform, evenly spaced cells — the shape of a DGGS
+/// aggregate (H3/A5 rollup, gpio `process aggregate`). Every cell carries its
+/// own count and every one must be drawn; none is a "simplified" version of
+/// another.
+fn cell_aggregate(n: usize) -> Vec<Option<Geometry<f64>>> {
+    let side = (n as f64).sqrt().ceil() as usize;
+    (0..n)
+        .map(|i| {
+            let (x, y) = (
+                -10.0 + (i % side) as f64 * 0.05,
+                20.0 + (i / side) as f64 * 0.05,
+            );
+            Some(Geometry::Polygon(Polygon::new(
+                LineString::from(vec![
+                    (x, y),
+                    (x + 0.02, y),
+                    (x + 0.02, y + 0.02),
+                    (x, y + 0.02),
+                    (x, y),
+                ]),
+                vec![],
+            )))
+        })
+        .collect()
+}
+
+/// The reported failure (#360): running a cell aggregate through the
+/// generalizing ladder answers the wrong question. The gates ask "is this
+/// feature big enough to see"; for an aggregate the question is "what do these
+/// cells sum to", so a coarse level shows some children and silently omits the
+/// rest. The reporter measured z0 falling from 3,399 cells to 278 — 92% of a
+/// choropleth in which every cell must be drawn.
+///
+/// Verbatim must keep every feature at every level.
+#[test]
+fn verbatim_keeps_every_feature_at_every_level() {
+    const N: usize = 400;
+    let cells = cell_aggregate(N);
+
+    for streaming in [true, false] {
+        // Baseline: the default ladder thins the aggregate away at coarse
+        // levels. This is correct for roads and wrong here — it is the
+        // behaviour the flag exists to switch off.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &cells, true, None);
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
+        let laddered: Vec<usize> = report.levels.iter().map(|l| l.feature_count).collect();
+        assert!(
+            laddered.iter().any(|&c| c < N),
+            "streaming={streaming}: the default ladder should thin this \
+             aggregate (that is the bug being fixed), got {laddered:?}"
+        );
+
+        // Verbatim: every level is the whole input.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &cells, true, None);
+        let report =
+            convert_to_overviews(tin.path(), tout.path(), &opts(streaming).verbatim()).unwrap();
+        let counts: Vec<usize> = report.levels.iter().map(|l| l.feature_count).collect();
+        assert_eq!(
+            counts,
+            vec![N; counts.len()],
+            "streaming={streaming}: every level must carry every cell"
+        );
+        assert!(
+            counts.len() >= 2,
+            "streaming={streaming}: no level may be omitted as empty, got {counts:?}"
+        );
+        validate_file(tout.path()).unwrap();
+    }
+}
+
+/// Verbatim must also leave geometry alone: a level that kept every feature
+/// but simplified their rings is still not the input.
+#[test]
+fn verbatim_preserves_vertex_counts_at_every_level() {
+    let cells = cell_aggregate(200);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &cells, true, None);
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true).verbatim()).unwrap();
+
+    let vertices: Vec<usize> = report.levels.iter().map(|l| l.vertex_count).collect();
+    assert!(
+        vertices.windows(2).all(|w| w[0] == w[1]),
+        "every level must carry identical geometry, got {vertices:?}"
+    );
+}
+
+/// The issue's parenthetical: `--polygon-thinning 0` was rejected ("must be a
+/// finite value > 0"), forcing a `1e-9` workaround. Zero is now the documented
+/// off switch and means what a caller expects — keep everything — rather than
+/// the old degenerate reading, which dropped everything.
+#[test]
+fn zero_thinning_is_the_off_switch_not_an_error() {
+    let cells = cell_aggregate(120);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &cells, true, None);
+
+    let mut o = opts(true);
+    o.assign.polygon_thinning = 0.0;
+    o.assign.polygon_visibility = 0.0;
+    o.density.enabled = false;
+    let report = convert_to_overviews(tin.path(), tout.path(), &o)
+        .expect("0 must be accepted as the off switch");
+    assert!(
+        report.levels.iter().all(|l| l.feature_count == 120),
+        "0 must keep every feature, got {:?}",
+        report
+            .levels
+            .iter()
+            .map(|l| l.feature_count)
+            .collect::<Vec<_>>()
+    );
+
+    // Still nonsense, still rejected.
+    let mut bad = opts(true);
+    bad.assign.polygon_thinning = -1.0;
+    assert!(convert_to_overviews(tin.path(), tout.path(), &bad).is_err());
+    let mut nan = opts(true);
+    nan.assign.polygon_thinning = f64::NAN;
+    assert!(convert_to_overviews(tin.path(), tout.path(), &nan).is_err());
+}
+
+/// `verbatim()` and `is_verbatim()` must agree, and the flag must not reach
+/// beyond the ladder into unrelated configuration.
+#[test]
+fn verbatim_is_recognizable_and_leaves_other_options_alone() {
+    let base = ConvertOptions {
+        mode: Mode::Duplicating,
+        max_row_group_size: 1234,
+        cluster: true,
+        ..opts(true)
+    };
+    assert!(!base.clone().is_verbatim());
+
+    let v = base.clone().verbatim();
+    assert!(v.is_verbatim());
+    assert_eq!(v.max_row_group_size, 1234, "layout knobs are untouched");
+    assert!(v.cluster, "an explicit --cluster is the caller's call");
+    assert_eq!(v.mode, base.mode);
+    assert_eq!(v.levels, base.levels);
 }
 
 // ============================================================================

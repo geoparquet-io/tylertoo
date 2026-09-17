@@ -473,6 +473,68 @@ pub fn resolve_in_flight_batches(requested: usize) -> usize {
     }
 }
 
+impl ConvertOptions {
+    /// Turn off the whole generalization ladder: tile this input **exactly as
+    /// given** at every level (#345 / #360).
+    ///
+    /// The ladder derives coarse levels from the fine input by thinning and
+    /// simplifying. That is right for a road network and wrong for a
+    /// pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is
+    /// their parent, and its count is their sum. Run an aggregate through the
+    /// gates and a coarse level shows *some* children and silently omits the
+    /// rest, rather than showing what they sum to — a choropleth in which
+    /// every cell must be drawn loses most of itself.
+    ///
+    /// Before this existed the only way there was a four-flag incantation
+    /// (`--no-density-drop --polygon-visibility 0 --polygon-thinning 1e-9
+    /// --simplify-factor 0`), which covered only polygons and leaned on `1e-9`
+    /// because `0` was rejected. This is the same intent, stated once, for
+    /// every geometry kind:
+    ///
+    /// - no cell-winner thinning (points, lines, polygons)
+    /// - no visibility gates
+    /// - no simplification
+    /// - no per-level density budget
+    /// - no line coalescing (merging changes feature identity)
+    ///
+    /// It leaves everything else — mode, level plan, CRS, row-group layout,
+    /// clustering if the caller asked for it — untouched, so it composes with
+    /// the rest of the configuration. Apply it first and override afterwards
+    /// if you want *nearly* verbatim.
+    ///
+    /// Note that this governs the **convert** side. A per-tile size limit on
+    /// the export can still drop features; pass `--max-tile-size 0` (which
+    /// `tylertoo tiles --verbatim` does for you) when every feature must
+    /// survive.
+    #[must_use]
+    pub fn verbatim(mut self) -> Self {
+        self.assign.point_thinning = 0.0;
+        self.assign.line_thinning = 0.0;
+        self.assign.polygon_thinning = 0.0;
+        self.assign.line_visibility = 0.0;
+        self.assign.polygon_visibility = 0.0;
+        self.simplify.factor = 0.0;
+        self.density.enabled = false;
+        self.coalesce_lines = false;
+        self
+    }
+
+    /// Whether this configuration generalizes nothing — the predicate form of
+    /// [`Self::verbatim`], true for a config that reproduces its input at
+    /// every level however it was reached (the flag, or the equivalent knobs
+    /// set by hand).
+    pub fn is_verbatim(&self) -> bool {
+        self.assign.point_thinning == 0.0
+            && self.assign.line_thinning == 0.0
+            && self.assign.polygon_thinning == 0.0
+            && self.assign.line_visibility == 0.0
+            && self.assign.polygon_visibility == 0.0
+            && self.simplify.factor == 0.0
+            && !self.density.enabled
+            && !self.coalesce_lines
+    }
+}
+
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
@@ -742,6 +804,21 @@ pub enum ConvertError {
          represented without double counting"
     )]
     ClusterPartitioningUnsupported,
+    /// Verbatim tiling was requested in partitioning mode, where it degenerates.
+    ///
+    /// Partitioning places each feature at exactly its `min_level` (§2.3), and
+    /// `min_level` is the coarsest level whose thinning grid the feature wins.
+    /// With thinning off every feature wins at level 0, so the entire dataset
+    /// lands in the coarsest level and every finer level is emitted empty —
+    /// the opposite of "every level reproduces the input". Duplicating mode is
+    /// what makes verbatim meaningful, because it writes each feature at every
+    /// level it is visible at.
+    #[error(
+        "--verbatim requires duplicating mode: partitioning places each feature at \
+         exactly one level, so with thinning off every feature lands in the coarsest \
+         level and every finer level is empty"
+    )]
+    VerbatimPartitioningUnsupported,
     /// `--accumulate-attribute` was supplied without `--cluster`.
     #[error("--accumulate-attribute requires --cluster")]
     AccumulateWithoutCluster,
@@ -823,9 +900,12 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
         Ok(())
     };
     positive("gsd-base", options.gsd_base)?;
-    positive("point-thinning", options.assign.point_thinning)?;
-    positive("line-thinning", options.assign.line_thinning)?;
-    positive("polygon-thinning", options.assign.polygon_thinning)?;
+    // Thinning factors accept 0 as the documented OFF switch (#345/#360):
+    // every feature is its own cell, so nothing is thinned. Negative and
+    // non-finite values remain meaningless.
+    non_negative("point-thinning", options.assign.point_thinning)?;
+    non_negative("line-thinning", options.assign.line_thinning)?;
+    non_negative("polygon-thinning", options.assign.polygon_thinning)?;
     non_negative("line-visibility", options.assign.line_visibility)?;
     non_negative("polygon-visibility", options.assign.polygon_visibility)?;
     // Negative snap / junction-angle values are documented OFF switches; only
@@ -1181,6 +1261,31 @@ fn decode_and_filter_geometries(
     Ok((filtered, geoms))
 }
 
+/// Option combinations that no pipeline can honour, checked once for both.
+///
+/// These are rejections rather than silent adjustments: each one would
+/// otherwise produce a structurally valid file that is not what was asked for,
+/// which is harder to notice than an error.
+fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError> {
+    // Q4: a partitioning-mode feature has one row read across many zoom
+    // prefixes, so a per-level point_count cannot be represented.
+    if options.cluster && matches!(options.mode, Mode::Partitioning) {
+        return Err(ConvertError::ClusterPartitioningUnsupported);
+    }
+    // Verbatim degenerates in partitioning mode rather than doing nothing:
+    // every feature wins level 0, and partitioning writes it there and nowhere
+    // else. Rejecting beats emitting a pyramid whose finer levels are all
+    // empty and whose warning blames the visibility gates.
+    if options.is_verbatim() && matches!(options.mode, Mode::Partitioning) {
+        return Err(ConvertError::VerbatimPartitioningUnsupported);
+    }
+    // Aggregation is meaningless without clustering.
+    if !options.accumulate.is_empty() && !options.cluster {
+        return Err(ConvertError::AccumulateWithoutCluster);
+    }
+    Ok(())
+}
+
 /// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
 /// Runs the full option normalization (validation, cluster/accumulate checks,
 /// the partitioning-coalesce-inert rewrite) before dispatching.
@@ -1195,15 +1300,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // #272: place the remote-input disk spill (#219) where the caller asked
     // (no-op for local inputs, which never spill).
     source.set_spill_dir(options.spill_dir.as_deref());
-    // Clustering option sanity (Q4), shared by both pipelines: partitioning
-    // mode cannot represent per-level counts (see the error's rationale), and
-    // aggregation is meaningless without clustering.
-    if options.cluster && matches!(options.mode, Mode::Partitioning) {
-        return Err(ConvertError::ClusterPartitioningUnsupported);
-    }
-    if !options.accumulate.is_empty() && !options.cluster {
-        return Err(ConvertError::AccumulateWithoutCluster);
-    }
+    check_mode_combinations(options)?;
     // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
     // chain is a new geometry replacing several source rows, which the
     // feature-once/verbatim contract of §2.3 cannot represent, and removing
