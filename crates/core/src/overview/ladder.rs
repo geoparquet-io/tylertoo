@@ -87,17 +87,33 @@ impl EntryZoomLadder {
         distinct.sort_by(|a, b| b.total_cmp(a)); // descending: strongest first
         distinct.dedup_by(|a, b| a.total_cmp(b).is_eq());
 
-        let rungs = distinct
+        let total = distinct.len();
+        let rungs: Vec<(f64, u8)> = distinct
             .into_iter()
             .enumerate()
-            .map(|(rank, value)| {
+            .map_while(|(rank, value)| {
                 let offset = (rank as u32).saturating_mul(step as u32);
-                let zoom = (base_zoom as u32)
-                    .saturating_add(offset)
-                    .min(max_zoom as u32);
-                (value, zoom as u8)
+                let zoom = (base_zoom as u32).saturating_add(offset);
+                // Past the finest zoom the ladder has nothing to say. Clamping
+                // onto `max_zoom` instead would give every surplus value an
+                // entry level of "finest only" — and because a laddered
+                // feature is authoritative (it is removed from every winner
+                // grid and pinned to its entry level), that silently empties
+                // the coarse pyramid for any high-cardinality column. No rung
+                // means no ladder opinion, which leaves those features to the
+                // ordinary gate and thinning.
+                (zoom <= max_zoom as u32).then_some((value, zoom as u8))
             })
             .collect();
+        if rungs.len() < total {
+            log::warn!(
+                "[assign] entry-zoom ladder: {} of {total} distinct value(s) rank \
+                 past zoom {max_zoom} at step {step} and get no entry zoom — they \
+                 keep the ordinary visibility gate and thinning. Widen the zoom \
+                 range, lower --ladder-step, or name the rungs with --entry-zoom.",
+                total - rungs.len()
+            );
+        }
         Ok(Self::sorted(rungs))
     }
 
@@ -199,7 +215,9 @@ pub fn build_ladder(
     level_zooms: &[Option<u8>],
 ) -> Result<EntryZoomLadder, LadderError> {
     match &spec.kind {
-        EntryZoomKind::Explicit(pairs) => EntryZoomLadder::explicit(pairs.iter().copied()),
+        EntryZoomKind::Explicit(pairs) => {
+            EntryZoomLadder::explicit(snap_to_observed(pairs, values, &spec.column))
+        }
         EntryZoomKind::DenseRank { step } => {
             let base = level_zooms.iter().flatten().copied().min().unwrap_or(0);
             let max = level_zooms
@@ -211,6 +229,56 @@ pub fn build_ladder(
             EntryZoomLadder::dense_rank(values.iter().flatten().copied(), base, *step, max)
         }
     }
+}
+
+/// Relative tolerance for matching a hand-written rung against column data.
+///
+/// A value stored as `f32` widens to an `f64` that is not bit-equal to the
+/// decimal a caller types: `0.425_f32` becomes `0.42500001192092896`. The
+/// widening error is bounded by `2^-24` (~6e-8) relative, so a 1e-6 window
+/// admits it with three orders of magnitude to spare while staying far tighter
+/// than any spacing a human writes between rungs.
+const RUNG_MATCH_REL_TOLERANCE: f64 = 1e-6;
+
+/// Replace each hand-written rung value with the column value it names.
+///
+/// Rungs are matched against the data rather than compared bit-exactly, then
+/// stored as the observed value, so the later lookup can stay an exact
+/// binary search. A rung naming no row is dropped with a warning — silently
+/// keeping it would leave a spec that looks applied and is not.
+fn snap_to_observed(pairs: &[(f64, u8)], values: &[Option<f64>], column: &str) -> Vec<(f64, u8)> {
+    let mut observed: Vec<f64> = values
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    observed.sort_by(f64::total_cmp);
+    observed.dedup_by(|a, b| a.total_cmp(b).is_eq());
+    if observed.is_empty() {
+        // Nothing to snap against (empty input, or an all-null column). The
+        // ladder is inert either way; keep the spec as written.
+        return pairs.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(pairs.len());
+    for &(want, zoom) in pairs {
+        let nearest = observed
+            .iter()
+            .copied()
+            .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()));
+        match nearest {
+            Some(v) if (v - want).abs() <= RUNG_MATCH_REL_TOLERANCE * want.abs().max(1.0) => {
+                out.push((v, zoom));
+            }
+            _ => log::warn!(
+                "[assign] entry-zoom rung {want} matches no value in column \
+                 {column:?}, so nothing enters at zoom {zoom}; check the spec \
+                 against the column's actual values"
+            ),
+        }
+    }
+    out
 }
 
 /// Map each feature's column value to the **level index** it may first appear
@@ -256,6 +324,63 @@ pub fn entry_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #364 S1: an explicit rung must match a value stored as `f32`.
+    ///
+    /// `0.425_f32` widens to `0.42500001192092896_f64`, which is not
+    /// bit-equal to the `0.425_f64` a caller types. Matching rungs with
+    /// `total_cmp` therefore matched nothing on a Float32 column — the common
+    /// storage for contour and magnitude data — and the PR's own documented
+    /// example silently fell back to gate-and-thin for every rung except the
+    /// ones that happen to be exact in binary (0.5 is, 0.425 and 0.2 are not).
+    #[test]
+    fn explicit_rungs_match_values_widened_from_f32() {
+        let column: Vec<Option<f64>> = [0.5f32, 0.425, 0.2, 0.425]
+            .iter()
+            .map(|v| Some(*v as f64))
+            .collect();
+        let spec = EntryZoomSpec {
+            column: "level".to_string(),
+            kind: EntryZoomKind::Explicit(vec![(0.5, 8), (0.425, 9), (0.2, 12)]),
+        };
+        let ladder = build_ladder(&spec, &column, &[Some(8), Some(10), Some(12)]).unwrap();
+        let got: Vec<Option<u8>> = column.iter().map(|v| ladder.entry_zoom(*v)).collect();
+        assert_eq!(
+            got,
+            vec![Some(8), Some(9), Some(12), Some(9)],
+            "every spec'd rung must match its column value despite f32 widening"
+        );
+    }
+
+    /// #364 S1: more distinct values than zooms must not pin the surplus to
+    /// the finest level.
+    ///
+    /// Clamping rank*step to `max_zoom` gave every surplus value an entry zoom
+    /// of `max_zoom`. Because a laddered feature is authoritative — it appears
+    /// from its entry level inward and is removed from every winner grid — that
+    /// made the bulk of a high-cardinality column appear ONLY at the finest
+    /// level, silently emptying the coarse pyramid. That is strictly worse than
+    /// not laddering those features at all, so they get no ladder opinion and
+    /// fall back to the ordinary gate and thinning.
+    #[test]
+    fn values_past_the_finest_zoom_get_no_ladder_opinion() {
+        // 12 distinct values, step 1, zooms 0..=6 → only 7 rungs fit.
+        let values: Vec<f64> = (0..12).map(f64::from).collect();
+        let ladder = EntryZoomLadder::dense_rank(values.iter().copied(), 0, 1, 6).unwrap();
+
+        // Strongest (11.0) enters at z0, each weaker one a zoom later.
+        assert_eq!(ladder.entry_zoom(Some(11.0)), Some(0));
+        assert_eq!(ladder.entry_zoom(Some(5.0)), Some(6));
+        // Rank 7 and beyond would need z7+, which the plan does not have.
+        for surplus in [4.0, 3.0, 2.0, 1.0, 0.0] {
+            assert_eq!(
+                ladder.entry_zoom(Some(surplus)),
+                None,
+                "{surplus} has no rung, so it must keep the ordinary behaviour \
+                 rather than being pinned to the finest level"
+            );
+        }
+    }
 
     /// The motivating case (#364): five contour magnitudes, strongest first,
     /// one zoom apart. The ladder must invert the size ordering that the
@@ -304,13 +429,61 @@ mod tests {
     }
 
     #[test]
-    fn step_widens_the_spacing_and_max_zoom_clamps() {
+    fn step_widens_the_spacing_and_ranks_past_the_finest_zoom_are_dropped() {
         let l = EntryZoomLadder::dense_rank([1.0, 2.0, 3.0, 4.0], 0, 3, 7).unwrap();
         assert_eq!(l.entry_zoom(Some(4.0)), Some(0));
         assert_eq!(l.entry_zoom(Some(3.0)), Some(3));
         assert_eq!(l.entry_zoom(Some(2.0)), Some(6));
-        // Rank 3 would land at 9; the archive stops at 7.
-        assert_eq!(l.entry_zoom(Some(1.0)), Some(7));
+        // Rank 3 would land at 9; the archive stops at 7. Clamping it onto 7
+        // would say "appears at the finest level only" — worse for that
+        // feature than never laddering it, since a laddered feature is also
+        // removed from every winner grid. No rung, no opinion.
+        assert_eq!(l.entry_zoom(Some(1.0)), None);
+        assert_eq!(l.len(), 3, "only the rungs that fit are kept");
+    }
+
+    /// The boundary: a rank landing exactly on `max_zoom` is kept.
+    #[test]
+    fn a_rung_landing_exactly_on_the_finest_zoom_is_kept() {
+        let l = EntryZoomLadder::dense_rank([1.0, 2.0, 3.0], 0, 1, 2).unwrap();
+        assert_eq!(l.entry_zoom(Some(3.0)), Some(0));
+        assert_eq!(l.entry_zoom(Some(2.0)), Some(1));
+        assert_eq!(
+            l.entry_zoom(Some(1.0)),
+            Some(2),
+            "exactly max_zoom, not past it"
+        );
+    }
+
+    /// A rung naming a value no row carries is dropped with a warning, not
+    /// silently retained as a rung nothing can match.
+    #[test]
+    fn explicit_rung_naming_no_observed_value_is_dropped() {
+        let column: Vec<Option<f64>> = vec![Some(0.5), Some(0.2)];
+        let spec = EntryZoomSpec {
+            column: "level".to_string(),
+            kind: EntryZoomKind::Explicit(vec![(0.5, 8), (0.9, 9), (0.2, 12)]),
+        };
+        let ladder = build_ladder(&spec, &column, &[Some(8), Some(10), Some(12)]).unwrap();
+        assert_eq!(ladder.len(), 2, "0.9 names no row");
+        assert_eq!(ladder.entry_zoom(Some(0.5)), Some(8));
+        assert_eq!(ladder.entry_zoom(Some(0.2)), Some(12));
+    }
+
+    /// Snapping must not pull a rung onto a value that is merely closest —
+    /// only onto one within the f32-widening tolerance.
+    #[test]
+    fn explicit_rung_does_not_snap_to_a_distant_value() {
+        let column: Vec<Option<f64>> = vec![Some(1.0), Some(2.0)];
+        let spec = EntryZoomSpec {
+            column: "level".to_string(),
+            kind: EntryZoomKind::Explicit(vec![(1.5, 8)]),
+        };
+        let err = build_ladder(&spec, &column, &[Some(8), Some(12)]).unwrap_err();
+        assert!(
+            matches!(err, LadderError::Empty),
+            "1.5 is nearest to both but matches neither: {err}"
+        );
     }
 
     /// A value the ladder does not know is not an error and not a drop: the

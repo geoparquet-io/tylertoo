@@ -1112,9 +1112,14 @@ impl ConvertTuningArgs {
                 // drop default would then delete it there for simplifying
                 // below that level's tolerance — undoing the promotion the
                 // caller asked for. An explicit --collapse-square still wins.
+                // A ladder implies --collapse, but that is applied in core
+                // (`convert_to_overviews_source_strategy`) so every caller
+                // gets it — the Python bindings and direct library users
+                // included, where the drop default silently deletes the
+                // promoted features and can empty the coarsest level outright.
                 collapse: if self.collapse_square {
                     CollapseMode::Square
-                } else if self.collapse || entry_zoom.is_some() {
+                } else if self.collapse {
                     CollapseMode::Point
                 } else {
                     CollapseMode::Drop
@@ -2920,6 +2925,99 @@ mod tests {
                 false,
             )
             .unwrap()
+    }
+
+    /// The `--entry-zoom` grammar, which had no tests despite +116 lines of
+    /// new surface and a mandatory-TDD policy.
+    #[test]
+    fn entry_zoom_spec_grammar() {
+        use tylertoo_core::overview::ladder::EntryZoomKind;
+
+        let ok = |spec: &str| parse_entry_zoom(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        let s = ok("level:0.5=8,0.425=9,0.2=12");
+        assert_eq!(s.column, "level");
+        match &s.kind {
+            EntryZoomKind::Explicit(pairs) => {
+                assert_eq!(pairs, &[(0.5, 8), (0.425, 9), (0.2, 12)]);
+            }
+            other => panic!("expected explicit rungs, got {other:?}"),
+        }
+
+        // Whitespace and a trailing comma are tolerated.
+        let s = ok("level: 0.5 = 8 , 0.2 = 12 ,");
+        match &s.kind {
+            EntryZoomKind::Explicit(pairs) => assert_eq!(pairs, &[(0.5, 8), (0.2, 12)]),
+            other => panic!("{other:?}"),
+        }
+
+        for bad in [
+            "level",         // no ':'
+            ":0.5=8",        // empty column
+            "level:",        // no pairs
+            "level:0.5",     // missing '='
+            "level:x=8",     // value not a number
+            "level:0.5=z",   // zoom not a number
+            "level:0.5=-1",  // negative zoom
+            "level:0.5=999", // beyond u8
+        ] {
+            assert!(parse_entry_zoom(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// #364: a ladder implies collapse-to-point, and that is applied in CORE so
+    /// every caller gets it — the CLI is not the only entry point, and the
+    /// Python bindings previously lost the entire coarsest level to the drop
+    /// default. `--collapse-square` still wins.
+    #[test]
+    fn a_ladder_implies_collapse_to_point_for_every_caller() {
+        use tylertoo_core::overview::simplify::CollapseMode;
+
+        // The CLI itself leaves the mode alone...
+        let cli = verbatim_opts(&["--magnitude-ladder", "level"]);
+        assert_eq!(cli.simplify.collapse, CollapseMode::Drop);
+        assert_eq!(
+            verbatim_opts(&["--magnitude-ladder", "level", "--collapse-square"])
+                .simplify
+                .collapse,
+            CollapseMode::Square,
+            "an explicit --collapse-square is not overridden"
+        );
+
+        // Core applies the implication (covered by
+        // `ladder_implies_collapse_to_point` in overview::convert), so a
+        // library or Python caller that builds ConvertOptions directly gets it
+        // too — which is what the CLI must NOT duplicate.
+        assert!(
+            cli.entry_zoom.is_some(),
+            "the ladder reaches ConvertOptions"
+        );
+    }
+
+    /// #364/#367: a ladder is not verbatim, and the run must not claim it is.
+    ///
+    /// `--verbatim` logs "every level reproduces the input" when
+    /// `is_verbatim()` holds. An entry-zoom ladder deliberately holds features
+    /// OUT of coarse levels, so a laddered run does not reproduce its input
+    /// there — reporting it as verbatim would make that line a lie on exactly
+    /// the runs that combine the two.
+    #[test]
+    fn a_ladder_means_the_run_is_not_verbatim() {
+        let laddered = verbatim_opts(&["--verbatim", "--magnitude-ladder", "level"]);
+        assert!(
+            laddered.entry_zoom.is_some(),
+            "precondition: the ladder must reach ConvertOptions"
+        );
+        assert!(
+            !laddered.is_verbatim(),
+            "a ladder holds features out of coarse levels, so this is not verbatim"
+        );
+        // The generalization knobs ARE still all off — that half is unchanged,
+        // which is what keeps the partitioning guard firing.
+        assert!(laddered.simplify.factor == 0.0 && !laddered.density.enabled);
+
+        // Without a ladder, --verbatim is still verbatim.
+        assert!(verbatim_opts(&["--verbatim"]).is_verbatim());
     }
 
     /// Verbatim in partitioning mode produces an empty pyramid, so it is

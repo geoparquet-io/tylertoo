@@ -1159,7 +1159,7 @@ mod tests {
         let ring = poly(1, -2.0, -2.0, 2.0, 2.0);
 
         // Control: the gate drops the core to the canonical level.
-        let control = assign_levels(&[core.clone(), ring.clone()], &gsds, &cfg, Crs::Epsg4326);
+        let control = assign_levels(&[core, ring], &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             control.assignments[0].min_level, 2,
             "without a ladder the tiny core is gated out of every coarse level"
@@ -1183,13 +1183,17 @@ mod tests {
         let cfg = AssignConfig::default();
 
         let mut ring = poly(0, -2.0, -2.0, 2.0, 2.0);
-        let control = assign_levels(&[ring.clone()], &gsds, &cfg, Crs::Epsg4326);
+        let control = assign_levels(&[ring], &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(control.assignments[0].min_level, 0, "large: wins level 0");
 
-        ring.entry_level = Some(2);
+        // Deliberately an INTERMEDIATE level, not the finest: on a 3-level
+        // plan `Some(2)` is indistinguishable from "the ladder did nothing and
+        // the feature fell through to canonical", so the test would pass with
+        // the entry level never applied.
+        ring.entry_level = Some(1);
         let laddered = assign_levels(&[ring], &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
-            laddered.assignments[0].min_level, 2,
+            laddered.assignments[0].min_level, 1,
             "an entry level must also delay a feature the grid would admit"
         );
     }
@@ -1208,7 +1212,7 @@ mod tests {
         b.sort_key = Some(1.0);
 
         // Control: they contest one cell and `b` loses the coarse level.
-        let control = assign_levels(&[a.clone(), b.clone()], &gsds, &cfg, Crs::Epsg4326);
+        let control = assign_levels(&[a, b], &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(control.assignments[0].min_level, 0);
         assert_eq!(control.assignments[1].min_level, 1, "b loses the cell");
 
@@ -1232,14 +1236,16 @@ mod tests {
 
         let big = poly(0, -2.0, -2.0, 2.0, 2.0);
         let mut laddered = poly(1, 40.0, 40.0, 44.0, 44.0);
-        laddered.entry_level = Some(2);
+        // Intermediate, so the assertion distinguishes "pinned here" from
+        // "dropped out of the grid and fell through to the finest level".
+        laddered.entry_level = Some(1);
 
         let out = assign_levels(&[big, laddered], &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             out.assignments[0].min_level, 0,
             "the unlabelled feature is unaffected by another feature's ladder"
         );
-        assert_eq!(out.assignments[1].min_level, 2);
+        assert_eq!(out.assignments[1].min_level, 1);
     }
 
     /// An entry level past the finest level clamps rather than producing a
@@ -1248,6 +1254,21 @@ mod tests {
     fn entry_level_beyond_the_finest_clamps() {
         let gsds = [gsd(2), gsd(4)];
         let cfg = AssignConfig::default();
+        // Two features, so the assertion distinguishes "clamped to the finest
+        // level" from "exempted from the grid and left at the finest level by
+        // default" — the sibling's entry level is only honoured if the value
+        // is actually read.
+        let mut far = point(0, 5.0, 5.0);
+        far.entry_level = Some(200);
+        let mut near = point(1, 6.0, 6.0);
+        near.entry_level = Some(0);
+        let both = assign_levels(&[far, near], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            both.assignments[1].min_level, 0,
+            "an in-range entry level is honoured, so the value is read"
+        );
+        assert_eq!(both.assignments[0].min_level, 1, "200 clamps to the finest");
+
         let mut p = point(0, 5.0, 5.0);
         p.entry_level = Some(200);
         let out = assign_levels(&[p], &gsds, &cfg, Crs::Epsg4326);
@@ -1268,7 +1289,11 @@ mod tests {
             .map(|i| {
                 let mut f = poly(i, i as f64 * 0.5, 0.0, i as f64 * 0.5 + 0.2, 0.2);
                 if i % 3 == 0 {
-                    f.entry_level = Some((i % 3) as u8);
+                    // Spread across levels: `i % 3` inside this branch is
+                    // always 0, so the original only ever exercised entry
+                    // level 0 — the one case where "pinned" and "coarsest"
+                    // coincide and a bug could hide.
+                    f.entry_level = Some((i % 5) as u8);
                 }
                 f
             })

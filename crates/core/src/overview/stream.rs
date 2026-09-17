@@ -1106,6 +1106,36 @@ fn pass1_projection(
     cols
 }
 
+/// Stamp each feature's entry level from the ladder column (#364).
+///
+/// Resolved against the same level plan the buffered pipeline uses, so both
+/// engines place a feature identically. A spec that yields no ladder — an
+/// unusable column, a GSD-only plan — leaves every `entry_level` as `None`,
+/// which is the "no ladder opinion" case the assignment already handles.
+///
+/// Lifted out of [`run_pass1`] rather than inlined: pass 1 is already at the
+/// cognitive-complexity ceiling the workspace lints enforce, and this is a
+/// self-contained step with no other reader in that function.
+fn apply_entry_levels(
+    options: &ConvertOptions,
+    ladder_values: &[Option<f64>],
+    num_rows: usize,
+    features: &mut [AssignFeature],
+) -> Result<(), ConvertError> {
+    if options.entry_zoom.is_none() {
+        return Ok(());
+    }
+    debug_assert_eq!(ladder_values.len(), num_rows);
+    let level_specs = options.levels.resolve(options.gsd_base)?;
+    if let Some(entry) = super::convert::resolve_entry_levels(options, ladder_values, &level_specs)?
+    {
+        for f in features.iter_mut() {
+            f.entry_level = entry.get(f.index).copied().flatten();
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_pass1(
     source: &ConvertSource,
@@ -1191,6 +1221,11 @@ fn run_pass1(
         // index, so every row-keyed table stays aligned (H4 hardening; a
         // skipped row must never shift attributes onto a neighbor's geometry).
         let base = num_rows;
+        // #364: which rows of this batch became features. The ladder ranks
+        // DISTINCT values, so it must see the same multiset the buffered engine
+        // sees — that one reads the column off the table AFTER filtering, so a
+        // value carried only by a rejected row must not create a rung here.
+        let mut kept_row = vec![false; geoms_buf.len()];
         for (i, gopt) in geoms_buf.iter().enumerate() {
             // Attribute filter (#315): keep only rows where the predicate is
             // TRUE. The row index still advances (row-keyed tables stay
@@ -1229,6 +1264,7 @@ fn run_pass1(
                 line_feat_pos.push(features.len());
                 line_geoms.push(g.clone());
             }
+            kept_row[i] = true;
             features.push(AssignFeature {
                 index: base + i,
                 bbox: fbbox,
@@ -1277,9 +1313,18 @@ fn run_pass1(
             acc_values[s].extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
         }
 
-        // Entry-zoom ladder (#364): row-indexed, like the ranking keys above.
+        // Entry-zoom ladder (#364): row-indexed, like the ranking keys above,
+        // but blanked for rows this pass rejected (null/unusable geometry, a
+        // false `--filter` predicate, a `--bbox` miss). Those rows produce no
+        // feature, so letting their values into the ladder would add rungs the
+        // buffered engine never sees and shift every weaker feature by `step`.
         if let Some(idx) = ladder_col {
-            ladder_values.extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
+            let keys = extract_sort_keys(batch.column(proj(idx)).as_ref());
+            ladder_values.extend(
+                keys.into_iter()
+                    .zip(&kept_row)
+                    .map(|(k, keep)| if *keep { k } else { None }),
+            );
         }
     }
 
@@ -1377,20 +1422,7 @@ fn run_pass1(
         }
     }
 
-    // Entry-zoom ladder (#364). Row-indexed like the ranking keys, and
-    // resolved against the same level plan the buffered pipeline uses, so both
-    // engines place a feature identically.
-    if options.entry_zoom.is_some() {
-        debug_assert_eq!(ladder_values.len(), num_rows);
-        let level_specs = options.levels.resolve(options.gsd_base)?;
-        if let Some(entry) =
-            super::convert::resolve_entry_levels(options, &ladder_values, &level_specs)?
-        {
-            for f in features.iter_mut() {
-                f.entry_level = entry[f.index];
-            }
-        }
-    }
+    apply_entry_levels(options, &ladder_values, num_rows, &mut features)?;
 
     // Coalescing scratch (Q3): line sort keys + per-line groups. `rows` and
     // `groups` are row-indexed; sort keys live on the features.

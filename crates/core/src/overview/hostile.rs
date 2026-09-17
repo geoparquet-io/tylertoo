@@ -1085,10 +1085,13 @@ fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
             "streaming={streaming}: precondition — the gate drops every 0.5 \
              core at the coarsest level without a ladder (got {before:?})"
         );
-        assert!(
-            after[0] > 0,
-            "streaming={streaming}: the ladder must admit the strongest \
-             magnitude at the coarsest level (before={before:?} after={after:?})"
+        // Deterministic: 8 sites, so all 8 cores. `> 0` would pass with seven
+        // of them lost, which is most of what the ladder exists to prevent.
+        assert_eq!(
+            after,
+            vec![8; after.len()],
+            "streaming={streaming}: the ladder must admit EVERY 0.5 core at \
+             every level (before={before:?})"
         );
         validate_file(tout2.path()).unwrap();
     }
@@ -1121,6 +1124,77 @@ fn entry_zoom_ladder_is_identical_across_pipelines() {
     assert_eq!(
         per_engine[0], per_engine[1],
         "streamed and buffered engines must agree on ladder placement"
+    );
+    // Absolute, not just A == B: a pure differential passes with the ladder
+    // switched off entirely, since both engines then agree on the unladdered
+    // answer. 6 sites, strongest band present at every level from the
+    // coarsest; the weakest joins only at the finest.
+    // `level_strong_counts` is cumulative (`>= min_mag`), so `all` is every
+    // feature and `strong` is just the top band.
+    let (strong, all) = &per_engine[0];
+    assert_eq!(
+        *strong,
+        vec![6; strong.len()],
+        "the strongest magnitude enters at the coarsest level and stays"
+    );
+    assert_eq!(
+        all[0], 6,
+        "level 0 carries ONLY the strongest band — the ladder holds the other \
+         four out (got {all:?})"
+    );
+    assert!(
+        all.last().is_some_and(|&c| c > all[0]),
+        "...and the weaker bands have joined by the finest level (got {all:?})"
+    );
+}
+
+/// #364: the two engines must rank the same rows, not just agree on a fixture
+/// where every row survives.
+///
+/// The ladder ranks DISTINCT values, so one extra value seen by only one
+/// engine shifts every weaker feature by a whole `step`. The buffered engine
+/// reads the column off the table *after* rejection; the streaming engine
+/// reads it off the raw batch during pass 1. Any row that one keeps and the
+/// other drops — a false `--filter` predicate, a null or unusable geometry, a
+/// `--bbox` miss — therefore split the two ladders.
+///
+/// `entry_zoom_ladder_is_identical_across_pipelines` cannot catch this: its
+/// fixture has no rejected rows at all, so the two multisets coincide by
+/// construction. This one puts a row in exactly that gap.
+#[test]
+fn entry_zoom_ladder_agrees_across_pipelines_when_rows_are_rejected() {
+    use crate::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let mut per_engine = Vec::new();
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 6);
+        let o = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "magnitude".to_string(),
+                kind: EntryZoomKind::DenseRank { step: 1 },
+            }),
+            // Excludes the strongest band, so the rows carrying the top
+            // distinct value never become features. If the ladder still sees
+            // that value, it spends rung 0 on a magnitude that is not in the
+            // output and every surviving band enters one zoom too late.
+            filter: Some("magnitude < 0.45".to_string()),
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+        per_engine.push((
+            level_strong_counts(tout.path(), 0.425),
+            level_strong_counts(tout.path(), 0.2),
+        ));
+    }
+    assert_eq!(
+        per_engine[0], per_engine[1],
+        "a filtered-out row must not create a ladder rung in one engine only"
+    );
+    assert!(
+        per_engine[0].0.iter().any(|&c| c > 0),
+        "precondition: the surviving strongest band must reach some level"
     );
 }
 
