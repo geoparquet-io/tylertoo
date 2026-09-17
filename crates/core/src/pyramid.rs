@@ -189,14 +189,24 @@ pub fn classify_band_input(path: &Path) -> BandSource {
     use std::io::Read;
 
     let mut magic = [0u8; 7];
-    let is_archive = std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && &magic == b"PMTiles";
-    if is_archive {
-        BandSource::Archive
-    } else {
-        BandSource::Source
+    match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)) {
+        Ok(()) if &magic == b"PMTiles" => BandSource::Archive,
+        Ok(()) => BandSource::Source,
+        Err(e) => {
+            // "Cannot read it" is not the same as "it is a source". A file
+            // that exists but cannot be opened would otherwise be handed to
+            // the parquet reader and fail as a malformed source, hiding the
+            // real cause. NotFound stays quiet — the CLI reports a missing
+            // input by name before reaching here.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "cannot read band input {}: {e}; treating it as a source to \
+                     tile, which will fail if it is actually a PMTiles archive",
+                    path.display()
+                );
+            }
+            BandSource::Source
+        }
     }
 }
 

@@ -124,9 +124,19 @@ range; an archive is merged as-is. That keeps the older two-step workflow
 (tile each band yourself, then merge) working unchanged, and lets you mix:
 reuse last week's coarse archive and re-tile only the fine band.
 
-`LAYER` defaults to the input's file stem. Intermediates go to `--work-dir`
-(default: the system temp directory) and are removed whether the build
-succeeds or fails.
+`LAYER` defaults to the input's file stem — or, for a glob or a directory,
+the directory name, since a layer called `*` is not useful to a client. A path
+containing a colon (`s3://…`, `https://…`, `C:\…`) is fine; the layer is only
+split off when the last colon-separated segment looks like a layer id rather
+than part of a path. Zoom ranges must not overlap; a **gap** between bands is
+allowed but warns, because the merged archive advertises one continuous range
+and a client will request the uncovered zooms and get nothing.
+
+Intermediates go to `--work-dir` (default: the system temp directory) and are
+removed whether the build succeeds or fails. Budget for it: a band is tiled in
+duplicating mode, so its intermediate overview holds roughly *levels × input
+size*, every band's finished archive is on disk at once before the merge, and
+the merge itself spools through the temp directory.
 
 ---
 
