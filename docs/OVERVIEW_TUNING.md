@@ -85,6 +85,51 @@ the footer `levels[].gsd` already imply `1024`, so default output is unchanged).
 
 ---
 
+## Several inputs, one archive: `tylertoo pyramid`
+
+`--verbatim` makes one input tile honestly across the zooms it owns. A
+**pyramid** goes further: it serves the same map from a *different input* at
+different zooms — a pre-aggregated summary at coarse zooms, the raw features at
+fine ones — in one archive, so a client switches at the handover with no second
+request.
+
+```bash
+tylertoo pyramid fire-2023.pmtiles \
+  --band "0-5:cells_r5.parquet:aggregate" \
+  --band "6-8:cells_r8.parquet:aggregate" \
+  --band "9-14:points.parquet:features"
+```
+
+| layer | source | zooms |
+|-------|--------|-------|
+| `aggregate` | r5 cells | z0–5 |
+| `aggregate` | r8 cells | z6–8 |
+| `features` | raw detections | z9–14 |
+
+Two bands may share a layer name, as `aggregate` does here: to a client it is
+one layer whose content changes at z6. Zoom ranges must not overlap — two bands
+claiming one zoom would write the same tile ids — and that is checked before
+any tiling happens, so a bad plan costs an error rather than a conversion.
+
+**A band is tiled verbatim by default.** That is the premise of banding: the
+input already *is* the right resolution for the zooms it owns, so running the
+ladder over it would re-introduce exactly what the pyramid avoids. Pass
+`--generalize` when a band is raw features spanning several zooms and you do
+want the ladder inside it.
+
+**A band may be GeoParquet or an already-tiled PMTiles archive.** Both are
+spelled `--band LO-HI:PATH[:LAYER]`; the kind is detected from the file
+contents, not the extension. A source is tiled here, restricted to the band's
+range; an archive is merged as-is. That keeps the older two-step workflow
+(tile each band yourself, then merge) working unchanged, and lets you mix:
+reuse last week's coarse archive and re-tile only the fine band.
+
+`LAYER` defaults to the input's file stem. Intermediates go to `--work-dir`
+(default: the system temp directory) and are removed whether the build
+succeeds or fails.
+
+---
+
 ## Switching the ladder off entirely: `--verbatim`
 
 Everything below this heading generalizes: thinning, visibility gates,

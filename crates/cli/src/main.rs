@@ -144,7 +144,8 @@ enum Command {
     ExportPmtiles(ExportPmtilesArgs),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
-    /// Merge per-band PMTiles archives into one multi-band pyramid (issue #345).
+    /// Build a multi-band pyramid: several inputs, each owning a zoom range,
+    /// one archive (issue #345).
     Pyramid(PyramidArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
@@ -158,24 +159,57 @@ enum Command {
 
 /// Arguments for `tylertoo pyramid`.
 ///
-/// Step two of a two-step, the way `overview` -> `export-pmtiles` is: tile each
-/// band with `tylertoo tiles` restricted to that band's zoom range, then merge
-/// the archives here. A one-shot form that takes the GeoParquet inputs directly
-/// is the obvious follow-up; this exists to make the pyramid *shape* reachable.
+/// A pyramid serves the same map from a *different input* at different zooms:
+/// coarse zooms read a pre-aggregated summary, fine zooms read the raw
+/// features. That is not the generalization ladder — a coarse aggregate is a
+/// different aggregation, not a thinned sample of the fine one — which is why
+/// a band is tiled verbatim by default.
+///
+/// A band may point at GeoParquet (tiled here, one shot) or at a PMTiles
+/// archive already tiled for that range (merged as-is). The kind is detected
+/// from the file, so both spellings are just `--band LO-HI:PATH[:LAYER]`.
 #[derive(Parser, Debug)]
 pub struct PyramidArgs {
     /// Output PMTiles archive.
     pub output: PathBuf,
 
-    /// A band: `LO-HI:ARCHIVE[:LAYER]`, repeatable. ARCHIVE is a PMTiles file
-    /// already tiled for that zoom range. LAYER defaults to the file stem, and
-    /// several bands may share one layer name (the usual case: a coarse and a
-    /// fine aggregate that are the same layer to a client). Zoom ranges must
-    /// not overlap -- two bands claiming one zoom write the same tile ids.
-    /// ARCHIVE may not contain a `:`, which the spec cannot tell apart from the
+    /// A band: `LO-HI:INPUT[:LAYER]`, repeatable.
+    ///
+    /// INPUT is either a GeoParquet source — tiled here, restricted to this
+    /// band's zoom range — or a PMTiles archive already tiled for that range,
+    /// which is merged as-is. Which one it is is detected from the file, not
+    /// the extension.
+    ///
+    /// LAYER defaults to the file stem, and several bands may share one layer
+    /// name (the usual case: a coarse and a fine aggregate that are the same
+    /// layer to a client). Zoom ranges must not overlap -- two bands claiming
+    /// one zoom write the same tile ids.
+    ///
+    /// INPUT may not contain a `:`, which the spec cannot tell apart from the
     /// LAYER separator; rename the file or point at it through a symlink.
-    #[arg(long = "band", required = true, value_name = "LO-HI:ARCHIVE[:LAYER]")]
+    #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
+
+    /// Generalize each GeoParquet band with the normal ladder instead of
+    /// tiling it verbatim.
+    ///
+    /// Off by default: a band's premise is that its input is already the right
+    /// resolution for the zooms it owns, so thinning and simplifying it would
+    /// re-introduce exactly what banding avoids. Pass this when a band is raw
+    /// features spanning several zooms and you do want the ladder inside it.
+    #[arg(long)]
+    pub generalize: bool,
+
+    /// Per-tile MVT size cap for bands tiled here (e.g. "500K"). Unset means
+    /// no cap, matching the verbatim default: a valve that sheds features to
+    /// fit a byte budget would drop cells the band exists to draw.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
+    pub max_tile_size: Option<usize>,
+
+    /// Directory for the per-band intermediates (removed on the way out).
+    /// Defaults to the system temp directory.
+    #[arg(long, value_name = "DIR")]
+    pub work_dir: Option<PathBuf>,
 
     /// Overwrite the output if it exists.
     #[arg(short, long)]
@@ -1964,7 +1998,11 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
-    use tylertoo_core::pyramid::{merge_bands, validate_bands, Band};
+    use tylertoo_core::overview::convert::ConvertOptions;
+    use tylertoo_core::overview::export::ExportOptions;
+    use tylertoo_core::pyramid::{
+        build_pyramid, classify_band_input, validate_bands, Band, BandSource, PyramidOptions,
+    };
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1982,14 +2020,31 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     validate_bands(&bands).map_err(|e| anyhow::anyhow!(e))?;
 
+    // A source band may be a glob, a directory or a remote URL, none of which
+    // `exists()` answers usefully; only a local archive is checked here, and
+    // core reports an unreadable source with the reader's own error.
     for b in &bands {
-        if !b.input.exists() {
+        if !b.input.exists() && classify_band_input(&b.input) == BandSource::Archive {
             anyhow::bail!("band archive not found: {}", b.input.display());
         }
     }
 
-    let report =
-        merge_bands(&bands, &args.output).map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+    let convert = if args.generalize {
+        ConvertOptions::default()
+    } else {
+        ConvertOptions::default().verbatim()
+    };
+    let opts = PyramidOptions {
+        convert,
+        export: ExportOptions {
+            tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
+            ..ExportOptions::default()
+        },
+        work_dir: args.work_dir.clone(),
+    };
+
+    let report = build_pyramid(&bands, &args.output, &opts)
+        .map_err(|e| anyhow::anyhow!("pyramid build failed: {e}"))?;
 
     for (layer, lo, hi, n) in &report.per_band_tiles {
         println!(
@@ -2006,7 +2061,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         );
     }
     println!(
-        "✓ Merged {} band(s) → {} ({} tiles)",
+        "✓ Built {} band(s) → {} ({} tiles)",
         bands.len(),
         args.output.display(),
         format_number(report.total_tiles as u64)

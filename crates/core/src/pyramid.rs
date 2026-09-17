@@ -21,8 +21,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use tempfile::NamedTempFile;
+
 use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
+use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_writer::{
     decode_directory, tile_id_to_zxy, DirEntry, Header, StreamingPmtilesWriter,
 };
@@ -90,6 +94,42 @@ impl Band {
             min_zoom,
             max_zoom,
         })
+    }
+}
+
+/// What a band's `input` actually is.
+///
+/// The one-shot form (#345) takes GeoParquet sources and tiles them here; the
+/// two-step form takes archives already tiled for their zoom range. Both are
+/// spelled `--band LO-HI:PATH[:LAYER]`, so the kind is detected rather than
+/// declared — a caller should not have to tell tylertoo what its own file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandSource {
+    /// A PMTiles archive, merged as-is.
+    Archive,
+    /// A GeoParquet source (file, directory, glob, or remote URL) to tile.
+    Source,
+}
+
+/// Classify a band input by content, not by name.
+///
+/// A local file whose first bytes are the PMTiles v3 magic is an archive;
+/// everything else is a source to tile. Sniffing beats trusting the extension
+/// — `.pmtiles` is a convention, not a guarantee — and everything that is not
+/// a readable local file (a glob, a directory, an `s3://` URL) can only be a
+/// GeoParquet source here, since a band archive is always one local file.
+pub fn classify_band_input(path: &Path) -> BandSource {
+    use std::io::Read;
+
+    let mut magic = [0u8; 7];
+    let is_archive = std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"PMTiles";
+    if is_archive {
+        BandSource::Archive
+    } else {
+        BandSource::Source
     }
 }
 
@@ -316,6 +356,144 @@ pub struct PyramidReport {
     pub skipped: usize,
 }
 
+/// How the one-shot pyramid tiles each GeoParquet band.
+#[derive(Debug, Clone)]
+pub struct PyramidOptions {
+    /// Convert knobs applied to every source band, with the band's own zoom
+    /// range substituted for [`ConvertOptions::levels`].
+    ///
+    /// Defaults to [`ConvertOptions::verbatim`]: a pyramid band is an input
+    /// that already *is* the right resolution for the zooms it owns — that is
+    /// the whole premise of banding — so generalizing it would re-introduce
+    /// the problem the pyramid exists to avoid. Callers that want the ladder
+    /// inside a band pass a non-verbatim config.
+    pub convert: ConvertOptions,
+    /// Export knobs applied to every source band, with the band's own layer
+    /// name substituted for [`ExportOptions::layer_name`].
+    pub export: ExportOptions,
+    /// Directory for the per-band intermediates (one overview GeoParquet and
+    /// one PMTiles archive per source band, all removed on the way out).
+    /// `None` uses the system temp directory.
+    pub work_dir: Option<PathBuf>,
+}
+
+impl Default for PyramidOptions {
+    fn default() -> Self {
+        Self {
+            convert: ConvertOptions::default().verbatim(),
+            // Every feature of an aggregate band must be drawn, so the default
+            // per-tile size valve — which sheds features to fit a byte budget
+            // — is off, matching `tiles --verbatim`.
+            export: ExportOptions {
+                tile_size_limit: None,
+                ..ExportOptions::default()
+            },
+            work_dir: None,
+        }
+    }
+}
+
+/// Build a pyramid in one shot: tile every GeoParquet band into its own zoom
+/// range, then merge the results with any already-tiled bands (#345).
+///
+/// This is the form the issue asks for —
+/// `--band "0-5:cells_r5.parquet:aggregate"` — and it is deliberately thin:
+/// each source band runs the ordinary convert → export chain restricted to its
+/// zoom range, and [`merge_bands`] stitches the archives by tile id. Bands own
+/// disjoint zoom ranges, so no tile is ever claimed twice and the merge stays a
+/// concatenation rather than a per-tile layer union.
+///
+/// Bands may mix kinds freely: a band pointing at a PMTiles archive is used
+/// as-is (the two-step form), one pointing at anything else is tiled here.
+/// [`classify_band_input`] decides, by content.
+///
+/// Intermediates live in `work_dir` and are removed whether the build succeeds
+/// or fails.
+pub fn build_pyramid(
+    bands: &[Band],
+    output: &Path,
+    opts: &PyramidOptions,
+) -> Result<PyramidReport, Error> {
+    validate_bands(bands).map_err(Error::PMTilesWrite)?;
+
+    // Keeps every intermediate alive for the merge and unlinks them on drop —
+    // including the early-return paths below.
+    let mut scratch: Vec<NamedTempFile> = Vec::new();
+    let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
+
+    for band in bands {
+        if classify_band_input(&band.input) == BandSource::Archive {
+            log::info!(
+                "[pyramid] z{}-{} layer {:?}: using the pre-tiled archive {}",
+                band.min_zoom,
+                band.max_zoom,
+                band.layer,
+                band.input.display(),
+            );
+            tiled.push(band.clone());
+            continue;
+        }
+
+        log::info!(
+            "[pyramid] z{}-{} layer {:?}: tiling {}{}",
+            band.min_zoom,
+            band.max_zoom,
+            band.layer,
+            band.input.display(),
+            if opts.convert.is_verbatim() {
+                " (verbatim)"
+            } else {
+                ""
+            },
+        );
+
+        let named = |suffix: &str| -> Result<NamedTempFile, Error> {
+            let mut b = tempfile::Builder::new();
+            b.prefix("tylertoo-pyramid-").suffix(suffix);
+            match &opts.work_dir {
+                Some(dir) => b.tempfile_in(dir),
+                None => b.tempfile(),
+            }
+            .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
+        };
+
+        let overview = named(".parquet")?;
+        let archive = named(".pmtiles")?;
+
+        let convert = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: band.min_zoom,
+                max_zoom: band.max_zoom,
+            },
+            ..opts.convert.clone()
+        };
+        convert_to_overviews(&band.input, overview.path(), &convert).map_err(|e| {
+            Error::PMTilesWrite(format!("band {:?}: convert failed: {e}", band.layer))
+        })?;
+
+        let export = ExportOptions {
+            layer_name: band.layer.clone(),
+            ..opts.export.clone()
+        };
+        export_pmtiles(overview.path(), archive.path(), &export).map_err(|e| {
+            Error::PMTilesWrite(format!("band {:?}: export failed: {e}", band.layer))
+        })?;
+
+        tiled.push(Band {
+            input: archive.path().to_path_buf(),
+            layer: band.layer.clone(),
+            min_zoom: band.min_zoom,
+            max_zoom: band.max_zoom,
+        });
+        // The overview is only needed for the export above; the archive must
+        // outlive the merge.
+        drop(overview);
+        scratch.push(archive);
+    }
+
+    merge_bands(&tiled, output)
+}
+
 /// Merge per-band archives into one, in band order.
 ///
 /// Tiles are copied across still compressed; nothing is decoded. That is also
@@ -451,6 +629,256 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A band input is classified by content, not by name: `.pmtiles` is a
+    /// convention and a source can be a glob, a directory or a URL that no
+    /// extension rule would get right.
+    #[test]
+    fn band_input_kind_is_detected_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Real PMTiles magic, misleading extension.
+        let archive = dir.path().join("looks-like-data.parquet");
+        std::fs::write(&archive, b"PMTiles\x03rest-of-header").unwrap();
+        assert_eq!(classify_band_input(&archive), BandSource::Archive);
+
+        // Real parquet magic, misleading extension.
+        let source = dir.path().join("looks-like-an-archive.pmtiles");
+        std::fs::write(&source, b"PAR1........").unwrap();
+        assert_eq!(classify_band_input(&source), BandSource::Source);
+
+        // A glob, a directory and a remote URL are all sources: a band archive
+        // is always one local file.
+        assert_eq!(
+            classify_band_input(Path::new("/data/cells/*.parquet")),
+            BandSource::Source
+        );
+        assert_eq!(classify_band_input(dir.path()), BandSource::Source);
+        assert_eq!(
+            classify_band_input(Path::new("s3://bucket/cells.parquet")),
+            BandSource::Source
+        );
+
+        // A file too short to hold the magic is not an archive.
+        let stub = dir.path().join("tiny");
+        std::fs::write(&stub, b"PM").unwrap();
+        assert_eq!(classify_band_input(&stub), BandSource::Source);
+    }
+
+    /// The one-shot form (#345): GeoParquet in, one banded archive out. Each
+    /// band contributes tiles only within its own zoom range, and the bands
+    /// share a layer name — the FIRMS/contour shape, where a coarse aggregate
+    /// and a fine one are the same layer to a client.
+    #[test]
+    fn build_pyramid_tiles_geoparquet_bands_into_one_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let coarse = dir.path().join("coarse.parquet");
+        let fine = dir.path().join("fine.parquet");
+        write_cell_source(&coarse, 40, 0.6);
+        write_cell_source(&fine, 120, 0.2);
+
+        let out = dir.path().join("pyramid.pmtiles");
+        let bands = vec![
+            Band {
+                input: coarse.clone(),
+                layer: "aggregate".to_string(),
+                min_zoom: 0,
+                max_zoom: 2,
+            },
+            Band {
+                input: fine.clone(),
+                layer: "aggregate".to_string(),
+                min_zoom: 3,
+                max_zoom: 4,
+            },
+        ];
+        let report = build_pyramid(
+            &bands,
+            &out,
+            &PyramidOptions {
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.per_band_tiles.len(), 2);
+        assert!(report.total_tiles > 0);
+        assert_eq!(
+            report.skipped, 0,
+            "every tile must fall inside its band's declared range"
+        );
+
+        // Each band owns its zooms exclusively.
+        let zooms = archive_zooms(&out);
+        assert_eq!(
+            zooms,
+            vec![0, 1, 2, 3, 4],
+            "the merged archive must span every band's range"
+        );
+
+        // Intermediates are cleaned up: only the output remains.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("tylertoo-pyramid-"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    /// Bands may mix kinds: an already-tiled archive alongside a source that
+    /// this call tiles. Both spellings are `--band LO-HI:PATH[:LAYER]`.
+    #[test]
+    fn build_pyramid_mixes_pre_tiled_and_source_bands() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Band 1: tile a source the normal way, standing in for an archive a
+        // previous run produced.
+        let src = dir.path().join("pre.parquet");
+        write_cell_source(&src, 30, 0.6);
+        let pre = dir.path().join("pre.pmtiles");
+        build_pyramid(
+            &[Band {
+                input: src,
+                layer: "aggregate".to_string(),
+                min_zoom: 0,
+                max_zoom: 1,
+            }],
+            &pre,
+            &PyramidOptions {
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(classify_band_input(&pre), BandSource::Archive);
+
+        // Band 2: a source, tiled now.
+        let fine = dir.path().join("fine.parquet");
+        write_cell_source(&fine, 90, 0.25);
+
+        let out = dir.path().join("mixed.pmtiles");
+        let report = build_pyramid(
+            &[
+                Band {
+                    input: pre,
+                    layer: "aggregate".to_string(),
+                    min_zoom: 0,
+                    max_zoom: 1,
+                },
+                Band {
+                    input: fine,
+                    layer: "features".to_string(),
+                    min_zoom: 2,
+                    max_zoom: 3,
+                },
+            ],
+            &out,
+            &PyramidOptions {
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.skipped, 0);
+        assert_eq!(archive_zooms(&out), vec![0, 1, 2, 3]);
+    }
+
+    /// The premise of a band is that its input is already the right resolution
+    /// for the zooms it owns, so the default must not generalize it away —
+    /// that is the #360 failure the pyramid exists to sidestep.
+    #[test]
+    fn build_pyramid_defaults_to_verbatim_bands() {
+        assert!(
+            PyramidOptions::default().convert.is_verbatim(),
+            "a pyramid band must be tiled as given by default"
+        );
+        assert_eq!(
+            PyramidOptions::default().export.tile_size_limit,
+            None,
+            "a size valve that sheds features is not verbatim either"
+        );
+    }
+
+    /// An overlapping range is caught before any band is tiled, so a mistake
+    /// costs an error rather than a full conversion.
+    #[test]
+    fn build_pyramid_rejects_overlap_before_doing_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("cells.parquet");
+        write_cell_source(&src, 20, 0.5);
+        let out = dir.path().join("out.pmtiles");
+
+        let err = build_pyramid(
+            &[
+                Band {
+                    input: src.clone(),
+                    layer: "a".to_string(),
+                    min_zoom: 0,
+                    max_zoom: 3,
+                },
+                Band {
+                    input: src,
+                    layer: "b".to_string(),
+                    min_zoom: 3,
+                    max_zoom: 5,
+                },
+            ],
+            &out,
+            &PyramidOptions::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlap at zoom 3"), "{err}");
+        assert!(!out.exists(), "nothing should be written on a bad plan");
+    }
+
+    /// A grid of uniform cells: the shape of a DGGS aggregate band.
+    fn write_cell_source(path: &Path, n: usize, size: f64) {
+        use geo::{Geometry, LineString, Polygon};
+
+        let side = (n as f64).sqrt().ceil() as usize;
+        let geoms: Vec<Option<Geometry<f64>>> = (0..n)
+            .map(|i| {
+                let (x, y) = (
+                    -20.0 + (i % side) as f64 * size * 1.2,
+                    10.0 + (i / side) as f64 * size * 1.2,
+                );
+                Some(Geometry::Polygon(Polygon::new(
+                    LineString::from(vec![
+                        (x, y),
+                        (x + size, y),
+                        (x + size, y + size),
+                        (x, y + size),
+                        (x, y),
+                    ]),
+                    vec![],
+                )))
+            })
+            .collect();
+        crate::overview::testutil::write_input(path, &geoms, true, None);
+    }
+
+    /// The distinct zooms present in a PMTiles archive, ascending.
+    fn archive_zooms(path: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes[..127]).unwrap();
+        let root = compression::decompress(
+            &bytes[header.root_dir_offset as usize
+                ..(header.root_dir_offset + header.root_dir_length) as usize],
+            Compression::Gzip,
+        )
+        .unwrap();
+        let mut zooms: Vec<u8> = decode_directory(&root)
+            .unwrap()
+            .iter()
+            .filter(|e| e.run_length > 0)
+            .map(|e| tile_id_to_zxy(e.tile_id).unwrap().0)
+            .collect();
+        zooms.sort_unstable();
+        zooms.dedup();
+        zooms
+    }
 
     #[test]
     fn band_parses_range_path_and_layer() {

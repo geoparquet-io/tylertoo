@@ -31,7 +31,7 @@ Top-level CLI: a default (bare) tile pipeline plus subcommands.
 * `validate` — Validate a GeoParquet overview file against the spec (§6.2)
 * `export-pmtiles` — Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `decode` — Decode a PMTiles vector-tile archive back to GeoParquet
-* `pyramid` — Merge per-band PMTiles archives into one multi-band pyramid (issue #345)
+* `pyramid` — Build a multi-band pyramid: several inputs, each owning a zoom range, one archive (issue #345)
 
 
 
@@ -452,9 +452,9 @@ does not reproduce A. See docs/decode.md for details.
 
 ## `tylertoo pyramid`
 
-Merge per-band PMTiles archives into one multi-band pyramid (issue #345)
+Build a multi-band pyramid: several inputs, each owning a zoom range, one archive (issue #345)
 
-**Usage:** `tylertoo pyramid [OPTIONS] --band <LO-HI:ARCHIVE[:LAYER]> <OUTPUT>`
+**Usage:** `tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>`
 
 ###### **Arguments:**
 
@@ -462,7 +462,18 @@ Merge per-band PMTiles archives into one multi-band pyramid (issue #345)
 
 ###### **Options:**
 
-* `--band <LO-HI:ARCHIVE[:LAYER]>` — A band: `LO-HI:ARCHIVE[:LAYER]`, repeatable. ARCHIVE is a PMTiles file already tiled for that zoom range. LAYER defaults to the file stem, and several bands may share one layer name (the usual case: a coarse and a fine aggregate that are the same layer to a client). Zoom ranges must not overlap -- two bands claiming one zoom write the same tile ids. ARCHIVE may not contain a `:`, which the spec cannot tell apart from the LAYER separator; rename the file or point at it through a symlink
+* `--band <LO-HI:INPUT[:LAYER]>` — A band: `LO-HI:INPUT[:LAYER]`, repeatable.
+
+   INPUT is either a GeoParquet source — tiled here, restricted to this band's zoom range — or a PMTiles archive already tiled for that range, which is merged as-is. Which one it is is detected from the file, not the extension.
+
+   LAYER defaults to the file stem, and several bands may share one layer name (the usual case: a coarse and a fine aggregate that are the same layer to a client). Zoom ranges must not overlap -- two bands claiming one zoom write the same tile ids.
+
+   INPUT may not contain a `:`, which the spec cannot tell apart from the LAYER separator; rename the file or point at it through a symlink.
+* `--generalize` — Generalize each GeoParquet band with the normal ladder instead of tiling it verbatim.
+
+   Off by default: a band's premise is that its input is already the right resolution for the zooms it owns, so thinning and simplifying it would re-introduce exactly what banding avoids. Pass this when a band is raw features spanning several zooms and you do want the ladder inside it.
+* `--max-tile-size <SIZE>` — Per-tile MVT size cap for bands tiled here (e.g. "500K"). Unset means no cap, matching the verbatim default: a valve that sheds features to fit a byte budget would drop cells the band exists to draw
+* `--work-dir <DIR>` — Directory for the per-band intermediates (removed on the way out). Defaults to the system temp directory
 * `-f`, `--force` — Overwrite the output if it exists
 
 
