@@ -58,9 +58,7 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--gsd <GSDS>` — Explicit comma-separated GSD list (meters, strictly decreasing). Overrides --min-zoom/--max-zoom when set — the same semantics as `tylertoo overview --gsd`, so the absolute-GSD ladder is reachable in one step
 * `--bbox <XMIN,YMIN,XMAX,YMAX>` — Regional extract: only convert features whose bbox intersects this bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). See --bbox in `tylertoo overview --help` for details
 * `--layer-name <LAYER_NAME>` — Layer name for the output tiles (default: derived from input filename)
-* `--max-tile-size <SIZE>` — Maximum tile size (e.g., "500K", "1M", or raw bytes). When a tile exceeds this limit, the export sheds features in a single non-iterative pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --tile-size-limit for parity with `export-pmtiles`
-
-  Default value: `500K`
+* `--max-tile-size <SIZE>` — Maximum tile size (e.g., "500K", "1M", or raw bytes). When a tile exceeds this limit, the export sheds features in a single non-iterative pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --tile-size-limit for parity with `export-pmtiles`. With --verbatim and no explicit value, the cap is disabled: a valve that sheds features to fit a byte budget is not verbatim either
 * `--no-simple-clip-fastpath` — Disable the simple-clip fast path (issue #239), forcing the i_overlay boundary-bridge fallback on every polygon clip. The fast path is on by default (render-equivalent on simple rings); pass this only when you need byte-stable tile output, since the fast path rotates simple rings to a different start vertex
 * `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels, carried across tile seams so features don't clip at boundaries
 
@@ -71,6 +69,15 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--report <PATH>` — Write a JSON report to this path: a combined object with a `convert` section (the overview build, matching `overview --report`) and an `export` section (the PMTiles export, matching `export-pmtiles --report`), so the one-step run captures both halves the two-step chain would
 * `--keep-overview <PATH>` — Write the intermediate overview GeoParquet to PATH and RETAIN it, instead of a temp file removed after the export — one run then yields both artifacts: the reusable multi-resolution overview (queryable, re-exportable, see `tylertoo overview`) and the PMTiles. The PMTiles output is identical either way. Without this flag the intermediate is written to --spill-dir if given, else $TMPDIR if set, else the output directory, and deleted once the export finishes (see the note on the materialized intermediate under --spill-dir)
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
+* `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
+
+   The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.
+
+   Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0 with every thinning factor and visibility gate at 0, which was previously the only way there. Reach for it when the input is already the right resolution for the zooms you are asking for: DGGS/cell aggregates, pre-levelled input, or one band of a pyramid.
+
+   On `tiles` it also disables the per-tile size cap (an unbounded --max-tile-size), since a valve that sheds features to fit a byte budget is not verbatim either; pass --max-tile-size explicitly to put a cap back.
+
+   Composes with the rest: apply it and then override individual knobs afterwards for NEARLY verbatim.
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key
 * `--no-auto-rank` — Disable auto-detection of well-known schemas (Overture roads `class`/ `road_class`, Overture places `confidence`)
@@ -238,6 +245,15 @@ Build a multi-resolution overview GeoParquet file
 * `--bbox <XMIN,YMIN,XMAX,YMAX>` — Regional extract: only convert features whose bbox intersects this bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). Row groups whose GeoParquet 1.1 covering statistics don't intersect are skipped at the parquet footer level (no data pages read); inputs without covering stats degrade gracefully (all row groups read, exact per-feature filter still applies)
 * `--cogp-compat` — Emit the optional COGP compatibility footer key (partitioning mode)
 * `--report <PATH>` — Write the JSON conversion report to this path
+* `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
+
+   The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.
+
+   Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0 with every thinning factor and visibility gate at 0, which was previously the only way there. Reach for it when the input is already the right resolution for the zooms you are asking for: DGGS/cell aggregates, pre-levelled input, or one band of a pyramid.
+
+   On `tiles` it also disables the per-tile size cap (an unbounded --max-tile-size), since a valve that sheds features to fit a byte budget is not verbatim either; pass --max-tile-size explicitly to put a cap back.
+
+   Composes with the rest: apply it and then override individual knobs afterwards for NEARLY verbatim.
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key
 * `--no-auto-rank` — Disable auto-detection of well-known schemas (Overture roads `class`/ `road_class`, Overture places `confidence`)

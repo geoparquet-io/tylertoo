@@ -473,6 +473,68 @@ pub fn resolve_in_flight_batches(requested: usize) -> usize {
     }
 }
 
+impl ConvertOptions {
+    /// Turn off the whole generalization ladder: tile this input **exactly as
+    /// given** at every level (#345 / #360).
+    ///
+    /// The ladder derives coarse levels from the fine input by thinning and
+    /// simplifying. That is right for a road network and wrong for a
+    /// pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is
+    /// their parent, and its count is their sum. Run an aggregate through the
+    /// gates and a coarse level shows *some* children and silently omits the
+    /// rest, rather than showing what they sum to — a choropleth in which
+    /// every cell must be drawn loses most of itself.
+    ///
+    /// Before this existed the only way there was a four-flag incantation
+    /// (`--no-density-drop --polygon-visibility 0 --polygon-thinning 1e-9
+    /// --simplify-factor 0`), which covered only polygons and leaned on `1e-9`
+    /// because `0` was rejected. This is the same intent, stated once, for
+    /// every geometry kind:
+    ///
+    /// - no cell-winner thinning (points, lines, polygons)
+    /// - no visibility gates
+    /// - no simplification
+    /// - no per-level density budget
+    /// - no line coalescing (merging changes feature identity)
+    ///
+    /// It leaves everything else — mode, level plan, CRS, row-group layout,
+    /// clustering if the caller asked for it — untouched, so it composes with
+    /// the rest of the configuration. Apply it first and override afterwards
+    /// if you want *nearly* verbatim.
+    ///
+    /// Note that this governs the **convert** side. A per-tile size limit on
+    /// the export can still drop features; pass `--max-tile-size 0` (which
+    /// `tylertoo tiles --verbatim` does for you) when every feature must
+    /// survive.
+    #[must_use]
+    pub fn verbatim(mut self) -> Self {
+        self.assign.point_thinning = 0.0;
+        self.assign.line_thinning = 0.0;
+        self.assign.polygon_thinning = 0.0;
+        self.assign.line_visibility = 0.0;
+        self.assign.polygon_visibility = 0.0;
+        self.simplify.factor = 0.0;
+        self.density.enabled = false;
+        self.coalesce_lines = false;
+        self
+    }
+
+    /// Whether this configuration generalizes nothing — the predicate form of
+    /// [`Self::verbatim`], true for a config that reproduces its input at
+    /// every level however it was reached (the flag, or the equivalent knobs
+    /// set by hand).
+    pub fn is_verbatim(&self) -> bool {
+        self.assign.point_thinning == 0.0
+            && self.assign.line_thinning == 0.0
+            && self.assign.polygon_thinning == 0.0
+            && self.assign.line_visibility == 0.0
+            && self.assign.polygon_visibility == 0.0
+            && self.simplify.factor == 0.0
+            && !self.density.enabled
+            && !self.coalesce_lines
+    }
+}
+
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
@@ -823,9 +885,12 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
         Ok(())
     };
     positive("gsd-base", options.gsd_base)?;
-    positive("point-thinning", options.assign.point_thinning)?;
-    positive("line-thinning", options.assign.line_thinning)?;
-    positive("polygon-thinning", options.assign.polygon_thinning)?;
+    // Thinning factors accept 0 as the documented OFF switch (#345/#360):
+    // every feature is its own cell, so nothing is thinned. Negative and
+    // non-finite values remain meaningless.
+    non_negative("point-thinning", options.assign.point_thinning)?;
+    non_negative("line-thinning", options.assign.line_thinning)?;
+    non_negative("polygon-thinning", options.assign.polygon_thinning)?;
     non_negative("line-visibility", options.assign.line_visibility)?;
     non_negative("polygon-visibility", options.assign.polygon_visibility)?;
     // Negative snap / junction-angle values are documented OFF switches; only

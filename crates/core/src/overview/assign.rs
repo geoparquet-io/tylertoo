@@ -366,6 +366,9 @@ fn level_winner_positions(
     // dropping the cached 40-byte Priority shrinks each entry from 72 to 32
     // bytes (~55% off the grid, the structure the level count multiplies).
     let mut grid: HashMap<CellKey, usize> = HashMap::new();
+    // Features that bypass the grid entirely because their kind's thinning is
+    // disabled (factor 0) — every one of them wins.
+    let mut winners: Vec<usize> = Vec::new();
 
     for (pos, feat) in features.iter().enumerate() {
         // Zoom-band representation (#317 / #279): at a point-band level a
@@ -397,9 +400,21 @@ fn level_winner_positions(
             }
         }
 
+        // Thinning disabled for this kind (#345/#360): every feature is its
+        // own cell, so every feature that passed the gate survives. This is
+        // the exact form of what a vanishingly small factor (the `1e-9`
+        // workaround) approximated, without depending on float resolution to
+        // separate neighbours.
+        if config.thinning_factor(effective_kind) == 0.0 {
+            winners.push(pos);
+            continue;
+        }
+
         let cell_size = gsd_units * config.thinning_factor(effective_kind);
         // Guard against a zero/negative cell size (bad GSD input); also
-        // reject NaN.
+        // reject NaN. A *disabled* factor is handled above; reaching here with
+        // a non-positive cell size means a degenerate GSD, where skipping is
+        // still the right call.
         if cell_size <= 0.0 || cell_size.is_nan() {
             continue;
         }
@@ -421,7 +436,8 @@ fn level_winner_positions(
             .or_insert(pos);
     }
 
-    grid.into_values().collect()
+    winners.extend(grid.into_values());
+    winners
 }
 
 /// Estimated retained bytes per occupied winner-grid cell (#306).
@@ -473,6 +489,12 @@ fn estimate_level_grid_bytes(
     for kind in kinds {
         let count = kind_counts[kind.discriminant() as usize];
         if count == 0 {
+            continue;
+        }
+        if config.thinning_factor(kind) == 0.0 {
+            // Thinning disabled: every feature survives, so the winner vec
+            // holds one slot per feature (no grid entries).
+            entries = entries.saturating_add(count as u64);
             continue;
         }
         let cell = gsd_units * config.thinning_factor(kind);

@@ -50,6 +50,18 @@ fn parse_size_bytes(s: &str) -> Result<usize, String> {
 /// `0` (the off switch, e.g. `--max-tile-size 0`) becomes `None` (cap disabled);
 /// any positive byte count becomes `Some(n)`. The default `500K` therefore caps;
 /// `0` opts out. See issue #280.
+/// Default per-tile MVT size cap (tippecanoe parity, #280).
+const DEFAULT_MAX_TILE_SIZE: usize = 500 * 1024;
+
+/// Resolve the `tiles` per-tile size cap.
+///
+/// An explicit `--max-tile-size` always wins. Otherwise `--verbatim` means no
+/// cap — a valve that sheds features to fit a byte budget is not verbatim
+/// either — and the default is [`DEFAULT_MAX_TILE_SIZE`].
+fn resolve_tiles_size_limit(explicit: Option<usize>, verbatim: bool) -> Option<usize> {
+    size_limit_opt(explicit.unwrap_or(if verbatim { 0 } else { DEFAULT_MAX_TILE_SIZE }))
+}
+
 fn size_limit_opt(n: usize) -> Option<usize> {
     (n > 0).then_some(n)
 }
@@ -356,6 +368,32 @@ struct OverviewArgs {
 /// [`ConvertOptions`] via [`ConvertTuningArgs::build_convert_options`].
 #[derive(Args, Debug)]
 struct ConvertTuningArgs {
+    /// Tile the input EXACTLY AS GIVEN: switch the whole generalization
+    /// ladder off at every level (#345 / #360).
+    ///
+    /// The ladder derives coarse levels from the fine input by thinning and
+    /// simplifying. That is right for a road network and wrong for a
+    /// pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is
+    /// their parent, and its count is their sum. Run an aggregate through the
+    /// gates and a coarse level shows SOME cells and silently omits the rest,
+    /// instead of showing what they sum to.
+    ///
+    /// Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0
+    /// with every thinning factor and visibility gate at 0, which was
+    /// previously the only way there. Reach for it when the input is already
+    /// the right resolution for the zooms you are asking for: DGGS/cell
+    /// aggregates, pre-levelled input, or one band of a pyramid.
+    ///
+    /// On `tiles` it also disables the per-tile size cap (an unbounded
+    /// --max-tile-size), since a valve that sheds features to fit a byte
+    /// budget is not verbatim either; pass --max-tile-size explicitly to put
+    /// a cap back.
+    ///
+    /// Composes with the rest: apply it and then override individual knobs
+    /// afterwards for NEARLY verbatim.
+    #[arg(long, help_heading = "Thinning & visibility")]
+    verbatim: bool,
+
     /// Column name used as the cell-winner priority (sort) key. Mutually
     /// exclusive with --class-rank.
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
@@ -912,7 +950,7 @@ impl ConvertTuningArgs {
             None => Vec::new(),
         };
 
-        Ok(ConvertOptions {
+        let options = ConvertOptions {
             mode,
             levels,
             assign,
@@ -956,7 +994,20 @@ impl ConvertTuningArgs {
             bbox,
             filter: self.filter.clone(),
             spill_dir: self.spill_dir.clone(),
-        })
+        };
+
+        // Applied last so it wins over the ladder defaults, and logged because
+        // "no features were dropped" is a surprising thing to infer from a
+        // quiet run.
+        if self.verbatim {
+            log::info!(
+                "[convert] --verbatim: generalization off (no thinning, no \
+                 visibility gates, no simplification, no density budget, no \
+                 line coalescing); every level reproduces the input"
+            );
+            return Ok(options.verbatim());
+        }
+        Ok(options)
     }
 }
 
@@ -1036,8 +1087,10 @@ struct TilesArgs {
     /// point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to
     /// disable the cap. Aliased as --tile-size-limit for parity with
     /// `export-pmtiles`.
-    #[arg(long, value_name = "SIZE", alias = "tile-size-limit", default_value = "500K", value_parser = parse_size_bytes)]
-    max_tile_size: usize,
+    /// With --verbatim and no explicit value, the cap is disabled: a valve
+    /// that sheds features to fit a byte budget is not verbatim either.
+    #[arg(long, value_name = "SIZE", alias = "tile-size-limit", value_parser = parse_size_bytes)]
+    max_tile_size: Option<usize>,
 
     /// Disable the simple-clip fast path (issue #239), forcing the i_overlay
     /// boundary-bridge fallback on every polygon clip. The fast path is on by
@@ -1525,7 +1578,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         layer_name,
         tile_buffer: args.tile_buffer,
         extent: 4096,
-        tile_size_limit: size_limit_opt(args.max_tile_size),
+        tile_size_limit: resolve_tiles_size_limit(args.max_tile_size, args.tuning.verbatim),
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
     };
@@ -2504,20 +2557,77 @@ mod tests {
         // The two spellings are aliases and both accept human-readable sizes.
         let a = parse_tiles(&["--max-tile-size", "500K"]);
         let b = parse_tiles(&["--tile-size-limit", "500K"]);
-        assert_eq!(a.max_tile_size, 500 * 1024);
+        assert_eq!(a.max_tile_size, Some(500 * 1024));
         assert_eq!(a.max_tile_size, b.max_tile_size);
     }
 
     #[test]
     fn tile_size_cap_defaults_to_500k_and_zero_disables() {
         // #280: the per-tile cap is on by default at 500K on both commands.
-        assert_eq!(parse_tiles(&[]).max_tile_size, 500 * 1024);
+        assert_eq!(parse_tiles(&[]).max_tile_size, None);
+        assert_eq!(resolve_tiles_size_limit(None, false), Some(500 * 1024));
         assert_eq!(parse_export(&[]).tile_size_limit, 500 * 1024);
 
         // `0` is the off switch: the CLI value maps to `None` (cap disabled).
-        assert_eq!(parse_tiles(&["--max-tile-size", "0"]).max_tile_size, 0);
+        assert_eq!(
+            parse_tiles(&["--max-tile-size", "0"]).max_tile_size,
+            Some(0)
+        );
         assert_eq!(size_limit_opt(0), None);
         assert_eq!(size_limit_opt(500 * 1024), Some(500 * 1024));
+    }
+
+    /// #345/#360: verbatim means every feature reaches the tile, so the
+    /// default size valve — which sheds features to fit a byte budget — must
+    /// not quietly apply. An explicit value still wins, so a caller who wants
+    /// a cap with verbatim generalization can say so.
+    #[test]
+    fn verbatim_disables_the_tile_size_cap_unless_asked_otherwise() {
+        assert_eq!(resolve_tiles_size_limit(None, true), None);
+        assert_eq!(
+            resolve_tiles_size_limit(None, false),
+            Some(DEFAULT_MAX_TILE_SIZE)
+        );
+        assert_eq!(resolve_tiles_size_limit(Some(1024), true), Some(1024));
+        assert_eq!(resolve_tiles_size_limit(Some(0), false), None);
+    }
+
+    /// The flag reaches both commands that build a conversion, and switches
+    /// the whole ladder off rather than one knob.
+    #[test]
+    fn verbatim_flag_switches_off_the_whole_ladder() {
+        let tiles = parse_tiles(&["--verbatim"]);
+        assert!(tiles.tuning.verbatim);
+        let opts = tiles
+            .tuning
+            .build_convert_options(
+                tylertoo_core::overview::level::Mode::Duplicating,
+                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(opts.is_verbatim(), "the flag must reach ConvertOptions");
+
+        // ...and is off by default.
+        let plain = parse_tiles(&[]);
+        assert!(!plain.tuning.verbatim);
+        let opts = plain
+            .tuning
+            .build_convert_options(
+                tylertoo_core::overview::level::Mode::Duplicating,
+                tylertoo_core::overview::convert::LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(!opts.is_verbatim());
     }
 
     #[test]
