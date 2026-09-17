@@ -19,9 +19,10 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 - **`tylertoo validate`** — check an overview file against the spec.
 - **`tylertoo decode`** — decode any PMTiles vector-tile archive back to
   GeoParquet (the tiled representation; see [Decoding PMTiles](decode.md)).
-- **`tylertoo pyramid`** — merge per-band PMTiles archives into one
-  multi-band pyramid, where each band owns a disjoint zoom range (a
-  pre-aggregated summary at coarse zooms, the raw features at fine ones).
+- **`tylertoo pyramid`** — build a multi-band pyramid: several inputs,
+  each owning a disjoint zoom range, one archive (a pre-aggregated summary
+  at coarse zooms, the raw features at fine ones). Bands may be GeoParquet
+  (tiled for you) or already-tiled PMTiles.
 
 ## Quick Example
 

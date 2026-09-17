@@ -26,4 +26,6 @@ mod pipeline;
 pub mod reader;
 pub mod simplify;
 mod stream;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod writer;
