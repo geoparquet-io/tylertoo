@@ -760,6 +760,59 @@ be worse than the wrong name. Only names that are genuinely free are restored.
 By-name options follow the rename automatically (`--sort-key level`,
 `class_ranking.column`, `--accumulate-attribute`, `--filter`), so you do not
 need to spell the renamed name yourself.
+## Output feature order: `--feature-order`
+
+MVT does not define draw order, but renderers paint features in the order the
+tile lists them. So the order tylertoo writes features in **is** the paint order
+for any style that does not override it — and a style that relies on it will
+render differently against a differently-ordered archive of the same data.
+
+**tylertoo's default is input row order**, exactly: the overview file's row
+order, which is the source file's row order restricted to the rows each level
+kept. Measured across z12–z14 on a nested-contour fixture, the within-tile
+sequence has zero inversions against source row order at every zoom.
+
+**Do not assume tippecanoe matches it.** Tippecanoe's order is incidental
+rather than specified — it varies by zoom and by tile, and on the same input it
+can point the opposite way at some zooms and the same way at others (#361).
+If your style depends on paint order, pin it rather than inheriting it:
+
+```bash
+# Source row order (the default, and what tylertoo has always emitted)
+tylertoo tiles in.parquet out.pmtiles --feature-order input
+
+# Sort within each tile by a property: high `level` painted last (on top)
+tylertoo tiles in.parquet out.pmtiles --feature-order level
+
+# ...or first (underneath)
+tylertoo tiles in.parquet out.pmtiles --feature-order level:desc
+```
+
+Accepted on both `tiles` and `export-pmtiles`.
+
+Sorting by a column is the fix for the nested-choropleth case: five concentric
+contour bands where the small hot cores must land on top. `--feature-order
+level` does in the archive what `"fill-sort-key": ["get", "level"]` does in
+every downstream style, so consumers do not each have to know.
+
+Details that make the result reproducible:
+
+- **Ties keep input order.** The within-tile sort is stable over the
+  `(tile, row)` order, so two runs of the same build produce byte-identical
+  tiles.
+- **Ordering is per tile.** Nothing moves across tile boundaries; the option
+  changes the sequence within a tile and nothing else.
+- **Numeric types compare as numbers.** A column read as an integer in one
+  row group and a double in another is one ordering class, not two.
+- **A feature missing the property sorts first** (painted underneath) rather
+  than being dropped.
+- **Sorting is independent of the oversized-tile valve.** When
+  `--max-tile-size` is in force, which features survive is decided by
+  `select_kept_members` (largest-first, or a uniform spatial stride on
+  point-dominated tiles); `--feature-order` then orders the survivors.
+
+`--feature-order input` is the default and costs nothing; naming a column adds
+one stable sort per tile over features already in memory.
 
 ---
 

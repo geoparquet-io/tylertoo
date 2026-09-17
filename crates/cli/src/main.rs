@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::path::PathBuf;
+use tylertoo_core::overview::export::FeatureOrder;
 
 /// Parse human-readable memory size (e.g., "8G", "16G", "512M") to bytes.
 fn parse_memory_size(s: &str) -> Result<usize, String> {
@@ -279,6 +280,19 @@ struct ExportPmtilesArgs {
     /// value.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
+
+    /// Within-tile feature order (#361): `input` (default) or a property
+    /// name, optionally `:asc` / `:desc`.
+    ///
+    /// MVT does not define draw order, but renderers paint features in the
+    /// order the tile lists them, so this is the paint order for any style
+    /// that does not override it. `input` emits source row order. Naming a
+    /// column sorts within each tile by that property — `--feature-order
+    /// level` puts high `level` on top, which is what a nested choropleth
+    /// usually wants — with ties kept in input order so output stays
+    /// deterministic.
+    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
+    feature_order: FeatureOrder,
 
     /// Not supported here (single-file subcommand); accepted so the error
     /// can point at `overview`/`tiles` instead of clap's generic message.
@@ -1065,6 +1079,19 @@ struct TilesArgs {
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
+    /// Within-tile feature order (#361): `input` (default) or a property
+    /// name, optionally `:asc` / `:desc`.
+    ///
+    /// MVT does not define draw order, but renderers paint features in the
+    /// order the tile lists them, so this is the paint order for any style
+    /// that does not override it. `input` emits source row order. Naming a
+    /// column sorts within each tile by that property — `--feature-order
+    /// level` puts high `level` on top, which is what a nested choropleth
+    /// usually wants — with ties kept in input order so output stays
+    /// deterministic.
+    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
+    feature_order: FeatureOrder,
+
     /// Write a JSON report to this path: a combined object with a `convert`
     /// section (the overview build, matching `overview --report`) and an
     /// `export` section (the PMTiles export, matching `export-pmtiles
@@ -1528,6 +1555,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         tile_size_limit: size_limit_opt(args.max_tile_size),
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
+        feature_order: args.feature_order.clone(),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -1824,6 +1852,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         tile_size_limit: size_limit_opt(args.tile_size_limit),
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
+        feature_order: args.feature_order.clone(),
     };
 
     println!(
