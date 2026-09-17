@@ -58,51 +58,50 @@ fn verify_with_pmtiles_cli(path: &Path) -> bool {
     }
 }
 
+/// A real-data conversion must leave a root directory small enough for the
+/// initial 16 KB range request, or `pmtiles-js` cannot open the archive.
+///
+/// Runs the convert -> export chain **in process**. It used to shell out to
+/// `cargo run --release`, which was never exercised (#369: the fixture path
+/// resolved under `crates/core/`, so the test always skipped). Once it began
+/// running, that nested release build timed tarpaulin out — and it could
+/// never have contributed coverage anyway, since tarpaulin does not
+/// instrument a subprocess. In-process is faster, measurable, and tests the
+/// same invariant: the CLI was only ever a way to reach this chain, as the
+/// sibling property test below already assumes.
 #[test]
-fn test_cli_produces_valid_leaf_directories() {
-    // This test runs the CLI on a real fixture and verifies the output
-    // #369: resolved from the workspace root and content-checked. The
-    // literal that used to be here resolved under `crates/core/`, so this
-    // test skipped itself everywhere — including CI — while reporting `ok`.
+fn test_conversion_produces_valid_leaf_directories() {
+    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+
     let Some(fixture_path) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
         return;
     };
 
-    let output_path = Path::new("/tmp/test-leaf-integration.pmtiles");
-    let _ = fs::remove_file(output_path);
+    let overview = tempfile::Builder::new()
+        .suffix(".parquet")
+        .tempfile()
+        .expect("overview tempfile");
+    let output = tempfile::Builder::new()
+        .suffix(".pmtiles")
+        .tempfile()
+        .expect("output tempfile");
 
-    // Run the CLI to generate PMTiles
-    let cli_result = Command::new("cargo")
-        .args([
-            "run",
-            "--release",
-            "--package",
-            "tylertoo",
-            "--",
-            fixture_path.to_str().unwrap(),
-            output_path.to_str().unwrap(),
-            "--max-zoom",
-            "10",
-        ])
-        .output();
+    convert_to_overviews(
+        &fixture_path,
+        overview.path(),
+        &ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 10,
+            },
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+    export_pmtiles(overview.path(), output.path(), &ExportOptions::default()).expect("export");
 
-    match cli_result {
-        Ok(output) => {
-            if !output.status.success() {
-                eprintln!("CLI stderr: {}", String::from_utf8_lossy(&output.stderr));
-                panic!("CLI failed to produce PMTiles file");
-            }
-        }
-        Err(e) => {
-            panic!("Failed to run CLI: {}", e);
-        }
-    }
-
-    assert!(output_path.exists(), "PMTiles file should be created");
-
-    // Verify header fields
-    let (root_dir_length, leaf_dirs_offset, leaf_dirs_length) = read_pmtiles_header(output_path);
-
+    let (root_dir_length, leaf_dirs_offset, leaf_dirs_length) = read_pmtiles_header(output.path());
     eprintln!(
         "Integration test: root_dir_length={}, leaf_dirs_offset={}, leaf_dirs_length={}",
         root_dir_length, leaf_dirs_offset, leaf_dirs_length
@@ -116,14 +115,10 @@ fn test_cli_produces_valid_leaf_directories() {
         MAX_ROOT_DIR_SIZE
     );
 
-    // Verify with pmtiles CLI if available
     assert!(
-        verify_with_pmtiles_cli(output_path),
+        verify_with_pmtiles_cli(output.path()),
         "pmtiles verify failed"
     );
-
-    // Clean up
-    let _ = fs::remove_file(output_path);
 }
 
 #[test]
