@@ -813,6 +813,18 @@ Details that make the result reproducible:
   `select_kept_members` (largest-first, or a uniform spatial stride on
   point-dominated tiles); `--feature-order` then orders the survivors.
 
+- **The name is the key the tile advertises**, not the input column name. If a
+  source column was renamed on the way in to clear a reserved overview name
+  (`level`, `point_count`, `coalesced_count` — see
+  [Reserved column names](#reserved-column-names)) and then restored on export,
+  sort by the *source* name, because that is what the tile carries. A column
+  that stayed renamed (because the reserved name is genuinely published, as
+  `point_count` is under `--cluster`) has to be named as it appears.
+- **Naming a column the layer does not publish warns and changes nothing.**
+  Every feature is then equally unranked, so the output is input order — which
+  on its own looks exactly like success. The run lists the available property
+  names so a typo is obvious.
+
 `--feature-order input` is the default and costs nothing; naming a column adds
 one stable sort per tile over features already in memory.
 

@@ -627,6 +627,13 @@ fn export_pmtiles_impl(
     let mean_member_bytes = reader.finest_level_mean_row_bytes();
     let available_ram = available_memory_bytes();
 
+    // #361: a `--feature-order` column that names nothing is a no-op, and an
+    // indistinguishable one — every member's key is `Missing`, so they all
+    // compare equal and the stable sort leaves input order. A typo therefore
+    // looks exactly like success. Say so once, up front, against the names the
+    // tiles will actually advertise.
+    warn_if_order_column_is_absent(reader.schema(), &options.feature_order);
+
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
@@ -2763,6 +2770,45 @@ impl<'a> OrderKey<'a> {
             (Self::Text(a), Self::Text(b)) => a.cmp(b),
         }
     }
+}
+
+/// Warn when `order` names a column the layer does not publish.
+///
+/// Checked against the published property names rather than the raw schema, so
+/// it stays right for a column whose name was restored from the rename
+/// provenance (#359) and for one that is deliberately not exported.
+fn warn_if_order_column_is_absent(schema: &Schema, order: &FeatureOrder) {
+    let FeatureOrder::Column { name, .. } = order else {
+        return;
+    };
+    if !order_column_is_absent(schema, order) {
+        return;
+    }
+    log::warn!(
+        "--feature-order names {name:?}, which this layer does not publish, so \
+         the order is unchanged (input row order). Available: {}",
+        published_property_names(schema).join(", ")
+    );
+}
+
+/// Whether `order` names a column the layer will not publish. `false` for
+/// [`FeatureOrder::Input`], which names nothing.
+fn order_column_is_absent(schema: &Schema, order: &FeatureOrder) -> bool {
+    let FeatureOrder::Column { name, .. } = order else {
+        return false;
+    };
+    !published_property_names(schema).iter().any(|n| n == name)
+}
+
+/// The MVT property keys this schema will advertise.
+fn published_property_names(schema: &Schema) -> Vec<String> {
+    let Some(geom_idx) = geometry_index(schema) else {
+        return Vec::new(); // the export will fail for its own reasons
+    };
+    property_columns(schema, geom_idx)
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect()
 }
 
 /// Order members for encoding: tile-major always, then within each tile by
@@ -5441,6 +5487,40 @@ mod tests {
         let kept = select_kept_members(&members, 2);
         let counts: Vec<usize> = kept.iter().map(|m| m.geom.coords_count()).collect();
         assert_eq!(counts, vec![5, 4]);
+    }
+
+    /// A `--feature-order` column the layer does not publish is a silent
+    /// no-op — every key is `Missing`, so everything ties and the stable sort
+    /// leaves input order, which is indistinguishable from success. A typo
+    /// must therefore say something.
+    #[test]
+    fn absent_order_column_is_reported() {
+        use arrow_schema::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("elevation", DataType::Float64, true),
+            Field::new("level", DataType::Int32, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let column = |n: &str| FeatureOrder::Column {
+            name: n.to_string(),
+            descending: false,
+        };
+
+        assert!(!order_column_is_absent(&schema, &column("elevation")));
+        assert!(
+            order_column_is_absent(&schema, &column("elevatoin")),
+            "a misspelled column must be detectable"
+        );
+        // The default never warns.
+        assert!(!order_column_is_absent(&schema, &FeatureOrder::Input));
+
+        // The check is against PUBLISHED names, not schema names: the reserved
+        // `level` column is dropped from tile properties, so ordering by it
+        // would silently do nothing and must warn. (Once a *source* column has
+        // been restored onto that name, it is published and this flips —
+        // which is the point of checking the published side.)
+        assert!(order_column_is_absent(&schema, &column("level")));
     }
 
     /// The oversized-tile valve must not become the draw order.
