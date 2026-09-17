@@ -284,6 +284,24 @@ with `enabled: true` (§12.4) and a `coalescing` member with
 `enabled: true` (§13.4) each assert normative structural facts about
 the file that a validator MUST enforce.
 
+The `renamed_columns` member records collisions between input column
+names and the columns this format reserves. The rename is a property
+of *this file* — a reserved column is authoritative here, so both must
+coexist — and not of the data it came from. A consumer that does not
+carry a reserved column forward MAY therefore publish the renamed
+column under its recorded source name; it MUST NOT do so when that
+name is already taken by a column it is publishing, nor when it has
+already restored another column onto that name (two columns MAY be
+renamed away from one reserved name, so the map's values need not be
+distinct). Renderers of overview files (tylertoo's PMTiles export
+drops `level` from tile properties and restores a source `level`) are
+the motivating case.
+
+This does not make `renamed_columns` normative, so the two exceptions
+above stand: a reader that ignores the member entirely still produces
+a valid result, merely one that keeps the renamed name. The MUST NOT
+binds only a consumer that chooses to act on the member.
+
 ```
 Provenance := {
   "engine":       string,      // e.g. "tylertoo 0.6.0"
@@ -318,7 +336,17 @@ Provenance := {
   "ranking":      Ranking,     // OPTIONAL: cell-winner priority source
   "density_drop": DensityDrop, // OPTIONAL: per-level feature budget
   "clustering":   Clustering,  // OPTIONAL: point clustering (§12.4)
-  "coalescing":   Coalescing   // OPTIONAL: line coalescing (§13.4)
+  "coalescing":   Coalescing,  // OPTIONAL: line coalescing (§13.4)
+  "renamed_columns": { string: string, ... }
+                               // OPTIONAL: JSON object map of
+                               // OUTPUT column name → the SOURCE
+                               // column name it was moved aside
+                               // from, when an input column
+                               // collided with a column this file
+                               // reserves (`level`, and
+                               // `point_count` / `coalesced_count`
+                               // in the modes that append them).
+                               // Absent when nothing was renamed.
 }
 
 Ranking := {

@@ -1620,6 +1620,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         crs,
         options,
         ranking_provenance,
+        &renames,
     ));
 
     let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
@@ -2866,6 +2867,7 @@ pub(super) fn build_generalization(
     _crs: Crs,
     options: &ConvertOptions,
     ranking: RankingProvenance,
+    renames: &[(String, String)],
 ) -> Generalization {
     let levels = gsds
         .iter()
@@ -2976,6 +2978,20 @@ pub(super) fn build_generalization(
             })
         } else {
             None
+        },
+        // #359: record which source columns were moved aside for a reserved
+        // overview column, so the export can publish them under the name the
+        // caller's data actually had. Absent when nothing collided, keeping
+        // those footers byte-identical to before this field existed.
+        renamed_columns: if renames.is_empty() {
+            None
+        } else {
+            Some(
+                renames
+                    .iter()
+                    .map(|(old, new)| (new.clone(), old.clone()))
+                    .collect(),
+            )
         },
     }
 }
