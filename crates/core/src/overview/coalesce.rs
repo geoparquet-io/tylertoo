@@ -206,6 +206,7 @@ pub fn coalesce_level_lines(
             bbox: geom_bbox(l.geom),
             kind: FeatureKind::Line,
             sort_key: l.sort_key,
+            entry_level: None,
         };
         prio.insert(l.index, Priority::new(&feat, config.sort_direction));
         sort_keys.insert(l.index, l.sort_key);
@@ -251,6 +252,7 @@ pub fn coalesce_level_lines(
             bbox,
             kind: FeatureKind::Line,
             sort_key: sort_keys[&line.rep],
+            entry_level: None,
         };
         gated.push((line, feat));
     }

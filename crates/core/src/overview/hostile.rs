@@ -21,6 +21,7 @@ use super::convert::{convert_to_overviews, ConvertError, ConvertOptions, LevelPl
 use super::export::{export_pmtiles, ExportError, ExportOptions};
 use super::level::Mode;
 use super::reader::{OverviewReader, ReaderError};
+use super::simplify::{CollapseMode, SimplifyOptions};
 use super::testutil::write_input;
 
 // ============================================================================
@@ -968,6 +969,258 @@ fn verbatim_is_recognizable_and_leaves_other_options_alone() {
     assert!(v.cluster, "an explicit --cluster is the caller's call");
     assert_eq!(v.mode, base.mode);
     assert_eq!(v.levels, base.levels);
+}
+
+// ============================================================================
+// Entry-zoom ladder: attribute-driven entry, overriding the gate (#364)
+// ============================================================================
+
+/// Nested polygons: the highest value sits on the physically *smallest*
+/// ring, which is exactly the case geometry-ranked thinning gets backwards.
+/// Returns `(geometries, values)` in row order.
+fn nested_bands(sites: usize) -> (Vec<Option<Geometry<f64>>>, Vec<f64>) {
+    let mags = [100.0f64, 250.0, 600.0, 1500.0, 5000.0];
+    let mut geoms = Vec::new();
+    let mut values = Vec::new();
+    for s in 0..sites {
+        let (cx, cy) = (-40.0 + (s % 8) as f64 * 9.0, 10.0 + (s / 8) as f64 * 9.0);
+        for (k, m) in mags.iter().enumerate() {
+            // Outermost ring (weakest) is ~4 degrees; innermost (strongest) is
+            // tiny enough that every visibility gate removes it.
+            let r = 4.0 * (0.06f64).powi(k as i32);
+            geoms.push(Some(Geometry::Polygon(Polygon::new(
+                LineString::from(vec![
+                    (cx - r, cy - r),
+                    (cx + r, cy - r),
+                    (cx + r, cy + r),
+                    (cx - r, cy + r),
+                    (cx - r, cy - r),
+                ]),
+                vec![],
+            ))));
+            values.push(*m);
+        }
+    }
+    (geoms, values)
+}
+
+/// Write nested-polygon input with the values in a `magnitude` column.
+fn write_banded_input(path: &Path, sites: usize) -> Vec<f64> {
+    let (geoms, values) = nested_bands(sites);
+    super::testutil::write_input_with_f64(path, &geoms, "magnitude", &values);
+    values
+}
+
+/// Count how many rows at each level carry a value at or above `min_mag`.
+fn level_strong_counts(path: &Path, min_mag: f64) -> Vec<usize> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Float64Type;
+    use arrow_array::Array;
+
+    let reader = OverviewReader::open(path).unwrap();
+    let n = reader.meta().levels.len();
+    (0..n)
+        .map(|level| {
+            let mut strong = 0usize;
+            for batch in reader.read_level(level, None).unwrap() {
+                let batch = batch.unwrap();
+                let idx = batch.schema().index_of("magnitude").unwrap();
+                let col = batch.column(idx).as_primitive::<Float64Type>();
+                for i in 0..col.len() {
+                    if !col.is_null(i) && col.value(i) >= min_mag {
+                        strong += 1;
+                    }
+                }
+            }
+            strong
+        })
+        .collect()
+}
+
+/// The reported failure (#364): `--sort-key` chooses between features
+/// *competing for a cell*, but the visibility gate has already dropped the
+/// small strong cores on size, so coarse levels show the big weak rings.
+///
+/// An entry-zoom ladder must admit them regardless of size.
+#[test]
+fn entry_zoom_ladder_admits_strong_features_the_gate_drops() {
+    use crate::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    for streaming in [true, false] {
+        // Control: ranking only. The gate still removes the tiny cores.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 8);
+        let control = ConvertOptions {
+            sort_key: Some("magnitude".to_string()),
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin.path(), tout.path(), &control).unwrap();
+        let before = level_strong_counts(tout.path(), 5000.0);
+
+        // Ladder: the highest value enters at the coarsest level.
+        let tin2 = tempfile::NamedTempFile::new().unwrap();
+        let tout2 = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin2.path(), 8);
+        let laddered = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "magnitude".to_string(),
+                kind: EntryZoomKind::DenseRank { step: 1 },
+            }),
+            // A ladder admits the feature; the collapse disposition decides
+            // what its geometry becomes there. Without one, a 6-metre core
+            // admitted to a ~10 km-tolerance level is simplified away again —
+            // which is why the CLI turns this on alongside a ladder.
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Point,
+                ..Default::default()
+            },
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin2.path(), tout2.path(), &laddered).unwrap();
+        let after = level_strong_counts(tout2.path(), 5000.0);
+
+        assert_eq!(
+            before[0], 0,
+            "streaming={streaming}: precondition — the gate drops every top-value \
+             core at the coarsest level without a ladder (got {before:?})"
+        );
+        // Deterministic: 8 sites, so all 8 cores. `> 0` would pass with seven
+        // of them lost, which is most of what the ladder exists to prevent.
+        assert_eq!(
+            after,
+            vec![8; after.len()],
+            "streaming={streaming}: the ladder must admit EVERY top-value shape at \
+             every level (before={before:?})"
+        );
+        validate_file(tout2.path()).unwrap();
+    }
+}
+
+/// Both engines must place a laddered feature identically — the ladder is
+/// resolved from the same column and the same level plan in each.
+#[test]
+fn entry_zoom_ladder_is_identical_across_pipelines() {
+    use crate::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let mut per_engine = Vec::new();
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 6);
+        let o = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "magnitude".to_string(),
+                kind: EntryZoomKind::DenseRank { step: 1 },
+            }),
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+        per_engine.push((
+            level_strong_counts(tout.path(), 5000.0),
+            level_strong_counts(tout.path(), 100.0),
+        ));
+    }
+    assert_eq!(
+        per_engine[0], per_engine[1],
+        "streamed and buffered engines must agree on ladder placement"
+    );
+    // Absolute, not just A == B: a pure differential passes with the ladder
+    // switched off entirely, since both engines then agree on the unladdered
+    // answer. 6 sites, strongest band present at every level from the
+    // coarsest; the weakest joins only at the finest.
+    // `level_strong_counts` is cumulative (`>= min_mag`), so `all` is every
+    // feature and `strong` is just the top band.
+    let (strong, all) = &per_engine[0];
+    assert_eq!(
+        *strong,
+        vec![6; strong.len()],
+        "the highest value enters at the coarsest level and stays"
+    );
+    assert_eq!(
+        all[0], 6,
+        "level 0 carries ONLY the strongest band — the ladder holds the other \
+         four out (got {all:?})"
+    );
+    assert!(
+        all.last().is_some_and(|&c| c > all[0]),
+        "...and the weaker bands have joined by the finest level (got {all:?})"
+    );
+}
+
+/// #364: the two engines must rank the same rows, not just agree on a fixture
+/// where every row survives.
+///
+/// The ladder ranks DISTINCT values, so one extra value seen by only one
+/// engine shifts every weaker feature by a whole `step`. The buffered engine
+/// reads the column off the table *after* rejection; the streaming engine
+/// reads it off the raw batch during pass 1. Any row that one keeps and the
+/// other drops — a false `--filter` predicate, a null or unusable geometry, a
+/// `--bbox` miss — therefore split the two ladders.
+///
+/// `entry_zoom_ladder_is_identical_across_pipelines` cannot catch this: its
+/// fixture has no rejected rows at all, so the two multisets coincide by
+/// construction. This one puts a row in exactly that gap.
+#[test]
+fn entry_zoom_ladder_agrees_across_pipelines_when_rows_are_rejected() {
+    use crate::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let mut per_engine = Vec::new();
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 6);
+        let o = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "magnitude".to_string(),
+                kind: EntryZoomKind::DenseRank { step: 1 },
+            }),
+            // Excludes the strongest band, so the rows carrying the top
+            // distinct value never become features. If the ladder still sees
+            // that value, it spends rung 0 on a value that is not in the
+            // output and every surviving band enters one zoom too late.
+            filter: Some("magnitude < 2000".to_string()),
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+        per_engine.push((
+            level_strong_counts(tout.path(), 1500.0),
+            level_strong_counts(tout.path(), 100.0),
+        ));
+    }
+    assert_eq!(
+        per_engine[0], per_engine[1],
+        "a filtered-out row must not create a ladder rung in one engine only"
+    );
+    assert!(
+        per_engine[0].0.iter().any(|&c| c > 0),
+        "precondition: the surviving strongest band must reach some level"
+    );
+}
+
+/// A ladder column that does not exist is a configuration error, reported
+/// before any conversion work rather than silently ignored.
+#[test]
+fn entry_zoom_missing_column_is_rejected() {
+    use crate::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 2);
+        let o = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "nope".to_string(),
+                kind: EntryZoomKind::DenseRank { step: 1 },
+            }),
+            ..opts(streaming)
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+        assert!(
+            matches!(err, ConvertError::InvalidConfig(ref m) if m.contains("nope")),
+            "streaming={streaming}: got {err}"
+        );
+    }
 }
 
 // ============================================================================

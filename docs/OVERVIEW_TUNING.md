@@ -571,6 +571,95 @@ provenance as `generalization.collapse: "square"` (`--collapse` records
 
 ---
 
+## Attribute-driven entry zoom: `--magnitude-ladder`, `--entry-zoom`
+
+Everything in the next section decides *which of the features competing for a
+cell wins*. It runs **after** the visibility gate, which has already dropped
+features for being small. That ordering is backwards whenever a dataset's most
+important features are also its physically smallest.
+
+A population-density choropleth is the everyday case: the dense urban tracts
+carrying the highest values are tiny next to the sparse rural ones. A coarse
+level therefore keeps the large low-value polygons and hides the small
+high-value ones — precisely the opposite of what the map should show zoomed
+out. `--sort-key` helps where features survive to compete, but cannot reach a
+feature the gate removed first.
+
+A **ladder** answers a different question: not "which of these wins a cell" but
+"how early may this feature appear at all". Each distinct value of a column
+gets an *entry zoom*; a feature appears from its entry zoom inward and at none
+before it, **exempt from the visibility gate and from thinning** throughout.
+
+```bash
+# Derive it: distinct values ranked descending, one zoom apart from --min-zoom
+tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 6 \
+  --magnitude-ladder density
+
+# ...or place the rungs by hand. Rungs must fall inside the zoom range, and
+# each names a value the column actually carries.
+tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 8 \
+  --entry-zoom "density:5000=0,1000=3,200=6"
+```
+
+With five distinct values over `--min-zoom 0 --max-zoom 6` and the default
+step, counting features present at each zoom, the derived ladder gives a clean
+staircase: the strongest rank is the only thing at z0, and each weaker rank
+joins one zoom later. Without a ladder the strongest values do not appear at
+all until the gate stops removing them — typically the finest zooms, because
+they are the smallest features in the layer.
+
+Ranking **distinct values** (SQL `DENSE_RANK`) rather than the values
+themselves keeps the ladder scale-free. Mapping a raw value linearly onto the
+zoom range strands every rung in the upper zooms whenever the values occupy a
+narrow part of their nominal scale, which real data usually does.
+
+More distinct values than the zoom range has room for is fine: the ranks that
+would fall past the finest zoom get no rung, and those features keep the
+ordinary gate and thinning rather than being pinned to the finest level. The
+run says how many were left out.
+
+`--ladder-step N` widens the spacing. A value the ladder does not cover (null,
+or unlisted in an explicit spec) gets no entry zoom and takes the ordinary
+gate, so a partly populated column degrades to today's behaviour instead of
+hiding rows.
+
+### Two mechanisms can still undo a ladder
+
+The ladder governs **admission**. Two later stages can remove a feature it
+admitted, and both matter in practice:
+
+- **Simplification.** A feature admitted to a coarse level is still dropped
+  there if its geometry simplifies below that level's tolerance — the usual
+  case for small-but-strong features. `--magnitude-ladder` and `--entry-zoom`
+  therefore **imply `--collapse`**, so such a feature survives as a
+  representative point. `--collapse-square` overrides.
+- **The density budget**, which caps each level and sheds its lowest-priority
+  survivors *by size* — the same inversion the ladder corrects. Pair with
+  `--no-density-drop`, or with `--sort-key` on the same column so the budget
+  ranks the way the ladder does. tylertoo warns when a ladder runs with the
+  budget on and no sort key.
+
+With the budget off, the staircase is exact — each rank appears at its own
+zoom and at none before it, and every rank already admitted stays:
+
+```
+zoom     rank 4  rank 3  rank 2  rank 1  rank 0   (0 = highest value)
+z0            0       0       0       0     140
+z1            0       0       0     140     140
+z2            0       0     165     165     165
+z3            0     192     176     176     176
+z4          250     192     176     160     160
+```
+
+### Relation to tippecanoe
+
+This is tippecanoe's per-feature `tippecanoe.minzoom`, the one attribute-driven
+thinning lever it offers. tippecanoe takes the minzoom as an input attribute;
+`--magnitude-ladder` additionally *derives* one from a column, which is what
+callers were doing by hand upstream of it.
+
+---
+
 ## Ranking: which feature wins a cell
 
 When several features compete for one grid cell, the **winner** is the
@@ -905,7 +994,7 @@ render differently against a differently-ordered archive of the same data.
 
 **tylertoo's default is input row order**, exactly: the overview file's row
 order, which is the source file's row order restricted to the rows each level
-kept. Measured across z12–z14 on a nested-contour fixture, the within-tile
+kept. Measured across z12–z14 on a nested-polygon fixture, the within-tile
 sequence has zero inversions against source row order at every zoom.
 
 **Do not assume tippecanoe matches it.** Tippecanoe's order is incidental
@@ -926,10 +1015,11 @@ tylertoo tiles in.parquet out.pmtiles --feature-order level:desc
 
 Accepted on both `tiles` and `export-pmtiles`.
 
-Sorting by a column is the fix for the nested-choropleth case: five concentric
-contour bands where the small hot cores must land on top. `--feature-order
-level` does in the archive what `"fill-sort-key": ["get", "level"]` does in
-every downstream style, so consumers do not each have to know.
+Sorting by a column is the fix for any nested-polygon choropleth, where the
+small high-value shapes sit inside larger low-value ones and must land on top.
+`--feature-order level` does in the archive what
+`"fill-sort-key": ["get", "level"]` does in every downstream style, so
+consumers do not each have to know.
 
 Details that make the result reproducible:
 

@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::path::PathBuf;
 use tylertoo_core::overview::export::FeatureOrder;
+use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
 /// Parse human-readable memory size (e.g., "8G", "16G", "512M") to bytes.
 fn parse_memory_size(s: &str) -> Result<usize, String> {
@@ -451,6 +452,60 @@ struct ConvertTuningArgs {
     /// exclusive with --class-rank.
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
     sort_key: Option<String>,
+
+    /// Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
+    ///
+    /// Thinning ranks on geometry, which is backwards whenever a dataset's
+    /// most important features are its physically smallest — a population
+    /// density layer, say, where dense urban tracts are tiny next to sparse
+    /// rural ones. Coarse levels then keep the big low-value polygons and drop
+    /// the small high-value ones. --sort-key cannot fix that: it chooses
+    /// between features competing for a cell, and the visibility gate has
+    /// already dropped the small ones on size.
+    ///
+    /// A ladder ranks COL's DISTINCT values descending and gives each rank an
+    /// entry zoom one --ladder-step apart, starting at --min-zoom. A feature
+    /// appears from its entry zoom inward and not before, exempt from the
+    /// visibility gate and from thinning throughout. Nothing is deleted: the
+    /// finest level still carries every feature.
+    ///
+    /// Ranking DISTINCT values (SQL DENSE_RANK) rather than the values
+    /// themselves keeps the ladder scale-free — mapping a raw value onto the
+    /// zoom range strands everything in the upper zooms whenever the values
+    /// occupy a narrow part of their nominal scale.
+    ///
+    /// Implies --collapse unless you pass --collapse-square, so a promoted
+    /// feature that simplifies below its level's tolerance survives as a
+    /// representative point rather than being dropped again.
+    ///
+    /// Mutually exclusive with --entry-zoom.
+    #[arg(long, value_name = "COL", help_heading = "Ranking")]
+    magnitude_ladder: Option<String>,
+
+    /// Zooms between consecutive --magnitude-ladder rungs (default 1).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "1",
+        help_heading = "Ranking",
+        requires = "magnitude_ladder"
+    )]
+    ladder_step: u8,
+
+    /// Explicit entry zooms, for full control over the rungs:
+    /// `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g.
+    /// `--entry-zoom "density:5000=4,1000=6,200=8"`.
+    ///
+    /// Same semantics as --magnitude-ladder but the rungs are placed by hand
+    /// rather than derived. Values the spec does not list get no entry zoom
+    /// and take the ordinary gate. Mutually exclusive with --magnitude-ladder.
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help_heading = "Ranking",
+        conflicts_with = "magnitude_ladder"
+    )]
+    entry_zoom: Option<String>,
 
     /// Categorical class ranking (higher priority wins a cell). Format:
     /// `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g.
@@ -979,6 +1034,19 @@ impl ConvertTuningArgs {
             None => None,
         };
 
+        // Entry-zoom ladder (#364): derived from a column, or spelled out.
+        // clap enforces that the two are mutually exclusive.
+        let entry_zoom = match (&self.magnitude_ladder, &self.entry_zoom) {
+            (Some(col), _) => Some(EntryZoomSpec {
+                column: col.clone(),
+                kind: EntryZoomKind::DenseRank {
+                    step: self.ladder_step,
+                },
+            }),
+            (None, Some(spec)) => Some(parse_entry_zoom(spec)?),
+            (None, None) => None,
+        };
+
         // Clustering flags (Q4; also enforced in core).
         if !self.accumulate_attribute.is_empty() && !self.cluster {
             anyhow::bail!("--accumulate-attribute requires --cluster");
@@ -1029,6 +1097,7 @@ impl ConvertTuningArgs {
             levels,
             assign,
             sort_key: self.sort_key.clone(),
+            entry_zoom: entry_zoom.clone(),
             class_ranking,
             no_auto_rank: self.no_auto_rank,
             simplify: SimplifyOptions {
@@ -1038,6 +1107,17 @@ impl ConvertTuningArgs {
                 ),
                 // --collapse and --collapse-square are mutually exclusive
                 // (clap conflicts_with); both default off = drop (#279).
+                //
+                // A magnitude ladder implies --collapse (#364): the ladder
+                // admits a small-but-strong feature to a coarse level, and the
+                // drop default would then delete it there for simplifying
+                // below that level's tolerance — undoing the promotion the
+                // caller asked for. An explicit --collapse-square still wins.
+                // A ladder implies --collapse, but that is applied in core
+                // (`convert_to_overviews_source_strategy`) so every caller
+                // gets it — the Python bindings and direct library users
+                // included, where the drop default silently deletes the
+                // promoted features and can empty the coarsest level outright.
                 collapse: if self.collapse_square {
                     CollapseMode::Square
                 } else if self.collapse {
@@ -1803,6 +1883,47 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse an `--entry-zoom` spec: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` (#364).
+///
+/// Mirrors [`parse_class_rank`]'s grammar so the two read alike; the payload
+/// differs (a zoom, not a priority) because a rung places a feature rather
+/// than ordering it.
+fn parse_entry_zoom(spec: &str) -> Result<tylertoo_core::overview::ladder::EntryZoomSpec> {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let (column, rest) = spec.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "--entry-zoom {spec:?}: expected COLUMN:VALUE=ZOOM,VALUE=ZOOM,... \
+             (e.g. \"level:0.5=8,0.2=12\")"
+        )
+    })?;
+    if column.is_empty() {
+        anyhow::bail!("--entry-zoom {spec:?}: empty column name");
+    }
+    let mut rungs = Vec::new();
+    for pair in rest.split(',').filter(|p| !p.trim().is_empty()) {
+        let (value, zoom) = pair.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--entry-zoom {spec:?}: expected VALUE=ZOOM, got {pair:?}")
+        })?;
+        let value: f64 = value
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--entry-zoom {spec:?}: {value:?} is not a number"))?;
+        let zoom: u8 = zoom
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--entry-zoom {spec:?}: {zoom:?} is not a zoom level"))?;
+        rungs.push((value, zoom));
+    }
+    if rungs.is_empty() {
+        anyhow::bail!("--entry-zoom {spec:?}: no VALUE=ZOOM pairs");
+    }
+    Ok(EntryZoomSpec {
+        column: column.to_string(),
+        kind: EntryZoomKind::Explicit(rungs),
+    })
 }
 
 /// Parse a `--class-rank` spec: `COLUMN:VALUE=RANK,VALUE=RANK,...`.
@@ -2805,6 +2926,99 @@ mod tests {
                 false,
             )
             .unwrap()
+    }
+
+    /// The `--entry-zoom` grammar, which had no tests despite +116 lines of
+    /// new surface and a mandatory-TDD policy.
+    #[test]
+    fn entry_zoom_spec_grammar() {
+        use tylertoo_core::overview::ladder::EntryZoomKind;
+
+        let ok = |spec: &str| parse_entry_zoom(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        let s = ok("density:5000=4,1000=6,200=8");
+        assert_eq!(s.column, "density");
+        match &s.kind {
+            EntryZoomKind::Explicit(pairs) => {
+                assert_eq!(pairs, &[(5000.0, 4), (1000.0, 6), (200.0, 8)]);
+            }
+            other => panic!("expected explicit rungs, got {other:?}"),
+        }
+
+        // Whitespace and a trailing comma are tolerated.
+        let s = ok("density: 5000 = 4 , 200 = 8 ,");
+        match &s.kind {
+            EntryZoomKind::Explicit(pairs) => assert_eq!(pairs, &[(5000.0, 4), (200.0, 8)]),
+            other => panic!("{other:?}"),
+        }
+
+        for bad in [
+            "density",          // no ':'
+            ":5000=4",          // empty column
+            "density:",         // no pairs
+            "density:5000",     // missing '='
+            "density:x=4",      // value not a number
+            "density:5000=z",   // zoom not a number
+            "density:5000=-1",  // negative zoom
+            "density:5000=999", // beyond u8
+        ] {
+            assert!(parse_entry_zoom(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// #364: a ladder implies collapse-to-point, and that is applied in CORE so
+    /// every caller gets it — the CLI is not the only entry point, and the
+    /// Python bindings previously lost the entire coarsest level to the drop
+    /// default. `--collapse-square` still wins.
+    #[test]
+    fn a_ladder_implies_collapse_to_point_for_every_caller() {
+        use tylertoo_core::overview::simplify::CollapseMode;
+
+        // The CLI itself leaves the mode alone...
+        let cli = verbatim_opts(&["--magnitude-ladder", "level"]);
+        assert_eq!(cli.simplify.collapse, CollapseMode::Drop);
+        assert_eq!(
+            verbatim_opts(&["--magnitude-ladder", "level", "--collapse-square"])
+                .simplify
+                .collapse,
+            CollapseMode::Square,
+            "an explicit --collapse-square is not overridden"
+        );
+
+        // Core applies the implication (covered by
+        // `ladder_implies_collapse_to_point` in overview::convert), so a
+        // library or Python caller that builds ConvertOptions directly gets it
+        // too — which is what the CLI must NOT duplicate.
+        assert!(
+            cli.entry_zoom.is_some(),
+            "the ladder reaches ConvertOptions"
+        );
+    }
+
+    /// #364/#367: a ladder is not verbatim, and the run must not claim it is.
+    ///
+    /// `--verbatim` logs "every level reproduces the input" when
+    /// `is_verbatim()` holds. An entry-zoom ladder deliberately holds features
+    /// OUT of coarse levels, so a laddered run does not reproduce its input
+    /// there — reporting it as verbatim would make that line a lie on exactly
+    /// the runs that combine the two.
+    #[test]
+    fn a_ladder_means_the_run_is_not_verbatim() {
+        let laddered = verbatim_opts(&["--verbatim", "--magnitude-ladder", "level"]);
+        assert!(
+            laddered.entry_zoom.is_some(),
+            "precondition: the ladder must reach ConvertOptions"
+        );
+        assert!(
+            !laddered.is_verbatim(),
+            "a ladder holds features out of coarse levels, so this is not verbatim"
+        );
+        // The generalization knobs ARE still all off — that half is unchanged,
+        // which is what keeps the partitioning guard firing.
+        assert!(laddered.simplify.factor == 0.0 && !laddered.density.enabled);
+
+        // Without a ladder, --verbatim is still verbatim.
+        assert!(verbatim_opts(&["--verbatim"]).is_verbatim());
     }
 
     /// Verbatim in partitioning mode produces an empty pyramid, so it is

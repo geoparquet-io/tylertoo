@@ -757,7 +757,7 @@ mod tests {
 
     /// The one-shot form (#345): GeoParquet in, one banded archive out. Each
     /// band contributes tiles only within its own zoom range, and the bands
-    /// share a layer name — the FIRMS/contour shape, where a coarse aggregate
+    /// share a layer name — the FIRMS shape, where a coarse aggregate
     /// and a fine one are the same layer to a client.
     #[test]
     fn build_pyramid_tiles_geoparquet_bands_into_one_archive() {

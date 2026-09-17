@@ -68,3 +68,50 @@ pub(crate) fn write_input(
     writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
     writer.close().unwrap();
 }
+
+/// Write a GeoParquet file carrying one **f64 attribute column** alongside the
+/// geometry, for tests that rank on a real per-row value (#364's magnitude
+/// ladder).
+///
+/// A sibling of [`write_input`] rather than a parameter on it: that one's
+/// `extra_col` injects a constant Int32, which cannot carry a ladder's rungs.
+pub(crate) fn write_input_with_f64(
+    path: &Path,
+    geoms: &[Option<Geometry<f64>>],
+    column: &str,
+    values: &[f64],
+) {
+    use arrow_array::Float64Array;
+
+    assert_eq!(geoms.len(), values.len(), "one value per geometry");
+    let id = Int64Array::from((0..geoms.len() as i64).collect::<Vec<_>>());
+    let attr = Float64Array::from(values.to_vec());
+
+    let typ = GeometryType::new(Default::default());
+    let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+    b.extend_from_iter(geoms.iter().map(|g| g.as_ref()));
+    let geom_arr = b.finish();
+    let geom_field = geom_arr.data_type().to_field("geometry", true);
+
+    let schema = Arc::new(Schema::new(vec![
+        Arc::new(Field::new("id", DataType::Int64, false)),
+        Arc::new(Field::new(column, DataType::Float64, true)),
+        Arc::new(geom_field),
+    ]));
+    let columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), Arc::new(attr), geom_arr.to_array_ref()];
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+    let gpq_options = GeoParquetWriterOptionsBuilder::default()
+        .set_encoding(GeoParquetWriterEncoding::WKB)
+        .set_generate_covering(true)
+        .build();
+    let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+    let target_schema = encoder.target_schema();
+
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, target_schema, None).unwrap();
+    let encoded = encoder.encode_record_batch(&batch).unwrap();
+    writer.write(&encoded).unwrap();
+    writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+    writer.close().unwrap();
+}

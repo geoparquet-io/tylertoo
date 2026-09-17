@@ -62,6 +62,7 @@ use super::coalesce::{
     coalesce_level_lines, CoalesceInput, CoalesceParams, COALESCED_COUNT_COLUMN,
     DEFAULT_COALESCE_MAX_LEVEL_ROWS, DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
 };
+use super::ladder::{build_ladder, entry_levels, EntryZoomSpec};
 use super::level::{
     gsd_with_base, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance, Crs,
     DensityProvenance, Generalization, GeneralizationLevel, MemoryProfile, Mode, RankingProvenance,
@@ -271,6 +272,16 @@ pub struct ConvertOptions {
     pub levels: LevelPlan,
     /// Thinning / visibility / sort configuration for level assignment.
     pub assign: AssignConfig,
+    /// Attribute-driven entry zoom (#364): a magnitude ladder that decides how
+    /// early each feature may appear, overriding the visibility gate and
+    /// cell-winner thinning rather than acting after them.
+    ///
+    /// For nested-band data the strongest signal is carried by the physically
+    /// *smallest* feature, so geometry-ranked thinning gets coarse levels
+    /// backwards. [`sort_key`](Self::sort_key) cannot fix that on its own — it
+    /// chooses between features competing for a cell, and the gate has already
+    /// dropped the small ones on size.
+    pub entry_zoom: Option<EntryZoomSpec>,
     /// Optional column name whose (numeric) value is used as the cell-winner
     /// sort key. Mutually exclusive with [`class_ranking`](Self::class_ranking).
     pub sort_key: Option<String>,
@@ -524,6 +535,22 @@ impl ConvertOptions {
     /// every level however it was reached (the flag, or the equivalent knobs
     /// set by hand).
     pub fn is_verbatim(&self) -> bool {
+        // An entry-zoom ladder is not a generalization knob, but it does hold
+        // features out of coarse levels — so a laddered run does NOT reproduce
+        // its input at every level, whatever the knobs say. Reporting it as
+        // verbatim would make the CLI's "every level reproduces the input"
+        // line a lie on exactly the runs that combine the two (#364).
+        self.generalization_is_off() && self.entry_zoom.is_none()
+    }
+
+    /// Whether every *generalization* knob is off, ignoring the entry-zoom
+    /// ladder.
+    ///
+    /// This is the half that governs feature and vertex dropping, and it is
+    /// what the mode guards test: a ladder gives laddered features a level to
+    /// sit at, but unlabelled ones still collapse into the coarsest level
+    /// under partitioning, so the guard has to fire either way.
+    pub(crate) fn generalization_is_off(&self) -> bool {
         self.assign.point_thinning == 0.0
             && self.assign.line_thinning == 0.0
             && self.assign.polygon_thinning == 0.0
@@ -544,6 +571,7 @@ impl Default for ConvertOptions {
                 max_zoom: 6,
             },
             assign: AssignConfig::default(),
+            entry_zoom: None,
             sort_key: None,
             class_ranking: None,
             no_auto_rank: false,
@@ -1261,6 +1289,118 @@ fn decode_and_filter_geometries(
     Ok((filtered, geoms))
 }
 
+/// Adjustments both pipelines make before converting, or `None` to use the
+/// options as given.
+///
+/// These are silent-by-default traps, so each one logs. They are applied here
+/// rather than in the CLI so that every caller gets them — the Python bindings
+/// and direct library users included, where the untouched defaults delete the
+/// features a ladder has just promoted.
+pub(crate) fn adjusted_for_ladder_and_mode(options: &ConvertOptions) -> Option<ConvertOptions> {
+    // Q3 / #364: coalescing replaces source lines with merged chains and
+    // re-derives their features, so a chain has no entry zoom to inherit and
+    // the coalescer's own gate would re-drop the lines a ladder promoted.
+    // Partitioning cannot represent a merged chain at all (§2.3).
+    let coalescing_off = options.coalesce_lines
+        && match options.mode {
+            Mode::Partitioning => Some(
+                "line coalescing is inert in partitioning mode (feature-once / \
+                 geometry-verbatim contract); converting without it",
+            ),
+            _ if options.entry_zoom.is_some() => Some(
+                "line coalescing is inert with an entry-zoom ladder (a merged chain \
+                 has no entry zoom to inherit, and coalescing would re-gate the \
+                 lines the ladder promoted); converting without it",
+            ),
+            _ => None,
+        }
+        .inspect(|why| log::info!("{why}"))
+        .is_some();
+
+    // #364: a promoted feature is, by construction, below its new level's
+    // simplification tolerance, so the drop default deletes it again at exactly
+    // the levels it was promoted to — and a level left with nothing is omitted
+    // from the file entirely.
+    let collapse_to_point =
+        options.entry_zoom.is_some() && matches!(options.simplify.collapse, CollapseMode::Drop);
+    if collapse_to_point {
+        log::info!(
+            "an entry-zoom ladder implies collapse-to-point: a promoted feature is \
+             usually below its level's simplification tolerance and would be deleted \
+             there instead of drawn. Coarse levels therefore carry representative \
+             POINTS for those features — style them with a circle layer, or ask for \
+             --collapse-square to keep polygons."
+        );
+    }
+
+    if !coalescing_off && !collapse_to_point {
+        return None;
+    }
+    Some(ConvertOptions {
+        coalesce_lines: options.coalesce_lines && !coalescing_off,
+        simplify: SimplifyOptions {
+            collapse: if collapse_to_point {
+                CollapseMode::Point
+            } else {
+                options.simplify.collapse
+            },
+            ..options.simplify
+        },
+        ..options.clone()
+    })
+}
+
+#[cfg(test)]
+mod ladder_adjustment_tests {
+    use super::*;
+
+    fn with_ladder() -> ConvertOptions {
+        ConvertOptions {
+            entry_zoom: Some(crate::overview::ladder::EntryZoomSpec {
+                column: "level".to_string(),
+                kind: crate::overview::ladder::EntryZoomKind::DenseRank { step: 1 },
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// #364: the implication lives in core, so the CLI is not the only caller
+    /// that gets it. The Python bindings previously lost the whole coarsest
+    /// level to the drop default, taking the features the ladder had just
+    /// promoted with it.
+    #[test]
+    fn ladder_implies_collapse_to_point() {
+        let adjusted = adjusted_for_ladder_and_mode(&with_ladder())
+            .expect("a ladder must trigger an adjustment");
+        assert_eq!(adjusted.simplify.collapse, CollapseMode::Point);
+    }
+
+    /// An explicit choice is never overridden.
+    #[test]
+    fn an_explicit_collapse_square_survives_the_implication() {
+        let mut o = with_ladder();
+        o.simplify.collapse = CollapseMode::Square;
+        let adjusted = adjusted_for_ladder_and_mode(&o);
+        assert!(adjusted.is_none_or(|a| a.simplify.collapse == CollapseMode::Square));
+    }
+
+    /// Coalescing replaces lines with merged chains that carry no entry zoom,
+    /// which made the ladder a silent no-op for line features.
+    #[test]
+    fn ladder_turns_line_coalescing_off() {
+        let mut o = with_ladder();
+        o.coalesce_lines = true;
+        let adjusted = adjusted_for_ladder_and_mode(&o).expect("adjusted");
+        assert!(!adjusted.coalesce_lines);
+    }
+
+    /// Without a ladder nothing is adjusted, so default output is untouched.
+    #[test]
+    fn no_ladder_means_no_adjustment() {
+        assert!(adjusted_for_ladder_and_mode(&ConvertOptions::default()).is_none());
+    }
+}
+
 /// Option combinations that no pipeline can honour, checked once for both.
 ///
 /// These are rejections rather than silent adjustments: each one would
@@ -1276,7 +1416,7 @@ fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError>
     // every feature wins level 0, and partitioning writes it there and nowhere
     // else. Rejecting beats emitting a pyramid whose finer levels are all
     // empty and whose warning blames the visibility gates.
-    if options.is_verbatim() && matches!(options.mode, Mode::Partitioning) {
+    if options.generalization_is_off() && matches!(options.mode, Mode::Partitioning) {
         return Err(ConvertError::VerbatimPartitioningUnsupported);
     }
     // Aggregation is meaningless without clustering.
@@ -1309,20 +1449,13 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // without it (no column, no provenance); the CLI rejects an EXPLICIT
     // request instead.
     let inert_options: ConvertOptions;
-    let options: &ConvertOptions =
-        if options.coalesce_lines && matches!(options.mode, Mode::Partitioning) {
-            log::info!(
-                "line coalescing is inert in partitioning mode (feature-once / \
-                 geometry-verbatim contract); converting without it"
-            );
-            inert_options = ConvertOptions {
-                coalesce_lines: false,
-                ..options.clone()
-            };
+    let options: &ConvertOptions = match adjusted_for_ladder_and_mode(options) {
+        Some(adjusted) => {
+            inert_options = adjusted;
             &inert_options
-        } else {
-            options
-        };
+        }
+        None => options,
+    };
 
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
@@ -1464,6 +1597,11 @@ pub(crate) fn convert_to_overviews_source_strategy(
     let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
 
+    // Entry-zoom ladder (#364), resolved before assignment so the gate and
+    // thinning never see the features it governs.
+    let ladder_values = entry_zoom_column_values(options, &input_schema, &full)?;
+    let entry = resolve_entry_levels(options, &ladder_values, &level_specs)?;
+
     let features: Vec<AssignFeature> = geometries
         .iter()
         .enumerate()
@@ -1472,6 +1610,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
             bbox: geometry_bbox(g),
             kind: feature_kind(g),
             sort_key: sort_keys[i],
+            entry_level: entry.as_ref().and_then(|e| e[i]),
         })
         .collect();
 
@@ -2777,6 +2916,14 @@ pub(super) fn resolve_reserved_column_collisions(
             spec.column = new;
         }
     }
+    // #364: the motivating ladder column is literally named `level` (#359's
+    // reporter and #364's are the same dataset), so a ladder is the
+    // single most likely option to name a reserved column.
+    if let Some(spec) = options.entry_zoom.as_mut() {
+        if let Some(new) = remap(&spec.column) {
+            spec.column = new;
+        }
+    }
 
     let schema = Arc::new(Schema::new_with_metadata(
         new_fields,
@@ -2956,6 +3103,84 @@ pub(super) fn coalesce_effective(options: &ConvertOptions, num_lines: usize) -> 
         return false;
     }
     true
+}
+
+/// Resolve the per-feature entry levels for a conversion (#364), or `None`
+/// when no ladder was requested.
+///
+/// Shared by both pipelines so the ladder is derived once, the same way: the
+/// column is looked up by name (following any #288 rename, since `options` is
+/// already rewritten by then), its values extracted with the same numeric
+/// coercion `--sort-key` uses, and the rungs mapped onto the level plan.
+pub(super) fn resolve_entry_levels(
+    options: &ConvertOptions,
+    column_values: &[Option<f64>],
+    level_specs: &[(f64, Option<u8>)],
+) -> Result<Option<Vec<Option<u8>>>, ConvertError> {
+    let Some(spec) = &options.entry_zoom else {
+        return Ok(None);
+    };
+    let level_zooms: Vec<Option<u8>> = level_specs.iter().map(|(_, z)| *z).collect();
+    let ladder = build_ladder(spec, column_values, &level_zooms)
+        .map_err(|e| ConvertError::InvalidConfig(format!("entry-zoom: {e}")))?;
+    let levels = entry_levels(&ladder, column_values, &level_zooms);
+    let placed = levels.iter().filter(|l| l.is_some()).count();
+    log::info!(
+        "[assign] entry-zoom ladder on {:?}: {} rung(s) {:?}; {placed} of {} feature(s) placed",
+        spec.column,
+        ladder.len(),
+        ladder.to_map(),
+        column_values.len(),
+    );
+    // The ladder admits a feature to a level; write-time simplification then
+    // decides what its geometry becomes there. With the drop default, a
+    // feature whose geometry falls below the level tolerance is deleted — and
+    // for a ladder those are exactly the features the caller asked for, since
+    // the whole premise is that the strongest signal is the smallest geometry.
+    // Orthogonal mechanisms, so this warns rather than overriding; the CLI
+    // composes them by defaulting `--collapse` on alongside a ladder.
+    if matches!(options.simplify.collapse, CollapseMode::Drop) && options.simplify.factor > 0.0 {
+        log::warn!(
+            "[assign] entry-zoom ladder with --collapse off: a laddered feature \
+             admitted to a coarse level is still DROPPED there if its geometry \
+             simplifies below that level's tolerance, which is the usual case for \
+             the small-but-strong features a ladder exists to promote. Pass \
+             --collapse (representative point) or --collapse-square to keep them, \
+             or --simplify-factor 0 to disable simplification."
+        );
+    }
+    // Likewise the per-level density budget, which runs after assignment and
+    // sheds the lowest-priority survivors. Its priority is geometry-ranked
+    // unless a sort key says otherwise — the same inversion the ladder exists
+    // to correct — so it can undo the promotion feature by feature.
+    if options.density.enabled && options.sort_key.is_none() {
+        log::warn!(
+            "[assign] entry-zoom ladder with the density budget on and no \
+             --sort-key: the budget caps each level and sheds its lowest-priority \
+             survivors by SIZE, which can drop the small-but-strong features the \
+             ladder just promoted. Pass --no-density-drop, or --sort-key on the \
+             same column so the budget ranks the way the ladder does."
+        );
+    }
+    Ok(Some(levels))
+}
+
+/// Extract the ladder column's values, by name, from an in-memory table.
+pub(super) fn entry_zoom_column_values(
+    options: &ConvertOptions,
+    schema: &Schema,
+    table: &RecordBatch,
+) -> Result<Vec<Option<f64>>, ConvertError> {
+    let Some(spec) = &options.entry_zoom else {
+        return Ok(Vec::new());
+    };
+    let idx = schema.index_of(&spec.column).map_err(|_| {
+        ConvertError::InvalidConfig(format!(
+            "entry-zoom column {:?} not found in the input schema",
+            spec.column
+        ))
+    })?;
+    Ok(extract_sort_keys(table.column(idx).as_ref()))
 }
 
 /// Build informative generalization provenance (§3.5) from the emitted gsds.
@@ -4665,6 +4890,34 @@ mod tests {
         let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
         assert_eq!(renames.len(), 1);
         assert_eq!(opts.sort_key.as_deref(), Some("level_"));
+    }
+
+    /// #364 + #288: the motivating ladder column is named `level`, which is
+    /// also the reserved overview column — so a `--magnitude-ladder level`
+    /// must follow the rename, or the conversion fails with "column not found"
+    /// on the very case the feature exists for.
+    #[test]
+    fn resolver_rewrites_the_entry_zoom_column() {
+        use super::super::ladder::{EntryZoomKind, EntryZoomSpec};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("level", DataType::Float64, false),
+            Field::new("geometry", DataType::Binary, false),
+        ]));
+        let mut opts = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "level".to_string(),
+                kind: EntryZoomKind::DenseRank { step: 1 },
+            }),
+            ..Default::default()
+        };
+        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        assert_eq!(renames.len(), 1);
+        assert_eq!(
+            opts.entry_zoom.as_ref().unwrap().column,
+            "level_",
+            "the ladder column must follow the reserved-column rename"
+        );
     }
 
     #[test]

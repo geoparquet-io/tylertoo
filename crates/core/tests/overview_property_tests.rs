@@ -129,6 +129,7 @@ fn features(max: usize) -> impl Strategy<Value = Vec<AssignFeature>> {
                 bbox: [x, y, x + w, y + h],
                 kind,
                 sort_key,
+                entry_level: None,
             })
             .collect()
     })

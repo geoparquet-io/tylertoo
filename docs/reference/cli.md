@@ -86,6 +86,23 @@ Generate PMTiles vector tiles (the default pipeline)
 
    Supplies DEFAULTS rather than overriding: any knob you set explicitly wins, so --verbatim --simplify-factor 0.5 is NEARLY verbatim.
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
+* `--magnitude-ladder <COL>` — Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
+
+   Thinning ranks on geometry, which is backwards whenever a dataset's most important features are its physically smallest — a population density layer, say, where dense urban tracts are tiny next to sparse rural ones. Coarse levels then keep the big low-value polygons and drop the small high-value ones. --sort-key cannot fix that: it chooses between features competing for a cell, and the visibility gate has already dropped the small ones on size.
+
+   A ladder ranks COL's DISTINCT values descending and gives each rank an entry zoom one --ladder-step apart, starting at --min-zoom. A feature appears from its entry zoom inward and not before, exempt from the visibility gate and from thinning throughout. Nothing is deleted: the finest level still carries every feature.
+
+   Ranking DISTINCT values (SQL DENSE_RANK) rather than the values themselves keeps the ladder scale-free — mapping a raw value onto the zoom range strands everything in the upper zooms whenever the values occupy a narrow part of their nominal scale.
+
+   Implies --collapse unless you pass --collapse-square, so a promoted feature that simplifies below its level's tolerance survives as a representative point rather than being dropped again.
+
+   Mutually exclusive with --entry-zoom.
+* `--ladder-step <N>` — Zooms between consecutive --magnitude-ladder rungs (default 1)
+
+  Default value: `1`
+* `--entry-zoom <SPEC>` — Explicit entry zooms, for full control over the rungs: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g. `--entry-zoom "density:5000=4,1000=6,200=8"`.
+
+   Same semantics as --magnitude-ladder but the rungs are placed by hand rather than derived. Values the spec does not list get no entry zoom and take the ordinary gate. Mutually exclusive with --magnitude-ladder.
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key
 * `--no-auto-rank` — Disable auto-detection of well-known schemas (Overture roads `class`/ `road_class`, Overture places `confidence`)
 * `--filter <EXPR>` — Attribute filter: only convert features matching this SQL-WHERE-style predicate over the input's property columns, e.g. "confidence > 0.8", "crop_type IN ('soy', 'corn')", "note IS NOT NULL AND (class = 'a' OR class = 'b')". Supports =, !=, <, <=, >, >=, IN (...), IS [NOT] NULL, AND/OR/NOT, parentheses, 'string' and numeric literals, and "quoted column" names; timestamp columns compare against 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' / RFC 3339 datetime strings (read as UTC); nulls follow SQL three-valued logic (a row is kept only when the predicate is TRUE). Evaluated during the pass-1 scan, so it composes with --bbox; input row groups whose parquet column statistics preclude any match are skipped at the footer level (on remote input those byte ranges are never fetched). Aliased as --where. See docs/OVERVIEW_TUNING.md
@@ -254,6 +271,23 @@ Build a multi-resolution overview GeoParquet file
 
    Supplies DEFAULTS rather than overriding: any knob you set explicitly wins, so --verbatim --simplify-factor 0.5 is NEARLY verbatim.
 * `--sort-key <COL>` — Column name used as the cell-winner priority (sort) key. Mutually exclusive with --class-rank
+* `--magnitude-ladder <COL>` — Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
+
+   Thinning ranks on geometry, which is backwards whenever a dataset's most important features are its physically smallest — a population density layer, say, where dense urban tracts are tiny next to sparse rural ones. Coarse levels then keep the big low-value polygons and drop the small high-value ones. --sort-key cannot fix that: it chooses between features competing for a cell, and the visibility gate has already dropped the small ones on size.
+
+   A ladder ranks COL's DISTINCT values descending and gives each rank an entry zoom one --ladder-step apart, starting at --min-zoom. A feature appears from its entry zoom inward and not before, exempt from the visibility gate and from thinning throughout. Nothing is deleted: the finest level still carries every feature.
+
+   Ranking DISTINCT values (SQL DENSE_RANK) rather than the values themselves keeps the ladder scale-free — mapping a raw value onto the zoom range strands everything in the upper zooms whenever the values occupy a narrow part of their nominal scale.
+
+   Implies --collapse unless you pass --collapse-square, so a promoted feature that simplifies below its level's tolerance survives as a representative point rather than being dropped again.
+
+   Mutually exclusive with --entry-zoom.
+* `--ladder-step <N>` — Zooms between consecutive --magnitude-ladder rungs (default 1)
+
+  Default value: `1`
+* `--entry-zoom <SPEC>` — Explicit entry zooms, for full control over the rungs: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g. `--entry-zoom "density:5000=4,1000=6,200=8"`.
+
+   Same semantics as --magnitude-ladder but the rungs are placed by hand rather than derived. Values the spec does not list get no entry zoom and take the ordinary gate. Mutually exclusive with --magnitude-ladder.
 * `--class-rank <SPEC>` — Categorical class ranking (higher priority wins a cell). Format: `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g. `--class-rank road_class:motorway=5,primary=4,residential=2`. Present-but-unlisted values rank below every listed value (but above nulls). Mutually exclusive with --sort-key
 * `--no-auto-rank` — Disable auto-detection of well-known schemas (Overture roads `class`/ `road_class`, Overture places `confidence`)
 * `--filter <EXPR>` — Attribute filter: only convert features matching this SQL-WHERE-style predicate over the input's property columns, e.g. "confidence > 0.8", "crop_type IN ('soy', 'corn')", "note IS NOT NULL AND (class = 'a' OR class = 'b')". Supports =, !=, <, <=, >, >=, IN (...), IS [NOT] NULL, AND/OR/NOT, parentheses, 'string' and numeric literals, and "quoted column" names; timestamp columns compare against 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' / RFC 3339 datetime strings (read as UTC); nulls follow SQL three-valued logic (a row is kept only when the predicate is TRUE). Evaluated during the pass-1 scan, so it composes with --bbox; input row groups whose parquet column statistics preclude any match are skipped at the footer level (on remote input those byte ranges are never fetched). Aliased as --where. See docs/OVERVIEW_TUNING.md

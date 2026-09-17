@@ -5273,7 +5273,7 @@ mod tests {
             name: "level".to_string(),
             descending: false,
         };
-        // 0.2, 0.275, 0.425, 0.5 → the cores (0.5) end up on top.
+        // 0.2, 0.275, 0.425, 0.5 ascending → the highest value ends up on top.
         assert_eq!(paint_order(members, &order), vec![1, 3, 2, 0]);
     }
 
@@ -5549,7 +5549,7 @@ mod tests {
     /// #359 restores a source column that was renamed to clear the reserved
     /// `level`, so the tile advertises `level` while the schema still says
     /// `level_`. `--feature-order level` must therefore resolve — this is the
-    /// flag's headline case (nested contour bands), and checking the schema
+    /// flag's headline case (nested polygon bands), and checking the schema
     /// instead of the published names would reject exactly it.
     #[test]
     fn order_column_resolves_against_the_restored_source_name() {

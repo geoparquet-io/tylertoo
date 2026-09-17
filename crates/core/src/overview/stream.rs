@@ -1081,8 +1081,12 @@ fn pass1_projection(
     plan: &RankPlan,
     acc_cols: &[usize],
     filter: Option<&super::filter::BoundFilter>,
+    ladder_col: Option<usize>,
 ) -> Vec<usize> {
     let mut cols: Vec<usize> = vec![geom_idx];
+    // Entry-zoom ladder (#364): pass 1 decides the level, so its column has
+    // to be read here even though nothing else in pass 1 looks at it.
+    cols.extend(ladder_col);
     if let Some(f) = filter {
         cols.extend(f.columns().iter().copied());
     }
@@ -1102,6 +1106,36 @@ fn pass1_projection(
     cols
 }
 
+/// Stamp each feature's entry level from the ladder column (#364).
+///
+/// Resolved against the same level plan the buffered pipeline uses, so both
+/// engines place a feature identically. A spec that yields no ladder — an
+/// unusable column, a GSD-only plan — leaves every `entry_level` as `None`,
+/// which is the "no ladder opinion" case the assignment already handles.
+///
+/// Lifted out of [`run_pass1`] rather than inlined: pass 1 is already at the
+/// cognitive-complexity ceiling the workspace lints enforce, and this is a
+/// self-contained step with no other reader in that function.
+fn apply_entry_levels(
+    options: &ConvertOptions,
+    ladder_values: &[Option<f64>],
+    num_rows: usize,
+    features: &mut [AssignFeature],
+) -> Result<(), ConvertError> {
+    if options.entry_zoom.is_none() {
+        return Ok(());
+    }
+    debug_assert_eq!(ladder_values.len(), num_rows);
+    let level_specs = options.levels.resolve(options.gsd_base)?;
+    if let Some(entry) = super::convert::resolve_entry_levels(options, ladder_values, &level_specs)?
+    {
+        for f in features.iter_mut() {
+            f.entry_level = entry.get(f.index).copied().flatten();
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_pass1(
     source: &ConvertSource,
@@ -1115,7 +1149,23 @@ fn run_pass1(
 ) -> Result<Pass1Output, ConvertError> {
     let mut plan = build_rank_plan(input_schema, options)?;
 
-    let cols = pass1_projection(geom_idx, &plan, acc_cols, filter);
+    // Entry-zoom ladder column (#364), resolved by name against the (already
+    // #288-renamed) schema so a `--magnitude-ladder level` on a source that
+    // also has a reserved `level` still finds the caller's column.
+    let ladder_col = options
+        .entry_zoom
+        .as_ref()
+        .map(|spec| {
+            input_schema.index_of(&spec.column).map_err(|_| {
+                ConvertError::InvalidConfig(format!(
+                    "entry-zoom column {:?} not found in the input schema",
+                    spec.column
+                ))
+            })
+        })
+        .transpose()?;
+
+    let cols = pass1_projection(geom_idx, &plan, acc_cols, filter, ladder_col);
     // Original schema index → projected batch column index.
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
 
@@ -1135,6 +1185,8 @@ fn run_pass1(
     let mut explicit_keys: Vec<Option<f64>> = Vec::new();
     let mut confidence_keys: Vec<Option<f64>> = Vec::new();
     let mut acc_values: Vec<Vec<Option<f64>>> = vec![Vec::new(); acc_cols.len()];
+    // Entry-zoom ladder column values (#364), row-indexed.
+    let mut ladder_values: Vec<Option<f64>> = Vec::new();
     let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::new();
     // Coalescing (Q3): line rows + geometries, and — for an explicit class
     // ranking — the interned per-row class groups. `line_feat_pos` holds each
@@ -1169,6 +1221,11 @@ fn run_pass1(
         // index, so every row-keyed table stays aligned (H4 hardening; a
         // skipped row must never shift attributes onto a neighbor's geometry).
         let base = num_rows;
+        // #364: which rows of this batch became features. The ladder ranks
+        // DISTINCT values, so it must see the same multiset the buffered engine
+        // sees — that one reads the column off the table AFTER filtering, so a
+        // value carried only by a rejected row must not create a rung here.
+        let mut kept_row = vec![false; geoms_buf.len()];
         for (i, gopt) in geoms_buf.iter().enumerate() {
             // Attribute filter (#315): keep only rows where the predicate is
             // TRUE. The row index still advances (row-keyed tables stay
@@ -1207,11 +1264,13 @@ fn run_pass1(
                 line_feat_pos.push(features.len());
                 line_geoms.push(g.clone());
             }
+            kept_row[i] = true;
             features.push(AssignFeature {
                 index: base + i,
                 bbox: fbbox,
                 kind,
                 sort_key: None, // filled below once the ranking tier resolves
+                entry_level: None,
             });
         }
         num_rows += geoms_buf.len();
@@ -1252,6 +1311,20 @@ fn run_pass1(
         // Accumulate columns (Q4): per-spec source values, in row order.
         for (s, &idx) in acc_cols.iter().enumerate() {
             acc_values[s].extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
+        }
+
+        // Entry-zoom ladder (#364): row-indexed, like the ranking keys above,
+        // but blanked for rows this pass rejected (null/unusable geometry, a
+        // false `--filter` predicate, a `--bbox` miss). Those rows produce no
+        // feature, so letting their values into the ladder would add rungs the
+        // buffered engine never sees and shift every weaker feature by `step`.
+        if let Some(idx) = ladder_col {
+            let keys = extract_sort_keys(batch.column(proj(idx)).as_ref());
+            ladder_values.extend(
+                keys.into_iter()
+                    .zip(&kept_row)
+                    .map(|(k, keep)| if *keep { k } else { None }),
+            );
         }
     }
 
@@ -1348,6 +1421,8 @@ fn run_pass1(
             f.sort_key = keys[f.index];
         }
     }
+
+    apply_entry_levels(options, &ladder_values, num_rows, &mut features)?;
 
     // Coalescing scratch (Q3): line sort keys + per-line groups. `rows` and
     // `groups` are row-indexed; sort keys live on the features.
