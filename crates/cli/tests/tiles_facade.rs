@@ -1,8 +1,10 @@
 //! Integration test for the `tiles` facade: one-shot GeoParquet → PMTiles
 //! via overview convert → export-pmtiles through a temporary file.
 
-use std::path::Path;
 use std::process::Command;
+
+#[path = "../../../tests/support/fixture.rs"]
+mod fixture;
 
 /// PMTiles v3 archives start with the 7-byte magic "PMTiles" followed by the
 /// spec version byte 3.
@@ -14,11 +16,9 @@ fn tylertoo_bin() -> &'static str {
 
 #[test]
 fn tiles_facade_produces_valid_pmtiles() {
-    let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-    if !fixture.exists() {
-        eprintln!("Skipping: fixture not found");
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
         return;
-    }
+    };
 
     let dir = tempfile::tempdir().expect("tempdir");
     let output = dir.path().join("out.pmtiles");
@@ -64,11 +64,9 @@ fn tiles_facade_produces_valid_pmtiles() {
 
 #[test]
 fn bare_invocation_rewrites_to_tiles() {
-    let fixture = Path::new("../../tests/fixtures/realdata/road-detections.parquet");
-    if !fixture.exists() {
-        eprintln!("Skipping: fixture not found");
+    let Some(fixture) = fixture::realdata("road-detections.parquet") else {
         return;
-    }
+    };
 
     let dir = tempfile::tempdir().expect("tempdir");
     let output = dir.path().join("bare.pmtiles");
@@ -94,11 +92,9 @@ fn bare_invocation_rewrites_to_tiles() {
 /// to running the two-step `overview` → `export-pmtiles` chain by hand.
 #[test]
 fn tiles_keep_overview_retains_and_matches_two_step() {
-    let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-    if !fixture.exists() {
-        eprintln!("Skipping: fixture not found");
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
         return;
-    }
+    };
 
     let dir = tempfile::tempdir().expect("tempdir");
     let one_step_out = dir.path().join("one-step.pmtiles");

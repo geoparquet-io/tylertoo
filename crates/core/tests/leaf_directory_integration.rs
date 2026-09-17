@@ -7,6 +7,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../../../tests/support/fixture.rs"]
+mod fixture;
+
 /// PMTiles initial HTTP range request size (16KB)
 const INITIAL_FETCH_SIZE: usize = 16384;
 /// PMTiles header size
@@ -58,12 +61,12 @@ fn verify_with_pmtiles_cli(path: &Path) -> bool {
 #[test]
 fn test_cli_produces_valid_leaf_directories() {
     // This test runs the CLI on a real fixture and verifies the output
-    let fixture_path = Path::new("tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet");
-
-    if !fixture_path.exists() {
-        eprintln!("Skipping test: fixture not found at {:?}", fixture_path);
+    // #369: resolved from the workspace root and content-checked. The
+    // literal that used to be here resolved under `crates/core/`, so this
+    // test skipped itself everywhere — including CI — while reporting `ok`.
+    let Some(fixture_path) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
         return;
-    }
+    };
 
     let output_path = Path::new("/tmp/test-leaf-integration.pmtiles");
     let _ = fs::remove_file(output_path);

@@ -20,7 +20,15 @@ protoc --version  # Should be 3.x or higher
 
 # Enable the repo git hooks (fmt, clippy, version sync, README sync)
 git config core.hooksPath .githooks
+
+# Fetch the real-data test fixtures (a fresh clone holds git-lfs pointers,
+# not the files; the integration tests that need them skip without these)
+gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
 ```
+
+Tests backed by those fixtures skip, with a message naming the command
+above, when the fixtures are absent — they do not fail. See
+`tests/fixtures/realdata/README.md` for what each one is.
 
 The pre-commit hook runs `cargo fmt --check`, `cargo clippy` (deny
 warnings), a version-consistency check across the four version files,
