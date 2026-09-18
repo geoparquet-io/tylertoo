@@ -276,6 +276,45 @@ pub fn clip_multipolygon_ioverlay(
     ioverlay_to_geometry(result)
 }
 
+/// Union several polygons (whose exteriors all wind the same way and whose
+/// holes wind the other) into non-overlapping polygons, by intersecting the
+/// set with a strict-superset box under `FillRule::NonZero` (#383).
+///
+/// NonZero is the rule that makes overlapping parts *add*: EvenOdd would
+/// cut the overlap out as a hole. It relies on consistent winding, which is
+/// why the caller orients the parts first.
+pub fn union_polygons_ioverlay(polys: &[Polygon<f64>]) -> Option<Geometry<f64>> {
+    let mut rect: Option<geo::Rect<f64>> = None;
+    for p in polys {
+        let r = p.bounding_rect()?;
+        rect = Some(match rect {
+            None => r,
+            Some(acc) => geo::Rect::new(
+                geo::coord! { x: acc.min().x.min(r.min().x), y: acc.min().y.min(r.min().y) },
+                geo::coord! { x: acc.max().x.max(r.max().x), y: acc.max().y.max(r.max().y) },
+            ),
+        });
+    }
+    let rect = rect?;
+    let pad = rect.width().max(rect.height()).max(f64::MIN_POSITIVE) * 0.5;
+    let bounds = TileBounds::new(
+        rect.min().x - pad,
+        rect.min().y - pad,
+        rect.max().x + pad,
+        rect.max().y + pad,
+    );
+    let subj_shapes: Vec<IOverlayShape> = polys.iter().map(polygon_to_ioverlay).collect();
+    let clip = bounds_to_clip_box(&bounds);
+    let mut overlay = FloatOverlay::with_subj_and_clip_custom(
+        &subj_shapes,
+        &[clip],
+        Default::default(),
+        Default::default(),
+    );
+    let result: IOverlayShapes = overlay.overlay(OverlayRule::Intersect, FillRule::NonZero);
+    ioverlay_to_geometry(result)
+}
+
 /// Repair a self-intersecting polygon by re-tracing it through a boolean
 /// intersection with its own (padded) bounding box.
 ///

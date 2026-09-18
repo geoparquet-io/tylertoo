@@ -307,8 +307,553 @@ pub fn encode_multi_linestring(
     geometry
 }
 
+// ============================================================================
+// Polygon quantization cleanup (#383)
+// ============================================================================
+
+/// A closed ring in integer tile coordinates (first == last).
+type TileRing = Vec<(i32, i32)>;
+
+/// Snap a ring to tile units, dropping consecutive duplicates and closing it.
+/// Returns `None` when fewer than three distinct vertices remain — the ring
+/// has no area at this zoom and would only encode as a degenerate polygon.
+fn quantize_ring(ring: &LineString, bounds: &TileBounds, extent: u32) -> Option<TileRing> {
+    let mut out: TileRing = Vec::with_capacity(ring.0.len());
+    for c in &ring.0 {
+        let p = geo_to_tile_coords(c.x, c.y, bounds, extent);
+        if out.last() != Some(&p) {
+            out.push(p);
+        }
+    }
+    // Close (the source ring may or may not repeat its first vertex, and the
+    // first and last may have snapped together).
+    if out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    if out.len() < 3 {
+        return None;
+    }
+    let first = out[0];
+    out.push(first);
+    Some(out)
+}
+
+/// Twice the shoelace area of a closed integer ring. The sign is the
+/// orientation on the stored coordinates — which is what the MVT spec keys
+/// on: exterior rings positive, interior rings negative.
+fn ring_area2(ring: &[(i32, i32)]) -> i64 {
+    ring.windows(2)
+        .map(|w| i64::from(w[0].0) * i64::from(w[1].1) - i64::from(w[1].0) * i64::from(w[0].1))
+        .sum()
+}
+
+fn tile_rings_to_polygon(rings: &[TileRing]) -> Polygon<f64> {
+    let to_ls = |r: &TileRing| {
+        LineString::from(
+            r.iter()
+                .map(|&(x, y)| (f64::from(x), f64::from(y)))
+                .collect::<Vec<_>>(),
+        )
+    };
+    Polygon::new(to_ls(&rings[0]), rings[1..].iter().map(to_ls).collect())
+}
+
+/// Round a repaired (f64, integer-valued except at new crossing points)
+/// ring back to tile units, with the same dedup/closure rules as
+/// [`quantize_ring`].
+fn requantize_ring(ring: &LineString<f64>) -> Option<TileRing> {
+    let mut out: TileRing = Vec::with_capacity(ring.0.len());
+    for c in &ring.0 {
+        let p = (c.x.round() as i32, c.y.round() as i32);
+        if out.last() != Some(&p) {
+            out.push(p);
+        }
+    }
+    if out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    if out.len() < 3 {
+        return None;
+    }
+    let first = out[0];
+    out.push(first);
+    Some(out)
+}
+
+/// Split a closed ring at every vertex it visits twice (a "pinch": a neck
+/// that snapped shut, or a spike that folded back). Each loop between two
+/// visits of the same vertex becomes its own closed ring; zero-area loops
+/// (spikes) are dropped. The returned rings visit no vertex twice.
+fn split_pinches(mut ring: TileRing) -> Vec<TileRing> {
+    ring.pop(); // work on the open ring
+    let mut out = Vec::new();
+    let mut stack = vec![ring];
+    while let Some(mut cur) = stack.pop() {
+        // Find the first repeated vertex: sort (index, vertex) by vertex and
+        // look for an equal neighbour. No hashing, and n is small.
+        let mut order: Vec<usize> = (0..cur.len()).collect();
+        order.sort_unstable_by_key(|&i| cur[i]);
+        let mut pinch: Option<(usize, usize)> = None;
+        for w in order.windows(2) {
+            if cur[w[0]] == cur[w[1]] {
+                let (i, j) = (w[0].min(w[1]), w[0].max(w[1]));
+                // Take the earliest second visit so loops nest predictably.
+                if pinch.is_none_or(|(_, pj)| j < pj) {
+                    pinch = Some((i, j));
+                }
+            }
+        }
+        match pinch {
+            None => {
+                if cur.len() >= 3 {
+                    let first = cur[0];
+                    cur.push(first);
+                    if ring_area2(&cur) != 0 {
+                        out.push(cur);
+                    }
+                }
+            }
+            Some((i, j)) => {
+                // `cur[i..j]` is the loop entered at the pinch vertex; removing
+                // it leaves the vertex once, at index i, in the remainder.
+                let sub: Vec<(i32, i32)> = cur.drain(i..j).collect();
+                stack.push(cur);
+                stack.push(sub);
+            }
+        }
+    }
+    out
+}
+
+/// Insert every vertex that lies strictly inside a non-adjacent edge into
+/// that edge, so a ring that touches itself vertex-on-edge (a "T-touch")
+/// becomes one that visits the vertex twice, which [`split_pinches`] then
+/// resolves. Exact integer arithmetic; only exact coincidences qualify,
+/// which after snapping to the grid they frequently do.
+fn node_ring(ring: TileRing) -> TileRing {
+    let n = ring.len() - 1;
+    if n > SIMPLE_CHECK_MAX_EDGES {
+        return ring;
+    }
+    // (edge index, position along the edge, vertex) for every insertion.
+    let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
+    for (k, &v) in ring[..n].iter().enumerate() {
+        for i in 0..n {
+            // Edges that end or start at v contain it trivially.
+            if i == k || (i + 1) % n == k {
+                continue;
+            }
+            let (a, b) = (ring[i], ring[i + 1]);
+            let bx = edge_box(a, b);
+            if v.0 < bx.0 || v.0 > bx.2 || v.1 < bx.1 || v.1 > bx.3 || v == a || v == b {
+                continue;
+            }
+            let cross = (i64::from(b.0) - i64::from(a.0)) * (i64::from(v.1) - i64::from(a.1))
+                - (i64::from(b.1) - i64::from(a.1)) * (i64::from(v.0) - i64::from(a.0));
+            if cross == 0 {
+                let along = (i64::from(v.0) - i64::from(a.0)).abs()
+                    + (i64::from(v.1) - i64::from(a.1)).abs();
+                inserts.push((i, along, v));
+            }
+        }
+    }
+    if inserts.is_empty() {
+        return ring;
+    }
+    inserts.sort_unstable();
+    let mut out: TileRing = Vec::with_capacity(ring.len() + inserts.len());
+    let mut next = 0;
+    for (i, &v0) in ring[..n].iter().enumerate() {
+        out.push(v0);
+        while next < inserts.len() && inserts[next].0 == i {
+            let v = inserts[next].2;
+            if out.last() != Some(&v) {
+                out.push(v);
+            }
+            next += 1;
+        }
+    }
+    let first = out[0];
+    out.push(first);
+    out
+}
+
+/// Exact integer test: do closed segments `a` and `b` share any point
+/// (crossing, touching, or collinear overlap)?
+fn segments_meet(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bool {
+    let cross = |o: (i32, i32), p: (i32, i32), q: (i32, i32)| -> i64 {
+        (i64::from(p.0) - i64::from(o.0)) * (i64::from(q.1) - i64::from(o.1))
+            - (i64::from(p.1) - i64::from(o.1)) * (i64::from(q.0) - i64::from(o.0))
+    };
+    let on_segment = |p: (i32, i32), q: (i32, i32), r: (i32, i32)| -> bool {
+        r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
+    };
+    let (p1, p2) = a;
+    let (p3, p4) = b;
+    let d1 = cross(p3, p4, p1);
+    let d2 = cross(p3, p4, p2);
+    let d3 = cross(p1, p2, p3);
+    let d4 = cross(p1, p2, p4);
+    if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)) {
+        return true;
+    }
+    (d1 == 0 && on_segment(p3, p4, p1))
+        || (d2 == 0 && on_segment(p3, p4, p2))
+        || (d3 == 0 && on_segment(p1, p2, p3))
+        || (d4 == 0 && on_segment(p1, p2, p4))
+}
+
+/// Bounding box of an edge, for the cheap pair reject.
+#[inline]
+fn edge_box(p: (i32, i32), q: (i32, i32)) -> (i32, i32, i32, i32) {
+    (p.0.min(q.0), p.1.min(q.1), p.0.max(q.0), p.1.max(q.1))
+}
+
+#[inline]
+fn boxes_meet(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+}
+
+/// Rings larger than this skip the pairwise edge test and are trusted as
+/// they come: the test is quadratic, and such rings (national borders,
+/// coastlines) are rare and were valid before snapping.
+const SIMPLE_CHECK_MAX_EDGES: usize = 4096;
+
+/// Is a closed ring (no repeated vertices — see [`split_pinches`]) simple:
+/// no two non-adjacent edges meet, and no adjacent pair folds back onto
+/// itself?
+fn ring_is_simple(ring: &TileRing) -> bool {
+    let n = ring.len() - 1; // edges
+    if n > SIMPLE_CHECK_MAX_EDGES {
+        return true;
+    }
+    for i in 0..n {
+        let (a, b) = (ring[i], ring[i + 1]);
+        let bi = edge_box(a, b);
+        for j in (i + 1)..n {
+            let adjacent = j == i + 1 || (i == 0 && j == n - 1);
+            if adjacent {
+                // Adjacent edges share a vertex by construction; they may not
+                // overlap beyond it (a 180° fold), which with the shared
+                // vertex excluded is a collinear third point on the edge.
+                let c = if j == i + 1 { ring[j + 1] } else { ring[j] };
+                let cross = (i64::from(b.0) - i64::from(a.0)) * (i64::from(c.1) - i64::from(a.1))
+                    - (i64::from(b.1) - i64::from(a.1)) * (i64::from(c.0) - i64::from(a.0));
+                let dot = (i64::from(b.0) - i64::from(a.0)) * (i64::from(c.0) - i64::from(b.0))
+                    + (i64::from(b.1) - i64::from(a.1)) * (i64::from(c.1) - i64::from(b.1));
+                if cross == 0 && dot < 0 {
+                    return false;
+                }
+                continue;
+            }
+            let (c, d) = (ring[j], ring[j + 1]);
+            if boxes_meet(bi, edge_box(c, d)) && segments_meet((a, b), (c, d)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Exact integer test: do closed segments `a` and `b` cross properly or
+/// overlap along a stretch? Touching at a single point — an endpoint on the
+/// other segment, or a shared endpoint — is NOT counted: two rings of one
+/// polygon may touch at a point (a hole on the exterior, two holes meeting)
+/// and stay valid.
+fn segments_cross_or_overlap(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bool {
+    let cross = |o: (i32, i32), p: (i32, i32), q: (i32, i32)| -> i64 {
+        (i64::from(p.0) - i64::from(o.0)) * (i64::from(q.1) - i64::from(o.1))
+            - (i64::from(p.1) - i64::from(o.1)) * (i64::from(q.0) - i64::from(o.0))
+    };
+    let (p1, p2) = a;
+    let (p3, p4) = b;
+    let d1 = cross(p3, p4, p1);
+    let d2 = cross(p3, p4, p2);
+    let d3 = cross(p1, p2, p3);
+    let d4 = cross(p1, p2, p4);
+    if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)) {
+        return true; // proper crossing
+    }
+    if d1 == 0 && d2 == 0 {
+        // Collinear: overlap along more than a point?
+        let lo = |p: (i32, i32), q: (i32, i32)| (p.0.min(q.0), p.1.min(q.1));
+        let hi = |p: (i32, i32), q: (i32, i32)| (p.0.max(q.0), p.1.max(q.1));
+        let (alo, ahi, blo, bhi) = (lo(p1, p2), hi(p1, p2), lo(p3, p4), hi(p3, p4));
+        let ox = alo.0.max(blo.0)..=ahi.0.min(bhi.0);
+        let oy = alo.1.max(blo.1)..=ahi.1.min(bhi.1);
+        return !ox.is_empty()
+            && !oy.is_empty()
+            && (ox.start() != ox.end() || oy.start() != oy.end());
+    }
+    false
+}
+
+/// Do the edges of two rings cross or overlap (touching at points is fine)?
+fn rings_meet(a: &TileRing, b: &TileRing) -> bool {
+    let (na, nb) = (a.len() - 1, b.len() - 1);
+    if na > SIMPLE_CHECK_MAX_EDGES || nb > SIMPLE_CHECK_MAX_EDGES {
+        return false;
+    }
+    for i in 0..na {
+        let ba = edge_box(a[i], a[i + 1]);
+        for j in 0..nb {
+            if boxes_meet(ba, edge_box(b[j], b[j + 1]))
+                && segments_cross_or_overlap((a[i], a[i + 1]), (b[j], b[j + 1]))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Is a polygon (exterior first, then holes) clean in tile space: every ring
+/// simple and no two rings crossing or overlapping? (Rings touching at a
+/// point are left alone; a hole touching the exterior twice — a
+/// disconnected interior — slips through, and is rare enough to accept.)
+fn polygon_is_clean(rings: &[TileRing]) -> bool {
+    rings.iter().all(ring_is_simple)
+        && (0..rings.len()).all(|i| (i + 1..rings.len()).all(|j| !rings_meet(&rings[i], &rings[j])))
+}
+
+fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
+    ring.iter()
+        .fold((i32::MAX, i32::MAX, i32::MIN, i32::MIN), |b, &(x, y)| {
+            (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y))
+        })
+}
+
+/// Split every ring at its pinches and regroup the pieces into polygons.
+///
+/// Orientation is judged against each ring's *own* original sense, not a
+/// global convention, because source rings carry no guaranteed winding: a
+/// piece of the exterior that keeps the exterior's sense is another
+/// exterior (an island the neck used to join); one that reverses it is a
+/// hole touching the boundary. For a hole ring the roles swap. Holes are
+/// then attached to the first exterior whose box contains theirs.
+fn regroup_pinched(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
+    let mut exteriors: Vec<TileRing> = Vec::new();
+    let mut holes: Vec<TileRing> = Vec::new();
+    for (k, ring) in rings.into_iter().enumerate() {
+        let own_sign = ring_area2(&ring).signum();
+        for piece in split_pinches(node_ring(ring)) {
+            let same_sense = ring_area2(&piece).signum() == own_sign;
+            let is_exterior = (k == 0) == same_sense;
+            if is_exterior {
+                exteriors.push(piece);
+            } else {
+                holes.push(piece);
+            }
+        }
+    }
+    let boxes: Vec<_> = exteriors.iter().map(ring_box).collect();
+    let mut polys: Vec<Vec<TileRing>> = exteriors.into_iter().map(|e| vec![e]).collect();
+    for hole in holes {
+        let hb = ring_box(&hole);
+        if let Some(i) = boxes
+            .iter()
+            .position(|b| b.0 <= hb.0 && b.1 <= hb.1 && b.2 >= hb.2 && b.3 >= hb.3)
+        {
+            polys[i].push(hole);
+        }
+    }
+    polys
+}
+
+/// Make a quantized polygon valid in tile space.
+///
+/// Snapping to the tile grid can fold a ring onto itself: two source
+/// vertices that were a fraction of a unit apart land on the same column,
+/// and the ring now runs back down an edge it already ran up (raster-derived
+/// field boundaries with near-collinear vertices do this constantly), or a
+/// narrow neck closes and the ring touches itself. The source was valid; the
+/// tile geometry is not, and a fill renderer can show slivers or holes where
+/// the ring overlaps. tippecanoe cleans every polygon after snapping; this
+/// does the same, but only as much as each polygon needs:
+///
+/// 1. the polygon is checked with exact integer tests (no ring
+///    self-intersects, no two rings meet) — the usual outcome, returned
+///    untouched;
+/// 2. one that fails has its rings noded (a vertex lying on another edge is
+///    inserted into it) and split at pinch points (a vertex visited twice),
+///    and the pieces regrouped — this settles the common neck-snapped-shut
+///    and vertex-on-edge cases without an overlay;
+/// 3. a piece that still fails is re-resolved through the even-odd overlay
+///    that already repairs RDP bowties, snapped again, and pinch-split
+///    again (bounded rounds).
+///
+/// The result may be several polygons (a neck that closed splits the
+/// shape) — that is the correct tile geometry. Rings that collapse to
+/// nothing are dropped; an empty result means the polygon has no area at
+/// this zoom.
+fn clean_tile_polygon(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
+    if rings.is_empty() {
+        return Vec::new();
+    }
+    // The usual case: nothing touches, nothing crosses. One pass of the
+    // integer checks and out; noding and pinch-splitting only run on the
+    // polygons that fail it (a touch of any kind fails it).
+    if polygon_is_clean(&rings) {
+        return vec![rings];
+    }
+    let mut out = Vec::new();
+    for poly in regroup_pinched(rings) {
+        clean_into(poly, 0, &mut out);
+    }
+    out
+}
+
+/// Overlay rounds a polygon gets before it is emitted as-is. The overlay's
+/// new crossing points are fractional; snapping them can (rarely) cross
+/// again, and one more round settles that. Beyond that, emit what we have —
+/// a fill renderer copes, and unbounded loops are worse than a rare sliver.
+const MAX_REPAIR_ROUNDS: u32 = 2;
+
+/// Push `poly` onto `out` once it is clean, repairing through the overlay
+/// (and re-snapping) up to [`MAX_REPAIR_ROUNDS`] times.
+fn clean_into(poly: Vec<TileRing>, round: u32, out: &mut Vec<Vec<TileRing>>) {
+    if round >= MAX_REPAIR_ROUNDS || polygon_is_clean(&poly) {
+        out.push(poly);
+        return;
+    }
+    let Some(repaired) =
+        crate::ioverlay_clip::repair_polygon_ioverlay(&tile_rings_to_polygon(&poly))
+    else {
+        return;
+    };
+    for rs in requantized_parts(repaired) {
+        for piece in regroup_pinched(rs) {
+            clean_into(piece, round + 1, out);
+        }
+    }
+}
+
+/// Snap an overlay result back to tile rings, one `Vec<TileRing>` per part.
+fn requantized_parts(g: Geometry<f64>) -> Vec<Vec<TileRing>> {
+    let parts: Vec<Polygon<f64>> = match g {
+        Geometry::Polygon(p) => vec![p],
+        Geometry::MultiPolygon(mp) => mp.0,
+        _ => Vec::new(),
+    };
+    parts
+        .iter()
+        .filter_map(|p| {
+            let exterior = requantize_ring(p.exterior())?;
+            let mut rs = vec![exterior];
+            rs.extend(p.interiors().iter().filter_map(requantize_ring));
+            Some(rs)
+        })
+        .collect()
+}
+
+/// Orient a polygon's rings in tile space: exterior positive, holes negative.
+fn orient_tile_polygon(rings: &mut [TileRing]) {
+    for (i, ring) in rings.iter_mut().enumerate() {
+        let positive = ring_area2(ring) > 0;
+        if positive != (i == 0) {
+            ring.reverse();
+        }
+    }
+}
+
+/// Resolve overlaps *between* the parts of a multipolygon: each part is
+/// clean on its own by now, but two parts whose boxes meet may overlap or
+/// nest, and a fill renderer under even-odd would show the overlap as a
+/// hole. Parts are oriented consistently and unioned under NonZero, then
+/// snapped and cleaned again. Parts whose boxes are disjoint are left alone.
+fn resolve_part_overlaps(mut parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
+    if parts.len() < 2 {
+        return parts;
+    }
+    let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
+    let any_meet =
+        (0..parts.len()).any(|i| (i + 1..parts.len()).any(|j| boxes_meet(boxes[i], boxes[j])));
+    if !any_meet {
+        return parts;
+    }
+    for p in parts.iter_mut() {
+        orient_tile_polygon(p);
+    }
+    let polys: Vec<Polygon<f64>> = parts.iter().map(|p| tile_rings_to_polygon(p)).collect();
+    let Some(unioned) = crate::ioverlay_clip::union_polygons_ioverlay(&polys) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for rs in requantized_parts(unioned) {
+        for piece in regroup_pinched(rs) {
+            clean_into(piece, 1, &mut out);
+        }
+    }
+    out
+}
+
+/// Quantize every ring of `polygon`, clean the result, and return the
+/// polygons to emit (exterior first in each).
+fn quantized_polygons(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<Vec<TileRing>> {
+    let Some(exterior) = quantize_ring(polygon.exterior(), bounds, extent) else {
+        return Vec::new();
+    };
+    let mut rings = vec![exterior];
+    rings.extend(
+        polygon
+            .interiors()
+            .iter()
+            .filter_map(|r| quantize_ring(r, bounds, extent)),
+    );
+    clean_tile_polygon(rings)
+}
+
+/// Encode one closed integer ring with the orientation the spec requires
+/// (`exterior`: positive area; hole: negative), updating the cursor.
+fn encode_tile_ring(
+    ring: &[(i32, i32)],
+    exterior: bool,
+    cursor: &mut (i32, i32),
+    out: &mut Vec<u32>,
+) {
+    // Without the closing vertex: ClosePath returns to the first point.
+    let open = &ring[..ring.len() - 1];
+    let positive = ring_area2(ring) > 0;
+    let mut emit = |x: i32, y: i32, first: bool| {
+        if first {
+            out.push(command_encode(CMD_MOVE_TO, 1));
+        }
+        out.push(zigzag_encode(x - cursor.0));
+        out.push(zigzag_encode(y - cursor.1));
+        *cursor = (x, y);
+        if first {
+            out.push(command_encode(CMD_LINE_TO, (open.len() - 1) as u32));
+        }
+    };
+    if positive == exterior {
+        for (k, &(x, y)) in open.iter().enumerate() {
+            emit(x, y, k == 0);
+        }
+    } else {
+        // Reversed traversal, same start vertex, no copy.
+        emit(open[0].0, open[0].1, true);
+        for &(x, y) in open[1..].iter().rev() {
+            emit(x, y, false);
+        }
+    }
+    out.push(command_encode(CMD_CLOSE_PATH, 1));
+}
+
+fn encode_tile_polygons(polys: &[Vec<TileRing>]) -> Vec<u32> {
+    let total: usize = polys.iter().flatten().map(|r| 4 + r.len() * 2).sum();
+    let mut out = Vec::with_capacity(total);
+    let mut cursor = (0i32, 0i32);
+    for rings in polys {
+        for (i, ring) in rings.iter().enumerate() {
+            encode_tile_ring(ring, i == 0, &mut cursor, &mut out);
+        }
+    }
+    out
+}
+
 /// Encode a polygon ring (exterior or interior) to MVT geometry commands.
 /// Returns the commands and updates the cursor position.
+#[allow(dead_code)]
 fn encode_ring(
     ring: &LineString,
     bounds: &TileBounds,
@@ -362,30 +907,9 @@ fn encode_ring(
 /// - Exterior rings: clockwise in tile coordinates
 /// - Interior rings: counter-clockwise in tile coordinates
 pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
-    // Apply winding order correction for MVT compliance
-    let oriented = orient_polygon_for_mvt(polygon);
-
-    let mut geometry = Vec::new();
-    let mut cursor_x = 0i32;
-    let mut cursor_y = 0i32;
-
-    // Exterior ring
-    let exterior_cmds = encode_ring(
-        oriented.exterior(),
-        bounds,
-        extent,
-        &mut cursor_x,
-        &mut cursor_y,
-    );
-    geometry.extend(exterior_cmds);
-
-    // Interior rings (holes)
-    for interior in oriented.interiors() {
-        let interior_cmds = encode_ring(interior, bounds, extent, &mut cursor_x, &mut cursor_y);
-        geometry.extend(interior_cmds);
-    }
-
-    geometry
+    // Quantize first, clean in tile space (#383), then orient on the stored
+    // integer coordinates — the sign the spec is defined on.
+    encode_tile_polygons(&quantized_polygons(polygon, bounds, extent))
 }
 
 /// Encode a MultiPolygon geometry to MVT geometry commands.
@@ -395,32 +919,12 @@ pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
 /// - Exterior rings: clockwise in tile coordinates
 /// - Interior rings: counter-clockwise in tile coordinates
 pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
-    // Apply winding order correction for MVT compliance
-    let oriented = orient_multi_polygon_for_mvt(polygons);
-
-    let mut geometry = Vec::new();
-    let mut cursor_x = 0i32;
-    let mut cursor_y = 0i32;
-
-    for polygon in &oriented.0 {
-        // Exterior ring
-        let exterior_cmds = encode_ring(
-            polygon.exterior(),
-            bounds,
-            extent,
-            &mut cursor_x,
-            &mut cursor_y,
-        );
-        geometry.extend(exterior_cmds);
-
-        // Interior rings (holes)
-        for interior in polygon.interiors() {
-            let interior_cmds = encode_ring(interior, bounds, extent, &mut cursor_x, &mut cursor_y);
-            geometry.extend(interior_cmds);
-        }
-    }
-
-    geometry
+    let polys: Vec<Vec<TileRing>> = polygons
+        .0
+        .iter()
+        .flat_map(|p| quantized_polygons(p, bounds, extent))
+        .collect();
+    encode_tile_polygons(&resolve_part_overlaps(polys))
 }
 
 /// Encode any geo::Geometry to MVT geometry commands and return the geometry type.
@@ -1500,5 +2004,405 @@ mod tests {
             "Command overhead ratio should be >1.2x, got {:.2}x",
             cmd_ratio
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Quantization cleanup (#383)
+    // ------------------------------------------------------------------------
+
+    /// Decode a polygon command stream back into closed integer rings.
+    fn rings_of(commands: &[u32]) -> Vec<Vec<(i32, i32)>> {
+        let mut rings = Vec::new();
+        let mut cur: Vec<(i32, i32)> = Vec::new();
+        let (mut cx, mut cy) = (0i32, 0i32);
+        let mut i = 0;
+        while i < commands.len() {
+            let (cmd, count) = command_decode(commands[i]);
+            i += 1;
+            match cmd {
+                CMD_MOVE_TO | CMD_LINE_TO => {
+                    for _ in 0..count {
+                        cx += zigzag_decode(commands[i]);
+                        cy += zigzag_decode(commands[i + 1]);
+                        i += 2;
+                        cur.push((cx, cy));
+                    }
+                }
+                CMD_CLOSE_PATH => {
+                    let first = cur[0];
+                    cur.push(first);
+                    rings.push(std::mem::take(&mut cur));
+                }
+                _ => panic!("bad command"),
+            }
+        }
+        rings
+    }
+
+    /// Group decoded rings into polygons by the MVT rule: a positive-area
+    /// ring starts a polygon, negative-area rings are its holes.
+    fn rings_to_geo(rings: &[Vec<(i32, i32)>]) -> Vec<Polygon<f64>> {
+        let ls = |r: &Vec<(i32, i32)>| {
+            LineString::from(
+                r.iter()
+                    .map(|&(x, y)| (x as f64, y as f64))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut polys: Vec<Polygon<f64>> = Vec::new();
+        for r in rings {
+            if area2(r) > 0 {
+                polys.push(Polygon::new(ls(r), vec![]));
+            } else {
+                let last = polys.last_mut().expect("hole before any exterior");
+                let mut holes = last.interiors().to_vec();
+                holes.push(ls(r));
+                *last = Polygon::new(last.exterior().clone(), holes);
+            }
+        }
+        polys
+    }
+
+    /// Shoelace area * 2 of a closed integer ring (sign = orientation).
+    fn area2(ring: &[(i32, i32)]) -> i64 {
+        ring.windows(2)
+            .map(|w| i64::from(w[0].0) * i64::from(w[1].1) - i64::from(w[1].0) * i64::from(w[0].1))
+            .sum()
+    }
+
+    /// Tile bounds and a helper mapping tile units back to lng/lat so a
+    /// fixture can be designed in tile space with sub-unit offsets.
+    fn unit_bounds() -> TileBounds {
+        TileBounds::new(0.0, 0.0, 1.0, 1.0)
+    }
+    fn lnglat(x: f64, y: f64) -> (f64, f64) {
+        let b = unit_bounds();
+        let lng = b.lng_min + x / 4096.0 * (b.lng_max - b.lng_min);
+        let top = mercator_y_fraction(b.lat_max);
+        let bottom = mercator_y_fraction(b.lat_min);
+        let f = top + y / 4096.0 * (bottom - top);
+        let lat = (std::f64::consts::PI * (1.0 - 2.0 * f))
+            .sinh()
+            .atan()
+            .to_degrees();
+        (lng, lat)
+    }
+    fn poly_in_tile_units(exterior: &[(f64, f64)]) -> Polygon<f64> {
+        Polygon::new(
+            LineString::from(
+                exterior
+                    .iter()
+                    .map(|&(x, y)| lnglat(x, y))
+                    .collect::<Vec<_>>(),
+            ),
+            vec![],
+        )
+    }
+
+    /// A valid source ring whose vertices at x=100 and x=99.7 snap to the
+    /// same column, so the quantized ring runs down the column it already
+    /// ran up (the shape from #383: raster-derived field boundaries with
+    /// near-collinear vertices). The encoder must emit rings that are valid
+    /// in tile space, and the fill must be preserved.
+    #[test]
+    fn quantization_fold_is_repaired_into_valid_rings() {
+        use geo::Validation;
+        let ext = [
+            (100.0, 100.0),
+            (100.0, 159.0),
+            (94.0, 159.0),
+            (94.0, 168.0),
+            (69.0, 168.0),
+            (69.0, 151.0),
+            (78.0, 151.0),
+            (78.0, 142.0),
+            (99.7, 142.0),
+            (99.7, 117.0),
+            (94.0, 117.0),
+            (94.0, 100.0),
+            (100.0, 100.0),
+        ];
+        let poly = poly_in_tile_units(&ext);
+        assert!(poly.is_valid(), "the source polygon is valid");
+
+        let commands = encode_polygon(&poly, &unit_bounds(), 4096);
+        let rings = rings_of(&commands);
+        assert!(!rings.is_empty(), "the polygon must not vanish");
+        // Every emitted polygon is valid in tile space (the closed neck
+        // splits the shape in two, which is the correct tile geometry).
+        let out = rings_to_geo(&rings);
+        assert_eq!(out.len(), 2, "{rings:?}");
+        for p in &out {
+            assert!(p.is_valid(), "encoded rings must be valid: {rings:?}");
+        }
+        // Orientation per the MVT spec: exterior positive on tile coords.
+        assert!(area2(&rings[0]) > 0, "exterior must have positive area");
+        // Fill preserved: compare against the shoelace of the raw snapped
+        // ring, whose overlapping edges cancel exactly.
+        let snapped: Vec<(i32, i32)> = ext
+            .iter()
+            .map(|&(x, y)| (x.round() as i32, y.round() as i32))
+            .collect();
+        let expected = area2(&snapped).abs();
+        let got: i64 = rings.iter().map(|r| area2(r)).sum::<i64>().abs();
+        assert_eq!(got, expected, "fill must survive the repair");
+    }
+
+    /// A ring whose vertices all snap onto one line has no area and must be
+    /// dropped rather than emitted as a degenerate polygon.
+    #[test]
+    fn ring_that_collapses_to_a_line_is_dropped() {
+        let poly = poly_in_tile_units(&[
+            (10.0, 10.0),
+            (10.2, 20.0),
+            (9.8, 30.0),
+            (10.1, 20.0),
+            (10.0, 10.0),
+        ]);
+        let commands = encode_polygon(&poly, &unit_bounds(), 4096);
+        assert!(commands.is_empty(), "got {commands:?}");
+    }
+
+    /// Consecutive vertices that snap to the same point are emitted once.
+    #[test]
+    fn duplicate_snapped_vertices_are_removed() {
+        let poly = poly_in_tile_units(&[
+            (10.0, 10.0),
+            (10.2, 10.1),
+            (50.0, 10.0),
+            (50.0, 50.0),
+            (10.0, 50.0),
+            (10.0, 10.0),
+        ]);
+        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        assert_eq!(rings.len(), 1);
+        assert_eq!(
+            rings[0].len(),
+            5,
+            "4 distinct vertices + close: {:?}",
+            rings[0]
+        );
+    }
+
+    /// A polygon that is already clean encodes exactly as before: same
+    /// vertices, exterior positive, hole negative.
+    #[test]
+    fn clean_polygon_encodes_unchanged_with_spec_orientation() {
+        let poly = Polygon::new(
+            LineString::from(
+                [
+                    (10.0, 10.0),
+                    (90.0, 10.0),
+                    (90.0, 90.0),
+                    (10.0, 90.0),
+                    (10.0, 10.0),
+                ]
+                .iter()
+                .map(|&(x, y)| lnglat(x, y))
+                .collect::<Vec<_>>(),
+            ),
+            vec![LineString::from(
+                [
+                    (40.0, 40.0),
+                    (60.0, 40.0),
+                    (60.0, 60.0),
+                    (40.0, 60.0),
+                    (40.0, 40.0),
+                ]
+                .iter()
+                .map(|&(x, y)| lnglat(x, y))
+                .collect::<Vec<_>>(),
+            )],
+        );
+        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        assert_eq!(rings.len(), 2);
+        assert_eq!(rings[0].len(), 5);
+        assert_eq!(rings[1].len(), 5);
+        assert!(area2(&rings[0]) > 0);
+        assert!(area2(&rings[1]) < 0);
+        assert_eq!(area2(&rings[0]).abs(), 2 * 80 * 80);
+        assert_eq!(area2(&rings[1]).abs(), 2 * 20 * 20);
+    }
+
+    /// A neck that closes to a single point leaves the overlay with one
+    /// contour that touches itself at a vertex (a "pinch"). Fill renderers
+    /// cope, but it is not a valid ring; it must come out as two polygons.
+    #[test]
+    fn pinched_ring_is_split_into_separate_polygons() {
+        use geo::Validation;
+        // Box A (10..50 × 10..50) joined to box B (50..80 × 20..40) by a neck
+        // 0.4 units tall at x=50 that snaps to zero height, so the two
+        // boxes meet at the single vertex (50, 30).
+        let ext = [
+            (10.0, 10.0),
+            (50.0, 10.0),
+            (50.0, 29.8),
+            (80.0, 20.0),
+            (80.0, 40.0),
+            (50.0, 30.2),
+            (50.0, 50.0),
+            (10.0, 50.0),
+            (10.0, 10.0),
+        ];
+        let poly = poly_in_tile_units(&ext);
+        assert!(poly.is_valid());
+        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let out = rings_to_geo(&rings);
+        assert_eq!(out.len(), 2, "pinch must split: {rings:?}");
+        for p in &out {
+            assert!(p.is_valid(), "{rings:?}");
+        }
+        let snapped: Vec<(i32, i32)> = ext
+            .iter()
+            .map(|&(x, y)| (x.round() as i32, y.round() as i32))
+            .collect();
+        let got: i64 = rings.iter().map(|r| area2(r)).sum::<i64>().abs();
+        assert_eq!(got, area2(&snapped).abs());
+    }
+
+    /// A bite whose loop runs the other way is a hole touching the boundary,
+    /// which is valid and must stay one polygon with one hole.
+    #[test]
+    fn pinched_reverse_loop_becomes_a_touching_hole() {
+        use geo::Validation;
+        // Square with an inner loop entered and left through the same
+        // vertex (40, 40), traversed clockwise relative to the exterior.
+        let ext = [
+            (10.0, 10.0),
+            (90.0, 10.0),
+            (90.0, 90.0),
+            (10.0, 90.0),
+            (10.0, 40.0),
+            (40.0, 40.0),
+            (40.0, 60.0),
+            (60.0, 60.0),
+            (60.0, 40.2),
+            (40.0, 39.8),
+            (10.0, 39.8),
+            (10.0, 10.0),
+        ];
+        let poly = poly_in_tile_units(&ext);
+        assert!(poly.is_valid());
+        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let out = rings_to_geo(&rings);
+        assert_eq!(out.len(), 1, "{rings:?}");
+        assert_eq!(out[0].interiors().len(), 1, "{rings:?}");
+        assert!(out[0].is_valid(), "{rings:?}");
+    }
+
+    /// A ring lifted from real output after the overlay repair (#383): it
+    /// still visits (42, -1) twice — a notch whose 0.8-unit channel snapped
+    /// shut. Whatever the overlay returns, the cleaner must not emit a ring
+    /// that touches itself; here the loop runs against the exterior's sense
+    /// inside the fill, so it is a hole touching the boundary at that point.
+    #[test]
+    fn real_pinched_ring_from_field_data_becomes_a_touching_hole() {
+        use geo::Validation;
+        let ring: Vec<(i32, i32)> = vec![
+            (0, 0),
+            (0, -10),
+            (9, -10),
+            (9, -35),
+            (17, -35),
+            (17, -52),
+            (25, -52),
+            (25, -86),
+            (34, -86),
+            (34, -103),
+            (42, -103),
+            (42, -94),
+            (76, -94),
+            (76, -44),
+            (67, -44),
+            (67, -10),
+            (76, -10),
+            (76, -1),
+            (67, -1),
+            (67, 0),
+            (42, 0),
+            (42, -1),
+            (51, -1),
+            (51, -10),
+            (42, -10),
+            (42, -1),
+            (34, -1),
+            (34, 0),
+            (0, 0),
+        ];
+        let ring: TileRing = ring.into_iter().map(|(x, y)| (x + 200, y + 200)).collect();
+        let before = ring_area2(&ring).abs();
+        let polys = clean_tile_polygon(vec![ring]);
+        let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
+        let out = rings_to_geo(&flat);
+        assert_eq!(out.len(), 1, "{flat:?}");
+        assert_eq!(out[0].interiors().len(), 1, "{flat:?}");
+        assert!(out[0].is_valid(), "{flat:?}");
+        let after: i64 = flat.iter().map(|r| ring_area2(r)).sum::<i64>().abs();
+        assert_eq!(after, before, "fill must be preserved");
+    }
+
+    /// Two parts of a multipolygon that overlap each other (each valid on
+    /// its own) must come out as one polygon covering their union — under
+    /// even-odd a renderer would punch the overlap out as a hole.
+    #[test]
+    fn overlapping_multipolygon_parts_are_unioned() {
+        use geo::Validation;
+        let sq = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            Polygon::new(
+                LineString::from(
+                    [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+                        .iter()
+                        .map(|&(x, y)| lnglat(x, y))
+                        .collect::<Vec<_>>(),
+                ),
+                vec![],
+            )
+        };
+        let mp = MultiPolygon::new(vec![
+            sq(10.0, 10.0, 50.0, 50.0),
+            sq(30.0, 30.0, 70.0, 70.0),
+            sq(200.0, 200.0, 210.0, 210.0),
+        ]);
+        let rings = rings_of(&encode_multi_polygon(&mp, &unit_bounds(), 4096));
+        let out = rings_to_geo(&rings);
+        assert_eq!(out.len(), 2, "{rings:?}");
+        for p in &out {
+            assert!(p.is_valid(), "{rings:?}");
+        }
+        let total: i64 = rings.iter().map(|r| area2(r)).sum();
+        // 40*40 + 40*40 - 20*20 (overlap once) + 10*10, doubled.
+        assert_eq!(total, 2 * (1600 + 1600 - 400 + 100));
+    }
+
+    /// A coarse-level ring (RDP output) that crosses itself, lifted from
+    /// real z11 output that was still invalid after the first cut of #383.
+    #[test]
+    fn crossing_ring_from_field_data_is_repaired() {
+        use geo::Validation;
+        let ring: Vec<(i32, i32)> = vec![
+            (0, 0),
+            (0, -6),
+            (31, -2),
+            (31, 11),
+            (46, 19),
+            (44, 38),
+            (33, 36),
+            (37, 27),
+            (25, 36),
+            (0, 19),
+            (4, 4),
+            (14, 4),
+            (16, 8),
+            (21, 6),
+            (0, 0),
+        ];
+        let ring: TileRing = ring.into_iter().map(|(x, y)| (x + 100, y + 100)).collect();
+        assert!(!ring_is_simple(&ring), "fixture must self-intersect");
+        let polys = clean_tile_polygon(vec![ring]);
+        let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
+        assert!(!flat.is_empty());
+        for p in rings_to_geo(&flat) {
+            assert!(p.is_valid(), "{flat:?}");
+        }
     }
 }
