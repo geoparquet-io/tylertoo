@@ -59,6 +59,7 @@ stored, reusable level.
 |---|---|---|
 | `-z` / `-Z` maximum/minimum zoom | `--max-zoom` / `--min-zoom` | Same zoom range |
 | `-l` layer name | `--layer-name` | Set at export |
+| `-L` one layer per input | `pyramid --band LO-HI:INPUT:LAYER …` with bands sharing a zoom range | Each band is its own ladder; tiles at shared zooms carry every layer |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
 | `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder; tylertoo anchors on the full canonical count, so the default differs |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell, leaving per-level totals unchanged |
@@ -88,9 +89,10 @@ point CSV, plus GeoJSON on standard input. tylertoo reads GeoParquet in
 converts other formats first.
 
 **Ships tileset tooling.** `tile-join` merges tilesets and joins CSV attributes
-onto existing features, `-zg` guesses a maximum zoom from feature spacing, `-L`
-names layers per input file, and `-e` writes a directory of tiles. tylertoo has
-no equivalent to these; it writes one PMTiles archive or the overview file.
+onto existing features, `-zg` guesses a maximum zoom from feature spacing, and
+`-e` writes a directory of tiles. tylertoo has no equivalent to these; it
+writes one PMTiles archive or the overview file. (`-L`, one layer per input
+file, is covered by `pyramid` bands that share a zoom range.)
 
 ### Decoding tiles back
 

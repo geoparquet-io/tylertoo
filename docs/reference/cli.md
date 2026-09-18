@@ -511,7 +511,7 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 
    INPUT is either a GeoParquet source — tiled here, restricted to this band's zoom range — or a PMTiles archive already tiled for that range, which is merged as-is. Which one it is is detected from the file, not the extension.
 
-   LAYER defaults to the file stem, and several bands may share one layer name (the usual case: a coarse and a fine aggregate that are the same layer to a client). Zoom ranges must not overlap -- two bands claiming one zoom write the same tile ids.
+   LAYER defaults to the file stem, and several bands may share one layer name (the usual case: a coarse and a fine aggregate that are the same layer to a client). Two bands in the SAME layer must not share a zoom -- they would write the same tile ids. Bands in DIFFERENT layers may (tippecanoe's -L): at the zooms they share, each tile carries every band's layer, so `--band 0-13:a.parquet:2024 --band 0-13:b.parquet:2025 --generalize` is one archive with two independently generalized layers. The per-tile size cap applies to each band's tiles before they are combined, not to the combined tile.
 
    INPUT may not contain a `:`, which the spec cannot tell apart from the LAYER separator; rename the file or point at it through a symlink.
 * `--generalize` — Generalize each GeoParquet band with the normal ladder instead of tiling it verbatim.

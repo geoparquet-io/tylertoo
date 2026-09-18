@@ -210,36 +210,67 @@ pub fn classify_band_input(path: &Path) -> BandSource {
     }
 }
 
-/// Reject overlapping zoom ranges. Two bands claiming one zoom would each write
-/// the same tile ids, and the merge would silently keep whichever came last.
+/// Reject two bands claiming one zoom **for the same layer**: each would write
+/// the same tile ids and the merge would silently keep whichever came last.
+///
+/// Bands naming *different* layers may share zooms (#385): that is
+/// tippecanoe's `-L`, several layers in one tile, and the merge concatenates
+/// their layer messages tile by tile.
 pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
     if bands.is_empty() {
         return Err("a pyramid needs at least one --band".to_string());
     }
     let mut sorted: Vec<&Band> = bands.iter().collect();
-    sorted.sort_by_key(|b| b.min_zoom);
-    for w in sorted.windows(2) {
-        if w[1].min_zoom <= w[0].max_zoom {
-            return Err(format!(
-                "bands overlap at zoom {}: {}-{} and {}-{}",
-                w[1].min_zoom, w[0].min_zoom, w[0].max_zoom, w[1].min_zoom, w[1].max_zoom
-            ));
+    sorted.sort_by_key(|b| (b.min_zoom, b.max_zoom));
+    for (i, a) in sorted.iter().enumerate() {
+        for b in &sorted[i + 1..] {
+            if b.min_zoom <= a.max_zoom && a.layer == b.layer {
+                return Err(format!(
+                    "bands overlap at zoom {} in layer {:?}: {}-{} and {}-{}",
+                    b.min_zoom.max(a.min_zoom),
+                    a.layer,
+                    a.min_zoom,
+                    a.max_zoom,
+                    b.min_zoom,
+                    b.max_zoom
+                ));
+            }
         }
-        // A gap is legal — the caller may not want those zooms — but it is
-        // rarely deliberate, and the merged archive cannot express it: the
-        // header and `vector_layers` span min..max, so a client honouring
-        // maxzoom renders the gap blank instead of overzooming the band below.
-        if w[1].min_zoom > w[0].max_zoom + 1 {
-            log::warn!(
-                "no band covers z{}-{}: the merged archive still advertises \
-                 those zooms (its range spans every band), so clients will \
-                 request them and get nothing",
-                w[0].max_zoom + 1,
-                w[1].min_zoom - 1
-            );
+    }
+    // A gap is legal — the caller may not want those zooms — but it is
+    // rarely deliberate, and the merged archive cannot express it: the
+    // header and `vector_layers` span min..max, so a client honouring
+    // maxzoom renders the gap blank instead of overzooming the band below.
+    let lo = sorted.iter().map(|b| b.min_zoom).min().unwrap_or(0);
+    let hi = sorted.iter().map(|b| b.max_zoom).max().unwrap_or(0);
+    let mut gap_start: Option<u8> = None;
+    for z in lo..=hi {
+        let covered = sorted.iter().any(|b| b.min_zoom <= z && z <= b.max_zoom);
+        match (covered, gap_start) {
+            (false, None) => gap_start = Some(z),
+            (true, Some(g)) => {
+                log::warn!(
+                    "no band covers z{g}-{}: the merged archive still advertises \
+                     those zooms (its range spans every band), so clients will \
+                     request them and get nothing",
+                    z - 1
+                );
+                gap_start = None;
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// Whether any two bands share a zoom (necessarily in different layers once
+/// [`validate_bands`] has passed).
+fn bands_share_zooms(bands: &[Band]) -> bool {
+    bands.iter().enumerate().any(|(i, a)| {
+        bands[i + 1..]
+            .iter()
+            .any(|b| a.min_zoom <= b.max_zoom && b.min_zoom <= a.max_zoom)
+    })
 }
 
 /// One layer's entry in the merged archive's `vector_layers`.
@@ -387,20 +418,35 @@ impl BandArchive {
     where
         F: FnMut(u8, u32, u32, &[u8]) -> Result<(), Error>,
     {
+        self.for_each_tile_range(|z, x, y, range| f(z, x, y, &self.bytes[range]))
+    }
+
+    /// Like [`Self::for_each_tile`], but hands out the tile's byte range in
+    /// the archive instead of the slice, so a caller can index tiles across
+    /// several archives first and read them later (#385).
+    fn for_each_tile_range<F>(&self, mut f: F) -> Result<(), Error>
+    where
+        F: FnMut(u8, u32, u32, std::ops::Range<usize>) -> Result<(), Error>,
+    {
         for e in &self.entries {
             let start = (self.header.tile_data_offset + e.offset) as usize;
             let end = start
                 .checked_add(e.length as usize)
                 .filter(|&x| x <= self.bytes.len())
                 .ok_or_else(|| Error::PMTilesWrite("tile data past end of archive".to_string()))?;
-            let data = &self.bytes[start..end];
             for i in 0..u64::from(e.run_length.max(1)) {
                 let (z, x, y) = tile_id_to_zxy(e.tile_id + i)
                     .map_err(|e| Error::PMTilesWrite(format!("bad tile id: {e}")))?;
-                f(z, x, y, data)?;
+                f(z, x, y, start..end)?;
             }
         }
         Ok(())
+    }
+
+    /// A tile's still-compressed bytes by range (from
+    /// [`Self::for_each_tile_range`]).
+    fn tile(&self, range: std::ops::Range<usize>) -> &[u8] {
+        &self.bytes[range]
     }
 }
 
@@ -606,6 +652,117 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     let mut per_band = Vec::new();
     let mut skipped_total = 0usize;
     let mut union: Option<TileBounds> = None;
+
+    if bands_share_zooms(bands) {
+        // #385: bands in different layers share zooms, so one tile id can
+        // come from several bands. Index every band's tiles first, then emit
+        // each id once: a tile only one band wrote is copied still-compressed
+        // exactly as the single-pass path below does; a tile several bands
+        // wrote is decompressed, its layer messages concatenated in band
+        // order (an MVT tile is a protobuf message whose only field is a
+        // repeated `layers`, so byte concatenation IS layer concatenation),
+        // and recompressed. Every band's archive is held for the duration —
+        // the compressed archives, not the tile set.
+        let archives: Vec<BandArchive> = bands
+            .iter()
+            .map(|b| BandArchive::open(&b.input))
+            .collect::<Result<_, _>>()?;
+        type Ref = (usize, std::ops::Range<usize>);
+        let mut index: BTreeMap<(u8, u32, u32), Vec<Ref>> = BTreeMap::new();
+        let mut counts = vec![0usize; bands.len()];
+        for (bi, (band, archive)) in bands.iter().zip(&archives).enumerate() {
+            if let Some(b) = archive.bounds {
+                match union.as_mut() {
+                    Some(u) => u.expand(&b),
+                    None => union = Some(b),
+                }
+            }
+            let mut skipped = 0usize;
+            archive.for_each_tile_range(|z, x, y, range| {
+                if z < band.min_zoom || z > band.max_zoom {
+                    skipped += 1;
+                    return Ok(());
+                }
+                let refs = index.entry((z, x, y)).or_default();
+                if let Some((prev, _)) = refs.iter().find(|(p, _)| bands[*p].layer == band.layer) {
+                    return Err(Error::PMTilesWrite(format!(
+                        "tile {z}/{x}/{y} claimed twice for layer {:?} (bands {} and {})",
+                        band.layer,
+                        bands[*prev].input.display(),
+                        band.input.display()
+                    )));
+                }
+                refs.push((bi, range));
+                counts[bi] += 1;
+                Ok(())
+            })?;
+            if skipped > 0 {
+                log::warn!(
+                    "band {:?} ({}): dropped {skipped} tile(s) outside its declared zoom range \
+                     z{}-{}; the archive was tiled with a different range than --band declares",
+                    band.layer,
+                    band.input.display(),
+                    band.min_zoom,
+                    band.max_zoom
+                );
+                skipped_total += skipped;
+            }
+            layers.push(LayerMeta {
+                id: band.layer.clone(),
+                minzoom: band.min_zoom,
+                maxzoom: band.max_zoom,
+                fields: archive.fields.clone(),
+            });
+        }
+        let mut combined = 0usize;
+        let mut buf = Vec::new();
+        for (&(z, x, y), refs) in &index {
+            if let [(bi, range)] = refs.as_slice() {
+                let data = archives[*bi].tile(range.clone());
+                let hash = TileHasher::hash(data);
+                writer
+                    .add_tile_precompressed(z, x, y, hash, data, data.len(), 0)
+                    .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
+                continue;
+            }
+            buf.clear();
+            for (bi, range) in refs {
+                let plain = compression::decompress(
+                    archives[*bi].tile(range.clone()),
+                    archives[*bi].header.tile_compression,
+                )
+                .map_err(|e| {
+                    Error::PMTilesWrite(format!(
+                        "tile {z}/{x}/{y} of band {:?} failed to decompress: {e}",
+                        bands[*bi].layer
+                    ))
+                })?;
+                buf.extend_from_slice(&plain);
+            }
+            writer
+                .add_tile(z, x, y, &buf)
+                .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
+            combined += 1;
+        }
+        log::info!(
+            "[pyramid] {} tile id(s) shared by several layers were merged; {} tile(s) copied as-is",
+            combined,
+            index.len() - combined
+        );
+        for (band, n) in bands.iter().zip(counts) {
+            per_band.push((band.layer.clone(), band.min_zoom, band.max_zoom, n));
+        }
+        return finish_merge(
+            writer,
+            union,
+            layers,
+            per_band,
+            skipped_total,
+            index.len(),
+            output,
+        );
+    }
+
     // Guards against a later band overwriting an earlier one's tile. Disjoint
     // zoom ranges make that impossible; this asserts it.
     let mut seen: BTreeMap<(u8, u32, u32), &str> = BTreeMap::new();
@@ -663,6 +820,28 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
         });
     }
 
+    let total_tiles = seen.len();
+    finish_merge(
+        writer,
+        union,
+        layers,
+        per_band,
+        skipped_total,
+        total_tiles,
+        output,
+    )
+}
+
+/// The tail shared by both merge paths: bounds, `vector_layers`, finalize.
+fn finish_merge(
+    mut writer: StreamingPmtilesWriter,
+    union: Option<TileBounds>,
+    layers: Vec<LayerMeta>,
+    per_band: Vec<(String, u8, u8, usize)>,
+    skipped_total: usize,
+    total_tiles: usize,
+    output: &Path,
+) -> Result<PyramidReport, Error> {
     match union {
         Some(b) => writer.set_bounds(&b),
         // Leaving the header bounds unset is no worse than the degenerate box
@@ -709,7 +888,7 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
         .map_err(|e| Error::PMTilesWrite(format!("Failed to write {}: {e}", output.display())))?;
 
     Ok(PyramidReport {
-        total_tiles: seen.len(),
+        total_tiles,
         per_band_tiles: per_band,
         skipped: skipped_total,
     })
@@ -817,6 +996,76 @@ mod tests {
         assert!(leftovers.is_empty(), "left behind {leftovers:?}");
     }
 
+    /// #385: two GeoParquet bands that name different layers may cover the
+    /// same zooms — tippecanoe's `-L`. Each is tiled on its own ladder and
+    /// the archive carries both layers at the shared zooms.
+    #[test]
+    fn build_pyramid_layers_two_sources_over_the_same_zooms() {
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.parquet");
+        let b = dir.path().join("b.parquet");
+        write_cell_source(&a, 40, 0.6);
+        write_cell_source(&b, 40, 0.6);
+
+        let out = dir.path().join("layers.pmtiles");
+        let bands = vec![
+            Band {
+                input: a,
+                layer: "2024".to_string(),
+                min_zoom: 0,
+                max_zoom: 3,
+            },
+            Band {
+                input: b,
+                layer: "2025".to_string(),
+                min_zoom: 0,
+                max_zoom: 3,
+            },
+        ];
+        let report = build_pyramid(
+            &bands,
+            &out,
+            &PyramidOptions {
+                work_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.per_band_tiles.len(), 2);
+        assert_eq!(archive_zooms(&out), vec![0, 1, 2, 3]);
+
+        // Identical sources ⇒ identical tile sets ⇒ every tile carries both
+        // layers, in band order.
+        let archive = BandArchive::open(&out).unwrap();
+        let mut tiles = 0;
+        archive
+            .for_each_tile(|_, _, _, data| {
+                let plain = compression::decompress(data, Compression::Gzip).unwrap();
+                let names: Vec<String> = crate::vector_tile::Tile::decode(plain.as_slice())
+                    .unwrap()
+                    .layers
+                    .into_iter()
+                    .map(|l| l.name)
+                    .collect();
+                assert_eq!(names, vec!["2024", "2025"]);
+                tiles += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tiles, report.total_tiles);
+
+        let meta: Value = serde_json::from_str(&read_metadata(&out)).unwrap();
+        let ids: Vec<&str> = meta["vector_layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["2024", "2025"]);
+    }
+
     /// Bands may mix kinds: an already-tiled archive alongside a source that
     /// this call tiles. Both spellings are `--band LO-HI:PATH[:LAYER]`.
     #[test]
@@ -910,7 +1159,7 @@ mod tests {
                 },
                 Band {
                     input: src,
-                    layer: "b".to_string(),
+                    layer: "a".to_string(),
                     min_zoom: 3,
                     max_zoom: 5,
                 },
@@ -996,6 +1245,114 @@ mod tests {
         ];
         let err = validate_bands(&bands).unwrap_err();
         assert!(err.contains("overlap at zoom 5"), "{err}");
+    }
+
+    /// #385: bands may share zooms when they name different layers — that is
+    /// tippecanoe's `-L`, two layers in one tile. Same-layer overlap is still
+    /// the silent-overwrite it always was.
+    #[test]
+    fn overlapping_bands_with_distinct_layers_are_accepted() {
+        let bands = vec![
+            Band::parse("0-13:a.parquet:2024").unwrap(),
+            Band::parse("0-13:b.parquet:2025").unwrap(),
+        ];
+        validate_bands(&bands).unwrap();
+
+        let bands = vec![
+            Band::parse("0-13:a.parquet:2024").unwrap(),
+            Band::parse("0-13:b.parquet:2025").unwrap(),
+            Band::parse("10-13:c.parquet:2024").unwrap(),
+        ];
+        let err = validate_bands(&bands).unwrap_err();
+        assert!(
+            err.contains("overlap at zoom 10") && err.contains("\"2024\""),
+            "{err}"
+        );
+    }
+
+    /// A minimal MVT tile with one empty layer named `name` (version 2).
+    fn layer_tile(name: &str) -> Vec<u8> {
+        let mut layer = vec![0x0A, name.len() as u8];
+        layer.extend_from_slice(name.as_bytes());
+        layer.extend_from_slice(&[0x78, 0x02]); // version = 2
+        let mut tile = vec![0x1A, layer.len() as u8];
+        tile.extend_from_slice(&layer);
+        tile
+    }
+
+    fn write_band_with_payload(path: &Path, layer: &str, tiles: &[(u8, u32, u32)], payload: &[u8]) {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name(layer);
+        w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+        w.set_fields(HashMap::from([(
+            format!("{layer}_f"),
+            "Number".to_string(),
+        )]));
+        for (z, x, y) in tiles {
+            w.add_tile(*z, *x, *y, payload).unwrap();
+        }
+        w.finalize(path).unwrap();
+    }
+
+    /// Decode a merged tile's layer names in order.
+    fn merged_layer_names(archive: &Path, z: u8, x: u32, y: u32) -> Vec<String> {
+        use prost::Message;
+        let a = BandArchive::open(archive).unwrap();
+        let mut found = None;
+        a.for_each_tile(|tz, tx, ty, data| {
+            if (tz, tx, ty) == (z, x, y) {
+                found = Some(compression::decompress(data, Compression::Gzip).unwrap());
+            }
+            Ok(())
+        })
+        .unwrap();
+        let plain = found.unwrap_or_else(|| panic!("tile {z}/{x}/{y} missing"));
+        crate::vector_tile::Tile::decode(plain.as_slice())
+            .unwrap()
+            .layers
+            .into_iter()
+            .map(|l| l.name)
+            .collect()
+    }
+
+    /// #385: at a zoom two bands share, a tile both wrote carries both layers
+    /// (the MVT layer messages concatenated, in band order); a tile only one
+    /// band wrote passes through untouched; `vector_layers` lists both.
+    #[test]
+    fn merge_concatenates_layers_of_bands_sharing_a_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        write_band_with_payload(&a, "2024", &[(3, 1, 1), (3, 2, 2)], &layer_tile("2024"));
+        write_band_with_payload(&b, "2025", &[(3, 1, 1), (3, 3, 3)], &layer_tile("2025"));
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands(
+            &[
+                Band::parse(&format!("0-3:{}:2024", a.display())).unwrap(),
+                Band::parse(&format!("0-3:{}:2025", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 3, "three distinct tile ids");
+
+        assert_eq!(merged_layer_names(&out, 3, 1, 1), vec!["2024", "2025"]);
+        assert_eq!(merged_layer_names(&out, 3, 2, 2), vec!["2024"]);
+        assert_eq!(merged_layer_names(&out, 3, 3, 3), vec!["2025"]);
+
+        let meta: Value = serde_json::from_str(&read_metadata(&out)).unwrap();
+        let ids: Vec<&str> = meta["vector_layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["2024", "2025"]);
+        assert_eq!(
+            meta["vector_layers"][1]["fields"]["2025_f"],
+            json!("Number")
+        );
     }
 
     #[test]
