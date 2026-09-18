@@ -1245,6 +1245,9 @@ pub struct StreamingPmtilesWriter {
     min_zoom: u8,
     /// Max zoom level seen
     max_zoom: u8,
+    /// Minimum zoom the archive *declares* even when no tile exists there
+    /// (#380): the header and `vector_layers` cover `min(declared, seen)`.
+    declared_min_zoom: Option<u8>,
     /// Geographic bounds
     bounds: TileBounds,
     /// Layer name for metadata
@@ -1299,6 +1302,7 @@ impl StreamingPmtilesWriter {
             current_offset: 0,
             min_zoom: 255,
             max_zoom: 0,
+            declared_min_zoom: None,
             bounds: TileBounds::empty(),
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
@@ -1319,6 +1323,34 @@ impl StreamingPmtilesWriter {
     /// Set the layer name for metadata.
     pub fn set_layer_name(&mut self, name: &str) {
         self.layer_name = name.to_string();
+    }
+
+    /// Declare a minimum zoom for the archive regardless of which zooms end
+    /// up holding tiles (#380). The header `min_zoom` and the layer's
+    /// `minzoom` become `min(declared, coarsest tile written)`: an empty zoom
+    /// in a PMTiles archive is just an absent tile, so declaring z0 over a
+    /// pyramid whose coarsest level generalized to nothing is honest, whereas
+    /// letting the header drift to z1 hides the requested range from clients
+    /// that trust it. A declared value finer than a written tile is ignored —
+    /// the header can widen the range, never narrow it over real tiles.
+    pub fn set_declared_min_zoom(&mut self, zoom: u8) {
+        self.declared_min_zoom = Some(zoom);
+    }
+
+    /// The header's minimum zoom: the coarsest tile written, widened by any
+    /// declared minimum; 0 for an empty archive.
+    fn header_min_zoom(&self) -> u8 {
+        let seen = if self.min_zoom == 255 {
+            None
+        } else {
+            Some(self.min_zoom)
+        };
+        match (seen, self.declared_min_zoom) {
+            (Some(s), Some(d)) => s.min(d),
+            (Some(s), None) => s,
+            (None, Some(d)) => d,
+            (None, None) => 0,
+        }
     }
 
     /// Set field metadata.
@@ -1598,11 +1630,7 @@ impl StreamingPmtilesWriter {
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
-            min_zoom: if self.min_zoom == 255 {
-                0
-            } else {
-                self.min_zoom
-            },
+            min_zoom: self.header_min_zoom(),
             max_zoom: if self.max_zoom == 0 && self.entries.is_empty() {
                 0
             } else {
@@ -1615,7 +1643,7 @@ impl StreamingPmtilesWriter {
             center_zoom: if self.entries.is_empty() {
                 0
             } else {
-                (self.min_zoom + self.max_zoom) / 2
+                (self.header_min_zoom() + self.max_zoom) / 2
             },
             center_lon: (self.bounds.lng_min + self.bounds.lng_max) / 2.0,
             center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
@@ -1703,11 +1731,7 @@ impl StreamingPmtilesWriter {
 
     /// Build metadata JSON string.
     fn build_metadata_json(&self) -> String {
-        let min_z = if self.min_zoom == 255 {
-            0
-        } else {
-            self.min_zoom
-        };
+        let min_z = self.header_min_zoom();
         let max_z = if self.max_zoom == 0 && self.entries.is_empty() {
             0
         } else {
@@ -2594,6 +2618,55 @@ mod tests {
         assert!(metadata_json.contains(r#""id":"buildings""#));
 
         let _ = fs::remove_file(path);
+    }
+
+    /// #380: an archive built for z0..z4 whose coarsest levels hold no tiles
+    /// must still say z0 in the header and in `vector_layers`, or a client
+    /// configured for the requested range never asks for the zoomed-out view.
+    #[test]
+    fn streaming_writer_declared_min_zoom_widens_header_and_layer_range() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("declared.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("t");
+        writer.set_declared_min_zoom(0);
+        writer.add_tile(2, 1, 1, &[0x1a, 0x00]).unwrap();
+        writer.add_tile(4, 5, 5, &[0x1a, 0x01]).unwrap();
+        writer.finalize(&path).unwrap();
+
+        let data = fs::read(&path).unwrap();
+        let header = Header::from_bytes(&data[..127]).unwrap();
+        assert_eq!(header.min_zoom, 0, "declared minimum wins over observed z2");
+        assert_eq!(header.max_zoom, 4);
+
+        let start = header.json_metadata_offset as usize;
+        let end = start + header.json_metadata_length as usize;
+        let mut json = String::new();
+        GzDecoder::new(&data[start..end])
+            .read_to_string(&mut json)
+            .unwrap();
+        assert!(
+            json.contains(r#""minzoom":0"#),
+            "vector_layers must advertise the declared minimum: {json}"
+        );
+    }
+
+    /// A declared minimum finer than the coarsest tile present cannot narrow
+    /// the range: the tiles are there, the header must cover them.
+    #[test]
+    fn streaming_writer_declared_min_zoom_never_hides_written_tiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("declared-narrow.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("t");
+        writer.set_declared_min_zoom(3);
+        writer.add_tile(2, 1, 1, &[0x1a, 0x00]).unwrap();
+        writer.finalize(&path).unwrap();
+        let data = fs::read(&path).unwrap();
+        assert_eq!(Header::from_bytes(&data[..127]).unwrap().min_zoom, 2);
     }
 
     // -------------------------------------------------------------------------

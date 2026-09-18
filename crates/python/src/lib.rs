@@ -122,6 +122,9 @@ fn convert(
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
         feature_order: parse_feature_order(feature_order)?,
+        // #380: the archive declares the requested range even when the
+        // coarsest levels generalized to nothing.
+        min_zoom: Some(min_zoom),
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -807,6 +810,7 @@ fn export_pmtiles(
         simple_clip_fastpath,
         partition_wave,
         feature_order: parse_feature_order(feature_order)?,
+        min_zoom: None,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

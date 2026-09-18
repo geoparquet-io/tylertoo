@@ -442,6 +442,7 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--layer-name <LAYER_NAME>` — MVT layer name written into every tile
 
   Default value: `overview`
+* `--min-zoom <ZOOM>` — Minimum zoom the archive declares, even if the overview file's coarsest levels are missing (#380). `overview` omits a level that generalizes to nothing, so a file built for z0..z13 can start at z2; without this the header then says z2 and a client set up for the requested range never asks for the zoomed-out view. The empty zooms hold no tiles (an empty tile, in PMTiles terms). Must not be finer than the coarsest level present. Default: the coarsest level's zoom
 * `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels (feature seam continuity)
 
   Default value: `8`

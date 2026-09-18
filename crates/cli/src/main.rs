@@ -290,6 +290,16 @@ struct ExportPmtilesArgs {
     #[arg(long, default_value = "overview")]
     layer_name: String,
 
+    /// Minimum zoom the archive declares, even if the overview file's coarsest
+    /// levels are missing (#380). `overview` omits a level that generalizes to
+    /// nothing, so a file built for z0..z13 can start at z2; without this the
+    /// header then says z2 and a client set up for the requested range never
+    /// asks for the zoomed-out view. The empty zooms hold no tiles (an empty
+    /// tile, in PMTiles terms). Must not be finer than the coarsest level
+    /// present. Default: the coarsest level's zoom
+    #[arg(long, value_name = "ZOOM")]
+    min_zoom: Option<u8>,
+
     /// Per-tile edge buffer, in tile pixels (feature seam continuity).
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
@@ -1762,6 +1772,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
+        // #380: the archive declares the zoom range that was asked for, even
+        // when the coarsest levels generalized to nothing and were omitted
+        // from the overview. Only a zoom plan has a requested minimum zoom.
+        min_zoom: args.gsd.is_none().then_some(args.min_zoom),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -1787,6 +1801,21 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         export_report.max_zoom,
         convert_report.duration_secs + export_report.duration_secs
     );
+    // #380: the header covers the requested range; say which zooms in it
+    // hold nothing rather than let the range above imply they do.
+    let empty_zooms: Vec<String> = convert_report
+        .skipped_empty_levels
+        .iter()
+        .filter_map(|l| l.zoom)
+        .map(|z| format!("z{z}"))
+        .collect();
+    if !empty_zooms.is_empty() {
+        println!(
+            "  {} declared but empty: every feature generalized away there \
+             (see --collapse / --collapse-square)",
+            empty_zooms.join(", ")
+        );
+    }
 
     // A combined report so the one-step run captures both halves the two-step
     // chain would write (`overview --report` + `export-pmtiles --report`).
@@ -2100,6 +2129,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
+        min_zoom: args.min_zoom,
     };
 
     println!(
