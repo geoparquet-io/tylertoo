@@ -444,10 +444,11 @@ pub fn encode_directory(entries: &[DirEntry]) -> Vec<u8> {
             encode_varint(entry.offset + 1, &mut buf);
         }
 
-        // Update expected offset for next entry (only if this entry has data)
-        if entry.run_length > 0 {
-            expected_offset = entry.offset + entry.length as u64;
-        }
+        // Update expected offset for next entry. The spec's contiguity rule
+        // applies to every entry, leaf pointers (run_length == 0) included:
+        // their `length` is the compressed leaf size and leaves are laid out
+        // back to back in the leaf section (#377).
+        expected_offset = entry.offset + entry.length as u64;
     }
 
     buf
@@ -512,10 +513,11 @@ pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
             entry.offset = encoded_offset.saturating_sub(1);
         }
 
-        // Update expected offset for next entry
-        if entry.run_length > 0 {
-            expected_offset = entry.offset + entry.length as u64;
-        }
+        // Update expected offset for next entry — for leaf pointers too.
+        // tippecanoe and go-pmtiles encode every leaf after the first as
+        // contiguous; gating this on run_length > 0 resolved them all to
+        // offset 0 and `decode` failed with "incomplete deflate stream" (#377).
+        expected_offset = entry.offset + entry.length as u64;
     }
 
     Some(entries)
@@ -2243,6 +2245,83 @@ mod tests {
         // The encoding should be smaller than naive (due to delta encoding)
         // Each entry would be ~24 bytes naive, but delta should compress
         assert!(encoded.len() < entries.len() * 24);
+    }
+
+    /// Three leaf pointers laid out the way tippecanoe / go-pmtiles write a
+    /// root directory: every entry has run_length = 0 and every offset after
+    /// the first is encoded as 0 ("contiguous with the previous entry").
+    fn tippecanoe_style_leaf_root() -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_varint(3, &mut buf);
+        // tile ids: 0, 1000, 2000 (delta-encoded)
+        for delta in [0, 1000, 1000] {
+            encode_varint(delta, &mut buf);
+        }
+        // run lengths: all 0 (leaf pointers)
+        for _ in 0..3 {
+            encode_varint(0, &mut buf);
+        }
+        // compressed leaf lengths
+        for len in [100, 200, 50] {
+            encode_varint(len, &mut buf);
+        }
+        // offsets: explicit 0 (stored as 0 + 1), then contiguous, contiguous
+        for encoded_offset in [1, 0, 0] {
+            encode_varint(encoded_offset, &mut buf);
+        }
+        buf
+    }
+
+    fn dir_tuples(entries: &[DirEntry]) -> Vec<(u64, u64, u32, u32)> {
+        entries
+            .iter()
+            .map(|e| (e.tile_id, e.offset, e.length, e.run_length))
+            .collect()
+    }
+
+    #[test]
+    fn test_decode_directory_resolves_contiguous_leaf_offsets() {
+        // Issue #377: the contiguous-offset rule applies to leaf pointers too.
+        // Before the fix every leaf after the first decoded to offset 0, so
+        // `decode` sliced the wrong bytes and gzip failed with
+        // "incomplete deflate stream" on any tippecanoe archive with leaves.
+        let entries = decode_directory(&tippecanoe_style_leaf_root()).unwrap();
+        assert_eq!(
+            dir_tuples(&entries),
+            vec![(0, 0, 100, 0), (1000, 100, 200, 0), (2000, 300, 50, 0)]
+        );
+    }
+
+    #[test]
+    fn test_encode_directory_contiguous_leaf_entries_encode_as_zero() {
+        // The encoder must apply the same rule, so our root directories are
+        // as compact as the spec allows and round-trip through any reader.
+        let entries = vec![
+            DirEntry {
+                tile_id: 0,
+                offset: 0,
+                length: 100,
+                run_length: 0,
+            },
+            DirEntry {
+                tile_id: 1000,
+                offset: 100,
+                length: 200,
+                run_length: 0,
+            },
+            DirEntry {
+                tile_id: 2000,
+                offset: 300,
+                length: 50,
+                run_length: 0,
+            },
+        ];
+        let encoded = encode_directory(&entries);
+        assert_eq!(encoded, tippecanoe_style_leaf_root());
+        assert_eq!(
+            dir_tuples(&decode_directory(&encoded).unwrap()),
+            dir_tuples(&entries)
+        );
     }
 
     #[test]
