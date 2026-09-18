@@ -1511,3 +1511,148 @@ fn antimeridian_polygon_export_smears_world_row() {
         finest.tile_count
     );
 }
+
+// ---------------------------------------------------------------------------
+// Property selection (#386)
+// ---------------------------------------------------------------------------
+
+/// `include` keeps only the named properties (plus geometry and the
+/// reserved columns the writer appends); `exclude` drops the named ones;
+/// both pipelines agree.
+#[test]
+fn property_selection_narrows_the_overview_columns() {
+    use super::properties::PropertySelection;
+
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &spread_points(4), true, Some("extra"));
+
+        // include: only `name`.
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let o = ConvertOptions {
+            properties: PropertySelection {
+                include: Some(vec!["name".to_string()]),
+                ..Default::default()
+            },
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin.path(), tout.path(), &o).expect("include converts");
+        let names = output_column_names(tout.path());
+        assert!(
+            names.contains(&"name".to_string()),
+            "streaming={streaming} {names:?}"
+        );
+        assert!(
+            names.contains(&"geometry".to_string()),
+            "streaming={streaming} {names:?}"
+        );
+        assert!(
+            !names.contains(&"id".to_string()),
+            "streaming={streaming} {names:?}"
+        );
+        assert!(
+            !names.contains(&"extra".to_string()),
+            "streaming={streaming} {names:?}"
+        );
+
+        // exclude: drop `extra` only.
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let o = ConvertOptions {
+            properties: PropertySelection {
+                exclude: vec!["extra".to_string()],
+                ..Default::default()
+            },
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude converts");
+        let names = output_column_names(tout.path());
+        assert!(
+            names.contains(&"id".to_string()),
+            "streaming={streaming} {names:?}"
+        );
+        assert!(
+            names.contains(&"name".to_string()),
+            "streaming={streaming} {names:?}"
+        );
+        assert!(
+            !names.contains(&"extra".to_string()),
+            "streaming={streaming} {names:?}"
+        );
+
+        // exclude_all: geometry only — the rows still convert.
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let o = ConvertOptions {
+            properties: PropertySelection {
+                exclude_all: true,
+                ..Default::default()
+            },
+            ..opts(streaming)
+        };
+        let report =
+            convert_to_overviews(tin.path(), tout.path(), &o).expect("exclude_all converts");
+        assert_eq!(report.input_features, 4);
+        let names = output_column_names(tout.path());
+        for dropped in ["id", "name", "extra"] {
+            assert!(
+                !names.contains(&dropped.to_string()),
+                "streaming={streaming} {names:?}"
+            );
+        }
+        assert!(names.contains(&"geometry".to_string()));
+    }
+}
+
+/// A knob that reads an excluded column is an error naming the knob, and a
+/// misspelled include is an error too — silently converting without the
+/// column the caller asked for would be worse than stopping.
+#[test]
+fn property_selection_rejects_knob_columns_and_typos() {
+    use super::properties::PropertySelection;
+
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(4), true, Some("extra"));
+    let tout = tempfile::NamedTempFile::new().unwrap();
+
+    let o = ConvertOptions {
+        filter: Some("extra > 0".to_string()),
+        properties: PropertySelection {
+            exclude: vec!["extra".to_string()],
+            ..Default::default()
+        },
+        ..opts(true)
+    };
+    let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("\"extra\"") && msg.contains("--filter"),
+        "{msg}"
+    );
+
+    let o = ConvertOptions {
+        sort_key: Some("extra".to_string()),
+        properties: PropertySelection {
+            include: Some(vec!["name".to_string()]),
+            ..Default::default()
+        },
+        ..opts(true)
+    };
+    let msg = convert_to_overviews(tin.path(), tout.path(), &o)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("--sort-key"), "{msg}");
+
+    let o = ConvertOptions {
+        properties: PropertySelection {
+            include: Some(vec!["nmae".to_string()]),
+            ..Default::default()
+        },
+        ..opts(true)
+    };
+    let msg = convert_to_overviews(tin.path(), tout.path(), &o)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("\"nmae\"") && msg.contains("\"name\""),
+        "{msg}"
+    );
+}

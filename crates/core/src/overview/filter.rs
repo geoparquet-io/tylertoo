@@ -196,6 +196,33 @@ pub enum FilterExpr {
     Or(Box<FilterExpr>, Box<FilterExpr>),
 }
 
+impl FilterExpr {
+    /// Every column name the expression references, in first-seen order,
+    /// deduplicated. Names as written (before any reserved-column rename).
+    pub fn column_names(&self) -> Vec<String> {
+        fn walk(e: &FilterExpr, out: &mut Vec<String>) {
+            let mut push = |c: &String| {
+                if !out.contains(c) {
+                    out.push(c.clone());
+                }
+            };
+            match e {
+                FilterExpr::Compare { column, .. }
+                | FilterExpr::In { column, .. }
+                | FilterExpr::IsNull { column, .. } => push(column),
+                FilterExpr::Not(inner) => walk(inner, out),
+                FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+}
+
 /// Parse a filter expression source string into a [`FilterExpr`].
 pub fn parse_filter(src: &str) -> Result<FilterExpr, FilterError> {
     let tokens = tokenize(src)?;

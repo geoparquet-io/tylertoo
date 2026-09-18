@@ -68,6 +68,7 @@ use super::level::{
     DensityProvenance, Generalization, GeneralizationLevel, MemoryProfile, Mode, RankingProvenance,
     RepresentationBandProvenance, GSD_TILE_BASE, METERS_PER_DEGREE,
 };
+use super::properties::{PropertySelection, PropertySelectionError};
 use super::simplify::{
     simplify_cascade, simplify_for_level, simplify_step, CascadeStep, CollapseMode, Representation,
     Simplified, SimplifyOptions,
@@ -434,6 +435,15 @@ pub struct ConvertOptions {
     /// statistics degrade gracefully to the exact per-row evaluation. See
     /// [`super::filter`] for the grammar. Default `None` (no filtering).
     pub filter: Option<String>,
+    /// Which property columns the output carries (#386): tippecanoe's
+    /// `-x` / `-y` / `-X`. Resolved once against the input schema and applied
+    /// as a read projection before anything else looks at the schema, so the
+    /// parquet reader skips the excluded column chunks and the overview file
+    /// only carries the kept columns. The geometry column is always kept. A
+    /// column another knob reads (`sort_key`, `class_ranking`, `entry_zoom`,
+    /// `accumulate`, `filter`) must stay included; excluding it is rejected.
+    /// Default: keep everything.
+    pub properties: PropertySelection,
     /// Directory for the remote-input disk spill (#219 / #272). A remote
     /// convert stages every fetched column chunk in an anonymous temp file
     /// (growing to ≈1× the touched input bytes) so later passes re-read
@@ -595,6 +605,7 @@ impl Default for ConvertOptions {
             coalesce_junction_angle: DEFAULT_JUNCTION_ANGLE_DEG,
             bbox: None,
             filter: None,
+            properties: PropertySelection::default(),
             spill_dir: None,
         }
     }
@@ -765,6 +776,9 @@ pub enum ConvertError {
     /// Opening the input failed (bad URL scheme, remote store error, ...).
     #[error("input error: {0}")]
     Input(#[from] crate::input::InputError),
+    /// The property selection (#386) does not fit the input schema.
+    #[error("property selection: {0}")]
+    Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
     #[error("parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -1429,6 +1443,78 @@ fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError>
 /// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
 /// Runs the full option normalization (validation, cluster/accumulate checks,
 /// the partitioning-coalesce-inert rewrite) before dispatching.
+/// Columns the tuning knobs read, paired with the knob that reads them —
+/// these must survive the property selection (#386).
+fn knob_columns(options: &ConvertOptions) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(c) = &options.sort_key {
+        out.push((c.clone(), "--sort-key".to_string()));
+    }
+    if let Some(r) = &options.class_ranking {
+        out.push((r.column.clone(), "--class-rank".to_string()));
+    }
+    if let Some(e) = &options.entry_zoom {
+        out.push((
+            e.column.clone(),
+            "--magnitude-ladder / --entry-zoom".to_string(),
+        ));
+    }
+    for a in &options.accumulate {
+        out.push((a.column.clone(), "--accumulate-attribute".to_string()));
+    }
+    if let Some(f) = &options.filter {
+        // Syntax was validated by `validate_options`; a parse failure here
+        // would already have been reported, so an unparsable filter simply
+        // contributes no required columns.
+        if let Ok(expr) = super::filter::parse_filter(f) {
+            for c in expr.column_names() {
+                out.push((c, "--filter".to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Apply `options.properties` (#386) to `source`: resolve the selection
+/// against the file schema and restrict every later read to the kept
+/// columns. A no-op for the default (keep everything).
+fn apply_property_selection(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+) -> Result<(), ConvertError> {
+    if options.properties.is_identity() {
+        return Ok(());
+    }
+    let schema = source.file_schema()?;
+    let geom_idx = find_geometry_column(&schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let mut warn = |msg: String| log::warn!("[convert] {msg}");
+    let keep = options
+        .properties
+        .resolve(&schema, geom_idx, &knob_columns(options), &mut warn)?;
+    let kept_names: Vec<&str> = keep
+        .iter()
+        .filter(|&&i| i != geom_idx)
+        .map(|&i| schema.field(i).name().as_str())
+        .collect();
+    let dropped = schema.fields().len() - keep.len();
+    log::info!(
+        "[convert] property selection: keeping {} of {} property column(s) ({}), dropping {dropped}",
+        kept_names.len(),
+        schema.fields().len() - 1,
+        if kept_names.is_empty() {
+            "none — geometry only".to_string()
+        } else {
+            kept_names
+                .iter()
+                .map(|n| format!("{n:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    source.restrict_columns(keep)?;
+    Ok(())
+}
+
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -1437,6 +1523,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
 ) -> Result<ConvertReport, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
+    // #386: narrow the source to the requested property columns before any
+    // schema index is derived, so both pipelines see the projected layout.
+    apply_property_selection(source, options)?;
     // #272: place the remote-input disk spill (#219) where the caller asked
     // (no-op for local inputs, which never spill).
     source.set_spill_dir(options.spill_dir.as_deref());
@@ -1481,10 +1570,23 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     // --- Read the input footer, preserving the full property schema. ---------
     // (For a remote source, the footer is range-fetched once and cached.)
-    let builder = source_single.open()?;
+    let mut builder = source_single.open()?;
     // `read_schema` matches the raw batches read below; `input_schema` is the
     // possibly-renamed schema used for every downstream (name-based) lookup.
-    let read_schema = builder.schema().clone();
+    // The property selection (#386) is a read projection here, exactly as the
+    // streaming path gets it through `ConvertSource::schema`.
+    let read_schema = match source.column_projection() {
+        Some(keep) => {
+            let mask = parquet::arrow::ProjectionMask::roots(
+                builder.parquet_schema(),
+                keep.iter().copied(),
+            );
+            let projected = Arc::new(builder.schema().project(keep)?);
+            builder = builder.with_projection(mask);
+            projected
+        }
+        None => builder.schema().clone(),
+    };
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
     let crs = detect_crs_from_kv(builder.metadata().file_metadata().key_value_metadata())?;

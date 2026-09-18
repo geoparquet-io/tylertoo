@@ -67,6 +67,8 @@ pub enum ConvertSource {
 pub struct SingleSource {
     source: InputSource,
     meta: std::sync::OnceLock<PartMeta>,
+    /// Root columns every read is restricted to (#386); `None` = all.
+    projection: std::sync::OnceLock<Vec<usize>>,
 }
 
 impl SingleSource {
@@ -74,6 +76,7 @@ impl SingleSource {
         SingleSource {
             source,
             meta: std::sync::OnceLock::new(),
+            projection: std::sync::OnceLock::new(),
         }
     }
 
@@ -118,6 +121,8 @@ pub struct MultiSource {
     /// The unioned schema: partition 0's fields with nullability OR-ed
     /// across all partitions.
     schema: SchemaRef,
+    /// Root columns every read is restricted to (#386); `None` = all.
+    projection: std::sync::OnceLock<Vec<usize>>,
 }
 
 /// Per-part row-group selection: the multi-file analogue of the single-file
@@ -401,11 +406,58 @@ impl ConvertSource {
     }
 
     /// The Arrow schema of the dataset. For a multi source this is the
-    /// validated union schema (nullability OR-ed across parts).
+    /// validated union schema (nullability OR-ed across parts). After
+    /// [`Self::restrict_columns`], only the kept columns, in file order.
     pub fn schema(&self) -> Result<SchemaRef, InputError> {
+        let full = match self {
+            ConvertSource::Single(s) => s.meta()?.schema.clone(),
+            ConvertSource::Multi(m) => m.schema.clone(),
+        };
+        Ok(match self.column_projection() {
+            None => full,
+            Some(keep) => Arc::new(full.project(keep)?),
+        })
+    }
+
+    /// The unprojected schema: every column the files carry, whether or not
+    /// [`Self::restrict_columns`] has narrowed what reads return.
+    pub fn file_schema(&self) -> Result<SchemaRef, InputError> {
         match self {
             ConvertSource::Single(s) => Ok(s.meta()?.schema.clone()),
             ConvertSource::Multi(m) => Ok(m.schema.clone()),
+        }
+    }
+
+    /// Restrict every later read — and [`Self::schema`] — to these root
+    /// columns of the file schema, sorted ascending (#386). Applied once,
+    /// before anything derives column indices from the schema, so every
+    /// downstream index is already relative to the projected layout and the
+    /// parquet reader never decodes the excluded column chunks. A second
+    /// call is a programming error.
+    pub fn restrict_columns(&self, keep: Vec<usize>) -> Result<(), InputError> {
+        let ncols = self.file_schema()?.fields().len();
+        if keep.windows(2).any(|w| w[0] >= w[1]) || keep.iter().any(|&i| i >= ncols) {
+            return Err(InputError::Arrow(arrow_schema::ArrowError::SchemaError(
+                format!("column restriction {keep:?} is not a sorted subset of 0..{ncols}"),
+            )));
+        }
+        let cell = match self {
+            ConvertSource::Single(s) => &s.projection,
+            ConvertSource::Multi(m) => &m.projection,
+        };
+        cell.set(keep).map_err(|_| {
+            InputError::Arrow(arrow_schema::ArrowError::SchemaError(
+                "column restriction already applied to this source".to_string(),
+            ))
+        })
+    }
+
+    /// The root columns reads are restricted to, if any (see
+    /// [`Self::restrict_columns`]).
+    pub fn column_projection(&self) -> Option<&[usize]> {
+        match self {
+            ConvertSource::Single(s) => s.projection.get().map(Vec::as_slice),
+            ConvertSource::Multi(m) => m.projection.get().map(Vec::as_slice),
         }
     }
 
@@ -544,9 +596,17 @@ impl ConvertSource {
                 "row-group selection must cover every part"
             );
         }
+        // A plan's projection indexes the (possibly restricted) schema this
+        // source exposes; the reader wants file-root indices. Compose the two.
+        let projection = match (self.column_projection(), plan.projection) {
+            (None, None) => None,
+            (None, Some(cols)) => Some(cols.to_vec()),
+            (Some(base), None) => Some(base.to_vec()),
+            (Some(base), Some(cols)) => Some(cols.iter().map(|&c| base[c]).collect()),
+        };
         Ok(SourceStream {
             parts,
-            projection: plan.projection.map(<[usize]>::to_vec),
+            projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
             batch_size: plan.batch_size.max(1),
             part_idx: 0,
@@ -696,6 +756,7 @@ impl MultiSource {
             parts,
             metas,
             schema,
+            projection: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1525,6 +1586,93 @@ mod tests {
             let batch = batch.unwrap();
             assert_eq!(batch.num_columns(), 1);
             assert_eq!(batch.schema().field(0).name(), "id");
+        }
+    }
+
+    // --- column restriction (#386) -------------------------------------------
+
+    /// Three-column fixture: `id`, `name`, `extra`.
+    fn write_three(path: &Path, ids: Vec<i64>) {
+        let n = ids.len();
+        write_parquet(
+            path,
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("extra", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("r{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn restrict_columns_narrows_schema_and_every_read() {
+        for multi in [false, true] {
+            let dir = tmpdir();
+            write_three(&dir.path().join("p0.parquet"), vec![0, 1]);
+            if multi {
+                write_three(&dir.path().join("p1.parquet"), vec![2]);
+            }
+            let input = if multi {
+                dir.path().to_path_buf()
+            } else {
+                dir.path().join("p0.parquet")
+            };
+            let src = ConvertSource::resolve(input.to_str().unwrap()).unwrap();
+            assert_eq!(src.schema().unwrap().fields().len(), 3);
+
+            // Keep id + extra (drop the middle column, so indices shift).
+            src.restrict_columns(vec![0, 2]).unwrap();
+            let names: Vec<String> = src
+                .schema()
+                .unwrap()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            assert_eq!(names, vec!["id", "extra"], "multi={multi}");
+            assert_eq!(src.file_schema().unwrap().fields().len(), 3);
+
+            // A full read returns only the kept columns.
+            let plan = ReadPlan {
+                batch_size: 8,
+                projection: None,
+                row_groups: None,
+            };
+            let mut rows = 0;
+            for batch in src.open_stream(&plan).unwrap() {
+                let batch = batch.unwrap();
+                assert_eq!(batch.num_columns(), 2);
+                assert_eq!(batch.schema().field(1).name(), "extra");
+                rows += batch.num_rows();
+            }
+            assert_eq!(rows, if multi { 3 } else { 2 });
+
+            // A plan projection indexes the restricted schema: 1 = extra.
+            let cols = [1usize];
+            let plan = ReadPlan {
+                batch_size: 8,
+                projection: Some(&cols),
+                row_groups: None,
+            };
+            for batch in src.open_stream(&plan).unwrap() {
+                let batch = batch.unwrap();
+                assert_eq!(batch.num_columns(), 1);
+                assert_eq!(batch.schema().field(0).name(), "extra");
+            }
+
+            // Applying twice, or an unsorted / out-of-range set, is refused.
+            assert!(src.restrict_columns(vec![0]).is_err());
+            let fresh = ConvertSource::resolve(input.to_str().unwrap()).unwrap();
+            assert!(fresh.restrict_columns(vec![2, 0]).is_err());
+            assert!(fresh.restrict_columns(vec![0, 7]).is_err());
         }
     }
 

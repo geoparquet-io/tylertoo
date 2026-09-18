@@ -1295,6 +1295,46 @@ statistics and prunes more.
 
 ---
 
+## Property selection: `--include-property` / `--exclude-property` / `--exclude-all-properties`
+
+Which attribute columns the output carries — tippecanoe's `-y` / `-x` / `-X`.
+Everything not selected is dropped **at scan time** on `overview` and `tiles`:
+the parquet reader skips the excluded column chunks, the intermediate overview
+file only carries the kept columns, and the tiles' per-feature bytes shrink
+accordingly (which matters for the `--max-tile-size` valve — a tile that has
+to shed features to fit its byte budget sheds fewer when it is not carrying
+eight columns nobody asked for). The geometry column is always kept.
+
+```bash
+# Tiles carry only confidence and metrics:area
+tylertoo tiles fields.parquet fields.pmtiles --max-zoom 13 \
+  --include-property confidence --include-property metrics:area
+
+# Everything except the id and the timestamp
+tylertoo overview fields.parquet ov.parquet --exclude-property id \
+  --exclude-property "determination:datetime"
+
+# Geometry only
+tylertoo tiles fields.parquet outlines.pmtiles --exclude-all-properties
+```
+
+| Knob | Default | Semantics |
+|------|---------|-----------|
+| `--include-property COL` (repeatable) | all | keep ONLY these; naming a column the input lacks is an error |
+| `--exclude-property COL` (repeatable) | none | drop these, after `--include-property`; an unknown name only warns |
+| `--exclude-all-properties` | off | geometry-only output |
+
+**Interactions**: a column another knob reads — `--sort-key`, `--class-rank`,
+`--magnitude-ladder` / `--entry-zoom`, `--accumulate-attribute`, `--filter` —
+must stay included; excluding it is rejected with the knob's name, because
+the knobs evaluate over the projected batches and would otherwise go silently
+inert. `export-pmtiles` takes the same three flags and applies them to the
+tiles only, matched on the property names the tiles publish (the overview
+file is untouched); there, the `--feature-order` column is the one that must
+stay.
+
+---
+
 ## Performance profiles: `--profile`, `--in-flight-batches`
 
 Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),

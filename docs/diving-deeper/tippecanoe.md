@@ -60,6 +60,7 @@ stored, reusable level.
 | `-z` / `-Z` maximum/minimum zoom | `--max-zoom` / `--min-zoom` | Same zoom range |
 | `-l` layer name | `--layer-name` | Set at export |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
+| `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied at scan time on `overview` / `tiles`, at export on `export-pmtiles` |
 | `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder; tylertoo anchors on the full canonical count, so the default differs |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell, leaving per-level totals unchanged |
 | `-S` simplification | `--simplify-factor` | RDP, cascading by default |

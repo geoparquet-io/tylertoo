@@ -300,6 +300,22 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "ZOOM")]
     min_zoom: Option<u8>,
 
+    /// Keep ONLY these properties in the tiles (repeatable; tippecanoe -y),
+    /// matched on the names the tiles publish. The overview file is
+    /// untouched. Naming a property the file does not export is an error;
+    /// the --feature-order column must stay included
+    #[arg(long, value_name = "NAME")]
+    include_property: Vec<String>,
+
+    /// Drop these properties from the tiles (repeatable; tippecanoe -x).
+    /// Applied after --include-property
+    #[arg(long, value_name = "NAME")]
+    exclude_property: Vec<String>,
+
+    /// Drop every property (tippecanoe -X): geometry-only tiles
+    #[arg(long)]
+    exclude_all_properties: bool,
+
     /// Per-tile edge buffer, in tile pixels (feature seam continuity).
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
@@ -546,6 +562,26 @@ struct ConvertTuningArgs {
     /// --where. See docs/OVERVIEW_TUNING.md.
     #[arg(long, value_name = "EXPR", alias = "where", help_heading = "Filtering")]
     filter: Option<String>,
+
+    /// Keep ONLY these property columns (repeatable; tippecanoe -y). Every
+    /// other property is dropped at scan time: the parquet reader skips the
+    /// excluded column chunks and the overview file only carries what was
+    /// asked for. The geometry column is always kept. A column another knob
+    /// reads (--sort-key, --filter, --accumulate-attribute,
+    /// --magnitude-ladder, --class-rank) must stay included; naming a column
+    /// the input does not have is an error
+    #[arg(long, value_name = "COL", help_heading = "Properties")]
+    include_property: Vec<String>,
+
+    /// Drop these property columns (repeatable; tippecanoe -x). Applied after
+    /// --include-property. Naming a column the input does not have only
+    /// warns
+    #[arg(long, value_name = "COL", help_heading = "Properties")]
+    exclude_property: Vec<String>,
+
+    /// Drop every property column (tippecanoe -X): geometry-only output
+    #[arg(long, help_heading = "Properties")]
+    exclude_all_properties: bool,
 
     /// GSD tile-band base for the zoom→GSD mapping: gsd(z) = 40075016.69 /
     /// base / 2^z (spec §5.2, cogp-rs default 1024).
@@ -977,6 +1013,15 @@ impl ConvertTuningArgs {
     /// Build [`ConvertOptions`] from the shared tuning flags, applying the same
     /// validation both `overview` and `tiles` rely on. The parent command owns
     /// `mode`, the `levels` plan, `bbox`, and `cogp_compat` and passes them in.
+    /// The property include/exclude choice (#386).
+    fn property_selection(&self) -> tylertoo_core::overview::properties::PropertySelection {
+        tylertoo_core::overview::properties::PropertySelection {
+            include: (!self.include_property.is_empty()).then(|| self.include_property.clone()),
+            exclude: self.exclude_property.clone(),
+            exclude_all: self.exclude_all_properties,
+        }
+    }
+
     fn build_convert_options(
         &self,
         mode: tylertoo_core::overview::level::Mode,
@@ -1163,6 +1208,7 @@ impl ConvertTuningArgs {
             coalesce_junction_angle: self.coalesce_junction_angle,
             bbox,
             filter: self.filter.clone(),
+            properties: self.property_selection(),
             spill_dir: self.spill_dir.clone(),
         };
 
@@ -1776,6 +1822,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // when the coarsest levels generalized to nothing and were omitted
         // from the overview. Only a zoom plan has a requested minimum zoom.
         min_zoom: args.gsd.is_none().then_some(args.min_zoom),
+
+        // The property selection was applied on convert (#386): the
+        // intermediate overview already carries only the kept columns.
+        properties: Default::default(),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -2141,6 +2191,12 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
         min_zoom: args.min_zoom,
+
+        properties: tylertoo_core::overview::properties::PropertySelection {
+            include: (!args.include_property.is_empty()).then(|| args.include_property.clone()),
+            exclude: args.exclude_property.clone(),
+            exclude_all: args.exclude_all_properties,
+        },
     };
 
     println!(
