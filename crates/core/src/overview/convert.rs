@@ -39,7 +39,7 @@ use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
-use geo::{BoundingRect, Geometry};
+use geo::{Area, BoundingRect, Geometry};
 use geoarrow::array::{from_arrow_array, GeometryBuilder};
 use geoarrow::datatypes::GeometryType;
 use geoarrow_array::GeoArrowArray;
@@ -51,6 +51,7 @@ use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_opt_from_array;
 
+use super::accumulate::{is_carrier, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, DensityBudgetConfig,
     FeatureKind, SUPERCELL_GSD_FACTOR,
@@ -70,8 +71,8 @@ use super::level::{
 };
 use super::properties::{PropertySelection, PropertySelectionError};
 use super::simplify::{
-    simplify_cascade, simplify_for_level, simplify_step, CascadeStep, CollapseMode, Representation,
-    Simplified, SimplifyOptions,
+    carrier_square, simplify_cascade, simplify_for_level, simplify_step, CascadeStep, CollapseMode,
+    Representation, Simplified, SimplifyOptions,
 };
 use super::writer::{
     LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy,
@@ -1776,6 +1777,20 @@ pub(crate) fn convert_to_overviews_source_strategy(
     let num_levels = level_gsds.len();
     let finest = num_levels.saturating_sub(1);
 
+    // #384: tiny-polygon accumulator carriers per level (row-indexed here,
+    // since `features[i].index == i`), and the winner table by row for the
+    // carrier test in the level loop.
+    let row_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+    let carriers = in_memory_carriers(
+        options,
+        &features,
+        &row_min_levels,
+        &geometries,
+        &level_gsds,
+        &level_reprs,
+        crs,
+    );
+
     // --- Cluster tables (Q4): per level, winner → point_count + aggregates. --
     let cluster_tables = if options.cluster {
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
@@ -1819,7 +1834,16 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     for (level, &(gsd_m, zoom)) in level_specs.iter().enumerate() {
         let member_indices: Vec<usize> = match options.mode {
-            Mode::Duplicating => assignment.duplicating_at_level(level as u8),
+            Mode::Duplicating => {
+                let mut v = assignment.duplicating_at_level(level as u8);
+                // #384: carriers join the level (sorted merge; disjoint from
+                // members by construction).
+                if !carriers[level].is_empty() {
+                    v.extend_from_slice(&carriers[level]);
+                    v.sort_unstable();
+                }
+                v
+            }
             Mode::Partitioning => assignment.partitioning_at_level(level as u8),
         };
 
@@ -1899,6 +1923,17 @@ pub(crate) fn convert_to_overviews_source_strategy(
                     vertex_count += count_vertices(g);
                     indices.push(i);
                     geoms.push(g.clone());
+                    continue;
+                }
+                // #384: a carrier is not a member — it stands in for its
+                // cell's dropped area as one placeholder square.
+                if usize::from(row_min_levels[i]) > level && is_carrier(&carriers[level], i) {
+                    if let Some(sq) = carrier_square(&geometries[i], gsd_m, crs, &options.simplify)
+                    {
+                        vertex_count += count_vertices(&sq);
+                        indices.push(i);
+                        geoms.push(sq);
+                    }
                     continue;
                 }
                 let simplified = if cascade_chain.is_empty() {
@@ -2051,6 +2086,55 @@ pub(crate) fn convert_to_overviews_source_strategy(
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
     })
+}
+
+/// The tiny-polygon accumulator's carriers for the in-memory reference path
+/// (#384): the same function the streaming path runs, over the same feature
+/// table, so the two paths agree on every carrier.
+fn in_memory_carriers(
+    options: &ConvertOptions,
+    features: &[AssignFeature],
+    row_min_levels: &[u8],
+    geometries: &[Geometry<f64>],
+    level_gsds: &[f64],
+    level_reprs: &[Representation],
+    crs: Crs,
+) -> Vec<Vec<usize>> {
+    let num_levels = level_gsds.len();
+    let finest = num_levels.saturating_sub(1);
+    let enabled = matches!(options.mode, Mode::Duplicating)
+        && (options.simplify.collapse == CollapseMode::Square
+            || level_reprs.contains(&Representation::Square));
+    let acc_levels: Vec<AccumulateLevel> = level_gsds
+        .iter()
+        .enumerate()
+        .map(|(l, &gsd)| AccumulateLevel {
+            gsd_meters: gsd,
+            enabled: enabled
+                && l != finest
+                && (options.simplify.collapse == CollapseMode::Square
+                    || level_reprs[l] == Representation::Square),
+        })
+        .collect();
+    if !acc_levels.iter().any(|l| l.enabled) {
+        return vec![Vec::new(); num_levels];
+    }
+    let areas: Vec<f32> = geometries
+        .iter()
+        .map(|g| match g {
+            Geometry::Polygon(p) => p.unsigned_area() as f32,
+            Geometry::MultiPolygon(mp) => mp.unsigned_area() as f32,
+            _ => 0.0,
+        })
+        .collect();
+    tiny_polygon_carriers(
+        features,
+        row_min_levels,
+        &areas,
+        &acc_levels,
+        crs,
+        options.simplify.factor,
+    )
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a

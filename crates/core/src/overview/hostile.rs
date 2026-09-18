@@ -1698,3 +1698,131 @@ fn property_selection_makes_the_source_single_use() {
         "unexpected error: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tiny-polygon accumulator (#384)
+// ---------------------------------------------------------------------------
+
+/// A 63×63 block of 40 m fields (1,600 m² each, ~6.3 km² in all) near
+/// 10°E 45°N — a country of fields in miniature: at the coarse zooms every
+/// one of them is sub-visible on its own.
+fn field_block() -> Vec<Option<Geometry<f64>>> {
+    let side = 40.0 / 111_320.0; // ~40 m in degrees
+    let pitch = side * 1.5;
+    let mut out = Vec::new();
+    for r in 0..63 {
+        for c in 0..63 {
+            let x = 10.0 + c as f64 * pitch;
+            let y = 45.0 + r as f64 * pitch;
+            out.push(Some(Geometry::Polygon(Polygon::new(
+                LineString::from(vec![
+                    (x, y),
+                    (x + side, y),
+                    (x + side, y + side),
+                    (x, y + side),
+                    (x, y),
+                ]),
+                vec![],
+            ))));
+        }
+    }
+    out
+}
+
+/// With the square disposition, coarse levels carry placeholder squares
+/// whose total area matches the fields they stand for; without it, those
+/// levels are empty and omitted. Both pipelines agree exactly.
+#[test]
+fn tiny_polygon_accumulator_preserves_dropped_area_at_coarse_levels() {
+    use geo::Area;
+
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let fields = field_block();
+    write_input(tin.path(), &fields, true, None);
+    let input_area: f64 = fields
+        .iter()
+        .map(|g| match g {
+            Some(Geometry::Polygon(p)) => p.unsigned_area(),
+            _ => 0.0,
+        })
+        .sum();
+
+    // Drop (the default): nothing survives at z2..z5.
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true)).unwrap();
+    assert!(
+        report.skipped_empty_levels.len() >= 3,
+        "coarse levels must be empty without the accumulator: {:?}",
+        report.levels.iter().map(|l| l.zoom).collect::<Vec<_>>()
+    );
+
+    // Square: the accumulator stands in for the dropped fields.
+    let mut per_pipeline: Vec<Vec<(u8, usize)>> = Vec::new();
+    for streaming in [true, false] {
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let o = ConvertOptions {
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Square,
+                ..SimplifyOptions::default()
+            },
+            ..opts(streaming)
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+        // A level whose placeholder is bigger than the whole block cannot
+        // hold one; every other level must.
+        for sk in &report.skipped_empty_levels {
+            let gsd_deg = sk.gsd / 111_320.0;
+            assert!(
+                gsd_deg * gsd_deg > input_area,
+                "streaming={streaming}: z{:?} skipped although {:.1} placeholders of area exist",
+                sk.zoom,
+                input_area / (gsd_deg * gsd_deg)
+            );
+        }
+        let counts: Vec<(u8, usize)> = report
+            .levels
+            .iter()
+            .map(|l| (l.zoom.unwrap(), l.feature_count))
+            .collect();
+        per_pipeline.push(counts.clone());
+
+        // At every coarse level the placeholder area is within one
+        // threshold per cell of the input area (each cell keeps < 1
+        // threshold unemitted); here the block spans a handful of cells.
+        for (li, l) in report.levels.iter().enumerate() {
+            if li + 1 == report.levels.len() {
+                continue; // canonical: the fields themselves
+            }
+            let rows = read_level_ids_geoms(tout.path(), li);
+            let area: f64 = rows
+                .iter()
+                .map(|(_, g)| match g {
+                    Geometry::Polygon(p) => p.unsigned_area(),
+                    Geometry::MultiPolygon(mp) => mp.unsigned_area(),
+                    _ => 0.0,
+                })
+                .sum();
+            let gsd_deg = l.gsd / 111_320.0;
+            let threshold = gsd_deg * gsd_deg; // factor 1.0
+            let cells = 4.0; // patches are 32×gsd; the block is ~3.8 km wide
+            assert!(
+                area <= input_area + 1e-12 && area >= input_area - cells * threshold,
+                "streaming={streaming} z{}: placeholder area {area:e} vs input {input_area:e} \
+                 (threshold {threshold:e}, {} rows)",
+                l.zoom.unwrap(),
+                rows.len()
+            );
+            assert!(
+                rows.len() >= ((input_area / threshold) as usize).saturating_sub(cells as usize),
+                "streaming={streaming} z{}: {} squares for {:.1} thresholds of area",
+                l.zoom.unwrap(),
+                rows.len(),
+                input_area / threshold
+            );
+        }
+    }
+    assert_eq!(
+        per_pipeline[0], per_pipeline[1],
+        "streaming and in-memory pipelines must agree on carriers"
+    );
+}

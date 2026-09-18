@@ -774,6 +774,12 @@ fn polygon_anchor(poly: &Polygon<f64>) -> Option<Point<f64>> {
 ///
 /// # Why a per-feature hash instead of tippecanoe's accumulator
 ///
+/// (Since #384 the write-time dither below is only half the story: polygons
+/// a level does not carry at all go through a deterministic per-patch
+/// accumulator in `overview::accumulate`, run once on the pass-1 feature
+/// table. The dither remains for members that collapse under the tolerance
+/// at write time, where the reasoning below still holds.)
+///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's tiny-polygon reduction
 /// (clip.cpp, `tiny_polygon` handling; the legacy per-tile pipeline's #85
 /// port did the same) walks the features of a tile **serially**,
@@ -853,6 +859,32 @@ fn squarify_polygon(poly: &Polygon<f64>, tol: f64) -> Simplified {
     } else {
         Simplified::Dropped
     }
+}
+
+/// Placeholder square for a tiny-polygon accumulator carrier (#384): a
+/// `tol × tol` square at the polygon's representative point, `tol` being
+/// this level's simplification tolerance — the same square the
+/// [`CollapseMode::Square`] dither emits, so the two placeholders are
+/// interchangeable to a renderer. `None` for non-polygonal input.
+pub(super) fn carrier_square(
+    geom: &Geometry<f64>,
+    gsd_meters: f64,
+    crs: Crs,
+    opts: &SimplifyOptions,
+) -> Option<Geometry<f64>> {
+    let anchor = match geom {
+        Geometry::Polygon(p) => polygon_anchor(p),
+        Geometry::MultiPolygon(mp) => {
+            mp.0.iter()
+                .max_by(|a, b| a.unsigned_area().total_cmp(&b.unsigned_area()))
+                .and_then(polygon_anchor)
+        }
+        _ => None,
+    }?;
+    Some(Geometry::Polygon(placeholder_square(
+        anchor,
+        world_tolerance(gsd_meters, crs, opts),
+    )))
 }
 
 /// Resolve a collapsed polygon per the [`CollapseMode`] (#279): drop by

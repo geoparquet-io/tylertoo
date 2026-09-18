@@ -59,13 +59,14 @@ use crossbeam_channel::{Receiver, Sender};
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use arrow_select::take::take;
-use geo::Geometry;
+use geo::{Area, Geometry};
 use geoarrow::array::from_arrow_array;
 use rayon::prelude::*;
 
 use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
 use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
+use super::accumulate::{is_carrier, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind};
 use super::cluster::{build_cluster_tables, verify_sum_invariant, ClusterEntry, ClusterTables};
 use super::coalesce::CoalesceInput;
@@ -84,8 +85,8 @@ use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
 use super::pipeline;
 use super::simplify::{
-    full_resolution_fallback_count, simplify_cascade, simplify_step, validation_skip_count,
-    CascadeStep, Representation, Simplified, SimplifyOptions,
+    carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
+    validation_skip_count, CascadeStep, CollapseMode, Representation, Simplified, SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
@@ -281,6 +282,76 @@ fn select_row_groups_streaming(
     })
 }
 
+/// Unsigned area of a polygonal geometry in CRS units², 0 for anything else
+/// (the accumulator's per-feature input, #384).
+fn polygon_area_f32(g: &Geometry<f64>) -> f32 {
+    match g {
+        Geometry::Polygon(p) => p.unsigned_area() as f32,
+        Geometry::MultiPolygon(mp) => mp.unsigned_area() as f32,
+        _ => 0.0,
+    }
+}
+
+/// Run the tiny-polygon accumulator (#384) for the streaming path: per
+/// planned level, the sorted row indices of its carriers; empty per level
+/// unless the accumulator applies there.
+fn streaming_carriers(
+    options: &ConvertOptions,
+    features: &[AssignFeature],
+    feat_min_levels: &[u8],
+    areas: Vec<f32>,
+    level_gsds: &[f64],
+    level_reprs: &[Representation],
+    crs: Crs,
+) -> Vec<Vec<usize>> {
+    let finest_planned = level_gsds.len().saturating_sub(1);
+    let acc_levels: Vec<AccumulateLevel> = level_gsds
+        .iter()
+        .enumerate()
+        .map(|(l, &gsd)| AccumulateLevel {
+            gsd_meters: gsd,
+            enabled: l != finest_planned
+                && accumulator_enabled(options)
+                && (options.simplify.collapse == CollapseMode::Square
+                    || level_reprs[l] == Representation::Square),
+        })
+        .collect();
+    if !acc_levels.iter().any(|l| l.enabled) {
+        return vec![Vec::new(); level_gsds.len()];
+    }
+    let t = Instant::now();
+    let carriers = tiny_polygon_carriers(
+        features,
+        feat_min_levels,
+        &areas,
+        &acc_levels,
+        crs,
+        options.simplify.factor,
+    );
+    let total: usize = carriers.iter().map(Vec::len).sum();
+    log::info!(
+        "[convert] tiny-polygon accumulator: {total} placeholder square(s) across {} \
+         level(s) stand in for the polygons those levels dropped ({:.2}s)",
+        acc_levels.iter().filter(|l| l.enabled).count(),
+        t.elapsed().as_secs_f64()
+    );
+    carriers
+}
+
+/// Whether the tiny-polygon accumulator (#384) is in play for this run:
+/// duplicating mode (a carrier is a second appearance of a feature, which
+/// partitioning's feature-once contract cannot represent) with the square
+/// disposition somewhere — globally via `--collapse-square`, or in a
+/// `--representation` square band.
+fn accumulator_enabled(options: &ConvertOptions) -> bool {
+    matches!(options.mode, Mode::Duplicating)
+        && (options.simplify.collapse == CollapseMode::Square
+            || options
+                .representation
+                .iter()
+                .any(|b| b.repr == Representation::Square))
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -385,6 +456,7 @@ pub(crate) fn convert_streaming_strategy(
     let t_pass1 = Instant::now();
     let Pass1Output {
         mut features,
+        areas,
         provenance: ranking_provenance,
         acc_values,
         coalesce: coalesce_scratch,
@@ -478,6 +550,19 @@ pub(crate) fn convert_streaming_strategy(
     let feat_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
     drop(assignment);
 
+    // #384: tiny-polygon accumulator — per level, the carriers that stand in
+    // for the sub-visible polygons the level dropped. Row-indexed like the
+    // winner table; empty per level unless the accumulator applies there.
+    let carriers = streaming_carriers(
+        options,
+        &features,
+        &feat_min_levels,
+        areas,
+        &level_gsds,
+        &level_reprs,
+        crs,
+    );
+
     // Cluster tables (Q4): built from the pass-1 features + final winner
     // table, before the O(N) scratch is freed. Memory afterwards is
     // O(non-singleton clusters), carried into pass 2 alongside `min_levels`.
@@ -565,6 +650,11 @@ pub(crate) fn convert_streaming_strategy(
             .collect(),
         Mode::Partitioning => hist,
     };
+    // #384: carriers are members of their level only (not of finer ones —
+    // there the feature is either a real member already or absent).
+    for (count, level_carriers) in counts.iter_mut().zip(&carriers) {
+        *count += level_carriers.len();
+    }
     if let Some(scratch) = &coalesce_scratch {
         // Duplicating only (partitioning + coalescing is rejected upstream).
         let inputs = scratch.inputs();
@@ -721,6 +811,7 @@ pub(crate) fn convert_streaming_strategy(
                 kinds: kinds.as_deref(),
                 coalesce_table: coalesce_tables[i].as_ref(),
                 cascade_chain: &cascade_chains[i],
+                carriers: &carriers[e.orig as usize],
             }
         })
         .collect();
@@ -1049,6 +1140,10 @@ impl CoalesceScratch {
 struct Pass1Output {
     /// Per-feature assignment inputs (bbox, kind, resolved sort key).
     features: Vec<AssignFeature>,
+    /// Per-feature unsigned polygon area in CRS units² (0 for other kinds),
+    /// parallel to `features`; empty unless the tiny-polygon accumulator is
+    /// on (#384), since it is the one consumer.
+    areas: Vec<f32>,
     /// Resolved ranking provenance (§3.5).
     provenance: RankingProvenance,
     /// Per-accumulate-spec source values (Q4), parallel to `acc_cols`.
@@ -1178,6 +1273,9 @@ fn run_pass1(
     })?;
 
     let mut features: Vec<AssignFeature> = Vec::new();
+    // #384: polygon areas for the tiny-polygon accumulator, when it is on.
+    let want_areas = accumulator_enabled(options);
+    let mut areas: Vec<f32> = Vec::new();
     let mut num_rows = 0usize;
     let mut geom_bytes = 0u64;
     let mut skipped_rows = 0usize;
@@ -1265,6 +1363,9 @@ fn run_pass1(
                 line_geoms.push(g.clone());
             }
             kept_row[i] = true;
+            if want_areas {
+                areas.push(polygon_area_f32(g));
+            }
             features.push(AssignFeature {
                 index: base + i,
                 bbox: fbbox,
@@ -1438,6 +1539,7 @@ fn run_pass1(
 
     Ok(Pass1Output {
         features,
+        areas,
         provenance,
         acc_values,
         coalesce,
@@ -1544,6 +1646,31 @@ pub(super) struct LevelStreamCtx<'a> {
     /// off, partitioning, or verbatim level) — the level then simplifies
     /// canonical geometry directly with `gsd_m` / `point_repr`.
     cascade_chain: &'a [CascadeStep],
+    /// Tiny-polygon accumulator carriers at this level (#384): sorted row
+    /// indices of polygons that are NOT members (`min_level > orig_level`)
+    /// but are emitted as a placeholder square standing in for the dropped
+    /// area around them. Empty unless the accumulator applies.
+    carriers: &'a [usize],
+}
+
+impl LevelStreamCtx<'_> {
+    /// Is row `g` emitted at this level: a winner-table member, or a
+    /// tiny-polygon carrier (#384)?
+    #[inline]
+    fn is_member(&self, g: usize) -> bool {
+        let ml = self.min_levels[g];
+        if self.duplicating {
+            ml <= self.orig_level || is_carrier(self.carriers, g)
+        } else {
+            ml == self.orig_level
+        }
+    }
+
+    /// Is row `g` a carrier here (emitted as a square, not as itself)?
+    #[inline]
+    fn is_carrier_row(&self, g: usize) -> bool {
+        self.duplicating && self.min_levels[g] > self.orig_level && is_carrier(self.carriers, g)
+    }
 }
 
 impl LevelStreamCtx<'_> {
@@ -1725,12 +1852,7 @@ pub(super) fn process_level_batch(
                     return table.contains_key(&g);
                 }
             }
-            let ml = ctx.min_levels[g];
-            if ctx.duplicating {
-                ml <= ctx.orig_level
-            } else {
-                ml == ctx.orig_level
-            }
+            ctx.is_member(g)
         })
         .collect();
     if selected.is_empty() {
@@ -1781,6 +1903,11 @@ pub(super) fn process_level_batch(
                 if let Some((merged, _)) = ctx.coalesce_table.and_then(|t| t.get(&(row_offset + i)))
                 {
                     Simplified::Keep(merged.clone())
+                } else if ctx.is_carrier_row(row_offset + i) {
+                    // #384: a carrier stands in for its neighbourhood's
+                    // dropped area as one placeholder square.
+                    carrier_square(g, ctx.gsd_m, ctx.crs, ctx.simplify)
+                        .map_or(Simplified::Dropped, Simplified::Keep)
                 } else if !ctx.cascade_chain.is_empty() {
                     simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify)
                 } else {
@@ -1913,7 +2040,9 @@ pub(super) fn process_batch_cascade(
         {
             continue;
         }
-        if finest.min_levels[g] <= finest.orig_level {
+        if finest.min_levels[g] <= finest.orig_level
+            || ctxs.iter().any(|c| is_carrier(c.carriers, g))
+        {
             *pos = u32::try_from(selected.len()).expect("batch rows fit in u32");
             selected.push(i);
         }
@@ -2024,6 +2153,17 @@ pub(super) fn process_batch_cascade(
                         verts += count_vertices(s);
                         kept_idx.push(i);
                         kept_geoms.push(s.clone());
+                    }
+                } else if ctx.is_carrier_row(g) {
+                    // #384: not a member, but the carrier of its cell's
+                    // dropped area — one placeholder square.
+                    debug_assert_ne!(pos, u32::MAX, "carrier row missing from cascade superset");
+                    if let Some(sq) =
+                        carrier_square(&geoms[pos as usize], ctx.gsd_m, ctx.crs, ctx.simplify)
+                    {
+                        verts += count_vertices(&sq);
+                        kept_idx.push(i);
+                        kept_geoms.push(sq);
                     }
                 }
             }

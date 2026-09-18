@@ -65,7 +65,7 @@ stored, reusable level.
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell, leaving per-level totals unchanged |
 | `-S` simplification | `--simplify-factor` | RDP, cascading by default |
 | `--drop-fraction-as-needed` tile-size loop | `--tile-size-limit` | Single non-iterative drop pass, since levels are already budgeted |
-| tiny-polygon reduction | `--collapse-square` | Per-feature area dither instead of a per-tile accumulator |
+| tiny-polygon reduction | `--collapse-square` | Area accumulator per 32×GSD patch of the level (tile-less), plus a per-feature dither for write-time collapses |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |
 

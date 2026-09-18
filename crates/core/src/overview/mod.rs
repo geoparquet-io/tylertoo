@@ -11,6 +11,7 @@
 //! file into a PMTiles archive (one zoom per level), and `check` validates
 //! files against the spec (§6.2).
 
+pub mod accumulate;
 pub mod assign;
 pub mod check;
 pub mod cluster;
