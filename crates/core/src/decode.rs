@@ -137,6 +137,26 @@ pub enum DecodeError {
     #[error("archive does not contain vector tiles (tile type {0:?})")]
     NotVectorTiles(TileType),
 
+    #[error("failed to decompress {what} at byte offset {offset} ({length} bytes): {source}")]
+    Decompress {
+        what: &'static str,
+        offset: u64,
+        length: u64,
+        source: std::io::Error,
+    },
+
+    #[error(
+        "failed to decompress tile z{z}/{x}/{y} at byte offset {offset} ({length} bytes): {source}"
+    )]
+    TileDecompress {
+        z: u8,
+        x: u32,
+        y: u32,
+        offset: u64,
+        length: u64,
+        source: std::io::Error,
+    },
+
     #[error("MVT protobuf decode failed for tile z{z}/{x}/{y}: {source}")]
     Mvt {
         z: u8,
@@ -318,29 +338,39 @@ fn collect_tile_refs(
         Ok(&bytes[start..end])
     };
 
-    let decode_dir = |raw: &[u8], what: &str| -> Result<Vec<_>, DecodeError> {
-        let plain = decompress(raw, header.internal_compression)?;
-        decode_directory(&plain)
-            .ok_or_else(|| DecodeError::InvalidArchive(format!("undecodable {what}")))
-    };
+    let decode_dir =
+        |offset: u64, length: u64, what: &'static str| -> Result<Vec<_>, DecodeError> {
+            let raw = section(offset, length, what)?;
+            let plain = decompress(raw, header.internal_compression).map_err(|source| {
+                DecodeError::Decompress {
+                    what,
+                    offset,
+                    length,
+                    source,
+                }
+            })?;
+            decode_directory(&plain).ok_or_else(|| {
+                DecodeError::InvalidArchive(format!(
+                    "undecodable {what} at byte offset {offset} ({length} bytes)"
+                ))
+            })
+        };
 
-    let root_raw = section(
+    let root = decode_dir(
         header.root_dir_offset,
         header.root_dir_length,
         "root directory",
     )?;
-    let root = decode_dir(root_raw, "root directory")?;
 
     let mut entries = Vec::new();
     for entry in root {
         if entry.run_length == 0 {
             // Leaf directory: offset is relative to the leaf-dirs section.
-            let leaf_raw = section(
+            entries.extend(decode_dir(
                 header.leaf_dirs_offset + entry.offset,
                 u64::from(entry.length),
                 "leaf directory",
-            )?;
-            entries.extend(decode_dir(leaf_raw, "leaf directory")?);
+            )?);
         } else {
             entries.push(entry);
         }
@@ -394,7 +424,15 @@ fn decode_tile_features(
     options: &DecodeOptions,
 ) -> Result<Vec<(String, DecodedFeature)>, DecodeError> {
     let raw = &bytes[tile.start..tile.start + tile.len];
-    let plain = decompress(raw, header.tile_compression)?;
+    let plain =
+        decompress(raw, header.tile_compression).map_err(|source| DecodeError::TileDecompress {
+            z: tile.z,
+            x: tile.x,
+            y: tile.y,
+            offset: tile.start as u64,
+            length: tile.len as u64,
+            source,
+        })?;
     let decoded = Tile::decode(plain.as_slice()).map_err(|source| DecodeError::Mvt {
         z: tile.z,
         x: tile.x,
