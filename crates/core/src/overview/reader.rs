@@ -153,6 +153,35 @@ impl OverviewReader {
         Some(bytes / rows as u64)
     }
 
+    /// The largest value of integer column `name` across the whole file, read
+    /// from row-group statistics alone (no data pages).
+    ///
+    /// `None` when the column is absent, is not INT32/INT64, or any row group
+    /// lacks a max statistic — the caller then knows nothing and must treat
+    /// the column as carrying information. Used to recognise provenance
+    /// counters that never left 1 (#379).
+    pub fn int_column_max(&self, name: &str) -> Option<i64> {
+        use parquet::file::statistics::Statistics;
+
+        let descr = self.metadata.file_metadata().schema_descr();
+        let col_idx =
+            (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name)?;
+        let mut max: Option<i64> = None;
+        for rg in 0..self.metadata.num_row_groups() {
+            let rgm = self.metadata.row_group(rg);
+            if rgm.num_rows() == 0 {
+                continue;
+            }
+            let rg_max = match rgm.column(col_idx).statistics()? {
+                Statistics::Int32(s) => i64::from(*s.max_opt()?),
+                Statistics::Int64(s) => *s.max_opt()?,
+                _ => return None,
+            };
+            max = Some(max.map_or(rg_max, |m| m.max(rg_max)));
+        }
+        max
+    }
+
     /// The Arrow schema of the file (including the `level` column).
     pub fn schema(&self) -> &SchemaRef {
         &self.schema

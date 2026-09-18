@@ -634,7 +634,7 @@ fn export_pmtiles_impl(
     // #359: which name each column is published under. Derived once from the
     // file's own rename provenance so a standalone `export-pmtiles` on an
     // overview written by an earlier run restores names just as `tiles` does.
-    let published = PublishedNames::from_meta(reader.meta(), reader.schema());
+    let published = PublishedNames::from_reader(&reader);
 
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
@@ -3140,12 +3140,25 @@ fn geometry_index(schema: &Schema) -> Option<usize> {
 /// `coalesced_count` *are* real MVT properties in the modes that append them,
 /// so a column moved aside from one of those keeps the renamed name — merging
 /// two columns into one key would be worse than the wrong name.
+///
+/// It also carries the *suppressed* columns (#379): provenance counters the
+/// converter appends whenever its feature is on — `coalesced_count` with line
+/// coalescing (the default), `point_count` with `--cluster` — but which never
+/// left 1 because nothing was merged (a polygon layer through the coalescer,
+/// say). A column that is 1 on every row is not a property of the data; in the
+/// tiles it is schema noise a style editor shows as a real attribute, and a tag
+/// pair per feature. The overview file keeps the column — its validator relies
+/// on it — this only decides what the MVT carries. Whether a counter ever
+/// exceeded 1 is read from row-group statistics, so the check costs nothing
+/// and a file whose stats are missing keeps the column (nothing is known).
 #[derive(Debug, Clone, Default)]
 struct PublishedNames {
     /// Schema field name → published key, for the columns that differ.
     /// Empty for the identity mapping, which is the overwhelmingly common
     /// case (nothing collided, or the file predates the provenance).
     restored: HashMap<String, String>,
+    /// Schema field names that are not exported at all (#379).
+    suppressed: HashSet<String>,
 }
 
 impl PublishedNames {
@@ -3197,7 +3210,10 @@ impl PublishedNames {
                  the reserved overview column, #288/#359)"
             );
         }
-        Self { restored }
+        Self {
+            restored,
+            suppressed: HashSet::new(),
+        }
     }
 
     /// Build from an overview file's footer metadata; identity when the file
@@ -3211,6 +3227,37 @@ impl PublishedNames {
             Some(renames) => Self::from_renames(renames, schema),
             None => Self::identity(),
         }
+    }
+
+    /// Build from an open overview file: the rename mapping from its footer,
+    /// plus suppression of the provenance counters that never left 1 (#379).
+    fn from_reader(reader: &OverviewReader) -> Self {
+        let meta = reader.meta();
+        let mut names = Self::from_meta(meta, reader.schema());
+        let generalization = meta.generalization.as_ref();
+        let counters = [
+            generalization
+                .and_then(|g| g.coalescing.as_ref())
+                .map(|c| c.coalesced_count_column.as_str()),
+            generalization
+                .and_then(|g| g.clustering.as_ref())
+                .map(|c| c.point_count_column.as_str()),
+        ];
+        for column in counters.into_iter().flatten() {
+            if reader.int_column_max(column) == Some(1) {
+                log::info!(
+                    "[export] not exporting {column:?}: it is 1 on every row \
+                     (nothing was merged), so it says nothing about the data (#379)"
+                );
+                names.suppressed.insert(column.to_string());
+            }
+        }
+        names
+    }
+
+    /// Whether a schema column is withheld from the tiles entirely.
+    fn is_suppressed(&self, schema_name: &str) -> bool {
+        self.suppressed.contains(schema_name)
     }
 
     /// The MVT key for a schema field name.
@@ -3238,6 +3285,7 @@ fn property_columns(
         .filter(|&(i, f)| {
             i != geom_idx
                 && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+                && !published.is_suppressed(f.name())
                 && is_supported_scalar(f.data_type())
         })
         .map(|(i, f)| (i, published.publish(f.name()).to_string()))
@@ -3333,7 +3381,10 @@ fn field_metadata(
     let geom_idx = geom_idx.unwrap_or(usize::MAX);
     let mut out = HashMap::new();
     for (i, f) in schema.fields().iter().enumerate() {
-        if i == geom_idx || f.name().eq_ignore_ascii_case(LEVEL_COLUMN) {
+        if i == geom_idx
+            || f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+            || published.is_suppressed(f.name())
+        {
             continue;
         }
         let ty = match f.data_type() {
@@ -5956,5 +6007,128 @@ mod tests {
             .read_exact(&mut magic)
             .unwrap();
         assert_eq!(&magic, b"PMTiles");
+    }
+
+    // --- provenance columns that carry no information (#379) ----------------
+
+    /// Two-level fixture whose footer says coalescing was on and whose
+    /// `coalesced_count` column holds `counts[k]` at level k.
+    fn write_coalesced_fixture(path: &Path, counts: &[Vec<i32>]) {
+        use crate::overview::level::{CoalescingProvenance, Generalization};
+        use arrow_array::Int32Array;
+
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let b = Geometry::Point(Point::new(120.0, -40.0));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geometry_field(),
+            Field::new("coalesced_count", DataType::Int32, false),
+        ]));
+        let specs: Vec<LevelSpec> = (0..counts.len())
+            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
+            .collect();
+        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
+        opts.generalization = Some(Generalization {
+            engine: "tylertoo test".to_string(),
+            gsd_base: None,
+            cascade: None,
+            collapse: None,
+            representation: None,
+            levels: vec![],
+            ranking: None,
+            density_drop: None,
+            clustering: None,
+            coalescing: Some(CoalescingProvenance {
+                enabled: true,
+                snap_tolerance_gsd_factor: 1.0,
+                junction_angle: Some(0.0),
+                max_level_rows: Some(2_000_000),
+                coalesced_count_column: "coalesced_count".to_string(),
+            }),
+            renamed_columns: None,
+        });
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        for (k, level_counts) in counts.iter().enumerate() {
+            let n = level_counts.len();
+            let geoms: Vec<Geometry<f64>> = (0..n)
+                .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                    Arc::new(build_geometry_array(&geoms).to_array_ref()),
+                    Arc::new(Int32Array::from(level_counts.clone())),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(k, Some(n), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+    }
+
+    /// Export the fixture and return the property names the tiles carry, as
+    /// seen through `decode_pmtiles` (the union of every layer's keys).
+    fn exported_property_names(input: &Path) -> Vec<String> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(input, tout.path(), &ExportOptions::default()).unwrap();
+        let decoded = tempfile::NamedTempFile::new().unwrap();
+        crate::decode::decode_pmtiles(
+            tout.path(),
+            decoded.path(),
+            &crate::decode::DecodeOptions::default(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(decoded.path()).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "zoom" | "layer" | "mvt_id" | "geometry" | "bbox"
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalesced_count_is_not_exported_when_it_is_1_everywhere() {
+        // A polygon/point-only input gets the column too (coalescing is on by
+        // default) but nothing was ever merged: every value is 1. That is not
+        // a property of the data and must not reach the tiles.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_coalesced_fixture(tin.path(), &[vec![1, 1], vec![1, 1]]);
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["id"], "coalesced_count leaked into the tiles");
+
+        // ... and the layer must not advertise it either.
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        let published = PublishedNames::from_reader(&reader);
+        let fields = field_metadata(reader.schema(), geometry_index(reader.schema()), &published);
+        assert!(
+            !fields.contains_key("coalesced_count"),
+            "vector_layers fields must not advertise it: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn coalesced_count_is_exported_when_coalescing_merged_something() {
+        // Level 0 merged two segments somewhere: the column now carries real
+        // information and stays a property.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_coalesced_fixture(tin.path(), &[vec![2, 1], vec![1, 1]]);
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["coalesced_count", "id"]);
     }
 }
