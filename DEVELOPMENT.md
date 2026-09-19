@@ -255,6 +255,14 @@ RUST_BACKTRACE=1 cargo test --package tylertoo-core <test-name>
 
 ## Dependency Updates
 
+`Cargo.lock` is committed, so every build — local, CI, and the release
+artifacts — resolves to the same versions. Update it deliberately
+(`cargo update -p <crate>`, or let the manifest edit rewrite it) and
+commit the result alongside the change. CI's audit job fails if the lock
+is stale relative to the manifests; the weekly security job deliberately
+re-resolves from scratch as an early warning for what the next bump would
+pull in.
+
 Dependabot (weekly) covers cargo, pip (uv lockfile), and GitHub
 Actions; patch/minor updates auto-merge once all gates pass, majors
 wait for a human. A weekly security job (cargo-audit + cargo-deny +

@@ -5,6 +5,12 @@
 # (advisories, licenses, bans, sources — policy in deny.toml) and pip-audit
 # (against crates/python/uv.lock).
 #
+# Unlike the per-PR audit in ci.yml — which audits the committed Cargo.lock,
+# i.e. exactly what we build and ship -- this job deliberately re-resolves the
+# Rust dependency graph first. That makes it the early-warning lane: it sees
+# advisories, yanks and policy breaks in the versions a future `cargo update`
+# would pick up, before we take the bump.
+#
 # On failure it does NOT fail silently: it opens (or updates) a pinned issue
 # labelled `security-audit` with the failing output, so the advisory has a
 # visible, assignable home.
@@ -77,6 +83,10 @@ jobs:
             fi
           }
 
+          # Deliberate fresh resolution (see the header comment): this lane
+          # audits the *newest* compatible versions, not the committed
+          # Cargo.lock. Do not replace with a plain checkout audit — that is
+          # what ci.yml's audit job already does.
           cargo generate-lockfile
 
           run_audit "cargo audit" cargo audit
