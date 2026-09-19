@@ -777,8 +777,9 @@ struct ConvertTuningArgs {
     /// --coalesce-junction-angle of straight. The merged feature keeps the
     /// attributes of its highest-priority member, and the output gains a
     /// `coalesced_count` INT32 NOT NULL column (source segments merged per
-    /// row; 1 for unmerged rows and everywhere at the canonical level).
-    /// Points and polygons are unaffected. In partitioning mode coalescing
+    /// row; 1 for unmerged rows and everywhere at the canonical level;
+    /// withheld from tiles when it is 1 everywhere). Points and polygons are
+    /// unaffected. In partitioning mode coalescing
     /// is inert (a merged chain cannot satisfy the feature-once/verbatim
     /// contract). See docs/OVERVIEW_TUNING.md.
     #[arg(long, help_heading = "Line coalescing")]

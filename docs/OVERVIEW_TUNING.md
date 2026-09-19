@@ -859,7 +859,9 @@ run:
   member** (same class-rank → size → hash order as the cell-winner stage)
   and the output gains a **`coalesced_count`** INT32 NOT NULL column
   (source segments merged per row; 1 for unmerged rows and everywhere at
-  the canonical level, which is never coalesced).
+  the canonical level, which is never coalesced). It is withheld from tiles
+  when it is 1 everywhere — nothing was merged, so it says nothing about
+  the data (#379); the overview file keeps it.
 - Points and polygons are untouched. MultiLineString rows pass through
   unmerged.
 
@@ -902,7 +904,8 @@ the candidate set at every non-canonical level is **all** lines (dropped
 fragments must be reclaimable, so no winner-table pre-filter applies).
 Datasets with more lines than this ceiling skip coalescing with a warning
 — the file still carries the `coalesced_count` column (all 1) and the
-provenance block, so the schema is stable. Levels that large are
+provenance block, so the overview schema is stable (the tiles then withhold
+the column, as for any all-1 counter). Levels that large are
 near-canonical anyway, where segments are individually visible and
 coalescing matters least. This is the streaming pipeline's one deliberate
 `O(lines)` residual allocation.
@@ -953,7 +956,7 @@ reserved column is authoritative.
 |---|---|---|
 | `level` | always | **no** — dropped from tile properties |
 | `point_count` | `--cluster` | yes |
-| `coalesced_count` | line coalescing (on by default) | yes |
+| `coalesced_count` | line coalescing (on by default) | yes, unless 1 on every row (then withheld from tiles; the overview file keeps it) |
 
 A rename is logged at `warn`:
 
@@ -981,6 +984,8 @@ Restoration is conditional. `point_count` and `coalesced_count` *are* real MVT
 properties in the modes that append them, so a column moved aside from one of
 those keeps its renamed name — merging two columns into one tile property would
 be worse than the wrong name. Only names that are genuinely free are restored.
+A `coalesced_count` withheld from the tiles (1 on every row) counts as free, so
+a source `coalesced_count` is then published under its own name.
 
 By-name options follow the rename automatically (`--sort-key level`,
 `class_ranking.column`, `--accumulate-attribute`, `--filter`), so you do not
