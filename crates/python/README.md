@@ -7,6 +7,61 @@
 
 Fast GeoParquet → PMTiles converter in Rust.
 
+📖 **[Documentation](https://geoparquet-io.github.io/tylertoo/)** ·
+[Getting Started](https://geoparquet-io.github.io/tylertoo/getting-started/) ·
+[Live demo](https://geoparquet-io.github.io/tylertoo/demo/) ·
+[Overview tuning](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) ·
+[CLI reference](https://geoparquet-io.github.io/tylertoo/reference/cli/)
+
+## Quickstart
+
+Three commands and real data — 17,465 Madagascar admin-4 boundary polygons
+(28 MB) from this repo's fixture release. The download dominates; the
+conversion itself takes about a second.
+
+```bash
+cargo install tylertoo
+curl -LO https://github.com/geoparquet-io/tylertoo/releases/download/fixtures-v1/fieldmaps-madagascar-adm4.parquet
+tylertoo fieldmaps-madagascar-adm4.parquet madagascar.pmtiles --max-zoom 10
+```
+
+Real output, with log timestamps stripped and the routine per-level lines
+elided:
+
+```text
+[convert] scan complete: 17465 feature(s) from 17465 row(s)
+[convert] pass 2: building 11 overview level(s) from a single read (finest level streamed last)
+[rss] convert peak: 231 MiB
+  intermediate overview: /var/.../T/.tylertoo-overview-p7TdMr.parquet (25.87 MiB, removed after export; --keep-overview PATH retains it)
+[export] scan complete: 10 levels, single read, 0.15s
+[export] level 10/10 z10 done: 17465 feats, 524 tiles, 1 partitions, 0.3s (total 1s)
+✓ Converted fieldmaps-madagascar-adm4.parquet → madagascar.pmtiles
+  752 tiles across z0..z10 in 1.18s
+  z0 declared but empty: every feature generalized away there (see --collapse / --collapse-square), or an entry-zoom ladder holds every feature out of them
+```
+
+That leaves a 6.7 MB `madagascar.pmtiles`. Drop it onto
+[pmtiles.io](https://pmtiles.io/) to view it — the MVT source-layer is
+`overview`. (z0 is one tile at 39 km/pixel, where every polygon simplifies to
+nothing; `--collapse` keeps them as dots instead.)
+
+From here,
+[Getting Started](https://geoparquet-io.github.io/tylertoo/getting-started/)
+covers preparing your own input and the two-step overview workflow.
+
+> **Status: 0.7, actively developed toward 1.0.** The CLI surface and the
+> `geo:overviews` format still move between minor versions; the
+> [Road to 1.0](https://github.com/geoparquet-io/tylertoo/issues/463) issue
+> tracks what stabilizing them requires. Output is checked against readers
+> other than our own: PMTiles archives are verified with `pmtiles verify`
+> (go-pmtiles) in the test suite, `tylertoo decode` is golden-compared against
+> `tippecanoe-decode`, the generalization ladder is calibrated on rendered
+> sweeps against tippecanoe v2.49 golden tiles
+> ([corpus/SWEEPS.md](corpus/SWEEPS.md)), and overview files stay ordinary
+> GeoParquet that DuckDB and any Arrow reader can open. Published head-to-head
+> benchmark numbers are still to come — see
+> [#447](https://github.com/geoparquet-io/tylertoo/issues/447).
+
 **tylertoo** takes its name from ["Tippecanoe and Tyler Too"](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too),
 the 1840 U.S. campaign slogan. It's a nod to [tippecanoe](https://github.com/felt/tippecanoe),
 the vector-tile tool this project measures itself against — tylertoo runs alongside it.
@@ -16,16 +71,12 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 - PMTiles export from an overview file (`tylertoo export-pmtiles`)
 - One-shot GeoParquet → PMTiles (`tylertoo tiles`, or the bare form)
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
-- Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
+- Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine; measured, see [ARCHITECTURE.md](context/ARCHITECTURE.md))
 - Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/diving-deeper/remote-and-multi-file.md))
 - Attribute filtering (`--filter` / `--where`) — tile only the features matching a SQL-WHERE-style predicate (`"confidence > 0.8"`, `"crop IN ('soy', 'corn')"`), with parquet row-group statistics pushdown so non-matching row groups are never read (or fetched, on remote input); composes with `--bbox` ([Tuning guide](docs/OVERVIEW_TUNING.md#attribute-filter---filter----where))
 - Spec validation (`tylertoo validate`)
 - PMTiles → GeoParquet decoding (`tylertoo decode`) — tippecanoe-decode
   semantics, any PMTiles v3 MVT archive
-
-> **⚠️ Work in Progress**:
-> Code is generated with Claude; take it with a grain of salt.
-> --Nissim
 
 ## Install
 
@@ -33,6 +84,10 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 cargo install tylertoo    # CLI
 pip install tylertoo      # Python
 ```
+
+Prebuilt CLI binaries for Linux (x86_64 gnu and musl), macOS (Intel and Apple
+Silicon) and Windows x86_64 are attached to every
+[GitHub Release](https://github.com/geoparquet-io/tylertoo/releases).
 
 ## Usage
 
@@ -92,11 +147,16 @@ across tiles and zooms — no round-trip guarantee), with `zoom`/`layer`/
 ### Input Preparation
 
 Inputs must be WGS84 (EPSG:4326), and should be Hilbert-sorted with sane
-row groups. Use [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
+row groups. Use [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io)
+(`gpio`, verified against 1.5.0):
 
 ```bash
-gpio convert reproject input.parquet prepared.parquet \
-  -d EPSG:4326 --hilbert --row-group-size 100000
+# Already WGS84: Hilbert-sort and repack row groups in one pass.
+gpio sort hilbert input.parquet prepared.parquet --row-group-size-mb 128
+
+# In another projection: reproject first, then sort.
+gpio convert reproject input.parquet wgs84.parquet -d EPSG:4326
+gpio sort hilbert wgs84.parquet prepared.parquet --row-group-size-mb 128
 ```
 
 ### Python
