@@ -51,7 +51,7 @@ use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_opt_from_array;
 
-use super::accumulate::{is_carrier, tiny_polygon_carriers, AccumulateLevel};
+use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, DensityBudgetConfig,
     FeatureKind, SUPERCELL_GSD_FACTOR,
@@ -1353,6 +1353,19 @@ pub(crate) fn adjusted_for_ladder_and_mode(options: &ConvertOptions) -> Option<C
         );
     }
 
+    // #384: partitioning levels are verbatim, so neither the tiny-polygon
+    // accumulator (a carrier is a second appearance of a feature) nor the
+    // write-time dither ever runs there. Say so rather than silently
+    // producing the same file the flag was meant to change.
+    if matches!(options.mode, Mode::Partitioning)
+        && matches!(options.simplify.collapse, CollapseMode::Square)
+    {
+        log::info!(
+            "collapse-square has no effect in partitioning mode (levels are verbatim: \
+             no polygon is dropped or collapsed, so there is nothing to stand in for)"
+        );
+    }
+
     if !coalescing_off && !collapse_to_point {
         return None;
     }
@@ -2112,8 +2125,7 @@ fn in_memory_carriers(
             gsd_meters: gsd,
             enabled: enabled
                 && l != finest
-                && (options.simplify.collapse == CollapseMode::Square
-                    || level_reprs[l] == Representation::Square),
+                && level_accumulates(options.simplify.collapse, level_reprs[l]),
         })
         .collect();
     if !acc_levels.iter().any(|l| l.enabled) {

@@ -1826,3 +1826,102 @@ fn tiny_polygon_accumulator_preserves_dropped_area_at_coarse_levels() {
         "streaming and in-memory pipelines must agree on carriers"
     );
 }
+
+/// A global `--collapse-square` must not leak polygon carrier squares into
+/// a `point` representation band: at a point-band level the contract is
+/// points only, so the accumulator stays off there (streaming AND
+/// in-memory).
+#[test]
+fn tiny_polygon_accumulator_stays_out_of_point_bands() {
+    use super::convert::RepresentationBand;
+    use super::simplify::Representation;
+
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &field_block(), true, None);
+
+    for streaming in [true, false] {
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let o = ConvertOptions {
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Square,
+                ..SimplifyOptions::default()
+            },
+            representation: vec![RepresentationBand {
+                min_zoom: 2,
+                max_zoom: 5,
+                repr: Representation::Point,
+            }],
+            ..opts(streaming)
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+        for (li, l) in report.levels.iter().enumerate() {
+            let zoom = l.zoom.unwrap();
+            if zoom > 5 {
+                continue; // canonical: the fields themselves
+            }
+            let rows = read_level_ids_geoms(tout.path(), li);
+            let polygons = rows
+                .iter()
+                .filter(|(_, g)| matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)))
+                .count();
+            assert_eq!(
+                polygons,
+                0,
+                "streaming={streaming} z{zoom}: {polygons} polygon(s) in a point band ({} rows)",
+                rows.len()
+            );
+            assert!(
+                rows.iter().any(|(_, g)| matches!(g, Geometry::Point(_))),
+                "streaming={streaming} z{zoom}: point band carries no points"
+            );
+        }
+    }
+}
+
+/// In partitioning mode every level is verbatim: neither the accumulator
+/// nor the dither runs, so `--collapse-square` is accepted and changes
+/// nothing — the feature-once contract holds (a carrier would be a second
+/// appearance) and no placeholder square appears anywhere.
+#[test]
+fn tiny_polygon_accumulator_is_inert_in_partitioning_mode() {
+    use geo::Area;
+
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let fields = field_block();
+    write_input(tin.path(), &fields, true, None);
+    let field_area = match &fields[0] {
+        Some(Geometry::Polygon(p)) => p.unsigned_area(),
+        _ => unreachable!(),
+    };
+
+    for streaming in [true, false] {
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let o = ConvertOptions {
+            mode: Mode::Partitioning,
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Square,
+                ..SimplifyOptions::default()
+            },
+            ..opts(streaming)
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+        let total: usize = report.levels.iter().map(|l| l.feature_count).sum();
+        assert_eq!(
+            total,
+            fields.len(),
+            "streaming={streaming}: feature-once broken (a carrier square appeared)"
+        );
+        for li in 0..report.levels.len() {
+            for (id, g) in read_level_ids_geoms(tout.path(), li) {
+                let area = match &g {
+                    Geometry::Polygon(p) => p.unsigned_area(),
+                    _ => panic!("streaming={streaming}: row {id} is not a polygon"),
+                };
+                assert!(
+                    (area - field_area).abs() < field_area * 1e-6,
+                    "streaming={streaming}: row {id} has area {area:e}, not a verbatim field ({field_area:e})"
+                );
+            }
+        }
+    }
+}

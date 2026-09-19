@@ -533,22 +533,26 @@ Two mechanisms share the threshold `T = tol²` (#384):
 
 **The accumulator** covers every polygon the level does *not* carry —
 failed the visibility gate, lost its thinning cell, cut by the density
-budget. After assignment, each such polygon adds its area to a running
-total for its **patch** (a 32×GSD square, 1/32 of a 1024-px tile), in
-input order; each time a patch's total crosses `T`, the polygon that
-crossed it becomes the level's *carrier* and is emitted as a `T`-area
-square at its representative point, with its own attributes. A patch
-keeps less than one `T` unemitted, so the placeholder area of a level
-equals the dropped area to within one square per patch. This is what
-makes a country of 25 m fields read as farmland at z0 instead of
+budget. After assignment, each such polygon adds its area, **clamped to
+`T`**, to a running total for its **patch** (a 32×GSD square, 1/32 of a
+1024-px tile), in input order; each time a patch's total crosses `T`,
+the polygon that crossed it becomes the level's *carrier* and is emitted
+as a `T`-area square at its representative point, with its own
+attributes. A polygon contributes at most one placeholder of area
+(a gate-failed polygon is often bigger than `T` — the gate is
+`--polygon-visibility` pixels wide — and a thinning or budget loser can
+be any size), and a patch keeps less than one `T` unemitted. This is
+what makes a country of 25 m fields read as farmland at z0 instead of
 vanishing: on a 368k-field sample, z1–z6 carry ~98% of the input area
-against 1.5–7% with the dither alone.
+against 1.5–7% with the dither alone. Features placed by an entry-zoom
+ladder (`--entry-zoom`) are never accumulated: the ladder decides where
+they first appear.
 
 **The dither** covers the polygons the level *does* carry but that
 collapse below `T` at write time (RDP shrinks them under the tolerance):
 one of area `A` survives as a square with probability `A / T`, decided by
 a hash of its anchor coordinates. The two sets are disjoint, so nothing
-is counted twice, and both are exact in expectation.
+is counted twice.
 
 Both are **deterministic**: the accumulator runs once over the pass-1
 feature table in input order, so every engine (in-memory / streaming /
@@ -565,9 +569,18 @@ Divergences from tippecanoe (see `context/ARCHITECTURE.md`):
   land at the carriers' own positions inside the patch (input order is
   Hilbert order for a prepared file, so they cluster where the fields
   are).
+- tippecanoe only accumulates rings with area ≤ `tiny_polygon_size²` and
+  keeps larger rings as geometry; we clamp each polygon's contribution to
+  one placeholder instead of skipping large ones — a non-member was
+  already dropped by the gate or thinning here, so there is no geometry
+  to keep.
+- tippecanoe places the placeholder at the ring's first vertex with side
+  `tiny_polygon_size` (default 2 px); ours sits at the polygon's
+  representative point with side `simplify-factor × GSD`.
 - the accumulator needs duplicating mode (a carrier is a second appearance
   of a feature, which partitioning's feature-once contract cannot
-  represent); in partitioning mode only the dither applies.
+  represent). In partitioning mode neither mechanism applies: levels are
+  verbatim, so `--collapse-square` is accepted and logged as inert.
 
 At the mid zooms, a dense square carpet can exceed `--max-tile-size`; the
 valve then sheds squares for that tile, as it would any feature. Raise

@@ -66,7 +66,7 @@ use rayon::prelude::*;
 use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
 use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
-use super::accumulate::{is_carrier, tiny_polygon_carriers, AccumulateLevel};
+use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind};
 use super::cluster::{build_cluster_tables, verify_sum_invariant, ClusterEntry, ClusterTables};
 use super::coalesce::CoalesceInput;
@@ -312,8 +312,7 @@ fn streaming_carriers(
             gsd_meters: gsd,
             enabled: l != finest_planned
                 && accumulator_enabled(options)
-                && (options.simplify.collapse == CollapseMode::Square
-                    || level_reprs[l] == Representation::Square),
+                && level_accumulates(options.simplify.collapse, level_reprs[l]),
         })
         .collect();
     if !acc_levels.iter().any(|l| l.enabled) {

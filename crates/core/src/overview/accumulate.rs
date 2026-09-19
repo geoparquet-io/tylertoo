@@ -7,8 +7,9 @@
 //! tippecanoe answers this with its tiny-polygon reduction — every dropped
 //! polygon's area goes into a running total, and each time the total crosses
 //! one placeholder's worth a placeholder square is emitted where the
-//! polygon that crossed it sits. Aggregate area is preserved and dense
-//! regions read as dense.
+//! polygon that crossed it sits. Dense regions read as dense, and the
+//! placeholder area tracks the dropped area: a polygon contributes at most
+//! one placeholder of area, and a patch keeps less than one `T` unemitted.
 //!
 //! This is the same accumulator, run once per level after assignment, over
 //! every polygon that is *not* a member of that level, bucketed into
@@ -29,11 +30,23 @@
 //! computed once on the pass-1 feature table, so every engine reads the
 //! same carrier set (the reason the per-feature dither exists is engine
 //! independence; this keeps it).
+//!
+//! Divergences from tippecanoe's `reduce_tiny_poly` (clip.cpp): (a) it only
+//! accumulates rings with area ≤ `tiny_polygon_size²` and keeps larger
+//! rings as geometry, whereas we clamp each polygon's contribution to one
+//! placeholder instead of skipping large ones — they were already dropped
+//! by the gate or thinning here, so there is no geometry to keep; (b) it
+//! places the placeholder at the ring's first vertex with side
+//! `tiny_polygon_size` (default 2 px), whereas ours sits at the polygon's
+//! representative point with side `factor × gsd`. Features placed by an
+//! entry-zoom ladder (#364) are never accumulated: the ladder decides where
+//! they first appear.
 
 use std::collections::HashMap;
 
 use super::assign::{gsd_to_coord_units, AssignFeature, FeatureKind};
 use super::level::Crs;
+use super::simplify::{CollapseMode, Representation};
 
 /// Accumulation patch width in GSD multiples: 1/32 of a 1024-pixel tile.
 pub const ACCUMULATE_CELL_GSD: f64 = 32.0;
@@ -43,10 +56,23 @@ pub const ACCUMULATE_CELL_GSD: f64 = 32.0;
 pub struct AccumulateLevel {
     /// Ground sample distance in meters.
     pub gsd_meters: f64,
-    /// Whether this level accumulates at all (square disposition or a
-    /// square representation band). The canonical level never does — every
-    /// feature is already present there.
+    /// Whether this level accumulates at all ([`level_accumulates`]). The
+    /// canonical level never does — every feature is already present there.
     pub enabled: bool,
+}
+
+/// Whether a level's effective disposition is the placeholder square, i.e.
+/// whether the accumulator runs there: a `square` representation band, or
+/// the global `--collapse-square` at a plain-geometry level. A `point` band
+/// is points only — its polygons thin on the point grid, and their losers
+/// must not come back as squares. Shared by every engine so the carrier
+/// sets cannot drift.
+pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
+    match repr {
+        Representation::Square => true,
+        Representation::Geometry => collapse == CollapseMode::Square,
+        Representation::Point => false,
+    }
 }
 
 /// Run the accumulator. Returns, per level, the **sorted** row indices
@@ -86,10 +112,21 @@ pub fn tiny_polygon_carriers(
             if f.kind != FeatureKind::Polygon || usize::from(ml) <= li {
                 continue; // not a polygon, or already present at this level
             }
+            if f.entry_level.is_some() {
+                continue; // #364: the ladder decides where it first appears
+            }
             let area = f64::from(area);
             if area.is_nan() || area <= 0.0 {
                 continue;
             }
+            // DIVERGENCE FROM TIPPECANOE: tippecanoe only accumulates rings
+            // with area <= pixel² and keeps larger rings as geometry, so its
+            // residual never exceeds one placeholder. Here a non-member is
+            // gone whatever its size (gate-failed polygons routinely sit in
+            // (T, 2T); thinning and budget losers are unbounded), so clamp
+            // the contribution instead: a polygon is worth at most one
+            // placeholder, and the residual invariant (< T per patch) holds.
+            let area = area.min(threshold);
             let (cx, cy) = f.center();
             let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
             let total = acc.entry(key).or_insert(0.0);
@@ -188,6 +225,90 @@ mod tests {
         let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
         assert_eq!(out[0].len(), 2);
         assert_eq!(out[0], vec![3, 8], "the 4th field of each cell crosses");
+    }
+
+    /// A polygon bigger than one placeholder contributes at most one
+    /// placeholder's worth (tippecanoe's accounting: it never accumulates
+    /// a ring above `pixel²`). Ten fields of 1.4 T must leave NO residual
+    /// — the 0.5 T field after them cannot cross on its own.
+    #[test]
+    fn a_polygon_larger_than_the_threshold_contributes_one_placeholder() {
+        let mut feats: Vec<AssignFeature> = (0..10)
+            .map(|i| square(i, 10.0 + i as f64 * 5.0, 10.0, 1183.0))
+            .collect();
+        feats.push(square(10, 100.0, 10.0, 707.0));
+        let min_levels = vec![1u8; 11];
+        let mut areas = vec![1_400_000.0f32; 10];
+        areas.push(500_000.0);
+        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        assert_eq!(
+            out[0],
+            (0..10).collect::<Vec<_>>(),
+            "one carrier per over-threshold field and none for the 0.5 T tail"
+        );
+    }
+
+    /// Mixed over-threshold (T..8T) and tiny (0.1 T) fields in one patch:
+    /// the emitted area (carriers × T) equals Σ min(area, T) to within one
+    /// T, i.e. the residual stays bounded however large the big ones are.
+    #[test]
+    fn over_threshold_areas_are_clamped_before_accumulating() {
+        let t = 1_000_000.0f64;
+        let big = [1.5, 3.0, 7.9, 1.01, 5.0, 2.0, 6.5, 1.2, 4.4, 7.0];
+        let mut feats = Vec::new();
+        let mut areas = Vec::new();
+        for (i, &b) in big.iter().enumerate() {
+            feats.push(square(2 * i, 10.0 + i as f64 * 5.0, 10.0, 100.0));
+            areas.push((b * t) as f32);
+            feats.push(square(2 * i + 1, 20.0 + i as f64 * 5.0, 10.0, 100.0));
+            areas.push((0.1 * t) as f32);
+        }
+        let min_levels = vec![1u8; feats.len()];
+        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let expected: f64 = areas.iter().map(|&a| f64::from(a).min(t)).sum();
+        let emitted = out[0].len() as f64 * t;
+        assert!(
+            emitted <= expected + 1.0 && emitted > expected - t,
+            "{} carriers emit {emitted:e} for {expected:e} of clamped area",
+            out[0].len()
+        );
+        // Every big field is its own carrier; the tinies together make
+        // exactly one more (10 × 0.1 T).
+        assert_eq!(out[0].len(), big.len() + 1, "{:?}", out[0]);
+    }
+
+    /// #364: a feature the entry-zoom ladder placed at level 3 is held out
+    /// of levels 0..3 on purpose; its area must not turn into carrier
+    /// squares there, however large it is.
+    #[test]
+    fn laddered_features_are_never_accumulated() {
+        let mut feats: Vec<AssignFeature> = (0..3).map(|i| square(i, 10.0, 10.0, 5000.0)).collect();
+        for f in &mut feats {
+            f.entry_level = Some(3);
+        }
+        let min_levels = vec![3u8; 3];
+        let areas = vec![25_000_000.0f32; 3]; // 25 T each
+        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        assert!(
+            out[0].is_empty(),
+            "laddered features became carriers: {:?}",
+            out[0]
+        );
+    }
+
+    /// The per-level switch both engines share: a `point` band never
+    /// accumulates, whatever the global disposition.
+    #[test]
+    fn point_bands_never_accumulate() {
+        use CollapseMode as C;
+        use Representation as R;
+        assert!(level_accumulates(C::Square, R::Geometry));
+        assert!(level_accumulates(C::Square, R::Square));
+        assert!(level_accumulates(C::Drop, R::Square));
+        assert!(!level_accumulates(C::Square, R::Point));
+        assert!(!level_accumulates(C::Drop, R::Geometry));
+        assert!(!level_accumulates(C::Point, R::Geometry));
+        assert!(!level_accumulates(C::Point, R::Point));
     }
 
     #[test]
