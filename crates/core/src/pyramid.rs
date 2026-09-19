@@ -656,6 +656,10 @@ pub fn build_pyramid(
 
         let export = ExportOptions {
             layer_name: band.layer.clone(),
+            // The band's own range, not a caller-wide value: a `min_zoom`
+            // set on `opts.export` would apply to every band alike, and be
+            // rejected by any band whose range starts finer (#380).
+            min_zoom: Some(band.min_zoom),
             ..opts.export.clone()
         };
         export_pmtiles(overview.path(), archive.path(), &export).map_err(|e| {
@@ -699,6 +703,14 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     // 300-byte band archive into 164 KiB.
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)
         .map_err(|e| Error::PMTilesWrite(format!("Failed to create streaming writer: {e}")))?;
+    // #380: a band's coarse zooms may hold no tiles (every feature generalized
+    // away there), and the writer would otherwise derive the header's min
+    // zoom from the coarsest tile it sees while `vector_layers[].minzoom`
+    // says what the band declared. Declare the coarsest band; the writer
+    // widens over empty zooms and never narrows over real tiles.
+    if let Some(min_zoom) = bands.iter().map(|b| b.min_zoom).min() {
+        writer.set_declared_min_zoom(min_zoom);
+    }
     let mut layers: Vec<LayerMeta> = Vec::new();
     let mut per_band = Vec::new();
     let mut skipped_total = 0usize;
@@ -1392,6 +1404,42 @@ mod tests {
             .into_iter()
             .map(|l| l.name)
             .collect()
+    }
+
+    /// #380 on the pyramid path: a band declared `0-3` whose coarse zooms
+    /// generalized to nothing holds tiles only at z3. The merged header must
+    /// still declare z0, as `vector_layers[].minzoom` already does — on both
+    /// the single-pass and the shared-zoom path.
+    #[test]
+    fn merge_declares_the_bands_min_zoom_even_when_coarse_zooms_are_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        write_band_with_payload(&a, "2024", &[(3, 1, 1)], &layer_tile("2024"));
+        write_band_with_payload(&b, "2025", &[(3, 2, 2)], &layer_tile("2025"));
+
+        // Single band, single-pass path.
+        let out = dir.path().join("one.pmtiles");
+        merge_bands(
+            &[Band::parse(&format!("0-3:{}:2024", a.display())).unwrap()],
+            &out,
+        )
+        .unwrap();
+        let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!((h.min_zoom, h.max_zoom), (0, 3), "single-pass header");
+
+        // Two layers over shared zooms, two-phase path; the coarser band wins.
+        let out = dir.path().join("two.pmtiles");
+        merge_bands(
+            &[
+                Band::parse(&format!("2-3:{}:2024", a.display())).unwrap(),
+                Band::parse(&format!("1-3:{}:2025", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+        let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!((h.min_zoom, h.max_zoom), (1, 3), "two-phase header");
     }
 
     /// #385: at a zoom two bands share, a tile both wrote carries both layers

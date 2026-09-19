@@ -190,7 +190,10 @@ pub struct PyramidArgs {
     /// band's layer, so `--band 0-13:a.parquet:2024 --band 0-13:b.parquet:2025
     /// --generalize` is one archive with two independently generalized
     /// layers. The per-tile size cap applies to each band's tiles before
-    /// they are combined, not to the combined tile.
+    /// they are combined, not to the combined tile. For a pre-tiled archive
+    /// LAYER is a label: when bands share zooms it must match the layer
+    /// name inside the archive, or the merge is refused rather than write
+    /// two layers of one name into a tile.
     ///
     /// INPUT may not contain a `:`, which the spec cannot tell apart from the
     /// LAYER separator; rename the file or point at it through a symlink.
