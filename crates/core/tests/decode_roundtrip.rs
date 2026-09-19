@@ -538,3 +538,173 @@ fn decode_golden_against_tippecanoe_decode() {
         ours.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Foreign root → leaf layout (#377 / #382)
+// ---------------------------------------------------------------------------
+
+/// Protobuf varint.
+fn varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// A minimal MVT tile: one layer `t` (extent 4096, version 2) holding one
+/// point feature at tile-local `(x, y)`. Distinct coordinates give distinct
+/// tile bytes, so the writer cannot collapse the tiles into runs.
+fn mvt_point_tile(x: u32, y: u32) -> Vec<u8> {
+    let zigzag = |v: u32| u64::from(v) << 1; // non-negative → zigzag is v*2
+    let mut geom = Vec::new();
+    varint(9, &mut geom); // MoveTo, count 1
+    varint(zigzag(x), &mut geom);
+    varint(zigzag(y), &mut geom);
+
+    let mut feature = vec![0x18, 0x01]; // type = POINT
+    feature.push(0x22); // geometry (packed)
+    varint(geom.len() as u64, &mut feature);
+    feature.extend_from_slice(&geom);
+
+    let mut layer = vec![0x0A, 0x01, b't']; // name = "t"
+    layer.push(0x12); // features
+    varint(feature.len() as u64, &mut layer);
+    layer.extend_from_slice(&feature);
+    layer.extend_from_slice(&[0x28, 0x80, 0x20]); // extent = 4096
+    layer.extend_from_slice(&[0x78, 0x02]); // version = 2
+
+    let mut tile = vec![0x1A]; // layers
+    varint(layer.len() as u64, &mut tile);
+    tile.extend_from_slice(&layer);
+    tile
+}
+
+/// Re-encode a directory of leaf pointers the way tippecanoe / go-pmtiles
+/// write a root: every offset after the first is the contiguous marker 0.
+/// Independent of `encode_directory` on purpose — this pins the on-disk
+/// shape that other writers produce, whatever our encoder does.
+fn tippecanoe_style_root(entries: &[tylertoo_core::pmtiles_writer::DirEntry]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    varint(entries.len() as u64, &mut buf);
+    let mut last_id = 0;
+    for e in entries {
+        varint(e.tile_id - last_id, &mut buf);
+        last_id = e.tile_id;
+    }
+    for e in entries {
+        varint(u64::from(e.run_length), &mut buf);
+    }
+    for e in entries {
+        varint(u64::from(e.length), &mut buf);
+    }
+    for (i, e) in entries.iter().enumerate() {
+        if i == 0 {
+            varint(e.offset + 1, &mut buf);
+        } else {
+            let prev = &entries[i - 1];
+            assert_eq!(
+                e.offset,
+                prev.offset + u64::from(prev.length),
+                "leaf directories must be laid out back to back for this test"
+            );
+            varint(0, &mut buf);
+        }
+    }
+    buf
+}
+
+/// Decode an archive whose root directory points at leaf directories using
+/// the spec's contiguous-offset encoding — the layout tippecanoe and
+/// go-pmtiles produce, and the one that failed with "incomplete deflate
+/// stream" before #377. The archive is synthesized here: our writer supplies
+/// the leaves and tile data, and the root is rewritten by hand.
+#[test]
+fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
+    use tylertoo_core::compression::{compress, decompress};
+    use tylertoo_core::pmtiles_writer::{decode_directory, Header};
+    use tylertoo_core::{Compression, StreamingPmtilesWriter};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ours = dir.path().join("ours.pmtiles");
+
+    // Enough distinct tiles, scattered widely enough, that the *compressed*
+    // root exceeds the 16 KB budget and overflows into leaf directories. A
+    // regular block of tiles has near-zero entropy in its id deltas and
+    // gzips into the root no matter how many there are.
+    const N: u32 = 12_000;
+    const Z: u8 = 13;
+    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+    writer.set_layer_name("t");
+    let mut seen = std::collections::HashSet::new();
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    while seen.len() < N as usize {
+        // xorshift64*: deterministic, no dependency
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let r = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let (x, y) = ((r & 0x1FFF) as u32, ((r >> 13) & 0x1FFF) as u32);
+        if seen.insert((x, y)) {
+            writer
+                .add_tile(Z, x, y, &mvt_point_tile(x % 4096, y % 4096))
+                .unwrap();
+        }
+    }
+    writer.finalize(&ours).unwrap();
+
+    let bytes = std::fs::read(&ours).unwrap();
+    let header = Header::from_bytes(&bytes[..127]).unwrap();
+    assert!(
+        header.leaf_dirs_length > 0,
+        "fixture must have leaf directories, got none for {N} tiles"
+    );
+    let root_start = header.root_dir_offset as usize;
+    let root_end = root_start + header.root_dir_length as usize;
+    let root = decode_directory(
+        &decompress(&bytes[root_start..root_end], header.internal_compression).unwrap(),
+    )
+    .unwrap();
+    assert!(root.len() > 1, "root must hold several leaf pointers");
+    assert!(root.iter().all(|e| e.run_length == 0));
+
+    // Splice in the foreign-style root. Its length differs from ours, so
+    // every later section shifts by `delta`.
+    let plain_root = tippecanoe_style_root(&root);
+    // Our encoder now writes exactly this shape; pin that parity explicitly,
+    // since the splice below is otherwise a no-op against our own archive.
+    assert_eq!(
+        tylertoo_core::pmtiles_writer::encode_directory(&root),
+        plain_root,
+        "encode_directory must write leaf pointers with contiguous offsets"
+    );
+    let foreign_root = compress(&plain_root, header.internal_compression).unwrap();
+    let delta = foreign_root.len() as i64 - header.root_dir_length as i64;
+    let shift = |off: u64| (off as i64 + delta) as u64;
+    let foreign_header = Header {
+        root_dir_length: foreign_root.len() as u64,
+        json_metadata_offset: shift(header.json_metadata_offset),
+        leaf_dirs_offset: shift(header.leaf_dirs_offset),
+        tile_data_offset: shift(header.tile_data_offset),
+        ..header
+    };
+    let mut foreign = Vec::with_capacity(bytes.len());
+    foreign.extend_from_slice(&foreign_header.to_bytes());
+    foreign.extend_from_slice(&bytes[127..root_start]);
+    foreign.extend_from_slice(&foreign_root);
+    foreign.extend_from_slice(&bytes[root_end..]);
+    let theirs = dir.path().join("theirs.pmtiles");
+    std::fs::write(&theirs, &foreign).unwrap();
+
+    // Decode both; the foreign layout must yield exactly the same tiles.
+    let decode = |input: &Path, name: &str| {
+        let out = dir.path().join(name);
+        decode_pmtiles(input, &out, &DecodeOptions::default()).unwrap()
+    };
+    let ours_report = decode(&ours, "ours.parquet");
+    let theirs_report = decode(&theirs, "theirs.parquet");
+    assert_eq!(ours_report.tiles_read, u64::from(N));
+    assert_eq!(theirs_report.tiles_read, ours_report.tiles_read);
+    assert_eq!(theirs_report.features_written, ours_report.features_written);
+    assert_eq!(theirs_report.features_written, u64::from(N));
+}
