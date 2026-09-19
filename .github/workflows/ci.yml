@@ -127,10 +127,13 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Install cargo-machete
+      - name: Install cargo-shear
         uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
-          tool: cargo-machete
+          tool: cargo-shear
+
+      - name: Install similarity-rs
+        run: cargo install similarity-rs --locked
 
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -164,7 +167,28 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Check for unused dependencies
-        run: cargo machete
+        # cargo-shear, not cargo-machete: it also inspects
+        # [workspace.dependencies], where machete only reads member crates.
+        # Intentional non-code deps are listed under
+        # [package.metadata.cargo-shear] in the owning crate.
+        run: cargo shear
+
+      - name: Check for duplicated code
+        # Hard gate at 0.95 APTED similarity. The workspace has zero pairs at
+        # or above this threshold. similarity-rs has no baseline or per-pair
+        # suppression, so a new finding must be refactored, not annotated.
+        # RATCHET: lower the threshold as duplication drops — never raise it.
+        run: |
+          similarity-rs \
+            --threshold 0.95 \
+            --min-lines 10 \
+            --skip-test \
+            crates/core/src crates/cli/src crates/python/src \
+            | tee similarity.txt
+          if grep -q "Similarity:" similarity.txt; then
+            echo "::error::duplicate code found at >=0.95 similarity"
+            exit 1
+          fi
 
       - name: Run unit tests
         run: cargo test --lib --all-features
@@ -497,16 +521,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # cargo-semver-checks resolves its baseline from a git revision,
+          # so the job needs main's history, not just this commit.
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
 
-      - name: Install cargo-audit and cargo-deny
+      - name: Install cargo-audit, cargo-deny, and cargo-semver-checks
         uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
-          tool: cargo-audit,cargo-deny
+          tool: cargo-audit,cargo-deny,cargo-semver-checks
 
       - name: Generate lockfile
         run: cargo generate-lockfile
@@ -516,6 +543,76 @@ jobs:
 
       - name: Run cargo deny (advisories, licenses, bans, sources)
         run: cargo deny check
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Check for breaking API changes
+        # Compares tylertoo-core's public API against main and fails on a
+        # breaking change that the version bump does not allow. Pre-1.0, a
+        # breaking change requires a MINOR bump.
+        #
+        # The baseline is a git revision, not crates.io: tylertoo-core is
+        # unpublished, so the default registry lookup finds nothing. On a
+        # push to main the baseline is HEAD, which passes trivially; the PR
+        # run is the gate that matters.
+        run: |
+          cargo semver-checks check-release \
+            --package tylertoo-core \
+            --baseline-rev origin/main
+
+  # Public API surface: fail when tylertoo-core's exported API drifts from the
+  # committed baseline. This is a REVIEW gate, not a ban on growth — an
+  # intentional change is landed by regenerating the baseline in the same PR:
+  #
+  #   cd crates/core
+  #   rustup toolchain install $NIGHTLY   # the pin below
+  #   cargo +$NIGHTLY public-api --simplified > api/tylertoo-core.txt
+  #
+  # TOOLCHAIN EXCEPTION: this is the one job with a pinned toolchain. The
+  # workspace policy is floating `stable` (see the header), but the baseline
+  # is rustdoc JSON, and rustdoc renders paths differently from one nightly
+  # to the next. A floating `nightly` broke this gate with no source change
+  # when `std::io::Error` started printing as `core::io::error::Error`. The
+  # pin makes the diff mean "the API changed", not "rustc changed". Bump it
+  # deliberately, regenerating the baseline in the same commit.
+  public-api:
+    name: Public API
+    runs-on: ubuntu-latest
+    env:
+      NIGHTLY: nightly-2026-09-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust nightly
+        # cargo-public-api reads rustdoc JSON, which is nightly-only.
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked
+
+      - name: Diff the public API against the baseline
+        run: |
+          cargo "+$NIGHTLY" public-api --simplified > api-current.txt
+          if ! diff -u api/tylertoo-core.txt api-current.txt; then
+            echo "::error::tylertoo-core public API changed."
+            echo "Regenerate the baseline in this PR if the change is intended:"
+            echo "  cd crates/core && cargo +$NIGHTLY public-api \\"
+            echo "    --simplified > api/tylertoo-core.txt"
+            exit 1
+          fi
+        working-directory: crates/core
 
   # Lint the CI configuration itself.
   ci-lint:

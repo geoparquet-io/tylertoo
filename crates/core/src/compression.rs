@@ -76,6 +76,46 @@ impl Compression {
     }
 }
 
+/// One direction of the codec: the three per-algorithm entry points plus the
+/// verb used in the `Unknown` error message.
+///
+/// `compress` and `decompress` are mirror images. Writing the match arms twice
+/// meant every new algorithm had to be added in two places, so the dispatch
+/// lives here once and each public function supplies its own table.
+struct Codec {
+    verb: &'static str,
+    gzip: fn(&[u8]) -> io::Result<Vec<u8>>,
+    brotli: fn(&[u8]) -> io::Result<Vec<u8>>,
+    zstd: fn(&[u8]) -> io::Result<Vec<u8>>,
+}
+
+const COMPRESS: &Codec = &Codec {
+    verb: "compress",
+    gzip: compress_gzip,
+    brotli: compress_brotli,
+    zstd: compress_zstd,
+};
+
+const DECOMPRESS: &Codec = &Codec {
+    verb: "decompress",
+    gzip: decompress_gzip,
+    brotli: decompress_brotli,
+    zstd: decompress_zstd,
+};
+
+fn dispatch(data: &[u8], compression: Compression, codec: &Codec) -> io::Result<Vec<u8>> {
+    match compression {
+        Compression::Unknown => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Cannot {} with unknown compression type", codec.verb),
+        )),
+        Compression::None => Ok(data.to_vec()),
+        Compression::Gzip => (codec.gzip)(data),
+        Compression::Brotli => (codec.brotli)(data),
+        Compression::Zstd => (codec.zstd)(data),
+    }
+}
+
 /// Compress data using the specified algorithm.
 ///
 /// # Arguments
@@ -85,16 +125,7 @@ impl Compression {
 /// # Returns
 /// Compressed data, or original data if compression is None.
 pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
-    match compression {
-        Compression::Unknown => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Cannot compress with unknown compression type",
-        )),
-        Compression::None => Ok(data.to_vec()),
-        Compression::Gzip => compress_gzip(data),
-        Compression::Brotli => compress_brotli(data),
-        Compression::Zstd => compress_zstd(data),
-    }
+    dispatch(data, compression, COMPRESS)
 }
 
 /// Decompress data using the specified algorithm.
@@ -110,16 +141,7 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
 /// # Returns
 /// Decompressed data, or a copy of the input if compression is None.
 pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
-    match compression {
-        Compression::Unknown => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Cannot decompress with unknown compression type",
-        )),
-        Compression::None => Ok(data.to_vec()),
-        Compression::Gzip => decompress_gzip(data),
-        Compression::Brotli => decompress_brotli(data),
-        Compression::Zstd => decompress_zstd(data),
-    }
+    dispatch(data, compression, DECOMPRESS)
 }
 
 /// Decompress gzip data.

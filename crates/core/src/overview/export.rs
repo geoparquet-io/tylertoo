@@ -631,6 +631,68 @@ fn export_pmtiles_with_partition_target(
     )
 }
 
+/// Plan every level's partitions and wave width.
+///
+/// `ceiling_wave` is the resolved `--partition-wave` upper bound. On `auto`
+/// each level narrows it further from its own densest partition (#311); an
+/// explicit wave is honoured verbatim.
+#[allow(clippy::too_many_arguments)]
+fn plan_levels(
+    scans: &[LevelScan],
+    meta: &OverviewsMeta,
+    num_levels: usize,
+    partition_target: usize,
+    ceiling_wave: usize,
+    auto_wave: bool,
+    mean_member_bytes: Option<u64>,
+    available_ram: Option<u64>,
+) -> Vec<LevelPlan> {
+    scans
+        .iter()
+        .enumerate()
+        .map(|(level_idx, scan)| {
+            let zoom = zoom_for_level(meta, level_idx);
+
+            // Split the zoom's tiles into contiguous ascending (x, y) ranges
+            // of roughly `partition_target` members each.
+            let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
+
+            // Per-level memory guard (#311): on `auto`, narrow the wave from
+            // THIS level's densest planned partition so a dense finest zoom
+            // does not OOM the whole run. Explicit waves are honoured verbatim.
+            let wave = if auto_wave {
+                let w = memory_safe_level_wave(
+                    ceiling_wave,
+                    &partitions,
+                    mean_member_bytes,
+                    available_ram,
+                );
+                if w < ceiling_wave {
+                    let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+                    let budget_mib = available_ram
+                        .map(|r| ((r as f64 * EXPORT_WAVE_RAM_FRACTION) as u64) / (1024 * 1024))
+                        .unwrap_or(0);
+                    log::info!(
+                        "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
+                         (densest partition {densest} members × ~{} B/member × {MEMBER_MEMORY_INFLATION}, \
+                         {budget_mib} MiB budget) — #311 density guard",
+                        level_idx + 1,
+                        mean_member_bytes.unwrap_or(0),
+                    );
+                }
+                w
+            } else {
+                ceiling_wave
+            };
+            LevelPlan {
+                zoom,
+                partitions,
+                wave,
+            }
+        })
+        .collect()
+}
+
 /// Full implementation with the #235 test knobs: `force_legacy_pass2` pins the
 /// pre-#235 per-level wave-read pass 2 (the byte-identity oracle the
 /// single-read fan-out is tested against; also the production duplicating
@@ -762,50 +824,16 @@ fn export_pmtiles_impl(
     // single-read fill (#235) routes members by (level, partition, wave), so
     // the drain loop below must consume the exact same plan it was filled
     // against; hoisting the planning out of the level loop guarantees that.
-    let plans: Vec<LevelPlan> = scans
-        .iter()
-        .enumerate()
-        .map(|(level_idx, scan)| {
-            let zoom = zoom_for_level(&meta, level_idx);
-
-            // Split the zoom's tiles into contiguous ascending (x, y) ranges
-            // of roughly `partition_target` members each.
-            let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
-
-            // Per-level memory guard (#311): on `auto`, narrow the wave from
-            // THIS level's densest planned partition so a dense finest zoom
-            // does not OOM the whole run. Explicit waves are honoured verbatim.
-            let wave = if auto_wave {
-                let w = memory_safe_level_wave(
-                    ceiling_wave,
-                    &partitions,
-                    mean_member_bytes,
-                    available_ram,
-                );
-                if w < ceiling_wave {
-                    let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-                    let budget_mib = available_ram
-                        .map(|r| ((r as f64 * EXPORT_WAVE_RAM_FRACTION) as u64) / (1024 * 1024))
-                        .unwrap_or(0);
-                    log::info!(
-                        "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
-                         (densest partition {densest} members × ~{} B/member × {MEMBER_MEMORY_INFLATION}, \
-                         {budget_mib} MiB budget) — #311 density guard",
-                        level_idx + 1,
-                        mean_member_bytes.unwrap_or(0),
-                    );
-                }
-                w
-            } else {
-                ceiling_wave
-            };
-            LevelPlan {
-                zoom,
-                partitions,
-                wave,
-            }
-        })
-        .collect();
+    let plans = plan_levels(
+        &scans,
+        &meta,
+        num_levels,
+        partition_target,
+        ceiling_wave,
+        auto_wave,
+        mean_member_bytes,
+        available_ram,
+    );
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
     // is the accumulating row-group prefix (§5.1), so the legacy per-level
@@ -848,99 +876,21 @@ fn export_pmtiles_impl(
     };
 
     for (level_idx, plan) in plans.iter().enumerate() {
-        let scan = &scans[level_idx];
-        let zoom = plan.zoom;
-        let partitions = &plan.partitions;
-        let partition_wave = plan.wave;
-
-        // Pass 2: process partitions in ascending tile order, streaming each
-        // finished partition's encoded tiles straight to the writer. To hide
-        // the per-partition band re-read/decode behind clip work, partitions
-        // are processed in small parallel waves (order-preserving collect,
-        // then a serial in-order write), so peak memory is O(one wave of
-        // partitions + writer state), not O(zoom band).
-        let t_tiles = Instant::now();
-        let ctx = LevelCtx {
-            reader: &reader,
-            level_idx,
-            crs,
-            zoom,
-            opts: options,
-            published: &published,
-        };
-        let mut tile_count = 0usize;
-        let mut tile_feature_count = 0usize;
-        let mut oversized = 0usize;
-        let mut write_secs = 0f64;
-        let total_waves = partitions.len().div_ceil(partition_wave);
-        // Within-level progress (#229): a long finest level is where runs get
-        // stuck, so emit a throttled wave counter. If it advances the level is
-        // slow; if it freezes the level is stuck — diagnosable in minutes.
-        let mut last_wave_log = Instant::now();
-        for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
-            let results: Vec<Vec<EncodedTile>> = match store.as_mut() {
-                Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options)?,
-                None => process_wave(&ctx, wave)?,
-            };
-            let t_write = Instant::now();
-            for tiles in &results {
-                for t in tiles {
-                    tile_feature_count += t.feature_count;
-                    if t.oversized {
-                        oversized += 1;
-                    }
-                    writer.add_tile_precompressed(
-                        zoom,
-                        t.x,
-                        t.y,
-                        t.hash,
-                        &t.data,
-                        t.raw_len,
-                        t.feature_count,
-                    )?;
-                }
-                tile_count += tiles.len();
-            }
-            write_secs += t_write.elapsed().as_secs_f64();
-
-            if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
-                log::info!(
-                    "[export] level {}/{num_levels} z{zoom}: wave {}/{total_waves}, \
-                     {tile_count} tiles, {:.0}s",
-                    level_idx + 1,
-                    wave_idx + 1,
-                    start.elapsed().as_secs_f64(),
-                );
-                last_wave_log = Instant::now();
-            }
-        }
-        // Per-level summary at info so operators see progress without RUST_LOG
-        // (env_logger defaults to info). Detailed clip/write split stays debug.
-        log::info!(
-            "[export] level {}/{num_levels} z{zoom} done: {} feats, {tile_count} tiles, \
-             {} partitions, {:.1}s (total {:.0}s)",
-            level_idx + 1,
-            scan.feature_count,
-            partitions.len(),
-            t_tiles.elapsed().as_secs_f64(),
-            start.elapsed().as_secs_f64(),
-        );
-        log::debug!(
-            "[profile] z{zoom} (level {level_idx}, {} feats, {tile_count} tiles, {} partitions): \
-             clip+encode+gzip={:.2}s write={write_secs:.2}s",
-            scan.feature_count,
-            partitions.len(),
-            t_tiles.elapsed().as_secs_f64() - write_secs,
-        );
-
-        zooms.push(ZoomReport {
-            zoom,
-            level: level_idx,
-            level_feature_count: scan.feature_count,
-            tile_count,
-            tile_feature_count,
-            oversized_tiles: oversized,
-        });
+        zooms.push(export_level(
+            &mut writer,
+            store.as_mut(),
+            &ExportLevelCtx {
+                reader: &reader,
+                scan: &scans[level_idx],
+                plan,
+                level_idx,
+                num_levels,
+                crs,
+                published: &published,
+                options,
+                start,
+            },
+        )?);
 
         // Salvageable output (#229): snapshot a valid archive capped at this
         // zoom so an interrupted run keeps its finished zooms. Throttled, and
@@ -951,8 +901,9 @@ fn export_pmtiles_impl(
             writer.checkpoint(output_path.as_ref())?;
             last_checkpoint = Instant::now();
             log::info!(
-                "[export] checkpoint written: zooms {}..={zoom} salvageable ({:.2}s)",
+                "[export] checkpoint written: zooms {}..={} salvageable ({:.2}s)",
                 zoom_for_level(&meta, 0),
+                plan.zoom,
                 t_ckpt.elapsed().as_secs_f64(),
             );
         }
@@ -979,6 +930,134 @@ fn export_pmtiles_impl(
         total_tile_features,
         oversized_tiles,
         duration_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+/// Everything one level's pass-2 render reads besides the writer and the
+/// member store.
+struct ExportLevelCtx<'a> {
+    reader: &'a OverviewReader,
+    /// This level's scan-pass result (feature count, bounds, tile counts).
+    scan: &'a LevelScan,
+    /// This level's partitions and wave width, fixed by [`plan_levels`].
+    plan: &'a LevelPlan,
+    level_idx: usize,
+    num_levels: usize,
+    crs: Crs,
+    published: &'a PublishedNames,
+    options: &'a ExportOptions,
+    /// Start of the whole export, for the elapsed-time progress lines.
+    start: Instant,
+}
+
+/// Render and write one level's tiles, then report what it produced.
+///
+/// Partitions are processed in ascending tile order, and each finished
+/// partition's encoded tiles stream straight to the writer. To hide the
+/// per-partition band re-read/decode behind clip work, partitions run in small
+/// parallel waves (order-preserving collect, then a serial in-order write), so
+/// peak memory is O(one wave of partitions + writer state), not O(zoom band).
+fn export_level(
+    writer: &mut StreamingPmtilesWriter,
+    mut store: Option<&mut MemberStore>,
+    level: &ExportLevelCtx<'_>,
+) -> Result<ZoomReport, ExportError> {
+    let ExportLevelCtx {
+        reader,
+        scan,
+        plan,
+        level_idx,
+        num_levels,
+        crs,
+        published,
+        options,
+        start,
+    } = *level;
+    let zoom = plan.zoom;
+    let partitions = &plan.partitions;
+    let partition_wave = plan.wave;
+
+    let t_tiles = Instant::now();
+    let ctx = LevelCtx {
+        reader,
+        level_idx,
+        crs,
+        zoom,
+        opts: options,
+        published,
+    };
+    let mut tile_count = 0usize;
+    let mut tile_feature_count = 0usize;
+    let mut oversized = 0usize;
+    let mut write_secs = 0f64;
+    let total_waves = partitions.len().div_ceil(partition_wave);
+    // Within-level progress (#229): a long finest level is where runs get
+    // stuck, so emit a throttled wave counter. If it advances the level is
+    // slow; if it freezes the level is stuck — diagnosable in minutes.
+    let mut last_wave_log = Instant::now();
+    for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
+        let results: Vec<Vec<EncodedTile>> = match store.as_deref_mut() {
+            Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options)?,
+            None => process_wave(&ctx, wave)?,
+        };
+        let t_write = Instant::now();
+        for tiles in &results {
+            for t in tiles {
+                tile_feature_count += t.feature_count;
+                if t.oversized {
+                    oversized += 1;
+                }
+                writer.add_tile_precompressed(
+                    zoom,
+                    t.x,
+                    t.y,
+                    t.hash,
+                    &t.data,
+                    t.raw_len,
+                    t.feature_count,
+                )?;
+            }
+            tile_count += tiles.len();
+        }
+        write_secs += t_write.elapsed().as_secs_f64();
+
+        if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
+            log::info!(
+                "[export] level {}/{num_levels} z{zoom}: wave {}/{total_waves}, \
+                 {tile_count} tiles, {:.0}s",
+                level_idx + 1,
+                wave_idx + 1,
+                start.elapsed().as_secs_f64(),
+            );
+            last_wave_log = Instant::now();
+        }
+    }
+    // Per-level summary at info so operators see progress without RUST_LOG
+    // (env_logger defaults to info). Detailed clip/write split stays debug.
+    log::info!(
+        "[export] level {}/{num_levels} z{zoom} done: {} feats, {tile_count} tiles, \
+         {} partitions, {:.1}s (total {:.0}s)",
+        level_idx + 1,
+        scan.feature_count,
+        partitions.len(),
+        t_tiles.elapsed().as_secs_f64(),
+        start.elapsed().as_secs_f64(),
+    );
+    log::debug!(
+        "[profile] z{zoom} (level {level_idx}, {} feats, {tile_count} tiles, {} partitions): \
+         clip+encode+gzip={:.2}s write={write_secs:.2}s",
+        scan.feature_count,
+        partitions.len(),
+        t_tiles.elapsed().as_secs_f64() - write_secs,
+    );
+
+    Ok(ZoomReport {
+        zoom,
+        level: level_idx,
+        level_feature_count: scan.feature_count,
+        tile_count,
+        tile_feature_count,
+        oversized_tiles: oversized,
     })
 }
 
@@ -3867,13 +3946,23 @@ mod tests {
 
     /// Write a 2-level duplicating overview fixture. `level_geoms[k]` are the
     /// geometries (and ids) at level k. Levels use z = 2 + 2k.
-    fn write_fixture(path: &Path, level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)]) -> OverviewsMeta {
+    /// Write a one-batch-per-level overview file and return its metadata.
+    ///
+    /// `write_fixture` and `write_partitioning_fixture` are the two modes
+    /// callers want; both delegate here so the level-spec ladder and the
+    /// write loop exist once.
+    fn write_mode_fixture(
+        path: &Path,
+        level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)],
+        mode: Mode,
+        max_row_group_size: usize,
+    ) -> OverviewsMeta {
         let schema = Arc::new(source_schema());
         let specs: Vec<LevelSpec> = (0..level_geoms.len())
             .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
             .collect();
-        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
-        opts.max_row_group_size = 10_000;
+        let mut opts = OverviewWriterOptions::new(mode, specs);
+        opts.max_row_group_size = max_row_group_size;
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         for (k, (ids, geoms)) in level_geoms.iter().enumerate() {
             assert_eq!(
@@ -3888,6 +3977,10 @@ mod tests {
             );
         }
         writer.finish().unwrap()
+    }
+
+    fn write_fixture(path: &Path, level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)]) -> OverviewsMeta {
+        write_mode_fixture(path, level_geoms, Mode::Duplicating, 10_000)
     }
 
     /// Decode all (geom_type, coords, keys) of a raw MVT tile's single layer.
@@ -4723,26 +4816,7 @@ mod tests {
         path: &Path,
         level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)],
     ) -> OverviewsMeta {
-        let schema = Arc::new(source_schema());
-        let specs: Vec<LevelSpec> = (0..level_geoms.len())
-            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
-            .collect();
-        let mut opts = OverviewWriterOptions::new(Mode::Partitioning, specs);
-        opts.max_row_group_size = 2;
-        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
-        for (k, (ids, geoms)) in level_geoms.iter().enumerate() {
-            assert_eq!(
-                writer
-                    .write_level(
-                        k,
-                        Some(ids.len()),
-                        std::iter::once(batch(&schema, ids, geoms))
-                    )
-                    .unwrap(),
-                LevelWriteOutcome::Written
-            );
-        }
-        writer.finish().unwrap()
+        write_mode_fixture(path, level_geoms, Mode::Partitioning, 2)
     }
 
     /// #233: the single-read fan-out scan ([`scan_all_levels`]) must produce, for

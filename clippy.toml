@@ -6,3 +6,10 @@
 # to 30 to make the gate pass on current code. RATCHET: lower this toward 25
 # as those functions get refactored — never raise it.
 cognitive-complexity-threshold = 30
+
+# too_many_lines is enabled as a hard gate via [workspace.lints.clippy] in
+# Cargo.toml. Clippy's default threshold is 100; the four longest functions in
+# the workspace were refactored down for this gate, and the longest remaining
+# one is 183 clippy lines. RATCHET: lower this toward 100 as the remaining long
+# functions get split — never raise it.
+too-many-lines-threshold = 200

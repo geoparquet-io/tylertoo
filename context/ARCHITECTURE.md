@@ -17,7 +17,7 @@ Related canonical documents:
 
 ## Decision Record: Legacy Tiles Pipeline Removed (#177, 2026-07-03)
 
-The legacy per-tile pipeline (`pipeline.rs`, `Converter`, the streaming
+The legacy per-tile pipeline (`crates/core/src/pipeline.rs`, `Converter`, the streaming
 external-sort/bucketed tiler and its quality features) was **removed**. The
 overview pipeline (`overview convert` → `export-pmtiles`) supersedes it for
 the project's core workflow: it is faster (Moldova full pipeline < 2 min),
@@ -25,6 +25,10 @@ memory-bounded (convert ~0.4 GB for a z0–6 pyramid, ~1.4 GB for z0–14; expor
 ladder (ranking, density budget, clustering, coalescing) the tile path never
 got. See `context/TILE_SIMPLIFY_POSTMORTEM.md` for why the tile-path quality
 work had already been excised.
+
+`crates/core/src/overview/pipeline.rs` is a different, live file: the
+single-read pass-2 engine added in #213. Only the crate-root
+`crates/core/src/pipeline.rs` was deleted.
 
 What survives:
 

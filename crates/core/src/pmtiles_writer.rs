@@ -659,6 +659,42 @@ pub fn gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 // Task 9: Full PMTiles Writer
 // ============================================================================
 
+/// Render the TileJSON `fields` object for a layer.
+///
+/// Shared by `PmtilesWriter` and `StreamingPmtilesWriter`: both emit the same
+/// metadata, and a second copy of this drifted once already. Field names are
+/// sorted so the output is byte-for-byte deterministic.
+fn fields_json(fields: &HashMap<String, String>) -> String {
+    if fields.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut field_pairs: Vec<_> = fields.iter().collect();
+    field_pairs.sort_by_key(|(k, _)| *k);
+
+    let field_strings: Vec<String> = field_pairs
+        .iter()
+        .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
+        .collect();
+
+    format!("{{{}}}", field_strings.join(","))
+}
+
+/// Render the TileJSON `tilestats` fragment, including its trailing comma.
+///
+/// Returns an empty string when the archive holds no features, which keeps the
+/// surrounding metadata object valid. Shared with `fields_json` above.
+fn tilestats_json(layer_name: &str, total_features: u64, field_count: usize) -> String {
+    if total_features == 0 {
+        return String::new();
+    }
+
+    format!(
+        r#""tilestats":{{"layerCount":1,"layers":[{{"layer":"{}","count":{},"attributeCount":{}}}]}},"#,
+        layer_name, total_features, field_count
+    )
+}
+
 /// Tile entry with hash for deduplication
 #[derive(Debug, Clone)]
 struct TileEntry {
@@ -666,9 +702,6 @@ struct TileEntry {
     data: Option<Vec<u8>>,
     /// Hash of uncompressed content (for deduplication)
     hash: u64,
-    /// Uncompressed size (for stats)
-    #[allow(dead_code)] // Reserved for future deduplication stats reporting
-    uncompressed_size: u32,
 }
 
 /// PMTiles v3 writer
@@ -808,34 +841,12 @@ impl PmtilesWriter {
 
     /// Build the fields JSON object string
     fn build_fields_json(&self) -> String {
-        if self.fields.is_empty() {
-            return "{}".to_string();
-        }
-
-        // Sort field names for deterministic output
-        let mut field_pairs: Vec<_> = self.fields.iter().collect();
-        field_pairs.sort_by_key(|(k, _)| *k);
-
-        let field_strings: Vec<String> = field_pairs
-            .iter()
-            .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
-            .collect();
-
-        format!("{{{}}}", field_strings.join(","))
+        fields_json(&self.fields)
     }
 
     /// Build the tilestats JSON fragment
     fn build_tilestats_json(&self) -> String {
-        if self.total_features == 0 {
-            return String::new();
-        }
-
-        format!(
-            r#""tilestats":{{"layerCount":1,"layers":[{{"layer":"{}","count":{},"attributeCount":{}}}]}},"#,
-            self.layer_name,
-            self.total_features,
-            self.fields.len()
-        )
+        tilestats_json(&self.layer_name, self.total_features, self.fields.len())
     }
 
     /// Add a tile (will be gzip compressed)
@@ -883,7 +894,6 @@ impl PmtilesWriter {
                     TileEntry {
                         data: None, // No data stored for duplicates
                         hash,
-                        uncompressed_size,
                     },
                 );
             } else {
@@ -900,7 +910,6 @@ impl PmtilesWriter {
                     TileEntry {
                         data: Some(compressed),
                         hash,
-                        uncompressed_size,
                     },
                 );
             }
@@ -913,7 +922,6 @@ impl PmtilesWriter {
                 TileEntry {
                     data: Some(compressed),
                     hash,
-                    uncompressed_size,
                 },
             );
         }
@@ -942,7 +950,6 @@ impl PmtilesWriter {
             TileEntry {
                 data: Some(compressed_data),
                 hash,
-                uncompressed_size: 0, // Unknown
             },
         );
 
@@ -1755,32 +1762,11 @@ impl StreamingPmtilesWriter {
     }
 
     fn build_fields_json(&self) -> String {
-        if self.fields.is_empty() {
-            return "{}".to_string();
-        }
-
-        let mut field_pairs: Vec<_> = self.fields.iter().collect();
-        field_pairs.sort_by_key(|(k, _)| *k);
-
-        let field_strings: Vec<String> = field_pairs
-            .iter()
-            .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
-            .collect();
-
-        format!("{{{}}}", field_strings.join(","))
+        fields_json(&self.fields)
     }
 
     fn build_tilestats_json(&self) -> String {
-        if self.total_features == 0 {
-            return String::new();
-        }
-
-        format!(
-            r#""tilestats":{{"layerCount":1,"layers":[{{"layer":"{}","count":{},"attributeCount":{}}}]}},"#,
-            self.layer_name,
-            self.total_features,
-            self.fields.len()
-        )
+        tilestats_json(&self.layer_name, self.total_features, self.fields.len())
     }
 }
 

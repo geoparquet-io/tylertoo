@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,11 +54,12 @@ use crate::batch_processor::extract_geometries_opt_from_array;
 
 use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
-    apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, DensityBudgetConfig,
-    FeatureKind, SUPERCELL_GSD_FACTOR,
+    apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Assignment,
+    DensityBudgetConfig, FeatureKind, SUPERCELL_GSD_FACTOR,
 };
 use super::cluster::{
-    build_cluster_tables, verify_sum_invariant, AccumulateSpec, ClusterEntry, POINT_COUNT_COLUMN,
+    build_cluster_tables, verify_sum_invariant, AccumulateSpec, ClusterEntry, ClusterTables,
+    POINT_COUNT_COLUMN,
 };
 use super::coalesce::{
     coalesce_level_lines, CoalesceInput, CoalesceParams, COALESCED_COUNT_COLUMN,
@@ -75,8 +77,7 @@ use super::simplify::{
     Representation, Simplified, SimplifyOptions,
 };
 use super::writer::{
-    LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy,
-    WriterError, LEVEL_COLUMN,
+    LevelSpec, LevelWriteOutcome, OverviewWriter, RowGroupSizePolicy, WriterError, LEVEL_COLUMN,
 };
 
 /// How the caller specifies the overview levels.
@@ -1459,9 +1460,6 @@ fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError>
     Ok(())
 }
 
-/// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
-/// Runs the full option normalization (validation, cluster/accumulate checks,
-/// the partitioning-coalesce-inert rewrite) before dispatching.
 /// Columns the tuning knobs read, paired with the knob that reads them —
 /// these must survive the property selection (#386).
 fn knob_columns(options: &ConvertOptions) -> Vec<(String, String)> {
@@ -1582,59 +1580,79 @@ fn project_builder_to_selection(
     }
 }
 
-pub(crate) fn convert_to_overviews_source_strategy(
-    source: &ConvertSource,
-    output_path: &Path,
+/// Intern the class-group column that line coalescing (Q3) groups chains by.
+///
+/// `None` unless the resolved ranking is class-based, which is what supplies
+/// the grouping column.
+fn intern_coalesce_groups(
+    input_schema: &Schema,
+    full: &RecordBatch,
+    ranking_provenance: &RankingProvenance,
+) -> Option<Vec<u32>> {
+    let col = coalesce_group_column(ranking_provenance)?;
+    let idx = input_schema.index_of(col).expect("ranking column exists");
+    let mut interner = GroupInterner::default();
+    let mut groups = Vec::with_capacity(full.num_rows());
+    interner.extend(full.column(idx).as_ref(), &mut groups);
+    Some(groups)
+}
+
+/// Build the cluster tables (Q4) and check the §12.1 sum invariant.
+///
+/// `acc_values` holds one vector per accumulate spec, indexed by position in
+/// `features` (not by input row).
+pub(super) fn build_verified_cluster_tables(
+    features: &[AssignFeature],
+    min_levels: &[u8],
+    level_gsds: &[f64],
+    acc_values: &[Vec<Option<f64>>],
+    crs: Crs,
     options: &ConvertOptions,
-    strategy: super::stream::Pass2Strategy,
-) -> Result<ConvertReport, ConvertError> {
-    // Knob sanity (H4), shared by both pipelines.
-    validate_options(options)?;
-    // #386: narrow the source to the requested property columns before any
-    // schema index is derived, so both pipelines see the projected layout.
-    apply_property_selection(source, options)?;
-    // #272: place the remote-input disk spill (#219) where the caller asked
-    // (no-op for local inputs, which never spill).
-    source.set_spill_dir(options.spill_dir.as_deref());
-    check_mode_combinations(options)?;
-    // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
-    // chain is a new geometry replacing several source rows, which the
-    // feature-once/verbatim contract of §2.3 cannot represent, and removing
-    // merged members from finer bands would break prefix reads. Coalescing
-    // is on by default, so partitioning conversions silently proceed
-    // without it (no column, no provenance); the CLI rejects an EXPLICIT
-    // request instead.
-    let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match adjusted_for_ladder_and_mode(options) {
-        Some(adjusted) => {
-            inert_options = adjusted;
-            &inert_options
-        }
-        None => options,
-    };
+) -> Result<ClusterTables, ConvertError> {
+    let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
+    let tables = build_cluster_tables(
+        features,
+        min_levels,
+        level_gsds,
+        &options.assign,
+        crs,
+        acc_values,
+        &ops,
+    );
+    // Strict §12.1 accounting: Σ point_count per level == source point count,
+    // and no clustered level thins its points to zero.
+    verify_sum_invariant(features, min_levels, &tables).map_err(ConvertError::ClusterInvariant)?;
+    Ok(tables)
+}
 
-    // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
-    // is kept as the reference implementation (`streaming: false`).
-    if options.streaming {
-        return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
-    }
+/// The in-memory input table, plus everything the footer settles about it.
+///
+/// The in-memory reference path reads the whole (row-group-pruned, attribute-
+/// filtered) input into one `RecordBatch` and decodes its geometries once.
+struct LoadedInput {
+    /// `options` with reserved-column renames applied (#288); the caller
+    /// borrows this for the rest of the conversion.
+    options: ConvertOptions,
+    input_schema: SchemaRef,
+    crs: Crs,
+    renames: Vec<(String, String)>,
+    geom_idx: usize,
+    geom_field: Field,
+    /// Schema indices of the accumulate columns (Q4).
+    acc_cols: Vec<usize>,
+    /// The filtered table, relabelled to `input_schema`.
+    full: RecordBatch,
+    /// Decoded geometries, row-aligned with `full`.
+    geometries: Vec<Geometry<f64>>,
+    row_groups_total: usize,
+    row_groups_read: usize,
+}
 
-    // The in-memory reference path below predates multi-partition input
-    // (v0.7) and reads through one parquet builder; multi sources are
-    // streaming-only.
-    let source_single: &InputSource = match source {
-        ConvertSource::Single(s) => s.input(),
-        ConvertSource::Multi(_) => return Err(ConvertError::MultiPartitionRequiresStreaming),
-    };
-
-    let start = Instant::now();
-
-    // A numeric sort key and a categorical class ranking are mutually
-    // exclusive (Q1): they would both drive `AssignFeature::sort_key`.
-    if options.sort_key.is_some() && options.class_ranking.is_some() {
-        return Err(ConvertError::RankingConflict);
-    }
-
+fn load_input_table(
+    source: &ConvertSource,
+    source_single: &InputSource,
+    options: &ConvertOptions,
+) -> Result<LoadedInput, ConvertError> {
     // --- Read the input footer, preserving the full property schema. ---------
     // (For a remote source, the footer is range-fetched once and cached.)
     // `read_schema` matches the raw batches read below; `input_schema` is the
@@ -1650,9 +1668,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // authoritative. `options` is cloned so by-name ranking/accumulate options
     // can be rewritten to the renamed columns. The rename preserves column
     // order, so `read_schema` and `input_schema` share indices.
-    let mut options = options.clone();
-    let (input_schema, renames) = resolve_reserved_column_collisions(&read_schema, &mut options);
-    let options = &options;
+    let mut resolved = options.clone();
+    let (input_schema, renames) = resolve_reserved_column_collisions(&read_schema, &mut resolved);
+    let options = &resolved;
 
     // Attribute filter (#315): parse + bind against the (possibly renamed)
     // input schema. Syntax was already validated in `validate_options`.
@@ -1722,144 +1740,59 @@ pub(crate) fn convert_to_overviews_source_strategy(
     } else {
         RecordBatch::try_new(input_schema.clone(), full.columns().to_vec())?
     };
-    let num_features = full.num_rows();
 
-    // Resolve the cell-winner ranking (Q1): explicit sort key / explicit class
-    // ranking / auto-detected well-known schema / size fallback. Returns the
-    // per-feature sort keys and the provenance recorded in the footer (§3.5).
-    let (sort_keys, ranking_provenance) =
-        resolve_ranking(&input_schema, &full, &geometries, options)?;
-
-    // --- Coalescing groups (Q3): interned class values, when class-ranked. ---
-    let num_lines = geometries
-        .iter()
-        .filter(|g| feature_kind(g) == FeatureKind::Line)
-        .count();
-    let coalesce_on = coalesce_effective(options, num_lines);
-    let line_groups: Option<Vec<u32>> = if coalesce_on {
-        coalesce_group_column(&ranking_provenance).map(|col| {
-            let idx = input_schema.index_of(col).expect("ranking column exists");
-            let mut interner = GroupInterner::default();
-            let mut groups = Vec::with_capacity(full.num_rows());
-            interner.extend(full.column(idx).as_ref(), &mut groups);
-            groups
-        })
-    } else {
-        None
-    };
-
-    // --- Level assignment. ---------------------------------------------------
-    let level_specs = options.levels.resolve(options.gsd_base)?;
-    let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
-
-    // Entry-zoom ladder (#364), resolved before assignment so the gate and
-    // thinning never see the features it governs.
-    let ladder_values = entry_zoom_column_values(options, &input_schema, &full)?;
-    let entry = resolve_entry_levels(options, &ladder_values, &level_specs)?;
-
-    let features: Vec<AssignFeature> = geometries
-        .iter()
-        .enumerate()
-        .map(|(i, g)| AssignFeature {
-            index: i,
-            bbox: geometry_bbox(g),
-            kind: feature_kind(g),
-            sort_key: sort_keys[i],
-            entry_level: entry.as_ref().and_then(|e| e[i]),
-        })
-        .collect();
-
-    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
-    let antimeridian_suspect_features = features
-        .iter()
-        .filter(|f| bbox_antimeridian_suspect(&f.bbox, crs))
-        .count();
-    warn_antimeridian_suspects(antimeridian_suspect_features);
-
-    // #306: cap the transient winner-grid memory at the profile-derived RAM
-    // budget (`speed` stays unbounded). Pure scheduling — output-identical.
-    // Zoom-band representation selector (#317 / #279): per-level
-    // representations, parallel to the plan.
-    let level_reprs = level_representations(&level_specs, &options.representation);
-    let assignment = assign_levels_bounded(
-        &features,
-        &level_gsds,
-        &options.assign,
+    Ok(LoadedInput {
+        options: resolved.clone(),
+        input_schema,
         crs,
-        super::pipeline::pass1_grid_budget_bytes(options.profile),
-        &level_reprs,
-    );
-    // Q2: layer the per-level density budget on top of cell-winner thinning.
-    // When disabled this is an identity, so `--no-density-drop` reproduces the
-    // pre-Q2 assignment (and, since no density_drop provenance is emitted, a
-    // byte-identical footer).
-    let assignment = if options.density.enabled {
-        apply_density_budget(
-            &assignment,
-            &features,
-            &level_gsds,
-            &options.assign,
-            &options.density,
-            crs,
-        )
-    } else {
-        assignment
-    };
-    let num_levels = level_gsds.len();
-    let finest = num_levels.saturating_sub(1);
+        renames,
+        geom_idx,
+        geom_field,
+        acc_cols,
+        full,
+        geometries,
+        row_groups_total,
+        row_groups_read,
+    })
+}
 
-    // #384: tiny-polygon accumulator carriers per level (row-indexed here,
-    // since `features[i].index == i`), and the winner table by row for the
-    // carrier test in the level loop.
-    let row_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
-    let carriers = in_memory_carriers(
-        options,
-        &features,
-        &row_min_levels,
-        &geometries,
-        &level_gsds,
-        &level_reprs,
-        crs,
-    );
+struct EmittedLevel {
+    /// Index in the resolved level plan (cluster-table key; may differ
+    /// from the emitted index when empty levels are omitted, §7.3).
+    orig: usize,
+    gsd: f64,
+    zoom: Option<u8>,
+    indices: Vec<usize>,
+    geoms: Vec<Geometry<f64>>,
+    vertex_count: usize,
+    /// Coalescing (Q3): this level's chain table (rep row → merged
+    /// geometry + member count). `None` at non-coalesced levels.
+    coalesce: Option<CoalesceTable>,
+}
 
-    // --- Cluster tables (Q4): per level, winner → point_count + aggregates. --
-    let cluster_tables = if options.cluster {
-        let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
-        let acc_values = extract_accumulate_values(&full, &acc_cols);
-        let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
-        let tables = build_cluster_tables(
-            &features,
-            &min_levels,
-            &level_gsds,
-            &options.assign,
-            crs,
-            &acc_values,
-            &ops,
-        );
-        // Strict §12.1 accounting: Σ point_count per level == source point
-        // count, and no clustered level thins its points to zero.
-        verify_sum_invariant(&features, &min_levels, &tables)
-            .map_err(ConvertError::ClusterInvariant)?;
-        Some(tables)
-    } else {
-        None
-    };
-
+/// Build every level's generalized selection, coarse to fine.
+///
+/// Returns the emitted levels and the planned levels that were omitted because
+/// every candidate collapsed (§7.3, #211 auto-clamp).
+#[allow(clippy::too_many_arguments)]
+fn build_emitted_levels(
+    assignment: &Assignment,
+    features: &[AssignFeature],
+    geometries: &[Geometry<f64>],
+    level_specs: &[(f64, Option<u8>)],
+    level_reprs: &[Representation],
+    line_groups: Option<&Vec<u32>>,
+    coalesce_on: bool,
+    finest: usize,
+    crs: Crs,
+    // Coarsest level per input row (#384), and per planned level the
+    // tiny-polygon accumulator's carrier rows.
+    row_min_levels: &[u8],
+    carriers: &[Vec<usize>],
+    options: &ConvertOptions,
+) -> (Vec<EmittedLevel>, Vec<SkippedLevelReport>) {
     // --- Build per-level generalized selections (coarse→fine). ---------------
     // Each emitted entry: (spec, feature indices, geometries, vertex_count).
-    struct EmittedLevel {
-        /// Index in the resolved level plan (cluster-table key; may differ
-        /// from the emitted index when empty levels are omitted, §7.3).
-        orig: usize,
-        gsd: f64,
-        zoom: Option<u8>,
-        indices: Vec<usize>,
-        geoms: Vec<Geometry<f64>>,
-        vertex_count: usize,
-        /// Coalescing (Q3): this level's chain table (rep row → merged
-        /// geometry + member count). `None` at non-coalesced levels.
-        coalesce: Option<CoalesceTable>,
-    }
     let mut emitted: Vec<EmittedLevel> = Vec::new();
     let mut skipped: Vec<SkippedLevelReport> = Vec::new();
 
@@ -2004,49 +1937,227 @@ pub(crate) fn convert_to_overviews_source_strategy(
         });
     }
 
+    (emitted, skipped)
+}
+
+/// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
+/// Runs the full option normalization (validation, cluster/accumulate checks,
+/// the partitioning-coalesce-inert rewrite) before dispatching.
+pub(crate) fn convert_to_overviews_source_strategy(
+    source: &ConvertSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+    strategy: super::stream::Pass2Strategy,
+) -> Result<ConvertReport, ConvertError> {
+    // Knob sanity (H4), shared by both pipelines.
+    validate_options(options)?;
+    // #386: narrow the source to the requested property columns before any
+    // schema index is derived, so both pipelines see the projected layout.
+    apply_property_selection(source, options)?;
+    // #272: place the remote-input disk spill (#219) where the caller asked
+    // (no-op for local inputs, which never spill).
+    source.set_spill_dir(options.spill_dir.as_deref());
+    check_mode_combinations(options)?;
+    // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
+    // chain is a new geometry replacing several source rows, which the
+    // feature-once/verbatim contract of §2.3 cannot represent, and removing
+    // merged members from finer bands would break prefix reads. Coalescing
+    // is on by default, so partitioning conversions silently proceed
+    // without it (no column, no provenance); the CLI rejects an EXPLICIT
+    // request instead.
+    let inert_options: ConvertOptions;
+    let options: &ConvertOptions = match adjusted_for_ladder_and_mode(options) {
+        Some(adjusted) => {
+            inert_options = adjusted;
+            &inert_options
+        }
+        None => options,
+    };
+
+    // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
+    // is kept as the reference implementation (`streaming: false`).
+    if options.streaming {
+        return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
+    }
+
+    // The in-memory reference path below predates multi-partition input
+    // (v0.7) and reads through one parquet builder; multi sources are
+    // streaming-only.
+    let source_single: &InputSource = match source {
+        ConvertSource::Single(s) => s.input(),
+        ConvertSource::Multi(_) => return Err(ConvertError::MultiPartitionRequiresStreaming),
+    };
+
+    let start = Instant::now();
+
+    // A numeric sort key and a categorical class ranking are mutually
+    // exclusive (Q1): they would both drive `AssignFeature::sort_key`.
+    if options.sort_key.is_some() && options.class_ranking.is_some() {
+        return Err(ConvertError::RankingConflict);
+    }
+
+    let LoadedInput {
+        options: resolved_options,
+        input_schema,
+        crs,
+        renames,
+        geom_idx,
+        geom_field,
+        acc_cols,
+        full,
+        geometries,
+        row_groups_total,
+        row_groups_read,
+    } = load_input_table(source, source_single, options)?;
+    let options = &resolved_options;
+    let num_features = full.num_rows();
+
+    // Resolve the cell-winner ranking (Q1): explicit sort key / explicit class
+    // ranking / auto-detected well-known schema / size fallback. Returns the
+    // per-feature sort keys and the provenance recorded in the footer (§3.5).
+    let (sort_keys, ranking_provenance) =
+        resolve_ranking(&input_schema, &full, &geometries, options)?;
+
+    // --- Coalescing groups (Q3): interned class values, when class-ranked. ---
+    let num_lines = geometries
+        .iter()
+        .filter(|g| feature_kind(g) == FeatureKind::Line)
+        .count();
+    let coalesce_on = coalesce_effective(options, num_lines);
+    let line_groups: Option<Vec<u32>> = coalesce_on
+        .then(|| intern_coalesce_groups(&input_schema, &full, &ranking_provenance))
+        .flatten();
+
+    // --- Level assignment. ---------------------------------------------------
+    let level_specs = options.levels.resolve(options.gsd_base)?;
+    let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
+
+    // Entry-zoom ladder (#364), resolved before assignment so the gate and
+    // thinning never see the features it governs.
+    let ladder_values = entry_zoom_column_values(options, &input_schema, &full)?;
+    let entry = resolve_entry_levels(options, &ladder_values, &level_specs)?;
+
+    let features: Vec<AssignFeature> = geometries
+        .iter()
+        .enumerate()
+        .map(|(i, g)| AssignFeature {
+            index: i,
+            bbox: geometry_bbox(g),
+            kind: feature_kind(g),
+            sort_key: sort_keys[i],
+            entry_level: entry.as_ref().and_then(|e| e[i]),
+        })
+        .collect();
+
+    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
+    let antimeridian_suspect_features = features
+        .iter()
+        .filter(|f| bbox_antimeridian_suspect(&f.bbox, crs))
+        .count();
+    warn_antimeridian_suspects(antimeridian_suspect_features);
+
+    // #306: cap the transient winner-grid memory at the profile-derived RAM
+    // budget (`speed` stays unbounded). Pure scheduling — output-identical.
+    // Zoom-band representation selector (#317 / #279): per-level
+    // representations, parallel to the plan.
+    let level_reprs = level_representations(&level_specs, &options.representation);
+    let assignment = assign_levels_bounded(
+        &features,
+        &level_gsds,
+        &options.assign,
+        crs,
+        super::pipeline::pass1_grid_budget_bytes(options.profile),
+        &level_reprs,
+    );
+    // Q2: layer the per-level density budget on top of cell-winner thinning.
+    // When disabled this is an identity, so `--no-density-drop` reproduces the
+    // pre-Q2 assignment (and, since no density_drop provenance is emitted, a
+    // byte-identical footer).
+    let assignment = if options.density.enabled {
+        apply_density_budget(
+            &assignment,
+            &features,
+            &level_gsds,
+            &options.assign,
+            &options.density,
+            crs,
+        )
+    } else {
+        assignment
+    };
+    let num_levels = level_gsds.len();
+    let finest = num_levels.saturating_sub(1);
+
+    // #384: tiny-polygon accumulator carriers per level (row-indexed here,
+    // since `features[i].index == i`), and the winner table by row for the
+    // carrier test in the level loop.
+    let row_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+    let carriers = in_memory_carriers(
+        options,
+        &features,
+        &row_min_levels,
+        &geometries,
+        &level_gsds,
+        &level_reprs,
+        crs,
+    );
+
+    // --- Cluster tables (Q4): per level, winner → point_count + aggregates. --
+    let cluster_tables = if options.cluster {
+        let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+        let acc_values = extract_accumulate_values(&full, &acc_cols);
+        Some(build_verified_cluster_tables(
+            &features,
+            &min_levels,
+            &level_gsds,
+            &acc_values,
+            crs,
+            options,
+        )?)
+    } else {
+        None
+    };
+
+    let (emitted, mut skipped) = build_emitted_levels(
+        &assignment,
+        &features,
+        &geometries,
+        &level_specs,
+        &level_reprs,
+        line_groups.as_ref(),
+        coalesce_on,
+        finest,
+        crs,
+        &row_min_levels,
+        &carriers,
+        options,
+    );
+
     if emitted.is_empty() {
         return Err(ConvertError::NoData);
     }
     warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
 
     // --- Build the output writer schema (source schema + geoarrow geometry). -
+    // Base + point_count when clustering (Q4) + coalesced_count when
+    // coalescing (Q3) — the same three schemas the streaming path builds.
     let geom_name = geom_field.name().clone();
-    // A fresh mixed-Geometry field carries the geoarrow extension the writer /
-    // geoparquet encoder detect; each level's geometry array is built as the
-    // same type so RecordBatch assembly matches.
-    let geom_out_field = mixed_geometry_field(&geom_name);
-    let source_schema = build_source_schema(&input_schema, geom_idx, geom_out_field.clone());
-    // Writer schema: base + point_count when clustering (Q4) + coalesced_count
-    // when coalescing (Q3).
-    let cluster_schema = if options.cluster {
-        append_point_count_field(&source_schema)
-    } else {
-        source_schema.clone()
-    };
-    let out_schema = if options.coalesce_lines {
-        append_coalesced_count_field(&cluster_schema)
-    } else {
-        cluster_schema.clone()
-    };
+    let (source_schema, cluster_schema, out_schema) =
+        super::stream::build_level_schemas(&input_schema, geom_idx, &geom_name, options);
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()
         .map(|e| LevelSpec::new(e.gsd, e.zoom))
         .collect();
     let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
-    let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
-    writer_opts.max_row_group_size = options.max_row_group_size;
-    writer_opts.row_group_size_policy = options.row_group_size_policy;
-    writer_opts.full_column_stats = options.full_column_stats;
-    writer_opts.cogp_compat_key = options.cogp_compat_key;
-    writer_opts.encode_concurrency = encode_concurrency_for(options.profile);
-    writer_opts.generalization = Some(build_generalization(
+    let writer_opts = super::stream::build_writer_options(
+        writer_levels,
         &emitted_gsds,
         crs,
-        options,
         ranking_provenance,
         &renames,
-    ));
+        options,
+    );
 
     let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -2055,43 +2166,23 @@ pub(crate) fn convert_to_overviews_source_strategy(
         .filter(|&c| c != geom_idx)
         .collect();
 
-    let mut level_reports = Vec::with_capacity(emitted.len());
-    for (level_idx, e) in emitted.iter().enumerate() {
-        let mut batch = build_level_batch(
-            &source_schema,
-            &full,
-            &non_geom_cols,
+    let mut level_reports = write_emitted_levels(
+        &mut writer,
+        &emitted,
+        &LevelWriteInputs {
+            full: &full,
+            source_schema: &source_schema,
+            cluster_schema: &cluster_schema,
+            out_schema: &out_schema,
+            non_geom_cols: &non_geom_cols,
             geom_idx,
-            &e.indices,
-            &e.geoms,
-        )?;
-        if let Some(tables) = &cluster_tables {
-            // Canonical level: singleton clusters, columns verbatim (§2.4).
-            let table = (e.orig != finest).then(|| &tables[e.orig]);
-            batch = apply_cluster_columns(batch, &cluster_schema, &e.indices, table, &acc_cols)?;
-        }
-        if options.coalesce_lines {
-            // Canonical level (and guard-skipped runs): table is None ⇒ all 1.
-            batch = apply_coalesced_count(batch, &out_schema, &e.indices, e.coalesce.as_ref())?;
-        }
-        // SkippedEmpty is unreachable here (every emitted level has >= 1
-        // feature), but the bookkeeping stays aligned with the streaming path.
-        let outcome =
-            writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
-        record_level_outcome(
-            outcome,
-            SkippedLevelReport {
-                planned_level: e.orig,
-                gsd: e.gsd,
-                zoom: e.zoom,
-            },
-            e.indices.len(),
-            e.indices.len(),
-            e.vertex_count,
-            &mut level_reports,
-            &mut skipped,
-        );
-    }
+            cluster_tables: cluster_tables.as_ref(),
+            acc_cols: &acc_cols,
+            finest,
+        },
+        options,
+        &mut skipped,
+    )?;
     skipped.sort_by_key(|s| s.planned_level);
 
     let meta = writer.finish()?;
@@ -2117,6 +2208,87 @@ pub(crate) fn convert_to_overviews_source_strategy(
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
     })
+}
+
+/// Everything the in-memory level-write loop reads besides the levels.
+///
+/// `write_emitted_levels` borrows a dozen pieces of the conversion state;
+/// threading them as separate parameters made the signature longer than the
+/// body, so they travel together.
+struct LevelWriteInputs<'a> {
+    /// The whole input table; each level takes its rows by index.
+    full: &'a RecordBatch,
+    source_schema: &'a Schema,
+    cluster_schema: &'a Schema,
+    out_schema: &'a Schema,
+    non_geom_cols: &'a [usize],
+    geom_idx: usize,
+    /// Cluster tables (Q4), or `None` when clustering is off.
+    cluster_tables: Option<&'a ClusterTables>,
+    /// Schema indices of the accumulate columns (Q4).
+    acc_cols: &'a [usize],
+    /// Index of the canonical (finest) planned level.
+    finest: usize,
+}
+
+/// Write every emitted level to the output file, coarse to fine.
+///
+/// Per level: take the member rows into a batch, layer the cluster (Q4) and
+/// coalesced-count (Q3) columns on top, and record what the writer did with
+/// it. Levels the writer skipped are appended to `skipped`, matching the
+/// streaming path's bookkeeping.
+fn write_emitted_levels(
+    writer: &mut OverviewWriter<File>,
+    emitted: &[EmittedLevel],
+    inputs: &LevelWriteInputs<'_>,
+    options: &ConvertOptions,
+    skipped: &mut Vec<SkippedLevelReport>,
+) -> Result<Vec<LevelReport>, ConvertError> {
+    let mut level_reports = Vec::with_capacity(emitted.len());
+    for (level_idx, e) in emitted.iter().enumerate() {
+        let mut batch = build_level_batch(
+            inputs.source_schema,
+            inputs.full,
+            inputs.non_geom_cols,
+            inputs.geom_idx,
+            &e.indices,
+            &e.geoms,
+        )?;
+        if let Some(tables) = inputs.cluster_tables {
+            // Canonical level: singleton clusters, columns verbatim (§2.4).
+            let table = (e.orig != inputs.finest).then(|| &tables[e.orig]);
+            batch = apply_cluster_columns(
+                batch,
+                inputs.cluster_schema,
+                &e.indices,
+                table,
+                inputs.acc_cols,
+            )?;
+        }
+        if options.coalesce_lines {
+            // Canonical level (and guard-skipped runs): table is None ⇒ all 1.
+            batch =
+                apply_coalesced_count(batch, inputs.out_schema, &e.indices, e.coalesce.as_ref())?;
+        }
+        // SkippedEmpty is unreachable here (every emitted level has >= 1
+        // feature), but the bookkeeping stays aligned with the streaming path.
+        let outcome =
+            writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
+        record_level_outcome(
+            outcome,
+            SkippedLevelReport {
+                planned_level: e.orig,
+                gsd: e.gsd,
+                zoom: e.zoom,
+            },
+            e.indices.len(),
+            e.indices.len(),
+            e.vertex_count,
+            &mut level_reports,
+            skipped,
+        );
+    }
+    Ok(level_reports)
 }
 
 /// The tiny-polygon accumulator's carriers for the in-memory reference path
