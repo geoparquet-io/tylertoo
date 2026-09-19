@@ -9,8 +9,9 @@
 
 use std::path::PathBuf;
 
+use tylertoo_core::compression::compress;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::pmtiles_writer::Header;
+use tylertoo_core::pmtiles_writer::{encode_directory, DirEntry, Header};
 use tylertoo_core::{Compression, StreamingPmtilesWriter};
 
 /// A minimal MVT tile: one layer `t` with one point feature at (1, 1).
@@ -102,5 +103,103 @@ fn tile_decompression_failure_names_tile_and_offset() {
     assert!(
         msg.contains(&format!("offset {first_tile}")),
         "message must give the byte offset, got: {msg}"
+    );
+}
+
+/// Append a hand-built root directory (and optionally a leaf directory) to a
+/// valid archive and repoint the header at them. Every other section stays
+/// where it was, so only the directory content is hostile.
+fn with_directories(bytes: &[u8], root: &[DirEntry], leaf: Option<&[DirEntry]>) -> Vec<u8> {
+    let header = Header::from_bytes(&bytes[..127]).unwrap();
+    let mut out = bytes.to_vec();
+    let mut header = header;
+    if let Some(leaf) = leaf {
+        let enc = compress(&encode_directory(leaf), header.internal_compression).unwrap();
+        header.leaf_dirs_offset = out.len() as u64;
+        header.leaf_dirs_length = enc.len() as u64;
+        out.extend_from_slice(&enc);
+    }
+    let enc = compress(&encode_directory(root), header.internal_compression).unwrap();
+    header.root_dir_offset = out.len() as u64;
+    header.root_dir_length = enc.len() as u64;
+    out.extend_from_slice(&enc);
+    out[..127].copy_from_slice(&header.to_bytes());
+    out
+}
+
+#[test]
+fn hostile_leaf_offset_is_an_error_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    // A leaf pointer whose offset wraps u64 when added to the section base.
+    let root = [DirEntry {
+        tile_id: 0,
+        offset: u64::MAX - 64,
+        length: 10,
+        run_length: 0,
+    }];
+    let err = decode_err(
+        &dir,
+        "hostile-leaf.pmtiles",
+        &with_directories(&bytes, &root, None),
+    );
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("leaf directory")),
+        "expected an InvalidArchive naming the leaf directory, got: {err}"
+    );
+}
+
+#[test]
+fn hostile_tile_offset_is_an_error_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let root = [DirEntry {
+        tile_id: 0,
+        offset: u64::MAX - 64,
+        length: 10,
+        run_length: 1,
+    }];
+    let err = decode_err(
+        &dir,
+        "hostile-tile.pmtiles",
+        &with_directories(&bytes, &root, None),
+    );
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("tile data")),
+        "expected an InvalidArchive naming the tile data, got: {err}"
+    );
+}
+
+#[test]
+fn nested_leaf_directories_are_rejected_not_decoded_as_tiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    // The leaf directory itself holds a leaf pointer (run_length 0). PMTiles
+    // v3 allows this shape but this decoder does not walk it; it must say so
+    // rather than slice directory bytes as a tile.
+    let leaf = [DirEntry {
+        tile_id: 0,
+        offset: 0,
+        length: 10,
+        run_length: 0,
+    }];
+    let enc_len = compress(&encode_directory(&leaf), Compression::Gzip)
+        .unwrap()
+        .len() as u32;
+    let root = [DirEntry {
+        tile_id: 0,
+        offset: 0,
+        length: enc_len,
+        run_length: 0,
+    }];
+    let err = decode_err(
+        &dir,
+        "nested-leaf.pmtiles",
+        &with_directories(&bytes, &root, Some(&leaf)),
+    );
+    let msg = err.to_string();
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(_)) && msg.contains("leaf"),
+        "expected an InvalidArchive about nested leaf directories, got: {msg}"
     );
 }

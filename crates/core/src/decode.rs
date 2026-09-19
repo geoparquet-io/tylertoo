@@ -362,15 +362,31 @@ fn collect_tile_refs(
         "root directory",
     )?;
 
+    // Entry offsets are relative to their section; the base is added here.
+    // Both come from the archive, so the sum is checked rather than trusted.
+    let absolute = |base: u64, relative: u64, what: &str| -> Result<u64, DecodeError> {
+        base.checked_add(relative)
+            .ok_or_else(|| DecodeError::InvalidArchive(format!("{what} offset overflow")))
+    };
+
     let mut entries = Vec::new();
     for entry in root {
         if entry.run_length == 0 {
             // Leaf directory: offset is relative to the leaf-dirs section.
-            entries.extend(decode_dir(
-                header.leaf_dirs_offset + entry.offset,
+            let leaf = decode_dir(
+                absolute(header.leaf_dirs_offset, entry.offset, "leaf directory")?,
                 u64::from(entry.length),
                 "leaf directory",
-            )?);
+            )?;
+            // The spec allows a leaf to point at further leaves; this walker
+            // is one level deep. Falling through would slice directory bytes
+            // as a tile, so say so instead.
+            if leaf.iter().any(|e| e.run_length == 0) {
+                return Err(DecodeError::InvalidArchive(
+                    "multi-level leaf directories are not supported".to_string(),
+                ));
+            }
+            entries.extend(leaf);
         } else {
             entries.push(entry);
         }
@@ -385,17 +401,14 @@ fn collect_tile_refs(
             {
                 continue;
             }
+            let start = absolute(header.tile_data_offset, entry.offset, "tile data")?;
             // Validate the range now so pass B can slice without checks.
-            section(
-                header.tile_data_offset + entry.offset,
-                u64::from(entry.length),
-                "tile data",
-            )?;
+            section(start, u64::from(entry.length), "tile data")?;
             tiles.push(TileRef {
                 z,
                 x,
                 y,
-                start: (header.tile_data_offset + entry.offset) as usize,
+                start: start as usize,
                 len: entry.length as usize,
             });
         }
