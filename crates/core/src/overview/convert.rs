@@ -39,7 +39,7 @@ use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
-use geo::{BoundingRect, Geometry};
+use geo::{Area, BoundingRect, Geometry};
 use geoarrow::array::{from_arrow_array, GeometryBuilder};
 use geoarrow::datatypes::GeometryType;
 use geoarrow_array::GeoArrowArray;
@@ -51,6 +51,7 @@ use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_opt_from_array;
 
+use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, DensityBudgetConfig,
     FeatureKind, SUPERCELL_GSD_FACTOR,
@@ -70,8 +71,8 @@ use super::level::{
 };
 use super::properties::{PropertySelection, PropertySelectionError};
 use super::simplify::{
-    simplify_cascade, simplify_for_level, simplify_step, CascadeStep, CollapseMode, Representation,
-    Simplified, SimplifyOptions,
+    carrier_square, simplify_cascade, simplify_for_level, simplify_step, CascadeStep, CollapseMode,
+    Representation, Simplified, SimplifyOptions,
 };
 use super::writer::{
     LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions, RowGroupSizePolicy,
@@ -1352,6 +1353,19 @@ pub(crate) fn adjusted_for_ladder_and_mode(options: &ConvertOptions) -> Option<C
         );
     }
 
+    // #384: partitioning levels are verbatim, so neither the tiny-polygon
+    // accumulator (a carrier is a second appearance of a feature) nor the
+    // write-time dither ever runs there. Say so rather than silently
+    // producing the same file the flag was meant to change.
+    if matches!(options.mode, Mode::Partitioning)
+        && matches!(options.simplify.collapse, CollapseMode::Square)
+    {
+        log::info!(
+            "collapse-square has no effect in partitioning mode (levels are verbatim: \
+             no polygon is dropped or collapsed, so there is nothing to stand in for)"
+        );
+    }
+
     if !coalescing_off && !collapse_to_point {
         return None;
     }
@@ -1536,6 +1550,38 @@ fn apply_property_selection(
     Ok(())
 }
 
+/// Apply the property selection (#386) to the in-memory path's parquet
+/// builder as a read projection — exactly what the streaming path gets
+/// through `ConvertSource::schema` — and return the builder with the schema
+/// its batches will carry.
+fn project_builder_to_selection(
+    source: &ConvertSource,
+    builder: parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<
+        crate::input::InputReader,
+    >,
+) -> Result<
+    (
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<crate::input::InputReader>,
+        SchemaRef,
+    ),
+    ConvertError,
+> {
+    match source.column_projection() {
+        Some(keep) => {
+            let mask = parquet::arrow::ProjectionMask::roots(
+                builder.parquet_schema(),
+                keep.iter().copied(),
+            );
+            let projected = Arc::new(builder.schema().project(keep)?);
+            Ok((builder.with_projection(mask), projected))
+        }
+        None => {
+            let schema = builder.schema().clone();
+            Ok((builder, schema))
+        }
+    }
+}
+
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -1591,23 +1637,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     // --- Read the input footer, preserving the full property schema. ---------
     // (For a remote source, the footer is range-fetched once and cached.)
-    let mut builder = source_single.open()?;
     // `read_schema` matches the raw batches read below; `input_schema` is the
     // possibly-renamed schema used for every downstream (name-based) lookup.
-    // The property selection (#386) is a read projection here, exactly as the
-    // streaming path gets it through `ConvertSource::schema`.
-    let read_schema = match source.column_projection() {
-        Some(keep) => {
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                keep.iter().copied(),
-            );
-            let projected = Arc::new(builder.schema().project(keep)?);
-            builder = builder.with_projection(mask);
-            projected
-        }
-        None => builder.schema().clone(),
-    };
+    let (builder, read_schema) = project_builder_to_selection(source, source_single.open()?)?;
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
     let crs = detect_crs_from_kv(builder.metadata().file_metadata().key_value_metadata())?;
@@ -1776,6 +1808,20 @@ pub(crate) fn convert_to_overviews_source_strategy(
     let num_levels = level_gsds.len();
     let finest = num_levels.saturating_sub(1);
 
+    // #384: tiny-polygon accumulator carriers per level (row-indexed here,
+    // since `features[i].index == i`), and the winner table by row for the
+    // carrier test in the level loop.
+    let row_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+    let carriers = in_memory_carriers(
+        options,
+        &features,
+        &row_min_levels,
+        &geometries,
+        &level_gsds,
+        &level_reprs,
+        crs,
+    );
+
     // --- Cluster tables (Q4): per level, winner → point_count + aggregates. --
     let cluster_tables = if options.cluster {
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
@@ -1819,7 +1865,16 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     for (level, &(gsd_m, zoom)) in level_specs.iter().enumerate() {
         let member_indices: Vec<usize> = match options.mode {
-            Mode::Duplicating => assignment.duplicating_at_level(level as u8),
+            Mode::Duplicating => {
+                let mut v = assignment.duplicating_at_level(level as u8);
+                // #384: carriers join the level (sorted merge; disjoint from
+                // members by construction).
+                if !carriers[level].is_empty() {
+                    v.extend_from_slice(&carriers[level]);
+                    v.sort_unstable();
+                }
+                v
+            }
             Mode::Partitioning => assignment.partitioning_at_level(level as u8),
         };
 
@@ -1899,6 +1954,17 @@ pub(crate) fn convert_to_overviews_source_strategy(
                     vertex_count += count_vertices(g);
                     indices.push(i);
                     geoms.push(g.clone());
+                    continue;
+                }
+                // #384: a carrier is not a member — it stands in for its
+                // cell's dropped area as one placeholder square.
+                if usize::from(row_min_levels[i]) > level && is_carrier(&carriers[level], i) {
+                    if let Some(sq) = carrier_square(&geometries[i], gsd_m, crs, &options.simplify)
+                    {
+                        vertex_count += count_vertices(&sq);
+                        indices.push(i);
+                        geoms.push(sq);
+                    }
                     continue;
                 }
                 let simplified = if cascade_chain.is_empty() {
@@ -2051,6 +2117,54 @@ pub(crate) fn convert_to_overviews_source_strategy(
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
     })
+}
+
+/// The tiny-polygon accumulator's carriers for the in-memory reference path
+/// (#384): the same function the streaming path runs, over the same feature
+/// table, so the two paths agree on every carrier.
+fn in_memory_carriers(
+    options: &ConvertOptions,
+    features: &[AssignFeature],
+    row_min_levels: &[u8],
+    geometries: &[Geometry<f64>],
+    level_gsds: &[f64],
+    level_reprs: &[Representation],
+    crs: Crs,
+) -> Vec<Vec<usize>> {
+    let num_levels = level_gsds.len();
+    let finest = num_levels.saturating_sub(1);
+    let enabled = matches!(options.mode, Mode::Duplicating)
+        && (options.simplify.collapse == CollapseMode::Square
+            || level_reprs.contains(&Representation::Square));
+    let acc_levels: Vec<AccumulateLevel> = level_gsds
+        .iter()
+        .enumerate()
+        .map(|(l, &gsd)| AccumulateLevel {
+            gsd_meters: gsd,
+            enabled: enabled
+                && l != finest
+                && level_accumulates(options.simplify.collapse, level_reprs[l]),
+        })
+        .collect();
+    if !acc_levels.iter().any(|l| l.enabled) {
+        return vec![Vec::new(); num_levels];
+    }
+    let areas: Vec<f32> = geometries
+        .iter()
+        .map(|g| match g {
+            Geometry::Polygon(p) => p.unsigned_area() as f32,
+            Geometry::MultiPolygon(mp) => mp.unsigned_area() as f32,
+            _ => 0.0,
+        })
+        .collect();
+    tiny_polygon_carriers(
+        features,
+        row_min_levels,
+        &areas,
+        &acc_levels,
+        crs,
+        options.simplify.factor,
+    )
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a

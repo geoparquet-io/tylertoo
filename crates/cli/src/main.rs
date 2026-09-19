@@ -637,17 +637,24 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Generalization")]
     collapse: bool,
 
-    /// Collapse below-visibility polygons to a ~1xGSD placeholder SQUARE at
-    /// the representative point instead of dropping them (tippecanoe
+    /// Stand in for the polygons a coarse level drops with ~1xGSD placeholder
+    /// SQUARES, so the level still shows where the area is (tippecanoe
     /// tiny-polygon reduction; opt-in).
     ///
-    /// Squares are area-dithered: a polygon of area A below the level
-    /// threshold T = (simplify-factor * gsd)^2 survives as a T-area square
-    /// with probability A/T, so aggregate area stays truthful — dense city
-    /// blocks read denser than isolated barns. Type-preserving (the output
-    /// stays Polygon), so plain fill styles keep working, unlike --collapse.
-    /// Deterministic per feature (same input -> same output, engine- and
-    /// thread-independent). See docs/OVERVIEW_TUNING.md.
+    /// Two mechanisms, one threshold T = (simplify-factor * gsd)^2 (#384):
+    /// every polygon the level does NOT carry — failed the visibility gate,
+    /// lost its thinning cell, cut by the density budget — adds its area to
+    /// an accumulator for its 32xGSD patch, and each time a patch's total
+    /// crosses T the polygon that crossed it is emitted as a T-area square
+    /// with its own attributes; a polygon the level DOES carry but that
+    /// collapses below T at write time survives as a square with probability
+    /// A/T. Either way aggregate area stays truthful: a country of 25 m
+    /// fields reads as farmland at z0 instead of vanishing, and dense blocks
+    /// read denser than isolated barns. Type-preserving (the output stays
+    /// Polygon), so plain fill styles keep working, unlike --collapse.
+    /// Deterministic (same input -> same output, engine- and
+    /// thread-independent). Duplicating mode only. See
+    /// docs/OVERVIEW_TUNING.md.
     #[arg(long, conflicts_with = "collapse", help_heading = "Generalization")]
     collapse_square: bool,
 

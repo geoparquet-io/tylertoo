@@ -350,7 +350,7 @@ tolerance = simplify_factor * gsd(level)          (meters, then CRS-converted)
 |------|---------|-------|-----------|
 | `--simplify-factor` | `1.0` | × GSD (RDP tolerance) | **bigger = cruder + lighter** |
 | `--collapse` | off | flag | below-gate polygons become a representative point instead of dropping |
-| `--collapse-square` | off | flag | below-gate polygons become an area-dithered ~1×GSD placeholder square (type-preserving) |
+| `--collapse-square` | off | flag | dropped polygons stand in as ~1×GSD placeholder squares: a per-patch area accumulator for everything a level does not carry, an area dither for members that collapse at write time (type-preserving) |
 | `--representation` | none (all `geom`) | `LO-HI:KIND,…` | per-zoom-band representation: `geom`, `point`, or `square` |
 | `--no-cascade` | off (cascading **on**) | flag | disables cascading simplification, reproducing pre-cascade output byte-for-byte |
 
@@ -529,48 +529,70 @@ The requested bands are recorded in the footer provenance
 ### `--collapse-square` — tippecanoe tiny-polygon squares as the global disposition
 
 `--collapse-square` is the third **below-tolerance disposition**, next to
-the drop default and `--collapse`-to-point: a polygon that collapses below
-the level tolerance is replaced by a `tol × tol` square (`tol =
-simplify-factor × GSD`, CRS-converted) centered on its representative
-point. This is tippecanoe's **tiny-polygon reduction** — the
-primary-reference behavior for keeping dense small-polygon layers
-(buildings, parcels) visible at coarse zooms with **no style changes**:
-squares are polygons, `geometry_types` stays `["Polygon"]`, and there is
-no spec-Q4 geometry-type opt-in involved.
+the drop default and `--collapse`-to-point: polygons a level cannot show
+as themselves stand in as `tol × tol` squares (`tol = simplify-factor ×
+GSD`, CRS-converted). This is tippecanoe's **tiny-polygon reduction** —
+the primary-reference behavior for keeping dense small-polygon layers
+(fields, buildings, parcels) visible at coarse zooms with **no style
+changes**: squares are polygons, `geometry_types` stays `["Polygon"]`, and
+there is no spec-Q4 geometry-type opt-in involved.
 
-**Area dithering.** Emitting *every* tiny polygon as a full-tolerance
-square would massively inflate apparent area. Instead a polygon of area
-`A < tol²` survives with probability `A / tol²`, so the **expected emitted
-area equals the true area** — dense city blocks emit many squares,
-isolated barns mostly none, and aggregate density stays truthful.
-MultiPolygon parts dither individually (per-part density, like
-tippecanoe's ring-by-ring reduction).
+Two mechanisms share the threshold `T = tol²` (#384):
 
-The dither is **deterministic**: the decision is a hash of the feature's
-anchor coordinates, so the same input produces byte-identical output
-across runs, engines (in-memory / streaming / pipelined), and thread
-counts. Under cascading, a kept square's anchor is its own center, so
-coarser levels re-dither it against the same hash draw with a shrinking
-keep probability — survival is monotone fine→coarse.
+**The accumulator** covers every polygon the level does *not* carry —
+failed the visibility gate, lost its thinning cell, cut by the density
+budget. After assignment, each such polygon adds its area, **clamped to
+`T`**, to a running total for its **patch** (a 32×GSD square, 1/32 of a
+1024-px tile), in input order; each time a patch's total crosses `T`,
+the polygon that crossed it becomes the level's *carrier* and is emitted
+as a `T`-area square at its representative point, with its own
+attributes. A polygon contributes at most one placeholder of area
+(a gate-failed polygon is often bigger than `T` — the gate is
+`--polygon-visibility` pixels wide — and a thinning or budget loser can
+be any size), and a patch keeps less than one `T` unemitted. This is
+what makes a country of 25 m fields read as farmland at z0 instead of
+vanishing: on a 368k-field sample, z1–z6 carry ~98% of the input area
+against 1.5–7% with the dither alone. Features placed by an entry-zoom
+ladder (`--entry-zoom`) are never accumulated: the ladder decides where
+they first appear.
+
+**The dither** covers the polygons the level *does* carry but that
+collapse below `T` at write time (RDP shrinks them under the tolerance):
+one of area `A` survives as a square with probability `A / T`, decided by
+a hash of its anchor coordinates. The two sets are disjoint, so nothing
+is counted twice.
+
+Both are **deterministic**: the accumulator runs once over the pass-1
+feature table in input order, so every engine (in-memory / streaming /
+pipelined) reads the same carrier set, and the dither is a pure function
+of the feature. The same input produces byte-identical output across
+runs, engines and thread counts. Under cascading, a kept square's anchor
+is its own center, so coarser levels re-dither it against the same hash
+draw with a shrinking keep probability — survival is monotone fine→coarse.
 
 Divergences from tippecanoe (see `context/ARCHITECTURE.md`):
 
-- tippecanoe accumulates area **serially per tile** and emits a square
-  each time the accumulator crosses the threshold (exact); overview
-  levels have no tile scope and require order-independence, so we dither
-  **per feature** (exact in expectation).
-- area removed by cell-winner thinning or the density budget is **not**
-  accumulated — a thinned feature contributes no square. Tippecanoe's
-  drop-rate similarly removes features before its accumulator sees them,
-  but the two pipelines thin differently, so the surviving-area sets
-  differ.
+- tippecanoe accumulates **per tile**; we accumulate per 32×GSD patch of
+  the level, since overview levels have no tile scope. Squares therefore
+  land at the carriers' own positions inside the patch (input order is
+  Hilbert order for a prepared file, so they cluster where the fields
+  are).
+- tippecanoe only accumulates rings with area ≤ `tiny_polygon_size²` and
+  keeps larger rings as geometry; we clamp each polygon's contribution to
+  one placeholder instead of skipping large ones — a non-member was
+  already dropped by the gate or thinning here, so there is no geometry
+  to keep.
+- tippecanoe places the placeholder at the ring's first vertex with side
+  `tiny_polygon_size` (default 2 px); ours sits at the polygon's
+  representative point with side `simplify-factor × GSD`.
+- the accumulator needs duplicating mode (a carrier is a second appearance
+  of a feature, which partitioning's feature-once contract cannot
+  represent). In partitioning mode neither mechanism applies: levels are
+  verbatim, so `--collapse-square` is accepted and logged as inert.
 
-Like `--collapse`, the global flag changes only the write-time
-disposition, not *eligibility*: the assign-time visibility gate still
-keeps most tiny polygons out of coarse levels. For a full tiny-polygon
-fill, either combine it with `--polygon-visibility 0` (the dot-fill
-recipe, squares instead of points) or use a `square` band — bands bypass
-the gate in-band automatically.
+At the mid zooms, a dense square carpet can exceed `--max-tile-size`; the
+valve then sheds squares for that tile, as it would any feature. Raise
+the cap or accept the thinner carpet.
 
 Opt-in for now: the drop default is unchanged pending the #259-fixture
 sweep (#279 tracks the default decision). Recorded in the footer
