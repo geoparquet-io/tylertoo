@@ -119,6 +119,7 @@ use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord};
 
+use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
 use super::pipe::scoped_pipe;
 use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
@@ -634,7 +635,7 @@ fn export_pmtiles_impl(
     // #359: which name each column is published under. Derived once from the
     // file's own rename provenance so a standalone `export-pmtiles` on an
     // overview written by an earlier run restores names just as `tiles` does.
-    let published = PublishedNames::from_meta(reader.meta(), reader.schema());
+    let published = PublishedNames::from_reader(&reader);
 
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
@@ -3138,14 +3139,33 @@ fn geometry_index(schema: &Schema) -> Option<usize> {
 /// Restoration is conditional, not automatic: a rename is undone only when its
 /// source name is not already published by another column. `point_count` and
 /// `coalesced_count` *are* real MVT properties in the modes that append them,
-/// so a column moved aside from one of those keeps the renamed name — merging
-/// two columns into one key would be worse than the wrong name.
+/// unless withheld (#379), so a column moved aside from one of those keeps the
+/// renamed name — merging two columns into one key would be worse than the
+/// wrong name.
+///
+/// It also carries the *suppressed* columns (#379): the `coalesced_count`
+/// provenance counter the converter appends whenever line coalescing is on
+/// (the default), when it never left 1 because nothing was merged (a polygon
+/// layer through the coalescer, say). A column that is 1 on every row is not
+/// a property of the data; in the tiles it is schema noise a style editor
+/// shows as a real attribute, and a tag pair per feature. The overview file
+/// keeps the column — its validator relies on it — this only decides what
+/// the MVT carries. Whether the counter ever exceeded 1 is read from
+/// row-group statistics, so the check costs nothing and a file whose stats
+/// are missing keeps the column (nothing is known). `point_count` is never
+/// withheld: `--cluster` is an explicit opt-in whose documented contract is
+/// the column (a style scales symbols by it), and a schema that depends on
+/// whether anything happened to cluster would break such styles. Suppression
+/// is decided *before* restoration, so a withheld counter's name is free for
+/// a source column that was moved aside from it.
 #[derive(Debug, Clone, Default)]
 struct PublishedNames {
     /// Schema field name → published key, for the columns that differ.
     /// Empty for the identity mapping, which is the overwhelmingly common
     /// case (nothing collided, or the file predates the provenance).
     restored: HashMap<String, String>,
+    /// Schema field names that are not exported at all (#379).
+    suppressed: HashSet<String>,
 }
 
 impl PublishedNames {
@@ -3155,15 +3175,23 @@ impl PublishedNames {
     }
 
     /// Resolve publication names for `schema` from a file's `renamed_columns`
-    /// provenance (output name → source name; see [`Generalization`]).
-    fn from_renames(renames: &BTreeMap<String, String>, schema: &Schema) -> Self {
+    /// provenance (output name → source name; see [`Generalization`]), with
+    /// `suppressed` the schema columns the export withholds (#379).
+    fn from_renames(
+        renames: &BTreeMap<String, String>,
+        schema: &Schema,
+        suppressed: HashSet<String>,
+    ) -> Self {
         // Names already spoken for by a column that will publish under its own
         // schema name. `level` is excluded because the export drops it, which
-        // is precisely what frees the name for restoration.
+        // is precisely what frees the name for restoration; a suppressed
+        // counter is excluded for the same reason.
         let occupied: HashSet<String> = schema
             .fields()
             .iter()
-            .filter(|f| !f.name().eq_ignore_ascii_case(LEVEL_COLUMN))
+            .filter(|f| {
+                !f.name().eq_ignore_ascii_case(LEVEL_COLUMN) && !suppressed.contains(f.name())
+            })
             .map(|f| f.name().to_ascii_lowercase())
             .collect();
 
@@ -3197,20 +3225,61 @@ impl PublishedNames {
                  the reserved overview column, #288/#359)"
             );
         }
-        Self { restored }
+        Self {
+            restored,
+            suppressed,
+        }
     }
 
-    /// Build from an overview file's footer metadata; identity when the file
-    /// carries no rename provenance.
-    fn from_meta(meta: &OverviewsMeta, schema: &Schema) -> Self {
+    /// Build from an overview file's footer metadata, with `suppressed` the
+    /// schema columns the export withholds (#379); the rename mapping is the
+    /// identity when the file carries no rename provenance.
+    fn from_meta(meta: &OverviewsMeta, schema: &Schema, suppressed: HashSet<String>) -> Self {
         match meta
             .generalization
             .as_ref()
             .and_then(|g| g.renamed_columns.as_ref())
         {
-            Some(renames) => Self::from_renames(renames, schema),
-            None => Self::identity(),
+            Some(renames) => Self::from_renames(renames, schema, suppressed),
+            None => Self {
+                suppressed,
+                ..Self::identity()
+            },
         }
+    }
+
+    /// Build from an open overview file: suppression of a `coalesced_count`
+    /// counter that never left 1 (#379), then the rename mapping from the
+    /// footer — in that order, so a withheld counter's name counts as free.
+    /// `point_count` is deliberately not considered (see the type doc).
+    fn from_reader(reader: &OverviewReader) -> Self {
+        let meta = reader.meta();
+        let mut suppressed = HashSet::new();
+        let counter = meta
+            .generalization
+            .as_ref()
+            .and_then(|g| g.coalescing.as_ref())
+            .map(|c| c.coalesced_count_column.as_str())
+            // The footer names the column, but only the converter's own
+            // counter is eligible: a tampered or foreign footer must not be
+            // able to withhold a real data column.
+            .filter(|&c| c == COALESCED_COUNT_COLUMN);
+        if let Some(column) = counter {
+            if reader.int_column_max(column) == Some(1) {
+                log::info!(
+                    "[export] not exporting {column:?}: it is 1 on every row \
+                     (no lines were merged), so it says nothing about the data; \
+                     the overview file keeps it (#379)"
+                );
+                suppressed.insert(column.to_string());
+            }
+        }
+        Self::from_meta(meta, reader.schema(), suppressed)
+    }
+
+    /// Whether a schema column is withheld from the tiles entirely.
+    fn is_suppressed(&self, schema_name: &str) -> bool {
+        self.suppressed.contains(schema_name)
     }
 
     /// The MVT key for a schema field name.
@@ -3238,6 +3307,7 @@ fn property_columns(
         .filter(|&(i, f)| {
             i != geom_idx
                 && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+                && !published.is_suppressed(f.name())
                 && is_supported_scalar(f.data_type())
         })
         .map(|(i, f)| (i, published.publish(f.name()).to_string()))
@@ -3333,7 +3403,10 @@ fn field_metadata(
     let geom_idx = geom_idx.unwrap_or(usize::MAX);
     let mut out = HashMap::new();
     for (i, f) in schema.fields().iter().enumerate() {
-        if i == geom_idx || f.name().eq_ignore_ascii_case(LEVEL_COLUMN) {
+        if i == geom_idx
+            || f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+            || published.is_suppressed(f.name())
+        {
             continue;
         }
         let ty = match f.data_type() {
@@ -3569,13 +3642,15 @@ fn reproject_3857_to_4326(g: &Geometry<f64>) -> Geometry<f64> {
 mod tests {
     use super::*;
     use crate::mvt::{command_decode, zigzag_decode};
-    use crate::overview::level::{gsd, Level, Mode};
+    use crate::overview::level::{
+        gsd, ClusteringProvenance, CoalescingProvenance, Generalization, Level, Mode,
+    };
     use crate::overview::writer::{
         LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions,
     };
     use crate::vector_tile::tile::GeomType;
     use crate::vector_tile::Tile;
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use geo::{Geometry, LineString, Point};
     use geoarrow::array::GeometryBuilder;
@@ -4699,6 +4774,7 @@ mod tests {
         let published = PublishedNames::from_renames(
             &BTreeMap::from([("level_".to_string(), "level".to_string())]),
             &schema,
+            HashSet::new(),
         );
 
         let cols = property_columns(&schema, 3, &published);
@@ -4736,6 +4812,7 @@ mod tests {
         let published = PublishedNames::from_renames(
             &BTreeMap::from([("point_count_".to_string(), "point_count".to_string())]),
             &schema,
+            HashSet::new(),
         );
 
         let names: Vec<String> = property_columns(&schema, 2, &published)
@@ -4775,6 +4852,7 @@ mod tests {
                 ("level__".to_string(), "level".to_string()),
             ]),
             &schema,
+            HashSet::new(),
         );
 
         let names: Vec<String> = property_columns(&schema, 3, &published)
@@ -5563,6 +5641,7 @@ mod tests {
         let published = PublishedNames::from_renames(
             &BTreeMap::from([("level_".to_string(), "level".to_string())]),
             &schema,
+            HashSet::new(),
         );
         let column = |n: &str| FeatureOrder::Column {
             name: n.to_string(),
@@ -5956,5 +6035,262 @@ mod tests {
             .read_exact(&mut magic)
             .unwrap();
         assert_eq!(&magic, b"PMTiles");
+    }
+
+    // --- provenance columns that carry no information (#379) ----------------
+
+    /// A `Generalization` block declaring only line coalescing, optionally
+    /// with rename provenance (#288/#359).
+    fn coalescing_generalization(renames: Option<BTreeMap<String, String>>) -> Generalization {
+        Generalization {
+            engine: "tylertoo test".to_string(),
+            gsd_base: None,
+            cascade: None,
+            collapse: None,
+            representation: None,
+            levels: vec![],
+            ranking: None,
+            density_drop: None,
+            clustering: None,
+            coalescing: Some(CoalescingProvenance {
+                enabled: true,
+                snap_tolerance_gsd_factor: 1.0,
+                junction_angle: Some(0.0),
+                max_level_rows: Some(2_000_000),
+                coalesced_count_column: "coalesced_count".to_string(),
+            }),
+            renamed_columns: renames,
+        }
+    }
+
+    /// A `Generalization` block declaring only clustering (`--cluster`).
+    fn clustering_generalization() -> Generalization {
+        Generalization {
+            clustering: Some(ClusteringProvenance {
+                enabled: true,
+                point_count_column: "point_count".to_string(),
+                accumulated: vec![],
+            }),
+            coalescing: None,
+            ..coalescing_generalization(None)
+        }
+    }
+
+    /// Two-level fixture with the given footer provenance whose INT32
+    /// `counter` column holds `counts[k]` at level k. Schema: `id`, then
+    /// `user_column` (an INT32 user column, when given), `geometry`, `counter`.
+    fn write_counter_fixture(
+        path: &Path,
+        generalization: Generalization,
+        counter: &str,
+        counts: &[Vec<i32>],
+        user_column: Option<&str>,
+    ) {
+        use arrow_array::Int32Array;
+
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let b = Geometry::Point(Point::new(120.0, -40.0));
+        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        if let Some(name) = user_column {
+            fields.push(Field::new(name, DataType::Int32, false));
+        }
+        fields.push(geometry_field());
+        fields.push(Field::new(counter, DataType::Int32, false));
+        let schema = Arc::new(Schema::new(fields));
+        let specs: Vec<LevelSpec> = (0..counts.len())
+            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
+            .collect();
+        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
+        opts.generalization = Some(generalization);
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        for (k, level_counts) in counts.iter().enumerate() {
+            let n = level_counts.len();
+            let geoms: Vec<Geometry<f64>> = (0..n)
+                .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
+                .collect();
+            let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
+                (0..n as i64).collect::<Vec<_>>(),
+            ))];
+            if user_column.is_some() {
+                columns.push(Arc::new(Int32Array::from(vec![7; n])));
+            }
+            columns.push(Arc::new(build_geometry_array(&geoms).to_array_ref()));
+            columns.push(Arc::new(Int32Array::from(level_counts.clone())));
+            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            assert_eq!(
+                writer
+                    .write_level(k, Some(n), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+    }
+
+    /// Two-level fixture whose footer says coalescing was on and whose
+    /// `coalesced_count` column holds `counts[k]` at level k.
+    fn write_coalesced_fixture(path: &Path, counts: &[Vec<i32>]) {
+        write_counter_fixture(
+            path,
+            coalescing_generalization(None),
+            "coalesced_count",
+            counts,
+            None,
+        );
+    }
+
+    /// Export the fixture and return the property names the tiles carry, as
+    /// seen through `decode_pmtiles` (the union of every layer's keys).
+    fn exported_property_names(input: &Path) -> Vec<String> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(input, tout.path(), &ExportOptions::default()).unwrap();
+        let decoded = tempfile::NamedTempFile::new().unwrap();
+        crate::decode::decode_pmtiles(
+            tout.path(),
+            decoded.path(),
+            &crate::decode::DecodeOptions::default(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(decoded.path()).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "zoom" | "layer" | "mvt_id" | "geometry" | "bbox"
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalesced_count_is_not_exported_when_it_is_1_everywhere() {
+        // A polygon/point-only input gets the column too (coalescing is on by
+        // default) but nothing was ever merged: every value is 1. That is not
+        // a property of the data and must not reach the tiles.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_coalesced_fixture(tin.path(), &[vec![1, 1], vec![1, 1]]);
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["id"], "coalesced_count leaked into the tiles");
+
+        // ... and the layer must not advertise it either.
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        let published = PublishedNames::from_reader(&reader);
+        let fields = field_metadata(reader.schema(), geometry_index(reader.schema()), &published);
+        assert!(
+            !fields.contains_key("coalesced_count"),
+            "vector_layers fields must not advertise it: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn coalesced_count_is_exported_when_coalescing_merged_something() {
+        // Level 0 merged two segments somewhere: the column now carries real
+        // information and stays a property.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_coalesced_fixture(tin.path(), &[vec![2, 1], vec![1, 1]]);
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["coalesced_count", "id"]);
+    }
+
+    /// #379 must not undo #359: once the converter's own `coalesced_count` is
+    /// withheld, the name is free again, so a user column that was moved
+    /// aside to `coalesced_count_` on convert (#288) is given its name back.
+    #[test]
+    fn suppressed_counter_frees_its_name_for_a_renamed_source_column() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_counter_fixture(
+            tin.path(),
+            coalescing_generalization(Some(BTreeMap::from([(
+                "coalesced_count_".to_string(),
+                "coalesced_count".to_string(),
+            )]))),
+            "coalesced_count",
+            &[vec![1, 1], vec![1, 1]],
+            Some("coalesced_count_"),
+        );
+
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        let published = PublishedNames::from_reader(&reader);
+        let schema = reader.schema();
+        let names: Vec<String> =
+            property_columns(schema, geometry_index(schema).unwrap(), &published)
+                .into_iter()
+                .map(|(_, n)| n)
+                .collect();
+        assert_eq!(
+            names,
+            vec!["id", "coalesced_count"],
+            "the withheld counter no longer occupies its name"
+        );
+        let fields = field_metadata(schema, geometry_index(schema), &published);
+        assert_eq!(
+            fields.get("coalesced_count").map(String::as_str),
+            Some("Number")
+        );
+        assert!(!fields.contains_key("coalesced_count_"), "{fields:?}");
+
+        // End to end: the tiles carry the user's column under its own name.
+        let mut exported = exported_property_names(tin.path());
+        exported.sort();
+        assert_eq!(exported, vec!["coalesced_count", "id"]);
+    }
+
+    /// `point_count` is a documented part of the `--cluster` contract (a
+    /// style scales symbols by it), so it stays even when nothing clustered:
+    /// the max==1 rule applies to `coalesced_count` only.
+    #[test]
+    fn point_count_is_exported_even_when_it_is_1_everywhere() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_counter_fixture(
+            tin.path(),
+            clustering_generalization(),
+            "point_count",
+            &[vec![1, 1], vec![1, 1]],
+            None,
+        );
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["id", "point_count"], "point_count must stay");
+
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        let published = PublishedNames::from_reader(&reader);
+        let fields = field_metadata(reader.schema(), geometry_index(reader.schema()), &published);
+        assert_eq!(
+            fields.get("point_count").map(String::as_str),
+            Some("Number")
+        );
+    }
+
+    /// The footer names the counter column, but only the converter's own
+    /// `coalesced_count` may be withheld: a footer pointing the name at a
+    /// real data column must not make the export drop that column.
+    #[test]
+    fn footer_cannot_redirect_suppression_onto_a_data_column() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let mut generalization = coalescing_generalization(None);
+        generalization
+            .coalescing
+            .as_mut()
+            .unwrap()
+            .coalesced_count_column = "id".to_string();
+        // Two rows per level, so `id` is 0/1: its max really is 1.
+        write_counter_fixture(
+            tin.path(),
+            generalization,
+            "coalesced_count",
+            &[vec![1, 1], vec![1, 1]],
+            None,
+        );
+        let names = exported_property_names(tin.path());
+        assert!(
+            names.contains(&"id".to_string()),
+            "id was withheld: {names:?}"
+        );
     }
 }
