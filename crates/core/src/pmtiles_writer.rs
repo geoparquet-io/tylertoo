@@ -517,7 +517,8 @@ pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
         // tippecanoe and go-pmtiles encode every leaf after the first as
         // contiguous; gating this on run_length > 0 resolved them all to
         // offset 0 and `decode` failed with "incomplete deflate stream" (#377).
-        expected_offset = entry.offset + entry.length as u64;
+        // Both operands come from the archive, so the sum is checked.
+        expected_offset = entry.offset.checked_add(u64::from(entry.length))?;
     }
 
     Some(entries)
@@ -2322,6 +2323,24 @@ mod tests {
             dir_tuples(&decode_directory(&encoded).unwrap()),
             dir_tuples(&entries)
         );
+    }
+
+    #[test]
+    fn test_decode_directory_rejects_offset_that_overflows_the_accumulator() {
+        // An explicit offset varint of u64::MAX decodes to u64::MAX - 1; the
+        // contiguous accumulator (offset + length) must fail as a decode
+        // error rather than overflow. Hand-encoded: two tile entries.
+        let mut buf = Vec::new();
+        encode_varint(2, &mut buf); // count
+        encode_varint(0, &mut buf); // tile id 0
+        encode_varint(1, &mut buf); // tile id 1 (delta)
+        encode_varint(1, &mut buf); // run lengths
+        encode_varint(1, &mut buf);
+        encode_varint(5, &mut buf); // lengths
+        encode_varint(5, &mut buf);
+        encode_varint(u64::MAX, &mut buf); // offsets: hostile, then contiguous
+        encode_varint(0, &mut buf);
+        assert!(decode_directory(&buf).is_none());
     }
 
     #[test]

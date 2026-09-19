@@ -670,8 +670,15 @@ fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
 
     // Splice in the foreign-style root. Its length differs from ours, so
     // every later section shifts by `delta`.
-    let foreign_root =
-        compress(&tippecanoe_style_root(&root), header.internal_compression).unwrap();
+    let plain_root = tippecanoe_style_root(&root);
+    // Our encoder now writes exactly this shape; pin that parity explicitly,
+    // since the splice below is otherwise a no-op against our own archive.
+    assert_eq!(
+        tylertoo_core::pmtiles_writer::encode_directory(&root),
+        plain_root,
+        "encode_directory must write leaf pointers with contiguous offsets"
+    );
+    let foreign_root = compress(&plain_root, header.internal_compression).unwrap();
     let delta = foreign_root.len() as i64 - header.root_dir_length as i64;
     let shift = |off: u64| (off as i64 + delta) as u64;
     let foreign_header = Header {
