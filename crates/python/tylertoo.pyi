@@ -76,5 +76,6 @@ def export_pmtiles(
     simple_clip_fastpath: bool = True,
     partition_wave: int = 0,
     feature_order: str = "input",
+    min_zoom: int | None = None,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...

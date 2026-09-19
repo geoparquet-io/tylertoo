@@ -770,6 +770,15 @@ fn overview(
 ///         lists them, so this is the paint order for any style that does not
 ///         override it. "input" emits source row order; naming a column sorts
 ///         within each tile by that property, ties kept in input order.
+///     min_zoom (int, optional): Minimum zoom the archive declares even when
+///         the overview file's coarsest levels are missing (#380). ``overview``
+///         omits a level that generalizes to nothing, so a file built for
+///         z0..z13 can start at z2; without this the header says z2 and a
+///         client set up for the requested range never asks for the
+///         zoomed-out view. The empty zooms hold no tiles. Must not be finer
+///         than the coarsest level present. Defaults to None (the coarsest
+///         level's zoom). ``convert()`` passes its own ``min_zoom`` here, so
+///         pass the same value to match what it writes.
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
@@ -787,7 +796,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input"))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -800,6 +809,7 @@ fn export_pmtiles(
     simple_clip_fastpath: bool,
     partition_wave: usize,
     feature_order: &str,
+    min_zoom: Option<u8>,
 ) -> PyResult<Py<PyDict>> {
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
@@ -810,7 +820,8 @@ fn export_pmtiles(
         simple_clip_fastpath,
         partition_wave,
         feature_order: parse_feature_order(feature_order)?,
-        min_zoom: None,
+        // #380: the declared minimum; None keeps the coarsest level's zoom.
+        min_zoom,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

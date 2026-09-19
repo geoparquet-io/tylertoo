@@ -1810,11 +1810,22 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .map(|z| format!("z{z}"))
         .collect();
     if !empty_zooms.is_empty() {
-        println!(
-            "  {} declared but empty: every feature generalized away there \
-             (see --collapse / --collapse-square)",
-            empty_zooms.join(", ")
-        );
+        // Point at the collapse flags only when neither was passed; with one
+        // on, the level was empty because there was less than one placeholder
+        // of area in it, and the hint would name the flag already given.
+        if args.tuning.collapse || args.tuning.collapse_square {
+            println!(
+                "  {} declared but empty: less than one placeholder of area there",
+                empty_zooms.join(", ")
+            );
+        } else {
+            println!(
+                "  {} declared but empty: every feature generalized away there \
+                 (see --collapse / --collapse-square), or an entry-zoom ladder \
+                 holds every feature out of them",
+                empty_zooms.join(", ")
+            );
+        }
     }
 
     // A combined report so the one-step run captures both halves the two-step

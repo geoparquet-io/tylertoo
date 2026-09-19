@@ -1338,18 +1338,16 @@ impl StreamingPmtilesWriter {
     }
 
     /// The header's minimum zoom: the coarsest tile written, widened by any
-    /// declared minimum; 0 for an empty archive.
+    /// declared minimum. An archive with no tiles is z0..z0 whatever was
+    /// declared — its max zoom collapses to 0, and a declared minimum above
+    /// that would invert the range.
     fn header_min_zoom(&self) -> u8 {
-        let seen = if self.min_zoom == 255 {
-            None
-        } else {
-            Some(self.min_zoom)
-        };
-        match (seen, self.declared_min_zoom) {
-            (Some(s), Some(d)) => s.min(d),
-            (Some(s), None) => s,
-            (None, Some(d)) => d,
-            (None, None) => 0,
+        if self.entries.is_empty() {
+            return 0;
+        }
+        match self.declared_min_zoom {
+            Some(d) => self.min_zoom.min(d),
+            None => self.min_zoom,
         }
     }
 
@@ -2667,6 +2665,39 @@ mod tests {
         writer.finalize(&path).unwrap();
         let data = fs::read(&path).unwrap();
         assert_eq!(Header::from_bytes(&data[..127]).unwrap().min_zoom, 2);
+    }
+
+    /// A declared minimum over an archive that got no tiles at all must not
+    /// outrun the zero max zoom the empty archive collapses to: the header
+    /// stays z0..z0 (min <= max), as it was before declared minimums existed.
+    #[test]
+    fn streaming_writer_declared_min_zoom_over_zero_tiles_stays_z0() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("declared-empty.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("t");
+        writer.set_declared_min_zoom(3);
+        writer.finalize(&path).unwrap();
+
+        let data = fs::read(&path).unwrap();
+        let header = Header::from_bytes(&data[..127]).unwrap();
+        assert_eq!(header.min_zoom, 0, "empty archive is z0..z0, not z3..z0");
+        assert_eq!(header.max_zoom, 0);
+        assert_eq!(header.center_zoom, 0);
+
+        let start = header.json_metadata_offset as usize;
+        let end = start + header.json_metadata_length as usize;
+        let mut json = String::new();
+        GzDecoder::new(&data[start..end])
+            .read_to_string(&mut json)
+            .unwrap();
+        assert!(
+            json.contains(r#""minzoom":0"#),
+            "vector_layers of an empty archive stay at minzoom 0: {json}"
+        );
     }
 
     // -------------------------------------------------------------------------

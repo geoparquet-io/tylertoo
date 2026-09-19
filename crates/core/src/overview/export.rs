@@ -266,7 +266,8 @@ pub struct ZoomReport {
 pub struct ExportReport {
     /// Level materialization mode of the source overview file.
     pub mode: String,
-    /// PMTiles header min zoom (coarsest level's zoom).
+    /// PMTiles header min zoom: the declared minimum zoom (coarsest level's
+    /// zoom unless widened by [`ExportOptions::min_zoom`]).
     pub min_zoom: u8,
     /// PMTiles header max zoom (finest level's zoom).
     pub max_zoom: u8,
@@ -644,9 +645,9 @@ fn export_pmtiles_impl(
         }
         Some(declared) if declared < coarsest_zoom => {
             log::info!(
-                "[export] declaring z{declared}..z{max_zoom} in the header: the overview \
-                 file starts at z{coarsest_zoom} (coarser levels generalized to nothing and \
-                 were omitted, spec §7.3), so z{declared}..z{} hold no tiles",
+                "[export] widening the declared zoom range to z{declared}..z{max_zoom}; \
+                 the file's coarsest level is z{coarsest_zoom}, so z{declared}..z{} hold \
+                 no tiles",
                 coarsest_zoom - 1
             );
             declared
