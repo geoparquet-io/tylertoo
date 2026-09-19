@@ -9,12 +9,15 @@
 //! cells with their own counts), not a thinned sample of the fine one, and
 //! every cell must be drawn at every zoom of its band.
 //!
-//! Bands own disjoint zoom ranges, so no tile is ever claimed by two bands and
-//! the merge is a concatenation rather than a per-tile layer union. That is the
-//! whole reason this is tractable: each band is tiled by the ordinary pipeline,
-//! and the archives are stitched by tile id.
+//! Each band is tiled by the ordinary pipeline and the archives are stitched
+//! by tile id. Bands of the same layer must not share a zoom — they would
+//! write the same tile ids — so within a layer the merge is a plain
+//! concatenation of archives. Bands in *different* layers may share zooms
+//! (tippecanoe's `-L`, #385): at a shared zoom a tile several bands wrote has
+//! their layer messages concatenated, and a tile only one band wrote passes
+//! through untouched.
 //!
-//! See issue #345.
+//! See issues #345 and #385.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,7 +31,7 @@ use crate::dedup::TileHasher;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_writer::{
-    decode_directory, tile_id_to_zxy, DirEntry, Header, StreamingPmtilesWriter,
+    decode_directory, tile_id_to_zxy, DirEntry, Header, StreamingPmtilesWriter, TileType,
 };
 use crate::tile::TileBounds;
 use crate::Error;
@@ -286,7 +289,9 @@ struct LayerMeta {
 /// One band's archive, read and parsed exactly once.
 ///
 /// The whole file is held while that band is merged — it is the compressed
-/// archive, not the expanded tile set, and only one band is open at a time.
+/// archive, not the expanded tile set. With disjoint zoom ranges only one
+/// band is open at a time; when bands share zooms every band's archive is
+/// open together, since one tile id can then draw on several of them.
 /// Tiles are handed out by [`BandArchive::for_each_tile`] as borrowed slices,
 /// so a run-length entry costs one slice rather than N owned copies.
 struct BandArchive {
@@ -297,6 +302,10 @@ struct BandArchive {
     entries: Vec<DirEntry>,
     /// `vector_layers[0].fields`, or `{}` when the metadata has no usable one.
     fields: Value,
+    /// Every `vector_layers[*].id` the archive declares — the MVT layer
+    /// name(s) actually inside its tiles, as opposed to the label `--band`
+    /// gives it. Empty when the metadata has none.
+    layer_ids: Vec<String>,
     /// The archive's own header bounds, when they describe a real box.
     bounds: Option<TileBounds>,
 }
@@ -341,6 +350,15 @@ impl BandArchive {
                  re-tile this band with gzip tiles",
                 path.display(),
                 header.tile_compression
+            )));
+        }
+        // The merge concatenates tile bodies at shared zooms, which is only
+        // meaningful for MVT: two PNGs glued together are not a PNG.
+        if header.tile_type != TileType::Mvt {
+            return Err(Error::PMTilesWrite(format!(
+                "{}: tile type is {:?}, but a pyramid band must hold MVT tiles",
+                path.display(),
+                header.tile_type
             )));
         }
 
@@ -396,7 +414,7 @@ impl BandArchive {
             header.json_metadata_length,
             "metadata",
         )?;
-        let fields = parse_fields(raw_meta, header.internal_compression, path)?;
+        let (fields, layer_ids) = parse_layers(raw_meta, header.internal_compression, path)?;
         let bounds = usable_bounds(&header);
 
         Ok(BandArchive {
@@ -404,6 +422,7 @@ impl BandArchive {
             header,
             entries,
             fields,
+            layer_ids,
             bounds,
         })
     }
@@ -418,26 +437,39 @@ impl BandArchive {
     where
         F: FnMut(u8, u32, u32, &[u8]) -> Result<(), Error>,
     {
-        self.for_each_tile_range(|z, x, y, range| f(z, x, y, &self.bytes[range]))
+        self.for_each_tile_range(|_, z, x, y, range| f(z, x, y, &self.bytes[range]))
     }
 
-    /// Like [`Self::for_each_tile`], but hands out the tile's byte range in
-    /// the archive instead of the slice, so a caller can index tiles across
-    /// several archives first and read them later (#385).
+    /// Like [`Self::for_each_tile`], but hands out the tile id alongside
+    /// `(z, x, y)` and the tile's byte range in the archive instead of the
+    /// slice, so a caller can index tiles across several archives first and
+    /// read them later in id order (#385).
     fn for_each_tile_range<F>(&self, mut f: F) -> Result<(), Error>
     where
-        F: FnMut(u8, u32, u32, std::ops::Range<usize>) -> Result<(), Error>,
+        F: FnMut(u64, u8, u32, u32, std::ops::Range<usize>) -> Result<(), Error>,
     {
+        // Offsets, lengths and ids are archive-supplied: every add is checked
+        // so a corrupt directory reports rather than wraps.
+        let past_end = || Error::PMTilesWrite("tile data past end of archive".to_string());
         for e in &self.entries {
-            let start = (self.header.tile_data_offset + e.offset) as usize;
+            let start = self
+                .header
+                .tile_data_offset
+                .checked_add(e.offset)
+                .and_then(|s| usize::try_from(s).ok())
+                .ok_or_else(past_end)?;
             let end = start
                 .checked_add(e.length as usize)
                 .filter(|&x| x <= self.bytes.len())
-                .ok_or_else(|| Error::PMTilesWrite("tile data past end of archive".to_string()))?;
+                .ok_or_else(past_end)?;
             for i in 0..u64::from(e.run_length.max(1)) {
-                let (z, x, y) = tile_id_to_zxy(e.tile_id + i)
+                let id = e
+                    .tile_id
+                    .checked_add(i)
+                    .ok_or_else(|| Error::PMTilesWrite("tile id past end of range".to_string()))?;
+                let (z, x, y) = tile_id_to_zxy(id)
                     .map_err(|e| Error::PMTilesWrite(format!("bad tile id: {e}")))?;
-                f(z, x, y, start..end)?;
+                f(id, z, x, y, start..end)?;
             }
         }
         Ok(())
@@ -450,14 +482,19 @@ impl BandArchive {
     }
 }
 
-/// Lift `vector_layers[0].fields` out of a band archive's JSON metadata.
+/// Lift `vector_layers[0].fields` and every `vector_layers[*].id` out of a
+/// band archive's JSON metadata.
 ///
 /// Parsed with `serde_json` rather than scanned for `"fields":` and brace
 /// counted. The hand-rolled version had two failure modes: its depth counter
 /// underflowed on a `}` seen before any `{` (a panic in debug, a wrap and a
 /// silent `{}` in release), and it counted braces inside string literals, so a
 /// field *named* with a `}` truncated the object into invalid JSON.
-fn parse_fields(raw: &[u8], internal: Compression, path: &Path) -> Result<Value, Error> {
+fn parse_layers(
+    raw: &[u8],
+    internal: Compression,
+    path: &Path,
+) -> Result<(Value, Vec<String>), Error> {
     let plain = compression::decompress(raw, internal)
         .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))?;
     // Unparseable metadata is not fatal: the band's tiles are still usable,
@@ -469,16 +506,25 @@ fn parse_fields(raw: &[u8], internal: Compression, path: &Path) -> Result<Value,
                 "{}: metadata is not valid JSON ({e}); merged layer will declare no fields",
                 path.display()
             );
-            return Ok(json!({}));
+            return Ok((json!({}), Vec::new()));
         }
     };
-    Ok(parsed
-        .get("vector_layers")
-        .and_then(|v| v.get(0))
+    let layers = parsed.get("vector_layers").and_then(Value::as_array);
+    let fields = layers
+        .and_then(|v| v.first())
         .and_then(|l| l.get("fields"))
         .filter(|f| f.is_object())
         .cloned()
-        .unwrap_or_else(|| json!({})))
+        .unwrap_or_else(|| json!({}));
+    let ids = layers
+        .map(|v| {
+            v.iter()
+                .filter_map(|l| l.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((fields, ids))
 }
 
 /// What a pyramid build produced.
@@ -535,9 +581,10 @@ impl Default for PyramidOptions {
 /// This is the form the issue asks for —
 /// `--band "0-5:cells_r5.parquet:aggregate"` — and it is deliberately thin:
 /// each source band runs the ordinary convert → export chain restricted to its
-/// zoom range, and [`merge_bands`] stitches the archives by tile id. Bands own
-/// disjoint zoom ranges, so no tile is ever claimed twice and the merge stays a
-/// concatenation rather than a per-tile layer union.
+/// zoom range, and [`merge_bands`] stitches the archives by tile id. Bands of
+/// the same layer must not share a zoom; bands in different layers may, and at
+/// a shared zoom the tile's layers are concatenated (tiles only one band wrote
+/// pass through untouched).
 ///
 /// Bands may mix kinds freely: a band pointing at a PMTiles archive is used
 /// as-is (the two-step form), one pointing at anything else is tiled here.
@@ -632,13 +679,17 @@ pub fn build_pyramid(
 
 /// Merge per-band archives into one, in band order.
 ///
-/// Tiles are copied across still compressed; nothing is decoded. That is also
-/// why the merged metadata carries no `tilestats` — reconstructing feature
-/// counts and attribute histograms would mean parsing every MVT, which is
-/// exactly the cost this merge exists to avoid.
+/// A tile only one band wrote is copied across still compressed. Only a tile
+/// that several bands (in different layers) wrote at a shared zoom is
+/// decompressed, so its layer messages can be concatenated, and recompressed;
+/// no MVT is ever decoded. That is also why the merged metadata carries no
+/// `tilestats` — reconstructing feature counts and attribute histograms would
+/// mean parsing every MVT, which is exactly the cost this merge exists to
+/// avoid.
 pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error> {
-    // A library caller can hand over overlapping bands covering disjoint
-    // geography, which the per-tile collision check below would never catch.
+    // A library caller can hand over same-layer bands that overlap in zoom
+    // but cover disjoint geography, which the per-tile collision check below
+    // would never catch.
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
 
     // StreamingPmtilesWriter, not PmtilesWriter: it spools tile bytes to a temp
@@ -667,8 +718,35 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
             .iter()
             .map(|b| BandArchive::open(&b.input))
             .collect::<Result<_, _>>()?;
+        // The `:LAYER` of a pre-tiled band is a label; the layer name inside
+        // its tiles is whatever the archive was exported with. validate_bands
+        // only sees the labels, so two archives both carrying `fields`,
+        // labelled `2024` and `2025`, would pass and the concatenated tile
+        // would hold two layers of one name — an MVT §4.1 violation a client
+        // resolves by dropping one. An archive whose metadata declares no
+        // layers cannot be checked; that case has already been warned about.
+        for (band, archive) in bands.iter().zip(&archives) {
+            if !archive.layer_ids.is_empty() && archive.layer_ids != [band.layer.as_str()] {
+                return Err(Error::PMTilesWrite(format!(
+                    "band `{}` ({}) carries layer(s) {:?} but is labelled `{}`; when bands \
+                     share zooms the archive's layer must match its label so tiles do not \
+                     carry two layers of one name",
+                    band.layer,
+                    band.input.display(),
+                    archive.layer_ids,
+                    band.layer
+                )));
+            }
+        }
         type Ref = (usize, std::ops::Range<usize>);
-        let mut index: BTreeMap<(u8, u32, u32), Vec<Ref>> = BTreeMap::new();
+        // One tile id's `(z, x, y)` and every band range that wrote it.
+        type Slot = ((u8, u32, u32), Vec<Ref>);
+        // Keyed by tile id, not (z, x, y): the writer appends tile data in
+        // add order and stamps the header `clustered`, which promises that
+        // offsets are monotonic in directory (tile id) order. Row-major order
+        // is not Hilbert order at any zoom ≥ 1, and go-pmtiles `verify`
+        // rejected the result as "out-of-order entry in clustered archive".
+        let mut index: BTreeMap<u64, Slot> = BTreeMap::new();
         let mut counts = vec![0usize; bands.len()];
         for (bi, (band, archive)) in bands.iter().zip(&archives).enumerate() {
             if let Some(b) = archive.bounds {
@@ -678,12 +756,12 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
                 }
             }
             let mut skipped = 0usize;
-            archive.for_each_tile_range(|z, x, y, range| {
+            archive.for_each_tile_range(|id, z, x, y, range| {
                 if z < band.min_zoom || z > band.max_zoom {
                     skipped += 1;
                     return Ok(());
                 }
-                let refs = index.entry((z, x, y)).or_default();
+                let (_, refs) = index.entry(id).or_insert_with(|| ((z, x, y), Vec::new()));
                 if let Some((prev, _)) = refs.iter().find(|(p, _)| bands[*p].layer == band.layer) {
                     return Err(Error::PMTilesWrite(format!(
                         "tile {z}/{x}/{y} claimed twice for layer {:?} (bands {} and {})",
@@ -716,7 +794,8 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
         }
         let mut combined = 0usize;
         let mut buf = Vec::new();
-        for (&(z, x, y), refs) in &index {
+        for ((z, x, y), refs) in index.values() {
+            let (z, x, y) = (*z, *x, *y);
             if let [(bi, range)] = refs.as_slice() {
                 let data = archives[*bi].tile(range.clone());
                 let hash = TileHasher::hash(data);
@@ -1353,6 +1432,130 @@ mod tests {
             meta["vector_layers"][1]["fields"]["2025_f"],
             json!("Number")
         );
+    }
+
+    /// The two-phase merge used to walk its index in `(z, x, y)` order and the
+    /// writer appends tile data in add order, so the directory — sorted by
+    /// tile id, and stamped `clustered` — pointed at non-monotonic offsets.
+    /// Row-major order is not Hilbert order at any zoom ≥ 1; go-pmtiles
+    /// `verify` reported "out-of-order entry in clustered archive". This is
+    /// its check: walking the directory, each entry's offset is either one
+    /// already seen (a dedup back-reference) or the current running end.
+    #[test]
+    fn merge_writes_shared_zoom_tiles_in_tile_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        // Every tile distinct, so nothing dedups and every offset is fresh.
+        let z1: Vec<(u8, u32, u32)> = vec![(1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)];
+        for (path, label) in [(&a, "a"), (&b, "b")] {
+            let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+            w.set_layer_name(label);
+            w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+            for &(z, x, y) in &z1 {
+                w.add_tile(z, x, y, &layer_tile(&format!("{label}-{x}-{y}")))
+                    .unwrap();
+            }
+            w.finalize(path).unwrap();
+        }
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands(
+            &[
+                Band::parse(&format!("1-1:{}:a", a.display())).unwrap(),
+                Band::parse(&format!("1-1:{}:b", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 4);
+
+        let bytes = std::fs::read(&out).unwrap();
+        let h = Header::from_bytes(&bytes).unwrap();
+        assert!(h.clustered, "the writer stamps every archive clustered");
+        let root = compression::decompress(
+            &bytes[h.root_dir_offset as usize..(h.root_dir_offset + h.root_dir_length) as usize],
+            h.internal_compression,
+        )
+        .unwrap();
+        let entries: Vec<(u64, u64, u32)> = decode_directory(&root)
+            .unwrap()
+            .iter()
+            .filter(|e| e.run_length > 0)
+            .map(|e| (e.tile_id, e.offset, e.length))
+            .collect();
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        let mut seen = std::collections::HashSet::new();
+        let mut end = 0u64;
+        for &(id, offset, length) in &entries {
+            if seen.contains(&offset) {
+                continue;
+            }
+            assert_eq!(
+                offset, end,
+                "out-of-order entry in clustered archive at tile id {id}: {entries:?}"
+            );
+            seen.insert(offset);
+            end = offset + u64::from(length);
+        }
+    }
+
+    /// For a pre-tiled band the `:LAYER` in `--band` is a label; the MVT layer
+    /// name inside each tile is whatever the archive was exported with. Two
+    /// archives both carrying layer `fields`, labelled `2024` and `2025`,
+    /// passed validation and produced tiles with two layers named `fields` —
+    /// an MVT §4.1 violation MapLibre resolves by keeping one of them. The
+    /// archive's own layer id must match its label when bands share zooms.
+    #[test]
+    fn merge_rejects_shared_zoom_band_whose_archive_layer_differs_from_its_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        write_band_with_payload(&a, "fields", &[(3, 1, 1)], &layer_tile("fields"));
+        write_band_with_payload(&b, "fields", &[(3, 1, 1)], &layer_tile("fields"));
+
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[
+                Band::parse(&format!("0-3:{}:2024", a.display())).unwrap(),
+                Band::parse(&format!("0-3:{}:2025", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`2024`") && msg.contains("fields"),
+            "must name both the label and the archive's layer: {msg}"
+        );
+        assert!(!out.exists(), "nothing should be written on a bad plan");
+    }
+
+    /// Only MVT tiles can be concatenated: two PNGs glued together are not a
+    /// PNG. The tile type is in the header, so it is checked on open.
+    #[test]
+    fn non_mvt_band_archive_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("raster.pmtiles");
+        write_band(
+            &src,
+            "agg",
+            &[(3, 1, 1)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+        let mut bytes = std::fs::read(&src).unwrap();
+        // Byte 99 of the header is the tile type; 2 is PNG.
+        bytes[99] = 2;
+        std::fs::write(&src, &bytes).unwrap();
+
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[Band::parse(&format!("3-3:{}:agg", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Png"), "{err}");
     }
 
     #[test]
