@@ -47,3 +47,21 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+# cargo-binstall metadata: points at the tarballs/zip release.yml already
+# publishes (tylertoo-$VERSION-$TARGET{.tar.gz,.zip}), so `cargo binstall
+# tylertoo` resolves a prebuilt binary instead of falling back to a
+# from-source build. `{ archive-suffix }` with `pkg-fmt = "tgz"` makes
+# binstall probe both `.tgz` and `.tar.gz` and use whichever exists — see
+# https://github.com/cargo-bins/cargo-binstall/blob/main/crates/binstalk-fetchers/src/gh_crate_meta.rs
+# (PkgFmt::Tgz -> [".tgz", ".tar.gz"]) — so this resolves to the real
+# `.tar.gz` assets without needing a non-standard pkg-fmt value. Each
+# archive's binary sits one directory down (release.yml stages it under
+# `tylertoo-$VERSION-$TARGET/`), hence the explicit `bin-dir`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tylertoo-{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "tylertoo-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
