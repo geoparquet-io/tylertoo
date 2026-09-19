@@ -1295,6 +1295,58 @@ statistics and prunes more.
 
 ---
 
+## Property selection: `--include-property` / `--exclude-property` / `--exclude-all-properties`
+
+Which attribute columns the output carries — tippecanoe's `-y` / `-x` / `-X`.
+Everything not selected is dropped **at scan time** on `overview` and `tiles`:
+the excluded columns are not decoded, the intermediate overview file only
+carries the kept columns, and the tiles' per-feature bytes shrink
+accordingly (which matters for the `--max-tile-size` valve — a tile that has
+to shed features to fit its byte budget sheds fewer when it is not carrying
+eight columns nobody asked for). The geometry column is always kept.
+
+```bash
+# Tiles carry only confidence and metrics:area
+tylertoo tiles fields.parquet fields.pmtiles --max-zoom 13 \
+  --include-property confidence --include-property metrics:area
+
+# Everything except the id and the timestamp
+tylertoo overview fields.parquet ov.parquet --exclude-property id \
+  --exclude-property "determination:datetime"
+
+# Geometry only
+tylertoo tiles fields.parquet outlines.pmtiles --exclude-all-properties
+```
+
+| Knob | Default | Semantics |
+|------|---------|-----------|
+| `--include-property COL` (repeatable) | all | keep ONLY these; naming a column the input lacks is an error |
+| `--exclude-property COL` (repeatable) | none | drop these; an unknown name only warns; ignored when `--include-property` is given |
+| `--exclude-all-properties` | off | geometry-only output; ignored when `--include-property` is given |
+
+The three combine as tippecanoe's do: an include list is the whole answer and
+the exclude flags are then ignored (tippecanoe's `-y` implies `-X`, and its
+attribute filter consults only the include set once one exists), so
+`--exclude-all-properties --include-property foo` keeps `foo`, and
+`--include-property a --include-property b --exclude-property b` keeps both.
+Without an include list, `--exclude-all-properties` keeps nothing and
+`--exclude-property` drops what it names.
+
+**Interactions**: a column another knob reads — `--sort-key`, `--class-rank`,
+`--magnitude-ladder` / `--entry-zoom`, `--accumulate-attribute`, `--filter` —
+must stay included; excluding it is rejected with the knob's name, because
+the knobs evaluate over the projected batches and would otherwise go silently
+inert. `export-pmtiles` takes the same three flags and applies them to the
+tiles only, matched on the property names the tiles publish (the overview
+file is untouched); there, the `--feature-order` column is the one that must
+stay — and `tiles` rejects the same pairing up front, since its selection is
+applied at convert and the column would be gone before export could sort on
+it. An explicit `--include-property coalesced_count` on export wins over the
+1-everywhere withholding (#379): the column is in the file, and naming it is
+not a typo.
+
+---
+
 ## Performance profiles: `--profile`, `--in-flight-batches`
 
 Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),

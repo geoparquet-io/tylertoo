@@ -123,6 +123,7 @@ use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
 use super::pipe::scoped_pipe;
 use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
+use super::properties::PropertySelection;
 use super::reader::{OverviewReader, ReaderError};
 use super::writer::LEVEL_COLUMN;
 
@@ -226,6 +227,11 @@ pub struct ExportOptions {
     /// rejected if it is. The one-shot `tiles` command passes its
     /// `--min-zoom` here; `export-pmtiles --min-zoom` sets it directly.
     pub min_zoom: Option<u8>,
+    /// Which properties the tiles carry (#386): tippecanoe's `-x` / `-y` /
+    /// `-X`, matched against the property names as the tiles would publish
+    /// them. The overview file is untouched. Default: keep everything the
+    /// file exports.
+    pub properties: PropertySelection,
 }
 
 impl Default for ExportOptions {
@@ -239,6 +245,7 @@ impl Default for ExportOptions {
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
             min_zoom: None,
+            properties: PropertySelection::default(),
         }
     }
 }
@@ -314,6 +321,18 @@ pub enum ExportError {
          it over real tiles (#380)"
     )]
     DeclaredMinZoomTooFine { declared: u8, coarsest: u8 },
+
+    #[error(
+        "included property {name:?} is not a property this overview file exports \
+         (exportable: {available})"
+    )]
+    UnknownProperty { name: String, available: String },
+
+    #[error(
+        "property {name:?} is excluded but {knob} reads it; keep it in the selection or \
+         drop the knob"
+    )]
+    PropertyRequiredByKnob { name: String, knob: String },
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -677,7 +696,13 @@ fn export_pmtiles_impl(
     // #359: which name each column is published under. Derived once from the
     // file's own rename provenance so a standalone `export-pmtiles` on an
     // overview written by an earlier run restores names just as `tiles` does.
-    let published = PublishedNames::from_reader(&reader);
+    // #386: then the caller's include/exclude, matched on the published names.
+    let published = PublishedNames::from_reader(&reader).with_selection(
+        reader.schema(),
+        geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?,
+        &options.properties,
+        &options.feature_order,
+    )?;
 
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
@@ -3317,6 +3342,114 @@ impl PublishedNames {
             }
         }
         Self::from_meta(meta, reader.schema(), suppressed)
+    }
+
+    /// Apply a caller's property selection (#386) on top of the file-derived
+    /// naming: every exportable property whose *published* name the
+    /// selection drops is withheld. Names are matched as the tile would
+    /// carry them, which is what a style author has in front of them, so a
+    /// column restored from a reserved-column rename is addressed by its
+    /// restored name. An `include` naming no exportable property is an
+    /// error; excluding the `--feature-order` column is too, since the sort
+    /// would then have nothing to read.
+    ///
+    /// An explicit `include` wins over the #379 heuristic: a counter the
+    /// file-derived naming withheld because it never left 1 is exported
+    /// after all when the caller names it, since the column is plainly in
+    /// the file and asking for it is not a typo.
+    fn with_selection(
+        mut self,
+        schema: &Schema,
+        geom_idx: usize,
+        selection: &PropertySelection,
+        feature_order: &FeatureOrder,
+    ) -> Result<Self, ExportError> {
+        if selection.is_identity() {
+            return Ok(self);
+        }
+        if let Some(include) = &selection.include {
+            let exported: Vec<String> = property_columns(schema, geom_idx, &self)
+                .into_iter()
+                .map(|(_, n)| n)
+                .collect();
+            for name in include {
+                if exported.contains(name) {
+                    continue;
+                }
+                // Suppression is keyed by schema name; the include list
+                // speaks published names, so map through the rename table.
+                let withheld = schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .find(|n| self.is_suppressed(n) && self.publish(n) == name)
+                    .cloned();
+                if let Some(schema_name) = withheld {
+                    log::info!(
+                        "[export] exporting {schema_name:?} after all: it was withheld \
+                         (#379) but --include-property names it"
+                    );
+                    self.suppressed.remove(&schema_name);
+                }
+            }
+        }
+        let exportable: Vec<(usize, String)> = property_columns(schema, geom_idx, &self);
+        let published: Vec<&str> = exportable.iter().map(|(_, n)| n.as_str()).collect();
+        if let Some(include) = &selection.include {
+            for name in include {
+                if !published.contains(&name.as_str()) {
+                    return Err(ExportError::UnknownProperty {
+                        name: name.clone(),
+                        available: published
+                            .iter()
+                            .map(|n| format!("{n:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    });
+                }
+            }
+        }
+        for name in &selection.exclude {
+            if !published.contains(&name.as_str()) {
+                log::warn!(
+                    "[export] excluded property {name:?} is not exported by this file anyway"
+                );
+            }
+        }
+        if let FeatureOrder::Column { name, .. } = feature_order {
+            if published.contains(&name.as_str()) && !selection.keeps(name) {
+                return Err(ExportError::PropertyRequiredByKnob {
+                    name: name.clone(),
+                    knob: "--feature-order".to_string(),
+                });
+            }
+        }
+        let mut dropped = 0usize;
+        for (idx, name) in &exportable {
+            if !selection.keeps(name) {
+                self.suppressed.insert(schema.field(*idx).name().clone());
+                dropped += 1;
+            }
+        }
+        let kept: Vec<&str> = published
+            .iter()
+            .copied()
+            .filter(|n| selection.keeps(n))
+            .collect();
+        log::info!(
+            "[export] property selection: keeping {} of {} ({}), dropping {dropped}",
+            kept.len(),
+            published.len(),
+            if kept.is_empty() {
+                "none — geometry only".to_string()
+            } else {
+                kept.iter()
+                    .map(|n| format!("{n:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+        Ok(self)
     }
 
     /// Whether a schema column is withheld from the tiles entirely.
@@ -6231,6 +6364,66 @@ mod tests {
         );
     }
 
+    /// An explicit `--include-property coalesced_count` wins over the
+    /// max==1 heuristic: the column is plainly in the file, and a caller who
+    /// names it wants it (a style that keys on it, a debugging pass).
+    #[test]
+    fn coalesced_count_explicit_include_overrides_suppression() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_coalesced_fixture(tin.path(), &[vec![1, 1], vec![1, 1]]);
+        let opts = ExportOptions {
+            properties: PropertySelection {
+                include: Some(vec!["coalesced_count".to_string()]),
+                ..Default::default()
+            },
+            ..ExportOptions::default()
+        };
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(tin.path(), tout.path(), &opts).expect("explicit include exports");
+        let decoded = tempfile::NamedTempFile::new().unwrap();
+        crate::decode::decode_pmtiles(
+            tout.path(),
+            decoded.path(),
+            &crate::decode::DecodeOptions::default(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(decoded.path()).unwrap();
+        let names: Vec<String> = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "zoom" | "layer" | "mvt_id" | "geometry" | "bbox"
+                )
+            })
+            .collect();
+        assert_eq!(names, vec!["coalesced_count"]);
+
+        // ... and the layer advertises it.
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        let geom_idx = geometry_index(reader.schema()).unwrap();
+        let published = PublishedNames::from_reader(&reader)
+            .with_selection(
+                reader.schema(),
+                geom_idx,
+                &opts.properties,
+                &opts.feature_order,
+            )
+            .unwrap();
+        let fields = field_metadata(reader.schema(), Some(geom_idx), &published);
+        assert_eq!(
+            fields.keys().collect::<Vec<_>>(),
+            vec!["coalesced_count"],
+            "{fields:?}"
+        );
+    }
+
     #[test]
     fn coalesced_count_is_exported_when_coalescing_merged_something() {
         // Level 0 merged two segments somewhere: the column now carries real
@@ -6393,6 +6586,115 @@ mod tests {
         assert!(
             msg.contains("min_zoom") && msg.contains('3') && msg.contains('2'),
             "error must name the declared and actual minimum: {msg}"
+        );
+    }
+
+    // --- property selection at export (#386) --------------------------------
+
+    /// Export the plain two-column fixture (`id`, `name`) under a selection
+    /// and return the property names the tiles carry.
+    fn exported_names_with(selection: PropertySelection) -> Result<Vec<String>, ExportError> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let b = Geometry::Point(Point::new(120.0, -40.0));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[
+                (vec![0, 1], vec![a.clone(), b.clone()]),
+                (vec![0, 1], vec![a.clone(), b.clone()]),
+            ],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            properties: selection,
+            ..ExportOptions::default()
+        };
+        export_pmtiles(tin.path(), tout.path(), &opts)?;
+        let decoded = tempfile::NamedTempFile::new().unwrap();
+        crate::decode::decode_pmtiles(
+            tout.path(),
+            decoded.path(),
+            &crate::decode::DecodeOptions::default(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(decoded.path()).unwrap();
+        Ok(ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "zoom" | "layer" | "mvt_id" | "geometry" | "bbox"
+                )
+            })
+            .collect())
+    }
+
+    #[test]
+    fn export_property_selection_include_exclude_and_none() {
+        let include = PropertySelection {
+            include: Some(vec!["name".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(exported_names_with(include).unwrap(), vec!["name"]);
+
+        let exclude = PropertySelection {
+            exclude: vec!["name".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(exported_names_with(exclude).unwrap(), vec!["id"]);
+
+        let none = PropertySelection {
+            exclude_all: true,
+            ..Default::default()
+        };
+        assert!(exported_names_with(none).unwrap().is_empty());
+    }
+
+    #[test]
+    fn export_property_selection_rejects_unknown_include() {
+        let typo = PropertySelection {
+            include: Some(vec!["nmae".to_string()]),
+            ..Default::default()
+        };
+        let msg = exported_names_with(typo).unwrap_err().to_string();
+        assert!(
+            msg.contains("\"nmae\"") && msg.contains("\"name\""),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn export_property_selection_cannot_drop_the_feature_order_column() {
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![a.clone()]), (vec![0], vec![a])],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            feature_order: FeatureOrder::Column {
+                name: "id".to_string(),
+                descending: false,
+            },
+            properties: PropertySelection {
+                exclude: vec!["id".to_string()],
+                ..Default::default()
+            },
+            ..ExportOptions::default()
+        };
+        let msg = export_pmtiles(tin.path(), tout.path(), &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("--feature-order") && msg.contains("\"id\""),
+            "{msg}"
         );
     }
 }

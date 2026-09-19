@@ -24,6 +24,7 @@ pub mod ladder;
 pub mod level;
 mod pipe;
 mod pipeline;
+pub mod properties;
 pub mod reader;
 pub mod simplify;
 mod stream;

@@ -125,6 +125,7 @@ fn convert(
         // #380: the archive declares the requested range even when the
         // coarsest levels generalized to nothing.
         min_zoom: Some(min_zoom),
+        properties: Default::default(),
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -691,6 +692,8 @@ fn overview(
         coalesce_junction_angle,
         bbox: bbox.map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]),
         filter,
+        // #386: property selection is not on the Python surface yet.
+        properties: Default::default(),
         spill_dir,
     };
 
@@ -822,6 +825,7 @@ fn export_pmtiles(
         feature_order: parse_feature_order(feature_order)?,
         // #380: the declared minimum; None keeps the coarsest level's zoom.
         min_zoom,
+        properties: Default::default(),
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

@@ -236,3 +236,53 @@ fn spill_dir_flag_reaches_convert_options() {
         );
     }
 }
+
+/// #386: on `tiles` the property selection is applied at convert, so an
+/// excluded column is gone from the intermediate before export gets to sort
+/// on it. `export-pmtiles` rejects `--feature-order X --exclude-property X`
+/// outright; `tiles` must do the same, up front, rather than run the whole
+/// convert and then quietly fall back to input order. Checked before any
+/// input I/O, so no fixture is needed and nothing is written.
+#[test]
+fn tiles_rejects_feature_order_on_an_excluded_property() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.parquet");
+    std::fs::write(&input, b"not really parquet").unwrap();
+    let out = dir.path().join("out.pmtiles");
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--exclude-property",
+            "id",
+            "--feature-order",
+            "id",
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(
+        !output.status.success(),
+        "--feature-order on an excluded property must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "property \"id\" is excluded but --feature-order reads it; keep it in the \
+             selection or drop the knob"
+        ),
+        "error should use the export wording, got: {stderr}"
+    );
+    assert!(!out.exists(), "no output must be written");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "in.parquet")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "nothing else must be written: {leftovers:?}"
+    );
+}
