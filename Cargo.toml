@@ -44,11 +44,9 @@ geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
 prost = "0.14"
 prost-build = "0.14"
 
-# Parallelism and spatial indexing
+# Parallelism
 rayon = "1.10"
-rstar = "0.13"
 crossbeam-channel = "0.5"
-dashmap = "6"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -67,12 +65,8 @@ indicatif = "0.18"
 
 # Tracing / Profiling
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-tracing-chrome = "0.7"
 
-# External sorting
-extsort = "0.5"
-rmp-serde = "1.3"
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 
 # Memory profiling (actual RSS measurement)
@@ -97,6 +91,8 @@ proptest = "1"
 # Complexity gate: clippy default threshold (25); zero findings today.
 # Tighten via `cognitive-complexity-threshold` in clippy.toml if desired.
 cognitive_complexity = "warn"
+# Function-length gate: see `too-many-lines-threshold` in clippy.toml.
+too_many_lines = "warn"
 # Pedantic subset (zero findings on current code)
 filter_map_next = "warn"
 flat_map_option = "warn"

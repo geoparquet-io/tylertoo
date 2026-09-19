@@ -88,20 +88,48 @@ checks). All of them are runnable locally.
 
 ```bash
 # Lint (curated pedantic subset via [workspace.lints.clippy];
-# cognitive-complexity threshold in clippy.toml)
+# cognitive-complexity and too-many-lines thresholds in
+# clippy.toml)
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Format
 cargo fmt --all --check
 
 # Unused dependencies
-cargo install cargo-machete   # once
-cargo machete
+cargo install cargo-shear   # once
+cargo shear
+
+# Duplicated code (hard gate: zero pairs at >=0.95)
+cargo install similarity-rs   # once
+similarity-rs --threshold 0.95 --min-lines 10 \
+  --skip-test crates/core/src crates/cli/src \
+  crates/python/src
+
+# Public API surface (baseline lives in
+# crates/core/api/tylertoo-core.txt). The nightly
+# is pinned: rustdoc renders paths differently from
+# one nightly to the next, so a floating toolchain
+# reports drift that is not there. The pin lives in
+# the public-api job in .github/workflows/ci.yml.
+cargo install cargo-public-api        # once
+rustup toolchain install \
+  nightly-2026-09-15                  # once
+cd crates/core
+cargo +nightly-2026-09-15 public-api \
+  --simplified | diff -u api/tylertoo-core.txt -
+cd ../..
 
 # Supply chain (policy in deny.toml)
 cargo install cargo-audit cargo-deny   # once
 cargo audit
 cargo deny check
+
+# Breaking changes vs. main (tylertoo-core is
+# unpublished, so the baseline is a git revision)
+cargo install cargo-semver-checks   # once
+cargo semver-checks check-release \
+  --package tylertoo-core \
+  --baseline-rev origin/main
 
 # Profiling feature still compiles
 cargo build --features dhat-heap
@@ -113,8 +141,20 @@ cargo tarpaulin --out xml --all-features --workspace \
 ```
 
 Some thresholds are **ratchets** set at current-code level and marked
-`RATCHET` in-source (`clippy.toml` cognitive-complexity 30, xenon
+`RATCHET` in-source (`clippy.toml` cognitive-complexity 30 and
+too-many-lines 200, the similarity-rs threshold 0.95, xenon
 max-absolute C). Lower them as code improves; never raise them.
+
+`cargo shear` replaced `cargo machete`: shear also inspects
+`[workspace.dependencies]`, where machete reads only member crates.
+A dependency that is deliberately declared without a code reference
+(a transitive version pin, for instance) is listed under
+`[package.metadata.cargo-shear]` in the crate that owns it.
+
+similarity-rs has no baseline file and no per-pair suppression. A new
+finding at or above 0.95 has to be refactored away. When the API
+gate fires on an intended change, regenerate the baseline in the
+same PR — see `crates/core/api/README.md`.
 
 ### Python (`crates/python`)
 

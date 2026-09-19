@@ -108,5 +108,5 @@ workspace = true
 
 # aws-smithy-types is a version-pin only (see the comment beside it); no code
 # in this crate references it directly.
-[package.metadata.cargo-machete]
+[package.metadata.cargo-shear]
 ignored = ["aws-smithy-types"]
