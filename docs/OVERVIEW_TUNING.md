@@ -107,9 +107,14 @@ tylertoo pyramid fire-2023.pmtiles \
 | `features` | raw detections | z9–14 |
 
 Two bands may share a layer name, as `aggregate` does here: to a client it is
-one layer whose content changes at z6. Zoom ranges must not overlap — two bands
-claiming one zoom would write the same tile ids — and that is checked before
+one layer whose content changes at z6. Two bands of the **same** layer must not
+share a zoom — they would write the same tile ids — and that is checked before
 any tiling happens, so a bad plan costs an error rather than a conversion.
+Bands in **different** layers may share zooms (tippecanoe's `-L`): at the
+zooms they share, a tile every band wrote carries every band's layer, and a
+tile only one band wrote passes through untouched. So
+`--band 0-13:a.parquet:2024 --band 0-13:b.parquet:2025` is one archive with
+two independent layers over the same zooms.
 
 **A band is tiled verbatim by default.** That is the premise of banding: the
 input already *is* the right resolution for the zooms it owns, so running the
@@ -128,7 +133,10 @@ reuse last week's coarse archive and re-tile only the fine band.
 the directory name, since a layer called `*` is not useful to a client. A path
 containing a colon (`s3://…`, `https://…`, `C:\…`) is fine; the layer is only
 split off when the last colon-separated segment looks like a layer id rather
-than part of a path. Zoom ranges must not overlap; a **gap** between bands is
+than part of a path. For a pre-tiled archive the layer is a *label*: the layer
+name inside its tiles is whatever the archive was exported with, and when bands
+share zooms the two must agree, or the combined tile would hold two layers of
+one name (which a client resolves by dropping one). A **gap** between bands is
 allowed but warns, because the merged archive advertises one continuous range
 and a client will request the uncovered zooms and get nothing.
 
