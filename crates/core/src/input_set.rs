@@ -432,8 +432,9 @@ impl ConvertSource {
     /// columns of the file schema, sorted ascending (#386). Applied once,
     /// before anything derives column indices from the schema, so every
     /// downstream index is already relative to the projected layout and the
-    /// parquet reader never decodes the excluded column chunks. A second
-    /// call is a programming error.
+    /// excluded columns are never decoded (a remote input still stages every
+    /// chunk of a row group; only the decode is skipped). A second call is a
+    /// programming error.
     pub fn restrict_columns(&self, keep: Vec<usize>) -> Result<(), InputError> {
         let ncols = self.file_schema()?.fields().len();
         if keep.windows(2).any(|w| w[0] >= w[1]) || keep.iter().any(|&i| i >= ncols) {

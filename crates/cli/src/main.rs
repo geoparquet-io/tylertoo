@@ -308,11 +308,12 @@ struct ExportPmtilesArgs {
     include_property: Vec<String>,
 
     /// Drop these properties from the tiles (repeatable; tippecanoe -x).
-    /// Applied after --include-property
+    /// Ignored when --include-property is given, as in tippecanoe
     #[arg(long, value_name = "NAME")]
     exclude_property: Vec<String>,
 
-    /// Drop every property (tippecanoe -X): geometry-only tiles
+    /// Drop every property (tippecanoe -X): geometry-only tiles. Ignored
+    /// when --include-property is given, as in tippecanoe
     #[arg(long)]
     exclude_all_properties: bool,
 
@@ -564,22 +565,23 @@ struct ConvertTuningArgs {
     filter: Option<String>,
 
     /// Keep ONLY these property columns (repeatable; tippecanoe -y). Every
-    /// other property is dropped at scan time: the parquet reader skips the
-    /// excluded column chunks and the overview file only carries what was
-    /// asked for. The geometry column is always kept. A column another knob
+    /// other property is dropped at scan time: the excluded columns are not
+    /// decoded and the overview file only carries what was asked for. The
+    /// geometry column is always kept. A column another knob
     /// reads (--sort-key, --filter, --accumulate-attribute,
     /// --magnitude-ladder, --class-rank) must stay included; naming a column
     /// the input does not have is an error
     #[arg(long, value_name = "COL", help_heading = "Properties")]
     include_property: Vec<String>,
 
-    /// Drop these property columns (repeatable; tippecanoe -x). Applied after
-    /// --include-property. Naming a column the input does not have only
-    /// warns
+    /// Drop these property columns (repeatable; tippecanoe -x). Ignored when
+    /// --include-property is given, as in tippecanoe. Naming a column the
+    /// input does not have only warns
     #[arg(long, value_name = "COL", help_heading = "Properties")]
     exclude_property: Vec<String>,
 
-    /// Drop every property column (tippecanoe -X): geometry-only output
+    /// Drop every property column (tippecanoe -X): geometry-only output.
+    /// Ignored when --include-property is given, as in tippecanoe
     #[arg(long, help_heading = "Properties")]
     exclude_all_properties: bool,
 
@@ -1735,6 +1737,20 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     let options = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
+
+    // #386: the property selection is applied at convert, so an excluded
+    // column is already gone from the intermediate when export would sort
+    // on it — export-pmtiles rejects that pairing outright, and so must the
+    // facade, before any work is done, rather than run the whole convert
+    // and then quietly fall back to input order. Same wording as export's
+    // `PropertyRequiredByKnob`.
+    if let FeatureOrder::Column { name, .. } = &args.feature_order {
+        anyhow::ensure!(
+            options.properties.keeps(name),
+            "property {name:?} is excluded but --feature-order reads it; keep it in the \
+             selection or drop the knob"
+        );
+    }
 
     // Intermediate overview file (#314): retained at --keep-overview when
     // given; otherwise a temp file in --spill-dir / $TMPDIR / the output

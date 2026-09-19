@@ -1656,3 +1656,45 @@ fn property_selection_rejects_knob_columns_and_typos() {
         "{msg}"
     );
 }
+
+/// A `ConvertSource` is single-use once a selection has been applied: the
+/// projection lives on the source, so a second conversion through it — with
+/// any selection, the default included — must be refused rather than
+/// silently narrowed to the first call's columns.
+#[test]
+fn property_selection_makes_the_source_single_use() {
+    use super::convert::convert_to_overviews_sources;
+    use super::properties::PropertySelection;
+    use crate::input_set::ConvertSource;
+
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(4), true, Some("extra"));
+    let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let o = ConvertOptions {
+        properties: PropertySelection {
+            include: Some(vec!["name".to_string()]),
+            ..Default::default()
+        },
+        ..opts(true)
+    };
+    convert_to_overviews_sources(&source, tout.path(), &o).expect("first convert");
+
+    // Default selection on the same source: an error, not a narrowed file.
+    let tout2 = tempfile::NamedTempFile::new().unwrap();
+    let err = convert_to_overviews_sources(&source, tout2.path(), &opts(true))
+        .expect_err("a projected source must not be reused");
+    assert!(
+        err.to_string().contains("already applied"),
+        "unexpected error: {err}"
+    );
+
+    // ... and so is a second explicit selection.
+    let err = convert_to_overviews_sources(&source, tout2.path(), &o)
+        .expect_err("a projected source must not be reused");
+    assert!(
+        err.to_string().contains("already applied"),
+        "unexpected error: {err}"
+    );
+}

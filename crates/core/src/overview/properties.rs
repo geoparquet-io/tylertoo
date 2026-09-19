@@ -4,10 +4,12 @@
 //! same choice is [`PropertySelection`], resolved once against the input
 //! schema into the set of root columns to read. The geometry column is never
 //! a property and is always kept. Applied at *scan* time on `overview` /
-//! `tiles` (the parquet reader skips the excluded column chunks, and the
-//! intermediate overview file only carries what was asked for) and at
-//! export time on `export-pmtiles` (the overview file is unchanged; the
-//! tiles carry the selection).
+//! `tiles` (the excluded columns are not decoded, and the intermediate
+//! overview file only carries what was asked for) and at export time on
+//! `export-pmtiles` (the overview file is unchanged; the tiles carry the
+//! selection). The flags combine as tippecanoe's do: an include list is the
+//! whole answer and the exclude flags are then ignored (see
+//! [`PropertySelection::keeps`]).
 //!
 //! A column a tuning knob reads (`--sort-key`, `--filter`,
 //! `--accumulate-attribute`, `--magnitude-ladder` / `--entry-zoom`,
@@ -24,12 +26,14 @@ use thiserror::Error;
 /// (parquet column names are case-sensitive).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PropertySelection {
-    /// When `Some`, only these properties are kept (`-y`). An empty list
-    /// keeps none — the same as [`Self::exclude_all`].
+    /// When `Some`, only these properties are kept (`-y`), and `exclude` /
+    /// `exclude_all` are ignored, as in tippecanoe. An empty list keeps
+    /// none — the same as [`Self::exclude_all`].
     pub include: Option<Vec<String>>,
-    /// Properties dropped (`-x`). Applied after `include`.
+    /// Properties dropped (`-x`). Ignored when `include` is given.
     pub exclude: Vec<String>,
-    /// Keep no properties at all (`-X`): geometry-only output.
+    /// Keep no properties at all (`-X`): geometry-only output. Ignored when
+    /// `include` is given.
     pub exclude_all: bool,
 }
 
@@ -65,14 +69,19 @@ impl PropertySelection {
     }
 
     /// Whether a property named `name` survives the selection.
+    ///
+    /// The three fields are read the way tippecanoe reads `-y` / `-x` / `-X`
+    /// (`main.cpp` sets `exclude_all` for `-y`; `serial.cpp` then keeps a
+    /// key iff it is in `include`, never consulting `exclude`): an include
+    /// list is the whole answer, so `-X -y foo` keeps `foo` and
+    /// `-y a -y b -x b` keeps both. Without one, `-X` keeps nothing and `-x`
+    /// drops what it names.
     pub fn keeps(&self, name: &str) -> bool {
+        if let Some(include) = &self.include {
+            return include.iter().any(|n| n == name);
+        }
         if self.exclude_all {
             return false;
-        }
-        if let Some(include) = &self.include {
-            if !include.iter().any(|n| n == name) {
-                return false;
-            }
         }
         !self.exclude.iter().any(|n| n == name)
     }
@@ -194,24 +203,44 @@ mod tests {
         assert_eq!(resolve(&sel, &[]).unwrap(), vec![1, 2, 3]);
     }
 
+    /// tippecanoe `-y a -y b -x b` keeps both: `serial.cpp` consults only
+    /// the include set once `-y` is given, so `-x` is ignored.
     #[test]
-    fn exclude_applies_after_include() {
+    fn include_wins_over_exclude() {
         let sel = PropertySelection {
             include: Some(vec!["confidence".into(), "metrics:area".into()]),
             exclude: vec!["metrics:area".into()],
             ..Default::default()
         };
-        assert_eq!(resolve(&sel, &[]).unwrap(), vec![1, 2]);
+        assert_eq!(resolve(&sel, &[]).unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
     fn exclude_all_leaves_geometry_only() {
         let sel = PropertySelection {
             exclude_all: true,
-            include: Some(vec!["confidence".into()]),
             ..Default::default()
         };
         assert_eq!(resolve(&sel, &[]).unwrap(), vec![2]);
+        // ... and `-x` on top changes nothing.
+        let sel = PropertySelection {
+            exclude_all: true,
+            exclude: vec!["confidence".into()],
+            ..Default::default()
+        };
+        assert_eq!(resolve(&sel, &[]).unwrap(), vec![2]);
+    }
+
+    /// tippecanoe `-X -y foo` keeps `foo`: `-y` itself implies `-X`, and the
+    /// include set is what is consulted.
+    #[test]
+    fn include_wins_over_exclude_all() {
+        let sel = PropertySelection {
+            exclude_all: true,
+            include: Some(vec!["confidence".into()]),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&sel, &[]).unwrap(), vec![1, 2]);
     }
 
     #[test]

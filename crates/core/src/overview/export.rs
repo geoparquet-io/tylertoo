@@ -3352,6 +3352,11 @@ impl PublishedNames {
     /// restored name. An `include` naming no exportable property is an
     /// error; excluding the `--feature-order` column is too, since the sort
     /// would then have nothing to read.
+    ///
+    /// An explicit `include` wins over the #379 heuristic: a counter the
+    /// file-derived naming withheld because it never left 1 is exported
+    /// after all when the caller names it, since the column is plainly in
+    /// the file and asking for it is not a typo.
     fn with_selection(
         mut self,
         schema: &Schema,
@@ -3361,6 +3366,32 @@ impl PublishedNames {
     ) -> Result<Self, ExportError> {
         if selection.is_identity() {
             return Ok(self);
+        }
+        if let Some(include) = &selection.include {
+            let exported: Vec<String> = property_columns(schema, geom_idx, &self)
+                .into_iter()
+                .map(|(_, n)| n)
+                .collect();
+            for name in include {
+                if exported.contains(name) {
+                    continue;
+                }
+                // Suppression is keyed by schema name; the include list
+                // speaks published names, so map through the rename table.
+                let withheld = schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .find(|n| self.is_suppressed(n) && self.publish(n) == name)
+                    .cloned();
+                if let Some(schema_name) = withheld {
+                    log::info!(
+                        "[export] exporting {schema_name:?} after all: it was withheld \
+                         (#379) but --include-property names it"
+                    );
+                    self.suppressed.remove(&schema_name);
+                }
+            }
         }
         let exportable: Vec<(usize, String)> = property_columns(schema, geom_idx, &self);
         let published: Vec<&str> = exportable.iter().map(|(_, n)| n.as_str()).collect();
@@ -6330,6 +6361,66 @@ mod tests {
         assert!(
             !fields.contains_key("coalesced_count"),
             "vector_layers fields must not advertise it: {fields:?}"
+        );
+    }
+
+    /// An explicit `--include-property coalesced_count` wins over the
+    /// max==1 heuristic: the column is plainly in the file, and a caller who
+    /// names it wants it (a style that keys on it, a debugging pass).
+    #[test]
+    fn coalesced_count_explicit_include_overrides_suppression() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_coalesced_fixture(tin.path(), &[vec![1, 1], vec![1, 1]]);
+        let opts = ExportOptions {
+            properties: PropertySelection {
+                include: Some(vec!["coalesced_count".to_string()]),
+                ..Default::default()
+            },
+            ..ExportOptions::default()
+        };
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(tin.path(), tout.path(), &opts).expect("explicit include exports");
+        let decoded = tempfile::NamedTempFile::new().unwrap();
+        crate::decode::decode_pmtiles(
+            tout.path(),
+            decoded.path(),
+            &crate::decode::DecodeOptions::default(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(decoded.path()).unwrap();
+        let names: Vec<String> = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "zoom" | "layer" | "mvt_id" | "geometry" | "bbox"
+                )
+            })
+            .collect();
+        assert_eq!(names, vec!["coalesced_count"]);
+
+        // ... and the layer advertises it.
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        let geom_idx = geometry_index(reader.schema()).unwrap();
+        let published = PublishedNames::from_reader(&reader)
+            .with_selection(
+                reader.schema(),
+                geom_idx,
+                &opts.properties,
+                &opts.feature_order,
+            )
+            .unwrap();
+        let fields = field_metadata(reader.schema(), Some(geom_idx), &published);
+        assert_eq!(
+            fields.keys().collect::<Vec<_>>(),
+            vec!["coalesced_count"],
+            "{fields:?}"
         );
     }
 

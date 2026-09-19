@@ -438,8 +438,8 @@ pub struct ConvertOptions {
     /// Which property columns the output carries (#386): tippecanoe's
     /// `-x` / `-y` / `-X`. Resolved once against the input schema and applied
     /// as a read projection before anything else looks at the schema, so the
-    /// parquet reader skips the excluded column chunks and the overview file
-    /// only carries the kept columns. The geometry column is always kept. A
+    /// excluded columns are never decoded and the overview file only
+    /// carries the kept columns. The geometry column is always kept. A
     /// column another knob reads (`sort_key`, `class_ranking`, `entry_zoom`,
     /// `accumulate`, `filter`) must stay included; excluding it is rejected.
     /// Default: keep everything.
@@ -1194,6 +1194,11 @@ pub fn convert_to_overviews(
 /// source themselves: a `--files-from` manifest
 /// ([`ConvertSource::from_manifest`]), an explicit input list
 /// ([`ConvertSource::from_input_list`]), or custom object stores.
+///
+/// A source is single-use once a property selection (`options.properties`,
+/// #386) has been applied to it: the column projection lives on the
+/// `ConvertSource`, so a second conversion through the same source is an
+/// error — with any selection, the default included.
 pub fn convert_to_overviews_sources(
     source: &ConvertSource,
     output_path: &Path,
@@ -1478,10 +1483,26 @@ fn knob_columns(options: &ConvertOptions) -> Vec<(String, String)> {
 /// Apply `options.properties` (#386) to `source`: resolve the selection
 /// against the file schema and restrict every later read to the kept
 /// columns. A no-op for the default (keep everything).
+///
+/// The projection lives on the source, so a source that already carries
+/// one is refused whatever the new selection — the default included, which
+/// would otherwise silently produce a file narrowed to the earlier call's
+/// columns. One rule: a `ConvertSource` is single-use once a selection has
+/// been applied.
 fn apply_property_selection(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<(), ConvertError> {
+    if source.column_projection().is_some() {
+        return Err(
+            crate::input::InputError::Arrow(arrow_schema::ArrowError::SchemaError(
+                "column restriction already applied to this source; a ConvertSource is \
+                 single-use once a property selection has been applied"
+                    .to_string(),
+            ))
+            .into(),
+        );
+    }
     if options.properties.is_identity() {
         return Ok(());
     }
