@@ -1054,6 +1054,9 @@ pub(crate) fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, InputError> {
     })?;
     let mut files = Vec::new();
     for entry in paths {
+        // glob 0.3.3 dropped `impl From<GlobError> for io::Error` and 0.3.4
+        // restored it, deprecating `into_error`. The floor in Cargo.toml is
+        // 0.3.4 so that `into` is the one form that compiles warning-free.
         let path = entry.map_err(|e| InputError::Io(e.into()))?;
         if path.is_file() && path.extension().is_some_and(|ext| ext == "parquet") {
             files.push(path);
