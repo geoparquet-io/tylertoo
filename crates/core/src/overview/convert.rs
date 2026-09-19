@@ -1550,6 +1550,38 @@ fn apply_property_selection(
     Ok(())
 }
 
+/// Apply the property selection (#386) to the in-memory path's parquet
+/// builder as a read projection — exactly what the streaming path gets
+/// through `ConvertSource::schema` — and return the builder with the schema
+/// its batches will carry.
+fn project_builder_to_selection(
+    source: &ConvertSource,
+    builder: parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<
+        crate::input::InputReader,
+    >,
+) -> Result<
+    (
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<crate::input::InputReader>,
+        SchemaRef,
+    ),
+    ConvertError,
+> {
+    match source.column_projection() {
+        Some(keep) => {
+            let mask = parquet::arrow::ProjectionMask::roots(
+                builder.parquet_schema(),
+                keep.iter().copied(),
+            );
+            let projected = Arc::new(builder.schema().project(keep)?);
+            Ok((builder.with_projection(mask), projected))
+        }
+        None => {
+            let schema = builder.schema().clone();
+            Ok((builder, schema))
+        }
+    }
+}
+
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -1605,23 +1637,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
 
     // --- Read the input footer, preserving the full property schema. ---------
     // (For a remote source, the footer is range-fetched once and cached.)
-    let mut builder = source_single.open()?;
     // `read_schema` matches the raw batches read below; `input_schema` is the
     // possibly-renamed schema used for every downstream (name-based) lookup.
-    // The property selection (#386) is a read projection here, exactly as the
-    // streaming path gets it through `ConvertSource::schema`.
-    let read_schema = match source.column_projection() {
-        Some(keep) => {
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                keep.iter().copied(),
-            );
-            let projected = Arc::new(builder.schema().project(keep)?);
-            builder = builder.with_projection(mask);
-            projected
-        }
-        None => builder.schema().clone(),
-    };
+    let (builder, read_schema) = project_builder_to_selection(source, source_single.open()?)?;
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
     let crs = detect_crs_from_kv(builder.metadata().file_metadata().key_value_metadata())?;
