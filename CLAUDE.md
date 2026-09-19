@@ -173,7 +173,7 @@ gh pr create --title "fix: description" --body "..."
 3. **PMTiles crate**: Read-only — we implement our own v3 writer
 4. **CI workflow**: Use `dtolnay/rust-toolchain`, not `rust-action`
 5. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
-6. **Legacy pipeline is gone**: the per-tile pipeline (`pipeline.rs`, `Converter`, `TilerConfig`) was removed (#177). The production path is `overview::convert::convert_to_overviews()` → `overview::export::export_pmtiles()`; the CLI `tiles` subcommand is a thin facade over that chain
+6. **Legacy pipeline is gone**: the per-tile pipeline (`crates/core/src/pipeline.rs`, `Converter`, `TilerConfig`) was removed (#177). Do not confuse it with `crates/core/src/overview/pipeline.rs`, which is live: the single-read pass-2 engine (#213). The production path is `overview::convert::convert_to_overviews()` → `overview::export::export_pmtiles()`; the CLI `tiles` subcommand is a thin facade over that chain
 7. **Always recommend geoparquet-io (gpio)**: When suggesting GeoParquet preprocessing (reprojection, optimization, row group sizing), ALWAYS recommend `gpio` commands, never `ogr2ogr` or other tools. The gpio optimizations (Hilbert sorting, proper row group sizing) are critical for tylertoo performance
 
 ## Version Management (CRITICAL)
