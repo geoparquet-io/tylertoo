@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::take::take;
 use geo::{Area, Geometry};
 use geoarrow::array::from_arrow_array;
@@ -68,7 +68,7 @@ use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
 use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind};
-use super::cluster::{build_cluster_tables, verify_sum_invariant, ClusterEntry, ClusterTables};
+use super::cluster::{ClusterEntry, ClusterTables};
 use super::coalesce::CoalesceInput;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
@@ -237,7 +237,7 @@ fn partition_emitted_levels(
 /// `source` (base), `cluster` (+ `point_count` when clustering, Q4), and `out`
 /// (+ `coalesced_count` when coalescing, Q3). All three are needed downstream,
 /// so they are returned together.
-fn build_level_schemas(
+pub(super) fn build_level_schemas(
     input_schema: &Schema,
     geom_idx: usize,
     geom_name: &str,
@@ -256,6 +256,32 @@ fn build_level_schemas(
         cluster_schema.clone()
     };
     (source_schema, cluster_schema, out_schema)
+}
+
+/// Build the writer options both convert paths use: the shared knobs plus the
+/// generalization provenance recorded in the footer (§3.5).
+pub(super) fn build_writer_options(
+    writer_levels: Vec<LevelSpec>,
+    emitted_gsds: &[f64],
+    crs: Crs,
+    ranking_provenance: RankingProvenance,
+    renames: &[(String, String)],
+    options: &ConvertOptions,
+) -> OverviewWriterOptions {
+    let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
+    writer_opts.max_row_group_size = options.max_row_group_size;
+    writer_opts.row_group_size_policy = options.row_group_size_policy;
+    writer_opts.full_column_stats = options.full_column_stats;
+    writer_opts.cogp_compat_key = options.cogp_compat_key;
+    writer_opts.encode_concurrency = encode_concurrency_for(options.profile);
+    writer_opts.generalization = Some(build_generalization(
+        emitted_gsds,
+        crs,
+        options,
+        ranking_provenance,
+        renames,
+    ));
+    writer_opts
 }
 
 /// Combined per-part footer-statistics row-group selection for the streaming
@@ -351,152 +377,439 @@ fn accumulator_enabled(options: &ConvertOptions) -> bool {
                 .any(|b| b.repr == Representation::Square))
 }
 
-pub(crate) fn convert_streaming_strategy(
-    source: &ConvertSource,
-    output_path: &Path,
+/// Prebuild every non-verbatim level's coalesce chain table.
+///
+/// The single read fans each batch out to all levels at once, so every level's
+/// table has to exist before the read starts. Deterministic and keyed by rep
+/// row, so the result is byte-identical to the former per-level build.
+fn build_pass2_coalesce_tables(
+    coalesce_scratch: Option<&CoalesceScratch>,
+    emitted: &[EmitLevel],
+    finest: usize,
+    crs: Crs,
     options: &ConvertOptions,
-    strategy: Pass2Strategy,
-) -> Result<ConvertReport, ConvertError> {
-    let start = Instant::now();
-    // #295: peak-RSS-by-phase instrumentation. Each phase boundary logs process
-    // RSS; the max is reported at the end so a single run shows both the peak
-    // and which phase produced it.
-    let mut peak_rss_mib = 0.0f64;
-
-    if options.sort_key.is_some() && options.class_ranking.is_some() {
-        return Err(ConvertError::RankingConflict);
+) -> Vec<Option<CoalesceTable>> {
+    match coalesce_scratch {
+        Some(scratch) => {
+            log::info!(
+                "[convert] building coalesce chain tables for {} level(s)",
+                emitted.len()
+            );
+            let inputs = scratch.inputs();
+            emitted
+                .par_iter()
+                .map(|e| {
+                    let verbatim =
+                        matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
+                    (!verbatim).then(|| {
+                        build_level_coalesce_table(
+                            &inputs,
+                            e.orig as usize,
+                            finest,
+                            e.gsd,
+                            crs,
+                            options,
+                        )
+                    })
+                })
+                .collect()
+        }
+        None => std::iter::repeat_with(|| None)
+            .take(emitted.len())
+            .collect(),
     }
+}
 
-    // Schema checks (level column, geometry column) — footer-only reads.
-    // (For a remote source, #210, the footer is range-fetched once here and
-    // cached across the passes below. For a multi-partition source the
-    // schema is the validated union schema and the key-value metadata is
-    // partition 0's — construction proved all parts agree.)
-    let input_schema: SchemaRef = source.schema()?;
-
-    // CRS detection + rejection (spec Q3) — footer metadata only.
-    let kv = source.key_value_metadata()?;
-    let crs = super::convert::detect_crs_from_kv(kv.as_ref())?;
-
-    // Reserved-column collisions (#288) are resolved BEFORE row-group
-    // selection so the attribute filter (#315) can bind against the final
-    // (possibly renamed) schema; the rename is metadata-only and never
-    // affects the footer statistics either pruning path reads. See the
-    // full #288 rationale on the block below.
-    let mut options = options.clone();
-    let (input_schema, renames) = resolve_reserved_column_collisions(&input_schema, &mut options);
-    let options = &options;
-
-    // Attribute filter (#315): parse + bind against the input schema.
-    // Syntax was already validated in `validate_options`; binding resolves
-    // column names to indices and type-checks literals.
-    let bound_filter = super::convert::bind_attribute_filter(options, &input_schema, &renames)?;
-
-    // Regional extract (#102) + attribute filter (#315): prune input row
-    // groups by footer statistics — bbox covering stats for `--bbox`,
-    // per-column min/max/null-count stats for `--filter` — before any data
-    // pages are read. The two prunings compose by intersection. The
-    // selection is PER PART and every pass reads the same selection in the
-    // same part order, so the global row indices addressing the winner
-    // tables stay aligned. Groups without stats are kept; the exact
-    // per-feature filters in pass 1 guarantee identical output either way.
-    let row_groups_total = source.num_row_groups_total()?;
-    let bbox_units = options
-        .bbox
-        .map(|b| super::convert::bbox_to_crs_units(&b, crs));
-    let selected_row_groups =
-        select_row_groups_streaming(source, bbox_units.as_ref(), bound_filter.as_ref())?;
-    let row_groups_read = selected_row_groups
-        .as_ref()
-        .map_or(row_groups_total, RowGroupSelection::total_selected);
-    if selected_row_groups.is_some() {
-        let what = super::convert::pruning_label(options.bbox.is_some(), bound_filter.is_some());
-        log::info!("{what} filter: reading {row_groups_read}/{row_groups_total} input row groups");
-    }
-    // #267: nudge toward --bbox / download-first for a large whole-file remote
-    // convert (quiet for local inputs and effective bbox extracts).
-    super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total);
-    // #272: preflight the spill volume. The disk spill (#219) grows to ≈ the
-    // selected input bytes — known exactly here, the first moment after
-    // row-group selection (summed per part for a multi source) — so compare
-    // it against the free space where the spill will live and warn up front
-    // (naming the dir and the shortfall) instead of silently degrading to
-    // network re-fetch mid-convert.
-    super::convert::warn_spill_space(
-        source,
-        source.selected_input_bytes(selected_row_groups.as_ref())?,
-        options.spill_dir.as_deref(),
-    );
-
-    // Pass 0 (#286/#287): stage the selected row groups to local disk so both
-    // passes below read from the spill, not the network.
-    stage_input_pass0(source, selected_row_groups.as_ref(), row_groups_read);
-
-    // (Reserved-column collisions, #288, were resolved above, before the
-    // row-group selection: any input column named `level` / `point_count` /
-    // `coalesced_count` (case-insensitive) is renamed instead of rejecting
-    // the file, keeping the reserved output columns authoritative. The
-    // rename preserves column order, so the projection indices pass 1
-    // computes against `input_schema` stay valid against the raw file, and
-    // pass 2 relabels non-geometry columns positionally into the renamed
-    // source schema (`build_source_schema`). `options` was cloned so
-    // by-name ranking/accumulate options could be rewritten to the renamed
-    // columns.)
-
-    let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
-    let geom_field = input_schema.field(geom_idx).clone();
-
-    // Clustering schema checks + accumulate column resolution (Q4).
-    let acc_cols = validate_cluster_schema(&input_schema, options)?;
-    // Coalescing schema check (Q3).
-    validate_coalesce_schema(&input_schema, options)?;
-
-    // --- Pass 1: stream → AssignFeatures + resolved ranking. -----------------
-    let t_pass1 = Instant::now();
-    let Pass1Output {
-        mut features,
-        areas,
-        provenance: ranking_provenance,
-        acc_values,
-        coalesce: coalesce_scratch,
-        num_rows,
-        skipped_rows,
-        geom_bytes,
-    } = run_pass1(
-        source,
-        &input_schema,
-        geom_idx,
-        options,
-        &acc_cols,
-        selected_row_groups.as_ref(),
-        bbox_units.as_ref(),
-        bound_filter.as_ref(),
-    )?;
-    if skipped_rows > 0 {
-        log::warn!(
-            "skipping {skipped_rows} of {num_rows} input rows with a null, \
-             empty, or non-finite geometry"
-        );
-    }
-    let num_features = features.len();
-
-    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
-    let antimeridian_suspect_features = features
+/// Cascading (#218): per level, the fine→coarse GSD chain from the finest
+/// non-canonical level down to (and including) that level.
+///
+/// Chains are built from the emitted plan, so the Serial fold, the pipelined
+/// incremental fold, and the in-memory path all step through the same GSD
+/// sequence. The chain is empty when cascading does not apply to the level.
+/// Zoom-band representation selector (#317 / #279): steps carry each
+/// contributing level's representation so the fold pointifies / squarifies at
+/// the right band level (see `simplify_cascade`).
+fn build_cascade_chains(
+    emitted: &[EmitLevel],
+    finest: usize,
+    duplicating: bool,
+    options: &ConvertOptions,
+) -> Vec<Vec<CascadeStep>> {
+    let repr_of =
+        |zoom: Option<u8>| super::convert::representation_for_zoom(&options.representation, zoom);
+    emitted
         .iter()
-        .filter(|f| super::convert::bbox_antimeridian_suspect(&f.bbox, crs))
-        .count();
-    super::convert::warn_antimeridian_suspects(antimeridian_suspect_features);
+        .map(|e| {
+            let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
+            if !duplicating || verbatim || !options.simplify.cascade {
+                return Vec::new();
+            }
+            let mut chain: Vec<CascadeStep> = emitted
+                .iter()
+                .filter(|f| (f.orig as usize) < finest && f.orig >= e.orig)
+                .map(|f| CascadeStep {
+                    gsd_meters: f.gsd,
+                    repr: repr_of(f.zoom),
+                })
+                .collect();
+            chain.reverse();
+            chain
+        })
+        .collect()
+}
 
-    // Stage markers (#242): everything between pass 1 and the writer used to
-    // run in total info-level silence — on planet-scale inputs that was tens
-    // of minutes with no output.
-    log::info!("[convert] scan complete: {num_features} feature(s) from {num_rows} row(s)");
-    log::debug!(
-        "[profile] pass1 stream+scan: {:.2}s",
-        t_pass1.elapsed().as_secs_f64()
+/// Everything the per-level pass-2 contexts borrow from the convert driver.
+///
+/// `LevelStreamCtx` holds a dozen borrows into pass-1 state. Threading them
+/// through as separate parameters made the builder's signature longer than its
+/// body, so they travel together.
+struct LevelCtxInputs<'a> {
+    source_schema: &'a Schema,
+    cluster_schema: &'a Schema,
+    out_schema: &'a Schema,
+    non_geom_cols: &'a [usize],
+    geom_idx: usize,
+    min_levels: &'a [u8],
+    acc_cols: &'a [usize],
+    kinds: Option<&'a [FeatureKind]>,
+    cluster_tables: Option<&'a ClusterTables>,
+    coalesce_tables: &'a [Option<CoalesceTable>],
+    cascade_chains: &'a [Vec<CascadeStep>],
+    /// Per planned level, the tiny-polygon accumulator's carrier rows (#384).
+    carriers: &'a [Vec<usize>],
+    crs: Crs,
+    finest: usize,
+    duplicating: bool,
+}
+
+/// Build one `LevelStreamCtx` per emitted level, in level order.
+fn build_level_ctxs<'a>(
+    emitted: &[EmitLevel],
+    options: &'a ConvertOptions,
+    inputs: &LevelCtxInputs<'a>,
+) -> Vec<LevelStreamCtx<'a>> {
+    let repr_of =
+        |zoom: Option<u8>| super::convert::representation_for_zoom(&options.representation, zoom);
+    emitted
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let verbatim =
+                matches!(options.mode, Mode::Partitioning) || e.orig as usize == inputs.finest;
+            LevelStreamCtx {
+                source_schema: inputs.source_schema,
+                cluster_schema: inputs.cluster_schema,
+                out_schema: inputs.out_schema,
+                non_geom_cols: inputs.non_geom_cols,
+                geom_idx: inputs.geom_idx,
+                min_levels: inputs.min_levels,
+                orig_level: e.orig,
+                duplicating: inputs.duplicating,
+                verbatim,
+                gsd_m: e.gsd,
+                repr: repr_of(e.zoom),
+                crs: inputs.crs,
+                simplify: &options.simplify,
+                cluster_enabled: options.cluster,
+                // Canonical level: singleton clusters, columns verbatim (§2.4).
+                cluster_table: inputs
+                    .cluster_tables
+                    .filter(|_| e.orig as usize != inputs.finest)
+                    .map(|t| &t[e.orig as usize]),
+                acc_cols: inputs.acc_cols,
+                coalesce_enabled: options.coalesce_lines,
+                kinds: inputs.kinds,
+                coalesce_table: inputs.coalesce_tables[i].as_ref(),
+                cascade_chain: &inputs.cascade_chains[i],
+                carriers: &inputs.carriers[e.orig as usize],
+            }
+        })
+        .collect()
+}
+
+/// Run pass 2 over every emitted level and return `(outcome, rows, vertices)`
+/// per level, in level order.
+///
+/// The outcome distinguishes a written level from one the writer skipped
+/// because every candidate collapsed during simplification (#211).
+#[allow(clippy::too_many_arguments)]
+fn run_pass2_levels(
+    writer: &mut OverviewWriter<File>,
+    ctxs: &[LevelStreamCtx<'_>],
+    hints: &[usize],
+    source: &ConvertSource,
+    options: &ConvertOptions,
+    selected_row_groups: Option<&RowGroupSelection>,
+    in_flight_batches: usize,
+    out_schema: &Schema,
+    num_rows: usize,
+    geom_bytes: u64,
+    strategy: Pass2Strategy,
+) -> Result<Vec<(LevelWriteOutcome, usize, usize)>, ConvertError> {
+    let n = ctxs.len();
+    let level_stats: Vec<(LevelWriteOutcome, usize, usize)> = match strategy {
+        // Reference: one in-order re-read per level (pre-#213 behavior).
+        Pass2Strategy::Serial => ctxs
+            .iter()
+            .enumerate()
+            .map(|(i, ctx)| {
+                write_level_streaming(
+                    writer,
+                    i,
+                    hints[i],
+                    source,
+                    options.read_batch_size,
+                    in_flight_batches,
+                    selected_row_groups,
+                    ctx,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+        // Production: buffer levels 0..n-1 from a single read, then stream the
+        // finest (verbatim, largest) level last straight into the writer.
+        Pass2Strategy::Pipelined => {
+            let buffered_rows: usize = hints[..n - 1].iter().sum();
+            // #305: pass 1's measured average encoded-geometry size per input
+            // row sizes the RAM-vs-spill estimate (falls back to calibrated
+            // constants on an empty scan). Same decision timing as before —
+            // pass 1 has always completed by this point (the assign barrier).
+            let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
+            let backing = pipeline::resolve_backing(
+                options.profile,
+                options.mode,
+                buffered_rows,
+                avg_geom_bytes,
+            );
+            log::info!(
+                "[convert] pass 2: building {n} overview level(s) from a \
+                 single read (finest level streamed last)"
+            );
+            let mut stats = if n > 1 {
+                pipeline::run_pass2_buffered(
+                    writer,
+                    &ctxs[..n - 1],
+                    &hints[..n - 1],
+                    source,
+                    options.read_batch_size,
+                    selected_row_groups,
+                    in_flight_batches,
+                    backing,
+                    out_schema,
+                )?
+            } else {
+                Vec::new()
+            };
+            stats.push(write_level_streaming(
+                writer,
+                n - 1,
+                hints[n - 1],
+                source,
+                options.read_batch_size,
+                in_flight_batches,
+                selected_row_groups,
+                &ctxs[n - 1],
+            )?);
+            stats
+        }
+    };
+    Ok(level_stats)
+}
+
+/// The resolved ranking tier: the per-row sort keys (absent for the size
+/// fallback), the provenance record, and the per-row class groups that line
+/// coalescing needs (present only for the class-based tiers).
+type ResolvedRanking = (
+    Option<Vec<Option<f64>>>,
+    RankingProvenance,
+    Option<Vec<u32>>,
+);
+
+/// Pick the ranking tier, in the same order and with the same logging as the
+/// in-memory path.
+fn resolve_ranking_tier(
+    plan: RankPlan,
+    explicit_keys: Vec<Option<f64>>,
+    confidence_keys: Vec<Option<f64>>,
+    explicit_groups: Vec<u32>,
+    collect_lines: bool,
+    feature_count: usize,
+    point_count: usize,
+) -> ResolvedRanking {
+    let n = feature_count;
+    let size_fallback = || {
+        log::info!(
+            "overview ranking: no sort key specified or auto-detected; using size + \
+             deterministic-hash fallback"
+        );
+        RankingProvenance {
+            mode: "size-fallback".to_string(),
+            column: None,
+            ranks: None,
+            unknown_rank: None,
+        }
+    };
+
+    // Resolve the tier (same order + logging as the in-memory path). The
+    // third element is the all-row class-group vector for coalescing, present
+    // only for the class-based tiers (matches `coalesce_group_column`).
+    match plan {
+        RankPlan::ExplicitSort { name, .. } => {
+            log::info!("overview ranking: explicit numeric sort-key column {name:?}");
+            (
+                Some(explicit_keys),
+                RankingProvenance {
+                    mode: "explicit-sort-key".to_string(),
+                    column: Some(name),
+                    ranks: None,
+                    unknown_rank: None,
+                },
+                None,
+            )
+        }
+        RankPlan::ExplicitClass { ranking, .. } => {
+            log::info!(
+                "overview ranking: explicit class-ranking on column {:?} ({} named classes, unknown_rank={})",
+                ranking.column,
+                ranking.ranks.len(),
+                ranking.unknown_rank
+            );
+            (
+                Some(explicit_keys),
+                class_ranking_provenance("class-ranking", &ranking),
+                collect_lines.then_some(explicit_groups),
+            )
+        }
+        RankPlan::Auto { roads, confidence } => {
+            if let Some(cand) = roads
+                .into_iter()
+                .find(|c| c.found.len() >= ROAD_VOCAB_MIN_DISTINCT)
+            {
+                log::info!(
+                    "overview ranking: auto-detected Overture road classes in column {:?}; \
+                     applying built-in ranking (motorway > … > service > tail)",
+                    cand.ranking.column
+                );
+                let prov = class_ranking_provenance("auto-overture-roads", &cand.ranking);
+                (Some(cand.keys), prov, collect_lines.then_some(cand.groups))
+            } else if let Some((_, col_name)) = confidence.filter(|_| n > 0 && point_count * 2 >= n)
+            {
+                log::info!(
+                    "overview ranking: auto-detected Overture places confidence column {col_name:?} \
+                     (numeric point ranking)"
+                );
+                (
+                    Some(confidence_keys),
+                    RankingProvenance {
+                        mode: "auto-confidence".to_string(),
+                        column: Some(col_name),
+                        ranks: None,
+                        unknown_rank: None,
+                    },
+                    None,
+                )
+            } else {
+                (None, size_fallback(), None)
+            }
+        }
+        RankPlan::SizeFallback => (None, size_fallback(), None),
+    }
+}
+
+/// The writer and the three schemas pass 2 encodes against.
+struct LevelWriter {
+    writer: OverviewWriter<File>,
+    source_schema: Schema,
+    cluster_schema: Schema,
+    out_schema: Schema,
+    /// Input-schema indices of every column except the geometry column.
+    non_geom_cols: Vec<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_level_writer(
+    output_path: &Path,
+    input_schema: &Schema,
+    geom_idx: usize,
+    geom_field: &Field,
+    emitted: &[EmitLevel],
+    crs: Crs,
+    ranking_provenance: RankingProvenance,
+    renames: &[(String, String)],
+    options: &ConvertOptions,
+) -> Result<LevelWriter, ConvertError> {
+    // --- Writer setup (identical to the in-memory path). ---------------------
+    // Writer schemas: base + point_count when clustering (Q4) + coalesced_count
+    // when coalescing (Q3).
+    let geom_name = geom_field.name().clone();
+    let (source_schema, cluster_schema, out_schema) =
+        build_level_schemas(input_schema, geom_idx, &geom_name, options);
+
+    let writer_levels: Vec<LevelSpec> = emitted
+        .iter()
+        .map(|e| LevelSpec::new(e.gsd, e.zoom))
+        .collect();
+    let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
+    let writer_opts = build_writer_options(
+        writer_levels,
+        &emitted_gsds,
+        crs,
+        ranking_provenance,
+        renames,
+        options,
     );
-    log_phase_rss("pass1 scan", &mut peak_rss_mib);
 
+    let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
+
+    let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
+        .filter(|&c| c != geom_idx)
+        .collect();
+
+    Ok(LevelWriter {
+        writer,
+        source_schema,
+        cluster_schema,
+        out_schema,
+        non_geom_cols,
+    })
+}
+
+/// The winner tables: which level each row belongs to, and how many rows each
+/// level gets.
+///
+/// Built from the pass-1 feature scratch, which this stage frees before it
+/// returns. Everything here is O(dataset); pass 2 only carries the row-indexed
+/// `min_levels` byte table plus the cluster and coalesce tables.
+struct WinnerTables {
+    /// The resolved level plan: `(gsd, zoom)` per planned level.
+    level_specs: Vec<(f64, Option<u8>)>,
+    /// Cluster tables (Q4), or `None` when clustering is off.
+    cluster_tables: Option<ClusterTables>,
+    /// Per-row geometry kinds (Q3), or `None` when line coalescing is off.
+    kinds: Option<Vec<FeatureKind>>,
+    /// The pass-1 line scratch, kept only when coalescing survives the memory
+    /// guard.
+    coalesce_scratch: Option<CoalesceScratch>,
+    /// Coarsest level per INPUT ROW; [`UNASSIGNED_LEVEL`] for skipped rows.
+    min_levels: Vec<u8>,
+    /// Per-level winner counts, cumulative in duplicating mode.
+    counts: Vec<usize>,
+    /// Per planned level, the sorted row indices of the tiny-polygon
+    /// accumulator's carriers (#384); empty per level unless it applies.
+    carriers: Vec<Vec<usize>>,
+    finest: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_winner_tables(
+    features: &mut Vec<AssignFeature>,
+    acc_values: Vec<Vec<Option<f64>>>,
+    areas: Vec<f32>,
+    coalesce_scratch: Option<CoalesceScratch>,
+    num_rows: usize,
+    crs: Crs,
+    options: &ConvertOptions,
+    peak_rss_mib: &mut f64,
+) -> Result<WinnerTables, ConvertError> {
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
@@ -508,7 +821,7 @@ pub(crate) fn convert_streaming_strategy(
     // representations, parallel to the plan.
     let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
     let assignment = assign_levels_bounded(
-        &features,
+        features,
         &level_gsds,
         &options.assign,
         crs,
@@ -520,7 +833,7 @@ pub(crate) fn convert_streaming_strategy(
     let assignment = if options.density.enabled {
         apply_density_budget(
             &assignment,
-            &features,
+            features,
             &level_gsds,
             &options.assign,
             &options.density,
@@ -542,7 +855,7 @@ pub(crate) fn convert_streaming_strategy(
     );
     // Pass-1 winner tables (bboxes/kinds/sort-keys for every feature across all
     // levels) are the O(dataset) peak candidate flagged in #295.
-    log_phase_rss("assignment+budget (winner tables)", &mut peak_rss_mib);
+    log_phase_rss("assignment+budget (winner tables)", peak_rss_mib);
 
     // The feature-parallel winner table (coarsest level per FEATURE, in
     // `features` order) feeds the cluster stage and the per-level counts.
@@ -554,7 +867,7 @@ pub(crate) fn convert_streaming_strategy(
     // winner table; empty per level unless the accumulator applies there.
     let carriers = streaming_carriers(
         options,
-        &features,
+        features,
         &feat_min_levels,
         areas,
         &level_gsds,
@@ -568,25 +881,18 @@ pub(crate) fn convert_streaming_strategy(
     // Accumulate values are extracted per ROW; the cluster stage indexes them
     // by feature position, so remap through each feature's row index.
     let cluster_tables: Option<ClusterTables> = if options.cluster {
-        let ops: Vec<_> = options.accumulate.iter().map(|s| s.op).collect();
         let acc_feat: Vec<Vec<Option<f64>>> = acc_values
             .iter()
             .map(|vals| features.iter().map(|f| vals[f.index]).collect())
             .collect();
-        let tables = build_cluster_tables(
-            &features,
+        Some(super::convert::build_verified_cluster_tables(
+            features,
             &feat_min_levels,
             &level_gsds,
-            &options.assign,
-            crs,
             &acc_feat,
-            &ops,
-        );
-        // Strict §12.1 accounting: Σ point_count per level == source point
-        // count, and no clustered level thins its points to zero.
-        verify_sum_invariant(&features, &feat_min_levels, &tables)
-            .map_err(ConvertError::ClusterInvariant)?;
-        Some(tables)
+            crs,
+            options,
+        )?)
     } else {
         None
     };
@@ -602,7 +908,7 @@ pub(crate) fn convert_streaming_strategy(
     );
     let kinds: Option<Vec<FeatureKind>> = options.coalesce_lines.then(|| {
         let mut k = vec![FeatureKind::Point; num_rows];
-        for f in &features {
+        for f in features.iter() {
             k[f.index] = f.kind;
         }
         k
@@ -669,6 +975,244 @@ pub(crate) fn convert_streaming_strategy(
         }
     }
 
+    Ok(WinnerTables {
+        level_specs,
+        cluster_tables,
+        kinds,
+        coalesce_scratch,
+        min_levels,
+        counts,
+        carriers,
+        finest,
+    })
+}
+
+/// Footer-only preparation: everything the convert driver settles before the
+/// first data page is read.
+///
+/// Schema and CRS checks, reserved-column renames (#288), attribute-filter
+/// binding (#315), row-group pruning (#102 / #315), and the pass-0 staging of
+/// the selected groups to local disk (#286/#287).
+struct Preflight {
+    /// `options` with reserved-column renames applied; the driver borrows this
+    /// for the rest of the conversion.
+    options: ConvertOptions,
+    input_schema: SchemaRef,
+    crs: Crs,
+    renames: Vec<(String, String)>,
+    geom_idx: usize,
+    geom_field: Field,
+    /// Schema indices of the accumulate columns (Q4).
+    acc_cols: Vec<usize>,
+    bbox_units: Option<[f64; 4]>,
+    bound_filter: Option<super::filter::BoundFilter>,
+    selected_row_groups: Option<RowGroupSelection>,
+    row_groups_total: usize,
+    row_groups_read: usize,
+}
+
+fn convert_preflight(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+) -> Result<Preflight, ConvertError> {
+    // Schema checks (level column, geometry column) — footer-only reads.
+    // (For a remote source, #210, the footer is range-fetched once here and
+    // cached across the passes below. For a multi-partition source the
+    // schema is the validated union schema and the key-value metadata is
+    // partition 0's — construction proved all parts agree.)
+    let input_schema: SchemaRef = source.schema()?;
+
+    // CRS detection + rejection (spec Q3) — footer metadata only.
+    let kv = source.key_value_metadata()?;
+    let crs = super::convert::detect_crs_from_kv(kv.as_ref())?;
+
+    // Reserved-column collisions (#288) are resolved BEFORE row-group
+    // selection so the attribute filter (#315) can bind against the final
+    // (possibly renamed) schema; the rename is metadata-only and never
+    // affects the footer statistics either pruning path reads. See the
+    // full #288 rationale on the block below.
+    let mut resolved = options.clone();
+    let (input_schema, renames) = resolve_reserved_column_collisions(&input_schema, &mut resolved);
+    let options = &resolved;
+
+    // Attribute filter (#315): parse + bind against the input schema.
+    // Syntax was already validated in `validate_options`; binding resolves
+    // column names to indices and type-checks literals.
+    let bound_filter = super::convert::bind_attribute_filter(options, &input_schema, &renames)?;
+
+    // Regional extract (#102) + attribute filter (#315): prune input row
+    // groups by footer statistics — bbox covering stats for `--bbox`,
+    // per-column min/max/null-count stats for `--filter` — before any data
+    // pages are read. The two prunings compose by intersection. The
+    // selection is PER PART and every pass reads the same selection in the
+    // same part order, so the global row indices addressing the winner
+    // tables stay aligned. Groups without stats are kept; the exact
+    // per-feature filters in pass 1 guarantee identical output either way.
+    let row_groups_total = source.num_row_groups_total()?;
+    let bbox_units = options
+        .bbox
+        .map(|b| super::convert::bbox_to_crs_units(&b, crs));
+    let selected_row_groups =
+        select_row_groups_streaming(source, bbox_units.as_ref(), bound_filter.as_ref())?;
+    let row_groups_read = selected_row_groups
+        .as_ref()
+        .map_or(row_groups_total, RowGroupSelection::total_selected);
+    if selected_row_groups.is_some() {
+        let what = super::convert::pruning_label(options.bbox.is_some(), bound_filter.is_some());
+        log::info!("{what} filter: reading {row_groups_read}/{row_groups_total} input row groups");
+    }
+    // #267: nudge toward --bbox / download-first for a large whole-file remote
+    // convert (quiet for local inputs and effective bbox extracts).
+    super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total);
+    // #272: preflight the spill volume. The disk spill (#219) grows to ≈ the
+    // selected input bytes — known exactly here, the first moment after
+    // row-group selection (summed per part for a multi source) — so compare
+    // it against the free space where the spill will live and warn up front
+    // (naming the dir and the shortfall) instead of silently degrading to
+    // network re-fetch mid-convert.
+    super::convert::warn_spill_space(
+        source,
+        source.selected_input_bytes(selected_row_groups.as_ref())?,
+        options.spill_dir.as_deref(),
+    );
+
+    // Pass 0 (#286/#287): stage the selected row groups to local disk so both
+    // passes below read from the spill, not the network.
+    stage_input_pass0(source, selected_row_groups.as_ref(), row_groups_read);
+
+    // (Reserved-column collisions, #288, were resolved above, before the
+    // row-group selection: any input column named `level` / `point_count` /
+    // `coalesced_count` (case-insensitive) is renamed instead of rejecting
+    // the file, keeping the reserved output columns authoritative. The
+    // rename preserves column order, so the projection indices pass 1
+    // computes against `input_schema` stay valid against the raw file, and
+    // pass 2 relabels non-geometry columns positionally into the renamed
+    // source schema (`build_source_schema`). `options` was cloned so
+    // by-name ranking/accumulate options could be rewritten to the renamed
+    // columns.)
+
+    let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_field = input_schema.field(geom_idx).clone();
+
+    // Clustering schema checks + accumulate column resolution (Q4).
+    let acc_cols = validate_cluster_schema(&input_schema, options)?;
+    // Coalescing schema check (Q3).
+    validate_coalesce_schema(&input_schema, options)?;
+
+    Ok(Preflight {
+        options: resolved.clone(),
+        input_schema,
+        crs,
+        renames,
+        geom_idx,
+        geom_field,
+        acc_cols,
+        bbox_units,
+        bound_filter,
+        selected_row_groups,
+        row_groups_total,
+        row_groups_read,
+    })
+}
+
+pub(crate) fn convert_streaming_strategy(
+    source: &ConvertSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+    strategy: Pass2Strategy,
+) -> Result<ConvertReport, ConvertError> {
+    let start = Instant::now();
+    // #295: peak-RSS-by-phase instrumentation. Each phase boundary logs process
+    // RSS; the max is reported at the end so a single run shows both the peak
+    // and which phase produced it.
+    let mut peak_rss_mib = 0.0f64;
+
+    if options.sort_key.is_some() && options.class_ranking.is_some() {
+        return Err(ConvertError::RankingConflict);
+    }
+
+    let Preflight {
+        options: resolved_options,
+        input_schema,
+        crs,
+        renames,
+        geom_idx,
+        geom_field,
+        acc_cols,
+        bbox_units,
+        bound_filter,
+        selected_row_groups,
+        row_groups_total,
+        row_groups_read,
+    } = convert_preflight(source, options)?;
+    let options = &resolved_options;
+
+    // --- Pass 1: stream → AssignFeatures + resolved ranking. -----------------
+    let t_pass1 = Instant::now();
+    let Pass1Output {
+        mut features,
+        areas,
+        provenance: ranking_provenance,
+        acc_values,
+        coalesce: coalesce_scratch,
+        num_rows,
+        skipped_rows,
+        geom_bytes,
+    } = run_pass1(
+        source,
+        &input_schema,
+        geom_idx,
+        options,
+        &acc_cols,
+        selected_row_groups.as_ref(),
+        bbox_units.as_ref(),
+        bound_filter.as_ref(),
+    )?;
+    if skipped_rows > 0 {
+        log::warn!(
+            "skipping {skipped_rows} of {num_rows} input rows with a null, \
+             empty, or non-finite geometry"
+        );
+    }
+    let num_features = features.len();
+
+    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
+    let antimeridian_suspect_features = features
+        .iter()
+        .filter(|f| super::convert::bbox_antimeridian_suspect(&f.bbox, crs))
+        .count();
+    super::convert::warn_antimeridian_suspects(antimeridian_suspect_features);
+
+    // Stage markers (#242): everything between pass 1 and the writer used to
+    // run in total info-level silence — on planet-scale inputs that was tens
+    // of minutes with no output.
+    log::info!("[convert] scan complete: {num_features} feature(s) from {num_rows} row(s)");
+    log::debug!(
+        "[profile] pass1 stream+scan: {:.2}s",
+        t_pass1.elapsed().as_secs_f64()
+    );
+    log_phase_rss("pass1 scan", &mut peak_rss_mib);
+
+    let WinnerTables {
+        level_specs,
+        cluster_tables,
+        kinds,
+        coalesce_scratch,
+        min_levels,
+        counts,
+        carriers,
+        finest,
+    } = resolve_winner_tables(
+        &mut features,
+        acc_values,
+        areas,
+        coalesce_scratch,
+        num_rows,
+        crs,
+        options,
+        &mut peak_rss_mib,
+    )?;
+
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.
     let (emitted, mut skipped) = partition_emitted_levels(&level_specs, &counts);
@@ -677,37 +1221,23 @@ pub(crate) fn convert_streaming_strategy(
     }
     warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
 
-    // --- Writer setup (identical to the in-memory path). ---------------------
-    // Writer schemas: base + point_count when clustering (Q4) + coalesced_count
-    // when coalescing (Q3).
-    let geom_name = geom_field.name().clone();
-    let (source_schema, cluster_schema, out_schema) =
-        build_level_schemas(&input_schema, geom_idx, &geom_name, options);
-
-    let writer_levels: Vec<LevelSpec> = emitted
-        .iter()
-        .map(|e| LevelSpec::new(e.gsd, e.zoom))
-        .collect();
-    let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
-    let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
-    writer_opts.max_row_group_size = options.max_row_group_size;
-    writer_opts.row_group_size_policy = options.row_group_size_policy;
-    writer_opts.full_column_stats = options.full_column_stats;
-    writer_opts.cogp_compat_key = options.cogp_compat_key;
-    writer_opts.encode_concurrency = encode_concurrency_for(options.profile);
-    writer_opts.generalization = Some(build_generalization(
-        &emitted_gsds,
+    let LevelWriter {
+        mut writer,
+        source_schema,
+        cluster_schema,
+        out_schema,
+        non_geom_cols,
+    } = create_level_writer(
+        output_path,
+        &input_schema,
+        geom_idx,
+        &geom_field,
+        &emitted,
         crs,
-        options,
         ranking_provenance,
         &renames,
-    ));
-
-    let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
-
-    let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
-        .filter(|&c| c != geom_idx)
-        .collect();
+        options,
+    )?;
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
@@ -715,107 +1245,33 @@ pub(crate) fn convert_streaming_strategy(
     log_phase_rss("pre-pass2 (winner tables freed)", &mut peak_rss_mib);
     let t_pass2 = Instant::now();
 
-    // Prebuild every non-verbatim level's coalesce chain table up front, in
-    // parallel: the single read fans each batch to all levels at once, so all
-    // levels' tables must exist during the read. Deterministic and keyed by rep
-    // row, so this is byte-identical to the former per-level build.
-    let coalesce_tables: Vec<Option<CoalesceTable>> = match &coalesce_scratch {
-        Some(scratch) => {
-            log::info!(
-                "[convert] building coalesce chain tables for {} level(s)",
-                emitted.len()
-            );
-            let inputs = scratch.inputs();
-            emitted
-                .par_iter()
-                .map(|e| {
-                    let verbatim =
-                        matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-                    (!verbatim).then(|| {
-                        build_level_coalesce_table(
-                            &inputs,
-                            e.orig as usize,
-                            finest,
-                            e.gsd,
-                            crs,
-                            options,
-                        )
-                    })
-                })
-                .collect()
-        }
-        None => std::iter::repeat_with(|| None)
-            .take(emitted.len())
-            .collect(),
-    };
+    let coalesce_tables =
+        build_pass2_coalesce_tables(coalesce_scratch.as_ref(), &emitted, finest, crs, options);
 
     let duplicating = matches!(options.mode, Mode::Duplicating);
-    // Cascading (#218): per level, the fine→coarse GSD chain from the finest
-    // non-canonical level down to (and including) that level. Chains are
-    // built from the emitted plan, so the Serial fold, the pipelined
-    // incremental fold, and the in-memory path all step through the same GSD
-    // sequence. Empty when cascading does not apply to the level.
-    // Zoom-band representation selector (#317 / #279): each level's
-    // Representation from its zoom. Steps carry each contributing level's
-    // representation so the fold pointifies / squarifies at the right band
-    // level (see `simplify_cascade`).
-    let repr_of =
-        |zoom: Option<u8>| super::convert::representation_for_zoom(&options.representation, zoom);
-    let cascade_chains: Vec<Vec<CascadeStep>> = emitted
-        .iter()
-        .map(|e| {
-            let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-            if !duplicating || verbatim || !options.simplify.cascade {
-                return Vec::new();
-            }
-            let mut chain: Vec<CascadeStep> = emitted
-                .iter()
-                .filter(|f| (f.orig as usize) < finest && f.orig >= e.orig)
-                .map(|f| CascadeStep {
-                    gsd_meters: f.gsd,
-                    repr: repr_of(f.zoom),
-                })
-                .collect();
-            chain.reverse();
-            chain
-        })
-        .collect();
-    let ctxs: Vec<LevelStreamCtx> = emitted
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let verbatim = matches!(options.mode, Mode::Partitioning) || e.orig as usize == finest;
-            LevelStreamCtx {
-                source_schema: &source_schema,
-                cluster_schema: &cluster_schema,
-                out_schema: &out_schema,
-                non_geom_cols: &non_geom_cols,
-                geom_idx,
-                min_levels: &min_levels,
-                orig_level: e.orig,
-                duplicating,
-                verbatim,
-                gsd_m: e.gsd,
-                repr: repr_of(e.zoom),
-                crs,
-                simplify: &options.simplify,
-                cluster_enabled: options.cluster,
-                // Canonical level: singleton clusters, columns verbatim (§2.4).
-                cluster_table: cluster_tables
-                    .as_ref()
-                    .filter(|_| e.orig as usize != finest)
-                    .map(|t| &t[e.orig as usize]),
-                acc_cols: &acc_cols,
-                coalesce_enabled: options.coalesce_lines,
-                kinds: kinds.as_deref(),
-                coalesce_table: coalesce_tables[i].as_ref(),
-                cascade_chain: &cascade_chains[i],
-                carriers: &carriers[e.orig as usize],
-            }
-        })
-        .collect();
+    let cascade_chains = build_cascade_chains(&emitted, finest, duplicating, options);
+    let ctxs = build_level_ctxs(
+        &emitted,
+        options,
+        &LevelCtxInputs {
+            source_schema: &source_schema,
+            cluster_schema: &cluster_schema,
+            out_schema: &out_schema,
+            non_geom_cols: &non_geom_cols,
+            geom_idx,
+            min_levels: &min_levels,
+            acc_cols: &acc_cols,
+            kinds: kinds.as_deref(),
+            cluster_tables: cluster_tables.as_ref(),
+            coalesce_tables: &coalesce_tables,
+            cascade_chains: &cascade_chains,
+            carriers: &carriers,
+            crs,
+            finest,
+            duplicating,
+        },
+    );
 
-    let n = emitted.len();
     let hints: Vec<usize> = emitted.iter().map(|e| e.hint).collect();
 
     // Snapshot for the end-of-pass-2 summary: the counter is process-wide,
@@ -829,71 +1285,19 @@ pub(crate) fn convert_streaming_strategy(
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
     let in_flight_batches = resolve_and_log_in_flight_batches(options.in_flight_batches);
 
-    let level_stats: Vec<(LevelWriteOutcome, usize, usize)> = match strategy {
-        // Reference: one in-order re-read per level (pre-#213 behavior).
-        Pass2Strategy::Serial => ctxs
-            .iter()
-            .enumerate()
-            .map(|(i, ctx)| {
-                write_level_streaming(
-                    &mut writer,
-                    i,
-                    hints[i],
-                    source,
-                    options.read_batch_size,
-                    in_flight_batches,
-                    selected_row_groups.as_ref(),
-                    ctx,
-                )
-            })
-            .collect::<Result<_, _>>()?,
-        // Production: buffer levels 0..n-1 from a single read, then stream the
-        // finest (verbatim, largest) level last straight into the writer.
-        Pass2Strategy::Pipelined => {
-            let buffered_rows: usize = hints[..n - 1].iter().sum();
-            // #305: pass 1's measured average encoded-geometry size per input
-            // row sizes the RAM-vs-spill estimate (falls back to calibrated
-            // constants on an empty scan). Same decision timing as before —
-            // pass 1 has always completed by this point (the assign barrier).
-            let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
-            let backing = pipeline::resolve_backing(
-                options.profile,
-                options.mode,
-                buffered_rows,
-                avg_geom_bytes,
-            );
-            log::info!(
-                "[convert] pass 2: building {n} overview level(s) from a \
-                 single read (finest level streamed last)"
-            );
-            let mut stats = if n > 1 {
-                pipeline::run_pass2_buffered(
-                    &mut writer,
-                    &ctxs[..n - 1],
-                    &hints[..n - 1],
-                    source,
-                    options.read_batch_size,
-                    selected_row_groups.as_ref(),
-                    in_flight_batches,
-                    backing,
-                    &out_schema,
-                )?
-            } else {
-                Vec::new()
-            };
-            stats.push(write_level_streaming(
-                &mut writer,
-                n - 1,
-                hints[n - 1],
-                source,
-                options.read_batch_size,
-                in_flight_batches,
-                selected_row_groups.as_ref(),
-                &ctxs[n - 1],
-            )?);
-            stats
-        }
-    };
+    let level_stats = run_pass2_levels(
+        &mut writer,
+        &ctxs,
+        &hints,
+        source,
+        options,
+        selected_row_groups.as_ref(),
+        in_flight_batches,
+        &out_schema,
+        num_rows,
+        geom_bytes,
+        strategy,
+    )?;
     log_validation_skips(validation_skips_before);
 
     // Fold each emitted level's write outcome into the shared bookkeeping
@@ -1428,89 +1832,15 @@ fn run_pass1(
         }
     }
 
-    let n = features.len();
-    let size_fallback = || {
-        log::info!(
-            "overview ranking: no sort key specified or auto-detected; using size + \
-             deterministic-hash fallback"
-        );
-        RankingProvenance {
-            mode: "size-fallback".to_string(),
-            column: None,
-            ranks: None,
-            unknown_rank: None,
-        }
-    };
-
-    // Resolve the tier (same order + logging as the in-memory path). The
-    // third element is the all-row class-group vector for coalescing, present
-    // only for the class-based tiers (matches `coalesce_group_column`).
-    type Resolved = (
-        Option<Vec<Option<f64>>>,
-        RankingProvenance,
-        Option<Vec<u32>>,
+    let (keys, provenance, all_groups) = resolve_ranking_tier(
+        plan,
+        explicit_keys,
+        confidence_keys,
+        explicit_groups,
+        collect_lines,
+        features.len(),
+        point_count,
     );
-    let (keys, provenance, all_groups): Resolved = match plan {
-        RankPlan::ExplicitSort { name, .. } => {
-            log::info!("overview ranking: explicit numeric sort-key column {name:?}");
-            (
-                Some(explicit_keys),
-                RankingProvenance {
-                    mode: "explicit-sort-key".to_string(),
-                    column: Some(name),
-                    ranks: None,
-                    unknown_rank: None,
-                },
-                None,
-            )
-        }
-        RankPlan::ExplicitClass { ranking, .. } => {
-            log::info!(
-                "overview ranking: explicit class-ranking on column {:?} ({} named classes, unknown_rank={})",
-                ranking.column,
-                ranking.ranks.len(),
-                ranking.unknown_rank
-            );
-            (
-                Some(explicit_keys),
-                class_ranking_provenance("class-ranking", &ranking),
-                collect_lines.then_some(explicit_groups),
-            )
-        }
-        RankPlan::Auto { roads, confidence } => {
-            if let Some(cand) = roads
-                .into_iter()
-                .find(|c| c.found.len() >= ROAD_VOCAB_MIN_DISTINCT)
-            {
-                log::info!(
-                    "overview ranking: auto-detected Overture road classes in column {:?}; \
-                     applying built-in ranking (motorway > … > service > tail)",
-                    cand.ranking.column
-                );
-                let prov = class_ranking_provenance("auto-overture-roads", &cand.ranking);
-                (Some(cand.keys), prov, collect_lines.then_some(cand.groups))
-            } else if let Some((_, col_name)) = confidence.filter(|_| n > 0 && point_count * 2 >= n)
-            {
-                log::info!(
-                    "overview ranking: auto-detected Overture places confidence column {col_name:?} \
-                     (numeric point ranking)"
-                );
-                (
-                    Some(confidence_keys),
-                    RankingProvenance {
-                        mode: "auto-confidence".to_string(),
-                        column: Some(col_name),
-                        ranks: None,
-                        unknown_rank: None,
-                    },
-                    None,
-                )
-            } else {
-                (None, size_fallback(), None)
-            }
-        }
-        RankPlan::SizeFallback => (None, size_fallback(), None),
-    };
 
     if let Some(keys) = keys {
         // Keys are extracted per ROW (including skipped-geometry rows), so
