@@ -149,6 +149,10 @@ fn tiles_keep_overview_retains_and_matches_two_step() {
         .status()
         .expect("run tylertoo overview");
     assert!(status.success(), "overview exited with {status}");
+    // #380: `tiles` declares the requested zoom range in the archive header
+    // even when the coarsest levels generalized to nothing and were omitted
+    // from the overview; the two-step chain has to be told that minimum,
+    // since the overview file does not remember what was requested.
     let status = Command::new(tylertoo_bin())
         .args([
             "export-pmtiles",
@@ -156,6 +160,8 @@ fn tiles_keep_overview_retains_and_matches_two_step() {
             two_step_out.to_str().unwrap(),
             "--layer-name",
             "parity",
+            "--min-zoom",
+            "0",
         ])
         .status()
         .expect("run tylertoo export-pmtiles");

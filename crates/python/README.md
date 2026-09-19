@@ -68,6 +68,10 @@ tylertoo validate overviews.parquet
 tylertoo export-pmtiles overviews.parquet output.pmtiles
 ```
 
+To match what `tiles` writes, pass `export-pmtiles --min-zoom <the overview's
+requested minimum>` — otherwise the archive header starts at the coarsest
+level that actually holds features.
+
 Every tuning knob is available on the one-shot `tiles` command as well as
 on `overview` / `export-pmtiles` — see
 [Overview Tuning](docs/OVERVIEW_TUNING.md). Defaults are calibrated on

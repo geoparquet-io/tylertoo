@@ -162,6 +162,10 @@ tylertoo export-pmtiles \
   --layer-name fields
 ```
 
+To match what `tiles` writes, pass `export-pmtiles --min-zoom <the overview's
+requested minimum>` — otherwise the archive header starts at the coarsest
+level that actually holds features.
+
 ## Viewing the tiles
 
 A PMTiles archive is a single file served over HTTP range requests, so any

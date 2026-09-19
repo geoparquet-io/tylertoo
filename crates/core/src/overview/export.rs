@@ -213,6 +213,19 @@ pub struct ExportOptions {
     /// Within-tile feature order (#361). Defaults to [`FeatureOrder::Input`],
     /// the order tylertoo has always emitted.
     pub feature_order: FeatureOrder,
+    /// Minimum zoom the archive declares, even when the overview file's
+    /// coarsest levels are missing (#380).
+    ///
+    /// The converter omits a level that generalizes to nothing (spec §7.3), so
+    /// an overview built for z0..z13 can start at z2. Left `None`, the header
+    /// says z2 and a client configured for the requested range never asks for
+    /// the zoomed-out view. Set to the requested minimum, the header and
+    /// `vector_layers[].minzoom` cover it; the empty zooms simply have no
+    /// tiles, which in PMTiles is an empty tile. Must not be finer than the
+    /// coarsest level present — that would misdescribe real tiles — and is
+    /// rejected if it is. The one-shot `tiles` command passes its
+    /// `--min-zoom` here; `export-pmtiles --min-zoom` sets it directly.
+    pub min_zoom: Option<u8>,
 }
 
 impl Default for ExportOptions {
@@ -225,6 +238,7 @@ impl Default for ExportOptions {
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
+            min_zoom: None,
         }
     }
 }
@@ -252,7 +266,8 @@ pub struct ZoomReport {
 pub struct ExportReport {
     /// Level materialization mode of the source overview file.
     pub mode: String,
-    /// PMTiles header min zoom (coarsest level's zoom).
+    /// PMTiles header min zoom: the declared minimum zoom (coarsest level's
+    /// zoom unless widened by [`ExportOptions::min_zoom`]).
     pub min_zoom: u8,
     /// PMTiles header max zoom (finest level's zoom).
     pub max_zoom: u8,
@@ -292,6 +307,13 @@ pub enum ExportError {
     /// The file has no geometry column.
     #[error("overview file has no geometry column")]
     NoGeometryColumn,
+
+    #[error(
+        "declared min_zoom {declared} is finer than the coarsest level present (zoom \
+         {coarsest}): the header can widen the zoom range over empty zooms, not narrow \
+         it over real tiles (#380)"
+    )]
+    DeclaredMinZoomTooFine { declared: u8, coarsest: u8 },
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -611,8 +633,27 @@ fn export_pmtiles_impl(
     let crs = detect_crs(input_path)?;
 
     let num_levels = reader.num_levels();
-    let min_zoom = zoom_for_level(&meta, 0);
+    let coarsest_zoom = zoom_for_level(&meta, 0);
     let max_zoom = zoom_for_level(&meta, num_levels - 1);
+    // #380: the archive may declare a coarser minimum than the file holds.
+    let min_zoom = match options.min_zoom {
+        Some(declared) if declared > coarsest_zoom => {
+            return Err(ExportError::DeclaredMinZoomTooFine {
+                declared,
+                coarsest: coarsest_zoom,
+            });
+        }
+        Some(declared) if declared < coarsest_zoom => {
+            log::info!(
+                "[export] widening the declared zoom range to z{declared}..z{max_zoom}; \
+                 the file's coarsest level is z{coarsest_zoom}, so z{declared}..z{} hold \
+                 no tiles",
+                coarsest_zoom - 1
+            );
+            declared
+        }
+        _ => coarsest_zoom,
+    };
 
     // Resolve the partition-wave *ceiling* once (auto-sizes from available cores
     // when the caller left it at PARTITION_WAVE_AUTO) and surface it (#293). On
@@ -632,6 +673,7 @@ fn export_pmtiles_impl(
     // schema (property columns, level/covering excluded).
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
     writer.set_layer_name(&options.layer_name);
+    writer.set_declared_min_zoom(min_zoom);
     // #359: which name each column is published under. Derived once from the
     // file's own rename provenance so a standalone `export-pmtiles` on an
     // overview written by an earlier run restores names just as `tiles` does.
@@ -6291,6 +6333,66 @@ mod tests {
         assert!(
             names.contains(&"id".to_string()),
             "id was withheld: {names:?}"
+        );
+    }
+
+    // --- declared minimum zoom (#380) ----------------------------------------
+
+    /// The converter omits levels that generalize to nothing (§7.3), so an
+    /// overview built for z0..z4 can start at z2. The archive must still
+    /// declare the range that was asked for.
+    #[test]
+    fn export_declared_min_zoom_is_written_to_header_and_report() {
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let b = Geometry::Point(Point::new(120.0, -40.0));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[
+                (vec![0, 1], vec![a.clone(), b.clone()]),
+                (vec![0, 1], vec![a.clone(), b.clone()]),
+            ],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            min_zoom: Some(0),
+            ..ExportOptions::default()
+        };
+        let report = export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+        assert_eq!(report.min_zoom, 0, "report must cover the declared range");
+        assert_eq!(report.max_zoom, 4);
+        assert_eq!(
+            report.zooms.len(),
+            2,
+            "no phantom per-zoom rows for empty zooms"
+        );
+
+        let data = std::fs::read(tout.path()).unwrap();
+        let header = crate::pmtiles_writer::Header::from_bytes(&data[..127]).unwrap();
+        assert_eq!(header.min_zoom, 0);
+        assert_eq!(header.max_zoom, 4);
+    }
+
+    /// Declaring a minimum finer than the coarsest level would misdescribe
+    /// tiles that exist; that is a caller error, not something to paper over.
+    #[test]
+    fn export_declared_min_zoom_finer_than_coarsest_level_is_rejected() {
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![a.clone()]), (vec![0], vec![a.clone()])],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            min_zoom: Some(3),
+            ..ExportOptions::default()
+        };
+        let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("min_zoom") && msg.contains('3') && msg.contains('2'),
+            "error must name the declared and actual minimum: {msg}"
         );
     }
 }
