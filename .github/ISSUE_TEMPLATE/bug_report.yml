@@ -32,7 +32,7 @@ body:
       label: Exact command
       description: The exact command you ran, including all flags.
       render: shell
-      placeholder: tylertoo tiles input.parquet output.pmtiles --zoom 0-14
+      placeholder: tylertoo tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
     validations:
       required: true
 
