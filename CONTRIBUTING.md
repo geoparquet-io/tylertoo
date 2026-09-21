@@ -1,5 +1,9 @@
 # Contributing to tylertoo
 
+Participation in this project is governed by our [Code of Conduct](https://github.com/geoparquet-io/tylertoo/blob/main/CODE_OF_CONDUCT.md).
+
+Found a security issue? See [SECURITY.md](https://github.com/geoparquet-io/tylertoo/blob/main/SECURITY.md) for how to report it privately.
+
 ## Development Setup
 
 ```bash
@@ -35,8 +39,12 @@ Python setup, and how to run every CI gate locally.
    and (for Python changes) the ruff/mypy/stubtest/vulture/xenon/pytest
    suite via `uv run`. The full list with commands:
    [DEVELOPMENT.md → CI Gates](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
-3. Submit the PR; never bypass the pre-commit hooks (`--no-verify` is
-   forbidden).
+3. Submit the PR using the [PR template](https://github.com/geoparquet-io/tylertoo/blob/main/.github/PULL_REQUEST_TEMPLATE.md);
+   never bypass the pre-commit hooks (`--no-verify` is forbidden).
+
+Filing a bug or feature request instead? Use the
+[issue templates](.github/ISSUE_TEMPLATE/) — they ask for the details we
+need to act on the report quickly.
 
 ## Releasing (Maintainers)
 

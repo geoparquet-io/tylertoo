@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest an idea or improvement for tylertoo
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! tylertoo deliberately tracks
+        tippecanoe parity where it makes sense, so telling us about a
+        tippecanoe equivalent (if one exists) really helps us evaluate
+        the request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve? What's missing or painful today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: What would you like tylertoo to do instead?
+    validations:
+      required: true
+
+  - type: input
+    id: tippecanoe-equivalent
+    attributes:
+      label: tippecanoe equivalent (if any)
+      description: >
+        Does tippecanoe (or planetiler) have a flag or behavior that
+        does this? e.g. `-zg`, `--drop-densest-as-needed`.
+      placeholder: e.g. tippecanoe -zg
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else?
+      description: Additional context, links, or examples.
+    validations:
+      required: false

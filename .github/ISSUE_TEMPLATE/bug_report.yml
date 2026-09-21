@@ -1,0 +1,86 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! The more detail you
+        give us, the faster we can reproduce and fix it.
+
+  - type: input
+    id: version
+    attributes:
+      label: tylertoo version
+      description: Output of `tylertoo --version`
+      placeholder: tylertoo 0.7.0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS and version, e.g. macOS 14.5, Ubuntu 22.04, Windows 11
+      placeholder: macOS 14.5 (arm64)
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      description: The exact command you ran, including all flags.
+      render: shell
+      placeholder: tylertoo tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+    validations:
+      required: true
+
+  - type: textarea
+    id: input-data
+    attributes:
+      label: Input data shape
+      description: >
+        Row count, geometry type(s) (point/line/polygon/mixed), and CRS
+        of the input GeoParquet. A link to the file (if public) helps a
+        lot — we can't always reproduce from a description alone.
+      placeholder: |
+        ~2.1M rows, Polygon, EPSG:4326
+        Link: https://example.com/data.parquet
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include the full error message if any.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: >
+        Re-run with `RUST_LOG=info` (or `debug` for more detail) set in
+        the environment and paste the output here.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else?
+      description: Additional context, screenshots, or things you've already tried.
+    validations:
+      required: false
