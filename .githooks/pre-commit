@@ -64,6 +64,35 @@ if ! cargo metadata --format-version=1 >/dev/null 2>&1; then
 fi
 echo "Version consistency check passed!"
 
+# Keep crates/python/uv.lock in step with the bumped version. The lockfile
+# pins the project's own version, so `cz bump` leaves it stale and the CI
+# `uv sync --locked` step fails with an opaque resolver error. Regenerating
+# here mirrors the README sync below: the hook fixes it and stages the result.
+echo "Checking crates/python/uv.lock..."
+if command -v uv >/dev/null 2>&1; then
+    if ! (cd crates/python && uv lock --check >/dev/null 2>&1); then
+        (cd crates/python && uv lock --quiet)
+        git add crates/python/uv.lock
+        echo "uv.lock was stale; regenerated and staged."
+    fi
+    echo "uv.lock check passed!"
+else
+    # No uv on PATH, so fall back to the version comparison that catches the
+    # bump case. Full dependency drift still gets caught by CI.
+    UV_LOCK_VERSION=$(awk '/^name = "tylertoo"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' crates/python/uv.lock)
+    if [ "$WORKSPACE_VERSION" != "$UV_LOCK_VERSION" ]; then
+        echo ""
+        echo "ERROR: uv.lock version mismatch!"
+        echo "  workspace.package.version = $WORKSPACE_VERSION"
+        echo "  crates/python/uv.lock     = $UV_LOCK_VERSION"
+        echo ""
+        echo "Fix: install uv, then run 'cd crates/python && uv lock'."
+        echo ""
+        exit 1
+    fi
+    echo "uv.lock version check passed (uv absent, version-only check)."
+fi
+
 # Sync READMEs to subcrates
 echo "Syncing README.md to subcrates..."
 cp README.md crates/core/README.md
