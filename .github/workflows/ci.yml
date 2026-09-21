@@ -138,7 +138,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-shear
-        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-shear
 
@@ -430,7 +430,7 @@ jobs:
       - name: Install tarpaulin
         # Prebuilt binary via install-action; `cargo install cargo-tarpaulin`
         # was several minutes of compile time on every run.
-        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-tarpaulin
 
@@ -438,7 +438,7 @@ jobs:
         run: cargo tarpaulin --out xml --all-features --workspace --exclude tylertoo-python
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: ./cobertura.xml
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -541,7 +541,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-audit, cargo-deny, and cargo-semver-checks
-        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-audit,cargo-deny,cargo-semver-checks
 
