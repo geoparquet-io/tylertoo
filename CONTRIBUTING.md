@@ -91,6 +91,12 @@ truth for `version_files`). A bump updates:
 | `crates/python/pyproject.toml` | `version = "X.Y.Z"` |
 | `.cz.toml` | its own `version` field |
 
+One file it does **not** update is `crates/python/uv.lock`, which pins
+the Python project's own version. The pre-commit hook runs `uv lock`
+and stages the result, so a bump commit carries the refreshed lockfile.
+Commit with the hook enabled (`git config core.hooksPath .githooks`) or
+run `cd crates/python && uv lock` yourself.
+
 The pre-commit hook and the CI Version Consistency job both fail if
 these drift.
 
@@ -111,3 +117,5 @@ gh workflow run release.yml --ref main
 | `failed to select version for tylertoo-core` | workspace dependency version not updated | Ensure the `[workspace.dependencies]` entry in `Cargo.toml` moved with the bump |
 | `cz: command not found` | Commitizen not installed | `uv tool install commitizen` |
 | Version Consistency job fails | Manual edit to one version file | Re-run `uv run cz bump` from the repo root |
+| `uv.lock needs to be updated, but --locked was provided` | Version bumped without refreshing the lockfile | `cd crates/python && uv lock`, then commit `uv.lock` |
+| `No pyproject.toml found` from `uv lock` | Run from the repo root | The Python project is in `crates/python`; run it there |
