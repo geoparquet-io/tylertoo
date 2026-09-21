@@ -1,0 +1,211 @@
+diff --git a/.cz.toml b/.cz.toml
+index 24720ce..f98a8f0 100644
+--- a/.cz.toml
++++ b/.cz.toml
+@@ -1,6 +1,6 @@
+ [tool.commitizen]
+ name = "cz_conventional_commits"
+-version = "0.6.0"
++version = "0.6.1"
+ tag_format = "v$version"
+ version_files = [
+     # Workspace version (first match)
+diff --git a/Cargo.toml b/Cargo.toml
+index 0191299..bc37db7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,19 +7,19 @@ members = [
+ ]
+ 
+ [workspace.package]
+-version = "0.6.0"
++version = "0.6.1"
+ edition = "2021"
+ rust-version = "1.75"
+ authors = ["Nissim Lebovits <nlebovits@pm.me>"]
+ license = "Apache-2.0"
+-repository = "https://github.com/geoparquet-io/gpq-tiles"
+-homepage = "https://github.com/geoparquet-io/gpq-tiles"
++repository = "https://github.com/geoparquet-io/tylertoo"
++homepage = "https://github.com/geoparquet-io/tylertoo"
+ keywords = ["geoparquet", "pmtiles", "vector-tiles", "mvt", "geospatial"]
+ categories = ["science", "data-structures", "encoding"]
+ 
+ [workspace.dependencies]
+ # Internal crates
+-gpq-tiles-core = { path = "crates/core", version = "0.6.0" }
++gpq-tiles-core = { path = "crates/core", version = "0.6.1" }
+ 
+ # Core geospatial dependencies
+ geoarrow = "0.4"
+diff --git a/README.md b/README.md
+index 7fa5f0e..30e4356 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,19 @@
+ # gpq-tiles
+ 
++> ## ⚠️ Renamed: `gpq-tiles` is now **tylertoo**
++>
++> This project has been renamed. Development continues at
++> **[geoparquet-io/tylertoo](https://github.com/geoparquet-io/tylertoo)** — nothing further will be
++> published under the `gpq-tiles` name.
++>
++> **Migrate:** `cargo install tylertoo` (was `cargo install gpq-tiles`) ·
++> `pip install tylertoo` (was `pip install gpq-tiles`).
++> In Rust, depend on [`tylertoo-core`](https://crates.io/crates/tylertoo-core) instead of
++> `gpq-tiles-core`; in Python, `import tylertoo` instead of `import gpq_tiles`.
++>
++> `0.6.1` is a metadata-only tombstone release — the code is unchanged from `0.6.0`, so anything
++> pinned to `gpq-tiles ~0.6` keeps working exactly as before.
++
+ [![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
+ [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
+ [![Crates.io](https://img.shields.io/crates/v/gpq-tiles?color=blue)](https://crates.io/crates/gpq-tiles)
+diff --git a/crates/cli/Cargo.toml b/crates/cli/Cargo.toml
+index fab3297..135c91e 100644
+--- a/crates/cli/Cargo.toml
++++ b/crates/cli/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "gpq-tiles"
+-description = "CLI tool for converting GeoParquet to PMTiles vector tiles"
++description = "RENAMED to tylertoo — this crate is no longer maintained under this name. Use `cargo install tylertoo`. See https://crates.io/crates/tylertoo"
+ readme = "README.md"
+ version.workspace = true
+ edition.workspace = true
+diff --git a/crates/cli/README.md b/crates/cli/README.md
+index 7db68fa..8b530ec 100644
+--- a/crates/cli/README.md
++++ b/crates/cli/README.md
+@@ -1,5 +1,19 @@
+ # gpq-tiles
+ 
++> ## ⚠️ Renamed: `gpq-tiles` is now **tylertoo**
++>
++> This project has been renamed. Development continues at
++> **[geoparquet-io/tylertoo](https://github.com/geoparquet-io/tylertoo)** — nothing further will be
++> published under the `gpq-tiles` name.
++>
++> **Migrate:** `cargo install tylertoo` (was `cargo install gpq-tiles`) ·
++> `pip install tylertoo` (was `pip install gpq-tiles`).
++> In Rust, depend on [`tylertoo-core`](https://crates.io/crates/tylertoo-core) instead of
++> `gpq-tiles-core`; in Python, `import tylertoo` instead of `import gpq_tiles`.
++>
++> `0.6.1` is a metadata-only tombstone release — the code is unchanged from `0.6.0`, so anything
++> pinned to `gpq-tiles ~0.6` keeps working exactly as before.
++
+ [![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
+ [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
+ [![Crates.io](https://img.shields.io/crates/v/gpq-tiles?color=blue)](https://crates.io/crates/gpq-tiles)
+diff --git a/crates/core/Cargo.toml b/crates/core/Cargo.toml
+index 26f4e9f..042dd7e 100644
+--- a/crates/core/Cargo.toml
++++ b/crates/core/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "gpq-tiles-core"
+-description = "Core library for converting GeoParquet to PMTiles vector tiles"
++description = "RENAMED to tylertoo-core — this crate is no longer maintained under this name. See https://crates.io/crates/tylertoo-core"
+ readme = "README.md"
+ version.workspace = true
+ edition.workspace = true
+diff --git a/crates/core/README.md b/crates/core/README.md
+index 7db68fa..8b530ec 100644
+--- a/crates/core/README.md
++++ b/crates/core/README.md
+@@ -1,5 +1,19 @@
+ # gpq-tiles
+ 
++> ## ⚠️ Renamed: `gpq-tiles` is now **tylertoo**
++>
++> This project has been renamed. Development continues at
++> **[geoparquet-io/tylertoo](https://github.com/geoparquet-io/tylertoo)** — nothing further will be
++> published under the `gpq-tiles` name.
++>
++> **Migrate:** `cargo install tylertoo` (was `cargo install gpq-tiles`) ·
++> `pip install tylertoo` (was `pip install gpq-tiles`).
++> In Rust, depend on [`tylertoo-core`](https://crates.io/crates/tylertoo-core) instead of
++> `gpq-tiles-core`; in Python, `import tylertoo` instead of `import gpq_tiles`.
++>
++> `0.6.1` is a metadata-only tombstone release — the code is unchanged from `0.6.0`, so anything
++> pinned to `gpq-tiles ~0.6` keeps working exactly as before.
++
+ [![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
+ [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
+ [![Crates.io](https://img.shields.io/crates/v/gpq-tiles?color=blue)](https://crates.io/crates/gpq-tiles)
+diff --git a/crates/python/Cargo.toml b/crates/python/Cargo.toml
+index b61d272..92881a9 100644
+--- a/crates/python/Cargo.toml
++++ b/crates/python/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "gpq-tiles-python"
+-description = "Python bindings for gpq-tiles"
++description = "RENAMED to tylertoo — Python bindings are now published as `tylertoo` on PyPI. See https://pypi.org/project/tylertoo/"
+ version.workspace = true
+ edition.workspace = true
+ rust-version.workspace = true
+diff --git a/crates/python/README.md b/crates/python/README.md
+index 7db68fa..8b530ec 100644
+--- a/crates/python/README.md
++++ b/crates/python/README.md
+@@ -1,5 +1,19 @@
+ # gpq-tiles
+ 
++> ## ⚠️ Renamed: `gpq-tiles` is now **tylertoo**
++>
++> This project has been renamed. Development continues at
++> **[geoparquet-io/tylertoo](https://github.com/geoparquet-io/tylertoo)** — nothing further will be
++> published under the `gpq-tiles` name.
++>
++> **Migrate:** `cargo install tylertoo` (was `cargo install gpq-tiles`) ·
++> `pip install tylertoo` (was `pip install gpq-tiles`).
++> In Rust, depend on [`tylertoo-core`](https://crates.io/crates/tylertoo-core) instead of
++> `gpq-tiles-core`; in Python, `import tylertoo` instead of `import gpq_tiles`.
++>
++> `0.6.1` is a metadata-only tombstone release — the code is unchanged from `0.6.0`, so anything
++> pinned to `gpq-tiles ~0.6` keeps working exactly as before.
++
+ [![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
+ [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
+ [![Crates.io](https://img.shields.io/crates/v/gpq-tiles?color=blue)](https://crates.io/crates/gpq-tiles)
+diff --git a/crates/python/pyproject.toml b/crates/python/pyproject.toml
+index e5b0ded..687d047 100644
+--- a/crates/python/pyproject.toml
++++ b/crates/python/pyproject.toml
+@@ -4,8 +4,8 @@ build-backend = "maturin"
+ 
+ [project]
+ name = "gpq-tiles"
+-version = "0.6.0"
+-description = "Fast GeoParquet to PMTiles converter"
++version = "0.6.1"
++description = "RENAMED to tylertoo — this package is no longer maintained under this name. Use `pip install tylertoo`. See https://pypi.org/project/tylertoo/"
+ readme = "README.md"
+ license = { text = "Apache-2.0" }
+ authors = [
+@@ -27,8 +27,8 @@ classifiers = [
+ requires-python = ">=3.9"
+ 
+ [project.urls]
+-Homepage = "https://github.com/geoparquet-io/gpq-tiles"
+-Repository = "https://github.com/geoparquet-io/gpq-tiles"
++Homepage = "https://github.com/geoparquet-io/tylertoo"
++Repository = "https://github.com/geoparquet-io/tylertoo"
+ 
+ [project.optional-dependencies]
+ dev = ["pytest>=8.0", "pytest-cov", "ruff"]
+diff --git a/crates/python/uv.lock b/crates/python/uv.lock
+index a04a12f..f43f5a7 100644
+--- a/crates/python/uv.lock
++++ b/crates/python/uv.lock
+@@ -459,7 +459,7 @@ wheels = [
+ 
+ [[package]]
+ name = "gpq-tiles"
+-version = "0.3.0"
++version = "0.6.1"
+ source = { editable = "." }
+ 
+ [package.optional-dependencies]
