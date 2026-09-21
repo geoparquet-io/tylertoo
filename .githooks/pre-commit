@@ -64,6 +64,18 @@ if ! cargo metadata --format-version=1 >/dev/null 2>&1; then
 fi
 echo "Version consistency check passed!"
 
+# Keep Cargo.lock in step with the bumped version. The lockfile pins the
+# workspace members' own versions, so `cz bump` leaves it stale and the CI
+# `cargo metadata --locked` audit gate fails — the same failure mode uv.lock
+# had before #466. The `cargo metadata` resolution check above already
+# refreshed the working-tree lock; stage it if it moved.
+echo "Checking Cargo.lock..."
+if ! git diff --quiet -- Cargo.lock; then
+    git add Cargo.lock
+    echo "Cargo.lock was stale; refreshed and staged."
+fi
+echo "Cargo.lock check passed!"
+
 # Keep crates/python/uv.lock in step with the bumped version. The lockfile
 # pins the project's own version, so `cz bump` leaves it stale and the CI
 # `uv sync --locked` step fails with an opaque resolver error. Regenerating

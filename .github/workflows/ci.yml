@@ -174,7 +174,7 @@ jobs:
       - name: Run clippy
         # -D warnings also denies the curated [workspace.lints.clippy] set
         # (pedantic subset + cognitive_complexity) defined in Cargo.toml.
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check for unused dependencies
         # cargo-shear, not cargo-machete: it also inspects
@@ -201,7 +201,7 @@ jobs:
           fi
 
       - name: Run unit tests
-        run: cargo test --lib --all-features
+        run: cargo test --locked --lib --all-features
 
   # Full test suite
   test:
@@ -266,7 +266,7 @@ jobs:
 
       - name: Run all tests (excluding slow regression tests)
         # Large polygon regression tests are run manually - see tests/fixtures/realdata/README.md
-        run: cargo test --all-features -- --skip large_polygon_regression
+        run: cargo test --locked --all-features -- --skip large_polygon_regression
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.
@@ -374,7 +374,7 @@ jobs:
 
       - name: Regenerate CLI reference
         run: |
-          cargo run -p tylertoo --features gen-docs -- gen-reference-docs \
+          cargo run --locked -p tylertoo --features gen-docs -- gen-reference-docs \
             > docs/reference/cli.md
 
       - name: Build extension and regenerate Python reference
@@ -473,7 +473,7 @@ jobs:
           key: ${{ runner.os }}-cargo-profiling-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build with dhat-heap feature
-        run: cargo build --release --features dhat-heap
+        run: cargo build --locked --release --features dhat-heap
 
   # Build on exactly the declared MSRV. The `rust-version` in Cargo.toml is a
   # published compatibility promise, and nothing else in CI exercises it --
@@ -519,7 +519,7 @@ jobs:
       # --all-features so the optional `remote` stack (object_store, aws-*) is
       # covered too; that is where the MSRV floor actually comes from.
       - name: Check on the declared MSRV
-        run: cargo check --workspace --all-targets --all-features
+        run: cargo check --locked --workspace --all-targets --all-features
 
   # Security audit: advisories on every PR, plus full supply-chain policy
   # (licenses, bans, sources) via cargo-deny. The weekly security.yml run

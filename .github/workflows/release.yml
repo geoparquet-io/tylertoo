@@ -88,7 +88,7 @@ jobs:
 
       - name: Publish tylertoo-core to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
-        run: cargo publish --package tylertoo-core
+        run: cargo publish --locked --package tylertoo-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -97,7 +97,7 @@ jobs:
         run: |
           # Wait for crates.io to index tylertoo-core
           sleep 30
-          cargo publish --package tylertoo
+          cargo publish --locked --package tylertoo
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -169,7 +169,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --package tylertoo --target "$TARGET"
+        run: cargo build --locked --release --package tylertoo --target "$TARGET"
 
       - name: Smoke test binary
         # x86_64-apple-darwin is cross-compiled on the arm64 runner; running
