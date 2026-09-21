@@ -72,7 +72,7 @@ aws-credential-types = { version = "1", optional = true }
 # run and the pin is no longer load-bearing for that reason -- the lock holds
 # 1.6.3 on its own. Keep it only until the upstream fix lands.
 # TODO: drop this pin once aws-config requires aws-smithy-json >= 0.64.
-aws-smithy-types = { version = "=1.6.3", optional = true }
+aws-smithy-types = { version = "=1.6.4", optional = true }
 async-trait = { version = "0.1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
