@@ -359,7 +359,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --out dist -m crates/python/Cargo.toml
+          args: --release --locked --out dist -m crates/python/Cargo.toml
           before-script-linux: |
             # protoc for prost-build. It is a host tool, so the x86_64 build
             # is right for every one of these containers, including the
@@ -385,7 +385,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m crates/python/Cargo.toml
+          args: --release --locked --out dist -m crates/python/Cargo.toml
 
       - name: Check the wheel is abi3
         shell: bash
