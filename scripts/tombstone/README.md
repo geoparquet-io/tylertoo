@@ -160,7 +160,9 @@ reproduces 0.6.0's exact distribution set:
 ```bash
 cd /tmp/gpq-tombstone
 git checkout -b release/gpq-tiles-0.6.1
-git commit -am "chore(release): tombstone gpq-tiles 0.6.1 -> tylertoo"
+# --no-verify: the v0.6.0 tree's own pre-commit hook would run current-toolchain
+# clippy on the old tree and overwrite the subcrate READMEs via its sync step
+git commit --no-verify -am "chore(release): tombstone gpq-tiles 0.6.1 -> tylertoo"
 git push origin release/gpq-tiles-0.6.1
 git tag -a v0.6.1 -m "gpq-tiles 0.6.1 (tombstone)" && git push origin v0.6.1
 ```
@@ -174,8 +176,12 @@ Caveats, all of them deliberate trade-offs — read before doing this:
   "crate version already uploaded" — harmless: `build-wheels` / `build-sdist` / `publish-python`
   do not `needs:` it and still run. To let CI do everything, skip Part 1 and just tag.
 - It needs `CARGO_REGISTRY_TOKEN` (repo secret, still present) and a working PyPI credential — see
-  above. If trusted publishing is dead, set a `PYPI_API_TOKEN` secret first; the old workflow's
-  publish step falls back to it.
+  above. There is **no secret fallback**: the old workflow's publish step is
+  `pypa/gh-action-pypi-publish` with no `password:` input, so a `PYPI_API_TOKEN` secret would
+  never reach it. If trusted publishing is dead, either (re)add a PyPI trusted publisher for the
+  `gpq-tiles` project pointing at `geoparquet-io/tylertoo` / `release.yml` before tagging, or let
+  `publish-python` fail, download the run's wheel and sdist artifacts, and `twine upload` them
+  manually.
 - The workflow uses floating action tags (`actions/checkout@v6`, …), which today's `zizmor` gate on
   `main` would reject. That gate does not run on a tag push of an old tree, so it is not blocking —
   but do not "fix" the old workflow; leave the tagged tree as-is.
