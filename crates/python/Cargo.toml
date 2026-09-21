@@ -15,7 +15,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tylertoo-core = { workspace = true, features = ["remote"] }
-pyo3 = { workspace = true }
+# abi3-py39: build against CPython's stable ABI so a single wheel per
+# platform covers every CPython >= 3.9 (matching `requires-python`).
+# This binding is a thin facade over tylertoo-core -- it only uses the
+# pyo3 safe API, no version-specific C API -- so the stable ABI costs
+# nothing here.
+pyo3 = { workspace = true, features = ["abi3-py39"] }
 tempfile = "3"
 
 [lints]

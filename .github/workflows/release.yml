@@ -275,27 +275,70 @@ jobs:
             --notes-file release-notes.md \
             dist/*
 
+  # One wheel per platform, not one per platform x interpreter: the binding
+  # builds against CPython's stable ABI (`abi3-py39` in crates/python/Cargo.toml),
+  # so each wheel is tagged `cp39-abi3` and installs on every CPython >= 3.9.
+  # That also kills the old cp38 anomaly -- the tag no longer depends on
+  # whichever interpreter happens to be default inside the build container.
   build-wheels:
-    name: Build wheels (${{ matrix.os }})
+    name: Build wheel (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # Linux wheels are built inside maturin-action's manylinux /
+          # musllinux containers; aarch64 is cross-compiled there (the
+          # container host is always x86_64), so no QEMU is involved.
+          #
+          # `native: true` marks the entries whose wheel can be installed and
+          # imported on the runner itself (manylinux x86_64 on the glibc
+          # runner, macOS arm64 on the arm64 runner, Windows x86_64). The
+          # cross-compiled ones (linux aarch64, musllinux on a glibc runner,
+          # macOS x86_64 on the arm64 runner) cannot be smoke-tested here.
+          - name: manylinux-x86_64
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+            native: true
+          - name: manylinux-aarch64
+            os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          - name: musllinux-x86_64
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: musllinux_1_2
+          - name: musllinux-aarch64
+            os: ubuntu-latest
+            target: aarch64
+            manylinux: musllinux_1_2
+          # Cross-compiled from the arm64 runner, same as build-binaries:
+          # Intel macOS runners are retired.
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            native: true
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            native: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install Rust
+        # Linux builds run in a container that ships its own toolchain; only
+        # the macOS/Windows runners need one (plus the cross target).
+        if: runner.os != 'Linux'
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
-
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          targets: ${{ matrix.target }}
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -310,36 +353,73 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Build wheels (Linux)
+      - name: Build wheel (Linux)
         if: runner.os == 'Linux'
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
-          target: x86_64
-          manylinux: auto
-          args: --release --out dist -m crates/python/Cargo.toml
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -m crates/python/Cargo.toml
           before-script-linux: |
-            # Install protoc inside manylinux container
+            # protoc for prost-build. It is a host tool, so the x86_64 build
+            # is right for every one of these containers, including the
+            # aarch64 cross ones. The musllinux images are Debian-based and
+            # the manylinux ones RPM-based, hence the unzip fallback chain.
+            if ! command -v unzip >/dev/null 2>&1; then
+              if command -v apt-get >/dev/null 2>&1; then
+                apt-get update && apt-get install -y unzip
+              elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y unzip
+              elif command -v yum >/dev/null 2>&1; then
+                yum install -y unzip
+              elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache unzip
+              fi
+            fi
             curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip
-            unzip protoc-25.1-linux-x86_64.zip -d /usr/local
+            unzip -o protoc-25.1-linux-x86_64.zip -d /usr/local
             rm protoc-25.1-linux-x86_64.zip
 
-      - name: Build wheels (macOS)
-        if: runner.os == 'macOS'
+      - name: Build wheel (macOS/Windows)
+        if: runner.os != 'Linux'
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
-          args: --release --out dist -m crates/python/Cargo.toml
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist -m crates/python/Cargo.toml
 
-      - name: Build wheels (Windows)
-        if: runner.os == 'Windows'
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
-        with:
-          args: --release --out dist -m crates/python/Cargo.toml
+      - name: Check the wheel is abi3
+        shell: bash
+        run: |
+          ls -l dist
+          # Exactly one wheel per platform, and it must be the stable-ABI one.
+          count=$(find dist -name '*.whl' | wc -l | tr -d ' ')
+          if [ "$count" != "1" ]; then
+            echo "::error::expected 1 wheel, found $count"
+            exit 1
+          fi
+          wheel=$(find dist -name '*.whl')
+          case "$(basename "$wheel")" in
+            *-cp39-abi3-*) echo "OK: $(basename "$wheel")" ;;
+            *) echo "::error::wheel is not cp39-abi3: $(basename "$wheel")"; exit 1 ;;
+          esac
+
+      - name: Smoke test wheel import (native builds only)
+        # The abi3 check above is filename-only; actually install and import
+        # the wheel so a build-but-broken-at-import wheel never reaches PyPI
+        # (a bad upload permanently burns the filename). Only runner-native
+        # wheels can run here -- cross-compiled ones are skipped by design.
+        if: matrix.native
+        shell: bash
+        run: |
+          pip install --no-index --find-links dist tylertoo
+          python -c "import tylertoo; print(tylertoo.__doc__ or 'ok')"
 
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.name }}
           path: dist
+          if-no-files-found: error
 
   build-sdist:
     name: Build source distribution
@@ -363,7 +443,12 @@ jobs:
 
   publish-python:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    # release-rust is in needs only for its release_exists output: without
+    # the gate, a manual workflow_dispatch would upload wheels built from
+    # main-HEAD under the already-released version. Artifacts still come
+    # from build-wheels/build-sdist.
+    needs: [release-rust, build-wheels, build-sdist]
+    if: needs.release-rust.outputs.release_exists == 'false'
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
