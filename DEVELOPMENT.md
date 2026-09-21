@@ -22,8 +22,8 @@ protoc --version  # Should be 3.x or higher
 git config core.hooksPath .githooks
 
 # Fetch the geometry-test-data submodule (the geometry fixture tests
-# read from it; an uninitialized submodule makes them skip with
-# "Fixture not found, skipping", not fail)
+# read from it; without it some skip silently and others panic —
+# see below)
 git submodule update --init
 
 # Fetch the real-data test fixtures (a fresh clone holds git-lfs pointers,
@@ -39,11 +39,13 @@ them — and a guard that stays silent there is how #369 went unnoticed
 for six months. See `tests/fixtures/realdata/README.md` for what each
 fixture is.
 
-The same silent-skip hazard applies to the `geometry-test-data`
-submodule. If it is not initialized, the tests that read it print
-"Fixture not found, skipping" and pass. Run `git submodule update
---init` once after cloning and again whenever the submodule pointer
-moves upstream.
+The `geometry-test-data` submodule has a related hazard. If it is not
+initialized, the tests in `ioverlay_real_fixtures_test.rs` print
+"Fixture not found, skipping test" and pass, while
+`invalid_geometry_clipping.rs` fails with a file-read panic. CI checks
+the submodule out via `submodules: recursive`, so this bites local
+clones only. Run `git submodule update --init` once after cloning and
+again whenever the submodule pointer moves upstream.
 
 The pre-commit hook runs `cargo fmt --check`, `cargo clippy` (deny
 warnings), a version-consistency check across the four version files,
