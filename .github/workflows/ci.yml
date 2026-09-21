@@ -149,19 +149,19 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install protoc
         run: |
@@ -174,7 +174,7 @@ jobs:
       - name: Run clippy
         # -D warnings also denies the curated [workspace.lints.clippy] set
         # (pedantic subset + cognitive_complexity) defined in Cargo.toml.
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check for unused dependencies
         # cargo-shear, not cargo-machete: it also inspects
@@ -201,7 +201,7 @@ jobs:
           fi
 
       - name: Run unit tests
-        run: cargo test --lib --all-features
+        run: cargo test --locked --lib --all-features
 
   # Full test suite
   test:
@@ -240,19 +240,19 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -266,7 +266,7 @@ jobs:
 
       - name: Run all tests (excluding slow regression tests)
         # Large polygon regression tests are run manually - see tests/fixtures/realdata/README.md
-        run: cargo test --all-features -- --skip large_polygon_regression
+        run: cargo test --locked --all-features -- --skip large_polygon_regression
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.
@@ -297,7 +297,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
@@ -364,7 +364,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-reference-docs-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-reference-docs-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
@@ -374,7 +374,7 @@ jobs:
 
       - name: Regenerate CLI reference
         run: |
-          cargo run -p tylertoo --features gen-docs -- gen-reference-docs \
+          cargo run --locked -p tylertoo --features gen-docs -- gen-reference-docs \
             > docs/reference/cli.md
 
       - name: Build extension and regenerate Python reference
@@ -470,10 +470,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-profiling-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-profiling-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build with dhat-heap feature
-        run: cargo build --release --features dhat-heap
+        run: cargo build --locked --release --features dhat-heap
 
   # Build on exactly the declared MSRV. The `rust-version` in Cargo.toml is a
   # published compatibility promise, and nothing else in CI exercises it --
@@ -514,12 +514,12 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
 
       # --all-features so the optional `remote` stack (object_store, aws-*) is
       # covered too; that is where the MSRV floor actually comes from.
       - name: Check on the declared MSRV
-        run: cargo check --workspace --all-targets --all-features
+        run: cargo check --locked --workspace --all-targets --all-features
 
   # Security audit: advisories on every PR, plus full supply-chain policy
   # (licenses, bans, sources) via cargo-deny. The weekly security.yml run
@@ -545,8 +545,14 @@ jobs:
         with:
           tool: cargo-audit,cargo-deny,cargo-semver-checks
 
-      - name: Generate lockfile
-        run: cargo generate-lockfile
+      # Cargo.lock is committed, so there is nothing to generate here: the
+      # audits below run against the exact versions we build and ship. This
+      # step only fails the job if the lock is stale relative to the
+      # manifests, instead of letting the audit silently re-resolve.
+      # (The weekly security.yml run keeps auditing a *fresh* resolution as
+      # the early-warning lane — see the comment on that step.)
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Run cargo audit
         run: cargo audit

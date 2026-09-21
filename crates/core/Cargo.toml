@@ -67,8 +67,10 @@ aws-credential-types = { version = "1", optional = true }
 # non_exhaustive `Document` enum, which aws-smithy-json 0.63.0 -- the version
 # aws-config 1.12 still requires -- does not handle, so a fresh resolution of
 # the `remote` feature fails to compile upstream (E0004/E0308 inside
-# aws-smithy-json). Not our code, but Cargo.lock is gitignored, so every CI run
-# re-resolves and picks up the break.
+# aws-smithy-json). Not our code.
+# Cargo.lock is now committed (#412), so CI no longer re-resolves on every
+# run and the pin is no longer load-bearing for that reason -- the lock holds
+# 1.6.3 on its own. Keep it only until the upstream fix lands.
 # TODO: drop this pin once aws-config requires aws-smithy-json >= 0.64.
 aws-smithy-types = { version = "=1.6.3", optional = true }
 async-trait = { version = "0.1", optional = true }

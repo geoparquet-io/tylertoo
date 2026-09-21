@@ -36,9 +36,12 @@ serde_json = "1"
 tempfile = "3"
 dhat = { version = "0.3", optional = true }
 # Exact pin (not caret): the CI drift-guard regenerates reference/cli.md and
-# fails on any byte change, and Cargo.lock is not committed — so a new
-# clap-markdown patch with different output would break unrelated PRs. Bump
-# deliberately and regenerate. Dependabot proposes the bump.
+# fails on any byte change — so a new clap-markdown patch with different
+# output would break unrelated PRs. Bump deliberately and regenerate.
+# Dependabot proposes the bump.
+# Cargo.lock is now committed (#412), so the lock alone already holds the
+# version steady across CI runs; the exact pin can be relaxed to a caret in a
+# follow-up (the last open box on #412).
 clap-markdown = { version = "=0.1.5", optional = true }
 
 [dev-dependencies]
