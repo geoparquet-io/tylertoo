@@ -290,10 +290,17 @@ jobs:
           # Linux wheels are built inside maturin-action's manylinux /
           # musllinux containers; aarch64 is cross-compiled there (the
           # container host is always x86_64), so no QEMU is involved.
+          #
+          # `native: true` marks the entries whose wheel can be installed and
+          # imported on the runner itself (manylinux x86_64 on the glibc
+          # runner, macOS arm64 on the arm64 runner, Windows x86_64). The
+          # cross-compiled ones (linux aarch64, musllinux on a glibc runner,
+          # macOS x86_64 on the arm64 runner) cannot be smoke-tested here.
           - name: manylinux-x86_64
             os: ubuntu-latest
             target: x86_64
             manylinux: auto
+            native: true
           - name: manylinux-aarch64
             os: ubuntu-latest
             target: aarch64
@@ -314,9 +321,11 @@ jobs:
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
+            native: true
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            native: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -394,6 +403,17 @@ jobs:
             *) echo "::error::wheel is not cp39-abi3: $(basename "$wheel")"; exit 1 ;;
           esac
 
+      - name: Smoke test wheel import (native builds only)
+        # The abi3 check above is filename-only; actually install and import
+        # the wheel so a build-but-broken-at-import wheel never reaches PyPI
+        # (a bad upload permanently burns the filename). Only runner-native
+        # wheels can run here -- cross-compiled ones are skipped by design.
+        if: matrix.native
+        shell: bash
+        run: |
+          pip install --no-index --find-links dist tylertoo
+          python -c "import tylertoo; print(tylertoo.__doc__ or 'ok')"
+
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -423,7 +443,12 @@ jobs:
 
   publish-python:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    # release-rust is in needs only for its release_exists output: without
+    # the gate, a manual workflow_dispatch would upload wheels built from
+    # main-HEAD under the already-released version. Artifacts still come
+    # from build-wheels/build-sdist.
+    needs: [release-rust, build-wheels, build-sdist]
+    if: needs.release-rust.outputs.release_exists == 'false'
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
