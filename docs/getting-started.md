@@ -28,7 +28,9 @@ elided:
 
 You now have a 6.7 MB `madagascar.pmtiles`. Drop it onto
 [pmtiles.io](https://pmtiles.io/) to see it; the MVT source-layer is
-`overview`. The z0 note is real and worth reading: z0 is a single tile at
+`fieldmaps-madagascar-adm4` (the one-shot form names the layer after the
+input file stem — pass `--layer-name` to override it). The z0 note is real
+and worth reading: z0 is a single tile at
 39 km/pixel, where every one of these polygons simplifies to nothing.
 `--collapse` keeps them as representative points instead.
 
@@ -153,7 +155,7 @@ tylertoo overview \
   prepared.parquet \
   preview-ov.parquet \
   --min-zoom 0 --max-zoom 12 \
-  --bbox -48,-24,-46,-22
+  --bbox=-48,-24,-46,-22
 ```
 
 Peak memory tracks the largest row group, not the size of the file, so a file
@@ -260,11 +262,11 @@ straddle a tile boundary are clipped into each tile they touch.
 
 A PMTiles archive is a single file served over HTTP range requests, so any
 PMTiles-aware viewer renders it without a running tile server. Drop the file
-onto [pmtiles.io](https://pmtiles.io/), or serve it locally — Python's
-`http.server` (3.7+) honors Range:
+onto [pmtiles.io](https://pmtiles.io/), or serve it locally with a server
+that honors Range requests (Python's `http.server` does not):
 
 ```bash
-python3 -m http.server 8080
+npx serve .            # or: caddy file-server, or: pmtiles serve .
 ```
 
 ## Converting in one step
