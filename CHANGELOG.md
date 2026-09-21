@@ -7,247 +7,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## v0.7.0 (2026-09-19)
 
-### Feat
+The release that replaces the original per-tile pipeline with the
+`geo:overviews` architecture. Tiling now runs as *build a multi-resolution
+overview GeoParquet, then export tiles from it*, with the overview file as a
+first-class artifact you can validate, query with SQL, and re-export.
 
-- **convert**: tiny-polygon accumulator — coarse levels keep the dropped area (#384) (#394)
-- **pyramid**: bands in different layers may share a zoom range — multi-layer archives (#385) (#392)
-- --include-property / --exclude-property / --exclude-all-properties (#386) (#391)
-- **convert**: attribute-driven entry zoom — the magnitude ladder (#364) (#375)
-- **pyramid**: tile GeoParquet bands directly, one shot (#345) (#368)
-- **export**: add --feature-order to pin within-tile draw order (#361) (#366)
-- **convert**: add --verbatim, tiling an input exactly as given (#345, #360) (#367)
-- **pyramid**: merge per-band archives into one multi-band pyramid
-- **export**: default per-tile size cap at 500K (tippecanoe parity)
-- **filter**: timestamp column support in --filter
-- **cli,python**: expose --representation and --collapse-square (#317, #279)
-- **overview**: zoom-band representation selector + tiny-polygon placeholder squares (#317, #279)
-- **convert**: attribute filter --filter/--where with stats pushdown (#315)
-- **cli**: ergonomic one-step tiles — --keep-overview, controllable temp, visible disk cost (#314)
-- **cli**: tiles tuning parity — expose --gsd and --report (#316)
-- **core**: warn when remote-input spill dir is on tmpfs/ramfs (#273)
-- **core**: AWS_SKIP_SIGNATURE hint on signature errors at custom endpoints (TDD green)
-- **cli**: friendly single-file-only rejections on validate/decode/export-pmtiles (TDD green)
-- **core**: derive default layer name from multi-partition inputs (TDD green)
-- **python**: overview() accepts list[str] input (explicit ordered parts)
-- **cli**: --files-from manifest on tiles and overview
-- **core**: remote prefix listing, --files-from manifest core, store sharing
-- **core**: retune coarse-zoom polygon defaults from the #259 sweep
-- **core**: plumb ConvertSource through the streaming pipeline
-- **core**: ConvertSource abstraction + local multi-partition resolution
-- **core**: configurable input-spill directory + free-space guard (#272)
-- **ci**: attach prebuilt CLI binaries and real release notes to GitHub Releases
-- **core**: warn on large full-file remote convert (#267)
-- **export**: default simple_clip_fastpath on; add --no-simple-clip-fastpath opt-out (#256)
-- **cli**: expose overview tuning + memory flags on the tiles one-shot command
-- **export**: incremental checkpoints + per-level progress logging (#229)
-- **core**: cascade provenance, spec + tuning docs, Python surface (#218)
-- **core**: cascade flag, simplify_cascade fold, i_overlay candidate repair (#218)
-- remote input support — convert directly from s3://, https://, gs:// (#210)
-- **core**: opt-in zoom-scaled per-level row-group sizing policy (TDD green)
-- **cli**: add decode subcommand (PMTiles -> GeoParquet)
-- **core**: PMTiles -> GeoParquet decode module (#112)
-- **core**: add PMTiles read-side primitives
-- warn on antimeridian-suspect features at convert time + user docs (#188)
-- **bench**: remote-storage (S3 range-request) access benchmark
-- **core**: enforce strict cluster sum invariant (spec §12.1)
-- **core**: emit complete coalescing provenance and ranks as object map
-- **core**: stamp overview footers with spec version 0.2.0
-- **python**: re-point convert() at the overview facade
-- **cli**: reimplement tiles as a facade over overview convert -> export
-- **python**: expose the overview pipeline (E3)
-- **core**: default junction continuation OFF per maintainer sweep review
-- **core**: chain density budget, junction continuation, coalescing on by default
-- **cli**: add --coalesce-lines, --coalesce-snap, --coalesce-max-level-rows
-- **core**: wire line coalescing through both overview pipelines
-- **core**: add line network coalescing engine (Q3)
-- **cli**: default point-thinning 16.0 when clustering
-- **core**: validate clustering metadata (point_count column + values)
-- **cli**: --cluster and --accumulate-attribute flags on overview
-- **core**: per-level point clustering with point_count + numeric aggregation
-- **cli**: expose --no-streaming and --read-batch-size overview flags
-- **core**: two-pass streaming overview convert (H3)
-- **overview**: per-level row-group sizing + string/geometry stats suppression (H1)
-- **overview**: add export-pmtiles (E0)
-- **overview**: add Q2 density-based per-level budget
-- **overview**: retune line-thinning default 2.0 -> 1.0
-- **overview**: expose --gsd-base knob, document tuning, add true-scale renders
-- **overview**: class-aware cell-winner ranking (Q1)
-- **cli**: add overview and validate subcommands
-- **core**: add overview convert pipeline (P5)
-- **overview**: add overview reader and conformance validator (P4)
-- **overview**: add level metadata model and GeoParquet overview writer (P3)
-- **overview**: add world-space GSD-driven simplification (P2)
-- **overview**: add pure level-assignment engine (P1)
-- **simplify**: add coalesced-linestring simplification and noop removal
-- **python**: add simplify_factor to Python bindings
-- **cli**: add --simplify and --simplify-factor flags
-- **pipeline**: integrate simplify_geometry_for_tile into encoding
-- **simplify**: add unified simplify_geometry_for_tile helper
-- **simplify**: add boundary-preserving polygon ring simplification
-- **simplify**: add boundary-preserving linestring simplification
-- **simplify**: add tile boundary detection
-- **core**: add simplify_factor to TilerConfig
-- **core**: Wave 3 - adaptive retry loop and zoom propagation
-- **core,cli**: Wave 2 - adaptive threshold integration
-- **core**: Wave 1 - adaptive threshold infrastructure
-- **coalesce**: implement property passthrough for keep-first/strict modes
-- **coalesce**: wire predictive architecture into pipeline
-- **pipeline**: implement tile-level geometry coalescing
-- **pipeline**: wire coalesce_config through tile encoding
-- add CoalesceConfig and CLI flags for geometry coalescing
-- **core**: add SpatialGrid and CoalesceTargets for coalescing
-- **core**: implement coalesce_geometries for geometry merging
-- **core**: add covering_tiles and percentile utilities
-- **cli**: add --memory-budget flag to control sort segment size
-- **core**: implement disk-spilling external sort for memory-bounded processing
-- **core**: implement spatial bucketing for memory-bounded tile generation
-- **core**: add row group filtering and memory-bounded processing infrastructure
-- **core**: improve error messages for directory path failures
-- support partitioned GeoParquet directories
-- add zoom_range_for_bbox() unified min/max zoom function
-- add min_zoom_for_bbox() for visibility-based zoom filtering
-- add per-feature max zoom optimization (--auto-max-zoom)
-- **core**: skip clipping for features fully contained within tile bounds
-- **core**: add drop-smallest filtering to legacy TileIterator path
-- **core**: add drop-smallest filtering to streaming path
-- **core**: implement drop-smallest filtering in encode_tile_from_raw
-- **config,cli,python**: add drop-smallest-as-needed configuration
-- **core**: add geometry_pixel_area_world dispatcher for all types
-- **core**: add Sortable trait to TileRef for external sorting
-- **core**: add TileRef for lightweight sorting
-- **core**: add disk-backed GeometryStore for bounded memory
+### Added
 
-### Fix
+- **`geo:overviews` GeoParquet overviews** — `tylertoo overview` embeds
+  COG-style multi-resolution levels in a single valid GeoParquet file;
+  `tylertoo validate` checks one against the draft spec (#168, #184, #190).
+- **`tylertoo export-pmtiles`** — PMTiles v3 export from an overview file,
+  with per-level progress logging and incremental checkpoints (#169, #229).
+- **`tylertoo tiles`, and the bare form** — one-shot GeoParquet → PMTiles as a
+  facade over overview → export, with `--keep-overview`, a controllable spill
+  directory, a free-space preflight, and tuning parity with the two-step
+  commands (#251, #276, #318, #319).
+- **`tylertoo decode`** — PMTiles v3 → GeoParquet with tippecanoe-decode
+  semantics and `zoom` / `layer` / `mvt_id` provenance columns (#112, #206).
+- **`tylertoo pyramid`** — multi-band archives: several inputs, each owning a
+  disjoint zoom range, merged into one PMTiles. Bands may be GeoParquet (tiled
+  for you) or already-tiled PMTiles, and bands in different layers may share a
+  zoom range (#348, #385, #392).
+- **Remote input** — read `s3://`, `https://` and `gs://` GeoParquet over
+  byte-range requests, including remote prefix listing (#210, #216, #281).
+- **Multi-file input** — a local directory, a glob, an `s3://` / `gs://`
+  prefix, a `--files-from` manifest (ordered, mixed local and remote), or a
+  Python `list[str]` is read as one logical dataset, with cross-partition
+  schema and CRS validation and a deterministic row order (#277, #281, #282).
+- **`--spill-dir` and a free-space guard** — place the remote-input spill file
+  where you want it; the converter projects the spill footprint before pass 1
+  and warns when the volume may not fit it, or when it is on tmpfs (#272,
+  #273). A full-file remote conversion that would stage roughly the whole
+  object warns up front with the equivalent download-then-convert commands
+  (#267).
+- **`--bbox` regional extracts** — row-group-level spatial pushdown, so a city
+  comes out of a country-scale file without reading — or, on remote input,
+  fetching — the rest (#102, #207).
+- **`--filter` / `--where`** — SQL-WHERE-style attribute predicates with
+  parquet row-group statistics pushdown, timestamp columns included
+  (#315, #321).
+- **Property selection** — `--include-property`, `--exclude-property` and
+  `--exclude-all-properties` (tippecanoe `-y` / `-x` / `-X`), applied at scan
+  time on `overview` and at encode time on `export-pmtiles` (#386, #391).
+- **`--feature-order`** — pin within-tile draw order to input order or to a
+  property, ascending or descending (#361, #366).
+- **Magnitude ladder** — `--magnitude-ladder` and `--entry-zoom` let an
+  attribute decide the zoom at which each feature first appears (#364, #375).
+- **`--verbatim`** — tile the input exactly as given, switching the whole
+  generalization ladder off at every level (#345, #360, #367).
+- **Zoom-band representation** — `--representation "0-7:point"` draws a band as
+  representative points and the rest as polygons in one archive, and
+  `--collapse-square` stands in for dropped tiny polygons with area-dithered
+  placeholder squares (#279, #317, #322).
+- **Tiny-polygon accumulator** — coarse levels keep the area they drop instead
+  of losing it (#384, #394).
+- **Per-level point clustering** — `--cluster` and `--accumulate-attribute`
+  carry cluster winners with a `point_count` column and numeric attribute
+  aggregation through the overview pipeline (#170).
+- **Line coalescing** — on by default, with `--coalesce-snap`,
+  `--coalesce-max-level-rows` and `--no-coalesce-lines` (#183).
+- **Cascading simplification** — each level simplifies the one above it rather
+  than the source; `--no-cascade` opts out (#218).
+- **`--report`** — machine-readable JSON run reports from `overview`,
+  `export-pmtiles` and `tiles` (#316, #318).
+- **Python overview API** — `overview()`, `validate()` and `export_pmtiles()`
+  bindings, with `convert()` kept as a facade over them (#185).
+- **Prebuilt CLI binaries** attached to every GitHub Release — Linux x86_64
+  (gnu and musl), macOS Intel and Apple Silicon, Windows x86_64 — plus
+  generated release notes (#275).
+- Antimeridian-suspect features are flagged with a warning at convert time
+  (#188, #199).
 
-- **core**: raise the glob floor to 0.3.4 and convert with into
-- **export**: declare the requested min zoom even when coarse levels generalized to nothing (#380) (#390)
-- **mvt**: clean polygons in tile space after quantization (#383) (#393)
-- **export**: withhold coalesced_count from tiles when it is 1 everywhere (#379) (#389)
-- **pmtiles**: apply contiguous-offset rule to leaf directory entries (#377) (#378)
-- **decode**: name the section or tile that failed to decompress, with byte offset (#381) (#388)
-- **export**: publish renamed source columns under their source name (#359) (#365)
-- **core**: release the producer before joining it in the streaming engines (#362) (#363)
-- declare the real MSRV (1.95, was 1.75) and verify it in CI
-- **input**: import ObjectStoreExt for object_store 0.14
-- **pyramid**: rebuild the band merge around review findings
-- **cli**: teach the bare-form rewrite about pyramid
-- **pmtiles**: never write leaf_dirs_offset = 0
-- **overview**: box LevelSink::Spill for arrow 59
-- **pmtiles**: split oversized directories into leaves in PmtilesWriter
-- **export**: encode UTC-stamped timestamps instead of advertising nulls
-- **export**: encode DATE, TIMESTAMP and DECIMAL instead of dropping them
-- **export**: stop out-of-domain bboxes claiming every tile column
-- **export**: --tile-buffer is tile pixels, not MVT extent units
-- **export**: derive tile membership from the buffer-expanded bbox
-- **deps**: pin aws-smithy-types below 1.7.0, unbreaking Check
-- **ci**: pin rust-toolchain at the v1 tag, unbreaking CI Lint
-- **python**: bump pip past PYSEC-2026-3721, unbreaking Python Quality
-- **input**: replace deprecated GlobError::into_error, unbreaking CI on main
-- **python**: sync tylertoo.pyi tile_size_limit default to 512000
-- **convert**: assume OGC:CRS84 for explicit null GeoParquet crs
-- **python**: add filter kwarg to overview type stub
-- **overview**: auto-rename reserved-column collisions instead of rejecting (#288)
-- **core**: review fixes — remote URL classification, CRS/metadata diagnostics, cached single footer
-- **python**: add spill_dir to type stub
-- **core**: stop re-fetching oversized remote column chunks per page (#261)
-- **core**: enable allow_http for http:// remote inputs
-- **clip**: keep MultiPolygon parts that split into pieces at tile bounds (#244)
-- **core**: address CI gates for #211 clamp (clippy complexity, must-use, xenon)
-- **core**: auto-clamp empty overview levels instead of failing (#211)
-- green the mypy and security-audit gates for remote input
-- **python**: add bbox parameter to overview() type stub
-- **core**: clippy/MSRV cleanups in bbox filter code
-- **python**: wire bbox regional extract through the Python bindings
-- **core**: emit spec-compliant MVT polygon ring winding
-- **core**: migrate to arrow/parquet 58 APIs for geoarrow 0.8
-- **bench**: migrate deprecated criterion::black_box to std::hint::black_box
-- **core**: validate geo:overviews footer against actual row groups on open
-- **core**: reject nonsensical overview conversion knobs up front
-- **core**: row-align overview winner tables around skipped hostile geometries
-- **core**: use Web Mercator Y for latitude in tile-local coordinate transform
-- **clippy**: last 1.96 lint in debug_antarctica test
-- **clippy**: appease Rust 1.96 lints (unnecessary_sort_by, manual_checked_ops)
-- **clippy**: resolve -D warnings failures across overview + simplify
-- **overview**: reject case-insensitive level column collisions (F2)
-- **test**: increase memory budget to 500MB for tarpaulin overhead
-- **test**: increase memory budget for CI environments
-- **core**: fix clippy len_zero warning in test
-- **core**: improve CannotReduceFurther error with actionable suggestions
-- **core**: improve CannotReduceFurther error with actionable suggestions
-- **core**: complete adaptive threshold algorithm integration
-- **core**: track actual RSS instead of throughput for memory reporting
-- **coalesce**: address adversarial review findings
-- address clippy warnings
-- **core**: add gap-based dropping to clustering path + tests
-- **core**: sort records by original Hilbert index for gap-based dropping
-- **core**: make temp file names unique with pid/tid for parallel safety
-- **core**: remove unused segment_idx field in external sort
-- **core**: prioritize exact "geometry" column match over partial
-- **core**: apply PR #116's multi-file process_geometries_parallel
-- use single pipeline for all files, not separate pipelines per file
-- **core**: apply PR #116 directory support to get_row_group_count
-- **core**: update extract_crs to handle directory paths
-- update test calls after rebase on PR #133
-- **test**: use array instead of vec for fixed-size test data
-- **bench**: remove unnecessary mut and casts in tile_ref benchmark
+### Changed
 
-### Refactor
+- **Breaking: the legacy per-tile pipeline is gone.** `pipeline.rs`,
+  `Converter` and `TilerConfig` were removed along with their library
+  re-exports, and every path now runs overview → export (#177, #189). The
+  flags tied to the old pipeline — `--streaming-mode`, the old
+  `--include` / `--exclude` / `--exclude-all` property filtering,
+  output-compression selection, `--deterministic` — are gone; the tuning
+  surface is the `overview` / `export-pmtiles` flag set, all of which the
+  one-shot `tiles` command also accepts (#249).
+- **Breaking: Python `convert()` is deprecated.** It no longer runs the removed
+  legacy pipeline; it is a facade chaining `overview()` + `export_pmtiles()`.
+  Use the two-step API for the full option surface.
+- `--polygon-visibility` retuned **4.0 → 2.0** (#259): the rendered sweep
+  showed gates above 2.0 starve coarse zooms without making files smaller, and
+  gates below ~2.0 mostly admit candidates the write-time collapse drops
+  anyway (`corpus/SWEEPS.md`, Decision 6).
+- Per-tile size caps at 500K by default, matching tippecanoe (#280).
+- The simple-clip fast path is on by default; `--no-simple-clip-fastpath` opts
+  out (#239, #256).
+- Line thinning retuned 2.0 → 1.0, point thinning defaults to 16.0 under
+  clustering, and junction continuation now defaults off — all from the same
+  sweep methodology.
+- Overview footers declare spec version 0.2.0 (#184, #190).
+- The declared MSRV is 1.95 — it had claimed 1.75 — and CI verifies it (#358).
 
-- **core**: split the four conversion drivers into named phases
-- **core**: fold away the near-identical writer and codec pairs
-- **core**: sweep dead code and tighten the public surface
-- **core**: remove legacy per-tile pipeline
-- **tiles**: complete excision — drop CLI flags + lib re-export
-- **tiles**: remove unproven zoom-dependent simplification (#158)
-- **overview**: unify Crs and METERS_PER_DEGREE in level.rs
-- **cli**: replace --auto-max-zoom with --zoom-by-area flags
-- **core**: replace auto_max_zoom with zoom_by_area in TilerConfig
+### Fixed
 
-### Perf
+- **PMTiles directories**: the contiguous-offset rule now applies to leaf
+  entries, oversized directories split into leaves, and `leaf_dirs_offset` is
+  never written as 0 (#356, #377, #378).
+- **MVT polygons are cleaned in tile space after quantization**, so
+  quantization can no longer leave self-intersecting or degenerate rings
+  (#383, #393). Ring winding follows the spec.
+- `export-pmtiles` declares the requested minimum zoom even when the coarse
+  levels generalized to nothing (#380, #390).
+- `coalesced_count` is withheld from tiles when it is 1 everywhere (#379,
+  #389).
+- Renamed source columns are published under their source name (#359, #365).
+- `DATE`, `TIMESTAMP` and `DECIMAL` properties are encoded instead of dropped,
+  with timestamps UTC-stamped.
+- `--tile-buffer` is read as tile pixels, not MVT extent units, and tile
+  membership derives from the buffer-expanded bbox.
+- MultiPolygon parts that split into pieces at a tile boundary are kept (#244).
+- Empty overview levels auto-clamp instead of failing the run (#211).
+- Reserved-column collisions are auto-renamed rather than rejected (#288).
+- An explicit null GeoParquet `crs` is assumed to be OGC:CRS84.
+- Coarse-level export used geographic latitude instead of Web Mercator Y in the
+  tile-local transform, distorting high-latitude tiles.
+- An input with a case-insensitive `level` column collision is rejected up
+  front instead of producing an ambiguous overview file.
+- `decode` names the section or tile that failed to decompress, with its byte
+  offset (#381, #388).
+- Oversized remote column chunks are no longer re-fetched per page (#261), and
+  `http://` inputs work (#262).
 
-- **export**: halve member-store fill budget to 128 MiB
-- **export**: single-read fan-out pass 2 for partitioning mode (#235)
-- **convert**: bound pass-1 winner-grid memory with budgeted level waves (#306)
-- **export**: size partition wave from densest partition, not flat constant (#311)
-- **writer**: parallelize GeoParquet WKB encode (#304)
-- **export**: memory-budget preflight for auto partition wave (#303)
-- **convert**: size auto RAM-vs-spill from measured geometry (#305)
-- **export**: auto-scale partition wave to available cores (#293)
-- **convert**: recalibrate auto buffered-output estimate to measured cost (#294)
-- **convert**: add per-phase RSS instrumentation (#295)
-- **convert**: make auto profile pick backing from workload, not mode (#294)
-- **core**: parallelize parquet row-group encoding (#296)
-- **core**: fuse pass-1 geometry traversals in streaming convert (#274)
-- **convert**: --in-flight-batches auto — core-aware pass-2 concurrency
-- **remote**: stage selected row groups up front to coalesce and parallelize fetches (#286, #287)
-- **core**: parallelize explicit-list remote connects (TDD green)
-- **core**: spill remote input to disk to bound re-reads to ~1× (#219)
-- **core**: parallelize convert's dominant serial stages (#264)
-- **bench**: refresh big-file profile, add sweep harness + convert guard + docs
-- **export**: opt-in simple-clip fast path skipping i_overlay fallback (#239)
-- **clip**: replace O(V²) self-intersection scan with sweepline (#241)
-- **convert**: cap O(V²) validity check on oversized RDP candidates (#242)
-- **export**: fix O(V²) clip stall on large-extent polygons (#237)
-- **export**: single-read fan-out scan, kill cross-level prefix re-read (#233)
-- **export**: wave-batched shared read, kill per-partition re-reads (#228)
-- **export**: parallelize scan_level and gzip compression (#227)
-- **export**: top-down recursive tile splitting for large polygons (#226)
-- **core**: cascading simplification in all three pass-2 paths (#218)
-- **core**: single-read pipelined pass-2 engine + --profile presets (#213, #212)
-- **bench**: read AWS bucket/region/profile from env vars
-- **bench**: four-way overview layout benchmark + column-per-zoom prototype
-- **bench**: row-group sizing sweep against real S3 (#202)
-- **core**: add --bbox row-group filtering for regional extracts (#102)
-- **bench**: demonstrate the remote latency floor with a parallel range-request reader
-- **core**: stream finished tile partitions to PMTiles writer (H3b)
-- **core**: parallelize export clip and MVT encode with rayon (H3c lever 2)
-- **core**: export bbox-containment clip fast path (H3c lever 4)
-- **core**: parallelize pass-2 simplification with rayon (H3c lever 1)
-- **core**: cut validation waste in overview simplify (H3c lever 3)
-- **core**: H3(c) wall-time profile of overview pipeline
-- **core**: add row-level predicate pushdown for spatial filtering
-- **core**: add column projection for geometry-only reads
-- **core**: revert to extsort crate to fix 7x performance regression
+### Performance
+
+- Remote-input network traffic is bounded to about 1× the object's bytes —
+  down from ~3× — regardless of zoom range or pass count: the selected row
+  groups are staged up front so the fetches coalesce and parallelize, fetched
+  column chunks are cached to the largest row group's working set (#261), and
+  an on-disk spill file serves passes 2 and later from local disk instead of
+  the network (#219, #286, #287). The spill is best-effort; if the volume
+  fills, conversion continues with network re-fetch.
+- Export runs a single-read fan-out pass that kills cross-level prefix and
+  per-partition re-reads, and parallelizes clip, simplify, MVT encode and gzip
+  (#227, #228, #233, #235).
+- Large polygons split top-down recursively instead of being clipped whole
+  (#226), and three O(V²) hot spots in clipping and validity checking were
+  replaced or capped (#237, #241, #242).
+- Memory is budgeted rather than guessed: winner-grid level waves, partition
+  waves sized from the densest partition and from available cores, and an auto
+  profile that picks RAM-vs-spill from measured geometry (#293, #294, #303,
+  #305, #306, #311).
+- Parquet row-group encoding and GeoParquet WKB encoding run in parallel
+  (#296, #304).
+- `--profile` presets over a single-read pipelined pass-2 engine (#212, #213).
+
+### Internal
+
+Clippy, rustfmt, dependency, CI and benchmark-harness work is omitted from this
+section; `git log v0.6.0..v0.7.0` holds the full 465-commit record.
 
 ## v0.6.0 (2026-03-11)
 

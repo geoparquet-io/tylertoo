@@ -7,6 +7,46 @@
 
 Fast GeoParquet → PMTiles converter in Rust.
 
+📖 **[Documentation](https://geoparquet-io.github.io/tylertoo/)** ·
+[Getting Started](https://geoparquet-io.github.io/tylertoo/getting-started/) ·
+[Live demo](https://geoparquet-io.github.io/tylertoo/demo/) ·
+[Overview tuning](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) ·
+[CLI reference](https://geoparquet-io.github.io/tylertoo/reference/cli/)
+
+## Quickstart
+
+```bash
+cargo install tylertoo
+curl -LO https://github.com/geoparquet-io/tylertoo/releases/download/fixtures-v1/fieldmaps-madagascar-adm4.parquet
+tylertoo fieldmaps-madagascar-adm4.parquet madagascar.pmtiles --max-zoom 10
+```
+
+The output of this should be:
+
+```text
+[convert] scan complete: 17465 feature(s) from 17465 row(s)
+[convert] pass 2: building 11 overview level(s) from a single read (finest level streamed last)
+[rss] convert peak: 231 MiB
+  intermediate overview: /var/.../T/.tylertoo-overview-p7TdMr.parquet (25.87 MiB, removed after export; --keep-overview PATH retains it)
+[export] scan complete: 10 levels, single read, 0.15s
+[export] level 10/10 z10 done: 17465 feats, 524 tiles, 1 partitions, 0.3s (total 1s)
+✓ Converted fieldmaps-madagascar-adm4.parquet → madagascar.pmtiles
+  752 tiles across z0..z10 in 1.18s
+  z0 declared but empty: every feature generalized away there (see --collapse / --collapse-square), or an entry-zoom ladder holds every feature out of them
+```
+
+The output `madagascar.pmtiles` should be 6.7mb, and can be dropped into
+[pmtiles.io](https://pmtiles.io/) to view it.
+
+From here,
+[Getting Started](https://geoparquet-io.github.io/tylertoo/getting-started/)
+covers preparing your own input and the two-step overview workflow.
+
+> **Status:** Under active development, expect changes while we stabilize to
+> a 1.0 — see the
+> [Road to 1.0](https://github.com/geoparquet-io/tylertoo/issues/463) issue
+> for what's currently planned.
+
 **tylertoo** takes its name from ["Tippecanoe and Tyler Too"](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too),
 the 1840 U.S. campaign slogan. It's a nod to [tippecanoe](https://github.com/felt/tippecanoe),
 the vector-tile tool this project measures itself against — tylertoo runs alongside it.
@@ -16,16 +56,12 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 - PMTiles export from an overview file (`tylertoo export-pmtiles`)
 - One-shot GeoParquet → PMTiles (`tylertoo tiles`, or the bare form)
 - Quality ladder tuned against tippecanoe: class ranking (Overture auto-detect), visibility gates, density budget, point clustering, line coalescing
-- Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine)
+- Memory-bounded streaming conversion — a 632k-polygon / 38M-vertex file converts to a full z0–14 overview pyramid in ~45 s at ~1.4 GB peak RSS, or a default z0–6 pyramid in ~7 s at ~0.4 GB (16-core machine; measured, see [ARCHITECTURE.md](https://github.com/geoparquet-io/tylertoo/blob/main/context/ARCHITECTURE.md))
 - Remote inputs (`s3://`, `https://`, `gs://`) read via byte-range requests — with `--bbox`, extract a city from a remote country-scale file while downloading only the matching row groups ([Remote Reads](docs/diving-deeper/remote-and-multi-file.md))
 - Attribute filtering (`--filter` / `--where`) — tile only the features matching a SQL-WHERE-style predicate (`"confidence > 0.8"`, `"crop IN ('soy', 'corn')"`), with parquet row-group statistics pushdown so non-matching row groups are never read (or fetched, on remote input); composes with `--bbox` ([Tuning guide](docs/OVERVIEW_TUNING.md#attribute-filter---filter----where))
 - Spec validation (`tylertoo validate`)
 - PMTiles → GeoParquet decoding (`tylertoo decode`) — tippecanoe-decode
   semantics, any PMTiles v3 MVT archive
-
-> **⚠️ Work in Progress**:
-> Code is generated with Claude; take it with a grain of salt.
-> --Nissim
 
 ## Install
 
@@ -33,6 +69,10 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 cargo install tylertoo    # CLI
 pip install tylertoo      # Python
 ```
+
+Prebuilt CLI binaries for Linux (x86_64 gnu and musl), macOS (Intel and Apple
+Silicon) and Windows x86_64 are attached to every
+[GitHub Release](https://github.com/geoparquet-io/tylertoo/releases).
 
 ## Usage
 
@@ -92,11 +132,16 @@ across tiles and zooms — no round-trip guarantee), with `zoom`/`layer`/
 ### Input Preparation
 
 Inputs must be WGS84 (EPSG:4326), and should be Hilbert-sorted with sane
-row groups. Use [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
+row groups. Use [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io)
+(`gpio`, verified against 1.5.0):
 
 ```bash
-gpio convert reproject input.parquet prepared.parquet \
-  -d EPSG:4326 --hilbert --row-group-size 100000
+# Already WGS84: Hilbert-sort and repack row groups in one pass.
+gpio sort hilbert input.parquet prepared.parquet --row-group-size-mb 128
+
+# In another projection: reproject first, then sort.
+gpio convert reproject input.parquet wgs84.parquet -d EPSG:4326
+gpio sort hilbert wgs84.parquet prepared.parquet --row-group-size-mb 128
 ```
 
 ### Python

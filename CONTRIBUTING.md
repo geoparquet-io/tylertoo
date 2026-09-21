@@ -68,12 +68,24 @@ uv run cz bump --increment MINOR --changelog   # or PATCH/MAJOR
 # 3. Verify build works
 cargo check
 
-# 4. Push and create PR
+# 4. Curate CHANGELOG.md (see below), then commit the edit
+
+# 5. Push and create PR
 git push -u origin release/vX.Y.Z
 gh pr create --title "Release vX.Y.Z" --body "Automated release"
 
-# 5. Merge PR → release.yml auto-publishes
+# 6. Merge PR → release.yml auto-publishes
 ```
+
+### Curating the Changelog
+
+`cz bump --changelog` writes a raw commit dump. Before pushing the tag, edit
+the new section in `CHANGELOG.md` into a user-facing one: group it under
+**Added / Changed / Fixed / Performance**, one line per user-visible change
+with its PR reference, and drop or compress the dev noise (clippy, fmt, CI,
+dependency bumps) into a single "Internal" line. Leave older sections alone.
+`docs/changelog.md` is a symlink to `CHANGELOG.md`, so the docs site picks the
+edit up with no second copy to keep in sync.
 
 ### What Commitizen Updates
 

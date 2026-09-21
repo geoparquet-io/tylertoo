@@ -71,7 +71,8 @@ transform (`write_json.cpp`), accurate to the tile quantization limit — about
 
 - Decoded output is unsorted point-in-time data; before serving it anywhere,
   optimize it with [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
-  `gpio convert reproject decoded.parquet out.parquet -d EPSG:4326 --hilbert --row-group-size 100000`.
+  `gpio sort hilbert decoded.parquet out.parquet --row-group-size-mb 128`
+  (decoded output is already lon/lat WGS84, so no reprojection step is needed).
 - Feature counts match `tippecanoe-decode` exactly for the same zoom
   selection; the integration suite pins this against the real binary when it
   is installed.
