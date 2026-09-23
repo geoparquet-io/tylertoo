@@ -363,17 +363,25 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
-    /// Within-tile feature order (#361): `input` (default) or a property
-    /// name, optionally `:asc` / `:desc`.
+    /// Within-tile feature order: `spatial` (default), `input`, or a
+    /// property name, optionally `:asc` / `:desc`.
+    ///
+    /// `spatial` (#343) orders each tile's features along a Hilbert curve, so
+    /// the cursor deltas MVT stores between features stay small and the tile
+    /// gzips smaller — same features, same vertices, fewer bytes. `input`
+    /// emits source row order, which was the default before v0.8.
     ///
     /// MVT does not define draw order, but renderers paint features in the
-    /// order the tile lists them, so this is the paint order for any style
-    /// that does not override it. `input` emits source row order. Naming a
-    /// column sorts within each tile by that property — `--feature-order
-    /// level` puts high `level` on top, which is what a nested choropleth
-    /// usually wants — with ties kept in input order so output stays
-    /// deterministic.
-    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
+    /// order the tile lists them, so this is also the paint order for any
+    /// style that does not override it. Naming a column pins that order —
+    /// `--feature-order level` puts high `level` on top, which is what a
+    /// nested choropleth usually wants — with ties kept in input order so
+    /// output stays deterministic.
+    #[arg(
+        long,
+        value_name = "spatial|input|COLUMN[:asc|:desc]",
+        default_value = "spatial"
+    )]
     feature_order: FeatureOrder,
 
     /// Not supported here (single-file subcommand); accepted so the error
@@ -1358,17 +1366,25 @@ struct TilesArgs {
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
-    /// Within-tile feature order (#361): `input` (default) or a property
-    /// name, optionally `:asc` / `:desc`.
+    /// Within-tile feature order: `spatial` (default), `input`, or a
+    /// property name, optionally `:asc` / `:desc`.
+    ///
+    /// `spatial` (#343) orders each tile's features along a Hilbert curve, so
+    /// the cursor deltas MVT stores between features stay small and the tile
+    /// gzips smaller — same features, same vertices, fewer bytes. `input`
+    /// emits source row order, which was the default before v0.8.
     ///
     /// MVT does not define draw order, but renderers paint features in the
-    /// order the tile lists them, so this is the paint order for any style
-    /// that does not override it. `input` emits source row order. Naming a
-    /// column sorts within each tile by that property — `--feature-order
-    /// level` puts high `level` on top, which is what a nested choropleth
-    /// usually wants — with ties kept in input order so output stays
-    /// deterministic.
-    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
+    /// order the tile lists them, so this is also the paint order for any
+    /// style that does not override it. Naming a column pins that order —
+    /// `--feature-order level` puts high `level` on top, which is what a
+    /// nested choropleth usually wants — with ties kept in input order so
+    /// output stays deterministic.
+    #[arg(
+        long,
+        value_name = "spatial|input|COLUMN[:asc|:desc]",
+        default_value = "spatial"
+    )]
     feature_order: FeatureOrder,
 
     /// Write a JSON report to this path: a combined object with a `convert`
@@ -2616,8 +2632,18 @@ mod tests {
             descending,
         };
 
-        assert_eq!(parse_tiles(&[]).feature_order, FeatureOrder::Input);
-        assert_eq!(parse_export(&[]).feature_order, FeatureOrder::Input);
+        // #343: the default is spatial on both commands, and `input` is still
+        // reachable as an explicit value.
+        assert_eq!(parse_tiles(&[]).feature_order, FeatureOrder::Spatial);
+        assert_eq!(parse_export(&[]).feature_order, FeatureOrder::Spatial);
+        assert_eq!(
+            parse_tiles(&["--feature-order", "input"]).feature_order,
+            FeatureOrder::Input
+        );
+        assert_eq!(
+            parse_export(&["--feature-order", "input"]).feature_order,
+            FeatureOrder::Input
+        );
 
         assert_eq!(
             parse_tiles(&["--feature-order", "level:desc"]).feature_order,

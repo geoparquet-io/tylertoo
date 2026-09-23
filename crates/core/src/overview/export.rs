@@ -2811,10 +2811,27 @@ fn members_recursive_vec(
 /// change; naming it makes it something a caller can depend on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum FeatureOrder {
+    /// Spatial order (#343) — within each tile, features follow a Hilbert
+    /// curve over their representative point in tile-local coordinates, ties
+    /// broken by input order.
+    ///
+    /// This is the default because it is what the *bytes* want: MVT
+    /// delta-encodes the cursor between features, so listing spatially
+    /// adjacent features next to each other produces small, repetitive deltas
+    /// that gzip compresses far better. Measured against the previous
+    /// [`FeatureOrder::Input`] default, it is a pure win on archive size at
+    /// identical information content — same features, same vertices, same
+    /// properties, different order.
+    ///
+    /// It does change default *paint* order, since renderers paint in tile
+    /// order. For opaque, non-overlapping polygons that is invisible; a style
+    /// that depends on draw order should pin it with a column (or `input`)
+    /// rather than inherit it, which was already the documented advice.
+    #[default]
+    Spatial,
     /// Input row order — the overview file's row order, which is the source
     /// file's row order restricted to the rows the level kept. This is what
-    /// tylertoo has always emitted and stays the default.
-    #[default]
+    /// tylertoo emitted by default before #343.
     Input,
     /// Ascending (or descending) by an MVT property, ties broken by input
     /// order so the result is fully determined.
@@ -2829,8 +2846,14 @@ pub enum FeatureOrder {
 impl std::str::FromStr for FeatureOrder {
     type Err = String;
 
-    /// `input` | `<column>` | `<column>:asc` | `<column>:desc`.
+    /// `spatial` | `input` | `<column>` | `<column>:asc` | `<column>:desc`.
+    ///
+    /// `spatial` and `input` are reserved words; a column genuinely named one
+    /// of them is addressed with an explicit direction (`spatial:asc`).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "spatial" {
+            return Ok(Self::Spatial);
+        }
         if s == "input" {
             return Ok(Self::Input);
         }
@@ -2849,7 +2872,9 @@ impl std::str::FromStr for FeatureOrder {
             None => (s, false),
         };
         if name.is_empty() {
-            return Err("expected `input` or a column name, e.g. `level:desc`".to_string());
+            return Err(
+                "expected `spatial`, `input` or a column name, e.g. `level:desc`".to_string(),
+            );
         }
         Ok(Self::Column {
             name: name.to_string(),
@@ -2998,15 +3023,77 @@ fn compare_by_feature_order(
     ord.then_with(|| a.seq.cmp(&b.seq))
 }
 
-fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
-    members.par_sort_unstable_by_key(|m| (m.key, m.seq));
-    let FeatureOrder::Column { name, descending } = order else {
-        return;
+/// Order of the within-tile Hilbert curve used by [`FeatureOrder::Spatial`]:
+/// the grid is `2^SPATIAL_GRID_ORDER` cells per axis.
+///
+/// 16 resolves 16× finer than the 4096-unit default MVT extent, so two members
+/// that quantize to the same encoded tile coordinate almost always share a
+/// Hilbert cell too — and then fall back to input order, which is the stable,
+/// caller-visible tie-break. It also keeps the index well inside a `u32`.
+const SPATIAL_GRID_ORDER: u8 = 16;
+
+/// The tile a member key names, at `zoom`. `key` packs `(x, y)` as
+/// `x << 32 | y` — see [`encode_members`], which groups on the same key.
+#[inline]
+fn tile_of_key(key: u64, zoom: u8) -> TileCoord {
+    TileCoord::new((key >> 32) as u32, key as u32, zoom)
+}
+
+/// A member's position on its tile's Hilbert curve (#343).
+///
+/// Pure `f(geometry, tile)`: the geometry's representative point is projected
+/// into tile-local coordinates by exactly the transform MVT encoding uses
+/// ([`crate::mvt::geo_to_tile_coords_unrounded`]), quantized onto the
+/// [`SPATIAL_GRID_ORDER`] grid, and walked along the same Hilbert curve
+/// PMTiles orders its tiles with. No thread identity, no arrival order and no
+/// global state enter it, so the rank — and therefore the encoded tile — is
+/// byte-identical across thread counts and engines.
+///
+/// The representative point is the geometry's bounding-box centre rather than
+/// its first vertex: a clipped feature's first vertex is wherever the clip
+/// happened to start it, which moves with the buffer, while the centre tracks
+/// where the feature actually *is*. Coordinates in the tile's buffer fall
+/// outside the grid and clamp onto its edge; co-located members then tie and
+/// resolve by input order.
+fn spatial_rank(geom: &Geometry<f64>, tb: &TileBounds) -> u64 {
+    let Some(first) = geom.coords_iter().next() else {
+        return 0; // an empty geometry has no place; input order decides
     };
-    // `chunk_by_mut` yields the same runs `encode_members` will group on.
-    for tile in members.chunk_by_mut(|a, b| a.key == b.key) {
-        tile.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+    let extent = 1u32 << SPATIAL_GRID_ORDER;
+    let (x, y) = crate::mvt::geo_to_tile_coords_unrounded(first.x, first.y, tb, extent);
+    // A NaN coordinate saturates to 0 on the `as` cast, which is a defined
+    // cell rather than a panic; such a member simply sorts with the origin.
+    let cell = |v: f64| v.clamp(0.0, (extent - 1) as f64) as u32;
+    crate::pmtiles_writer::xy_to_hilbert(SPATIAL_GRID_ORDER, cell(x), cell(y))
+}
+
+/// Order one tile's members for encoding. `tile` is a single run of equal
+/// `key`, so nothing here can move a member across a tile boundary.
+fn sort_one_tile(tile: &mut [Member], zoom: u8, order: &FeatureOrder) {
+    match order {
+        FeatureOrder::Input => {}
+        FeatureOrder::Spatial => {
+            let tb = tile_of_key(tile[0].key, zoom).bounds();
+            tile.sort_by_cached_key(|m| (spatial_rank(&m.geom, &tb), m.seq));
+        }
+        FeatureOrder::Column { name, descending } => {
+            tile.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+        }
     }
+}
+
+fn sort_members_for_encode(members: &mut [Member], zoom: u8, order: &FeatureOrder) {
+    members.par_sort_unstable_by_key(|m| (m.key, m.seq));
+    if matches!(order, FeatureOrder::Input) {
+        return;
+    }
+    // `chunk_by_mut` yields the same runs `encode_members` will group on. The
+    // runs are disjoint and each sort is a pure function of its own run, so
+    // fanning them across the pool changes timing and nothing else.
+    let tiles: Vec<&mut [Member]> = members.chunk_by_mut(|a, b| a.key == b.key).collect();
+    tiles
+        .into_par_iter()
+        .for_each(|tile| sort_one_tile(tile, zoom, order));
 }
 
 fn encode_members(
@@ -3014,7 +3101,7 @@ fn encode_members(
     zoom: u8,
     opts: &ExportOptions,
 ) -> Result<Vec<EncodedTile>, ExportError> {
-    sort_members_for_encode(&mut members, &opts.feature_order);
+    sort_members_for_encode(&mut members, zoom, &opts.feature_order);
 
     // Runs of equal key. `members` is sorted by key above, so consecutive
     // grouping is total grouping.
@@ -3027,8 +3114,9 @@ fn encode_members(
     groups
         .into_par_iter()
         .filter_map(|g| {
-            let (x, y) = ((g[0].key >> 32) as u32, g[0].key as u32);
-            let tb = TileCoord::new(x, y, zoom).bounds();
+            let coord = tile_of_key(g[0].key, zoom);
+            let (x, y) = (coord.x, coord.y);
+            let tb = coord.bounds();
             let (data, count, oversized) = encode_tile(g, &tb, opts);
             if count == 0 {
                 return None;
@@ -3080,7 +3168,7 @@ fn encode_tile(
             // `select_kept_members` decide *which* features survive.
             let keep_frac = limit as f64 / data.len() as f64;
             let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
-            let kept = shed_to_fit(members, keep, opts);
+            let kept = shed_to_fit(members, keep, tb, opts);
             let keep = kept.len();
             let data = build_mvt(kept, tb, opts);
             log::warn!(
@@ -3105,13 +3193,24 @@ fn encode_tile(
 /// this then restores the caller's draw order over them. Emitting the
 /// selection ranking as the draw order would silently override a pinned
 /// `--feature-order` — and only on oversized tiles, i.e. exactly the dense
-/// ones a caller pins an order for. The default [`FeatureOrder::Input`] keeps
-/// the vertex-count order, which is the pre-#280 behaviour and byte-identical
-/// to it.
-fn shed_to_fit<'a>(members: &'a [Member], keep: usize, opts: &ExportOptions) -> Vec<&'a Member> {
+/// ones a caller pins an order for. [`FeatureOrder::Input`] keeps the
+/// vertex-count order, which is the pre-#280 behaviour and byte-identical
+/// to it; the [`FeatureOrder::Spatial`] default re-lays the survivors along
+/// the curve, since an oversized tile is precisely where the byte saving
+/// matters most.
+fn shed_to_fit<'a>(
+    members: &'a [Member],
+    keep: usize,
+    tb: &TileBounds,
+    opts: &ExportOptions,
+) -> Vec<&'a Member> {
     let mut kept = select_kept_members(members, keep);
-    if let FeatureOrder::Column { name, descending } = &opts.feature_order {
-        kept.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+    match &opts.feature_order {
+        FeatureOrder::Input => {}
+        FeatureOrder::Spatial => kept.sort_by_cached_key(|m| (spatial_rank(&m.geom, tb), m.seq)),
+        FeatureOrder::Column { name, descending } => {
+            kept.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+        }
     }
     kept
 }
@@ -5565,24 +5664,178 @@ mod tests {
     }
 
     /// Draw order within a tile, as the renderer sees it: `build_mvt` emits
-    /// features in iteration order, so this is the paint sequence.
+    /// features in iteration order, so this is the paint sequence. Members
+    /// carry tile key 0, so zoom 0 puts the whole world in their tile.
     fn paint_order(members: Vec<Member>, order: &FeatureOrder) -> Vec<u64> {
         let mut m = members;
-        sort_members_for_encode(&mut m, order);
+        sort_members_for_encode(&mut m, 0, order);
         m.iter().map(|x| x.seq).collect()
     }
 
-    /// The default is input order, which is what tylertoo has always done and
-    /// what the file's row order already encodes. Pinning it in a test makes
-    /// the guarantee something callers can rely on rather than an accident.
+    /// `input` emits source row order, which is what tylertoo emitted by
+    /// default before #343. Pinning it in a test makes the guarantee something
+    /// callers can rely on rather than an accident.
     #[test]
-    fn default_feature_order_is_input_row_order() {
+    fn input_feature_order_is_source_row_order() {
         let members = vec![
             ordered_member(7, 0.5),
             ordered_member(2, 0.2),
             ordered_member(5, 0.35),
         ];
         assert_eq!(paint_order(members, &FeatureOrder::Input), vec![2, 5, 7]);
+    }
+
+    /// #343: the default is spatial order, and `spatial` is the spelling that
+    /// names it.
+    #[test]
+    fn default_feature_order_is_spatial() {
+        assert_eq!(FeatureOrder::default(), FeatureOrder::Spatial);
+        assert_eq!(
+            ExportOptions::default().feature_order,
+            FeatureOrder::Spatial
+        );
+        assert_eq!(
+            "spatial".parse::<FeatureOrder>().unwrap(),
+            FeatureOrder::Spatial
+        );
+        // `spatial` is a reserved word now, so a column that really is called
+        // `spatial` needs the explicit direction suffix — same escape hatch
+        // `input` has always had.
+        assert_eq!(
+            "spatial:asc".parse::<FeatureOrder>().unwrap(),
+            FeatureOrder::Column {
+                name: "spatial".to_string(),
+                descending: false
+            }
+        );
+    }
+
+    /// A member at a given lng/lat with no properties, for the spatial tests.
+    fn placed_member(seq: u64, lng: f64, lat: f64) -> Member {
+        Member {
+            key: 0,
+            seq,
+            geom: Geometry::Point(Point::new(lng, lat)),
+            props: Arc::new(Vec::new()),
+        }
+    }
+
+    /// #343: MVT delta-encodes the cursor between features, so a tile whose
+    /// features are spatially adjacent compresses far better than one whose
+    /// cursor jumps around. The default therefore walks each tile's members
+    /// along a Hilbert curve over their representative point.
+    ///
+    /// The curve's first-level shape is fixed (see `xy_to_hilbert`): in
+    /// tile-local coordinates, where y increases *downwards*, it visits the
+    /// quadrants (0,0) → (0,1) → (1,1) → (1,0), i.e. NW → SW → SE → NE on a
+    /// north-up map. One point per quadrant, fed in the reverse of that order,
+    /// must come back in it.
+    #[test]
+    fn spatial_feature_order_walks_the_tile_hilbert_curve() {
+        let members = vec![
+            placed_member(0, 90.0, 45.0),   // NE — last on the curve
+            placed_member(1, 90.0, -45.0),  // SE
+            placed_member(2, -90.0, -45.0), // SW
+            placed_member(3, -90.0, 45.0),  // NW — first on the curve
+        ];
+        assert_eq!(
+            paint_order(members, &FeatureOrder::Spatial),
+            vec![3, 2, 1, 0]
+        );
+    }
+
+    /// Two members that land on the same Hilbert cell keep input order, so the
+    /// key is a *total* order: the same tile encodes byte-identically however
+    /// many threads built it and whatever order they arrived in.
+    #[test]
+    fn spatial_feature_order_breaks_ties_by_input_order() {
+        let members = vec![
+            placed_member(9, 10.0, 10.0),
+            placed_member(4, 10.0, 10.0),
+            placed_member(6, 10.0, 10.0),
+        ];
+        assert_eq!(
+            paint_order(members, &FeatureOrder::Spatial),
+            vec![4, 6, 9],
+            "co-located members fall back to input order"
+        );
+    }
+
+    /// Spatial order is per tile, like every other order: nothing may move
+    /// across a tile key, or `encode_members`' run-grouping would split tiles.
+    #[test]
+    fn spatial_feature_order_never_reorders_across_tiles() {
+        // Tile 1 holds the westernmost point; it must not migrate into tile 0.
+        let mut members = vec![
+            Member {
+                key: 1,
+                ..placed_member(0, -90.0, 45.0)
+            },
+            placed_member(1, 90.0, 45.0),
+            placed_member(2, -90.0, 45.0),
+        ];
+        sort_members_for_encode(&mut members, 0, &FeatureOrder::Spatial);
+        assert_eq!(
+            members.iter().map(|m| m.key).collect::<Vec<_>>(),
+            vec![0, 0, 1],
+            "tiles must stay grouped and ascending"
+        );
+        assert_eq!(
+            members.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![2, 1, 0],
+            "the reorder applies within each tile, not across the level"
+        );
+    }
+
+    /// #343 end to end, through the real encode path: the tile a renderer
+    /// receives lists its features along the Hilbert curve by default, and
+    /// `--feature-order input` puts them back in source row order.
+    #[test]
+    fn encoded_tile_lists_features_in_spatial_order_by_default() {
+        // One point per quadrant of the z0 world tile, listed in an order
+        // that is deliberately not spatially coherent.
+        let feats: Vec<Feature> = [(90.0, 45.0), (-90.0, -45.0), (90.0, -45.0), (-90.0, 45.0)]
+            .into_iter()
+            .map(|(lng, lat)| Feature {
+                geom: Geometry::Point(Point::new(lng, lat)),
+                props: Vec::new(),
+            })
+            .collect();
+
+        // Name each encoded feature by the quadrant its tile coordinate lands
+        // in, so the assertion reads as the curve rather than as raw pixels.
+        let quadrants = |opts: &ExportOptions| -> Vec<&'static str> {
+            let tiles = encode_level_tiles(&feats, 0, opts);
+            assert_eq!(tiles.len(), 1, "all four points share the z0 world tile");
+            decode_tile(&tiles[0].data).layers[0]
+                .features
+                .iter()
+                .map(|f| {
+                    let half = ExportOptions::default().extent as i32 / 2;
+                    match decode_coords(&f.geometry)[0] {
+                        (x, y) if x < half && y < half => "NW",
+                        (x, y) if x < half && y >= half => "SW",
+                        (_, y) if y >= half => "SE",
+                        _ => "NE",
+                    }
+                })
+                .collect()
+        };
+
+        let input = ExportOptions {
+            feature_order: FeatureOrder::Input,
+            ..ExportOptions::default()
+        };
+        assert_eq!(
+            quadrants(&input),
+            vec!["NE", "SW", "SE", "NW"],
+            "`input` must still emit source row order"
+        );
+        assert_eq!(
+            quadrants(&ExportOptions::default()),
+            vec!["NW", "SW", "SE", "NE"],
+            "the default must walk the tile's Hilbert curve"
+        );
     }
 
     /// #361: styling a nested stack needs the small hot cores painted last.
@@ -5721,6 +5974,7 @@ mod tests {
         let mut members = vec![mk(1, 0, 0.1), mk(0, 1, 0.9), mk(0, 2, 0.2)];
         sort_members_for_encode(
             &mut members,
+            0,
             &FeatureOrder::Column {
                 name: "level".to_string(),
                 descending: false,
@@ -5939,7 +6193,8 @@ mod tests {
             },
             ..ExportOptions::default()
         };
-        let kept = shed_to_fit(&members, 3, &ordered);
+        let tb = TileCoord::new(0, 0, 0).bounds();
+        let kept = shed_to_fit(&members, 3, &tb, &ordered);
         let levels: Vec<u64> = kept.iter().map(|m| m.seq).collect();
         assert_eq!(
             levels,
@@ -5957,19 +6212,37 @@ mod tests {
             },
             ..ExportOptions::default()
         };
-        let kept: Vec<u64> = shed_to_fit(&members, 3, &desc)
+        let kept: Vec<u64> = shed_to_fit(&members, 3, &tb, &desc)
             .iter()
             .map(|m| m.seq)
             .collect();
         assert_eq!(kept, vec![5, 4, 3]);
 
-        // The default is unchanged: the valve's largest-first ranking stands,
-        // which is the pre-#280 behaviour this must stay byte-identical to.
-        let kept: Vec<u64> = shed_to_fit(&members, 3, &ExportOptions::default())
+        // `input` leaves the valve's largest-first ranking alone, which is the
+        // pre-#280 behaviour this must stay byte-identical to.
+        let input = ExportOptions {
+            feature_order: FeatureOrder::Input,
+            ..ExportOptions::default()
+        };
+        let kept: Vec<u64> = shed_to_fit(&members, 3, &tb, &input)
             .iter()
             .map(|m| m.seq)
             .collect();
-        assert_eq!(kept, vec![5, 4, 3], "default order must not change");
+        assert_eq!(kept, vec![5, 4, 3], "`input` order must not change");
+
+        // #343: the spatial default re-lays the survivors along the curve
+        // instead of leaving them in the valve's largest-first ranking. These
+        // linestrings are microscopic and share one Hilbert cell of the z0
+        // tile, so the curve ties and input order resolves them.
+        let kept: Vec<u64> = shed_to_fit(&members, 3, &tb, &ExportOptions::default())
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![3, 4, 5],
+            "the default orders the survivors spatially, not by the valve's ranking"
+        );
     }
 
     /// `Some(0)` is the core off switch (CLI `--max-tile-size 0` / Python

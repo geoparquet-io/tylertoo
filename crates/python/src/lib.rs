@@ -66,12 +66,16 @@ fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
 ///         Faster fine-zoom polygon export; output is render-equivalent on
 ///         simple rings but stores them rotated to a different start vertex.
 ///         Defaults to True; set False for byte-stable tile output.
-///     feature_order (str, optional): Within-tile feature order (#361):
-///         "input" (default) or a property name, optionally suffixed
-///         ":asc" / ":desc". Renderers paint features in the order the tile
-///         lists them, so this is the paint order for any style that does not
-///         override it. "input" emits source row order; naming a column sorts
-///         within each tile by that property, ties kept in input order.
+///     feature_order (str, optional): Within-tile feature order: "spatial"
+///         (default), "input", or a property name, optionally suffixed
+///         ":asc" / ":desc". "spatial" (#343) walks each tile's features
+///         along a Hilbert curve so the cursor deltas MVT stores between
+///         features stay small and the tile gzips smaller — same features,
+///         same vertices, fewer bytes. "input" emits source row order, which
+///         was the default before v0.8. Renderers paint features in the order
+///         the tile lists them, so this is also the paint order for any style
+///         that does not override it; naming a column pins that order, ties
+///         kept in input order.
 ///
 /// Returns:
 ///     None
@@ -85,7 +89,7 @@ fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="spatial"))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
     py: Python<'_>,
@@ -767,12 +771,16 @@ fn overview(
 ///         integer to override. Wider waves keep more cores busy at
 ///         proportionally more peak memory. Output is byte-identical for
 ///         every value (the wave is a scheduling concern).
-///     feature_order (str, optional): Within-tile feature order (#361):
-///         "input" (default) or a property name, optionally suffixed
-///         ":asc" / ":desc". Renderers paint features in the order the tile
-///         lists them, so this is the paint order for any style that does not
-///         override it. "input" emits source row order; naming a column sorts
-///         within each tile by that property, ties kept in input order.
+///     feature_order (str, optional): Within-tile feature order: "spatial"
+///         (default), "input", or a property name, optionally suffixed
+///         ":asc" / ":desc". "spatial" (#343) walks each tile's features
+///         along a Hilbert curve so the cursor deltas MVT stores between
+///         features stay small and the tile gzips smaller — same features,
+///         same vertices, fewer bytes. "input" emits source row order, which
+///         was the default before v0.8. Renderers paint features in the order
+///         the tile lists them, so this is also the paint order for any style
+///         that does not override it; naming a column pins that order, ties
+///         kept in input order.
 ///     min_zoom (int, optional): Minimum zoom the archive declares even when
 ///         the overview file's coarsest levels are missing (#380). ``overview``
 ///         omits a level that generalizes to nothing, so a file built for
@@ -799,7 +807,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="spatial", min_zoom=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,

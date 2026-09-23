@@ -273,7 +273,12 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
 ///
 /// Implementation follows the standard Hilbert curve algorithm:
 /// https://en.wikipedia.org/wiki/Hilbert_curve
-fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
+///
+/// `z` is the curve's order: the grid is `2^z` cells per axis and `x`/`y`
+/// must be within it. Shared with the export's within-tile feature ordering
+/// (#343), which walks the same curve over a tile-local grid, so there is one
+/// Hilbert implementation in the crate rather than two that could drift.
+pub(crate) fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
     let n = 1u32 << z;
     let mut rx: u32;
     let mut ry: u32;
