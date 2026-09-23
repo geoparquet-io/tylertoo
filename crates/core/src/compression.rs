@@ -76,43 +76,74 @@ impl Compression {
     }
 }
 
-/// One direction of the codec: the three per-algorithm entry points plus the
-/// verb used in the `Unknown` error message.
+/// Ceiling for decompressing one PMTiles *internal* section: a root or leaf
+/// directory, or the JSON metadata (#417).
+///
+/// Directories are sized for the 16 KiB initial range request — the writer
+/// caps the compressed root at `MAX_ROOT_DIR_BYTES` (16257 bytes) and
+/// partitions the rest into leaves of a few thousand entries, each entry
+/// about 30 bytes of varints once decompressed. 16 MiB leaves room for
+/// roughly half a million entries in a single directory: orders of magnitude
+/// past any directory (or TileJSON metadata blob) a real archive carries,
+/// while keeping a decompression bomb to a bounded allocation.
+pub const MAX_INTERNAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Ceiling for decompressing one tile body (#417).
+///
+/// Our exporter caps encoded tiles at `DEFAULT_TILE_SIZE_LIMIT` (500 KiB —
+/// tippecanoe's default bar). A foreign archive may have been written with
+/// that cap disabled, so this leaves 1000x headroom; what it forbids is the
+/// KB-sized bomb that expands to tens of gigabytes.
+pub const MAX_TILE_BYTES: u64 = 500 * 1024 * 1024;
+
+/// One direction of the codec: the three per-algorithm entry points, the
+/// uncompressed passthrough, and the verb used in the `Unknown` error
+/// message.
 ///
 /// `compress` and `decompress` are mirror images. Writing the match arms twice
 /// meant every new algorithm had to be added in two places, so the dispatch
-/// lives here once and each public function supplies its own table.
-struct Codec {
+/// lives here once and each public function supplies its own table. `A` is the
+/// extra argument a direction needs: nothing for compression, the output
+/// ceiling for decompression.
+struct Codec<A> {
     verb: &'static str,
-    gzip: fn(&[u8]) -> io::Result<Vec<u8>>,
-    brotli: fn(&[u8]) -> io::Result<Vec<u8>>,
-    zstd: fn(&[u8]) -> io::Result<Vec<u8>>,
+    none: fn(&[u8], A) -> io::Result<Vec<u8>>,
+    gzip: fn(&[u8], A) -> io::Result<Vec<u8>>,
+    brotli: fn(&[u8], A) -> io::Result<Vec<u8>>,
+    zstd: fn(&[u8], A) -> io::Result<Vec<u8>>,
 }
 
-const COMPRESS: &Codec = &Codec {
+const COMPRESS: &Codec<()> = &Codec {
     verb: "compress",
+    none: copy_all,
     gzip: compress_gzip,
     brotli: compress_brotli,
     zstd: compress_zstd,
 };
 
-const DECOMPRESS: &Codec = &Codec {
+const DECOMPRESS: &Codec<u64> = &Codec {
     verb: "decompress",
+    none: copy_capped,
     gzip: decompress_gzip,
     brotli: decompress_brotli,
     zstd: decompress_zstd,
 };
 
-fn dispatch(data: &[u8], compression: Compression, codec: &Codec) -> io::Result<Vec<u8>> {
+fn dispatch<A>(
+    data: &[u8],
+    compression: Compression,
+    arg: A,
+    codec: &Codec<A>,
+) -> io::Result<Vec<u8>> {
     match compression {
         Compression::Unknown => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("Cannot {} with unknown compression type", codec.verb),
         )),
-        Compression::None => Ok(data.to_vec()),
-        Compression::Gzip => (codec.gzip)(data),
-        Compression::Brotli => (codec.brotli)(data),
-        Compression::Zstd => (codec.zstd)(data),
+        Compression::None => (codec.none)(data, arg),
+        Compression::Gzip => (codec.gzip)(data, arg),
+        Compression::Brotli => (codec.brotli)(data, arg),
+        Compression::Zstd => (codec.zstd)(data, arg),
     }
 }
 
@@ -125,7 +156,7 @@ fn dispatch(data: &[u8], compression: Compression, codec: &Codec) -> io::Result<
 /// # Returns
 /// Compressed data, or original data if compression is None.
 pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
-    dispatch(data, compression, COMPRESS)
+    dispatch(data, compression, (), COMPRESS)
 }
 
 /// Decompress data using the specified algorithm.
@@ -134,39 +165,88 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
 /// #112) uses this for directories, JSON metadata, and tile data, honoring
 /// the compression codes declared in the archive header.
 ///
+/// Every input is archive-controlled, so decompression is *bounded*: a
+/// KB-sized bomb must not become tens of gigabytes of resident memory
+/// (#417). `max_out` is the exact number of decompressed bytes the caller is
+/// willing to hold — [`MAX_INTERNAL_BYTES`] for directories and metadata,
+/// [`MAX_TILE_BYTES`] for a tile body. Output *of exactly* `max_out` bytes is
+/// returned; one byte more is an error, and nothing is silently truncated.
+///
 /// # Arguments
 /// * `data` - Compressed input data
 /// * `compression` - Compression algorithm the data was compressed with
+/// * `max_out` - Largest decompressed size accepted, in bytes
 ///
 /// # Returns
 /// Decompressed data, or a copy of the input if compression is None.
-pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
-    dispatch(data, compression, DECOMPRESS)
+pub fn decompress(data: &[u8], compression: Compression, max_out: u64) -> io::Result<Vec<u8>> {
+    dispatch(data, compression, max_out, DECOMPRESS)
 }
 
-/// Decompress gzip data.
-fn decompress_gzip(data: &[u8]) -> io::Result<Vec<u8>> {
+/// Copy the input through, the compression side's `None` arm.
+///
+/// Infallible, but the `Result` is what the codec table's function pointers
+/// are shaped like — the other three arms can all fail.
+#[allow(clippy::unnecessary_wraps)]
+fn copy_all(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
+    Ok(data.to_vec())
+}
+
+/// Copy the input through, the decompression side's `None` arm: the ceiling
+/// applies to stored tiles too, so one code path decides how much a caller
+/// may be handed.
+fn copy_capped(data: &[u8], max_out: u64) -> io::Result<Vec<u8>> {
+    if data.len() as u64 > max_out {
+        return Err(too_big("stored", max_out));
+    }
+    Ok(data.to_vec())
+}
+
+/// Read a decompressor to its end, refusing to hold more than `max_out`
+/// bytes.
+///
+/// `take(max_out + 1)` is what makes the check exact rather than truncating:
+/// the extra byte is the evidence that the stream had more to give, and the
+/// allocation stays bounded whatever the stream claims.
+fn read_capped(reader: impl io::Read, max_out: u64, what: &'static str) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
+    reader
+        .take(max_out.saturating_add(1))
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > max_out {
+        return Err(too_big(what, max_out));
+    }
     Ok(out)
 }
 
-/// Decompress brotli data.
-fn decompress_brotli(data: &[u8]) -> io::Result<Vec<u8>> {
-    use std::io::Read;
-    let mut out = Vec::new();
-    brotli::Decompressor::new(data, 4096).read_to_end(&mut out)?;
-    Ok(out)
+fn too_big(what: &str, max_out: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{what} output exceeds the {max_out}-byte decompression ceiling"),
+    )
 }
 
-/// Decompress zstd data.
-fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::decode_all(data)
+/// Decompress gzip data, bounded by `max_out`.
+fn decompress_gzip(data: &[u8], max_out: u64) -> io::Result<Vec<u8>> {
+    read_capped(flate2::read::GzDecoder::new(data), max_out, "gzip")
+}
+
+/// Decompress brotli data, bounded by `max_out`.
+fn decompress_brotli(data: &[u8], max_out: u64) -> io::Result<Vec<u8>> {
+    read_capped(brotli::Decompressor::new(data, 4096), max_out, "brotli")
+}
+
+/// Decompress zstd data, bounded by `max_out`.
+///
+/// Streamed rather than `zstd::decode_all`, which sizes its buffer from the
+/// frame's own content-size field and so cannot be bounded.
+fn decompress_zstd(data: &[u8], max_out: u64) -> io::Result<Vec<u8>> {
+    read_capped(zstd::stream::read::Decoder::new(data)?, max_out, "zstd")
 }
 
 /// Compress data with gzip.
-fn compress_gzip(data: &[u8]) -> io::Result<Vec<u8>> {
+fn compress_gzip(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
     use flate2::write::GzEncoder;
     use flate2::Compression as GzCompression;
 
@@ -176,7 +256,7 @@ fn compress_gzip(data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// Compress data with brotli.
-fn compress_brotli(data: &[u8]) -> io::Result<Vec<u8>> {
+fn compress_brotli(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
     use brotli::enc::BrotliEncoderParams;
     use brotli::CompressorWriter;
 
@@ -196,7 +276,7 @@ fn compress_brotli(data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// Compress data with zstd.
-fn compress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
+fn compress_zstd(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
     // Use compression level 3 (default) - good balance of speed and ratio
     zstd::encode_all(data, 3)
 }
@@ -422,7 +502,7 @@ mod tests {
             Compression::Zstd,
         ] {
             let compressed = compress(original, compression).unwrap();
-            let decompressed = decompress(&compressed, compression).unwrap();
+            let decompressed = decompress(&compressed, compression, MAX_INTERNAL_BYTES).unwrap();
             assert_eq!(
                 decompressed,
                 original.to_vec(),
@@ -441,18 +521,68 @@ mod tests {
             Compression::Zstd,
         ] {
             let compressed = compress(&[], compression).unwrap();
-            let decompressed = decompress(&compressed, compression).unwrap();
+            let decompressed = decompress(&compressed, compression, MAX_INTERNAL_BYTES).unwrap();
             assert!(decompressed.is_empty(), "{}", compression.name());
         }
     }
 
     #[test]
     fn test_decompress_unknown_is_error() {
-        assert!(decompress(b"anything", Compression::Unknown).is_err());
+        assert!(decompress(b"anything", Compression::Unknown, MAX_INTERNAL_BYTES).is_err());
     }
 
     #[test]
     fn test_decompress_corrupt_gzip_is_error() {
-        assert!(decompress(b"not gzip at all", Compression::Gzip).is_err());
+        assert!(decompress(b"not gzip at all", Compression::Gzip, MAX_INTERNAL_BYTES).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Decompression ceilings (#417)
+    // -------------------------------------------------------------------------
+
+    /// A megabyte of zeros: a few hundred bytes on the wire in every codec.
+    const BOMB_PLAIN: usize = 1024 * 1024;
+
+    #[test]
+    fn decompress_refuses_output_past_max_out() {
+        for compression in [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Brotli,
+            Compression::Zstd,
+        ] {
+            let compressed = compress(&vec![0u8; BOMB_PLAIN], compression).unwrap();
+            let err = decompress(&compressed, compression, 1024)
+                .expect_err(compression.name())
+                .to_string();
+            assert!(
+                err.contains("exceeds") && err.contains("1024"),
+                "{}: {err}",
+                compression.name()
+            );
+        }
+    }
+
+    #[test]
+    fn decompress_ceiling_is_exact_not_truncating() {
+        // Exactly at the ceiling is fine; one byte under must fail rather
+        // than hand back a silently shortened buffer.
+        for compression in [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Brotli,
+            Compression::Zstd,
+        ] {
+            let plain = vec![7u8; BOMB_PLAIN];
+            let compressed = compress(&plain, compression).unwrap();
+            let exact = decompress(&compressed, compression, BOMB_PLAIN as u64).unwrap();
+            assert_eq!(exact.len(), BOMB_PLAIN, "{}", compression.name());
+            assert_eq!(exact, plain, "{}", compression.name());
+            assert!(
+                decompress(&compressed, compression, BOMB_PLAIN as u64 - 1).is_err(),
+                "{} must not truncate to the ceiling",
+                compression.name()
+            );
+        }
     }
 }

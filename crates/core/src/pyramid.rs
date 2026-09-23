@@ -26,12 +26,13 @@ use serde_json::{json, Value};
 
 use tempfile::NamedTempFile;
 
-use crate::compression::{self, Compression};
+use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_writer::{
-    decode_directory, tile_id_to_zxy, DirEntry, Header, StreamingPmtilesWriter, TileType,
+    decode_directory, max_expanded_entries, tile_id_to_zxy, DirEntry, Header,
+    StreamingPmtilesWriter, TileType,
 };
 use crate::tile::TileBounds;
 use crate::Error;
@@ -373,8 +374,9 @@ impl BandArchive {
             Ok(&bytes[start..end])
         };
         let dir = |raw: &[u8], what: &str| -> Result<Vec<DirEntry>, Error> {
-            let plain = compression::decompress(raw, header.internal_compression)
-                .map_err(|e| Error::PMTilesWrite(format!("{what}: {e}")))?;
+            let plain =
+                compression::decompress(raw, header.internal_compression, MAX_INTERNAL_BYTES)
+                    .map_err(|e| Error::PMTilesWrite(format!("{what}: {e}")))?;
             decode_directory(&plain)
                 .ok_or_else(|| Error::PMTilesWrite(format!("undecodable {what}")))
         };
@@ -389,11 +391,15 @@ impl BandArchive {
                 entries.push(e);
                 continue;
             }
-            let leaf = slice(
-                header.leaf_dirs_offset + e.offset,
-                u64::from(e.length),
-                "leaf dir",
-            )?;
+            // Base and entry offset both come from the archive, so the sum
+            // is checked rather than wrapped into a plausible-looking one.
+            let leaf_at = header
+                .leaf_dirs_offset
+                .checked_add(e.offset)
+                .ok_or_else(|| {
+                    Error::PMTilesWrite(format!("leaf dir offset overflow in {}", path.display()))
+                })?;
+            let leaf = slice(leaf_at, u64::from(e.length), "leaf dir")?;
             for inner in dir(leaf, "leaf dir")? {
                 // run_length 0 inside a leaf is a second-level leaf pointer.
                 // The spec allows arbitrarily deep directories; this reader
@@ -451,6 +457,13 @@ impl BandArchive {
         // Offsets, lengths and ids are archive-supplied: every add is checked
         // so a corrupt directory reports rather than wraps.
         let past_end = || Error::PMTilesWrite("tile data past end of archive".to_string());
+        // Run lengths are archive-controlled u32s, and every expanded id
+        // becomes a map entry in the merge: one 0xFFFFFFFF run is tens of
+        // gigabytes. Spend a budget of what this archive could legitimately
+        // address, so many plausible runs cannot add up to the same attack
+        // (#417).
+        let limit = max_expanded_entries(&self.header);
+        let mut budget = limit;
         for e in &self.entries {
             let start = self
                 .header
@@ -462,7 +475,15 @@ impl BandArchive {
                 .checked_add(e.length as usize)
                 .filter(|&x| x <= self.bytes.len())
                 .ok_or_else(past_end)?;
-            for i in 0..u64::from(e.run_length.max(1)) {
+            let run = u64::from(e.run_length.max(1));
+            budget = budget.checked_sub(run).ok_or_else(|| {
+                Error::PMTilesWrite(format!(
+                    "directory entry for tile id {} claims a run of {run} tiles, past this \
+                     archive's run-length expansion limit of {limit} tiles",
+                    e.tile_id
+                ))
+            })?;
+            for i in 0..run {
                 let id = e
                     .tile_id
                     .checked_add(i)
@@ -495,7 +516,7 @@ fn parse_layers(
     internal: Compression,
     path: &Path,
 ) -> Result<(Value, Vec<String>), Error> {
-    let plain = compression::decompress(raw, internal)
+    let plain = compression::decompress(raw, internal, MAX_INTERNAL_BYTES)
         .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))?;
     // Unparseable metadata is not fatal: the band's tiles are still usable,
     // they just end up declaring no field types.
@@ -821,6 +842,7 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
                 let plain = compression::decompress(
                     archives[*bi].tile(range.clone()),
                     archives[*bi].header.tile_compression,
+                    MAX_TILE_BYTES,
                 )
                 .map_err(|e| {
                     Error::PMTilesWrite(format!(
@@ -1133,7 +1155,8 @@ mod tests {
         let mut tiles = 0;
         archive
             .for_each_tile(|_, _, _, data| {
-                let plain = compression::decompress(data, Compression::Gzip).unwrap();
+                let plain =
+                    compression::decompress(data, Compression::Gzip, MAX_TILE_BYTES).unwrap();
                 let names: Vec<String> = crate::vector_tile::Tile::decode(plain.as_slice())
                     .unwrap()
                     .layers
@@ -1297,6 +1320,7 @@ mod tests {
             &bytes[header.root_dir_offset as usize
                 ..(header.root_dir_offset + header.root_dir_length) as usize],
             Compression::Gzip,
+            MAX_INTERNAL_BYTES,
         )
         .unwrap();
         let mut zooms: Vec<u8> = decode_directory(&root)
@@ -1392,7 +1416,8 @@ mod tests {
         let mut found = None;
         a.for_each_tile(|tz, tx, ty, data| {
             if (tz, tx, ty) == (z, x, y) {
-                found = Some(compression::decompress(data, Compression::Gzip).unwrap());
+                found =
+                    Some(compression::decompress(data, Compression::Gzip, MAX_TILE_BYTES).unwrap());
             }
             Ok(())
         })
@@ -1524,6 +1549,7 @@ mod tests {
         let root = compression::decompress(
             &bytes[h.root_dir_offset as usize..(h.root_dir_offset + h.root_dir_length) as usize],
             h.internal_compression,
+            MAX_INTERNAL_BYTES,
         )
         .unwrap();
         let entries: Vec<(u64, u64, u32)> = decode_directory(&root)
@@ -1727,7 +1753,8 @@ mod tests {
         let h = Header::from_bytes(&bytes).unwrap();
         let raw = &bytes[h.json_metadata_offset as usize
             ..(h.json_metadata_offset + h.json_metadata_length) as usize];
-        let plain = compression::decompress(raw, h.internal_compression).unwrap();
+        let plain =
+            compression::decompress(raw, h.internal_compression, MAX_INTERNAL_BYTES).unwrap();
         String::from_utf8(plain).unwrap()
     }
 

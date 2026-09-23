@@ -203,3 +203,88 @@ fn nested_leaf_directories_are_rejected_not_decoded_as_tiles() {
         "expected an InvalidArchive about nested leaf directories, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hostile archives: resource exhaustion (#417)
+// ---------------------------------------------------------------------------
+
+/// Repoint the header's root directory at `raw` bytes appended to the archive.
+fn with_raw_root(bytes: &[u8], raw: &[u8]) -> Vec<u8> {
+    let mut header = Header::from_bytes(&bytes[..127]).unwrap();
+    let mut out = bytes.to_vec();
+    header.root_dir_offset = out.len() as u64;
+    header.root_dir_length = raw.len() as u64;
+    out.extend_from_slice(raw);
+    out[..127].copy_from_slice(&header.to_bytes());
+    out
+}
+
+#[test]
+fn hostile_run_length_is_rejected_before_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    // The archive tops out at z5, whose whole address space is 1365 tile ids.
+    // A single entry claiming a million-tile run is not a real archive; it is
+    // 32 MB of TileRefs (and, at u32::MAX, 137 GB).
+    let root = [DirEntry {
+        tile_id: 0,
+        offset: 0,
+        length: 0,
+        run_length: 1_000_000,
+    }];
+    let err = decode_err(
+        &dir,
+        "hostile-run.pmtiles",
+        &with_directories(&bytes, &root, None),
+    );
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("run-length expansion")),
+        "expected an InvalidArchive about run-length expansion, got: {err}"
+    );
+}
+
+#[test]
+fn run_length_expansion_total_is_capped_across_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    // Each run is individually plausible; together they address more tiles
+    // than the archive's zoom range can hold.
+    let root: Vec<DirEntry> = (0..3)
+        .map(|i| DirEntry {
+            tile_id: i * 700,
+            offset: 0,
+            length: 0,
+            run_length: 700,
+        })
+        .collect();
+    let err = decode_err(
+        &dir,
+        "hostile-run-total.pmtiles",
+        &with_directories(&bytes, &root, None),
+    );
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("run-length expansion")),
+        "expected an InvalidArchive about run-length expansion, got: {err}"
+    );
+}
+
+#[test]
+fn directory_decompression_bomb_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let header = Header::from_bytes(&bytes[..127]).unwrap();
+    // 32 MiB of zeros gzips to a few tens of KB: the classic bomb shape, and
+    // far past any directory a real archive carries.
+    let bomb = compress(&vec![0u8; 32 * 1024 * 1024], header.internal_compression).unwrap();
+    assert!(
+        bomb.len() < 256 * 1024,
+        "the bomb must be small on disk, got {} bytes",
+        bomb.len()
+    );
+    let err = decode_err(&dir, "bomb.pmtiles", &with_raw_root(&bytes, &bomb));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("root directory") && msg.contains("exceeds"),
+        "expected a capped-decompression error naming the section, got: {msg}"
+    );
+}

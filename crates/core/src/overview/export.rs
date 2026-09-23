@@ -3194,8 +3194,12 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
     // the assertions in the tests below operate on the uncompressed payload.
     let mut tiles = encode_members(members, zoom, opts).expect("in-memory gzip is infallible");
     for t in &mut tiles {
-        t.data = crate::compression::decompress(&t.data, Compression::Gzip)
-            .expect("gzip roundtrip of just-compressed tile");
+        t.data = crate::compression::decompress(
+            &t.data,
+            Compression::Gzip,
+            crate::compression::MAX_TILE_BYTES,
+        )
+        .expect("gzip roundtrip of just-compressed tile");
     }
     tiles
 }
@@ -4103,6 +4107,7 @@ mod tests {
             &bytes[header.root_dir_offset as usize
                 ..(header.root_dir_offset + header.root_dir_length) as usize],
             header.internal_compression,
+            compression::MAX_INTERNAL_BYTES,
         )
         .unwrap();
         let entries = decode_directory(&root).expect("root directory must decode");
@@ -4114,7 +4119,9 @@ mod tests {
         for e in &entries {
             let start = (header.tile_data_offset + e.offset) as usize;
             let raw = &bytes[start..start + e.length as usize];
-            let plain = compression::decompress(raw, header.tile_compression).unwrap();
+            let plain =
+                compression::decompress(raw, header.tile_compression, compression::MAX_TILE_BYTES)
+                    .unwrap();
             let decoded = decode_tile(&plain);
             let features: usize = decoded.layers.iter().map(|l| l.features.len()).sum();
             let zxy = tile_id_to_zxy(e.tile_id).unwrap();

@@ -216,15 +216,66 @@ impl Header {
         let tile_type = TileType::from_code(bytes[99])
             .ok_or_else(|| err(format!("invalid tile type code {}", bytes[99])))?;
 
+        // ---- Semantic validation (#417) -----------------------------------
+        // Everything below drives later slices, tile-id math and allocation
+        // sizes, and all of it is attacker-controlled in a foreign archive.
+        // Nonsense is rejected here, once, rather than defended against at
+        // every use.
+        let (min_zoom, max_zoom, center_zoom) = (bytes[100], bytes[101], bytes[118]);
+        if max_zoom > MAX_TILE_ID_ZOOM {
+            return Err(err(format!(
+                "max zoom {max_zoom} is past z{MAX_TILE_ID_ZOOM}, \
+                 the deepest zoom a PMTiles tile id can address"
+            )));
+        }
+        if min_zoom > max_zoom {
+            return Err(err(format!(
+                "min zoom {min_zoom} is deeper than max zoom {max_zoom}"
+            )));
+        }
+        // Only the upper end is enforced: a center *deeper* than the archive
+        // goes nowhere, while a center zoom of 0 is the near-universal
+        // "unset" value even in archives that start at z5.
+        if center_zoom > max_zoom {
+            return Err(err(format!(
+                "center zoom {center_zoom} is deeper than max zoom {max_zoom}"
+            )));
+        }
+
+        // Section bounds. How they compare to the *file* size is checked by
+        // the callers that know it (a header may legitimately be parsed from
+        // the first 127 bytes of a range request); what can be said here is
+        // that no section may wrap u64.
+        let root_dir_offset = read_u64(8);
+        let root_dir_length = read_u64(16);
+        let json_metadata_offset = read_u64(24);
+        let json_metadata_length = read_u64(32);
+        let leaf_dirs_offset = read_u64(40);
+        let leaf_dirs_length = read_u64(48);
+        let tile_data_offset = read_u64(56);
+        let tile_data_length = read_u64(64);
+        for (what, offset, length) in [
+            ("root directory", root_dir_offset, root_dir_length),
+            ("JSON metadata", json_metadata_offset, json_metadata_length),
+            ("leaf directories", leaf_dirs_offset, leaf_dirs_length),
+            ("tile data", tile_data_offset, tile_data_length),
+        ] {
+            if offset.checked_add(length).is_none() {
+                return Err(err(format!(
+                    "{what} section at offset {offset} with length {length} overflows u64"
+                )));
+            }
+        }
+
         Ok(Header {
-            root_dir_offset: read_u64(8),
-            root_dir_length: read_u64(16),
-            json_metadata_offset: read_u64(24),
-            json_metadata_length: read_u64(32),
-            leaf_dirs_offset: read_u64(40),
-            leaf_dirs_length: read_u64(48),
-            tile_data_offset: read_u64(56),
-            tile_data_length: read_u64(64),
+            root_dir_offset,
+            root_dir_length,
+            json_metadata_offset,
+            json_metadata_length,
+            leaf_dirs_offset,
+            leaf_dirs_length,
+            tile_data_offset,
+            tile_data_length,
             addressed_tiles_count: read_u64(72),
             tile_entries_count: read_u64(80),
             tile_contents_count: read_u64(88),
@@ -232,13 +283,13 @@ impl Header {
             internal_compression,
             tile_compression,
             tile_type,
-            min_zoom: bytes[100],
-            max_zoom: bytes[101],
+            min_zoom,
+            max_zoom,
             min_lon: read_coord(102),
             min_lat: read_coord(106),
             max_lon: read_coord(110),
             max_lat: read_coord(114),
-            center_zoom: bytes[118],
+            center_zoom,
             center_lon: read_coord(119),
             center_lat: read_coord(123),
         })
@@ -299,6 +350,43 @@ fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
         s /= 2;
     }
     d
+}
+
+/// Deepest zoom a PMTiles tile id can address.
+///
+/// The cumulative Hilbert id of the last z31 tile is `(4^32 - 1) / 3 - 1`,
+/// which still fits a u64; z32 does not. We never *write* past z30 (see the
+/// converter's own zoom cap), but a foreign archive may legitimately go to
+/// z31, so the read side accepts the full addressable range.
+pub const MAX_TILE_ID_ZOOM: u8 = 31;
+
+/// Hard ceiling on how many tiles one directory walk may expand to (#417).
+///
+/// Run lengths are archive-controlled u32s, and each expanded entry costs
+/// tens of bytes in the reader (a `TileRef`, or a `BTreeMap` node in the
+/// pyramid merge). 2^28 entries is already ~8 GB of those — past anything a
+/// machine will finish decoding, and far past the ~3.6e8 addresses of a
+/// fully dense z0-z14 pyramid. It is the backstop for archives that declare
+/// a deep `max_zoom`; [`max_expanded_entries`] usually lands well below it.
+pub const MAX_EXPANDED_TILE_ENTRIES: u64 = 1 << 28;
+
+/// Number of tile ids addressable at or above `max_zoom`'s pyramid: the sum
+/// of `4^z` for `z` in `0..=max_zoom`, saturating at
+/// [`MAX_EXPANDED_TILE_ENTRIES`].
+fn tile_address_space(max_zoom: u8) -> u64 {
+    (0..=max_zoom.min(MAX_TILE_ID_ZOOM))
+        .try_fold(0u64, |acc, z| acc.checked_add(1u64 << (2 * u32::from(z))))
+        .unwrap_or(u64::MAX)
+}
+
+/// How many tiles a directory walk over `header`'s archive may expand to.
+///
+/// Two bounds, whichever is tighter: the archive cannot address more tiles
+/// than its own zoom range holds, and no archive worth reading expands past
+/// [`MAX_EXPANDED_TILE_ENTRIES`]. Both operands are derived from the header,
+/// which [`Header::from_bytes`] has already range-checked.
+pub fn max_expanded_entries(header: &Header) -> u64 {
+    tile_address_space(header.max_zoom).min(MAX_EXPANDED_TILE_ENTRIES)
 }
 
 /// Convert a PMTiles TileID back to tile coordinates (z, x, y).
@@ -463,10 +551,18 @@ pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
     // Number of entries
     let (count, consumed) = decode_varint(&data[offset..])?;
     offset += consumed;
-    let count = count as usize;
 
     if count == 0 {
         return Some(Vec::new());
+    }
+
+    // The count is an archive-controlled varint and it sizes an allocation,
+    // so it is checked against what the body could possibly hold rather than
+    // trusted (#397): every entry contributes at least one varint byte to
+    // each of the four columns.
+    let count = usize::try_from(count).ok()?;
+    if count > (data.len() - offset) / 4 {
+        return None;
     }
 
     let mut entries = Vec::with_capacity(count);
@@ -476,7 +572,9 @@ pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
     for _ in 0..count {
         let (delta, consumed) = decode_varint(&data[offset..])?;
         offset += consumed;
-        last_id += delta;
+        // Both operands come from the archive: a wrapping sum would land the
+        // entry on an unrelated (and in-bounds-looking) tile id.
+        last_id = last_id.checked_add(delta)?;
         entries.push(DirEntry {
             tile_id: last_id,
             offset: 0,
@@ -489,14 +587,18 @@ pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
     for entry in entries.iter_mut() {
         let (run_length, consumed) = decode_varint(&data[offset..])?;
         offset += consumed;
-        entry.run_length = run_length as u32;
+        // Truncating here would turn a 2^32 run length into 0 — a *leaf
+        // pointer* — and the walker would then slice tile bytes as a
+        // directory.
+        entry.run_length = u32::try_from(run_length).ok()?;
     }
 
     // Decode lengths
     for entry in entries.iter_mut() {
         let (length, consumed) = decode_varint(&data[offset..])?;
         offset += consumed;
-        entry.length = length as u32;
+        // Likewise: 2^32 + 10 must not quietly become a 10-byte read.
+        entry.length = u32::try_from(length).ok()?;
     }
 
     // Decode offsets (with contiguous encoding)
@@ -1847,7 +1949,12 @@ mod tests {
         // assertion above and still hand a reader garbage. So walk the
         // directories the way a reader does and check the bytes come back.
         let read_dir = |raw: &[u8]| -> Vec<DirEntry> {
-            let plain = compression::decompress(raw, header.internal_compression).unwrap();
+            let plain = compression::decompress(
+                raw,
+                header.internal_compression,
+                compression::MAX_INTERNAL_BYTES,
+            )
+            .unwrap();
             decode_directory(&plain).expect("directory must decode")
         };
         let root = read_dir(
@@ -2033,6 +2140,131 @@ mod tests {
             (31, (1u32 << 31) - 1, 0),
         ] {
             assert_eq!(tile_id_to_zxy(tile_id(z, x, y)).unwrap(), (z, x, y));
+        }
+    }
+
+    // ---- Hostile archives (#417) -------------------------------------------
+
+    /// Hand-assemble a directory body: count, then the four varint columns.
+    fn hostile_directory(
+        count: u64,
+        deltas: &[u64],
+        run_lengths: &[u64],
+        lengths: &[u64],
+        offsets: &[u64],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_varint(count, &mut buf);
+        for column in [deltas, run_lengths, lengths, offsets] {
+            for &v in column {
+                encode_varint(v, &mut buf);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn decode_directory_rejects_run_length_past_u32() {
+        // 2^32 truncates to 0 — a tile entry silently becomes a *leaf
+        // pointer*, and the reader then slices tile bytes as a directory.
+        let data = hostile_directory(1, &[1], &[1u64 << 32], &[10], &[1]);
+        assert!(
+            decode_directory(&data).is_none(),
+            "a run length past u32 must be rejected, not truncated"
+        );
+    }
+
+    #[test]
+    fn decode_directory_rejects_length_past_u32() {
+        // 2^32 + 10 truncates to 10: a 4 GiB claim becomes a 10-byte read.
+        let data = hostile_directory(1, &[1], &[1], &[(1u64 << 32) + 10], &[1]);
+        assert!(
+            decode_directory(&data).is_none(),
+            "a length past u32 must be rejected, not truncated"
+        );
+    }
+
+    #[test]
+    fn decode_directory_rejects_tile_id_delta_overflow() {
+        // Two deltas that wrap u64 when summed: the second entry's id would
+        // land back near zero and address an unrelated tile.
+        let data = hostile_directory(2, &[u64::MAX, u64::MAX], &[1, 1], &[10, 10], &[1, 0]);
+        assert!(
+            decode_directory(&data).is_none(),
+            "a tile-id delta sum that wraps u64 must be rejected"
+        );
+    }
+
+    #[test]
+    fn decode_directory_rejects_entry_count_the_body_cannot_hold() {
+        // The count is an archive-controlled varint that is trusted straight
+        // into `Vec::with_capacity`: u64::MAX aborts the process on capacity
+        // overflow before a single entry is read.
+        let mut data = Vec::new();
+        encode_varint(u64::MAX, &mut data);
+        assert!(
+            decode_directory(&data).is_none(),
+            "an entry count the body cannot possibly hold must be rejected"
+        );
+    }
+
+    #[test]
+    fn header_rejects_zoom_past_the_tile_id_space() {
+        let mut bytes = Header::default().to_bytes();
+        bytes[101] = 32; // max_zoom
+        assert!(
+            Header::from_bytes(&bytes).is_err(),
+            "z32 has no PMTiles tile-id space"
+        );
+    }
+
+    #[test]
+    fn header_rejects_inverted_zoom_range() {
+        let mut bytes = Header::default().to_bytes();
+        bytes[100] = 10; // min_zoom
+        bytes[101] = 5; // max_zoom
+        assert!(Header::from_bytes(&bytes).is_err(), "min_zoom > max_zoom");
+    }
+
+    #[test]
+    fn header_rejects_center_zoom_past_max_zoom() {
+        let mut bytes = Header::default().to_bytes();
+        bytes[101] = 6; // max_zoom
+        bytes[118] = 7; // center_zoom
+        assert!(
+            Header::from_bytes(&bytes).is_err(),
+            "a center deeper than the archive's deepest zoom is nonsense"
+        );
+    }
+
+    #[test]
+    fn header_rejects_section_bounds_that_overflow_u64() {
+        for header in [
+            Header {
+                root_dir_offset: u64::MAX,
+                root_dir_length: 2,
+                ..Default::default()
+            },
+            Header {
+                json_metadata_offset: u64::MAX - 1,
+                json_metadata_length: 8,
+                ..Default::default()
+            },
+            Header {
+                leaf_dirs_offset: u64::MAX,
+                leaf_dirs_length: 1,
+                ..Default::default()
+            },
+            Header {
+                tile_data_offset: u64::MAX,
+                tile_data_length: u64::MAX,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                Header::from_bytes(&header.to_bytes()).is_err(),
+                "section offset + length must not wrap u64: {header:?}"
+            );
         }
     }
 
