@@ -458,7 +458,23 @@ fn level_winner_positions(
             .or_insert(pos);
     }
 
+    // Determinism contract (#423): `grid.into_values()` drains the HashMap in
+    // its internal bucket order, which is a function of the (randomized,
+    // per-process) hash of `CellKey` — not of anything about this run's
+    // input or thread count. The caller currently folds `winners` through a
+    // commutative min (`if level < min_levels[pos] { .. }`), so today the
+    // HashMap order is harmless. But it is the one place in this module where
+    // raw HashMap iteration order reaches a `Vec` at all, and it takes only
+    // one future refactor of the caller (e.g. anything positional, or a
+    // tie-break that isn't truly order-independent) to turn that into a
+    // build-to-build / thread-count-to-thread-count byte diff. Sorting here
+    // costs nothing to reason about later: `winners` holds feature positions
+    // (`usize`, `Ord`), one per occupied cell — sorting is O(cells log
+    // cells), not O(features log features), and cells are bounded by the
+    // memory budget in `estimate_level_grid_bytes` above, so this is cheap
+    // relative to the grid build it follows.
     winners.extend(grid.into_values());
+    winners.sort_unstable();
     winners
 }
 
