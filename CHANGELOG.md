@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.7.1 (2026-09-23)
+
+A packaging and docs release that fills in what v0.7.0 left out. The tiling
+engine is unchanged. What's new is how you install it and how you get started.
+
+### Added
+
+- **Python wheels for every common platform.** `pip install tylertoo` now
+  finds a prebuilt wheel on Linux x86_64 and aarch64 (manylinux and musllinux,
+  so Alpine works too), macOS Intel and Apple Silicon, and Windows x86_64.
+  Wheels are built for the stable ABI (`abi3-py39`), so one wheel covers every
+  CPython from 3.9 up and there are no more source builds on newer
+  interpreters (#410, #473).
+- **`cargo binstall tylertoo`** downloads the prebuilt release binary instead
+  of building from source, so you don't need Rust or `protoc` (#411, #469).
+- **A quickstart you can run in 60 seconds**, in the README and at the top of
+  the getting-started guide. It uses a 28 MB sample file you can download, and
+  every command was checked by running it (#413, #472).
+- **Community files:** `SECURITY.md` with private vulnerability reporting, a
+  code of conduct, issue forms, a PR template, and a set of issues labelled
+  good-first-issue (#415, #467).
+
+### Changed
+
+- **Reproducible builds.** `Cargo.lock` is now committed, and release
+  binaries, wheels and crates.io publishes all build with `--locked`. Every
+  artifact is built from the reviewed dependency tree, not whatever crates.io
+  resolves on release day. v0.7.0 was built without a lockfile (#412, #468).
+- **Clearer README intro and a curated v0.7.0 changelog.** The Brazil tutorial
+  now points at the real 52-file remote manifest (the single file it named
+  never existed), and the gpio commands, which included a flag gpio 1.5.0
+  doesn't have, are corrected (#414, #472).
+
+### Fixed
+
+- **Release pipeline:** the natively built wheels are smoke-tested (installed
+  and imported) before publish, and a manual re-run of the release workflow
+  can no longer upload wheels under a version that has already been released
+  (#473).
+
+### Internal
+
+- uv.lock version-sync hook and CI check (#466); geometry-test-data submodule
+  setup documented (#464, #474); gpq-tiles tombstone runbook (#470);
+  rust-toolchain action re-pin (#475); dependency and action bumps (#477,
+  #478).
+
 ## v0.7.0 (2026-09-19)
 
 The release that replaces the original per-tile pipeline with the

@@ -4223,7 +4223,7 @@ checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "tylertoo"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "tylertoo-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4290,7 +4290,7 @@ dependencies = [
 
 [[package]]
 name = "tylertoo-python"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "pyo3",
  "tempfile",
