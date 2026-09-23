@@ -120,8 +120,31 @@ pub struct RowGroupBounds {
 }
 
 impl RowGroupBounds {
+    /// True when every corner of the stats bbox is a finite number, i.e. when
+    /// the bbox can bound anything at all. Deliberately not public: it is an
+    /// implementation detail of [`Self::intersects`], and the public surface
+    /// is gated by a baseline (`crates/core/api/`).
+    fn is_finite(&self) -> bool {
+        self.xmin.is_finite()
+            && self.ymin.is_finite()
+            && self.xmax.is_finite()
+            && self.ymax.is_finite()
+    }
+
     /// Check if this row group's bounds intersect with the given filter bounds.
+    ///
+    /// A non-finite bbox is treated as *no* bbox and always intersects (#428).
+    /// Every comparison against a NaN is false, so without this guard a single
+    /// NaN statistic — how a foreign writer spells nodata, and what pre-1.0
+    /// writers emitted for an all-NaN column — would prune the row group and
+    /// silently drop every feature in it. Unusable statistics mean "read it",
+    /// never "skip it"; [`extract_row_group_bounds_from_metadata`] already
+    /// drops such a bbox on the way in, and this keeps the invariant for a
+    /// `RowGroupBounds` built any other way.
     pub fn intersects(&self, filter: &TileBounds) -> bool {
+        if !self.is_finite() {
+            return true;
+        }
         // Standard AABB intersection test
         self.xmin <= filter.lng_max
             && self.xmax >= filter.lng_min
@@ -277,7 +300,12 @@ pub fn find_bbox_column_indices(
 
 /// Extract a statistic value from column metadata.
 ///
-/// Handles both f32 and f64 physical types, converting to f64.
+/// Handles both f32 and f64 physical types, converting to f64. A non-finite
+/// statistic reads as *missing* (`None`, #428): NaN/±inf cannot bound
+/// anything, and a caller that treated one as a bound would prune row groups
+/// it must read (every comparison against a NaN is false). arrow-rs leaves NaN
+/// out of the statistics it computes, but a file written elsewhere can carry
+/// one, so the guard belongs on the read side.
 fn extract_stat_value(
     row_group: &parquet::file::metadata::RowGroupMetaData,
     col_idx: usize,
@@ -292,19 +320,20 @@ fn extract_stat_value(
         stats.max_bytes_opt()?
     };
 
-    match bytes.len() {
+    let value = match bytes.len() {
         4 => {
             // FLOAT (f32)
             let arr: [u8; 4] = bytes.try_into().ok()?;
-            Some(f32::from_le_bytes(arr) as f64)
+            f32::from_le_bytes(arr) as f64
         }
         8 => {
             // DOUBLE (f64)
             let arr: [u8; 8] = bytes.try_into().ok()?;
-            Some(f64::from_le_bytes(arr))
+            f64::from_le_bytes(arr)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    value.is_finite().then_some(value)
 }
 
 /// Extract bounding boxes for all row groups from a Parquet file.
@@ -343,8 +372,10 @@ pub fn extract_row_group_bounds_from_reader(
 /// This is the metadata-only variant of [`extract_row_group_bounds_from_reader`]:
 /// callers that already hold a [`ParquetMetaData`] (e.g. from a
 /// `ParquetRecordBatchReaderBuilder`) can prune without re-opening the file.
-/// Returns `None` for row groups whose covering statistics are unavailable, and
-/// `vec![None; n]` when the file lacks geo/covering metadata entirely.
+/// Returns `None` for row groups whose covering statistics are unavailable —
+/// including a bbox with a non-finite corner, which cannot bound anything
+/// (#428) — and `vec![None; n]` when the file lacks geo/covering metadata
+/// entirely.
 pub fn extract_row_group_bounds_from_metadata(
     metadata: &ParquetMetaData,
 ) -> Result<Vec<Option<RowGroupBounds>>, Error> {
@@ -881,6 +912,186 @@ mod tests {
             tiles.len() >= 4 && tiles.len() <= 12,
             "Expected 4-12 tiles, got {}",
             tiles.len()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Non-finite statistics (#428)
+    // -------------------------------------------------------------------------
+
+    /// Synthetic footer metadata for a file whose covering bbox lives in four
+    /// flat DOUBLE columns, with the given `(min, max)` statistics per column
+    /// in `xmin, ymin, xmax, ymax` order.
+    ///
+    /// Hand-built rather than written through `ArrowWriter`: arrow-rs skips
+    /// NaN when it computes float statistics, so a NaN min/max can only reach
+    /// us from *another* writer — which is exactly the case under test.
+    fn metadata_with_bbox_stats(stats: [(f64, f64); 4], num_rows: i64) -> ParquetMetaData {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
+        };
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        let names = ["xmin", "ymin", "xmax", "ymax"];
+        let fields = names
+            .iter()
+            .map(|n| {
+                Arc::new(
+                    Type::primitive_type_builder(n, PhysicalType::DOUBLE)
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let schema = Type::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+
+        let columns = (0..4)
+            .map(|i| {
+                let (min, max) = stats[i];
+                ColumnChunkMetaData::builder(descr.column(i))
+                    .set_statistics(Statistics::double(
+                        Some(min),
+                        Some(max),
+                        None,
+                        Some(0),
+                        false,
+                    ))
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let rg = RowGroupMetaData::builder(descr.clone())
+            .set_num_rows(num_rows)
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+
+        let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"covering":{"bbox":{"xmin":["xmin"],"ymin":["ymin"],"xmax":["xmax"],"ymax":["ymax"]}}}}}"#;
+        let file_meta = FileMetaData::new(
+            2,
+            num_rows,
+            None,
+            Some(vec![KeyValue::new("geo".to_string(), geo.to_string())]),
+            descr,
+            None,
+        );
+        ParquetMetaData::new(file_meta, vec![rg])
+    }
+
+    /// A NaN in the stats bbox makes every AABB comparison false, which would
+    /// PRUNE the row group — silent data loss. Unusable statistics mean
+    /// "read it".
+    #[test]
+    fn non_finite_bounds_never_prune() {
+        let filter = TileBounds {
+            lng_min: -5.0,
+            lat_min: -5.0,
+            lng_max: 5.0,
+            lat_max: 5.0,
+        };
+        for (label, bounds) in [
+            (
+                "NaN xmin",
+                RowGroupBounds {
+                    row_group_idx: 0,
+                    xmin: f64::NAN,
+                    ymin: -10.0,
+                    xmax: 10.0,
+                    ymax: 10.0,
+                    num_rows: 100,
+                },
+            ),
+            (
+                "NaN ymax",
+                RowGroupBounds {
+                    row_group_idx: 0,
+                    xmin: -10.0,
+                    ymin: -10.0,
+                    xmax: 10.0,
+                    ymax: f64::NAN,
+                    num_rows: 100,
+                },
+            ),
+            (
+                "all NaN",
+                RowGroupBounds {
+                    row_group_idx: 0,
+                    xmin: f64::NAN,
+                    ymin: f64::NAN,
+                    xmax: f64::NAN,
+                    ymax: f64::NAN,
+                    num_rows: 100,
+                },
+            ),
+        ] {
+            assert!(
+                bounds.intersects(&filter),
+                "{label}: a non-finite statistic must keep the row group, not prune it"
+            );
+        }
+    }
+
+    /// The same thing one layer down: a non-finite statistic is read as
+    /// *missing* statistics, so every caller's "no stats -> read it" branch
+    /// does the right thing without knowing about NaN.
+    #[test]
+    fn non_finite_statistics_read_as_missing() {
+        let finite = metadata_with_bbox_stats(
+            [(-10.0, -1.0), (-10.0, -1.0), (1.0, 10.0), (1.0, 10.0)],
+            100,
+        );
+        let bounds = extract_row_group_bounds_from_metadata(&finite).unwrap();
+        assert_eq!(
+            bounds[0].as_ref().map(|b| (b.xmin, b.ymax)),
+            Some((-10.0, 10.0)),
+            "control: finite statistics are still read"
+        );
+
+        let nan = metadata_with_bbox_stats(
+            [
+                (f64::NAN, f64::NAN),
+                (-10.0, -1.0),
+                (1.0, 10.0),
+                (1.0, 10.0),
+            ],
+            100,
+        );
+        let bounds = extract_row_group_bounds_from_metadata(&nan).unwrap();
+        assert_eq!(
+            bounds,
+            vec![None],
+            "a NaN covering statistic must read as missing statistics"
+        );
+    }
+
+    /// End of the line: the row-group selector that the bbox extract path
+    /// actually calls must KEEP a NaN-statistic row group.
+    #[test]
+    fn non_finite_statistics_keep_the_row_group_selected() {
+        let nan = metadata_with_bbox_stats(
+            [
+                (f64::NAN, f64::NAN),
+                (-10.0, -1.0),
+                (1.0, 10.0),
+                (1.0, 10.0),
+            ],
+            100,
+        );
+        // A bbox on the far side of the world from any plausible reading of
+        // those statistics: only the NaN guard can keep this row group.
+        let selected =
+            crate::overview::convert::select_input_row_groups(&nan, &[100.0, 60.0, 110.0, 70.0]);
+        assert_eq!(
+            selected,
+            vec![0],
+            "a row group whose covering statistics are unusable must be read, not pruned"
         );
     }
 }

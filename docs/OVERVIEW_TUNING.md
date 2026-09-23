@@ -712,6 +712,14 @@ used is recorded in the footer `generalization.ranking` provenance.
 
 `--sort-key` and `--class-rank` are mutually exclusive.
 
+**Unrankable values.** A null ranks below every real key: a feature with no key
+still appears, it just loses any cell it contests to one that has a key. A NaN
+or infinity in a numeric column ranks the same way — those are how float
+columns usually spell nodata, and neither is a priority anything can compare
+against. Such a row is never dropped for it; it competes as a keyless feature.
+The entry-zoom ladder and `--accumulate` read their columns by the same rule,
+so a NaN is no rung and no summand.
+
 ---
 
 ## Density budget: `--drop-rate`, `--drop-gamma`, `--no-density-drop`
@@ -1298,7 +1306,9 @@ engine involved):
 NULL value is UNKNOWN, `AND`/`OR`/`NOT` combine with Kleene logic, and a row
 is kept only when the whole predicate is TRUE. So `confidence > 0.8` drops
 null-confidence rows — and so does `NOT (confidence > 0.8)`. Use
-`IS NULL` / `IS NOT NULL` to test nulls explicitly.
+`IS NULL` / `IS NOT NULL` to test nulls explicitly. A NaN in a float column is
+UNKNOWN too — no comparison against it has an answer, and it is nodata far more
+often than it is a value. Infinities are ordinary values and compare normally.
 
 Like `--bbox`, the filter is two-stage:
 

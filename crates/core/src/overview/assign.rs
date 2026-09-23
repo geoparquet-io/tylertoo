@@ -1130,6 +1130,43 @@ mod tests {
         }
     }
 
+    /// #428: a NaN in the sort-key column must rank as a MISSING key (below
+    /// every real key), not as a value `Priority::beats` cannot order.
+    ///
+    /// `beats` answers false in both directions for a NaN, so the incumbent of
+    /// a cell wins it no matter what its key says: put the NaN row first and
+    /// the documented "larger sort key wins" rule silently inverts. The fix is
+    /// upstream — the key never reaches the comparator as a NaN — so this test
+    /// builds its keys the way the pipeline does, off the column.
+    #[test]
+    fn nan_sort_key_ranks_as_a_missing_key() {
+        use super::super::convert::extract_sort_keys;
+        use arrow_array::Float64Array;
+
+        let gsds = [gsd(2), gsd(6)];
+        let cfg = AssignConfig::default();
+
+        let col = Float64Array::from(vec![f64::NAN, 1.0]);
+        let keys = extract_sort_keys(&col);
+
+        // Two points close enough to contest one coarse cell; the NaN row is
+        // the incumbent (lower index), the real key arrives as challenger.
+        let mut nan_row = point(0, 10.0, 10.0);
+        nan_row.sort_key = keys[0];
+        let mut valued = point(1, 10.0001, 10.0001);
+        valued.sort_key = keys[1];
+
+        let out = assign_levels(&[nan_row, valued], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            out.assignments[1].min_level, 0,
+            "the row with a real sort key must win the cell"
+        );
+        assert_eq!(
+            out.assignments[0].min_level, 1,
+            "the NaN row ranks as keyless and loses the cell"
+        );
+    }
+
     fn poly(index: usize, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> AssignFeature {
         AssignFeature {
             index,
