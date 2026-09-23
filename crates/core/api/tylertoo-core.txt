@@ -2566,6 +2566,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pyramid::Pyramid
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidReport
 pub fn tylertoo_core::pyramid::build_pyramid(&[tylertoo_core::pyramid::Band], &std::path::Path, &tylertoo_core::pyramid::PyramidOptions) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::classify_band_input(&std::path::Path) -> tylertoo_core::pyramid::BandSource
+pub fn tylertoo_core::pyramid::implicit_layer_overlaps(&[tylertoo_core::pyramid::Band]) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
 pub fn tylertoo_core::pyramid::merge_bands(&[tylertoo_core::pyramid::Band], &std::path::Path) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::validate_bands(&[tylertoo_core::pyramid::Band]) -> core::result::Result<(), alloc::string::String>
 pub mod tylertoo_core::quality

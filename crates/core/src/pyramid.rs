@@ -276,6 +276,61 @@ fn bands_share_zooms(bands: &[Band]) -> bool {
     })
 }
 
+/// Whether a band's layer name is simply its input's file stem — i.e. the
+/// spec almost certainly did not spell out a `:LAYER`.
+///
+/// DIVERGENCE FROM THE ISSUE (#405): the issue asks `Band::parse` to record
+/// the flag on `Band`. `Band`'s fields are public and the struct is
+/// exhaustively constructible, so a new field — public or private — is a
+/// major semver break that `cargo semver-checks` rejects without a version
+/// bump. The name is derived instead, with exactly the function `parse`
+/// itself would have used, which keeps the public API additive. The one
+/// inaccuracy is an explicit label that repeats the stem (`x.parquet:x`); it
+/// can only make the warning below appear where it was not needed, never
+/// suppress it where it was.
+fn layer_is_input_derived(band: &Band) -> bool {
+    band.input
+        .to_str()
+        .and_then(default_layer_for)
+        .is_some_and(|derived| derived == band.layer)
+}
+
+/// Pairs of layer names that share a zoom where at least one of the two was
+/// never spelled out in the spec (#405).
+///
+/// Bands in different layers are allowed to share zooms — that is
+/// tippecanoe's `-L`. But a band whose layer name came from its file stem did
+/// not *ask* to be its own layer, so `--band 0-5:coarse.parquet --band
+/// 5-13:fine.parquet` (one zoom too wide) quietly produces two layers instead
+/// of the error it used to. Pure so it can be tested directly; the caller
+/// warns rather than errors, since stem-named layers over one range are a
+/// legitimate workflow.
+pub fn implicit_layer_overlaps(bands: &[Band]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (i, a) in bands.iter().enumerate() {
+        for b in &bands[i + 1..] {
+            let shares_zoom = a.min_zoom <= b.max_zoom && b.min_zoom <= a.max_zoom;
+            let either_implicit = layer_is_input_derived(a) || layer_is_input_derived(b);
+            if shares_zoom && a.layer != b.layer && either_implicit {
+                out.push((a.layer.clone(), b.layer.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Say so, once, when [`implicit_layer_overlaps`] finds anything.
+fn warn_implicit_layer_overlaps(bands: &[Band]) {
+    for (a, b) in implicit_layer_overlaps(bands) {
+        log::warn!(
+            "bands {a:?} and {b:?} share a zoom, so the archive gets two layers named after \
+             their inputs; if they are meant to be one layer give both the same explicit \
+             `:LAYER` (or `=LAYER`), and if they are not, check the zoom ranges for an \
+             off-by-one"
+        );
+    }
+}
+
 /// One layer's entry in the merged archive's `vector_layers`.
 #[derive(Debug, Clone)]
 struct LayerMeta {
@@ -598,6 +653,9 @@ pub fn build_pyramid(
     opts: &PyramidOptions,
 ) -> Result<PyramidReport, Error> {
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
+    // Once, here — `merge_bands` validates again for its own library callers,
+    // and a warning repeated per phase reads like two problems.
+    warn_implicit_layer_overlaps(bands);
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
     // including the early-return paths below.
@@ -858,7 +916,19 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     // zoom ranges make that impossible; this asserts it.
     let mut seen: BTreeMap<(u8, u32, u32), &str> = BTreeMap::new();
 
-    for band in bands {
+    // #404: coarsest band first, whatever order the caller listed them in.
+    // The writer appends tile data in add order and stamps the header
+    // `clustered`, which promises offsets monotonic in tile id — and tile ids
+    // ascend with zoom. `--band 6-13:fine --band 0-5:coarse` therefore wrote
+    // z6-13's bytes before z0-5's and go-pmtiles `verify` rejected the result
+    // as "out-of-order entry in clustered archive". The ranges are disjoint
+    // here (the shared-zoom path returned above), so sorting by `min_zoom`
+    // puts every band's tiles in ascending tile-id order. `validate_bands`
+    // sorts a copy of the same slice for its overlap check.
+    let mut ordered: Vec<&Band> = bands.iter().collect();
+    ordered.sort_by_key(|b| (b.min_zoom, b.max_zoom));
+
+    for band in ordered {
         let archive = BandArchive::open(&band.input)?;
         if let Some(b) = archive.bounds {
             match union.as_mut() {
@@ -923,6 +993,39 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     )
 }
 
+/// Fold one band's `fields` object into the layer's accumulated one (#372).
+///
+/// A layer's bands are meant to be the same layer at different zooms, so
+/// `vector_layers[].fields` — what a client introspects to discover a layer's
+/// attributes — has to be their union. Keeping the first non-empty object
+/// instead dropped every other band's attributes, and #389 made even
+/// identical schemas diverge legitimately (`coalesced_count` is withheld from
+/// a band whose counter never went above 1).
+///
+/// A field two bands type differently is a genuine schema disagreement: keep
+/// the first and say so, rather than resolve it silently.
+fn union_fields(into: &mut Value, from: Value, layer: &str) {
+    let Value::Object(from) = from else { return };
+    if !into.is_object() {
+        *into = json!({});
+    }
+    let Some(target) = into.as_object_mut() else {
+        return;
+    };
+    for (name, ty) in from {
+        match target.get(&name) {
+            None => {
+                target.insert(name, ty);
+            }
+            Some(first) if *first != ty => log::warn!(
+                "layer {layer:?}: bands disagree on the type of field {name:?} \
+                 ({first} and {ty}); keeping {first}"
+            ),
+            Some(_) => {}
+        }
+    }
+}
+
 /// The tail shared by both merge paths: bounds, `vector_layers`, finalize.
 fn finish_merge(
     mut writer: StreamingPmtilesWriter,
@@ -951,9 +1054,7 @@ fn finish_merge(
             Some(m) => {
                 m.minzoom = m.minzoom.min(l.minzoom);
                 m.maxzoom = m.maxzoom.max(l.maxzoom);
-                if m.fields.as_object().is_some_and(|o| o.is_empty()) {
-                    m.fields = l.fields;
-                }
+                union_fields(&mut m.fields, l.fields, &l.id);
             }
             None => merged.push(l),
         }
@@ -1930,5 +2031,201 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("past end of"), "{err}");
+    }
+
+    /// #404: the single-pass path copied each band's tiles in *argument*
+    /// order, so `--band 2-2:fine --band 0-1:coarse` wrote z2's tile data
+    /// before z0's while the writer stamps the header `clustered` — which
+    /// promises offsets monotonic in tile-id order. go-pmtiles `verify`
+    /// reported "out-of-order entry in clustered archive". Same clustered walk
+    /// as `merge_writes_shared_zoom_tiles_in_tile_id_order` (#392), on the
+    /// disjoint-band path.
+    #[test]
+    fn merge_writes_disjoint_bands_in_tile_id_order_given_fine_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let coarse = dir.path().join("coarse.pmtiles");
+        let fine = dir.path().join("fine.pmtiles");
+        // Every tile distinct, so nothing dedups and every offset is fresh.
+        for (path, label, tiles) in [
+            (
+                &coarse,
+                "coarse",
+                vec![(0u8, 0u32, 0u32), (1, 0, 0), (1, 1, 1)],
+            ),
+            (&fine, "fine", vec![(2, 0, 0), (2, 3, 3), (2, 1, 2)]),
+        ] {
+            let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+            w.set_layer_name(label);
+            w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+            for &(z, x, y) in &tiles {
+                w.add_tile(z, x, y, &layer_tile(&format!("{label}-{z}-{x}-{y}")))
+                    .unwrap();
+            }
+            w.finalize(path).unwrap();
+        }
+
+        let out = dir.path().join("merged.pmtiles");
+        // Fine band first: legal, and the zoom ranges are disjoint.
+        let report = merge_bands(
+            &[
+                Band::parse(&format!("2-2:{}:fine", fine.display())).unwrap(),
+                Band::parse(&format!("0-1:{}:coarse", coarse.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 6);
+
+        let bytes = std::fs::read(&out).unwrap();
+        let h = Header::from_bytes(&bytes).unwrap();
+        assert!(h.clustered, "the writer stamps every archive clustered");
+        let root = compression::decompress(
+            &bytes[h.root_dir_offset as usize..(h.root_dir_offset + h.root_dir_length) as usize],
+            h.internal_compression,
+        )
+        .unwrap();
+        let entries: Vec<(u64, u64, u32)> = decode_directory(&root)
+            .unwrap()
+            .iter()
+            .filter(|e| e.run_length > 0)
+            .map(|e| (e.tile_id, e.offset, e.length))
+            .collect();
+        assert_eq!(entries.len(), 6, "{entries:?}");
+        let mut seen = std::collections::HashSet::new();
+        let mut end = 0u64;
+        for &(id, offset, length) in &entries {
+            if seen.contains(&offset) {
+                continue;
+            }
+            assert_eq!(
+                offset, end,
+                "out-of-order entry in clustered archive at tile id {id}: {entries:?}"
+            );
+            seen.insert(offset);
+            end = offset + u64::from(length);
+        }
+    }
+
+    /// #372: two bands of one layer each declare their own attributes.
+    /// `vector_layers[].fields` is what a client introspects to discover a
+    /// layer's attributes, so it must be the union across the layer's bands —
+    /// taking the first non-empty one dropped every other band's fields.
+    #[test]
+    fn merged_layer_fields_are_the_union_across_bands() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        write_band(&a, "cells", &[(0, 0, 0)], bounds, &[("a", "Number")]);
+        write_band(&b, "cells", &[(1, 0, 0)], bounds, &[("b", "String")]);
+
+        let out = dir.path().join("merged.pmtiles");
+        merge_bands(
+            &[
+                Band::parse(&format!("0-0:{}:cells", a.display())).unwrap(),
+                Band::parse(&format!("1-1:{}:cells", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+
+        let meta = read_metadata(&out);
+        let v: Value = serde_json::from_str(&meta).unwrap();
+        let layers = v["vector_layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1, "{meta}");
+        assert_eq!(layers[0]["fields"]["a"], json!("Number"), "{meta}");
+        assert_eq!(
+            layers[0]["fields"]["b"],
+            json!("String"),
+            "the second band's fields must survive: {meta}"
+        );
+    }
+
+    /// A genuine schema disagreement between two bands of one layer keeps the
+    /// first band's type (and warns); it must not drop the field or invent a
+    /// union type.
+    #[test]
+    fn merged_layer_fields_keep_the_first_type_on_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        write_band(&a, "cells", &[(0, 0, 0)], bounds, &[("n", "Number")]);
+        write_band(&b, "cells", &[(1, 0, 0)], bounds, &[("n", "String")]);
+
+        let out = dir.path().join("merged.pmtiles");
+        merge_bands(
+            &[
+                Band::parse(&format!("0-0:{}:cells", a.display())).unwrap(),
+                Band::parse(&format!("1-1:{}:cells", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+
+        let meta = read_metadata(&out);
+        let v: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(
+            v["vector_layers"][0]["fields"]["n"],
+            json!("Number"),
+            "{meta}"
+        );
+    }
+
+    /// #405: since bands in different layers may share zooms (#392), an
+    /// off-by-one range between two *unlabelled* bands silently turns one
+    /// intended layer into two named after the files. Nothing errors — the
+    /// split is legal, and stem-named layers are a real workflow — but the
+    /// condition is worth naming out loud.
+    #[test]
+    fn implicit_layer_overlap_is_reported() {
+        let parse = |specs: &[&str]| -> Vec<Band> {
+            specs.iter().map(|s| Band::parse(s).unwrap()).collect()
+        };
+
+        // The typo: 0-5 and 5-13 share z5, and neither band was labelled.
+        let bands = parse(&["0-5:coarse.parquet", "5-13:fine.parquet"]);
+        assert_eq!(
+            implicit_layer_overlaps(&bands),
+            vec![("coarse".to_string(), "fine".to_string())],
+            "an unlabelled overlap must be reported"
+        );
+
+        // Explicit labels: two layers over one range is the whole point of
+        // tippecanoe's -L, so say nothing.
+        let bands = parse(&["0-13:a.parquet:2024", "0-13:b.parquet:2025"]);
+        assert!(
+            implicit_layer_overlaps(&bands).is_empty(),
+            "explicitly labelled bands are intentional"
+        );
+
+        // One band labelled, one not: the unlabelled one is still the one
+        // that may be a typo, so the pair is still reported.
+        let bands = parse(&["0-5:coarse.parquet", "5-13:fine.parquet:features"]);
+        assert_eq!(
+            implicit_layer_overlaps(&bands),
+            vec![("coarse".to_string(), "features".to_string())],
+            "one implicit label in the pair is enough to report"
+        );
+
+        // Adjacent, not overlapping: the ordinary pyramid.
+        let bands = parse(&["0-4:coarse.parquet", "5-13:fine.parquet"]);
+        assert!(implicit_layer_overlaps(&bands).is_empty(), "no shared zoom");
+    }
+
+    /// What the check reads instead of a flag on `Band`: whether the layer
+    /// name is exactly what the input would have derived.
+    #[test]
+    fn a_stem_named_layer_reads_as_implicit() {
+        let band = |spec: &str| Band::parse(spec).unwrap();
+        assert!(layer_is_input_derived(&band("0-5:x.parquet")), "stem");
+        assert!(
+            !layer_is_input_derived(&band("0-5:x.parquet:agg")),
+            "explicit label"
+        );
+        assert!(
+            layer_is_input_derived(&band("0-5:/data/cells/*.parquet")),
+            "a glob derives the directory name"
+        );
     }
 }
