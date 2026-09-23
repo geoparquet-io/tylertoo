@@ -55,6 +55,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -327,11 +328,43 @@ pub struct OverviewWriter<W: Write + Send> {
     written_spec_indices: Vec<usize>,
     /// Index of the next level expected by [`Self::write_level`].
     next_level_idx: usize,
+    /// Test-only fault injection for the detached encode tasks (#426).
+    #[cfg(test)]
+    encode_faults: EncodeFaults,
+}
+
+/// Test-only fault injection for the detached encode tasks (#426).
+///
+/// Production code never constructs anything but the default (no faults); the
+/// tests flip a flag to make one spawned encode task panic, without needing an
+/// input that genuinely breaks the encoder.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+struct EncodeFaults {
+    /// Panic inside the spawned row-group encode task.
+    row_group: bool,
+    /// Panic inside the spawned WKB encode task.
+    wkb: bool,
+}
+
+#[cfg(test)]
+impl EncodeFaults {
+    fn trip_row_group(self) {
+        if self.row_group {
+            panic!("injected row-group encode panic");
+        }
+    }
+
+    fn trip_wkb(self) {
+        if self.wkb {
+            panic!("injected WKB encode panic");
+        }
+    }
 }
 
 /// One in-flight row-group encode: the receiver delivers the finished column
-/// chunks (or the encode error) from the Rayon task. `None` on the channel
-/// (sender dropped without sending) means the encode task panicked.
+/// chunks, the encode error, or — since #426 — the caught panic from the Rayon
+/// task, rendered as a [`ParquetError::General`].
 type EncodeResult = Result<Vec<ArrowColumnChunk>, ParquetError>;
 
 /// One in-flight WKB-encode chunk (#304): the GeoParquet-encoded batch plus
@@ -462,12 +495,20 @@ impl<W: Write + Send> OverviewWriter<W> {
             level_row_group_ends: Vec::new(),
             written_spec_indices: Vec::new(),
             next_level_idx: 0,
+            #[cfg(test)]
+            encode_faults: EncodeFaults::default(),
         })
     }
 
     /// The number of levels declared in the options.
     pub fn num_levels(&self) -> usize {
         self.options.levels.len()
+    }
+
+    /// Test-only: arm the encode-task fault injection (#426).
+    #[cfg(test)]
+    fn set_encode_faults(&mut self, faults: EncodeFaults) {
+        self.encode_faults = faults;
     }
 
     /// Write one level's batches (coarse → fine).
@@ -682,9 +723,19 @@ impl<W: Write + Send> OverviewWriter<W> {
             }
         }
         let augmented_schema = self.augmented_schema.clone();
+        #[cfg(test)]
+        let faults = self.encode_faults;
         let (tx, rx) = bounded::<WkbEncodeResult>(1);
         rayon::spawn(move || {
-            let _ = tx.send(wkb_encode_chunk(&augmented_schema, &chunk));
+            // A panic here must not reach rayon-core (#426): catch it and send
+            // it as this chunk's error, the same way an encode failure travels.
+            let result = catch_encode_panic(WKB_TASK, move || {
+                #[cfg(test)]
+                faults.trip_wkb();
+                wkb_encode_chunk(&augmented_schema, &chunk)
+            })
+            .unwrap_or_else(Err);
+            let _ = tx.send(result);
         });
         wkb_inflight.push_back(rx);
         Ok(())
@@ -698,9 +749,12 @@ impl<W: Write + Send> OverviewWriter<W> {
         rx: Receiver<WkbEncodeResult>,
         asm: &mut RgAssembly,
     ) -> Result<(), WriterError> {
+        // A disconnect means the task's sender was dropped without sending —
+        // it never ran (pool shutdown). A panic inside the task arrives as an
+        // ordinary `Err` on the channel instead (#426).
         let (encoded, geo_meta) = rx
             .recv()
-            .map_err(|_| WriterError::GeoParquet("parallel WKB encode task panicked".to_string()))?
+            .map_err(|_| WriterError::GeoParquet(format!("{WKB_TASK} did not report a result")))?
             .map_err(WriterError::GeoParquet)?;
         let encoded = align_to_target_schema(encoded, &self.target_schema)?;
         fold_geo_metadata(&mut self.geo_meta_acc, geo_meta).map_err(WriterError::GeoParquet)?;
@@ -730,9 +784,19 @@ impl<W: Write + Send> OverviewWriter<W> {
         let rg_index = self.row_groups_written + asm.inflight.len();
         let writers = self.rg_factory.create_column_writers(rg_index)?;
         let target_schema = self.target_schema.clone();
+        #[cfg(test)]
+        let faults = self.encode_faults;
         let (tx, rx) = bounded::<EncodeResult>(1);
         rayon::spawn(move || {
-            let _ = tx.send(encode_row_group(writers, batches, &target_schema));
+            // A panic here must not reach rayon-core (#426): catch it and send
+            // it as this row group's error, like any other encode failure.
+            let result = catch_encode_panic(ROW_GROUP_TASK, move || {
+                #[cfg(test)]
+                faults.trip_row_group();
+                encode_row_group(writers, batches, &target_schema)
+            })
+            .unwrap_or_else(|msg| Err(ParquetError::General(msg)));
+            let _ = tx.send(result);
         });
         asm.inflight.push_back(rx);
         Ok(())
@@ -741,10 +805,12 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// Wait for one in-flight row group's encode to finish and append its
     /// column chunks to the file as the next row group (serial, in order).
     fn drain_encoded(&mut self, rx: Receiver<EncodeResult>) -> Result<(), WriterError> {
+        // As in `drain_wkb_encoded`: a disconnect means the task never ran; a
+        // panic inside it arrives as an `Err` on the channel (#426).
         let chunks = rx.recv().map_err(|_| {
-            WriterError::Parquet(ParquetError::General(
-                "parallel row-group encode task panicked".to_string(),
-            ))
+            WriterError::Parquet(ParquetError::General(format!(
+                "{ROW_GROUP_TASK} did not report a result"
+            )))
         })??;
         let mut rg_writer = self.writer.next_row_group()?;
         for chunk in chunks {
@@ -857,6 +923,48 @@ impl<W: Write + Send> OverviewWriter<W> {
 
 /// Encode one row group's Arrow columns into Parquet [`ArrowColumnChunk`]s
 /// (dictionary/RLE/delta + ZSTD compression) — the CPU-heavy step run on the
+/// Label for the detached row-group encode task, used both in its
+/// panic-to-error string and in the channel-disconnect fallback.
+const ROW_GROUP_TASK: &str = "parallel row-group encode task";
+
+/// Label for the detached WKB encode task (#304).
+const WKB_TASK: &str = "parallel WKB encode task";
+
+/// Run one detached encode task's body, turning a panic into an error string
+/// instead of letting it escape into rayon-core (#426).
+///
+/// `rayon::spawn` jobs are *detached*: rayon-core runs them under
+/// `Registry::catch_unwind`, which — with no `panic_handler` on the pool, and
+/// the global pool has none — drops an `AbortIfPanic` guard and calls
+/// `process::abort()`. A panicking encode task would therefore SIGABRT the
+/// whole process: no unwind, no destructors (temp spools and part-files left
+/// behind), and no error for the caller to report. Installing a global
+/// `panic_handler` would fix it for the pool, but this is a library: the
+/// global Rayon pool belongs to the host application (CLI, Python, or an
+/// embedder), so we keep the panic inside our own task instead.
+///
+/// The caught payload is delivered over the very channel the encode's `Err`
+/// travels on, so it surfaces as an ordinary [`WriterError`] from
+/// [`OverviewWriter::write_level`] and every caller's `Drop` runs.
+///
+/// `AssertUnwindSafe` is sound here: the task body owns everything it touches
+/// (the column writers, batches, and schema handles moved into the spawn) and
+/// shares nothing mutable with the writer thread — its only channel back is
+/// the result `Sender`, which carries this error. Any partially-built state is
+/// dropped with the task; nothing observes it afterwards.
+fn catch_encode_panic<T>(task: &str, body: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(AssertUnwindSafe(body)).map_err(|payload| {
+        let detail = if let Some(msg) = payload.downcast_ref::<&'static str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = payload.downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        format!("{task} panicked: {detail}")
+    })
+}
+
 /// Rayon pool (#296). `batches` are the row group's target-schema slices in row
 /// order; `target_schema` maps each column to its leaf writer(s) via
 /// [`compute_leaves`].
@@ -2358,6 +2466,81 @@ mod tests {
         assert!(
             rg_has_stats(tmp.path(), 0, "geometry"),
             "geometry stats should be kept under full_column_stats"
+        );
+    }
+
+    /// Run one level through the parallel encode path with a fault armed,
+    /// returning the error `write_level` surfaced. A scoped stand-in for the
+    /// temp spool that callers hold across a write is dropped on the way out;
+    /// the returned path must no longer exist, proving the error path *unwound
+    /// and returned* (destructors ran) rather than aborting the process.
+    fn write_level_with_faults(faults: EncodeFaults) -> (WriterError, std::path::PathBuf) {
+        let schema = Arc::new(source_schema());
+        let spool = tempfile::NamedTempFile::new().unwrap();
+        let spool_path = spool.path().to_path_buf();
+
+        let mut opts = duplicating_options();
+        opts.max_row_group_size = 4;
+        // > 1 selects both pipelined stages (#296 row groups, #304 WKB).
+        opts.encode_concurrency = 2;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+        writer.set_encode_faults(faults);
+
+        let ids: Vec<i64> = (0..10).collect();
+        let batches = vec![source_batch(&schema, &ids)];
+        let err = writer
+            .write_level(0, Some(ids.len()), batches.into_iter())
+            .expect_err("a panicking encode task must surface as an error");
+        drop(spool);
+        (err, spool_path)
+    }
+
+    /// #426: a panic inside the detached row-group encode task must be
+    /// reported as a `WriterError` on the writer thread. Before the fix,
+    /// `rayon::spawn`'s `AbortIfPanic` turned it into a SIGABRT of the whole
+    /// process (no unwind, no destructors, no diagnostics) and the
+    /// "task panicked" error string was dead code.
+    #[test]
+    fn row_group_encode_panic_surfaces_as_error() {
+        let (err, spool_path) = write_level_with_faults(EncodeFaults {
+            row_group: true,
+            wkb: false,
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parallel row-group encode task panicked"),
+            "expected the row-group panic error, got: {msg}"
+        );
+        assert!(
+            msg.contains("injected row-group encode panic"),
+            "panic payload should be carried in the error, got: {msg}"
+        );
+        assert!(
+            !spool_path.exists(),
+            "temp spool must be cleaned up on the error path (Drop must run)"
+        );
+    }
+
+    /// #426, WKB stage (#304): same guarantee for the other detached spawn.
+    #[test]
+    fn wkb_encode_panic_surfaces_as_error() {
+        let (err, spool_path) = write_level_with_faults(EncodeFaults {
+            row_group: false,
+            wkb: true,
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parallel WKB encode task panicked"),
+            "expected the WKB panic error, got: {msg}"
+        );
+        assert!(
+            msg.contains("injected WKB encode panic"),
+            "panic payload should be carried in the error, got: {msg}"
+        );
+        assert!(
+            !spool_path.exists(),
+            "temp spool must be cleaned up on the error path (Drop must run)"
         );
     }
 }
