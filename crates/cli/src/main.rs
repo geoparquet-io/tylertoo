@@ -2,6 +2,23 @@
 //!
 //! This is a thin wrapper around the tylertoo-core library.
 
+/// Global allocator for static-musl builds (#480).
+///
+/// musl's `mallocng` deterministically fails *small* allocations once a large
+/// live heap has been fragmented by many threads: a 38.7M-polygon `tiles` run
+/// aborted with `memory allocation of 148448 bytes failed` at the identical
+/// input row across two runs, at 28.6 GB RSS on a node with 240 GB granted —
+/// >200 GB of headroom. mimalloc's segment/page allocator does not degrade
+/// that way, so the musl release binary uses it instead.
+///
+/// Scoped to `target_env = "musl"` on purpose: glibc, macOS and Windows builds
+/// keep the platform allocator (nothing to fix there), and the Python
+/// extension module never routes through this crate — a pyo3 `cdylib` must
+/// leave the host interpreter's allocator arrangements alone.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
