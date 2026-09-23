@@ -1925,3 +1925,143 @@ fn tiny_polygon_accumulator_is_inert_in_partitioning_mode() {
         }
     }
 }
+
+// ============================================================================
+// Class 13: coordinates outside the declared CRS's range (#429)
+//
+// A GeoParquet whose coordinates are Web Mercator METERS under CRS84 metadata
+// used to convert with exit 0 into an empty tile archive. Pass 1 now counts
+// the out-of-range features, warns once with the gpio reprojection hint, and
+// fails outright when EVERY feature is out of range.
+// ============================================================================
+
+/// Polygons whose coordinates are Web Mercator meters (roughly Berlin) — the
+/// ticket's fixture, written under the default CRS84 `geo` metadata.
+fn webmerc_meter_polygons(n: usize) -> Vec<Option<Geometry<f64>>> {
+    (0..n)
+        .map(|i| {
+            let x = 1_489_000.0 + i as f64 * 20_000.0;
+            let y = 6_883_000.0 + i as f64 * 20_000.0;
+            Some(Geometry::Polygon(Polygon::new(
+                LineString::from(vec![
+                    (x, y),
+                    (x + 10_000.0, y),
+                    (x + 10_000.0, y + 10_000.0),
+                    (x, y + 10_000.0),
+                    (x, y),
+                ]),
+                vec![],
+            )))
+        })
+        .collect()
+}
+
+#[test]
+fn all_features_out_of_crs_range_errors_rather_than_producing_nothing() {
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &webmerc_meter_polygons(3), true, None);
+        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
+        let ConvertError::AllFeaturesOutOfRange { count, .. } = &err else {
+            panic!("streaming={streaming}: expected AllFeaturesOutOfRange, got: {err}");
+        };
+        assert_eq!(*count, 3, "streaming={streaming}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("every feature fell outside") && msg.contains("gpio convert reproject"),
+            "streaming={streaming}: message must name the loss and the gpio fix: {msg}"
+        );
+    }
+}
+
+#[test]
+fn partial_out_of_range_features_are_counted_and_conversion_succeeds() {
+    // 1 of 3 features carries meter-scale coordinates: the conversion still
+    // succeeds (the two lon/lat features tile fine) but the report counts the
+    // stray one so the CLI can say so.
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let mut geoms = spread_points(2);
+        geoms.extend(webmerc_meter_polygons(1));
+        write_input(tin.path(), &geoms, true, None);
+
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
+            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
+        assert_eq!(
+            report.out_of_range_features, 1,
+            "streaming={streaming}: exactly the meter-scale feature is out of range"
+        );
+        assert_eq!(report.input_features, 3, "streaming={streaming}");
+    }
+}
+
+#[test]
+fn in_range_input_reports_zero_out_of_range_features() {
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &spread_points(4), true, None);
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
+        assert_eq!(report.out_of_range_features, 0, "streaming={streaming}");
+    }
+}
+
+#[test]
+fn coordinates_exactly_on_the_domain_edge_are_in_range() {
+    use super::convert::bbox_out_of_crs_range;
+    use super::level::Crs;
+
+    // The whole world, the poles, and an antimeridian vertex are legitimate.
+    for bbox in [
+        [-180.0, -90.0, 180.0, 90.0],
+        [180.0, 90.0, 180.0, 90.0],
+        [-180.0, -90.0, -180.0, -90.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ] {
+        assert!(
+            !bbox_out_of_crs_range(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} sits on (not beyond) the domain edge"
+        );
+    }
+    // One ULP beyond any edge is out.
+    for bbox in [
+        [-180.000_001, 0.0, 0.0, 0.0],
+        [0.0, -90.000_001, 0.0, 0.0],
+        [0.0, 0.0, 180.000_001, 0.0],
+        [0.0, 0.0, 0.0, 90.000_001],
+    ] {
+        assert!(
+            bbox_out_of_crs_range(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} reaches beyond the domain"
+        );
+    }
+    // A 3857 input is measured against the Web Mercator world extent.
+    assert!(!bbox_out_of_crs_range(
+        &[-20_037_508.0, -20_037_508.0, 20_037_508.0, 20_037_508.0],
+        Crs::Epsg3857
+    ));
+    assert!(bbox_out_of_crs_range(
+        &[0.0, 0.0, 30_000_000.0, 0.0],
+        Crs::Epsg3857
+    ));
+}
+
+#[test]
+fn out_of_range_warning_names_the_share_the_cause_and_the_gpio_fix() {
+    use super::convert::out_of_range_warning;
+    use super::level::Crs;
+
+    assert!(out_of_range_warning(0, 10, Crs::Epsg4326).is_none());
+    assert!(out_of_range_warning(3, 0, Crs::Epsg4326).is_none());
+
+    let msg = out_of_range_warning(1, 4, Crs::Epsg4326).expect("a warning is warranted");
+    assert!(msg.contains("1 feature(s) (25.0%)"), "{msg}");
+    assert!(msg.contains("CRS84 coordinate range"), "{msg}");
+    assert!(msg.contains("EPSG:3857 meters"), "{msg}");
+    assert!(
+        msg.contains("gpio convert reproject <input> reprojected.parquet -d EPSG:4326"),
+        "the gpio hint must match quality.rs's wording: {msg}"
+    );
+}

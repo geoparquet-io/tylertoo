@@ -1876,11 +1876,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         output.file_name().unwrap_or_default().to_string_lossy()
     );
     println!(
-        "  {} tiles across z{}..z{} in {:.2}s",
-        format_number(export_report.total_tiles as u64),
-        export_report.min_zoom,
-        export_report.max_zoom,
-        convert_report.duration_secs + export_report.duration_secs
+        "  {}",
+        tiles_summary_line(
+            export_report.total_tiles,
+            export_report.min_zoom,
+            export_report.max_zoom,
+            convert_report.duration_secs + export_report.duration_secs,
+            convert_report.out_of_range_features,
+        )
     );
     // #380: the header covers the requested range; say which zooms in it
     // hold nothing rather than let the range above imply they do.
@@ -1924,6 +1927,36 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The tile-count line of the `tiles` summary (#429).
+///
+/// Normally a bare count. When features were lost to coordinates outside the
+/// CRS84 range it says so on the same line — a wrong-CRS input reporting a
+/// bare "✓ Converted … 0 tiles" was the headline lie of issue #429. A 100%
+/// loss never reaches here (the conversion fails outright), so this covers
+/// the partial case and the "some other filter also emptied the archive" one.
+fn tiles_summary_line(
+    total_tiles: usize,
+    min_zoom: u8,
+    max_zoom: u8,
+    secs: f64,
+    out_of_range: usize,
+) -> String {
+    let zooms = format!("z{min_zoom}..z{max_zoom}");
+    let tiles = format_number(total_tiles as u64);
+    if out_of_range == 0 {
+        return format!("{tiles} tiles across {zooms} in {secs:.2}s");
+    }
+    let dropped = format!(
+        "{} feature(s) dropped (out of range)",
+        format_number(out_of_range as u64)
+    );
+    if total_tiles == 0 {
+        format!("{tiles} tiles — {dropped} — {zooms} in {secs:.2}s")
+    } else {
+        format!("{tiles} tiles across {zooms} in {secs:.2}s — {dropped}")
+    }
 }
 
 /// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
@@ -1977,6 +2010,15 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             format_number(lvl.feature_count as u64),
             format_number(lvl.vertex_count as u64),
             HumanBytes(lvl.compressed_bytes.max(0) as u64)
+        );
+    }
+    if report.out_of_range_features > 0 {
+        println!(
+            "  note: {} of {} input features lie outside the CRS84 coordinate range \
+             (\u{b1}180\u{b0}/\u{b1}90\u{b0}) and cannot be tiled \u{2014} reproject with \
+             `gpio convert reproject <input> reprojected.parquet -d EPSG:4326`",
+            format_number(report.out_of_range_features as u64),
+            format_number(report.input_features as u64)
         );
     }
     if !report.skipped_empty_levels.is_empty() {
@@ -3424,6 +3466,29 @@ mod tests {
             missing.is_empty(),
             "flags on overview/export-pmtiles not surfaced on `tiles` — add each \
              to TilesArgs, or to the allow-list with a documented reason: {missing:?}"
+        );
+    }
+    // --- #429: out-of-range honesty in the tiles summary ---------------------
+
+    /// A bare "N tiles" line is fine only when nothing was lost. With
+    /// out-of-range features the line must name them, and a zero-tile archive
+    /// must never read as an unqualified success.
+    #[test]
+    fn tiles_summary_line_names_out_of_range_losses() {
+        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0);
+        assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
+
+        let empty = tiles_summary_line(0, 0, 14, 0.05, 3);
+        assert!(
+            empty.starts_with("0 tiles \u{2014} 3 feature(s) dropped (out of range)"),
+            "a wrong-CRS run must not read as a clean success: {empty}"
+        );
+
+        let partial = tiles_summary_line(10, 0, 14, 0.2, 1);
+        assert!(
+            partial.contains("10 tiles across z0..z14")
+                && partial.contains("1 feature(s) dropped (out of range)"),
+            "a partial loss still reports its tiles AND its losses: {partial}"
         );
     }
 }

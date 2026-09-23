@@ -1183,6 +1183,10 @@ pub(crate) fn convert_streaming_strategy(
         .count();
     super::convert::warn_antimeridian_suspects(antimeridian_suspect_features);
 
+    // #429: count features outside the CRS's coordinate range, warn once, and
+    // refuse to "succeed" into an empty archive when every feature is out.
+    let out_of_range_features = super::convert::tally_out_of_range(&features, crs)?;
+
     // Stage markers (#242): everything between pass 1 and the writer used to
     // run in total info-level silence — on planet-scale inputs that was tens
     // of minutes with no output.
@@ -1359,6 +1363,7 @@ pub(crate) fn convert_streaming_strategy(
         row_groups_total,
         row_groups_read,
         antimeridian_suspect_features,
+        out_of_range_features,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(source),
     })

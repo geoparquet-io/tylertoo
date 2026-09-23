@@ -135,7 +135,7 @@ pub fn crs_info_from_kv_metadata(
     // Look for the "geo" key in key-value metadata
     let Some(kv_metadata) = kv_metadata else {
         // No metadata at all - assume WGS84 with warning
-        tracing::warn!("GeoParquet file has no key-value metadata; assuming WGS84");
+        log::warn!("GeoParquet file has no key-value metadata; assuming WGS84");
         return Ok(CrsInfo::wgs84());
     };
 
@@ -146,7 +146,7 @@ pub fn crs_info_from_kv_metadata(
 
     let Some(geo_json_str) = geo_value else {
         // No geo metadata - assume WGS84 with warning
-        tracing::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84");
+        log::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84");
         return Ok(CrsInfo::wgs84());
     };
 
@@ -162,13 +162,13 @@ pub fn crs_info_from_kv_metadata(
 
     // Get the columns object
     let Some(columns) = geo_json.get("columns").and_then(Value::as_object) else {
-        tracing::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84");
+        log::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84");
         return Ok(CrsInfo::wgs84());
     };
 
     // Get the primary column's metadata
     let Some(column_meta) = columns.get(primary_column) else {
-        tracing::warn!(
+        log::warn!(
             "GeoParquet 'geo' metadata missing column '{}'; assuming WGS84",
             primary_column
         );
@@ -201,13 +201,13 @@ pub fn crs_info_from_kv_metadata(
                 // the missing-geo-metadata precedent and assume.
                 .unwrap_or(true);
             if bbox_plausible_degrees {
-                tracing::warn!(
+                log::warn!(
                     "GeoParquet 'crs' is explicitly null (no CRS assigned); \
                      assuming OGC:CRS84 (lon/lat WGS84)"
                 );
                 Ok(CrsInfo::wgs84())
             } else {
-                tracing::warn!(
+                log::warn!(
                     "GeoParquet 'crs' is explicitly null and the declared bbox \
                      is outside lon/lat degree ranges; treating CRS as unknown"
                 );
@@ -243,7 +243,7 @@ pub fn crs_info_from_kv_metadata(
             })
         }
         Some(other) => {
-            tracing::warn!("Unexpected CRS format in GeoParquet metadata: {:?}", other);
+            log::warn!("Unexpected CRS format in GeoParquet metadata: {:?}", other);
             Ok(CrsInfo::unknown())
         }
     }

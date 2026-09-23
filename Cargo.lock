@@ -4282,7 +4282,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tracing",
  "url",
  "xxhash-rust",
  "zstd 0.14.0",

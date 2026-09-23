@@ -760,6 +760,16 @@ pub struct ConvertReport {
     /// about (one aggregate `log::warn!`), never mutated; see
     /// `context/ANTIMERIDIAN.md` (issue #188).
     pub antimeridian_suspect_features: usize,
+    /// Features whose bounding box falls outside the input CRS's coordinate
+    /// range — outside Â±180Â°/Â±90Â° for EPSG:4326, outside the Web Mercator
+    /// world extent for EPSG:3857. The near-certain cause is projected
+    /// coordinates (e.g. EPSG:3857 meters) stored under CRS84 metadata; such
+    /// features cannot be tiled and vanish at export. Warned about (one
+    /// aggregate `log::warn!`); when EVERY feature is out of range the
+    /// conversion fails with
+    /// [`ConvertError::AllFeaturesOutOfRange`] rather than writing an empty
+    /// archive (#429).
+    pub out_of_range_features: usize,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
     /// Remote-input fetch counters (#210): range requests issued and bytes
@@ -798,6 +808,25 @@ pub enum ConvertError {
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
+    },
+    /// Every input feature lies outside the input CRS's coordinate range
+    /// (#429). The overwhelmingly likely cause is projected coordinates
+    /// stored under geographic metadata, which used to convert "successfully"
+    /// into an empty tile archive.
+    #[error(
+        "every feature fell outside the {crs} coordinate range: all {count} feature(s) \
+         have coordinates outside {range}. The coordinates look like a projected CRS \
+         (e.g. EPSG:3857 meters) while the file's metadata says {crs}. \
+         Reproject with geoparquet-io:\n  \
+         gpio convert reproject <input> reprojected.parquet -d EPSG:4326"
+    )]
+    AllFeaturesOutOfRange {
+        /// The CRS the input's metadata declares.
+        crs: &'static str,
+        /// The coordinate range that CRS allows.
+        range: &'static str,
+        /// Number of features, all of them out of range.
+        count: usize,
     },
     /// The input has no geometry column.
     #[error("input has no geometry column")]
@@ -2056,6 +2085,10 @@ pub(crate) fn convert_to_overviews_source_strategy(
         .count();
     warn_antimeridian_suspects(antimeridian_suspect_features);
 
+    // #429: count features outside the CRS's coordinate range, warn once, and
+    // refuse to "succeed" into an empty archive when every feature is out.
+    let out_of_range_features = tally_out_of_range(&features, crs)?;
+
     // #306: cap the transient winner-grid memory at the profile-derived RAM
     // budget (`speed` stays unbounded). Pure scheduling — output-identical.
     // Zoom-band representation selector (#317 / #279): per-level
@@ -2205,6 +2238,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         row_groups_total,
         row_groups_read,
         antimeridian_suspect_features,
+        out_of_range_features,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
     })
@@ -2562,6 +2596,87 @@ pub(super) fn warn_antimeridian_suspects(count: usize) {
              \"Antimeridian-Crossing Geometry\")."
         );
     }
+}
+
+/// The coordinate range `crs` admits, as `(max_abs_x, max_abs_y, label,
+/// range_text)`. Feeds the out-of-range gate (#429) and its message.
+pub(super) fn crs_coordinate_range(crs: Crs) -> (f64, f64, &'static str, &'static str) {
+    match crs {
+        Crs::Epsg4326 => (
+            180.0,
+            90.0,
+            "OGC:CRS84 / EPSG:4326",
+            "±180° longitude / ±90° latitude",
+        ),
+        Crs::Epsg3857 => (
+            WEBMERC_HALF_M,
+            WEBMERC_HALF_M,
+            "EPSG:3857",
+            "±20037508.34 m",
+        ),
+    }
+}
+
+/// Whether a feature bbox lies (even partly) outside the coordinate range its
+/// CRS admits (#429): beyond ±180°/±90° for EPSG:4326, beyond the Web Mercator
+/// world extent for EPSG:3857.
+///
+/// The bounds are INCLUSIVE: a feature touching exactly ±180° or ±90° is
+/// legitimate (a whole-world bbox, a pole, an antimeridian vertex) and must
+/// not be counted. Only a coordinate strictly beyond the edge — the signature
+/// of projected meters stored under geographic metadata — trips it.
+pub(super) fn bbox_out_of_crs_range(bbox: &[f64; 4], crs: Crs) -> bool {
+    let (max_x, max_y, _, _) = crs_coordinate_range(crs);
+    bbox[0] < -max_x || bbox[2] > max_x || bbox[1] < -max_y || bbox[3] > max_y
+}
+
+/// #429 decision + message (pure, so it is unit-testable without capturing
+/// logs). The one aggregate warning for `count` of `total` out-of-range
+/// features, or `None` to stay quiet.
+pub(super) fn out_of_range_warning(count: usize, total: usize, crs: Crs) -> Option<String> {
+    if count == 0 || total == 0 {
+        return None;
+    }
+    let (_, _, crs_label, range) = crs_coordinate_range(crs);
+    let pct = count as f64 / total as f64 * 100.0;
+    Some(format!(
+        "{count} feature(s) ({pct:.1}%) fell outside the CRS84 coordinate range \
+         ({range}) — coordinates look like a projected CRS (e.g. EPSG:3857 meters); \
+         the file's metadata says {crs_label}. They cannot be tiled and vanish at \
+         export. Reproject with geoparquet-io:\n  \
+         gpio convert reproject <input> reprojected.parquet -d EPSG:4326"
+    ))
+}
+
+/// Count the out-of-range features of a pass-1 scan, warn once, and fail when
+/// EVERY feature is out of range (#429).
+///
+/// Called from both engines at the end of pass 1, where the `AssignFeature`
+/// bboxes exist and nothing has been written yet.
+///
+/// DIVERGENCE FROM THE TICKET'S WORDING: the 100%-loss check fires here rather
+/// than "at the end of convert". Pass 1 already knows the answer, and failing
+/// here costs no second pass and leaves no half-written overview behind.
+pub(super) fn tally_out_of_range(
+    features: &[AssignFeature],
+    crs: Crs,
+) -> Result<usize, ConvertError> {
+    let count = features
+        .iter()
+        .filter(|f| bbox_out_of_crs_range(&f.bbox, crs))
+        .count();
+    if let Some(msg) = out_of_range_warning(count, features.len(), crs) {
+        log::warn!("{msg}");
+    }
+    if count > 0 && count == features.len() {
+        let (_, _, crs_label, range) = crs_coordinate_range(crs);
+        return Err(ConvertError::AllFeaturesOutOfRange {
+            crs: crs_label,
+            range,
+            count,
+        });
+    }
+    Ok(count)
 }
 
 /// Object-size threshold above which a *full-file* remote convert emits the
