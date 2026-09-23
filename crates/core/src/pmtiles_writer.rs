@@ -11,6 +11,7 @@
 use crate::compression::{self, Compression};
 use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
 use crate::tile::TileBounds;
+use crate::world_coord::MAX_LATITUDE;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -961,13 +962,13 @@ impl PmtilesWriter {
 
     /// Set geographic bounds for the tileset
     ///
-    /// Latitude values are clamped to Web Mercator bounds (±85.05°).
+    /// Latitude values are clamped to the exact Web Mercator bound (`world_coord::MAX_LATITUDE`, ±85.05112878°).
     pub fn set_bounds(&mut self, bounds: &TileBounds) {
         self.bounds = TileBounds::new(
             bounds.lng_min,
-            bounds.lat_min.clamp(-85.05, 85.05),
+            bounds.lat_min.clamp(-MAX_LATITUDE, MAX_LATITUDE),
             bounds.lng_max,
-            bounds.lat_max.clamp(-85.05, 85.05),
+            bounds.lat_max.clamp(-MAX_LATITUDE, MAX_LATITUDE),
         );
     }
 
@@ -1376,13 +1377,13 @@ impl StreamingPmtilesWriter {
 
     /// Set geographic bounds.
     ///
-    /// Latitude values are clamped to Web Mercator bounds (±85.05°).
+    /// Latitude values are clamped to the exact Web Mercator bound (`world_coord::MAX_LATITUDE`, ±85.05112878°).
     pub fn set_bounds(&mut self, bounds: &TileBounds) {
         self.bounds = TileBounds::new(
             bounds.lng_min,
-            bounds.lat_min.clamp(-85.05, 85.05),
+            bounds.lat_min.clamp(-MAX_LATITUDE, MAX_LATITUDE),
             bounds.lng_max,
-            bounds.lat_max.clamp(-85.05, 85.05),
+            bounds.lat_max.clamp(-MAX_LATITUDE, MAX_LATITUDE),
         );
     }
 

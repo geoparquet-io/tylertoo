@@ -5,6 +5,8 @@
 
 use std::f64::consts::PI;
 
+use crate::world_coord::MAX_LATITUDE;
+
 /// Tile coordinates: x, y, and zoom level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileCoord {
@@ -152,10 +154,14 @@ pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     let x = ((lng + 180.0) / 360.0 * n).floor() as u32;
     let x = x.min(max_coord);
 
-    // Clamp latitude to Web Mercator bounds to prevent tile coordinate overflow.
-    // Web Mercator is defined for ~±85.0511° but we use ±85.05° for safety margin.
+    // Clamp latitude to the exact Web Mercator bound to prevent tile coordinate
+    // overflow for out-of-range latitudes (the projection is undefined beyond
+    // ±MAX_LATITUDE). This is not a safety margin: it is the precise limit
+    // where Web Mercator's y coordinate reaches infinity, so clamping to a
+    // shorter/rounder value would silently move points that legitimately sit
+    // at the edge of a full EPSG:3857 extent into the wrong tile row (#416).
     // Without this clamp, lat=-90° produces y values 6-20x larger than valid bounds.
-    let lat = lat.clamp(-85.05, 85.05);
+    let lat = lat.clamp(-MAX_LATITUDE, MAX_LATITUDE);
 
     // Convert latitude to tile y (Web Mercator)
     // Clamp to valid range for the same edge case reasons
@@ -620,6 +626,38 @@ mod tests {
                 "lat=-85.05 at zoom {} should have y <= {}",
                 zoom,
                 max_valid
+            );
+        }
+    }
+
+    #[test]
+    fn test_lng_lat_to_tile_exact_mercator_bound_maps_to_edge_rows() {
+        // The exact Web Mercator latitude bound (85.0511287798066, matching
+        // world_coord::MAX_LATITUDE) must map to the top row (y=0) and its
+        // mirror to the bottom row (y = 2^z - 1) at every zoom level.
+        //
+        // Regression for #416: clamping to the shaved literal ±85.05 instead
+        // of the exact bound moved these points several rows away from the
+        // tile edge at z>=15 (e.g. row 38 instead of 0 at z20), silently
+        // dropping the top/bottom Web Mercator band for any dataset whose
+        // extent reaches the true Web Mercator limit.
+        const EXACT_MAX_LAT: f64 = 85.0511287798066;
+
+        for zoom in [0u8, 5, 10, 15, 18, 20, 22] {
+            let max_valid = 2_u32.pow(zoom as u32) - 1;
+
+            let north = lng_lat_to_tile(0.0, EXACT_MAX_LAT, zoom);
+            assert_eq!(
+                north.y, 0,
+                "lat={EXACT_MAX_LAT} at zoom {zoom} should map to y=0, got {}",
+                north.y
+            );
+
+            let south = lng_lat_to_tile(0.0, -EXACT_MAX_LAT, zoom);
+            assert_eq!(
+                south.y, max_valid,
+                "lat=-{EXACT_MAX_LAT} at zoom {zoom} should map to y={max_valid}, got {}",
+                south.y
             );
         }
     }
