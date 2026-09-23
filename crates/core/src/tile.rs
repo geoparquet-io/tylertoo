@@ -5,6 +5,51 @@
 
 use std::f64::consts::PI;
 
+/// The maximum Web Mercator zoom tylertoo will **write**.
+///
+/// Three limits stack up, and 30 is the largest zoom that clears all of them
+/// with room to spare (#371):
+///
+/// * **Tile coordinates are `u32`.** A tile index at zoom `z` runs to
+///   `2^z - 1`, so `z <= 31` is the hard ceiling and `z == 32` wraps to 0.
+/// * **The PMTiles Hilbert tile id is `u64`.** Its base term is
+///   `sum(4^i for i in 1..z)`, which needs `4^z` headroom — `4u64.pow` blows
+///   past `u64` at z32, and every `1u32 << z` in the Hilbert transform masks
+///   to `n = 1` in release rather than panicking, silently corrupting *every*
+///   tile id in the archive.
+/// * **The grid is already absurd.** z30 is ~1.15e18 tiles and a ground
+///   sample distance of ~3.6e-5 m; no real dataset resolves past it.
+///
+/// So: take what the math supports (z31), keep one level of safety margin,
+/// and land on 30 — the value [`crate::pyramid::Band`] has always enforced,
+/// now shared by the conversion and export validators so every write path
+/// rejects an out-of-range zoom *before* doing any work.
+///
+/// This is deliberately the **write/convert-side** cap. Reading a foreign
+/// PMTiles archive is a separate question (an archive may legitimately
+/// address up to z31); see [`crate::pmtiles_writer::tile_id_to_zxy`].
+pub const MAX_ZOOM: u8 = 30;
+
+/// Tiles per axis at `zoom` (`2^zoom`), in `u64` and saturating at `2^32`.
+///
+/// `2u32.pow(zoom)` / `1u32 << zoom` panic in debug and silently mask in
+/// release once `zoom >= 32` (#371). Every caller is validated against
+/// [`MAX_ZOOM`] long before it gets here, so the saturation is unreachable in
+/// practice — it exists so the paths that bypass options validation (PMTiles
+/// reading, hand-built [`TileCoord`]s) degrade to a clamped value instead of
+/// a wrapped one.
+#[inline]
+pub fn tiles_per_axis(zoom: u8) -> u64 {
+    1u64 << zoom.min(32)
+}
+
+/// Highest valid tile index on either axis at `zoom` (`2^zoom - 1`),
+/// saturating at [`u32::MAX`]. See [`tiles_per_axis`] (#371).
+#[inline]
+pub fn max_tile_index(zoom: u8) -> u32 {
+    (tiles_per_axis(zoom) - 1).min(u64::from(u32::MAX)) as u32
+}
+
 /// Tile coordinates: x, y, and zoom level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileCoord {
@@ -57,9 +102,9 @@ impl TileCoord {
     ///
     /// Each tile at zoom z has exactly four children at zoom z+1,
     /// forming a 2x2 grid that exactly covers the parent tile.
-    /// Returns `None` at zoom 30 (maximum supported zoom).
+    /// Returns `None` at [`MAX_ZOOM`] (the maximum supported zoom).
     pub fn children(&self) -> Option<[TileCoord; 4]> {
-        if self.z >= 30 {
+        if self.z >= MAX_ZOOM {
             return None;
         }
         let child_z = self.z + 1;
@@ -144,8 +189,10 @@ impl TileBounds {
 pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     let n = 2_f64.powi(zoom as i32);
 
-    // Maximum valid tile coordinate at this zoom level
-    let max_coord = 2_u32.pow(zoom as u32).saturating_sub(1);
+    // Maximum valid tile coordinate at this zoom level.
+    // #371: via `max_tile_index`, which is u64 internally — `2u32.pow(zoom)`
+    // overflowed at z32 (debug panic, release mask).
+    let max_coord = max_tile_index(zoom);
 
     // Convert longitude to tile x
     // Clamp to valid range to handle lng=180° edge case (which would produce x=2^z)
@@ -231,7 +278,8 @@ pub(crate) fn tile_ranges_for_bbox(bbox: &TileBounds, zoom: u8) -> BboxTileRange
     let min_y_tile = lng_lat_to_tile(bbox.lng_min, bbox.lat_max, zoom).y; // lat_max -> min_y
     let max_y_tile = lng_lat_to_tile(bbox.lng_min, bbox.lat_min, zoom).y; // lat_min -> max_y
 
-    let max_tile_x = 2_u32.pow(zoom as u32) - 1;
+    // #371: u64 tile-grid math, saturating instead of overflowing at z32.
+    let max_tile_x = max_tile_index(zoom);
 
     // Calculate x-tile ranges
     let (x, x2): ((u32, u32), Option<(u32, u32)>) = if crosses_antimeridian {
@@ -350,6 +398,55 @@ mod tests {
         bbox.expand(&TileBounds::new(-10.0, -10.0, 10.0, 10.0));
         assert!(bbox.is_valid());
         assert_eq!(bbox.lng_min, -10.0);
+    }
+
+    /// #371 boundary: the grid helpers are exact at the write ceiling and
+    /// saturate instead of wrapping past the 32-bit coordinate limit.
+    /// `2u32.pow(zoom)` panicked in debug and wrapped to 0 in release at z32.
+    #[test]
+    fn tile_grid_helpers_are_exact_at_max_zoom_and_saturate_beyond() {
+        assert_eq!(MAX_ZOOM, 30);
+        assert_eq!(tiles_per_axis(0), 1);
+        assert_eq!(tiles_per_axis(MAX_ZOOM), 1 << 30);
+        assert_eq!(tiles_per_axis(MAX_ZOOM), 1_073_741_824);
+        assert_eq!(max_tile_index(MAX_ZOOM), 1_073_741_823);
+        // z31 is still addressable in u32; z32 would have wrapped.
+        assert_eq!(max_tile_index(31), u32::MAX / 2);
+        assert_eq!(max_tile_index(32), u32::MAX);
+        for z in [33u8, 64, 255] {
+            assert_eq!(max_tile_index(z), u32::MAX, "z{z} must saturate, not wrap");
+        }
+    }
+
+    /// #371: tile lookup at the ceiling stays inside the grid. Before the fix
+    /// this whole family of call sites shared one `2u32.pow(zoom)`.
+    #[test]
+    fn lng_lat_to_tile_stays_in_range_at_max_zoom() {
+        let max = max_tile_index(MAX_ZOOM);
+        for (lng, lat) in [
+            (-180.0, 85.05),
+            (180.0, -85.05),
+            (0.0, 0.0),
+            (179.999, 84.9),
+        ] {
+            let t = lng_lat_to_tile(lng, lat, MAX_ZOOM);
+            assert_eq!(t.z, MAX_ZOOM);
+            assert!(t.x <= max, "x {} out of range at z{MAX_ZOOM}", t.x);
+            assert!(t.y <= max, "y {} out of range at z{MAX_ZOOM}", t.y);
+        }
+        // The whole world at z30 spans the whole grid.
+        let world = TileBounds::new(-180.0, -85.05, 180.0, 85.05);
+        let ranges = tile_ranges_for_bbox(&world, MAX_ZOOM);
+        assert_eq!(ranges.x, (0, max));
+        assert!(ranges.x2.is_none());
+    }
+
+    /// `children()` is the pyramid walk's stopping rule; it must stop at the
+    /// shared ceiling rather than a hard-coded literal (#371).
+    #[test]
+    fn children_stop_at_max_zoom() {
+        assert!(TileCoord::new(0, 0, MAX_ZOOM - 1).children().is_some());
+        assert!(TileCoord::new(0, 0, MAX_ZOOM).children().is_none());
     }
 
     #[test]

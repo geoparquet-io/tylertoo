@@ -1421,7 +1421,9 @@ mod tests {
     fn expected_mercator_tile_y(lat: f64, zoom: u8, tile_y: u32, extent: u32) -> i32 {
         let phi = lat.to_radians();
         let merc = (1.0 - (phi.tan() + 1.0 / phi.cos()).ln() / std::f64::consts::PI) / 2.0;
-        ((merc * (1u32 << zoom) as f64 - tile_y as f64) * extent as f64).round() as i32
+        // #371: u64 tile-grid math — `1u32 << zoom` masks in release at z32.
+        ((merc * crate::tile::tiles_per_axis(zoom) as f64 - tile_y as f64) * extent as f64).round()
+            as i32
     }
 
     #[test]
@@ -1473,7 +1475,8 @@ mod tests {
         // visually correct before the mercator fix and must not shift.
         let (lng, lat) = (-74.0060_f64, 40.7128_f64);
         let zoom = 12u8;
-        let n = 1u32 << zoom;
+        // #371: u64 tile-grid math — `1u32 << zoom` masks in release at z32.
+        let n = crate::tile::tiles_per_axis(zoom);
         let tx = (((lng + 180.0) / 360.0) * n as f64).floor() as u32;
         let phi = lat.to_radians();
         let merc = (1.0 - (phi.tan() + 1.0 / phi.cos()).ln() / std::f64::consts::PI) / 2.0;

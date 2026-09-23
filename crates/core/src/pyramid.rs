@@ -46,11 +46,9 @@ pub struct Band {
 }
 
 impl Band {
-    /// Web Mercator zoom ceiling. Beyond this the tile grid no longer fits the
-    /// arithmetic downstream (`1u32 << zoom`), which overflows at z32 — a debug
-    /// panic, and silently wrong tile buffers in release. Rejecting here costs
-    /// an error message; accepting costs a full band conversion first.
-    const MAX_ZOOM: u8 = 30;
+    /// Web Mercator zoom ceiling: the shared [`crate::tile::MAX_ZOOM`] (#371),
+    /// which every write path now enforces at options validation.
+    const MAX_ZOOM: u8 = crate::tile::MAX_ZOOM;
 
     /// Parse `LO-HI:PATH[:LAYER]`. The layer is optional and defaults to the
     /// input's file stem.
