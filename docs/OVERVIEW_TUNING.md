@@ -129,11 +129,25 @@ range; an archive is merged as-is. That keeps the older two-step workflow
 (tile each band yourself, then merge) working unchanged, and lets you mix:
 reuse last week's coarse archive and re-tile only the fine band.
 
+**A band source may be remote.** `--band 9-13:https://data.source.coop/…/features.parquet`
+streams with byte-range requests exactly as `tiles` and `overview` do, so a
+band no longer has to be staged locally first. A band *archive* must be local:
+the merge reads its directories and tile bytes by offset, so a remote
+`.pmtiles` band is refused with a message saying to stage it.
+
 `LAYER` defaults to the input's file stem — or, for a glob or a directory,
 the directory name, since a layer called `*` is not useful to a client. A path
 containing a colon (`s3://…`, `https://…`, `C:\…`) is fine; the layer is only
-split off when the last colon-separated segment looks like a layer id rather
-than part of a path. For a pre-tiled archive the layer is a *label*: the layer
+split off the **last** colon when what follows it has no `/`, `\` or `:`, so a
+URL's scheme, a port and a `2024:06/` directory all stay part of the input.
+The one shape that rule cannot express is an input *ending* in a bare colon
+segment — a Hive directory such as `admin:country_code=BR`. For those, spell
+the band with `=` instead: **`--band LO-HI=INPUT[=LAYER]`**, where the range is
+split at the first `=` and the layer at the last, again only when the segment
+after it has no `/`, `\` or `:`. That keeps
+`--band 0-13=admin:country_code=BR/part.parquet` whole; an input that itself
+ends in `=VALUE` is indistinguishable from a layer, so give it an explicit
+`=LAYER`. For a pre-tiled archive the layer is a *label*: the layer
 name inside its tiles is whatever the archive was exported with, and when bands
 share zooms the two must agree, or the combined tile would hold two layers of
 one name (which a client resolves by dropping one). A **gap** between bands is

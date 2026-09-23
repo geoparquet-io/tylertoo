@@ -180,7 +180,9 @@ pub struct PyramidArgs {
     /// INPUT is either a GeoParquet source — tiled here, restricted to this
     /// band's zoom range — or a PMTiles archive already tiled for that range,
     /// which is merged as-is. Which one it is is detected from the file, not
-    /// the extension.
+    /// the extension. A source may be remote (`https://`, `s3://`, `gs://`),
+    /// read with byte-range requests like every other subcommand's input; a
+    /// band ARCHIVE must be local, since the merge reads it by offset.
     ///
     /// LAYER defaults to the file stem, and several bands may share one layer
     /// name (the usual case: a coarse and a fine aggregate that are the same
@@ -195,8 +197,14 @@ pub struct PyramidArgs {
     /// name inside the archive, or the merge is refused rather than write
     /// two layers of one name into a tile.
     ///
-    /// INPUT may not contain a `:`, which the spec cannot tell apart from the
-    /// LAYER separator; rename the file or point at it through a symlink.
+    /// Colons in INPUT: the LAYER is only split off the LAST `:` when what
+    /// follows it has no `/`, `\` or `:`, so a URL, a Windows drive and a
+    /// `2024:06/` directory stay whole. For the inputs that rule cannot
+    /// express — one ENDING in a bare colon segment, e.g. a Hive directory
+    /// `admin:country_code=BR` — spell the band `LO-HI=INPUT[=LAYER]`
+    /// instead: the range is split at the first `=` and the LAYER at the
+    /// last, again only when the segment after it has no `/`, `\` or `:`. An
+    /// INPUT that itself ends in `=VALUE` needs an explicit `=LAYER`.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
 
