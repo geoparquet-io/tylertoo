@@ -528,7 +528,8 @@ fn memory_safe_level_wave(
 /// [`PARTITION_SLOT_TRANSIENT_BYTES`] each) fit in
 /// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM (probe shared with the
 /// convert-side `--profile auto`: `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
-/// then `/proc/meminfo` `MemAvailable`), floored at [`PARTITION_WAVE_MIN`].
+/// then the container-aware `min(cgroup limit, /proc/meminfo MemAvailable)` —
+/// see [`available_memory_bytes`]), floored at [`PARTITION_WAVE_MIN`].
 /// When RAM cannot be probed the cap falls back to
 /// [`PARTITION_WAVE_FALLBACK_MAX`], reproducing #293's fixed clamp. Any
 /// explicit positive value is honoured verbatim (uncapped — the caller opted

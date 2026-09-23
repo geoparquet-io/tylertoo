@@ -353,9 +353,10 @@ struct ExportPmtilesArgs {
     /// Partitions processed per band read during export (the export
     /// concurrency knob). `auto` (the default) preflights a memory budget:
     /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
-    /// only when RAM cannot be probed; override the RAM figure with
-    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// transients fit in a fraction of available RAM (container-aware: cgroup
+    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
+    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
+    /// Pass an explicit integer to override.
     /// Wider waves keep more cores busy at proportionally more peak memory
     /// (one wave of partitions resident). The chosen width and the preflight
     /// inputs are logged at export start. Output is byte-identical for every
@@ -976,7 +977,8 @@ struct ConvertTuningArgs {
     /// with buffered output). `bounded` spills them to temporary Arrow IPC
     /// files (memory-capped; slight temp-I/O cost). `auto` (default) is
     /// workload-based: it estimates buffered output from feature and level
-    /// counts and spills when that exceeds a fraction of available RAM, so large
+    /// counts and spills when that exceeds a fraction of available RAM
+    /// (container-aware: cgroup v2/v1 limits are respected), so large
     /// duplicating runs prefer bounded instead of risking OOM (override the RAM
     /// figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical
     /// across profiles. No effect with --no-streaming.
@@ -1348,9 +1350,10 @@ struct TilesArgs {
     /// Partitions processed per band read during the export phase (the export
     /// concurrency knob). `auto` (the default) preflights a memory budget:
     /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
-    /// only when RAM cannot be probed; override the RAM figure with
-    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// transients fit in a fraction of available RAM (container-aware: cgroup
+    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
+    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
+    /// Pass an explicit integer to override.
     /// Wider waves keep more cores busy at proportionally more peak memory
     /// (one wave of partitions resident). The chosen width and the preflight
     /// inputs are logged at export start. Output is byte-identical for every

@@ -761,8 +761,9 @@ fn overview(
 ///         during export (the export concurrency knob). Defaults to 0, which
 ///         auto-sizes via a memory-budget preflight: the machine's core
 ///         count, capped by how many estimated per-partition transients fit
-///         in a fraction of available RAM (floor 6; fixed cap 16 only when
-///         RAM cannot be probed; override the RAM figure with the
+///         in a fraction of available RAM (container-aware: cgroup v2/v1
+///         limits are respected; floor 6; fixed cap 16 only when RAM cannot
+///         be probed; override the RAM figure with the
 ///         TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive
 ///         integer to override. Wider waves keep more cores busy at
 ///         proportionally more peak memory. Output is byte-identical for
