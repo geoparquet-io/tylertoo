@@ -2329,7 +2329,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // coalescing (Q3) — the same three schemas the streaming path builds.
     let geom_name = geom_field.name().clone();
     let (source_schema, cluster_schema, out_schema) =
-        super::stream::build_level_schemas(&input_schema, geom_idx, &geom_name, options);
+        super::stream::build_level_schemas(&input_schema, geom_idx, &geom_name, crs, options);
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()
@@ -2560,31 +2560,25 @@ pub(crate) fn detect_crs_from_kv(
     use crate::quality::CrsKind;
 
     let info = crate::quality::crs_info_from_kv_metadata(kv)?;
-    if info.is_wgs84 {
-        return Ok(Crs::Epsg4326);
-    }
-    // Not lon/lat: ask the shared classifier what it IS, rather than
+    // Ask the shared classifier what the declaration IS, rather than
     // substring-matching here (#518 — the duplicated matcher in
     // `crate::covering` read EPSG:3857's "WGS 84 / Pseudo-Mercator"
-    // PROJJSON as WGS84).
-    let kind = info
-        .identifier
-        .as_deref()
-        .or(info.name.as_deref())
-        .map(crate::quality::classify_crs_identifier)
-        .unwrap_or(CrsKind::Unknown);
-    match kind {
-        CrsKind::Wgs84 => return Ok(Crs::Epsg4326),
-        CrsKind::WebMercator => return Ok(Crs::Epsg3857),
-        CrsKind::Unknown => {}
+    // PROJJSON as WGS84; #519 — export kept a fourth copy).
+    //
+    // No `.or(info.name)` fallback: `crs_info_from_kv_metadata` sets
+    // `identifier` to the id string *or else* the name for a PROJJSON `crs`,
+    // and leaves `name` unset for every other shape, so `identifier: None`
+    // implies `name: None`. The branch was unreachable.
+    match crate::quality::classify_crs_info(&info) {
+        CrsKind::Wgs84 => Ok(Crs::Epsg4326),
+        CrsKind::WebMercator => Ok(Crs::Epsg3857),
+        CrsKind::Unknown => Err(ConvertError::UnsupportedCrs {
+            crs: info
+                .identifier
+                .or(info.name)
+                .unwrap_or_else(|| "unknown".to_string()),
+        }),
     }
-    Err(ConvertError::UnsupportedCrs {
-        crs: info
-            .identifier
-            .clone()
-            .or_else(|| info.name.clone())
-            .unwrap_or_else(|| "unknown".to_string()),
-    })
 }
 
 /// Half the Web Mercator world extent in meters (`±` = the x/y range of
@@ -2753,7 +2747,18 @@ fn select_input_row_groups_combined(
 /// rename preserves it, so it is available at every call site.
 pub(super) fn find_geometry_column(schema: &Schema) -> Option<usize> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    if let Some(geo_json) = schema.metadata().get("geo") {
+    // Case-INSENSITIVE, matching both footer readers
+    // ([`crate::covering::get_geo_metadata`] and
+    // [`crate::quality::crs_info_from_kv_metadata`], which both lowercase the
+    // key). A file whose key is spelled "GEO" would otherwise leave the
+    // reader on the name heuristic while pruning followed `primary_column` —
+    // the very disagreement #518 closed, left open on this side (#519).
+    if let Some(geo_json) = schema
+        .metadata()
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
+        .map(|(_, v)| v)
+    {
         if let Some(primary) = serde_json::from_str::<serde_json::Value>(geo_json)
             .ok()
             .and_then(|v| v.get("primary_column")?.as_str().map(str::to_string))
@@ -3495,10 +3500,99 @@ fn extract_numeric(col: &dyn Array, finite_only: bool) -> Vec<Option<f64>> {
     }
 }
 
-/// A mixed-`Geometry` GeoArrow field carrying the geoarrow extension metadata.
-pub(super) fn mixed_geometry_field(name: &str) -> Arc<Field> {
+/// The CRS to stamp on the OUTPUT geometry field, as geoarrow extension
+/// metadata.
+///
+/// This is the ONLY thing that tells the overview file what coordinate system
+/// its numbers are in: the writer regenerates the file-level `geo` JSON from
+/// the schema it is handed, so a geometry field built with
+/// `Default::default()` metadata produces an overview with no `crs` key —
+/// which GeoParquet *defines* to mean OGC:CRS84 (#519). For an EPSG:3857
+/// input that is a silent lie: the export reads metres as degrees, every
+/// feature falls outside the lon/lat world, and a *successful, empty* archive
+/// comes out. Carrying the declaration through is what makes the export's
+/// 3857 reprojection reachable at all.
+///
+/// The result is always PROJJSON or nothing, because
+/// `geoparquet`'s `DefaultCrsTransform` **silently drops** any other CRS
+/// representation on write (it does no conversion). So:
+///
+/// 1. an input `crs` that is already PROJJSON is carried verbatim — from the
+///    geometry field's own geoarrow extension metadata (a natively
+///    GeoArrow-typed input) or, far more commonly, from the file-level `geo`
+///    JSON's `columns[<name>].crs` (a WKB GeoParquet input, whose Arrow
+///    geometry field is a plain binary field);
+/// 2. anything else — an `"EPSG:3857"` string, an explicit `null`, an absent
+///    key, a CRS the field never carried — is re-expressed from `crs`, the
+///    CRS this conversion actually ran in. EPSG:3857 gets canonical PROJJSON;
+///    EPSG:4326 gets nothing, because an absent `crs` key already *means*
+///    OGC:CRS84 and inventing a declaration adds no information.
+///
+/// `edges` is deliberately NOT carried: every generalization step (simplify,
+/// clip, coalesce, cluster) is planar, so the geometry this writes has planar
+/// edges whatever the input declared.
+pub(super) fn geometry_field_metadata(
+    schema: &Schema,
+    geom_idx: usize,
+    crs: Crs,
+) -> Arc<geoarrow::datatypes::Metadata> {
+    use geoarrow::datatypes::{Crs as GeoCrs, Metadata};
+
+    let field = schema.field(geom_idx);
+    let declared_projjson = || -> Option<serde_json::Value> {
+        if let Ok(md) = Metadata::try_from(field) {
+            if let Some(v @ serde_json::Value::Object(_)) = md.crs().crs_value() {
+                return Some(v.clone());
+            }
+        }
+        // Case-insensitive, like every other reader of this key (#519).
+        let geo_json = schema
+            .metadata()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
+            .map(|(_, v)| v)?;
+        let v: serde_json::Value = serde_json::from_str(geo_json).ok()?;
+        match v.get("columns")?.get(field.name())?.get("crs")? {
+            o @ serde_json::Value::Object(_) => Some(o.clone()),
+            _ => None,
+        }
+    };
+
+    let projjson = declared_projjson().or_else(|| canonical_projjson(crs));
+    let geo_crs = projjson.map(GeoCrs::from_projjson).unwrap_or_default();
+    Arc::new(Metadata::new(geo_crs, None))
+}
+
+/// Canonical PROJJSON for a [`Crs`], or `None` where a declaration adds
+/// nothing (EPSG:4326: an absent GeoParquet `crs` key already means
+/// OGC:CRS84).
+///
+/// Identification only — authority, code and name — not a full datum /
+/// conversion / axis definition. That is what every consumer needs to know
+/// which CRS this is, and it is what round-trips through
+/// [`crate::quality::classify_crs_projjson`].
+fn canonical_projjson(crs: Crs) -> Option<serde_json::Value> {
+    match crs {
+        Crs::Epsg4326 => None,
+        Crs::Epsg3857 => Some(serde_json::json!({
+            "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "id": { "authority": "EPSG", "code": 3857 }
+        })),
+    }
+}
+
+/// A mixed-`Geometry` GeoArrow field carrying the geoarrow extension metadata
+/// (`metadata`: the input geometry field's own CRS/edges, see
+/// [`geometry_field_metadata`] — never `Default::default()` for a real
+/// conversion).
+pub(super) fn mixed_geometry_field(
+    name: &str,
+    metadata: Arc<geoarrow::datatypes::Metadata>,
+) -> Arc<Field> {
     use geoarrow_array::GeoArrowArray;
-    let typ = GeometryType::new(Default::default());
+    let typ = GeometryType::new(metadata);
     let empty = GeometryBuilder::new(typ).with_prefer_multi(false).finish();
     Arc::new(empty.data_type().to_field(name, true))
 }
@@ -3542,7 +3636,13 @@ pub(super) fn build_level_batch(
     let mut non_geom_iter = non_geom_cols.iter();
     for i in 0..source_schema.fields().len() {
         if i == geom_idx {
-            let typ = GeometryType::new(Default::default());
+            // Same extension metadata as the field it fills (which
+            // `mixed_geometry_field` already stamped), so the array and the
+            // schema can never disagree about the CRS (#519).
+            let typ = GeometryType::new(Arc::new(
+                geoarrow::datatypes::Metadata::try_from(source_schema.field(geom_idx))
+                    .unwrap_or_default(),
+            ));
             let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
             b.extend_from_iter(geoms.iter().map(Some));
             columns.push(b.finish().to_array_ref());
@@ -6187,6 +6287,101 @@ mod tests {
                 .collect(),
         );
         assert_eq!(find_geometry_column(&with_stale), Some(1));
+    }
+
+    /// #519: whatever shape the input declares its CRS in, the OUTPUT
+    /// geometry field must end up with PROJJSON — `geoparquet`'s default CRS
+    /// transform silently drops every other representation on write, and a
+    /// dropped 3857 declaration is the silent-empty-archive bug itself.
+    #[test]
+    fn output_geometry_metadata_is_always_projjson_or_nothing() {
+        fn schema_with_crs(crs: Option<serde_json::Value>) -> Schema {
+            let geo = serde_json::json!({
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": { "geometry": {
+                    "encoding": "WKB",
+                    "crs": crs,
+                }}
+            });
+            Schema::new_with_metadata(
+                vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("geometry", DataType::Binary, true),
+                ],
+                [("geo".to_string(), geo.to_string())].into_iter().collect(),
+            )
+        }
+        let projjson_of = |md: &geoarrow::datatypes::Metadata| -> Option<serde_json::Value> {
+            match md.crs().crs_value() {
+                Some(v @ serde_json::Value::Object(_)) => Some(v.clone()),
+                _ => None,
+            }
+        };
+
+        // A string CRS cannot survive the writer, so it is re-expressed as
+        // canonical PROJJSON for the CRS the conversion ran in.
+        let s = schema_with_crs(Some(serde_json::json!("EPSG:3857")));
+        let md = geometry_field_metadata(&s, 1, Crs::Epsg3857);
+        let v = projjson_of(&md).expect("a 3857 overview must declare its CRS as PROJJSON");
+        assert_eq!(
+            crate::quality::classify_crs_projjson(&v),
+            crate::quality::CrsKind::WebMercator
+        );
+
+        // An input PROJJSON is carried verbatim, not flattened.
+        let rich = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "id": { "authority": "EPSG", "code": 3857 },
+            "scope": "Web mapping and visualisation."
+        });
+        let s = schema_with_crs(Some(rich.clone()));
+        assert_eq!(
+            projjson_of(&geometry_field_metadata(&s, 1, Crs::Epsg3857)),
+            Some(rich)
+        );
+
+        // null / absent, 3857 session ⇒ still declared.
+        for declared in [Some(serde_json::Value::Null), None] {
+            let s = schema_with_crs(declared);
+            assert!(
+                projjson_of(&geometry_field_metadata(&s, 1, Crs::Epsg3857)).is_some(),
+                "a 3857 conversion must never emit an undeclared overview"
+            );
+            // …and a 4326 session declares nothing, because an absent `crs`
+            // key already means OGC:CRS84.
+            assert_eq!(
+                projjson_of(&geometry_field_metadata(&s, 1, Crs::Epsg4326)),
+                None
+            );
+        }
+    }
+
+    /// #519: the "geo" key lookup must be case-INSENSITIVE, like both footer
+    /// readers ([`crate::covering::get_geo_metadata`] and
+    /// [`crate::quality::crs_info_from_kv_metadata`] both lowercase it). A
+    /// file spelling it "GEO" would otherwise leave the reader on the name
+    /// heuristic (`geom_shape`) while pruning followed `primary_column`
+    /// (`centroid`) — exactly the reader/pruner disagreement #518 closed,
+    /// left open on this side.
+    #[test]
+    fn find_geometry_column_reads_the_geo_key_case_insensitively() {
+        let geo = r#"{"version":"1.1.0","primary_column":"centroid","columns":{"centroid":{"encoding":"WKB"}}}"#;
+        for key in ["geo", "GEO", "Geo"] {
+            let schema = Schema::new_with_metadata(
+                vec![
+                    Field::new("centroid", DataType::Binary, true),
+                    Field::new("geom_shape", DataType::Binary, true),
+                ],
+                [(key.to_string(), geo.to_string())].into_iter().collect(),
+            );
+            assert_eq!(
+                find_geometry_column(&schema),
+                Some(0),
+                "primary_column must be honored for a {key:?} key"
+            );
+        }
     }
 
     /// The alignment above only holds if the "geo" key-value metadata really

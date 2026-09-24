@@ -242,9 +242,16 @@ pub(super) fn build_level_schemas(
     input_schema: &Schema,
     geom_idx: usize,
     geom_name: &str,
+    crs: Crs,
     options: &ConvertOptions,
 ) -> (Schema, Schema, Schema) {
-    let geom_out_field = mixed_geometry_field(geom_name);
+    // The output geometry field must inherit the INPUT field's geoarrow
+    // extension metadata — above all its CRS. Dropping it made the overview
+    // claim the GeoParquet default (OGC:CRS84) for a metre file (#519).
+    let geom_out_field = mixed_geometry_field(
+        geom_name,
+        super::convert::geometry_field_metadata(input_schema, geom_idx, crs),
+    );
     let source_schema = build_source_schema(input_schema, geom_idx, geom_out_field);
     let cluster_schema = if options.cluster {
         append_point_count_field(&source_schema)
@@ -792,7 +799,7 @@ fn create_level_writer(
     // when coalescing (Q3).
     let geom_name = geom_field.name().clone();
     let (source_schema, cluster_schema, out_schema) =
-        build_level_schemas(input_schema, geom_idx, &geom_name, options);
+        build_level_schemas(input_schema, geom_idx, &geom_name, crs, options);
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()

@@ -123,7 +123,7 @@ pub fn tylertoo_core::covering::extract_row_group_bounds_from_reader(&parquet::f
 pub fn tylertoo_core::covering::find_bbox_column_indices(&parquet::file::metadata::ParquetMetaData, &tylertoo_core::covering::CoveringSpec) -> core::option::Option<tylertoo_core::covering::BboxColumnIndices>
 pub fn tylertoo_core::covering::get_geo_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<core::option::Option<alloc::string::String>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::parse_bounds(&str) -> core::result::Result<tylertoo_core::tile::TileBounds, tylertoo_core::Error>
-pub fn tylertoo_core::covering::parse_covering_metadata(&str) -> core::result::Result<core::option::Option<tylertoo_core::covering::CoveringSpec>, tylertoo_core::Error>
+pub fn tylertoo_core::covering::parse_covering_metadata(&str, core::option::Option<&str>) -> core::result::Result<core::option::Option<tylertoo_core::covering::CoveringSpec>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::tile_to_bounds(u8, u32, u32) -> tylertoo_core::tile::TileBounds
 pub mod tylertoo_core::decode
 pub enum tylertoo_core::decode::DecodeError

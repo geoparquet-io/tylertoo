@@ -107,7 +107,7 @@ pub(crate) fn classify_crs_identifier(id: &str) -> CrsKind {
     let up = id.to_uppercase();
 
     // 1. Web Mercator, BEFORE any WGS-84 test.
-    if up.contains("3857") || up.contains("900913") || up.contains("PSEUDO-MERCATOR") {
+    if is_web_mercator_marker(&up) {
         return CrsKind::WebMercator;
     }
     // 2. Explicit lon/lat identifiers, including the URN/URL spellings
@@ -118,12 +118,44 @@ pub(crate) fn classify_crs_identifier(id: &str) -> CrsKind {
     // 3. Bare WGS-84 *names* ("WGS 84", "WGS_1984"). A projected CRS name is
     //    always "<base> / <projection>", so a `/` disqualifies this branch —
     //    "WGS 84 / UTM zone 33N" is meters, not degrees.
-    if (up.contains("WGS 84") || up.contains("WGS84") || up.contains("WGS_1984"))
-        && !up.contains('/')
-    {
+    if is_bare_wgs84_name(&up) {
         return CrsKind::Wgs84;
     }
     CrsKind::Unknown
+}
+
+/// Every spelling of Web Mercator we accept, tested against an
+/// already-uppercased string.
+///
+/// The ESRI aliases (102100 / 102113) and the deprecated EPSG:3785 are the
+/// same projection under different authorities, and ArcGIS-exported data
+/// labels itself with them routinely. Refusing them made a plainly Web
+/// Mercator file "unsupported" (#519 S4).
+fn is_web_mercator_marker(up: &str) -> bool {
+    up.contains("3857")
+        || up.contains("900913")
+        || up.contains("102100")
+        || up.contains("102113")
+        || up.contains("3785")
+        || up.contains("PSEUDO-MERCATOR")
+        || up.contains("WEB MERCATOR")
+}
+
+/// A bare WGS-84 *name*, tested against an already-uppercased string: the
+/// `WGS 84` family with no projection suffix.
+///
+/// One rule, used by BOTH the string path and the PROJJSON no-id name
+/// fallback. They used to disagree — the PROJJSON side matched a closed list
+/// of eight literals, so a realistic `"name": "WGS 84 (G1762)"` (a WGS-84
+/// realization, plain lon/lat) was WGS84 to `detect_crs_from_kv` — which
+/// re-classifies the name through the lenient string path — and NOT WGS84 to
+/// `is_wgs84` / `validate_wgs84` on the very same file (#519).
+///
+/// The `/` guard is what keeps it honest: a projected CRS name is always
+/// "<base> / <projection>", so "WGS 84 / UTM zone 33N" is refused here and
+/// falls through to [`CrsKind::Unknown`].
+fn is_bare_wgs84_name(up: &str) -> bool {
+    (up.contains("WGS 84") || up.contains("WGS84") || up.contains("WGS_1984")) && !up.contains('/')
 }
 
 /// Classify a PROJJSON object structurally.
@@ -151,7 +183,9 @@ pub(crate) fn classify_crs_projjson(projjson: &Value) -> CrsKind {
         if authority.is_some_and(|a| a.eq_ignore_ascii_case("EPSG")) {
             return match code {
                 Some(4326) => CrsKind::Wgs84,
-                Some(3857 | 900913) => CrsKind::WebMercator,
+                // 900913 (Google) and 3785 (deprecated) are the same
+                // projection as 3857 under other codes.
+                Some(3857 | 900913 | 3785) => CrsKind::WebMercator,
                 // Present and not one of ours: authoritative NO. Never fall
                 // through to the name.
                 Some(_) => CrsKind::Unknown,
@@ -161,6 +195,13 @@ pub(crate) fn classify_crs_projjson(projjson: &Value) -> CrsKind {
         if authority.is_some_and(|a| a.eq_ignore_ascii_case("OGC")) {
             return match code_str {
                 Some(c) if c.eq_ignore_ascii_case("CRS84") => CrsKind::Wgs84,
+                _ => CrsKind::Unknown,
+            };
+        }
+        // ESRI's own codes for Web Mercator, which ArcGIS exports carry.
+        if authority.is_some_and(|a| a.eq_ignore_ascii_case("ESRI")) {
+            return match code {
+                Some(102100 | 102113) => CrsKind::WebMercator,
                 _ => CrsKind::Unknown,
             };
         }
@@ -176,23 +217,46 @@ pub(crate) fn classify_crs_projjson(projjson: &Value) -> CrsKind {
         return CrsKind::Unknown;
     };
     let up = name.trim().to_uppercase();
-    if up.contains("PSEUDO-MERCATOR") || up.contains("WEB MERCATOR") {
+    if is_web_mercator_marker(&up) {
         return CrsKind::WebMercator;
     }
     if is_projected {
         return CrsKind::Unknown;
     }
-    match up.as_str() {
-        "WGS 84"
-        | "WGS84"
-        | "WGS 84 (CRS84)"
-        | "WGS 84 (CRS 84)"
-        | "WGS_1984"
-        | "GCS_WGS_1984"
-        | "WGS 84 (GEOGRAPHIC 3D)"
-        | "WGS 84 LONGITUDE-LATITUDE" => CrsKind::Wgs84,
-        _ => CrsKind::Unknown,
+    // Same rule as the string path ([`is_bare_wgs84_name`]), NOT a closed
+    // list of literals: the list refused realistic realization names like
+    // "WGS 84 (G1762)" that `detect_crs_from_kv` accepted through the string
+    // path, so one file could be WGS84 to the converter and not-WGS84 to
+    // `validate_wgs84` (#519). The mercator and `is_projected` guards above
+    // are what make the looser test safe here.
+    // (Every literal the old list held — including ESRI's "GCS_WGS_1984" and
+    // "WGS 84 (GEOGRAPHIC 3D)" — contains one of the three substrings and no
+    // `/`, so nothing that used to be accepted is lost.)
+    if is_bare_wgs84_name(&up) {
+        return CrsKind::Wgs84;
     }
+    CrsKind::Unknown
+}
+
+/// Classify an already-extracted [`CrsInfo`] — the one answer both the
+/// convert side ([`crate::overview::convert::detect_crs_from_kv`]) and the
+/// export side (`overview::export::detect_crs`) ask for, so the two can never
+/// disagree about one file (#519: export kept a fourth hand-rolled
+/// `contains("3857")` matcher that was blind to PROJJSON).
+///
+/// `is_wgs84` is already classifier-derived upstream — structurally for
+/// PROJJSON, via [`classify_crs_identifier`] for a string — so it is
+/// honoured first; otherwise the identifier is re-classified. Callers decide
+/// for themselves what an [`CrsKind::Unknown`] with nothing declared at all
+/// should mean.
+pub(crate) fn classify_crs_info(info: &CrsInfo) -> CrsKind {
+    if info.is_wgs84 {
+        return CrsKind::Wgs84;
+    }
+    info.identifier
+        .as_deref()
+        .map(classify_crs_identifier)
+        .unwrap_or(CrsKind::Unknown)
 }
 
 /// Check if a CRS identifier represents WGS84 or compatible CRS.
@@ -647,6 +711,90 @@ mod tests {
             classify_crs_identifier(r#"{"type":"GeographicCRS","name":"WGS 84""#),
             CrsKind::Unknown
         );
+    }
+
+    /// #519: the PROJJSON no-id name fallback and the string path must apply
+    /// the SAME rule. The fallback used to be a closed list of eight
+    /// literals, so a realistic WGS-84 realization name was lon/lat to
+    /// `detect_crs_from_kv` (which re-classifies the name through the string
+    /// path) and NOT lon/lat to `is_wgs84` / `validate_wgs84` — one file,
+    /// two answers.
+    #[test]
+    fn projjson_name_fallback_matches_the_string_path() {
+        for name in [
+            "WGS 84 (G1762)",
+            "WGS 84 (G2139)",
+            "WGS 84 (Transit)",
+            "WGS 84",
+            "WGS84",
+            "WGS_1984",
+            "GCS_WGS_1984",
+            "WGS 84 (CRS84)",
+            "WGS 84 (Geographic 3D)",
+        ] {
+            let no_id: Value = serde_json::json!({ "type": "GeographicCRS", "name": name });
+            assert_eq!(
+                classify_crs_projjson(&no_id),
+                CrsKind::Wgs84,
+                "PROJJSON name {name:?} must classify as lon/lat"
+            );
+            assert!(
+                is_wgs84_projjson(&no_id),
+                "is_wgs84 must agree for {name:?}"
+            );
+            assert_eq!(
+                classify_crs_identifier(name),
+                CrsKind::Wgs84,
+                "the string path must give the same answer for {name:?}"
+            );
+        }
+
+        // …and a projected WGS-84-based name is still refused by BOTH.
+        for name in ["WGS 84 / UTM zone 33N", "WGS 84 / World Mercator"] {
+            let no_id: Value = serde_json::json!({ "type": "GeographicCRS", "name": name });
+            assert_eq!(classify_crs_projjson(&no_id), CrsKind::Unknown, "{name:?}");
+            assert!(!is_wgs84_projjson(&no_id), "{name:?}");
+            assert_eq!(classify_crs_identifier(name), CrsKind::Unknown, "{name:?}");
+        }
+    }
+
+    /// #519 (S4): ESRI's Web Mercator codes and the deprecated EPSG:3785 are
+    /// the same projection as EPSG:3857. Refusing them made plainly Web
+    /// Mercator ArcGIS exports "unsupported".
+    #[test]
+    fn web_mercator_aliases_are_recognized() {
+        for id in [
+            "ESRI:102100",
+            "ESRI:102113",
+            "EPSG:3785",
+            "epsg:3785",
+            "urn:ogc:def:crs:EPSG::3785",
+        ] {
+            assert_eq!(
+                classify_crs_identifier(id),
+                CrsKind::WebMercator,
+                "{id:?} is Web Mercator"
+            );
+        }
+        for (authority, code) in [("ESRI", 102100), ("ESRI", 102113), ("EPSG", 3785)] {
+            let v: Value = serde_json::json!({
+                "type": "ProjectedCRS",
+                "name": "WGS 84 / Pseudo-Mercator",
+                "id": { "authority": authority, "code": code }
+            });
+            assert_eq!(
+                classify_crs_projjson(&v),
+                CrsKind::WebMercator,
+                "{authority}:{code}"
+            );
+        }
+        // An unrelated ESRI code is still not classifiable.
+        let other: Value = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "NAD 1983 StatePlane",
+            "id": { "authority": "ESRI", "code": 102645 }
+        });
+        assert_eq!(classify_crs_projjson(&other), CrsKind::Unknown);
     }
 
     /// #518 (4): arrow-rs writes an unset Parquet `Geometry` CRS as the

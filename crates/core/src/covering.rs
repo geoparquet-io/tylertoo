@@ -228,32 +228,40 @@ struct BboxCovering {
     ymax: Vec<String>,
 }
 
-/// Parse the covering specification from GeoParquet geo metadata JSON.
-///
-/// Returns `None` if the metadata doesn't contain covering information.
+/// Parse the covering specification from GeoParquet geo metadata JSON, for
+/// ONE named geometry column.
 ///
 /// # Arguments
 ///
 /// * `geo_json` - The JSON string from the "geo" key-value metadata
+/// * `geom_column` - the column whose covering is wanted: for pruning, the
+///   column the rest of the pipeline will actually read
+///   ([`resolve_geometry_column_name`]). `None` means the caller has no
+///   column in hand, and then the spec-REQUIRED `primary_column` is the only
+///   thing consulted.
+///
+/// There is deliberately **no** "first column that happens to declare a
+/// covering" fallback (#519). A file with a `centroid` covering beside a
+/// `geom_shape` the pipeline reads got pruned on the centroid's envelope —
+/// silent data loss — and, with two covered columns, the fallback scanned a
+/// `HashMap`'s values, so *which* wrong column won varied run to run. A
+/// column with no covering of its own simply has no tier-1 bounds; the row
+/// group is then read, which is always correct.
 ///
 /// # Returns
 ///
-/// `Ok(Some(CoveringSpec))` if covering metadata is present and valid,
-/// `Ok(None)` if no covering metadata exists,
+/// `Ok(Some(CoveringSpec))` if that column declares a valid covering,
+/// `Ok(None)` if it does not (or is absent from the metadata),
 /// `Err` if the JSON is malformed.
-pub fn parse_covering_metadata(geo_json: &str) -> Result<Option<CoveringSpec>, Error> {
+pub fn parse_covering_metadata(
+    geo_json: &str,
+    geom_column: Option<&str>,
+) -> Result<Option<CoveringSpec>, Error> {
     let metadata: GeoMetadata = serde_json::from_str(geo_json)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
 
-    // Find the geometry column (use primary_column if specified, otherwise first with covering)
-    let geom_column = if let Some(ref primary) = metadata.primary_column {
-        metadata.columns.get(primary)
-    } else {
-        // Find first column with covering metadata
-        metadata.columns.values().find(|col| col.covering.is_some())
-    };
-
-    let Some(column) = geom_column else {
+    let name = geom_column.or(metadata.primary_column.as_deref());
+    let Some(column) = name.and_then(|n| metadata.columns.get(n)) else {
         return Ok(None);
     };
 
@@ -427,7 +435,10 @@ pub fn extract_row_group_bounds_from_metadata(
         return Ok(vec![None; num_row_groups]);
     };
 
-    let covering = parse_covering_metadata(&geo_json)?;
+    // Tier 1 must prune on the column the reader reads, not on whichever
+    // column happens to declare a covering first (#519).
+    let geom_column = resolve_geometry_column_name(metadata);
+    let covering = parse_covering_metadata(&geo_json, geom_column.as_deref())?;
     let Some(covering) = covering else {
         // No covering metadata - return all None
         return Ok(vec![None; num_row_groups]);
@@ -692,9 +703,10 @@ pub(crate) fn geo_statistics_bounds(
 /// than guess (#518). `geom_column: None` ("couldn't resolve") likewise
 /// skips it.
 ///
-/// Tier 1 needs no such argument: [`parse_covering_metadata`] already keys
-/// off the "geo" JSON `primary_column`, which is the first thing
-/// [`resolve_geometry_column_name`] returns.
+/// Tier 1 applies the same rule from inside
+/// [`extract_row_group_bounds_from_metadata`], which resolves the column
+/// itself and asks [`parse_covering_metadata`] for THAT column's covering
+/// (#519 — it used to accept any column's, `primary_column` or not).
 pub(crate) fn extract_row_group_bounds_tiered(
     metadata: &ParquetMetaData,
     session_crs: Crs,
@@ -871,7 +883,7 @@ mod tests {
             "version": "1.1.0"
         }"#;
 
-        let result = parse_covering_metadata(geo_json).unwrap();
+        let result = parse_covering_metadata(geo_json, Some("geometry")).unwrap();
         assert!(result.is_some());
 
         let spec = result.unwrap();
@@ -892,14 +904,74 @@ mod tests {
             "primary_column": "geometry"
         }"#;
 
-        let result = parse_covering_metadata(geo_json).unwrap();
+        let result = parse_covering_metadata(geo_json, Some("geometry")).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_covering_metadata_invalid_json() {
-        let result = parse_covering_metadata("not valid json");
+        let result = parse_covering_metadata("not valid json", Some("geometry"));
         assert!(result.is_err());
+    }
+
+    /// #519: a covering belonging to ANOTHER column is not this column's
+    /// covering. The old "first column with a covering" fallback handed the
+    /// `centroid` covering to a pipeline reading `geom_shape`, and pruned
+    /// against an envelope of points that are not the data.
+    #[test]
+    fn parse_covering_metadata_refuses_another_columns_covering() {
+        let geo_json = r#"{
+            "version": "1.1.0",
+            "columns": {
+                "centroid": {
+                    "encoding": "WKB",
+                    "covering": { "bbox": {
+                        "xmin": ["centroid_bbox", "xmin"],
+                        "ymin": ["centroid_bbox", "ymin"],
+                        "xmax": ["centroid_bbox", "xmax"],
+                        "ymax": ["centroid_bbox", "ymax"]
+                    }}
+                },
+                "geom_shape": { "encoding": "WKB" }
+            }
+        }"#;
+        assert_eq!(
+            parse_covering_metadata(geo_json, Some("geom_shape")).unwrap(),
+            None,
+            "geom_shape declares no covering of its own"
+        );
+        assert!(parse_covering_metadata(geo_json, Some("centroid"))
+            .unwrap()
+            .is_some());
+        // No primary_column and no column in hand ⇒ nothing to key off.
+        assert_eq!(parse_covering_metadata(geo_json, None).unwrap(), None);
+    }
+
+    /// The same shape, but with TWO covered columns: the old `HashMap`
+    /// `values()` scan picked a different one run to run (iteration order is
+    /// randomized per process), so a bbox extract's output depended on the
+    /// hash seed. The resolved-column lookup is a function of the input.
+    #[test]
+    fn parse_covering_metadata_is_deterministic_with_two_covered_columns() {
+        let geo_json = r#"{
+            "version": "1.1.0",
+            "columns": {
+                "centroid": { "covering": { "bbox": {
+                    "xmin": ["c", "xmin"], "ymin": ["c", "ymin"],
+                    "xmax": ["c", "xmax"], "ymax": ["c", "ymax"]
+                }}},
+                "geom_shape": { "covering": { "bbox": {
+                    "xmin": ["g", "xmin"], "ymin": ["g", "ymin"],
+                    "xmax": ["g", "xmax"], "ymax": ["g", "ymax"]
+                }}}
+            }
+        }"#;
+        for _ in 0..16 {
+            let spec = parse_covering_metadata(geo_json, Some("geom_shape"))
+                .unwrap()
+                .expect("geom_shape declares a covering");
+            assert_eq!(spec.xmin_path, vec!["g", "xmin"]);
+        }
     }
 
     #[test]
@@ -1953,6 +2025,109 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Tier 1 must prune on the column the pipeline READS (#519)
+    // -------------------------------------------------------------------------
+
+    /// Synthetic GeoParquet 1.1 footer whose schema is
+    /// `[c_xmin, c_ymin, c_xmax, c_ymax (DOUBLE), centroid, geom_shape]`, with
+    /// covering-column statistics for the `centroid` column only. The "geo"
+    /// JSON declares `centroid`'s covering and — deliberately — **no**
+    /// `primary_column`, the shape that made tier 1 fall back to "whichever
+    /// column declares a covering".
+    fn metadata_with_centroid_covering(bbox: (f64, f64, f64, f64)) -> ParquetMetaData {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
+        };
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        let mut fields: Vec<Arc<Type>> = ["c_xmin", "c_ymin", "c_xmax", "c_ymax"]
+            .iter()
+            .map(|n| {
+                Arc::new(
+                    Type::primitive_type_builder(n, PhysicalType::DOUBLE)
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        for n in ["centroid", "geom_shape"] {
+            fields.push(Arc::new(
+                Type::primitive_type_builder(n, PhysicalType::BYTE_ARRAY)
+                    .build()
+                    .unwrap(),
+            ));
+        }
+        let schema = Type::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+
+        let (xmin, ymin, xmax, ymax) = bbox;
+        let mut columns: Vec<ColumnChunkMetaData> = [xmin, ymin, xmax, ymax]
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                ColumnChunkMetaData::builder(descr.column(i))
+                    .set_statistics(Statistics::double(Some(v), Some(v), None, Some(0), false))
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        for i in 4..6 {
+            columns.push(
+                ColumnChunkMetaData::builder(descr.column(i))
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let rg = RowGroupMetaData::builder(descr.clone())
+            .set_num_rows(10)
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+
+        let geo_json = r#"{"version":"1.1.0","columns":{
+            "centroid":{"encoding":"WKB","covering":{"bbox":{
+                "xmin":["c_xmin"],"ymin":["c_ymin"],
+                "xmax":["c_xmax"],"ymax":["c_ymax"]}}},
+            "geom_shape":{"encoding":"WKB"}}}"#;
+        let kv = Some(vec![KeyValue::new("geo".to_string(), geo_json.to_string())]);
+        let file_meta = FileMetaData::new(2, 10, None, kv, descr, None);
+        ParquetMetaData::new(file_meta, vec![rg])
+    }
+
+    /// #519: the centroids sit at (100..110, 60..70); the shapes they
+    /// summarize span the whole world for all pruning knows, because
+    /// `geom_shape` declares no covering. A bbox over the shapes must KEEP
+    /// the row group. Tier 1 used to take the `centroid` covering (first
+    /// column with one, `primary_column` absent) and prune the row group
+    /// away — the reader would have found the features, pruning never let it
+    /// look.
+    #[test]
+    fn tier1_ignores_another_columns_covering() {
+        let metadata = metadata_with_centroid_covering((100.0, 60.0, 110.0, 70.0));
+        assert_eq!(
+            resolve_geometry_column_name(&metadata).as_deref(),
+            Some("geom_shape"),
+            "the pipeline reads geom_shape (the first `geom*` name)"
+        );
+        assert_eq!(
+            extract_row_group_bounds_from_metadata(&metadata).unwrap(),
+            vec![None],
+            "geom_shape declares no covering ⇒ no tier-1 bounds"
+        );
+        assert_eq!(
+            crate::overview::convert::select_input_row_groups(&metadata, &[0.0, 0.0, 1.0, 1.0]),
+            vec![0],
+            "pruning on the centroid covering is silent data loss"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Tier 2 must prune on the column the pipeline READS (#518)
     // -------------------------------------------------------------------------
 
@@ -2227,13 +2402,12 @@ mod tests {
                     lng_max: qx0.max(qx1),
                     lat_max: qy0.max(qy1),
                 };
-                // Model exactly what GeoParquet 2.0 native geo_statistics
-                // holds per row group: the tight envelope of its rows.
-                // `geo_statistics_bounds` reads that envelope verbatim
-                // (proven by the deterministic tests above), so testing the
-                // envelope + `RowGroupBounds::intersects` here covers the
-                // same invariant end to end without needing real parquet
-                // I/O (unavailable — see `metadata_with_tiered_stats`).
+                // Scope (#519): this case exercises the *intersection
+                // predicate* over tight per-row-group envelopes — the
+                // arithmetic core, including the antimeridian wraparound and
+                // NaN rules. It deliberately does NOT go through
+                // `extract_row_group_bounds_tiered`; the sibling property
+                // below does that over real `ParquetMetaData`.
                 let bounds: Vec<RowGroupBounds> = groups
                     .iter()
                     .enumerate()
@@ -2262,6 +2436,84 @@ mod tests {
                 prop_assert!(
                     truth.is_subset(&selected),
                     "pruned a row group with a truly matching point: truth={truth:?} selected={selected:?}"
+                );
+            }
+        }
+
+        // The same invariant, but driven through the REAL tiered path
+        // (#519): synthetic-but-genuine `ParquetMetaData` carrying native
+        // `geo_statistics` on two geometry columns, fed to
+        // `select_input_row_groups` — CRS detection, column resolution, tier
+        // selection and all.
+        //
+        // Both columns get an envelope, and the "geo" JSON's
+        // `primary_column` varies over {absent, centroid, geom_shape}, so the
+        // property sees every combination of "annotated column" and "column
+        // the pipeline reads". Truth is the points of the column the READER
+        // would read — which is what pruning must never drop. A prune keyed
+        // off the other column's envelope violates it, which is exactly the
+        // #518/#519 bug class.
+        proptest! {
+            #[test]
+            fn tiered_selection_never_drops_a_true_match(
+                centroid_pts in proptest::collection::vec((-100.0f64..100.0, -100.0f64..100.0), 1..5),
+                shape_pts in proptest::collection::vec((-100.0f64..100.0, -100.0f64..100.0), 1..5),
+                primary_idx in 0usize..3,
+                qx0 in -100.0f64..100.0, qx1 in -100.0f64..100.0,
+                qy0 in -100.0f64..100.0, qy1 in -100.0f64..100.0,
+            ) {
+                /// `(xmin, xmax, ymin, ymax)` — `BoundingBox::new`'s order.
+                fn envelope(pts: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+                    (
+                        pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                        pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+                        pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                        pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+                    )
+                }
+
+                let primary = [None, Some("centroid"), Some("geom_shape")][primary_idx];
+                let geo_json = primary.map(|p| {
+                    format!(
+                        r#"{{"version":"1.1.0","primary_column":"{p}","columns":{{"{p}":{{"encoding":"WKB"}}}}}}"#
+                    )
+                });
+                let metadata = metadata_with_two_geometry_columns(
+                    Some(envelope(&centroid_pts)),
+                    Some(envelope(&shape_pts)),
+                    geo_json.as_deref(),
+                );
+
+                // The column the READER reads: `primary_column` when
+                // declared, else the `geom*` heuristic.
+                let read_column = primary.unwrap_or("geom_shape");
+                let resolved = resolve_geometry_column_name(&metadata);
+                prop_assert_eq!(
+                    resolved.as_deref(),
+                    Some(read_column),
+                    "pruning and the reader must agree on the column"
+                );
+                let read_pts = if read_column == "centroid" {
+                    &centroid_pts
+                } else {
+                    &shape_pts
+                };
+
+                let filter = TileBounds {
+                    lng_min: qx0.min(qx1),
+                    lat_min: qy0.min(qy1),
+                    lng_max: qx0.max(qx1),
+                    lat_max: qy0.max(qy1),
+                };
+                let selected = crate::overview::convert::select_input_row_groups(
+                    &metadata,
+                    &[filter.lng_min, filter.lat_min, filter.lng_max, filter.lat_max],
+                );
+                let truly_matches = read_pts.iter().any(|&p| point_in_bbox(p, &filter));
+                prop_assert!(
+                    !truly_matches || selected == vec![0],
+                    "pruned the only row group although {read_column} has a matching point: \
+                     read_pts={read_pts:?} filter={filter:?} selected={selected:?}"
                 );
             }
         }
