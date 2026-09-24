@@ -32,8 +32,8 @@ use crate::input::url_scheme;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_writer::{
-    decode_directory, max_expanded_entries, tile_id_to_zxy, DirEntry, Header,
-    StreamingPmtilesWriter, TileType, MAX_LEAF_DIRECTORIES,
+    max_expanded_entries, read_all_entries, tile_id_to_zxy, DirEntry, Header,
+    StreamingPmtilesWriter, TileType,
 };
 use crate::tile::TileBounds;
 use crate::Error;
@@ -808,102 +808,11 @@ impl BandArchive {
                 .ok_or_else(|| past_end(what))?;
             Ok(&bytes[start..end])
         };
-        // An entry's range must lie inside the section it is relative to, not
-        // merely inside the file: a leaf pointer aimed at the tile data would
-        // otherwise be parsed as a directory (#417).
-        let within = |off: u64, len: u64, section_len: u64, what: &str| -> Result<(), Error> {
-            match off.checked_add(len) {
-                Some(end) if end <= section_len => Ok(()),
-                _ => Err(Error::PMTilesWrite(format!(
-                    "{}: {what} at {off} ({len} bytes) extends past its \
-                     {section_len}-byte section",
-                    path.display()
-                ))),
-            }
-        };
-        let dir = |raw: &[u8], what: &str| -> Result<Vec<DirEntry>, Error> {
-            let plain = compression::decompress_capped(
-                raw,
-                header.internal_compression,
-                MAX_INTERNAL_BYTES,
-            )
-            .map_err(|e| Error::PMTilesWrite(format!("{what}: {e}")))?;
-            decode_directory(&plain)
-                .ok_or_else(|| Error::PMTilesWrite(format!("undecodable {what}")))
-        };
 
-        let root = dir(
-            slice(header.root_dir_offset, header.root_dir_length, "root dir")?,
-            "root dir",
-        )?;
-        // Two budgets, because one huge leaf and a million tiny ones are
-        // different attacks (#417). Entries accumulated across the walk are
-        // bounded by what the archive could legitimately address — the same
-        // denomination `for_each_tile_range` spends on run lengths — and the
-        // *number* of leaves is bounded separately, since an empty leaf costs
-        // no entries while still costing a `MAX_INTERNAL_BYTES`
-        // decompression apiece.
-        let entry_limit = max_expanded_entries(&header);
-        let mut entry_budget = entry_limit;
-        let mut leaves_visited = 0usize;
-        let too_many_entries = || {
-            Error::PMTilesWrite(format!(
-                "{}: directory entries exceed this archive's limit of {entry_limit} entries",
-                path.display()
-            ))
-        };
-
-        let mut entries = Vec::new();
-        for e in root {
-            if e.run_length != 0 {
-                entry_budget = entry_budget.checked_sub(1).ok_or_else(too_many_entries)?;
-                entries.push(e);
-                continue;
-            }
-            leaves_visited += 1;
-            if leaves_visited > MAX_LEAF_DIRECTORIES {
-                return Err(Error::PMTilesWrite(format!(
-                    "{}: root directory points at more than {MAX_LEAF_DIRECTORIES} \
-                     leaf directories",
-                    path.display()
-                )));
-            }
-            within(
-                e.offset,
-                u64::from(e.length),
-                header.leaf_dirs_length,
-                "leaf dir",
-            )?;
-            // Base and entry offset both come from the archive, so the sum
-            // is checked rather than wrapped into a plausible-looking one.
-            let leaf_at = header
-                .leaf_dirs_offset
-                .checked_add(e.offset)
-                .ok_or_else(|| {
-                    Error::PMTilesWrite(format!("leaf dir offset overflow in {}", path.display()))
-                })?;
-            let leaf = slice(leaf_at, u64::from(e.length), "leaf dir")?;
-            let decoded = dir(leaf, "leaf dir")?;
-            // Spent before the entries are kept, not after: a root full of
-            // pointers at one 16 MiB leaf body is a ~50 KB file that would
-            // otherwise accumulate entries until the process died.
-            entry_budget = entry_budget
-                .checked_sub(decoded.len() as u64)
-                .ok_or_else(too_many_entries)?;
-            for inner in decoded {
-                // run_length 0 inside a leaf is a second-level leaf pointer.
-                // The spec allows arbitrarily deep directories; this reader
-                // handles one level, and falling through would emit directory
-                // bytes as a tile. Say so instead of producing garbage.
-                if inner.run_length == 0 {
-                    return Err(Error::PMTilesWrite(format!(
-                        "{}: multi-level leaf directories are not supported",
-                        path.display()
-                    )));
-                }
-                entries.push(inner);
-            }
-        }
+        // Root directory plus one level of leaf expansion, budgeted against
+        // #417's two attacks (a huge leaf, or a million tiny ones).
+        let entries = read_all_entries(&bytes, &header)
+            .map_err(|e| Error::PMTilesWrite(format!("{}: {e}", path.display())))?;
 
         let raw_meta = slice(
             header.json_metadata_offset,
@@ -1663,6 +1572,7 @@ fn finish_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pmtiles_writer::{decode_directory, MAX_LEAF_DIRECTORIES};
     use std::collections::HashMap;
 
     /// A band input is classified by content, not by name: `.pmtiles` is a

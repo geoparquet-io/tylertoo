@@ -4191,6 +4191,15 @@ mod tests {
     /// `"generator":"tylertoo"` (was `"gpq-tiles"`) — the only output-bound
     /// byte change from the rename, so the hash was re-captured on the same
     /// fixture. The export logic is unchanged.
+    ///
+    /// REPIN (clustered header flag honesty): the header's `clustered` byte
+    /// (offset 96) now reflects the directory's actual offset layout instead
+    /// of a hardcoded `true` — this fixture's 13-tile export adds tiles
+    /// zoom-by-zoom in row-major order, which is not tile-id order, so the
+    /// byte flips `1` -> `0`. Verified this is the *only* byte that moved:
+    /// flipping byte 96 of the new archive back to `1` reproduces the prior
+    /// hash (`0dfdf8a0bb941a0c`) exactly. No tile data, directory entry, or
+    /// metadata byte changed.
     #[test]
     fn export_archive_matches_pre_refactor_reference() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4210,11 +4219,12 @@ mod tests {
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            // RE-BLESSED: `leaf_dirs_offset` in the 127-byte header changed
-            // from 0 to the leaf section's position, because go-pmtiles
-            // rejects a zero there. Eight header bytes; no tile data moved,
-            // and the per-tile assertions below are unchanged.
-            "0dfdf8a0bb941a0c",
+            // RE-BLESSED: the `clustered` header byte (offset 96) is now
+            // derived from the directory's actual offset layout instead of a
+            // hardcoded `true` (see the REPIN note above this test). One
+            // header byte; no tile data moved, and the per-tile assertions
+            // below are unchanged.
+            "f0394915010f49bd",
             "archive bytes diverged from the pre-refactor reference"
         );
 

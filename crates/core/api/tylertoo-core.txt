@@ -2524,6 +2524,7 @@ pub fn tylertoo_core::pmtiles_writer::make_root_leaves(&[tylertoo_core::pmtiles_
 pub fn tylertoo_core::pmtiles_writer::max_expanded_entries(&tylertoo_core::pmtiles_writer::Header) -> u64
 pub fn tylertoo_core::pmtiles_writer::tile_id(u8, u32, u32) -> u64
 pub fn tylertoo_core::pmtiles_writer::tile_id_to_zxy(u64) -> tylertoo_core::Result<(u8, u32, u32)>
+pub fn tylertoo_core::pmtiles_writer::verify_clustered(&std::path::Path) -> tylertoo_core::Result<bool>
 pub mod tylertoo_core::pyramid
 pub enum tylertoo_core::pyramid::BandSource
 pub tylertoo_core::pyramid::BandSource::Archive
