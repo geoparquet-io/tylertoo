@@ -2017,6 +2017,11 @@ impl Pass1Timers {
     fn add(cell: &AtomicU64, start: Instant) {
         cell.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
+    /// Add a pre-measured duration (used by the reader thread for read time,
+    /// mirroring [`Pass2Timers::add_dur`]).
+    fn add_dur(cell: &AtomicU64, dur: Duration) {
+        cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+    }
     fn secs(cell: &AtomicU64) -> f64 {
         Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
     }
@@ -2116,6 +2121,156 @@ fn apply_entry_levels(
     Ok(())
 }
 
+/// Default rows per pass-1 scan chunk (#460): each read batch is sliced into
+/// chunks of this many rows and scanned (geometry decode + `scan_feature` +
+/// bbox/filter gating) in parallel across a rayon `par_iter`. 1024 is small
+/// enough that a batch (default 8192 rows, [`DEFAULT_READ_BATCH_SIZE`]) still
+/// fans out across a handful of cores, and large enough that per-chunk
+/// overhead (a `RecordBatch::slice` + a `Vec` allocation per output field)
+/// stays negligible next to the per-row work it parallelizes.
+///
+/// [`DEFAULT_READ_BATCH_SIZE`]: super::convert::DEFAULT_READ_BATCH_SIZE
+const PASS1_CHUNK_ROWS: usize = 1024;
+
+/// One batch handed from the pass-1 reader thread to the parallel-scan
+/// consumer — mirrors [`pipeline::ReadMsg`], pass 2's equivalent.
+struct Pass1ReadMsg {
+    batch: RecordBatch,
+    read_dur: Duration,
+}
+
+/// One line geometry collected while scanning a chunk (Q3 coalescing),
+/// chunk-local until the consumer rebases it (see [`ChunkScan`]).
+struct ChunkLine {
+    /// Row offset within the chunk (0-based).
+    local_row: usize,
+    /// This line's position within [`ChunkScan::features`] — rebased by the
+    /// consumer into a position within the pass's full `features` vector,
+    /// exactly like the pre-parallel `line_feat_pos` bookkeeping.
+    local_feat_pos: usize,
+    geom: Geometry<f64>,
+}
+
+/// Result of scanning one chunk of a batch ([`scan_chunk`]): every index
+/// inside this struct is CHUNK-LOCAL (0-based within the chunk's own row
+/// range). The consumer rebases every index by the chunk's global row/feature
+/// offset before merging into the pass's accumulators — never handed a global
+/// base, so there is no way to rebase twice or drift (see the module's
+/// pass-1 parallelization notes on `run_pass1`).
+struct ChunkScan {
+    /// Features found in this chunk; `AssignFeature::index` is the row's
+    /// offset WITHIN THE CHUNK, rebased by the consumer to `chunk_base + i`.
+    features: Vec<AssignFeature>,
+    /// #384 polygon areas, parallel to `features` (empty unless enabled).
+    areas: Vec<f32>,
+    /// One entry per chunk row: was it kept (became a feature)? Length
+    /// equals the chunk's row count; merged into the batch-wide `kept_row`
+    /// the ladder-blanking step reads.
+    kept_row: Vec<bool>,
+    lines: Vec<ChunkLine>,
+    point_count: usize,
+    /// Rows skipped for a null, empty, or non-finite geometry (H4) — NOT
+    /// including attribute-filtered or bbox-missed rows, matching the
+    /// pre-parallel `skipped_rows` semantics exactly.
+    skipped_rows: usize,
+}
+
+/// Scan one chunk of a pass-1 batch: decode its geometry slice, then apply
+/// the attribute filter / null-or-invalid-geometry / regional-bbox gates and
+/// bucket each surviving row into a chunk-local [`AssignFeature`] — the
+/// per-row body of the pre-#460 `run_pass1` loop, unchanged in logic, just
+/// scoped to `[0, gcol.len())` instead of a whole batch so it can run as one
+/// rayon task among several. Never sees a global row or feature index (see
+/// [`ChunkScan`]).
+#[allow(clippy::too_many_arguments)]
+fn scan_chunk(
+    geom_field: &Field,
+    gcol: &dyn Array,
+    filter_mask: Option<&[Option<bool>]>,
+    bbox_units: Option<&[f64; 4]>,
+    collect_lines: bool,
+    want_areas: bool,
+    timers: &Pass1Timers,
+) -> Result<ChunkScan, ConvertError> {
+    let t_decode = Instant::now();
+    let garr = from_arrow_array(gcol, geom_field)
+        .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+    let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::new();
+    extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)?;
+    Pass1Timers::add(&timers.decode, t_decode);
+
+    let t_scan = Instant::now();
+    let mut features: Vec<AssignFeature> = Vec::new();
+    let mut areas: Vec<f32> = Vec::new();
+    let mut kept_row = vec![false; geoms_buf.len()];
+    let mut lines: Vec<ChunkLine> = Vec::new();
+    let mut point_count = 0usize;
+    let mut skipped_rows = 0usize;
+
+    for (i, gopt) in geoms_buf.iter().enumerate() {
+        // Attribute filter (#315): keep only rows where the predicate is
+        // TRUE. The row index still advances (row-keyed tables stay
+        // aligned); the slot stays UNASSIGNED so pass 2 drops it too.
+        if let Some(mask) = filter_mask {
+            if mask[i] != Some(true) {
+                continue;
+            }
+        }
+        let Some(g) = gopt.as_ref() else {
+            skipped_rows += 1;
+            continue;
+        };
+        // #274: a single geometry walk yields the usable filter, bbox, and
+        // kind (was `usable_geometry` + `geometry_bbox` + `feature_kind`,
+        // which traversed the coords twice). `None` == unusable (empty or
+        // non-finite), identical to the old `usable_geometry` reject.
+        let Some((kind, fbbox)) = scan_feature(g) else {
+            skipped_rows += 1;
+            continue;
+        };
+        // Regional extract (#102): a feature whose bbox misses the region
+        // produces no AssignFeature — its winner-table slot stays at the
+        // UNASSIGNED sentinel, so pass 2 drops the row too. The row index
+        // still advances (row-keyed tables stay aligned).
+        if let Some(bb) = bbox_units {
+            if !super::convert::bboxes_intersect(&fbbox, bb) {
+                continue;
+            }
+        }
+        if matches!(kind, FeatureKind::Point) {
+            point_count += 1;
+        }
+        if collect_lines && matches!(kind, FeatureKind::Line) {
+            lines.push(ChunkLine {
+                local_row: i,
+                local_feat_pos: features.len(),
+                geom: g.clone(),
+            });
+        }
+        kept_row[i] = true;
+        if want_areas {
+            areas.push(polygon_area_f32(g));
+        }
+        features.push(AssignFeature {
+            index: i, // chunk-local; the consumer rebases to `chunk_base + i`
+            bbox: fbbox,
+            kind,
+            sort_key: None, // filled below once the ranking tier resolves
+            entry_level: None,
+        });
+    }
+    Pass1Timers::add(&timers.scan, t_scan);
+
+    Ok(ChunkScan {
+        features,
+        areas,
+        kept_row,
+        lines,
+        point_count,
+        skipped_rows,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_pass1(
     source: &ConvertSource,
@@ -2127,6 +2282,182 @@ fn run_pass1(
     bbox_units: Option<&[f64; 4]>,
     filter: Option<&super::filter::BoundFilter>,
 ) -> Result<Pass1Output, ConvertError> {
+    run_pass1_with_chunk_rows(
+        source,
+        input_schema,
+        geom_idx,
+        options,
+        acc_cols,
+        row_groups,
+        bbox_units,
+        filter,
+        PASS1_CHUNK_ROWS,
+    )
+}
+
+/// [`run_pass1`], with the within-batch scan chunk size as an explicit
+/// parameter (production always calls it via [`run_pass1`] with
+/// [`PASS1_CHUNK_ROWS`]; tests use this directly to compare a heavily-chunked
+/// run against `chunk_rows: usize::MAX` — effectively one chunk per batch,
+/// the pre-#460 shape — and assert byte-identical [`Pass1Output`]).
+///
+/// Reader thread ([`super::pipe::scoped_pipe`], depth = pass 2's resolved
+/// in-flight-batches setting) → consumer: each batch is sliced into
+/// `chunk_rows`-row chunks (`RecordBatch::slice`, zero-copy), scanned in
+/// parallel by [`scan_chunk`] (geometry decode + gating), then merged back in
+/// ascending chunk order on the consumer thread. The order-dependent pieces —
+/// [`GroupInterner`], the columnar ranking/accumulate/ladder column
+/// extraction, and the coalesce-scratch line order — stay serial, running
+/// once per batch on the full (unsliced) batch exactly as before; only the
+/// per-row geometry decode + `scan_feature` + gating work is chunked and
+/// parallelized. A skipped row (null/non-finite geometry, a false
+/// `--filter`, or a `--bbox` miss) still advances the row index it would
+/// under the serial loop — [`ChunkScan`] returns chunk-local indices and the
+/// consumer rebases them to `chunk_base + i` before merging, so a feature's
+/// global `index` (and everything keyed by it downstream, notably
+/// `Priority::beats`'s `stable_hash(index)` tie-break) is identical
+/// regardless of `chunk_rows`.
+/// Per-batch columnar key extraction for pass 1: ranking keys (explicit
+/// sort/class, or the auto-detected road-class/confidence candidates),
+/// accumulate-column values (Q4), and the entry-zoom ladder column (#364).
+/// Order-dependent — [`GroupInterner`] interns class values in first-seen
+/// order — so this always runs serially over the FULL (unsliced) batch, never
+/// chunked, exactly as the pre-#460 loop did.
+///
+/// Pulled out of [`run_pass1_with_chunk_rows`] rather than inlined: it is a
+/// self-contained step with no other reader of the intermediate state, and
+/// inlining it pushes that function over the workspace's line-count lint.
+#[allow(clippy::too_many_arguments)]
+fn extract_pass1_batch_keys(
+    batch: &RecordBatch,
+    proj: &dyn Fn(usize) -> usize,
+    plan: &mut RankPlan,
+    collect_lines: bool,
+    ladder_col: Option<usize>,
+    kept_row: &[bool],
+    explicit_keys: &mut Vec<Option<f64>>,
+    confidence_keys: &mut Vec<Option<f64>>,
+    explicit_interner: &mut GroupInterner,
+    explicit_groups: &mut Vec<u32>,
+    acc_cols: &[usize],
+    acc_values: &mut [Vec<Option<f64>>],
+    ladder_values: &mut Vec<Option<f64>>,
+) -> Result<(), ConvertError> {
+    match plan {
+        RankPlan::ExplicitSort { idx, .. } => {
+            explicit_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
+        }
+        RankPlan::ExplicitClass { idx, ranking } => {
+            let col = batch.column(proj(*idx));
+            explicit_keys.extend(extract_class_ranks(col.as_ref(), ranking)?);
+            if collect_lines {
+                explicit_interner.extend(col.as_ref(), explicit_groups);
+            }
+        }
+        RankPlan::Auto { roads, confidence } => {
+            for cand in roads.iter_mut() {
+                let col = batch.column(proj(cand.idx));
+                scan_road_vocab(col.as_ref(), &mut cand.found);
+                cand.keys
+                    .extend(extract_class_ranks(col.as_ref(), &cand.ranking)?);
+                if collect_lines {
+                    cand.interner.extend(col.as_ref(), &mut cand.groups);
+                }
+            }
+            if let Some((idx, _)) = confidence {
+                confidence_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
+            }
+        }
+        RankPlan::SizeFallback => {}
+    }
+
+    // Accumulate columns (Q4): per-spec source values, in row order.
+    // `extract_numeric_values`, not `extract_sort_keys` — aggregating is not
+    // ranking, so ±inf is a summand and only NaN is skipped (#428). Must
+    // match `convert::extract_accumulate_values`, which the buffered engine
+    // uses: the two engines are byte-identical by contract.
+    for (s, &idx) in acc_cols.iter().enumerate() {
+        acc_values[s].extend(extract_numeric_values(batch.column(proj(idx)).as_ref()));
+    }
+
+    // Entry-zoom ladder (#364): row-indexed, like the ranking keys above, but
+    // blanked for rows this pass rejected (null/unusable geometry, a false
+    // `--filter` predicate, a `--bbox` miss). Those rows produce no feature,
+    // so letting their values into the ladder would add rungs the buffered
+    // engine never sees and shift every weaker feature by `step`.
+    if let Some(idx) = ladder_col {
+        let keys = extract_sort_keys(batch.column(proj(idx)).as_ref());
+        ladder_values.extend(
+            keys.into_iter()
+                .zip(kept_row)
+                .map(|(k, keep)| if *keep { k } else { None }),
+        );
+    }
+    Ok(())
+}
+
+/// Merge one batch's chunk-local [`scan_chunk`] results into the pass's
+/// running accumulators, IN ASCENDING CHUNK ORDER, rebasing every chunk-local
+/// index (`AssignFeature::index`, a line's row, a line's position in
+/// `features`) by `base + chunk_start` as it merges. Returns the batch-wide
+/// `kept_row` flags (one per batch row) the ladder-blanking step reads.
+///
+/// Pulled out of [`run_pass1_with_chunk_rows`] rather than inlined: it is a
+/// self-contained step (no other reader of `ranges`/`chunk_results` exists)
+/// and inlining it pushes that function over the workspace's line-count lint.
+#[allow(clippy::too_many_arguments)]
+fn merge_pass1_chunks(
+    chunk_results: Vec<Result<ChunkScan, ConvertError>>,
+    ranges: &[(usize, usize)],
+    base: usize,
+    n: usize,
+    want_areas: bool,
+    features: &mut Vec<AssignFeature>,
+    areas: &mut Vec<f32>,
+    line_rows: &mut Vec<usize>,
+    line_feat_pos: &mut Vec<usize>,
+    line_geoms: &mut Vec<Geometry<f64>>,
+    point_count: &mut usize,
+    skipped_rows: &mut usize,
+) -> Result<Vec<bool>, ConvertError> {
+    let mut kept_row = vec![false; n];
+    for (ci, res) in chunk_results.into_iter().enumerate() {
+        let chunk = res?;
+        let (start, _len) = ranges[ci];
+        let chunk_base = base + start;
+        kept_row[start..start + chunk.kept_row.len()].copy_from_slice(&chunk.kept_row);
+        *point_count += chunk.point_count;
+        *skipped_rows += chunk.skipped_rows;
+        if want_areas {
+            areas.extend(chunk.areas);
+        }
+        let feat_offset = features.len();
+        for line in chunk.lines {
+            line_rows.push(chunk_base + line.local_row);
+            line_feat_pos.push(feat_offset + line.local_feat_pos);
+            line_geoms.push(line.geom);
+        }
+        for mut f in chunk.features {
+            f.index += chunk_base;
+            features.push(f);
+        }
+    }
+    Ok(kept_row)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pass1_with_chunk_rows(
+    source: &ConvertSource,
+    input_schema: &Schema,
+    geom_idx: usize,
+    options: &ConvertOptions,
+    acc_cols: &[usize],
+    row_groups: Option<&RowGroupSelection>,
+    bbox_units: Option<&[f64; 4]>,
+    filter: Option<&super::filter::BoundFilter>,
+    chunk_rows: usize,
+) -> Result<Pass1Output, ConvertError> {
+    let chunk_rows = chunk_rows.max(1);
     let mut plan = build_rank_plan(input_schema, options)?;
 
     // Entry-zoom ladder column (#364), resolved by name against the (already
@@ -2148,6 +2479,7 @@ fn run_pass1(
     let cols = pass1_projection(geom_idx, &plan, acc_cols, filter, ladder_col);
     // Original schema index → projected batch column index.
     let proj = |orig: usize| cols.binary_search(&orig).expect("projected column");
+    let gcol_idx = proj(geom_idx);
 
     // Regional extract (#102): read only the bbox-selected row groups
     // (identical per-part selection in pass 2, keeping row indices aligned).
@@ -2159,6 +2491,12 @@ fn run_pass1(
 
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
+    let timers_ref = &pass1_timers;
+    let in_flight = super::convert::resolve_in_flight_batches(options.in_flight_batches);
+    log::debug!(
+        "[convert] pass 1 parallelism: {in_flight} read batch(es) in flight, \
+         chunk_rows={chunk_rows}"
+    );
 
     let mut features: Vec<AssignFeature> = Vec::new();
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
@@ -2173,7 +2511,6 @@ fn run_pass1(
     let mut acc_values: Vec<Vec<Option<f64>>> = vec![Vec::new(); acc_cols.len()];
     // Entry-zoom ladder column values (#364), row-indexed.
     let mut ladder_values: Vec<Option<f64>> = Vec::new();
-    let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::new();
     // Coalescing (Q3): line rows + geometries, and — for an explicit class
     // ranking — the interned per-row class groups. `line_feat_pos` holds each
     // line's position in `features` (NOT its row index: skipped-geometry rows
@@ -2185,153 +2522,124 @@ fn run_pass1(
     let mut explicit_groups: Vec<u32> = Vec::new();
     let mut explicit_interner = GroupInterner::default();
 
-    loop {
-        let t_read = Instant::now();
-        let batch = match reader.next() {
-            None => break,
-            Some(b) => b?,
-        };
-        Pass1Timers::add(&pass1_timers.read, t_read);
-
-        let t_decode = Instant::now();
-        let gcol_idx = proj(geom_idx);
-        let schema = batch.schema();
-        let gfield = schema.field(gcol_idx);
-        let garr = from_arrow_array(batch.column(gcol_idx).as_ref(), gfield)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-        geoms_buf.clear();
-        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)?;
-        Pass1Timers::add(&pass1_timers.decode, t_decode);
-
-        let t_scan = Instant::now();
-        // Attribute filter (#315): evaluate the predicate over the projected
-        // batch once. A row whose result is not TRUE (FALSE or SQL-UNKNOWN)
-        // produces no AssignFeature — exactly like a bbox miss below — while
-        // the row index still advances, keeping row-keyed tables aligned.
-        let filter_mask: Option<Vec<Option<bool>>> = filter.map(|f| f.eval_mask(&batch, &proj));
-
-        // `AssignFeature::index` is the GLOBAL ROW index: pass 2 addresses the
-        // winner tables by raw row position. Rows with a null, empty, or
-        // non-finite geometry produce no feature but still advance the row
-        // index, so every row-keyed table stays aligned (H4 hardening; a
-        // skipped row must never shift attributes onto a neighbor's geometry).
-        let base = num_rows;
-        // #364: which rows of this batch became features. The ladder ranks
-        // DISTINCT values, so it must see the same multiset the buffered engine
-        // sees — that one reads the column off the table AFTER filtering, so a
-        // value carried only by a rejected row must not create a rung here.
-        let mut kept_row = vec![false; geoms_buf.len()];
-        for (i, gopt) in geoms_buf.iter().enumerate() {
-            // Attribute filter (#315): keep only rows where the predicate is
-            // TRUE. The row index still advances (row-keyed tables stay
-            // aligned); the slot stays UNASSIGNED so pass 2 drops it too.
-            if let Some(mask) = &filter_mask {
-                if mask[i] != Some(true) {
-                    continue;
+    scoped_pipe(
+        in_flight,
+        // Producer: read batches in order until EOF or the consumer hangs
+        // up. A read error propagates via `?` (real failure, not a
+        // disconnect); a `SendError` means the consumer stopped — a clean
+        // `break`, per `scoped_pipe`'s contract.
+        |tx: &Sender<Pass1ReadMsg>| -> Result<(), ConvertError> {
+            loop {
+                let t_read = Instant::now();
+                let batch = match reader.next() {
+                    None => break,
+                    Some(res) => res?,
+                };
+                let read_dur = t_read.elapsed();
+                if tx.send(Pass1ReadMsg { batch, read_dur }).is_err() {
+                    break;
                 }
             }
-            let Some(g) = gopt.as_ref() else {
-                skipped_rows += 1;
-                continue;
-            };
-            // #274: a single geometry walk yields the usable filter, bbox, and
-            // kind (was `usable_geometry` + `geometry_bbox` + `feature_kind`,
-            // which traversed the coords twice). `None` == unusable (empty or
-            // non-finite), identical to the old `usable_geometry` reject.
-            let Some((kind, fbbox)) = scan_feature(g) else {
-                skipped_rows += 1;
-                continue;
-            };
-            // Regional extract (#102): a feature whose bbox misses the region
-            // produces no AssignFeature — its winner-table slot stays at the
-            // UNASSIGNED sentinel, so pass 2 drops the row too. The row index
-            // still advances (row-keyed tables stay aligned).
-            if let Some(bb) = bbox_units {
-                if !super::convert::bboxes_intersect(&fbbox, bb) {
-                    continue;
-                }
-            }
-            if matches!(kind, FeatureKind::Point) {
-                point_count += 1;
-            }
-            if collect_lines && matches!(kind, FeatureKind::Line) {
-                line_rows.push(base + i);
-                line_feat_pos.push(features.len());
-                line_geoms.push(g.clone());
-            }
-            kept_row[i] = true;
-            if want_areas {
-                areas.push(polygon_area_f32(g));
-            }
-            features.push(AssignFeature {
-                index: base + i,
-                bbox: fbbox,
-                kind,
-                sort_key: None, // filled below once the ranking tier resolves
-                entry_level: None,
-            });
-        }
-        num_rows += geoms_buf.len();
-        // #305: measure the encoded geometry column's in-memory size so the
-        // pass-2 RAM-vs-spill estimate can use this input's actual average
-        // geometry weight instead of a one-size-fits-all constant. O(#buffers)
-        // per batch — no per-row work, no re-encode.
-        geom_bytes += batch.column(gcol_idx).get_array_memory_size() as u64;
-        Pass1Timers::add(&pass1_timers.scan, t_scan);
+            Ok(())
+        },
+        // Consumer: process batches in read order. Within a batch, the
+        // geometry decode + per-row scan/gate fans out over `chunk_rows`-row
+        // chunks via rayon (order-preserving `collect`); the order-dependent
+        // columnar extraction below stays serial on the full batch, exactly
+        // as the pre-#460 loop did.
+        |rx: Receiver<Pass1ReadMsg>| -> Result<(), ConvertError> {
+            for msg in rx.iter() {
+                Pass1Timers::add_dur(&timers_ref.read, msg.read_dur);
+                let batch = msg.batch;
+                let n = batch.num_rows();
+                let base = num_rows;
+                let schema = batch.schema();
+                let gfield = schema.field(gcol_idx).clone();
 
-        let t_keys = Instant::now();
-        match &mut plan {
-            RankPlan::ExplicitSort { idx, .. } => {
-                explicit_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
-            }
-            RankPlan::ExplicitClass { idx, ranking } => {
-                let col = batch.column(proj(*idx));
-                explicit_keys.extend(extract_class_ranks(col.as_ref(), ranking)?);
-                if collect_lines {
-                    explicit_interner.extend(col.as_ref(), &mut explicit_groups);
-                }
-            }
-            RankPlan::Auto { roads, confidence } => {
-                for cand in roads.iter_mut() {
-                    let col = batch.column(proj(cand.idx));
-                    scan_road_vocab(col.as_ref(), &mut cand.found);
-                    cand.keys
-                        .extend(extract_class_ranks(col.as_ref(), &cand.ranking)?);
-                    if collect_lines {
-                        cand.interner.extend(col.as_ref(), &mut cand.groups);
-                    }
-                }
-                if let Some((idx, _)) = confidence {
-                    confidence_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
-                }
-            }
-            RankPlan::SizeFallback => {}
-        }
+                let t_filter = Instant::now();
+                // Attribute filter (#315): evaluate the predicate over the
+                // projected batch once, up front — `eval_expr` is a pure
+                // per-row column comparison (no cross-row context), so the
+                // mask can be sliced per chunk below.
+                let filter_mask: Option<Vec<Option<bool>>> =
+                    filter.map(|f| f.eval_mask(&batch, &proj));
+                Pass1Timers::add(&timers_ref.scan, t_filter);
 
-        // Accumulate columns (Q4): per-spec source values, in row order.
-        // `extract_numeric_values`, not `extract_sort_keys` — aggregating is
-        // not ranking, so ±inf is a summand and only NaN is skipped (#428).
-        // Must match `convert::extract_accumulate_values`, which the buffered
-        // engine uses: the two engines are byte-identical by contract.
-        for (s, &idx) in acc_cols.iter().enumerate() {
-            acc_values[s].extend(extract_numeric_values(batch.column(proj(idx)).as_ref()));
-        }
+                // Chunk boundaries: contiguous, non-overlapping, ascending.
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                let mut off = 0usize;
+                while off < n {
+                    let len = chunk_rows.min(n - off);
+                    ranges.push((off, len));
+                    off += len;
+                }
 
-        // Entry-zoom ladder (#364): row-indexed, like the ranking keys above,
-        // but blanked for rows this pass rejected (null/unusable geometry, a
-        // false `--filter` predicate, a `--bbox` miss). Those rows produce no
-        // feature, so letting their values into the ladder would add rungs the
-        // buffered engine never sees and shift every weaker feature by `step`.
-        if let Some(idx) = ladder_col {
-            let keys = extract_sort_keys(batch.column(proj(idx)).as_ref());
-            ladder_values.extend(
-                keys.into_iter()
-                    .zip(&kept_row)
-                    .map(|(k, keep)| if *keep { k } else { None }),
-            );
-        }
-        Pass1Timers::add(&pass1_timers.keys, t_keys);
-    }
+                let chunk_results: Vec<Result<ChunkScan, ConvertError>> = ranges
+                    .par_iter()
+                    .map(|&(start, len)| {
+                        let sliced = batch.slice(start, len);
+                        let gcol = sliced.column(gcol_idx).clone();
+                        let mask_slice = filter_mask.as_deref().map(|m| &m[start..start + len]);
+                        scan_chunk(
+                            &gfield,
+                            gcol.as_ref(),
+                            mask_slice,
+                            bbox_units,
+                            collect_lines,
+                            want_areas,
+                            timers_ref,
+                        )
+                    })
+                    .collect();
+
+                // Merge chunks IN ORDER, rebasing every chunk-local index by
+                // this chunk's global row/feature offset — never a global
+                // base handed into `scan_chunk` itself (H4: a skipped row
+                // must still advance the row index exactly as the serial
+                // loop advanced it, so every row-keyed table stays aligned).
+                let kept_row = merge_pass1_chunks(
+                    chunk_results,
+                    &ranges,
+                    base,
+                    n,
+                    want_areas,
+                    &mut features,
+                    &mut areas,
+                    &mut line_rows,
+                    &mut line_feat_pos,
+                    &mut line_geoms,
+                    &mut point_count,
+                    &mut skipped_rows,
+                )?;
+                num_rows += n;
+                // #305: measure the encoded geometry column's in-memory size
+                // so the pass-2 RAM-vs-spill estimate can use this input's
+                // actual average geometry weight instead of a
+                // one-size-fits-all constant. O(#buffers) per batch — no
+                // per-row work, no re-encode, unaffected by chunking.
+                geom_bytes += batch.column(gcol_idx).get_array_memory_size() as u64;
+
+                let t_keys = Instant::now();
+                extract_pass1_batch_keys(
+                    &batch,
+                    &proj,
+                    &mut plan,
+                    collect_lines,
+                    ladder_col,
+                    &kept_row,
+                    &mut explicit_keys,
+                    &mut confidence_keys,
+                    &mut explicit_interner,
+                    &mut explicit_groups,
+                    acc_cols,
+                    &mut acc_values,
+                    &mut ladder_values,
+                )?;
+                Pass1Timers::add(&timers_ref.keys, t_keys);
+            }
+            Ok(())
+        },
+    )?;
 
     let t_assemble = Instant::now();
     let (keys, provenance, all_groups) = resolve_ranking_tier(
@@ -3055,4 +3363,229 @@ pub(super) fn process_batch_cascade(
         per_level.push(res?);
     }
     Ok(per_level)
+}
+
+// ============================================================================
+// Pass-1 parallelization tests (#460)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use geo::{LineString, Point, Polygon};
+
+    /// `LevelPlan` lives in `convert.rs` and `write_input_with_f64` in the
+    /// shared `testutil` module — neither is re-imported at the top of this
+    /// module (only the items `run_pass1` itself needs are), so pull them in
+    /// via the grandparent (`overview`) module directly.
+    use super::super::convert::LevelPlan;
+    use super::super::testutil::write_input_with_f64;
+
+    /// A mix of points, lines, and polygons, spread out so every row is its
+    /// own coarse-level cell winner and no feature collapses during
+    /// simplification (that would make an equivalence test brittle for the
+    /// wrong reason — collapse thresholds, not chunking, deciding the
+    /// output).
+    fn mixed_geometries(n_points: usize, n_lines: usize, n_polys: usize) -> Vec<Geometry<f64>> {
+        let mut geoms = Vec::new();
+        for i in 0..n_points {
+            geoms.push(Geometry::Point(Point::new(i as f64 * 3.0, i as f64 * 2.0)));
+        }
+        for i in 0..n_lines {
+            let base = 100.0 + i as f64 * 10.0;
+            let ls = LineString::from(vec![(base, 0.0), (base + 5.0, 3.0), (base + 9.0, 1.0)]);
+            geoms.push(Geometry::LineString(ls));
+        }
+        for i in 0..n_polys {
+            let cx = -80.0 + i as f64 * 12.0;
+            let cy = -40.0 - i as f64 * 5.0;
+            let half = 2.0 + i as f64;
+            let ext = LineString::from(vec![
+                (cx - half, cy - half),
+                (cx + half, cy - half),
+                (cx + half, cy + half),
+                (cx - half, cy + half),
+                (cx - half, cy - half),
+            ]);
+            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+        }
+        geoms
+    }
+
+    /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh
+    /// [`convert_preflight`] each time (mirrors how `convert_streaming_strategy`
+    /// prepares its inputs).
+    fn run_pass1_for_test(path: &Path, options: &ConvertOptions, chunk_rows: usize) -> Pass1Output {
+        let source = ConvertSource::resolve_path(path).unwrap();
+        let pre = convert_preflight(&source, options).unwrap();
+        run_pass1_with_chunk_rows(
+            &source,
+            &pre.input_schema,
+            pre.geom_idx,
+            &pre.options,
+            &pre.acc_cols,
+            pre.selected_row_groups.as_ref(),
+            pre.bbox_units.as_ref(),
+            pre.bound_filter.as_ref(),
+            chunk_rows,
+        )
+        .unwrap()
+    }
+
+    /// Field-by-field [`AssignFeature`] comparison ([`AssignFeature`] has no
+    /// `PartialEq` — it isn't needed outside tests, and deriving it here would
+    /// mean editing `assign.rs`, outside this PR's file scope).
+    fn assert_features_eq(a: &[AssignFeature], b: &[AssignFeature]) {
+        assert_eq!(a.len(), b.len(), "feature count differs");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(x.index, y.index, "feature {i}: index differs");
+            assert_eq!(x.bbox, y.bbox, "feature {i}: bbox differs");
+            assert_eq!(x.kind, y.kind, "feature {i}: kind differs");
+            assert_eq!(x.sort_key, y.sort_key, "feature {i}: sort_key differs");
+            assert_eq!(
+                x.entry_level, y.entry_level,
+                "feature {i}: entry_level differs"
+            );
+        }
+    }
+
+    /// Full [`Pass1Output`] equivalence: every field a caller of `run_pass1`
+    /// depends on, EXCEPT `pass1_stage_secs` (wall-clock profiling data,
+    /// expected to differ between a serial and a chunked/parallel run).
+    fn assert_pass1_outputs_eq(a: &Pass1Output, b: &Pass1Output) {
+        assert_eq!(a.num_rows, b.num_rows, "num_rows differs");
+        assert_eq!(a.skipped_rows, b.skipped_rows, "skipped_rows differs");
+        assert_eq!(a.geom_bytes, b.geom_bytes, "geom_bytes differs");
+        assert_eq!(a.provenance, b.provenance, "ranking provenance differs");
+        assert_eq!(a.acc_values, b.acc_values, "acc_values differ");
+        assert_features_eq(&a.features, &b.features);
+        assert_eq!(a.areas, b.areas, "areas differ");
+        match (&a.coalesce, &b.coalesce) {
+            (None, None) => {}
+            (Some(x), Some(y)) => {
+                assert_eq!(x.rows, y.rows, "coalesce rows differ");
+                assert_eq!(x.sort_keys, y.sort_keys, "coalesce sort_keys differ");
+                assert_eq!(x.groups, y.groups, "coalesce groups differ");
+                assert_eq!(x.geoms, y.geoms, "coalesce geoms differ");
+            }
+            _ => panic!("coalesce presence differs between serial and chunked runs"),
+        }
+    }
+
+    /// #460: a chunk size of `usize::MAX` (one chunk per batch — the pre-#460
+    /// shape, one big `scan_chunk` call) must produce byte-identical
+    /// [`Pass1Output`] to a heavily chunked run (`chunk_rows: 7`, several
+    /// chunks per batch, `read_batch_size: 7` too, so chunk AND batch
+    /// boundaries both cut across the fixture repeatedly).
+    #[test]
+    fn pass1_parallel_matches_serial_on_fixture() {
+        let geoms = mixed_geometries(23, 9, 7); // points, lines, polygons: 39 rows
+        let n = geoms.len();
+        let values: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
+        let opt_geoms: Vec<Option<Geometry<f64>>> = geoms.into_iter().map(Some).collect();
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &opt_geoms, "rank", &values);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 9,
+            },
+            sort_key: Some("rank".to_string()),
+            read_batch_size: 7,
+            // #384 tiny-polygon accumulator: exercises the `want_areas` path
+            // (per-feature polygon-area collection) through the chunked scan.
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Square,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let serial = run_pass1_for_test(tin.path(), &options, usize::MAX);
+        let chunked = run_pass1_for_test(tin.path(), &options, 7);
+
+        assert_pass1_outputs_eq(&serial, &chunked);
+        assert!(
+            !serial.features.is_empty(),
+            "fixture must produce at least one feature"
+        );
+        assert!(
+            serial.coalesce.is_some(),
+            "fixture's lines must produce a coalesce scratch (coalesce_lines defaults on)"
+        );
+    }
+
+    /// #460: nulls, non-finite geometries, and attribute-filtered rows are
+    /// interleaved so at least one of every skip category lands in the
+    /// middle of a chunk (`chunk_rows: 3`) as well as straddling a chunk
+    /// boundary and a batch boundary (`read_batch_size: 5`). Every kept
+    /// feature's global row `index` — the thing `Priority::beats`'s
+    /// `stable_hash(index)` tie-break depends on — must match the serial
+    /// (`usize::MAX` chunk) run exactly.
+    #[test]
+    fn pass1_chunking_preserves_row_indices_with_skipped_geometries() {
+        let mut geoms: Vec<Option<Geometry<f64>>> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        for i in 0..24 {
+            match i % 6 {
+                // Null geometry: skipped (H4), row index still advances.
+                0 => {
+                    geoms.push(None);
+                    values.push(10.0);
+                }
+                // Non-finite coordinate: `scan_feature` rejects it, skipped.
+                1 => {
+                    geoms.push(Some(Geometry::Point(Point::new(f64::NAN, 1.0))));
+                    values.push(10.0);
+                }
+                // Valid geometry, but the attribute filter drops it (rank <=
+                // 5): NOT counted in `skipped_rows`, but still no feature.
+                2 => {
+                    geoms.push(Some(Geometry::Point(Point::new(i as f64, i as f64 * 0.5))));
+                    values.push(1.0);
+                }
+                // Valid, kept.
+                _ => {
+                    geoms.push(Some(Geometry::Point(Point::new(
+                        i as f64 * 2.0,
+                        -(i as f64),
+                    ))));
+                    values.push(10.0);
+                }
+            }
+        }
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 8,
+            },
+            filter: Some("rank > 5.0".to_string()),
+            read_batch_size: 5,
+            ..Default::default()
+        };
+
+        let serial = run_pass1_for_test(tin.path(), &options, usize::MAX);
+        let chunked = run_pass1_for_test(tin.path(), &options, 3);
+
+        assert_pass1_outputs_eq(&serial, &chunked);
+
+        // Sanity: the fixture actually exercises all three skip categories,
+        // so the equivalence assertion above is meaningful, not vacuous.
+        assert!(
+            serial.skipped_rows > 0,
+            "fixture must include null/non-finite rows"
+        );
+        assert!(
+            serial.features.len() + serial.skipped_rows < serial.num_rows,
+            "fixture must also include attribute-filtered rows (not counted \
+             in skipped_rows)"
+        );
+    }
 }
