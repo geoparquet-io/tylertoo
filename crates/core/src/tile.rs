@@ -5,6 +5,8 @@
 
 use std::f64::consts::PI;
 
+use crate::world_coord::MAX_LATITUDE;
+
 /// Tile coordinates: x, y, and zoom level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileCoord {
@@ -135,7 +137,8 @@ impl TileBounds {
 /// # Arguments
 ///
 /// * `lng` - Longitude in degrees (-180 to 180)
-/// * `lat` - Latitude in degrees (-85.0511 to 85.0511, Web Mercator bounds)
+/// * `lat` - Latitude in degrees. Values outside the Web Mercator bounds
+///   (`±world_coord::MAX_LATITUDE`) are silently clamped, not rejected.
 /// * `zoom` - Zoom level (0-30)
 ///
 /// # Returns
@@ -152,15 +155,26 @@ pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     let x = ((lng + 180.0) / 360.0 * n).floor() as u32;
     let x = x.min(max_coord);
 
-    // Clamp latitude to Web Mercator bounds to prevent tile coordinate overflow.
-    // Web Mercator is defined for ~±85.0511° but we use ±85.05° for safety margin.
-    // Without this clamp, lat=-90° produces y values 6-20x larger than valid bounds.
-    let lat = lat.clamp(-85.05, 85.05);
+    // Clamp latitude to the Web Mercator bound to prevent tile coordinate
+    // overflow for out-of-range latitudes. ±MAX_LATITUDE is not where the
+    // projection stops being defined — it is where its y reaches the edge of
+    // the square world extent (normalized y = 0 north, 1 south). The
+    // projection itself only diverges at ±90°, which is why without this
+    // clamp lat=-90° produces y values 6-20x larger than valid bounds.
+    //
+    // The bound is used exactly, not shaved to a rounder value: clamping
+    // short of it silently moved points that legitimately sit at the edge of
+    // a full EPSG:3857 extent into the wrong tile row (#416).
+    let lat = lat.clamp(-MAX_LATITUDE, MAX_LATITUDE);
 
     // Convert latitude to tile y (Web Mercator)
-    // Clamp to valid range for the same edge case reasons
     let lat_rad = lat.to_radians();
     let y = ((1.0 - lat_rad.tan().asinh() / PI) / 2.0 * n).floor() as u32;
+    // Defense in depth for the south edge: at lat = -MAX_LATITUDE the raw row
+    // sits infinitesimally below 2^z, and a rounding error in the other
+    // direction would floor it to exactly 2^z — one past the last valid row.
+    // With MAX_LATITUDE rounded down this no longer triggers, but the clamp
+    // still guards any future change to the constant's last digits.
     let y = y.min(max_coord);
 
     TileCoord::new(x, y, zoom)
@@ -621,6 +635,50 @@ mod tests {
                 zoom,
                 max_valid
             );
+        }
+    }
+
+    #[test]
+    fn test_lng_lat_to_tile_exact_mercator_bound_maps_to_edge_rows() {
+        // The Web Mercator latitude bound must map to the top row (y=0) and
+        // its mirror to the bottom row (y = 2^z - 1) at every zoom level.
+        //
+        // Regression for #416: clamping to the shaved literal ±85.05 instead
+        // of the exact bound moved these points several rows away from the
+        // tile edge at z>=15 (e.g. row 38 instead of 0 at z20), silently
+        // dropping the top/bottom Web Mercator band for any dataset whose
+        // extent reaches the true Web Mercator limit.
+        //
+        // Three latitudes per hemisphere: the bound itself (exercises the
+        // clamp's no-op path at its exact boundary), a value one ULP outside
+        // it (exercises the clamp), and the pole (the projection's actual
+        // divergence, far outside the clamp).
+        const JUST_OUTSIDE: f64 = 85.051_128_779_806_6;
+        // Compile-time guard: JUST_OUTSIDE only exercises the clamp while it
+        // sits above MAX_LATITUDE, which also pins the constant to the "round
+        // down" side of the true bound.
+        const { assert!(JUST_OUTSIDE > MAX_LATITUDE) };
+
+        for zoom in [0u8, 5, 10, 15, 18, 20, 22] {
+            let max_valid = 2_u32.pow(zoom as u32) - 1;
+
+            for lat in [MAX_LATITUDE, JUST_OUTSIDE, 90.0] {
+                let north = lng_lat_to_tile(0.0, lat, zoom);
+                assert_eq!(
+                    north.y, 0,
+                    "lat={lat} at zoom {zoom} should map to y=0, got {}",
+                    north.y
+                );
+            }
+
+            for lat in [-MAX_LATITUDE, -JUST_OUTSIDE, -90.0] {
+                let south = lng_lat_to_tile(0.0, lat, zoom);
+                assert_eq!(
+                    south.y, max_valid,
+                    "lat={lat} at zoom {zoom} should map to y={max_valid}, got {}",
+                    south.y
+                );
+            }
         }
     }
 }

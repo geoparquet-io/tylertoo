@@ -322,8 +322,16 @@ pub(super) struct Priority {
 
 impl Priority {
     pub(super) fn new(feat: &AssignFeature, dir: SortDirection) -> Self {
+        // A non-finite key is a MISSING key (#428). The extractors upstream
+        // already file NaN/±inf under `None`, but `AssignFeature::sort_key`
+        // is reachable from the public `assign_levels` API and from
+        // `--class-rank`, so the invariant that `beats` needs is enforced
+        // here too — where it is cheap and where breaking it is fatal:
+        // `beats` answers false in BOTH directions for a NaN, which is not a
+        // strict weak order, so the cell incumbent would keep the cell
+        // whatever the keys say and `sort_by` would be entitled to panic.
         // Apply direction so a plain "larger wins" comparison is correct.
-        let sort_rank = feat.sort_key.map(|k| match dir {
+        let sort_rank = feat.sort_key.filter(|k| k.is_finite()).map(|k| match dir {
             SortDirection::Desc => k,
             SortDirection::Asc => -k,
         });
@@ -458,7 +466,23 @@ fn level_winner_positions(
             .or_insert(pos);
     }
 
+    // Determinism contract (#423): `grid.into_values()` drains the HashMap in
+    // its internal bucket order, which is a function of the (randomized,
+    // per-process) hash of `CellKey` — not of anything about this run's
+    // input or thread count. The caller currently folds `winners` through a
+    // commutative min (`if level < min_levels[pos] { .. }`), so today the
+    // HashMap order is harmless. But it is the one place in this module where
+    // raw HashMap iteration order reaches a `Vec` at all, and it takes only
+    // one future refactor of the caller (e.g. anything positional, or a
+    // tie-break that isn't truly order-independent) to turn that into a
+    // build-to-build / thread-count-to-thread-count byte diff. Sorting here
+    // costs nothing to reason about later: `winners` holds feature positions
+    // (`usize`, `Ord`), one per occupied cell — sorting is O(cells log
+    // cells), not O(features log features), and cells are bounded by the
+    // memory budget in `estimate_level_grid_bytes` above, so this is cheap
+    // relative to the grid build it follows.
     winners.extend(grid.into_values());
+    winners.sort_unstable();
     winners
 }
 
@@ -1128,6 +1152,128 @@ mod tests {
             sort_key: None,
             entry_level: None,
         }
+    }
+
+    /// #428: a NaN in the sort-key column must rank as a MISSING key (below
+    /// every real key), not as a value `Priority::beats` cannot order.
+    ///
+    /// `beats` answers false in both directions for a NaN, so the incumbent of
+    /// a cell wins it no matter what its key says: put the NaN row first and
+    /// the documented "larger sort key wins" rule silently inverts. The fix is
+    /// upstream — the key never reaches the comparator as a NaN — so this test
+    /// builds its keys the way the pipeline does, off the column.
+    #[test]
+    fn nan_sort_key_ranks_as_a_missing_key() {
+        use super::super::convert::extract_sort_keys;
+        use arrow_array::Float64Array;
+
+        let gsds = [gsd(2), gsd(6)];
+        let cfg = AssignConfig::default();
+
+        let col = Float64Array::from(vec![f64::NAN, 1.0]);
+        let keys = extract_sort_keys(&col);
+
+        // Two points close enough to contest one coarse cell; the NaN row is
+        // the incumbent (lower index), the real key arrives as challenger.
+        let mut nan_row = point(0, 10.0, 10.0);
+        nan_row.sort_key = keys[0];
+        let mut valued = point(1, 10.0001, 10.0001);
+        valued.sort_key = keys[1];
+
+        let out = assign_levels(&[nan_row, valued], &gsds, &cfg, Crs::Epsg4326);
+        assert_eq!(
+            out.assignments[1].min_level, 0,
+            "the row with a real sort key must win the cell"
+        );
+        assert_eq!(
+            out.assignments[0].min_level, 1,
+            "the NaN row ranks as keyless and loses the cell"
+        );
+    }
+
+    /// #428, the local invariant: the extractors are not the only way a key
+    /// reaches the comparator. `assign_levels` is public, and `--class-rank`
+    /// feeds `sort_key` straight from a caller-supplied rank table, so
+    /// `Priority::new` itself files a non-finite key under "missing". Without
+    /// that, a NaN incumbent keeps every cell it holds (`beats` is false in
+    /// both directions), inverting the documented "larger key wins" rule.
+    #[test]
+    fn non_finite_sort_key_set_directly_loses_every_contest() {
+        let gsds = [gsd(2), gsd(6)];
+        let cfg = AssignConfig::default();
+
+        for (label, bad) in [
+            ("NaN", f64::NAN),
+            ("+inf", f64::INFINITY),
+            ("-inf", f64::NEG_INFINITY),
+        ] {
+            for dir in [SortDirection::Desc, SortDirection::Asc] {
+                let cfg = AssignConfig {
+                    sort_direction: dir,
+                    ..cfg
+                };
+                // The unrankable row is the incumbent (lower index): only a
+                // comparator that treats it as keyless can dethrone it.
+                let mut incumbent = point(0, 10.0, 10.0);
+                incumbent.sort_key = Some(bad);
+                let mut challenger = point(1, 10.0001, 10.0001);
+                challenger.sort_key = Some(1.0);
+
+                let out = assign_levels(&[incumbent, challenger], &gsds, &cfg, Crs::Epsg4326);
+                assert_eq!(
+                    out.assignments[1].min_level, 0,
+                    "{label}/{dir:?}: the row with a real key must win the cell"
+                );
+                assert_eq!(
+                    out.assignments[0].min_level, 1,
+                    "{label}/{dir:?}: an unrankable key ranks as keyless and loses"
+                );
+            }
+        }
+    }
+
+    /// The same invariant reached the way `--class-rank` reaches it: a rank
+    /// table carrying a NaN (the CLI and the Python binding both reject one
+    /// now, but the core API cannot be stopped from building it) must not let
+    /// the NaN-ranked class win contests it should lose.
+    #[test]
+    fn nan_class_rank_loses_every_contest() {
+        use super::super::convert::{extract_class_ranks, ClassRanking};
+        use arrow_array::StringArray;
+
+        let ranking = ClassRanking {
+            column: "cls".to_string(),
+            ranks: vec![("bad".to_string(), f64::NAN), ("good".to_string(), 1.0)],
+            unknown_rank: -1.0,
+        };
+        let col = StringArray::from(vec!["bad", "good"]);
+        let ranks = extract_class_ranks(&col, &ranking).unwrap();
+        assert_eq!(
+            ranks[0].map(f64::is_nan),
+            Some(true),
+            "the NaN gets through"
+        );
+
+        let mut nan_ranked = point(0, 10.0, 10.0);
+        nan_ranked.sort_key = ranks[0];
+        let mut ranked = point(1, 10.0001, 10.0001);
+        ranked.sort_key = ranks[1];
+
+        let gsds = [gsd(2), gsd(6)];
+        let out = assign_levels(
+            &[nan_ranked, ranked],
+            &gsds,
+            &AssignConfig::default(),
+            Crs::Epsg4326,
+        );
+        assert_eq!(
+            out.assignments[1].min_level, 0,
+            "the really-ranked class wins the cell"
+        );
+        assert_eq!(
+            out.assignments[0].min_level, 1,
+            "the NaN-ranked class ranks as unranked and loses it"
+        );
     }
 
     fn poly(index: usize, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> AssignFeature {

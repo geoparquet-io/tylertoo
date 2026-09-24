@@ -74,9 +74,9 @@ use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
-    count_vertices, encode_concurrency_for, extract_class_ranks, extract_sort_keys,
-    fill_level_bytes, find_geometry_column, mixed_geometry_field, overture_road_ranking,
-    record_level_outcome, resolve_reserved_column_collisions, scan_feature,
+    count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
+    extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
+    overture_road_ranking, record_level_outcome, resolve_reserved_column_collisions, scan_feature,
     validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, ClassRanking,
     CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, SkippedLevelReport,
     KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
@@ -1814,8 +1814,12 @@ fn run_pass1(
         }
 
         // Accumulate columns (Q4): per-spec source values, in row order.
+        // `extract_numeric_values`, not `extract_sort_keys` — aggregating is
+        // not ranking, so ±inf is a summand and only NaN is skipped (#428).
+        // Must match `convert::extract_accumulate_values`, which the buffered
+        // engine uses: the two engines are byte-identical by contract.
         for (s, &idx) in acc_cols.iter().enumerate() {
-            acc_values[s].extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
+            acc_values[s].extend(extract_numeric_values(batch.column(proj(idx)).as_ref()));
         }
 
         // Entry-zoom ladder (#364): row-indexed, like the ranking keys above,

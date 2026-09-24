@@ -44,10 +44,14 @@
 //! identical output either way. Statistics min/max are valid bounds even
 //! when writers truncate them, so bound-based pruning stays correct.
 //!
-//! Numeric comparisons are performed in `f64` (matching the ranking path's
-//! [`extract_sort_keys`]); Int64 statistics outside the exact-`f64` range
-//! (|v| >= 2^53) are widened before pruning so rounding can never prune a
-//! matching row group.
+//! Numeric comparisons are performed in `f64` (through the ranking path's
+//! [`extract_numeric_values`]); Int64 statistics outside the exact-`f64`
+//! range (|v| >= 2^53) are widened before pruning so rounding can never prune
+//! a matching row group. A NaN — nodata in most float columns, and a value no
+//! comparison can answer — evaluates to UNKNOWN like a null rather than to
+//! TRUE/FALSE, and NaN column statistics are treated as no statistics at all
+//! (#428): they bound nothing, and taking them as bounds would prune row
+//! groups holding matching rows.
 
 use std::collections::HashMap;
 
@@ -57,7 +61,7 @@ use arrow_schema::{DataType, Schema, TimeUnit};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
-use super::convert::extract_sort_keys;
+use super::convert::extract_numeric_values;
 
 /// Errors from parsing or binding a `--filter` expression.
 #[derive(Debug, thiserror::Error)]
@@ -990,7 +994,7 @@ fn eval_expr(
         BoundExpr::Compare { col, op, value } => {
             let arr = batch.column(proj(col.idx));
             match (col.kind, value) {
-                (ColKind::Num, Literal::Number(lit)) => extract_sort_keys(arr.as_ref())
+                (ColKind::Num, Literal::Number(lit)) => extract_numeric_values(arr.as_ref())
                     .into_iter()
                     .map(|v| v.map(|v| cmp_num(v, *op, *lit)))
                     .collect(),
@@ -1030,7 +1034,7 @@ fn eval_expr(
                             _ => None,
                         })
                         .collect();
-                    extract_sort_keys(arr.as_ref())
+                    extract_numeric_values(arr.as_ref())
                         .into_iter()
                         .map(|v| v.map(|v| lits.contains(&v)))
                         .collect()
@@ -1137,8 +1141,14 @@ fn widen_i64(v: i64, is_min: bool) -> f64 {
 }
 
 /// `(min, max)` of a numeric column chunk as `f64` bounds, when available.
+///
+/// A NaN bound reads as *no* bound (#428): every comparison against it is
+/// false, so [`range_can_match_num`] would answer "cannot match" and prune a
+/// row group whose other rows do match. arrow-rs leaves NaN out of the
+/// statistics it writes, but a file written elsewhere can carry one.
 fn num_bounds(stats: &Statistics) -> Option<(f64, f64)> {
-    match stats {
+    let finite = |(min, max): (f64, f64)| (!min.is_nan() && !max.is_nan()).then_some((min, max));
+    let bounds = match stats {
         Statistics::Int32(s) => Some((*s.min_opt()? as f64, *s.max_opt()? as f64)),
         Statistics::Int64(s) => Some((
             widen_i64(*s.min_opt()?, true),
@@ -1147,7 +1157,8 @@ fn num_bounds(stats: &Statistics) -> Option<(f64, f64)> {
         Statistics::Float(s) => Some((*s.min_opt()? as f64, *s.max_opt()? as f64)),
         Statistics::Double(s) => Some((*s.min_opt()?, *s.max_opt()?)),
         _ => None,
-    }
+    };
+    bounds.and_then(finite)
 }
 
 /// `(min, max)` of a string column chunk, when available and valid UTF-8.
@@ -1304,6 +1315,50 @@ mod tests {
     };
     use arrow_schema::{Field, TimeUnit};
     use std::sync::Arc;
+
+    // ---- non-finite statistics (#428) ------------------------------------
+
+    /// A NaN min/max makes every `range_can_match_num` comparison false, so
+    /// the row group is PRUNED — the rows that do match the predicate are lost
+    /// without a word. Statistics that cannot bound anything must read as
+    /// absent, which is the branch that keeps the row group.
+    #[test]
+    fn nan_numeric_statistics_never_prune() {
+        use parquet::file::statistics::Statistics;
+
+        let nan = Statistics::double(Some(f64::NAN), Some(f64::NAN), None, Some(0), false);
+        assert_eq!(
+            num_bounds(&nan),
+            None,
+            "unusable (NaN) statistics must read as absent, never as a bound"
+        );
+
+        // A half-NaN interval is just as unusable.
+        let half = Statistics::double(Some(f64::NAN), Some(10.0), None, Some(0), false);
+        assert_eq!(num_bounds(&half), None);
+
+        // Control: ±inf IS a bound, and a finite interval is unaffected.
+        assert_eq!(
+            num_bounds(&Statistics::double(
+                Some(f64::NEG_INFINITY),
+                Some(10.0),
+                None,
+                Some(0),
+                false
+            )),
+            Some((f64::NEG_INFINITY, 10.0))
+        );
+        assert_eq!(
+            num_bounds(&Statistics::double(
+                Some(-1.0),
+                Some(10.0),
+                None,
+                Some(0),
+                false
+            )),
+            Some((-1.0, 10.0))
+        );
+    }
 
     // ---- parser ----------------------------------------------------------
 
@@ -1561,6 +1616,80 @@ mod tests {
         assert_eq!(
             eval("id IN (1, 3)"),
             vec![Some(false), Some(true), Some(false), Some(true)]
+        );
+    }
+
+    /// #428, row-level evaluation: a NaN in a float column is UNKNOWN, the
+    /// same tri-state a null gets, because no comparison against it has an
+    /// answer. Pinned here because one of these is a deliberate BEHAVIOR
+    /// CHANGE: `!=` (and `NOT IN`) used to return TRUE for a NaN row —
+    /// `NaN != 5` is true under IEEE-754 — so such rows were kept. They are
+    /// now dropped, like null rows, which is the SQL reading of "unknown".
+    ///
+    /// The `IS NULL` pair is the awkward corner and is pinned on purpose: a
+    /// NaN is a present value, so `IS NULL` does NOT match it and
+    /// `IS NOT NULL` does. Together with the rule above, no predicate selects
+    /// NaN rows — documented in `docs/OVERVIEW_TUNING.md`.
+    #[test]
+    fn eval_nan_is_unknown_not_a_comparable_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "confidence",
+            DataType::Float64,
+            true,
+        )]));
+        let confidence: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(9.0),
+            None,
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![confidence]).unwrap();
+        let eval = |src: &str| {
+            let expr = parse_filter(src).unwrap();
+            BoundFilter::bind(&expr, &batch.schema(), &[])
+                .unwrap()
+                .eval_mask(&batch, &|i| i)
+        };
+
+        // Ordinary comparison: the NaN row is UNKNOWN, exactly like the null.
+        assert_eq!(
+            eval("confidence > 0.8"),
+            vec![Some(true), None, Some(true), None]
+        );
+        // NOT does not resurrect it (Kleene: NOT UNKNOWN = UNKNOWN).
+        assert_eq!(
+            eval("NOT (confidence > 0.8)"),
+            vec![Some(false), None, Some(false), None]
+        );
+        // The behavior change: `NaN != 5` is TRUE in IEEE-754 but UNKNOWN
+        // here, so the NaN row is dropped rather than kept.
+        assert_eq!(
+            eval("confidence != 5"),
+            vec![Some(true), None, Some(true), None]
+        );
+        assert_eq!(
+            eval("confidence = 1.0"),
+            vec![Some(true), None, Some(false), None]
+        );
+        // IN / NOT IN read the column the same way.
+        assert_eq!(
+            eval("confidence IN (1.0, 9.0)"),
+            vec![Some(true), None, Some(true), None]
+        );
+        assert_eq!(
+            eval("confidence NOT IN (5)"),
+            vec![Some(true), None, Some(true), None]
+        );
+        // But the null tests see a NaN as the present value it is.
+        assert_eq!(
+            eval("confidence IS NULL"),
+            vec![Some(false), Some(false), Some(false), Some(true)],
+            "a NaN is a present value: IS NULL must NOT match it"
+        );
+        assert_eq!(
+            eval("confidence IS NOT NULL"),
+            vec![Some(true), Some(true), Some(true), Some(false)],
+            "...and IS NOT NULL does"
         );
     }
 

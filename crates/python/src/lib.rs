@@ -299,9 +299,12 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     class_ranks (dict[str, float], optional): Map of class value to
 ///         priority; higher priority wins a cell. Present-but-unlisted values
 ///         rank below every listed value (but above nulls) unless
-///         class_rank_unknown overrides that.
+///         class_rank_unknown overrides that. Priorities must be finite:
+///         NaN and infinity cannot be ordered against other classes and are
+///         rejected with ValueError.
 ///     class_rank_unknown (float, optional): Priority for present-but-unlisted
-///         class values. Defaults to min(class_ranks.values()) - 1.
+///         class values. Defaults to min(class_ranks.values()) - 1. Must be
+///         finite.
 ///     no_auto_rank (bool, optional): Disable auto-detection of well-known
 ///         schemas (Overture roads class/road_class, Overture places
 ///         confidence). Defaults to False.
@@ -601,6 +604,24 @@ fn overview(
                     "class_ranks must contain at least one value: rank entry",
                 ));
             }
+            // Ranks must be finite (#428), mirroring the CLI's --class-rank
+            // parsing. A NaN is not ordered, so the incumbent of a contested
+            // cell would silently keep it; and the min() fold below IGNORES
+            // NaN, so one would leave unknown_rank at +inf — unlisted values
+            // outranking every listed class, the inverse of the rule this
+            // argument documents.
+            if let Some((value, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
+                return Err(PyErr::new::<PyValueError, _>(format!(
+                    "class_ranks[{value:?}] = {rank}: ranks must be finite numbers \
+                     (NaN and infinity cannot be ordered against other classes)"
+                )));
+            }
+            if let Some(unknown) = class_rank_unknown.filter(|u| !u.is_finite()) {
+                return Err(PyErr::new::<PyValueError, _>(format!(
+                    "class_rank_unknown = {unknown}: must be a finite number \
+                     (NaN and infinity cannot be ordered against other classes)"
+                )));
+            }
             let min_rank = ranks.values().copied().fold(f64::INFINITY, f64::min);
             Some(ClassRanking {
                 column,
@@ -781,8 +802,9 @@ fn overview(
 ///         during export (the export concurrency knob). Defaults to 0, which
 ///         auto-sizes via a memory-budget preflight: the machine's core
 ///         count, capped by how many estimated per-partition transients fit
-///         in a fraction of available RAM (floor 6; fixed cap 16 only when
-///         RAM cannot be probed; override the RAM figure with the
+///         in a fraction of available RAM (container-aware: cgroup v2/v1
+///         limits are respected; floor 6; fixed cap 16 only when RAM cannot
+///         be probed; override the RAM figure with the
 ///         TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive
 ///         integer to override. Wider waves keep more cores busy at
 ///         proportionally more peak memory. Output is byte-identical for
