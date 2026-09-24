@@ -2893,8 +2893,8 @@ pub(super) fn count_vertices(g: &Geometry<f64>) -> usize {
 }
 
 /// Extract an optional f64 **sort key** per row from a numeric Arrow column:
-/// [`extract_numeric_values`] with every non-finite value filed under
-/// "missing key" as well (#428).
+/// [`extract_numeric_values`] with ±inf filed under "missing key" as well
+/// (#428).
 ///
 /// A NaN must never reach the ranking comparator: [`super::assign::Priority`]
 /// answers "does not beat" in BOTH directions for one, which is not a strict
@@ -2909,17 +2909,13 @@ pub(super) fn count_vertices(g: &Geometry<f64>) -> usize {
 /// beats `None`), so a NaN-keyed feature ranks exactly where a null-keyed one
 /// does — and, like it, is never dropped.
 ///
-/// The same rule reaches the entry-zoom ladder and the accumulate columns,
-/// which read their values through this function: a NaN rung is not a rung,
-/// and a NaN summand would poison a whole cluster's aggregate.
+/// The entry-zoom ladder reads its column through here too: a non-finite
+/// rung is not a rung. The **accumulate** columns do not — they aggregate
+/// rather than rank, so they take [`extract_numeric_values`] and keep ±inf;
+/// dropping it there would contradict the canonical level, which carries the
+/// source value verbatim.
 pub(super) fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
-    let mut values = extract_numeric_values(col);
-    for v in values.iter_mut() {
-        if v.is_some_and(|v| !v.is_finite()) {
-            *v = None;
-        }
-    }
-    values
+    extract_numeric(col, true)
 }
 
 /// Extract an optional f64 value per row from a numeric Arrow column.
@@ -2928,11 +2924,18 @@ pub(super) fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
 /// NaN is not a value any comparison can answer — it is how plenty of sources
 /// spell nodata in a float column — so it reads as *absent*, the same call
 /// the tile-order [`OrderKey`](super::export) makes. ±inf is kept: it is
-/// perfectly comparable, and the `--filter` path that reads columns through
-/// here would silently drop rows that genuinely match a predicate if it were
-/// dropped. The ranking family narrows this further; see
-/// [`extract_sort_keys`].
+/// perfectly comparable, so the `--filter` path and the `--accumulate`
+/// aggregates that read columns through here neither drop matching rows nor
+/// disagree with the canonical level's verbatim value. The ranking family
+/// narrows this further; see [`extract_sort_keys`].
 pub(super) fn extract_numeric_values(col: &dyn Array) -> Vec<Option<f64>> {
+    extract_numeric(col, false)
+}
+
+/// Shared body of [`extract_numeric_values`] and [`extract_sort_keys`]: one
+/// pass over the column, with `finite_only` choosing how wide the "absent"
+/// bucket is (NaN alone, or NaN and ±inf).
+fn extract_numeric(col: &dyn Array, finite_only: bool) -> Vec<Option<f64>> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
         Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
@@ -2950,9 +2953,15 @@ pub(super) fn extract_numeric_values(col: &dyn Array) -> Vec<Option<f64>> {
                         return None;
                     }
                     let v = a.value(i) as f64;
-                    // Never true for the integer types; free there, and the
-                    // one place a float column's nodata is caught.
-                    (!v.is_nan()).then_some(v)
+                    // Neither test can fail for the integer types; free
+                    // there, and the one place a float column's nodata is
+                    // caught.
+                    let usable = if finite_only {
+                        v.is_finite()
+                    } else {
+                        !v.is_nan()
+                    };
+                    usable.then_some(v)
                 })
                 .collect()
         }};
@@ -3114,13 +3123,21 @@ pub(super) fn append_point_count_field(schema: &Schema) -> Schema {
 
 /// Per-feature accumulate values (one vector per spec, parallel to the rows),
 /// extracted from the resolved column indices of a batch-shaped table.
+///
+/// Read through [`extract_numeric_values`], not [`extract_sort_keys`] (#428):
+/// aggregation is not ranking. A NaN is skipped (it would poison every
+/// aggregate it touched, and it is nodata far more often than a value), but
+/// ±inf is a summand like any other — dropping it would make
+/// `--accumulate-attribute v:max` over `{1.0, +inf}` report `1.0` at the
+/// coarse levels while the canonical level, which copies the source value
+/// verbatim, still shows `inf`: a pyramid contradicting itself.
 pub(super) fn extract_accumulate_values(
     batch: &RecordBatch,
     acc_col_indices: &[usize],
 ) -> Vec<Vec<Option<f64>>> {
     acc_col_indices
         .iter()
-        .map(|&idx| extract_sort_keys(batch.column(idx).as_ref()))
+        .map(|&idx| extract_numeric_values(batch.column(idx).as_ref()))
         .collect()
 }
 

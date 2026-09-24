@@ -1619,6 +1619,80 @@ mod tests {
         );
     }
 
+    /// #428, row-level evaluation: a NaN in a float column is UNKNOWN, the
+    /// same tri-state a null gets, because no comparison against it has an
+    /// answer. Pinned here because one of these is a deliberate BEHAVIOR
+    /// CHANGE: `!=` (and `NOT IN`) used to return TRUE for a NaN row —
+    /// `NaN != 5` is true under IEEE-754 — so such rows were kept. They are
+    /// now dropped, like null rows, which is the SQL reading of "unknown".
+    ///
+    /// The `IS NULL` pair is the awkward corner and is pinned on purpose: a
+    /// NaN is a present value, so `IS NULL` does NOT match it and
+    /// `IS NOT NULL` does. Together with the rule above, no predicate selects
+    /// NaN rows — documented in `docs/OVERVIEW_TUNING.md`.
+    #[test]
+    fn eval_nan_is_unknown_not_a_comparable_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "confidence",
+            DataType::Float64,
+            true,
+        )]));
+        let confidence: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(9.0),
+            None,
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![confidence]).unwrap();
+        let eval = |src: &str| {
+            let expr = parse_filter(src).unwrap();
+            BoundFilter::bind(&expr, &batch.schema(), &[])
+                .unwrap()
+                .eval_mask(&batch, &|i| i)
+        };
+
+        // Ordinary comparison: the NaN row is UNKNOWN, exactly like the null.
+        assert_eq!(
+            eval("confidence > 0.8"),
+            vec![Some(true), None, Some(true), None]
+        );
+        // NOT does not resurrect it (Kleene: NOT UNKNOWN = UNKNOWN).
+        assert_eq!(
+            eval("NOT (confidence > 0.8)"),
+            vec![Some(false), None, Some(false), None]
+        );
+        // The behavior change: `NaN != 5` is TRUE in IEEE-754 but UNKNOWN
+        // here, so the NaN row is dropped rather than kept.
+        assert_eq!(
+            eval("confidence != 5"),
+            vec![Some(true), None, Some(true), None]
+        );
+        assert_eq!(
+            eval("confidence = 1.0"),
+            vec![Some(true), None, Some(false), None]
+        );
+        // IN / NOT IN read the column the same way.
+        assert_eq!(
+            eval("confidence IN (1.0, 9.0)"),
+            vec![Some(true), None, Some(true), None]
+        );
+        assert_eq!(
+            eval("confidence NOT IN (5)"),
+            vec![Some(true), None, Some(true), None]
+        );
+        // But the null tests see a NaN as the present value it is.
+        assert_eq!(
+            eval("confidence IS NULL"),
+            vec![Some(false), Some(false), Some(false), Some(true)],
+            "a NaN is a present value: IS NULL must NOT match it"
+        );
+        assert_eq!(
+            eval("confidence IS NOT NULL"),
+            vec![Some(true), Some(true), Some(true), Some(false)],
+            "...and IS NOT NULL does"
+        );
+    }
+
     #[test]
     fn eval_bool_and_string_ordering() {
         assert_eq!(

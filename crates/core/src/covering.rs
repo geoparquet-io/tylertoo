@@ -120,29 +120,33 @@ pub struct RowGroupBounds {
 }
 
 impl RowGroupBounds {
-    /// True when every corner of the stats bbox is a finite number, i.e. when
-    /// the bbox can bound anything at all. Deliberately not public: it is an
-    /// implementation detail of [`Self::intersects`], and the public surface
-    /// is gated by a baseline (`crates/core/api/`).
-    fn is_finite(&self) -> bool {
-        self.xmin.is_finite()
-            && self.ymin.is_finite()
-            && self.xmax.is_finite()
-            && self.ymax.is_finite()
+    /// True when a corner of the stats bbox is a NaN, i.e. when the bbox
+    /// cannot bound anything at all. ±inf is *not* NaN: it is an ordered
+    /// value, and the classic empty-envelope sentinel (`xmin = +inf`,
+    /// `xmax = -inf`) bounds an empty set correctly under the plain AABB
+    /// test. Deliberately not public: it is an implementation detail of
+    /// [`Self::intersects`], and the public surface is gated by a baseline
+    /// (`crates/core/api/`).
+    fn has_nan(&self) -> bool {
+        self.xmin.is_nan() || self.ymin.is_nan() || self.xmax.is_nan() || self.ymax.is_nan()
     }
 
     /// Check if this row group's bounds intersect with the given filter bounds.
     ///
-    /// A non-finite bbox is treated as *no* bbox and always intersects (#428).
-    /// Every comparison against a NaN is false, so without this guard a single
-    /// NaN statistic — how a foreign writer spells nodata, and what pre-1.0
-    /// writers emitted for an all-NaN column — would prune the row group and
-    /// silently drop every feature in it. Unusable statistics mean "read it",
-    /// never "skip it"; [`extract_row_group_bounds_from_metadata`] already
-    /// drops such a bbox on the way in, and this keeps the invariant for a
-    /// `RowGroupBounds` built any other way.
+    /// A bbox holding a NaN is treated as *no* bbox and always intersects
+    /// (#428). Every comparison against a NaN is false, so without this guard
+    /// a single NaN statistic — how a foreign writer spells nodata, and what
+    /// pre-1.0 writers emitted for an all-NaN column — would prune the row
+    /// group and silently drop every feature in it. Unusable statistics mean
+    /// "read it", never "skip it"; [`extract_row_group_bounds_from_metadata`]
+    /// already drops such a bbox on the way in, and this keeps the invariant
+    /// for a `RowGroupBounds` built any other way.
+    ///
+    /// Infinities are left to the AABB test, which handles them exactly: an
+    /// `xmin = +inf / xmax = -inf` envelope (the conventional "empty" bbox)
+    /// intersects nothing and is pruned, which is what it asks for.
     pub fn intersects(&self, filter: &TileBounds) -> bool {
-        if !self.is_finite() {
+        if self.has_nan() {
             return true;
         }
         // Standard AABB intersection test
@@ -153,6 +157,14 @@ impl RowGroupBounds {
     }
 
     /// Convert to TileBounds for compatibility with existing code.
+    ///
+    /// No NaN guard here on purpose: this is a plain field-for-field view of
+    /// the same numbers, and the only way in (`extract_stat_value`) already
+    /// refuses a NaN statistic, so a `RowGroupBounds` this crate builds never
+    /// holds one. A caller that constructs the struct itself and
+    /// hands a NaN corner to something that compares it gets the usual
+    /// IEEE-754 answer (every comparison false); the guard that matters for
+    /// pruning lives in [`Self::intersects`].
     pub fn to_tile_bounds(&self) -> TileBounds {
         TileBounds {
             lng_min: self.xmin,
@@ -300,12 +312,18 @@ pub fn find_bbox_column_indices(
 
 /// Extract a statistic value from column metadata.
 ///
-/// Handles both f32 and f64 physical types, converting to f64. A non-finite
-/// statistic reads as *missing* (`None`, #428): NaN/±inf cannot bound
-/// anything, and a caller that treated one as a bound would prune row groups
-/// it must read (every comparison against a NaN is false). arrow-rs leaves NaN
-/// out of the statistics it computes, but a file written elsewhere can carry
-/// one, so the guard belongs on the read side.
+/// Handles both f32 and f64 physical types, converting to f64. A **NaN**
+/// statistic reads as *missing* (`None`, #428): it cannot bound anything, and
+/// a caller that treated one as a bound would prune row groups it must read
+/// (every comparison against a NaN is false). arrow-rs leaves NaN out of the
+/// statistics it computes, but a file written elsewhere can carry one, so the
+/// guard belongs on the read side.
+///
+/// ±inf is kept, matching the `--filter` path's
+/// [`num_bounds`](crate::overview::filter): an infinity is an ordered value
+/// and bounds perfectly well. In particular the conventional empty-envelope
+/// sentinel (`xmin = +inf`, `xmax = -inf`) stays a real, empty bbox and goes
+/// on being pruned.
 fn extract_stat_value(
     row_group: &parquet::file::metadata::RowGroupMetaData,
     col_idx: usize,
@@ -333,7 +351,7 @@ fn extract_stat_value(
         }
         _ => return None,
     };
-    value.is_finite().then_some(value)
+    (!value.is_nan()).then_some(value)
 }
 
 /// Extract bounding boxes for all row groups from a Parquet file.
@@ -373,9 +391,8 @@ pub fn extract_row_group_bounds_from_reader(
 /// callers that already hold a [`ParquetMetaData`] (e.g. from a
 /// `ParquetRecordBatchReaderBuilder`) can prune without re-opening the file.
 /// Returns `None` for row groups whose covering statistics are unavailable —
-/// including a bbox with a non-finite corner, which cannot bound anything
-/// (#428) — and `vec![None; n]` when the file lacks geo/covering metadata
-/// entirely.
+/// including a bbox with a NaN corner, which cannot bound anything (#428) —
+/// and `vec![None; n]` when the file lacks geo/covering metadata entirely.
 pub fn extract_row_group_bounds_from_metadata(
     metadata: &ParquetMetaData,
 ) -> Result<Vec<Option<RowGroupBounds>>, Error> {
@@ -916,7 +933,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Non-finite statistics (#428)
+    // NaN statistics (#428)
     // -------------------------------------------------------------------------
 
     /// Synthetic footer metadata for a file whose covering bbox lives in four
@@ -989,7 +1006,7 @@ mod tests {
     /// PRUNE the row group — silent data loss. Unusable statistics mean
     /// "read it".
     #[test]
-    fn non_finite_bounds_never_prune() {
+    fn nan_bounds_never_prune() {
         let filter = TileBounds {
             lng_min: -5.0,
             lat_min: -5.0,
@@ -1033,16 +1050,69 @@ mod tests {
         ] {
             assert!(
                 bounds.intersects(&filter),
-                "{label}: a non-finite statistic must keep the row group, not prune it"
+                "{label}: a NaN statistic must keep the row group, not prune it"
             );
         }
     }
 
-    /// The same thing one layer down: a non-finite statistic is read as
-    /// *missing* statistics, so every caller's "no stats -> read it" branch
-    /// does the right thing without knowing about NaN.
+    /// ±inf is NOT NaN: it is an ordered value that bounds perfectly well, so
+    /// the guard must not swallow it. In particular the conventional empty
+    /// envelope (`xmin = +inf`, `xmax = -inf`) says "this row group holds
+    /// nothing" and must keep being pruned — treating it as unusable would
+    /// un-prune a row group that older code correctly skipped.
     #[test]
-    fn non_finite_statistics_read_as_missing() {
+    fn infinite_bounds_still_prune() {
+        let filter = TileBounds {
+            lng_min: -5.0,
+            lat_min: -5.0,
+            lng_max: 5.0,
+            lat_max: 5.0,
+        };
+
+        let empty_sentinel = RowGroupBounds {
+            row_group_idx: 0,
+            xmin: f64::INFINITY,
+            ymin: f64::INFINITY,
+            xmax: f64::NEG_INFINITY,
+            ymax: f64::NEG_INFINITY,
+            num_rows: 100,
+        };
+        assert!(
+            !empty_sentinel.intersects(&filter),
+            "the empty-envelope sentinel bounds an empty set and must prune"
+        );
+
+        let whole_world = RowGroupBounds {
+            row_group_idx: 0,
+            xmin: f64::NEG_INFINITY,
+            ymin: f64::NEG_INFINITY,
+            xmax: f64::INFINITY,
+            ymax: f64::INFINITY,
+            num_rows: 100,
+        };
+        assert!(
+            whole_world.intersects(&filter),
+            "an unbounded bbox contains everything and must be read"
+        );
+
+        // An infinity on the far side of the filter still prunes normally.
+        let east_of_everything = RowGroupBounds {
+            row_group_idx: 0,
+            xmin: 10.0,
+            ymin: -10.0,
+            xmax: f64::INFINITY,
+            ymax: 10.0,
+            num_rows: 100,
+        };
+        assert!(!east_of_everything.intersects(&filter));
+    }
+
+    /// The same thing one layer down: a NaN statistic is read as *missing*
+    /// statistics, so every caller's "no stats -> read it" branch does the
+    /// right thing without knowing about NaN — while ±inf reads as the real
+    /// bound it is.
+    #[test]
+    fn nan_statistics_read_as_missing() {
         let finite = metadata_with_bbox_stats(
             [(-10.0, -1.0), (-10.0, -1.0), (1.0, 10.0), (1.0, 10.0)],
             100,
@@ -1069,12 +1139,30 @@ mod tests {
             vec![None],
             "a NaN covering statistic must read as missing statistics"
         );
+
+        // ±inf survives the read: it is a bound, not a missing statistic.
+        let sentinel = metadata_with_bbox_stats(
+            [
+                (f64::INFINITY, f64::INFINITY),
+                (f64::INFINITY, f64::INFINITY),
+                (f64::NEG_INFINITY, f64::NEG_INFINITY),
+                (f64::NEG_INFINITY, f64::NEG_INFINITY),
+            ],
+            100,
+        );
+        let bounds = extract_row_group_bounds_from_metadata(&sentinel).unwrap();
+        assert_eq!(
+            bounds[0].as_ref().map(|b| (b.xmin, b.xmax)),
+            Some((f64::INFINITY, f64::NEG_INFINITY)),
+            "an infinite statistic is a real bound and must be read as one"
+        );
     }
 
     /// End of the line: the row-group selector that the bbox extract path
-    /// actually calls must KEEP a NaN-statistic row group.
+    /// actually calls must KEEP a NaN-statistic row group — and must still
+    /// DROP an empty-envelope one.
     #[test]
-    fn non_finite_statistics_keep_the_row_group_selected() {
+    fn nan_statistics_keep_the_row_group_selected() {
         let nan = metadata_with_bbox_stats(
             [
                 (f64::NAN, f64::NAN),
@@ -1092,6 +1180,24 @@ mod tests {
             selected,
             vec![0],
             "a row group whose covering statistics are unusable must be read, not pruned"
+        );
+
+        let sentinel = metadata_with_bbox_stats(
+            [
+                (f64::INFINITY, f64::INFINITY),
+                (f64::INFINITY, f64::INFINITY),
+                (f64::NEG_INFINITY, f64::NEG_INFINITY),
+                (f64::NEG_INFINITY, f64::NEG_INFINITY),
+            ],
+            100,
+        );
+        let selected = crate::overview::convert::select_input_row_groups(
+            &sentinel,
+            &[100.0, 60.0, 110.0, 70.0],
+        );
+        assert!(
+            selected.is_empty(),
+            "an empty-envelope row group bounds nothing and must stay pruned (got {selected:?})"
         );
     }
 }

@@ -2053,6 +2053,14 @@ fn parse_entry_zoom(spec: &str) -> Result<tylertoo_core::overview::ladder::Entry
 /// `unknown_rank` (the priority for present-but-unlisted values) is derived as
 /// `min(listed ranks) - 1.0`, so unknown classes always lose to every listed
 /// value while still beating null/missing values (which lose to any rank).
+///
+/// Ranks must be finite (#428). `f64::from_str` happily accepts `nan` and
+/// `inf`, and either one breaks this flag's contract: a NaN is not ordered
+/// (the ranking comparator answers "does not beat" in both directions, so the
+/// cell incumbent silently keeps the cell), and `min(ranks)` computed with
+/// `f64::min` *ignores* NaN — one `nan` entry would leave `unknown_rank` at
+/// `+inf - 1.0 = +inf`, making unlisted values outrank every named class,
+/// the exact inverse of what this flag documents.
 fn parse_class_rank(spec: &str) -> Result<tylertoo_core::overview::convert::ClassRanking> {
     use tylertoo_core::overview::convert::ClassRanking;
 
@@ -2083,6 +2091,12 @@ fn parse_class_rank(spec: &str) -> Result<tylertoo_core::overview::convert::Clas
             .trim()
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid rank in '{pair}': {e}"))?;
+        if !rank.is_finite() {
+            anyhow::bail!(
+                "invalid rank in '{pair}': ranks must be finite numbers \
+                 (NaN and infinity cannot be ordered against other classes)"
+            );
+        }
         ranks.push((value.to_string(), rank));
     }
     if ranks.is_empty() {
@@ -2432,6 +2446,40 @@ fn format_number(n: u64) -> String {
 mod tests {
     use super::*;
     use tylertoo_core::overview::cluster::AccumulateOp;
+
+    /// #428: `f64::from_str` accepts `nan`, `inf` and `-inf`, and either one
+    /// breaks `--class-rank`'s contract. A NaN is not ordered, so the cell
+    /// incumbent would silently keep every cell it contests; worse, the
+    /// `unknown_rank` derivation uses `f64::min`, which IGNORES NaN — one
+    /// `nan` entry leaves the fold at `+inf`, so unlisted values would
+    /// outrank every named class, the inverse of the documented rule. The
+    /// parser rejects them with an explanation rather than producing that.
+    #[test]
+    fn class_rank_rejects_non_finite_ranks() {
+        for spec in [
+            "cls:motorway=nan,trunk=2",
+            "cls:motorway=NaN",
+            "cls:motorway=inf,trunk=2",
+            "cls:motorway=-inf",
+            "cls:motorway=infinity",
+        ] {
+            let err = parse_class_rank(spec)
+                .unwrap_err()
+                .to_string()
+                .to_ascii_lowercase();
+            assert!(
+                err.contains("finite"),
+                "'{spec}' must be rejected as non-finite, got: {err}"
+            );
+        }
+
+        // Control: ordinary ranks still parse, and the unknown rank is
+        // min(ranks) - 1 — below every named class, above a null.
+        let cr = parse_class_rank("cls:motorway=3,trunk=2,primary=1").unwrap();
+        assert_eq!(cr.column, "cls");
+        assert_eq!(cr.unknown_rank, 0.0);
+        assert_eq!(cr.ranks.len(), 3);
+    }
 
     // --- single-file-only rejections (v0.7 PR-C) -----------------------------
 

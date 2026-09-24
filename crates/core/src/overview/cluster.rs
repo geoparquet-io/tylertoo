@@ -594,6 +594,59 @@ mod tests {
         );
     }
 
+    /// #428: what the accumulate path does with the two kinds of "not an
+    /// ordinary number". A NaN is skipped — it would poison every aggregate
+    /// it touched and it is nodata far more often than a value — so it does
+    /// not even count as a contributor. An infinity is a real summand: the
+    /// canonical level copies the source value verbatim, so dropping it at
+    /// the coarse levels would make the pyramid contradict itself (`max` over
+    /// `{1.0, +inf}` reporting `1.0` up top and `inf` at the bottom).
+    ///
+    /// The NaN is filed under `None` upstream, by
+    /// `convert::extract_numeric_values`; this pins what the aggregation then
+    /// makes of `{None, 1.0, +inf}`.
+    #[test]
+    fn nan_is_skipped_but_infinity_aggregates() {
+        let feats: Vec<AssignFeature> = (0..3).map(|i| point(i, i as f64 * 100.0, 0.0)).collect();
+        let gsds = [gsd(2), gsd(10)];
+        let cfg = AssignConfig::default();
+        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
+
+        // Specs 0..3 read the source column {NaN, 1.0, +inf} as the extractor
+        // hands it over; spec 4 is an all-finite {NaN, 1.0, 3.0} whose mean
+        // pins the contributor COUNT, which `inf / n` cannot distinguish.
+        let mut vals = vec![vec![None, Some(1.0), Some(f64::INFINITY)]; 4];
+        vals.push(vec![None, Some(1.0), Some(3.0)]);
+        let ops = [
+            AccumulateOp::Sum,
+            AccumulateOp::Max,
+            AccumulateOp::Min,
+            AccumulateOp::Mean,
+            AccumulateOp::Mean,
+        ];
+        let tables =
+            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &vals, &ops);
+
+        assert_eq!(tables[0].len(), 1, "one cluster at level 0");
+        let entry = tables[0].values().next().unwrap();
+        assert_eq!(
+            entry.point_count, 3,
+            "point_count counts ROWS, NaN value or not"
+        );
+        assert_eq!(
+            entry.aggregates,
+            vec![
+                Some(f64::INFINITY), // sum: 1.0 + inf, the NaN contributes nothing
+                Some(f64::INFINITY), // max
+                Some(1.0),           // min: inf loses to the real value
+                Some(f64::INFINITY), // mean
+                Some(2.0),           // mean over 2 contributors, not 4/3 over 3
+            ],
+            "the NaN is not a contributor (count = 2), the infinity is"
+        );
+    }
+
     #[test]
     fn all_null_values_yield_none_aggregate() {
         let feats: Vec<AssignFeature> = (0..3).map(|i| point(i, i as f64 * 100.0, 0.0)).collect();

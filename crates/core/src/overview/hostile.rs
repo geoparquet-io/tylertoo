@@ -228,12 +228,18 @@ fn nonfinite_coordinate_rows_skipped() {
         geoms.push(Some(Geometry::Point(Point::new(f64::NAN, 1.0))));
         geoms.push(Some(Geometry::Point(Point::new(2.0, f64::INFINITY))));
         // WITH bbox covering (#428): the non-finite rows poison the generated
-        // bbox columns, and a non-finite covering statistic used to make every
-        // AABB comparison false — pruning the row group and losing the four
-        // good rows with it. The row group must be read, not pruned.
+        // bbox columns — the `+inf` y reaches the ymax statistic verbatim.
+        // Paired with a `--bbox` below so the row-group selector actually
+        // runs over those statistics: an infinite bound must be compared, not
+        // treated as a reason to prune, or the four good rows vanish with it.
         write_input(tin.path(), &geoms, true, None);
 
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
+        // Comfortably around the four good points at (-60,-30)..(0,6).
+        let o = ConvertOptions {
+            bbox: Some([-70.0, -40.0, 10.0, 20.0]),
+            ..opts(streaming)
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o)
             .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
         assert_eq!(report.input_features, 4, "streaming={streaming}");
 
