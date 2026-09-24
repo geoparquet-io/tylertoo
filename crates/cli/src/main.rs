@@ -171,6 +171,8 @@ enum Command {
     /// Build a multi-band pyramid: several inputs, each owning a zoom range,
     /// one archive (issue #345).
     Pyramid(PyramidArgs),
+    /// Concatenate disjoint PMTiles archives into one (issue #498).
+    Merge(MergeArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
     /// Compiled only under the `gen-docs` feature; used by CI to regenerate
@@ -286,6 +288,60 @@ pub struct PyramidArgs {
     /// flag). Pass this only for a deliberately sparse pyramid.
     #[arg(long)]
     pub allow_missing_zooms: bool,
+
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    pub force: bool,
+}
+
+/// Arguments for `tylertoo merge`.
+///
+/// Merge concatenates PMTiles archives that hold *disjoint* tiles into one,
+/// by copying tile bodies verbatim: nothing is decoded, re-simplified or
+/// re-encoded, so the merged archive's tiles are bit-identical to its inputs'.
+///
+/// It is the second half of a sharded build: tile each shard of a large input
+/// separately, then merge the shard archives into the archive that ships.
+/// Because a shard is a contiguous slice of a (gpio-sorted) source, the tile
+/// ids it produces are a contiguous slice of the archive's id space, and the
+/// shards are disjoint by construction.
+///
+/// That disjointness is checked, not assumed: if any two inputs claim
+/// overlapping tile ids the merge is refused, naming both archives, before
+/// any tile is copied. An overlap means the shards were cut wrong (or one was
+/// listed twice, or is left over from an earlier run), and merging anyway
+/// would produce an archive whose tiles silently shadow each other.
+///
+/// To combine archives that *do* overlap — different data at different zooms,
+/// or several layers over the same zooms — use `tylertoo pyramid`, which
+/// merges by band and concatenates layers where they meet.
+#[derive(Parser, Debug)]
+pub struct MergeArgs {
+    /// Output PMTiles archive.
+    pub output: PathBuf,
+
+    /// Input PMTiles archives, two or more. They must hold disjoint tile ids
+    /// and agree on tile type and tile compression; the merged archive's
+    /// bounds are the union of theirs, its zoom range the union of the ranges
+    /// they declare, and its `vector_layers` the union of theirs (layers
+    /// sharing an id collapse into one entry spanning their combined zooms,
+    /// with their fields unioned).
+    #[arg(required = true, value_name = "INPUT")]
+    pub inputs: Vec<PathBuf>,
+
+    /// Directory for the merge's spool file, which holds the merged tile data
+    /// until the archive is assembled. Defaults to the system temp directory
+    /// — worth setting when the output is large and `/tmp` is a small tmpfs.
+    #[arg(long, value_name = "DIR")]
+    pub work_dir: Option<PathBuf>,
+
+    /// Write the JSON merge report to this path.
+    ///
+    /// Includes per-zoom tile counts, which are what a sharded build is
+    /// checked against: merging N shards must yield the same tiles per zoom
+    /// as tiling the whole input in one pass.
+    #[arg(long, value_name = "PATH")]
+    pub report: Option<PathBuf>,
 
     /// Overwrite the output if it exists.
     #[arg(short, long)]
@@ -1550,6 +1606,7 @@ fn main() -> Result<()> {
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Decode(args) => run_decode(args),
         Command::Pyramid(args) => run_pyramid(args),
+        Command::Merge(args) => run_merge(args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
         Command::GenReferenceDocs => {
@@ -1590,13 +1647,14 @@ where
     // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
     // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
     // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 8] = [
+    const SUBCOMMANDS: [&str; 9] = [
         "tiles",
         "overview",
         "validate",
         "export-pmtiles",
         "decode",
         "pyramid",
+        "merge",
         "gen-reference-docs",
         "help",
     ];
@@ -2642,6 +2700,88 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         args.output.display(),
         format_number(report.total_tiles as u64)
     );
+    Ok(())
+}
+
+/// Run `tylertoo merge`: several disjoint PMTiles archives → one (thin facade
+/// over `tylertoo_core::merge::merge_shards`).
+fn run_merge(args: MergeArgs) -> Result<()> {
+    use tylertoo_core::merge::{merge_shards, MergeOptions};
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    if args.output.exists() && !args.force {
+        anyhow::bail!(
+            "{} exists (use --force to overwrite)",
+            args.output.display()
+        );
+    }
+
+    // Name a missing input here rather than letting the reader fail later
+    // with a bare "No such file or directory" and no path. Every input is a
+    // local archive read by offset, so `exists()` has a useful answer for all
+    // of them — unlike `pyramid`'s bands, which may be globs or URLs.
+    for input in &args.inputs {
+        if !input.exists() {
+            anyhow::bail!("input archive not found: {}", input.display());
+        }
+        if *input == args.output {
+            anyhow::bail!(
+                "{} is both an input and the output; merge reads its inputs while it writes",
+                input.display()
+            );
+        }
+    }
+    if args.inputs.len() < 2 {
+        // Not an error: merging one archive is a well-defined (if pointless)
+        // copy, and a script that shards dynamically can legitimately end up
+        // with one shard. Worth saying out loud, though.
+        eprintln!("note: merging a single archive just rewrites it");
+    }
+
+    println!(
+        "Merging {} archive(s) → {}",
+        args.inputs.len(),
+        args.output.display()
+    );
+    let opts = MergeOptions {
+        work_dir: args.work_dir.clone(),
+    };
+    let report = merge_shards(&args.inputs, &args.output, &opts)
+        .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
+
+    for (zoom, count) in &report.per_zoom_tile_counts {
+        println!("  z{:<2} {:>10} tiles", zoom, format_number(*count));
+    }
+    if !report.inputs_without_bounds.is_empty() {
+        // Almost always a shard exported without bounds, which quietly
+        // shrinks the merged archive's extent, so it belongs on stdout next
+        // to the counts and not only in the log.
+        println!(
+            "  ! {} input(s) carried no usable bounds and were excluded from the merged bounds:",
+            report.inputs_without_bounds.len()
+        );
+        for name in &report.inputs_without_bounds {
+            println!("      {name}");
+        }
+    }
+    println!(
+        "\n✓ {} tiles ({} unique) from {} archive(s), z{}..z{} in {:.2}s",
+        format_number(report.tiles_total),
+        format_number(report.unique_tiles),
+        report.inputs,
+        report.min_zoom,
+        report.max_zoom,
+        report.duration_secs
+    );
+
+    if let Some(path) = &args.report {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
+        println!("  report → {}", path.display());
+    }
     Ok(())
 }
 

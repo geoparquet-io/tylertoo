@@ -49,6 +49,7 @@ pub mod fs_probe;
 pub mod input;
 pub mod input_set;
 pub mod ioverlay_clip;
+pub mod merge;
 pub mod mvt;
 pub mod overview;
 pub mod pmtiles_writer;

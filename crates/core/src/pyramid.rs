@@ -699,14 +699,57 @@ fn check_shared_zoom_layer_labels(bands: &[Band], archives: &[BandArchive]) -> R
     Ok(())
 }
 
-/// One layer's entry in the merged archive's `vector_layers`.
+/// One layer's entry in a merged archive's `vector_layers`.
+///
+/// Shared with [`crate::merge`], which unions shard archives' `vector_layers`
+/// by the same rules the pyramid merge settled on in #492: same-id layers
+/// collapse to one entry spanning `min(minzoom)..=max(maxzoom)` with
+/// [`union_fields`]'d fields.
 #[derive(Debug, Clone)]
-struct LayerMeta {
-    id: String,
-    minzoom: u8,
-    maxzoom: u8,
-    /// The band's `fields` object, lifted verbatim from its metadata.
-    fields: Value,
+pub(crate) struct LayerMeta {
+    pub(crate) id: String,
+    pub(crate) minzoom: u8,
+    pub(crate) maxzoom: u8,
+    /// The input's `fields` object, lifted verbatim from its metadata.
+    pub(crate) fields: Value,
+}
+
+/// Collapse layers sharing an `id` into one entry, and serialize the result
+/// as a `vector_layers` array (#492).
+///
+/// Several inputs may declare the same layer — the pyramid's aggregate bands
+/// do, and every shard of one sharded build does — and a client seeing that
+/// layer declared twice with conflicting ranges has no way to reconcile them.
+/// Zooms widen to the union; fields union with the first type winning a
+/// conflict (and saying so).
+///
+/// Serialized through `serde_json`, not `format!`: a layer id can be a
+/// user-supplied name, and a `"` or `\` in one would otherwise break the JSON.
+pub(crate) fn vector_layers_json(layers: Vec<LayerMeta>) -> Value {
+    let mut merged: Vec<LayerMeta> = Vec::new();
+    for l in layers {
+        match merged.iter_mut().find(|m| m.id == l.id) {
+            Some(m) => {
+                m.minzoom = m.minzoom.min(l.minzoom);
+                m.maxzoom = m.maxzoom.max(l.maxzoom);
+                union_fields(&mut m.fields, l.fields, &l.id);
+            }
+            None => merged.push(l),
+        }
+    }
+    Value::Array(
+        merged
+            .iter()
+            .map(|l| {
+                json!({
+                    "id": l.id,
+                    "minzoom": l.minzoom,
+                    "maxzoom": l.maxzoom,
+                    "fields": l.fields,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// One band's archive, indexed and parsed exactly once.
@@ -1379,7 +1422,7 @@ pub fn merge_bands_with_options(
 /// caller listed the bands. Both are "first bands processed", not "first
 /// bands as typed" — the disjoint path's sort runs before this ever sees a
 /// field.
-fn union_fields(into: &mut Value, from: Value, layer: &str) {
+pub(crate) fn union_fields(into: &mut Value, from: Value, layer: &str) {
     let Value::Object(from) = from else { return };
     if !into.is_object() {
         *into = json!({});
@@ -1447,33 +1490,7 @@ fn finish_merge(
     // Several bands may share a layer name (the aggregate bands do). Collapse
     // them into one entry spanning their combined zooms, or a client sees the
     // same layer declared twice with conflicting ranges.
-    let mut merged: Vec<LayerMeta> = Vec::new();
-    for l in layers {
-        match merged.iter_mut().find(|m| m.id == l.id) {
-            Some(m) => {
-                m.minzoom = m.minzoom.min(l.minzoom);
-                m.maxzoom = m.maxzoom.max(l.maxzoom);
-                union_fields(&mut m.fields, l.fields, &l.id);
-            }
-            None => merged.push(l),
-        }
-    }
-    // Serialized through serde_json, not format!: a layer id is a user-supplied
-    // --band name, and a `"` or `\` in one would otherwise break the JSON.
-    let json = Value::Array(
-        merged
-            .iter()
-            .map(|l| {
-                json!({
-                    "id": l.id,
-                    "minzoom": l.minzoom,
-                    "maxzoom": l.maxzoom,
-                    "fields": l.fields,
-                })
-            })
-            .collect(),
-    );
-    writer.set_vector_layers_json(json.to_string());
+    writer.set_vector_layers_json(vector_layers_json(layers).to_string());
     writer
         .finalize(output)
         .map_err(|e| Error::PMTilesWrite(format!("Failed to write {}: {e}", output.display())))?;
