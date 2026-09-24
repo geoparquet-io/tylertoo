@@ -319,6 +319,11 @@ jobs:
 
       - name: Download test fixtures
         if: steps.fixture-cache.outputs.cache-hit != 'true'
+        # This job sets defaults.run.working-directory: crates/python, but
+        # the cache step above (and the tests themselves) use the repo-root
+        # tests/fixtures/realdata. Override back to the workspace root so
+        # the download lands in the same place the cache step reads/writes.
+        working-directory: ${{ github.workspace }}
         run: |
           gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
         env:
