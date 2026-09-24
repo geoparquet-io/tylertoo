@@ -320,6 +320,13 @@ jobs:
       - name: stubtest (tylertoo.pyi matches the built module)
         run: uv run python -m mypy.stubtest tylertoo --allowlist stubtest-allowlist.txt
 
+      # The binding's own test suite (#418). Fixture-dependent integration
+      # tests self-skip via their skipif markers when tests/fixtures/realdata
+      # is absent (it is not downloaded here); the kwarg-surface tests run
+      # unconditionally. Locally: 88 passed in <1s once the extension is built.
+      - name: pytest
+        run: uv run --no-sync pytest tests/ -v
+
       - name: vulture (dead code)
         run: uv run vulture
 
