@@ -1169,6 +1169,19 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
                 .to_string(),
         ));
     }
+    // #513, in the spirit of the #272 spill-dir block below: both plan paths
+    // are touched LONG after the expensive work. `--save-plan` is written
+    // only once pass 1 and the assignment are complete, so an unwritable
+    // target used to cost the whole scan and then leave no overview either;
+    // `--plan` is opened after the preflight, which for remote inputs
+    // includes pass-0 staging.
+    if let Some(path) = &options.plan {
+        preflight_plan_readable(path)?;
+    }
+    if let Some(path) = &options.save_plan {
+        preflight_save_plan_writable(path)?;
+    }
+
     // #517 S2: the `TYLERTOO_PROFILE_JSON` dump is appended once, at the very
     // end of a possibly multi-hour run. Probe its path here, with the other
     // path preflights, so a typo'd or unwritable target is loud immediately.
@@ -1270,6 +1283,91 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
                 dir.display()
             )));
         }
+    }
+    Ok(())
+}
+
+/// #513: `--plan PATH` must be readable *now*, not after the preflight (and,
+/// for a remote input, after pass-0 staging) has already run.
+fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
+    if path.is_dir() {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan {} is a directory, not a convert plan file",
+            path.display()
+        )));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        ConvertError::InvalidConfig(format!("--plan {} cannot be read: {e}", path.display()))
+    })?;
+    // 16 bytes of magic + checksum: enough to say "that is not a plan"
+    // before anything expensive happens. The full checksum is verified at
+    // load, where the payload is read anyway.
+    let mut magic = [0u8; 8];
+    if std::io::Read::read_exact(&mut file, &mut magic).is_err()
+        || &magic != super::plan_state::PLAN_MAGIC
+    {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan {} is not a tylertoo convert plan (bad magic bytes). Plans written \
+             by an older tylertoo must be re-created with --save-plan.",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// #513: `--save-plan PATH` is written only once pass 1 AND the assignment
+/// are complete — `--save-plan /mnt/scratch/x.plan` onto an unmounted
+/// `/mnt/scratch` used to scan for hours and then die with a bare, pathless
+/// `No such file or directory`, with no overview written either. Probe the
+/// parent directory for real (a `create` + `remove` of a uniquely named
+/// sibling), because "the directory exists" is not "I may write in it".
+///
+/// **Clobber semantics:** an existing plan is overwritten, with a log line.
+/// That matches how `overview`/`tiles` treat their own outputs; only
+/// `pyramid`, which merges several archives, gates overwrites behind
+/// `-f/--force`.
+fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
+    let bad = |what: String| Err(ConvertError::InvalidConfig(what));
+    if path.is_dir() {
+        return bad(format!(
+            "--save-plan {} is a directory; give the plan a file path",
+            path.display()
+        ));
+    }
+    // `Path::parent` yields `Some("")` for a bare file name: that is `.`.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return bad(format!(
+            "--save-plan {}: its parent directory {} does not exist",
+            path.display(),
+            parent.display(),
+        ));
+    }
+    let probe = parent.join(format!(
+        ".tylertoo-save-plan-probe.{}.{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) => {
+            return bad(format!(
+                "--save-plan {}: its parent directory {} is not writable: {e}",
+                path.display(),
+                parent.display(),
+            ));
+        }
+    }
+    if path.exists() {
+        log::info!(
+            "[convert] --save-plan {} already exists and will be overwritten",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -5103,6 +5201,139 @@ mod tests {
             msg.contains("/nonexistent/tylertoo-spill-dir-272"),
             "error names the path: {msg}"
         );
+    }
+
+    /// #513: both plan paths are validated at option time, BEFORE anything is
+    /// scanned. `--save-plan` is written only once pass 1 and the assignment
+    /// are done, so a bad target used to cost the whole scan and then leave
+    /// no overview either.
+    #[test]
+    fn validate_options_preflights_the_plan_paths() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // --plan that does not exist.
+        let missing = dir.path().join("nope.plan");
+        let msg = validate_options(&ConvertOptions {
+            plan: Some(missing.clone()),
+            ..Default::default()
+        })
+        .expect_err("an unreadable --plan must be rejected")
+        .to_string();
+        assert!(msg.contains("--plan"), "names the flag: {msg}");
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "names the path: {msg}"
+        );
+
+        // --plan that exists but is not a plan: caught by the magic bytes,
+        // long before pass-0 staging opens the input.
+        let junk = dir.path().join("notaplan.parquet");
+        std::fs::write(&junk, b"PAR1 definitely not a convert plan").unwrap();
+        let msg = validate_options(&ConvertOptions {
+            plan: Some(junk.clone()),
+            ..Default::default()
+        })
+        .expect_err("a non-plan --plan must be rejected")
+        .to_string();
+        assert!(msg.contains("not a tylertoo convert plan"), "{msg}");
+        assert!(msg.contains(&junk.display().to_string()), "{msg}");
+
+        // --plan pointed at a directory.
+        let msg = validate_options(&ConvertOptions {
+            plan: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .expect_err("a directory --plan must be rejected")
+        .to_string();
+        assert!(msg.contains("is a directory"), "{msg}");
+
+        // --save-plan under a parent that does not exist (the issue's
+        // unmounted /mnt/scratch).
+        let unmounted = dir.path().join("mnt").join("scratch").join("x.plan");
+        let msg = validate_options(&ConvertOptions {
+            save_plan: Some(unmounted.clone()),
+            ..Default::default()
+        })
+        .expect_err("an unwritable --save-plan parent must be rejected")
+        .to_string();
+        assert!(msg.contains("--save-plan"), "names the flag: {msg}");
+        assert!(
+            msg.contains(&unmounted.display().to_string()),
+            "names the path: {msg}"
+        );
+        assert!(msg.contains("does not exist"), "{msg}");
+
+        // A writable parent passes, and leaves no probe file behind.
+        let ok = dir.path().join("fine.plan");
+        validate_options(&ConvertOptions {
+            save_plan: Some(ok.clone()),
+            ..Default::default()
+        })
+        .expect("a writable --save-plan target is accepted");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name();
+                name.to_string_lossy()
+                    .starts_with(".tylertoo-save-plan-probe")
+                    .then_some(name)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "probe file left behind: {leftovers:?}"
+        );
+
+        // Clobbering an existing plan is ALLOWED (matching how overview and
+        // tiles treat their own outputs); only `pyramid` gates that behind
+        // -f/--force. The overwrite is announced, not refused.
+        std::fs::write(&ok, b"an older plan").unwrap();
+        validate_options(&ConvertOptions {
+            save_plan: Some(ok),
+            ..Default::default()
+        })
+        .expect("an existing plan is overwritten, not refused");
+    }
+
+    /// #513: the preflight runs before a single input byte is read — the
+    /// whole point is not paying for pass 1 first.
+    #[test]
+    fn save_plan_preflight_fails_before_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &synthetic_geometries(), false, None);
+        let out = dir.path().join("out.parquet");
+
+        let err = convert_to_overviews(
+            &input,
+            &out,
+            &ConvertOptions {
+                save_plan: Some(dir.path().join("mnt").join("scratch").join("x.plan")),
+                ..Default::default()
+            },
+        )
+        .expect_err("must fail fast")
+        .to_string();
+        assert!(err.contains("--save-plan"), "{err}");
+        assert!(err.contains("does not exist"), "names the reason: {err}");
+        assert!(
+            !out.exists(),
+            "the run must not have got as far as writing an overview"
+        );
+
+        let err = convert_to_overviews(
+            &input,
+            &out,
+            &ConvertOptions {
+                plan: Some(dir.path().join("absent.plan")),
+                ..Default::default()
+            },
+        )
+        .expect_err("must fail fast")
+        .to_string();
+        assert!(err.contains("--plan"), "{err}");
+        assert!(err.contains("cannot be read"), "names the reason: {err}");
+        assert!(!out.exists(), "{err}");
     }
 
     // --- synthetic GeoParquet input builders --------------------------------

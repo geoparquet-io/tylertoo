@@ -1645,6 +1645,17 @@ shard the same one.
 
 Both flags require the streaming pipeline (they are its pass-1 stage), they
 are mutually exclusive, and they are available on `overview` and `tiles`.
+
+**Both paths are checked before anything is scanned.** `--save-plan` is
+written only once pass 1 *and* the assignment are complete, so pointing it at
+an unmounted volume used to cost the entire scan and then leave you with no
+plan **and** no overview. Its parent directory must therefore exist and be
+writable at option-validation time, and `--plan` must be a readable convert
+plan (magic bytes checked) — same fail-fast contract as `--spill-dir`.
+An existing plan at `--save-plan PATH` is **overwritten**, with a log line;
+that matches how `overview` and `tiles` treat their own outputs (only
+`pyramid`, which merges several archives, gates overwrites behind
+`-f/--force`).
 Not yet exposed in the Python bindings.
 
 ---

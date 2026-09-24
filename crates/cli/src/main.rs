@@ -1111,6 +1111,10 @@ struct ConvertTuningArgs {
     /// dense-ranks the whole column. A sharded build must therefore consume
     /// ONE plan rather than recompute the assignment per shard, or the
     /// shards' pyramids disagree.
+    ///
+    /// PATH's parent directory must exist and be writable; that is checked
+    /// up front, before anything is scanned. An existing plan at PATH is
+    /// overwritten, with a log line.
     #[arg(
         long,
         value_name = "PATH",
@@ -1137,6 +1141,9 @@ struct ConvertTuningArgs {
     /// mtime and no ETag here, so an object rewritten in place with the same
     /// size, row count and row-group layout is NOT detected; tylertoo warns
     /// when any part is remote.
+    ///
+    /// PATH must be a readable convert plan; that is checked up front,
+    /// before the input is opened.
     #[arg(
         long,
         value_name = "PATH",

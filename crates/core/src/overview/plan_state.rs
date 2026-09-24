@@ -121,7 +121,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 2;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x02";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x02";
 
 /// Bytes ahead of the IPC payload: [`PLAN_MAGIC`] (8) + the payload's
 /// xxh3-64 checksum, little-endian (8).
