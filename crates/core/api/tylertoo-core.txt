@@ -44,8 +44,11 @@ impl core::marker::Unpin for tylertoo_core::compression::Compression
 impl core::marker::UnsafeUnpin for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::compression::Compression
+pub const tylertoo_core::compression::MAX_INTERNAL_BYTES: u64
+pub const tylertoo_core::compression::MAX_TILE_BYTES: u64
 pub fn tylertoo_core::compression::compress(&[u8], tylertoo_core::compression::Compression) -> core::io::error::Result<alloc::vec::Vec<u8>>
 pub fn tylertoo_core::compression::decompress(&[u8], tylertoo_core::compression::Compression) -> core::io::error::Result<alloc::vec::Vec<u8>>
+pub fn tylertoo_core::compression::decompress_capped(&[u8], tylertoo_core::compression::Compression, u64) -> core::io::error::Result<alloc::vec::Vec<u8>>
 pub mod tylertoo_core::covering
 pub struct tylertoo_core::covering::BboxColumnIndices
 pub tylertoo_core::covering::BboxColumnIndices::xmax: usize
@@ -2509,6 +2512,8 @@ impl core::marker::Unpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
+pub const tylertoo_core::pmtiles_writer::MAX_EXPANDED_TILE_ENTRIES: u64
+pub const tylertoo_core::pmtiles_writer::MAX_LEAF_DIRECTORIES: usize
 pub const tylertoo_core::pmtiles_writer::MAX_TILE_ID_ZOOM: u8
 pub fn tylertoo_core::pmtiles_writer::decode_directory(&[u8]) -> core::option::Option<alloc::vec::Vec<tylertoo_core::pmtiles_writer::DirEntry>>
 pub fn tylertoo_core::pmtiles_writer::decode_varint(&[u8]) -> core::option::Option<(u64, usize)>
@@ -2516,6 +2521,7 @@ pub fn tylertoo_core::pmtiles_writer::encode_directory(&[tylertoo_core::pmtiles_
 pub fn tylertoo_core::pmtiles_writer::encode_varint(u64, &mut alloc::vec::Vec<u8>)
 pub fn tylertoo_core::pmtiles_writer::gzip_compress(&[u8]) -> core::io::error::Result<alloc::vec::Vec<u8>>
 pub fn tylertoo_core::pmtiles_writer::make_root_leaves(&[tylertoo_core::pmtiles_writer::DirEntry], tylertoo_core::compression::Compression) -> core::io::error::Result<tylertoo_core::pmtiles_writer::DirectoryLayout>
+pub fn tylertoo_core::pmtiles_writer::max_expanded_entries(&tylertoo_core::pmtiles_writer::Header) -> u64
 pub fn tylertoo_core::pmtiles_writer::tile_id(u8, u32, u32) -> u64
 pub fn tylertoo_core::pmtiles_writer::tile_id_to_zxy(u64) -> tylertoo_core::Result<(u8, u32, u32)>
 pub mod tylertoo_core::pyramid
