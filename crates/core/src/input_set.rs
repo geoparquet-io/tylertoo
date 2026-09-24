@@ -512,6 +512,46 @@ impl ConvertSource {
             .collect())
     }
 
+    /// Total rows this source will actually STREAM under `selected`: the sum
+    /// of `num_rows()` over the selected row groups of every part (every row
+    /// group when `selected` is `None`), straight from the already-parsed
+    /// footers.
+    ///
+    /// This is the domain of the convert plan's row-indexed winner tables
+    /// (#511/#512). `part_row_counts` above only knows each part's TOTAL row
+    /// count, which stops describing the replay as soon as `--bbox` or
+    /// `--filter` prunes row groups — and that was exactly the hole a forged
+    /// plan walked through. Row-group row counts are footer facts, so this
+    /// costs no extra I/O and works for a remote part too.
+    ///
+    /// A selection index outside the part's row-group range contributes
+    /// nothing rather than panicking: the caller compares the total and
+    /// reports a mismatch.
+    pub fn selected_row_count(
+        &self,
+        selected: Option<&RowGroupSelection>,
+    ) -> Result<i64, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let groups = m.parquet.row_groups();
+                match selected.and_then(|s| s.parts().get(i)) {
+                    Some(picked) => picked
+                        .iter()
+                        .filter_map(|&g| groups.get(g))
+                        .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                        .sum::<i64>(),
+                    None => groups
+                        .iter()
+                        .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                        .sum::<i64>(),
+                }
+            })
+            .sum())
+    }
+
     /// Per-part bbox row-group selection (#102): applies the single-file
     /// covering-statistics pruning to each part independently.
     /// `bbox_units` is `[xmin, ymin, xmax, ymax]` in the file CRS units.

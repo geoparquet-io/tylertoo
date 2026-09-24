@@ -1237,7 +1237,13 @@ fn resolve_plan_state(
         .then(|| Fingerprint::capture(inputs.source, inputs.selected_row_groups, options, flag))
         .transpose()?;
     match &options.plan {
-        Some(path) => load_plan_state(path, fingerprint.expect("captured for --plan"), options),
+        Some(path) => load_plan_state(
+            path,
+            fingerprint.expect("captured for --plan"),
+            options,
+            inputs.source,
+            inputs.selected_row_groups,
+        ),
         None => run_pass1_and_assign(inputs, options, fingerprint, peak_rss_mib),
     }
 }
@@ -1375,6 +1381,8 @@ fn load_plan_state(
     path: &Path,
     current: Fingerprint,
     options: &ConvertOptions,
+    source: &ConvertSource,
+    selected_row_groups: Option<&RowGroupSelection>,
 ) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
     let plan = ConvertPlan::load(path)?;
@@ -1388,22 +1396,28 @@ fn load_plan_state(
             totals.n_rows,
         )));
     }
-    // #511: the winner table is addressed by row position, so the plan's row
-    // domain must equal what THIS run will actually stream. The per-part row
-    // counts are already compared field by field above; this catches the
-    // dataset-level case the fingerprint cannot see on its own (a plan whose
-    // totals disagree with the inputs it names). Skipped when row groups are
-    // pruned, where the footers no longer describe the rows read.
-    if let Some(total) = current.unpruned_total_rows() {
-        if total != plan.min_levels.len() as i64 {
-            return Err(ConvertError::InvalidConfig(format!(
-                "--plan: {} holds {} winner-table row(s) but the input(s) named in it \
-                 have {total} row(s) now. Re-run without --plan (add --save-plan to write \
-                 a fresh one).",
-                path.display(),
-                plan.min_levels.len(),
-            )));
-        }
+    // #511/#512: the winner table is addressed by row position, so the plan's
+    // row domain must equal what THIS run will actually stream. The per-part
+    // footer row counts are already compared field by field above; this
+    // catches the dataset-level case the fingerprint cannot see on its own (a
+    // plan whose tables disagree with the inputs it names).
+    //
+    // It used to be gated on `Fingerprint::unpruned_total_rows()`, which
+    // returns `None` as soon as ANY part is row-group pruned — so under
+    // `--bbox` / `--filter` the one structural check standing between a
+    // forged (but checksum-valid) plan and an out-of-bounds index in pass 2
+    // simply did not run. The gate is gone: sum `num_rows()` over the row
+    // groups this run SELECTED, which is exactly pass 1's row domain, pruned
+    // or not, and costs nothing (the footers are already parsed).
+    let will_stream = source.selected_row_count(selected_row_groups)?;
+    if will_stream != plan.min_levels.len() as i64 {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan: {} does not match this run's input: the plan holds {} winner-table \
+             row(s) but the row group(s) this run will read hold {will_stream} row(s). \
+             Re-run without --plan (add --save-plan to write a fresh one).",
+            path.display(),
+            plan.min_levels.len(),
+        )));
     }
     // #512: bound the cluster aggregate arity by this run's accumulate specs,
     // rather than trusting the stride the plan's JSON block declares.

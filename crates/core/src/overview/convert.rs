@@ -1299,17 +1299,32 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     let mut file = std::fs::File::open(path).map_err(|e| {
         ConvertError::InvalidConfig(format!("--plan {} cannot be read: {e}", path.display()))
     })?;
-    // 16 bytes of magic + checksum: enough to say "that is not a plan"
-    // before anything expensive happens. The full checksum is verified at
-    // load, where the payload is read anyway.
+    // The 8 magic bytes alone are enough to say "that is not a plan" before
+    // anything expensive happens; the checksum in the other 8 header bytes,
+    // and the payload it covers, are verified at load, where the whole file
+    // is read anyway.
     let mut magic = [0u8; 8];
     if std::io::Read::read_exact(&mut file, &mut magic).is_err()
-        || &magic != super::plan_state::PLAN_MAGIC
+        || !magic.starts_with(super::plan_state::PLAN_MAGIC_PREFIX)
     {
         return Err(ConvertError::InvalidConfig(format!(
             "--plan {} is not a tylertoo convert plan (bad magic bytes). Plans written \
              by an older tylertoo must be re-created with --save-plan.",
             path.display()
+        )));
+    }
+    // The last magic byte is the format version. Matching on the PREFIX and
+    // reading that byte separately means a plan from a FUTURE tylertoo says
+    // so — "plan format v3" — instead of being reported as a corrupt file
+    // with "bad magic bytes", which sends the reader looking for the wrong
+    // problem entirely.
+    let version = magic[super::plan_state::PLAN_MAGIC_PREFIX.len()];
+    if version != super::plan_state::PLAN_FORMAT_VERSION_BYTE {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan {} is a tylertoo convert plan in format v{version}, but this tylertoo \
+             reads v{}. Re-create it with --save-plan.",
+            path.display(),
+            super::plan_state::PLAN_FORMAT_VERSION_BYTE,
         )));
     }
     Ok(())
@@ -1364,6 +1379,18 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
         }
     }
     if path.exists() {
+        // #513 follow-up: a writable parent says nothing about an existing
+        // file inside it — `--save-plan` onto a mode-444 (or root-owned)
+        // plan passed this preflight and then died after the whole scan,
+        // which is the exact failure #513 exists to prevent. Probe the file
+        // the way `write_plan_file` will open it, minus `truncate`, so a
+        // preflight that merely observes cannot destroy the old plan.
+        if let Err(e) = std::fs::OpenOptions::new().write(true).open(path) {
+            return bad(format!(
+                "--save-plan {} exists and is not writable: {e}",
+                path.display(),
+            ));
+        }
         log::info!(
             "[convert] --save-plan {} already exists and will be overwritten",
             path.display()
@@ -5238,6 +5265,26 @@ mod tests {
         assert!(msg.contains("not a tylertoo convert plan"), "{msg}");
         assert!(msg.contains(&junk.display().to_string()), "{msg}");
 
+        // A plan written by a FUTURE tylertoo: reported as the version skew
+        // it is, not as "bad magic bytes", which sends whoever reads the
+        // message looking for a corrupt file instead.
+        let future = dir.path().join("v3.plan");
+        let mut bytes = b"TTPLAN\x00\x03".to_vec();
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&future, &bytes).unwrap();
+        let msg = validate_options(&ConvertOptions {
+            plan: Some(future.clone()),
+            ..Default::default()
+        })
+        .expect_err("a future plan format must be rejected")
+        .to_string();
+        assert!(
+            msg.contains("format v3"),
+            "names the version it found: {msg}"
+        );
+        assert!(!msg.contains("bad magic"), "{msg}");
+        assert!(msg.contains(&future.display().to_string()), "{msg}");
+
         // --plan pointed at a directory.
         let msg = validate_options(&ConvertOptions {
             plan: Some(dir.path().to_path_buf()),
@@ -5293,6 +5340,86 @@ mod tests {
             ..Default::default()
         })
         .expect("an existing plan is overwritten, not refused");
+    }
+
+    /// #513 follow-up: an existing but UNWRITABLE target passed the
+    /// parent-directory-only preflight and then died after the whole scan —
+    /// the exact failure #513 exists to prevent, one level down. Clobbering
+    /// an existing plan is allowed, so the preflight has to prove it can
+    /// actually clobber this one.
+    #[test]
+    #[cfg(unix)]
+    fn save_plan_preflight_rejects_an_unwritable_existing_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &synthetic_geometries(), false, None);
+        let out = dir.path().join("out.parquet");
+
+        // A read-only file in a perfectly writable directory.
+        let locked = dir.path().join("locked.plan");
+        std::fs::write(&locked, b"an older plan").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Running as root defeats mode bits entirely; skip rather than lie.
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&locked)
+            .is_ok()
+        {
+            eprintln!("skipping: this user can write a mode-444 file (root?)");
+            return;
+        }
+
+        // At OPTION time — before the input is even opened, let alone
+        // scanned. Pre-fix this returned Ok(()) and the run died with a bare
+        // `Permission denied` from `write_plan_file`, after pass 1.
+        let err = validate_options(&ConvertOptions {
+            save_plan: Some(locked.clone()),
+            ..Default::default()
+        })
+        .expect_err("an unwritable existing plan must be rejected at option time")
+        .to_string();
+        assert!(
+            err.contains("--save-plan") && err.contains("not writable"),
+            "{err}"
+        );
+
+        let err = convert_to_overviews(
+            &input,
+            &out,
+            &ConvertOptions {
+                save_plan: Some(locked.clone()),
+                ..Default::default()
+            },
+        )
+        .expect_err("an unwritable existing plan must fail fast")
+        .to_string();
+        assert!(err.contains("--save-plan"), "names the flag: {err}");
+        assert!(
+            err.contains(&locked.display().to_string()),
+            "names the path: {err}"
+        );
+        assert!(err.contains("not writable"), "names the reason: {err}");
+        assert!(
+            !out.exists(),
+            "the run must not have got as far as writing an overview"
+        );
+        // The preflight only OBSERVES: the old plan is still there, intact.
+        assert_eq!(std::fs::read(&locked).unwrap(), b"an older plan");
+
+        // Made writable again, the same target is accepted.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        validate_options(&ConvertOptions {
+            save_plan: Some(locked.clone()),
+            ..Default::default()
+        })
+        .expect("a writable existing plan is clobbered, not refused");
+        assert_eq!(
+            std::fs::read(&locked).unwrap(),
+            b"an older plan",
+            "the preflight must not truncate the file it probes"
+        );
     }
 
     /// #513: the preflight runs before a single input byte is read — the

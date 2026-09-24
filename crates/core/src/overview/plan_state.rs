@@ -123,6 +123,23 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 2;
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
 pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x02";
 
+/// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
+/// version byte.
+///
+/// Readers match on THIS and then compare the version byte separately, so a
+/// plan written by a future tylertoo is reported as "format v3" rather than
+/// as "bad magic bytes" — the latter sends whoever reads the message looking
+/// for a corrupt file instead of a version skew.
+pub(super) const PLAN_MAGIC_PREFIX: &[u8; 7] = b"TTPLAN\x00";
+
+/// [`PLAN_FORMAT_VERSION`] as it appears in the magic's last byte.
+pub(super) const PLAN_FORMAT_VERSION_BYTE: u8 = PLAN_FORMAT_VERSION as u8;
+
+const _: () = assert!(
+    PLAN_MAGIC[PLAN_MAGIC_PREFIX.len()] == PLAN_FORMAT_VERSION_BYTE,
+    "PLAN_MAGIC's version byte must track PLAN_FORMAT_VERSION"
+);
+
 /// Bytes ahead of the IPC payload: [`PLAN_MAGIC`] (8) + the payload's
 /// xxh3-64 checksum, little-endian (8).
 const PLAN_HEADER_LEN: usize = 16;
@@ -298,20 +315,6 @@ impl Fingerprint {
             options: options_digest(options),
             inputs,
         })
-    }
-
-    /// Total rows across every part, when no part is row-group pruned.
-    ///
-    /// With `--bbox` / `--filter` pruning the run reads a subset of each
-    /// part, so the footer totals no longer describe the winner table's
-    /// domain and this returns `None`. Unpruned, it is exactly the number of
-    /// rows the plan's `min_levels` must cover — the cross-check that turns a
-    /// swapped input into an error rather than a corrupt pyramid (#511).
-    pub fn unpruned_total_rows(&self) -> Option<i64> {
-        if self.inputs.iter().any(|i| i.row_groups.is_some()) {
-            return None;
-        }
-        self.inputs.iter().map(|i| i.num_rows).sum()
     }
 
     /// Verify `self` (loaded from a plan) against the current run's
@@ -940,11 +943,23 @@ impl ConvertPlan {
                 "is too short to be a tylertoo convert plan (no header)",
             )
         })?;
-        if &header[..PLAN_MAGIC.len()] != PLAN_MAGIC {
+        if !header.starts_with(PLAN_MAGIC_PREFIX) {
             return Err(plan_err(
                 path,
                 "is not a tylertoo convert plan (bad magic bytes). Plans written by an \
                  older tylertoo must be re-created with --save-plan.",
+            ));
+        }
+        // Version byte, read separately from the prefix so a FUTURE format is
+        // named as such instead of being reported as corruption.
+        let version = header[PLAN_MAGIC_PREFIX.len()];
+        if version != PLAN_FORMAT_VERSION_BYTE {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "is a tylertoo convert plan in format v{version}, but this tylertoo \
+                     reads v{PLAN_FORMAT_VERSION_BYTE}. Re-create it with --save-plan."
+                ),
             ));
         }
         let want = u64::from_le_bytes(
@@ -952,6 +967,14 @@ impl ConvertPlan {
                 .try_into()
                 .expect("header is 8 + 8 bytes"),
         );
+        // Seek explicitly to the payload rather than relying on the cursor
+        // the header read happened to leave behind (a `try_clone` shares the
+        // file offset, so this worked only as a side effect of the
+        // `read_exact` above). The writer states the same offset the same
+        // way; an implicit, asymmetric version of it is one refactor away
+        // from hashing the header too and failing every load.
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))
+            .map_err(|e| plan_err(path, &format!("reading it failed: {e}")))?;
         let got = hash_payload(BufReader::new(
             file.try_clone()
                 .map_err(|e| plan_err(path, &format!("{e}")))?,
@@ -1039,6 +1062,36 @@ impl ConvertPlan {
             })
             .transpose()?;
 
+        // #512 follow-up: `kinds` is addressed by the SAME row position as
+        // `min_levels` (`finest.kinds[g]` in pass 2's batch fan-out), so a
+        // checksum-valid plan whose `kinds` is short is an out-of-bounds index
+        // waiting to happen — the checksum proves the bytes are the ones that
+        // were written, never that they are consistent.
+        //
+        // The other sections were audited for the same hole and are already
+        // closed: `carriers` is bounded by `meta.num_levels` in
+        // `rebuild_carriers` and its row values are only ever `binary_search`ed
+        // (`is_carrier`); the coalesce sections are length-matched against each
+        // other in `rebuild_coalesce` and their row values key a `HashMap`; the
+        // cluster sections are length-matched in `rebuild_cluster_tables` and
+        // are likewise `HashMap`-keyed by row. Polygon `areas` never reach the
+        // artifact — they are consumed into `carriers` before the plan is
+        // built. `min_levels` and `kinds` are the only two indexed by raw row.
+        if let Some(kinds) = &kinds {
+            if kinds.len() != min_levels.len() {
+                return Err(plan_err(
+                    path,
+                    &format!(
+                        "does not match itself: section \"kinds\" holds {} row(s) but section \
+                         \"min_levels\" holds {}. Every row-indexed section must cover the \
+                         same input rows — re-create the plan with --save-plan.",
+                        kinds.len(),
+                        min_levels.len(),
+                    ),
+                ));
+            }
+        }
+
         let carrier_offsets = u64_section(&batch, "carrier_offsets", path)?.unwrap_or_default();
         let carrier_rows = u64_section(&batch, "carrier_rows", path)?.unwrap_or_default();
         let carriers = rebuild_carriers(&carrier_offsets, &carrier_rows, meta.num_levels, path)?;
@@ -1095,10 +1148,14 @@ fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<
     w.write_all(PLAN_MAGIC)
         .and_then(|()| w.write_all(&0u64.to_le_bytes()))
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    let mut ipc = FileWriter::try_new(w, schema)?;
-    ipc.write(batch)?;
-    ipc.finish()?;
-    let mut w = ipc.into_inner()?;
+    // Arrow's own errors carry no path: `--save-plan /mnt/full/x.plan` used to
+    // fail with a bare "No space left on device" naming neither the flag nor
+    // the file. Every arrow step is prefixed the same way the io steps are.
+    let arrow = |e: arrow_schema::ArrowError| save_plan_err(path, &format!("{e}"));
+    let mut ipc = FileWriter::try_new(w, schema).map_err(arrow)?;
+    ipc.write(batch).map_err(arrow)?;
+    ipc.finish().map_err(arrow)?;
+    let mut w = ipc.into_inner().map_err(arrow)?;
     w.flush()
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
     drop(w);
@@ -1594,35 +1651,6 @@ mod tests {
             .unwrap();
     }
 
-    /// The dataset-level cross-check: unpruned, the parts' footer row counts
-    /// sum to the winner table's domain; pruned, they cannot and must not be
-    /// compared.
-    #[test]
-    fn unpruned_total_rows_sums_only_without_pruning() {
-        let mut f = tiny_fingerprint();
-        f.inputs[0].row_groups = None;
-        assert_eq!(f.unpruned_total_rows(), Some(9));
-
-        f.inputs.push(InputFingerprint {
-            path: "/tmp/b.parquet".to_string(),
-            byte_len: None,
-            mtime_nanos: None,
-            row_groups: None,
-            row_groups_total: Some(1),
-            num_rows: Some(4),
-        });
-        assert_eq!(f.unpruned_total_rows(), Some(13));
-
-        // A pruned part makes the footer totals meaningless.
-        f.inputs[1].row_groups = Some(vec![0]);
-        assert_eq!(f.unpruned_total_rows(), None);
-
-        // As does a part whose footer row count is unavailable.
-        f.inputs[1].row_groups = None;
-        f.inputs[1].num_rows = None;
-        assert_eq!(f.unpruned_total_rows(), None);
-    }
-
     fn touched_err(saved: &Fingerprint, current: &Fingerprint) -> String {
         saved.verify(current).unwrap_err().to_string()
     }
@@ -1770,12 +1798,26 @@ mod tests {
             std::fs::write(f.path(), &bytes).unwrap();
             assert!(load_err(f.path()).contains("is corrupt"), "byte {at}");
         }
-        for at in 0..PLAN_MAGIC.len() {
+        // The magic PREFIX: not a plan at all.
+        for at in 0..PLAN_MAGIC_PREFIX.len() {
             let mut bytes = original.clone();
             bytes[at] ^= 0xff;
             std::fs::write(f.path(), &bytes).unwrap();
             assert!(load_err(f.path()).contains("bad magic"), "byte {at}");
         }
+        // ...and the version byte that closes it: a plan in a format this
+        // build does not read, reported as the version skew it is rather
+        // than as corruption.
+        let at = PLAN_MAGIC_PREFIX.len();
+        let mut bytes = original.clone();
+        bytes[at] = PLAN_FORMAT_VERSION_BYTE + 1;
+        std::fs::write(f.path(), &bytes).unwrap();
+        let err = load_err(f.path());
+        assert!(
+            err.contains(&format!("format v{}", PLAN_FORMAT_VERSION_BYTE + 1)),
+            "names the version it found: {err}"
+        );
+        assert!(!err.contains("bad magic"), "{err}");
 
         // Truncation, and a file that is not a plan at all.
         std::fs::write(f.path(), &original[..PLAN_HEADER_LEN + 8]).unwrap();
@@ -1810,6 +1852,45 @@ mod tests {
         );
         let err = load_err(f.path());
         assert!(err.contains("unknown geometry-kind code 7"), "{err}");
+    }
+
+    /// Class (e): a plan whose ROW-INDEXED sections disagree with each other.
+    ///
+    /// The checksum (#512) proves the bytes are the ones that were written;
+    /// it proves nothing about whether they are consistent, and anyone who
+    /// can forge a plan can re-checksum it. `kinds` is addressed by the same
+    /// row position as `min_levels` (`finest.kinds[g]` in pass 2's batch
+    /// fan-out), so a short `kinds` was an out-of-bounds index — a PANIC —
+    /// reached through a fully valid header.
+    #[test]
+    fn plan_rejects_row_sections_of_disagreeing_length() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let plan = tiny_plan();
+        assert_eq!(
+            plan.kinds.as_ref().unwrap().len(),
+            plan.min_levels.len(),
+            "precondition: the honest plan agrees with itself"
+        );
+        plan.save(f.path()).unwrap();
+        let (schema, batch) = reopen(f.path());
+        let mut columns = batch.columns().to_vec();
+
+        // One row short of `min_levels`, checksum repaired by `forge`.
+        let mut b = LargeListBuilder::new(UInt8Builder::new());
+        b.values().append_slice(&[0, 1, 2, 1, 1, 1, 2, 2]);
+        b.append(true);
+        columns[schema.index_of("kinds").unwrap()] = Arc::new(b.finish());
+        forge(
+            f.path(),
+            &serde_json::to_string(&meta_of(&schema)).unwrap(),
+            columns,
+        );
+        let err = load_err(f.path());
+        assert!(err.contains("does not match itself"), "{err}");
+        assert!(
+            err.contains("\"kinds\" holds 8") && err.contains("\"min_levels\" holds 9"),
+            "names both sections and both lengths: {err}"
+        );
     }
 
     /// Class (d'): `typed_section!` read `values()`, which discards the null
@@ -2076,6 +2157,155 @@ mod tests {
             std::fs::read(&pm_a).unwrap(),
             std::fs::read(&pm_b).unwrap(),
             "{name}: the exported PMTiles archive must be byte-identical"
+        );
+    }
+
+    /// Forge a plan that is already on disk: truncate the named row-indexed
+    /// sections by one row, optionally dropping `totals.n_rows` to match, and
+    /// repair the header checksum. The result is a plan any reader accepts as
+    /// intact — which is the whole point: a checksum is an integrity check,
+    /// not a consistency check, and anyone who can edit a plan can re-compute
+    /// it.
+    fn forge_shorter_plan(path: &Path, sections: &[&str], fix_totals: bool) {
+        let (schema, batch) = reopen(path);
+        let mut columns = batch.columns().to_vec();
+        for name in sections {
+            let idx = schema.index_of(name).unwrap();
+            let values = u8_section(&batch, name, path).unwrap().unwrap();
+            let mut b = LargeListBuilder::new(UInt8Builder::new());
+            b.values().append_slice(&values[..values.len() - 1]);
+            b.append(true);
+            columns[idx] = Arc::new(b.finish());
+        }
+        let mut meta = meta_of(&schema);
+        if fix_totals {
+            let n = meta["totals"]["n_rows"].as_u64().unwrap();
+            meta["totals"]["n_rows"] = serde_json::json!(n - 1);
+        }
+        forge(path, &serde_json::to_string(&meta).unwrap(), columns);
+    }
+
+    /// The review's first forge probe, end to end: a checksum-VALID plan
+    /// whose `kinds` is one row short of `min_levels`, replayed with NO
+    /// pruning. Pass 2's batch fan-out does `finest.kinds[g]` for every row
+    /// it reads, so this used to be an out-of-bounds PANIC on the last row —
+    /// reached through a header that verified perfectly.
+    #[test]
+    fn convert_with_forged_short_kinds_is_refused() {
+        use super::super::convert::{convert_to_overviews, LevelPlan};
+        use super::super::testutil::write_input;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // Lines: coalescing is what puts `kinds` on the pass-2 hot path.
+        write_input(&input, &line_fixture(), true, None);
+        let plan_path = dir.path().join("convert.plan");
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 7,
+            },
+            ..Default::default()
+        };
+        convert_to_overviews(
+            &input,
+            dir.path().join("a.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        forge_shorter_plan(&plan_path, &["kinds"], false);
+
+        let err = convert_to_overviews(
+            &input,
+            dir.path().join("b.parquet"),
+            &ConvertOptions {
+                plan: Some(plan_path),
+                ..base
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--plan"), "names the flag: {err}");
+        assert!(err.contains("does not match"), "{err}");
+        assert!(err.contains("kinds"), "names the section: {err}");
+    }
+
+    /// The review's second forge probe: the same class of forgery under
+    /// `--bbox`. The dataset-level row-domain check used to be gated on
+    /// `unpruned_total_rows()`, which gives up the moment ANY part is
+    /// row-group pruned — so the one structural check between a forged plan
+    /// and an out-of-bounds index in pass 2 simply did not run under
+    /// `--bbox` / `--filter`. The identical forgery WITHOUT a bbox was caught
+    /// cleanly, which is what made it a hole rather than a gap.
+    #[test]
+    fn convert_with_forged_truncated_tables_is_refused_under_bbox() {
+        use super::super::convert::{convert_to_overviews, LevelPlan};
+        use super::super::testutil::write_input;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &point_fixture(), true, None);
+        let plan_path = dir.path().join("convert.plan");
+        // A bbox that keeps every row: pruning is what disabled the check,
+        // not the rows it removes.
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 7,
+            },
+            bbox: Some([-180.0, -90.0, 180.0, 90.0]),
+            ..Default::default()
+        };
+        convert_to_overviews(
+            &input,
+            dir.path().join("a.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        let saved = ConvertPlan::load(&plan_path).unwrap();
+        assert!(
+            saved.fingerprint.inputs[0].row_groups.is_some(),
+            "precondition: --bbox really did record a row-group selection"
+        );
+
+        // Truncate BOTH row-indexed sections and the declared row total, so
+        // every other consistency check still passes and only the row-domain
+        // check can catch it.
+        let mut sections = vec!["min_levels"];
+        if saved.kinds.is_some() {
+            sections.push("kinds");
+        }
+        forge_shorter_plan(&plan_path, &sections, true);
+        let forged =
+            ConvertPlan::load(&plan_path).expect("the forgery loads: it is self-consistent");
+        assert_eq!(forged.min_levels.len(), saved.min_levels.len() - 1);
+
+        let err = convert_to_overviews(
+            &input,
+            dir.path().join("b.parquet"),
+            &ConvertOptions {
+                plan: Some(plan_path),
+                ..base
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--plan"), "names the flag: {err}");
+        assert!(err.contains("does not match"), "{err}");
+        assert!(
+            err.contains(&format!("{} winner-table", saved.min_levels.len() - 1)),
+            "names what the plan holds: {err}"
+        );
+        assert!(
+            err.contains(&format!("{} row(s)", saved.min_levels.len())),
+            "names what this run will read: {err}"
         );
     }
 

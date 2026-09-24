@@ -1587,8 +1587,13 @@ damaged in transit — re-create it with --save-plan.
 
 — rather than an arrow-internal panic. Every other structural problem (a
 plan that is not a plan, a foreign format version, an impossible level count
-or cluster stride, an unknown geometry-kind code) is likewise an error naming
-`--plan` and the path.
+or cluster stride, an unknown geometry-kind code, row-indexed sections of
+disagreeing length) is likewise an error naming `--plan` and the path.
+
+The checksum proves the file is the one that was written; it proves nothing
+about whether the file makes sense. So the plan's row domain is also compared
+against the rows this run will actually read — the sum over the row groups
+`--bbox` / `--filter` selected — every time, pruned or not.
 
 **The plan is verified, not trusted.** It stores a fingerprint: the tylertoo
 version, every thinning-relevant flag, and each input's identity. A mismatch
@@ -1650,8 +1655,10 @@ are mutually exclusive, and they are available on `overview` and `tiles`.
 written only once pass 1 *and* the assignment are complete, so pointing it at
 an unmounted volume used to cost the entire scan and then leave you with no
 plan **and** no overview. Its parent directory must therefore exist and be
-writable at option-validation time, and `--plan` must be a readable convert
-plan (magic bytes checked) — same fail-fast contract as `--spill-dir`.
+writable at option-validation time — and if a plan is already sitting at that
+path, it must itself be writable, since it is about to be clobbered. `--plan`
+must be a readable convert plan (magic bytes checked, with a future format
+version named as such) — same fail-fast contract as `--spill-dir`.
 An existing plan at `--save-plan PATH` is **overwritten**, with a log line;
 that matches how `overview` and `tiles` treat their own outputs (only
 `pyramid`, which merges several archives, gates overwrites behind

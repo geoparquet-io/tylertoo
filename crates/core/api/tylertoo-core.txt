@@ -412,6 +412,7 @@ pub fn tylertoo_core::input_set::ConvertSource::schema(&self) -> core::result::R
 pub fn tylertoo_core::input_set::ConvertSource::select_row_groups(&self, &[f64; 4]) -> core::result::Result<tylertoo_core::input_set::RowGroupSelection, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::select_row_groups_matching(&self, &tylertoo_core::overview::filter::BoundFilter) -> core::result::Result<tylertoo_core::input_set::RowGroupSelection, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::selected_input_bytes(&self, core::option::Option<&tylertoo_core::input_set::RowGroupSelection>) -> core::result::Result<u64, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input_set::ConvertSource::selected_row_count(&self, core::option::Option<&tylertoo_core::input_set::RowGroupSelection>) -> core::result::Result<i64, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::set_spill_dir(&self, core::option::Option<&std::path::Path>)
 pub fn tylertoo_core::input_set::ConvertSource::single(tylertoo_core::input::InputSource) -> Self
 pub fn tylertoo_core::input_set::ConvertSource::stage_selected(&self, core::option::Option<&tylertoo_core::input_set::RowGroupSelection>) -> core::result::Result<(), tylertoo_core::input::InputError>
