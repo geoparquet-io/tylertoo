@@ -355,6 +355,11 @@ pub struct ConvertOptions {
     pub entry_zoom: Option<EntryZoomSpec>,
     /// Optional column name whose (numeric) value is used as the cell-winner
     /// sort key. Mutually exclusive with [`class_ranking`](Self::class_ranking).
+    ///
+    /// A null — or a NaN/infinite value, which is how a float column usually
+    /// spells nodata — is a *missing* key: the feature still appears, it just
+    /// loses any cell it contests to a feature that has a key
+    /// ([`extract_sort_keys`]).
     pub sort_key: Option<String>,
     /// Optional explicit categorical class ranking (Q1 tier 1). Mutually
     /// exclusive with [`sort_key`](Self::sort_key).
@@ -828,6 +833,25 @@ pub struct ConvertReport {
     /// about (one aggregate `log::warn!`), never mutated; see
     /// `context/ANTIMERIDIAN.md` (issue #188).
     pub antimeridian_suspect_features: usize,
+    /// Features whose bounding box falls outside the input CRS's coordinate
+    /// range — outside ±180°/±90° for EPSG:4326, outside the Web Mercator
+    /// world extent for EPSG:3857. The near-certain cause (when the values
+    /// are large) is projected coordinates stored under CRS84 metadata; such
+    /// features cannot be tiled and vanish at export. Warned about (one
+    /// aggregate `log::warn!`); see
+    /// [`unprojectable_features`](Self::unprojectable_features) for the
+    /// companion loss and the shared failure gate (#429).
+    pub out_of_range_features: usize,
+    /// Features with valid lon/lat that nonetheless lie outside the Web
+    /// Mercator tiling domain (`|lat| > 85.05°`) — an Arctic or Antarctic
+    /// extract is legal CRS84 and still tiles to nothing, because the tiler
+    /// clamps latitude and the tile-local clipping then discards the
+    /// geometry. Disjoint from
+    /// [`out_of_range_features`](Self::out_of_range_features). When the two
+    /// together account for ≥99% of the input the conversion fails with
+    /// [`ConvertError::AllFeaturesOutOfRange`] rather than writing an empty
+    /// archive (#429).
+    pub unprojectable_features: usize,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
     /// Remote-input fetch counters (#210): range requests issued and bytes
@@ -866,6 +890,27 @@ pub enum ConvertError {
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
+    },
+    /// All but a sliver (≥99%, [`ALL_LOST_PERCENT`]) of the input cannot be
+    /// tiled (#429): the coordinates fall outside the declared CRS's range,
+    /// or they are valid lon/lat outside the Web Mercator tiling domain.
+    /// Either way the conversion used to "succeed" into an empty tile
+    /// archive. The threshold is a share rather than 100% so a wrong-CRS file
+    /// carrying a handful of `POINT(0 0)` placeholder rows still fails.
+    #[error("{}", all_lost_message(.crs, .out_of_range, .unprojectable, .total, .max_abs))]
+    AllFeaturesOutOfRange {
+        /// The CRS the input's metadata declares.
+        crs: Crs,
+        /// Features outside that CRS's coordinate range.
+        out_of_range: usize,
+        /// Features valid for the CRS but outside the Web Mercator tiling
+        /// domain (`|lat| > 85.05°`).
+        unprojectable: usize,
+        /// Total features scanned.
+        total: usize,
+        /// Largest `|coordinate|` among the out-of-range features; gates the
+        /// projected-CRS diagnosis in the message.
+        max_abs: f64,
     },
     /// The input has no geometry column.
     #[error("input has no geometry column")]
@@ -2141,12 +2186,11 @@ pub(crate) fn convert_to_overviews_source_strategy(
         })
         .collect();
 
-    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
-    let antimeridian_suspect_features = features
-        .iter()
-        .filter(|f| bbox_antimeridian_suspect(&f.bbox, crs))
-        .count();
-    warn_antimeridian_suspects(antimeridian_suspect_features);
+    // One pass over the pass-1 bboxes for every bbox-derived tally: #188
+    // antimeridian suspects, and the #429 losses (outside the CRS range, or
+    // outside the Web Mercator tiling domain). Warns once per kind and
+    // refuses to "succeed" into an empty archive when ~everything is lost.
+    let tallies = tally_feature_bboxes(&features, crs)?;
 
     // #306: cap the transient winner-grid memory at the profile-derived RAM
     // budget (`speed` stays unbounded). Pure scheduling — output-identical.
@@ -2296,7 +2340,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
         total_compressed_bytes,
         row_groups_total,
         row_groups_read,
-        antimeridian_suspect_features,
+        antimeridian_suspect_features: tallies.antimeridian_suspect,
+        out_of_range_features: tallies.out_of_range,
+        unprojectable_features: tallies.unprojectable,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
     })
@@ -2655,6 +2701,291 @@ pub(super) fn warn_antimeridian_suspects(count: usize) {
     }
 }
 
+/// The coordinate range a [`Crs`] admits, plus the words a message needs for
+/// it. Feeds the #429 out-of-range gate and every message derived from it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct CrsRange {
+    /// Largest legal `|x|` (longitude degrees, or Web Mercator meters).
+    pub max_x: f64,
+    /// Largest legal `|y|` (latitude degrees, or Web Mercator meters).
+    pub max_y: f64,
+    /// The CRS as the file's own metadata declares it.
+    pub label: &'static str,
+    /// The legal range, spelled out for a user-facing message.
+    pub text: &'static str,
+}
+
+/// The coordinate range `crs` admits (#429).
+pub(super) fn crs_coordinate_range(crs: Crs) -> CrsRange {
+    match crs {
+        Crs::Epsg4326 => CrsRange {
+            max_x: 180.0,
+            max_y: 90.0,
+            label: "OGC:CRS84 / EPSG:4326",
+            text: "±180° longitude / ±90° latitude",
+        },
+        Crs::Epsg3857 => CrsRange {
+            max_x: WEBMERC_HALF_M,
+            max_y: WEBMERC_HALF_M,
+            label: "EPSG:3857",
+            text: "±20037508.34 m",
+        },
+    }
+}
+
+/// Whether a feature bbox lies (even partly) outside the coordinate range its
+/// CRS admits (#429): beyond ±180°/±90° for EPSG:4326, beyond the Web Mercator
+/// world extent for EPSG:3857.
+///
+/// The bounds are INCLUSIVE: a feature touching exactly ±180° or ±90° is
+/// legitimate (a whole-world bbox, a pole, an antimeridian vertex) and must
+/// not be counted. Only a coordinate strictly beyond the edge — the signature
+/// of projected meters stored under geographic metadata — trips it.
+pub(super) fn bbox_out_of_crs_range(bbox: &[f64; 4], crs: Crs) -> bool {
+    let r = crs_coordinate_range(crs);
+    bbox[0] < -r.max_x || bbox[2] > r.max_x || bbox[1] < -r.max_y || bbox[3] > r.max_y
+}
+
+/// Whether a bbox is legal for its CRS yet lies wholly outside the Web
+/// Mercator TILING domain (#429, review S1-3).
+///
+/// The out-of-range check above is about the CRS's own range; this one is
+/// about what the tiler can actually reach. `lng_lat_to_tile` clamps latitude
+/// to the Mercator limit and the tile-local clipping then discards the
+/// geometry, so an Arctic or Antarctic extract confined to `|lat| > 85.05°` is
+/// perfectly valid CRS84 and still tiles to nothing — the exact #429 symptom
+/// with a counter that reads zero.
+///
+/// Only a bbox ENTIRELY beyond the limit counts: a feature straddling it
+/// (Svalbard, an ice-shelf polygon reaching the pole) still puts geometry in
+/// tiles and is merely clipped.
+///
+/// The threshold is the projection's own limit ([`crate::world_coord::MAX_LATITUDE`],
+/// 85.0511°) rather than the slightly tighter ±85.05° the tiler clamps to, so
+/// the count never overstates: a feature in that 0.001° sliver is clamped to
+/// the world's top edge, not counted as lost.
+///
+/// A 3857 input is already expressed in the tiling domain's own units, so
+/// anything inside the world extent projects by construction and the range
+/// check above covers the rest.
+pub(super) fn bbox_unprojectable(bbox: &[f64; 4], crs: Crs) -> bool {
+    use crate::world_coord::MAX_LATITUDE;
+    match crs {
+        Crs::Epsg3857 => false,
+        Crs::Epsg4326 => bbox[1] > MAX_LATITUDE || bbox[3] < -MAX_LATITUDE,
+    }
+}
+
+/// Largest `|coordinate|` in a bbox. Distinguishes a stray 0–360°-convention
+/// longitude (≈360) from projected meters (≈10⁶) so the diagnosis can be
+/// gated on magnitude (review S2-2).
+fn bbox_max_abs(bbox: &[f64; 4]) -> f64 {
+    bbox.iter().fold(0.0f64, |m, v| m.max(v.abs()))
+}
+
+/// `|coordinate|` above which out-of-range values stop looking like a data
+/// quirk and start looking like another CRS's units. A 0–360° longitude tops
+/// out at 360; Web Mercator meters start in the millions (review S2-2).
+const PROJECTED_COORD_MAGNITUDE: f64 = 1000.0;
+
+/// Whether the out-of-range coordinates are big enough to diagnose as "this
+/// file is in a projected CRS" rather than as stray values. For a file whose
+/// metadata ALREADY declares a projected CRS, any excess beyond the world
+/// extent is pathological, so the diagnosis always applies there.
+fn looks_projected(crs: Crs, max_abs: f64) -> bool {
+    match crs {
+        Crs::Epsg3857 => true,
+        Crs::Epsg4326 => max_abs > PROJECTED_COORD_MAGNITUDE,
+    }
+}
+
+/// The `gpio` reprojection advice for a file whose coordinates do not fit its
+/// declared CRS (#429, review S2-3). Honest for both a 4326-labeled file
+/// holding projected coordinates and a file that already declares a projected
+/// CRS but overflows its world extent.
+fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
+    if !looks_projected(crs, max_abs) {
+        return String::new();
+    }
+    let diagnosis = match crs {
+        Crs::Epsg4326 => {
+            "The coordinates look like a projected CRS (e.g. EPSG:3857 meters) while the \
+             file's metadata says OGC:CRS84 / EPSG:4326, so the metadata is probably wrong."
+        }
+        Crs::Epsg3857 => {
+            "The file's metadata says EPSG:3857 but the coordinates fall outside the Web \
+             Mercator world extent, so they are probably in some other projected CRS."
+        }
+    };
+    format!(
+        " {diagnosis} Confirm the real CRS with `gpio inspect <input>`, then reproject with \
+         geoparquet-io:\n  gpio convert reproject <input> reprojected.parquet -d EPSG:4326"
+    )
+}
+
+/// #429 decision + message (pure, so it is unit-testable without capturing
+/// logs). The one aggregate warning for `count` of `total` out-of-range
+/// features, or `None` to stay quiet.
+///
+/// `max_abs` is the largest `|coordinate|` among the offenders: the
+/// projected-CRS diagnosis (and its `gpio` hint) is gated on it, so one
+/// Pacific point at lng 180.001 gets neutral wording rather than being told
+/// its whole file is in the wrong CRS (review S2-2).
+pub(super) fn out_of_range_warning(
+    count: usize,
+    total: usize,
+    crs: Crs,
+    max_abs: f64,
+) -> Option<String> {
+    if count == 0 || total == 0 {
+        return None;
+    }
+    let range = crs_coordinate_range(crs);
+    let (label, text) = (range.label, range.text);
+    let pct = count as f64 / total as f64 * 100.0;
+    let advice = reprojection_advice(crs, max_abs);
+    Some(format!(
+        "{count} of {total} feature(s) ({pct:.1}%) reach beyond the {label} coordinate \
+         range ({text}) and were dropped or clipped.{advice}"
+    ))
+}
+
+/// The one aggregate warning for features that are valid lon/lat but lie
+/// outside the Web Mercator tiling domain (#429, review S1-3), or `None`.
+pub(super) fn unprojectable_warning(count: usize, total: usize) -> Option<String> {
+    if count == 0 || total == 0 {
+        return None;
+    }
+    let pct = count as f64 / total as f64 * 100.0;
+    Some(format!(
+        "{count} of {total} feature(s) ({pct:.1}%) have valid lon/lat but lie outside the \
+         Web Mercator tiling domain (|lat| > 85.05°); these features cannot be tiled. \
+         Web Mercator does not reach the poles — clip the input to |lat| ≤ 85.05° or use \
+         a polar tiling scheme instead."
+    ))
+}
+
+/// Share of the input that must be lost before a conversion is a failure
+/// rather than a warning (#429, review S2-1). Exactly 100% let a million-row
+/// wrong-CRS file sail through on a dozen `POINT(0 0)` placeholder rows.
+pub(super) const ALL_LOST_PERCENT: usize = 99;
+
+/// One-pass pass-1 bbox tallies: #188 antimeridian suspects plus the #429
+/// losses. Fused into a single traversal of the feature list (review S3b).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(super) struct BboxTallies {
+    /// Features whose bbox spans more than 180° of longitude (#188).
+    pub antimeridian_suspect: usize,
+    /// Features outside their CRS's coordinate range (#429).
+    pub out_of_range: usize,
+    /// Features valid for the CRS but outside the Web Mercator tiling
+    /// domain (#429, review S1-3). Disjoint from `out_of_range`.
+    pub unprojectable: usize,
+    /// Largest `|coordinate|` among the out-of-range features, for the
+    /// magnitude-gated diagnosis.
+    pub max_abs_out_of_range: f64,
+}
+
+impl BboxTallies {
+    /// Features that cannot be tiled at all, by either cause.
+    pub fn lost(&self) -> usize {
+        self.out_of_range + self.unprojectable
+    }
+}
+
+/// The message body of [`ConvertError::AllFeaturesOutOfRange`]: how much was
+/// lost, to which cause, and what to do about it.
+fn all_lost_message(
+    crs: &Crs,
+    out_of_range: &usize,
+    unprojectable: &usize,
+    total: &usize,
+    max_abs: &f64,
+) -> String {
+    let (out_of_range, unprojectable, total) = (*out_of_range, *unprojectable, *total);
+    let lost = out_of_range + unprojectable;
+    let pct = if total == 0 {
+        0.0
+    } else {
+        lost as f64 / total as f64 * 100.0
+    };
+    let range = crs_coordinate_range(*crs);
+    let mut causes = Vec::new();
+    if out_of_range > 0 {
+        causes.push(format!(
+            "{out_of_range} reach beyond the {} coordinate range ({})",
+            range.label, range.text
+        ));
+    }
+    if unprojectable > 0 {
+        causes.push(format!(
+            "{unprojectable} have valid lon/lat but lie outside the Web Mercator tiling \
+             domain (|lat| > 85.05°)"
+        ));
+    }
+    format!(
+        "nothing left to tile: {lost} of {total} feature(s) ({pct:.1}%) cannot be tiled — {}.{}",
+        causes.join("; "),
+        reprojection_advice(*crs, *max_abs)
+    )
+}
+
+/// Build the ≥99%-lost failure for a pass-1 tally, or `None` when the
+/// conversion still has something to tile (#429, review S2-1).
+pub(super) fn all_lost_error(t: &BboxTallies, total: usize, crs: Crs) -> Option<ConvertError> {
+    let lost = t.lost();
+    if lost == 0 || total == 0 || lost * 100 < total * ALL_LOST_PERCENT {
+        return None;
+    }
+    Some(ConvertError::AllFeaturesOutOfRange {
+        crs,
+        out_of_range: t.out_of_range,
+        unprojectable: t.unprojectable,
+        total,
+        max_abs: t.max_abs_out_of_range,
+    })
+}
+
+/// Tally a pass-1 scan's bboxes, emit the aggregate warnings, and fail when
+/// all but a sliver of the input cannot be tiled (#188, #429).
+///
+/// Called from both engines at the end of pass 1, where the `AssignFeature`
+/// bboxes exist and nothing has been written yet.
+///
+/// DIVERGENCE FROM THE TICKET'S WORDING: the all-lost check fires here rather
+/// than "at the end of convert". Pass 1 already knows the answer, and failing
+/// here costs no second pass and leaves no half-written overview behind (see
+/// `context/ARCHITECTURE.md`).
+pub(super) fn tally_feature_bboxes(
+    features: &[AssignFeature],
+    crs: Crs,
+) -> Result<BboxTallies, ConvertError> {
+    let mut t = BboxTallies::default();
+    for f in features {
+        if bbox_antimeridian_suspect(&f.bbox, crs) {
+            t.antimeridian_suspect += 1;
+        }
+        if bbox_out_of_crs_range(&f.bbox, crs) {
+            t.out_of_range += 1;
+            t.max_abs_out_of_range = t.max_abs_out_of_range.max(bbox_max_abs(&f.bbox));
+        } else if bbox_unprojectable(&f.bbox, crs) {
+            t.unprojectable += 1;
+        }
+    }
+    let total = features.len();
+    warn_antimeridian_suspects(t.antimeridian_suspect);
+    if let Some(msg) = out_of_range_warning(t.out_of_range, total, crs, t.max_abs_out_of_range) {
+        log::warn!("{msg}");
+    }
+    if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
+        log::warn!("{msg}");
+    }
+    match all_lost_error(&t, total, crs) {
+        Some(e) => Err(e),
+        None => Ok(t),
+    }
+}
+
 /// Object-size threshold above which a *full-file* remote convert emits the
 /// #267 download-first nudge. Below ~1 GiB the local spill footprint and the
 /// second-pass disk read are cheap enough not to warrant a warning.
@@ -2978,9 +3309,50 @@ pub(super) fn count_vertices(g: &Geometry<f64>) -> usize {
     g.coords_count()
 }
 
-/// Extract an optional f64 sort key per row from a numeric Arrow column.
-/// Non-numeric columns and null values yield `None`.
+/// Extract an optional f64 **sort key** per row from a numeric Arrow column:
+/// [`extract_numeric_values`] with ±inf filed under "missing key" as well
+/// (#428).
+///
+/// A NaN must never reach the ranking comparator: [`super::assign::Priority`]
+/// answers "does not beat" in BOTH directions for one, which is not a strict
+/// weak order — the incumbent of a cell then keeps it whatever the keys say
+/// (inverting the documented "larger key wins" rule), and `sort_by` is
+/// entitled to permute or panic on it, which would break byte-identity
+/// between the two engines. Infinities are ordered, but they are nodata in
+/// this position just as much as a NaN is, and a rank of "larger than every
+/// real value" is not something an attribute column means to say.
+///
+/// A missing key ranks below every present key (`Priority::beats`: `Some`
+/// beats `None`), so a NaN-keyed feature ranks exactly where a null-keyed one
+/// does — and, like it, is never dropped.
+///
+/// The entry-zoom ladder reads its column through here too: a non-finite
+/// rung is not a rung. The **accumulate** columns do not — they aggregate
+/// rather than rank, so they take [`extract_numeric_values`] and keep ±inf;
+/// dropping it there would contradict the canonical level, which carries the
+/// source value verbatim.
 pub(super) fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
+    extract_numeric(col, true)
+}
+
+/// Extract an optional f64 value per row from a numeric Arrow column.
+/// Non-numeric columns, null values and NaNs yield `None`.
+///
+/// NaN is not a value any comparison can answer — it is how plenty of sources
+/// spell nodata in a float column — so it reads as *absent*, the same call
+/// the tile-order [`OrderKey`](super::export) makes. ±inf is kept: it is
+/// perfectly comparable, so the `--filter` path and the `--accumulate`
+/// aggregates that read columns through here neither drop matching rows nor
+/// disagree with the canonical level's verbatim value. The ranking family
+/// narrows this further; see [`extract_sort_keys`].
+pub(super) fn extract_numeric_values(col: &dyn Array) -> Vec<Option<f64>> {
+    extract_numeric(col, false)
+}
+
+/// Shared body of [`extract_numeric_values`] and [`extract_sort_keys`]: one
+/// pass over the column, with `finite_only` choosing how wide the "absent"
+/// bucket is (NaN alone, or NaN and ±inf).
+fn extract_numeric(col: &dyn Array, finite_only: bool) -> Vec<Option<f64>> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
         Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
@@ -2995,10 +3367,18 @@ pub(super) fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
             (0..n)
                 .map(|i| {
                     if a.is_null(i) {
-                        None
-                    } else {
-                        Some(a.value(i) as f64)
+                        return None;
                     }
+                    let v = a.value(i) as f64;
+                    // Neither test can fail for the integer types; free
+                    // there, and the one place a float column's nodata is
+                    // caught.
+                    let usable = if finite_only {
+                        v.is_finite()
+                    } else {
+                        !v.is_nan()
+                    };
+                    usable.then_some(v)
                 })
                 .collect()
         }};
@@ -3160,13 +3540,21 @@ pub(super) fn append_point_count_field(schema: &Schema) -> Schema {
 
 /// Per-feature accumulate values (one vector per spec, parallel to the rows),
 /// extracted from the resolved column indices of a batch-shaped table.
+///
+/// Read through [`extract_numeric_values`], not [`extract_sort_keys`] (#428):
+/// aggregation is not ranking. A NaN is skipped (it would poison every
+/// aggregate it touched, and it is nodata far more often than a value), but
+/// ±inf is a summand like any other — dropping it would make
+/// `--accumulate-attribute v:max` over `{1.0, +inf}` report `1.0` at the
+/// coarse levels while the canonical level, which copies the source value
+/// verbatim, still shows `inf`: a pyramid contradicting itself.
 pub(super) fn extract_accumulate_values(
     batch: &RecordBatch,
     acc_col_indices: &[usize],
 ) -> Vec<Vec<Option<f64>>> {
     acc_col_indices
         .iter()
-        .map(|&idx| extract_sort_keys(batch.column(idx).as_ref()))
+        .map(|&idx| extract_numeric_values(batch.column(idx).as_ref()))
         .collect()
 }
 
@@ -4089,6 +4477,68 @@ pub(super) fn fill_level_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #428: NaN is how plenty of sources spell nodata in a float column, and
+    /// it is not a value anything can rank — `Priority::beats` returns false
+    /// in BOTH directions for it, which is not a strict weak order. Sort-key
+    /// extraction files a non-finite value under "missing key", the same
+    /// place a null goes, so no comparator ever sees one.
+    #[test]
+    fn extract_sort_keys_files_non_finite_under_missing() {
+        use arrow_array::{Float32Array, Float64Array, Int64Array};
+
+        let col = Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            None,
+            Some(2.0),
+        ]);
+        assert_eq!(
+            extract_sort_keys(&col),
+            vec![Some(1.0), None, None, None, None, Some(2.0)],
+            "a NaN / infinite sort key ranks as a missing key"
+        );
+
+        let col = Float32Array::from(vec![Some(1.0f32), Some(f32::NAN)]);
+        assert_eq!(
+            extract_sort_keys(&col),
+            vec![Some(1.0), None],
+            "f32 columns widen to f64 and keep the same rule"
+        );
+
+        // Integers cannot be non-finite: unchanged.
+        let col = Int64Array::from(vec![Some(-1i64), None, Some(7)]);
+        assert_eq!(extract_sort_keys(&col), vec![Some(-1.0), None, Some(7.0)]);
+    }
+
+    /// The filter path reads the same columns but must NOT lose ±inf: it is a
+    /// perfectly comparable value there, and dropping it would be a silent
+    /// data loss of its own. Only NaN — which no comparison can answer — is
+    /// read as "no value" (UNKNOWN under the filter's Kleene logic).
+    #[test]
+    fn extract_numeric_values_keeps_infinities_but_not_nan() {
+        use arrow_array::Float64Array;
+
+        let col = Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            None,
+        ]);
+        assert_eq!(
+            extract_numeric_values(&col),
+            vec![
+                Some(1.0),
+                None,
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None
+            ]
+        );
+    }
 
     /// #274: proptest pinning `scan_feature` byte-equivalent to the three
     /// functions it fuses (`usable_geometry` + `geometry_bbox` + `feature_kind`).

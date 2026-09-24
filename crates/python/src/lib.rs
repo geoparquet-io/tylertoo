@@ -157,11 +157,15 @@ fn convert(
 
 /// Map a [`ConvertError`] to the Python exception type it deserves:
 /// user-input problems (bad options, missing/mistyped columns, invalid level
-/// plans) become `ValueError`; everything else (I/O, decode, writer) becomes
+/// plans, an input whose coordinates or CRS the tiler cannot work with)
+/// become `ValueError`; everything else (I/O, decode, writer) becomes
 /// `RuntimeError`.
 fn convert_error_to_py(e: ConvertError) -> PyErr {
     match e {
-        ConvertError::InvalidLevels(_)
+        // The input itself is the problem, not the run (#429).
+        ConvertError::AllFeaturesOutOfRange { .. }
+        | ConvertError::UnsupportedCrs { .. }
+        | ConvertError::InvalidLevels(_)
         | ConvertError::RankingConflict
         | ConvertError::ClusterPartitioningUnsupported
         | ConvertError::AccumulateWithoutCluster
@@ -214,6 +218,16 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     dict.set_item("total_compressed_bytes", report.total_compressed_bytes)?;
     dict.set_item("row_groups_total", report.row_groups_total)?;
     dict.set_item("row_groups_read", report.row_groups_read)?;
+    // Input-quality counters: antimeridian suspects (#188) and the two #429
+    // losses (outside the declared CRS's range; valid lon/lat outside the Web
+    // Mercator tiling domain). Python callers get the same honesty the CLI
+    // summary does.
+    dict.set_item(
+        "antimeridian_suspect_features",
+        report.antimeridian_suspect_features,
+    )?;
+    dict.set_item("out_of_range_features", report.out_of_range_features)?;
+    dict.set_item("unprojectable_features", report.unprojectable_features)?;
     dict.set_item("duration_secs", report.duration_secs)?;
     // Remote-input fetch counters (#210); None for local inputs.
     match &report.remote_fetch {
@@ -285,9 +299,12 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     class_ranks (dict[str, float], optional): Map of class value to
 ///         priority; higher priority wins a cell. Present-but-unlisted values
 ///         rank below every listed value (but above nulls) unless
-///         class_rank_unknown overrides that.
+///         class_rank_unknown overrides that. Priorities must be finite:
+///         NaN and infinity cannot be ordered against other classes and are
+///         rejected with ValueError.
 ///     class_rank_unknown (float, optional): Priority for present-but-unlisted
-///         class values. Defaults to min(class_ranks.values()) - 1.
+///         class values. Defaults to min(class_ranks.values()) - 1. Must be
+///         finite.
 ///     no_auto_rank (bool, optional): Disable auto-detection of well-known
 ///         schemas (Overture roads class/road_class, Overture places
 ///         confidence). Defaults to False.
@@ -406,16 +423,22 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     omitted because no feature is visible at their scale — the written
 ///     pyramid is auto-clamped to the non-empty levels), "input_features",
 ///     "total_rows", "total_vertices", "total_compressed_bytes",
-///     "row_groups_total", "row_groups_read", "duration_secs", and
-///     "remote_fetch" (None for local inputs; for remote URLs a dict with
-///     "requests", "bytes_fetched", "object_size").
+///     "row_groups_total", "row_groups_read",
+///     "antimeridian_suspect_features" (features whose bbox spans more than
+///     180° of longitude), "out_of_range_features" (features reaching beyond
+///     the declared CRS's coordinate range — dropped or clipped),
+///     "unprojectable_features" (features with valid lon/lat outside the Web
+///     Mercator tiling domain, |lat| > 85.05° — these cannot be tiled),
+///     "duration_secs", and "remote_fetch" (None for local inputs; for remote
+///     URLs a dict with "requests", "bytes_fetched", "object_size").
 ///
 /// Raises:
 ///     ValueError: Invalid options (bad mode/direction/op, conflicting or
 ///         incomplete ranking options, invalid level plan, missing or
-///         mistyped columns).
-///     RuntimeError: The conversion itself failed (I/O, decode, unsupported
-///         CRS, writer errors).
+///         mistyped columns), an unsupported input CRS, or an input where
+///         ≥99% of features cannot be tiled.
+///     RuntimeError: The conversion itself failed (I/O, decode, writer
+///         errors).
 ///
 /// Example:
 ///     >>> from tylertoo import overview
@@ -580,6 +603,24 @@ fn overview(
                 return Err(PyErr::new::<PyValueError, _>(
                     "class_ranks must contain at least one value: rank entry",
                 ));
+            }
+            // Ranks must be finite (#428), mirroring the CLI's --class-rank
+            // parsing. A NaN is not ordered, so the incumbent of a contested
+            // cell would silently keep it; and the min() fold below IGNORES
+            // NaN, so one would leave unknown_rank at +inf — unlisted values
+            // outranking every listed class, the inverse of the rule this
+            // argument documents.
+            if let Some((value, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
+                return Err(PyErr::new::<PyValueError, _>(format!(
+                    "class_ranks[{value:?}] = {rank}: ranks must be finite numbers \
+                     (NaN and infinity cannot be ordered against other classes)"
+                )));
+            }
+            if let Some(unknown) = class_rank_unknown.filter(|u| !u.is_finite()) {
+                return Err(PyErr::new::<PyValueError, _>(format!(
+                    "class_rank_unknown = {unknown}: must be a finite number \
+                     (NaN and infinity cannot be ordered against other classes)"
+                )));
             }
             let min_rank = ranks.values().copied().fold(f64::INFINITY, f64::min);
             Some(ClassRanking {

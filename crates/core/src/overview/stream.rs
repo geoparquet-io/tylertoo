@@ -74,9 +74,9 @@ use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
-    count_vertices, encode_concurrency_for, extract_class_ranks, extract_sort_keys,
-    fill_level_bytes, find_geometry_column, mixed_geometry_field, overture_road_ranking,
-    record_level_outcome, resolve_reserved_column_collisions, scan_feature,
+    count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
+    extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
+    overture_road_ranking, record_level_outcome, resolve_reserved_column_collisions, scan_feature,
     validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, ClassRanking,
     CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, SkippedLevelReport,
     KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
@@ -1176,12 +1176,11 @@ pub(crate) fn convert_streaming_strategy(
     }
     let num_features = features.len();
 
-    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
-    let antimeridian_suspect_features = features
-        .iter()
-        .filter(|f| super::convert::bbox_antimeridian_suspect(&f.bbox, crs))
-        .count();
-    super::convert::warn_antimeridian_suspects(antimeridian_suspect_features);
+    // One pass over the pass-1 bboxes for every bbox-derived tally: #188
+    // antimeridian suspects, and the #429 losses (outside the CRS range, or
+    // outside the Web Mercator tiling domain). Warns once per kind and
+    // refuses to "succeed" into an empty archive when ~everything is lost.
+    let tallies = super::convert::tally_feature_bboxes(&features, crs)?;
 
     // Stage markers (#242): everything between pass 1 and the writer used to
     // run in total info-level silence — on planet-scale inputs that was tens
@@ -1358,7 +1357,9 @@ pub(crate) fn convert_streaming_strategy(
         total_compressed_bytes,
         row_groups_total,
         row_groups_read,
-        antimeridian_suspect_features,
+        antimeridian_suspect_features: tallies.antimeridian_suspect,
+        out_of_range_features: tallies.out_of_range,
+        unprojectable_features: tallies.unprojectable,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(source),
     })
@@ -1813,8 +1814,12 @@ fn run_pass1(
         }
 
         // Accumulate columns (Q4): per-spec source values, in row order.
+        // `extract_numeric_values`, not `extract_sort_keys` — aggregating is
+        // not ranking, so ±inf is a summand and only NaN is skipped (#428).
+        // Must match `convert::extract_accumulate_values`, which the buffered
+        // engine uses: the two engines are byte-identical by contract.
         for (s, &idx) in acc_cols.iter().enumerate() {
-            acc_values[s].extend(extract_sort_keys(batch.column(proj(idx)).as_ref()));
+            acc_values[s].extend(extract_numeric_values(batch.column(proj(idx)).as_ref()));
         }
 
         // Entry-zoom ladder (#364): row-indexed, like the ranking keys above,

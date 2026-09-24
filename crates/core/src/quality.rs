@@ -123,6 +123,31 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
     crs_info_from_kv_metadata(file_metadata.key_value_metadata())
 }
 
+/// One-shot gates for the "assuming WGS84 / unknown CRS" warnings below.
+///
+/// [`crs_info_from_kv_metadata`] runs once PER PART of a multi-file input
+/// (`MultiSource::from_sources` detects the CRS of every part, plus a raw
+/// descriptor read for the mismatch message), so an 800-part glob whose parts
+/// all share one metadata quirk used to print 800 identical `warn!` lines
+/// (#429 review). Each distinct warning fires once per process instead —
+/// which for a single-part input is exactly the old behavior.
+mod warn_once {
+    use std::sync::Once;
+
+    /// Fire `f` the first time this gate is reached.
+    pub(super) fn gate(once: &'static Once, f: impl FnOnce()) {
+        once.call_once(f);
+    }
+
+    pub(super) static NO_KV_METADATA: Once = Once::new();
+    pub(super) static NO_GEO_METADATA: Once = Once::new();
+    pub(super) static NO_COLUMNS: Once = Once::new();
+    pub(super) static MISSING_COLUMN: Once = Once::new();
+    pub(super) static NULL_CRS_DEGREES: Once = Once::new();
+    pub(super) static NULL_CRS_UNKNOWN: Once = Once::new();
+    pub(super) static UNEXPECTED_CRS_FORMAT: Once = Once::new();
+}
+
 /// Extract CRS information from already-parsed parquet key-value metadata.
 ///
 /// The metadata-only core of [`extract_crs`], shared with input paths that
@@ -135,7 +160,9 @@ pub fn crs_info_from_kv_metadata(
     // Look for the "geo" key in key-value metadata
     let Some(kv_metadata) = kv_metadata else {
         // No metadata at all - assume WGS84 with warning
-        tracing::warn!("GeoParquet file has no key-value metadata; assuming WGS84");
+        warn_once::gate(&warn_once::NO_KV_METADATA, || {
+            log::warn!("GeoParquet file has no key-value metadata; assuming WGS84")
+        });
         return Ok(CrsInfo::wgs84());
     };
 
@@ -146,7 +173,9 @@ pub fn crs_info_from_kv_metadata(
 
     let Some(geo_json_str) = geo_value else {
         // No geo metadata - assume WGS84 with warning
-        tracing::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84");
+        warn_once::gate(&warn_once::NO_GEO_METADATA, || {
+            log::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84")
+        });
         return Ok(CrsInfo::wgs84());
     };
 
@@ -162,16 +191,20 @@ pub fn crs_info_from_kv_metadata(
 
     // Get the columns object
     let Some(columns) = geo_json.get("columns").and_then(Value::as_object) else {
-        tracing::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84");
+        warn_once::gate(&warn_once::NO_COLUMNS, || {
+            log::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84")
+        });
         return Ok(CrsInfo::wgs84());
     };
 
     // Get the primary column's metadata
     let Some(column_meta) = columns.get(primary_column) else {
-        tracing::warn!(
-            "GeoParquet 'geo' metadata missing column '{}'; assuming WGS84",
-            primary_column
-        );
+        warn_once::gate(&warn_once::MISSING_COLUMN, || {
+            log::warn!(
+                "GeoParquet 'geo' metadata missing column '{}'; assuming WGS84",
+                primary_column
+            )
+        });
         return Ok(CrsInfo::wgs84());
     };
 
@@ -201,16 +234,20 @@ pub fn crs_info_from_kv_metadata(
                 // the missing-geo-metadata precedent and assume.
                 .unwrap_or(true);
             if bbox_plausible_degrees {
-                tracing::warn!(
-                    "GeoParquet 'crs' is explicitly null (no CRS assigned); \
-                     assuming OGC:CRS84 (lon/lat WGS84)"
-                );
+                warn_once::gate(&warn_once::NULL_CRS_DEGREES, || {
+                    log::warn!(
+                        "GeoParquet 'crs' is explicitly null (no CRS assigned); \
+                         assuming OGC:CRS84 (lon/lat WGS84)"
+                    )
+                });
                 Ok(CrsInfo::wgs84())
             } else {
-                tracing::warn!(
-                    "GeoParquet 'crs' is explicitly null and the declared bbox \
-                     is outside lon/lat degree ranges; treating CRS as unknown"
-                );
+                warn_once::gate(&warn_once::NULL_CRS_UNKNOWN, || {
+                    log::warn!(
+                        "GeoParquet 'crs' is explicitly null and the declared bbox \
+                         is outside lon/lat degree ranges; treating CRS as unknown"
+                    )
+                });
                 Ok(CrsInfo::unknown())
             }
         }
@@ -243,7 +280,9 @@ pub fn crs_info_from_kv_metadata(
             })
         }
         Some(other) => {
-            tracing::warn!("Unexpected CRS format in GeoParquet metadata: {:?}", other);
+            warn_once::gate(&warn_once::UNEXPECTED_CRS_FORMAT, || {
+                log::warn!("Unexpected CRS format in GeoParquet metadata: {:?}", other)
+            });
             Ok(CrsInfo::unknown())
         }
     }

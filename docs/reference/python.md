@@ -34,8 +34,8 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 * `ladder_step` (`int`) — Zooms between consecutive `magnitude_ladder` rungs. Defaults to 1.
 * `sort_direction` (`str`) — "desc" (larger sort_key wins, default) or "asc" (smaller wins, e.g. rank columns where 1 is best).
 * `class_rank_column` (`str`) — String column carrying categorical classes for cell-winner ranking. Requires class_ranks. Mutually exclusive with sort_key.
-* `class_ranks` (`dict[str, float]`) — Map of class value to priority; higher priority wins a cell. Present-but-unlisted values rank below every listed value (but above nulls) unless class_rank_unknown overrides that.
-* `class_rank_unknown` (`float`) — Priority for present-but-unlisted class values. Defaults to min(class_ranks.values()) - 1.
+* `class_ranks` (`dict[str, float]`) — Map of class value to priority; higher priority wins a cell. Present-but-unlisted values rank below every listed value (but above nulls) unless class_rank_unknown overrides that. Priorities must be finite: NaN and infinity cannot be ordered against other classes and are rejected with ValueError.
+* `class_rank_unknown` (`float`) — Priority for present-but-unlisted class values. Defaults to min(class_ranks.values()) - 1. Must be finite.
 * `no_auto_rank` (`bool`) — Disable auto-detection of well-known schemas (Overture roads class/road_class, Overture places confidence). Defaults to False.
 * `simplify_factor` (`float`) — RDP tolerance = factor * gsd (duplicating mode only). Lower = crisper but heavier levels; higher = cruder and lighter. Defaults to 1.0.
 * `collapse` (`bool`) — Collapse below-visibility polygons to a representative point instead of dropping them. Defaults to False.
@@ -69,12 +69,12 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 
 ###### **Returns:**
 
-`dict` — Conversion report with keys "mode", "levels" (list of dicts with "level", "gsd", "zoom", "feature_count", "vertex_count", "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels" (list of dicts with "planned_level", "gsd", "zoom": planned levels omitted because no feature is visible at their scale — the written pyramid is auto-clamped to the non-empty levels), "input_features", "total_rows", "total_vertices", "total_compressed_bytes", "row_groups_total", "row_groups_read", "duration_secs", and "remote_fetch" (None for local inputs; for remote URLs a dict with "requests", "bytes_fetched", "object_size").
+`dict` — Conversion report with keys "mode", "levels" (list of dicts with "level", "gsd", "zoom", "feature_count", "vertex_count", "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels" (list of dicts with "planned_level", "gsd", "zoom": planned levels omitted because no feature is visible at their scale — the written pyramid is auto-clamped to the non-empty levels), "input_features", "total_rows", "total_vertices", "total_compressed_bytes", "row_groups_total", "row_groups_read", "antimeridian_suspect_features" (features whose bbox spans more than 180° of longitude), "out_of_range_features" (features reaching beyond the declared CRS's coordinate range — dropped or clipped), "unprojectable_features" (features with valid lon/lat outside the Web Mercator tiling domain, |lat| > 85.05° — these cannot be tiled), "duration_secs", and "remote_fetch" (None for local inputs; for remote URLs a dict with "requests", "bytes_fetched", "object_size").
 
 ###### **Raises:**
 
-* `ValueError` — Invalid options (bad mode/direction/op, conflicting or incomplete ranking options, invalid level plan, missing or mistyped columns).
-* `RuntimeError` — The conversion itself failed (I/O, decode, unsupported CRS, writer errors).
+* `ValueError` — Invalid options (bad mode/direction/op, conflicting or incomplete ranking options, invalid level plan, missing or mistyped columns), an unsupported input CRS, or an input where ≥99% of features cannot be tiled.
+* `RuntimeError` — The conversion itself failed (I/O, decode, writer errors).
 
 ###### **Example:**
 
