@@ -195,6 +195,9 @@ pub struct PyramidArgs {
     /// name inside the archive, or the merge is refused rather than write
     /// two layers of one name into a tile.
     ///
+    /// Bands are emitted coarsest-first in the merged archive regardless of
+    /// listing order.
+    ///
     /// INPUT may not contain a `:`, which the spec cannot tell apart from the
     /// LAYER separator; rename the file or point at it through a symlink.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
