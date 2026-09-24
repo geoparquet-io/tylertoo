@@ -305,6 +305,25 @@ jobs:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
 
+      # The pytest step's integration tests read tests/fixtures/realdata.
+      # Those files are git-LFS pointers in a plain checkout (checkout
+      # doesn't fetch LFS), which exist but are not parquet — so the tests'
+      # skipif guards pass and every conversion fails on "Corrupt footer".
+      # Same cache + release-download pattern as the Rust jobs.
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Sync environment (builds the extension module)
         run: uv sync --locked
 
@@ -320,10 +339,9 @@ jobs:
       - name: stubtest (tylertoo.pyi matches the built module)
         run: uv run python -m mypy.stubtest tylertoo --allowlist stubtest-allowlist.txt
 
-      # The binding's own test suite (#418). Fixture-dependent integration
-      # tests self-skip via their skipif markers when tests/fixtures/realdata
-      # is absent (it is not downloaded here); the kwarg-surface tests run
-      # unconditionally. Locally: 88 passed in <1s once the extension is built.
+      # The binding's own test suite (#418): kwarg-surface tests plus the
+      # integration classes against the downloaded fixtures. 88 tests, <1s
+      # once the extension is built.
       - name: pytest
         run: uv run --no-sync pytest tests/ -v
 
