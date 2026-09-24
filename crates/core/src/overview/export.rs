@@ -32,7 +32,7 @@
 //!    [`StreamingPmtilesWriter`]. Tiles are written in ascending PMTiles
 //!    tile-id order per zoom, and levels export in ascending zoom, so the
 //!    whole archive is added in globally ascending tile-id order — the
-//!    archive is genuinely `clustered: true` (#504; before that it was
+//!    archive is genuinely `clustered: true` (#506; before that it was
 //!    row-major `(x, y)` order, an arbitrary historical layout with no such
 //!    guarantee).
 //!
@@ -378,7 +378,7 @@ pub enum ExportError {
         ceiling: u8,
     },
 
-    /// Two levels resolve to the same (or a non-increasing) zoom (#504
+    /// Two levels resolve to the same (or a non-increasing) zoom (#506
     /// follow-up).
     ///
     /// `zoom_for_level`'s §3.3 validation only requires `gsd` to be strictly
@@ -387,12 +387,12 @@ pub enum ExportError {
     /// same integer zoom, or two GSDs both coarser than the zoom-0
     /// threshold, both pass that check and both resolve here to the same
     /// zoom. Export keys each level's tiles by PMTiles tile id within that
-    /// level's own zoom and streams levels ascending (#504); a duplicate
-    /// zoom would write that zoom's tile ids a second time. Before #504 this
+    /// level's own zoom and streams levels ascending (#506); a duplicate
+    /// zoom would write that zoom's tile ids a second time. Before #506 this
     /// silently clobbered directory entries (both levels used the same
     /// row-major `(x, y)` key, so the second level's write just overwrote
     /// the first level's slot in the directory — latent tile-data
-    /// corruption with no error). Since #504 it instead trips the writer's
+    /// corruption with no error). Since #506 it instead trips the writer's
     /// ascending-tile-id `debug_assert!` in a debug build. Neither is
     /// acceptable: reject it here, with a real error, before any scan runs.
     #[error(
@@ -518,7 +518,7 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 
 /// Members-per-partition target for the partitioned streaming export (H3(b)).
 ///
-/// Each zoom's tiles are split into contiguous PMTiles tile-id ranges (#504;
+/// Each zoom's tiles are split into contiguous PMTiles tile-id ranges (#506;
 /// row-major `(x, y)` ranges before it) whose summed (feature × tile) member
 /// counts reach at least this value; partitions are processed one at a time
 /// and streamed to the writer, so this bounds the per-partition working set
@@ -801,7 +801,7 @@ fn plan_levels(
             let zoom = zoom_for_level(meta, level_idx)?;
 
             // Split the zoom's tiles into contiguous ascending PMTiles
-            // tile-id ranges (#504) of roughly `partition_target` members
+            // tile-id ranges (#506) of roughly `partition_target` members
             // each.
             let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
 
@@ -866,13 +866,13 @@ fn export_pmtiles_impl(
     // scan runs — a level whose GSD implies a zoom past `MAX_ZOOM` fails here
     // rather than producing an archive with wrapped tile ids.
     //
-    // #504 follow-up: `OverviewsMeta::validate` (run by `OverviewReader::open`
+    // #506 follow-up: `OverviewsMeta::validate` (run by `OverviewReader::open`
     // above) only requires `gsd` to be strictly decreasing across levels, not
     // that the ZOOM each one derives to is distinct — two GSDs close enough
     // to round to the same integer zoom both pass that check. Resolve every
     // level's zoom here and require strict ascent before any scan runs; see
     // [`ExportError::LevelZoomsNotAscending`] for what a collision used to do
-    // silently (pre-#504) and what it does now if left unrejected.
+    // silently (pre-#506) and what it does now if left unrejected.
     let level_zooms: Vec<u8> = (0..num_levels)
         .map(|level_idx| zoom_for_level(&meta, level_idx))
         .collect::<Result<_, _>>()?;
@@ -936,7 +936,7 @@ fn export_pmtiles_impl(
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
-    // #504: export now adds every tile in ascending PMTiles tile-id (Hilbert)
+    // #506: export now adds every tile in ascending PMTiles tile-id (Hilbert)
     // order — per zoom via `tile_key`, and zooms ascend across levels — so
     // the archive is genuinely clustered. Debug-only: catches an ordering
     // regression here rather than downstream as a quietly `clustered: false`
@@ -1264,11 +1264,11 @@ fn export_level(
 /// `export_level` writes them to the archive in exactly that order (levels
 /// export in ascending zoom, and every id at zoom `z` is less than every id
 /// at zoom `z + 1`). That is what makes the export archive genuinely
-/// `clustered: true` (#504) — the derived header flag from #501 comes out
+/// `clustered: true` (#506) — the derived header flag from #501 comes out
 /// true because the bytes really are laid out that way, not because it is
 /// asserted.
 ///
-/// DIVERGENCE FROM the pre-#504 key: this used to be the row-major pack
+/// DIVERGENCE FROM the pre-#506 key: this used to be the row-major pack
 /// `(x << 32) | y`, chosen only to preserve a specific historical byte
 /// layout. Switching to the tile id changes that layout (tile data now lands
 /// in Hilbert order, which is spatially compact rather than column-striped)
@@ -1313,7 +1313,7 @@ struct LevelScan {
     feature_count: usize,
     /// Union of feature bboxes (`None` when no feature has one).
     bounds: Option<TileBounds>,
-    /// Member count per tile key, ascending PMTiles tile id (#504; ascending
+    /// Member count per tile key, ascending PMTiles tile id (#506; ascending
     /// `(x, y)` before it).
     tile_counts: BTreeMap<u64, usize>,
 }
@@ -2257,7 +2257,7 @@ fn scan_level(
     Ok(scan)
 }
 
-/// Split a zoom's tiles (ascending key order — since #504, ascending PMTiles
+/// Split a zoom's tiles (ascending key order — since #506, ascending PMTiles
 /// tile id / Hilbert order) into contiguous partitions of at least
 /// `partition_target` members each (the last partition may be smaller).
 ///
@@ -2776,7 +2776,7 @@ fn node_overlaps_ranges(node: TileCoord, zoom: u8, ranges: &BboxTileRanges) -> b
 
 /// `true` when tile node `(x, y, z)`'s descendant-leaf key range overlaps the
 /// partition key window `[key_lo, key_hi]`. Keys are PMTiles tile ids
-/// (#504), so a node's subtree spans an EXACT contiguous interval at `zoom`
+/// (#506), so a node's subtree spans an EXACT contiguous interval at `zoom`
 /// — [`crate::tile::node_id_range`] — rather than the conservative,
 /// gap-riddled bounding box the row-major key used to produce. The test is
 /// therefore now precise, not just safe: it never skips a needed tile (the
@@ -4312,7 +4312,7 @@ mod tests {
     /// hash (`0dfdf8a0bb941a0c`) exactly. No tile data, directory entry, or
     /// metadata byte changed.
     ///
-    /// REPIN (#504, tile-id-ordered export): tiles are now added to the
+    /// REPIN (#506, tile-id-ordered export): tiles are now added to the
     /// writer in ascending PMTiles tile-id (Hilbert) order per zoom instead
     /// of row-major `(x, y)` order, so the on-disk directory and tile-data
     /// layout changes even though the tile *set* does not — hence a new
@@ -4321,10 +4321,10 @@ mod tests {
     /// so this note only adds the two checks those don't cover):
     /// * `verify_clustered(path)` and `header.clustered` are both now
     ///   `true` for this archive (they were both honestly `false` before
-    ///   #504, per the REPIN note above and `pmtiles_clustered.rs`).
+    ///   #506, per the REPIN note above and `pmtiles_clustered.rs`).
     /// * Per-tile MVT **content** is unchanged: dumping
     ///   `z/x/y -> hash(decompressed tile bytes)` for all 13 tiles on this
-    ///   exact fixture, on the pre-#504 tree and on this tree, produces the
+    ///   exact fixture, on the pre-#506 tree and on this tree, produces the
     ///   same 13 `(z, x, y)` keys with the same 13 content hashes in both
     ///   dumps — the only difference between the two runs is
     ///   `clustered: false -> true`. Only the ORDER tiles were written in
@@ -4349,7 +4349,7 @@ mod tests {
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            // RE-BLESSED (#504): tiles are now written in ascending PMTiles
+            // RE-BLESSED (#506): tiles are now written in ascending PMTiles
             // tile-id order rather than row-major (x, y) order, which moves
             // every tile's on-disk offset and flips the `clustered` header
             // byte true. See the REPIN note above this test for the content
@@ -4405,11 +4405,11 @@ mod tests {
     /// The PMTiles directory is always sorted by tile id (a writer invariant
     /// independent of add order — see `StreamingPmtilesWriter::write_archive`
     /// — and the format's own contract), so walking it ascending is not by
-    /// itself evidence of #504. What #504 changes is whether the underlying
+    /// itself evidence of #506. What #506 changes is whether the underlying
     /// tile DATA is laid out in that same order.
     ///
     /// That is NOT the same claim as "every entry's offset is >= the
-    /// previous entry's offset" (#504 review, F4): a deduplication
+    /// previous entry's offset" (#506 review, F4): a deduplication
     /// back-reference legally points an entry at an EARLIER tile's already-written
     /// bytes (`offsets_are_clustered`'s own contract — see
     /// `pmtiles_writer::verify_clustered`), and that is still a `clustered`
@@ -4420,7 +4420,12 @@ mod tests {
     /// of each other, not because export guarantees it. The real predicate
     /// this test checks is [`crate::pmtiles_writer::verify_clustered`], the
     /// same file-side re-derivation the header's own `clustered` byte is
-    /// checked against.
+    /// checked against — plus, since the #506 review, the *strict* walk
+    /// go-pmtiles `verify` itself performs (every first-seen offset equals
+    /// the running end of the data written so far; a repeated offset is a
+    /// dedup back-reference and is skipped). `verify_clustered` is laxer
+    /// than that today (#516), so pinning the tool's rule here keeps this
+    /// test from blessing an archive go-pmtiles would refuse.
     #[test]
     fn export_emits_tiles_in_ascending_tile_id() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4433,7 +4438,9 @@ mod tests {
         export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
 
         use crate::compression;
-        use crate::pmtiles_writer::{decode_directory, verify_clustered, DirEntry, Header};
+        use crate::pmtiles_writer::{
+            decode_directory, tile_id_to_zxy, verify_clustered, DirEntry, Header,
+        };
         let bytes = std::fs::read(tout.path()).unwrap();
         let header = Header::from_bytes(&bytes).unwrap();
         let root = compression::decompress_capped(
@@ -4455,7 +4462,7 @@ mod tests {
         );
 
         // The directory is always sorted by tile id (a writer invariant, not
-        // specific to #504) -- asserted here as a sanity check on the walk
+        // specific to #506) -- asserted here as a sanity check on the walk
         // itself, not as the test's main claim.
         let mut prev: Option<&DirEntry> = None;
         for e in &entries {
@@ -4468,7 +4475,7 @@ mod tests {
             prev = Some(e);
         }
 
-        // The actual #504 claim: the tile DATA is genuinely laid out in
+        // The actual #506 claim: the tile DATA is genuinely laid out in
         // ascending tile-id order, dedup back-references included --
         // `verify_clustered` re-derives this from the offsets directly
         // rather than assuming raw monotonicity.
@@ -4477,6 +4484,39 @@ mod tests {
             "export must write tile data in genuinely clustered (ascending \
              tile-id) order -- verify_clustered on the exported archive says \
              it is not"
+        );
+
+        // ...and the same walk go-pmtiles `verify` performs, pinned directly
+        // (#506 review, F4 follow-up). `verify_clustered` currently accepts a
+        // strictly weaker predicate than go-pmtiles does (#516): it tolerates
+        // an entry whose offset merely REPEATS an earlier one, whereas
+        // go-pmtiles requires that every FIRST-SEEN offset equal the running
+        // end of the previously written blob. Copied from
+        // `pyramid::tests::merge_writes_disjoint_bands_in_tile_id_order_given_fine_first`
+        // so this test keeps holding the tool's line even if #516 changes the
+        // library-side helper.
+        let mut seen_offsets = std::collections::HashSet::new();
+        let mut end = 0u64;
+        for e in &entries {
+            if !seen_offsets.insert(e.offset) {
+                // A dedup back-reference to bytes already written: legal, and
+                // it does not advance the frontier.
+                continue;
+            }
+            assert_eq!(
+                e.offset,
+                end,
+                "out-of-order entry in clustered archive at tile id {} (z/x/y {:?}): \
+                 go-pmtiles `verify` rejects a first-seen offset that is not the \
+                 running end of the tile data written so far",
+                e.tile_id,
+                tile_id_to_zxy(e.tile_id).unwrap()
+            );
+            end = e.offset + u64::from(e.length);
+        }
+        assert_eq!(
+            end, header.tile_data_length,
+            "the walk must account for every byte of the tile-data section"
         );
     }
 
@@ -4502,7 +4542,7 @@ mod tests {
         let header = Header::from_bytes(&bytes).unwrap();
         assert!(
             header.clustered,
-            "export archive must be genuinely clustered (#504)"
+            "export archive must be genuinely clustered (#506)"
         );
         assert_eq!(
             header.clustered,
@@ -7259,12 +7299,12 @@ mod tests {
         );
     }
 
-    /// #504 follow-up (F1): `OverviewsMeta::validate` only requires `gsd` to
+    /// #506 follow-up (F1): `OverviewsMeta::validate` only requires `gsd` to
     /// be strictly decreasing across levels, not that the derived ZOOM is
     /// distinct — two GSDs close enough to round to the same integer zoom
-    /// both pass it. Pre-#504 this silently wrote that zoom's tiles twice,
+    /// both pass it. Pre-#506 this silently wrote that zoom's tiles twice,
     /// clobbering directory entries with no error (both levels shared the
-    /// same row-major key); post-#504 it instead trips the writer's
+    /// same row-major key); post-#506 it instead trips the writer's
     /// ascending-tile-id `debug_assert!`. Either way it must be a clean,
     /// named `ExportError`, caught before any scan runs.
     #[test]

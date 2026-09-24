@@ -394,7 +394,7 @@ pub(crate) fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
     // The assert and the clamp are unreachable through either of this
     // function's two callers, both of which bound `z` themselves before
     // calling in: `tile_id` returns the out-of-range sentinel before it gets
-    // here, and `crate::tile::node_id_range` (#504) carries the identical
+    // here, and `crate::tile::node_id_range` (#506) carries the identical
     // debug_assert + clamp pair on its own `target_z` before it does. They
     // are kept as this function's own guard rail regardless — the assert
     // restates the contract at the point that actually needs it, and the
@@ -1676,7 +1676,7 @@ pub struct StreamingPmtilesWriter {
     total_features: u64,
     /// Whether finalize has been called (prevents double cleanup)
     finalized: bool,
-    /// Debug-only ordering contract (#504): when set, every `add_tile*` call
+    /// Debug-only ordering contract (#506): when set, every `add_tile*` call
     /// `debug_assert!`s its tile id is strictly greater than the previous
     /// one. A caller that has arranged to add tiles in ascending PMTiles
     /// tile-id (Hilbert) order — the export path, after this PR — opts in so
@@ -1734,7 +1734,7 @@ impl StreamingPmtilesWriter {
         })
     }
 
-    /// Opt into the debug-only ascending-tile-id assertion (#504): see the
+    /// Opt into the debug-only ascending-tile-id assertion (#506): see the
     /// `expect_clustered` field doc for what it checks and why it is
     /// debug-only.
     pub fn set_expect_clustered(&mut self, expect: bool) {
@@ -2028,7 +2028,7 @@ impl StreamingPmtilesWriter {
         // Whether the directory this run is about to write is *actually*
         // clustered — sorting by tile_id (above) does not imply it. Callers
         // add tiles in whatever order they discover them (ascending tile id
-        // for export, since #504; tile-id order for a pyramid merge), and the
+        // for export, since #506; tile-id order for a pyramid merge), and the
         // offsets in `self.entries` reflect add order, not tile-id order.
         // Deriving the header flag from those offsets, after the sort, means
         // the flag can never claim more than the bytes on disk actually
@@ -2038,7 +2038,7 @@ impl StreamingPmtilesWriter {
         // `expect_clustered`'s `debug_assert!` (in `check_expect_clustered`)
         // catches an ordering regression while adding tiles, but only in a
         // debug build — a release build silently ships a `clustered: false`
-        // archive with no signal at all (#504 review, F6). This is the
+        // archive with no signal at all (#506 review, F6). This is the
         // release-mode fallback: the caller promised ascending adds and the
         // derived flag says the promise was not kept, so say so at `warn`
         // rather than staying silent. Not an error — the archive is still
@@ -2184,7 +2184,7 @@ impl StreamingPmtilesWriter {
     /// `self.entries` is in add order, which is not necessarily tile-id order
     /// for every caller (a pyramid merge, say, may still add out of order),
     /// and the check would be meaningless. Export itself now adds in
-    /// ascending tile-id order already (#504), but this function does not —
+    /// ascending tile-id order already (#506), but this function does not —
     /// and should not — assume that of every caller; it re-derives the truth
     /// from the sorted offsets regardless of how `self.entries` got here.
     fn entries_are_clustered(&self) -> bool {
@@ -4513,7 +4513,7 @@ mod tests {
         assert_eq!(header.clustered, verify_clustered(tmp.path()).unwrap());
     }
 
-    /// F8 (#504 review): `set_expect_clustered(true)` pins a real ordering
+    /// F8 (#506 review): `set_expect_clustered(true)` pins a real ordering
     /// contract, not just documentation -- two out-of-order adds must trip
     /// the `debug_assert!` in `check_expect_clustered`. Debug-only: with
     /// assertions disabled the panic never fires (see [`Self::write_archive`]'s

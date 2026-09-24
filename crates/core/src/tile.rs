@@ -258,18 +258,25 @@ fn hilbert_zoom_base(z: u8) -> u64 {
 ///
 /// A PMTiles tile id is `base(z) + hilbert_idx(z, x, y)`, where
 /// `base(z) = (4^z - 1) / 3` is the count of tiles at shallower zooms and
-/// `hilbert_idx` is the tile's position on the zoom's Hilbert curve. Because
-/// the curve is built by recursive quadrant subdivision (each of a node's 4
-/// children occupies a contiguous quarter of the parent's span, in the same
-/// rotation the parent used), a node at zoom `zn` with Hilbert index `h` owns
-/// exactly the descendant ids
+/// `hilbert_idx` is the tile's position on the zoom's Hilbert curve. The curve
+/// is built by recursive quadrant subdivision: the walk enters a node, covers
+/// each of its four children completely before moving to the next, and leaves.
+/// Each child's own sub-curve is rotated and/or reflected relative to the
+/// parent's — that is what makes it a Hilbert curve rather than a Z-order
+/// curve — but the rotation only permutes the order *within* a child's
+/// quarter; the walk never leaves the quarter mid-child. Bit-wise, the
+/// consequence is a fixed prefix: a depth-`z` Hilbert index's leading
+/// `2 * zn` bits are exactly the depth-`zn` Hilbert index of that tile's
+/// zoom-`zn` ancestor, whatever the rotations below. So a node at zoom `zn`
+/// with Hilbert index `h` owns exactly the descendant ids
 ///
 /// ```text
 /// base(z) + h * 4^Δ  ..=  base(z) + (h + 1) * 4^Δ - 1,   Δ = z - zn
 /// ```
 ///
-/// at any deeper zoom `z` — a single contiguous interval, not merely a
-/// superset. That is what lets the export cascade prune a subtree against a
+/// at any deeper zoom `z` — the prefix pinned to `h` while the low `2Δ` bits
+/// range over all of `0 ..= 4^Δ - 1`, i.e. a single contiguous interval, not
+/// merely a superset. That is what lets the export cascade prune a subtree against a
 /// partition's `[key_lo, key_hi]` window with an *exact* interval
 /// intersection instead of the old conservative row-major bounding check.
 ///
@@ -884,7 +891,97 @@ mod tests {
         }
     }
 
-    /// F2 (#504 review): `target_z` past [`crate::pmtiles_writer::MAX_TILE_ID_ZOOM`]
+    /// #506 review, S4: the brute-force test above only walks node zooms and
+    /// target zooms small enough to enumerate every descendant, so it never
+    /// reaches the deep shifts (`delta` up to 31) the export cascade actually
+    /// uses. This one pins the stronger, cheaper claim at those depths: the
+    /// ranges of ALL `4^zn` nodes at a zoom *exactly tile* the target zoom's
+    /// id space — sorted by start, they are gapless, non-overlapping, and
+    /// their union is precisely `[base(target_z), base(target_z) + 4^target_z)`.
+    /// A rotation bug (the premise the doc comment used to get wrong) would
+    /// show up as a duplicate or a gap here, not as a wrong endpoint.
+    #[test]
+    fn node_id_ranges_partition_the_target_zoom_id_space() {
+        for zn in 0u8..=6 {
+            let side = 1u32 << zn;
+            for target_z in [15u8, 25, 31] {
+                let mut ranges: Vec<(u64, u64)> = Vec::with_capacity((side as usize).pow(2));
+                for x in 0..side {
+                    for y in 0..side {
+                        let r = node_id_range(TileCoord::new(x, y, zn), target_z);
+                        ranges.push((*r.start(), *r.end()));
+                    }
+                }
+                ranges.sort_unstable();
+
+                let span = 1u64 << (2 * u32::from(target_z - zn));
+                let base = hilbert_zoom_base(target_z);
+                let total = 1u64 << (2 * u32::from(target_z));
+                let mut expected_start = base;
+                for &(start, end) in &ranges {
+                    assert_eq!(
+                        start, expected_start,
+                        "z{zn} -> z{target_z}: ranges are not gapless/disjoint at {start}"
+                    );
+                    assert_eq!(
+                        end - start + 1,
+                        span,
+                        "z{zn} -> z{target_z}: every node owns exactly 4^delta ids"
+                    );
+                    expected_start = end + 1;
+                }
+                assert_eq!(
+                    expected_start,
+                    base + total,
+                    "z{zn} -> z{target_z}: the union must be the whole zoom's id space"
+                );
+            }
+        }
+    }
+
+    /// #506 review, S4: the direct statement of what the export cascade relies
+    /// on — a tile's own id lies inside the range of EVERY one of its
+    /// ancestors, at every ancestor zoom — sampled over 200k random z20 tiles
+    /// (4.2M containment checks). The cascade prunes a subtree the moment a
+    /// node's range misses the partition window, so a single ancestor whose
+    /// range excludes one of its own descendants would silently drop that
+    /// tile from the archive.
+    #[test]
+    fn node_id_range_contains_every_descendant_at_every_ancestor_zoom() {
+        const TARGET_Z: u8 = 20;
+        const SAMPLES: u32 = 200_000;
+        let side = 1u32 << TARGET_Z;
+        // Deterministic xorshift64* — no `rand` dependency, and a failure is
+        // reproducible from the seed alone.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..SAMPLES {
+            let r = next();
+            let x = (r as u32) % side;
+            let y = ((r >> 32) as u32) % side;
+            let id = crate::pmtiles_writer::tile_id(TARGET_Z, x, y);
+            for za in 0..=TARGET_Z {
+                let d = TARGET_Z - za;
+                let ancestor = TileCoord::new(x >> d, y >> d, za);
+                let range = node_id_range(ancestor, TARGET_Z);
+                assert!(
+                    range.contains(&id),
+                    "z{TARGET_Z} tile ({x},{y}) id {id} is outside its z{za} ancestor \
+                     ({},{})'s range {:?}",
+                    ancestor.x,
+                    ancestor.y,
+                    range
+                );
+            }
+        }
+    }
+
+    /// F2 (#506 review): `target_z` past [`crate::pmtiles_writer::MAX_TILE_ID_ZOOM`]
     /// must fail loudly in a debug build rather than silently shift by >= 64
     /// bits (masked to a near-zero shift in release -- see `node_id_range`'s
     /// doc).
@@ -897,7 +994,7 @@ mod tests {
         );
     }
 
-    /// F2 (#504 review): `target_z < node.z` has no valid descendant range
+    /// F2 (#506 review): `target_z < node.z` has no valid descendant range
     /// (node.z's Hilbert index and target_z's cumulative base would be
     /// different zooms' incompatible units) and must fail loudly rather than
     /// silently collapse `delta` to 0 via `saturating_sub`.

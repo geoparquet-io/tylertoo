@@ -12,7 +12,7 @@
 //! archive's directory entries, thousands were non-monotonic in tile-id
 //! order (measured at 5,007 of 10,075 while diagnosing that bug).
 //!
-//! #504 closes the gap on the other side: export now adds tiles in ascending
+//! #506 closes the gap on the other side: export now adds tiles in ascending
 //! PMTiles tile-id order per zoom (levels export in ascending zoom, so this
 //! holds globally too), so the archive is genuinely clustered and the header
 //! flag comes out `true`. This test asserts both halves of that: the flag is
@@ -66,7 +66,7 @@ fn header_clustered_flag_matches_the_actual_entry_layout() {
 
     assert!(
         header.clustered,
-        "export now writes tiles in ascending PMTiles tile-id order (#504); \
+        "export now writes tiles in ascending PMTiles tile-id order (#506); \
          a real export archive must be genuinely clustered"
     );
     assert_eq!(
