@@ -1447,6 +1447,17 @@ extra in-flight batch costs proportionally more peak RAM (`N × read_batch_size`
 rows resident). `--read-batch-size` (above) remains the rows-per-batch knob;
 `--in-flight-batches` is how many such batches coexist.
 
+⚠️ **musl binaries v0.7.1 and earlier — prefer `--profile bounded` on large
+duplicating runs.** The `x86_64-unknown-linux-musl` release binary up to and
+including v0.7.1 could abort with `memory allocation of N bytes failed` part
+way through pass 2 of a `speed`/`auto` run — musl's `mallocng` failing a small
+allocation under heavy multi-threaded fragmentation while tens of GB of
+headroom remained ([#480](https://github.com/geoparquet-io/tylertoo/issues/480)).
+`--profile bounded` avoids the in-RAM level buffering that triggers it. From
+the release after v0.7.1 the musl binary ships with mimalloc as its global
+allocator and no longer needs the workaround; other platforms were never
+affected.
+
 ⚠️ **Interaction — `speed` + partitioning on a multi-GB input is the
 memory-risky quadrant.** `speed` buffers whole output levels in RAM, and
 partitioning's output can approach input size; on a multi-GB input that can
@@ -1477,6 +1488,7 @@ that. If you force `speed` on a large partitioning run, watch peak RSS.
 | Conversion runs out of memory / swaps on a big file | streaming is already the default; LOWER `--read-batch-size`; make sure `--no-streaming` is NOT set |
 | Conversion is slow / uses only one core | the engine now reads the input once and parallelizes simplification across all cores; RAISE `--in-flight-batches` for more read/compute overlap |
 | Conversion runs out of memory in `speed` profile | `--profile bounded` (spills each level to temp files, caps RAM); `--profile auto` picks this automatically for large partitioning runs |
+| `memory allocation of N bytes failed` on a v0.7.1-or-earlier musl binary, with RAM to spare | `--profile bounded` — musl `mallocng` fragmentation, fixed after v0.7.1 by shipping mimalloc ([#480](https://github.com/geoparquet-io/tylertoo/issues/480)) |
 
 See `corpus/SWEEPS.md` for an empirical `--line-thinning` ×
 `--simplify-factor` sweep on Portland roads, and the Q2 section there for the
