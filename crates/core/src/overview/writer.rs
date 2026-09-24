@@ -93,6 +93,13 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 /// Default maximum row-group size in rows (§4.5, configurable).
 pub const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 10_000;
 
+/// Safety ceiling for the projected total row-group count across every level
+/// (#507). Parquet hard-caps a file at 32,767 row groups; we preflight
+/// against 32,000 — 767 rows of headroom — before pass 2 opens the output
+/// file, so a planet-scale run that would blow the real limit is caught (and
+/// the cap auto-scaled) in milliseconds instead of after hours of writing.
+pub(crate) const SAFE_ROW_GROUP_CEILING: usize = 32_000;
+
 /// Maximum rows per parallel WKB-encode chunk (#304). Incoming batches are
 /// split at this grain before being dispatched to the Rayon pool, so even the
 /// buffered engine's one-batch-per-level shape parallelizes, and one in-flight
@@ -1240,6 +1247,96 @@ fn rg_row_target(max_row_group_size: usize, level_row_hint: Option<usize>) -> us
     }
 }
 
+/// Projected total row groups across every level (#507), mirroring
+/// `write_level`'s own split arithmetic: [`effective_rg_cap`] gives each
+/// level's cap, and a level with `counts[l]` rows becomes
+/// `ceil(counts[l] / cap)` row groups (0 for an empty/omitted level, §7.3) —
+/// the same count `rg_row_target` produces (a level that fits in one row
+/// group needs exactly `ceil(n / cap) == 1` groups too). `level_zooms` and
+/// `finest_zoom` are the per-level / finest-level zoom metadata
+/// [`RowGroupSizePolicy::ZoomScaled`] reads; `level_zooms.len()` must equal
+/// `counts.len()`.
+pub(crate) fn projected_row_groups(
+    counts: &[usize],
+    base_cap: usize,
+    policy: RowGroupSizePolicy,
+    level_zooms: &[Option<u8>],
+    finest_zoom: Option<u8>,
+) -> usize {
+    counts
+        .iter()
+        .zip(level_zooms)
+        .map(|(&n, &zoom)| {
+            if n == 0 {
+                return 0;
+            }
+            let cap = effective_rg_cap(base_cap, policy, zoom, finest_zoom).max(1);
+            n.div_ceil(cap)
+        })
+        .sum()
+}
+
+/// The smallest row-group base cap `>= base_cap` under which
+/// [`projected_row_groups`] fits within `ceiling` (#507's auto-scale, option
+/// 2 of the issue). `Some(base_cap)` unchanged when it already fits — callers
+/// compare the result to `base_cap` to decide whether to warn.
+///
+/// `None` only when raising the cap can never help: every non-empty level
+/// contributes at least one row group regardless of cap (a level fitting in
+/// one row group already IS one row group), so more non-empty levels than
+/// `ceiling` is unfixable by this knob alone. In practice this can't happen —
+/// levels are bounded by [`crate::tile::MAX_ZOOM`], far below `ceiling` — but
+/// callers still surface it as an actionable error rather than looping
+/// forever or silently under-shooting.
+pub(crate) fn autoscale_cap(
+    counts: &[usize],
+    base_cap: usize,
+    policy: RowGroupSizePolicy,
+    level_zooms: &[Option<u8>],
+    finest_zoom: Option<u8>,
+    ceiling: usize,
+) -> Option<usize> {
+    let fits =
+        |cap: usize| projected_row_groups(counts, cap, policy, level_zooms, finest_zoom) <= ceiling;
+    if fits(base_cap) {
+        return Some(base_cap);
+    }
+    let nonempty_levels = counts.iter().filter(|&&n| n > 0).count();
+    if nonempty_levels > ceiling {
+        return None;
+    }
+    // `projected_row_groups` is non-increasing as the base cap rises: every
+    // level's effective cap (`effective_rg_cap`) is non-decreasing in
+    // `base_cap` (`Constant` returns it verbatim; `ZoomScaled` multiplies it
+    // by a fixed power), so binary search for the minimal fitting cap.
+    //
+    // `hi` = the largest level count always fits: at `base_cap == max(counts)`
+    // every level's effective cap is `>= base_cap >= counts[l]` (the
+    // multiplier in `ZoomScaled` only ever scales a level's cap UP from
+    // `base_cap`, and the finest level's cap equals `base_cap` exactly), so
+    // every non-empty level becomes exactly one row group — `nonempty_levels`
+    // total, already proven `<= ceiling` above.
+    let mut lo = base_cap.saturating_add(1);
+    let mut hi = counts.iter().copied().max().unwrap_or(base_cap).max(lo);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(round_up_clean(lo))
+}
+
+/// Round a row-group cap up to a clean multiple of 1,000 (#507): a tidy value
+/// for the warning log / CLI suggestion. Never rounds below `n`, so the
+/// result still fits (`projected_row_groups` is non-increasing in the cap).
+fn round_up_clean(n: usize) -> usize {
+    const STEP: usize = 1_000;
+    n.div_ceil(STEP).saturating_mul(STEP)
+}
+
 /// Build [`WriterProperties`]: ZSTD, no dictionary on geometry + bbox columns
 /// (§4.5), manual per-level row-group control, and statistics tuned so the
 /// footer stays small (H1) while the pruning index survives.
@@ -2354,6 +2451,206 @@ mod tests {
         assert_eq!(
             effective_rg_cap(usize::MAX / 2, ZoomScaled, Some(0), Some(30)),
             usize::MAX
+        );
+    }
+
+    /// #507: [`projected_row_groups`] must predict exactly the row-group
+    /// count the real writer produces under [`RowGroupSizePolicy::Constant`]
+    /// — the preflight is only useful if its math matches `write_level`'s.
+    #[test]
+    fn projected_row_groups_matches_actual_writer_output() {
+        let counts = [3usize, 10, 17];
+        let cap = 4;
+        let opts = {
+            let mut o = duplicating_options();
+            o.max_row_group_size = cap;
+            o
+        };
+        let zooms: Vec<Option<u8>> = opts.levels.iter().map(|l| l.zoom).collect();
+        let finest_zoom = opts.levels.last().and_then(|l| l.zoom);
+        let projected = projected_row_groups(
+            &counts,
+            cap,
+            opts.row_group_size_policy,
+            &zooms,
+            finest_zoom,
+        );
+        // Level 0: ceil(3/4)=1, level 1: ceil(10/4)=3, level 2: ceil(17/4)=5.
+        assert_eq!(projected, 1 + 3 + 5);
+
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for (level, &n) in counts.iter().enumerate() {
+                let ids: Vec<i64> = (0..n as i64).collect();
+                let _ = writer
+                    .write_level(level, Some(n), std::iter::once(source_batch(&schema, &ids)))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert_eq!(pm.num_row_groups(), projected);
+    }
+
+    /// Same equivalence check under [`RowGroupSizePolicy::ZoomScaled`], where
+    /// each level's effective cap differs.
+    #[test]
+    fn projected_row_groups_matches_actual_writer_output_zoom_scaled() {
+        let counts = [10usize, 10, 17];
+        let cap = 4;
+        let opts = {
+            let mut o = duplicating_options();
+            o.max_row_group_size = cap;
+            o.row_group_size_policy = RowGroupSizePolicy::ZoomScaled;
+            o
+        };
+        let zooms: Vec<Option<u8>> = opts.levels.iter().map(|l| l.zoom).collect();
+        let finest_zoom = opts.levels.last().and_then(|l| l.zoom);
+        let projected = projected_row_groups(
+            &counts,
+            cap,
+            opts.row_group_size_policy,
+            &zooms,
+            finest_zoom,
+        );
+
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for (level, &n) in counts.iter().enumerate() {
+                let ids: Vec<i64> = (0..n as i64).collect();
+                let _ = writer
+                    .write_level(level, Some(n), std::iter::once(source_batch(&schema, &ids)))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert_eq!(pm.num_row_groups(), projected);
+    }
+
+    #[test]
+    fn autoscale_cap_noop_when_already_fits() {
+        let counts = [100usize, 200, 300];
+        let zooms = [Some(2u8), Some(4u8), Some(6u8)];
+        let got = autoscale_cap(
+            &counts,
+            100,
+            RowGroupSizePolicy::Constant,
+            &zooms,
+            Some(6),
+            32_000,
+        );
+        assert_eq!(got, Some(100));
+    }
+
+    /// #507's core scenario: a base cap that would blow the safety ceiling
+    /// gets raised to the smallest clean-multiple cap that fits.
+    #[test]
+    fn autoscale_cap_raises_cap_to_fit_ceiling() {
+        // 3 levels of 1,000 rows each, cap 1: 3,000 row groups — above a
+        // ceiling of 10.
+        let counts = [1_000usize, 1_000, 1_000];
+        let zooms = [Some(2u8), Some(4u8), Some(6u8)];
+        let ceiling = 10;
+        let cap = autoscale_cap(
+            &counts,
+            1,
+            RowGroupSizePolicy::Constant,
+            &zooms,
+            Some(6),
+            ceiling,
+        )
+        .expect("autoscale should find a fitting cap");
+        assert!(cap > 1);
+        assert_eq!(
+            cap % 1_000,
+            0,
+            "cap should round to a clean multiple: {cap}"
+        );
+        let projected =
+            projected_row_groups(&counts, cap, RowGroupSizePolicy::Constant, &zooms, Some(6));
+        assert!(
+            projected <= ceiling,
+            "projected {projected} > ceiling {ceiling}"
+        );
+    }
+
+    /// No cap can help when the non-empty level count alone exceeds the
+    /// ceiling — every non-empty level always contributes >= 1 row group.
+    #[test]
+    fn autoscale_cap_none_when_levels_alone_exceed_ceiling() {
+        let counts = [1usize, 1, 1, 1, 1];
+        let zooms = [Some(0u8), Some(1u8), Some(2u8), Some(3u8), Some(4u8)];
+        let got = autoscale_cap(
+            &counts,
+            10,
+            RowGroupSizePolicy::Constant,
+            &zooms,
+            Some(4),
+            2,
+        );
+        assert_eq!(got, None);
+    }
+
+    /// End-to-end (#507): forcing a tiny base cap (`--row-group-size 1`)
+    /// against a tiny mocked ceiling — far below the real 32,767 parquet
+    /// limit, so the test runs in milliseconds — proves the writer succeeds
+    /// and stays within the ceiling once its cap is auto-scaled, instead of
+    /// producing far more row groups than the ceiling allows.
+    #[test]
+    fn autoscaled_cap_keeps_writer_output_within_ceiling() {
+        let counts = [20usize, 20, 20];
+        let base_cap = 1;
+        let ceiling = 5;
+        let mut opts = duplicating_options();
+        let zooms: Vec<Option<u8>> = opts.levels.iter().map(|l| l.zoom).collect();
+        let finest_zoom = opts.levels.last().and_then(|l| l.zoom);
+        let cap = autoscale_cap(
+            &counts,
+            base_cap,
+            opts.row_group_size_policy,
+            &zooms,
+            finest_zoom,
+            ceiling,
+        )
+        .expect("autoscale should find a fitting cap");
+        opts.max_row_group_size = cap;
+
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for (level, &n) in counts.iter().enumerate() {
+                let ids: Vec<i64> = (0..n as i64).collect();
+                let outcome = writer
+                    .write_level(level, Some(n), std::iter::once(source_batch(&schema, &ids)))
+                    .unwrap();
+                assert_eq!(outcome, LevelWriteOutcome::Written);
+            }
+            writer.finish().unwrap();
+        }
+
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert!(
+            pm.num_row_groups() <= ceiling,
+            "row groups {} exceed the mocked ceiling {ceiling}",
+            pm.num_row_groups()
         );
     }
 

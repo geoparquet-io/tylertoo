@@ -269,15 +269,48 @@ pub(super) fn build_level_schemas(
 }
 
 /// Build the writer options both convert paths use: the shared knobs plus the
-/// generalization provenance recorded in the footer (§3.5).
+/// generalization provenance recorded in the footer (§3.5), and the #507
+/// row-group-ceiling preflight — computed from `level_row_counts` (the same
+/// per-level winner hints the writer sizes row groups from) BEFORE pass 2
+/// ever opens the output file, so a projected overflow is caught (and the
+/// cap auto-scaled) in milliseconds instead of after hours of writing.
 pub(super) fn build_writer_options(
     writer_levels: Vec<LevelSpec>,
     emitted_gsds: &[f64],
+    level_row_counts: &[usize],
     crs: Crs,
     ranking_provenance: RankingProvenance,
     renames: &[(String, String)],
     options: &ConvertOptions,
-) -> OverviewWriterOptions {
+) -> Result<OverviewWriterOptions, ConvertError> {
+    build_writer_options_with_ceiling(
+        writer_levels,
+        emitted_gsds,
+        level_row_counts,
+        crs,
+        ranking_provenance,
+        renames,
+        options,
+        super::writer::SAFE_ROW_GROUP_CEILING,
+    )
+}
+
+/// [`build_writer_options`], parameterized on the safety ceiling (#507 test
+/// seam): production always calls it via `build_writer_options` with
+/// [`super::writer::SAFE_ROW_GROUP_CEILING`]; tests pass a tiny ceiling to
+/// exercise the auto-scale / unreachable-error paths without constructing
+/// tens of thousands of row groups.
+#[allow(clippy::too_many_arguments)]
+fn build_writer_options_with_ceiling(
+    writer_levels: Vec<LevelSpec>,
+    emitted_gsds: &[f64],
+    level_row_counts: &[usize],
+    crs: Crs,
+    ranking_provenance: RankingProvenance,
+    renames: &[(String, String)],
+    options: &ConvertOptions,
+    ceiling: usize,
+) -> Result<OverviewWriterOptions, ConvertError> {
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
     writer_opts.row_group_size_policy = options.row_group_size_policy;
@@ -291,7 +324,47 @@ pub(super) fn build_writer_options(
         ranking_provenance,
         renames,
     ));
-    writer_opts
+
+    // #507: preflight the parquet 32,767-row-groups-per-file ceiling. Mirrors
+    // the writer's own per-level split arithmetic (`projected_row_groups`),
+    // so this predicts the exact row-group count `write_level` will produce.
+    let level_zooms: Vec<Option<u8>> = writer_opts.levels.iter().map(|l| l.zoom).collect();
+    let finest_zoom = writer_opts.levels.last().and_then(|l| l.zoom);
+    match super::writer::autoscale_cap(
+        level_row_counts,
+        writer_opts.max_row_group_size,
+        writer_opts.row_group_size_policy,
+        &level_zooms,
+        finest_zoom,
+        ceiling,
+    ) {
+        Some(cap) if cap > writer_opts.max_row_group_size => {
+            let projected = super::writer::projected_row_groups(
+                level_row_counts,
+                writer_opts.max_row_group_size,
+                writer_opts.row_group_size_policy,
+                &level_zooms,
+                finest_zoom,
+            );
+            log::warn!(
+                "[convert] projected output needs {projected} row groups at \
+                 --row-group-size {old} — above parquet's 32,767-row-group-per-file limit \
+                 (safety ceiling {ceiling}); auto-scaling --row-group-size to {cap} to fit \
+                 (pass --row-group-size {cap} explicitly to silence this warning)",
+                old = writer_opts.max_row_group_size,
+            );
+            writer_opts.max_row_group_size = cap;
+        }
+        Some(_) => {}
+        None => {
+            return Err(ConvertError::RowGroupCeilingUnreachable {
+                levels: level_row_counts.iter().filter(|&&n| n > 0).count(),
+                ceiling,
+            });
+        }
+    }
+
+    Ok(writer_opts)
 }
 
 /// Combined per-part footer-statistics row-group selection for the streaming
@@ -818,14 +891,16 @@ fn create_level_writer(
         .map(|e| LevelSpec::new(e.gsd, e.zoom))
         .collect();
     let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
+    let level_row_counts: Vec<usize> = emitted.iter().map(|e| e.hint).collect();
     let writer_opts = build_writer_options(
         writer_levels,
         &emitted_gsds,
+        &level_row_counts,
         crs,
         ranking_provenance,
         renames,
         options,
-    );
+    )?;
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -3582,11 +3657,7 @@ pub(super) fn process_batch_cascade(
     Ok(per_level)
 }
 
-// ============================================================================
-// Pass-1 parallelization tests (#460)
-// ============================================================================
-
-#[cfg(test)]
+// =====================================================================#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3988,5 +4059,113 @@ mod tests {
             msg.contains(&format!("index {}", BAD_ROW - lo)),
             "expected the (chunk-local) decoder index to survive the wrap; got: {msg}"
         );
+    }
+
+    fn ranking_provenance() -> RankingProvenance {
+        RankingProvenance {
+            mode: "size-fallback".to_string(),
+            column: None,
+            ranks: None,
+            unknown_rank: None,
+        }
+    }
+
+    fn three_levels() -> Vec<LevelSpec> {
+        vec![
+            LevelSpec::new(100.0, Some(2)),
+            LevelSpec::new(50.0, Some(4)),
+            LevelSpec::new(10.0, Some(6)),
+        ]
+    }
+
+    /// #507: when the projected row-group count already fits the ceiling,
+    /// `--row-group-size` passes through unchanged.
+    #[test]
+    fn build_writer_options_leaves_cap_alone_when_it_fits() {
+        let options = ConvertOptions::default();
+        let counts = [10usize, 10, 10];
+        let opts = build_writer_options_with_ceiling(
+            three_levels(),
+            &[100.0, 50.0, 10.0],
+            &counts,
+            Crs::Epsg4326,
+            ranking_provenance(),
+            &[],
+            &options,
+            32_000,
+        )
+        .unwrap();
+        assert_eq!(opts.max_row_group_size, options.max_row_group_size);
+    }
+
+    /// #507's core scenario: a base cap that would blow the (mocked, tiny)
+    /// ceiling is auto-scaled up instead of being carried through to the
+    /// writer verbatim, where it would eventually fail mid-write hours in.
+    #[test]
+    fn build_writer_options_autoscales_cap_past_a_tiny_ceiling() {
+        let options = ConvertOptions {
+            max_row_group_size: 1,
+            ..ConvertOptions::default()
+        };
+        let counts = [20usize, 20, 20]; // 60 row groups at cap 1
+        let ceiling = 5;
+        let opts = build_writer_options_with_ceiling(
+            three_levels(),
+            &[100.0, 50.0, 10.0],
+            &counts,
+            Crs::Epsg4326,
+            ranking_provenance(),
+            &[],
+            &options,
+            ceiling,
+        )
+        .unwrap();
+        assert!(
+            opts.max_row_group_size > 1,
+            "cap should have been raised, got {}",
+            opts.max_row_group_size
+        );
+        let level_zooms: Vec<Option<u8>> = opts.levels.iter().map(|l| l.zoom).collect();
+        let finest_zoom = opts.levels.last().and_then(|l| l.zoom);
+        let projected = super::super::writer::projected_row_groups(
+            &counts,
+            opts.max_row_group_size,
+            opts.row_group_size_policy,
+            &level_zooms,
+            finest_zoom,
+        );
+        assert!(
+            projected <= ceiling,
+            "projected {projected} > ceiling {ceiling}"
+        );
+    }
+
+    /// #507: when even an unbounded cap can't help (more non-empty levels
+    /// than the ceiling allows), the preflight errors out before pass 2
+    /// opens the output file instead of writing a file the parquet crate
+    /// will later reject.
+    #[test]
+    fn build_writer_options_errors_when_autoscaling_cannot_fit() {
+        let options = ConvertOptions::default();
+        let counts = [1usize, 1, 1];
+        let ceiling = 1; // 3 non-empty levels > ceiling of 1
+        let err = build_writer_options_with_ceiling(
+            three_levels(),
+            &[100.0, 50.0, 10.0],
+            &counts,
+            Crs::Epsg4326,
+            ranking_provenance(),
+            &[],
+            &options,
+            ceiling,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::RowGroupCeilingUnreachable {
+                levels: 3,
+                ceiling: 1
+            }
+        ));
     }
 }

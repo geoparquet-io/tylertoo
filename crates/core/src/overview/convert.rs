@@ -1080,6 +1080,25 @@ pub enum ConvertError {
     /// can never trip it.
     #[error("cluster invariant violated (spec §12.1): {0}")]
     ClusterInvariant(String),
+    /// Even after auto-scaling `--row-group-size` up, the projected output
+    /// row-group count cannot be brought under the safety ceiling (#507).
+    /// This only happens when the emitted (non-empty) level count itself
+    /// exceeds the ceiling — no cap raise helps there, since every non-empty
+    /// level always contributes at least one row group. In practice
+    /// unreachable (levels are bounded by [`crate::tile::MAX_ZOOM`], far
+    /// below the ceiling), but surfaced as an actionable error rather than
+    /// silently producing a file the parquet writer will reject.
+    #[error(
+        "cannot fit {levels} emitted overview level(s) under the {ceiling}-row-group \
+         preflight safety ceiling (parquet's hard limit is 32,767 row groups per file) \
+         even after auto-scaling --row-group-size; reduce the number of overview levels"
+    )]
+    RowGroupCeilingUnreachable {
+        /// Emitted (non-empty) levels.
+        levels: usize,
+        /// The safety ceiling checked against.
+        ceiling: usize,
+    },
 }
 
 /// Convert a GeoParquet file into a multi-resolution overview GeoParquet file.
@@ -2352,14 +2371,16 @@ pub(crate) fn convert_to_overviews_source_strategy(
         .map(|e| LevelSpec::new(e.gsd, e.zoom))
         .collect();
     let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
+    let level_row_counts: Vec<usize> = emitted.iter().map(|e| e.indices.len()).collect();
     let writer_opts = super::stream::build_writer_options(
         writer_levels,
         &emitted_gsds,
+        &level_row_counts,
         crs,
         ranking_provenance,
         &renames,
         options,
-    );
+    )?;
 
     let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
