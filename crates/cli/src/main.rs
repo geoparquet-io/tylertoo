@@ -219,6 +219,9 @@ pub struct PyramidArgs {
     /// name inside the archive, or the merge is refused rather than write
     /// two layers of one name into a tile.
     ///
+    /// Bands are emitted coarsest-first in the merged archive regardless of
+    /// listing order.
+    ///
     /// Colons in INPUT: the LAYER is only split off the LAST `:` when what
     /// follows it has no `/`, `\` or `:`, so a URL, a Windows drive and a
     /// `2024:06/` directory stay whole. A drive-relative path with no `\`
