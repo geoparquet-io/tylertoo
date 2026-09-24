@@ -1176,12 +1176,11 @@ pub(crate) fn convert_streaming_strategy(
     }
     let num_features = features.len();
 
-    // #188 follow-up: count antimeridian-suspect bboxes and warn once.
-    let antimeridian_suspect_features = features
-        .iter()
-        .filter(|f| super::convert::bbox_antimeridian_suspect(&f.bbox, crs))
-        .count();
-    super::convert::warn_antimeridian_suspects(antimeridian_suspect_features);
+    // One pass over the pass-1 bboxes for every bbox-derived tally: #188
+    // antimeridian suspects, and the #429 losses (outside the CRS range, or
+    // outside the Web Mercator tiling domain). Warns once per kind and
+    // refuses to "succeed" into an empty archive when ~everything is lost.
+    let tallies = super::convert::tally_feature_bboxes(&features, crs)?;
 
     // Stage markers (#242): everything between pass 1 and the writer used to
     // run in total info-level silence — on planet-scale inputs that was tens
@@ -1358,7 +1357,9 @@ pub(crate) fn convert_streaming_strategy(
         total_compressed_bytes,
         row_groups_total,
         row_groups_read,
-        antimeridian_suspect_features,
+        antimeridian_suspect_features: tallies.antimeridian_suspect,
+        out_of_range_features: tallies.out_of_range,
+        unprojectable_features: tallies.unprojectable,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(source),
     })

@@ -19,6 +19,20 @@ CRS places its features at the wrong tile coordinates rather than failing
 loudly, so reprojecting to `EPSG:4326` first is the difference between a correct
 map and a subtly broken one.
 
+**A file that cannot be tiled says so.** Two kinds of input tile to nothing, and
+the converter counts both rather than reporting a silent success. Coordinates
+that reach beyond the declared CRS's range — projected meters stored under
+CRS84 metadata is the usual cause — are counted as dropped, and when the values
+are large enough to be another CRS's units the warning names the `gpio convert
+reproject` fix. Features with perfectly valid lon/lat that sit outside the Web
+Mercator tiling domain (`|lat| > 85.05°`, an Arctic or Antarctic extract) are
+counted separately: Web Mercator does not reach the poles, so there is nothing
+to reproject and those features simply cannot be tiled. Both counts appear in
+the run summary and in the conversion report
+(`out_of_range_features`, `unprojectable_features`), and when the two together
+account for 99% or more of the input, the conversion fails instead of writing an
+empty archive.
+
 **Streaming memory depends on row-group size.** The converter reads one row
 group at a time, so peak memory tracks the largest row group in the file, not
 the file's total size. Row groups far below the target multiply per-read

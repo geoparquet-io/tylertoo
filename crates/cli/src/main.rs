@@ -1916,11 +1916,15 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         output.file_name().unwrap_or_default().to_string_lossy()
     );
     println!(
-        "  {} tiles across z{}..z{} in {:.2}s",
-        format_number(export_report.total_tiles as u64),
-        export_report.min_zoom,
-        export_report.max_zoom,
-        convert_report.duration_secs + export_report.duration_secs
+        "  {}",
+        tiles_summary_line(
+            export_report.total_tiles,
+            export_report.min_zoom,
+            export_report.max_zoom,
+            convert_report.duration_secs + export_report.duration_secs,
+            convert_report.out_of_range_features,
+            convert_report.unprojectable_features,
+        )
     );
     // #380: the header covers the requested range; say which zooms in it
     // hold nothing rather than let the range above imply they do.
@@ -1964,6 +1968,51 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The tile-count line of the `tiles` summary (#429).
+///
+/// Normally a bare count. When features were lost it says so on the same line
+/// — a wrong-CRS input reporting a bare "✓ Converted … 0 tiles" was the
+/// headline lie of issue #429. The two losses are named separately because
+/// they have different fixes: coordinates outside the declared CRS's range
+/// (usually a reprojection away), and valid lon/lat outside the Web Mercator
+/// tiling domain (nothing to reproject — Mercator does not reach the poles).
+/// A ≥99% loss never reaches here (the conversion fails outright), so this
+/// covers the partial case and the "some other filter also emptied the
+/// archive" one.
+fn tiles_summary_line(
+    total_tiles: usize,
+    min_zoom: u8,
+    max_zoom: u8,
+    secs: f64,
+    out_of_range: usize,
+    unprojectable: usize,
+) -> String {
+    let zooms = format!("z{min_zoom}..z{max_zoom}");
+    let tiles = format_number(total_tiles as u64);
+    let mut losses: Vec<String> = Vec::new();
+    if out_of_range > 0 {
+        losses.push(format!(
+            "{} feature(s) dropped (outside the declared CRS range)",
+            format_number(out_of_range as u64)
+        ));
+    }
+    if unprojectable > 0 {
+        losses.push(format!(
+            "{} feature(s) dropped (|lat| > 85.05°, outside the Web Mercator tiling domain)",
+            format_number(unprojectable as u64)
+        ));
+    }
+    if losses.is_empty() {
+        return format!("{tiles} tiles across {zooms} in {secs:.2}s");
+    }
+    let dropped = losses.join(", ");
+    if total_tiles == 0 {
+        format!("{tiles} tiles — {dropped} — {zooms} in {secs:.2}s")
+    } else {
+        format!("{tiles} tiles across {zooms} in {secs:.2}s — {dropped}")
+    }
 }
 
 /// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
@@ -2017,6 +2066,27 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             format_number(lvl.feature_count as u64),
             format_number(lvl.vertex_count as u64),
             HumanBytes(lvl.compressed_bytes.max(0) as u64)
+        );
+    }
+    // #429: the aggregate `log::warn!` from the converter already names the
+    // declared CRS, its range and the fix; the note here only makes sure the
+    // summary itself never reads as an unqualified success.
+    if report.out_of_range_features > 0 {
+        println!(
+            "  note: {} of {} input features reach beyond the coordinate range the \
+             file's declared CRS allows and were dropped or clipped \u{2014} see the \
+             warning above, and check the real CRS with `gpio inspect <input>`",
+            format_number(report.out_of_range_features as u64),
+            format_number(report.input_features as u64)
+        );
+    }
+    if report.unprojectable_features > 0 {
+        println!(
+            "  note: {} of {} input features have valid lon/lat but lie outside the \
+             Web Mercator tiling domain (|lat| > 85.05\u{b0}); these features cannot \
+             be tiled",
+            format_number(report.unprojectable_features as u64),
+            format_number(report.input_features as u64)
         );
     }
     if !report.skipped_empty_levels.is_empty() {
@@ -3559,6 +3629,50 @@ mod tests {
             missing.is_empty(),
             "flags on overview/export-pmtiles not surfaced on `tiles` — add each \
              to TilesArgs, or to the allow-list with a documented reason: {missing:?}"
+        );
+    }
+    // --- #429: out-of-range honesty in the tiles summary ---------------------
+
+    /// A bare "N tiles" line is fine only when nothing was lost. With lost
+    /// features the line must name them — and name WHICH loss, since the two
+    /// have different fixes — and a zero-tile archive must never read as an
+    /// unqualified success.
+    #[test]
+    fn tiles_summary_line_names_out_of_range_losses() {
+        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0);
+        assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
+
+        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0);
+        assert!(
+            empty.starts_with(
+                "0 tiles \u{2014} 3 feature(s) dropped (outside the declared CRS range)"
+            ),
+            "a wrong-CRS run must not read as a clean success: {empty}"
+        );
+
+        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0);
+        assert!(
+            partial.contains("10 tiles across z0..z14")
+                && partial.contains("1 feature(s) dropped (outside the declared CRS range)"),
+            "a partial loss still reports its tiles AND its losses: {partial}"
+        );
+
+        // The Mercator-domain loss is named separately: nothing to reproject.
+        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7);
+        assert!(
+            polar.contains(
+                "7 feature(s) dropped (|lat| > 85.05\u{b0}, outside the Web Mercator \
+                 tiling domain)"
+            ) && !polar.contains("declared CRS range"),
+            "an Arctic extract must be told why it tiled to nothing: {polar}"
+        );
+
+        // Both at once, both named.
+        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3);
+        assert!(
+            both.contains("2 feature(s) dropped (outside the declared CRS range)")
+                && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
+            "{both}"
         );
     }
 }
