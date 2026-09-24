@@ -168,14 +168,16 @@ fn stage_input_pass0(
     }
 }
 
-/// Resolve the pass-2 in-flight depth (auto-sizing from available cores when
-/// the caller left it at [`super::convert::IN_FLIGHT_BATCHES_AUTO`]) and log
-/// the chosen depth alongside the detected core count, so pass-2 core
-/// utilization is observable rather than a mystery (#264).
-fn resolve_and_log_in_flight_batches(requested: usize) -> usize {
+/// Resolve an in-flight depth (auto-sizing from available cores when the
+/// caller left it at [`super::convert::IN_FLIGHT_BATCHES_AUTO`]) and log the
+/// chosen depth alongside the detected core count, so core utilization is
+/// observable rather than a mystery (#264; shared by pass 1 and pass 2 as of
+/// #460, since both now run a dedicated reader thread ahead of a bounded
+/// channel — `phase` names which one in the log line, e.g. `"pass 1"`).
+fn resolve_and_log_in_flight_batches(phase: &str, requested: usize) -> usize {
     let in_flight = super::convert::resolve_in_flight_batches(requested);
     log::info!(
-        "[convert] pass 2 parallelism: {in_flight} read batch(es) in flight ({} core(s) detected)",
+        "[convert] {phase} parallelism: {in_flight} read batch(es) in flight ({} core(s) detected)",
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(0)
@@ -1542,7 +1544,7 @@ pub(crate) fn convert_streaming_strategy(
     // every candidate collapsed during simplification (#211).
     // Resolve the in-flight depth once (auto-sizes from available cores when
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
-    let in_flight_batches = resolve_and_log_in_flight_batches(options.in_flight_batches);
+    let in_flight_batches = resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches);
 
     let (level_stats, pass2_engine_timers) = run_pass2_levels(
         &mut writer,
@@ -1982,23 +1984,34 @@ struct Pass1Output {
     pass1_stage_secs: Pass1StageSecs,
 }
 
-/// Wall-time accumulators for pass-1 stages ([profile] logging), stored as
-/// nanoseconds. Pass 1 is single-threaded today, but this mirrors
-/// [`Pass2Timers`]'s atomics pattern so both stay easy to reconcile and any
-/// future parallelization of pass 1 needs no accounting rework.
+/// CORE-SECONDS accumulators for pass-1 stages ([profile] logging), stored as
+/// nanoseconds — mirrors [`Pass2Timers`]'s atomics pattern (the two engines
+/// stay easy to reconcile), and as of #460 the mirroring is literal: `read`
+/// is timed on the dedicated reader thread while `decode`/`scan` run
+/// concurrently on the consumer's rayon chunks, so these are SUMMED
+/// core-seconds across threads, not wall-clock — `read + decode + scan +
+/// keys + assemble` can (and on a multi-core box, should) exceed the run's
+/// actual wall time, exactly like [`Pass2Timers`]'s "stage sums are
+/// core-seconds, overlap wall" already reads.
 #[derive(Default)]
 struct Pass1Timers {
-    /// Parquet read + Arrow decode of the raw batch (`reader.next()`).
+    /// Parquet read + Arrow decode of the raw batch (`reader.next()`), timed
+    /// on the reader thread — overlaps every other stage below.
     read: AtomicU64,
-    /// Geometry column decode (`from_arrow_array` + geometry extraction).
+    /// Geometry column decode (`from_arrow_array` + geometry extraction),
+    /// summed across the batch's parallel `scan_chunk` rayon tasks.
     decode: AtomicU64,
     /// Per-row feature scan: attribute-filter eval, `scan_feature` (bbox +
-    /// kind), the regional-extract bbox test.
+    /// kind), the regional-extract bbox test — summed across the batch's
+    /// parallel `scan_chunk` rayon tasks.
     scan: AtomicU64,
-    /// Ranking-key, accumulate-value, and entry-zoom-ladder column extraction.
+    /// Ranking-key, accumulate-value, and entry-zoom-ladder column
+    /// extraction — serial (order-dependent, `extract_pass1_batch_keys`),
+    /// one measurement per batch.
     keys: AtomicU64,
     /// Post-scan assembly: ranking-tier resolution, sort-key stamping,
-    /// entry-level stamping, coalesce-scratch assembly.
+    /// entry-level stamping, coalesce-scratch assembly — serial, once for
+    /// the whole pass (not per batch).
     assemble: AtomicU64,
 }
 
@@ -2043,7 +2056,8 @@ impl Pass1Timers {
         let rows_per_sec = if wall > 0.0 { rows as f64 / wall } else { 0.0 };
         log::debug!(
             "[profile] pass1 ({rows} rows): wall={wall:.2}s read={:.2}s decode={:.2}s \
-             scan={:.2}s keys={:.2}s assemble={:.2}s rows/s={rows_per_sec:.0}",
+             scan={:.2}s keys={:.2}s assemble={:.2}s rows/s={rows_per_sec:.0} \
+             (stage sums are core-seconds, overlap wall)",
             s.read,
             s.decode,
             s.scan,
@@ -2056,8 +2070,11 @@ impl Pass1Timers {
 /// Pass 1: stream the input (geometry + ranking/accumulate columns only) and
 /// produce the per-feature [`AssignFeature`]s (with resolved sort keys), the
 /// ranking provenance block (§3.5), and — when clustering with aggregation —
-/// the per-spec source values (parallel to `acc_cols`). Memory: `O(read
-/// batch)` transient + `O(N)` small per-feature records.
+/// the per-spec source values (parallel to `acc_cols`). Memory: `O(in_flight
+/// × read_batch)` transient (#460: the reader thread can run up to
+/// [`ConvertOptions::in_flight_batches`] batches ahead of the chunked-scan
+/// consumer — the same knob pass 2 already used, was `O(read batch)` when
+/// pass 1 was single-threaded) + `O(N)` small per-feature records.
 /// The sorted, deduplicated column projection pass 1 reads: geometry +
 /// ranking candidates + accumulate columns (Q4) + attribute-filter columns
 /// (#315).
@@ -2192,18 +2209,23 @@ fn scan_chunk(
     want_areas: bool,
     timers: &Pass1Timers,
 ) -> Result<ChunkScan, ConvertError> {
+    let chunk_len = gcol.len();
     let t_decode = Instant::now();
     let garr = from_arrow_array(gcol, geom_field)
         .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-    let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::new();
+    let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::with_capacity(chunk_len);
     extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)?;
     Pass1Timers::add(&timers.decode, t_decode);
 
     let t_scan = Instant::now();
-    let mut features: Vec<AssignFeature> = Vec::new();
-    let mut areas: Vec<f32> = Vec::new();
+    // Upper bounds: every chunk row could become a feature (or a line, or an
+    // area entry when the row is a polygon). Slight over-allocation on a
+    // mostly-skipped/mostly-non-polygon chunk beats the repeated reallocation
+    // an unsized `Vec::new()` would otherwise do as the chunk fills in.
+    let mut features: Vec<AssignFeature> = Vec::with_capacity(chunk_len);
+    let mut areas: Vec<f32> = Vec::with_capacity(if want_areas { chunk_len } else { 0 });
     let mut kept_row = vec![false; geoms_buf.len()];
-    let mut lines: Vec<ChunkLine> = Vec::new();
+    let mut lines: Vec<ChunkLine> = Vec::with_capacity(if collect_lines { chunk_len } else { 0 });
     let mut point_count = 0usize;
     let mut skipped_rows = 0usize;
 
@@ -2295,28 +2317,6 @@ fn run_pass1(
     )
 }
 
-/// [`run_pass1`], with the within-batch scan chunk size as an explicit
-/// parameter (production always calls it via [`run_pass1`] with
-/// [`PASS1_CHUNK_ROWS`]; tests use this directly to compare a heavily-chunked
-/// run against `chunk_rows: usize::MAX` — effectively one chunk per batch,
-/// the pre-#460 shape — and assert byte-identical [`Pass1Output`]).
-///
-/// Reader thread ([`super::pipe::scoped_pipe`], depth = pass 2's resolved
-/// in-flight-batches setting) → consumer: each batch is sliced into
-/// `chunk_rows`-row chunks (`RecordBatch::slice`, zero-copy), scanned in
-/// parallel by [`scan_chunk`] (geometry decode + gating), then merged back in
-/// ascending chunk order on the consumer thread. The order-dependent pieces —
-/// [`GroupInterner`], the columnar ranking/accumulate/ladder column
-/// extraction, and the coalesce-scratch line order — stay serial, running
-/// once per batch on the full (unsliced) batch exactly as before; only the
-/// per-row geometry decode + `scan_feature` + gating work is chunked and
-/// parallelized. A skipped row (null/non-finite geometry, a false
-/// `--filter`, or a `--bbox` miss) still advances the row index it would
-/// under the serial loop — [`ChunkScan`] returns chunk-local indices and the
-/// consumer rebases them to `chunk_base + i` before merging, so a feature's
-/// global `index` (and everything keyed by it downstream, notably
-/// `Priority::beats`'s `stable_hash(index)` tie-break) is identical
-/// regardless of `chunk_rows`.
 /// Per-batch columnar key extraction for pass 1: ranking keys (explicit
 /// sort/class, or the auto-detected road-class/confidence candidates),
 /// accumulate-column values (Q4), and the entry-zoom ladder column (#364).
@@ -2445,6 +2445,34 @@ fn merge_pass1_chunks(
     Ok(kept_row)
 }
 
+/// [`run_pass1`], with the within-batch scan chunk size as an explicit
+/// parameter (production always calls it via [`run_pass1`] with
+/// [`PASS1_CHUNK_ROWS`]; tests use this directly to compare a heavily-chunked
+/// run against `chunk_rows: usize::MAX` — effectively one chunk per batch,
+/// the pre-#460 shape — and assert byte-identical [`Pass1Output`]).
+///
+/// Reader thread ([`super::pipe::scoped_pipe`], depth = pass 2's resolved
+/// in-flight-batches setting) → consumer: each batch is sliced into
+/// `chunk_rows`-row chunks (`RecordBatch::slice`, zero-copy), scanned in
+/// parallel by [`scan_chunk`] (geometry decode + gating), then merged back in
+/// ascending chunk order on the consumer thread. The order-dependent pieces —
+/// [`GroupInterner`], the columnar ranking/accumulate/ladder column
+/// extraction, and the coalesce-scratch line order — stay serial, running
+/// once per batch on the full (unsliced) batch exactly as before; only the
+/// per-row geometry decode + `scan_feature` + gating work is chunked and
+/// parallelized. A skipped row (null/non-finite geometry, a false
+/// `--filter`, or a `--bbox` miss) still advances the row index it would
+/// under the serial loop — [`ChunkScan`] returns chunk-local indices and the
+/// consumer rebases them to `chunk_base + i` before merging, so a feature's
+/// global `index` (and everything keyed by it downstream, notably
+/// `Priority::beats`'s `stable_hash(index)` tie-break) is identical
+/// regardless of `chunk_rows`.
+///
+/// Memory: `O(in_flight × read_batch)` transient plus `O(N)` small
+/// per-feature records. The reader thread can now run up to `in_flight`
+/// batches ([`ConvertOptions::in_flight_batches`]) ahead of the chunked-scan
+/// consumer, up from the pre-#460 `O(read batch)` — pass 1 shares the same
+/// read/compute overlap knob pass 2 already used.
 #[allow(clippy::too_many_arguments)]
 fn run_pass1_with_chunk_rows(
     source: &ConvertSource,
@@ -2492,11 +2520,8 @@ fn run_pass1_with_chunk_rows(
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
     let timers_ref = &pass1_timers;
-    let in_flight = super::convert::resolve_in_flight_batches(options.in_flight_batches);
-    log::debug!(
-        "[convert] pass 1 parallelism: {in_flight} read batch(es) in flight, \
-         chunk_rows={chunk_rows}"
-    );
+    let in_flight = resolve_and_log_in_flight_batches("pass 1", options.in_flight_batches);
+    log::debug!("[profile] pass1 chunk_rows={chunk_rows}");
 
     let mut features: Vec<AssignFeature> = Vec::new();
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
@@ -2577,8 +2602,10 @@ fn run_pass1_with_chunk_rows(
                 let chunk_results: Vec<Result<ChunkScan, ConvertError>> = ranges
                     .par_iter()
                     .map(|&(start, len)| {
-                        let sliced = batch.slice(start, len);
-                        let gcol = sliced.column(gcol_idx).clone();
+                        // Slice only the geometry column (not the whole
+                        // `RecordBatch`, which would touch every non-geometry
+                        // column's offsets too, for no benefit here).
+                        let gcol = batch.column(gcol_idx).slice(start, len);
                         let mask_slice = filter_mask.as_deref().map(|m| &m[start..start + len]);
                         scan_chunk(
                             &gfield,
@@ -3413,6 +3440,33 @@ mod tests {
         geoms
     }
 
+    /// Pure-arithmetic mirror of the chunk-splitting loop in
+    /// `run_pass1_with_chunk_rows`'s consumer (`chunk_rows.min(remaining)`
+    /// repeated per batch until it's consumed, one batch per
+    /// `read_batch_size`-row group except a possibly-shorter last one) — the
+    /// total number of `scan_chunk` calls a `(num_rows, read_batch_size,
+    /// chunk_rows)` combination produces.
+    ///
+    /// Used by tests to assert a fixture's parameters actually exercise more
+    /// than one chunk per batch, deterministically. A runtime counter would
+    /// need to be shared (test-only) global state, which is unsound under
+    /// `cargo test`'s default cross-test parallelism — other tests call
+    /// `run_pass1` concurrently in the same process, so a shared counter
+    /// would be racy and occasionally flaky. Pure arithmetic has no such
+    /// hazard.
+    fn total_pass1_chunks(num_rows: usize, read_batch_size: usize, chunk_rows: usize) -> usize {
+        let read_batch_size = read_batch_size.max(1);
+        let chunk_rows = chunk_rows.max(1);
+        let mut total = 0usize;
+        let mut remaining = num_rows;
+        while remaining > 0 {
+            let batch_len = remaining.min(read_batch_size);
+            total += batch_len.div_ceil(chunk_rows);
+            remaining -= batch_len;
+        }
+        total
+    }
+
     /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh
     /// [`convert_preflight`] each time (mirrors how `convert_streaming_strategy`
     /// prepares its inputs).
@@ -3488,13 +3542,22 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_input_with_f64(tin.path(), &opt_geoms, "rank", &values);
 
+        // read_batch_size (16) > chunk_rows (5): every batch splits into
+        // SEVERAL chunks. (#460 review: read_batch_size == chunk_rows made
+        // every batch exactly one chunk on both sides of the comparison
+        // below, comparing the chunked path to itself with zero multi-chunk
+        // coverage of the two most order-sensitive merges — line coalesce
+        // scratch and #384 areas — hence the `total_pass1_chunks` assertion
+        // that pins this down.)
+        const READ_BATCH_SIZE: usize = 16;
+        const CHUNK_ROWS: usize = 5;
         let options = ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 1,
                 max_zoom: 9,
             },
             sort_key: Some("rank".to_string()),
-            read_batch_size: 7,
+            read_batch_size: READ_BATCH_SIZE,
             // #384 tiny-polygon accumulator: exercises the `want_areas` path
             // (per-feature polygon-area collection) through the chunked scan.
             simplify: SimplifyOptions {
@@ -3505,7 +3568,7 @@ mod tests {
         };
 
         let serial = run_pass1_for_test(tin.path(), &options, usize::MAX);
-        let chunked = run_pass1_for_test(tin.path(), &options, 7);
+        let chunked = run_pass1_for_test(tin.path(), &options, CHUNK_ROWS);
 
         assert_pass1_outputs_eq(&serial, &chunked);
         assert!(
@@ -3515,6 +3578,19 @@ mod tests {
         assert!(
             serial.coalesce.is_some(),
             "fixture's lines must produce a coalesce scratch (coalesce_lines defaults on)"
+        );
+
+        // Guard against the comparison above going vacuous: the chunked run
+        // must actually have split every batch into more than one chunk, not
+        // just matched the one-chunk-per-batch serial shape by coincidence.
+        let serial_chunks = total_pass1_chunks(n, READ_BATCH_SIZE, usize::MAX);
+        let chunked_chunks = total_pass1_chunks(n, READ_BATCH_SIZE, CHUNK_ROWS);
+        assert!(
+            chunked_chunks > serial_chunks,
+            "chunk_rows={CHUNK_ROWS} must produce more chunks than \
+             chunk_rows=usize::MAX (one per batch): serial={serial_chunks} \
+             chunked={chunked_chunks} over {n} rows / {READ_BATCH_SIZE}-row \
+             batches"
         );
     }
 
@@ -3561,18 +3637,21 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_input_with_f64(tin.path(), &geoms, "rank", &values);
 
+        const READ_BATCH_SIZE: usize = 5;
+        const CHUNK_ROWS: usize = 3;
         let options = ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 1,
                 max_zoom: 8,
             },
             filter: Some("rank > 5.0".to_string()),
-            read_batch_size: 5,
+            read_batch_size: READ_BATCH_SIZE,
             ..Default::default()
         };
 
+        let n = geoms.len();
         let serial = run_pass1_for_test(tin.path(), &options, usize::MAX);
-        let chunked = run_pass1_for_test(tin.path(), &options, 3);
+        let chunked = run_pass1_for_test(tin.path(), &options, CHUNK_ROWS);
 
         assert_pass1_outputs_eq(&serial, &chunked);
 
@@ -3586,6 +3665,17 @@ mod tests {
             serial.features.len() + serial.skipped_rows < serial.num_rows,
             "fixture must also include attribute-filtered rows (not counted \
              in skipped_rows)"
+        );
+
+        // Guard against the comparison above going vacuous (#460 review).
+        let serial_chunks = total_pass1_chunks(n, READ_BATCH_SIZE, usize::MAX);
+        let chunked_chunks = total_pass1_chunks(n, READ_BATCH_SIZE, CHUNK_ROWS);
+        assert!(
+            chunked_chunks > serial_chunks,
+            "chunk_rows={CHUNK_ROWS} must produce more chunks than \
+             chunk_rows=usize::MAX (one per batch): serial={serial_chunks} \
+             chunked={chunked_chunks} over {n} rows / {READ_BATCH_SIZE}-row \
+             batches"
         );
     }
 }

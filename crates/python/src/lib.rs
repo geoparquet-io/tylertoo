@@ -403,10 +403,13 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         temporary Arrow IPC files), or "auto" (pick per mode + estimated
 ///         size). Output is byte-identical across profiles. Defaults to "auto".
 ///     in_flight_batches (int, optional): Read batches allowed in flight through
-///         the pass-2 pipeline at once (read/compute-overlap knob). Higher
-///         improves core utilization at proportionally more peak memory.
-///         Defaults to 0, which auto-sizes to the machine's available cores
-///         (clamped to 4..=16); pass an explicit positive integer to override.
+///         the streaming pipeline at once (read/compute-overlap knob) — pass
+///         1's scan and pass 2's per-level fan-out both use it. Higher
+///         improves core utilization at proportionally more peak memory (per
+///         pass; passes 1 and 2 never run concurrently, so this does not
+///         double). Defaults to 0, which auto-sizes to the machine's
+///         available cores (clamped to 4..=16); pass an explicit positive
+///         integer to override.
 ///     spill_dir (str or os.PathLike, optional): Directory for the
 ///         remote-input spill file. A remote convert stages every fetched
 ///         chunk on local disk (≈1x the touched input bytes) so later passes

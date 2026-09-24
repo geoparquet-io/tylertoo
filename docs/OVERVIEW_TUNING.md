@@ -1515,10 +1515,12 @@ the wave schedule never changes the output.
 
 **`--in-flight-batches`** is the primary read/compute-overlap knob: it sets how
 many Arrow read batches may be moving through the pipeline at once (the
-bounded-channel depth). RAISE it for more read/compute overlap and better core
+bounded-channel depth) — both passes use it: pass 1's chunked scan and pass 2's
+per-level fan-out. RAISE it for more read/compute overlap and better core
 utilization when a few long-pole geometries otherwise stall the pipeline; each
 extra in-flight batch costs proportionally more peak RAM (`N × read_batch_size`
-rows resident). `--read-batch-size` (above) remains the rows-per-batch knob;
+rows resident, per pass — passes 1 and 2 never run concurrently, so this does
+not double). `--read-batch-size` (above) remains the rows-per-batch knob;
 `--in-flight-batches` is how many such batches coexist.
 
 ⚠️ **musl binaries v0.7.1 and earlier — prefer `--profile bounded` on large
