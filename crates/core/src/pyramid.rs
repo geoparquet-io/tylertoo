@@ -88,9 +88,12 @@ impl Band {
             band_separator(spec).ok_or_else(|| format!("band {spec:?}: {BAND_FORMS}"))?;
         let (range, rest) = spec.split_at(at);
         let rest = &rest[sep.len_utf8()..];
-        let (lo, hi) = range
-            .split_once('-')
-            .ok_or_else(|| format!("band {spec:?}: zoom range must be LO-HI"))?;
+        let (lo, hi) = range.split_once('-').ok_or_else(|| {
+            format!(
+                "band {spec:?}: zoom range must be LO-HI; every band spec must \
+                 start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:{spec}\""
+            )
+        })?;
         let min_zoom: u8 = lo
             .trim()
             .parse()
@@ -165,6 +168,21 @@ fn split_colon_form(rest: &str) -> (&str, Option<&str>) {
     let rest = rest.trim();
     if let Some(scheme) = url_scheme(rest) {
         // Past the `scheme://`, so the scheme's own colon can never split.
+        //
+        // This branch is provably equivalent to the generic fallback below
+        // (rsplit_once(':') on the whole `rest`, minus the drive-letter
+        // carve-out which cannot fire here — a scheme is never one ASCII
+        // letter) for every realizable input: if `authority_and_path`
+        // contains a `:`, it is the last `:` in `rest` too, since nothing
+        // after the scheme prefix can contain one that isn't in it, so both
+        // splits land on the same byte. If it contains none, the fallback's
+        // rsplit_once(':') on `rest` finds the scheme's own colon instead,
+        // splitting off `"//" + authority_and_path` as the candidate
+        // layer — but that always contains the `/` from `"://"`, so
+        // `is_bare_layer_token` rejects it and the fallback also keeps
+        // `rest` whole. Kept as its own branch (rather than folded into the
+        // fallback) because slicing by byte offset here is clearer than
+        // re-deriving the scheme boundary from the split fallback would be.
         let authority_and_path = &rest[scheme.len() + 3..];
         return match authority_and_path.rsplit_once(':') {
             // `is_bare_layer_token` rejects a segment containing `/`, which is
@@ -296,8 +314,16 @@ pub enum BandSource {
 /// A `scheme://` input short-circuits to [`BandSource::Source`] (#482) without
 /// touching the filesystem: a band archive has to be read as a local file, so
 /// a remote input can only be a GeoParquet source, and the open below could
-/// only ever fail for it. [`remote_archive_rejection`] turns a remote input
-/// that is plainly an archive into an error instead.
+/// only ever fail for it.
+///
+/// **This function does not reject a remote `.pmtiles` input** — it has no
+/// error case, only two classifications, and a `scheme://foo.pmtiles` input
+/// classifies as `Source` exactly like any other remote path (it will only
+/// fail later, obscurely, inside the parquet reader). [`validate_bands`]
+/// applies [`remote_archive_rejection`] up front to every band before any
+/// band is tiled; a caller that classifies bands without going through
+/// `validate_bands` first (or `build_pyramid`, which calls it) must apply
+/// `remote_archive_rejection` itself to get that check.
 pub fn classify_band_input(path: &Path) -> BandSource {
     use std::io::Read;
 
@@ -329,6 +355,14 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 
 /// Reject two bands claiming one zoom **for the same layer**: each would write
 /// the same tile ids and the merge would silently keep whichever came last.
+/// Also rejects any band naming a remote `.pmtiles` archive (#482) — checked
+/// for every band up front, before any band is tiled.
+///
+/// The remote-archive check is pure string work (no I/O), so doing it here
+/// for all bands is free and catches a late band's bad input before an
+/// expensive earlier band is tiled — `build_pyramid` used to run this check
+/// per band interleaved with tiling, so a later band's error only surfaced
+/// after every band ahead of it had already converted.
 ///
 /// Bands naming *different* layers may share zooms (#385): that is
 /// tippecanoe's `-L`, several layers in one tile, and the merge concatenates
@@ -336,6 +370,11 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
     if bands.is_empty() {
         return Err("a pyramid needs at least one --band".to_string());
+    }
+    for band in bands {
+        if let Some(msg) = remote_archive_rejection(&band.input) {
+            return Err(msg);
+        }
     }
     let mut sorted: Vec<&Band> = bands.iter().collect();
     sorted.sort_by_key(|b| (b.min_zoom, b.max_zoom));
@@ -711,6 +750,11 @@ pub fn build_pyramid(
     output: &Path,
     opts: &PyramidOptions,
 ) -> Result<PyramidReport, Error> {
+    // Validates every band up front, including (#482) that none names a
+    // remote `.pmtiles` archive — pure string work, so it is cheap to run for
+    // every band before any band is tiled, rather than interleaved with
+    // tiling below where a late band's bad input would only surface after
+    // every earlier band had already converted.
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
@@ -719,12 +763,6 @@ pub fn build_pyramid(
     let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
 
     for band in bands {
-        // #482: a band may name a remote GeoParquet source, but not a remote
-        // archive — the merge reads directories and tile bytes out of a local
-        // file. Say so before spending a conversion on it.
-        if let Some(msg) = remote_archive_rejection(&band.input) {
-            return Err(Error::PMTilesWrite(msg));
-        }
         if classify_band_input(&band.input) == BandSource::Archive {
             log::info!(
                 "[pyramid] z{}-{} layer {:?}: using the pre-tiled archive {}",

@@ -139,7 +139,11 @@ the merge reads its directories and tile bytes by offset, so a remote
 the directory name, since a layer called `*` is not useful to a client. A path
 containing a colon (`s3://…`, `https://…`, `C:\…`) is fine; the layer is only
 split off the **last** colon when what follows it has no `/`, `\` or `:`, so a
-URL's scheme, a port and a `2024:06/` directory all stay part of the input.
+URL's scheme, a port and a `2024:06/` directory all stay part of the input. A
+drive-relative path with no `\` after the drive, e.g. `C:data.parquet`, stays
+whole too: a single ASCII letter before the last colon is treated as a drive
+letter rather than a path, even though `data.parquet` alone would otherwise
+look like a bare layer name.
 The one shape that rule cannot express is an input *ending* in a bare colon
 segment — a Hive directory such as `admin:country_code=BR`. For those, spell
 the band with `=` instead: **`--band LO-HI=INPUT[=LAYER]`**, where the range is
