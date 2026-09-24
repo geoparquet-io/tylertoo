@@ -239,6 +239,61 @@ pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
     TileCoord::new(x, y, z).bounds()
 }
 
+/// The first PMTiles tile id at zoom `z`: `(4^z - 1) / 3`, the count of tiles
+/// at every shallower zoom (`sum(4^i for i in 0..z)`).
+///
+/// This is the same cumulative base [`crate::pmtiles_writer::tile_id`] adds
+/// its within-zoom Hilbert index to (that function's `base_id` is this value
+/// minus 1, folded into a `+ hilbert_idx + 1` for `z >= 1`; both forms agree
+/// for every `z`, this one included at `z = 0`).
+#[inline]
+fn hilbert_zoom_base(z: u8) -> u64 {
+    ((1u64 << (2 * u32::from(z))) - 1) / 3
+}
+
+/// The inclusive range of PMTiles tile ids, at `target_z`, addressed by
+/// `node`'s subtree — every descendant leaf of `node` down to `target_z`.
+///
+/// # The nesting property
+///
+/// A PMTiles tile id is `base(z) + hilbert_idx(z, x, y)`, where
+/// `base(z) = (4^z - 1) / 3` is the count of tiles at shallower zooms and
+/// `hilbert_idx` is the tile's position on the zoom's Hilbert curve. Because
+/// the curve is built by recursive quadrant subdivision (each of a node's 4
+/// children occupies a contiguous quarter of the parent's span, in the same
+/// rotation the parent used), a node at zoom `zn` with Hilbert index `h` owns
+/// exactly the descendant ids
+///
+/// ```text
+/// base(z) + h * 4^Δ  ..=  base(z) + (h + 1) * 4^Δ - 1,   Δ = z - zn
+/// ```
+///
+/// at any deeper zoom `z` — a single contiguous interval, not merely a
+/// superset. That is what lets the export cascade prune a subtree against a
+/// partition's `[key_lo, key_hi]` window with an *exact* interval
+/// intersection instead of the old conservative row-major bounding check.
+///
+/// # Panics
+///
+/// Debug-asserts `target_z >= node.z` (a node has no id at a shallower zoom
+/// than itself).
+pub fn node_id_range(node: TileCoord, target_z: u8) -> std::ops::RangeInclusive<u64> {
+    debug_assert!(
+        target_z >= node.z,
+        "node_id_range: target_z ({target_z}) must be >= node.z ({})",
+        node.z
+    );
+    let delta = target_z.saturating_sub(node.z);
+    let h = crate::pmtiles_writer::xy_to_hilbert(node.z, node.x, node.y);
+    let base_target = hilbert_zoom_base(target_z);
+    // 4^delta descendant leaves per node at this depth; exact in u64 for every
+    // delta this crate ever sees (target_z <= MAX_TILE_ID_ZOOM = 31).
+    let span = 1u64 << (2 * u32::from(delta));
+    let start = base_target + h * span;
+    let end = start + span - 1;
+    start..=end
+}
+
 /// Get all tiles that intersect a geographic bounding box at a given zoom level
 ///
 /// Handles antimeridian crossing: when `lng_min > lng_max`, the bbox crosses
@@ -740,6 +795,63 @@ mod tests {
                 zoom,
                 max_valid
             );
+        }
+    }
+
+    /// [`node_id_range`] must match a brute-force enumeration of every
+    /// descendant tile id, exhaustively for all nodes at `z <= 4` and every
+    /// deeper target zoom up to `z + 2`: the returned interval's endpoints
+    /// equal the min/max of the descendant set, AND every id in between is
+    /// actually a descendant (no gaps) -- the nesting property this PR's
+    /// tile-id-ordered export leans on.
+    #[test]
+    fn node_id_range_matches_bruteforce_descendants() {
+        for z in 0u8..=4 {
+            let n = 1u32 << z;
+            for x in 0..n {
+                for y in 0..n {
+                    let node = TileCoord::new(x, y, z);
+                    for delta in 0u8..=2 {
+                        let target_z = z + delta;
+                        let shift = u32::from(delta);
+                        let x0 = x << shift;
+                        let y0 = y << shift;
+                        let span = 1u32 << shift;
+                        let mut ids: Vec<u64> = Vec::with_capacity((span * span) as usize);
+                        for dx in 0..span {
+                            for dy in 0..span {
+                                ids.push(crate::pmtiles_writer::tile_id(
+                                    target_z,
+                                    x0 + dx,
+                                    y0 + dy,
+                                ));
+                            }
+                        }
+                        ids.sort_unstable();
+
+                        let range = node_id_range(node, target_z);
+                        assert_eq!(
+                            *range.start(),
+                            ids[0],
+                            "node ({x},{y},{z}) -> z{target_z}: range start diverges"
+                        );
+                        assert_eq!(
+                            *range.end(),
+                            *ids.last().unwrap(),
+                            "node ({x},{y},{z}) -> z{target_z}: range end diverges"
+                        );
+                        // No gaps: the brute-force set, sorted, must be exactly
+                        // the contiguous run [start, end] -- not just share its
+                        // endpoints.
+                        let expected: Vec<u64> = range.clone().collect();
+                        assert_eq!(
+                            ids, expected,
+                            "node ({x},{y},{z}) -> z{target_z}: descendant ids are not \
+                             the contiguous interval node_id_range claims"
+                        );
+                    }
+                }
+            }
         }
     }
 

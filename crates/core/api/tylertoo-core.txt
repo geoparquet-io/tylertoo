@@ -2485,6 +2485,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &st
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mut self, &str)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
@@ -2714,6 +2715,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::tile::TileCoord
 pub const tylertoo_core::tile::MAX_ZOOM: u8
 pub fn tylertoo_core::tile::lng_lat_to_tile(f64, f64, u8) -> tylertoo_core::tile::TileCoord
 pub fn tylertoo_core::tile::max_tile_index(u8) -> u32
+pub fn tylertoo_core::tile::node_id_range(tylertoo_core::tile::TileCoord, u8) -> core::ops::range::RangeInclusive<u64>
 pub fn tylertoo_core::tile::tile_bounds(u32, u32, u8) -> tylertoo_core::tile::TileBounds
 pub fn tylertoo_core::tile::tiles_for_bbox(&tylertoo_core::tile::TileBounds, u8) -> impl core::iter::traits::iterator::Iterator<Item = tylertoo_core::tile::TileCoord>
 pub fn tylertoo_core::tile::tiles_per_axis(u8) -> u64
@@ -3045,6 +3047,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &st
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mut self, &str)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)

@@ -386,7 +386,7 @@ fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
 ///
 /// Implementation follows the standard Hilbert curve algorithm:
 /// https://en.wikipedia.org/wiki/Hilbert_curve
-fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
+pub(crate) fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
     // #371: `1u32 << z` overflows at z32 — in release it masks the shift to
     // `z & 31`, so z32 yields n = 1 and every tile id in the archive is wrong
     // with no diagnostic. u64 covers the whole z<=31 PMTiles address space.
@@ -1673,6 +1673,16 @@ pub struct StreamingPmtilesWriter {
     total_features: u64,
     /// Whether finalize has been called (prevents double cleanup)
     finalized: bool,
+    /// Debug-only ordering contract (#504): when set, every `add_tile*` call
+    /// `debug_assert!`s its tile id is strictly greater than the previous
+    /// one. A caller that has arranged to add tiles in ascending PMTiles
+    /// tile-id (Hilbert) order — the export path, after this PR — opts in so
+    /// an ordering regression fails fast in a debug build instead of quietly
+    /// shipping a `clustered: false` archive. Never checked in release (the
+    /// `clustered` header byte is derived honestly regardless, via
+    /// [`Self::entries_are_clustered`], so a violation here is a perf/quality
+    /// regression, not a correctness bug worth a release-mode cost).
+    expect_clustered: bool,
 }
 
 impl StreamingPmtilesWriter {
@@ -1717,7 +1727,33 @@ impl StreamingPmtilesWriter {
             stats: StreamingWriteStats::default(),
             total_features: 0,
             finalized: false,
+            expect_clustered: false,
         })
+    }
+
+    /// Opt into the debug-only ascending-tile-id assertion (#504): see the
+    /// `expect_clustered` field doc for what it checks and why it is
+    /// debug-only.
+    pub fn set_expect_clustered(&mut self, expect: bool) {
+        self.expect_clustered = expect;
+    }
+
+    /// `debug_assert!` that `id` continues the ascending run this writer was
+    /// told to expect, given the most recently added entry (if any).
+    #[inline]
+    fn check_expect_clustered(&self, id: u64) {
+        if !self.expect_clustered {
+            return;
+        }
+        if let Some(last) = self.entries.last() {
+            debug_assert!(
+                id > last.tile_id,
+                "expect_clustered: tile id {id} did not continue the ascending run \
+                 (last added was {}); the caller opted into tile-id-ordered adds \
+                 but did not deliver them",
+                last.tile_id
+            );
+        }
     }
 
     /// Get the path to the temp file (for testing).
@@ -1807,12 +1843,14 @@ impl StreamingPmtilesWriter {
         data: &[u8],
         feature_count: usize,
     ) -> std::io::Result<()> {
+        let id = checked_tile_id(z, x, y)?;
+        self.check_expect_clustered(id);
+
         let temp_file = self
             .temp_file
             .as_mut()
             .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
 
-        let id = checked_tile_id(z, x, y)?;
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
 
@@ -1881,12 +1919,14 @@ impl StreamingPmtilesWriter {
         raw_len: usize,
         feature_count: usize,
     ) -> std::io::Result<()> {
+        let id = checked_tile_id(z, x, y)?;
+        self.check_expect_clustered(id);
+
         let temp_file = self
             .temp_file
             .as_mut()
             .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
 
-        let id = checked_tile_id(z, x, y)?;
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
 
