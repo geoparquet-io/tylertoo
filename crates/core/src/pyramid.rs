@@ -26,13 +26,14 @@ use serde_json::{json, Value};
 
 use tempfile::NamedTempFile;
 
-use crate::compression::{self, Compression};
+use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::url_scheme;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_writer::{
-    decode_directory, tile_id_to_zxy, DirEntry, Header, StreamingPmtilesWriter, TileType,
+    decode_directory, max_expanded_entries, tile_id_to_zxy, DirEntry, Header,
+    StreamingPmtilesWriter, TileType, MAX_LEAF_DIRECTORIES,
 };
 use crate::tile::TileBounds;
 use crate::Error;
@@ -616,19 +617,40 @@ impl BandArchive {
             )));
         }
 
+        let past_end =
+            |what: &str| Error::PMTilesWrite(format!("{what} past end of {}", path.display()));
         let slice = |off: u64, len: u64, what: &str| -> Result<&[u8], Error> {
-            let start = off as usize;
-            let end = start
-                .checked_add(len as usize)
+            // Both come from the archive; a `as usize` truncation on a 32-bit
+            // target would turn a wild offset into a plausible in-range one
+            // (matching decode.rs's `section`).
+            let start = usize::try_from(off).map_err(|_| past_end(what))?;
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|l| start.checked_add(l))
                 .filter(|&e| e <= bytes.len())
-                .ok_or_else(|| {
-                    Error::PMTilesWrite(format!("{what} past end of {}", path.display()))
-                })?;
+                .ok_or_else(|| past_end(what))?;
             Ok(&bytes[start..end])
         };
+        // An entry's range must lie inside the section it is relative to, not
+        // merely inside the file: a leaf pointer aimed at the tile data would
+        // otherwise be parsed as a directory (#417).
+        let within = |off: u64, len: u64, section_len: u64, what: &str| -> Result<(), Error> {
+            match off.checked_add(len) {
+                Some(end) if end <= section_len => Ok(()),
+                _ => Err(Error::PMTilesWrite(format!(
+                    "{}: {what} at {off} ({len} bytes) extends past its \
+                     {section_len}-byte section",
+                    path.display()
+                ))),
+            }
+        };
         let dir = |raw: &[u8], what: &str| -> Result<Vec<DirEntry>, Error> {
-            let plain = compression::decompress(raw, header.internal_compression)
-                .map_err(|e| Error::PMTilesWrite(format!("{what}: {e}")))?;
+            let plain = compression::decompress_capped(
+                raw,
+                header.internal_compression,
+                MAX_INTERNAL_BYTES,
+            )
+            .map_err(|e| Error::PMTilesWrite(format!("{what}: {e}")))?;
             decode_directory(&plain)
                 .ok_or_else(|| Error::PMTilesWrite(format!("undecodable {what}")))
         };
@@ -637,18 +659,61 @@ impl BandArchive {
             slice(header.root_dir_offset, header.root_dir_length, "root dir")?,
             "root dir",
         )?;
+        // Two budgets, because one huge leaf and a million tiny ones are
+        // different attacks (#417). Entries accumulated across the walk are
+        // bounded by what the archive could legitimately address — the same
+        // denomination `for_each_tile_range` spends on run lengths — and the
+        // *number* of leaves is bounded separately, since an empty leaf costs
+        // no entries while still costing a `MAX_INTERNAL_BYTES`
+        // decompression apiece.
+        let entry_limit = max_expanded_entries(&header);
+        let mut entry_budget = entry_limit;
+        let mut leaves_visited = 0usize;
+        let too_many_entries = || {
+            Error::PMTilesWrite(format!(
+                "{}: directory entries exceed this archive's limit of {entry_limit} entries",
+                path.display()
+            ))
+        };
+
         let mut entries = Vec::new();
         for e in root {
             if e.run_length != 0 {
+                entry_budget = entry_budget.checked_sub(1).ok_or_else(too_many_entries)?;
                 entries.push(e);
                 continue;
             }
-            let leaf = slice(
-                header.leaf_dirs_offset + e.offset,
+            leaves_visited += 1;
+            if leaves_visited > MAX_LEAF_DIRECTORIES {
+                return Err(Error::PMTilesWrite(format!(
+                    "{}: root directory points at more than {MAX_LEAF_DIRECTORIES} \
+                     leaf directories",
+                    path.display()
+                )));
+            }
+            within(
+                e.offset,
                 u64::from(e.length),
+                header.leaf_dirs_length,
                 "leaf dir",
             )?;
-            for inner in dir(leaf, "leaf dir")? {
+            // Base and entry offset both come from the archive, so the sum
+            // is checked rather than wrapped into a plausible-looking one.
+            let leaf_at = header
+                .leaf_dirs_offset
+                .checked_add(e.offset)
+                .ok_or_else(|| {
+                    Error::PMTilesWrite(format!("leaf dir offset overflow in {}", path.display()))
+                })?;
+            let leaf = slice(leaf_at, u64::from(e.length), "leaf dir")?;
+            let decoded = dir(leaf, "leaf dir")?;
+            // Spent before the entries are kept, not after: a root full of
+            // pointers at one 16 MiB leaf body is a ~50 KB file that would
+            // otherwise accumulate entries until the process died.
+            entry_budget = entry_budget
+                .checked_sub(decoded.len() as u64)
+                .ok_or_else(too_many_entries)?;
+            for inner in decoded {
                 // run_length 0 inside a leaf is a second-level leaf pointer.
                 // The spec allows arbitrarily deep directories; this reader
                 // handles one level, and falling through would emit directory
@@ -705,7 +770,21 @@ impl BandArchive {
         // Offsets, lengths and ids are archive-supplied: every add is checked
         // so a corrupt directory reports rather than wraps.
         let past_end = || Error::PMTilesWrite("tile data past end of archive".to_string());
+        // Run lengths are archive-controlled u32s, and every expanded id
+        // becomes a map entry in the merge: one 0xFFFFFFFF run is tens of
+        // gigabytes. Spend a budget of what this archive could legitimately
+        // address, so many plausible runs cannot add up to the same attack
+        // (#417).
+        let limit = max_expanded_entries(&self.header);
+        let mut budget = limit;
         for e in &self.entries {
+            // Inside the declared tile-data section, not merely inside the
+            // file: an entry aimed at the directories would otherwise be
+            // handed to the MVT decoder as a tile (#417).
+            match e.offset.checked_add(u64::from(e.length)) {
+                Some(end) if end <= self.header.tile_data_length => {}
+                _ => return Err(past_end()),
+            }
             let start = self
                 .header
                 .tile_data_offset
@@ -716,7 +795,15 @@ impl BandArchive {
                 .checked_add(e.length as usize)
                 .filter(|&x| x <= self.bytes.len())
                 .ok_or_else(past_end)?;
-            for i in 0..u64::from(e.run_length.max(1)) {
+            let run = u64::from(e.run_length.max(1));
+            budget = budget.checked_sub(run).ok_or_else(|| {
+                Error::PMTilesWrite(format!(
+                    "directory entry for tile id {} claims a run of {run} tiles, past this \
+                     archive's run-length expansion limit of {limit} tiles",
+                    e.tile_id
+                ))
+            })?;
+            for i in 0..run {
                 let id = e
                     .tile_id
                     .checked_add(i)
@@ -761,7 +848,7 @@ fn parse_layers(
     path: &Path,
     label: &str,
 ) -> Result<(Value, Vec<String>), Error> {
-    let plain = compression::decompress(raw, internal)
+    let plain = compression::decompress_capped(raw, internal, MAX_INTERNAL_BYTES)
         .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))?;
     // Unparseable metadata is not fatal: the band's tiles are still usable,
     // they just end up declaring no field types.
@@ -1141,9 +1228,10 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
             }
             buf.clear();
             for (bi, range) in refs {
-                let plain = compression::decompress(
+                let plain = compression::decompress_capped(
                     archives[*bi].tile(range.clone()),
                     archives[*bi].header.tile_compression,
+                    MAX_TILE_BYTES,
                 )
                 .map_err(|e| {
                     Error::PMTilesWrite(format!(
@@ -1534,7 +1622,8 @@ mod tests {
         let mut tiles = 0;
         archive
             .for_each_tile(|_, _, _, data| {
-                let plain = compression::decompress(data, Compression::Gzip).unwrap();
+                let plain = compression::decompress_capped(data, Compression::Gzip, MAX_TILE_BYTES)
+                    .unwrap();
                 let names: Vec<String> = crate::vector_tile::Tile::decode(plain.as_slice())
                     .unwrap()
                     .layers
@@ -1694,10 +1783,11 @@ mod tests {
     fn archive_zooms(path: &Path) -> Vec<u8> {
         let bytes = std::fs::read(path).unwrap();
         let header = Header::from_bytes(&bytes[..127]).unwrap();
-        let root = compression::decompress(
+        let root = compression::decompress_capped(
             &bytes[header.root_dir_offset as usize
                 ..(header.root_dir_offset + header.root_dir_length) as usize],
             Compression::Gzip,
+            MAX_INTERNAL_BYTES,
         )
         .unwrap();
         let mut zooms: Vec<u8> = decode_directory(&root)
@@ -1793,7 +1883,10 @@ mod tests {
         let mut found = None;
         a.for_each_tile(|tz, tx, ty, data| {
             if (tz, tx, ty) == (z, x, y) {
-                found = Some(compression::decompress(data, Compression::Gzip).unwrap());
+                found = Some(
+                    compression::decompress_capped(data, Compression::Gzip, MAX_TILE_BYTES)
+                        .unwrap(),
+                );
             }
             Ok(())
         })
@@ -1922,9 +2015,10 @@ mod tests {
         let bytes = std::fs::read(&out).unwrap();
         let h = Header::from_bytes(&bytes).unwrap();
         assert!(h.clustered, "the writer stamps every archive clustered");
-        let root = compression::decompress(
+        let root = compression::decompress_capped(
             &bytes[h.root_dir_offset as usize..(h.root_dir_offset + h.root_dir_length) as usize],
             h.internal_compression,
+            MAX_INTERNAL_BYTES,
         )
         .unwrap();
         let entries: Vec<(u64, u64, u32)> = decode_directory(&root)
@@ -2128,7 +2222,8 @@ mod tests {
         let h = Header::from_bytes(&bytes).unwrap();
         let raw = &bytes[h.json_metadata_offset as usize
             ..(h.json_metadata_offset + h.json_metadata_length) as usize];
-        let plain = compression::decompress(raw, h.internal_compression).unwrap();
+        let plain = compression::decompress_capped(raw, h.internal_compression, MAX_INTERNAL_BYTES)
+            .unwrap();
         String::from_utf8(plain).unwrap()
     }
 
@@ -2331,6 +2426,186 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("past end of"), "{err}");
+    }
+
+    // ---- Hostile band archives (#417) --------------------------------------
+    //
+    // `merge_bands` takes archives straight from a caller — the third-party
+    // input path #417 names — so the resource ceilings have to hold on the
+    // pyramid reader, not just on `decode`.
+
+    /// Append hand-built root and leaf directories to a valid band archive
+    /// and repoint the header at them. Every other section stays where it
+    /// was, so only the directory content is hostile.
+    fn rewrite_directories(path: &Path, root: &[DirEntry], leaf: &[DirEntry]) {
+        use crate::pmtiles_writer::encode_directory;
+
+        let mut bytes = std::fs::read(path).unwrap();
+        let mut header = Header::from_bytes(&bytes).unwrap();
+
+        let leaf_enc =
+            compression::compress(&encode_directory(leaf), header.internal_compression).unwrap();
+        header.leaf_dirs_offset = bytes.len() as u64;
+        header.leaf_dirs_length = leaf_enc.len() as u64;
+        bytes.extend_from_slice(&leaf_enc);
+
+        let root_enc =
+            compression::compress(&encode_directory(root), header.internal_compression).unwrap();
+        header.root_dir_offset = bytes.len() as u64;
+        header.root_dir_length = root_enc.len() as u64;
+        bytes.extend_from_slice(&root_enc);
+
+        bytes[..127].copy_from_slice(&header.to_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// A z3 band archive whose sections are otherwise sound.
+    fn hostile_band(dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join("band.pmtiles");
+        write_band(
+            &path,
+            "agg",
+            &[(3, 1, 1)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+        path
+    }
+
+    /// S1-1, the big-leaf half: a root full of pointers at *one* leaf body.
+    /// Each pointer costs ~5 bytes on disk and yields a whole leaf's worth of
+    /// entries, so a ~50 KB file used to accumulate entries until the process
+    /// died. The entry budget is spent before the entries are kept.
+    #[test]
+    fn hostile_leaf_flattening_is_capped_in_the_pyramid_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+
+        // z3's whole address space is 85 tile ids, so 4 x 60 entries is
+        // already past anything this archive could address.
+        let leaf: Vec<DirEntry> = (0..60)
+            .map(|i| DirEntry {
+                tile_id: i + 1,
+                offset: 0,
+                length: 4,
+                run_length: 1,
+            })
+            .collect();
+        let leaf_len = compression::compress(
+            &crate::pmtiles_writer::encode_directory(&leaf),
+            Compression::Gzip,
+        )
+        .unwrap()
+        .len() as u32;
+        let root: Vec<DirEntry> = (0..4)
+            .map(|_| DirEntry {
+                tile_id: 0,
+                offset: 0,
+                length: leaf_len,
+                run_length: 0,
+            })
+            .collect();
+        rewrite_directories(&path, &root, &leaf);
+
+        let err = match BandArchive::open(&path, "") {
+            Ok(_) => panic!("a hostile directory must not open cleanly"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("directory entries") && err.contains("limit"),
+            "expected an entry-budget error, got: {err}"
+        );
+    }
+
+    /// S1-1, the many-leaves half: an *empty* leaf costs nothing against the
+    /// entry budget but still costs a bounded decompression apiece, so the
+    /// number of leaves visited is capped separately.
+    #[test]
+    fn hostile_leaf_count_is_capped_in_the_pyramid_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+
+        let leaf: Vec<DirEntry> = Vec::new();
+        let leaf_len = compression::compress(
+            &crate::pmtiles_writer::encode_directory(&leaf),
+            Compression::Gzip,
+        )
+        .unwrap()
+        .len() as u32;
+        let root: Vec<DirEntry> = (0..=MAX_LEAF_DIRECTORIES)
+            .map(|_| DirEntry {
+                tile_id: 0,
+                offset: 0,
+                length: leaf_len,
+                run_length: 0,
+            })
+            .collect();
+        rewrite_directories(&path, &root, &leaf);
+
+        let err = match BandArchive::open(&path, "") {
+            Ok(_) => panic!("a hostile directory must not open cleanly"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("leaf directories") && err.contains(&MAX_LEAF_DIRECTORIES.to_string()),
+            "expected a leaf-count error, got: {err}"
+        );
+    }
+
+    /// An oversized run length through the pyramid reader: every expanded id
+    /// becomes a map entry in the merge, so one 0xFFFFFFFF run is tens of
+    /// gigabytes.
+    #[test]
+    fn hostile_run_length_is_capped_in_the_pyramid_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+        let root = [DirEntry {
+            tile_id: 0,
+            offset: 0,
+            length: 4,
+            run_length: u32::MAX,
+        }];
+        rewrite_directories(&path, &root, &[]);
+
+        // Opening is fine — run lengths are left intact until expansion —
+        // and the merge is where the budget is spent.
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[Band::parse(&format!("3-3:{}:agg", path.display())).unwrap()],
+            &out,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("run-length expansion"),
+            "expected a run-length expansion error, got: {err}"
+        );
+    }
+
+    /// A tile entry pointing outside the declared tile-data section would be
+    /// handed to the MVT decoder as a tile; the file-bounds check alone would
+    /// wave it through.
+    #[test]
+    fn tile_entry_outside_the_tile_data_section_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+        let header = Header::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        let root = [DirEntry {
+            tile_id: 0,
+            offset: header.tile_data_length, // one past the section's end
+            length: 4,
+            run_length: 1,
+        }];
+        rewrite_directories(&path, &root, &[]);
+
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[Band::parse(&format!("3-3:{}:agg", path.display())).unwrap()],
+            &out,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("past end of"), "{err}");
     }
 
     /// #404: the single-pass path copied each band's tiles in *argument*

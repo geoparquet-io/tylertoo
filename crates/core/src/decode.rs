@@ -51,8 +51,10 @@
 //!   emit GeoParquet through the existing GeoArrow writer stack, which is
 //!   the point of the feature.
 //! - Degenerate MVT content (zero-area rings, one-point linestrings,
-//!   interior rings before any exterior ring) is dropped rather than
-//!   emitted; the MVT spec leaves decoder behavior for these undefined.
+//!   interior rings before any exterior ring, and rings whose coordinates
+//!   are so large their winding cannot be determined exactly) is dropped
+//!   rather than emitted; the MVT spec leaves decoder behavior for these
+//!   undefined.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -76,9 +78,11 @@ use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::compression::decompress;
+use crate::compression::{decompress_capped, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::mvt::{command_decode, zigzag_decode};
-use crate::pmtiles_writer::{decode_directory, tile_id_to_zxy, Header, TileType};
+use crate::pmtiles_writer::{
+    decode_directory, max_expanded_entries, tile_id_to_zxy, Header, TileType, MAX_LEAF_DIRECTORIES,
+};
 use crate::vector_tile::tile::GeomType;
 use crate::vector_tile::Tile;
 
@@ -341,14 +345,13 @@ fn collect_tile_refs(
     let decode_dir =
         |offset: u64, length: u64, what: &'static str| -> Result<Vec<_>, DecodeError> {
             let raw = section(offset, length, what)?;
-            let plain = decompress(raw, header.internal_compression).map_err(|source| {
-                DecodeError::Decompress {
+            let plain = decompress_capped(raw, header.internal_compression, MAX_INTERNAL_BYTES)
+                .map_err(|source| DecodeError::Decompress {
                     what,
                     offset,
                     length,
                     source,
-                }
-            })?;
+                })?;
             decode_directory(&plain).ok_or_else(|| {
                 DecodeError::InvalidArchive(format!(
                     "undecodable {what} at byte offset {offset} ({length} bytes)"
@@ -369,9 +372,48 @@ fn collect_tile_refs(
             .ok_or_else(|| DecodeError::InvalidArchive(format!("{what} offset overflow")))
     };
 
+    // An entry's `(offset, length)` must lie inside the section it is
+    // relative to, not merely inside the file: a leaf pointer aimed at the
+    // tile data would otherwise be parsed as a directory, and a tile entry
+    // aimed at the directories would be handed to the MVT decoder. Cheap
+    // defense in depth on top of the file-bounds check in `section` (#417).
+    let within =
+        |offset: u64, length: u64, section_len: u64, what: &str| -> Result<(), DecodeError> {
+            match offset.checked_add(length) {
+                Some(end) if end <= section_len => Ok(()),
+                _ => Err(DecodeError::InvalidArchive(format!(
+                    "{what} at {offset} ({length} bytes) extends past its \
+                     {section_len}-byte section"
+                ))),
+            }
+        };
+
+    // Two budgets, because one huge leaf and a million tiny ones are
+    // different attacks (#417). Accumulated entries are bounded by what the
+    // archive could legitimately address — the same denomination the
+    // run-length budget below spends — and the *number* of leaves visited is
+    // bounded separately, since an empty leaf costs no entries while still
+    // costing a `MAX_INTERNAL_BYTES` decompression apiece.
+    let entry_limit = max_expanded_entries(header);
+    let mut entry_budget = entry_limit;
+    let mut leaves_visited = 0usize;
+
     let mut entries = Vec::new();
     for entry in root {
         if entry.run_length == 0 {
+            leaves_visited += 1;
+            if leaves_visited > MAX_LEAF_DIRECTORIES {
+                return Err(DecodeError::InvalidArchive(format!(
+                    "archive's root directory points at more than {MAX_LEAF_DIRECTORIES} \
+                     leaf directories"
+                )));
+            }
+            within(
+                entry.offset,
+                u64::from(entry.length),
+                header.leaf_dirs_length,
+                "leaf directory",
+            )?;
             // Leaf directory: offset is relative to the leaf-dirs section.
             let leaf = decode_dir(
                 absolute(header.leaf_dirs_offset, entry.offset, "leaf directory")?,
@@ -386,16 +428,56 @@ fn collect_tile_refs(
                     "multi-level leaf directories are not supported".to_string(),
                 ));
             }
+            // Spent before the extend, not after: a root full of pointers at
+            // one 16 MiB leaf body is a ~50 KB file that would otherwise
+            // accumulate entries until the process died.
+            entry_budget = entry_budget.checked_sub(leaf.len() as u64).ok_or_else(|| {
+                DecodeError::InvalidArchive(format!(
+                    "directory entries across this archive's leaf directories exceed its \
+                     limit of {entry_limit} entries"
+                ))
+            })?;
             entries.extend(leaf);
         } else {
+            entry_budget = entry_budget.checked_sub(1).ok_or_else(|| {
+                DecodeError::InvalidArchive(format!(
+                    "directory entries across this archive's directories exceed its \
+                     limit of {entry_limit} entries"
+                ))
+            })?;
             entries.push(entry);
         }
     }
 
+    // Run lengths are archive-controlled u32s: one entry claiming 0xFFFFFFFF
+    // is 137 GB of TileRefs. The budget is what the archive could legitimately
+    // address (see `max_expanded_entries`), spent across every entry so a
+    // thousand plausible-looking runs cannot add up to the same attack.
+    let mut budget = entry_limit;
     let mut tiles = Vec::new();
     for entry in &entries {
-        for i in 0..u64::from(entry.run_length.max(1)) {
-            let (z, x, y) = tile_id_to_zxy(entry.tile_id + i)?;
+        within(
+            entry.offset,
+            u64::from(entry.length),
+            header.tile_data_length,
+            "tile data",
+        )?;
+        let run = u64::from(entry.run_length.max(1));
+        budget = budget.checked_sub(run).ok_or_else(|| {
+            DecodeError::InvalidArchive(format!(
+                "directory entry for tile id {} claims a run of {run} tiles, past this \
+                 archive's run-length expansion limit of {entry_limit} tiles",
+                entry.tile_id,
+            ))
+        })?;
+        for i in 0..run {
+            let tile_id = entry.tile_id.checked_add(i).ok_or_else(|| {
+                DecodeError::InvalidArchive(format!(
+                    "run of {run} tiles from tile id {} overflows the tile-id space",
+                    entry.tile_id
+                ))
+            })?;
+            let (z, x, y) = tile_id_to_zxy(tile_id)?;
             if options.min_zoom.is_some_and(|mz| z < mz)
                 || options.max_zoom.is_some_and(|mz| z > mz)
             {
@@ -438,13 +520,15 @@ fn decode_tile_features(
 ) -> Result<Vec<(String, DecodedFeature)>, DecodeError> {
     let raw = &bytes[tile.start..tile.start + tile.len];
     let plain =
-        decompress(raw, header.tile_compression).map_err(|source| DecodeError::TileDecompress {
-            z: tile.z,
-            x: tile.x,
-            y: tile.y,
-            offset: tile.start as u64,
-            length: tile.len as u64,
-            source,
+        decompress_capped(raw, header.tile_compression, MAX_TILE_BYTES).map_err(|source| {
+            DecodeError::TileDecompress {
+                z: tile.z,
+                x: tile.x,
+                y: tile.y,
+                offset: tile.start as u64,
+                length: tile.len as u64,
+                source,
+            }
         })?;
     let decoded = Tile::decode(plain.as_slice()).map_err(|source| DecodeError::Mvt {
         z: tile.z,
@@ -536,15 +620,28 @@ impl Part {
     /// Twice the signed area by the surveyor's formula on raw tile coords.
     /// Per the MVT spec, positive ⇒ exterior ring, negative ⇒ interior ring
     /// (Y axis points down in tile space).
-    fn area2(&self) -> i64 {
+    ///
+    /// Computed in `i128`, not `i64`: tile coordinates are accumulated
+    /// zigzag deltas, so a hostile tile can walk them past 2^32 and make the
+    /// cross products overflow `i64` — which panics in debug and, in
+    /// release, *flips the sign* and with it the exterior/interior
+    /// classification (the decode-side twin of #406). `i128` is branch-free
+    /// for every product (both factors fit `i64`, so the product fits), but
+    /// it is not unconditionally enough: the running sum of a ring with
+    /// millions of vertices could still overflow, so the additions are
+    /// checked. `None` means the ring is so large its winding cannot be
+    /// determined exactly, and the caller drops it like a zero-area ring.
+    fn area2(&self) -> Option<i128> {
         let n = self.pts.len();
-        let mut sum = 0i64;
+        let mut sum: i128 = 0;
         for i in 0..n {
             let (x0, y0) = self.pts[i];
             let (x1, y1) = self.pts[(i + 1) % n];
-            sum += x0 * y1 - x1 * y0;
+            let cross =
+                (i128::from(x0) * i128::from(y1)).checked_sub(i128::from(x1) * i128::from(y0))?;
+            sum = sum.checked_add(cross)?;
         }
-        sum
+        Some(sum)
     }
 }
 
@@ -656,7 +753,11 @@ fn assemble_geometry(
                 if !part.closed || part.pts.len() < 3 {
                     continue;
                 }
-                let area2 = part.area2();
+                // `None` is an unclassifiable ring (see `area2`), dropped
+                // exactly like the zero-area case below.
+                let Some(area2) = part.area2() else {
+                    continue;
+                };
                 if area2 == 0 {
                     continue;
                 }
@@ -1263,6 +1364,40 @@ mod tests {
     }
 
     #[test]
+    fn ring_area_survives_saturated_coordinate_deltas() {
+        // A hostile tile can walk the cursor to ~2^32 with two maximal
+        // zigzag deltas per axis. The doubled area of the resulting ring is
+        // ~1.8e19, past i64::MAX: computed in i64 it panics in debug and
+        // wraps *negative* in release, turning an exterior ring into an
+        // interior one (the decode-side twin of #406).
+        let big = i32::MAX;
+        let geom = [
+            command_encode(1, 1),
+            zigzag_encode(0),
+            zigzag_encode(0),
+            command_encode(2, 4),
+            zigzag_encode(big),
+            zigzag_encode(0),
+            zigzag_encode(big),
+            zigzag_encode(0),
+            zigzag_encode(0),
+            zigzag_encode(big),
+            zigzag_encode(0),
+            zigzag_encode(big),
+            command_encode(7, 1),
+        ];
+        let parts = parse_command_stream(&geom).unwrap();
+        assert_eq!(parts[0].pts.len(), 5, "ring must have been parsed whole");
+        assert!(
+            matches!(
+                assemble_geometry(GeomType::Polygon, &parts, |x, y| (x as f64, y as f64)),
+                Some(Geometry::Polygon(_))
+            ),
+            "a positively wound ring must stay an exterior ring"
+        );
+    }
+
+    #[test]
     fn assemble_leading_interior_ring_is_dropped() {
         // A CCW-in-tile-space (negative-area) ring with no preceding
         // exterior: dropped, not promoted.
@@ -1281,7 +1416,10 @@ mod tests {
             command_encode(7, 1),
         ];
         let parts = parse_command_stream(&geom).unwrap();
-        assert!(parts[0].area2() < 0, "test ring must be interior-wound");
+        assert!(
+            parts[0].area2().unwrap() < 0,
+            "test ring must be interior-wound"
+        );
         assert!(
             assemble_geometry(GeomType::Polygon, &parts, |x, y| (x as f64, y as f64)).is_none()
         );

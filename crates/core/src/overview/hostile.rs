@@ -810,9 +810,12 @@ fn archive_layer_fields(path: &Path) -> Vec<String> {
     // PMTiles v3 header: the JSON metadata offset/length live at bytes 24..40.
     let off = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
     let len = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
-    let json =
-        crate::compression::decompress(&buf[off..off + len], crate::compression::Compression::Gzip)
-            .expect("archive metadata is gzip");
+    let json = crate::compression::decompress_capped(
+        &buf[off..off + len],
+        crate::compression::Compression::Gzip,
+        crate::compression::MAX_INTERNAL_BYTES,
+    )
+    .expect("archive metadata is gzip");
     let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
     let mut out: Vec<String> = v["vector_layers"]
         .as_array()
