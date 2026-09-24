@@ -74,12 +74,14 @@ use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
 use parquet::arrow::ArrowWriter;
+use parquet::file::metadata::KeyValue;
 use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::compression::{decompress_capped, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::mvt::{command_decode, zigzag_decode};
+use crate::overview::writer::geo_metadata_json_deterministic;
 use crate::pmtiles_writer::{
     decode_directory, max_expanded_entries, tile_id_to_zxy, Header, TileType, MAX_LEAF_DIRECTORIES,
 };
@@ -295,11 +297,17 @@ pub fn decode_pmtiles(
         flush_batch(&mut batch, &schema, &mut encoder, &mut writer, &col_types)?;
     }
 
-    writer.append_key_value_metadata(
-        encoder
-            .into_keyvalue()
+    // #508: the encoder's own `into_keyvalue()` serializes `geometry_types`
+    // straight out of a `HashSet`, so two decodes of the same archive produce
+    // footers differing by that array's element order. A decoded archive is
+    // the common MIXED-geometry case (points, lines and polygons from one
+    // PMTiles archive land in one output file), so take the same
+    // deterministic serialization `overview::writer` uses.
+    writer.append_key_value_metadata(KeyValue::new(
+        "geo".to_string(),
+        geo_metadata_json_deterministic(&encoder.into_geoparquet_metadata())
             .map_err(|e| DecodeError::Write(e.to_string()))?,
-    );
+    ));
     writer.close()?;
 
     report.elapsed_secs = start.elapsed().as_secs_f64();

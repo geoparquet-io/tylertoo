@@ -325,9 +325,14 @@ fn build_writer_options_with_ceiling(
         renames,
     ));
 
-    // #507: preflight the parquet 32,767-row-groups-per-file ceiling. Mirrors
-    // the writer's own per-level split arithmetic (`projected_row_groups`),
-    // so this predicts the exact row-group count `write_level` will produce.
+    // #507: preflight parquet's per-file row-group ceiling. Mirrors the
+    // writer's own per-level split arithmetic (`projected_row_groups`) exactly,
+    // but is fed `level_row_counts` — pass 1's PRE-simplification winner hints
+    // — so the result is a conservative UPPER BOUND on the row-group count
+    // `write_level` will actually produce, not a prediction of it. (Measured:
+    // 807 projected vs 776 written on a fixture where simplification collapsed
+    // winners. Over-estimating is the safe direction: it can only auto-scale
+    // the cap sooner than strictly needed, never later.)
     let level_zooms: Vec<Option<u8>> = writer_opts.levels.iter().map(|l| l.zoom).collect();
     let finest_zoom = writer_opts.levels.last().and_then(|l| l.zoom);
     match super::writer::autoscale_cap(
@@ -347,10 +352,12 @@ fn build_writer_options_with_ceiling(
                 finest_zoom,
             );
             log::warn!(
-                "[convert] projected output needs {projected} row groups at \
-                 --row-group-size {old} — above parquet's 32,767-row-group-per-file limit \
-                 (safety ceiling {ceiling}); auto-scaling --row-group-size to {cap} to fit \
-                 (pass --row-group-size {cap} explicitly to silence this warning)",
+                "[convert] projected output needs up to {projected} row groups at \
+                 --row-group-size {old} — over the {ceiling}-row-group preflight ceiling \
+                 (parquet's hard limit is 32,768 row groups per file); auto-scaling \
+                 --row-group-size to {cap} to fit. Larger row groups mean proportionally \
+                 more memory held per row group while writing. Pass --row-group-size {cap} \
+                 explicitly to silence this warning.",
                 old = writer_opts.max_row_group_size,
             );
             writer_opts.max_row_group_size = cap;
@@ -358,6 +365,11 @@ fn build_writer_options_with_ceiling(
         Some(_) => {}
         None => {
             return Err(ConvertError::RowGroupCeilingUnreachable {
+                // PLANNED levels: `level_row_counts` are pre-simplification
+                // hints, so a level whose winners all collapse still counts
+                // here. An upper bound is the right side to err on for a
+                // preflight, and the message says "planned" rather than
+                // claiming these are the levels that get written.
                 levels: level_row_counts.iter().filter(|&&n| n > 0).count(),
                 ceiling,
             });
@@ -865,6 +877,10 @@ struct LevelWriter {
     out_schema: Schema,
     /// Input-schema indices of every column except the geometry column.
     non_geom_cols: Vec<usize>,
+    /// `Some(cap)` when the #507 preflight raised `--row-group-size` to fit
+    /// parquet's row-group ceiling — see
+    /// [`ConvertReport::effective_max_row_group_size`].
+    effective_max_row_group_size: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -901,6 +917,11 @@ fn create_level_writer(
         renames,
         options,
     )?;
+    // #507: `build_writer_options` may have raised the cap to fit parquet's
+    // row-group ceiling. Record it before the options move into the writer.
+    let effective_max_row_group_size = (writer_opts.max_row_group_size
+        != options.max_row_group_size)
+        .then_some(writer_opts.max_row_group_size);
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -914,6 +935,7 @@ fn create_level_writer(
         cluster_schema,
         out_schema,
         non_geom_cols,
+        effective_max_row_group_size,
     })
 }
 
@@ -1580,6 +1602,7 @@ pub(crate) fn convert_streaming_strategy(
         cluster_schema,
         out_schema,
         non_geom_cols,
+        effective_max_row_group_size,
     } = create_level_writer(
         output_path,
         &input_schema,
@@ -1720,6 +1743,7 @@ pub(crate) fn convert_streaming_strategy(
         unprojectable_features: tallies.unprojectable,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(source),
+        effective_max_row_group_size,
     })
 }
 

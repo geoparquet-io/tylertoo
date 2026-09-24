@@ -94,10 +94,15 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 pub const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 10_000;
 
 /// Safety ceiling for the projected total row-group count across every level
-/// (#507). Parquet hard-caps a file at 32,767 row groups; we preflight
-/// against 32,000 — 767 rows of headroom — before pass 2 opens the output
-/// file, so a planet-scale run that would blow the real limit is caught (and
-/// the cap auto-scaled) in milliseconds instead of after hours of writing.
+/// (#507). Parquet's row-group ordinal is an `i16`, so a file holds at most
+/// 32,768 row groups (ordinals 0..=32,767); we preflight against 32,000 — 768
+/// row groups of headroom — before pass 2 opens the output file, so a
+/// planet-scale run that would blow the real limit is caught (and the cap
+/// auto-scaled) in milliseconds instead of after hours of writing.
+///
+/// The headroom matters because the projection is fed pass 1's
+/// pre-simplification winner hints: it is an upper bound on the written
+/// row-group count, not an exact prediction.
 pub(crate) const SAFE_ROW_GROUP_CEILING: usize = 32_000;
 
 /// Maximum rows per parallel WKB-encode chunk (#304). Incoming batches are
@@ -1176,12 +1181,24 @@ fn fold_geo_metadata(
 /// array alphabetically before the final string encode, so the same input
 /// always produces the same footer bytes.
 ///
+/// Used by [`crate::decode`] too: the decode writer emits its own GeoParquet
+/// footer, and a decoded archive is the common MIXED-geometry case (points,
+/// lines and polygons from one PMTiles archive all land in one file), so it
+/// is if anything more exposed to the flip than the overview writer is.
+///
 /// (`columns` itself is a `HashMap`, but `serde_json::Value`'s map type is a
 /// `BTreeMap` under this crate's default feature set — `to_value` already
-/// sorts column names by key, so only the array fields need an explicit
-/// sort.)
-fn geo_metadata_json_deterministic(geo_meta: &GeoParquetMetadata) -> Result<String, WriterError> {
+/// sorts column names by key. The explicit `sort_keys` below makes that
+/// independent of the feature set: enabling `serde_json/preserve_order`
+/// anywhere in the dependency graph would silently switch `Value::Object` to
+/// an insertion-ordered map and put the `HashMap`'s order straight back into
+/// the footer. The `BTreeMap` default is the backup explanation, not the
+/// guarantee.)
+pub(crate) fn geo_metadata_json_deterministic(
+    geo_meta: &GeoParquetMetadata,
+) -> Result<String, WriterError> {
     let mut value = serde_json::to_value(geo_meta)?;
+    sort_keys(&mut value);
     if let Some(cols) = value.get_mut("columns").and_then(|c| c.as_object_mut()) {
         for col in cols.values_mut() {
             if let Some(types) = col.get_mut("geometry_types").and_then(|t| t.as_array_mut()) {
@@ -1190,6 +1207,31 @@ fn geo_metadata_json_deterministic(geo_meta: &GeoParquetMetadata) -> Result<Stri
         }
     }
     Ok(serde_json::to_string(&value)?)
+}
+
+/// Recursively sort every JSON object's keys, for [`geo_metadata_json_deterministic`].
+///
+/// A no-op under `serde_json`'s default `BTreeMap`-backed `Value::Object`
+/// (already sorted); it exists so the footer stays deterministic if the
+/// `preserve_order` feature is ever switched on somewhere in the graph.
+fn sort_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(map)
+                .into_iter()
+                .map(|(k, mut v)| {
+                    sort_keys(&mut v);
+                    (k, v)
+                })
+                .collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (k, v) in entries {
+                map.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sort_keys),
+        _ => {}
+    }
 }
 
 /// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
@@ -1294,6 +1336,14 @@ pub(crate) fn projected_row_groups(
     level_zooms: &[Option<u8>],
     finest_zoom: Option<u8>,
 ) -> usize {
+    // The doc contract above: one zoom per level. `zip` would silently
+    // truncate to the shorter side and under-count the projection — the one
+    // direction that matters, since the caller preflights against a ceiling.
+    debug_assert_eq!(
+        counts.len(),
+        level_zooms.len(),
+        "projected_row_groups: one zoom per level"
+    );
     counts
         .iter()
         .zip(level_zooms)
@@ -2743,7 +2793,7 @@ mod tests {
     }
 
     /// End-to-end (#507): forcing a tiny base cap (`--row-group-size 1`)
-    /// against a tiny mocked ceiling — far below the real 32,767 parquet
+    /// against a tiny mocked ceiling — far below the real 32,768 parquet
     /// limit, so the test runs in milliseconds — proves the writer succeeds
     /// and stays within the ceiling once its cap is auto-scaled, instead of
     /// producing far more row groups than the ceiling allows.

@@ -891,6 +891,16 @@ pub struct ConvertReport {
     /// With [`ConvertOptions::bbox`], `bytes_fetched / object_size` is the
     /// fraction of the remote file actually moved.
     pub remote_fetch: Option<crate::input::FetchStats>,
+    /// The row-group cap actually used, when the #507 preflight had to raise
+    /// [`ConvertOptions::max_row_group_size`] to keep the projected row-group
+    /// count under parquet's per-file ceiling. `None` when the requested cap
+    /// was used verbatim (the common case).
+    ///
+    /// Recorded because the raise is otherwise invisible after the run: it
+    /// changes the output file's row-group layout — and its peak write
+    /// memory, which scales with the cap — while `--row-group-size` still
+    /// reads as whatever the caller asked for.
+    pub effective_max_row_group_size: Option<usize>,
 }
 
 /// Errors from [`convert_to_overviews`].
@@ -1082,19 +1092,22 @@ pub enum ConvertError {
     ClusterInvariant(String),
     /// Even after auto-scaling `--row-group-size` up, the projected output
     /// row-group count cannot be brought under the safety ceiling (#507).
-    /// This only happens when the emitted (non-empty) level count itself
-    /// exceeds the ceiling — no cap raise helps there, since every non-empty
-    /// level always contributes at least one row group. In practice
-    /// unreachable (levels are bounded by [`crate::tile::MAX_ZOOM`], far
-    /// below the ceiling), but surfaced as an actionable error rather than
-    /// silently producing a file the parquet writer will reject.
+    /// This only happens when the PLANNED level count itself exceeds the
+    /// ceiling — no cap raise helps there, since every level holding rows
+    /// always contributes at least one row group. In practice unreachable
+    /// (levels are bounded by [`crate::tile::MAX_ZOOM`], far below the
+    /// ceiling), but surfaced as an actionable error rather than silently
+    /// producing a file the parquet writer will reject.
     #[error(
-        "cannot fit {levels} emitted overview level(s) under the {ceiling}-row-group \
-         preflight safety ceiling (parquet's hard limit is 32,767 row groups per file) \
+        "cannot fit {levels} planned overview level(s) under the {ceiling}-row-group \
+         preflight safety ceiling (parquet's hard limit is 32,768 row groups per file) \
          even after auto-scaling --row-group-size; reduce the number of overview levels"
     )]
     RowGroupCeilingUnreachable {
-        /// Emitted (non-empty) levels.
+        /// Levels the preflight expects to hold rows. Counted from pass 1's
+        /// pre-simplification winner hints, so a level that ends up empty
+        /// after simplification is still counted here — an upper bound, not
+        /// the written level count.
         levels: usize,
         /// The safety ceiling checked against.
         ceiling: usize,
@@ -2381,6 +2394,11 @@ pub(crate) fn convert_to_overviews_source_strategy(
         &renames,
         options,
     )?;
+    // #507: `build_writer_options` may have raised the cap to fit parquet's
+    // row-group ceiling. Record it before the options move into the writer.
+    let effective_max_row_group_size = (writer_opts.max_row_group_size
+        != options.max_row_group_size)
+        .then_some(writer_opts.max_row_group_size);
 
     let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -2432,6 +2450,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         unprojectable_features: tallies.unprojectable,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
+        effective_max_row_group_size,
     })
 }
 
