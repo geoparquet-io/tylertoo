@@ -997,6 +997,10 @@ pub tylertoo_core::overview::convert::ConvertError::UnsupportedCrs
 pub tylertoo_core::overview::convert::ConvertError::UnsupportedCrs::crs: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::VerbatimPartitioningUnsupported
 pub tylertoo_core::overview::convert::ConvertError::Writer(tylertoo_core::overview::writer::WriterError)
+pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling
+pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::asked: alloc::string::String
+pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::ceiling: u8
+pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::zoom: i64
 impl core::convert::From<arrow_schema::error::ArrowError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(arrow_schema::error::ArrowError) -> Self
 impl core::convert::From<core::io::error::Error> for tylertoo_core::overview::convert::ConvertError
@@ -1218,10 +1222,21 @@ pub mod tylertoo_core::overview::export
 pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
+pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling
+pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::ceiling: u8
+pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::declared: u8
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declared: u8
 pub tylertoo_core::overview::export::ExportError::Io(core::io::error::Error)
+pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive
+pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive::gsd: f64
+pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive::level: usize
+pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling
+pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::ceiling: u8
+pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::gsd: f64
+pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::implied: i64
+pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::level: usize
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::knob: alloc::string::String
@@ -1355,7 +1370,7 @@ pub const tylertoo_core::overview::export::PARTITION_WAVE_FALLBACK_MAX: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize
 pub fn tylertoo_core::overview::export::export_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportReport, tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::resolve_partition_wave(usize) -> usize
-pub fn tylertoo_core::overview::export::zoom_for_level(&tylertoo_core::overview::level::OverviewsMeta, usize) -> u8
+pub fn tylertoo_core::overview::export::zoom_for_level(&tylertoo_core::overview::level::OverviewsMeta, usize) -> core::result::Result<u8, tylertoo_core::overview::export::ExportError>
 pub mod tylertoo_core::overview::filter
 pub enum tylertoo_core::overview::filter::CmpOp
 pub tylertoo_core::overview::filter::CmpOp::Eq
@@ -2494,6 +2509,7 @@ impl core::marker::Unpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
+pub const tylertoo_core::pmtiles_writer::MAX_TILE_ID_ZOOM: u8
 pub fn tylertoo_core::pmtiles_writer::decode_directory(&[u8]) -> core::option::Option<alloc::vec::Vec<tylertoo_core::pmtiles_writer::DirEntry>>
 pub fn tylertoo_core::pmtiles_writer::decode_varint(&[u8]) -> core::option::Option<(u64, usize)>
 pub fn tylertoo_core::pmtiles_writer::encode_directory(&[tylertoo_core::pmtiles_writer::DirEntry]) -> alloc::vec::Vec<u8>
@@ -2677,9 +2693,12 @@ impl core::marker::Unpin for tylertoo_core::tile::TileCoord
 impl core::marker::UnsafeUnpin for tylertoo_core::tile::TileCoord
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::tile::TileCoord
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::tile::TileCoord
+pub const tylertoo_core::tile::MAX_ZOOM: u8
 pub fn tylertoo_core::tile::lng_lat_to_tile(f64, f64, u8) -> tylertoo_core::tile::TileCoord
+pub fn tylertoo_core::tile::max_tile_index(u8) -> u32
 pub fn tylertoo_core::tile::tile_bounds(u32, u32, u8) -> tylertoo_core::tile::TileBounds
 pub fn tylertoo_core::tile::tiles_for_bbox(&tylertoo_core::tile::TileBounds, u8) -> impl core::iter::traits::iterator::Iterator<Item = tylertoo_core::tile::TileCoord>
+pub fn tylertoo_core::tile::tiles_per_axis(u8) -> u64
 pub mod tylertoo_core::vector_tile
 pub mod tylertoo_core::vector_tile::tile
 #[repr(i32)] pub enum tylertoo_core::vector_tile::tile::GeomType
