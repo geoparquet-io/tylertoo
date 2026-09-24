@@ -328,6 +328,16 @@ pub struct OverviewWriter<W: Write + Send> {
     written_spec_indices: Vec<usize>,
     /// Index of the next level expected by [`Self::write_level`].
     next_level_idx: usize,
+    /// Set once an encode task's error (including a caught panic, #426) has
+    /// surfaced from [`Self::drain_encoded`]/[`Self::drain_wkb_encoded`]. At
+    /// that point the writer may already have appended some row groups for
+    /// the in-progress level but not others — a structurally incomplete
+    /// file. Defense in depth: a caller is expected to propagate that first
+    /// error and stop, but one that logs-and-continues must not be able to
+    /// coax a seemingly-valid (but silently incomplete) file out of further
+    /// `write_level`/`finish` calls, so both refuse immediately once this is
+    /// set.
+    failed: bool,
     /// Test-only fault injection for the detached encode tasks (#426).
     #[cfg(test)]
     encode_faults: EncodeFaults,
@@ -495,6 +505,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             level_row_group_ends: Vec::new(),
             written_spec_indices: Vec::new(),
             next_level_idx: 0,
+            failed: false,
             #[cfg(test)]
             encode_faults: EncodeFaults::default(),
         })
@@ -539,6 +550,9 @@ impl<W: Write + Send> OverviewWriter<W> {
         level_row_hint: Option<usize>,
         batches: impl Iterator<Item = RecordBatch>,
     ) -> Result<LevelWriteOutcome, WriterError> {
+        if self.failed {
+            return Err(poisoned_writer_error());
+        }
         if level_idx != self.next_level_idx {
             return Err(WriterError::LevelOutOfOrder {
                 expected: self.next_level_idx,
@@ -749,16 +763,28 @@ impl<W: Write + Send> OverviewWriter<W> {
         rx: Receiver<WkbEncodeResult>,
         asm: &mut RgAssembly,
     ) -> Result<(), WriterError> {
-        // A disconnect means the task's sender was dropped without sending —
-        // it never ran (pool shutdown). A panic inside the task arrives as an
-        // ordinary `Err` on the channel instead (#426).
-        let (encoded, geo_meta) = rx
-            .recv()
-            .map_err(|_| WriterError::GeoParquet(format!("{WKB_TASK} did not report a result")))?
-            .map_err(WriterError::GeoParquet)?;
-        let encoded = align_to_target_schema(encoded, &self.target_schema)?;
-        fold_geo_metadata(&mut self.geo_meta_acc, geo_meta).map_err(WriterError::GeoParquet)?;
-        self.slice_into_row_groups(encoded, asm)
+        // Any error here (disconnect, a caught panic surfaced as `Err`, or a
+        // downstream schema/metadata failure) leaves this writer's row groups
+        // in a partially-appended state, so it poisons the writer (defense in
+        // depth, see `Self::failed`) regardless of which step failed.
+        let outcome: Result<(), WriterError> = (|| {
+            // A disconnect means the task's sender was dropped without
+            // sending — it never ran (pool shutdown). A panic inside the task
+            // arrives as an ordinary `Err` on the channel instead (#426).
+            let (encoded, geo_meta) = rx
+                .recv()
+                .map_err(|_| {
+                    WriterError::GeoParquet(format!("{WKB_TASK} did not report a result"))
+                })?
+                .map_err(WriterError::GeoParquet)?;
+            let encoded = align_to_target_schema(encoded, &self.target_schema)?;
+            fold_geo_metadata(&mut self.geo_meta_acc, geo_meta).map_err(WriterError::GeoParquet)?;
+            self.slice_into_row_groups(encoded, asm)
+        })();
+        if outcome.is_err() {
+            self.failed = true;
+        }
+        outcome
     }
 
     /// Dispatch one complete row group's column encoding to the Rayon pool,
@@ -787,10 +813,14 @@ impl<W: Write + Send> OverviewWriter<W> {
         #[cfg(test)]
         let faults = self.encode_faults;
         let (tx, rx) = bounded::<EncodeResult>(1);
+        // Include the row-group ordinal in the panic label so a caught panic
+        // identifies which row group failed, not just that "a" row-group task
+        // did.
+        let rg_task_label = format!("{ROW_GROUP_TASK} (row group {rg_index})");
         rayon::spawn(move || {
             // A panic here must not reach rayon-core (#426): catch it and send
             // it as this row group's error, like any other encode failure.
-            let result = catch_encode_panic(ROW_GROUP_TASK, move || {
+            let result = catch_encode_panic(&rg_task_label, move || {
                 #[cfg(test)]
                 faults.trip_row_group();
                 encode_row_group(writers, batches, &target_schema)
@@ -805,26 +835,40 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// Wait for one in-flight row group's encode to finish and append its
     /// column chunks to the file as the next row group (serial, in order).
     fn drain_encoded(&mut self, rx: Receiver<EncodeResult>) -> Result<(), WriterError> {
-        // As in `drain_wkb_encoded`: a disconnect means the task never ran; a
-        // panic inside it arrives as an `Err` on the channel (#426).
-        let chunks = rx.recv().map_err(|_| {
-            WriterError::Parquet(ParquetError::General(format!(
-                "{ROW_GROUP_TASK} did not report a result"
-            )))
-        })??;
-        let mut rg_writer = self.writer.next_row_group()?;
-        for chunk in chunks {
-            chunk.append_to_row_group(&mut rg_writer)?;
+        // Any error here (disconnect, a caught panic surfaced as `Err`, or a
+        // failure appending the already-encoded chunks) leaves this writer's
+        // row groups in a partially-appended state, so it poisons the writer
+        // (defense in depth, see `Self::failed`) regardless of which step
+        // failed.
+        let outcome: Result<(), WriterError> = (|| {
+            // As in `drain_wkb_encoded`: a disconnect means the task never
+            // ran; a panic inside it arrives as an `Err` on the channel (#426).
+            let chunks = rx.recv().map_err(|_| {
+                WriterError::Parquet(ParquetError::General(format!(
+                    "{ROW_GROUP_TASK} did not report a result"
+                )))
+            })??;
+            let mut rg_writer = self.writer.next_row_group()?;
+            for chunk in chunks {
+                chunk.append_to_row_group(&mut rg_writer)?;
+            }
+            rg_writer.close()?;
+            self.row_groups_written += 1;
+            Ok(())
+        })();
+        if outcome.is_err() {
+            self.failed = true;
         }
-        rg_writer.close()?;
-        self.row_groups_written += 1;
-        Ok(())
+        outcome
     }
 
     /// Finalize the file: write the `geo` and `geo:overviews` footer keys (plus
     /// the optional `cogp` key), then close. Returns the footer metadata that
     /// was written.
     pub fn finish(mut self) -> Result<OverviewsMeta, WriterError> {
+        if self.failed {
+            return Err(poisoned_writer_error());
+        }
         if self.next_level_idx != self.options.levels.len() {
             return Err(WriterError::IncompleteLevels {
                 written: self.next_level_idx,
@@ -921,14 +965,26 @@ impl<W: Write + Send> OverviewWriter<W> {
     }
 }
 
-/// Encode one row group's Arrow columns into Parquet [`ArrowColumnChunk`]s
-/// (dictionary/RLE/delta + ZSTD compression) — the CPU-heavy step run on the
 /// Label for the detached row-group encode task, used both in its
 /// panic-to-error string and in the channel-disconnect fallback.
 const ROW_GROUP_TASK: &str = "parallel row-group encode task";
 
 /// Label for the detached WKB encode task (#304).
 const WKB_TASK: &str = "parallel WKB encode task";
+
+/// The error `write_level`/`finish` return once [`OverviewWriter::failed`]
+/// (#426) is set. Reuses the existing [`WriterError::Parquet`] variant
+/// (the same synthetic-error shape as the channel-disconnect fallbacks in
+/// `drain_encoded`/`drain_wkb_encoded`) rather than adding a new public enum
+/// variant, keeping this a private, defense-in-depth detail with no public
+/// API footprint.
+fn poisoned_writer_error() -> WriterError {
+    WriterError::Parquet(ParquetError::General(
+        "writer is poisoned by a previous encode-task failure; \
+         no further writes are accepted"
+            .to_string(),
+    ))
+}
 
 /// Run one detached encode task's body, turning a panic into an error string
 /// instead of letting it escape into rayon-core (#426).
@@ -965,6 +1021,8 @@ fn catch_encode_panic<T>(task: &str, body: impl FnOnce() -> T) -> Result<T, Stri
     })
 }
 
+/// Encode one row group's Arrow columns into Parquet [`ArrowColumnChunk`]s
+/// (dictionary/RLE/delta + ZSTD compression) — the CPU-heavy step run on the
 /// Rayon pool (#296). `batches` are the row group's target-schema slices in row
 /// order; `target_schema` maps each column to its leaf writer(s) via
 /// [`compute_leaves`].
@@ -2471,9 +2529,14 @@ mod tests {
 
     /// Run one level through the parallel encode path with a fault armed,
     /// returning the error `write_level` surfaced. A scoped stand-in for the
-    /// temp spool that callers hold across a write is dropped on the way out;
-    /// the returned path must no longer exist, proving the error path *unwound
-    /// and returned* (destructors ran) rather than aborting the process.
+    /// temp spool that callers hold across a write is dropped (explicitly,
+    /// after `write_level` returns) on the way out; the returned path must no
+    /// longer exist. This is not evidence of unwinding — `write_level` itself
+    /// returns `Err` through ordinary control flow, since the panic is caught
+    /// and converted to an error *inside* the spawned task (#426). What it
+    /// proves is that the process is still alive and running normal Rust code
+    /// after the encode task panicked, rather than having been SIGABRTed
+    /// before `write_level` could return at all.
     fn write_level_with_faults(faults: EncodeFaults) -> (WriterError, std::path::PathBuf) {
         let schema = Arc::new(source_schema());
         let spool = tempfile::NamedTempFile::new().unwrap();
@@ -2496,6 +2559,21 @@ mod tests {
         (err, spool_path)
     }
 
+    /// Guard against the failure mode under test being an *indefinite hang*:
+    /// run `f` on a helper thread and fail the test if it does not finish.
+    /// Mirrors `pipe.rs`'s `within()` — a regression in the panic-catching
+    /// path here could wedge the Rayon pool (e.g. a poisoned lock) instead of
+    /// erroring, which would hang the suite rather than report a failure.
+    fn within<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 'static) -> R {
+        let (done_tx, done_rx) = bounded::<R>(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(f());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{what}: deadlocked (no result within 10s)"))
+    }
+
     /// #426: a panic inside the detached row-group encode task must be
     /// reported as a `WriterError` on the writer thread. Before the fix,
     /// `rayon::spawn`'s `AbortIfPanic` turned it into a SIGABRT of the whole
@@ -2503,14 +2581,21 @@ mod tests {
     /// "task panicked" error string was dead code.
     #[test]
     fn row_group_encode_panic_surfaces_as_error() {
-        let (err, spool_path) = write_level_with_faults(EncodeFaults {
-            row_group: true,
-            wkb: false,
+        let (err, spool_path) = within("row_group_encode_panic_surfaces_as_error", || {
+            write_level_with_faults(EncodeFaults {
+                row_group: true,
+                wkb: false,
+            })
         });
         let msg = err.to_string();
         assert!(
-            msg.contains("parallel row-group encode task panicked"),
-            "expected the row-group panic error, got: {msg}"
+            msg.contains("parallel row-group encode task (row group"),
+            "expected the row-group panic error labeled with its row-group \
+             index, got: {msg}"
+        );
+        assert!(
+            msg.contains(") panicked"),
+            "expected the row-group index parenthetical before 'panicked', got: {msg}"
         );
         assert!(
             msg.contains("injected row-group encode panic"),
@@ -2525,9 +2610,11 @@ mod tests {
     /// #426, WKB stage (#304): same guarantee for the other detached spawn.
     #[test]
     fn wkb_encode_panic_surfaces_as_error() {
-        let (err, spool_path) = write_level_with_faults(EncodeFaults {
-            row_group: false,
-            wkb: true,
+        let (err, spool_path) = within("wkb_encode_panic_surfaces_as_error", || {
+            write_level_with_faults(EncodeFaults {
+                row_group: false,
+                wkb: true,
+            })
         });
         let msg = err.to_string();
         assert!(
@@ -2541,6 +2628,58 @@ mod tests {
         assert!(
             !spool_path.exists(),
             "temp spool must be cleaned up on the error path (Drop must run)"
+        );
+    }
+
+    /// Defense in depth (#426): once an encode task's error has surfaced, the
+    /// writer is poisoned and must refuse further `write_level`/`finish`
+    /// calls, rather than let a caller that logs-and-continues coax a
+    /// seemingly-valid file out of a writer with partially-appended row
+    /// groups.
+    #[test]
+    fn writer_poisoned_after_encode_failure_rejects_further_calls() {
+        within(
+            "writer_poisoned_after_encode_failure_rejects_further_calls",
+            || {
+                let schema = Arc::new(source_schema());
+                let mut opts = duplicating_options();
+                opts.max_row_group_size = 4;
+                // > 1 selects both pipelined stages (#296 row groups, #304 WKB).
+                opts.encode_concurrency = 2;
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+                writer.set_encode_faults(EncodeFaults {
+                    row_group: true,
+                    wkb: false,
+                });
+
+                let ids: Vec<i64> = (0..10).collect();
+                let batches = vec![source_batch(&schema, &ids)];
+                writer
+                    .write_level(0, Some(ids.len()), batches.into_iter())
+                    .expect_err("the panicking encode task must surface as an error");
+
+                // Disarm the fault before retrying: if the poison check were
+                // missing, the next call would encode cleanly and mask the
+                // very bug this test guards against.
+                writer.set_encode_faults(EncodeFaults::default());
+                let batches = vec![source_batch(&schema, &ids)];
+                let err = writer
+                    .write_level(0, Some(ids.len()), batches.into_iter())
+                    .expect_err("writer must stay poisoned after the earlier failure");
+                assert!(
+                    err.to_string().contains("writer is poisoned"),
+                    "expected the poisoned-writer error, got: {err}"
+                );
+
+                let err = writer
+                    .finish()
+                    .expect_err("finish must also refuse a poisoned writer");
+                assert!(
+                    err.to_string().contains("writer is poisoned"),
+                    "expected the poisoned-writer error, got: {err}"
+                );
+            },
         );
     }
 }
