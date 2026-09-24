@@ -34,8 +34,18 @@ pub const WORLD_SCALE: u64 = 1_u64 << 32;
 /// Half the world scale (2^31) - useful for center calculations.
 pub const WORLD_HALF: u32 = 1_u32 << 31;
 
-/// Maximum valid latitude for Web Mercator projection.
-pub const MAX_LATITUDE: f64 = 85.05112878;
+/// Maximum valid latitude for Web Mercator projection: `atan(sinh(π))` in
+/// degrees, the latitude whose projected y reaches the edge of the square
+/// world extent (normalized y = 0 at the north edge, 1 at the south edge).
+///
+/// The exact value is 85.05112877980658…°, which is not representable in
+/// `f64`; this constant is the nearest representable value *below* it. The
+/// direction matters: rounding up (e.g. the `85.05112878` this constant used
+/// to carry) puts the north edge just outside the extent, so `lat ==
+/// MAX_LATITUDE` computes a slightly negative raw tile row and only lands on
+/// y = 0 by way of a saturating cast. Rounding down keeps every clamped
+/// latitude inside `[0, 2^z]`.
+pub const MAX_LATITUDE: f64 = 85.051_128_779_806_59;
 
 /// 32-bit world coordinate, matching tippecanoe's internal representation.
 ///

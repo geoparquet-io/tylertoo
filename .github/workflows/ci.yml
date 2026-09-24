@@ -142,6 +142,13 @@ jobs:
         with:
           tool: cargo-shear
 
+      # The musl release binary carries a musl-only #[global_allocator]
+      # (#480) that no other job compiles. cargo check needs no musl linker,
+      # so this catches cfg mistakes (e.g. clashing with the dhat-heap
+      # allocator) without a full cross build.
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
       - name: Install similarity-rs
         run: cargo install similarity-rs --locked
 
@@ -175,6 +182,16 @@ jobs:
         # -D warnings also denies the curated [workspace.lints.clippy] set
         # (pedantic subset + cognitive_complexity) defined in Cargo.toml.
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Check musl target compiles (both allocator arrangements)
+        # The CLI's musl-only #[global_allocator] (#480) must coexist with
+        # the dhat-heap allocator cfg; neither combination is compiled by
+        # any other job. musl-tools provides musl-gcc for the -sys crates'
+        # C code (zstd, mimalloc).
+        run: |
+          sudo apt-get install -y musl-tools
+          cargo check --locked --target x86_64-unknown-linux-musl -p tylertoo
+          cargo check --locked --target x86_64-unknown-linux-musl -p tylertoo --features dhat-heap
 
       - name: Check for unused dependencies
         # cargo-shear, not cargo-machete: it also inspects
@@ -305,6 +322,30 @@ jobs:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
 
+      # The pytest step's integration tests read tests/fixtures/realdata.
+      # Those files are git-LFS pointers in a plain checkout (checkout
+      # doesn't fetch LFS), which exist but are not parquet — so the tests'
+      # skipif guards pass and every conversion fails on "Corrupt footer".
+      # Same cache + release-download pattern as the Rust jobs.
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        # This job sets defaults.run.working-directory: crates/python, but
+        # the cache step above (and the tests themselves) use the repo-root
+        # tests/fixtures/realdata. Override back to the workspace root so
+        # the download lands in the same place the cache step reads/writes.
+        working-directory: ${{ github.workspace }}
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Sync environment (builds the extension module)
         run: uv sync --locked
 
@@ -319,6 +360,12 @@ jobs:
 
       - name: stubtest (tylertoo.pyi matches the built module)
         run: uv run python -m mypy.stubtest tylertoo --allowlist stubtest-allowlist.txt
+
+      # The binding's own test suite (#418): kwarg-surface tests plus the
+      # integration classes against the downloaded fixtures. 88 tests, <1s
+      # once the extension is built.
+      - name: pytest
+        run: uv run --no-sync pytest tests/ -v
 
       - name: vulture (dead code)
         run: uv run vulture

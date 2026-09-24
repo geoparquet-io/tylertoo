@@ -227,10 +227,19 @@ fn nonfinite_coordinate_rows_skipped() {
         let mut geoms = spread_points(4);
         geoms.push(Some(Geometry::Point(Point::new(f64::NAN, 1.0))));
         geoms.push(Some(Geometry::Point(Point::new(2.0, f64::INFINITY))));
-        // Covering generation over NaN bboxes is itself hostile; skip it.
-        write_input(tin.path(), &geoms, false, None);
+        // WITH bbox covering (#428): the non-finite rows poison the generated
+        // bbox columns — the `+inf` y reaches the ymax statistic verbatim.
+        // Paired with a `--bbox` below so the row-group selector actually
+        // runs over those statistics: an infinite bound must be compared, not
+        // treated as a reason to prune, or the four good rows vanish with it.
+        write_input(tin.path(), &geoms, true, None);
 
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
+        // Comfortably around the four good points at (-60,-30)..(0,6).
+        let o = ConvertOptions {
+            bbox: Some([-70.0, -40.0, 10.0, 20.0]),
+            ..opts(streaming)
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o)
             .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
         assert_eq!(report.input_features, 4, "streaming={streaming}");
 
@@ -1201,6 +1210,90 @@ fn entry_zoom_ladder_agrees_across_pipelines_when_rows_are_rejected() {
     );
 }
 
+/// #428: NaN is how plenty of sources spell nodata in a float column, and one
+/// in the `--sort-key` column used to reach `Priority::beats`, which answers
+/// false in BOTH directions for it — not a strict weak order. The row that
+/// holds a cell then keeps it whatever its key says (so the documented
+/// "larger key wins" rule inverts wherever a NaN row comes first), and the
+/// `sort_by`s built on the same comparator are free to permute, which breaks
+/// the byte-identity contract between the two engines.
+///
+/// A NaN-keyed feature must be treated as KEYLESS — ranked with the rows that
+/// have no key at all — and never dropped: it is a feature with an unrankable
+/// attribute, not a bad feature.
+#[test]
+fn nan_sort_key_rows_are_keyless_not_dropped() {
+    // Three pairs, far enough apart to own a coarse cell each, close enough
+    // within a pair to contest one. The NaN row of each pair comes FIRST, so
+    // it is the incumbent every challenger has to beat.
+    let mut geoms = Vec::new();
+    let mut values = Vec::new();
+    for k in 0..3 {
+        let (x, y) = (-60.0 + k as f64 * 60.0, 10.0);
+        geoms.push(Some(Geometry::Point(Point::new(x, y))));
+        values.push(f64::NAN);
+        geoms.push(Some(Geometry::Point(Point::new(x + 0.0001, y + 0.0001))));
+        values.push(100.0 + k as f64);
+    }
+
+    let mut per_engine = Vec::new();
+    for streaming in [true, false] {
+        // Twice per engine: same input, same options, same answer — a
+        // comparator that is not a total order is free to differ here.
+        let mut per_run = Vec::new();
+        for _ in 0..2 {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            super::testutil::write_input_with_f64(tin.path(), &geoms, "rank", &values);
+            let o = ConvertOptions {
+                sort_key: Some("rank".to_string()),
+                ..opts(streaming)
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &o)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
+            assert_eq!(
+                report.input_features, 6,
+                "streaming={streaming}: a NaN sort key must not drop the feature"
+            );
+            validate_file(tout.path()).unwrap();
+
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            let levels = reader.num_levels();
+            let ids: Vec<Vec<i64>> = (0..levels)
+                .map(|l| {
+                    read_level_ids_geoms(tout.path(), l)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
+                })
+                .collect();
+            per_run.push(ids);
+        }
+        assert_eq!(
+            per_run[0], per_run[1],
+            "streaming={streaming}: two runs over the same input must agree"
+        );
+        per_engine.push(per_run.pop().unwrap());
+    }
+
+    assert_eq!(
+        per_engine[0], per_engine[1],
+        "streamed and buffered engines must place NaN-keyed rows identically"
+    );
+    let ids = &per_engine[0];
+    assert_eq!(
+        ids.last().unwrap(),
+        &vec![0, 1, 2, 3, 4, 5],
+        "the canonical level keeps every row, NaN key or not (got {ids:?})"
+    );
+    assert_eq!(
+        ids[0],
+        vec![1, 3, 5],
+        "each coarse cell goes to the row with a real key — a NaN ranks as a \
+         missing key, which loses to any key at all (got {ids:?})"
+    );
+}
+
 /// A ladder column that does not exist is a configuration error, reported
 /// before any conversion work rather than silently ignored.
 #[test]
@@ -1927,4 +2020,355 @@ fn tiny_polygon_accumulator_is_inert_in_partitioning_mode() {
             }
         }
     }
+}
+
+// ============================================================================
+// Class 13: input that cannot be tiled (#429)
+//
+// Two ways a file converts with exit 0 into an empty tile archive:
+//   * coordinates outside the declared CRS's range (Web Mercator METERS under
+//     CRS84 metadata — the ticket's fixture), and
+//   * valid lon/lat outside the Web Mercator TILING domain (an Arctic or
+//     Antarctic extract at |lat| > 85.05°, which the tiler clamps and then
+//     clips away).
+// Pass 1 counts both, warns once per kind, and fails when the two together
+// account for ≥99% of the input.
+// ============================================================================
+
+/// Polygons whose coordinates are Web Mercator meters (roughly Berlin) — the
+/// ticket's fixture, written under the default CRS84 `geo` metadata.
+fn webmerc_meter_polygons(n: usize) -> Vec<Option<Geometry<f64>>> {
+    (0..n)
+        .map(|i| {
+            let x = 1_489_000.0 + i as f64 * 20_000.0;
+            let y = 6_883_000.0 + i as f64 * 20_000.0;
+            Some(Geometry::Polygon(Polygon::new(
+                LineString::from(vec![
+                    (x, y),
+                    (x + 10_000.0, y),
+                    (x + 10_000.0, y + 10_000.0),
+                    (x, y + 10_000.0),
+                    (x, y),
+                ]),
+                vec![],
+            )))
+        })
+        .collect()
+}
+
+/// Polygons in perfectly valid lon/lat that sit entirely north of the Web
+/// Mercator limit (lat 86–88): an Arctic extract that tiles to nothing.
+fn polar_polygons(n: usize) -> Vec<Option<Geometry<f64>>> {
+    (0..n)
+        .map(|i| {
+            let x = -60.0 + i as f64 * 15.0;
+            Some(Geometry::Polygon(Polygon::new(
+                LineString::from(vec![
+                    (x, 86.0),
+                    (x + 5.0, 86.0),
+                    (x + 5.0, 88.0),
+                    (x, 88.0),
+                    (x, 86.0),
+                ]),
+                vec![],
+            )))
+        })
+        .collect()
+}
+
+#[test]
+fn all_features_out_of_crs_range_errors_rather_than_producing_nothing() {
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &webmerc_meter_polygons(3), true, None);
+        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
+        let ConvertError::AllFeaturesOutOfRange {
+            out_of_range,
+            unprojectable,
+            total,
+            ..
+        } = &err
+        else {
+            panic!("streaming={streaming}: expected AllFeaturesOutOfRange, got: {err}");
+        };
+        assert_eq!((*out_of_range, *unprojectable, *total), (3, 0, 3));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("3 of 3 feature(s) (100.0%) cannot be tiled")
+                && msg.contains("gpio convert reproject"),
+            "streaming={streaming}: message must name the loss and the gpio fix: {msg}"
+        );
+    }
+}
+
+/// The #429 symptom with legal CRS84 coordinates: everything sits north of
+/// the Mercator limit, so the tiler clamps and clips it all away. A bare
+/// "0 tiles, exit 0" here was the review's S1-3 finding.
+#[test]
+fn all_features_beyond_the_mercator_limit_error_rather_than_producing_nothing() {
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &polar_polygons(3), true, None);
+        let err = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap_err();
+        let ConvertError::AllFeaturesOutOfRange {
+            out_of_range,
+            unprojectable,
+            total,
+            ..
+        } = &err
+        else {
+            panic!("streaming={streaming}: expected AllFeaturesOutOfRange, got: {err}");
+        };
+        assert_eq!(
+            (*out_of_range, *unprojectable, *total),
+            (0, 3, 3),
+            "streaming={streaming}: lat 86–88 is valid lon/lat, just untileable"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside the Web Mercator tiling domain (|lat| > 85.05°)"),
+            "streaming={streaming}: the message must name the real cause: {msg}"
+        );
+        assert!(
+            !msg.contains("gpio convert reproject"),
+            "streaming={streaming}: reprojecting to 4326 fixes nothing here: {msg}"
+        );
+    }
+}
+
+#[test]
+fn partial_out_of_range_features_are_counted_and_conversion_succeeds() {
+    // 1 of 3 features carries meter-scale coordinates: the conversion still
+    // succeeds (the two lon/lat features tile fine) but the report counts the
+    // stray one so the CLI can say so.
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let mut geoms = spread_points(2);
+        geoms.extend(webmerc_meter_polygons(1));
+        write_input(tin.path(), &geoms, true, None);
+
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
+            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
+        assert_eq!(
+            (report.out_of_range_features, report.unprojectable_features),
+            (1, 0),
+            "streaming={streaming}: exactly the meter-scale feature is out of range"
+        );
+        assert_eq!(report.input_features, 3, "streaming={streaming}");
+    }
+}
+
+/// The partial polar case: a mostly-temperate file with one Arctic feature
+/// converts fine, and the untileable one is counted rather than swallowed.
+#[test]
+fn partial_beyond_mercator_features_are_counted_and_conversion_succeeds() {
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let mut geoms = spread_points(2);
+        geoms.extend(polar_polygons(1));
+        write_input(tin.path(), &geoms, true, None);
+
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
+            .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
+        assert_eq!(
+            (report.out_of_range_features, report.unprojectable_features),
+            (0, 1),
+            "streaming={streaming}: the Arctic polygon is untileable, not out of range"
+        );
+        assert_eq!(report.input_features, 3, "streaming={streaming}");
+    }
+}
+
+#[test]
+fn in_range_input_reports_zero_untileable_features() {
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &spread_points(4), true, None);
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming)).unwrap();
+        assert_eq!(
+            (report.out_of_range_features, report.unprojectable_features),
+            (0, 0),
+            "streaming={streaming}"
+        );
+    }
+}
+
+#[test]
+fn coordinates_exactly_on_the_domain_edge_are_in_range() {
+    use super::convert::bbox_out_of_crs_range;
+    use super::level::Crs;
+
+    // The whole world, the poles, and an antimeridian vertex are legitimate.
+    for bbox in [
+        [-180.0, -90.0, 180.0, 90.0],
+        [180.0, 90.0, 180.0, 90.0],
+        [-180.0, -90.0, -180.0, -90.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ] {
+        assert!(
+            !bbox_out_of_crs_range(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} sits on (not beyond) the domain edge"
+        );
+    }
+    // One ULP beyond any edge is out.
+    for bbox in [
+        [-180.000_001, 0.0, 0.0, 0.0],
+        [0.0, -90.000_001, 0.0, 0.0],
+        [0.0, 0.0, 180.000_001, 0.0],
+        [0.0, 0.0, 0.0, 90.000_001],
+    ] {
+        assert!(
+            bbox_out_of_crs_range(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} reaches beyond the domain"
+        );
+    }
+    // A 3857 input is measured against the Web Mercator world extent.
+    assert!(!bbox_out_of_crs_range(
+        &[-20_037_508.0, -20_037_508.0, 20_037_508.0, 20_037_508.0],
+        Crs::Epsg3857
+    ));
+    assert!(bbox_out_of_crs_range(
+        &[0.0, 0.0, 30_000_000.0, 0.0],
+        Crs::Epsg3857
+    ));
+}
+
+/// Only a bbox ENTIRELY beyond the Mercator limit is untileable; one that
+/// straddles it still puts geometry in tiles and is merely clipped.
+#[test]
+fn only_wholly_polar_bboxes_count_as_unprojectable() {
+    use super::convert::bbox_unprojectable;
+    use super::level::Crs;
+
+    for bbox in [
+        [0.0, 86.0, 10.0, 88.0],   // wholly Arctic
+        [0.0, -89.0, 10.0, -86.0], // wholly Antarctic
+    ] {
+        assert!(
+            bbox_unprojectable(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} never reaches a tile"
+        );
+    }
+    for bbox in [
+        [0.0, 84.0, 10.0, 88.0],  // straddles the limit: clipped, not lost
+        [0.0, -85.0, 10.0, 85.0], // ordinary
+        [0.0, 85.05, 10.0, 85.05],
+    ] {
+        assert!(
+            !bbox_unprojectable(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} still has geometry inside the tiling domain"
+        );
+    }
+    // A 3857 input is already in the tiling domain's own units.
+    assert!(!bbox_unprojectable(
+        &[0.0, 19_000_000.0, 10.0, 20_000_000.0],
+        Crs::Epsg3857
+    ));
+}
+
+#[test]
+fn out_of_range_warning_diagnoses_a_projected_crs_only_when_the_values_are_big() {
+    use super::convert::out_of_range_warning;
+    use super::level::Crs;
+
+    assert!(out_of_range_warning(0, 10, Crs::Epsg4326, 0.0).is_none());
+    assert!(out_of_range_warning(3, 0, Crs::Epsg4326, 0.0).is_none());
+
+    // Meter-scale values: the file is almost certainly in another CRS.
+    let msg = out_of_range_warning(1, 4, Crs::Epsg4326, 6_883_000.0).expect("a warning is due");
+    assert!(msg.contains("1 of 4 feature(s) (25.0%)"), "{msg}");
+    assert!(
+        msg.contains("OGC:CRS84 / EPSG:4326 coordinate range"),
+        "{msg}"
+    );
+    assert!(msg.contains("EPSG:3857 meters"), "{msg}");
+    assert!(
+        msg.contains("gpio convert reproject <input> reprojected.parquet -d EPSG:4326"),
+        "the gpio hint must match quality.rs's wording: {msg}"
+    );
+
+    // One stray Pacific point at lng 180.001 (0–360° convention data) is not
+    // evidence of a projected CRS, and must not be diagnosed as one (S2-2).
+    let stray = out_of_range_warning(1, 1_000, Crs::Epsg4326, 180.001).expect("a warning is due");
+    assert!(stray.contains("1 of 1000 feature(s) (0.1%)"), "{stray}");
+    assert!(
+        stray.contains("reach beyond the OGC:CRS84 / EPSG:4326 coordinate range")
+            && stray.contains("dropped or clipped"),
+        "neutral wording for a stray coordinate: {stray}"
+    );
+    assert!(
+        !stray.contains("gpio convert reproject") && !stray.contains("projected CRS"),
+        "one stray coordinate must not accuse the whole file: {stray}"
+    );
+
+    // A file that already declares EPSG:3857 gets 3857-shaped wording, never
+    // a message that contradicts its own metadata (S2-3).
+    let m3857 = out_of_range_warning(2, 2, Crs::Epsg3857, 30_000_000.0).expect("a warning is due");
+    assert!(
+        m3857.contains("EPSG:3857 coordinate range (±20037508.34 m)")
+            && m3857.contains("metadata says EPSG:3857")
+            && !m3857.contains("CRS84"),
+        "a 3857 input must not be told its metadata says CRS84: {m3857}"
+    );
+}
+
+#[test]
+fn unprojectable_warning_names_the_mercator_domain_and_offers_no_reprojection() {
+    use super::convert::unprojectable_warning;
+
+    assert!(unprojectable_warning(0, 10).is_none());
+    assert!(unprojectable_warning(3, 0).is_none());
+
+    let msg = unprojectable_warning(2, 8).expect("a warning is due");
+    assert!(msg.contains("2 of 8 feature(s) (25.0%)"), "{msg}");
+    assert!(
+        msg.contains(
+            "valid lon/lat but lie outside the Web Mercator tiling domain \
+                      (|lat| > 85.05°); these features cannot be tiled"
+        ),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("gpio convert reproject"),
+        "reprojecting to 4326 fixes nothing here: {msg}"
+    );
+}
+
+/// The all-lost gate is a SHARE, not exactly 100%: a million-row wrong-CRS
+/// file with a dozen `POINT(0 0)` placeholder rows must still fail (S2-1).
+#[test]
+fn the_all_lost_gate_fires_at_99_percent_not_only_at_100() {
+    use super::convert::{all_lost_error, BboxTallies};
+    use super::level::Crs;
+
+    let lost = |out_of_range, unprojectable| BboxTallies {
+        out_of_range,
+        unprojectable,
+        max_abs_out_of_range: 6_883_000.0,
+        ..Default::default()
+    };
+
+    // 999,988 of 1,000,000 out of range (99.9988%) — a dozen placeholders no
+    // longer buy a "successful" empty archive.
+    let err = all_lost_error(&lost(999_988, 0), 1_000_000, Crs::Epsg4326)
+        .expect("99.9% lost is a failed conversion");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("999988 of 1000000 feature(s) (100.0%) cannot be tiled"),
+        "the message states the real count and share: {msg}"
+    );
+
+    // Exactly at the threshold: 99 of 100.
+    assert!(all_lost_error(&lost(99, 0), 100, Crs::Epsg4326).is_some());
+    // Mixed causes count together.
+    assert!(all_lost_error(&lost(50, 49), 100, Crs::Epsg4326).is_some());
+    // Below it the conversion is a warning, not a failure.
+    assert!(all_lost_error(&lost(98, 0), 100, Crs::Epsg4326).is_none());
+    assert!(all_lost_error(&lost(0, 0), 100, Crs::Epsg4326).is_none());
+    assert!(all_lost_error(&lost(0, 0), 0, Crs::Epsg4326).is_none());
 }

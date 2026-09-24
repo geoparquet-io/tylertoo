@@ -34,8 +34,8 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 * `ladder_step` (`int`) — Zooms between consecutive `magnitude_ladder` rungs. Defaults to 1.
 * `sort_direction` (`str`) — "desc" (larger sort_key wins, default) or "asc" (smaller wins, e.g. rank columns where 1 is best).
 * `class_rank_column` (`str`) — String column carrying categorical classes for cell-winner ranking. Requires class_ranks. Mutually exclusive with sort_key.
-* `class_ranks` (`dict[str, float]`) — Map of class value to priority; higher priority wins a cell. Present-but-unlisted values rank below every listed value (but above nulls) unless class_rank_unknown overrides that.
-* `class_rank_unknown` (`float`) — Priority for present-but-unlisted class values. Defaults to min(class_ranks.values()) - 1.
+* `class_ranks` (`dict[str, float]`) — Map of class value to priority; higher priority wins a cell. Present-but-unlisted values rank below every listed value (but above nulls) unless class_rank_unknown overrides that. Priorities must be finite: NaN and infinity cannot be ordered against other classes and are rejected with ValueError.
+* `class_rank_unknown` (`float`) — Priority for present-but-unlisted class values. Defaults to min(class_ranks.values()) - 1. Must be finite.
 * `no_auto_rank` (`bool`) — Disable auto-detection of well-known schemas (Overture roads class/road_class, Overture places confidence). Defaults to False.
 * `simplify_factor` (`float`) — RDP tolerance = factor * gsd (duplicating mode only). Lower = crisper but heavier levels; higher = cruder and lighter. Defaults to 1.0.
 * `collapse` (`bool`) — Collapse below-visibility polygons to a representative point instead of dropping them. Defaults to False.
@@ -69,12 +69,12 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 
 ###### **Returns:**
 
-`dict` — Conversion report with keys "mode", "levels" (list of dicts with "level", "gsd", "zoom", "feature_count", "vertex_count", "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels" (list of dicts with "planned_level", "gsd", "zoom": planned levels omitted because no feature is visible at their scale — the written pyramid is auto-clamped to the non-empty levels), "input_features", "total_rows", "total_vertices", "total_compressed_bytes", "row_groups_total", "row_groups_read", "duration_secs", and "remote_fetch" (None for local inputs; for remote URLs a dict with "requests", "bytes_fetched", "object_size").
+`dict` — Conversion report with keys "mode", "levels" (list of dicts with "level", "gsd", "zoom", "feature_count", "vertex_count", "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels" (list of dicts with "planned_level", "gsd", "zoom": planned levels omitted because no feature is visible at their scale — the written pyramid is auto-clamped to the non-empty levels), "input_features", "total_rows", "total_vertices", "total_compressed_bytes", "row_groups_total", "row_groups_read", "antimeridian_suspect_features" (features whose bbox spans more than 180° of longitude), "out_of_range_features" (features reaching beyond the declared CRS's coordinate range — dropped or clipped), "unprojectable_features" (features with valid lon/lat outside the Web Mercator tiling domain, |lat| > 85.05° — these cannot be tiled), "duration_secs", and "remote_fetch" (None for local inputs; for remote URLs a dict with "requests", "bytes_fetched", "object_size").
 
 ###### **Raises:**
 
-* `ValueError` — Invalid options (bad mode/direction/op, conflicting or incomplete ranking options, invalid level plan, missing or mistyped columns).
-* `RuntimeError` — The conversion itself failed (I/O, decode, unsupported CRS, writer errors).
+* `ValueError` — Invalid options (bad mode/direction/op, conflicting or incomplete ranking options, invalid level plan, missing or mistyped columns), an unsupported input CRS, or an input where ≥99% of features cannot be tiled.
+* `RuntimeError` — The conversion itself failed (I/O, decode, writer errors).
 
 ###### **Example:**
 
@@ -106,7 +106,7 @@ Python equivalent of `tylertoo export-pmtiles`: each overview level becomes one 
 * `extent` (`int`) — MVT tile extent (tile-local resolution). Defaults to 4096.
 * `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single non-iterative drop pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
 * `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.
-* `partition_wave` (`int`) — Partitions processed per band read during export (the export concurrency knob). Defaults to 0, which auto-sizes via a memory-budget preflight: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with the TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive integer to override. Wider waves keep more cores busy at proportionally more peak memory. Output is byte-identical for every value (the wave is a scheduling concern).
+* `partition_wave` (`int`) — Partitions processed per band read during export (the export concurrency knob). Defaults to 0, which auto-sizes via a memory-budget preflight: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with the TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive integer to override. Wider waves keep more cores busy at proportionally more peak memory. Output is byte-identical for every value (the wave is a scheduling concern).
 * `feature_order` (`str`) — Within-tile feature order (#361): "input" (default) or a property name, optionally suffixed ":asc" / ":desc". Renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. "input" emits source row order; naming a column sorts within each tile by that property, ties kept in input order.
 * `min_zoom` (`int`) — Minimum zoom the archive declares even when the overview file's coarsest levels are missing (#380). `overview` omits a level that generalizes to nothing, so a file built for z0..z13 can start at z2; without this the header says z2 and a client set up for the requested range never asks for the zoomed-out view. The empty zooms hold no tiles. Must not be finer than the coarsest level present. Defaults to None (the coarsest level's zoom). `convert()` passes its own `min_zoom` here, so pass the same value to match what it writes.
 

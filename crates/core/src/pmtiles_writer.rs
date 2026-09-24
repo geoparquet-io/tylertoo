@@ -11,6 +11,7 @@
 use crate::compression::{self, Compression};
 use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
 use crate::tile::TileBounds;
+use crate::world_coord::MAX_LATITUDE;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -1128,13 +1129,14 @@ impl PmtilesWriter {
 
     /// Set geographic bounds for the tileset
     ///
-    /// Latitude values are clamped to Web Mercator bounds (±85.05°).
+    /// Latitude values are clamped to the Web Mercator bound
+    /// (`±`[`crate::world_coord::MAX_LATITUDE`]).
     pub fn set_bounds(&mut self, bounds: &TileBounds) {
         self.bounds = TileBounds::new(
             bounds.lng_min,
-            bounds.lat_min.clamp(-85.05, 85.05),
+            bounds.lat_min.clamp(-MAX_LATITUDE, MAX_LATITUDE),
             bounds.lng_max,
-            bounds.lat_max.clamp(-85.05, 85.05),
+            bounds.lat_max.clamp(-MAX_LATITUDE, MAX_LATITUDE),
         );
     }
 
@@ -1543,13 +1545,14 @@ impl StreamingPmtilesWriter {
 
     /// Set geographic bounds.
     ///
-    /// Latitude values are clamped to Web Mercator bounds (±85.05°).
+    /// Latitude values are clamped to the Web Mercator bound
+    /// (`±`[`crate::world_coord::MAX_LATITUDE`]).
     pub fn set_bounds(&mut self, bounds: &TileBounds) {
         self.bounds = TileBounds::new(
             bounds.lng_min,
-            bounds.lat_min.clamp(-85.05, 85.05),
+            bounds.lat_min.clamp(-MAX_LATITUDE, MAX_LATITUDE),
             bounds.lng_max,
-            bounds.lat_max.clamp(-85.05, 85.05),
+            bounds.lat_max.clamp(-MAX_LATITUDE, MAX_LATITUDE),
         );
     }
 
@@ -2885,6 +2888,34 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    /// A full-world extent must survive `set_bounds` at the exact Web Mercator
+    /// latitude bound. The header stores latitude as `i32 = degrees * 1e7`, so
+    /// the clamp is directly observable there: the old `±85.05` clamp wrote
+    /// ±850_500_000 and shaved ~0.0011° (~125 m) off the top and bottom of
+    /// every world-spanning archive (#416).
+    #[test]
+    fn test_writer_bounds_keep_exact_mercator_latitude() {
+        let mut writer = PmtilesWriter::new();
+        writer.add_tile(0, 0, 0, &[1, 2, 3]).unwrap();
+        writer.set_bounds(&TileBounds::new(
+            -180.0,
+            -85.051_128_779_806_59,
+            180.0,
+            85.051_128_779_806_59,
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounds-mercator-clamp.pmtiles");
+        writer.write_to_file(&path).expect("Should write file");
+
+        let data = fs::read(&path).unwrap();
+        let min_lat = i32::from_le_bytes(data[106..110].try_into().unwrap());
+        let max_lat = i32::from_le_bytes(data[114..118].try_into().unwrap());
+
+        assert_eq!(max_lat, 850_511_287, "max_lat must keep the exact bound");
+        assert_eq!(min_lat, -850_511_287, "min_lat must keep the exact bound");
+    }
+
     // -------------------------------------------------------------------------
     // Field Metadata Tests
     // -------------------------------------------------------------------------
@@ -3447,6 +3478,33 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_file(output_path);
+    }
+
+    /// Streaming counterpart of `test_writer_bounds_keep_exact_mercator_latitude`:
+    /// the streaming writer has its own `set_bounds`, so it needs its own
+    /// guard against the clamp regressing to a rounded ±85.05 (#416).
+    #[test]
+    fn test_streaming_writer_bounds_keep_exact_mercator_latitude() {
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+        writer.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
+        writer.set_bounds(&TileBounds::new(
+            -180.0,
+            -85.051_128_779_806_59,
+            180.0,
+            85.051_128_779_806_59,
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("streaming-bounds-mercator-clamp.pmtiles");
+        writer.finalize(&output_path).expect("Should finalize");
+
+        let data = fs::read(&output_path).unwrap();
+        let min_lat = i32::from_le_bytes(data[106..110].try_into().unwrap());
+        let max_lat = i32::from_le_bytes(data[114..118].try_into().unwrap());
+
+        assert_eq!(max_lat, 850_511_287, "max_lat must keep the exact bound");
+        assert_eq!(min_lat, -850_511_287, "min_lat must keep the exact bound");
     }
 
     #[test]

@@ -2,6 +2,28 @@
 //!
 //! This is a thin wrapper around the tylertoo-core library.
 
+/// Global allocator for static-musl builds (#480).
+///
+/// musl's `mallocng` deterministically fails *small* allocations once a large
+/// live heap has been fragmented by many threads: a 38.7M-polygon `tiles` run
+/// aborted with `memory allocation of 148448 bytes failed` at the identical
+/// input row across two runs, at 28.6 GB RSS on a node with 240 GB granted —
+/// >200 GB of headroom. mimalloc's segment/page allocator does not degrade
+/// that way, so the musl release binary uses it instead.
+///
+/// Scoped to `target_env = "musl"` on purpose: glibc, macOS and Windows builds
+/// keep the platform allocator (nothing to fix there), and the Python
+/// extension module never routes through this crate — a pyo3 `cdylib` must
+/// leave the host interpreter's allocator arrangements alone.
+///
+/// Excluded under `dhat-heap`: dhat installs its own `#[global_allocator]`
+/// in tylertoo-core (it must own the allocator to count anything), and rustc
+/// allows only one in the crate graph. Heap-profiling a musl binary therefore
+/// runs on dhat's allocator and loses this fix for the duration.
+#[cfg(all(target_env = "musl", not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
@@ -180,7 +202,9 @@ pub struct PyramidArgs {
     /// INPUT is either a GeoParquet source — tiled here, restricted to this
     /// band's zoom range — or a PMTiles archive already tiled for that range,
     /// which is merged as-is. Which one it is is detected from the file, not
-    /// the extension.
+    /// the extension. A source may be remote (`https://`, `s3://`, `gs://`),
+    /// read with byte-range requests like every other subcommand's input; a
+    /// band ARCHIVE must be local, since the merge reads it by offset.
     ///
     /// LAYER defaults to the file stem, and several bands may share one layer
     /// name (the usual case: a coarse and a fine aggregate that are the same
@@ -195,8 +219,21 @@ pub struct PyramidArgs {
     /// name inside the archive, or the merge is refused rather than write
     /// two layers of one name into a tile.
     ///
-    /// INPUT may not contain a `:`, which the spec cannot tell apart from the
-    /// LAYER separator; rename the file or point at it through a symlink.
+    /// Bands are emitted coarsest-first in the merged archive regardless of
+    /// listing order.
+    ///
+    /// Colons in INPUT: the LAYER is only split off the LAST `:` when what
+    /// follows it has no `/`, `\` or `:`, so a URL, a Windows drive and a
+    /// `2024:06/` directory stay whole. A drive-relative path with no `\`
+    /// after the drive, e.g. `C:data.parquet`, also stays whole: a single
+    /// ASCII letter before the last `:` is treated as a drive letter, not a
+    /// path, even though `data.parquet` alone would otherwise look like a
+    /// bare layer name. For the inputs that rule cannot express — one ENDING
+    /// in a bare colon segment, e.g. a Hive directory
+    /// `admin:country_code=BR` — spell the band `LO-HI=INPUT[=LAYER]`
+    /// instead: the range is split at the first `=` and the LAYER at the
+    /// last, again only when the segment after it has no `/`, `\` or `:`. An
+    /// INPUT that itself ends in `=VALUE` needs an explicit `=LAYER`.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
 
@@ -353,9 +390,10 @@ struct ExportPmtilesArgs {
     /// Partitions processed per band read during export (the export
     /// concurrency knob). `auto` (the default) preflights a memory budget:
     /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
-    /// only when RAM cannot be probed; override the RAM figure with
-    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// transients fit in a fraction of available RAM (container-aware: cgroup
+    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
+    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
+    /// Pass an explicit integer to override.
     /// Wider waves keep more cores busy at proportionally more peak memory
     /// (one wave of partitions resident). The chosen width and the preflight
     /// inputs are logged at export start. Output is byte-identical for every
@@ -976,7 +1014,8 @@ struct ConvertTuningArgs {
     /// with buffered output). `bounded` spills them to temporary Arrow IPC
     /// files (memory-capped; slight temp-I/O cost). `auto` (default) is
     /// workload-based: it estimates buffered output from feature and level
-    /// counts and spills when that exceeds a fraction of available RAM, so large
+    /// counts and spills when that exceeds a fraction of available RAM
+    /// (container-aware: cgroup v2/v1 limits are respected), so large
     /// duplicating runs prefer bounded instead of risking OOM (override the RAM
     /// figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical
     /// across profiles. No effect with --no-streaming.
@@ -1348,9 +1387,10 @@ struct TilesArgs {
     /// Partitions processed per band read during the export phase (the export
     /// concurrency knob). `auto` (the default) preflights a memory budget:
     /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
-    /// only when RAM cannot be probed; override the RAM figure with
-    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// transients fit in a fraction of available RAM (container-aware: cgroup
+    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
+    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
+    /// Pass an explicit integer to override.
     /// Wider waves keep more cores busy at proportionally more peak memory
     /// (one wave of partitions resident). The chosen width and the preflight
     /// inputs are logged at export start. Output is byte-identical for every
@@ -1876,11 +1916,15 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         output.file_name().unwrap_or_default().to_string_lossy()
     );
     println!(
-        "  {} tiles across z{}..z{} in {:.2}s",
-        format_number(export_report.total_tiles as u64),
-        export_report.min_zoom,
-        export_report.max_zoom,
-        convert_report.duration_secs + export_report.duration_secs
+        "  {}",
+        tiles_summary_line(
+            export_report.total_tiles,
+            export_report.min_zoom,
+            export_report.max_zoom,
+            convert_report.duration_secs + export_report.duration_secs,
+            convert_report.out_of_range_features,
+            convert_report.unprojectable_features,
+        )
     );
     // #380: the header covers the requested range; say which zooms in it
     // hold nothing rather than let the range above imply they do.
@@ -1924,6 +1968,51 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The tile-count line of the `tiles` summary (#429).
+///
+/// Normally a bare count. When features were lost it says so on the same line
+/// — a wrong-CRS input reporting a bare "✓ Converted … 0 tiles" was the
+/// headline lie of issue #429. The two losses are named separately because
+/// they have different fixes: coordinates outside the declared CRS's range
+/// (usually a reprojection away), and valid lon/lat outside the Web Mercator
+/// tiling domain (nothing to reproject — Mercator does not reach the poles).
+/// A ≥99% loss never reaches here (the conversion fails outright), so this
+/// covers the partial case and the "some other filter also emptied the
+/// archive" one.
+fn tiles_summary_line(
+    total_tiles: usize,
+    min_zoom: u8,
+    max_zoom: u8,
+    secs: f64,
+    out_of_range: usize,
+    unprojectable: usize,
+) -> String {
+    let zooms = format!("z{min_zoom}..z{max_zoom}");
+    let tiles = format_number(total_tiles as u64);
+    let mut losses: Vec<String> = Vec::new();
+    if out_of_range > 0 {
+        losses.push(format!(
+            "{} feature(s) dropped (outside the declared CRS range)",
+            format_number(out_of_range as u64)
+        ));
+    }
+    if unprojectable > 0 {
+        losses.push(format!(
+            "{} feature(s) dropped (|lat| > 85.05°, outside the Web Mercator tiling domain)",
+            format_number(unprojectable as u64)
+        ));
+    }
+    if losses.is_empty() {
+        return format!("{tiles} tiles across {zooms} in {secs:.2}s");
+    }
+    let dropped = losses.join(", ");
+    if total_tiles == 0 {
+        format!("{tiles} tiles — {dropped} — {zooms} in {secs:.2}s")
+    } else {
+        format!("{tiles} tiles across {zooms} in {secs:.2}s — {dropped}")
+    }
 }
 
 /// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
@@ -1977,6 +2066,27 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             format_number(lvl.feature_count as u64),
             format_number(lvl.vertex_count as u64),
             HumanBytes(lvl.compressed_bytes.max(0) as u64)
+        );
+    }
+    // #429: the aggregate `log::warn!` from the converter already names the
+    // declared CRS, its range and the fix; the note here only makes sure the
+    // summary itself never reads as an unqualified success.
+    if report.out_of_range_features > 0 {
+        println!(
+            "  note: {} of {} input features reach beyond the coordinate range the \
+             file's declared CRS allows and were dropped or clipped \u{2014} see the \
+             warning above, and check the real CRS with `gpio inspect <input>`",
+            format_number(report.out_of_range_features as u64),
+            format_number(report.input_features as u64)
+        );
+    }
+    if report.unprojectable_features > 0 {
+        println!(
+            "  note: {} of {} input features have valid lon/lat but lie outside the \
+             Web Mercator tiling domain (|lat| > 85.05\u{b0}); these features cannot \
+             be tiled",
+            format_number(report.unprojectable_features as u64),
+            format_number(report.input_features as u64)
         );
     }
     if !report.skipped_empty_levels.is_empty() {
@@ -2053,6 +2163,14 @@ fn parse_entry_zoom(spec: &str) -> Result<tylertoo_core::overview::ladder::Entry
 /// `unknown_rank` (the priority for present-but-unlisted values) is derived as
 /// `min(listed ranks) - 1.0`, so unknown classes always lose to every listed
 /// value while still beating null/missing values (which lose to any rank).
+///
+/// Ranks must be finite (#428). `f64::from_str` happily accepts `nan` and
+/// `inf`, and either one breaks this flag's contract: a NaN is not ordered
+/// (the ranking comparator answers "does not beat" in both directions, so the
+/// cell incumbent silently keeps the cell), and `min(ranks)` computed with
+/// `f64::min` *ignores* NaN — one `nan` entry would leave `unknown_rank` at
+/// `+inf - 1.0 = +inf`, making unlisted values outrank every named class,
+/// the exact inverse of what this flag documents.
 fn parse_class_rank(spec: &str) -> Result<tylertoo_core::overview::convert::ClassRanking> {
     use tylertoo_core::overview::convert::ClassRanking;
 
@@ -2083,6 +2201,12 @@ fn parse_class_rank(spec: &str) -> Result<tylertoo_core::overview::convert::Clas
             .trim()
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid rank in '{pair}': {e}"))?;
+        if !rank.is_finite() {
+            anyhow::bail!(
+                "invalid rank in '{pair}': ranks must be finite numbers \
+                 (NaN and infinity cannot be ordered against other classes)"
+            );
+        }
         ranks.push((value.to_string(), rank));
     }
     if ranks.is_empty() {
@@ -2274,6 +2398,30 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     Ok(())
 }
 
+/// If `spec` is the `LO-HI=INPUT=LAYER` escape form and `layer` is exactly
+/// the segment `Band::parse` peeled off its end, the `=LAYER` suffix that was
+/// stripped — for callers that want to hint "was this actually part of the
+/// path?" when the stripped-down input then fails an existence check.
+///
+/// Mirrors `Band::parse`'s own separator choice (`=` wins whichever of `:`
+/// and `=` appears first) without reaching into its private helpers: this is
+/// a best-effort hint, not a re-parse, so a false negative here just means no
+/// hint is offered, not a wrong answer.
+fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
+    let colon = spec.find(':');
+    let equals = spec.find('=');
+    let is_equals_form = match (colon, equals) {
+        (Some(c), Some(e)) => e < c,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if !is_equals_form {
+        return None;
+    }
+    let suffix = format!("={layer}");
+    spec.ends_with(&suffix).then_some(suffix)
+}
+
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
@@ -2306,11 +2454,34 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     // plain existence test, skipped for the three spellings where `exists()`
     // has no useful answer — a remote URL, a glob, and anything else the
     // reader resolves itself.
-    for b in &bands {
+    for (spec, b) in args.bands.iter().zip(&bands) {
         let spelled = b.input.to_string_lossy();
         let deferred = spelled.contains("://") || spelled.contains(['*', '?', '[']);
         if !deferred && !b.input.exists() {
-            anyhow::bail!("band input not found: {}", b.input.display());
+            let mut msg = format!("band input not found: {}", b.input.display());
+            // A bare Hive partition dir spec like
+            // `0-13=admin:country_code=BR` (no trailing filename) silently
+            // parses as INPUT=admin:country_code, LAYER=BR: the trailing
+            // `=BR` looked like an explicit layer, so it was stripped from
+            // the path. If that is what happened here, say so — a bare
+            // "not found" gives no hint that a layer was ever peeled off.
+            if let Some(suffix) = stripped_equals_layer_suffix(spec, &b.layer) {
+                let candidate = format!("{}{suffix}", b.input.display());
+                if std::path::Path::new(&candidate).exists() {
+                    msg.push_str(&format!(
+                        "\n  hint: {candidate:?} exists — the trailing {suffix:?} was \
+                         parsed as a layer name (LO-HI=INPUT=LAYER); if it is part of \
+                         the path, append an explicit =LAYER instead"
+                    ));
+                } else {
+                    msg.push_str(&format!(
+                        "\n  hint: the trailing {suffix:?} was parsed as a layer name \
+                         (LO-HI=INPUT=LAYER); if it is part of the path, append an \
+                         explicit =LAYER instead"
+                    ));
+                }
+            }
+            anyhow::bail!(msg);
         }
     }
 
@@ -2432,6 +2603,40 @@ fn format_number(n: u64) -> String {
 mod tests {
     use super::*;
     use tylertoo_core::overview::cluster::AccumulateOp;
+
+    /// #428: `f64::from_str` accepts `nan`, `inf` and `-inf`, and either one
+    /// breaks `--class-rank`'s contract. A NaN is not ordered, so the cell
+    /// incumbent would silently keep every cell it contests; worse, the
+    /// `unknown_rank` derivation uses `f64::min`, which IGNORES NaN — one
+    /// `nan` entry leaves the fold at `+inf`, so unlisted values would
+    /// outrank every named class, the inverse of the documented rule. The
+    /// parser rejects them with an explanation rather than producing that.
+    #[test]
+    fn class_rank_rejects_non_finite_ranks() {
+        for spec in [
+            "cls:motorway=nan,trunk=2",
+            "cls:motorway=NaN",
+            "cls:motorway=inf,trunk=2",
+            "cls:motorway=-inf",
+            "cls:motorway=infinity",
+        ] {
+            let err = parse_class_rank(spec)
+                .unwrap_err()
+                .to_string()
+                .to_ascii_lowercase();
+            assert!(
+                err.contains("finite"),
+                "'{spec}' must be rejected as non-finite, got: {err}"
+            );
+        }
+
+        // Control: ordinary ranks still parse, and the unknown rank is
+        // min(ranks) - 1 — below every named class, above a null.
+        let cr = parse_class_rank("cls:motorway=3,trunk=2,primary=1").unwrap();
+        assert_eq!(cr.column, "cls");
+        assert_eq!(cr.unknown_rank, 0.0);
+        assert_eq!(cr.ranks.len(), 3);
+    }
 
     // --- single-file-only rejections (v0.7 PR-C) -----------------------------
 
@@ -3424,6 +3629,50 @@ mod tests {
             missing.is_empty(),
             "flags on overview/export-pmtiles not surfaced on `tiles` — add each \
              to TilesArgs, or to the allow-list with a documented reason: {missing:?}"
+        );
+    }
+    // --- #429: out-of-range honesty in the tiles summary ---------------------
+
+    /// A bare "N tiles" line is fine only when nothing was lost. With lost
+    /// features the line must name them — and name WHICH loss, since the two
+    /// have different fixes — and a zero-tile archive must never read as an
+    /// unqualified success.
+    #[test]
+    fn tiles_summary_line_names_out_of_range_losses() {
+        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0);
+        assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
+
+        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0);
+        assert!(
+            empty.starts_with(
+                "0 tiles \u{2014} 3 feature(s) dropped (outside the declared CRS range)"
+            ),
+            "a wrong-CRS run must not read as a clean success: {empty}"
+        );
+
+        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0);
+        assert!(
+            partial.contains("10 tiles across z0..z14")
+                && partial.contains("1 feature(s) dropped (outside the declared CRS range)"),
+            "a partial loss still reports its tiles AND its losses: {partial}"
+        );
+
+        // The Mercator-domain loss is named separately: nothing to reproject.
+        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7);
+        assert!(
+            polar.contains(
+                "7 feature(s) dropped (|lat| > 85.05\u{b0}, outside the Web Mercator \
+                 tiling domain)"
+            ) && !polar.contains("declared CRS range"),
+            "an Arctic extract must be told why it tiled to nothing: {polar}"
+        );
+
+        // Both at once, both named.
+        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3);
+        assert!(
+            both.contains("2 feature(s) dropped (outside the declared CRS range)")
+                && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
+            "{both}"
         );
     }
 }

@@ -44,8 +44,11 @@ impl core::marker::Unpin for tylertoo_core::compression::Compression
 impl core::marker::UnsafeUnpin for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::compression::Compression
+pub const tylertoo_core::compression::MAX_INTERNAL_BYTES: u64
+pub const tylertoo_core::compression::MAX_TILE_BYTES: u64
 pub fn tylertoo_core::compression::compress(&[u8], tylertoo_core::compression::Compression) -> core::io::error::Result<alloc::vec::Vec<u8>>
 pub fn tylertoo_core::compression::decompress(&[u8], tylertoo_core::compression::Compression) -> core::io::error::Result<alloc::vec::Vec<u8>>
+pub fn tylertoo_core::compression::decompress_capped(&[u8], tylertoo_core::compression::Compression, u64) -> core::io::error::Result<alloc::vec::Vec<u8>>
 pub mod tylertoo_core::covering
 pub struct tylertoo_core::covering::BboxColumnIndices
 pub tylertoo_core::covering::BboxColumnIndices::xmax: usize
@@ -963,6 +966,12 @@ pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnNotNumeric
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnNotNumeric::data_type: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnNotNumeric::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::AccumulateWithoutCluster
+pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange
+pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::crs: tylertoo_core::overview::level::Crs
+pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::max_abs: f64
+pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::out_of_range: usize
+pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::total: usize
+pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::unprojectable: usize
 pub tylertoo_core::overview::convert::ConvertError::Arrow(arrow_schema::error::ArrowError)
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing::name: alloc::string::String
@@ -1109,6 +1118,7 @@ pub tylertoo_core::overview::convert::ConvertReport::duration_secs: f64
 pub tylertoo_core::overview::convert::ConvertReport::input_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::levels: alloc::vec::Vec<tylertoo_core::overview::convert::LevelReport>
 pub tylertoo_core::overview::convert::ConvertReport::mode: tylertoo_core::overview::level::Mode
+pub tylertoo_core::overview::convert::ConvertReport::out_of_range_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::remote_fetch: core::option::Option<tylertoo_core::input::FetchStats>
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_read: usize
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_total: usize
@@ -1116,6 +1126,7 @@ pub tylertoo_core::overview::convert::ConvertReport::skipped_empty_levels: alloc
 pub tylertoo_core::overview::convert::ConvertReport::total_compressed_bytes: i64
 pub tylertoo_core::overview::convert::ConvertReport::total_rows: usize
 pub tylertoo_core::overview::convert::ConvertReport::total_vertices: usize
+pub tylertoo_core::overview::convert::ConvertReport::unprojectable_features: usize
 impl core::clone::Clone for tylertoo_core::overview::convert::ConvertReport
 pub fn tylertoo_core::overview::convert::ConvertReport::clone(&self) -> tylertoo_core::overview::convert::ConvertReport
 impl core::cmp::PartialEq for tylertoo_core::overview::convert::ConvertReport
@@ -2486,12 +2497,16 @@ impl core::marker::Unpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
+pub const tylertoo_core::pmtiles_writer::MAX_EXPANDED_TILE_ENTRIES: u64
+pub const tylertoo_core::pmtiles_writer::MAX_LEAF_DIRECTORIES: usize
+pub const tylertoo_core::pmtiles_writer::MAX_TILE_ID_ZOOM: u8
 pub fn tylertoo_core::pmtiles_writer::decode_directory(&[u8]) -> core::option::Option<alloc::vec::Vec<tylertoo_core::pmtiles_writer::DirEntry>>
 pub fn tylertoo_core::pmtiles_writer::decode_varint(&[u8]) -> core::option::Option<(u64, usize)>
 pub fn tylertoo_core::pmtiles_writer::encode_directory(&[tylertoo_core::pmtiles_writer::DirEntry]) -> alloc::vec::Vec<u8>
 pub fn tylertoo_core::pmtiles_writer::encode_varint(u64, &mut alloc::vec::Vec<u8>)
 pub fn tylertoo_core::pmtiles_writer::gzip_compress(&[u8]) -> core::io::error::Result<alloc::vec::Vec<u8>>
 pub fn tylertoo_core::pmtiles_writer::make_root_leaves(&[tylertoo_core::pmtiles_writer::DirEntry], tylertoo_core::compression::Compression) -> core::io::error::Result<tylertoo_core::pmtiles_writer::DirectoryLayout>
+pub fn tylertoo_core::pmtiles_writer::max_expanded_entries(&tylertoo_core::pmtiles_writer::Header) -> u64
 pub fn tylertoo_core::pmtiles_writer::tile_id(u8, u32, u32) -> u64
 pub fn tylertoo_core::pmtiles_writer::tile_id_to_zxy(u64) -> tylertoo_core::Result<(u8, u32, u32)>
 pub mod tylertoo_core::pyramid
