@@ -801,7 +801,7 @@ fn archive_layer_fields(path: &Path) -> Vec<String> {
     // PMTiles v3 header: the JSON metadata offset/length live at bytes 24..40.
     let off = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
     let len = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
-    let json = crate::compression::decompress(
+    let json = crate::compression::decompress_capped(
         &buf[off..off + len],
         crate::compression::Compression::Gzip,
         crate::compression::MAX_INTERNAL_BYTES,

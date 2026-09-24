@@ -78,10 +78,10 @@ use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::compression::{decompress, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
+use crate::compression::{decompress_capped, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::mvt::{command_decode, zigzag_decode};
 use crate::pmtiles_writer::{
-    decode_directory, max_expanded_entries, tile_id_to_zxy, Header, TileType,
+    decode_directory, max_expanded_entries, tile_id_to_zxy, Header, TileType, MAX_LEAF_DIRECTORIES,
 };
 use crate::vector_tile::tile::GeomType;
 use crate::vector_tile::Tile;
@@ -345,14 +345,13 @@ fn collect_tile_refs(
     let decode_dir =
         |offset: u64, length: u64, what: &'static str| -> Result<Vec<_>, DecodeError> {
             let raw = section(offset, length, what)?;
-            let plain = decompress(raw, header.internal_compression, MAX_INTERNAL_BYTES).map_err(
-                |source| DecodeError::Decompress {
+            let plain = decompress_capped(raw, header.internal_compression, MAX_INTERNAL_BYTES)
+                .map_err(|source| DecodeError::Decompress {
                     what,
                     offset,
                     length,
                     source,
-                },
-            )?;
+                })?;
             decode_directory(&plain).ok_or_else(|| {
                 DecodeError::InvalidArchive(format!(
                     "undecodable {what} at byte offset {offset} ({length} bytes)"
@@ -373,9 +372,48 @@ fn collect_tile_refs(
             .ok_or_else(|| DecodeError::InvalidArchive(format!("{what} offset overflow")))
     };
 
+    // An entry's `(offset, length)` must lie inside the section it is
+    // relative to, not merely inside the file: a leaf pointer aimed at the
+    // tile data would otherwise be parsed as a directory, and a tile entry
+    // aimed at the directories would be handed to the MVT decoder. Cheap
+    // defense in depth on top of the file-bounds check in `section` (#417).
+    let within =
+        |offset: u64, length: u64, section_len: u64, what: &str| -> Result<(), DecodeError> {
+            match offset.checked_add(length) {
+                Some(end) if end <= section_len => Ok(()),
+                _ => Err(DecodeError::InvalidArchive(format!(
+                    "{what} at {offset} ({length} bytes) extends past its \
+                     {section_len}-byte section"
+                ))),
+            }
+        };
+
+    // Two budgets, because one huge leaf and a million tiny ones are
+    // different attacks (#417). Accumulated entries are bounded by what the
+    // archive could legitimately address — the same denomination the
+    // run-length budget below spends — and the *number* of leaves visited is
+    // bounded separately, since an empty leaf costs no entries while still
+    // costing a `MAX_INTERNAL_BYTES` decompression apiece.
+    let entry_limit = max_expanded_entries(header);
+    let mut entry_budget = entry_limit;
+    let mut leaves_visited = 0usize;
+
     let mut entries = Vec::new();
     for entry in root {
         if entry.run_length == 0 {
+            leaves_visited += 1;
+            if leaves_visited > MAX_LEAF_DIRECTORIES {
+                return Err(DecodeError::InvalidArchive(format!(
+                    "archive's root directory points at more than {MAX_LEAF_DIRECTORIES} \
+                     leaf directories"
+                )));
+            }
+            within(
+                entry.offset,
+                u64::from(entry.length),
+                header.leaf_dirs_length,
+                "leaf directory",
+            )?;
             // Leaf directory: offset is relative to the leaf-dirs section.
             let leaf = decode_dir(
                 absolute(header.leaf_dirs_offset, entry.offset, "leaf directory")?,
@@ -390,8 +428,23 @@ fn collect_tile_refs(
                     "multi-level leaf directories are not supported".to_string(),
                 ));
             }
+            // Spent before the extend, not after: a root full of pointers at
+            // one 16 MiB leaf body is a ~50 KB file that would otherwise
+            // accumulate entries until the process died.
+            entry_budget = entry_budget.checked_sub(leaf.len() as u64).ok_or_else(|| {
+                DecodeError::InvalidArchive(format!(
+                    "directory entries across this archive's leaf directories exceed its \
+                     limit of {entry_limit} entries"
+                ))
+            })?;
             entries.extend(leaf);
         } else {
+            entry_budget = entry_budget.checked_sub(1).ok_or_else(|| {
+                DecodeError::InvalidArchive(format!(
+                    "directory entries across this archive's directories exceed its \
+                     limit of {entry_limit} entries"
+                ))
+            })?;
             entries.push(entry);
         }
     }
@@ -400,16 +453,21 @@ fn collect_tile_refs(
     // is 137 GB of TileRefs. The budget is what the archive could legitimately
     // address (see `max_expanded_entries`), spent across every entry so a
     // thousand plausible-looking runs cannot add up to the same attack.
-    let mut budget = max_expanded_entries(header);
+    let mut budget = entry_limit;
     let mut tiles = Vec::new();
     for entry in &entries {
+        within(
+            entry.offset,
+            u64::from(entry.length),
+            header.tile_data_length,
+            "tile data",
+        )?;
         let run = u64::from(entry.run_length.max(1));
         budget = budget.checked_sub(run).ok_or_else(|| {
             DecodeError::InvalidArchive(format!(
                 "directory entry for tile id {} claims a run of {run} tiles, past this \
-                 archive's run-length expansion limit of {} tiles",
+                 archive's run-length expansion limit of {entry_limit} tiles",
                 entry.tile_id,
-                max_expanded_entries(header)
             ))
         })?;
         for i in 0..run {
@@ -461,16 +519,17 @@ fn decode_tile_features(
     options: &DecodeOptions,
 ) -> Result<Vec<(String, DecodedFeature)>, DecodeError> {
     let raw = &bytes[tile.start..tile.start + tile.len];
-    let plain = decompress(raw, header.tile_compression, MAX_TILE_BYTES).map_err(|source| {
-        DecodeError::TileDecompress {
-            z: tile.z,
-            x: tile.x,
-            y: tile.y,
-            offset: tile.start as u64,
-            length: tile.len as u64,
-            source,
-        }
-    })?;
+    let plain =
+        decompress_capped(raw, header.tile_compression, MAX_TILE_BYTES).map_err(|source| {
+            DecodeError::TileDecompress {
+                z: tile.z,
+                x: tile.x,
+                y: tile.y,
+                offset: tile.start as u64,
+                length: tile.len as u64,
+                source,
+            }
+        })?;
     let decoded = Tile::decode(plain.as_slice()).map_err(|source| DecodeError::Mvt {
         z: tile.z,
         x: tile.x,

@@ -209,38 +209,58 @@ impl Header {
             )) / 10_000_000.0
         };
 
-        let internal_compression = Compression::from_code(bytes[97])
-            .ok_or_else(|| err(format!("invalid internal compression code {}", bytes[97])))?;
-        let tile_compression = Compression::from_code(bytes[98])
-            .ok_or_else(|| err(format!("invalid tile compression code {}", bytes[98])))?;
-        let tile_type = TileType::from_code(bytes[99])
-            .ok_or_else(|| err(format!("invalid tile type code {}", bytes[99])))?;
-
         // ---- Semantic validation (#417) -----------------------------------
         // Everything below drives later slices, tile-id math and allocation
         // sizes, and all of it is attacker-controlled in a foreign archive.
         // Nonsense is rejected here, once, rather than defended against at
-        // every use.
-        let (min_zoom, max_zoom, center_zoom) = (bytes[100], bytes[101], bytes[118]);
+        // every use. What is merely *sloppy* — a field nothing downstream
+        // reads — is repaired and logged: rejecting it would lock out real
+        // archives without protecting anything.
+        let internal_compression = Compression::from_code(bytes[97])
+            .filter(|c| *c != Compression::Unknown)
+            .ok_or_else(|| err(format!("invalid internal compression code {}", bytes[97])))?;
+        let tile_compression = Compression::from_code(bytes[98])
+            .filter(|c| *c != Compression::Unknown)
+            .ok_or_else(|| err(format!("invalid tile compression code {}", bytes[98])))?;
+        let tile_type = TileType::from_code(bytes[99])
+            .ok_or_else(|| err(format!("invalid tile type code {}", bytes[99])))?;
+
+        let (raw_min_zoom, max_zoom, raw_center_zoom) = (bytes[100], bytes[101], bytes[118]);
+        // `max_zoom` is load-bearing: `max_expanded_entries` sizes the
+        // directory-walk budget from it, and a zoom past z31 has no tile-id
+        // space at all. That one is an error.
         if max_zoom > MAX_TILE_ID_ZOOM {
             return Err(err(format!(
                 "max zoom {max_zoom} is past z{MAX_TILE_ID_ZOOM}, \
                  the deepest zoom a PMTiles tile id can address"
             )));
         }
-        if min_zoom > max_zoom {
-            return Err(err(format!(
-                "min zoom {min_zoom} is deeper than max zoom {max_zoom}"
-            )));
-        }
-        // Only the upper end is enforced: a center *deeper* than the archive
-        // goes nowhere, while a center zoom of 0 is the near-universal
-        // "unset" value even in archives that start at z5.
-        if center_zoom > max_zoom {
-            return Err(err(format!(
-                "center zoom {center_zoom} is deeper than max zoom {max_zoom}"
-            )));
-        }
+        // `min_zoom` and `center_zoom` are not: nothing in the decode,
+        // pyramid-merge or export path reads either. They are display
+        // metadata, and plenty of real archives carry a sloppy value for
+        // them (a merged or hand-edited header, a `min_zoom` left at the
+        // source's rather than the archive's). Clamp and say so.
+        let min_zoom = if raw_min_zoom > max_zoom {
+            log::warn!(
+                "PMTiles header declares min zoom {raw_min_zoom} deeper than max zoom \
+                 {max_zoom}; reading it as z{max_zoom}"
+            );
+            max_zoom
+        } else {
+            raw_min_zoom
+        };
+        // A center *deeper* than the archive goes nowhere; a center zoom of 0
+        // is the near-universal "unset" value even in archives that start at
+        // z5, so only the upper end is touched.
+        let center_zoom = if raw_center_zoom > max_zoom {
+            log::warn!(
+                "PMTiles header declares center zoom {raw_center_zoom} deeper than max zoom \
+                 {max_zoom}; reading it as z{max_zoom}"
+            );
+            max_zoom
+        } else {
+            raw_center_zoom
+        };
 
         // Section bounds. How they compare to the *file* size is checked by
         // the callers that know it (a header may legitimately be parsed from
@@ -362,13 +382,41 @@ pub const MAX_TILE_ID_ZOOM: u8 = 31;
 
 /// Hard ceiling on how many tiles one directory walk may expand to (#417).
 ///
-/// Run lengths are archive-controlled u32s, and each expanded entry costs
-/// tens of bytes in the reader (a `TileRef`, or a `BTreeMap` node in the
-/// pyramid merge). 2^28 entries is already ~8 GB of those — past anything a
-/// machine will finish decoding, and far past the ~3.6e8 addresses of a
-/// fully dense z0-z14 pyramid. It is the backstop for archives that declare
-/// a deep `max_zoom`; [`max_expanded_entries`] usually lands well below it.
-pub const MAX_EXPANDED_TILE_ENTRIES: u64 = 1 << 28;
+/// **The number this picks is a peak-memory target, not an address count.**
+/// Each expanded entry costs tens of bytes of reader state — 32 bytes for a
+/// `TileRef` in [`crate::decode`], more for a `BTreeMap` node in the pyramid
+/// merge — and both are held for the whole walk. 2^22 entries is therefore
+/// about 134 MB of `TileRef` (and a few hundred MB in the merge): a bound a
+/// machine survives, chosen so that no header value can turn a kilobyte of
+/// directory into gigabytes of resident memory.
+///
+/// It deliberately does *not* track the archive's address space. A fully
+/// dense z0-z14 pyramid addresses ~3.6e8 tiles, so `max_zoom = 14` — an
+/// entirely ordinary header byte — would otherwise license 8.6 GB here. No
+/// single `decode_pmtiles` or `merge_bands` call has any business expanding
+/// 4.2M tiles: that is already ~100x a realistic banded archive, and far more
+/// than the GeoParquet decode of one archive can finish.
+///
+/// [`max_expanded_entries`] takes this and the archive's own address space,
+/// whichever is smaller.
+pub const MAX_EXPANDED_TILE_ENTRIES: u64 = 1 << 22;
+
+/// Hard ceiling on how many leaf directories one walk may visit (#417).
+///
+/// [`MAX_EXPANDED_TILE_ENTRIES`] bounds the entries a walk accumulates, but
+/// an empty leaf costs nothing against that budget while still costing a
+/// bounded-but-real decompression (up to
+/// [`crate::compression::MAX_INTERNAL_BYTES`]) and a transient `DirEntry`
+/// allocation. A root full of pointers at the same leaf body is a ~50 KB
+/// file that would otherwise keep a reader busy for as long as the pointers
+/// last. One huge leaf and a million tiny ones are separate attacks, so this
+/// is a separate cap.
+///
+/// 4096 is well past any real archive: this writer partitions leaves at
+/// `INITIAL_LEAF_SIZE` (4096) entries apiece, so 4096 leaves address 16.7M
+/// tiles — already more than [`MAX_EXPANDED_TILE_ENTRIES`] admits, which
+/// means the entry budget binds first for any sanely packed archive.
+pub const MAX_LEAF_DIRECTORIES: usize = 4096;
 
 /// Number of tile ids addressable at or above `max_zoom`'s pyramid: the sum
 /// of `4^z` for `z` in `0..=max_zoom`, saturating at
@@ -385,6 +433,12 @@ fn tile_address_space(max_zoom: u8) -> u64 {
 /// than its own zoom range holds, and no archive worth reading expands past
 /// [`MAX_EXPANDED_TILE_ENTRIES`]. Both operands are derived from the header,
 /// which [`Header::from_bytes`] has already range-checked.
+///
+/// Safe on a hand-built [`Header`] that never went through
+/// [`Header::from_bytes`] as well: `tile_address_space` clamps `max_zoom`
+/// to [`MAX_TILE_ID_ZOOM`] itself, and the `min` with
+/// [`MAX_EXPANDED_TILE_ENTRIES`] means the result is bounded whatever
+/// `max_zoom` says.
 pub fn max_expanded_entries(header: &Header) -> u64 {
     tile_address_space(header.max_zoom).min(MAX_EXPANDED_TILE_ENTRIES)
 }
@@ -467,10 +521,20 @@ pub fn encode_varint(mut value: u64, buf: &mut Vec<u8>) {
 /// Decode a varint from bytes
 ///
 /// Returns (value, bytes_consumed) or None if invalid/incomplete.
+///
+/// Only the canonical encoding is accepted (#417). A u64 varint is at most
+/// ten bytes, and the tenth carries exactly one payload bit: `shift` is 63
+/// there, so bits 1-6 of `byte & 0x7f` would be shifted straight out of the
+/// register. Silently wrapping means an attacker picks any value they like
+/// and the reader sees a plausible small one instead — an offset, a length
+/// or a tile id that passed no check the caller believes it passed.
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
+        if shift == 63 && byte & 0x7f > 1 {
+            return None; // Non-canonical: the tenth byte's high bits do not fit a u64.
+        }
         result |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
             return Some((result, i + 1));
@@ -1949,7 +2013,7 @@ mod tests {
         // assertion above and still hand a reader garbage. So walk the
         // directories the way a reader does and check the bytes come back.
         let read_dir = |raw: &[u8]| -> Vec<DirEntry> {
-            let plain = compression::decompress(
+            let plain = compression::decompress_capped(
                 raw,
                 header.internal_compression,
                 compression::MAX_INTERNAL_BYTES,
@@ -2218,23 +2282,71 @@ mod tests {
         );
     }
 
+    /// `min_zoom` and `center_zoom` are display metadata — no reader path
+    /// touches either — so a sloppy-but-otherwise-valid archive is repaired
+    /// rather than refused. Rejecting them protected nothing and locked out
+    /// real files.
     #[test]
-    fn header_rejects_inverted_zoom_range() {
+    fn header_clamps_inverted_zoom_range_instead_of_rejecting_it() {
         let mut bytes = Header::default().to_bytes();
         bytes[100] = 10; // min_zoom
         bytes[101] = 5; // max_zoom
-        assert!(Header::from_bytes(&bytes).is_err(), "min_zoom > max_zoom");
+        let header = Header::from_bytes(&bytes).expect("a sloppy min zoom must not be fatal");
+        assert_eq!(header.max_zoom, 5);
+        assert_eq!(header.min_zoom, 5, "min zoom is clamped to max zoom");
     }
 
     #[test]
-    fn header_rejects_center_zoom_past_max_zoom() {
+    fn header_clamps_center_zoom_past_max_zoom() {
         let mut bytes = Header::default().to_bytes();
         bytes[101] = 6; // max_zoom
         bytes[118] = 7; // center_zoom
+        let header = Header::from_bytes(&bytes).expect("a sloppy center zoom must not be fatal");
+        assert_eq!(header.center_zoom, 6, "center zoom is clamped to max zoom");
+    }
+
+    #[test]
+    fn header_rejects_unknown_compression_codes() {
+        // Byte 0 parses as `Compression::Unknown`, which every codec call
+        // then fails on. Reject it here, where the message can say which
+        // field was nonsense, rather than at the first directory read.
+        let mut bytes = Header::default().to_bytes();
+        bytes[97] = 0; // internal_compression
+        let err = Header::from_bytes(&bytes).expect_err("unknown internal compression");
         assert!(
-            Header::from_bytes(&bytes).is_err(),
-            "a center deeper than the archive's deepest zoom is nonsense"
+            err.to_string().contains("internal compression"),
+            "message must name the field, got: {err}"
         );
+
+        let mut bytes = Header::default().to_bytes();
+        bytes[98] = 0; // tile_compression
+        let err = Header::from_bytes(&bytes).expect_err("unknown tile compression");
+        assert!(
+            err.to_string().contains("tile compression"),
+            "message must name the field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_varint_rejects_a_non_canonical_tenth_byte() {
+        // The tenth byte of a u64 varint carries exactly one payload bit.
+        // Anything above 1 there used to be shifted out of the register,
+        // handing the caller a small, plausible value of the attacker's
+        // choosing instead of the bytes that were actually written.
+        let mut data = vec![0xFFu8; 9];
+        data.push(0x02);
+        assert!(
+            decode_varint(&data).is_none(),
+            "the tenth byte's high bits must be rejected, not wrapped"
+        );
+
+        // The two canonical tenth bytes still decode.
+        let mut ok = vec![0xFFu8; 9];
+        ok.push(0x01);
+        assert_eq!(decode_varint(&ok), Some((u64::MAX, 10)));
+        let mut round = Vec::new();
+        encode_varint(u64::MAX, &mut round);
+        assert_eq!(decode_varint(&round), Some((u64::MAX, round.len())));
     }
 
     #[test]

@@ -82,19 +82,34 @@ impl Compression {
 /// Directories are sized for the 16 KiB initial range request — the writer
 /// caps the compressed root at `MAX_ROOT_DIR_BYTES` (16257 bytes) and
 /// partitions the rest into leaves of a few thousand entries, each entry
-/// about 30 bytes of varints once decompressed. 16 MiB leaves room for
-/// roughly half a million entries in a single directory: orders of magnitude
-/// past any directory (or TileJSON metadata blob) a real archive carries,
-/// while keeping a decompression bomb to a bounded allocation.
+/// about 30 bytes of varints once decompressed. 16 MiB is therefore ~550k
+/// entries in a realistically packed directory: orders of magnitude past any
+/// directory (or TileJSON metadata blob) a real archive carries, while
+/// keeping a decompression bomb to a bounded allocation.
+///
+/// The *worst case* is denser than that: `decode_directory` only requires
+/// four varint bytes per entry, so 16 MiB of hostile directory body admits
+/// about 4.19M entries — and it sizes a `Vec::with_capacity` from the
+/// declared count, a transient ~134 MB of `DirEntry` before a single column
+/// is read. That is the number the directory-walk budgets in `decode` and
+/// `pyramid` are sized against; this constant only bounds the *bytes* handed
+/// to the parser.
 pub const MAX_INTERNAL_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Ceiling for decompressing one tile body (#417).
+/// Ceiling for decompressing one tile body (#417), and the default ceiling
+/// [`decompress`] applies.
 ///
 /// Our exporter caps encoded tiles at `DEFAULT_TILE_SIZE_LIMIT` (500 KiB —
 /// tippecanoe's default bar). A foreign archive may have been written with
-/// that cap disabled, so this leaves 1000x headroom; what it forbids is the
-/// KB-sized bomb that expands to tens of gigabytes.
-pub const MAX_TILE_BYTES: u64 = 500 * 1024 * 1024;
+/// that cap disabled, so 64 MiB still leaves ~100x headroom over that bar.
+///
+/// It is deliberately far below "as much as a tile could conceivably be":
+/// the decompressed bytes are not the peak. `prost` decodes the tile into
+/// `Tile`, and a body that is nothing but packed varint geometry expands
+/// roughly 4-5x into the `Vec<u32>` command streams it parses to — so the
+/// ceiling on decompression is really a ceiling on a few hundred MB of
+/// protobuf state. At 500 MiB the same archive reached ~2.5 GB.
+pub const MAX_TILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One direction of the codec: the three per-algorithm entry points, the
 /// uncompressed passthrough, and the verb used in the `Unknown` error
@@ -159,16 +174,38 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     dispatch(data, compression, (), COMPRESS)
 }
 
-/// Decompress data using the specified algorithm.
+/// Decompress data using the specified algorithm, bounded by
+/// [`MAX_TILE_BYTES`].
 ///
 /// Inverse of [`compress`]: the read side of the PMTiles pipeline (issue
 /// #112) uses this for directories, JSON metadata, and tile data, honoring
 /// the compression codes declared in the archive header.
 ///
-/// Every input is archive-controlled, so decompression is *bounded*: a
-/// KB-sized bomb must not become tens of gigabytes of resident memory
-/// (#417). `max_out` is the exact number of decompressed bytes the caller is
-/// willing to hold — [`MAX_INTERNAL_BYTES`] for directories and metadata,
+/// **Behavior change (#417):** this used to decompress without limit. Every
+/// input is archive-controlled, so a KB-sized bomb could become tens of
+/// gigabytes of resident memory. It now refuses to hand back more than
+/// [`MAX_TILE_BYTES`] — the largest single payload any PMTiles section
+/// legitimately holds. The signature is unchanged; a caller that was
+/// decompressing a payload larger than that now gets an error instead of the
+/// bytes. Use [`decompress_capped`] to name a different (normally tighter)
+/// ceiling.
+///
+/// # Arguments
+/// * `data` - Compressed input data
+/// * `compression` - Compression algorithm the data was compressed with
+///
+/// # Returns
+/// Decompressed data, or a copy of the input if compression is None.
+pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
+    decompress_capped(data, compression, MAX_TILE_BYTES)
+}
+
+/// Decompress data using the specified algorithm, refusing to hold more than
+/// `max_out` bytes (#417).
+///
+/// The explicit-ceiling form of [`decompress`], and what the readers call:
+/// `max_out` is the exact number of decompressed bytes the caller is willing
+/// to hold — [`MAX_INTERNAL_BYTES`] for a directory or the JSON metadata,
 /// [`MAX_TILE_BYTES`] for a tile body. Output *of exactly* `max_out` bytes is
 /// returned; one byte more is an error, and nothing is silently truncated.
 ///
@@ -179,7 +216,11 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
 ///
 /// # Returns
 /// Decompressed data, or a copy of the input if compression is None.
-pub fn decompress(data: &[u8], compression: Compression, max_out: u64) -> io::Result<Vec<u8>> {
+pub fn decompress_capped(
+    data: &[u8],
+    compression: Compression,
+    max_out: u64,
+) -> io::Result<Vec<u8>> {
     dispatch(data, compression, max_out, DECOMPRESS)
 }
 
@@ -502,7 +543,8 @@ mod tests {
             Compression::Zstd,
         ] {
             let compressed = compress(original, compression).unwrap();
-            let decompressed = decompress(&compressed, compression, MAX_INTERNAL_BYTES).unwrap();
+            let decompressed =
+                decompress_capped(&compressed, compression, MAX_INTERNAL_BYTES).unwrap();
             assert_eq!(
                 decompressed,
                 original.to_vec(),
@@ -521,19 +563,22 @@ mod tests {
             Compression::Zstd,
         ] {
             let compressed = compress(&[], compression).unwrap();
-            let decompressed = decompress(&compressed, compression, MAX_INTERNAL_BYTES).unwrap();
+            let decompressed =
+                decompress_capped(&compressed, compression, MAX_INTERNAL_BYTES).unwrap();
             assert!(decompressed.is_empty(), "{}", compression.name());
         }
     }
 
     #[test]
     fn test_decompress_unknown_is_error() {
-        assert!(decompress(b"anything", Compression::Unknown, MAX_INTERNAL_BYTES).is_err());
+        assert!(decompress_capped(b"anything", Compression::Unknown, MAX_INTERNAL_BYTES).is_err());
     }
 
     #[test]
     fn test_decompress_corrupt_gzip_is_error() {
-        assert!(decompress(b"not gzip at all", Compression::Gzip, MAX_INTERNAL_BYTES).is_err());
+        assert!(
+            decompress_capped(b"not gzip at all", Compression::Gzip, MAX_INTERNAL_BYTES).is_err()
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -552,7 +597,7 @@ mod tests {
             Compression::Zstd,
         ] {
             let compressed = compress(&vec![0u8; BOMB_PLAIN], compression).unwrap();
-            let err = decompress(&compressed, compression, 1024)
+            let err = decompress_capped(&compressed, compression, 1024)
                 .expect_err(compression.name())
                 .to_string();
             assert!(
@@ -575,14 +620,36 @@ mod tests {
         ] {
             let plain = vec![7u8; BOMB_PLAIN];
             let compressed = compress(&plain, compression).unwrap();
-            let exact = decompress(&compressed, compression, BOMB_PLAIN as u64).unwrap();
+            let exact = decompress_capped(&compressed, compression, BOMB_PLAIN as u64).unwrap();
             assert_eq!(exact.len(), BOMB_PLAIN, "{}", compression.name());
             assert_eq!(exact, plain, "{}", compression.name());
             assert!(
-                decompress(&compressed, compression, BOMB_PLAIN as u64 - 1).is_err(),
+                decompress_capped(&compressed, compression, BOMB_PLAIN as u64 - 1).is_err(),
                 "{} must not truncate to the ceiling",
                 compression.name()
             );
         }
+    }
+
+    #[test]
+    fn decompress_defaults_to_the_tile_ceiling() {
+        // The two-argument form is the public API; it is not uncapped, it
+        // spends MAX_TILE_BYTES. A payload under the ceiling round-trips.
+        let plain = vec![3u8; BOMB_PLAIN];
+        let compressed = compress(&plain, Compression::Gzip).unwrap();
+        assert_eq!(
+            decompress(&compressed, Compression::Gzip).unwrap(),
+            plain,
+            "a payload well under the default ceiling must round-trip"
+        );
+        // And a stored payload past it is refused rather than returned.
+        let oversized = vec![0u8; MAX_TILE_BYTES as usize + 1];
+        let err = decompress(&oversized, Compression::None)
+            .expect_err("past the default ceiling must be an error")
+            .to_string();
+        assert!(
+            err.contains("exceeds") && err.contains(&MAX_TILE_BYTES.to_string()),
+            "the default ceiling must be MAX_TILE_BYTES, got: {err}"
+        );
     }
 }

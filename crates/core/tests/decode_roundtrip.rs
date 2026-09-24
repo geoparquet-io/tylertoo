@@ -621,7 +621,7 @@ fn tippecanoe_style_root(entries: &[tylertoo_core::pmtiles_writer::DirEntry]) ->
 /// the leaves and tile data, and the root is rewritten by hand.
 #[test]
 fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
-    use tylertoo_core::compression::{compress, decompress, MAX_INTERNAL_BYTES};
+    use tylertoo_core::compression::{compress, decompress_capped, MAX_INTERNAL_BYTES};
     use tylertoo_core::pmtiles_writer::{decode_directory, Header};
     use tylertoo_core::{Compression, StreamingPmtilesWriter};
 
@@ -662,7 +662,7 @@ fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
     let root_start = header.root_dir_offset as usize;
     let root_end = root_start + header.root_dir_length as usize;
     let root = decode_directory(
-        &decompress(
+        &decompress_capped(
             &bytes[root_start..root_end],
             header.internal_compression,
             MAX_INTERNAL_BYTES,

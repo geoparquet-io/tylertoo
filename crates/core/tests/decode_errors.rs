@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use tylertoo_core::compression::compress;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::pmtiles_writer::{encode_directory, DirEntry, Header};
+use tylertoo_core::pmtiles_writer::{encode_directory, DirEntry, Header, MAX_LEAF_DIRECTORIES};
 use tylertoo_core::{Compression, StreamingPmtilesWriter};
 
 /// A minimal MVT tile: one layer `t` with one point feature at (1, 1).
@@ -286,5 +286,176 @@ fn directory_decompression_bomb_is_capped() {
     assert!(
         msg.contains("root directory") && msg.contains("exceeds"),
         "expected a capped-decompression error naming the section, got: {msg}"
+    );
+}
+
+#[test]
+fn tile_body_decompression_bomb_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let header = Header::from_bytes(&bytes[..127]).unwrap();
+
+    // A tile *body* that gzips to a few tens of KB and expands past
+    // MAX_TILE_BYTES (64 MiB). The directory ceiling does not cover this
+    // path: tile bodies are decompressed with their own, larger ceiling.
+    let bomb = compress(&vec![0u8; 80 * 1024 * 1024], header.tile_compression).unwrap();
+    assert!(
+        bomb.len() < 512 * 1024,
+        "the bomb must be small on disk, got {} bytes",
+        bomb.len()
+    );
+
+    // Append the bomb as the archive's tile data and point one entry at it.
+    let mut out = bytes.to_vec();
+    let mut header = header;
+    header.tile_data_offset = out.len() as u64;
+    header.tile_data_length = bomb.len() as u64;
+    out.extend_from_slice(&bomb);
+    let root = [DirEntry {
+        tile_id: 0,
+        offset: 0,
+        length: bomb.len() as u32,
+        run_length: 1,
+    }];
+    let enc = compress(&encode_directory(&root), header.internal_compression).unwrap();
+    header.root_dir_offset = out.len() as u64;
+    header.root_dir_length = enc.len() as u64;
+    out.extend_from_slice(&enc);
+    out[..127].copy_from_slice(&header.to_bytes());
+
+    let err = decode_err(&dir, "tile-bomb.pmtiles", &out);
+    let msg = err.to_string();
+    assert!(
+        matches!(&err, DecodeError::TileDecompress { .. }) && msg.contains("exceeds"),
+        "expected a capped tile decompression naming the tile, got: {msg}"
+    );
+}
+
+#[test]
+fn truncation_mid_varint_in_a_directory_column_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let header = Header::from_bytes(&bytes[..127]).unwrap();
+
+    // A directory whose last column (offsets) ends in a continuation byte
+    // with nothing after it. `decode_varint` must run out of input and the
+    // walker must report rather than index past the buffer.
+    let root = [DirEntry {
+        tile_id: 1,
+        offset: 0,
+        length: 4,
+        run_length: 1,
+    }];
+    let mut body = encode_directory(&root);
+    body.pop();
+    body.push(0x80); // continuation bit set, no successor byte
+    let raw = compress(&body, header.internal_compression).unwrap();
+
+    let err = decode_err(
+        &dir,
+        "truncated-varint.pmtiles",
+        &with_raw_root(&bytes, &raw),
+    );
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("undecodable root directory")),
+        "expected an undecodable-directory error, got: {err}"
+    );
+}
+
+#[test]
+fn unknown_internal_compression_in_the_header_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, mut bytes) = small_archive(&dir);
+
+    // Code 0 is `Compression::Unknown` — in spec range, but every codec call
+    // fails on it. The header parse rejects it, where the message can name
+    // the field.
+    bytes[97] = 0;
+    let err = decode_err(&dir, "unknown-internal.pmtiles", &bytes);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("internal compression"),
+        "expected the header parse to name the field, got: {msg}"
+    );
+
+    let (_, mut bytes) = small_archive(&dir);
+    bytes[98] = 0; // tile_compression
+    let err = decode_err(&dir, "unknown-tile.pmtiles", &bytes);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tile compression"),
+        "expected the header parse to name the field, got: {msg}"
+    );
+}
+
+#[test]
+fn leaf_flattening_is_capped_before_entries_accumulate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+
+    // Every root pointer aims at the *same* leaf body. Each costs ~5 bytes on
+    // disk and yields a whole leaf's worth of entries, so the walk used to
+    // accumulate without limit. The archive tops out at z5 (1365 addressable
+    // tile ids), so 4 x 400 is already past what it could address.
+    let leaf: Vec<DirEntry> = (0..400)
+        .map(|i| DirEntry {
+            tile_id: i + 1,
+            offset: 0,
+            length: 4,
+            run_length: 1,
+        })
+        .collect();
+    let leaf_len = compress(&encode_directory(&leaf), Compression::Gzip)
+        .unwrap()
+        .len() as u32;
+    let root: Vec<DirEntry> = (0..4)
+        .map(|_| DirEntry {
+            tile_id: 0,
+            offset: 0,
+            length: leaf_len,
+            run_length: 0,
+        })
+        .collect();
+
+    let err = decode_err(
+        &dir,
+        "leaf-flattening.pmtiles",
+        &with_directories(&bytes, &root, Some(&leaf)),
+    );
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("directory entries")),
+        "expected an entry-budget error, got: {err}"
+    );
+}
+
+#[test]
+fn a_root_full_of_empty_leaf_pointers_is_capped_by_leaf_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+
+    // An *empty* leaf costs nothing against the entry budget while still
+    // costing a bounded decompression apiece — the second half of the attack,
+    // and why the leaf count is capped separately.
+    let leaf: Vec<DirEntry> = Vec::new();
+    let leaf_len = compress(&encode_directory(&leaf), Compression::Gzip)
+        .unwrap()
+        .len() as u32;
+    let root: Vec<DirEntry> = (0..=MAX_LEAF_DIRECTORIES)
+        .map(|_| DirEntry {
+            tile_id: 0,
+            offset: 0,
+            length: leaf_len,
+            run_length: 0,
+        })
+        .collect();
+
+    let err = decode_err(
+        &dir,
+        "many-leaves.pmtiles",
+        &with_directories(&bytes, &root, Some(&leaf)),
+    );
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("leaf directories")),
+        "expected a leaf-count error, got: {err}"
     );
 }
