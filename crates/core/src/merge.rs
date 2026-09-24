@@ -1,33 +1,47 @@
 //! Concatenate disjoint PMTiles archives into one, by blob copy.
 //!
 //! This is the second half of a sharded build (#498). Pass 1 tiles each shard
-//! of the input independently — a shard being a contiguous slice of the
-//! Hilbert-sorted source, so the tile ids it produces are a contiguous slice
-//! of the archive's id space — and this merges the shard archives into the
+//! of the input independently and this merges the shard archives into the
 //! archive that ships.
 //!
-//! Because the shards are disjoint *by construction*, the merge is a copy:
-//! every tile is written out exactly as it came in, still compressed, never
-//! decoded and never re-encoded. What it has to get right is the bookkeeping
-//! around the tiles — the directory ordering that makes the output genuinely
-//! clustered, the header's bounds and zoom range, the `vector_layers` union —
-//! and the check that the shards really were disjoint.
+//! A shard's tile ids are **disjoint** from every other shard's, but they are
+//! *not* a contiguous slice of the archive's id space: #498 cuts shards by
+//! pivot subtree, and two subtrees at different depths interleave on the
+//! Hilbert curve — shard A's first and last id can straddle every id shard B
+//! holds while the two sets share nothing. Anything that assumes contiguity
+//! (an id-range overlap test, for one) rejects correct shard sets.
 //!
-//! **Disjointness is validated, not assumed.** Each input's tile-id *range*
-//! (its directory's first and last id) must not overlap any other's. A
-//! mis-specified shard set — the same shard listed twice, a shard from an
-//! earlier run, overlapping bounds in the pass-1 split — would otherwise
-//! produce an archive whose tiles silently shadow each other, and the failure
-//! would surface much later as missing geometry on a map. The check reads
-//! directories only, so it costs nothing next to the merge it guards.
+//! Because the shards are disjoint, the merge is a copy: every tile is
+//! written out exactly as it came in, still compressed, never decoded and
+//! never re-encoded. What it has to get right is the bookkeeping around the
+//! tiles — the directory ordering that makes the output genuinely clustered,
+//! the header's bounds and zoom range, the `vector_layers` union — and the
+//! check that the shards really were disjoint.
 //!
-//! Overlap is a *range* check rather than a per-tile one on purpose: it is
-//! strictly stronger than what the merge needs, it is O(inputs) instead of
-//! O(tiles), and a shard set that trips it is a bug in how the shards were
-//! cut, not something to reconcile. The merge itself is nonetheless written
-//! as a proper k-way heap merge over the inputs' tile streams, so supporting
-//! genuinely interleaved inputs later means relaxing the validation, not
-//! rewriting the loop.
+//! **Disjointness is validated, not assumed — exactly, per tile id.** The
+//! k-way heap merge below emits ids in ascending order, so two inputs
+//! claiming one tile show up as two consecutive emissions of the same id.
+//! That is refused, naming both archives. A mis-specified shard set — the
+//! same shard listed twice, a shard from an earlier run, overlapping bounds
+//! in the pass-1 split — would otherwise produce an archive whose tiles
+//! silently shadow each other, and the failure would surface much later as
+//! missing geometry on a map. The check costs one `u64` comparison per tile
+//! and, unlike a range check, also catches a duplicate id *within* one
+//! archive (a spec-illegal double directory entry, which a per-archive range
+//! says nothing about) and applies to a single-input merge.
+//!
+//! ## Memory
+//!
+//! The inputs are indexed, not read: [`ArchiveIndex`] holds each one's
+//! header, directories and metadata, and tile bodies are read by offset as
+//! they are copied. The real ceiling is the **writer's**, not the readers':
+//! `StreamingPmtilesWriter` accumulates one `DirEntry` (24 bytes) per written
+//! tile id, plus one `HashMap<u64, (u64, u32)>` dedup-cache entry (20 bytes
+//! of payload, ~32 with hashbrown's overhead) per distinct tile body — all
+//! resident until `finalize`. A 100M-tile merge is therefore several
+//! gigabytes of writer bookkeeping however small the inputs' indexes are. The
+//! tile data itself never accumulates: it streams to the spool file in
+//! [`MergeOptions::work_dir`].
 //!
 //! The per-zoom tile counts in [`MergeReport`] are the point of the report:
 //! a sharded build's parity oracle is "merging N shards yields the same tiles
@@ -91,13 +105,6 @@ pub struct MergeReport {
     pub duration_secs: f64,
 }
 
-/// One input's expanded tile-id range, read from its directory alone.
-struct IdRange {
-    src: usize,
-    lo: u64,
-    hi: u64,
-}
-
 /// Merge `inputs` — PMTiles archives holding disjoint tile ids — into a
 /// single archive at `output`.
 ///
@@ -107,9 +114,10 @@ struct IdRange {
 /// union of their declared ranges, and its `vector_layers` the #492 union of
 /// theirs.
 ///
-/// Errors if the inputs disagree on tile type or compression, or if any two
-/// of them claim overlapping tile ids. See the module docs for why the
-/// overlap check is a range check.
+/// Errors if the inputs disagree on tile type or compression, or if any tile
+/// id is claimed twice — by two inputs or by one input's own directory. See
+/// the module docs for why that check is per tile id rather than per id
+/// range.
 pub fn merge_shards(
     inputs: &[PathBuf],
     output: &Path,
@@ -134,7 +142,6 @@ pub fn merge_shards(
     // stamp); compression is validated AND adopted, since the merged header
     // has to declare whatever the copied bodies actually are.
     let tile_compression = check_inputs_agree(&indexes)?;
-    check_disjoint(&indexes)?;
 
     let mut writer = match &options.work_dir {
         Some(dir) => StreamingPmtilesWriter::with_temp_dir(tile_compression, dir.clone()),
@@ -147,8 +154,28 @@ pub fn merge_shards(
     // tile at the build's deepest zoom, and deriving the merged maximum from
     // the deepest tile copied would narrow the range every such shard set
     // declares.
-    let min_zoom = indexes.iter().map(|i| i.header().min_zoom).min().unwrap();
-    let max_zoom = indexes.iter().map(|i| i.header().max_zoom).max().unwrap();
+    //
+    // An input holding NO tiles is excluded, the same way a bounds-less one
+    // is excluded from the bounds union. The writer stamps z0..z0 into an
+    // empty archive's header — a sentinel, not a declaration — and folding
+    // that in drags the merged minimum to z0, so the output claims zooms the
+    // build never produced on the word of a shard that contributed nothing.
+    let mut declared: Vec<(u8, u8)> = Vec::with_capacity(indexes.len());
+    for idx in &indexes {
+        if idx.tile_id_range().map_err(|e| at(idx, e))?.is_some() {
+            declared.push((idx.header().min_zoom, idx.header().max_zoom));
+        } else {
+            log::warn!(
+                "{}: holds no tiles; it is excluded from the merged archive's zoom range \
+                 (an empty archive's header reads as the writer's z0..z0 sentinel)",
+                idx.path().display()
+            );
+        }
+    }
+    // Every input empty: there is nothing to declare, and the writer's own
+    // empty-archive header (z0..z0) is the honest answer.
+    let min_zoom = declared.iter().map(|&(lo, _)| lo).min().unwrap_or(0);
+    let max_zoom = declared.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
     writer.set_declared_min_zoom(min_zoom);
     writer.set_declared_max_zoom(max_zoom);
 
@@ -180,7 +207,13 @@ pub fn merge_shards(
         ),
     }
 
-    let layers = collect_layers(&indexes);
+    // Sorted by id, not left in argument order: `vector_layers_json` keeps
+    // first-seen order, so `merge a.pmtiles b.pmtiles` and `merge b a` would
+    // otherwise produce byte-different archives whenever the inputs declare
+    // more than one distinct layer between them. (With a single shared layer
+    // — the normal shard case — order was already immaterial.)
+    let mut layers = collect_layers(&indexes);
+    layers.sort_by(|a, b| a.id.cmp(&b.id));
     if let Some(first) = layers.first().map(|l| l.id.clone()) {
         // Only the metadata's `name`; `vector_layers` below is authoritative
         // for what a client actually reads.
@@ -191,11 +224,10 @@ pub fn merge_shards(
     let mut per_zoom_tile_counts: BTreeMap<u8, u64> = BTreeMap::new();
     let mut tiles_total = 0u64;
 
-    // k-way merge by tile id. With validated-disjoint ranges the heap never
-    // holds a genuine tie and this degenerates to reading the archives in
-    // ascending-range order — which is exactly what makes the output
-    // clustered — but written as a merge so interleaved inputs are a
-    // validation change rather than a rewrite.
+    // k-way merge by tile id: ids come out globally ascending, which is
+    // exactly what makes the output clustered, and inputs whose id ranges
+    // interleave (#498's pivot-subtree shards) are handled without special
+    // cases. It is also where disjointness is checked — see `last_written`.
     let mut iters: Vec<_> = indexes.iter().map(ArchiveIndex::tiles).collect();
     let mut heads: Vec<Option<TileRef>> = vec![None; indexes.len()];
     let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
@@ -207,10 +239,20 @@ pub fn merge_shards(
         }
     }
 
+    // The last id written and which input wrote it. Ids arrive ascending, so
+    // a repeat is adjacent: this is the whole disjointness check.
+    let mut last_written: Option<(u64, usize)> = None;
+
     while let Some(Reverse((_, i))) = heap.pop() {
         let t = heads[i]
             .take()
             .expect("heap entry without a head is a bug in the merge loop");
+        if let Some((prev_id, prev_src)) = last_written {
+            if t.id <= prev_id {
+                return Err(duplicate_tile_id(&indexes[prev_src], &indexes[i], t.id));
+            }
+        }
+        last_written = Some((t.id, i));
         let data = indexes[i].read_range(t.range.clone())?;
         // Hash the COMPRESSED bytes, matching the pyramid merge: nothing is
         // decompressed here, so the uncompressed hash the writer's own path
@@ -299,57 +341,29 @@ fn check_inputs_agree(indexes: &[ArchiveIndex]) -> Result<Compression> {
     Ok(compression)
 }
 
-/// No two inputs may claim overlapping tile ids. See the module docs for why
-/// this is a range check.
-fn check_disjoint(indexes: &[ArchiveIndex]) -> Result<()> {
-    let mut ranges: Vec<IdRange> = Vec::new();
-    for (src, idx) in indexes.iter().enumerate() {
-        if let Some((lo, hi)) = idx.tile_id_range().map_err(|e| at(idx, e))? {
-            ranges.push(IdRange { src, lo, hi });
-        }
-    }
-    // Sorted by `lo`, an overlap is always between an input and whichever
-    // earlier one reaches deepest — tracked as a running high-water mark, so
-    // a wide range that swallows several later ones is still reported against
-    // the range that actually swallows them.
-    ranges.sort_by_key(|r| (r.lo, r.hi));
-    let mut furthest: Option<&IdRange> = None;
-    for r in &ranges {
-        if let Some(prev) = furthest {
-            if r.lo <= prev.hi {
-                // The first id both claim: `r` starts inside `prev`, so it is
-                // `r`'s own first id.
-                let zxy = tile_id_to_zxy(r.lo)
-                    .map(|(z, x, y)| format!("z{z}/{x}/{y}"))
-                    .unwrap_or_else(|_| "?".to_string());
-                return Err(Error::InvalidConfig(format!(
-                    "{} and {} claim overlapping tile ids: {} holds ids {}..={} and {} holds \
-                     {}..={}, colliding first at tile id {} ({zxy}). merge concatenates \
-                     disjoint shards — it will not reconcile a tile two inputs both claim, so \
-                     check how the shards were cut (a shard listed twice, or one left over \
-                     from an earlier run, is the usual cause)",
-                    indexes[prev.src].path().display(),
-                    indexes[r.src].path().display(),
-                    indexes[prev.src].path().display(),
-                    prev.lo,
-                    prev.hi,
-                    indexes[r.src].path().display(),
-                    r.lo,
-                    r.hi,
-                    r.lo,
-                )));
-            }
-            if r.hi > prev.hi {
-                furthest = Some(r);
-            }
-        } else {
-            furthest = Some(r);
-        }
-    }
-    Ok(())
+/// The error for a tile id claimed twice, naming both sides.
+///
+/// "some inputs overlap" is unactionable across a hundred shards, so both
+/// archives are named — the same archive twice when one input's own directory
+/// addresses an id more than once, which is spec-illegal and which a
+/// per-archive range check cannot see at all.
+fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Error {
+    let zxy = tile_id_to_zxy(id)
+        .map(|(z, x, y)| format!("z{z}/{x}/{y}"))
+        .unwrap_or_else(|_| "?".to_string());
+    Error::InvalidConfig(format!(
+        "{} and {} claim overlapping tile ids: both address tile id {id} ({zxy}). merge \
+         concatenates disjoint shards — it will not reconcile a tile two inputs both claim, \
+         so check how the shards were cut (a shard listed twice, or one left over from an \
+         earlier run, is the usual cause). The same archive named twice means its own \
+         directory addresses that id more than once, which no valid PMTiles archive does",
+        first.path().display(),
+        second.path().display(),
+    ))
 }
 
-/// Every `vector_layers` entry every input declares, in input order.
+/// Every `vector_layers` entry every input declares, in input order (the
+/// caller sorts).
 ///
 /// Unparseable or absent metadata is not fatal — the tiles are still
 /// copyable, they just describe no fields — but it is worth a warning, since
@@ -378,16 +392,31 @@ fn collect_layers(indexes: &[ArchiveIndex]) -> Vec<LayerMeta> {
             let Some(id) = l.get("id").and_then(Value::as_str) else {
                 continue;
             };
+            // `as u8` on a foreign JSON number truncates: a `minzoom` of 256
+            // became 0, silently widening the merged layer to the whole
+            // pyramid. Anything that is not a valid zoom falls back to the
+            // header's own value, which `Header::from_bytes` has already
+            // range-checked.
+            let zoom = |key: &str, fallback: u8| -> u8 {
+                match l.get(key).and_then(Value::as_u64) {
+                    Some(v) => match u8::try_from(v) {
+                        Ok(z) => z,
+                        Err(_) => {
+                            log::warn!(
+                                "{}: vector_layers[{id:?}].{key} = {v} is not a zoom; \
+                                 using the header's z{fallback}",
+                                idx.path().display()
+                            );
+                            fallback
+                        }
+                    },
+                    None => fallback,
+                }
+            };
             layers.push(LayerMeta {
                 id: id.to_string(),
-                minzoom: l
-                    .get("minzoom")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(u64::from(idx.header().min_zoom)) as u8,
-                maxzoom: l
-                    .get("maxzoom")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(u64::from(idx.header().max_zoom)) as u8,
+                minzoom: zoom("minzoom", idx.header().min_zoom),
+                maxzoom: zoom("maxzoom", idx.header().max_zoom),
                 fields: l
                     .get("fields")
                     .filter(|f| f.is_object())
@@ -528,19 +557,23 @@ mod tests {
         assert!(report.inputs_without_bounds.is_empty());
     }
 
-    /// The check that exists so a mis-cut shard set fails before the merge
-    /// burns hours, rather than producing an archive with silently shadowed
-    /// tiles. The message has to name BOTH archives: "some inputs overlap" is
-    /// unactionable across a hundred shards.
+    /// The check that exists so a mis-cut shard set fails rather than
+    /// producing an archive with silently shadowed tiles. The message has to
+    /// name BOTH archives: "some inputs overlap" is unactionable across a
+    /// hundred shards.
+    ///
+    /// The collision is a genuinely shared tile id, not merely overlapping id
+    /// *ranges* — see `merge_shards_accepts_disjoint_inputs_with_interleaved_ranges`
+    /// for why the range shape is legal.
     #[test]
-    fn merge_shards_rejects_overlapping_tile_ranges() {
+    fn merge_shards_rejects_overlapping_tile_ids() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("east.pmtiles");
         let b = dir.path().join("west.pmtiles");
         let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
         write_shard(&a, "l", &[(6, 0, 0), (6, 10, 10)], bounds, &[]);
-        // Starts inside a's range.
-        write_shard(&b, "l", &[(6, 5, 5), (6, 20, 20)], bounds, &[]);
+        // Holds one of a's tiles.
+        write_shard(&b, "l", &[(6, 10, 10), (6, 20, 20)], bounds, &[]);
 
         let out = dir.path().join("merged.pmtiles");
         let err = merge_shards(&[a.clone(), b.clone()], &out, &MergeOptions::default())
@@ -699,6 +732,142 @@ mod tests {
         assert_eq!(arr[0]["id"], json!("roads"));
         assert_eq!(arr[0]["fields"]["name"], json!("String"));
         assert_eq!(arr[0]["fields"]["lanes"], json!("Number"));
+    }
+
+    /// S2-1 (rev6 review): an input holding no tiles reads back as the
+    /// writer's z0..z0 sentinel, not as "no opinion". Folding that into the
+    /// zoom union dragged the merged archive's declared minimum to z0 — a
+    /// header claiming zooms the build never produced, from a shard that
+    /// contributed nothing. Tile-less inputs are excluded from the union (and
+    /// named in a warning), the same way bounds-less ones are excluded from
+    /// the bounds union.
+    #[test]
+    fn merge_shards_ignores_tile_less_inputs_in_the_zoom_union() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.pmtiles");
+        let empty = dir.path().join("empty.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        write_shard(&real, "l", &[(6, 0, 0), (6, 1, 1)], bounds, &[]);
+        write_shard_with(&empty, "l", &[], Some(bounds), &[], Compression::Gzip);
+        assert_eq!(
+            (header_of(&empty).min_zoom, header_of(&empty).max_zoom),
+            (0, 0),
+            "the empty shard's header is the z0..z0 sentinel this test is about"
+        );
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_shards(
+            &[real.clone(), empty.clone()],
+            &out,
+            &MergeOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            (report.min_zoom, report.max_zoom),
+            (6, 6),
+            "an empty shard must not widen the declared range: {report:?}"
+        );
+        let h = header_of(&out);
+        assert_eq!((h.min_zoom, h.max_zoom), (6, 6), "{h:?}");
+    }
+
+    /// S2-2 (rev6 review): #498's shards are cut by pivot subtree, not by a
+    /// contiguous slice of the id space, so two shards can hold entirely
+    /// disjoint ids whose *ranges* interleave. The old range-overlap check
+    /// refused exactly that — a correct shard set — with a message blaming
+    /// "a shard listed twice". Disjointness is now checked per tile id in the
+    /// merge loop, which accepts this and still refuses a genuine collision.
+    #[test]
+    fn merge_shards_accepts_disjoint_inputs_with_interleaved_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("subtree-a.pmtiles");
+        let b = dir.path().join("subtree-b.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        // Interleaved by tile id: each shard's range strictly contains ids the
+        // other holds, while the id SETS are disjoint.
+        write_shard(&a, "l", &[(6, 0, 0), (6, 20, 20)], bounds, &[]);
+        write_shard(&b, "l", &[(6, 10, 10), (6, 30, 30)], bounds, &[]);
+        let (alo, ahi) = ArchiveIndex::open(&a)
+            .unwrap()
+            .tile_id_range()
+            .unwrap()
+            .unwrap();
+        let (blo, bhi) = ArchiveIndex::open(&b)
+            .unwrap()
+            .tile_id_range()
+            .unwrap()
+            .unwrap();
+        assert!(
+            alo < bhi && blo < ahi,
+            "the fixture must interleave: a={alo}..={ahi} b={blo}..={bhi}"
+        );
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_shards(&[a.clone(), b.clone()], &out, &MergeOptions::default())
+            .expect("disjoint ids with interleaved ranges must merge");
+
+        assert_eq!(report.tiles_total, 4);
+        let mut expected = BTreeMap::new();
+        for shard in [&a, &b] {
+            expected.extend(tiles_of(shard));
+        }
+        assert_eq!(tiles_of(&out), expected);
+        assert!(verify_clustered(&out).unwrap(), "and still clustered");
+    }
+
+    /// S3-5 (rev6 review): a duplicate id *inside* one archive — a spec-illegal
+    /// double directory entry, or a delta-0 pair — is invisible to a
+    /// per-archive range check, and a single-input merge skipped the check
+    /// entirely. The per-tile check in the merge loop catches it, and names
+    /// the archive (twice, here, because both sides of the collision are the
+    /// same file).
+    #[test]
+    fn merge_shards_rejects_a_duplicate_id_within_one_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("doubled.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        write_shard(&src, "l", &[(6, 0, 0), (6, 1, 1)], bounds, &[]);
+
+        // Rewrite the root directory with the first entry's id repeated: two
+        // entries, same tile id, different bodies. `encode_directory` writes
+        // ids as deltas, so this is a delta of 0 on the wire — legal varints,
+        // illegal archive.
+        let bytes = std::fs::read(&src).unwrap();
+        let idx = ArchiveIndex::open(&src).unwrap();
+        let mut entries = idx.entries().to_vec();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        entries[1].tile_id = entries[0].tile_id;
+        drop(idx);
+
+        let mut header = Header::from_bytes(&bytes).unwrap();
+        let enc = crate::compression::compress(
+            &crate::pmtiles_writer::encode_directory(&entries),
+            header.internal_compression,
+        )
+        .unwrap();
+        let mut out_bytes = bytes.clone();
+        header.root_dir_offset = out_bytes.len() as u64;
+        header.root_dir_length = enc.len() as u64;
+        out_bytes.extend_from_slice(&enc);
+        out_bytes[..crate::pmtiles_writer::HEADER_BYTES].copy_from_slice(&header.to_bytes());
+        let doubled = dir.path().join("doubled-dir.pmtiles");
+        std::fs::write(&doubled, &out_bytes).unwrap();
+
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_shards(
+            std::slice::from_ref(&doubled),
+            &out,
+            &MergeOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("overlapping tile ids"), "{err}");
+        assert!(
+            err.matches("doubled-dir.pmtiles").count() >= 2,
+            "both sides of the collision must be named: {err}"
+        );
+        assert!(!out.exists(), "a rejected merge must write nothing");
     }
 
     /// Bodies are copied verbatim under one header that declares one

@@ -27,7 +27,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tylertoo_core::overview::export::FeatureOrder;
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
@@ -302,9 +302,11 @@ pub struct PyramidArgs {
 ///
 /// It is the second half of a sharded build: tile each shard of a large input
 /// separately, then merge the shard archives into the archive that ships.
-/// Because a shard is a contiguous slice of a (gpio-sorted) source, the tile
-/// ids it produces are a contiguous slice of the archive's id space, and the
-/// shards are disjoint by construction.
+/// A shard's tile ids are disjoint from every other shard's by construction,
+/// but they need not form a contiguous slice of the archive's id space — two
+/// subtrees at different depths interleave on the Hilbert curve, so one
+/// shard's first and last id can straddle ids another shard holds. The merge
+/// handles that; disjointness is checked per tile id, not per id range.
 ///
 /// That disjointness is checked, not assumed: if any two inputs claim
 /// overlapping tile ids the merge is refused, naming both archives, before
@@ -2703,6 +2705,62 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     Ok(())
 }
 
+/// A path's identity for "is this the same file?", resolved as far as the
+/// filesystem allows.
+///
+/// The file itself need not exist (the output usually does not), so the
+/// *parent* is canonicalized and the file name re-joined — that collapses
+/// `./out.pmtiles`, `dir/../out.pmtiles` and a symlinked directory to one
+/// key. When even the parent cannot be resolved the literal path is the key,
+/// which is what the comparison did before and is never worse.
+fn canonical_key(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            match parent.canonicalize() {
+                Ok(real) => real.join(name),
+                Err(_) => path.to_path_buf(),
+            }
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Fail now if `path` cannot be created, instead of after the work is done.
+///
+/// Probes by creating (and removing) the file when it does not exist, so a
+/// missing directory or a read-only one is reported with the path that caused
+/// it. An existing file is left strictly alone — `--force` decides whether it
+/// may be overwritten, and this must not truncate it.
+fn preflight_writable(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            anyhow::bail!(
+                "{}: directory {} does not exist",
+                path.display(),
+                parent.display()
+            );
+        }
+    }
+    match std::fs::File::create(path) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("{}: cannot be written ({e})", path.display()),
+    }
+}
+
 /// Run `tylertoo merge`: several disjoint PMTiles archives → one (thin facade
 /// over `tylertoo_core::merge::merge_shards`).
 fn run_merge(args: MergeArgs) -> Result<()> {
@@ -2721,16 +2779,34 @@ fn run_merge(args: MergeArgs) -> Result<()> {
     // with a bare "No such file or directory" and no path. Every input is a
     // local archive read by offset, so `exists()` has a useful answer for all
     // of them — unlike `pyramid`'s bands, which may be globs or URLs.
+    //
+    // The input/output comparison is on canonical paths: `merge out.pmtiles
+    // ./out.pmtiles shard.pmtiles` walked straight past a `PathBuf` equality
+    // test. All the reads complete before `finalize` creates the output, so
+    // the merge itself would have succeeded — and silently destroyed the
+    // input it had just consumed, which is worse than a failed merge.
+    let out_key = canonical_key(&args.output);
     for input in &args.inputs {
         if !input.exists() {
             anyhow::bail!("input archive not found: {}", input.display());
         }
-        if *input == args.output {
+        if canonical_key(input) == out_key {
             anyhow::bail!(
-                "{} is both an input and the output; merge reads its inputs while it writes",
+                "{} is both an input and the output; the merge would read it and then \
+                 overwrite it, destroying the input",
                 input.display()
             );
         }
+    }
+
+    // Preflight the paths the run will write, before it reads gigabytes: a
+    // `--report` in a directory that does not exist, or an output whose parent
+    // is missing or read-only, would otherwise surface only at the end. This
+    // mirrors `--work-dir`, which fails fast because the writer creates its
+    // spool file up front.
+    preflight_writable(&args.output).map_err(|e| anyhow::anyhow!("output {e}"))?;
+    if let Some(report) = &args.report {
+        preflight_writable(report).map_err(|e| anyhow::anyhow!("--report {e}"))?;
     }
     if args.inputs.len() < 2 {
         // Not an error: merging one archive is a well-defined (if pointless)
@@ -3958,5 +4034,52 @@ mod tests {
                 && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
             "{both}"
         );
+    }
+
+    /// #510 review, S3-7: `merge`'s "input is also the output" guard compared
+    /// raw `PathBuf`s, so `./out.pmtiles` walked straight past it and the run
+    /// overwrote the input it had just read. Spellings of one path must key
+    /// the same.
+    #[test]
+    fn canonical_key_collapses_spellings_of_one_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.pmtiles");
+        std::fs::write(&out, b"x").unwrap();
+
+        let dotted = dir.path().join(".").join("out.pmtiles");
+        let round_trip = dir.path().join("sub").join("..").join("out.pmtiles");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert_eq!(canonical_key(&out), canonical_key(&dotted));
+        assert_eq!(canonical_key(&out), canonical_key(&round_trip));
+
+        // A path that does not exist yet still keys by its canonical parent —
+        // the output usually does not exist when the guard runs.
+        let missing = dir.path().join("new.pmtiles");
+        let missing_dotted = dir.path().join(".").join("new.pmtiles");
+        assert_eq!(canonical_key(&missing), canonical_key(&missing_dotted));
+        assert_ne!(canonical_key(&missing), canonical_key(&out));
+    }
+
+    /// #510 review, S3-6: a `--report` (or output) path in a directory that
+    /// does not exist used to surface only after the merge had read every
+    /// input. It is probed up front, like `--work-dir`.
+    #[test]
+    fn preflight_writable_rejects_a_missing_directory_and_keeps_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = preflight_writable(&dir.path().join("nope").join("report.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+
+        // A writable directory passes and leaves nothing behind.
+        let fresh = dir.path().join("report.json");
+        preflight_writable(&fresh).unwrap();
+        assert!(!fresh.exists(), "the probe must not leave a file behind");
+
+        // An existing file is not touched — `--force` owns that decision.
+        let existing = dir.path().join("out.pmtiles");
+        std::fs::write(&existing, b"keep me").unwrap();
+        preflight_writable(&existing).unwrap();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
     }
 }

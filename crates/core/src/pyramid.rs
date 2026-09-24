@@ -699,6 +699,27 @@ fn check_shared_zoom_layer_labels(bands: &[Band], archives: &[BandArchive]) -> R
     Ok(())
 }
 
+/// A band's tile bytes, served from a one-slot cache keyed on the byte range.
+///
+/// A run-length directory entry hands every id of the run the same range, and
+/// those ids are adjacent in the merge's id-ordered index, so without this
+/// each one costs an identical positioned read. The clone is a memcpy of one
+/// compressed tile; the read it replaces is a syscall.
+fn read_cached(
+    archive: &BandArchive,
+    slot: &mut Option<(std::ops::Range<usize>, Vec<u8>)>,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<u8>, Error> {
+    if let Some((cached, bytes)) = slot {
+        if *cached == range {
+            return Ok(bytes.clone());
+        }
+    }
+    let data = archive.tile(range.clone())?;
+    *slot = Some((range, data.clone()));
+    Ok(data)
+}
+
 /// One layer's entry in a merged archive's `vector_layers`.
 ///
 /// Shared with [`crate::merge`], which unions shard archives' `vector_layers`
@@ -832,17 +853,22 @@ impl BandArchive {
     ///
     /// Run-length entries are expanded into individual ids — a band's
     /// numbering is not the merged archive's, which re-derives its own runs.
-    /// Every id of a run re-reads the one body; the merged writer's dedup
-    /// cache collapses the run again on the far side, and runs are rare
-    /// enough that the reread costs less than holding the file resident to
-    /// avoid it.
+    /// Every id of a run addresses the same body, and the ids of a run arrive
+    /// consecutively, so a one-slot cache keyed on the byte range serves the
+    /// whole run from one read: before it, an N-id run cost N `pread`s of the
+    /// identical bytes. (The merged writer's dedup cache collapses the run
+    /// again on the far side.)
     fn for_each_tile<F>(&self, mut f: F) -> Result<(), Error>
     where
         F: FnMut(u8, u32, u32, &[u8]) -> Result<(), Error>,
     {
+        let mut cached: Option<(std::ops::Range<usize>, Vec<u8>)> = None;
         self.for_each_tile_range(|_, z, x, y, range| {
-            let data = self.index.read_range(range)?;
-            f(z, x, y, &data)
+            if !matches!(&cached, Some((r, _)) if *r == range) {
+                cached = Some((range.clone(), self.index.read_range(range)?));
+            }
+            let (_, data) = cached.as_ref().expect("just populated");
+            f(z, x, y, data)
         })
     }
 
@@ -1268,10 +1294,15 @@ pub fn merge_bands_with_options(
         }
         let mut combined = 0usize;
         let mut buf = Vec::new();
+        // One cached (range, bytes) per band, for the same reason
+        // `for_each_tile` caches: a run-length entry gives every id of the run
+        // the same byte range, and those ids are adjacent in `index`, so
+        // without this each one re-reads the identical body.
+        let mut cache: Vec<Option<(std::ops::Range<usize>, Vec<u8>)>> = vec![None; archives.len()];
         for ((z, x, y), refs) in index.values() {
             let (z, x, y) = (*z, *x, *y);
             if let [(bi, range)] = refs.as_slice() {
-                let data = archives[*bi].tile(range.clone())?;
+                let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
                 let hash = TileHasher::hash(&data);
                 writer
                     .add_tile_precompressed(z, x, y, hash, &data, data.len(), 0)
@@ -1280,7 +1311,7 @@ pub fn merge_bands_with_options(
             }
             buf.clear();
             for (bi, range) in refs {
-                let raw = archives[*bi].tile(range.clone())?;
+                let raw = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
                 let plain = compression::decompress_capped(
                     &raw,
                     archives[*bi].header().tile_compression,

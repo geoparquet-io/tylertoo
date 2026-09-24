@@ -8,7 +8,7 @@
 //! - Configurable compression (gzip, brotli, zstd) for both directories and tiles
 //! - Clustered mode for efficient sequential reads
 
-use crate::compression::{self, Compression};
+use crate::compression::{self, Compression, MAX_INTERNAL_BYTES};
 use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
 use crate::tile::TileBounds;
 use crate::world_coord::MAX_LATITUDE;
@@ -36,13 +36,15 @@ pub enum TileType {
 
 // Compression enum is now imported from crate::compression
 
-/// PMTiles v3 header (127 bytes)
+/// The PMTiles v3 header's fixed on-disk size.
 ///
-/// The PMTiles v3 header's fixed on-disk size. A reader that fetches the
-/// header before it knows anything else about the archive — e.g.
-/// [`crate::archive_index::ArchiveIndex`] — needs exactly this many bytes.
+/// A reader that fetches the header before it knows anything else about the
+/// archive — e.g. [`crate::archive_index::ArchiveIndex`] — needs exactly this
+/// many bytes. See [`Header`] for the layout.
 pub const HEADER_BYTES: usize = 127;
 
+/// PMTiles v3 header (127 bytes)
+///
 /// Layout follows the spec exactly:
 /// - Bytes 0-6: Magic "PMTiles"
 /// - Byte 7: Version (3)
@@ -803,6 +805,19 @@ pub(crate) fn read_all_entries_from<S: ArchiveBytes + ?Sized>(
 ) -> Result<Vec<DirEntry>> {
     let past_end = |what: &str| Error::PMTilesWrite(format!("{what} past end of archive"));
     let slice = |off: u64, len: u64, what: &str| -> Result<std::borrow::Cow<'_, [u8]>> {
+        // #417, extended in #510: the declared length is checked against the
+        // internal-section ceiling BEFORE anything is allocated. Bounding it
+        // by the file's own length is no bound at all for a file-backed
+        // source — a header claiming a 256 MiB root directory made a reader
+        // allocate 256 MiB per archive, and a merge opens every shard at
+        // once. The section is decompressed under the same ceiling anyway, so
+        // a compressed body larger than it cannot be a legitimate directory.
+        if len > MAX_INTERNAL_BYTES {
+            return Err(Error::PMTilesWrite(format!(
+                "{what} claims {len} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
+                 ceiling on an archive's internal sections"
+            )));
+        }
         // Both come from the archive; a `as usize` truncation on a 32-bit
         // target would turn a wild offset into a plausible in-range one.
         let start = usize::try_from(off).map_err(|_| past_end(what))?;

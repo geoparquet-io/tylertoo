@@ -407,7 +407,9 @@ crates/core/src/
 ├── merge.rs            # Concatenate PMTiles archives holding DISJOINT tile
 │                       # ids into one, by blob copy — the second half of a
 │                       # sharded build (#498). Disjointness is validated
-│                       # up front; overlapping inputs are pyramid.rs's job
+│                       # per tile id as the k-way merge runs (shard id sets
+│                       # are disjoint but NOT contiguous ranges);
+│                       # overlapping inputs are pyramid.rs's job
 ├── archive_index.rs    # Read a PMTiles archive's header + directories and
 │                       # fetch tile bodies by offset; what lets pyramid.rs
 │                       # and merge.rs work on archives bigger than RAM

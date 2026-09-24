@@ -9,7 +9,8 @@
 
 use std::path::PathBuf;
 
-use tylertoo_core::compression::compress;
+use tylertoo_core::archive_index::ArchiveIndex;
+use tylertoo_core::compression::{compress, MAX_INTERNAL_BYTES};
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::pmtiles_writer::{encode_directory, DirEntry, Header, MAX_LEAF_DIRECTORIES};
 use tylertoo_core::{Compression, StreamingPmtilesWriter};
@@ -286,6 +287,71 @@ fn directory_decompression_bomb_is_capped() {
     assert!(
         msg.contains("root directory") && msg.contains("exceeds"),
         "expected a capped-decompression error naming the section, got: {msg}"
+    );
+}
+
+/// #510 review, S2-3: `ArchiveIndex::open` sized its reads from lengths the
+/// archive declares, bounded only by the file's own length. A header claiming
+/// a 256 MiB metadata block (or root directory) made `open` allocate that
+/// much — per input, and `tylertoo merge` opens every shard at once — and
+/// then SUCCEED, holding the block raw for the index's lifetime. Both reads
+/// are capped at `MAX_INTERNAL_BYTES` before the allocation, with #417's
+/// wording.
+///
+/// The oversized region is a sparse tail, so the probe costs no disk.
+fn with_sparse_tail(dir: &tempfile::TempDir, name: &str, bytes: &[u8], extra: u64) -> PathBuf {
+    let path = dir.path().join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(bytes.len() as u64 + extra).unwrap();
+    path
+}
+
+#[test]
+fn archive_index_metadata_read_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let mut header = Header::from_bytes(&bytes[..127]).unwrap();
+    const HUGE: u64 = 256 * 1024 * 1024;
+    header.json_metadata_offset = bytes.len() as u64;
+    header.json_metadata_length = HUGE;
+    let mut out = bytes.clone();
+    out[..127].copy_from_slice(&header.to_bytes());
+    let path = with_sparse_tail(&dir, "huge-metadata.pmtiles", &out, HUGE);
+
+    let err = match ArchiveIndex::open(&path) {
+        Ok(_) => panic!("a 256 MiB metadata block must be refused, not allocated"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("metadata") && err.contains("exceeds"),
+        "expected a capped-read error naming the section, got: {err}"
+    );
+    assert!(
+        err.contains(&MAX_INTERNAL_BYTES.to_string()),
+        "the message must give the ceiling, got: {err}"
+    );
+}
+
+#[test]
+fn archive_index_directory_read_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let mut header = Header::from_bytes(&bytes[..127]).unwrap();
+    const HUGE: u64 = 256 * 1024 * 1024;
+    header.root_dir_offset = bytes.len() as u64;
+    header.root_dir_length = HUGE;
+    let mut out = bytes.clone();
+    out[..127].copy_from_slice(&header.to_bytes());
+    let path = with_sparse_tail(&dir, "huge-root.pmtiles", &out, HUGE);
+
+    let err = match ArchiveIndex::open(&path) {
+        Ok(_) => panic!("a 256 MiB root directory must be refused, not allocated"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("root dir") && err.contains("exceeds"),
+        "expected a capped-read error naming the section, got: {err}"
     );
 }
 

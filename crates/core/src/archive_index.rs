@@ -187,6 +187,21 @@ impl ArchiveIndex {
 
         let entries = read_all_entries_from(&src, &header).map_err(at)?;
 
+        // Capped before the allocation, like the directory reads above
+        // (#417/#510): `json_metadata_length` is archive-supplied and bounded
+        // only by the file, so a header claiming 256 MiB of metadata used to
+        // make `open` allocate that much — per input, and a merge opens every
+        // shard at once — and then SUCCEED, holding it raw for the index's
+        // lifetime. `metadata_json` decompresses it under the same ceiling, so
+        // a larger compressed block cannot be legitimate metadata.
+        if header.json_metadata_length > MAX_INTERNAL_BYTES {
+            return Err(Error::PMTilesWrite(format!(
+                "{}: metadata claims {} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
+                 ceiling on an archive's internal sections",
+                path.display(),
+                header.json_metadata_length
+            )));
+        }
         let meta_end = header
             .json_metadata_offset
             .checked_add(header.json_metadata_length)
@@ -303,11 +318,29 @@ impl ArchiveIndex {
     /// what makes the merge's disjointness check cheap enough to run on every
     /// input up front.
     pub fn tile_id_range(&self) -> Result<Option<(u64, u64)>> {
+        // The same run-length expansion budget [`Self::tiles`] spends, for
+        // the same reason and with the same wording (#417/#510): without it,
+        // one hostile `run_length` came back as a plausible multi-billion-id
+        // range, and the merge reported that as an *overlap* — blaming an
+        // innocent archive for a corrupt one's directory.
+        let limit = max_expanded_entries(&self.header);
+        let mut budget = limit;
         let mut range: Option<(u64, u64)> = None;
         for e in &self.entries {
+            let run = u64::from(e.run_length.max(1));
+            match budget.checked_sub(run) {
+                Some(b) => budget = b,
+                None => {
+                    return Err(Error::PMTilesWrite(format!(
+                        "directory entry for tile id {} claims a run of {run} tiles, past this \
+                         archive's run-length expansion limit of {limit} tiles",
+                        e.tile_id
+                    )))
+                }
+            }
             let last = e
                 .tile_id
-                .checked_add(u64::from(e.run_length.max(1)) - 1)
+                .checked_add(run - 1)
                 .ok_or_else(|| Error::PMTilesWrite("tile id past end of range".to_string()))?;
             range = Some(match range {
                 None => (e.tile_id, last),
@@ -503,6 +536,50 @@ mod tests {
             .map(|&i| refs[i].range.len())
             .sum();
         assert_eq!(fetched, expected as u64);
+    }
+
+    /// #510 review, S3-4: [`ArchiveIndex::tiles`] spends a run-length
+    /// expansion budget so a hostile `run_length` is refused, but
+    /// [`ArchiveIndex::tile_id_range`] expanded the same runs with no budget
+    /// at all. A single `0xFFFFFFFF` run therefore came back as a plausible
+    /// four-billion-id range — which the merge then reported as an *overlap*,
+    /// blaming an innocent shard for a corrupt one's directory. Same budget,
+    /// same wording, so the diagnosis is "this archive is corrupt".
+    #[test]
+    fn tile_id_range_spends_the_run_length_budget() {
+        use crate::pmtiles_writer::{encode_directory, DirEntry, Header, HEADER_BYTES};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.pmtiles");
+        write_archive(&path, &[(5, 0, 0), (5, 1, 1)], 32);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let mut header = Header::from_bytes(&bytes).unwrap();
+        let entries = [DirEntry {
+            tile_id: 1,
+            offset: 0,
+            length: 8,
+            run_length: u32::MAX,
+        }];
+        let enc = compression::compress(&encode_directory(&entries), header.internal_compression)
+            .unwrap();
+        let mut out = bytes.clone();
+        header.root_dir_offset = out.len() as u64;
+        header.root_dir_length = enc.len() as u64;
+        out.extend_from_slice(&enc);
+        out[..HEADER_BYTES].copy_from_slice(&header.to_bytes());
+        let hostile = dir.path().join("hostile-run.pmtiles");
+        std::fs::write(&hostile, &out).unwrap();
+
+        let idx = ArchiveIndex::open(&hostile).unwrap();
+        let err = idx
+            .tile_id_range()
+            .expect_err("a 4-billion-tile run must be refused, not reported as a range")
+            .to_string();
+        assert!(
+            err.contains("run-length expansion"),
+            "the message must diagnose corruption, not an overlap: {err}"
+        );
     }
 
     /// The directory alone answers "which ids does this archive hold?", which
