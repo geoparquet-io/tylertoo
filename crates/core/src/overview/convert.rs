@@ -2668,7 +2668,7 @@ pub(super) fn bbox_out_of_crs_range(bbox: &[f64; 4], crs: Crs) -> bool {
 /// (Svalbard, an ice-shelf polygon reaching the pole) still puts geometry in
 /// tiles and is merely clipped.
 ///
-/// The threshold is the projection's own limit ([`WEBMERC_MAX_LAT`],
+/// The threshold is the projection's own limit ([`crate::world_coord::MAX_LATITUDE`],
 /// 85.0511°) rather than the slightly tighter ±85.05° the tiler clamps to, so
 /// the count never overstates: a feature in that 0.001° sliver is clamped to
 /// the world's top edge, not counted as lost.
@@ -2677,9 +2677,10 @@ pub(super) fn bbox_out_of_crs_range(bbox: &[f64; 4], crs: Crs) -> bool {
 /// anything inside the world extent projects by construction and the range
 /// check above covers the rest.
 pub(super) fn bbox_unprojectable(bbox: &[f64; 4], crs: Crs) -> bool {
+    use crate::world_coord::MAX_LATITUDE;
     match crs {
         Crs::Epsg3857 => false,
-        Crs::Epsg4326 => bbox[1] > WEBMERC_MAX_LAT || bbox[3] < -WEBMERC_MAX_LAT,
+        Crs::Epsg4326 => bbox[1] > MAX_LATITUDE || bbox[3] < -MAX_LATITUDE,
     }
 }
 
