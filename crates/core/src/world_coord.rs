@@ -116,7 +116,10 @@ impl WorldCoord {
             return (local_x, local_y);
         }
 
-        let shift = 32 - tile.z as u32;
+        // #371: saturating, because `32 - z` underflows from z33 up — a debug
+        // panic and, in release, a masked shift count. Identical for every zoom
+        // the writer can reach (z32 already shifts by 0).
+        let shift = 32_u32.saturating_sub(u32::from(tile.z));
         let tile_size = 1_u64 << shift;
 
         // World position of tile's top-left corner
@@ -234,7 +237,10 @@ pub fn tile_local_to_world(
         return WorldCoord::new(world_x, world_y);
     }
 
-    let shift = 32 - tile.z as u32;
+    // #371: saturating, because `32 - z` underflows from z33 up — a debug
+    // panic and, in release, a masked shift count. Identical for every zoom
+    // the writer can reach (z32 already shifts by 0).
+    let shift = 32_u32.saturating_sub(u32::from(tile.z));
     let tile_size = 1_u64 << shift;
 
     // World position of tile's top-left corner
@@ -317,7 +323,10 @@ impl WorldBounds {
             return Self::new(0, 0, u32::MAX, u32::MAX);
         }
 
-        let shift = 32 - tile.z as u32;
+        // #371: saturating, because `32 - z` underflows from z33 up — a debug
+        // panic and, in release, a masked shift count. Identical for every zoom
+        // the writer can reach (z32 already shifts by 0).
+        let shift = 32_u32.saturating_sub(u32::from(tile.z));
         let tile_size = 1_u64 << shift;
 
         let x_min = ((tile.x as u64) << shift) as u32;

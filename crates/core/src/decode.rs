@@ -395,7 +395,15 @@ fn collect_tile_refs(
     let mut tiles = Vec::new();
     for entry in &entries {
         for i in 0..u64::from(entry.run_length.max(1)) {
-            let (z, x, y) = tile_id_to_zxy(entry.tile_id + i)?;
+            // #371: `tile_id` and `run_length` both come from the archive, so
+            // the walk along a run can be made to overflow u64 by a hostile or
+            // corrupt directory. Same treatment as the sibling walker in
+            // `pyramid.rs`: an out-of-range run is a bad archive, not a panic
+            // (debug) or a wrapped id pointing at some other tile (release).
+            let id = entry.tile_id.checked_add(i).ok_or_else(|| {
+                DecodeError::InvalidArchive("tile id past end of range".to_string())
+            })?;
+            let (z, x, y) = tile_id_to_zxy(id)?;
             if options.min_zoom.is_some_and(|mz| z < mz)
                 || options.max_zoom.is_some_and(|mz| z > mz)
             {

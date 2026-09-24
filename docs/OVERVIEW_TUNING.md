@@ -62,15 +62,24 @@ gsd(z) = 40075016.69 / gsd_base / 2^z          (meters, spec §5.2)
 | `--gsd G1,G2,…` | — | meters, strictly decreasing | explicit per-level GSDs; **overrides** the zoom range and `--gsd-base` |
 | `--min-zoom` / `--max-zoom` | `0` / `6` | Web Mercator zoom | coarsest / finest (canonical) level (max **30**) |
 
-**Zoom ceiling: 30.** Every zoom tylertoo writes must fit the tile arithmetic:
-tile coordinates are 32-bit (so z31 is the hard limit) and the PMTiles Hilbert
-tile id needs `4^z` of headroom in a `u64`. 30 is what the math supports with a
-level of margin — and at ~1.15e18 tiles and a GSD of ~3.6e-5 m it is far past
-any real dataset. A `--max-zoom` above 30 is **rejected at option validation**,
-before the input is opened, rather than running for hours to produce an archive
-whose every tile id is wrong. The same ceiling applies to `--min-zoom` and to a
-`--gsd` fine enough to *imply* a zoom above it — an explicit GSD ladder records
-no zoom, so the implied one is checked on the same footing (#371).
+**Zoom ceiling: 30 — an addressability limit, not a recommendation.** Every
+zoom tylertoo writes must fit the tile arithmetic: tile coordinates are 32-bit
+(so z31 is the hard limit) and the PMTiles Hilbert tile id needs `4^z` of
+headroom in a `u64`. 30 is what the math supports with a level of margin. A
+`--max-zoom` above 30 is **rejected at option validation**, before the input is
+opened, rather than running for hours to produce an archive whose every tile id
+is wrong. The same ceiling applies to `--min-zoom` and to a `--gsd` fine enough
+to *imply* a zoom above it — an explicit GSD ladder records no zoom, so the
+implied one is checked on the same footing (#371).
+
+The ceiling says a zoom can be *addressed*, not that it is practical. Cost
+grows roughly **4x per zoom**: z30 is ~1.15e18 tiles at a GSD of ~3.6e-5 m, far
+past what any real dataset resolves. Points are cheap — a point touches one
+tile at every zoom — but line and polygon data is not: a single 1-degree
+linestring spans on the order of 3e6 tiles at z30, and rendering it is the
+same CPU-bound, RSS-growing walk that made an unbounded `--max-zoom` a bug in
+the first place. In practice the highest useful `--max-zoom` for non-point data
+is far below the ceiling; raise it a level at a time and watch the output size.
 
 `--gsd-base` is the **master detail knob** for a zoom-range plan. It scales the
 *whole ladder* at once:

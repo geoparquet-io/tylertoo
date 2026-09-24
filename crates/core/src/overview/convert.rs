@@ -112,34 +112,47 @@ impl LevelPlan {
     /// with growing RSS through a conversion whose output would be corrupt.
     ///
     /// Both arms are covered. An explicit [`ZoomRange`](LevelPlan::ZoomRange)
-    /// is checked directly; an explicit [`Gsds`](LevelPlan::Gsds) plan records
-    /// no zoom, so it is checked through the same §5.2 inverse the exporter
-    /// uses to derive one ([`zoom_for_gsd`]) — otherwise a small enough `--gsd`
-    /// walks straight past `--max-zoom`.
+    /// is checked directly — `min_zoom` as well as `max_zoom`, since either can
+    /// be handed in above the ceiling; an explicit [`Gsds`](LevelPlan::Gsds)
+    /// plan records no zoom, so it is checked through the same §5.2 inverse the
+    /// exporter uses to derive one ([`zoom_for_gsd`]) — otherwise a small
+    /// enough `--gsd` walks straight past `--max-zoom`.
     pub(super) fn check_zoom_ceiling(&self) -> Result<(), ConvertError> {
         let ceiling = MAX_ZOOM;
         match self {
-            LevelPlan::ZoomRange { max_zoom, .. } => {
-                if *max_zoom > ceiling {
-                    return Err(ConvertError::ZoomAboveCeiling {
-                        asked: format!("--max-zoom {max_zoom}"),
-                        zoom: i64::from(*max_zoom),
-                        ceiling,
-                    });
+            LevelPlan::ZoomRange { min_zoom, max_zoom } => {
+                // `min_zoom` first: with both out of range, the coarsest end is
+                // the more useful thing to name, and `min > max` (reported by
+                // `resolve`) would otherwise mask a z33 minimum entirely.
+                for (flag, z) in [("--min-zoom", *min_zoom), ("--max-zoom", *max_zoom)] {
+                    if z > ceiling {
+                        return Err(ConvertError::ZoomAboveCeiling {
+                            asked: format!("{flag} {z}"),
+                            zoom: i64::from(z),
+                            ceiling,
+                        });
+                    }
                 }
             }
             LevelPlan::Gsds(gsds) => {
-                for &g in gsds {
-                    if g.is_nan() || g <= 0.0 {
-                        // Left to the `resolve` arm, which reports it with the
-                        // level index; `zoom_for_gsd` is meaningless here.
-                        continue;
+                for (i, &g) in gsds.iter().enumerate() {
+                    // #371: a non-finite GSD has no meaningful zoom — `inf`
+                    // inverts to z = -inf, which is below the ceiling, so it
+                    // used to pass validation, convert, and only then fail at
+                    // export with "implies zoom 9223372036854775807". It is a
+                    // nonsense value; say so here, before any work.
+                    if !g.is_finite() || g <= 0.0 {
+                        return Err(ConvertError::InvalidLevels(Self::bad_gsd_message(i, g)));
                     }
                     let z = zoom_for_gsd(g).round();
                     if z > f64::from(ceiling) {
+                        let implied = z.min(i64::MAX as f64) as i64;
                         return Err(ConvertError::ZoomAboveCeiling {
-                            asked: format!("--gsd {g} (ground sample distance in meters)"),
-                            zoom: z.min(i64::MAX as f64) as i64,
+                            asked: format!(
+                                "--gsd {g} (ground sample distance in meters), \
+                                 which implies z{implied}"
+                            ),
+                            zoom: implied,
                             ceiling,
                         });
                     }
@@ -147,6 +160,14 @@ impl LevelPlan {
             }
         }
         Ok(())
+    }
+
+    /// The one wording for a GSD that is not a finite positive number, shared
+    /// by [`check_zoom_ceiling`](LevelPlan::check_zoom_ceiling) and
+    /// [`resolve`](LevelPlan::resolve) so the message does not depend on which
+    /// gate happens to run first.
+    fn bad_gsd_message(index: usize, gsd: f64) -> String {
+        format!("gsd[{index}] = {gsd} must be a finite value > 0")
     }
 
     /// Resolve to the coarse→fine list of `(gsd_meters, zoom?)` level specs.
@@ -186,10 +207,10 @@ impl LevelPlan {
                 check_len(gsds.len())?;
                 let mut prev: Option<f64> = None;
                 for (i, &g) in gsds.iter().enumerate() {
-                    if g <= 0.0 || g.is_nan() {
-                        return Err(ConvertError::InvalidLevels(format!(
-                            "gsd[{i}] = {g} must be > 0"
-                        )));
+                    // #371: `inf` is rejected here too — it is not a GSD, and
+                    // downstream it inverts to a zoom of -inf.
+                    if !g.is_finite() || g <= 0.0 {
+                        return Err(ConvertError::InvalidLevels(Self::bad_gsd_message(i, g)));
                     }
                     if let Some(p) = prev {
                         if g >= p {
@@ -884,10 +905,12 @@ pub enum ConvertError {
     #[error(
         "{asked} is above the maximum supported zoom {ceiling}: beyond z{ceiling} the \
          tile grid overflows 32-bit tile coordinates and the PMTiles Hilbert tile-id \
-         arithmetic (requested z{zoom})"
+         arithmetic"
     )]
     ZoomAboveCeiling {
-        /// The knob that asked for it, e.g. `--max-zoom 33` or `--gsd 5e-6`.
+        /// The knob that asked for it, already naming the zoom: `--max-zoom 33`,
+        /// or `--gsd 5e-6 (…), which implies z33`. The zoom is not repeated by
+        /// the message — for an explicit zoom that read `--max-zoom 33 … z33`.
         asked: String,
         /// The requested or GSD-implied zoom.
         zoom: i64,
@@ -4268,6 +4291,52 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--max-zoom"), "error names the flag: {msg}");
         assert!(msg.contains("30"), "error names the limit: {msg}");
+        // The zoom is named once, by `asked` — the message used to end with a
+        // redundant "(requested z33)".
+        assert_eq!(msg.matches("33").count(), 1, "zoom named once: {msg}");
+    }
+
+    /// #371: the ceiling applies to `--min-zoom` too, as the docs claim. A z33
+    /// minimum with a default z6 maximum used to be reported as "min_zoom must
+    /// be <= max_zoom", which says nothing about the real problem.
+    #[test]
+    fn validate_options_rejects_min_zoom_above_the_ceiling() {
+        let opts = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 33,
+                max_zoom: 35,
+            },
+            ..Default::default()
+        };
+        let err = validate_options(&opts).expect_err("a z33 minimum must be rejected");
+        assert!(
+            matches!(
+                err,
+                ConvertError::ZoomAboveCeiling {
+                    zoom: 33,
+                    ceiling: 30,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--min-zoom"),
+            "error names the flag: {err}"
+        );
+        // And with a max below the ceiling, so `min > max` cannot mask it.
+        let err = validate_options(&ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 31,
+                max_zoom: 6,
+            },
+            ..Default::default()
+        })
+        .expect_err("a z31 minimum must be rejected");
+        assert!(
+            matches!(err, ConvertError::ZoomAboveCeiling { zoom: 31, .. }),
+            "got: {err}"
+        );
     }
 
     /// #371, the `--gsd` door: an explicit GSD ladder records no zoom, so the
@@ -4319,6 +4388,39 @@ mod tests {
         ])
         .resolve(GSD_TILE_BASE)
         .expect("a z30 gsd ladder must be accepted");
+    }
+
+    /// #371: a non-finite `--gsd` is nonsense and is rejected up front.
+    ///
+    /// `inf` used to slip through every gate: it is not NaN and not `<= 0`, and
+    /// it inverts to a zoom of *negative* infinity, which is comfortably below
+    /// the ceiling — so it validated, converted, and only then failed at export
+    /// with "implies zoom 9223372036854775807". Every value that is not a
+    /// finite positive GSD now fails at option validation, before the input is
+    /// opened, naming the level and the requirement.
+    #[test]
+    fn non_finite_gsd_is_rejected_at_validation() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 0.0] {
+            let opts = ConvertOptions {
+                levels: LevelPlan::Gsds(vec![bad]),
+                ..Default::default()
+            };
+            let err = validate_options(&opts).expect_err("a non-finite gsd must be rejected");
+            assert!(
+                matches!(err, ConvertError::InvalidLevels(_)),
+                "gsd {bad}: got {err}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("gsd[0]") && msg.contains("finite"),
+                "gsd {bad}: message must name the level and the requirement: {msg}"
+            );
+            // `resolve` is the second gate and must agree with the first.
+            assert!(
+                LevelPlan::Gsds(vec![bad]).resolve(GSD_TILE_BASE).is_err(),
+                "gsd {bad} must not resolve"
+            );
+        }
     }
 
     /// #272: a configured spill dir must exist — fail fast at option

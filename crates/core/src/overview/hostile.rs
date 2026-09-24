@@ -541,9 +541,18 @@ fn forty_plus_zoom_levels_rejected() {
     );
 }
 
-/// The ceiling itself still converts: z30 is supported, not merely tolerated.
+/// The ceiling is not off by one: a plan ending exactly at z30 is accepted and
+/// converts four **points** without overflowing anything (#371).
+///
+/// That is all this proves. z30 being addressable is not a claim that it is
+/// practical: cost grows ~4x per zoom, and a single 1-degree linestring at z30
+/// spans on the order of 3e6 tiles — the CPU/RSS blowup of #371 is still
+/// reachable at the ceiling with line or polygon data. Deliberately not tested
+/// here: the point of this file is fast adversarial coverage, and a z30 line
+/// would take longer than every other test combined. See the max-zoom section
+/// of `docs/OVERVIEW_TUNING.md`.
 #[test]
-fn max_zoom_at_the_ceiling_converts() {
+fn points_at_the_max_zoom_ceiling_convert() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(4), true, None);

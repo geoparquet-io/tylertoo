@@ -30,14 +30,19 @@ use std::f64::consts::PI;
 /// address up to z31); see [`crate::pmtiles_writer::tile_id_to_zxy`].
 pub const MAX_ZOOM: u8 = 30;
 
-/// Tiles per axis at `zoom` (`2^zoom`), in `u64` and saturating at `2^32`.
+/// Tiles per axis at `zoom` (`2^zoom`), computed in `u64` and clamped at
+/// `2^32`.
 ///
 /// `2u32.pow(zoom)` / `1u32 << zoom` panic in debug and silently mask in
-/// release once `zoom >= 32` (#371). Every caller is validated against
-/// [`MAX_ZOOM`] long before it gets here, so the saturation is unreachable in
-/// practice — it exists so the paths that bypass options validation (PMTiles
-/// reading, hand-built [`TileCoord`]s) degrade to a clamped value instead of
-/// a wrapped one.
+/// release once `zoom >= 32` (#371). The clamp is a **policy bound, not a
+/// true tile count**: `2^32` is the largest grid a 32-bit tile coordinate can
+/// index (`0..=u32::MAX`), so it is where this crate stops counting — past
+/// z32 the value returned is that bound, not `2^zoom`.
+///
+/// Every caller is validated against [`MAX_ZOOM`] long before it gets here, so
+/// the clamp is unreachable in practice — it exists so the paths that bypass
+/// options validation (PMTiles reading, hand-built [`TileCoord`]s) degrade to
+/// a clamped value instead of a wrapped one.
 #[inline]
 pub fn tiles_per_axis(zoom: u8) -> u64 {
     1u64 << zoom.min(32)
@@ -400,21 +405,24 @@ mod tests {
         assert_eq!(bbox.lng_min, -10.0);
     }
 
-    /// #371 boundary: the grid helpers are exact at the write ceiling and
-    /// saturate instead of wrapping past the 32-bit coordinate limit.
-    /// `2u32.pow(zoom)` panicked in debug and wrapped to 0 in release at z32.
+    /// #371 boundary: the grid helpers are exact at the write ceiling and, past
+    /// the 32-bit coordinate limit, return the clamp rather than a wrapped
+    /// value. `2u32.pow(zoom)` panicked in debug and wrapped to 0 in release
+    /// at z32.
     #[test]
-    fn tile_grid_helpers_are_exact_at_max_zoom_and_saturate_beyond() {
+    fn tile_grid_helpers_are_exact_at_max_zoom_and_clamp_beyond() {
         assert_eq!(MAX_ZOOM, 30);
         assert_eq!(tiles_per_axis(0), 1);
         assert_eq!(tiles_per_axis(MAX_ZOOM), 1 << 30);
         assert_eq!(tiles_per_axis(MAX_ZOOM), 1_073_741_824);
         assert_eq!(max_tile_index(MAX_ZOOM), 1_073_741_823);
-        // z31 is still addressable in u32; z32 would have wrapped.
+        // z31 and z32 are both still exact — 2^32 - 1 is u32::MAX, the last
+        // index the coordinate type can name — where `2u32.pow(32)` wrapped
+        // to 0. The clamp only starts standing in for the true count at z33.
         assert_eq!(max_tile_index(31), u32::MAX / 2);
         assert_eq!(max_tile_index(32), u32::MAX);
         for z in [33u8, 64, 255] {
-            assert_eq!(max_tile_index(z), u32::MAX, "z{z} must saturate, not wrap");
+            assert_eq!(max_tile_index(z), u32::MAX, "z{z} must clamp, not wrap");
         }
     }
 
@@ -454,7 +462,7 @@ mod tests {
         // For various zooms, check that a tile's center converts back to the same tile
         for zoom in 0..=14 {
             // Use valid tile coordinates for each zoom (max tile = 2^zoom - 1)
-            let max_coord = 2_u32.pow(zoom as u32) - 1;
+            let max_coord = max_tile_index(zoom);
             let x = max_coord.min(100);
             let y = max_coord.min(200);
 
@@ -685,7 +693,7 @@ mod tests {
 
         // Test various edge cases
         for zoom in 0..=10 {
-            let max_valid = 2_u32.pow(zoom as u32) - 1;
+            let max_valid = max_tile_index(zoom);
 
             let tile_pos180 = lng_lat_to_tile(180.0, 0.0, zoom);
             assert!(
