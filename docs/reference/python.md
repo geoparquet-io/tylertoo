@@ -34,8 +34,8 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 * `ladder_step` (`int`) — Zooms between consecutive `magnitude_ladder` rungs. Defaults to 1.
 * `sort_direction` (`str`) — "desc" (larger sort_key wins, default) or "asc" (smaller wins, e.g. rank columns where 1 is best).
 * `class_rank_column` (`str`) — String column carrying categorical classes for cell-winner ranking. Requires class_ranks. Mutually exclusive with sort_key.
-* `class_ranks` (`dict[str, float]`) — Map of class value to priority; higher priority wins a cell. Present-but-unlisted values rank below every listed value (but above nulls) unless class_rank_unknown overrides that.
-* `class_rank_unknown` (`float`) — Priority for present-but-unlisted class values. Defaults to min(class_ranks.values()) - 1.
+* `class_ranks` (`dict[str, float]`) — Map of class value to priority; higher priority wins a cell. Present-but-unlisted values rank below every listed value (but above nulls) unless class_rank_unknown overrides that. Priorities must be finite: NaN and infinity cannot be ordered against other classes and are rejected with ValueError.
+* `class_rank_unknown` (`float`) — Priority for present-but-unlisted class values. Defaults to min(class_ranks.values()) - 1. Must be finite.
 * `no_auto_rank` (`bool`) — Disable auto-detection of well-known schemas (Overture roads class/road_class, Overture places confidence). Defaults to False.
 * `simplify_factor` (`float`) — RDP tolerance = factor * gsd (duplicating mode only). Lower = crisper but heavier levels; higher = cruder and lighter. Defaults to 1.0.
 * `collapse` (`bool`) — Collapse below-visibility polygons to a representative point instead of dropping them. Defaults to False.
