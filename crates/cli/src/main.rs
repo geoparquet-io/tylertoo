@@ -202,7 +202,9 @@ pub struct PyramidArgs {
     /// INPUT is either a GeoParquet source — tiled here, restricted to this
     /// band's zoom range — or a PMTiles archive already tiled for that range,
     /// which is merged as-is. Which one it is is detected from the file, not
-    /// the extension.
+    /// the extension. A source may be remote (`https://`, `s3://`, `gs://`),
+    /// read with byte-range requests like every other subcommand's input; a
+    /// band ARCHIVE must be local, since the merge reads it by offset.
     ///
     /// LAYER defaults to the file stem, and several bands may share one layer
     /// name (the usual case: a coarse and a fine aggregate that are the same
@@ -217,8 +219,18 @@ pub struct PyramidArgs {
     /// name inside the archive, or the merge is refused rather than write
     /// two layers of one name into a tile.
     ///
-    /// INPUT may not contain a `:`, which the spec cannot tell apart from the
-    /// LAYER separator; rename the file or point at it through a symlink.
+    /// Colons in INPUT: the LAYER is only split off the LAST `:` when what
+    /// follows it has no `/`, `\` or `:`, so a URL, a Windows drive and a
+    /// `2024:06/` directory stay whole. A drive-relative path with no `\`
+    /// after the drive, e.g. `C:data.parquet`, also stays whole: a single
+    /// ASCII letter before the last `:` is treated as a drive letter, not a
+    /// path, even though `data.parquet` alone would otherwise look like a
+    /// bare layer name. For the inputs that rule cannot express — one ENDING
+    /// in a bare colon segment, e.g. a Hive directory
+    /// `admin:country_code=BR` — spell the band `LO-HI=INPUT[=LAYER]`
+    /// instead: the range is split at the first `=` and the LAYER at the
+    /// last, again only when the segment after it has no `/`, `\` or `:`. An
+    /// INPUT that itself ends in `=VALUE` needs an explicit `=LAYER`.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
 
@@ -2299,6 +2311,30 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     Ok(())
 }
 
+/// If `spec` is the `LO-HI=INPUT=LAYER` escape form and `layer` is exactly
+/// the segment `Band::parse` peeled off its end, the `=LAYER` suffix that was
+/// stripped — for callers that want to hint "was this actually part of the
+/// path?" when the stripped-down input then fails an existence check.
+///
+/// Mirrors `Band::parse`'s own separator choice (`=` wins whichever of `:`
+/// and `=` appears first) without reaching into its private helpers: this is
+/// a best-effort hint, not a re-parse, so a false negative here just means no
+/// hint is offered, not a wrong answer.
+fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
+    let colon = spec.find(':');
+    let equals = spec.find('=');
+    let is_equals_form = match (colon, equals) {
+        (Some(c), Some(e)) => e < c,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if !is_equals_form {
+        return None;
+    }
+    let suffix = format!("={layer}");
+    spec.ends_with(&suffix).then_some(suffix)
+}
+
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
@@ -2331,11 +2367,34 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     // plain existence test, skipped for the three spellings where `exists()`
     // has no useful answer — a remote URL, a glob, and anything else the
     // reader resolves itself.
-    for b in &bands {
+    for (spec, b) in args.bands.iter().zip(&bands) {
         let spelled = b.input.to_string_lossy();
         let deferred = spelled.contains("://") || spelled.contains(['*', '?', '[']);
         if !deferred && !b.input.exists() {
-            anyhow::bail!("band input not found: {}", b.input.display());
+            let mut msg = format!("band input not found: {}", b.input.display());
+            // A bare Hive partition dir spec like
+            // `0-13=admin:country_code=BR` (no trailing filename) silently
+            // parses as INPUT=admin:country_code, LAYER=BR: the trailing
+            // `=BR` looked like an explicit layer, so it was stripped from
+            // the path. If that is what happened here, say so — a bare
+            // "not found" gives no hint that a layer was ever peeled off.
+            if let Some(suffix) = stripped_equals_layer_suffix(spec, &b.layer) {
+                let candidate = format!("{}{suffix}", b.input.display());
+                if std::path::Path::new(&candidate).exists() {
+                    msg.push_str(&format!(
+                        "\n  hint: {candidate:?} exists — the trailing {suffix:?} was \
+                         parsed as a layer name (LO-HI=INPUT=LAYER); if it is part of \
+                         the path, append an explicit =LAYER instead"
+                    ));
+                } else {
+                    msg.push_str(&format!(
+                        "\n  hint: the trailing {suffix:?} was parsed as a layer name \
+                         (LO-HI=INPUT=LAYER); if it is part of the path, append an \
+                         explicit =LAYER instead"
+                    ));
+                }
+            }
+            anyhow::bail!(msg);
         }
     }
 

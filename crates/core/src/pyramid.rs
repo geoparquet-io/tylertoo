@@ -28,6 +28,7 @@ use tempfile::NamedTempFile;
 
 use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
+use crate::input::url_scheme;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_writer::{
@@ -52,28 +53,47 @@ impl Band {
     /// an error message; accepting costs a full band conversion first.
     const MAX_ZOOM: u8 = 30;
 
-    /// Parse `LO-HI:PATH[:LAYER]`. The layer is optional and defaults to the
-    /// input's file stem.
+    /// Parse a band spec. The layer is optional and defaults to the input's
+    /// file stem. Two spellings are accepted (#482):
     ///
-    /// The zoom range is split off first. What remains is the path, *unless*
-    /// its last colon-separated segment is a bare layer token — no `/`, `\` or
-    /// `:` — in which case that is the layer. Paths legitimately contain
-    /// colons: `s3://bucket/x.parquet`, `https://host/x.parquet`,
-    /// `C:\data\x.parquet`. Splitting on the last colon unconditionally
-    /// mangled every one of those, and remote sources are genuinely supported
-    /// downstream, so the grammar has to admit them.
+    /// * `LO-HI:INPUT[:LAYER]` — the usual one.
+    /// * `LO-HI=INPUT[=LAYER]` — an escape form for an INPUT the colon form
+    ///   cannot express, `=` being invalid in a zoom range.
     ///
-    /// One extra rule closes `C:data.parquet`, where the last segment *is* a
-    /// bare token: a single-ASCII-letter candidate path is a Windows drive, so
-    /// the whole remainder is the path. All of this is pure string work — no
-    /// filesystem access, so it behaves the same for a glob or a URL.
+    /// Which one a spec is in is decided by whichever of `:` and `=` closes
+    /// the zoom range, i.e. whichever comes first ([`band_separator`]).
+    ///
+    /// In the `:` form the remainder is the INPUT, *unless* its last
+    /// colon-separated segment is a bare layer token — no `/`, `\` or `:`.
+    /// Paths legitimately contain colons: `s3://bucket/x.parquet`,
+    /// `https://host/x.parquet`, `C:\data\x.parquet`. The rule is
+    /// scheme-aware: in a `scheme://…` remainder the scheme's own colon and
+    /// any colon inside the URL path (a port, a `2024:06` directory) are part
+    /// of the URL, and only a *last* colon followed by a segment with no `/`
+    /// starts a LAYER. One extra rule closes `C:data.parquet`, where the last
+    /// segment *is* a bare token: a single-ASCII-letter candidate path is a
+    /// Windows drive, so the whole remainder is the path.
+    ///
+    /// In the `=` form the range is split at the FIRST `=` and a LAYER at the
+    /// LAST `=`, and again only when the segment after it is a bare layer
+    /// token. That keeps a Hive path such as
+    /// `admin:country_code=BR/part.parquet` whole; an input that *ends* in
+    /// `=VALUE` is indistinguishable from a layer, so those need an explicit
+    /// trailing `=LAYER`.
+    ///
+    /// All of this is pure string work — no filesystem access, so it behaves
+    /// the same for a glob or a URL.
     pub fn parse(spec: &str) -> Result<Self, String> {
-        let (range, rest) = spec
-            .split_once(':')
-            .ok_or_else(|| format!("band {spec:?}: expected LO-HI:PATH[:LAYER]"))?;
-        let (lo, hi) = range
-            .split_once('-')
-            .ok_or_else(|| format!("band {spec:?}: zoom range must be LO-HI"))?;
+        let (sep, at) =
+            band_separator(spec).ok_or_else(|| format!("band {spec:?}: {BAND_FORMS}"))?;
+        let (range, rest) = spec.split_at(at);
+        let rest = &rest[sep.len_utf8()..];
+        let (lo, hi) = range.split_once('-').ok_or_else(|| {
+            format!(
+                "band {spec:?}: zoom range must be LO-HI; every band spec must \
+                 start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:{spec}\""
+            )
+        })?;
         let min_zoom: u8 = lo
             .trim()
             .parse()
@@ -92,29 +112,25 @@ impl Band {
             ));
         }
 
-        // A trailing colon is an empty layer name, not part of the path.
-        // Falling through would silently keep the colon in the path.
-        if rest.trim_end().ends_with(':') {
+        // A trailing separator is an empty layer name, not part of the path.
+        // Falling through would silently keep it in the path.
+        if rest.trim_end().ends_with(sep) {
             return Err(format!("band {spec:?}: empty layer name"));
         }
-        let (path, layer) = match rest.rsplit_once(':') {
-            // A bare final segment is a layer name, unless what precedes it is
-            // a lone drive letter.
-            Some((p, l)) if is_bare_layer_token(l) && !p.is_empty() && !is_drive_letter(p) => {
-                (p.trim(), Some(l.trim().to_string()))
-            }
-            _ => (rest.trim(), None),
+        let (path, layer) = match sep {
+            ':' => split_colon_form(rest),
+            _ => split_equals_form(rest),
         };
         if path.is_empty() {
             return Err(format!("band {spec:?}: empty input path"));
         }
         let layer = match layer {
-            Some(l) if l.is_empty() => return Err(format!("band {spec:?}: empty layer name")),
-            Some(l) => l,
+            Some("") => return Err(format!("band {spec:?}: empty layer name")),
+            Some(l) => l.to_string(),
             None => default_layer_for(path).ok_or_else(|| {
                 format!(
                     "band {spec:?}: cannot derive a layer name from {path:?}; \
-                     append :LAYER"
+                     append {sep}LAYER"
                 )
             })?,
         };
@@ -125,6 +141,78 @@ impl Band {
             min_zoom,
             max_zoom,
         })
+    }
+}
+
+/// Both accepted band spellings, named in every ill-formed-spec error so the
+/// escape form is discoverable from the message rather than the manual.
+const BAND_FORMS: &str = "expected LO-HI:INPUT[:LAYER] or LO-HI=INPUT[=LAYER]";
+
+/// Which separator closes the zoom range, and its byte offset.
+///
+/// A zoom range is digits and `-`, so whichever of `:` and `=` appears first
+/// is the one that closes it. That is what lets
+/// `0-13=admin:country_code=BR/part.parquet` be the `=` form while
+/// `0-9:/data/country_code=BR/part.parquet` stays the `:` form.
+fn band_separator(spec: &str) -> Option<(char, usize)> {
+    match (spec.find(':'), spec.find('=')) {
+        (Some(c), Some(e)) => Some(if e < c { ('=', e) } else { (':', c) }),
+        (Some(c), None) => Some((':', c)),
+        (None, Some(e)) => Some(('=', e)),
+        (None, None) => None,
+    }
+}
+
+/// Split `INPUT[:LAYER]` — see [`Band::parse`] for the rule.
+fn split_colon_form(rest: &str) -> (&str, Option<&str>) {
+    let rest = rest.trim();
+    if let Some(scheme) = url_scheme(rest) {
+        // Past the `scheme://`, so the scheme's own colon can never split.
+        //
+        // This branch is provably equivalent to the generic fallback below
+        // (rsplit_once(':') on the whole `rest`, minus the drive-letter
+        // carve-out which cannot fire here — a scheme is never one ASCII
+        // letter) for every realizable input: if `authority_and_path`
+        // contains a `:`, it is the last `:` in `rest` too, since nothing
+        // after the scheme prefix can contain one that isn't in it, so both
+        // splits land on the same byte. If it contains none, the fallback's
+        // rsplit_once(':') on `rest` finds the scheme's own colon instead,
+        // splitting off `"//" + authority_and_path` as the candidate
+        // layer — but that always contains the `/` from `"://"`, so
+        // `is_bare_layer_token` rejects it and the fallback also keeps
+        // `rest` whole. Kept as its own branch (rather than folded into the
+        // fallback) because slicing by byte offset here is clearer than
+        // re-deriving the scheme boundary from the split fallback would be.
+        let authority_and_path = &rest[scheme.len() + 3..];
+        return match authority_and_path.rsplit_once(':') {
+            // `is_bare_layer_token` rejects a segment containing `/`, which is
+            // what keeps a port (`host:8080/x.parquet`) and a colon inside the
+            // URL path out of the layer slot.
+            Some((p, l)) if is_bare_layer_token(l) => (
+                rest[..scheme.len() + 3 + p.len()].trim_end(),
+                Some(l.trim()),
+            ),
+            _ => (rest, None),
+        };
+    }
+    match rest.rsplit_once(':') {
+        // A bare final segment is a layer name, unless what precedes it is a
+        // lone drive letter.
+        Some((p, l)) if is_bare_layer_token(l) && !p.is_empty() && !is_drive_letter(p) => {
+            (p.trim(), Some(l.trim()))
+        }
+        _ => (rest, None),
+    }
+}
+
+/// Split `INPUT[=LAYER]` — see [`Band::parse`] for the rule.
+fn split_equals_form(rest: &str) -> (&str, Option<&str>) {
+    let rest = rest.trim();
+    match rest.rsplit_once('=') {
+        Some((p, l)) if is_bare_layer_token(l) && !p.trim().is_empty() => {
+            (p.trim(), Some(l.trim()))
+        }
+        _ => (rest, None),
     }
 }
 
@@ -167,6 +255,40 @@ fn default_layer_for(path: &str) -> Option<String> {
     }
 }
 
+/// Whether a band input is a URL rather than a local path (#482).
+///
+/// Shape only — the same test [`crate::input::InputSource::from_path`] makes,
+/// so what looks remote here is exactly what the reader will fetch. An
+/// unsupported scheme is reported there, by name, rather than silently
+/// becoming a path.
+fn is_remote_input(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| url_scheme(s).is_some())
+}
+
+/// The error for a remote band input that is plainly a PMTiles archive, or
+/// `None` when the input is fine.
+///
+/// A band archive is read as a local file — directories, then tile bytes by
+/// offset — so a remote one is not supported. It cannot be *sniffed* either
+/// without fetching, so this is the one place the extension is trusted: it
+/// only has to be good enough to replace a parquet reader's complaint about
+/// a magic number with a sentence that says what to do.
+fn remote_archive_rejection(input: &Path) -> Option<String> {
+    if !is_remote_input(input) {
+        return None;
+    }
+    let s = input.to_str()?;
+    // A query string or fragment is part of the URL, not of the name.
+    let name = s.split(['?', '#']).next().unwrap_or(s);
+    if !name.to_ascii_lowercase().ends_with(".pmtiles") {
+        return None;
+    }
+    Some(format!(
+        "band input {s:?}: a remote band must be GeoParquet; stage PMTiles \
+         archives locally and point the band at the local file"
+    ))
+}
+
 /// What a band's `input` actually is.
 ///
 /// The one-shot form (#345) takes GeoParquet sources and tiles them here; the
@@ -188,8 +310,26 @@ pub enum BandSource {
 /// — `.pmtiles` is a convention, not a guarantee — and everything that is not
 /// a readable local file (a glob, a directory, an `s3://` URL) can only be a
 /// GeoParquet source here, since a band archive is always one local file.
+///
+/// A `scheme://` input short-circuits to [`BandSource::Source`] (#482) without
+/// touching the filesystem: a band archive has to be read as a local file, so
+/// a remote input can only be a GeoParquet source, and the open below could
+/// only ever fail for it.
+///
+/// **This function does not reject a remote `.pmtiles` input** — it has no
+/// error case, only two classifications, and a `scheme://foo.pmtiles` input
+/// classifies as `Source` exactly like any other remote path (it will only
+/// fail later, obscurely, inside the parquet reader). [`validate_bands`]
+/// applies [`remote_archive_rejection`] up front to every band before any
+/// band is tiled; a caller that classifies bands without going through
+/// `validate_bands` first (or `build_pyramid`, which calls it) must apply
+/// `remote_archive_rejection` itself to get that check.
 pub fn classify_band_input(path: &Path) -> BandSource {
     use std::io::Read;
+
+    if is_remote_input(path) {
+        return BandSource::Source;
+    }
 
     let mut magic = [0u8; 7];
     match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)) {
@@ -215,6 +355,14 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 
 /// Reject two bands claiming one zoom **for the same layer**: each would write
 /// the same tile ids and the merge would silently keep whichever came last.
+/// Also rejects any band naming a remote `.pmtiles` archive (#482) — checked
+/// for every band up front, before any band is tiled.
+///
+/// The remote-archive check is pure string work (no I/O), so doing it here
+/// for all bands is free and catches a late band's bad input before an
+/// expensive earlier band is tiled — `build_pyramid` used to run this check
+/// per band interleaved with tiling, so a later band's error only surfaced
+/// after every band ahead of it had already converted.
 ///
 /// Bands naming *different* layers may share zooms (#385): that is
 /// tippecanoe's `-L`, several layers in one tile, and the merge concatenates
@@ -222,6 +370,11 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
     if bands.is_empty() {
         return Err("a pyramid needs at least one --band".to_string());
+    }
+    for band in bands {
+        if let Some(msg) = remote_archive_rejection(&band.input) {
+            return Err(msg);
+        }
     }
     let mut sorted: Vec<&Band> = bands.iter().collect();
     sorted.sort_by_key(|b| (b.min_zoom, b.max_zoom));
@@ -597,6 +750,11 @@ pub fn build_pyramid(
     output: &Path,
     opts: &PyramidOptions,
 ) -> Result<PyramidReport, Error> {
+    // Validates every band up front, including (#482) that none names a
+    // remote `.pmtiles` archive — pure string work, so it is cheap to run for
+    // every band before any band is tiled, rather than interleaved with
+    // tiling below where a late band's bad input would only surface after
+    // every earlier band had already converted.
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
@@ -1930,5 +2088,151 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("past end of"), "{err}");
+    }
+
+    /// #482: a band must be able to name a remote input. The `:` form is
+    /// scheme-aware — after `LO-HI:`, a `scheme://` remainder splits a layer
+    /// off its LAST colon only when what follows carries no `/`.
+    #[test]
+    fn band_spec_names_remote_inputs() {
+        let ok = |spec: &str| Band::parse(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        let b = ok("0-13:https://data.source.coop/a/b.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("https://data.source.coop/a/b.parquet"),
+            "no layer segment: the whole remainder is the input"
+        );
+        assert_eq!(b.layer, "b");
+
+        let b = ok("0-13:https://x/y.parquet:fields");
+        assert_eq!(b.input, PathBuf::from("https://x/y.parquet"));
+        assert_eq!(b.layer, "fields");
+
+        let b = ok("0-13:s3://bucket/key.parquet:2024");
+        assert_eq!(b.input, PathBuf::from("s3://bucket/key.parquet"));
+        assert_eq!(b.layer, "2024");
+
+        let b = ok("0-13:gs://bucket/key.parquet");
+        assert_eq!(b.input, PathBuf::from("gs://bucket/key.parquet"));
+        assert_eq!(b.layer, "key");
+
+        // The last colon is inside the URL path, and the segment after it has
+        // a `/`, so it is not a layer.
+        let b = ok("0-13:https://host/2024:06/cells.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("https://host/2024:06/cells.parquet"),
+            "a colon inside the URL path is not a layer separator"
+        );
+        assert_eq!(b.layer, "cells");
+
+        // A port is part of the authority, not a layer.
+        let b = ok("0-13:http://localhost:8080/cells.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("http://localhost:8080/cells.parquet")
+        );
+        assert_eq!(b.layer, "cells");
+    }
+
+    /// #482: the `=` escape form, for inputs the `:` form cannot express.
+    ///
+    /// `LO-HI=INPUT[=LAYER]`: the range is split at the FIRST `=`, and a LAYER
+    /// at the LAST `=` only when the segment after it is a bare layer token
+    /// (no `/`, `\` or `:`). That keeps a Hive directory such as
+    /// `admin:country_code=BR/part.parquet` whole.
+    #[test]
+    fn band_spec_equals_form_escapes_colons() {
+        let ok = |spec: &str| Band::parse(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        let b = ok("0-13=local:odd:path.parquet=layer");
+        assert_eq!(b.input, PathBuf::from("local:odd:path.parquet"));
+        assert_eq!(b.layer, "layer");
+
+        let b = ok("0-13=admin:country_code=BR/part.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("admin:country_code=BR/part.parquet"),
+            "a Hive `=` inside the input keeps the input whole"
+        );
+        assert_eq!(b.layer, "part");
+
+        // No `=` beyond the separator: the whole remainder is the input.
+        let b = ok("0-9=/data/odd:dir/cells.parquet");
+        assert_eq!(b.input, PathBuf::from("/data/odd:dir/cells.parquet"));
+        assert_eq!(b.layer, "cells");
+
+        // Remote inputs work in this form too.
+        let b = ok("0-9=s3://bucket/a:b.parquet=agg");
+        assert_eq!(b.input, PathBuf::from("s3://bucket/a:b.parquet"));
+        assert_eq!(b.layer, "agg");
+
+        // The form is chosen by whichever separator ends the zoom range, so a
+        // `=` later in a `:` spec is just part of the input.
+        let b = ok("0-9:/data/country_code=BR/part.parquet");
+        assert_eq!(b.input, PathBuf::from("/data/country_code=BR/part.parquet"));
+
+        // Whitespace is trimmed on both sides of the split, as in the `:` form.
+        let b = ok("0-5= x.parquet = agg ");
+        assert_eq!(b.input, PathBuf::from("x.parquet"));
+        assert_eq!(b.layer, "agg");
+
+        for bad in [
+            "0-5=",           // empty input
+            "0-5=x.parquet=", // empty layer
+            "5-0=x.parquet",  // reversed range
+            "0-31=x.parquet", // above the zoom ceiling
+            "x=y.parquet",    // no range
+        ] {
+            assert!(Band::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// An ill-formed spec names both accepted forms, so the reader learns the
+    /// escape hatch from the error rather than the manual.
+    #[test]
+    fn band_spec_error_shows_both_forms() {
+        let err = Band::parse("0-5").unwrap_err();
+        assert!(err.contains("LO-HI:INPUT[:LAYER]"), "{err}");
+        assert!(err.contains("LO-HI=INPUT[=LAYER]"), "{err}");
+    }
+
+    /// #482: a remote input is a GeoParquet source, decided from the URL
+    /// shape alone — no local read, which for a URL could only ever fail.
+    #[test]
+    fn remote_band_input_is_a_source_without_a_local_read() {
+        for url in [
+            "https://data.source.coop/a/b.parquet",
+            "s3://bucket/key.parquet",
+            "gs://bucket/key.parquet",
+            "http://localhost:8080/cells.parquet",
+        ] {
+            assert_eq!(
+                classify_band_input(Path::new(url)),
+                BandSource::Source,
+                "{url}"
+            );
+        }
+    }
+
+    /// A remote PMTiles archive cannot be a band: the merge reads directories
+    /// and tile bytes out of a local file. Say so, instead of handing the URL
+    /// to the parquet reader.
+    #[test]
+    fn remote_pmtiles_band_is_rejected_with_a_clear_message() {
+        let msg = remote_archive_rejection(Path::new("https://host/tiles.pmtiles"))
+            .expect("a remote .pmtiles band must be rejected");
+        assert!(msg.contains("remote band must be GeoParquet"), "{msg}");
+        assert!(msg.contains("stage"), "{msg}");
+
+        assert!(
+            remote_archive_rejection(Path::new("https://host/cells.parquet")).is_none(),
+            "a remote GeoParquet band is fine"
+        );
+        assert!(
+            remote_archive_rejection(Path::new("/local/tiles.pmtiles")).is_none(),
+            "a local archive is the ordinary two-step form"
+        );
     }
 }
