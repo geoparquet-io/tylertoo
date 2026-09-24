@@ -1092,6 +1092,47 @@ struct ConvertTuningArgs {
     /// the intermediate: --spill-dir, $TMPDIR, the output directory.
     #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     spill_dir: Option<PathBuf>,
+
+    /// Write the convert plan artifact to PATH, then carry on converting.
+    ///
+    /// The plan is the complete result of pass 1 and the level assignment:
+    /// which level every input row enters at, the per-level counts, the
+    /// clustering / coalescing / carrier side tables, the resolved ranking
+    /// provenance and the dataset-wide tallies — plus a fingerprint of the
+    /// inputs and of every thinning-relevant flag. Re-running with --plan
+    /// then skips pass 1 and the assignment entirely.
+    ///
+    /// The assignment is dataset-global: the density budget water-fills a
+    /// super-cell budget over every candidate of a level, the level walk
+    /// carries a running kept count coarse to fine, and --magnitude-ladder
+    /// dense-ranks the whole column. A sharded build must therefore consume
+    /// ONE plan rather than recompute the assignment per shard, or the
+    /// shards' pyramids disagree.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "plan",
+        help_heading = "Memory & performance"
+    )]
+    save_plan: Option<PathBuf>,
+
+    /// Reuse the convert plan artifact at PATH instead of running pass 1 and
+    /// the level assignment.
+    ///
+    /// The plan's fingerprint must match this run — the tylertoo version,
+    /// every thinning-relevant flag, and each input's path, size, mtime and
+    /// pruned row groups. A mismatch is a hard error naming the offending
+    /// field, so a stale plan never silently produces a different pyramid.
+    /// The write-side flags (--profile, --row-group-size,
+    /// --in-flight-batches, --spill-dir) are deliberately NOT fingerprinted,
+    /// so one plan can be replayed across them.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "save_plan",
+        help_heading = "Memory & performance"
+    )]
+    plan: Option<PathBuf>,
 }
 
 impl ConvertTuningArgs {
@@ -1295,6 +1336,8 @@ impl ConvertTuningArgs {
             filter: self.filter.clone(),
             properties: self.property_selection(),
             spill_dir: self.spill_dir.clone(),
+            save_plan: self.save_plan.clone(),
+            plan: self.plan.clone(),
         };
 
         // Logged because "no features were dropped" is a surprising thing to

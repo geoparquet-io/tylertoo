@@ -95,6 +95,30 @@ verbatim (spec §2.4).
    serial engine that re-reads the input once per level is retained as the
    equivalence-tested reference.
 
+Pass 1 and the assignment can be **persisted and replayed** (`plan_state.rs`,
+`--save-plan` / `--plan`). Two reasons:
+
+- *Resume.* Pass 1 plus the assignment is most of the wall time on a large
+  input and depends on nothing the write side does, so re-running with
+  different write-side knobs should not pay for it twice.
+- *Sharding consistency (the load-bearing one).* The assignment is **not** a
+  per-feature function: `apply_density_budget` water-fills a 128 × GSD
+  super-cell budget over *every* candidate of a level, `assign_levels_bounded`
+  walks levels coarse → fine carrying a running `kept_count`, the entry-zoom
+  ladder dense-ranks the *global* distinct values of its column, and the Q1
+  auto-detection picks its column from a global vocabulary scan. A shard that
+  recomputed the assignment locally would fold over its own subset and reach a
+  different answer, so a sharded build MUST consume one global plan.
+
+The artifact is a single Arrow IPC file: the row-indexed winner table as a
+`UInt8` section, the side tables (per-row kinds, tiny-polygon carriers,
+cluster tables, the coalesce line scratch as WKB) as further sections, and
+the scalars, ranking provenance and fingerprint as JSON in the schema
+metadata under a versioned key. Loading verifies the fingerprint (tylertoo
+version, every thinning-relevant option field by field, and each input part's
+path / size / mtime / selected row groups) and hard-errors naming the
+offending field rather than running stale.
+
 Peak memory is `O(read batch + winner tables)` — Moldova (632k polygons,
 38M vertices) converts to a z0–14 pyramid in ~45 s / ~1.4 GB peak RSS on a 16-core machine
 (a default z0–6 pyramid is ~7 s / ~0.4 GB).
@@ -322,6 +346,8 @@ crates/core/src/
 │   ├── reader.rs       #   Overview file reader (level-banded row groups)
 │   ├── simplify.rs     #   World-space RDP simplification (GSD tolerance)
 │   ├── pipeline.rs     #   Single-read pass-2 engine (#213): fans each batch to all levels
+│   ├── plan_state.rs   #   Convert plan artifact (--save-plan/--plan): the persisted
+│   │                   #   pass-1 + assignment result, Arrow IPC + fingerprint
 │   ├── stream.rs       #   Two-pass streaming orchestration (pass-1 scan; pass-2 → pipeline.rs)
 │   └── writer.rs       #   Level-banded GeoParquet writer
 ├── input.rs            # Input source abstraction: local file or remote

@@ -1091,11 +1091,13 @@ pub tylertoo_core::overview::convert::ConvertOptions::levels: tylertoo_core::ove
 pub tylertoo_core::overview::convert::ConvertOptions::max_row_group_size: usize
 pub tylertoo_core::overview::convert::ConvertOptions::mode: tylertoo_core::overview::level::Mode
 pub tylertoo_core::overview::convert::ConvertOptions::no_auto_rank: bool
+pub tylertoo_core::overview::convert::ConvertOptions::plan: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::convert::ConvertOptions::profile: tylertoo_core::overview::level::MemoryProfile
 pub tylertoo_core::overview::convert::ConvertOptions::properties: tylertoo_core::overview::properties::PropertySelection
 pub tylertoo_core::overview::convert::ConvertOptions::read_batch_size: usize
 pub tylertoo_core::overview::convert::ConvertOptions::representation: alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>
 pub tylertoo_core::overview::convert::ConvertOptions::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
+pub tylertoo_core::overview::convert::ConvertOptions::save_plan: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::convert::ConvertOptions::simplify: tylertoo_core::overview::simplify::SimplifyOptions
 pub tylertoo_core::overview::convert::ConvertOptions::sort_key: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::convert::ConvertOptions::spill_dir: core::option::Option<std::path::PathBuf>

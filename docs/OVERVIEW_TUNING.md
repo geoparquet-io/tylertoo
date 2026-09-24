@@ -1541,6 +1541,67 @@ that. If you force `speed` on a large partitioning run, watch peak RSS.
 
 ---
 
+## Reusing a plan: `--save-plan`, `--plan`
+
+The streaming pipeline runs in two passes. **Pass 1** streams the whole input
+to decide which level every row enters at — the *winner table* — and then
+runs the level assignment and the density budget over it. **Pass 2** writes.
+On a large input, pass 1 plus the assignment is most of the wall time, and it
+depends on nothing the write side does.
+
+`--save-plan PATH` persists that result; `--plan PATH` replays it instead of
+recomputing it.
+
+```bash
+# Once: scan, assign, and keep the plan.
+tylertoo overview roads.parquet roads.parquet.overview \
+  --min-zoom 0 --max-zoom 14 --save-plan roads.plan
+
+# Again, tuning only the write side — pass 1 and the assignment are skipped.
+tylertoo overview roads.parquet roads-tuned.overview \
+  --min-zoom 0 --max-zoom 14 --plan roads.plan \
+  --profile bounded --row-group-size 50000
+```
+
+The artifact is one Arrow IPC file, sized by input **rows** rather than input
+bytes: one winner byte per row plus the small per-level side tables. A 28 MB
+/ 24k-feature polygon file yields a 49 KB plan. Line coalescing is the
+exception — the plan carries the collected line geometries as WKB, so a
+line-heavy input produces a proportionally larger artifact.
+
+**The plan is verified, not trusted.** It stores a fingerprint: the tylertoo
+version, every thinning-relevant flag, and each input's path, size, mtime and
+pruned row groups. A mismatch is a hard error naming the field:
+
+```
+--plan: saved plan does not match this run: input "roads.parquet" mtime was
+"1790242802390408452" when the plan was saved but is "1790244114398193000"
+now. Re-run without --plan (add --save-plan to write a fresh one).
+```
+
+Deliberately **not** fingerprinted, so one plan replays across them:
+`--profile`, `--row-group-size`, `--row-group-size-policy`,
+`--full-column-stats`, `--read-batch-size`, `--in-flight-batches`,
+`--spill-dir`, `--cogp-compat`. Everything that changes *which* features land
+at *which* level is fingerprinted, and output with `--plan` is byte-identical
+to the run that saved it.
+
+⚠️ **Why this matters for sharded builds.** The assignment is not a
+per-feature function: the density budget water-fills a 128 × GSD super-cell
+budget over *every* candidate of a level, the level walk carries a running
+kept count coarse → fine, `--magnitude-ladder` dense-ranks the *global*
+distinct values of its column, and the automatic class ranking picks its
+column from a global vocabulary scan. A shard that recomputed the assignment
+over its own subset would reach a different answer, and the shards' pyramids
+would disagree. Compute the assignment once, save the plan, and give every
+shard the same one.
+
+Both flags require the streaming pipeline (they are its pass-1 stage), they
+are mutually exclusive, and they are available on `overview` and `tiles`.
+Not yet exposed in the Python bindings.
+
+---
+
 ## Worked scenarios
 
 | Symptom | Fix |
