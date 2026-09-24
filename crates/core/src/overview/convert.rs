@@ -527,6 +527,36 @@ pub struct ConvertOptions {
     /// or faster volume instead. The directory must exist (validated up
     /// front). Local inputs never spill, so this has no effect on them.
     pub spill_dir: Option<PathBuf>,
+    /// Write the **convert plan artifact** to this path once pass 1 and the
+    /// level assignment are done, then carry on with the conversion.
+    ///
+    /// The plan holds the complete assignment result — the row-indexed winner
+    /// table, the per-level counts, the cluster / coalesce / carrier side
+    /// tables, the resolved ranking provenance and the dataset-wide tallies —
+    /// plus a fingerprint of the inputs and the thinning-relevant options.
+    /// Feeding it back via [`plan`](Self::plan) skips pass 1 and the
+    /// assignment entirely.
+    ///
+    /// The assignment is dataset-global (the density budget water-fills a
+    /// super-cell over every candidate of a level; the level walk carries a
+    /// running kept count; the entry-zoom ladder dense-ranks the whole
+    /// column), so a sharded build MUST consume one plan rather than
+    /// recompute the assignment per shard. Mutually exclusive with
+    /// [`plan`](Self::plan). Streaming pipeline only. Default `None`.
+    pub save_plan: Option<PathBuf>,
+    /// Load a previously saved convert plan from this path instead of running
+    /// pass 1 and the level assignment.
+    ///
+    /// The plan's fingerprint must match this run: the tylertoo version, every
+    /// thinning-relevant option, and each input part's path, size, mtime and
+    /// selected row groups. Any mismatch is a hard error naming the offending
+    /// field — a stale plan never silently produces a different pyramid. The
+    /// *write-side* knobs (profile, row-group sizing, in-flight depth,
+    /// compression, spill directory) are deliberately not fingerprinted, so
+    /// one plan can be replayed across them. Mutually exclusive with
+    /// [`save_plan`](Self::save_plan). Streaming pipeline only. Default
+    /// `None`.
+    pub plan: Option<PathBuf>,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -682,6 +712,8 @@ impl Default for ConvertOptions {
             filter: None,
             properties: PropertySelection::default(),
             spill_dir: None,
+            save_plan: None,
+            plan: None,
         }
     }
 }
@@ -1118,6 +1150,24 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     // type mismatch) happens later, once the schema is known.
     if let Some(f) = &options.filter {
         super::filter::parse_filter(f)?;
+    }
+    // Convert plan artifact: writing one and replaying one are opposite ends
+    // of the same run, and both need the streaming pipeline (the in-memory
+    // reference path has no separable pass 1 to skip).
+    if options.save_plan.is_some() && options.plan.is_some() {
+        return Err(ConvertError::InvalidConfig(
+            "--save-plan and --plan are mutually exclusive: one writes the \
+             pass-1/assignment artifact, the other replaces pass 1 with a \
+             saved one"
+                .to_string(),
+        ));
+    }
+    if !options.streaming && (options.save_plan.is_some() || options.plan.is_some()) {
+        return Err(ConvertError::InvalidConfig(
+            "--save-plan / --plan require the streaming pipeline (they persist \
+             and replay its pass-1 + assignment stage); drop --no-streaming"
+                .to_string(),
+        ));
     }
     // Zoom-band representation selector (#317 / #279).
     if !options.representation.is_empty() {

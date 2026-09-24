@@ -77,13 +77,14 @@ use super::convert::{
     count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
     extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
     overture_road_ranking, record_level_outcome, resolve_reserved_column_collisions, scan_feature,
-    validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, ClassRanking,
-    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
-    SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies,
+    ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
+    LevelReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
 use super::pipeline;
+use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals};
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
     validation_skip_count, CascadeStep, CollapseMode, Representation, Simplified, SimplifyOptions,
@@ -828,24 +829,24 @@ fn create_level_writer(
 /// Built from the pass-1 feature scratch, which this stage frees before it
 /// returns. Everything here is O(dataset); pass 2 only carries the row-indexed
 /// `min_levels` byte table plus the cluster and coalesce tables.
-struct WinnerTables {
+pub(super) struct WinnerTables {
     /// The resolved level plan: `(gsd, zoom)` per planned level.
-    level_specs: Vec<(f64, Option<u8>)>,
+    pub(super) level_specs: Vec<(f64, Option<u8>)>,
     /// Cluster tables (Q4), or `None` when clustering is off.
-    cluster_tables: Option<ClusterTables>,
+    pub(super) cluster_tables: Option<ClusterTables>,
     /// Per-row geometry kinds (Q3), or `None` when line coalescing is off.
-    kinds: Option<Vec<FeatureKind>>,
+    pub(super) kinds: Option<Vec<FeatureKind>>,
     /// The pass-1 line scratch, kept only when coalescing survives the memory
     /// guard.
-    coalesce_scratch: Option<CoalesceScratch>,
+    pub(super) coalesce_scratch: Option<CoalesceScratch>,
     /// Coarsest level per INPUT ROW; [`UNASSIGNED_LEVEL`] for skipped rows.
-    min_levels: Vec<u8>,
+    pub(super) min_levels: Vec<u8>,
     /// Per-level winner counts, cumulative in duplicating mode.
-    counts: Vec<usize>,
+    pub(super) counts: Vec<usize>,
     /// Per planned level, the sorted row indices of the tiny-polygon
     /// accumulator's carriers (#384); empty per level unless it applies.
-    carriers: Vec<Vec<usize>>,
-    finest: usize,
+    pub(super) carriers: Vec<Vec<usize>>,
+    pub(super) finest: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1164,6 +1165,246 @@ fn convert_preflight(
     })
 }
 
+/// The preflight-derived inputs pass 1 reads. Grouped so
+/// [`resolve_plan_state`] can take them as one argument.
+struct Pass1Inputs<'a> {
+    source: &'a ConvertSource,
+    input_schema: &'a Schema,
+    geom_idx: usize,
+    acc_cols: &'a [usize],
+    selected_row_groups: Option<&'a RowGroupSelection>,
+    bbox_units: Option<&'a [f64; 4]>,
+    bound_filter: Option<&'a super::filter::BoundFilter>,
+    crs: Crs,
+}
+
+/// Everything the rest of the driver consumes from pass 1 and the level
+/// assignment — whether they just ran, or a `--plan` artifact replaced them.
+struct PlanState {
+    tables: WinnerTables,
+    /// Resolved ranking provenance (§3.5); the writer stamps it into the
+    /// footer.
+    ranking_provenance: RankingProvenance,
+    /// Total input rows, INCLUDING skipped-geometry rows.
+    num_rows: usize,
+    /// Features that survived the scan.
+    num_features: usize,
+    /// Encoded-geometry bytes across the scan (#305): sizes the pass-2
+    /// RAM-vs-spill decision.
+    geom_bytes: u64,
+    /// Bbox-derived tallies for the report (#188 / #429).
+    tallies: BboxTallies,
+    pass1_stage_secs: Pass1StageSecs,
+    /// When this stage started, so the `[profile]` dump reports the wall time
+    /// of whichever path ran (near-zero for a loaded plan).
+    t_pass1: Instant,
+}
+
+/// Run pass 1 + the level assignment, or load the artifact that stands in for
+/// both (`--plan`), saving one on the way out when `--save-plan` asks.
+fn resolve_plan_state(
+    inputs: &Pass1Inputs<'_>,
+    options: &ConvertOptions,
+    peak_rss_mib: &mut Option<f64>,
+) -> Result<PlanState, ConvertError> {
+    // Captured before either branch: the load path compares the saved
+    // fingerprint against it, the save path stores it.
+    let fingerprint = (options.save_plan.is_some() || options.plan.is_some())
+        .then(|| Fingerprint::capture(inputs.source, inputs.selected_row_groups, options));
+    match &options.plan {
+        Some(path) => load_plan_state(path, fingerprint.expect("captured for --plan")),
+        None => run_pass1_and_assign(inputs, options, fingerprint, peak_rss_mib),
+    }
+}
+
+/// The ordinary path: stream the input, assign levels, and (when asked)
+/// persist the result before pass 2 starts.
+fn run_pass1_and_assign(
+    inputs: &Pass1Inputs<'_>,
+    options: &ConvertOptions,
+    fingerprint: Option<Fingerprint>,
+    peak_rss_mib: &mut Option<f64>,
+) -> Result<PlanState, ConvertError> {
+    let t_pass1 = Instant::now();
+    let Pass1Output {
+        mut features,
+        areas,
+        provenance: ranking_provenance,
+        acc_values,
+        coalesce: coalesce_scratch,
+        num_rows,
+        skipped_rows,
+        geom_bytes,
+        pass1_stage_secs,
+    } = run_pass1(
+        inputs.source,
+        inputs.input_schema,
+        inputs.geom_idx,
+        options,
+        inputs.acc_cols,
+        inputs.selected_row_groups,
+        inputs.bbox_units,
+        inputs.bound_filter,
+    )?;
+    if skipped_rows > 0 {
+        log::warn!(
+            "skipping {skipped_rows} of {num_rows} input rows with a null, \
+             empty, or non-finite geometry"
+        );
+    }
+    let num_features = features.len();
+    // Per-kind counts ride along in the plan artifact (a sharded build reads
+    // them to size its work); one extra O(N) pass, taken only when saving.
+    let kind_counts = options.save_plan.is_some().then(|| count_kinds(&features));
+
+    // One pass over the pass-1 bboxes for every bbox-derived tally: #188
+    // antimeridian suspects, and the #429 losses (outside the CRS range, or
+    // outside the Web Mercator tiling domain). Warns once per kind and
+    // refuses to "succeed" into an empty archive when ~everything is lost.
+    let tallies = super::convert::tally_feature_bboxes(&features, inputs.crs)?;
+
+    // Stage markers (#242): everything between pass 1 and the writer used to
+    // run in total info-level silence — on planet-scale inputs that was tens
+    // of minutes with no output.
+    log::info!("[convert] scan complete: {num_features} feature(s) from {num_rows} row(s)");
+    log::debug!(
+        "[profile] pass1 stream+scan: {:.2}s",
+        t_pass1.elapsed().as_secs_f64()
+    );
+    log_phase_rss("pass1 scan", peak_rss_mib);
+
+    let tables = resolve_winner_tables(
+        &mut features,
+        acc_values,
+        areas,
+        coalesce_scratch,
+        num_rows,
+        inputs.crs,
+        options,
+        peak_rss_mib,
+    )?;
+
+    // Persisted here, the first moment the assignment is complete and before
+    // pass 2 touches anything: what survives resolve_winner_tables IS the
+    // whole dataset-global result (the O(N)·48B feature scratch it folded
+    // over is already freed).
+    if let Some(path) = &options.save_plan {
+        let (n_points, n_lines, n_polygons) = kind_counts.expect("counted when saving a plan");
+        let totals = PlanTotals {
+            n_rows: num_rows,
+            n_features: num_features,
+            skipped_rows,
+            n_lines,
+            n_points,
+            n_polygons,
+            geom_bytes,
+            antimeridian_suspect: tallies.antimeridian_suspect,
+            out_of_range: tallies.out_of_range,
+            unprojectable: tallies.unprojectable,
+        };
+        let plan = ConvertPlan::from_winner_tables(
+            &tables,
+            fingerprint.expect("captured for --save-plan"),
+            &ranking_provenance,
+            options.entry_zoom.as_ref(),
+            totals,
+        )?;
+        plan.save(path)?;
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "[convert] saved the convert plan to {} ({bytes} bytes: {num_rows} row(s), \
+             {} level(s)) — re-run with --plan to skip pass 1 and the assignment",
+            path.display(),
+            tables.level_specs.len(),
+        );
+    }
+
+    Ok(PlanState {
+        tables,
+        ranking_provenance,
+        num_rows,
+        num_features,
+        geom_bytes,
+        tallies,
+        pass1_stage_secs,
+        t_pass1,
+    })
+}
+
+/// `(points, lines, polygons)` over the pass-1 features.
+fn count_kinds(features: &[AssignFeature]) -> (usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize);
+    for f in features {
+        match f.kind {
+            FeatureKind::Point => counts.0 += 1,
+            FeatureKind::Line => counts.1 += 1,
+            FeatureKind::Polygon => counts.2 += 1,
+        }
+    }
+    counts
+}
+
+/// The `--plan` path: pass 1 and the assignment are replaced wholesale by the
+/// saved artifact, after its fingerprint is verified against this run.
+fn load_plan_state(path: &Path, current: Fingerprint) -> Result<PlanState, ConvertError> {
+    let t_pass1 = Instant::now();
+    let plan = ConvertPlan::load(path)?;
+    plan.fingerprint.verify(&current)?;
+    let totals = plan.totals;
+    if plan.min_levels.len() != totals.n_rows {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan: {} holds {} winner-table row(s) but claims {} input row(s)",
+            path.display(),
+            plan.min_levels.len(),
+            totals.n_rows,
+        )));
+    }
+    if plan.counts.len() != plan.level_specs.len() || plan.finest >= plan.level_specs.len() {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan: {} has an inconsistent level plan ({} spec(s), {} count(s), finest {})",
+            path.display(),
+            plan.level_specs.len(),
+            plan.counts.len(),
+            plan.finest,
+        )));
+    }
+    if totals.skipped_rows > 0 {
+        log::warn!(
+            "skipping {} of {} input rows with a null, empty, or non-finite geometry",
+            totals.skipped_rows,
+            totals.n_rows
+        );
+    }
+    log::info!(
+        "[convert] loaded the convert plan from {} — pass 1 and the level assignment are \
+         skipped ({} feature(s) from {} row(s), {} level(s), ranking {:?}, {:.0}% points)",
+        path.display(),
+        totals.n_features,
+        totals.n_rows,
+        plan.level_specs.len(),
+        plan.rank_plan.mode,
+        totals.point_ratio() * 100.0,
+    );
+    let ranking_provenance = plan.rank_provenance.clone();
+    Ok(PlanState {
+        tables: plan.into_winner_tables()?,
+        ranking_provenance,
+        num_rows: totals.n_rows,
+        num_features: totals.n_features,
+        geom_bytes: totals.geom_bytes,
+        tallies: BboxTallies {
+            antimeridian_suspect: totals.antimeridian_suspect,
+            out_of_range: totals.out_of_range,
+            unprojectable: totals.unprojectable,
+            // Only feeds the all-lost diagnosis, which already fired (or did
+            // not) on the run that produced the plan.
+            max_abs_out_of_range: 0.0,
+        },
+        pass1_stage_secs: Pass1StageSecs::default(),
+        t_pass1,
+    })
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -1196,68 +1437,37 @@ pub(crate) fn convert_streaming_strategy(
     } = convert_preflight(source, options)?;
     let options = &resolved_options;
 
-    // --- Pass 1: stream → AssignFeatures + resolved ranking. -----------------
-    let t_pass1 = Instant::now();
-    let Pass1Output {
-        mut features,
-        areas,
-        provenance: ranking_provenance,
-        acc_values,
-        coalesce: coalesce_scratch,
+    // --- Pass 1 + assignment, or the saved plan that replaces them. ----------
+    let PlanState {
+        tables:
+            WinnerTables {
+                level_specs,
+                cluster_tables,
+                kinds,
+                coalesce_scratch,
+                min_levels,
+                counts,
+                carriers,
+                finest,
+            },
+        ranking_provenance,
         num_rows,
-        skipped_rows,
+        num_features,
         geom_bytes,
+        tallies,
         pass1_stage_secs,
-    } = run_pass1(
-        source,
-        &input_schema,
-        geom_idx,
-        options,
-        &acc_cols,
-        selected_row_groups.as_ref(),
-        bbox_units.as_ref(),
-        bound_filter.as_ref(),
-    )?;
-    if skipped_rows > 0 {
-        log::warn!(
-            "skipping {skipped_rows} of {num_rows} input rows with a null, \
-             empty, or non-finite geometry"
-        );
-    }
-    let num_features = features.len();
-
-    // One pass over the pass-1 bboxes for every bbox-derived tally: #188
-    // antimeridian suspects, and the #429 losses (outside the CRS range, or
-    // outside the Web Mercator tiling domain). Warns once per kind and
-    // refuses to "succeed" into an empty archive when ~everything is lost.
-    let tallies = super::convert::tally_feature_bboxes(&features, crs)?;
-
-    // Stage markers (#242): everything between pass 1 and the writer used to
-    // run in total info-level silence — on planet-scale inputs that was tens
-    // of minutes with no output.
-    log::info!("[convert] scan complete: {num_features} feature(s) from {num_rows} row(s)");
-    log::debug!(
-        "[profile] pass1 stream+scan: {:.2}s",
-        t_pass1.elapsed().as_secs_f64()
-    );
-    log_phase_rss("pass1 scan", &mut peak_rss_mib);
-
-    let WinnerTables {
-        level_specs,
-        cluster_tables,
-        kinds,
-        coalesce_scratch,
-        min_levels,
-        counts,
-        carriers,
-        finest,
-    } = resolve_winner_tables(
-        &mut features,
-        acc_values,
-        areas,
-        coalesce_scratch,
-        num_rows,
-        crs,
+        t_pass1,
+    } = resolve_plan_state(
+        &Pass1Inputs {
+            source,
+            input_schema: &input_schema,
+            geom_idx,
+            acc_cols: &acc_cols,
+            selected_row_groups: selected_row_groups.as_ref(),
+            bbox_units: bbox_units.as_ref(),
+            bound_filter: bound_filter.as_ref(),
+            crs,
+        },
         options,
         &mut peak_rss_mib,
     )?;
@@ -1715,17 +1925,17 @@ fn scan_road_vocab(col: &dyn Array, found: &mut HashSet<&'static str>) {
 /// be reclaimable, so no winner-table pre-filter applies). Bounded by
 /// [`ConvertOptions::coalesce_max_level_rows`]; beyond it coalescing is
 /// skipped and this scratch is never built.
-struct CoalesceScratch {
+pub(super) struct CoalesceScratch {
     /// Source row index per collected line, ascending input order.
-    rows: Vec<usize>,
+    pub(super) rows: Vec<usize>,
     /// The lines' decoded geometries, parallel to `rows`.
-    geoms: Vec<Geometry<f64>>,
+    pub(super) geoms: Vec<Geometry<f64>>,
     /// Sort key per line (Q1 ranking), parallel to `rows`; filled after the
     /// ranking tier resolves.
-    sort_keys: Vec<Option<f64>>,
+    pub(super) sort_keys: Vec<Option<f64>>,
     /// Interned class group per line, parallel to `rows`; `None` = no class
     /// ranking active (all lines compatible).
-    groups: Option<Vec<u32>>,
+    pub(super) groups: Option<Vec<u32>>,
 }
 
 impl CoalesceScratch {

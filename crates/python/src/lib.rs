@@ -736,6 +736,10 @@ fn overview(
         // #386: property selection is not on the Python surface yet.
         properties: Default::default(),
         spill_dir,
+        // The convert plan artifact (--save-plan / --plan) is not on the
+        // Python surface yet; follow-up.
+        save_plan: None,
+        plan: None,
     };
 
     // `str` stays the single-input path (files, directories, globs, remote
