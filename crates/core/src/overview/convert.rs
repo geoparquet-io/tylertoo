@@ -2583,20 +2583,33 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
     }
 }
 
-/// Row groups of the input whose bbox covering statistics intersect
-/// `bbox_units` (`[xmin, ymin, xmax, ymax]` in the file's CRS units).
+/// Row groups of the input whose bbox statistics intersect `bbox_units`
+/// (`[xmin, ymin, xmax, ymax]` in the file's CRS units).
 ///
-/// Statistics-only: operates purely on the parsed parquet footer
-/// ([`crate::covering::extract_row_group_bounds_from_metadata`]); no data
-/// pages are touched. Row groups with missing/unparseable covering
-/// statistics are conservatively KEPT (graceful degradation — the exact
-/// per-feature bbox filter downstream guarantees correctness either way).
+/// Statistics-only: operates purely on the parsed parquet footer, tiered
+/// (#497) between GeoParquet 1.1 covering-column stats and GeoParquet 2.0
+/// native geo statistics
+/// ([`crate::covering::extract_row_group_bounds_tiered`]); no data pages
+/// are touched. Row groups with no usable statistics from either tier are
+/// conservatively KEPT (graceful degradation — the exact per-feature bbox
+/// filter downstream guarantees correctness either way).
+///
+/// The session CRS is re-derived from `metadata` itself
+/// (footer-metadata-only, no I/O — the same detection that already
+/// produced `bbox_units` via [`bbox_to_crs_units`]) so tier 2 can refuse to
+/// prune when the geometry column's declared CRS doesn't agree with it
+/// (never guess). An undetectable CRS here (shouldn't happen — the pipeline
+/// already errored out earlier if so) just skips tier 2, same as any other
+/// "can't tell" case.
 pub(crate) fn select_input_row_groups(
     metadata: &parquet::file::metadata::ParquetMetaData,
     bbox_units: &[f64; 4],
 ) -> Vec<usize> {
-    let bounds = crate::covering::extract_row_group_bounds_from_metadata(metadata)
-        .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]);
+    let bounds = match detect_crs_from_kv(metadata.file_metadata().key_value_metadata()) {
+        Ok(crs) => crate::covering::extract_row_group_bounds_tiered(metadata, crs),
+        Err(_) => crate::covering::extract_row_group_bounds_from_metadata(metadata)
+            .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]),
+    };
     let filter = crate::tile::TileBounds {
         lng_min: bbox_units[0],
         lat_min: bbox_units[1],

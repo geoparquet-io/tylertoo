@@ -38,8 +38,10 @@
 //! This approach has ~4% overhead compared to baseline metadata reads, and is
 //! 370x faster than scanning column values.
 
+use crate::overview::level::Crs;
 use crate::tile::{lng_lat_to_tile, TileBounds, TileCoord};
 use crate::Error;
+use parquet::basic::LogicalType;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Deserialize;
@@ -145,15 +147,35 @@ impl RowGroupBounds {
     /// Infinities are left to the AABB test, which handles them exactly: an
     /// `xmin = +inf / xmax = -inf` envelope (the conventional "empty" bbox)
     /// intersects nothing and is pruned, which is what it asks for.
+    ///
+    /// **Antimeridian wraparound (#497):** per the Parquet Geospatial spec, a
+    /// bounding box's X range may have `xmin > xmax`, meaning the row
+    /// group's X coverage is *everything outside* the open interval
+    /// `(xmax, xmin)` — i.e. two lobes, `x <= xmax` OR `x >= xmin` — rather
+    /// than the usual single closed interval `[xmin, xmax]`. This shows up
+    /// both in GeoParquet 1.1 covering-column stats and GeoParquet 2.0
+    /// native geo statistics for a row group holding antimeridian-crossing
+    /// geometry. The filter bbox itself is assumed non-wrapping (never
+    /// produced by `--bbox` parsing). The non-wrapping path below is
+    /// byte-for-byte the prior test, so ordinary row groups pay no extra
+    /// cost.
     pub fn intersects(&self, filter: &TileBounds) -> bool {
         if self.has_nan() {
             return true;
         }
-        // Standard AABB intersection test
-        self.xmin <= filter.lng_max
-            && self.xmax >= filter.lng_min
-            && self.ymin <= filter.lat_max
-            && self.ymax >= filter.lat_min
+        let y_overlap = self.ymin <= filter.lat_max && self.ymax >= filter.lat_min;
+        if !y_overlap {
+            return false;
+        }
+        if self.xmin <= self.xmax {
+            // Standard AABB intersection test (unchanged fast path).
+            self.xmin <= filter.lng_max && self.xmax >= filter.lng_min
+        } else {
+            // Wraparound: the row group's X domain is x <= xmax OR x >= xmin.
+            // The filter (a single interval) misses it only when the whole
+            // filter interval falls inside the excluded gap (xmax, xmin).
+            filter.lng_min <= self.xmax || filter.lng_max >= self.xmin
+        }
     }
 
     /// Convert to TileBounds for compatibility with existing code.
@@ -465,6 +487,183 @@ pub fn get_geo_metadata(metadata: &ParquetMetaData) -> Result<Option<String>, Er
     }
 
     Ok(None)
+}
+
+// ============================================================================
+// GeoParquet 2.0 Native Geo Statistics (tier 2, #497)
+// ============================================================================
+//
+// GeoParquet 1.1's covering columns (above) require the legacy "geo" JSON
+// key-value metadata. A pure GeoParquet 2.0 file may carry no "geo" JSON at
+// all — its geometry column is a native Parquet `Geometry`/`Geography`
+// logical type instead, and *that* schema annotation is where its CRS and
+// per-row-group bounding box live (`ColumnChunkMetaData::geo_statistics`,
+// parsed unconditionally by the vendored `parquet` crate regardless of any
+// cargo feature). [`extract_row_group_bounds_tiered`] adds this as a second
+// tier, tried per row group only where covering-column stats (tier 1) are
+// unavailable; [`crate::overview::convert::select_input_row_groups`] is the
+// production entry point that calls it.
+
+/// Parquet leaf-column index of the file's GeoParquet 2.0 geometry column,
+/// found directly from its `LogicalType::Geometry` / `Geography` annotation
+/// in the raw Parquet schema — no "geo" JSON required, which is exactly the
+/// shape of a pure GeoParquet 2.0 file. When several columns carry the
+/// annotation, a column literally named "geometry" wins; otherwise the
+/// first one found in schema order. Mirrors
+/// [`crate::overview::convert::find_geometry_column`]'s Arrow-schema
+/// equivalent for the legacy WKB/GeoArrow path.
+pub(crate) fn find_native_geometry_leaf_column(
+    metadata: &ParquetMetaData,
+) -> Option<(usize, LogicalType)> {
+    let schema = metadata.file_metadata().schema_descr();
+    let num_columns = schema.num_columns();
+    let mut first: Option<(usize, LogicalType)> = None;
+
+    for col_idx in 0..num_columns {
+        let col = schema.column(col_idx);
+        let Some(lt) = col.logical_type_ref() else {
+            continue;
+        };
+        if !matches!(lt, LogicalType::Geometry(_) | LogicalType::Geography(_)) {
+            continue;
+        }
+        if col.name() == "geometry" {
+            return Some((col_idx, lt.clone()));
+        }
+        if first.is_none() {
+            first = Some((col_idx, lt.clone()));
+        }
+    }
+
+    first
+}
+
+/// A minimal CRS-string classifier for `LogicalType::Geometry(crs)` /
+/// `Geography(crs)` annotations, recognizing only the two CRSs
+/// [`crate::overview::level::Crs`] supports. Anything else — a PROJJSON
+/// blob, an unrecognized authority:code string, garbage — reads as `None`
+/// ("unresolvable"); [`native_geo_crs_matches`] treats that as "never
+/// guess" and skips tier-2 pruning entirely. Mirrors the identifier set
+/// `crate::quality::is_wgs84_identifier` recognizes for the legacy "geo"
+/// JSON CRS field and the substring match
+/// `crate::overview::convert::detect_crs_from_kv` uses for EPSG:3857,
+/// duplicated here (rather than exposed cross-module) to keep this change
+/// additive-only.
+fn crs_identifier_kind(id: &str) -> Option<Crs> {
+    let up = id.to_uppercase();
+    if up == "EPSG:4326"
+        || up == "OGC:CRS84"
+        || up == "CRS84"
+        || up == "URN:OGC:DEF:CRS:OGC::CRS84"
+        || up == "URN:OGC:DEF:CRS:EPSG::4326"
+        || up.contains("WGS 84")
+        || up.contains("WGS84")
+    {
+        return Some(Crs::Epsg4326);
+    }
+    if up.contains("3857") || up.contains("900913") {
+        return Some(Crs::Epsg3857);
+    }
+    None
+}
+
+/// Whether a native geometry column's declared CRS is consistent with
+/// `session_crs` — the CRS the rest of the conversion has already committed
+/// to via [`crate::overview::convert::detect_crs_from_kv`]. Tier-2 pruning
+/// is only safe when this holds; the caller must fall through to tier 3
+/// (read everything) rather than guess (#497).
+///
+/// DIVERGENCE FROM TIPPECANOE (N/A — no tippecanoe equivalent; this is a
+/// GeoParquet 2.0 concern): a `Geography` column is excluded
+/// unconditionally. Its edges interpolate along the sphere (non-planar), so
+/// a corner-only AABB test does not necessarily bound the true shape the
+/// way it does for a planar `Geometry` column — a great-circle arc can bulge
+/// outside the box its endpoints describe. Conservative: never prune it.
+pub(crate) fn native_geo_crs_matches(logical_type: &LogicalType, session_crs: Crs) -> bool {
+    let LogicalType::Geometry(g) = logical_type else {
+        return false;
+    };
+    let resolved = match &g.crs {
+        None => Some(Crs::Epsg4326), // unset ⇒ OGC:CRS84 per the Parquet spec
+        Some(s) => crs_identifier_kind(s),
+    };
+    resolved == Some(session_crs)
+}
+
+/// One row group's tier-2 bounds from `ColumnChunkMetaData::geo_statistics`,
+/// or `None` if unusable: no geo statistics at all, no bounding box within
+/// them (the spec allows a writer to emit `geospatial_types` without a
+/// `bbox` or vice versa), or a NaN corner (#428 precedent: unusable
+/// statistics must read as missing, never as an impossible/empty box that
+/// would prune the row group).
+fn row_group_native_bounds(
+    rg: &parquet::file::metadata::RowGroupMetaData,
+    rg_idx: usize,
+    geom_leaf_idx: usize,
+) -> Option<RowGroupBounds> {
+    let stats = rg.column(geom_leaf_idx).geo_statistics()?;
+    let bbox = stats.bounding_box()?;
+    let (xmin, xmax, ymin, ymax) = (
+        bbox.get_xmin(),
+        bbox.get_xmax(),
+        bbox.get_ymin(),
+        bbox.get_ymax(),
+    );
+    if xmin.is_nan() || xmax.is_nan() || ymin.is_nan() || ymax.is_nan() {
+        return None;
+    }
+    Some(RowGroupBounds {
+        row_group_idx: rg_idx,
+        xmin,
+        ymin,
+        xmax,
+        ymax,
+        num_rows: rg.num_rows() as usize,
+    })
+}
+
+/// Per-row-group bounds tier 2: GeoParquet 2.0 native geo statistics on the
+/// geometry column at `geom_leaf_idx`. `None` per row group where that
+/// chunk's statistics are absent or unusable.
+pub(crate) fn geo_statistics_bounds(
+    metadata: &ParquetMetaData,
+    geom_leaf_idx: usize,
+) -> Vec<Option<RowGroupBounds>> {
+    (0..metadata.num_row_groups())
+        .map(|rg_idx| row_group_native_bounds(metadata.row_group(rg_idx), rg_idx, geom_leaf_idx))
+        .collect()
+}
+
+/// Tiered per-row-group bbox extraction (#497): (1) GeoParquet 1.1 covering
+/// columns ([`extract_row_group_bounds_from_metadata`], unchanged) → (2)
+/// GeoParquet 2.0 native geo statistics ([`geo_statistics_bounds`]) → (3)
+/// `None` (the row group is read; the exact per-feature filter downstream
+/// is the correctness backstop either way, so over-pruning is the only
+/// danger and this order never increases it). Tiered per row group, not per
+/// file: a file with partial covering-column coverage still gets tier 2 for
+/// whichever row groups tier 1 missed.
+///
+/// Tier 2 fires only when the geometry column's declared CRS is consistent
+/// with `session_crs` ([`native_geo_crs_matches`]); an unresolvable or
+/// mismatched CRS skips tier 2 file-wide rather than guessing.
+pub(crate) fn extract_row_group_bounds_tiered(
+    metadata: &ParquetMetaData,
+    session_crs: Crs,
+) -> Vec<Option<RowGroupBounds>> {
+    let tier1 = extract_row_group_bounds_from_metadata(metadata)
+        .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]);
+    if tier1.iter().all(Option::is_some) {
+        return tier1; // fully covered — tier 2 would be wasted work
+    }
+
+    let tier2 = find_native_geometry_leaf_column(metadata)
+        .filter(|(_, lt)| native_geo_crs_matches(lt, session_crs))
+        .map(|(geom_idx, _)| geo_statistics_bounds(metadata, geom_idx));
+
+    match tier2 {
+        None => tier1,
+        Some(tier2) => tier1.into_iter().zip(tier2).map(|(a, b)| a.or(b)).collect(),
+    }
 }
 
 // ============================================================================
@@ -1199,5 +1398,539 @@ mod tests {
             selected.is_empty(),
             "an empty-envelope row group bounds nothing and must stay pruned (got {selected:?})"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // GeoParquet 2.0 native geo statistics (tier 2, #497)
+    // -------------------------------------------------------------------------
+
+    /// One row group's synthetic tier-1/tier-2 stats for
+    /// [`metadata_with_tiered_stats`]. `covering`/`native` are independently
+    /// present or absent so a single helper builds every tier-ordering
+    /// scenario.
+    #[derive(Clone, Copy)]
+    struct TieredRowGroupSpec {
+        /// Tier-1 covering-column bbox, `(xmin, ymin, xmax, ymax)`.
+        covering: Option<(f64, f64, f64, f64)>,
+        /// Tier-2 native `geo_statistics` bbox, `(xmin, xmax, ymin, ymax)`
+        /// — [`parquet::geospatial::bounding_box::BoundingBox::new`]'s own
+        /// (unusual) parameter order.
+        native: Option<(f64, f64, f64, f64)>,
+        num_rows: i64,
+    }
+
+    /// Build synthetic footer metadata with schema
+    /// `[xmin, ymin, xmax, ymax, geometry]`: the first four DOUBLE columns
+    /// are the GeoParquet 1.1 tier-1 covering columns; `geometry` is a
+    /// BYTE_ARRAY column annotated `LogicalType::Geometry(crs)` for tier 2.
+    /// `with_geo_json` attaches (or omits) the "geo" key-value metadata
+    /// that points a covering spec at the four DOUBLE columns — `false`
+    /// models a pure GeoParquet 2.0 file (no legacy "geo" JSON at all),
+    /// making tier 1 unavailable file-wide regardless of what any
+    /// individual row group's DOUBLE-column stats say.
+    ///
+    /// Hand-built rather than written through `ArrowWriter`: this build has
+    /// the vendored `parquet` crate's `geospatial` cargo feature off (the
+    /// write-side `GeospatialStatistics` accumulator is feature-gated,
+    /// unlike the read side used in production — see `extension.rs`'s
+    /// `logical_type_for_binary`), so `ArrowWriter` cannot emit
+    /// `LogicalType::Geometry` at all in this workspace. This mirrors
+    /// [`metadata_with_bbox_stats`]'s existing precedent for the same
+    /// reason (NaN statistics there).
+    fn metadata_with_tiered_stats(
+        crs: Option<&str>,
+        with_geo_json: bool,
+        row_groups: &[TieredRowGroupSpec],
+    ) -> ParquetMetaData {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
+        };
+        use parquet::file::statistics::Statistics;
+        use parquet::geospatial::bounding_box::BoundingBox;
+        use parquet::geospatial::statistics::GeospatialStatistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        let mut fields: Vec<Arc<Type>> = ["xmin", "ymin", "xmax", "ymax"]
+            .iter()
+            .map(|n| {
+                Arc::new(
+                    Type::primitive_type_builder(n, PhysicalType::DOUBLE)
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        fields.push(Arc::new(
+            Type::primitive_type_builder("geometry", PhysicalType::BYTE_ARRAY)
+                .with_logical_type(Some(LogicalType::geometry(crs.map(str::to_string))))
+                .build()
+                .unwrap(),
+        ));
+        let schema = Type::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+
+        let row_group_metas: Vec<RowGroupMetaData> = row_groups
+            .iter()
+            .map(|spec| {
+                let covering_vals: [Option<f64>; 4] = match spec.covering {
+                    Some((xmin, ymin, xmax, ymax)) => {
+                        [Some(xmin), Some(ymin), Some(xmax), Some(ymax)]
+                    }
+                    None => [None, None, None, None],
+                };
+                let mut columns: Vec<ColumnChunkMetaData> = covering_vals
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let mut builder = ColumnChunkMetaData::builder(descr.column(i));
+                        if let Some(v) = v {
+                            builder = builder.set_statistics(Statistics::double(
+                                Some(v),
+                                Some(v),
+                                None,
+                                Some(0),
+                                false,
+                            ));
+                        }
+                        builder.build().unwrap()
+                    })
+                    .collect();
+
+                let mut geom_builder = ColumnChunkMetaData::builder(descr.column(4));
+                if let Some((xmin, xmax, ymin, ymax)) = spec.native {
+                    geom_builder =
+                        geom_builder.set_geo_statistics(Box::new(GeospatialStatistics::new(
+                            Some(BoundingBox::new(xmin, xmax, ymin, ymax)),
+                            None,
+                        )));
+                }
+                columns.push(geom_builder.build().unwrap());
+
+                RowGroupMetaData::builder(descr.clone())
+                    .set_num_rows(spec.num_rows)
+                    .set_column_metadata(columns)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+
+        let total_rows: i64 = row_groups.iter().map(|s| s.num_rows).sum();
+        let geo_json = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"covering":{"bbox":{"xmin":["xmin"],"ymin":["ymin"],"xmax":["xmax"],"ymax":["ymax"]}}}}}"#;
+        let kv =
+            with_geo_json.then(|| vec![KeyValue::new("geo".to_string(), geo_json.to_string())]);
+        let file_meta = FileMetaData::new(2, total_rows, None, kv, descr, None);
+        ParquetMetaData::new(file_meta, row_group_metas)
+    }
+
+    /// Tier 2 fires when tier 1 has nothing at all — the pure GeoParquet 2.0
+    /// shape: no "geo" JSON, geometry column carries `LogicalType::Geometry`
+    /// with native `geo_statistics` instead.
+    #[test]
+    fn native_geo_stats_prune_without_covering_column() {
+        let specs = [
+            TieredRowGroupSpec {
+                covering: None,
+                native: Some((-100.0, -90.0, -10.0, -1.0)), // (xmin, xmax, ymin, ymax)
+                num_rows: 10,
+            },
+            TieredRowGroupSpec {
+                covering: None,
+                native: Some((0.0, 10.0, 0.0, 10.0)),
+                num_rows: 10,
+            },
+            TieredRowGroupSpec {
+                covering: None,
+                native: Some((50.0, 60.0, 50.0, 60.0)),
+                num_rows: 10,
+            },
+        ];
+        let metadata = metadata_with_tiered_stats(None, false, &specs);
+
+        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        assert_eq!(
+            bounds,
+            vec![
+                Some(RowGroupBounds {
+                    row_group_idx: 0,
+                    xmin: -100.0,
+                    ymin: -10.0,
+                    xmax: -90.0,
+                    ymax: -1.0,
+                    num_rows: 10,
+                }),
+                Some(RowGroupBounds {
+                    row_group_idx: 1,
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 10.0,
+                    ymax: 10.0,
+                    num_rows: 10,
+                }),
+                Some(RowGroupBounds {
+                    row_group_idx: 2,
+                    xmin: 50.0,
+                    ymin: 50.0,
+                    xmax: 60.0,
+                    ymax: 60.0,
+                    num_rows: 10,
+                }),
+            ],
+            "native geo_statistics must be read when no covering column exists"
+        );
+
+        // End-to-end through the production entry point: a bbox around row
+        // group 1 only must prune 0 and 2.
+        let selected =
+            crate::overview::convert::select_input_row_groups(&metadata, &[-1.0, -1.0, 11.0, 11.0]);
+        assert_eq!(selected, vec![1], "native stats did not prune 0 and 2");
+    }
+
+    /// Tier order: when BOTH tiers are present for a row group, tier 1
+    /// (covering columns) wins — even when tier 2's numbers disagree.
+    #[test]
+    fn covering_column_wins_over_native_stats() {
+        let specs = [TieredRowGroupSpec {
+            covering: Some((0.0, 0.0, 10.0, 10.0)), // the "true" bbox
+            // Deliberately wrong/wider — must be ignored in favor of tier 1.
+            native: Some((-1000.0, 1000.0, -1000.0, 1000.0)),
+            num_rows: 5,
+        }];
+        let metadata = metadata_with_tiered_stats(None, true, &specs);
+
+        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        assert_eq!(
+            bounds,
+            vec![Some(RowGroupBounds {
+                row_group_idx: 0,
+                xmin: 0.0,
+                ymin: 0.0,
+                xmax: 10.0,
+                ymax: 10.0,
+                num_rows: 5,
+            })],
+            "covering-column stats (tier 1) must win over native stats (tier 2)"
+        );
+
+        // A bbox that only the (wrong) native stats would keep must still
+        // be pruned, proving tier 1's numbers — not tier 2's — decided it.
+        let selected = crate::overview::convert::select_input_row_groups(
+            &metadata,
+            &[500.0, 500.0, 600.0, 600.0],
+        );
+        assert!(
+            selected.is_empty(),
+            "tier 1 must have decided pruning, not the wider tier-2 bbox"
+        );
+    }
+
+    /// Tiering is per row group, not per file: a row group tier 1 missed
+    /// still gets tier 2.
+    #[test]
+    fn native_stats_fill_in_where_covering_column_is_missing() {
+        let specs = [
+            TieredRowGroupSpec {
+                covering: Some((0.0, 0.0, 10.0, 10.0)),
+                native: None,
+                num_rows: 5,
+            },
+            TieredRowGroupSpec {
+                // This row group's covering-column stats are unset (as if
+                // that writer skipped them for just this chunk); only its
+                // native stats are usable.
+                covering: None,
+                native: Some((100.0, 110.0, 100.0, 110.0)),
+                num_rows: 5,
+            },
+        ];
+        let metadata = metadata_with_tiered_stats(None, true, &specs);
+
+        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        assert_eq!(
+            bounds[0].as_ref().map(|b| (b.xmin, b.ymax)),
+            Some((0.0, 10.0)),
+            "row group 0: tier 1"
+        );
+        assert_eq!(
+            bounds[1].as_ref().map(|b| (b.xmin, b.ymax)),
+            Some((100.0, 110.0)),
+            "row group 1: tier 2 fills in where tier 1 was missing"
+        );
+    }
+
+    /// The Parquet Geospatial spec allows `xmin > xmax` for a bbox that
+    /// wraps the antimeridian: the true X coverage is two lobes (`x <=
+    /// xmax` OR `x >= xmin`), not the empty interval a naive AABB test
+    /// would read it as.
+    #[test]
+    fn native_stats_antimeridian_bbox_keeps_both_lobes() {
+        // Row group's X range wraps: covers x <= -170 OR x >= 170.
+        let wrapping = RowGroupBounds {
+            row_group_idx: 0,
+            xmin: 170.0,
+            ymin: -10.0,
+            xmax: -170.0,
+            ymax: 10.0,
+            num_rows: 100,
+        };
+
+        let east_lobe = TileBounds {
+            lng_min: 175.0,
+            lat_min: -5.0,
+            lng_max: 179.0,
+            lat_max: 5.0,
+        };
+        assert!(
+            wrapping.intersects(&east_lobe),
+            "east lobe (near +180) must intersect"
+        );
+
+        let west_lobe = TileBounds {
+            lng_min: -179.0,
+            lat_min: -5.0,
+            lng_max: -178.0,
+            lat_max: 5.0,
+        };
+        assert!(
+            wrapping.intersects(&west_lobe),
+            "west lobe (near -180) must intersect"
+        );
+
+        let the_gap = TileBounds {
+            lng_min: -50.0,
+            lat_min: -5.0,
+            lng_max: 50.0,
+            lat_max: 5.0,
+        };
+        assert!(
+            !wrapping.intersects(&the_gap),
+            "a query entirely in the excluded gap must NOT intersect"
+        );
+
+        // Same thing through the extraction path: geo_statistics preserves
+        // the xmin > xmax inversion verbatim (no clamping/rejecting it).
+        let specs = [TieredRowGroupSpec {
+            covering: None,
+            native: Some((170.0, -170.0, -10.0, 10.0)), // (xmin, xmax, ymin, ymax)
+            num_rows: 100,
+        }];
+        let metadata = metadata_with_tiered_stats(None, false, &specs);
+        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let b = bounds[0].as_ref().expect("native stats must be read");
+        assert_eq!((b.xmin, b.xmax), (170.0, -170.0), "inversion preserved");
+
+        let selected = crate::overview::convert::select_input_row_groups(
+            &metadata,
+            &[175.0, -5.0, 179.0, 5.0],
+        );
+        assert_eq!(selected, vec![0], "east lobe must select the row group");
+
+        let selected =
+            crate::overview::convert::select_input_row_groups(&metadata, &[-50.0, -5.0, 50.0, 5.0]);
+        assert!(selected.is_empty(), "the gap must prune the row group");
+    }
+
+    /// Never guess: a native geometry column whose declared CRS doesn't
+    /// match the session CRS must skip tier 2 entirely (keep, don't prune).
+    #[test]
+    fn native_stats_crs_mismatch_never_prunes() {
+        let specs = [TieredRowGroupSpec {
+            covering: None,
+            // Values that look like plausible EPSG:3857 meters, not lon/lat.
+            native: Some((-1.0e7, -1.0e7 + 10.0, -1.0e7, -1.0e7 + 10.0)),
+            num_rows: 10,
+        }];
+        // Column declares EPSG:3857, but the session resolved to EPSG:4326
+        // (e.g. because there is no "geo" JSON at all to say otherwise).
+        let metadata = metadata_with_tiered_stats(Some("EPSG:3857"), false, &specs);
+
+        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        assert_eq!(
+            bounds,
+            vec![None],
+            "CRS mismatch between the column and the session must skip tier 2"
+        );
+
+        // Consistent CRS: tier 2 fires normally.
+        let metadata_ok = metadata_with_tiered_stats(Some("EPSG:3857"), false, &specs);
+        let bounds_ok = extract_row_group_bounds_tiered(&metadata_ok, Crs::Epsg3857);
+        assert!(
+            bounds_ok[0].is_some(),
+            "a matching CRS must let tier 2 through"
+        );
+    }
+
+    /// Never guess: an unresolvable CRS string (not one of the two CRSs
+    /// this pipeline supports) must skip tier 2, whatever the session CRS.
+    #[test]
+    fn native_stats_unresolvable_crs_never_prunes() {
+        let specs = [TieredRowGroupSpec {
+            covering: None,
+            native: Some((0.0, 10.0, 0.0, 10.0)),
+            num_rows: 10,
+        }];
+        // A CRS this crate cannot classify (e.g. a state-plane code).
+        let metadata = metadata_with_tiered_stats(Some("EPSG:2154"), false, &specs);
+        for crs in [Crs::Epsg4326, Crs::Epsg3857] {
+            let bounds = extract_row_group_bounds_tiered(&metadata, crs);
+            assert_eq!(bounds, vec![None], "unresolvable CRS must skip tier 2");
+        }
+    }
+
+    /// DIVERGENCE (documented on `native_geo_crs_matches`): `Geography`
+    /// columns are never pruned via tier 2, even with a WGS84 CRS —
+    /// spherical edge interpolation isn't bounded by a planar AABB corner
+    /// test the way a `Geometry` column's straight edges are.
+    #[test]
+    fn native_stats_geography_never_prunes() {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
+        use parquet::geospatial::bounding_box::BoundingBox;
+        use parquet::geospatial::statistics::GeospatialStatistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        let geometry_field = Arc::new(
+            Type::primitive_type_builder("geometry", PhysicalType::BYTE_ARRAY)
+                .with_logical_type(Some(LogicalType::geography(None, None)))
+                .build()
+                .unwrap(),
+        );
+        let schema = Type::group_type_builder("schema")
+            .with_fields(vec![geometry_field])
+            .build()
+            .unwrap();
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+        let geo_stats =
+            GeospatialStatistics::new(Some(BoundingBox::new(0.0, 10.0, 0.0, 10.0)), None);
+        let column = ColumnChunkMetaData::builder(descr.column(0))
+            .set_geo_statistics(Box::new(geo_stats))
+            .build()
+            .unwrap();
+        let rg = RowGroupMetaData::builder(descr.clone())
+            .set_num_rows(10)
+            .set_column_metadata(vec![column])
+            .build()
+            .unwrap();
+        let file_meta = FileMetaData::new(2, 10, None, None, descr, None);
+        let metadata = ParquetMetaData::new(file_meta, vec![rg]);
+
+        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        assert_eq!(bounds, vec![None], "Geography columns must never prune");
+    }
+
+    /// Extends the stats-free graceful-degradation contract to a pure
+    /// GeoParquet 2.0 file: `LogicalType::Geometry` present, no "geo" JSON,
+    /// AND no `geo_statistics` on any row group either (a writer that
+    /// annotated the schema but skipped stats). Every row group must still
+    /// be read — the same conservative behavior as the GP1.1
+    /// stats-free case covered by `bbox_filter_stats_free_degradation`
+    /// (`overview::convert` tests), exercised here at the unit level
+    /// because writing a real round-tripped GeoParquet 2.0 fixture needs
+    /// the vendored `parquet` crate's `geospatial` cargo feature, which
+    /// this workspace does not enable (see `metadata_with_tiered_stats`).
+    #[test]
+    fn select_input_row_groups_degrades_gracefully_for_stats_free_gp2() {
+        let specs = [
+            TieredRowGroupSpec {
+                covering: None,
+                native: None,
+                num_rows: 10,
+            },
+            TieredRowGroupSpec {
+                covering: None,
+                native: None,
+                num_rows: 10,
+            },
+        ];
+        let metadata = metadata_with_tiered_stats(None, false, &specs);
+
+        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        assert_eq!(bounds, vec![None, None]);
+
+        // A tiny, far-away bbox would prune everything if stats existed;
+        // with none at all, both row groups must still be read.
+        let selected = crate::overview::convert::select_input_row_groups(
+            &metadata,
+            &[500.0, 500.0, 501.0, 501.0],
+        );
+        assert_eq!(
+            selected,
+            vec![0, 1],
+            "stats-free GeoParquet 2.0 must degrade to reading everything"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Property test (#497): tier-2 bounds never prune a row group that
+    // truly contains a matching point.
+    // -------------------------------------------------------------------------
+
+    mod native_stats_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn point_in_bbox(p: (f64, f64), b: &TileBounds) -> bool {
+            p.0 >= b.lng_min && p.0 <= b.lng_max && p.1 >= b.lat_min && p.1 <= b.lat_max
+        }
+
+        proptest! {
+            #[test]
+            fn selection_never_drops_a_true_match(
+                groups in proptest::collection::vec(
+                    proptest::collection::vec((-100.0f64..100.0, -100.0f64..100.0), 1..6),
+                    1..6,
+                ),
+                qx0 in -100.0f64..100.0, qx1 in -100.0f64..100.0,
+                qy0 in -100.0f64..100.0, qy1 in -100.0f64..100.0,
+            ) {
+                let filter = TileBounds {
+                    lng_min: qx0.min(qx1),
+                    lat_min: qy0.min(qy1),
+                    lng_max: qx0.max(qx1),
+                    lat_max: qy0.max(qy1),
+                };
+                // Model exactly what GeoParquet 2.0 native geo_statistics
+                // holds per row group: the tight envelope of its rows.
+                // `geo_statistics_bounds` reads that envelope verbatim
+                // (proven by the deterministic tests above), so testing the
+                // envelope + `RowGroupBounds::intersects` here covers the
+                // same invariant end to end without needing real parquet
+                // I/O (unavailable — see `metadata_with_tiered_stats`).
+                let bounds: Vec<RowGroupBounds> = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pts)| {
+                        let xmin = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                        let xmax = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+                        let ymin = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+                        let ymax = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+                        RowGroupBounds {
+                            row_group_idx: i,
+                            xmin,
+                            ymin,
+                            xmax,
+                            ymax,
+                            num_rows: pts.len(),
+                        }
+                    })
+                    .collect();
+
+                let selected: std::collections::HashSet<usize> = (0..groups.len())
+                    .filter(|&i| bounds[i].intersects(&filter))
+                    .collect();
+                let truth: std::collections::HashSet<usize> = (0..groups.len())
+                    .filter(|&i| groups[i].iter().any(|&p| point_in_bbox(p, &filter)))
+                    .collect();
+                prop_assert!(
+                    truth.is_subset(&selected),
+                    "pruned a row group with a truly matching point: truth={truth:?} selected={selected:?}"
+                );
+            }
+        }
     }
 }
