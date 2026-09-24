@@ -2557,15 +2557,26 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 pub(crate) fn detect_crs_from_kv(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
 ) -> Result<Crs, ConvertError> {
+    use crate::quality::CrsKind;
+
     let info = crate::quality::crs_info_from_kv_metadata(kv)?;
     if info.is_wgs84 {
         return Ok(Crs::Epsg4326);
     }
-    if let Some(id) = &info.identifier {
-        let up = id.to_uppercase();
-        if up.contains("3857") || up.contains("900913") {
-            return Ok(Crs::Epsg3857);
-        }
+    // Not lon/lat: ask the shared classifier what it IS, rather than
+    // substring-matching here (#518 — the duplicated matcher in
+    // `crate::covering` read EPSG:3857's "WGS 84 / Pseudo-Mercator"
+    // PROJJSON as WGS84).
+    let kind = info
+        .identifier
+        .as_deref()
+        .or(info.name.as_deref())
+        .map(crate::quality::classify_crs_identifier)
+        .unwrap_or(CrsKind::Unknown);
+    match kind {
+        CrsKind::Wgs84 => return Ok(Crs::Epsg4326),
+        CrsKind::WebMercator => return Ok(Crs::Epsg3857),
+        CrsKind::Unknown => {}
     }
     Err(ConvertError::UnsupportedCrs {
         crs: info
@@ -2651,12 +2662,21 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 /// (never guess). An undetectable CRS here (shouldn't happen — the pipeline
 /// already errored out earlier if so) just skips tier 2, same as any other
 /// "can't tell" case.
+///
+/// The geometry column is resolved the same way
+/// ([`crate::covering::resolve_geometry_column_name`], the footer twin of
+/// [`find_geometry_column`]) and threaded into tier 2, so a file with more
+/// than one geometry column can never be pruned on an envelope the reader
+/// will not read (#518).
 pub(crate) fn select_input_row_groups(
     metadata: &parquet::file::metadata::ParquetMetaData,
     bbox_units: &[f64; 4],
 ) -> Vec<usize> {
+    let geom_column = crate::covering::resolve_geometry_column_name(metadata);
     let bounds = match detect_crs_from_kv(metadata.file_metadata().key_value_metadata()) {
-        Ok(crs) => crate::covering::extract_row_group_bounds_tiered(metadata, crs),
+        Ok(crs) => {
+            crate::covering::extract_row_group_bounds_tiered(metadata, crs, geom_column.as_deref())
+        }
         Err(_) => crate::covering::extract_row_group_bounds_from_metadata(metadata)
             .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]),
     };
@@ -2719,18 +2739,32 @@ fn select_input_row_groups_combined(
     }
 }
 
-/// Find the primary geometry column index (name `geometry`, else first `geom*`).
+/// Find the primary geometry column index: the "geo" metadata's
+/// `primary_column` when the schema carries that metadata and the named
+/// column exists, else the name heuristic (`geometry`, else first `geom*`).
+///
+/// The `primary_column` step is what keeps this in lockstep with
+/// [`crate::covering::resolve_geometry_column_name`], which pruning uses
+/// (#518): the two must name the SAME column or a pruned row group is
+/// silent data loss. GeoParquet makes `primary_column` required, so it is
+/// authoritative whenever a "geo" key exists; the heuristic covers the
+/// GeoParquet 2.0 / no-metadata case. `parquet_to_arrow_schema` copies the
+/// file's key-value metadata onto the Arrow schema, and the reserved-column
+/// rename preserves it, so it is available at every call site.
 pub(super) fn find_geometry_column(schema: &Schema) -> Option<usize> {
-    schema
-        .fields()
-        .iter()
-        .position(|f| f.name() == "geometry")
-        .or_else(|| {
-            schema
-                .fields()
-                .iter()
-                .position(|f| f.name().contains("geom"))
-        })
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    if let Some(geo_json) = schema.metadata().get("geo") {
+        if let Some(primary) = serde_json::from_str::<serde_json::Value>(geo_json)
+            .ok()
+            .and_then(|v| v.get("primary_column")?.as_str().map(str::to_string))
+        {
+            if let Some(idx) = names.iter().position(|n| *n == primary) {
+                return Some(idx);
+            }
+        }
+    }
+    let pick = crate::covering::geometry_column_by_name(&names)?;
+    names.iter().position(|n| *n == pick)
 }
 
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when the bbox is undefined).
@@ -5972,11 +6006,13 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         let tout = tempfile::NamedTempFile::new().unwrap();
 
-        // EPSG:32633 (UTM 33N) PROJJSON: neither 4326 nor 3857.
-        // Note: no "WGS 84" in the name — `is_wgs84_projjson` name-matches that.
+        // EPSG:32633 (UTM 33N) PROJJSON: neither 4326 nor 3857. Its real
+        // EPSG name — "WGS 84 / UTM zone 33N" — used to make
+        // `is_wgs84_projjson` name-match it as WGS84 (#518 (3)); the
+        // structured id now settles it.
         let projjson = serde_json::json!({
             "type": "ProjectedCRS",
-            "name": "UTM zone 33N",
+            "name": "WGS 84 / UTM zone 33N",
             "id": { "authority": "EPSG", "code": 32633 }
         });
         let md = geoarrow::datatypes::Metadata::new(
@@ -5990,6 +6026,193 @@ mod tests {
         assert!(
             matches!(err, ConvertError::UnsupportedCrs { .. }),
             "expected UnsupportedCrs, got {err:?}"
+        );
+    }
+
+    /// Build the "geo" key-value metadata for a single WKB geometry column
+    /// with the given `crs` value (a PROJJSON object or a string).
+    fn kv_geo_with_crs(crs: serde_json::Value) -> Vec<parquet::file::metadata::KeyValue> {
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": { "geometry": { "encoding": "WKB", "crs": crs } }
+        });
+        vec![parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        )]
+    }
+
+    /// #518 (2)/(3): a GeoPandas-shaped EPSG:3857 file declares PROJJSON whose
+    /// name is "WGS 84 / Pseudo-Mercator". The session CRS must come out
+    /// EPSG:3857 — detecting 4326 there is what turned a metre file into a
+    /// silently EMPTY archive (the bbox stayed in degrees, so every row group
+    /// was pruned and the #429 out-of-range warning never fired because
+    /// nothing was read).
+    #[test]
+    fn detect_crs_reads_pseudo_mercator_projjson_as_3857() {
+        let projjson = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "base_crs": { "name": "WGS 84", "id": { "authority": "EPSG", "code": 4326 } },
+            "id": { "authority": "EPSG", "code": 3857 }
+        });
+        let kv = kv_geo_with_crs(projjson);
+        assert_eq!(detect_crs_from_kv(Some(&kv)).unwrap(), Crs::Epsg3857);
+
+        // String forms resolve the same way.
+        for id in ["EPSG:3857", "EPSG:900913"] {
+            let kv = kv_geo_with_crs(serde_json::Value::String(id.to_string()));
+            assert_eq!(
+                detect_crs_from_kv(Some(&kv)).unwrap(),
+                Crs::Epsg3857,
+                "{id}"
+            );
+        }
+        // And a real 4326 file is untouched.
+        let kv = kv_geo_with_crs(serde_json::json!({
+            "type": "GeographicCRS",
+            "name": "WGS 84",
+            "id": { "authority": "EPSG", "code": 4326 }
+        }));
+        assert_eq!(detect_crs_from_kv(Some(&kv)).unwrap(), Crs::Epsg4326);
+
+        // A UTM zone — whose name also starts "WGS 84 /" — is rejected, not
+        // silently read as degrees.
+        let kv = kv_geo_with_crs(serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / UTM zone 33N",
+            "id": { "authority": "EPSG", "code": 32633 }
+        }));
+        assert!(matches!(
+            detect_crs_from_kv(Some(&kv)),
+            Err(ConvertError::UnsupportedCrs { .. })
+        ));
+    }
+
+    /// End-to-end #518 probe: a `--bbox` extract of an EPSG:3857 file whose
+    /// PROJJSON is named "WGS 84 / Pseudo-Mercator" must convert its features,
+    /// not produce a successful empty archive. The bbox is given in degrees
+    /// (always) and must be converted to metres before it meets the file's
+    /// metre row-group statistics.
+    #[test]
+    fn bbox_extract_of_a_pseudo_mercator_file_is_not_silently_empty() {
+        // Four row groups, one point each, around lon 40..41.5 / lat 5..5.75.
+        let lonlat = [(40.0, 5.0), (40.5, 5.25), (41.0, 5.5), (41.5, 5.75)];
+        let metres: Vec<(f64, f64)> = lonlat
+            .iter()
+            .map(|&(lon, lat)| lnglat_to_webmerc(lon, lat))
+            .collect();
+        let projjson = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "id": { "authority": "EPSG", "code": 3857 }
+        });
+        let md = geoarrow::datatypes::Metadata::new(
+            geoarrow::datatypes::Crs::from_projjson(projjson),
+            None,
+        );
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input_with_crs(tin.path(), &metres, true, Some(md));
+
+        // Sanity: the file really does declare 3857.
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(
+            std::fs::File::open(tin.path()).unwrap(),
+        )
+        .unwrap();
+        let kv = parquet::file::reader::FileReader::metadata(&reader)
+            .file_metadata()
+            .key_value_metadata()
+            .cloned();
+        assert_eq!(detect_crs_from_kv(kv.as_ref()).unwrap(), Crs::Epsg3857);
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            // Degrees around the first two points.
+            bbox: Some([39.9, 4.9, 40.6, 5.3]),
+            ..Default::default()
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+            .expect("a 3857 bbox extract must not fail/NoData");
+        let overview = OverviewReader::open(tout.path()).unwrap();
+        let ids = read_all_ids(&overview);
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "the bbox must be converted to metres before meeting metre statistics \
+             (report: {}/{} row groups read)",
+            report.row_groups_read,
+            report.row_groups_total
+        );
+    }
+
+    /// [`find_geometry_column`] and
+    /// [`crate::covering::resolve_geometry_column_name`] must name the SAME
+    /// column, or pruning drops what the reader would have kept (#518).
+    #[test]
+    fn find_geometry_column_honors_the_primary_column() {
+        let geo = r#"{"version":"1.1.0","primary_column":"centroid","columns":{"centroid":{"encoding":"WKB"}}}"#;
+        let fields = vec![
+            Field::new("centroid", DataType::Binary, true),
+            Field::new("geom_shape", DataType::Binary, true),
+        ];
+        let with_geo = Schema::new_with_metadata(
+            fields.clone(),
+            [("geo".to_string(), geo.to_string())].into_iter().collect(),
+        );
+        assert_eq!(
+            find_geometry_column(&with_geo),
+            Some(0),
+            "primary_column is authoritative"
+        );
+
+        // No "geo" metadata: the name heuristic, unchanged.
+        let bare = Schema::new(fields);
+        assert_eq!(find_geometry_column(&bare), Some(1), "first `geom*` column");
+
+        // A primary_column naming a column that isn't there falls back.
+        let stale = r#"{"version":"1.1.0","primary_column":"nope","columns":{}}"#;
+        let with_stale = Schema::new_with_metadata(
+            vec![
+                Field::new("centroid", DataType::Binary, true),
+                Field::new("geom_shape", DataType::Binary, true),
+            ],
+            [("geo".to_string(), stale.to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(find_geometry_column(&with_stale), Some(1));
+    }
+
+    /// The alignment above only holds if the "geo" key-value metadata really
+    /// does reach the Arrow schema the pipeline reads. Pin that.
+    #[test]
+    fn input_arrow_schema_carries_the_geo_metadata() {
+        let coords = [(0.0, 0.0), (1.0, 1.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        let file = std::fs::File::open(tin.path()).unwrap();
+        let builder =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let schema = builder.schema();
+        assert!(
+            schema.metadata().contains_key("geo"),
+            "arrow must surface the geo key-value metadata: {:?}",
+            schema.metadata().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            find_geometry_column(schema),
+            Some(
+                crate::covering::resolve_geometry_column_name(builder.metadata())
+                    .and_then(|n| schema.fields().iter().position(|f| *f.name() == n))
+                    .unwrap()
+            ),
+            "reader and pruning must resolve the same geometry column"
         );
     }
 
@@ -7972,6 +8195,17 @@ mod tests {
     /// row-group pruning can actually bite. Each row group contains one point
     /// at `(x, y)` with id = row-group index.
     fn write_multi_rg_input(path: &Path, coords: &[(f64, f64)], with_covering: bool) {
+        write_multi_rg_input_with_crs(path, coords, with_covering, None)
+    }
+
+    /// [`write_multi_rg_input`] with an explicit geometry CRS (#518: the
+    /// EPSG:3857 probe needs a file that declares Pseudo-Mercator PROJJSON).
+    fn write_multi_rg_input_with_crs(
+        path: &Path,
+        coords: &[(f64, f64)],
+        with_covering: bool,
+        crs_metadata: Option<geoarrow::datatypes::Metadata>,
+    ) {
         use parquet::file::properties::WriterProperties;
 
         let geoms: Vec<Geometry<f64>> = coords
@@ -7980,7 +8214,15 @@ mod tests {
             .collect();
         let n = geoms.len();
         let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-        let geom_arr = build_geometry_array(&geoms);
+        let geom_arr = match crs_metadata {
+            Some(md) => {
+                let typ = GeometryType::new(Arc::new(md));
+                let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+                b.extend_from_iter(geoms.iter().map(Some));
+                b.finish()
+            }
+            None => build_geometry_array(&geoms),
+        };
         let geom_field = geom_arr.data_type().to_field("geometry", true);
         let fields = vec![
             Arc::new(Field::new("id", DataType::Int64, false)),

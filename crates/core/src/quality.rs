@@ -53,43 +53,156 @@ impl CrsInfo {
     }
 }
 
-/// Check if a CRS identifier represents WGS84 or compatible CRS.
-fn is_wgs84_identifier(id: &str) -> bool {
-    let id_upper = id.to_uppercase();
-    // Common WGS84 identifiers
-    id_upper == "EPSG:4326"
-        || id_upper == "OGC:CRS84"
-        || id_upper == "CRS84"
-        || id_upper == "URN:OGC:DEF:CRS:OGC::CRS84"
-        || id_upper == "URN:OGC:DEF:CRS:EPSG::4326"
-        || id_upper.contains("WGS 84")
-        || id_upper.contains("WGS84")
+/// What a CRS declaration names, as far as the two CRSs tylertoo supports are
+/// concerned ([`crate::overview::level::Crs`]).
+///
+/// The single classifier for every CRS string in the codebase: the GeoParquet
+/// `geo` JSON `crs` field (string or PROJJSON), and the Parquet
+/// `LogicalType::Geometry(crs)` / `Geography(crs)` annotation that
+/// [`crate::covering`] prunes on. Both used to run their own substring
+/// matches, and both got EPSG:3857 wrong (#518).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrsKind {
+    /// Lon/lat WGS84 — EPSG:4326 / OGC:CRS84, including the spec's "unset
+    /// CRS means OGC:CRS84" default.
+    Wgs84,
+    /// Web Mercator meters — EPSG:3857 (or its legacy alias EPSG:900913).
+    WebMercator,
+    /// Anything else, plus everything that cannot be classified without
+    /// guessing. Callers must never prune, reproject or assume on this.
+    Unknown,
 }
 
-/// Check if PROJJSON represents WGS84.
-fn is_wgs84_projjson(projjson: &Value) -> bool {
-    // Check for EPSG code
+/// Classify a CRS identifier *string*.
+///
+/// Order matters (#518): EPSG:3857's own name is "WGS 84 / Pseudo-Mercator"
+/// and every UTM zone is "WGS 84 / UTM zone …", so a `contains("WGS 84")`
+/// test run first classifies half the projected world as lon/lat — which
+/// downstream means degrees-vs-meters silent data loss. Web Mercator markers
+/// are tested first, and a WGS-84 *substring* only counts when the string is
+/// not a projected-CRS name (those always carry a `/`).
+///
+/// A PROJJSON-shaped string is never substring-matched: it is parsed and
+/// classified structurally ([`classify_crs_projjson`]), or, if it will not
+/// parse, read as [`CrsKind::Unknown`].
+pub(crate) fn classify_crs_identifier(id: &str) -> CrsKind {
+    let id = id.trim();
+
+    // An unset CRS means OGC:CRS84 per the GeoParquet/Parquet specs. arrow-rs
+    // writes the unset Parquet `Geometry` CRS as the literal "srid:0" (#518),
+    // which is by far the most common shape of a GeoParquet 2.0 file in the
+    // wild — reading it as "unclassifiable" would disable pruning there.
+    if id.is_empty() || id.eq_ignore_ascii_case("srid:0") {
+        return CrsKind::Wgs84;
+    }
+
+    // PROJJSON inline in a string field: structure, never substrings.
+    if id.starts_with('{') || id.contains("\"type\"") {
+        return match serde_json::from_str::<Value>(id) {
+            Ok(v) => classify_crs_projjson(&v),
+            Err(_) => CrsKind::Unknown,
+        };
+    }
+
+    let up = id.to_uppercase();
+
+    // 1. Web Mercator, BEFORE any WGS-84 test.
+    if up.contains("3857") || up.contains("900913") || up.contains("PSEUDO-MERCATOR") {
+        return CrsKind::WebMercator;
+    }
+    // 2. Explicit lon/lat identifiers, including the URN/URL spellings
+    //    ("urn:ogc:def:crs:EPSG::4326", "http://.../EPSG/0/4326").
+    if up.contains("4326") || up.contains("CRS84") || up == "SRID:4326" {
+        return CrsKind::Wgs84;
+    }
+    // 3. Bare WGS-84 *names* ("WGS 84", "WGS_1984"). A projected CRS name is
+    //    always "<base> / <projection>", so a `/` disqualifies this branch —
+    //    "WGS 84 / UTM zone 33N" is meters, not degrees.
+    if (up.contains("WGS 84") || up.contains("WGS84") || up.contains("WGS_1984"))
+        && !up.contains('/')
+    {
+        return CrsKind::Wgs84;
+    }
+    CrsKind::Unknown
+}
+
+/// Classify a PROJJSON object structurally.
+///
+/// A present, structured authority id is AUTHORITATIVE (#518): an EPSG code
+/// that is not 4326 means the file is not lon/lat, full stop, whatever the
+/// `name` says. The name is consulted only when the object carries no id at
+/// all, and then only for non-projected types — EPSG:3857's PROJJSON is
+/// literally `{"type":"ProjectedCRS","name":"WGS 84 / Pseudo-Mercator",…}`,
+/// and the old name fallback declared exactly that file WGS84.
+pub(crate) fn classify_crs_projjson(projjson: &Value) -> CrsKind {
+    let name = projjson.get("name").and_then(Value::as_str);
+    let is_projected = projjson
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("ProjectedCRS"));
+
     if let Some(id) = projjson.get("id") {
         let authority = id.get("authority").and_then(Value::as_str);
         let code_i64 = id.get("code").and_then(Value::as_i64);
         let code_str = id.get("code").and_then(Value::as_str);
+        // A string code ("4326") is as authoritative as a numeric one.
+        let code = code_i64.or_else(|| code_str.and_then(|s| s.parse::<i64>().ok()));
 
-        if authority == Some("EPSG") && code_i64 == Some(4326) {
-            return true;
+        if authority.is_some_and(|a| a.eq_ignore_ascii_case("EPSG")) {
+            return match code {
+                Some(4326) => CrsKind::Wgs84,
+                Some(3857 | 900913) => CrsKind::WebMercator,
+                // Present and not one of ours: authoritative NO. Never fall
+                // through to the name.
+                Some(_) => CrsKind::Unknown,
+                None => CrsKind::Unknown,
+            };
         }
-        if authority == Some("OGC") && code_str == Some("CRS84") {
-            return true;
+        if authority.is_some_and(|a| a.eq_ignore_ascii_case("OGC")) {
+            return match code_str {
+                Some(c) if c.eq_ignore_ascii_case("CRS84") => CrsKind::Wgs84,
+                _ => CrsKind::Unknown,
+            };
+        }
+        // Some other authority with a real id: not classifiable, and the id
+        // still outranks the name.
+        if authority.is_some() {
+            return CrsKind::Unknown;
         }
     }
 
-    // Check the name as fallback
-    if let Some(name) = projjson.get("name").and_then(Value::as_str) {
-        if name.to_uppercase().contains("WGS 84") || name.to_uppercase().contains("WGS84") {
-            return true;
-        }
+    // No usable id at all — fall back to the well-known names.
+    let Some(name) = name else {
+        return CrsKind::Unknown;
+    };
+    let up = name.trim().to_uppercase();
+    if up.contains("PSEUDO-MERCATOR") || up.contains("WEB MERCATOR") {
+        return CrsKind::WebMercator;
     }
+    if is_projected {
+        return CrsKind::Unknown;
+    }
+    match up.as_str() {
+        "WGS 84"
+        | "WGS84"
+        | "WGS 84 (CRS84)"
+        | "WGS 84 (CRS 84)"
+        | "WGS_1984"
+        | "GCS_WGS_1984"
+        | "WGS 84 (GEOGRAPHIC 3D)"
+        | "WGS 84 LONGITUDE-LATITUDE" => CrsKind::Wgs84,
+        _ => CrsKind::Unknown,
+    }
+}
 
-    false
+/// Check if a CRS identifier represents WGS84 or compatible CRS.
+fn is_wgs84_identifier(id: &str) -> bool {
+    classify_crs_identifier(id) == CrsKind::Wgs84
+}
+
+/// Check if PROJJSON represents WGS84.
+fn is_wgs84_projjson(projjson: &Value) -> bool {
+    classify_crs_projjson(projjson) == CrsKind::Wgs84
 }
 
 /// Extract CRS information from GeoParquet file metadata.
@@ -436,6 +549,119 @@ mod tests {
             }
         });
         assert!(!is_wgs84_projjson(&projjson_27700));
+    }
+
+    /// #518 (3): a structured EPSG id that is present and ≠ 4326 is
+    /// authoritative. The old code fell through to `name.contains("WGS 84")`,
+    /// which is true for EPSG:3857 ("WGS 84 / Pseudo-Mercator") and for every
+    /// UTM zone ("WGS 84 / UTM zone 33N") — so a correctly declared 3857 file
+    /// was detected as EPSG:4326 and its meters were read as degrees.
+    #[test]
+    fn projjson_structured_id_outranks_a_wgs84_name() {
+        let pseudo_mercator: Value = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "id": { "authority": "EPSG", "code": 3857 }
+        });
+        assert!(
+            !is_wgs84_projjson(&pseudo_mercator),
+            "EPSG:3857 is not WGS84 however its name reads"
+        );
+        assert_eq!(
+            classify_crs_projjson(&pseudo_mercator),
+            CrsKind::WebMercator
+        );
+
+        let utm: Value = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / UTM zone 33N",
+            "id": { "authority": "EPSG", "code": 32633 }
+        });
+        assert!(!is_wgs84_projjson(&utm));
+        assert_eq!(classify_crs_projjson(&utm), CrsKind::Unknown);
+
+        // String-typed codes are just as authoritative as numeric ones.
+        let utm_str_code: Value = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / UTM zone 33N",
+            "id": { "authority": "EPSG", "code": "32633" }
+        });
+        assert!(!is_wgs84_projjson(&utm_str_code));
+    }
+
+    /// The name fallback is PRESERVED where it is the only evidence: a
+    /// PROJJSON object with no `id` at all.
+    #[test]
+    fn projjson_name_fallback_survives_when_there_is_no_id() {
+        let no_id: Value = serde_json::json!({
+            "type": "GeographicCRS",
+            "name": "WGS 84"
+        });
+        assert!(is_wgs84_projjson(&no_id));
+        assert_eq!(classify_crs_projjson(&no_id), CrsKind::Wgs84);
+
+        // …but a projected name is still not lon/lat.
+        let no_id_projected: Value = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator"
+        });
+        assert!(!is_wgs84_projjson(&no_id_projected));
+        assert_eq!(
+            classify_crs_projjson(&no_id_projected),
+            CrsKind::WebMercator
+        );
+    }
+
+    /// #518 (2): Web Mercator markers are tested BEFORE the WGS-84
+    /// substrings, and PROJJSON-shaped strings are parsed rather than
+    /// substring-matched.
+    #[test]
+    fn classify_identifier_orders_webmercator_before_wgs84() {
+        assert_eq!(classify_crs_identifier("EPSG:3857"), CrsKind::WebMercator);
+        assert_eq!(classify_crs_identifier("EPSG:900913"), CrsKind::WebMercator);
+        assert_eq!(
+            classify_crs_identifier("WGS 84 / Pseudo-Mercator"),
+            CrsKind::WebMercator
+        );
+        assert_eq!(
+            classify_crs_identifier("WGS 84 / UTM zone 33N"),
+            CrsKind::Unknown,
+            "a projected WGS84-based name is not lon/lat"
+        );
+
+        // Inline PROJJSON (what arrow-rs and GeoPandas put in the Parquet
+        // `LogicalType::Geometry(crs)` annotation).
+        let projjson_3857 = r#"{"type":"ProjectedCRS","name":"WGS 84 / Pseudo-Mercator",
+            "base_crs":{"name":"WGS 84"},"id":{"authority":"EPSG","code":3857}}"#;
+        assert_eq!(
+            classify_crs_identifier(projjson_3857),
+            CrsKind::WebMercator,
+            "3857 PROJJSON must never classify as lon/lat"
+        );
+        let projjson_4326 =
+            r#"{"type":"GeographicCRS","name":"WGS 84","id":{"authority":"EPSG","code":4326}}"#;
+        assert_eq!(classify_crs_identifier(projjson_4326), CrsKind::Wgs84);
+
+        // Unparsable PROJJSON-shaped input: refuse, never guess.
+        assert_eq!(
+            classify_crs_identifier(r#"{"type":"GeographicCRS","name":"WGS 84""#),
+            CrsKind::Unknown
+        );
+    }
+
+    /// #518 (4): arrow-rs writes an unset Parquet `Geometry` CRS as the
+    /// literal "srid:0"; per the GeoParquet/Parquet specs an unset CRS means
+    /// OGC:CRS84.
+    #[test]
+    fn classify_identifier_reads_unset_crs_as_crs84() {
+        assert_eq!(classify_crs_identifier("srid:0"), CrsKind::Wgs84);
+        assert_eq!(classify_crs_identifier("SRID:0"), CrsKind::Wgs84);
+        assert_eq!(classify_crs_identifier(""), CrsKind::Wgs84);
+        assert_eq!(classify_crs_identifier("   "), CrsKind::Wgs84);
+        // A real SRID is not the unset marker.
+        assert_eq!(classify_crs_identifier("srid:3857"), CrsKind::WebMercator);
+        assert_eq!(classify_crs_identifier("srid:4326"), CrsKind::Wgs84);
+        assert_eq!(classify_crs_identifier("srid:27700"), CrsKind::Unknown);
     }
 
     #[test]
