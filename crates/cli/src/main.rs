@@ -3576,6 +3576,30 @@ mod tests {
         assert_eq!(a.report, Some(PathBuf::from("out/report.json")));
     }
 
+    /// #371: the CLI is deliberately not where the zoom ceiling lives — clap
+    /// parses `--max-zoom 33` and `--gsd 0.000005` fine, and the level plan
+    /// carries them verbatim. Core rejects both at options validation, so the
+    /// library, the Python bindings and the CLI all get the same guarantee
+    /// from one place. This pins the hand-off: what the CLI hands core is the
+    /// out-of-range value, unclamped.
+    #[test]
+    fn tiles_passes_an_out_of_range_zoom_through_to_core_unclamped() {
+        use tylertoo_core::overview::convert::LevelPlan;
+
+        let a = parse_tiles(&["--min-zoom", "30", "--max-zoom", "33"]);
+        assert_eq!(a.max_zoom, 33, "the CLI must not silently clamp");
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+            LevelPlan::ZoomRange { max_zoom, .. } => assert_eq!(max_zoom, 33),
+            other => panic!("expected ZoomRange, got {other:?}"),
+        }
+
+        let a = parse_tiles(&["--gsd", "0.000005"]);
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+            LevelPlan::Gsds(gsds) => assert_eq!(gsds, vec![0.000_005]),
+            other => panic!("expected Gsds, got {other:?}"),
+        }
+    }
+
     /// Guards against future drift: every non-hidden long flag on `overview`
     /// or `export-pmtiles` must be reachable on the one-step `tiles` command,
     /// or be an explicitly allow-listed structural exception. `--spill-dir`,

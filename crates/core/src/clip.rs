@@ -628,7 +628,11 @@ pub fn buffer_pixels_to_world(zoom: u8, buffer_pixels: u32, extent: u32) -> u32 
     let tile_size_world: u64 = if zoom == 0 {
         crate::world_coord::WORLD_SCALE
     } else {
-        1_u64 << (32 - zoom as u32)
+        // #371: `32 - zoom` underflows at z33 (debug panic; in release a huge
+        // shift count that masks), so the subtraction saturates. Identical for
+        // every zoom the writer can reach — z32 already shifts by 0 — and past
+        // it the tile is one world unit wide, which is the clamped truth.
+        1_u64 << 32_u32.saturating_sub(u32::from(zoom))
     };
     (tile_size_world * buffer_pixels as u64 / extent as u64) as u32
 }

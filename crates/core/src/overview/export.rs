@@ -117,7 +117,7 @@ use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
 use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
-use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord};
+use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM};
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
@@ -322,6 +322,58 @@ pub enum ExportError {
     )]
     DeclaredMinZoomTooFine { declared: u8, coarsest: u8 },
 
+    /// A level resolves to a zoom above [`crate::tile::MAX_ZOOM`] (#371).
+    ///
+    /// Two ways in. The `--gsd` door: an explicit GSD ladder records no `zoom`
+    /// on its levels, so the exporter derives one from the GSD, and that
+    /// derivation used to clamp to `u8::MAX` — a `--gsd 0.000005` exported at
+    /// z255 regardless of `--max-zoom`. And a recorded `zoom` out of range,
+    /// which an overview file written before the ceiling existed can carry.
+    /// Either way the level is named along with the zoom it resolves to.
+    #[error(
+        "overview level {level} (gsd {gsd} m) resolves to zoom {implied} — above the \
+         maximum supported zoom {ceiling}; beyond z{ceiling} the tile grid overflows \
+         32-bit tile coordinates and the PMTiles Hilbert tile-id arithmetic (#371)"
+    )]
+    LevelZoomAboveCeiling {
+        /// Index of the offending level.
+        level: usize,
+        /// The level's ground sample distance in meters.
+        gsd: f64,
+        /// The zoom the level resolves to (recorded, or derived from the GSD).
+        implied: i64,
+        /// [`crate::tile::MAX_ZOOM`].
+        ceiling: u8,
+    },
+
+    /// A level's GSD is not a finite positive number (#371).
+    ///
+    /// Distinct from [`LevelZoomAboveCeiling`](ExportError::LevelZoomAboveCeiling):
+    /// `0`, a negative GSD and `NaN` have no zoom to be above or below a
+    /// ceiling, and reporting them as "implies zoom 9223372036854775807" said
+    /// nothing about what was actually wrong. (`+inf` is not one of these — it
+    /// is infinitely coarse, which is z0.) The conversion side rejects these up
+    /// front; this is the guard for an overview file that already carries one.
+    #[error(
+        "overview level {level} has gsd {gsd}, which is not a finite positive ground \
+         sample distance in meters (#371)"
+    )]
+    LevelGsdNotFinitePositive {
+        /// Index of the offending level.
+        level: usize,
+        /// The level's recorded GSD.
+        gsd: f64,
+    },
+
+    /// `--min-zoom` is above [`crate::tile::MAX_ZOOM`] (#371).
+    #[error("--min-zoom {declared} is above the maximum supported zoom {ceiling} (#371)")]
+    DeclaredMinZoomAboveCeiling {
+        /// The requested minimum zoom.
+        declared: u8,
+        /// [`crate::tile::MAX_ZOOM`].
+        ceiling: u8,
+    },
+
     #[error(
         "included property {name:?} is not a property this overview file exports \
          (exportable: {available})"
@@ -363,17 +415,64 @@ struct EncodedTile {
 /// Resolve the Web Mercator zoom for overview level `level_idx`.
 ///
 /// Uses the level's explicit `zoom` when present (§3.2). When absent, derives it
-/// from the level GSD via the §5.2 inverse — `z = round(log2(C / base / gsd))` —
-/// and clamps to `u8`. The rounding rule (nearest integer) is documented here so
-/// the mapping is reproducible: a level whose GSD sits between two zooms maps to
-/// the nearer one.
-pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> u8 {
+/// from the level GSD via the §5.2 inverse — `z = round(log2(C / base / gsd))`.
+/// The rounding rule (nearest integer) is documented here so the mapping is
+/// reproducible: a level whose GSD sits between two zooms maps to the nearer
+/// one.
+///
+/// Fallible since #371: the derivation used to `clamp(0.0, 255.0)`, which let a
+/// fine enough `--gsd` reach z255 with no error and no regard for `--max-zoom`.
+/// A level above [`MAX_ZOOM`] is now rejected, naming the GSD and the zoom it
+/// implies.
+///
+/// The degenerate GSDs are told apart rather than lumped into the ceiling
+/// message (#371). A GSD of `0`, a negative one, or `NaN` is not a ground
+/// sample distance at all — it has no zoom to be above or below a ceiling, so
+/// it gets [`LevelGsdNotFinitePositive`] instead of being reported as "implies
+/// zoom 9223372036854775807". `gsd = +inf` *is* meaningful: infinitely coarse,
+/// which inverts to `z = -inf` and lands on z0, the same floor any too-coarse
+/// level lands on. A finite but absurdly small GSD still inverts to `+inf` and
+/// is reported, correctly, as above the ceiling.
+///
+/// [`LevelGsdNotFinitePositive`]: ExportError::LevelGsdNotFinitePositive
+pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, ExportError> {
     let level = &meta.levels[level_idx];
-    if let Some(z) = level.zoom {
-        return z;
+    let implied: i64 = match level.zoom {
+        Some(z) => i64::from(z),
+        None => {
+            if level.gsd.is_nan() || level.gsd <= 0.0 {
+                return Err(ExportError::LevelGsdNotFinitePositive {
+                    level: level_idx,
+                    gsd: level.gsd,
+                });
+            }
+            if level.gsd == f64::INFINITY {
+                // Infinitely coarse: the whole world in one tile.
+                return Ok(0);
+            }
+            let z = zoom_for_gsd(level.gsd).round();
+            if z.is_infinite() {
+                // A subnormal GSD: finite and positive, but so fine that the
+                // §5.2 inverse overflows. Above the ceiling, by a lot.
+                return Err(ExportError::LevelZoomAboveCeiling {
+                    level: level_idx,
+                    gsd: level.gsd,
+                    implied: i64::MAX,
+                    ceiling: MAX_ZOOM,
+                });
+            }
+            z.clamp(i64::MIN as f64, i64::MAX as f64) as i64
+        }
+    };
+    if implied > i64::from(MAX_ZOOM) {
+        return Err(ExportError::LevelZoomAboveCeiling {
+            level: level_idx,
+            gsd: level.gsd,
+            implied,
+            ceiling: MAX_ZOOM,
+        });
     }
-    let z = zoom_for_gsd(level.gsd).round();
-    z.clamp(0.0, 255.0) as u8
+    Ok(implied.max(0) as u8)
 }
 
 /// Members-per-partition target for the partitioned streaming export (H3(b)).
@@ -652,12 +751,12 @@ fn plan_levels(
     auto_wave: bool,
     mean_member_bytes: Option<u64>,
     available_ram: Option<u64>,
-) -> Vec<LevelPlan> {
+) -> Result<Vec<LevelPlan>, ExportError> {
     scans
         .iter()
         .enumerate()
         .map(|(level_idx, scan)| {
-            let zoom = zoom_for_level(meta, level_idx);
+            let zoom = zoom_for_level(meta, level_idx)?;
 
             // Split the zoom's tiles into contiguous ascending (x, y) ranges
             // of roughly `partition_target` members each.
@@ -690,11 +789,11 @@ fn plan_levels(
             } else {
                 ceiling_wave
             };
-            LevelPlan {
+            Ok(LevelPlan {
                 zoom,
                 partitions,
                 wave,
-            }
+            })
         })
         .collect()
 }
@@ -720,10 +819,22 @@ fn export_pmtiles_impl(
     let crs = detect_crs(input_path)?;
 
     let num_levels = reader.num_levels();
-    let coarsest_zoom = zoom_for_level(&meta, 0);
-    let max_zoom = zoom_for_level(&meta, num_levels - 1);
+    // #371: every level's zoom is resolved (and ceiling-checked) before any
+    // scan runs — a level whose GSD implies a zoom past `MAX_ZOOM` fails here
+    // rather than producing an archive with wrapped tile ids.
+    let coarsest_zoom = zoom_for_level(&meta, 0)?;
+    let max_zoom = zoom_for_level(&meta, num_levels - 1)?;
     // #380: the archive may declare a coarser minimum than the file holds.
     let min_zoom = match options.min_zoom {
+        // #371: the declared minimum is a written header field, so it obeys the
+        // same ceiling as everything else. Checked before the #380 comparison
+        // so an out-of-range value is named as such.
+        Some(declared) if declared > MAX_ZOOM => {
+            return Err(ExportError::DeclaredMinZoomAboveCeiling {
+                declared,
+                ceiling: MAX_ZOOM,
+            });
+        }
         Some(declared) if declared > coarsest_zoom => {
             return Err(ExportError::DeclaredMinZoomTooFine {
                 declared,
@@ -839,7 +950,7 @@ fn export_pmtiles_impl(
         auto_wave,
         mean_member_bytes,
         available_ram,
-    );
+    )?;
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
     // is the accumulating row-group prefix (§5.1), so the legacy per-level
@@ -908,7 +1019,7 @@ fn export_pmtiles_impl(
             last_checkpoint = Instant::now();
             log::info!(
                 "[export] checkpoint written: zooms {}..={} salvageable ({:.2}s)",
-                zoom_for_level(&meta, 0),
+                coarsest_zoom,
                 plan.zoom,
                 t_ckpt.elapsed().as_secs_f64(),
             );
@@ -1871,7 +1982,9 @@ fn scan_all_levels(
 ) -> Result<Vec<LevelScan>, ExportError> {
     let num_levels = reader.num_levels();
     let partitioning = matches!(reader.mode(), Mode::Partitioning);
-    let zooms: Vec<u8> = (0..num_levels).map(|k| zoom_for_level(meta, k)).collect();
+    let zooms: Vec<u8> = (0..num_levels)
+        .map(|k| zoom_for_level(meta, k))
+        .collect::<Result<_, _>>()?;
     let mut scans: Vec<LevelScan> = (0..num_levels)
         .map(|_| LevelScan {
             feature_count: 0,
@@ -2373,7 +2486,10 @@ fn feature_tile_members(
 /// seam renders as a half circle.
 #[inline]
 fn buffer_deg_at_zoom(zoom: u8, opts: &ExportOptions) -> f64 {
-    let tile_width = 360.0 / f64::from(1u32 << zoom);
+    // #371: `1u32 << zoom` overflowed at z32 — a debug panic, and in release a
+    // masked shift that produced a silently wrong buffer for every tile.
+    // `powi` is exact for these powers of two and total for any u8 zoom.
+    let tile_width = 360.0 / 2f64.powi(i32::from(zoom));
     tile_width * buffer_fraction(opts)
 }
 
@@ -4745,8 +4861,8 @@ mod tests {
             ],
             generalization: None,
         };
-        assert_eq!(zoom_for_level(&meta, 0), 4);
-        assert_eq!(zoom_for_level(&meta, 1), 7);
+        assert_eq!(zoom_for_level(&meta, 0).unwrap(), 4);
+        assert_eq!(zoom_for_level(&meta, 1).unwrap(), 7);
     }
 
     #[test]
@@ -4770,8 +4886,140 @@ mod tests {
             ],
             generalization: None,
         };
-        assert_eq!(zoom_for_level(&meta, 0), 3);
-        assert_eq!(zoom_for_level(&meta, 1), 8);
+        assert_eq!(zoom_for_level(&meta, 0).unwrap(), 3);
+        assert_eq!(zoom_for_level(&meta, 1).unwrap(), 8);
+    }
+
+    /// #371, the `--gsd` door: `zoom_for_level` used to `clamp(0.0, 255.0)`,
+    /// so an overview level with a fine enough GSD exported at z255 — past
+    /// every shift and `pow` in the tile-id and buffer math — no matter what
+    /// `--max-zoom` said. It now errors, naming the GSD and the implied zoom.
+    #[test]
+    fn zoom_for_level_rejects_a_gsd_implying_a_zoom_above_the_ceiling() {
+        let meta = OverviewsMeta {
+            version: "0.1.0".to_string(),
+            mode: Some(Mode::Duplicating),
+            canonical_level: Some(0),
+            levels: vec![Level {
+                row_group_end: 0,
+                // 5e-6 m/px implies z ~= 33.
+                gsd: 0.000_005,
+                zoom: None,
+            }],
+            generalization: None,
+        };
+        let err = zoom_for_level(&meta, 0).expect_err("a z33 gsd must be rejected");
+        assert!(
+            matches!(
+                err,
+                ExportError::LevelZoomAboveCeiling {
+                    implied: 33,
+                    ceiling: 30,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("0.000005"), "error names the gsd: {msg}");
+        assert!(msg.contains("33"), "error names the implied zoom: {msg}");
+    }
+
+    /// The ceiling is inclusive on the export side too (#371).
+    #[test]
+    fn zoom_for_level_accepts_the_ceiling_exactly() {
+        let meta = OverviewsMeta {
+            version: "0.1.0".to_string(),
+            mode: Some(Mode::Duplicating),
+            canonical_level: Some(1),
+            levels: vec![
+                Level {
+                    row_group_end: 0,
+                    gsd: gsd(MAX_ZOOM),
+                    zoom: None,
+                },
+                Level {
+                    row_group_end: 1,
+                    gsd: gsd(MAX_ZOOM),
+                    zoom: Some(MAX_ZOOM),
+                },
+            ],
+            generalization: None,
+        };
+        assert_eq!(zoom_for_level(&meta, 0).unwrap(), MAX_ZOOM);
+        assert_eq!(zoom_for_level(&meta, 1).unwrap(), MAX_ZOOM);
+    }
+
+    /// #371: the degenerate GSDs are told apart. `+inf` is infinitely coarse —
+    /// it inverts to z = -inf, which is z0, the same floor any too-coarse level
+    /// lands on. `0`, `-inf`, a negative GSD and `NaN` are not ground sample
+    /// distances at all, and used to be reported (or, for `-inf`, not reported
+    /// at all) as "implies zoom 9223372036854775807". A subnormal GSD is a real
+    /// one, just far too fine: that stays the ceiling error.
+    #[test]
+    fn zoom_for_level_sorts_out_the_non_finite_gsds() {
+        let with_gsd = |g: f64| OverviewsMeta {
+            version: "0.1.0".to_string(),
+            mode: Some(Mode::Duplicating),
+            canonical_level: Some(0),
+            levels: vec![Level {
+                row_group_end: 0,
+                gsd: g,
+                zoom: None,
+            }],
+            generalization: None,
+        };
+
+        // Infinitely coarse -> the whole world in one tile.
+        assert_eq!(zoom_for_level(&with_gsd(f64::INFINITY), 0).unwrap(), 0);
+
+        for bad in [0.0, f64::NEG_INFINITY, f64::NAN, -1.0] {
+            let meta = with_gsd(bad);
+            let err = zoom_for_level(&meta, 0).expect_err("a bad gsd must be rejected");
+            assert!(
+                matches!(err, ExportError::LevelGsdNotFinitePositive { level: 0, .. }),
+                "gsd {bad}: got {err}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("finite positive") && !msg.contains("9223372036854775807"),
+                "gsd {bad}: {msg}"
+            );
+        }
+
+        // A subnormal GSD is a real one, just unreachably fine: still the
+        // ceiling error, not the "not a gsd" one.
+        let err = zoom_for_level(&with_gsd(f64::MIN_POSITIVE / 2.0), 0)
+            .expect_err("a subnormal gsd is above the ceiling");
+        assert!(
+            matches!(err, ExportError::LevelZoomAboveCeiling { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// #371: the per-tile buffer is derived from the tile width, which was
+    /// `360.0 / f64::from(1u32 << zoom)` — a debug panic and a masked shift
+    /// (hence a wildly wrong buffer) from z32 up. Exact at the ceiling, and
+    /// finite and shrinking all the way past it.
+    #[test]
+    fn buffer_deg_is_exact_at_max_zoom_and_never_overflows() {
+        let opts = ExportOptions::default();
+        let at = |z: u8| buffer_deg_at_zoom(z, &opts);
+        let frac = buffer_fraction(&opts);
+        assert_eq!(at(0), 360.0 * frac);
+        assert_eq!(at(MAX_ZOOM), 360.0 / 1_073_741_824.0 * frac);
+        // Defensive: reachable from PMTiles-reading paths that bypass the
+        // level plan, so it must stay finite and monotone past the ceiling.
+        let mut prev = at(MAX_ZOOM);
+        for z in [31u8, 32, 33, 64, 255] {
+            let v = at(z);
+            assert!(v.is_finite() && v >= 0.0, "buffer at z{z} is {v}");
+            assert!(
+                v < prev,
+                "buffer must keep shrinking at z{z}: {v} !< {prev}"
+            );
+            prev = v;
+        }
     }
 
     #[test]
@@ -4915,7 +5163,7 @@ mod tests {
         assert_eq!(scans[2].feature_count, 12);
 
         for (level_idx, scan) in scans.iter().enumerate() {
-            let zoom = zoom_for_level(&meta, level_idx);
+            let zoom = zoom_for_level(&meta, level_idx).unwrap();
             let oracle = scan_level(&reader, level_idx, Crs::Epsg4326, zoom, &opts).unwrap();
             assert_eq!(
                 *scan, oracle,
@@ -6676,6 +6924,90 @@ mod tests {
         assert!(
             msg.contains("min_zoom") && msg.contains('3') && msg.contains('2'),
             "error must name the declared and actual minimum: {msg}"
+        );
+    }
+
+    /// #371: `--min-zoom` is written into the archive header, so it obeys the
+    /// same ceiling as everything else — and is rejected naming the flag and
+    /// the limit rather than the #380 "finer than the coarsest level" message.
+    #[test]
+    fn export_declared_min_zoom_above_the_ceiling_is_rejected() {
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![a.clone()]), (vec![0], vec![a.clone()])],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            min_zoom: Some(33),
+            ..ExportOptions::default()
+        };
+        let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExportError::DeclaredMinZoomAboveCeiling {
+                    declared: 33,
+                    ceiling: 30
+                }
+            ),
+            "got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("--min-zoom"), "error names the flag: {msg}");
+        assert!(msg.contains("30"), "error names the limit: {msg}");
+    }
+
+    /// #371, end to end: an overview file written before the ceiling existed
+    /// can record an out-of-range zoom in its level metadata. Nothing derives
+    /// that zoom, so the GSD check never sees it — the export itself has to
+    /// refuse the file rather than write an archive whose z33 tile ids are
+    /// wrapped nonsense.
+    #[test]
+    fn export_rejects_a_level_whose_recorded_zoom_is_above_the_ceiling() {
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let schema = Arc::new(source_schema());
+        let specs = vec![
+            LevelSpec::new(gsd(2), Some(2)),
+            // What an older tylertoo would happily have written.
+            LevelSpec::new(gsd(4), Some(33)),
+        ];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = OverviewWriter::create(
+            tin.path(),
+            &schema,
+            OverviewWriterOptions::new(Mode::Duplicating, specs),
+        )
+        .unwrap();
+        for k in 0..2 {
+            assert_eq!(
+                writer
+                    .write_level(
+                        k,
+                        Some(1),
+                        std::iter::once(batch(&schema, &[0], std::slice::from_ref(&a))),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let err = export_pmtiles(tin.path(), tout.path(), &ExportOptions::default())
+            .expect_err("a recorded z33 level must be refused");
+        assert!(
+            matches!(
+                err,
+                ExportError::LevelZoomAboveCeiling {
+                    level: 1,
+                    implied: 33,
+                    ceiling: 30,
+                    ..
+                }
+            ),
+            "got: {err}"
         );
     }
 

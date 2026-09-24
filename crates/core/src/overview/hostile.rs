@@ -526,8 +526,13 @@ fn min_zoom_greater_than_max_zoom_rejected() {
     assert!(matches!(err, ConvertError::InvalidLevels(_)), "got: {err}");
 }
 
+/// BEHAVIOUR CHANGE (#371): a z0..z45 plan used to convert happily. It cannot
+/// produce a usable archive — past z31 the PMTiles Hilbert tile id has no u64
+/// address, and `1u32 << z` masks in release so every tile id is wrong — and a
+/// realistic input spins for hours getting there. The plan is now rejected at
+/// options validation, before the input is opened.
 #[test]
-fn forty_plus_zoom_levels_convert() {
+fn forty_plus_zoom_levels_rejected() {
     let tin = tempfile::NamedTempFile::new().unwrap();
     let tout = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &spread_points(4), true, None);
@@ -535,6 +540,35 @@ fn forty_plus_zoom_levels_convert() {
         levels: LevelPlan::ZoomRange {
             min_zoom: 0,
             max_zoom: 45,
+        },
+        ..Default::default()
+    };
+    let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+    assert!(
+        matches!(err, ConvertError::ZoomAboveCeiling { zoom: 45, .. }),
+        "got: {err}"
+    );
+}
+
+/// The ceiling is not off by one: a plan ending exactly at z30 is accepted and
+/// converts four **points** without overflowing anything (#371).
+///
+/// That is all this proves. z30 being addressable is not a claim that it is
+/// practical: cost grows ~4x per zoom, and a single 1-degree linestring at z30
+/// spans on the order of 3e6 tiles — the CPU/RSS blowup of #371 is still
+/// reachable at the ceiling with line or polygon data. Deliberately not tested
+/// here: the point of this file is fast adversarial coverage, and a z30 line
+/// would take longer than every other test combined. See the max-zoom section
+/// of `docs/OVERVIEW_TUNING.md`.
+#[test]
+fn points_at_the_max_zoom_ceiling_convert() {
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(4), true, None);
+    let o = ConvertOptions {
+        levels: LevelPlan::ZoomRange {
+            min_zoom: 28,
+            max_zoom: crate::tile::MAX_ZOOM,
         },
         ..Default::default()
     };

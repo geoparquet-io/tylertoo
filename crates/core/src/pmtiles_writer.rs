@@ -317,6 +317,15 @@ impl Header {
     }
 }
 
+/// Highest zoom a `u64` PMTiles tile id can address.
+///
+/// The cumulative Hilbert id at zoom `z` needs `4^z` of headroom, so z31
+/// (`4^31 = 2^62`) is the last zoom that fits (#371). This is the *addressing*
+/// limit of the format, deliberately one notch above what tylertoo will write
+/// ([`crate::tile::MAX_ZOOM`]): the writer's cap is a validation decision, this
+/// one is arithmetic.
+pub const MAX_TILE_ID_ZOOM: u8 = 31;
+
 /// Convert tile coordinates (z, x, y) to a TileID for PMTiles
 ///
 /// Uses Hilbert curve ordering for spatial locality. The tile ID is a cumulative
@@ -333,12 +342,44 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
     if z == 0 {
         return 0;
     }
-
-    // Calculate base ID: sum of all tiles in previous zoom levels
-    // At zoom z, there are 4^z tiles. Base for zoom z is sum of 4^i for i in 1..z
-    let base_id: u64 = (1..z as u64).map(|i| 4u64.pow(i as u32)).sum();
+    // #371: the cumulative base is `sum(4^i for i in 1..z)`, and `4u64.pow(i)`
+    // overflows u64 at z32 — a debug panic, a wrapped id in release. z32 is
+    // also past what a u64 tile id can address at all, so an out-of-range zoom
+    // returns a sentinel beyond the z31 address space rather than a plausible
+    // but wrong id: `tile_id_to_zxy` rejects it. Write paths never reach this —
+    // `tile::MAX_ZOOM` is enforced at options validation.
+    if z > MAX_TILE_ID_ZOOM {
+        return u64::MAX;
+    }
+    // Closed form of `sum(4^i for i in 1..z)` = (4^z - 4) / 3, evaluated in u64
+    // (exact for z <= 31: 4^31 = 2^62).
+    let base_id: u64 = ((1u64 << (2 * u32::from(z))) - 4) / 3;
     let hilbert_idx = xy_to_hilbert(z, x, y);
     base_id + hilbert_idx + 1
+}
+
+/// [`tile_id`] for the writer paths: an out-of-range zoom is an error, not a
+/// sentinel (#371).
+///
+/// `tile_id` returns `u64::MAX` past [`MAX_TILE_ID_ZOOM`] so that a *reading*
+/// caller gets an id that cannot decode. A writer must not store that: every
+/// tile added above the ceiling would collide on the same directory entry and
+/// `finalize` would happily produce an archive addressing one impossible tile.
+/// The `add_tile*` family already returns [`std::io::Result`], so the zoom is
+/// rejected there — before the id is computed, before any bytes are written.
+fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
+    if z > MAX_TILE_ID_ZOOM {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "zoom {z} has no PMTiles tile id: the cumulative Hilbert id is u64, \
+                 so z{MAX_TILE_ID_ZOOM} is the highest addressable zoom (tylertoo \
+                 writes at most z{}) (#371)",
+                crate::tile::MAX_ZOOM
+            ),
+        ));
+    }
+    Ok(tile_id(z, x, y))
 }
 
 /// Convert x,y coordinates to Hilbert curve index at zoom level z
@@ -346,19 +387,30 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
 /// Implementation follows the standard Hilbert curve algorithm:
 /// https://en.wikipedia.org/wiki/Hilbert_curve
 fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
-    let n = 1u32 << z;
-    let mut rx: u32;
-    let mut ry: u32;
-    let mut s: u32;
+    // #371: `1u32 << z` overflows at z32 — in release it masks the shift to
+    // `z & 31`, so z32 yields n = 1 and every tile id in the archive is wrong
+    // with no diagnostic. u64 covers the whole z<=31 PMTiles address space.
+    //
+    // The assert and the clamp are both unreachable today: `tile_id`, the only
+    // caller, returns the out-of-range sentinel before it gets here. They are
+    // kept as the function's own guard rail — the assert states the contract
+    // for a future second caller, and the clamp keeps release builds total
+    // (an unclamped `1u64 << z` still masks for z >= 64) rather than silently
+    // resuming with a wrong `n`.
+    debug_assert!(z <= MAX_TILE_ID_ZOOM, "tile_id must bound z first (#371)");
+    let n: u64 = 1u64 << z.min(MAX_TILE_ID_ZOOM);
+    let mut rx: u64;
+    let mut ry: u64;
+    let mut s: u64;
     let mut d: u64 = 0;
-    let mut x = x;
-    let mut y = y;
+    let mut x = u64::from(x);
+    let mut y = u64::from(y);
 
     s = n / 2;
     while s > 0 {
         rx = if (x & s) > 0 { 1 } else { 0 };
         ry = if (y & s) > 0 { 1 } else { 0 };
-        d += (s as u64) * (s as u64) * ((3 * rx) ^ ry) as u64;
+        d += s * s * ((3 * rx) ^ ry);
 
         // Rotate quadrant - use n-1 (full grid size - 1) not s-1
         if ry == 0 {
@@ -372,14 +424,6 @@ fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
     }
     d
 }
-
-/// Deepest zoom a PMTiles tile id can address.
-///
-/// The cumulative Hilbert id of the last z31 tile is `(4^32 - 1) / 3 - 1`,
-/// which still fits a u64; z32 does not. We never *write* past z30 (see the
-/// converter's own zoom cap), but a foreign archive may legitimately go to
-/// z31, so the read side accepts the full addressable range.
-pub const MAX_TILE_ID_ZOOM: u8 = 31;
 
 /// Hard ceiling on how many tiles one directory walk may expand to (#417).
 ///
@@ -451,7 +495,7 @@ pub fn max_expanded_entries(header: &Header) -> u64 {
 /// cumulative Hilbert ID can address); returns an error for IDs beyond z31.
 pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
     let mut acc: u64 = 0;
-    for z in 0u8..=31 {
+    for z in 0u8..=MAX_TILE_ID_ZOOM {
         let num = 1u64 << (2 * u64::from(z));
         if id - acc < num {
             let (x, y) = hilbert_d2xy(z, id - acc);
@@ -1039,7 +1083,7 @@ impl PmtilesWriter {
         data: &[u8],
         feature_count: usize,
     ) -> std::io::Result<()> {
-        let id = tile_id(z, x, y);
+        let id = checked_tile_id(z, x, y)?;
         let uncompressed_size = data.len() as u32;
 
         // Track zoom range
@@ -1109,7 +1153,7 @@ impl PmtilesWriter {
         y: u32,
         compressed_data: Vec<u8>,
     ) -> std::io::Result<()> {
-        let id = tile_id(z, x, y);
+        let id = checked_tile_id(z, x, y)?;
         // For pre-compressed tiles, use a unique hash based on the compressed data
         // This won't deduplicate as effectively but preserves the API
         let hash = TileHasher::hash(&compressed_data);
@@ -1583,7 +1627,7 @@ impl StreamingPmtilesWriter {
             .as_mut()
             .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
 
-        let id = tile_id(z, x, y);
+        let id = checked_tile_id(z, x, y)?;
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
 
@@ -1657,7 +1701,7 @@ impl StreamingPmtilesWriter {
             .as_mut()
             .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
 
-        let id = tile_id(z, x, y);
+        let id = checked_tile_id(z, x, y)?;
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
 
@@ -2149,6 +2193,101 @@ mod tests {
     fn test_tile_id_zoom_2_base() {
         // Z=2, X=0, Y=0 → TileID=5 (base for zoom 2)
         assert_eq!(tile_id(2, 0, 0), 5);
+    }
+
+    /// #371: the cumulative base is now the closed form `(4^z - 4) / 3`
+    /// instead of `sum(4^i for i in 1..z)` with `4u64.pow`, which overflowed
+    /// u64 at z32. The two must agree everywhere the old one was defined.
+    #[test]
+    fn tile_id_base_closed_form_matches_the_summation() {
+        for z in 1..=MAX_TILE_ID_ZOOM {
+            let summed: u64 = (1..u64::from(z)).map(|i| 4u64.pow(i as u32)).sum();
+            let closed = ((1u64 << (2 * u32::from(z))) - 4) / 3;
+            assert_eq!(closed, summed, "base id mismatch at z{z}");
+        }
+    }
+
+    /// #371 boundary: exact tile ids at the write ceiling. Before the fix
+    /// `xy_to_hilbert`'s `1u32 << z` was fine at z30 but the whole family of
+    /// shifts was one zoom from masking; these values pin the arithmetic.
+    #[test]
+    fn tile_id_exact_values_at_max_zoom() {
+        // base(30) = (4^30 - 4) / 3 = (2^60 - 4) / 3
+        let base = ((1u64 << 60) - 4) / 3;
+        assert_eq!(base, 384_307_168_202_282_324);
+        assert_eq!(tile_id(30, 0, 0), base + 1);
+        // The Hilbert curve at any zoom starts (0,0) and ends (n-1, 0).
+        let n = crate::tile::max_tile_index(30);
+        assert_eq!(n, (1u32 << 30) - 1);
+        assert_eq!(tile_id(30, n, 0), base + 4u64.pow(30));
+        // Every id at z30 lands inside z30's own block.
+        for (x, y) in [(0u32, 0u32), (n, 0), (0, n), (n, n), (12_345, 678_910)] {
+            let id = tile_id(30, x, y);
+            assert!(
+                id > base && id <= base + 4u64.pow(30),
+                "z30 id {id} outside its block for ({x}, {y})"
+            );
+            assert_eq!(tile_id_to_zxy(id).unwrap(), (30, x, y));
+        }
+    }
+
+    /// #371: past the u64 address space `tile_id` must not hand back a
+    /// plausible-but-wrong id. In release `1u32 << 32` masked to `n = 1`,
+    /// which silently collapsed every tile in the archive onto a few ids.
+    #[test]
+    fn tile_id_above_the_address_space_is_rejected_not_wrapped() {
+        for z in [32u8, 33, 64, 255] {
+            let id = tile_id(z, 0, 0);
+            assert_eq!(id, u64::MAX, "z{z} must return the out-of-range sentinel");
+            assert!(
+                tile_id_to_zxy(id).is_err(),
+                "the sentinel must not decode as a real tile"
+            );
+        }
+    }
+
+    /// #371: the sentinel is only useful if the writers refuse it. Before this
+    /// check, `add_tile(32, ..)` stored a directory entry keyed `u64::MAX` —
+    /// every tile past the ceiling collapsing onto one impossible id — and
+    /// `finalize` succeeded, producing an archive no reader can address.
+    #[test]
+    fn writers_reject_a_zoom_with_no_tile_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rejected.pmtiles");
+        let tile = [0x1a, 0x00];
+
+        for z in [32u8, 33, 255] {
+            let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+            streaming.set_layer_name("t");
+            let err = streaming
+                .add_tile(z, 0, 0, &tile)
+                .expect_err("a zoom past the address space must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains(&format!("zoom {z}")),
+                "error names the zoom: {err}"
+            );
+            assert!(streaming
+                .add_tile_precompressed(z, 0, 0, 0, &tile, tile.len(), 0)
+                .is_err());
+
+            let mut buffered = PmtilesWriter::new();
+            assert!(buffered.add_tile(z, 0, 0, &tile).is_err());
+            assert!(buffered
+                .add_tile_compressed(z, 0, 0, tile.to_vec())
+                .is_err());
+        }
+
+        // The ceiling itself is still writable, and the archive finalizes.
+        let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        streaming.set_layer_name("t");
+        streaming.add_tile(MAX_TILE_ID_ZOOM, 0, 0, &tile).unwrap();
+        streaming.finalize(&path).unwrap();
+        let data = fs::read(&path).unwrap();
+        assert_eq!(
+            Header::from_bytes(&data[..127]).unwrap().max_zoom,
+            MAX_TILE_ID_ZOOM
+        );
     }
 
     #[test]
