@@ -38,6 +38,7 @@ pub mod vector_tile {
     include!(concat!(env!("OUT_DIR"), "/vector_tile.rs"));
 }
 
+pub mod archive_index;
 pub mod batch_processor;
 pub mod clip;
 pub mod compression;

@@ -26,15 +26,13 @@ use serde_json::{json, Value};
 
 use tempfile::NamedTempFile;
 
+use crate::archive_index::ArchiveIndex;
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::url_scheme;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
-use crate::pmtiles_writer::{
-    max_expanded_entries, read_all_entries, tile_id_to_zxy, DirEntry, Header,
-    StreamingPmtilesWriter, TileType,
-};
+use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType};
 use crate::tile::TileBounds;
 use crate::Error;
 
@@ -644,7 +642,7 @@ fn track_band_bounds(
     union: &mut Option<TileBounds>,
     bands_without_bounds: &mut Vec<String>,
 ) {
-    match archive.bounds {
+    match archive.bounds() {
         Some(b) => match union.as_mut() {
             Some(u) => u.expand(&b),
             None => *union = Some(b),
@@ -711,53 +709,23 @@ struct LayerMeta {
     fields: Value,
 }
 
-/// One band's archive, read and parsed exactly once.
+/// One band's archive, indexed and parsed exactly once.
 ///
-/// The whole file is held while that band is merged — it is the compressed
-/// archive, not the expanded tile set. With disjoint zoom ranges only one
-/// band is open at a time; when bands share zooms every band's archive is
-/// open together, since one tile id can then draw on several of them.
-/// Tiles are handed out by [`BandArchive::for_each_tile`] as borrowed slices,
-/// so a run-length entry costs one slice rather than N owned copies.
+/// Only the header, the directories and the metadata are held while that band
+/// is merged — [`ArchiveIndex`] reads tile bodies by offset as they are
+/// copied. The merge used to `std::fs::read` the whole file instead, which
+/// meant a shared-zoom pyramid held every band's archive resident at once
+/// (#498): fine for a hand-built band, hopeless for a multi-gigabyte one.
+/// Tiles are handed out by [`BandArchive::for_each_tile`] one at a time, so a
+/// run-length entry costs one read rather than N.
 struct BandArchive {
-    bytes: Vec<u8>,
-    header: Header,
-    /// Root entries with every leaf pointer already resolved. Run lengths are
-    /// left intact; expansion happens per-tile in `for_each_tile`.
-    entries: Vec<DirEntry>,
+    index: ArchiveIndex,
     /// `vector_layers[0].fields`, or `{}` when the metadata has no usable one.
     fields: Value,
     /// Every `vector_layers[*].id` the archive declares — the MVT layer
     /// name(s) actually inside its tiles, as opposed to the label `--band`
     /// gives it. Empty when the metadata has none.
     layer_ids: Vec<String>,
-    /// The archive's own header bounds, when they describe a real box.
-    bounds: Option<TileBounds>,
-}
-
-/// The bounds a band actually claims, or `None`.
-///
-/// A writer that was never given bounds stores `TileBounds::empty()`, whose
-/// infinities saturate to ±214.7° on the way into the header and read back
-/// inverted (min > max). Unioning that swallows every real band, so an
-/// unusable box is dropped rather than folded in. A zero-area box is kept: it
-/// cannot poison a union, and a single-tile band legitimately has one.
-fn usable_bounds(header: &Header) -> Option<TileBounds> {
-    let b = TileBounds::new(
-        header.min_lon,
-        header.min_lat,
-        header.max_lon,
-        header.max_lat,
-    );
-    let finite = b.lng_min.is_finite()
-        && b.lat_min.is_finite()
-        && b.lng_max.is_finite()
-        && b.lat_max.is_finite();
-    if finite && b.is_valid() {
-        Some(b)
-    } else {
-        None
-    }
 }
 
 impl BandArchive {
@@ -770,9 +738,12 @@ impl BandArchive {
     /// to pick the right `vector_layers` entry when the archive's metadata
     /// carries several (see [`parse_layers`]).
     fn open(path: &Path, label: &str) -> Result<Self, Error> {
-        let bytes = std::fs::read(path)?;
-        let header = Header::from_bytes(&bytes)
-            .map_err(|e| Error::PMTilesWrite(format!("{}: {e}", path.display())))?;
+        // Header, directories and metadata — never the tile data. #417's
+        // ceilings on the directory walk live inside [`ArchiveIndex::open`],
+        // so a hostile band archive is refused there, with the same messages
+        // this reader used to produce inline.
+        let index = ArchiveIndex::open(path)?;
+        let header = index.header();
 
         // The merged archive declares gzip tile compression. Copying bytes out
         // of an archive that used anything else would mislabel every tile.
@@ -794,118 +765,63 @@ impl BandArchive {
             )));
         }
 
-        let past_end =
-            |what: &str| Error::PMTilesWrite(format!("{what} past end of {}", path.display()));
-        let slice = |off: u64, len: u64, what: &str| -> Result<&[u8], Error> {
-            // Both come from the archive; a `as usize` truncation on a 32-bit
-            // target would turn a wild offset into a plausible in-range one
-            // (matching decode.rs's `section`).
-            let start = usize::try_from(off).map_err(|_| past_end(what))?;
-            let end = usize::try_from(len)
-                .ok()
-                .and_then(|l| start.checked_add(l))
-                .filter(|&e| e <= bytes.len())
-                .ok_or_else(|| past_end(what))?;
-            Ok(&bytes[start..end])
-        };
-
-        // Root directory plus one level of leaf expansion, budgeted against
-        // #417's two attacks (a huge leaf, or a million tiny ones).
-        let entries = read_all_entries(&bytes, &header)
-            .map_err(|e| Error::PMTilesWrite(format!("{}: {e}", path.display())))?;
-
-        let raw_meta = slice(
-            header.json_metadata_offset,
-            header.json_metadata_length,
-            "metadata",
-        )?;
-        let (fields, layer_ids) = parse_layers(raw_meta, header.internal_compression, path, label)?;
-        let bounds = usable_bounds(&header);
+        let internal = header.internal_compression;
+        let (fields, layer_ids) = parse_layers(index.metadata_raw(), internal, path, label)?;
 
         Ok(BandArchive {
-            bytes,
-            header,
-            entries,
+            index,
             fields,
             layer_ids,
-            bounds,
         })
+    }
+
+    /// The archive's header.
+    fn header(&self) -> &Header {
+        self.index.header()
+    }
+
+    /// The archive's own header bounds, when they describe a real box.
+    fn bounds(&self) -> Option<TileBounds> {
+        self.index.bounds()
     }
 
     /// Hand every addressed tile to `f` as `(z, x, y, still-compressed bytes)`.
     ///
-    /// Run-length entries are expanded into individual ids — a band's numbering
-    /// is not the merged archive's, which re-derives its own runs — but the one
-    /// data slice is passed for each id rather than copied per id. The merged
-    /// writer's dedup cache collapses the run again on the far side.
+    /// Run-length entries are expanded into individual ids — a band's
+    /// numbering is not the merged archive's, which re-derives its own runs.
+    /// Every id of a run re-reads the one body; the merged writer's dedup
+    /// cache collapses the run again on the far side, and runs are rare
+    /// enough that the reread costs less than holding the file resident to
+    /// avoid it.
     fn for_each_tile<F>(&self, mut f: F) -> Result<(), Error>
     where
         F: FnMut(u8, u32, u32, &[u8]) -> Result<(), Error>,
     {
-        self.for_each_tile_range(|_, z, x, y, range| f(z, x, y, &self.bytes[range]))
+        self.for_each_tile_range(|_, z, x, y, range| {
+            let data = self.index.read_range(range)?;
+            f(z, x, y, &data)
+        })
     }
 
     /// Like [`Self::for_each_tile`], but hands out the tile id alongside
     /// `(z, x, y)` and the tile's byte range in the archive instead of the
-    /// slice, so a caller can index tiles across several archives first and
+    /// bytes, so a caller can index tiles across several archives first and
     /// read them later in id order (#385).
     fn for_each_tile_range<F>(&self, mut f: F) -> Result<(), Error>
     where
         F: FnMut(u64, u8, u32, u32, std::ops::Range<usize>) -> Result<(), Error>,
     {
-        // Offsets, lengths and ids are archive-supplied: every add is checked
-        // so a corrupt directory reports rather than wraps.
-        let past_end = || Error::PMTilesWrite("tile data past end of archive".to_string());
-        // Run lengths are archive-controlled u32s, and every expanded id
-        // becomes a map entry in the merge: one 0xFFFFFFFF run is tens of
-        // gigabytes. Spend a budget of what this archive could legitimately
-        // address, so many plausible runs cannot add up to the same attack
-        // (#417).
-        let limit = max_expanded_entries(&self.header);
-        let mut budget = limit;
-        for e in &self.entries {
-            // Inside the declared tile-data section, not merely inside the
-            // file: an entry aimed at the directories would otherwise be
-            // handed to the MVT decoder as a tile (#417).
-            match e.offset.checked_add(u64::from(e.length)) {
-                Some(end) if end <= self.header.tile_data_length => {}
-                _ => return Err(past_end()),
-            }
-            let start = self
-                .header
-                .tile_data_offset
-                .checked_add(e.offset)
-                .and_then(|s| usize::try_from(s).ok())
-                .ok_or_else(past_end)?;
-            let end = start
-                .checked_add(e.length as usize)
-                .filter(|&x| x <= self.bytes.len())
-                .ok_or_else(past_end)?;
-            let run = u64::from(e.run_length.max(1));
-            budget = budget.checked_sub(run).ok_or_else(|| {
-                Error::PMTilesWrite(format!(
-                    "directory entry for tile id {} claims a run of {run} tiles, past this \
-                     archive's run-length expansion limit of {limit} tiles",
-                    e.tile_id
-                ))
-            })?;
-            for i in 0..run {
-                let id = e
-                    .tile_id
-                    .checked_add(i)
-                    .ok_or_else(|| Error::PMTilesWrite("tile id past end of range".to_string()))?;
-                let (z, x, y) = tile_id_to_zxy(id)
-                    .map_err(|e| Error::PMTilesWrite(format!("bad tile id: {e}")))?;
-                f(id, z, x, y, start..end)?;
-            }
+        for tile in self.index.tiles() {
+            let t = tile?;
+            f(t.id, t.z, t.x, t.y, t.range)?;
         }
         Ok(())
     }
 
     /// A tile's still-compressed bytes by range (from
     /// [`Self::for_each_tile_range`]).
-    fn tile(&self, range: std::ops::Range<usize>) -> &[u8] {
-        &self.bytes[range]
+    fn tile(&self, range: std::ops::Range<usize>) -> Result<Vec<u8>, Error> {
+        self.index.read_range(range)
     }
 }
 
@@ -1262,7 +1178,7 @@ pub fn merge_bands_with_options(
         // #495: catch a band whose declared range the archive cannot honor
         // before any tile is touched.
         for (band, archive) in bands.iter().zip(&archives) {
-            check_band_zoom_range(band, &archive.header, allow_missing_zooms)?;
+            check_band_zoom_range(band, archive.header(), allow_missing_zooms)?;
         }
         // validate_bands only sees the labels, not what is actually inside
         // each archive's tiles; this is the check that catches the mismatch.
@@ -1312,18 +1228,19 @@ pub fn merge_bands_with_options(
         for ((z, x, y), refs) in index.values() {
             let (z, x, y) = (*z, *x, *y);
             if let [(bi, range)] = refs.as_slice() {
-                let data = archives[*bi].tile(range.clone());
-                let hash = TileHasher::hash(data);
+                let data = archives[*bi].tile(range.clone())?;
+                let hash = TileHasher::hash(&data);
                 writer
-                    .add_tile_precompressed(z, x, y, hash, data, data.len(), 0)
+                    .add_tile_precompressed(z, x, y, hash, &data, data.len(), 0)
                     .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
                 continue;
             }
             buf.clear();
             for (bi, range) in refs {
+                let raw = archives[*bi].tile(range.clone())?;
                 let plain = compression::decompress_capped(
-                    archives[*bi].tile(range.clone()),
-                    archives[*bi].header.tile_compression,
+                    &raw,
+                    archives[*bi].header().tile_compression,
                     MAX_TILE_BYTES,
                 )
                 .map_err(|e| {
@@ -1388,7 +1305,7 @@ pub fn merge_bands_with_options(
         let archive = BandArchive::open(&band.input, &band.layer)?;
         // #495: catch a band whose declared range the archive cannot honor
         // before any tile is touched.
-        check_band_zoom_range(band, &archive.header, allow_missing_zooms)?;
+        check_band_zoom_range(band, archive.header(), allow_missing_zooms)?;
         track_band_bounds(band, &archive, &mut union, &mut bands_without_bounds);
         let mut n = 0usize;
         let mut skipped = 0usize;
@@ -1572,7 +1489,7 @@ fn finish_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pmtiles_writer::{decode_directory, MAX_LEAF_DIRECTORIES};
+    use crate::pmtiles_writer::{decode_directory, tile_id_to_zxy, DirEntry, MAX_LEAF_DIRECTORIES};
     use std::collections::HashMap;
 
     /// A band input is classified by content, not by name: `.pmtiles` is a
