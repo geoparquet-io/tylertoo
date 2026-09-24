@@ -378,6 +378,43 @@ pub enum ExportError {
         ceiling: u8,
     },
 
+    /// Two levels resolve to the same (or a non-increasing) zoom (#504
+    /// follow-up).
+    ///
+    /// `zoom_for_level`'s §3.3 validation only requires `gsd` to be strictly
+    /// decreasing across levels, not that the ZOOM it rounds to (the §5.2
+    /// inverse) is distinct per level: two GSDs close enough to round to the
+    /// same integer zoom, or two GSDs both coarser than the zoom-0
+    /// threshold, both pass that check and both resolve here to the same
+    /// zoom. Export keys each level's tiles by PMTiles tile id within that
+    /// level's own zoom and streams levels ascending (#504); a duplicate
+    /// zoom would write that zoom's tile ids a second time. Before #504 this
+    /// silently clobbered directory entries (both levels used the same
+    /// row-major `(x, y)` key, so the second level's write just overwrote
+    /// the first level's slot in the directory — latent tile-data
+    /// corruption with no error). Since #504 it instead trips the writer's
+    /// ascending-tile-id `debug_assert!` in a debug build. Neither is
+    /// acceptable: reject it here, with a real error, before any scan runs.
+    #[error(
+        "overview levels {previous_level} (gsd {previous_gsd} m) and {level} (gsd {gsd} m) \
+         both resolve to zoom {zoom}; every level must resolve to a distinct, strictly \
+         increasing zoom"
+    )]
+    LevelZoomsNotAscending {
+        /// Index of the earlier, colliding level.
+        previous_level: usize,
+        /// The earlier level's resolved zoom (equal to `zoom`).
+        previous_zoom: u8,
+        /// The earlier level's GSD.
+        previous_gsd: f64,
+        /// Index of the later, colliding level.
+        level: usize,
+        /// The later level's resolved zoom (equal to `previous_zoom`).
+        zoom: u8,
+        /// The later level's GSD.
+        gsd: f64,
+    },
+
     #[error(
         "included property {name:?} is not a property this overview file exports \
          (exportable: {available})"
@@ -481,11 +518,12 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 
 /// Members-per-partition target for the partitioned streaming export (H3(b)).
 ///
-/// Each zoom's tiles are split into contiguous `(x, y)` ranges whose summed
-/// (feature × tile) member counts reach at least this value; partitions are
-/// processed one at a time and streamed to the writer, so this bounds the
-/// per-partition working set (clipped geometries + encoded tiles) instead of
-/// holding the whole zoom in memory.
+/// Each zoom's tiles are split into contiguous PMTiles tile-id ranges (#504;
+/// row-major `(x, y)` ranges before it) whose summed (feature × tile) member
+/// counts reach at least this value; partitions are processed one at a time
+/// and streamed to the writer, so this bounds the per-partition working set
+/// (clipped geometries + encoded tiles) instead of holding the whole zoom in
+/// memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing
@@ -762,8 +800,9 @@ fn plan_levels(
         .map(|(level_idx, scan)| {
             let zoom = zoom_for_level(meta, level_idx)?;
 
-            // Split the zoom's tiles into contiguous ascending (x, y) ranges
-            // of roughly `partition_target` members each.
+            // Split the zoom's tiles into contiguous ascending PMTiles
+            // tile-id ranges (#504) of roughly `partition_target` members
+            // each.
             let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
 
             // Per-level memory guard (#311): on `auto`, narrow the wave from
@@ -826,8 +865,31 @@ fn export_pmtiles_impl(
     // #371: every level's zoom is resolved (and ceiling-checked) before any
     // scan runs — a level whose GSD implies a zoom past `MAX_ZOOM` fails here
     // rather than producing an archive with wrapped tile ids.
-    let coarsest_zoom = zoom_for_level(&meta, 0)?;
-    let max_zoom = zoom_for_level(&meta, num_levels - 1)?;
+    //
+    // #504 follow-up: `OverviewsMeta::validate` (run by `OverviewReader::open`
+    // above) only requires `gsd` to be strictly decreasing across levels, not
+    // that the ZOOM each one derives to is distinct — two GSDs close enough
+    // to round to the same integer zoom both pass that check. Resolve every
+    // level's zoom here and require strict ascent before any scan runs; see
+    // [`ExportError::LevelZoomsNotAscending`] for what a collision used to do
+    // silently (pre-#504) and what it does now if left unrejected.
+    let level_zooms: Vec<u8> = (0..num_levels)
+        .map(|level_idx| zoom_for_level(&meta, level_idx))
+        .collect::<Result<_, _>>()?;
+    for i in 1..level_zooms.len() {
+        if level_zooms[i] <= level_zooms[i - 1] {
+            return Err(ExportError::LevelZoomsNotAscending {
+                previous_level: i - 1,
+                previous_zoom: level_zooms[i - 1],
+                previous_gsd: meta.levels[i - 1].gsd,
+                level: i,
+                zoom: level_zooms[i],
+                gsd: meta.levels[i].gsd,
+            });
+        }
+    }
+    let coarsest_zoom = level_zooms[0];
+    let max_zoom = level_zooms[num_levels - 1];
     // #380: the archive may declare a coarser minimum than the file holds.
     let min_zoom = match options.min_zoom {
         // #371: the declared minimum is a written header field, so it obeys the
@@ -1251,7 +1313,8 @@ struct LevelScan {
     feature_count: usize,
     /// Union of feature bboxes (`None` when no feature has one).
     bounds: Option<TileBounds>,
-    /// Member count per tile key, ascending `(x, y)`.
+    /// Member count per tile key, ascending PMTiles tile id (#504; ascending
+    /// `(x, y)` before it).
     tile_counts: BTreeMap<u64, usize>,
 }
 
@@ -4343,10 +4406,21 @@ mod tests {
     /// independent of add order — see `StreamingPmtilesWriter::write_archive`
     /// — and the format's own contract), so walking it ascending is not by
     /// itself evidence of #504. What #504 changes is whether the underlying
-    /// tile DATA is laid out in that same order: this test walks the
-    /// directory and asserts tile-data OFFSETS are non-decreasing as tile id
-    /// increases, i.e. the bytes on disk really do follow ascending tile-id
-    /// (Hilbert) order, not the pre-#504 row-major layout.
+    /// tile DATA is laid out in that same order.
+    ///
+    /// That is NOT the same claim as "every entry's offset is >= the
+    /// previous entry's offset" (#504 review, F4): a deduplication
+    /// back-reference legally points an entry at an EARLIER tile's already-written
+    /// bytes (`offsets_are_clustered`'s own contract — see
+    /// `pmtiles_writer::verify_clustered`), and that is still a `clustered`
+    /// archive under the PMTiles v3 definition (a forward-streaming reader
+    /// just re-serves bytes it already has buffered). A raw offset-monotonicity
+    /// assertion here would be too strict — it happened to hold on this
+    /// fixture only because none of its 13 tiles are non-adjacent duplicates
+    /// of each other, not because export guarantees it. The real predicate
+    /// this test checks is [`crate::pmtiles_writer::verify_clustered`], the
+    /// same file-side re-derivation the header's own `clustered` byte is
+    /// checked against.
     #[test]
     fn export_emits_tiles_in_ascending_tile_id() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4359,7 +4433,7 @@ mod tests {
         export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
 
         use crate::compression;
-        use crate::pmtiles_writer::{decode_directory, DirEntry, Header};
+        use crate::pmtiles_writer::{decode_directory, verify_clustered, DirEntry, Header};
         let bytes = std::fs::read(tout.path()).unwrap();
         let header = Header::from_bytes(&bytes).unwrap();
         let root = compression::decompress_capped(
@@ -4380,6 +4454,9 @@ mod tests {
             entries.len()
         );
 
+        // The directory is always sorted by tile id (a writer invariant, not
+        // specific to #504) -- asserted here as a sanity check on the walk
+        // itself, not as the test's main claim.
         let mut prev: Option<&DirEntry> = None;
         for e in &entries {
             if let Some(p) = prev {
@@ -4387,18 +4464,20 @@ mod tests {
                     e.tile_id > p.tile_id,
                     "directory entries must be strictly ascending by tile id"
                 );
-                assert!(
-                    e.offset >= p.offset,
-                    "tile {} at offset {} is behind tile {}'s offset {} -- tile \
-                     data is not laid out in ascending tile-id order",
-                    e.tile_id,
-                    e.offset,
-                    p.tile_id,
-                    p.offset,
-                );
             }
             prev = Some(e);
         }
+
+        // The actual #504 claim: the tile DATA is genuinely laid out in
+        // ascending tile-id order, dedup back-references included --
+        // `verify_clustered` re-derives this from the offsets directly
+        // rather than assuming raw monotonicity.
+        assert!(
+            verify_clustered(tout.path()).unwrap(),
+            "export must write tile data in genuinely clustered (ascending \
+             tile-id) order -- verify_clustered on the exported archive says \
+             it is not"
+        );
     }
 
     /// The counterpart to [`export_emits_tiles_in_ascending_tile_id`]: the
@@ -7173,6 +7252,83 @@ mod tests {
                     level: 1,
                     implied: 33,
                     ceiling: 30,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// #504 follow-up (F1): `OverviewsMeta::validate` only requires `gsd` to
+    /// be strictly decreasing across levels, not that the derived ZOOM is
+    /// distinct — two GSDs close enough to round to the same integer zoom
+    /// both pass it. Pre-#504 this silently wrote that zoom's tiles twice,
+    /// clobbering directory entries with no error (both levels shared the
+    /// same row-major key); post-#504 it instead trips the writer's
+    /// ascending-tile-id `debug_assert!`. Either way it must be a clean,
+    /// named `ExportError`, caught before any scan runs.
+    #[test]
+    fn export_rejects_levels_whose_derived_zooms_collide() {
+        // Guard the fixture's own premise: both GSDs must round to z4 and
+        // must be strictly decreasing (gsd(4) is the exact z4 value; scaling
+        // it up by less than sqrt(2) keeps the derived zoom at 4, since the
+        // z3/z4 rounding boundary sits at gsd(4) * sqrt(2)). If a future
+        // change to the GSD/zoom formula moves this, the test fails loudly
+        // here instead of silently stopping to exercise the collision.
+        let gsd_a = gsd(4) * 1.10;
+        let gsd_b = gsd(4) * 1.02;
+        assert!(
+            gsd_a > gsd_b,
+            "fixture premise: levels must stay coarse -> fine (gsd strictly decreasing)"
+        );
+        assert_eq!(
+            zoom_for_gsd(gsd_a).round() as u8,
+            4,
+            "fixture premise: gsd_a must derive to z4"
+        );
+        assert_eq!(
+            zoom_for_gsd(gsd_b).round() as u8,
+            4,
+            "fixture premise: gsd_b must derive to z4"
+        );
+
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let schema = Arc::new(source_schema());
+        // No explicit zoom on either level: both derive from gsd, and both
+        // derive to z4.
+        let specs = vec![LevelSpec::new(gsd_a, None), LevelSpec::new(gsd_b, None)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = OverviewWriter::create(
+            tin.path(),
+            &schema,
+            OverviewWriterOptions::new(Mode::Duplicating, specs),
+        )
+        .unwrap();
+        for k in 0..2 {
+            assert_eq!(
+                writer
+                    .write_level(
+                        k,
+                        Some(1),
+                        std::iter::once(batch(&schema, &[0], std::slice::from_ref(&a))),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let err = export_pmtiles(tin.path(), tout.path(), &ExportOptions::default())
+            .expect_err("two levels deriving the same zoom must be refused");
+        assert!(
+            matches!(
+                err,
+                ExportError::LevelZoomsNotAscending {
+                    previous_level: 0,
+                    previous_zoom: 4,
+                    level: 1,
+                    zoom: 4,
                     ..
                 }
             ),

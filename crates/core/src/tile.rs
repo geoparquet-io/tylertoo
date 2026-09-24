@@ -273,16 +273,45 @@ fn hilbert_zoom_base(z: u8) -> u64 {
 /// partition's `[key_lo, key_hi]` window with an *exact* interval
 /// intersection instead of the old conservative row-major bounding check.
 ///
+/// Crate-private: the export cascade (`overview::export::node_key_overlaps`)
+/// is the only caller, and it always passes a node produced by descending
+/// from the cascade root towards `target_z = zoom`, so `node.z <= target_z`
+/// holds by construction there. A hand-built call from outside the crate
+/// would have no such guarantee, and there is no meaningful "descendant
+/// range" to return when it does not hold — see `# Panics` below — so this
+/// stays `pub(crate)` rather than a public API a caller could misuse.
+///
 /// # Panics
 ///
-/// Debug-asserts `target_z >= node.z` (a node has no id at a shallower zoom
-/// than itself).
-pub fn node_id_range(node: TileCoord, target_z: u8) -> std::ops::RangeInclusive<u64> {
+/// Debug-asserts `target_z <= `[`MAX_TILE_ID_ZOOM`][crate::pmtiles_writer::MAX_TILE_ID_ZOOM]
+/// and `target_z >= node.z`. Both guard a real failure mode, not a paranoia
+/// check: past `MAX_TILE_ID_ZOOM` (31), `1u64 << (2 * delta)` below shifts by
+/// 64 or more bits, which panics in debug and — the actual danger — silently
+/// masks to a near-zero shift in release (#371's `xy_to_hilbert` hits the
+/// identical failure mode one function over). `target_z < node.z` has no
+/// valid answer at all: `node.z`'s own Hilbert index and `target_z`'s
+/// cumulative base are then different zooms' incompatible units, and
+/// `saturating_sub` would silently swallow that into `delta = 0` rather than
+/// surface it. In a release build (assertions compiled out) `target_z` is
+/// additionally clamped to `MAX_TILE_ID_ZOOM` before the shift, so an
+/// out-of-range call degrades to a wrong-but-bounded answer instead of the
+/// masked-shift garbage a raw `1u64 << 64+` would produce.
+pub(crate) fn node_id_range(node: TileCoord, target_z: u8) -> std::ops::RangeInclusive<u64> {
+    debug_assert!(
+        target_z <= crate::pmtiles_writer::MAX_TILE_ID_ZOOM,
+        "node_id_range: target_z ({target_z}) exceeds the deepest zoom a PMTiles tile id \
+         can address ({})",
+        crate::pmtiles_writer::MAX_TILE_ID_ZOOM
+    );
     debug_assert!(
         target_z >= node.z,
         "node_id_range: target_z ({target_z}) must be >= node.z ({})",
         node.z
     );
+    // See `# Panics`: unreachable when the two asserts above hold, kept as
+    // this function's own guard rail so a release build stays total instead
+    // of computing a masked, essentially-random shift.
+    let target_z = target_z.min(crate::pmtiles_writer::MAX_TILE_ID_ZOOM);
     let delta = target_z.saturating_sub(node.z);
     let h = crate::pmtiles_writer::xy_to_hilbert(node.z, node.x, node.y);
     let base_target = hilbert_zoom_base(target_z);
@@ -853,6 +882,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// F2 (#504 review): `target_z` past [`crate::pmtiles_writer::MAX_TILE_ID_ZOOM`]
+    /// must fail loudly in a debug build rather than silently shift by >= 64
+    /// bits (masked to a near-zero shift in release -- see `node_id_range`'s
+    /// doc).
+    #[test]
+    #[should_panic(expected = "exceeds the deepest zoom")]
+    fn node_id_range_rejects_target_z_past_max_tile_id_zoom() {
+        let _ = node_id_range(
+            TileCoord::new(0, 0, 0),
+            crate::pmtiles_writer::MAX_TILE_ID_ZOOM + 1,
+        );
+    }
+
+    /// F2 (#504 review): `target_z < node.z` has no valid descendant range
+    /// (node.z's Hilbert index and target_z's cumulative base would be
+    /// different zooms' incompatible units) and must fail loudly rather than
+    /// silently collapse `delta` to 0 via `saturating_sub`.
+    #[test]
+    #[should_panic(expected = "must be >= node.z")]
+    fn node_id_range_rejects_target_z_below_node_z() {
+        let _ = node_id_range(TileCoord::new(0, 0, 5), 3);
     }
 
     #[test]
