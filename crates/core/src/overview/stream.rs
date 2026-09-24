@@ -1422,10 +1422,6 @@ pub(crate) fn convert_streaming_strategy(
     strategy: Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
     let start = Instant::now();
-    // #517 S2: validate `TYLERTOO_PROFILE_JSON` (if set) immediately, not
-    // only when `write_profile_json` tries to append to it at the very end of
-    // a — possibly multi-hour — run.
-    preflight_profile_json_path();
     // #295: peak-RSS-by-phase instrumentation. Each phase boundary logs process
     // RSS; the max is reported at the end so a single run shows both the peak
     // and which phase produced it.
@@ -1710,32 +1706,62 @@ struct ProfileJsonInputs<'a> {
     in_flight_batches: usize,
 }
 
-/// Validate `TYLERTOO_PROFILE_JSON` at conversion *start* (#517 S2), if set.
+/// Validate `TYLERTOO_PROFILE_JSON` at option-validation time (#517 S2), if
+/// set — called once from `overview::convert::validate_options`, alongside
+/// the `--plan` / `--save-plan` preflights (#513), so every path preflight in
+/// the convert front end runs in one place and in the same shape.
 ///
 /// [`write_profile_json`] only runs once, at the very end of the run — an
 /// unwritable path (typo, missing directory, read-only mount, permissions)
 /// was previously reported by a single `log::warn` there, easy to miss in a
 /// multi-hour batch/benchmark run that otherwise exits 0 with its profiling
-/// data silently gone. This opens the same path in the same mode
-/// (create+append) immediately, so an operator sees the problem before
-/// spending the run, not after. Deliberately does not fail the conversion —
-/// a diagnostics-only knob must never gate production output — but the
-/// warning is made hard to miss.
-fn preflight_profile_json_path() {
+/// data silently gone. This probes the same path in the same mode (append)
+/// immediately, so an operator sees the problem before spending the run, not
+/// after. Deliberately does not fail the conversion — a diagnostics-only knob
+/// must never gate production output — but the warning is made hard to miss.
+///
+/// Probe-and-remove, matching `preflight_save_plan_writable`: an existing
+/// target is opened for append exactly as the dump will open it, and a
+/// MISSING one is probed through a uniquely named *sibling* that is removed
+/// again. An earlier version opened the target itself with `create(true)`,
+/// which left a stray zero-byte dump file behind whenever the run then failed
+/// (or the pipeline never reached the dump at all) — a preflight must observe
+/// the filesystem, not change it.
+pub(super) fn preflight_profile_json_path() {
     let Ok(path) = std::env::var("TYLERTOO_PROFILE_JSON") else {
         return;
     };
     if path.trim().is_empty() {
         return;
     }
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    let path = Path::new(&path);
+    let probed = if path.exists() {
+        // Same mode `write_profile_json` uses, minus `create`: nothing on
+        // disk changes, and a directory (or a read-only file) still fails here.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map(|_| ())
+    } else {
+        // `Path::parent` yields `Some("")` for a bare file name: that is `.`.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let probe = parent.join(format!(
+            ".tylertoo-profile-json-probe.{}.{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::File::create(&probe).map(|_| {
+            let _ = std::fs::remove_file(&probe);
+        })
+    };
+    if let Err(e) = probed {
+        let path = path.display();
         log::warn!(
             "[profile] ################################################\n\
-             [profile] TYLERTOO_PROFILE_JSON={path:?} is NOT WRITABLE: {e}\n\
+             [profile] TYLERTOO_PROFILE_JSON={path} is NOT WRITABLE: {e}\n\
              [profile] Profiling data for THIS RUN will be LOST — the \
              conversion will still proceed and complete normally.\n\
              [profile] ################################################"

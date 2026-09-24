@@ -133,6 +133,23 @@ fn profile_json_written_and_parses() {
     // issue named. A plain positivity check is deterministic (no timing
     // threshold to tune, so it can't flake on a slow/loaded CI runner) and
     // would have failed 100% of the time pre-fix.
+    // PRECONDITION for the guard below. The assertions that follow are sharp
+    // ONLY while this fixture/zoom-range plans exactly ONE level: with two or
+    // more levels the buffered engine also runs and contributes non-zero
+    // stage seconds of its own, so `> 0.0` would hold even with the finest
+    // level's timers dropped again (probed: all four assertions pass against
+    // the pre-fix code on a 6-level run). If this trips, re-pick the fixture
+    // or the zoom range to restore a single-level plan — do not relax the
+    // assertions. See the fixture comment above.
+    assert_eq!(
+        levels.len(),
+        1,
+        "the #517 S1 guard below is only sharp on a ONE-level plan (see the \
+         comment above): this run planned {} levels, so re-pick the fixture / \
+         zoom range rather than weakening the assertions: {value}",
+        levels.len()
+    );
+
     let stage = &value["pass2"]["stage_secs"];
     let stage_field = |name: &str| -> f64 {
         stage[name]
@@ -180,6 +197,19 @@ fn profile_json_written_and_parses() {
         "pass2.stage_secs sum ({stage_sum:.6}s) is implausibly small next to \
          phase_walls.pass2 ({pass2_wall:.6}s) — looks like a level's timers \
          are missing from the dump: {value}"
+    );
+
+    // The startup preflight probes writability with a uniquely named SIBLING
+    // file and removes it again; nothing of its own may survive the run.
+    let strays: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.starts_with(".tylertoo-profile-json-probe."))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the TYLERTOO_PROFILE_JSON preflight must leave no probe file behind, \
+         found: {strays:?}"
     );
 }
 
@@ -280,4 +310,54 @@ fn unwritable_profile_json_path_warns_loudly_at_startup() {
              preflight, not a late-run notice: {stderr}"
         );
     }
+}
+
+/// #517 S4 / cross-review: the startup preflight must OBSERVE the dump path,
+/// never create it. The first version opened the target itself with
+/// `create(true).append(true)`, so any run that then failed — or any pipeline
+/// that never reaches `write_profile_json` — left a stray ZERO-BYTE
+/// `profile.jsonl` behind, which reads as "a dump was written and it is
+/// empty" rather than "no dump was written". Probe-and-remove (the shape
+/// `--save-plan` uses, #513) fixes that.
+#[test]
+fn failed_run_leaves_no_zero_byte_profile_json() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile_json = dir.path().join("profile.jsonl");
+    // A writable profile path, but an overview output under a directory that
+    // does not exist: option validation passes (so the preflight runs), the
+    // conversion then fails long before the dump would be appended.
+    let out = dir.path().join("no-such-dir").join("out.parquet");
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "overview",
+            fixture.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "6",
+        ])
+        .env("TYLERTOO_PROFILE_JSON", &profile_json)
+        .output()
+        .expect("run tylertoo overview");
+    assert!(
+        !output.status.success(),
+        "this scenario must FAIL the conversion (unwritable overview output), \
+         otherwise it does not exercise the stray-file path: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !profile_json.exists(),
+        "a preflight must not create the dump file: {profile_json:?} exists \
+         ({} bytes) after a failed run that never wrote a profile line",
+        std::fs::metadata(&profile_json)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    );
 }

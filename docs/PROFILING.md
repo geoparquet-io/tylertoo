@@ -33,9 +33,9 @@ the benchmark docs.
 ## Structured JSON Profile Dump (`TYLERTOO_PROFILE_JSON`)
 
 Set `TYLERTOO_PROFILE_JSON=<path>` and every `overview`/`tiles` conversion
-appends one JSON object (one line, JSONL) to that file — the measurement
-base the perf series (pass-1 parallelization, pass-2 throughput, checkpoint
-work) is gated on:
+run through the **streaming pipeline** (the default) appends one JSON object
+(one line, JSONL) to that file — the measurement base the perf series
+(pass-1 parallelization, pass-2 throughput, checkpoint work) is gated on:
 
 ```bash
 TYLERTOO_PROFILE_JSON=/tmp/profile.jsonl \
@@ -46,7 +46,13 @@ cat /tmp/profile.jsonl | python3 -m json.tool
 It is an env var rather than a CLI flag so this diagnostics-only knob costs
 no CLI-doc churn, and it is best-effort: an unset/blank var is a no-op, and
 a write failure only logs — it never fails the conversion (see
-**Fail-fast preflight** below).
+**Early warning** below).
+
+`--no-streaming` (the in-memory reference path) writes **no dump at all**:
+it has none of the per-stage timers or phase walls the schema below is made
+of. Setting the var with `--no-streaming` logs a warning saying so and
+leaves the file untouched — so a missing line there means "wrong pipeline",
+not "the run was not profiled".
 
 ### Schema
 
@@ -62,12 +68,12 @@ a write failure only logs — it never fails the conversion (see
   "pass1": {
     "rows": 1000,                   // input rows streamed
     "rows_per_sec": 33682.7,
-    "stage_secs": {                 // pass-1 stage breakdown, in seconds
-      "read": 0.00199,
-      "decode": 0.00265,
-      "scan": 0.00022,
-      "keys": 0.00005,
-      "assemble": 0.00006
+    "stage_secs": {                 // pass-1 stage breakdown, in seconds —
+      "read": 0.00199,              // summed core-seconds; may exceed the
+      "decode": 0.00265,            // phase wall (phase_walls.pass1) under
+      "scan": 0.00022,              // parallelism (true once #504's parallel
+      "keys": 0.00005,              // pass-1 scan lands; until then pass 1
+      "assemble": 0.00006           // is serial and they agree)
     }
   },
   "pass2": {
@@ -102,15 +108,30 @@ inconsistency is exactly what shipped as #517 (the finest level's own
 stage timers were dropped) and is now covered by
 `crates/cli/tests/profile_json_dump.rs::profile_json_written_and_parses`.
 
-### Fail-fast preflight
+### Early warning
 
-An unwritable path (typo, missing directory, read-only mount) is validated
-**at conversion start**, not only when the dump is finally appended at the
-very end of the run: a bad path logs an unmistakable `log::warn` (`NOT
-WRITABLE`) immediately, so a multi-hour batch/sweep run doesn't silently
-lose its profiling data while still exiting `0`. This preflight — like the
-dump itself — never fails the conversion; it only makes the failure mode
-loud and early instead of quiet and late (#517).
+An unwritable path (typo, missing directory, read-only mount) is probed
+**at conversion start** — with the other convert path preflights, in
+`validate_options` — not only when the dump is finally appended at the very
+end of the run: a bad path logs an unmistakable `log::warn` (`NOT WRITABLE`)
+immediately, so a multi-hour batch/sweep run doesn't silently lose its
+profiling data while still exiting `0`. It is deliberately **not**
+fail-fast: like the dump itself it never fails the conversion, it only makes
+the failure mode loud and early instead of quiet and late (#517). The probe
+is read-only as far as the target is concerned — an existing file is opened
+for append, a missing one is checked through a uniquely named sibling that
+is removed again — so a preflight never leaves a zero-byte dump behind for
+a run that wrote no line.
+
+### What the dump does not contain
+
+The `[profile]` debug log carries a few numbers the JSON does not. Most
+notably, the **writer-thread busy time** of the finest (streamed) level —
+`total - recv_wait` from `write_level_streaming` — is logged per level but
+has no field in the dump, whose `pass2.stage_secs` covers producer-side
+stages only. Where the log and the dump disagree in shape like this, the log
+is the finer-grained view and the JSON is the stable, parseable one; only
+the JSON is covered by tests.
 
 ## Wall-Time Profiling with cargo-flamegraph
 
