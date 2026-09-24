@@ -522,6 +522,185 @@ fn warn_implicit_layer_overlaps(bands: &[Band]) {
     warn_pairs(&implicit_layer_overlaps(bands));
 }
 
+/// How a band's declared `min_zoom..=max_zoom` relates to the zoom range its
+/// archive actually holds (`header.min_zoom..=header.max_zoom`), for a
+/// pre-tiled band (#495).
+///
+/// This is a three-way contract, not a binary match/mismatch:
+///
+/// * [`Disjoint`](Self::Disjoint) — the two ranges share no zoom at all.
+///   There is no interpretation under which this band could write anything;
+///   always an error.
+/// * [`Overshoot`](Self::Overshoot) — the ranges overlap, but the band
+///   declares at least one zoom the archive does not have. Those zooms
+///   would render silently empty, which is almost always a `--band` range
+///   that disagrees with what the archive was actually tiled with. An error
+///   by default; downgradable to a warning for a deliberately sparse
+///   pyramid.
+/// * [`Subrange`](Self::Subrange) — the band's range is fully contained in
+///   the archive's. Fully supported and unremarkable: it is the documented
+///   way to split one pre-tiled archive across several bands (e.g. two
+///   `--band` entries pointing at the same z0-z13 archive, one declaring
+///   z0-5 and the other z6-13). The per-tile drop count at the merge site
+///   still applies (tiles outside the declared subrange are not copied),
+///   but only at `log::info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeFit {
+    Disjoint,
+    Overshoot,
+    Subrange,
+}
+
+/// Classify `band`'s declared range against an archive's actual
+/// `min_zoom..=max_zoom`. See [`RangeFit`].
+fn band_archive_range_fit(band: &Band, archive_min: u8, archive_max: u8) -> RangeFit {
+    if band.max_zoom < archive_min || band.min_zoom > archive_max {
+        RangeFit::Disjoint
+    } else if band.min_zoom < archive_min || band.max_zoom > archive_max {
+        RangeFit::Overshoot
+    } else {
+        RangeFit::Subrange
+    }
+}
+
+/// `z{lo}` for a single zoom, `z{lo}-{hi}` for a span.
+fn zoom_span(lo: u8, hi: u8) -> String {
+    if lo == hi {
+        format!("z{lo}")
+    } else {
+        format!("z{lo}-{hi}")
+    }
+}
+
+/// The zoom(s) an [`RangeFit::Overshoot`] band declares that its archive does
+/// not hold, for the error/warning message.
+fn missing_zoom_span(band: &Band, archive_min: u8, archive_max: u8) -> String {
+    let mut parts = Vec::new();
+    if band.min_zoom < archive_min {
+        parts.push(zoom_span(band.min_zoom, archive_min - 1));
+    }
+    if band.max_zoom > archive_max {
+        parts.push(zoom_span(archive_max + 1, band.max_zoom));
+    }
+    parts.join(" and ")
+}
+
+/// Validate one band's declared zoom range against what its archive actually
+/// holds (issue #495), right after [`BandArchive::open`] has read the
+/// header. See [`RangeFit`] for the three-way contract this enforces.
+///
+/// `allow_missing_zooms` downgrades the [`RangeFit::Overshoot`] case from an
+/// error to a warning, for a caller building a deliberately sparse pyramid.
+/// It has no effect on [`RangeFit::Disjoint`], which is always an error —
+/// there is no flag that makes an impossible range possible.
+fn check_band_zoom_range(
+    band: &Band,
+    header: &Header,
+    allow_missing_zooms: bool,
+) -> Result<(), Error> {
+    let (a_lo, a_hi) = (header.min_zoom, header.max_zoom);
+    match band_archive_range_fit(band, a_lo, a_hi) {
+        RangeFit::Subrange => Ok(()),
+        RangeFit::Disjoint => Err(Error::PMTilesWrite(format!(
+            "band {:?} ({}) declares {} but that archive holds {}, entirely outside \
+             the band's range; there is no zoom this band could write",
+            band.layer,
+            band.input.display(),
+            zoom_span(band.min_zoom, band.max_zoom),
+            zoom_span(a_lo, a_hi),
+        ))),
+        RangeFit::Overshoot => {
+            let missing = missing_zoom_span(band, a_lo, a_hi);
+            if allow_missing_zooms {
+                log::warn!(
+                    "band {:?} declares {} but {} holds {}; zooms {missing} will be \
+                     silently empty (allowed by --allow-missing-zooms)",
+                    band.layer,
+                    zoom_span(band.min_zoom, band.max_zoom),
+                    band.input.display(),
+                    zoom_span(a_lo, a_hi),
+                );
+                Ok(())
+            } else {
+                Err(Error::PMTilesWrite(format!(
+                    "band {:?} declares {} but {} holds {}; zooms {missing} would be \
+                     silently empty; pass --allow-missing-zooms (or set \
+                     PyramidOptions::allow_missing_zooms) for a deliberately sparse pyramid",
+                    band.layer,
+                    zoom_span(band.min_zoom, band.max_zoom),
+                    band.input.display(),
+                    zoom_span(a_lo, a_hi),
+                )))
+            }
+        }
+    }
+}
+
+/// Fold one band archive's bounds into the running union, or record it in
+/// `bands_without_bounds` (and warn) when the archive carried none (#495).
+fn track_band_bounds(
+    band: &Band,
+    archive: &BandArchive,
+    union: &mut Option<TileBounds>,
+    bands_without_bounds: &mut Vec<String>,
+) {
+    match archive.bounds {
+        Some(b) => match union.as_mut() {
+            Some(u) => u.expand(&b),
+            None => *union = Some(b),
+        },
+        None => {
+            let label = format!("{} ({})", band.layer, band.input.display());
+            log::warn!(
+                "band {label}: no usable bounds; excluded from the merged \
+                 archive's bounds union"
+            );
+            bands_without_bounds.push(label);
+        }
+    }
+}
+
+/// Log a subrange band's skipped-tile count, at info (#495): by the time
+/// this runs, [`check_band_zoom_range`] has already ruled out every case
+/// except a genuine subrange, so this is the documented "split one archive
+/// across several bands" workflow, never an anomaly.
+fn log_subrange_skip(band: &Band, skipped: usize) {
+    if skipped == 0 {
+        return;
+    }
+    log::info!(
+        "band {:?} ({}): dropped {skipped} tile(s) outside its declared subrange \
+         z{}-{}; the archive holds a wider range and this band uses only part of it",
+        band.layer,
+        band.input.display(),
+        band.min_zoom,
+        band.max_zoom
+    );
+}
+
+/// When bands share a zoom, an archive's own MVT layer must match its
+/// `--band` label, or the merge would write two layers of one name into a
+/// tile (#385, MVT §4.1). The `:LAYER` of a pre-tiled band is a label; the
+/// layer name inside its tiles is whatever the archive was exported with.
+/// An archive whose metadata declares no layers cannot be checked -- that
+/// case has already been warned about.
+fn check_shared_zoom_layer_labels(bands: &[Band], archives: &[BandArchive]) -> Result<(), Error> {
+    for (band, archive) in bands.iter().zip(archives) {
+        if !archive.layer_ids.is_empty() && archive.layer_ids != [band.layer.as_str()] {
+            return Err(Error::PMTilesWrite(format!(
+                "band `{}` ({}) carries layer(s) {:?} but is labelled `{}`; when bands \
+                 share zooms the archive's layer must match its label so tiles do not \
+                 carry two layers of one name",
+                band.layer,
+                band.input.display(),
+                archive.layer_ids,
+                band.layer
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One layer's entry in the merged archive's `vector_layers`.
 #[derive(Debug, Clone)]
 struct LayerMeta {
@@ -904,9 +1083,18 @@ pub struct PyramidReport {
     pub total_tiles: usize,
     pub per_band_tiles: Vec<(String, u8, u8, usize)>,
     /// Tiles found in a band archive at a zoom outside that band's declared
-    /// range, and therefore dropped. Non-zero means the zoom range the archive
-    /// was tiled with disagrees with the range `--band` declares.
+    /// range, and therefore dropped. Non-zero means the band declares a
+    /// subrange of what its archive actually holds (#495) — the documented
+    /// way to split one pre-tiled archive across several bands.
     pub skipped: usize,
+    /// A label (`"layer (path)"`) for every band whose archive header carried
+    /// no usable bounds, and so was excluded from the merged archive's bounds
+    /// union (#495). Empty when every band contributed real bounds. When this
+    /// is non-empty but not every band's label appears, the missing ones did
+    /// contribute; when it names every band, the merged archive's bounds are
+    /// left unset entirely (see the "no band archive carried usable bounds"
+    /// warning).
+    pub bands_without_bounds: Vec<String>,
 }
 
 /// How the one-shot pyramid tiles each GeoParquet band.
@@ -928,6 +1116,15 @@ pub struct PyramidOptions {
     /// one PMTiles archive per source band, all removed on the way out).
     /// `None` uses the system temp directory.
     pub work_dir: Option<PathBuf>,
+    /// Allow a pre-tiled band's declared zoom range to overshoot what its
+    /// archive actually holds (#495). Off by default: an overshooting band
+    /// declares zooms the archive does not have, and those zooms would
+    /// render silently empty — almost always a `--band` range that
+    /// disagrees with what the archive was tiled with, so it is a hard
+    /// error unless this is set. Has no effect on a *disjoint* range (the
+    /// band and archive share no zoom at all), which is always an error —
+    /// see [`crate::pyramid::merge_bands_with_options`].
+    pub allow_missing_zooms: bool,
 }
 
 impl Default for PyramidOptions {
@@ -942,6 +1139,7 @@ impl Default for PyramidOptions {
                 ..ExportOptions::default()
             },
             work_dir: None,
+            allow_missing_zooms: false,
         }
     }
 }
@@ -1076,7 +1274,7 @@ pub fn build_pyramid(
         scratch.push(archive);
     }
 
-    merge_bands(&tiled, output)
+    merge_bands_with_options(&tiled, output, opts.allow_missing_zooms)
 }
 
 /// Merge per-band archives into one, in band order.
@@ -1089,6 +1287,19 @@ pub fn build_pyramid(
 /// mean parsing every MVT, which is exactly the cost this merge exists to
 /// avoid.
 pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error> {
+    merge_bands_with_options(bands, output, false)
+}
+
+/// Like [`merge_bands`], but lets a caller allow a pre-tiled band's declared
+/// zoom range to overshoot what its archive actually holds (#495) instead of
+/// failing. Off (`false`) matches [`merge_bands`]'s behavior exactly. A
+/// *disjoint* range (the band and its archive share no zoom at all) is
+/// always an error; `allow_missing_zooms` has no effect on that case.
+pub fn merge_bands_with_options(
+    bands: &[Band],
+    output: &Path,
+    allow_missing_zooms: bool,
+) -> Result<PyramidReport, Error> {
     // A library caller can hand over same-layer bands that overlap in zoom
     // but cover disjoint geography, which the per-tile collision check below
     // would never catch.
@@ -1123,6 +1334,7 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     let mut per_band = Vec::new();
     let mut skipped_total = 0usize;
     let mut union: Option<TileBounds> = None;
+    let mut bands_without_bounds: Vec<String> = Vec::new();
 
     if bands_share_zooms(bands) {
         // #385: bands in different layers share zooms, so one tile id can
@@ -1138,26 +1350,14 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
             .iter()
             .map(|b| BandArchive::open(&b.input, &b.layer))
             .collect::<Result<_, _>>()?;
-        // The `:LAYER` of a pre-tiled band is a label; the layer name inside
-        // its tiles is whatever the archive was exported with. validate_bands
-        // only sees the labels, so two archives both carrying `fields`,
-        // labelled `2024` and `2025`, would pass and the concatenated tile
-        // would hold two layers of one name — an MVT §4.1 violation a client
-        // resolves by dropping one. An archive whose metadata declares no
-        // layers cannot be checked; that case has already been warned about.
+        // #495: catch a band whose declared range the archive cannot honor
+        // before any tile is touched.
         for (band, archive) in bands.iter().zip(&archives) {
-            if !archive.layer_ids.is_empty() && archive.layer_ids != [band.layer.as_str()] {
-                return Err(Error::PMTilesWrite(format!(
-                    "band `{}` ({}) carries layer(s) {:?} but is labelled `{}`; when bands \
-                     share zooms the archive's layer must match its label so tiles do not \
-                     carry two layers of one name",
-                    band.layer,
-                    band.input.display(),
-                    archive.layer_ids,
-                    band.layer
-                )));
-            }
+            check_band_zoom_range(band, &archive.header, allow_missing_zooms)?;
         }
+        // validate_bands only sees the labels, not what is actually inside
+        // each archive's tiles; this is the check that catches the mismatch.
+        check_shared_zoom_layer_labels(bands, &archives)?;
         type Ref = (usize, std::ops::Range<usize>);
         // One tile id's `(z, x, y)` and every band range that wrote it.
         type Slot = ((u8, u32, u32), Vec<Ref>);
@@ -1169,12 +1369,7 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
         let mut index: BTreeMap<u64, Slot> = BTreeMap::new();
         let mut counts = vec![0usize; bands.len()];
         for (bi, (band, archive)) in bands.iter().zip(&archives).enumerate() {
-            if let Some(b) = archive.bounds {
-                match union.as_mut() {
-                    Some(u) => u.expand(&b),
-                    None => union = Some(b),
-                }
-            }
+            track_band_bounds(band, archive, &mut union, &mut bands_without_bounds);
             let mut skipped = 0usize;
             archive.for_each_tile_range(|id, z, x, y, range| {
                 if z < band.min_zoom || z > band.max_zoom {
@@ -1194,17 +1389,8 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
                 counts[bi] += 1;
                 Ok(())
             })?;
-            if skipped > 0 {
-                log::warn!(
-                    "band {:?} ({}): dropped {skipped} tile(s) outside its declared zoom range \
-                     z{}-{}; the archive was tiled with a different range than --band declares",
-                    band.layer,
-                    band.input.display(),
-                    band.min_zoom,
-                    band.max_zoom
-                );
-                skipped_total += skipped;
-            }
+            log_subrange_skip(band, skipped);
+            skipped_total += skipped;
             layers.push(LayerMeta {
                 id: band.layer.clone(),
                 minzoom: band.min_zoom,
@@ -1257,8 +1443,11 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
             union,
             layers,
             per_band,
-            skipped_total,
-            index.len(),
+            MergeTally {
+                skipped_total,
+                bands_without_bounds,
+                total_tiles: index.len(),
+            },
             output,
         );
     }
@@ -1288,12 +1477,10 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
 
     for band in ordered {
         let archive = BandArchive::open(&band.input, &band.layer)?;
-        if let Some(b) = archive.bounds {
-            match union.as_mut() {
-                Some(u) => u.expand(&b),
-                None => union = Some(b),
-            }
-        }
+        // #495: catch a band whose declared range the archive cannot honor
+        // before any tile is touched.
+        check_band_zoom_range(band, &archive.header, allow_missing_zooms)?;
+        track_band_bounds(band, &archive, &mut union, &mut bands_without_bounds);
         let mut n = 0usize;
         let mut skipped = 0usize;
         archive.for_each_tile(|z, x, y, data| {
@@ -1319,17 +1506,8 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
             n += 1;
             Ok(())
         })?;
-        if skipped > 0 {
-            log::warn!(
-                "band {:?} ({}): dropped {skipped} tile(s) outside its declared zoom range \
-                 z{}-{}; the archive was tiled with a different range than --band declares",
-                band.layer,
-                band.input.display(),
-                band.min_zoom,
-                band.max_zoom
-            );
-            skipped_total += skipped;
-        }
+        log_subrange_skip(band, skipped);
+        skipped_total += skipped;
         per_band.push((band.layer.clone(), band.min_zoom, band.max_zoom, n));
         layers.push(LayerMeta {
             id: band.layer.clone(),
@@ -1345,8 +1523,11 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
         union,
         layers,
         per_band,
-        skipped_total,
-        total_tiles,
+        MergeTally {
+            skipped_total,
+            bands_without_bounds,
+            total_tiles,
+        },
         output,
     )
 }
@@ -1410,14 +1591,22 @@ fn field_type_str(v: &Value) -> String {
         .unwrap_or_else(|| v.to_string())
 }
 
+/// Bookkeeping neither branch of [`merge_bands_with_options`] can finish
+/// alone, threaded into [`finish_merge`] as one value to keep its argument
+/// count down.
+struct MergeTally {
+    skipped_total: usize,
+    bands_without_bounds: Vec<String>,
+    total_tiles: usize,
+}
+
 /// The tail shared by both merge paths: bounds, `vector_layers`, finalize.
 fn finish_merge(
     mut writer: StreamingPmtilesWriter,
     union: Option<TileBounds>,
     layers: Vec<LayerMeta>,
     per_band: Vec<(String, u8, u8, usize)>,
-    skipped_total: usize,
-    total_tiles: usize,
+    tally: MergeTally,
     output: &Path,
 ) -> Result<PyramidReport, Error> {
     match union {
@@ -1464,9 +1653,10 @@ fn finish_merge(
         .map_err(|e| Error::PMTilesWrite(format!("Failed to write {}: {e}", output.display())))?;
 
     Ok(PyramidReport {
-        total_tiles,
+        total_tiles: tally.total_tiles,
         per_band_tiles: per_band,
-        skipped: skipped_total,
+        skipped: tally.skipped_total,
+        bands_without_bounds: tally.bands_without_bounds,
     })
 }
 
@@ -1860,7 +2050,18 @@ mod tests {
         tile
     }
 
-    fn write_band_with_payload(path: &Path, layer: &str, tiles: &[(u8, u32, u32)], payload: &[u8]) {
+    /// `declared_min_zoom` mimics what a real per-band export does under
+    /// #380 -- a band's coarse zooms may hold no tiles at all, yet the
+    /// archive still *declares* the band's full range in its header. Pass
+    /// `None` when the test has no such gap and the header should simply
+    /// reflect the tiles actually written.
+    fn write_band_with_payload(
+        path: &Path,
+        layer: &str,
+        tiles: &[(u8, u32, u32)],
+        payload: &[u8],
+        declared_min_zoom: Option<u8>,
+    ) {
         let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         w.set_layer_name(layer);
         w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
@@ -1868,6 +2069,9 @@ mod tests {
             format!("{layer}_f"),
             "Number".to_string(),
         )]));
+        if let Some(z) = declared_min_zoom {
+            w.set_declared_min_zoom(z);
+        }
         for (z, x, y) in tiles {
             w.add_tile(*z, *x, *y, payload).unwrap();
         }
@@ -1907,8 +2111,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.pmtiles");
         let b = dir.path().join("b.pmtiles");
-        write_band_with_payload(&a, "2024", &[(3, 1, 1)], &layer_tile("2024"));
-        write_band_with_payload(&b, "2025", &[(3, 2, 2)], &layer_tile("2025"));
+        // Both archives declare a min zoom below their coarsest actual tile
+        // (#380), exactly as a real per-band export would: band `a` covers
+        // z0-3, band `b` (below) covers z1-3, so their archives declare
+        // z0 and z1 respectively even though both hold tiles only at z3.
+        write_band_with_payload(&a, "2024", &[(3, 1, 1)], &layer_tile("2024"), Some(0));
+        write_band_with_payload(&b, "2025", &[(3, 2, 2)], &layer_tile("2025"), Some(1));
 
         // Single band, single-pass path.
         let out = dir.path().join("one.pmtiles");
@@ -1942,14 +2150,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.pmtiles");
         let b = dir.path().join("b.pmtiles");
-        write_band_with_payload(&a, "2024", &[(3, 1, 1), (3, 2, 2)], &layer_tile("2024"));
-        write_band_with_payload(&b, "2025", &[(3, 1, 1), (3, 3, 3)], &layer_tile("2025"));
+        write_band_with_payload(
+            &a,
+            "2024",
+            &[(3, 1, 1), (3, 2, 2)],
+            &layer_tile("2024"),
+            None,
+        );
+        write_band_with_payload(
+            &b,
+            "2025",
+            &[(3, 1, 1), (3, 3, 3)],
+            &layer_tile("2025"),
+            None,
+        );
 
+        // Both archives hold tiles only at z3, so both bands declare exactly
+        // that -- the zoom range is not this test's concern.
         let out = dir.path().join("merged.pmtiles");
         let report = merge_bands(
             &[
-                Band::parse(&format!("0-3:{}:2024", a.display())).unwrap(),
-                Band::parse(&format!("0-3:{}:2025", b.display())).unwrap(),
+                Band::parse(&format!("3-3:{}:2024", a.display())).unwrap(),
+                Band::parse(&format!("3-3:{}:2025", b.display())).unwrap(),
             ],
             &out,
         )
@@ -2052,14 +2274,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.pmtiles");
         let b = dir.path().join("b.pmtiles");
-        write_band_with_payload(&a, "fields", &[(3, 1, 1)], &layer_tile("fields"));
-        write_band_with_payload(&b, "fields", &[(3, 1, 1)], &layer_tile("fields"));
+        write_band_with_payload(&a, "fields", &[(3, 1, 1)], &layer_tile("fields"), None);
+        write_band_with_payload(&b, "fields", &[(3, 1, 1)], &layer_tile("fields"), None);
 
+        // Both archives hold tiles only at z3; the bands declare exactly
+        // that so the zoom-range contract (#495) never fires here -- this
+        // test is about the layer-label mismatch, not the zoom range.
         let out = dir.path().join("merged.pmtiles");
         let err = merge_bands(
             &[
-                Band::parse(&format!("0-3:{}:2024", a.display())).unwrap(),
-                Band::parse(&format!("0-3:{}:2025", b.display())).unwrap(),
+                Band::parse(&format!("3-3:{}:2024", a.display())).unwrap(),
+                Band::parse(&format!("3-3:{}:2025", b.display())).unwrap(),
             ],
             &out,
         )
@@ -2249,11 +2474,13 @@ mod tests {
             &[],
         );
 
+        // Each band declares exactly the one zoom its archive holds -- this
+        // test is about bounds, not the zoom-range contract (#495).
         let out = dir.path().join("merged.pmtiles");
         merge_bands(
             &[
-                Band::parse(&format!("0-5:{}:agg", a.display())).unwrap(),
-                Band::parse(&format!("6-9:{}:pts", b.display())).unwrap(),
+                Band::parse(&format!("2-2:{}:agg", a.display())).unwrap(),
+                Band::parse(&format!("6-6:{}:pts", b.display())).unwrap(),
             ],
             &out,
         )
@@ -2395,6 +2622,176 @@ mod tests {
         .unwrap();
         assert_eq!(report.total_tiles, 1);
         assert_eq!(report.skipped, 2);
+    }
+
+    // ---- band zoom-range contract (#495) -----------------------------------
+
+    /// A band whose declared range shares no zoom at all with what its
+    /// archive holds is always an error -- there is no interpretation, and
+    /// no flag, under which it could write anything.
+    #[test]
+    fn band_zoom_range_disjoint_from_archive_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("archive.pmtiles");
+        write_band(
+            &src,
+            "agg",
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[Band::parse(&format!("8-10:{}:agg", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("z8-10") && msg.contains("z3-5"), "{msg}");
+        assert!(!out.exists(), "nothing should be written on a bad plan");
+    }
+
+    /// A band that declares zooms its archive does not have -- but still
+    /// overlaps it -- is an error by default: those zooms would render
+    /// silently empty, which is almost always a `--band` range that
+    /// disagrees with what the archive was actually tiled with.
+    #[test]
+    fn band_zoom_range_overshooting_archive_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("archive.pmtiles");
+        write_band(
+            &src,
+            "agg",
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        // Declares z2-5; the archive only holds z3-5, so z2 is missing.
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[Band::parse(&format!("2-5:{}:agg", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("z2-5") && msg.contains("z3-5") && msg.contains("silently empty"),
+            "{msg}"
+        );
+        assert!(!out.exists(), "nothing should be written on a bad plan");
+    }
+
+    /// The same overshoot as above, but with `allow_missing_zooms` set: the
+    /// build proceeds, the missing zoom is only a warning, and the archive is
+    /// written with whatever tiles the (narrower) source actually has.
+    #[test]
+    fn band_overshoot_allowed_with_flag_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("archive.pmtiles");
+        write_band(
+            &src,
+            "agg",
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands_with_options(
+            &[Band::parse(&format!("2-5:{}:agg", src.display())).unwrap()],
+            &out,
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 3, "every tile the archive actually has");
+        assert!(out.exists());
+    }
+
+    /// A band declaring a strict subrange of what its archive holds is fully
+    /// supported and unremarkable -- the documented way to split one
+    /// pre-tiled archive across several bands. No error, and the merge
+    /// proceeds normally; tiles outside the declared subrange are still
+    /// dropped and counted in `skipped`, just without the old "different
+    /// range" framing.
+    #[test]
+    fn band_subrange_of_archive_is_accepted_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("archive.pmtiles");
+        write_band(
+            &src,
+            "agg",
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        // z3-4 is a strict subrange of the archive's z3-5.
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands(
+            &[Band::parse(&format!("3-4:{}:agg", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(
+            report.total_tiles, 2,
+            "z5 tile outside the declared subrange"
+        );
+        assert_eq!(report.skipped, 1);
+    }
+
+    /// A band archive with no usable bounds used to vanish from the merged
+    /// union without a trace -- only a global warning fired, and only when
+    /// EVERY band lacked bounds. Now the report names which band(s) were
+    /// dropped, and the union still reflects every band that did carry
+    /// bounds.
+    #[test]
+    fn band_without_usable_bounds_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        write_band(
+            &a,
+            "agg",
+            &[(2, 1, 1)],
+            TileBounds::new(-10.0, -5.0, 0.0, 5.0),
+            &[],
+        );
+        // No set_bounds call: the writer's default TileBounds::empty()
+        // serializes to a header that reads back min > max -- unusable.
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name("pts");
+        w.add_tile(6, 30, 30, &[0x1a, 0x02, 0x08, 0x01]).unwrap();
+        w.finalize(&b).unwrap();
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands(
+            &[
+                Band::parse(&format!("2-2:{}:agg", a.display())).unwrap(),
+                Band::parse(&format!("6-6:{}:pts", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.bands_without_bounds.len(),
+            1,
+            "{:?}",
+            report.bands_without_bounds
+        );
+        assert!(
+            report.bands_without_bounds[0].contains("pts"),
+            "{:?}",
+            report.bands_without_bounds
+        );
+
+        // The union still reflects the one band that did carry bounds.
+        let bytes = std::fs::read(&out).unwrap();
+        let h = Header::from_bytes(&bytes).unwrap();
+        assert!((h.min_lon + 10.0).abs() < 1e-6, "min_lon {}", h.min_lon);
+        assert!((h.max_lon - 0.0).abs() < 1e-6, "max_lon {}", h.max_lon);
     }
 
     /// A corrupt json_metadata_length used to index the file slice unchecked
