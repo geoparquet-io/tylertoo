@@ -29,10 +29,17 @@ each output level's rows before writing them. The `speed` profile keeps that
 buffer in RAM, `bounded` spills it to temporary Arrow IPC files, and `auto`
 estimates the buffer from feature and level counts and spills when it would
 exceed a fraction of available RAM. That figure is container-aware: cgroup v2
-and v1 memory limits are respected, so a job inside a Slurm, Docker or
-Kubernetes memory cgroup sizes against the cgroup, not the whole node. The
-output is byte-identical across all three, so the choice is purely about the
-memory ceiling.
+(`memory.max` and `memory.high`) and v1 memory limits are respected, less the
+non-reclaimable memory the cgroup is already holding, so a job inside a Slurm,
+Docker or Kubernetes memory cgroup sizes against the cgroup, not the whole
+node. The output is byte-identical across all three, so the choice is purely
+about the memory ceiling.
+
+One caveat for cgroup users: the bounded path spills to the process temp
+directory, and on many Slurm and Kubernetes nodes `/tmp` is a tmpfs — RAM
+charged to the same cgroup, so spilling there buys nothing and can itself
+trigger the kill. Point `TMPDIR` (or `--spill-dir`) at real disk on those
+machines.
 
 **Remote input stages to a local spill file.** A remote convert fetches each
 column chunk it touches into a temporary file, growing to roughly one times the
@@ -72,10 +79,14 @@ per the profile decision above. `auto` is the default and the safe choice for
 large duplicating runs, which it steers toward `bounded` rather than risking an
 out-of-memory kill.
 
-**`TYLERTOO_AUTO_MEM_LIMIT_BYTES`.** Overrides the available-RAM figure that
-`auto` reads when it cannot probe the machine, or when you want to reserve
-headroom for other work on the box. It takes precedence over everything,
-including the cgroup limit.
+**`TYLERTOO_AUTO_MEM_LIMIT_BYTES`.** Sets the available-RAM figure `auto` sizes
+against, in bytes. It takes precedence over every other term of the probe: when
+it is set, neither the machine's `MemAvailable` nor the cgroup limit is
+consulted. Use it to supply a figure where the probe finds none, or to reserve
+headroom for other work on the box. The warning is the flip side of that
+precedence: a cluster that exported this variable as a workaround for the
+old, node-sized probe is now *disabling* the cgroup awareness that would
+otherwise size the run correctly. Unset it and let the probe read the cgroup.
 
 ### Overlapping read and compute
 

@@ -1417,12 +1417,18 @@ compute stage and the write stage**:
   its historical 2M-buffered-row spill floor. The decision (measured average,
   estimate, budget) is logged; `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the
   detected available RAM. The probe is **container-aware** (#481): cgroup v2
-  (`memory.max`, minimum along the cgroup path) and cgroup v1
-  (`memory.limit_in_bytes`) limits are respected, and the budget is
-  `min(cgroup limit, machine available)` — so a Slurm / Docker / k8s job sized
-  against a 160 GiB cgroup on a 2 TB node no longer picks `speed` and OOMs.
+  (`memory.max` and `memory.high`, minimum along the cgroup path) and cgroup v1
+  (`memory.limit_in_bytes`) limits are respected, the binding cgroup's
+  non-reclaimable current usage is subtracted so the figure is *headroom*
+  rather than a ceiling the run may already be sitting near, and the budget is
+  `min(cgroup headroom, machine available)` — so a Slurm / Docker / k8s job
+  inside a 160 GiB cgroup on a 2 TB node no longer sizes against the node.
   When the cgroup limit is the binding constraint, one info line says so
   (`memory budget from cgroup limit: N GiB (machine has M GiB)`).
+  Note that `bounded` (and an `auto` that picks it) spills to the process temp
+  directory, which on many Slurm and Kubernetes nodes is a tmpfs `/tmp` — RAM
+  charged to the very same cgroup, so the spill does not relieve the limit.
+  Point `TMPDIR` (or `--spill-dir`) at real disk there.
 
 The profile also governs the **pass-1 level-assignment grids** (#306). Level
 assignment builds one cell-winner grid per coarse level, concurrently across

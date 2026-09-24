@@ -213,15 +213,32 @@ pub(super) fn pass1_grid_budget_bytes(profile: MemoryProfile) -> u64 {
 /// Order of precedence:
 /// 1. `TYLERTOO_AUTO_MEM_LIMIT_BYTES` env override (ops / testing knob — treat
 ///    the box as having this many bytes of available RAM);
-/// 2. `min(cgroup memory limit, /proc/meminfo MemAvailable)` — the cgroup
+/// 2. `min(cgroup memory headroom, /proc/meminfo MemAvailable)` — the cgroup
 ///    term is what makes the probe container-aware (#481): under Slurm, Docker
 ///    or k8s the machine figure can overstate the real budget by an order of
 ///    magnitude (a 160 GiB cgroup on a 2 TB node), which had `auto` pick
-///    `speed` and OOM;
+///    `speed` and OOM. "Headroom", not the bare limit: the decision happens
+///    after pass 1 has already charged tens of GiB to the cgroup, so the
+///    non-reclaimable part of the cgroup's current usage is subtracted — the
+///    same sense as the machine term's `MemAvailable` (#485);
 /// 3. `None` (callers fall back to a fixed conservative budget — see
 ///    [`AUTO_FALLBACK_BUDGET_BYTES`] and
 ///    [`super::export::PARTITION_WAVE_FALLBACK_MAX`]).
+///
+/// The result is computed once per process and cached: the probe is called ~5×
+/// per run (convert's pass-1 grid budget and pass-2 backing decision, export's
+/// wave preflight and its log line), every input is process-global, and a
+/// cached figure also keeps the paired "decide" and "log/assert" calls from
+/// disagreeing when `MemAvailable` drifts between them.
 pub(super) fn available_memory_bytes() -> Option<u64> {
+    static CACHED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(probe_available_memory_bytes)
+}
+
+/// The uncached probe behind [`available_memory_bytes`]. Split out so the unit
+/// tests — which drive the readers against fixture trees — never depend on
+/// (or poison) the process-wide cache.
+fn probe_available_memory_bytes() -> Option<u64> {
     if let Ok(v) = std::env::var("TYLERTOO_AUTO_MEM_LIMIT_BYTES") {
         if let Ok(n) = v.trim().parse::<u64>() {
             return Some(n);
@@ -284,28 +301,110 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
     }
 }
 
-/// Container-aware memory limit under `root` (`/` in production; a tempdir in
-/// tests). cgroup v2 first, then the v1 memory controller.
+/// Container-aware memory headroom under `root` (`/` in production; a tempdir
+/// in tests). cgroup v2 first, then the v1 memory controller.
 fn read_cgroup_memory_limit(root: &std::path::Path) -> Option<u64> {
     read_cgroup_v2_limit(root).or_else(|| read_cgroup_v1_limit(root))
 }
 
-/// cgroup v2: `/sys/fs/cgroup<path>/memory.max`, where `<path>` comes from the
-/// `0::<path>` line of `/proc/self/cgroup`.
+/// cgroup v2: `/sys/fs/cgroup<path>/memory.{max,high}`, where `<path>` comes
+/// from the `0::<path>` line of `/proc/self/cgroup`.
+///
+/// Both files bound the budget: `memory.max` is the hard limit (OOM kill),
+/// `memory.high` the throttle ceiling systemd's `MemoryHigh=` and some Slurm
+/// setups use — often with `memory.max` left at `max`, which made a
+/// `memory.max`-only probe a no-op there (#485). The level's limit is the
+/// smaller of the two.
 fn read_cgroup_v2_limit(root: &std::path::Path) -> Option<u64> {
     let rel = proc_self_cgroup_path(root, CgroupSelector::V2).unwrap_or_default();
-    min_limit_along_path(&root.join("sys/fs/cgroup"), &rel, "memory.max")
+    let binding = min_limit_along_path(
+        &root.join("sys/fs/cgroup"),
+        &rel,
+        &["memory.max", "memory.high"],
+    )?;
+    Some(subtract_unreclaimable_usage(
+        binding.bytes,
+        &binding.dir,
+        "memory.current",
+        &["inactive_file", "slab_reclaimable"],
+    ))
 }
 
 /// cgroup v1: `/sys/fs/cgroup/memory<path>/memory.limit_in_bytes`, where
 /// `<path>` comes from the `memory`-controller line of `/proc/self/cgroup`.
+///
+/// Approximation: the v1 memory controller is assumed to be mounted at
+/// `/sys/fs/cgroup/memory`. Distros that co-mount controllers expose it at a
+/// combined directory instead (`/sys/fs/cgroup/memory,hugetlb`), usually with a
+/// `memory` symlink beside it — where the symlink is absent, the probe simply
+/// finds nothing and abstains (the machine figure is then the only term), which
+/// is the same fail-soft behavior as a missing file. Parsing `/proc/mounts` to
+/// find the real mount point would remove the approximation; v1 is legacy
+/// enough that it has not been worth the extra failure surface.
 fn read_cgroup_v1_limit(root: &std::path::Path) -> Option<u64> {
     let rel = proc_self_cgroup_path(root, CgroupSelector::V1Memory).unwrap_or_default();
-    min_limit_along_path(
+    let binding = min_limit_along_path(
         &root.join("sys/fs/cgroup/memory"),
         &rel,
-        "memory.limit_in_bytes",
-    )
+        &["memory.limit_in_bytes"],
+    )?;
+    Some(subtract_unreclaimable_usage(
+        binding.bytes,
+        &binding.dir,
+        "memory.usage_in_bytes",
+        &["total_inactive_file"],
+    ))
+}
+
+/// Turn a cgroup *limit* into the *headroom* left under it (#485).
+///
+/// The machine term of the probe is `MemAvailable` — what is still obtainable —
+/// while a cgroup limit is a ceiling that the process may already be sitting
+/// near: the `auto` decisions run after pass 1 has charged tens of GiB to the
+/// cgroup, so the bare limit is systematically optimistic. Subtract the part of
+/// current usage that cannot be reclaimed under pressure: current usage minus
+/// the reclaimable page cache / slab reported by `memory.stat`.
+///
+/// Fail-soft: if either the usage file or `memory.stat` cannot be read, no
+/// adjustment is made and the bare limit is returned — a probe must never turn
+/// a missing file into a wrong (tiny) budget.
+fn subtract_unreclaimable_usage(
+    limit: u64,
+    dir: &std::path::Path,
+    usage_file: &str,
+    reclaimable_keys: &[&str],
+) -> u64 {
+    let Some(usage) = read_u64_file(&dir.join(usage_file)) else {
+        return limit;
+    };
+    let Some(reclaimable) = sum_stat_keys(&dir.join("memory.stat"), reclaimable_keys) else {
+        return limit;
+    };
+    limit.saturating_sub(usage.saturating_sub(reclaimable))
+}
+
+/// A whole-file `u64` (`memory.current`, `memory.usage_in_bytes`). `None` when
+/// the file is missing or does not hold a plain number.
+fn read_u64_file(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Sum the named keys of a `key value`-per-line `memory.stat`. `None` only when
+/// the file cannot be read; keys that are absent or unparseable contribute 0,
+/// which biases the result toward a smaller (safer) headroom figure.
+fn sum_stat_keys(path: &std::path::Path, keys: &[&str]) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut total: u64 = 0;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if keys.contains(&key) {
+            total = total.saturating_add(value.parse().unwrap_or(0));
+        }
+    }
+    Some(total)
 }
 
 /// Which `/proc/self/cgroup` line to pick.
@@ -335,36 +434,71 @@ fn proc_self_cgroup_path(root: &std::path::Path, want: CgroupSelector) -> Option
     })
 }
 
-/// The smallest limit written in `file` at `base` or any directory along `rel`.
+/// The binding cgroup limit: its value and the directory that supplied it (the
+/// usage/stat files of that same level are what the headroom adjustment reads).
+struct BindingCgroupLimit {
+    dir: std::path::PathBuf,
+    bytes: u64,
+}
+
+/// The smallest limit written in any of `files` at `base` or any directory
+/// along `rel`, with the directory it came from.
 ///
 /// cgroup v2 enforces the **minimum** limit over the whole chain — an
 /// ancestor's tighter `memory.max` binds a child that set none — so the
 /// effective limit is the min over the path, not the leaf's value. `None` when
-/// every level is unlimited, absent or unparseable.
-fn min_limit_along_path(base: &std::path::Path, rel: &str, file: &str) -> Option<u64> {
+/// every level is unlimited, absent or unparseable, and also when `rel`
+/// contains a `..` component: a path that would escape the mount root means the
+/// probe cannot trust what it is reading, so it abstains rather than reporting
+/// some other cgroup's limit.
+fn min_limit_along_path(
+    base: &std::path::Path,
+    rel: &str,
+    files: &[&str],
+) -> Option<BindingCgroupLimit> {
     let mut dir = base.to_path_buf();
-    let mut best = parse_cgroup_limit(&dir.join(file));
+    let mut best = level_limit(&dir, files);
     for component in rel.split('/') {
-        // Skip empty/./.. so a malformed path can never escape the mount root.
-        if component.is_empty() || component == "." || component == ".." {
+        if component.is_empty() || component == "." {
             continue;
         }
+        if component == ".." {
+            return None;
+        }
         dir.push(component);
-        best = match (best, parse_cgroup_limit(&dir.join(file))) {
-            (Some(a), Some(b)) => Some(a.min(b)),
+        best = match (best, level_limit(&dir, files)) {
+            (Some(a), Some(b)) => Some(if b.bytes < a.bytes { b } else { a }),
             (only, None) | (None, only) => only,
         };
     }
     best
 }
 
+/// The limit one cgroup directory imposes: the smallest of `files` that holds a
+/// real value (v2 has two — the hard `memory.max` and the throttle
+/// `memory.high`), or `None` when the level sets none.
+fn level_limit(dir: &std::path::Path, files: &[&str]) -> Option<BindingCgroupLimit> {
+    files
+        .iter()
+        .filter_map(|file| parse_cgroup_limit(&dir.join(file)))
+        .min()
+        .map(|bytes| BindingCgroupLimit {
+            dir: dir.to_path_buf(),
+            bytes,
+        })
+}
+
 /// One cgroup limit file: a byte count, or `None` for `max`, the v1 "unlimited"
 /// sentinel, a missing file, or anything unparseable (never panics — a probe
 /// must not be able to fail a conversion).
+///
+/// `0` is a real limit, not "unset": a cgroup with `memory.high` (or
+/// `memory.max`) at 0 is throttled to nothing, and reporting it as such forces
+/// the bounded path — the fail-safe direction.
 fn parse_cgroup_limit(path: &std::path::Path) -> Option<u64> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: u64 = text.trim().parse().ok()?;
-    (value > 0 && value < CGROUP_UNLIMITED_SENTINEL).then_some(value)
+    (value < CGROUP_UNLIMITED_SENTINEL).then_some(value)
 }
 
 #[cfg(target_os = "linux")]
@@ -1031,6 +1165,222 @@ mod cgroup_tests {
     fn absent_files_are_none() {
         let dir = TempDir::new().unwrap();
         assert_eq!(read_cgroup_memory_limit(dir.path()), None);
+    }
+
+    // --- memory.high (#485, S2-2) ---------------------------------------
+
+    #[test]
+    fn v2_memory_high_binds_when_max_is_unlimited() {
+        // systemd MemoryHigh= / some Slurm setups throttle via memory.high and
+        // leave memory.max at "max" — a memory.max-only probe was a no-op there.
+        let dir = v2_root("/user.slice/job");
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/user.slice/job/memory.max",
+            "max\n",
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/user.slice/job/memory.high",
+            "171798691840\n",
+        );
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(160 * GIB));
+    }
+
+    #[test]
+    fn v2_takes_the_lower_of_max_and_high() {
+        let dir = v2_root("/user.slice/job");
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/user.slice/job/memory.max",
+            "171798691840\n",
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/user.slice/job/memory.high",
+            "1073741824\n",
+        );
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            Some(GIB),
+            "the throttle ceiling binds below the hard limit"
+        );
+        // …and an ancestor's memory.high still binds a leaf that set neither.
+        let dir = v2_root("/user.slice/job");
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/user.slice/memory.high",
+            "1073741824\n",
+        );
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(GIB));
+    }
+
+    // --- headroom: limit minus non-reclaimable usage (#485, S2-1) -------
+
+    #[test]
+    fn v2_subtracts_non_reclaimable_current_usage() {
+        let dir = v2_root("/slurm/job_42");
+        let cg = "sys/fs/cgroup/slurm/job_42";
+        write_file(dir.path(), &format!("{cg}/memory.max"), "171798691840\n");
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.current"),
+            &(100 * GIB).to_string(),
+        );
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.stat"),
+            &format!(
+                "anon {}\ninactive_file {}\nslab_reclaimable {}\nslab_unreclaimable {}\n",
+                70 * GIB,
+                20 * GIB,
+                10 * GIB,
+                GIB
+            ),
+        );
+        // 160 GiB limit − (100 GiB used − 30 GiB reclaimable) = 90 GiB.
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(90 * GIB));
+    }
+
+    #[test]
+    fn v2_usage_is_read_from_the_binding_level() {
+        // The ancestor's limit binds, so the ancestor's usage is what counts —
+        // reading the leaf's (smaller) usage would overstate the headroom.
+        let dir = v2_root("/slurm/job_42");
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/memory.max",
+            &(8 * GIB).to_string(),
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/memory.current",
+            &(6 * GIB).to_string(),
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/memory.stat",
+            "inactive_file 0\n",
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/job_42/memory.max",
+            &(64 * GIB).to_string(),
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/job_42/memory.current",
+            &(1024 * 1024).to_string(),
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/job_42/memory.stat",
+            "inactive_file 0\n",
+        );
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(2 * GIB));
+    }
+
+    #[test]
+    fn v2_unreadable_usage_or_stat_leaves_the_limit_alone() {
+        // memory.current present, memory.stat missing → no adjustment.
+        let dir = v2_root("/slurm/job_42");
+        let cg = "sys/fs/cgroup/slurm/job_42";
+        write_file(dir.path(), &format!("{cg}/memory.max"), "171798691840\n");
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.current"),
+            &(100 * GIB).to_string(),
+        );
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(160 * GIB));
+
+        // memory.stat present, memory.current missing → no adjustment either.
+        let dir = v2_root("/slurm/job_42");
+        write_file(dir.path(), &format!("{cg}/memory.max"), "171798691840\n");
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.stat"),
+            "inactive_file 0\n",
+        );
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(160 * GIB));
+    }
+
+    #[test]
+    fn usage_above_the_limit_saturates_to_zero() {
+        let dir = v2_root("/slurm/job_42");
+        let cg = "sys/fs/cgroup/slurm/job_42";
+        write_file(dir.path(), &format!("{cg}/memory.max"), &GIB.to_string());
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.current"),
+            &(4 * GIB).to_string(),
+        );
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.stat"),
+            "inactive_file 0\n",
+        );
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            Some(0),
+            "an over-budget cgroup reports no headroom, never an underflowed one"
+        );
+    }
+
+    #[test]
+    fn v1_subtracts_total_inactive_file() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "proc/self/cgroup", "7:memory:/slurm/job_42\n");
+        let cg = "sys/fs/cgroup/memory/slurm/job_42";
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.limit_in_bytes"),
+            "171798691840\n",
+        );
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.usage_in_bytes"),
+            &(100 * GIB).to_string(),
+        );
+        write_file(
+            dir.path(),
+            &format!("{cg}/memory.stat"),
+            &format!("cache {}\ntotal_inactive_file {}\n", 40 * GIB, 30 * GIB),
+        );
+        // 160 GiB − (100 GiB − 30 GiB) = 90 GiB.
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(90 * GIB));
+    }
+
+    // --- hardening (#485, S3-2 / S3-3) ----------------------------------
+
+    #[test]
+    fn zero_limit_is_a_real_limit() {
+        let dir = v2_root("/slurm/job_42");
+        write_file(dir.path(), "sys/fs/cgroup/slurm/job_42/memory.high", "0\n");
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            Some(0),
+            "a zero limit must force the bounded path, not read as 'unlimited'"
+        );
+    }
+
+    #[test]
+    fn dot_dot_in_the_cgroup_path_makes_the_probe_abstain() {
+        let dir = v2_root("/slurm/../other/job");
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/memory.max",
+            &(8 * GIB).to_string(),
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/other/job/memory.max",
+            &(4 * GIB).to_string(),
+        );
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            None,
+            "a path that could escape the mount root must not yield a limit"
+        );
     }
 
     #[test]

@@ -397,8 +397,12 @@ pub const PARTITION_WAVE_AUTO: usize = 0;
 pub const PARTITION_WAVE_MIN: usize = 6;
 
 /// Upper clamp for the auto-sized partition wave **when available RAM cannot
-/// be probed** (non-Linux without the env override, unreadable
-/// `/proc/meminfo`).
+/// be probed** — i.e. when no term of the probe yields a figure: non-Linux
+/// without the env override, or a Linux box where `/proc/meminfo` is
+/// unreadable *and* no cgroup memory limit is readable either. A readable
+/// cgroup limit is a signal on its own (#481/#485), so an unreadable
+/// `/proc/meminfo` inside a memory cgroup takes the budget path below, not
+/// this cap.
 ///
 /// This is #293's original fixed cap: it saturates a 16-core box while
 /// bounding the wave transient to a known multiple of the old width-6
@@ -528,8 +532,9 @@ fn memory_safe_level_wave(
 /// [`PARTITION_SLOT_TRANSIENT_BYTES`] each) fit in
 /// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM (probe shared with the
 /// convert-side `--profile auto`: `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
-/// then the container-aware `min(cgroup limit, /proc/meminfo MemAvailable)` —
-/// see [`available_memory_bytes`]), floored at [`PARTITION_WAVE_MIN`].
+/// then the container-aware `min(cgroup headroom, /proc/meminfo
+/// MemAvailable)` — see [`available_memory_bytes`]), floored at
+/// [`PARTITION_WAVE_MIN`].
 /// When RAM cannot be probed the cap falls back to
 /// [`PARTITION_WAVE_FALLBACK_MAX`], reproducing #293's fixed clamp. Any
 /// explicit positive value is honoured verbatim (uncapped — the caller opted
