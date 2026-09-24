@@ -385,21 +385,21 @@ pub const MAX_TILE_ID_ZOOM: u8 = 31;
 /// **The number this picks is a peak-memory target, not an address count.**
 /// Each expanded entry costs tens of bytes of reader state — 32 bytes for a
 /// `TileRef` in [`crate::decode`], more for a `BTreeMap` node in the pyramid
-/// merge — and both are held for the whole walk. 2^22 entries is therefore
-/// about 134 MB of `TileRef` (and a few hundred MB in the merge): a bound a
+/// merge — and both are held for the whole walk. 2^26 entries is therefore
+/// about 2.1 GB of `TileRef` (more in the merge): heavy, but a bound a real
 /// machine survives, chosen so that no header value can turn a kilobyte of
-/// directory into gigabytes of resident memory.
+/// directory into tens of gigabytes of resident memory.
 ///
 /// It deliberately does *not* track the archive's address space. A fully
 /// dense z0-z14 pyramid addresses ~3.6e8 tiles, so `max_zoom = 14` — an
-/// entirely ordinary header byte — would otherwise license 8.6 GB here. No
-/// single `decode_pmtiles` or `merge_bands` call has any business expanding
-/// 4.2M tiles: that is already ~100x a realistic banded archive, and far more
-/// than the GeoParquet decode of one archive can finish.
+/// entirely ordinary header byte — would otherwise license 8.6 GB here. The
+/// ceiling cannot be much tighter, though: a *legitimate* planet-scale band
+/// (land-covering features at z13 is tens of millions of tiles) must still
+/// merge, so the constant sits above real archives and below the attack.
 ///
 /// [`max_expanded_entries`] takes this and the archive's own address space,
 /// whichever is smaller.
-pub const MAX_EXPANDED_TILE_ENTRIES: u64 = 1 << 22;
+pub const MAX_EXPANDED_TILE_ENTRIES: u64 = 1 << 26;
 
 /// Hard ceiling on how many leaf directories one walk may visit (#417).
 ///
@@ -412,11 +412,12 @@ pub const MAX_EXPANDED_TILE_ENTRIES: u64 = 1 << 22;
 /// last. One huge leaf and a million tiny ones are separate attacks, so this
 /// is a separate cap.
 ///
-/// 4096 is well past any real archive: this writer partitions leaves at
-/// `INITIAL_LEAF_SIZE` (4096) entries apiece, so 4096 leaves address 16.7M
-/// tiles — already more than [`MAX_EXPANDED_TILE_ENTRIES`] admits, which
-/// means the entry budget binds first for any sanely packed archive.
-pub const MAX_LEAF_DIRECTORIES: usize = 4096;
+/// 16384 tracks the entry budget: this writer partitions leaves at
+/// `INITIAL_LEAF_SIZE` (4096) entries apiece, so 16384 leaves address the
+/// same 67M tiles [`MAX_EXPANDED_TILE_ENTRIES`] admits — a sanely packed
+/// archive exhausts both budgets together rather than tripping the leaf cap
+/// while entries remain.
+pub const MAX_LEAF_DIRECTORIES: usize = 16384;
 
 /// Number of tile ids addressable at or above `max_zoom`'s pyramid: the sum
 /// of `4^z` for `z` in `0..=max_zoom`, saturating at
