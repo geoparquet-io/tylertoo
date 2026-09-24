@@ -78,8 +78,8 @@ use super::convert::{
     extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
     overture_road_ranking, record_level_outcome, resolve_reserved_column_collisions, scan_feature,
     validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, ClassRanking,
-    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, SkippedLevelReport,
-    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
+    SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
@@ -193,10 +193,10 @@ fn current_rss_mib() -> Option<f64> {
 /// These `[rss] <phase>` lines pinpoint which phase dominates peak memory —
 /// pass-1 winner tables (O(dataset)) vs the pass-2 output sink (bounded by the
 /// #294 auto profile) — and validate the auto backing choice on real runs.
-fn log_phase_rss(phase: &str, peak_mib: &mut f64) {
+fn log_phase_rss(phase: &str, peak_mib: &mut Option<f64>) {
     if let Some(rss) = current_rss_mib() {
-        if rss > *peak_mib {
-            *peak_mib = rss;
+        if peak_mib.is_none_or(|p| rss > p) {
+            *peak_mib = Some(rss);
         }
         log::info!("[rss] {phase}: {rss:.0} MiB");
     }
@@ -527,8 +527,16 @@ fn build_level_ctxs<'a>(
         .collect()
 }
 
-/// Run pass 2 over every emitted level and return `(outcome, rows, vertices)`
-/// per level, in level order.
+/// Per-level `(outcome, rows, vertices, spill_bytes_written)`. `spill_bytes`
+/// is 0 for every level under the `Serial` strategy (a reference/test path
+/// that never spills) and for the streamed finest level (verbatim, written
+/// directly — never buffered or spilled).
+type LevelStat = (LevelWriteOutcome, usize, usize, u64);
+
+/// Run pass 2 over every emitted level and return each level's [`LevelStat`],
+/// in level order, plus the pipelined engine's aggregated
+/// [`pipeline::Pass2EngineResult::timers`] stage split ([profile] /
+/// `TYLERTOO_PROFILE_JSON` instrumentation).
 ///
 /// The outcome distinguishes a written level from one the writer skipped
 /// because every candidate collapsed during simplification (#211).
@@ -545,26 +553,29 @@ fn run_pass2_levels(
     num_rows: usize,
     geom_bytes: u64,
     strategy: Pass2Strategy,
-) -> Result<Vec<(LevelWriteOutcome, usize, usize)>, ConvertError> {
+) -> Result<(Vec<LevelStat>, Pass2Timers), ConvertError> {
     let n = ctxs.len();
-    let level_stats: Vec<(LevelWriteOutcome, usize, usize)> = match strategy {
+    let (level_stats, engine_timers): (Vec<LevelStat>, Pass2Timers) = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
-        Pass2Strategy::Serial => ctxs
-            .iter()
-            .enumerate()
-            .map(|(i, ctx)| {
-                write_level_streaming(
-                    writer,
-                    i,
-                    hints[i],
-                    source,
-                    options.read_batch_size,
-                    in_flight_batches,
-                    selected_row_groups,
-                    ctx,
-                )
-            })
-            .collect::<Result<_, _>>()?,
+        Pass2Strategy::Serial => (
+            ctxs.iter()
+                .enumerate()
+                .map(|(i, ctx)| {
+                    write_level_streaming(
+                        writer,
+                        i,
+                        hints[i],
+                        source,
+                        options.read_batch_size,
+                        in_flight_batches,
+                        selected_row_groups,
+                        ctx,
+                    )
+                    .map(|(o, r, v)| (o, r, v, 0u64))
+                })
+                .collect::<Result<_, _>>()?,
+            Pass2Timers::default(),
+        ),
         // Production: buffer levels 0..n-1 from a single read, then stream the
         // finest (verbatim, largest) level last straight into the writer.
         Pass2Strategy::Pipelined => {
@@ -582,10 +593,10 @@ fn run_pass2_levels(
             );
             log::info!(
                 "[convert] pass 2: building {n} overview level(s) from a \
-                 single read (finest level streamed last)"
+                     single read (finest level streamed last)"
             );
-            let mut stats = if n > 1 {
-                pipeline::run_pass2_buffered(
+            let (mut stats, engine_timers) = if n > 1 {
+                let result = pipeline::run_pass2_buffered(
                     writer,
                     &ctxs[..n - 1],
                     &hints[..n - 1],
@@ -595,11 +606,12 @@ fn run_pass2_levels(
                     in_flight_batches,
                     backing,
                     out_schema,
-                )?
+                )?;
+                (result.levels, result.timers)
             } else {
-                Vec::new()
+                (Vec::new(), Pass2Timers::default())
             };
-            stats.push(write_level_streaming(
+            let (o, r, v) = write_level_streaming(
                 writer,
                 n - 1,
                 hints[n - 1],
@@ -608,11 +620,48 @@ fn run_pass2_levels(
                 in_flight_batches,
                 selected_row_groups,
                 &ctxs[n - 1],
-            )?);
-            stats
+            )?;
+            stats.push((o, r, v, 0u64));
+            (stats, engine_timers)
         }
     };
-    Ok(level_stats)
+    Ok((level_stats, engine_timers))
+}
+
+/// Fold every emitted level's [`LevelStat`] into the shared bookkeeping
+/// (#211): `record_level_outcome` appends a renumbered [`LevelReport`] for a
+/// written level, or — for a level the writer omitted because every candidate
+/// collapsed during simplification — warns and records the plan in `skipped`,
+/// exactly like a plan-time omission. Returns the level reports alongside a
+/// parallel `spill_bytes` vector (same push/skip pattern, so the two stay the
+/// same length — the `TYLERTOO_PROFILE_JSON` per-level dump).
+fn build_level_reports(
+    emitted: &[EmitLevel],
+    level_stats: Vec<LevelStat>,
+    skipped: &mut Vec<SkippedLevelReport>,
+) -> (Vec<LevelReport>, Vec<u64>) {
+    let mut level_reports = Vec::with_capacity(emitted.len());
+    let mut level_spill_bytes: Vec<u64> = Vec::with_capacity(emitted.len());
+    for (e, (outcome, rows, vertices, spill_bytes)) in emitted.iter().zip(level_stats) {
+        let reports_before = level_reports.len();
+        record_level_outcome(
+            outcome,
+            SkippedLevelReport {
+                planned_level: e.orig as usize,
+                gsd: e.gsd,
+                zoom: e.zoom,
+            },
+            e.hint,
+            rows,
+            vertices,
+            &mut level_reports,
+            skipped,
+        );
+        if level_reports.len() > reports_before {
+            level_spill_bytes.push(spill_bytes);
+        }
+    }
+    (level_reports, level_spill_bytes)
 }
 
 /// The resolved ranking tier: the per-row sort keys (absent for the size
@@ -808,7 +857,7 @@ fn resolve_winner_tables(
     num_rows: usize,
     crs: Crs,
     options: &ConvertOptions,
-    peak_rss_mib: &mut f64,
+    peak_rss_mib: &mut Option<f64>,
 ) -> Result<WinnerTables, ConvertError> {
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
@@ -1125,7 +1174,7 @@ pub(crate) fn convert_streaming_strategy(
     // #295: peak-RSS-by-phase instrumentation. Each phase boundary logs process
     // RSS; the max is reported at the end so a single run shows both the peak
     // and which phase produced it.
-    let mut peak_rss_mib = 0.0f64;
+    let mut peak_rss_mib: Option<f64> = None;
 
     if options.sort_key.is_some() && options.class_ranking.is_some() {
         return Err(ConvertError::RankingConflict);
@@ -1158,6 +1207,7 @@ pub(crate) fn convert_streaming_strategy(
         num_rows,
         skipped_rows,
         geom_bytes,
+        pass1_stage_secs,
     } = run_pass1(
         source,
         &input_schema,
@@ -1284,7 +1334,7 @@ pub(crate) fn convert_streaming_strategy(
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
     let in_flight_batches = resolve_and_log_in_flight_batches(options.in_flight_batches);
 
-    let level_stats = run_pass2_levels(
+    let (level_stats, pass2_engine_timers) = run_pass2_levels(
         &mut writer,
         &ctxs,
         &hints,
@@ -1299,27 +1349,8 @@ pub(crate) fn convert_streaming_strategy(
     )?;
     log_validation_skips(validation_skips_before);
 
-    // Fold each emitted level's write outcome into the shared bookkeeping
-    // (#211): `record_level_outcome` appends a renumbered `LevelReport` for a
-    // written level, or — for a level the writer omitted because every
-    // candidate collapsed during simplification — warns and records the plan in
-    // `skipped`, exactly like a plan-time omission.
-    let mut level_reports = Vec::with_capacity(emitted.len());
-    for (e, (outcome, rows, vertices)) in emitted.iter().zip(level_stats) {
-        record_level_outcome(
-            outcome,
-            SkippedLevelReport {
-                planned_level: e.orig as usize,
-                gsd: e.gsd,
-                zoom: e.zoom,
-            },
-            e.hint,
-            rows,
-            vertices,
-            &mut level_reports,
-            &mut skipped,
-        );
-    }
+    let (mut level_reports, level_spill_bytes) =
+        build_level_reports(&emitted, level_stats, &mut skipped);
     skipped.sort_by_key(|s| s.planned_level);
     if level_reports.is_empty() {
         // Every emitted level collapsed at write time: no valid overview file
@@ -1340,12 +1371,35 @@ pub(crate) fn convert_streaming_strategy(
         t_finish.elapsed().as_secs_f64()
     );
     log_phase_rss("writer.finish", &mut peak_rss_mib);
-    log::info!("[rss] convert peak: {peak_rss_mib:.0} MiB");
+    log::info!(
+        "[rss] convert peak: {}",
+        peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
+    );
     fill_level_bytes(output_path, &meta, &mut level_reports)?;
 
     let total_rows: usize = level_reports.iter().map(|l| l.feature_count).sum();
     let total_vertices: usize = level_reports.iter().map(|l| l.vertex_count).sum();
     let total_compressed_bytes: i64 = level_reports.iter().map(|l| l.compressed_bytes).sum();
+
+    // Measurement base for the perf series (pass-1 parallelization, pass-2
+    // throughput, checkpoint work): a machine-readable dump of everything the
+    // `[profile]`/`[rss]` logs above report by hand, gated behind an env var.
+    // Zero effect on output bytes.
+    emit_profile_json(ProfileJsonContext {
+        options,
+        t_pass1,
+        pass1_rows: num_rows,
+        pass1_stage_secs,
+        t_pass2,
+        pass2_rows: total_rows,
+        pass2_engine_timers: &pass2_engine_timers,
+        t_finish,
+        start,
+        level_reports: &level_reports,
+        level_spill_bytes: &level_spill_bytes,
+        peak_rss_mib,
+        in_flight_batches,
+    });
 
     Ok(ConvertReport {
         mode: options.mode,
@@ -1363,6 +1417,154 @@ pub(crate) fn convert_streaming_strategy(
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(source),
     })
+}
+
+/// [`convert_streaming_strategy`]'s locals the `TYLERTOO_PROFILE_JSON` dump
+/// needs, grouped into a struct so [`emit_profile_json`] can be a single call
+/// there (clippy's function-length ceiling leaves no room for inlining this
+/// many field computations).
+struct ProfileJsonContext<'a> {
+    options: &'a ConvertOptions,
+    t_pass1: Instant,
+    pass1_rows: usize,
+    pass1_stage_secs: Pass1StageSecs,
+    t_pass2: Instant,
+    pass2_rows: usize,
+    pass2_engine_timers: &'a Pass2Timers,
+    t_finish: Instant,
+    start: Instant,
+    level_reports: &'a [LevelReport],
+    level_spill_bytes: &'a [u64],
+    peak_rss_mib: Option<f64>,
+    in_flight_batches: usize,
+}
+
+/// Turn a [`ProfileJsonContext`] into [`ProfileJsonInputs`] (elapsing the
+/// `Instant`s at the call site) and hand it to [`write_profile_json`].
+fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
+    write_profile_json(ProfileJsonInputs {
+        options: ctx.options,
+        pass1_wall_secs: ctx.t_pass1.elapsed().as_secs_f64(),
+        pass1_rows: ctx.pass1_rows,
+        pass1_stage_secs: ctx.pass1_stage_secs,
+        pass2_wall_secs: ctx.t_pass2.elapsed().as_secs_f64(),
+        pass2_rows: ctx.pass2_rows,
+        pass2_stage_secs: ctx.pass2_engine_timers.stage_secs(),
+        writer_finish_secs: ctx.t_finish.elapsed().as_secs_f64(),
+        total_secs: ctx.start.elapsed().as_secs_f64(),
+        levels: ctx
+            .level_reports
+            .iter()
+            .zip(ctx.level_spill_bytes.iter())
+            .map(|(l, &spill_bytes)| (l.feature_count, spill_bytes))
+            .collect(),
+        peak_rss_mib: ctx.peak_rss_mib,
+        in_flight_batches: ctx.in_flight_batches,
+    });
+}
+
+/// Inputs to [`write_profile_json`], grouped into a struct since the
+/// diagnostics dump otherwise needs an unreasonable number of loose scalars.
+struct ProfileJsonInputs<'a> {
+    options: &'a ConvertOptions,
+    pass1_wall_secs: f64,
+    /// Total INPUT rows pass 1 streamed (matches [`Pass1Output::num_rows`]).
+    pass1_rows: usize,
+    pass1_stage_secs: Pass1StageSecs,
+    pass2_wall_secs: f64,
+    /// Total OUTPUT rows written across every level (throughput is measured
+    /// in output rows, matching the `[profile] pass2 engine` log).
+    pass2_rows: usize,
+    pass2_stage_secs: Pass2StageSecs,
+    writer_finish_secs: f64,
+    total_secs: f64,
+    /// Per WRITTEN level, in writer order (matches `ConvertReport.levels`):
+    /// `(rows, spill_bytes_written)`. `spill_bytes_written` is 0 for a level
+    /// buffered in RAM or streamed directly (the finest level).
+    levels: Vec<(usize, u64)>,
+    peak_rss_mib: Option<f64>,
+    in_flight_batches: usize,
+}
+
+/// Append one JSON object (one line) with this conversion's stage timing and
+/// throughput to the file named by `TYLERTOO_PROFILE_JSON`, if set — the
+/// measurement base for the perf series gated on these numbers (pass-1
+/// parallelization, pass-2 throughput, checkpoint work). An env var, not a
+/// CLI flag, so a diagnostics-only knob costs no CLI-doc churn.
+///
+/// Best-effort and silent-safe: profiling instrumentation must never fail a
+/// conversion, so an unset/blank env var is a no-op and an open/write error is
+/// only logged. Reads exactly one already-computed number per field (no
+/// re-derivation), so this has zero effect on conversion output bytes.
+fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
+    let Ok(path) = std::env::var("TYLERTOO_PROFILE_JSON") else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    let rate = |rows: usize, secs: f64| if secs > 0.0 { rows as f64 / secs } else { 0.0 };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let levels_json: Vec<serde_json::Value> = inputs
+        .levels
+        .iter()
+        .map(|&(rows, spill_bytes)| serde_json::json!({"rows": rows, "spill_bytes": spill_bytes}))
+        .collect();
+    let value = serde_json::json!({
+        "timestamp": timestamp,
+        "phase_walls": {
+            "pass1": inputs.pass1_wall_secs,
+            "pass2": inputs.pass2_wall_secs,
+            "writer_finish": inputs.writer_finish_secs,
+            "total": inputs.total_secs,
+        },
+        "pass1": {
+            "rows": inputs.pass1_rows,
+            "rows_per_sec": rate(inputs.pass1_rows, inputs.pass1_wall_secs),
+            "stage_secs": {
+                "read": inputs.pass1_stage_secs.read,
+                "decode": inputs.pass1_stage_secs.decode,
+                "scan": inputs.pass1_stage_secs.scan,
+                "keys": inputs.pass1_stage_secs.keys,
+                "assemble": inputs.pass1_stage_secs.assemble,
+            },
+        },
+        "pass2": {
+            "rows": inputs.pass2_rows,
+            "rows_per_sec": rate(inputs.pass2_rows, inputs.pass2_wall_secs),
+            "stage_secs": {
+                "read": inputs.pass2_stage_secs.read,
+                "decode": inputs.pass2_stage_secs.decode,
+                "simplify": inputs.pass2_stage_secs.simplify,
+                "build": inputs.pass2_stage_secs.build,
+                "drain": inputs.pass2_stage_secs.drain,
+                "spill_write": inputs.pass2_stage_secs.spill_write,
+            },
+        },
+        "levels": levels_json,
+        "peak_rss_mib": inputs.peak_rss_mib,
+        "threads": rayon::current_num_threads(),
+        "in_flight": inputs.in_flight_batches,
+        "memory_profile": inputs.options.profile,
+    });
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{value}") {
+                log::warn!("[profile] TYLERTOO_PROFILE_JSON write to {path:?} failed: {e}");
+            }
+        }
+        Err(e) => {
+            log::warn!("[profile] TYLERTOO_PROFILE_JSON open {path:?} failed: {e}");
+        }
+    }
 }
 
 // ============================================================================
@@ -1565,6 +1767,75 @@ struct Pass1Output {
     /// RAM-vs-spill decision; near-free to collect (one buffer-size sum per
     /// batch — no re-encode).
     geom_bytes: u64,
+    /// Pass-1 stage wall-time split ([profile] / `TYLERTOO_PROFILE_JSON`
+    /// instrumentation, measurement base for the pass-1 parallelization work).
+    pass1_stage_secs: Pass1StageSecs,
+}
+
+/// Wall-time accumulators for pass-1 stages ([profile] logging), stored as
+/// nanoseconds. Pass 1 is single-threaded today, but this mirrors
+/// [`Pass2Timers`]'s atomics pattern so both stay easy to reconcile and any
+/// future parallelization of pass 1 needs no accounting rework.
+#[derive(Default)]
+struct Pass1Timers {
+    /// Parquet read + Arrow decode of the raw batch (`reader.next()`).
+    read: AtomicU64,
+    /// Geometry column decode (`from_arrow_array` + geometry extraction).
+    decode: AtomicU64,
+    /// Per-row feature scan: attribute-filter eval, `scan_feature` (bbox +
+    /// kind), the regional-extract bbox test.
+    scan: AtomicU64,
+    /// Ranking-key, accumulate-value, and entry-zoom-ladder column extraction.
+    keys: AtomicU64,
+    /// Post-scan assembly: ranking-tier resolution, sort-key stamping,
+    /// entry-level stamping, coalesce-scratch assembly.
+    assemble: AtomicU64,
+}
+
+/// Pass-1 stage wall-time split, in seconds — [`Pass1Timers`] snapshotted for
+/// callers outside this module ([profile] JSON dump).
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Pass1StageSecs {
+    pub(super) read: f64,
+    pub(super) decode: f64,
+    pub(super) scan: f64,
+    pub(super) keys: f64,
+    pub(super) assemble: f64,
+}
+
+impl Pass1Timers {
+    fn add(cell: &AtomicU64, start: Instant) {
+        cell.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    fn secs(cell: &AtomicU64) -> f64 {
+        Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
+    }
+    fn stage_secs(&self) -> Pass1StageSecs {
+        Pass1StageSecs {
+            read: Self::secs(&self.read),
+            decode: Self::secs(&self.decode),
+            scan: Self::secs(&self.scan),
+            keys: Self::secs(&self.keys),
+            assemble: Self::secs(&self.assemble),
+        }
+    }
+    /// Emit the [profile] stage breakdown plus an explicit rows/s figure so a
+    /// pass-1 run's throughput is directly comparable across corpora and
+    /// machines — the measurement base the pass-1 parallelization work is
+    /// gated on.
+    fn log_pass1_summary(&self, wall: f64, rows: usize) {
+        let s = self.stage_secs();
+        let rows_per_sec = if wall > 0.0 { rows as f64 / wall } else { 0.0 };
+        log::debug!(
+            "[profile] pass1 ({rows} rows): wall={wall:.2}s read={:.2}s decode={:.2}s \
+             scan={:.2}s keys={:.2}s assemble={:.2}s rows/s={rows_per_sec:.0}",
+            s.read,
+            s.decode,
+            s.scan,
+            s.keys,
+            s.assemble,
+        );
+    }
 }
 
 /// Pass 1: stream the input (geometry + ranking/accumulate columns only) and
@@ -1670,11 +1941,14 @@ fn run_pass1(
 
     // Regional extract (#102): read only the bbox-selected row groups
     // (identical per-part selection in pass 2, keeping row indices aligned).
-    let reader = source.open_stream(&ReadPlan {
+    let mut reader = source.open_stream(&ReadPlan {
         batch_size: options.read_batch_size.max(1),
         projection: Some(&cols),
         row_groups,
     })?;
+
+    let t_pass1_fn = Instant::now();
+    let pass1_timers = Pass1Timers::default();
 
     let mut features: Vec<AssignFeature> = Vec::new();
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
@@ -1701,8 +1975,15 @@ fn run_pass1(
     let mut explicit_groups: Vec<u32> = Vec::new();
     let mut explicit_interner = GroupInterner::default();
 
-    for batch in reader {
-        let batch = batch?;
+    loop {
+        let t_read = Instant::now();
+        let batch = match reader.next() {
+            None => break,
+            Some(b) => b?,
+        };
+        Pass1Timers::add(&pass1_timers.read, t_read);
+
+        let t_decode = Instant::now();
         let gcol_idx = proj(geom_idx);
         let schema = batch.schema();
         let gfield = schema.field(gcol_idx);
@@ -1710,7 +1991,9 @@ fn run_pass1(
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
         geoms_buf.clear();
         extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)?;
+        Pass1Timers::add(&pass1_timers.decode, t_decode);
 
+        let t_scan = Instant::now();
         // Attribute filter (#315): evaluate the predicate over the projected
         // batch once. A row whose result is not TRUE (FALSE or SQL-UNKNOWN)
         // produces no AssignFeature — exactly like a bbox miss below — while
@@ -1784,7 +2067,9 @@ fn run_pass1(
         // geometry weight instead of a one-size-fits-all constant. O(#buffers)
         // per batch — no per-row work, no re-encode.
         geom_bytes += batch.column(gcol_idx).get_array_memory_size() as u64;
+        Pass1Timers::add(&pass1_timers.scan, t_scan);
 
+        let t_keys = Instant::now();
         match &mut plan {
             RankPlan::ExplicitSort { idx, .. } => {
                 explicit_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
@@ -1835,8 +2120,10 @@ fn run_pass1(
                     .map(|(k, keep)| if *keep { k } else { None }),
             );
         }
+        Pass1Timers::add(&pass1_timers.keys, t_keys);
     }
 
+    let t_assemble = Instant::now();
     let (keys, provenance, all_groups) = resolve_ranking_tier(
         plan,
         explicit_keys,
@@ -1870,6 +2157,9 @@ fn run_pass1(
         rows: line_rows,
         geoms: line_geoms,
     });
+    Pass1Timers::add(&pass1_timers.assemble, t_assemble);
+
+    pass1_timers.log_pass1_summary(t_pass1_fn.elapsed().as_secs_f64(), num_rows);
 
     Ok(Pass1Output {
         features,
@@ -1880,6 +2170,7 @@ fn run_pass1(
         num_rows,
         skipped_rows,
         geom_bytes,
+        pass1_stage_secs: pass1_timers.stage_secs(),
     })
 }
 
@@ -1901,6 +2192,25 @@ pub(super) struct Pass2Timers {
     simplify: AtomicU64,
     /// Output batch assembly (`build_level_batch`).
     build: AtomicU64,
+    /// Draining a level's sink into `writer.write_level` (the serial parquet
+    /// append). Previously invisible: it runs after the read loop finishes,
+    /// one level at a time.
+    drain: AtomicU64,
+    /// The bounded-profile Arrow IPC spill write (`SpillState::push`), on the
+    /// consumer thread. Previously invisible and byte-uncounted.
+    spill_write: AtomicU64,
+}
+
+/// Pass-2 engine stage wall-time split, in seconds — [`Pass2Timers`]
+/// snapshotted for callers outside this module ([profile] JSON dump).
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Pass2StageSecs {
+    pub(super) read: f64,
+    pub(super) decode: f64,
+    pub(super) simplify: f64,
+    pub(super) build: f64,
+    pub(super) drain: f64,
+    pub(super) spill_write: f64,
 }
 
 impl Pass2Timers {
@@ -1917,18 +2227,38 @@ impl Pass2Timers {
     pub(super) fn read_cell(&self) -> &AtomicU64 {
         &self.read
     }
+    pub(super) fn drain_cell(&self) -> &AtomicU64 {
+        &self.drain
+    }
+    pub(super) fn spill_write_cell(&self) -> &AtomicU64 {
+        &self.spill_write
+    }
+    pub(super) fn stage_secs(&self) -> Pass2StageSecs {
+        Pass2StageSecs {
+            read: Self::secs(&self.read),
+            decode: Self::secs(&self.decode),
+            simplify: Self::secs(&self.simplify),
+            build: Self::secs(&self.build),
+            drain: Self::secs(&self.drain),
+            spill_write: Self::secs(&self.spill_write),
+        }
+    }
     /// Emit the aggregated per-stage breakdown ([profile] logging) for the
     /// pipelined engine, where stages interleave across levels so a per-level
     /// split is not meaningful.
     pub(super) fn log_engine_summary(&self, total_secs: f64, rows: usize) {
-        let read_s = Self::secs(&self.read);
-        let decode_s = Self::secs(&self.decode);
-        let simplify_s = Self::secs(&self.simplify);
-        let build_s = Self::secs(&self.build);
+        let s = self.stage_secs();
         log::debug!(
             "[profile] pass2 engine ({rows} rows): wall={total_secs:.2}s \
-             read={read_s:.2}s decode={decode_s:.2}s simplify={simplify_s:.2}s \
-             build={build_s:.2}s (stage sums are core-seconds, overlap wall)"
+             read={:.2}s decode={:.2}s simplify={:.2}s build={:.2}s \
+             drain={:.2}s spill_write={:.2}s (stage sums are core-seconds, \
+             overlap wall)",
+            s.read,
+            s.decode,
+            s.simplify,
+            s.build,
+            s.drain,
+            s.spill_write,
         );
     }
 }

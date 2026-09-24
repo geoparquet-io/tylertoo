@@ -6766,6 +6766,89 @@ mod tests {
         }
     }
 
+    /// `TYLERTOO_PROFILE_JSON`: a convert with the env var set appends exactly
+    /// one JSON object with positive pass-1/pass-2 throughput and a per-level
+    /// array matching `ConvertReport.levels` in length — the measurement base
+    /// the perf series (pass-1 parallelization, pass-2 throughput, checkpoint
+    /// work) is gated on.
+    #[test]
+    fn profile_json_written_and_parses() {
+        use super::super::stream::Pass2Strategy;
+
+        let geoms = synthetic_geometries();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        // A fresh path inside a temp dir: the file does not exist yet, so
+        // `write_profile_json`'s `OpenOptions::create(true)` must create it.
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("profile.jsonl");
+
+        // Safety: this test is the only place in the process that reads or
+        // writes `TYLERTOO_PROFILE_JSON`, so there is no concurrent-access
+        // hazard despite `set_var`/`remove_var` being unsafe in general.
+        unsafe {
+            std::env::set_var("TYLERTOO_PROFILE_JSON", &json_path);
+        }
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            ..Default::default()
+        };
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let result =
+            convert_to_overviews_strategy(tin.path(), out.path(), &opts, Pass2Strategy::Pipelined);
+
+        unsafe {
+            std::env::remove_var("TYLERTOO_PROFILE_JSON");
+        }
+
+        let report = result.unwrap();
+
+        let contents =
+            std::fs::read_to_string(&json_path).expect("TYLERTOO_PROFILE_JSON file must exist");
+        let mut lines = contents.lines();
+        let line = lines.next().expect("one JSON line must be written");
+        assert!(
+            lines.next().is_none(),
+            "exactly one JSON object for one conversion"
+        );
+        let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+
+        let pass1_rows_per_sec = value["pass1"]["rows_per_sec"]
+            .as_f64()
+            .expect("pass1.rows_per_sec must be a number");
+        assert!(
+            pass1_rows_per_sec > 0.0,
+            "pass1 rows/s must be positive: {value}"
+        );
+        let pass2_rows_per_sec = value["pass2"]["rows_per_sec"]
+            .as_f64()
+            .expect("pass2.rows_per_sec must be a number");
+        assert!(
+            pass2_rows_per_sec > 0.0,
+            "pass2 rows/s must be positive: {value}"
+        );
+
+        let levels = value["levels"].as_array().expect("levels must be an array");
+        assert_eq!(
+            levels.len(),
+            report.levels.len(),
+            "per-level array length must match ConvertReport.levels: {value}"
+        );
+        for level in levels {
+            assert!(level["rows"].is_u64(), "level.rows must be a number");
+            assert!(
+                level["spill_bytes"].is_u64(),
+                "level.spill_bytes must be a number"
+            );
+        }
+    }
+
     /// Pipelined output must be invariant to batching/overlap knobs
     /// (`read_batch_size`, `in_flight_batches`) — proving the ordered-sink /
     /// no-reorder-buffer invariant holds regardless of how the single read is
