@@ -88,7 +88,9 @@ use crate::input_set::{ConvertSource, RowGroupSelection};
 use super::assign::FeatureKind;
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::convert::{ConvertError, ConvertOptions};
+use super::ladder::EntryZoomSpec;
 use super::level::RankingProvenance;
+use super::stream::{CoalesceScratch, WinnerTables};
 
 /// Schema-metadata key under which the plan's JSON scalars travel.
 pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
@@ -416,6 +418,96 @@ pub(super) struct ConvertPlan {
     pub ladder: Option<LadderProvenance>,
     /// Dataset-wide tallies.
     pub totals: PlanTotals,
+}
+
+impl ConvertPlan {
+    /// Build a plan from the winner tables the assignment just produced,
+    /// plus the pass-1 scalars pass 2 and the report consume.
+    pub fn from_winner_tables(
+        tables: &WinnerTables,
+        fingerprint: Fingerprint,
+        rank_provenance: &RankingProvenance,
+        ladder: Option<&EntryZoomSpec>,
+        totals: PlanTotals,
+    ) -> Result<ConvertPlan, ConvertError> {
+        let coalesce = tables
+            .coalesce_scratch
+            .as_ref()
+            .map(|s| {
+                let wkb = s
+                    .geoms
+                    .iter()
+                    .map(crate::wkb::geometry_to_wkb)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        ConvertError::InvalidConfig(format!(
+                            "--save-plan: encoding a coalesce line failed: {e}"
+                        ))
+                    })?;
+                Ok::<_, ConvertError>(CoalescePlan {
+                    rows: s.rows.clone(),
+                    wkb,
+                    sort_keys: s.sort_keys.clone(),
+                    groups: s.groups.clone(),
+                })
+            })
+            .transpose()?;
+        Ok(ConvertPlan {
+            version: PLAN_FORMAT_VERSION,
+            fingerprint,
+            level_specs: tables.level_specs.clone(),
+            counts: tables.counts.clone(),
+            finest: tables.finest,
+            min_levels: tables.min_levels.clone(),
+            kinds: tables.kinds.clone(),
+            carriers: tables.carriers.clone(),
+            cluster_tables: tables.cluster_tables.clone(),
+            coalesce,
+            rank_provenance: rank_provenance.clone(),
+            rank_plan: RankPlanProvenance::from_provenance(rank_provenance),
+            ladder: ladder.map(|s| LadderProvenance {
+                column: s.column.clone(),
+                kind: format!("{:?}", s.kind),
+            }),
+            totals,
+        })
+    }
+
+    /// Rebuild the winner tables pass 2 addresses. Consumes the plan's
+    /// O(dataset) tables rather than cloning them.
+    pub fn into_winner_tables(self) -> Result<WinnerTables, ConvertError> {
+        let coalesce_scratch = self
+            .coalesce
+            .map(|c| {
+                let geoms = c
+                    .wkb
+                    .iter()
+                    .map(|w| crate::wkb::wkb_to_geometry(w))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        ConvertError::InvalidConfig(format!(
+                            "--plan: decoding a coalesce line failed: {e}"
+                        ))
+                    })?;
+                Ok::<_, ConvertError>(CoalesceScratch {
+                    rows: c.rows,
+                    geoms,
+                    sort_keys: c.sort_keys,
+                    groups: c.groups,
+                })
+            })
+            .transpose()?;
+        Ok(WinnerTables {
+            level_specs: self.level_specs,
+            cluster_tables: self.cluster_tables,
+            kinds: self.kinds,
+            coalesce_scratch,
+            min_levels: self.min_levels,
+            counts: self.counts,
+            carriers: self.carriers,
+            finest: self.finest,
+        })
+    }
 }
 
 /// The JSON block carried in the IPC schema metadata.
@@ -1099,6 +1191,278 @@ mod tests {
         plan.save(f.path()).unwrap();
         let err = ConvertPlan::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("plan format"), "{err}");
+    }
+
+    /// A grid of points: enough for a multi-level pyramid with real
+    /// thinning and a non-trivial winner table.
+    fn point_fixture() -> Vec<Option<geo::Geometry<f64>>> {
+        use geo::Point;
+
+        let mut geoms: Vec<Option<geo::Geometry<f64>>> = Vec::new();
+        for i in 0..24 {
+            for j in 0..24 {
+                let x = -20.0 + i as f64 * 1.7;
+                let y = -15.0 + j as f64 * 1.3;
+                geoms.push(Some(geo::Geometry::Point(Point::new(x, y))));
+            }
+        }
+        // One skipped row, so the UNASSIGNED sentinel is exercised too.
+        geoms.push(None);
+        geoms
+    }
+
+    /// Squares of widely differing size: drives the visibility gate, the
+    /// simplify cascade, and the tiny-polygon carrier accumulator (#384).
+    fn polygon_fixture() -> Vec<Option<geo::Geometry<f64>>> {
+        use geo::{Coord, LineString, Polygon};
+
+        let mut geoms: Vec<Option<geo::Geometry<f64>>> = Vec::new();
+        for i in 0..14 {
+            for j in 0..14 {
+                let x = -30.0 + i as f64 * 3.1;
+                let y = -20.0 + j as f64 * 2.7;
+                let w = 0.02 + ((i * 14 + j) % 11) as f64 * 0.24;
+                geoms.push(Some(geo::Geometry::Polygon(Polygon::new(
+                    LineString(vec![
+                        Coord { x, y },
+                        Coord { x: x + w, y },
+                        Coord { x: x + w, y: y + w },
+                        Coord { x, y: y + w },
+                        Coord { x, y },
+                    ]),
+                    vec![],
+                ))));
+            }
+        }
+        geoms.push(None);
+        geoms
+    }
+
+    /// **The oracle for the whole design**: a convert that writes a plan and
+    /// a convert that replays it must produce byte-identical output — both
+    /// the overview GeoParquet and the PMTiles archive exported from it.
+    ///
+    /// If the artifact were missing anything pass 2, the writer, or the
+    /// export reads out of pass 1, these bytes would differ.
+    ///
+    /// The two fixtures are deliberately single-geometry-type. A MIXED input
+    /// makes tylertoo's own output non-reproducible run to run: the
+    /// GeoParquet `geo` metadata's `geometry_types` array is built from an
+    /// unordered set upstream, so `["Point","Polygon"]` and
+    /// `["Polygon","Point"]` alternate between runs of the SAME conversion.
+    /// That is a pre-existing upstream ordering bug, unrelated to the plan
+    /// artifact, and excluding it here keeps this test a test of the plan.
+    /// Touching lines, so the Q3 coalescing scratch (decoded geometries,
+    /// sort keys, class groups) actually has to survive the artifact.
+    fn line_fixture() -> Vec<Option<geo::Geometry<f64>>> {
+        use geo::{Coord, LineString};
+
+        let mut geoms: Vec<Option<geo::Geometry<f64>>> = Vec::new();
+        for i in 0..18 {
+            let y = -20.0 + i as f64 * 2.3;
+            for seg in 0..6 {
+                let x = -30.0 + seg as f64 * 4.0;
+                geoms.push(Some(geo::Geometry::LineString(LineString(vec![
+                    Coord { x, y },
+                    Coord {
+                        x: x + 2.0,
+                        y: y + 0.4,
+                    },
+                    Coord { x: x + 4.0, y },
+                ]))));
+            }
+        }
+        geoms.push(None);
+        geoms
+    }
+
+    #[test]
+    fn convert_with_saved_plan_is_byte_identical() {
+        use super::super::convert::LevelPlan;
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 8,
+            },
+            ..Default::default()
+        };
+        type Case = (
+            &'static str,
+            Vec<Option<geo::Geometry<f64>>>,
+            ConvertOptions,
+        );
+        let cases: Vec<Case> = vec![
+            ("points", point_fixture(), base.clone()),
+            ("polygons", polygon_fixture(), base.clone()),
+            // Lines exercise the coalescing scratch the plan carries as WKB.
+            ("lines", line_fixture(), base.clone()),
+            // Clustering exercises the per-level cluster tables.
+            (
+                "points+cluster",
+                point_fixture(),
+                ConvertOptions {
+                    cluster: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (name, geoms, opts) in &cases {
+            assert_plan_replay_is_byte_identical(name, geoms, opts);
+        }
+    }
+
+    fn assert_plan_replay_is_byte_identical(
+        name: &str,
+        geoms: &[Option<geo::Geometry<f64>>],
+        base: &ConvertOptions,
+    ) {
+        use super::super::convert::convert_to_overviews;
+        use super::super::export::{export_pmtiles, ExportOptions};
+        use super::super::testutil::write_input;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, geoms, true, None);
+
+        let plan_path = dir.path().join("convert.plan");
+
+        // Run A: compute pass 1 + the assignment, and persist them.
+        let out_a = dir.path().join("a.parquet");
+        let report_a = convert_to_overviews(
+            &input,
+            &out_a,
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        let plan_bytes = std::fs::metadata(&plan_path).unwrap().len();
+        eprintln!(
+            "[plan] {name}: {} input geometries -> {plan_bytes} byte artifact",
+            geoms.len()
+        );
+        // The artifact is O(input rows), not O(geometry): one winner byte per
+        // row plus the small side tables (the line scratch aside).
+        assert!(plan_bytes > 0, "{name}: --save-plan wrote the artifact");
+
+        // Run B: replay it. Pass 1 and the assignment never run.
+        let out_b = dir.path().join("b.parquet");
+        let report_b = convert_to_overviews(
+            &input,
+            &out_b,
+            &ConvertOptions {
+                plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&out_a).unwrap(),
+            std::fs::read(&out_b).unwrap(),
+            "{name}: the overview GeoParquet must be byte-identical"
+        );
+        assert_eq!(report_a.input_features, report_b.input_features, "{name}");
+        assert_eq!(report_a.total_rows, report_b.total_rows, "{name}");
+        assert_eq!(report_a.total_vertices, report_b.total_vertices, "{name}");
+        assert_eq!(report_a.levels.len(), report_b.levels.len(), "{name}");
+        assert_eq!(
+            report_a.antimeridian_suspect_features, report_b.antimeridian_suspect_features,
+            "{name}"
+        );
+        assert!(report_a.total_rows > 0, "{name}: the fixture produced rows");
+
+        // ...and the archive exported from each is byte-identical too.
+        let pm_a = dir.path().join("a.pmtiles");
+        let pm_b = dir.path().join("b.pmtiles");
+        let export = ExportOptions {
+            layer_name: "plan".to_string(),
+            ..Default::default()
+        };
+        export_pmtiles(&out_a, &pm_a, &export).unwrap();
+        export_pmtiles(&out_b, &pm_b, &export).unwrap();
+        assert_eq!(
+            std::fs::read(&pm_a).unwrap(),
+            std::fs::read(&pm_b).unwrap(),
+            "{name}: the exported PMTiles archive must be byte-identical"
+        );
+    }
+
+    /// Replaying a plan against a *changed* input is refused, naming the
+    /// field — the end-to-end form of the fingerprint unit tests.
+    #[test]
+    fn convert_with_stale_plan_is_refused() {
+        use super::super::convert::{convert_to_overviews, LevelPlan};
+        use super::super::testutil::write_input;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &point_fixture(), true, None);
+        let plan_path = dir.path().join("convert.plan");
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 7,
+            },
+            ..Default::default()
+        };
+        convert_to_overviews(
+            &input,
+            dir.path().join("a.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        // Rewrite the input with fewer features: same path, different bytes.
+        write_input(&input, &point_fixture()[..100], true, None);
+        let err = convert_to_overviews(
+            &input,
+            dir.path().join("b.parquet"),
+            &ConvertOptions {
+                plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("byte_len") || err.contains("mtime"),
+            "names the offending field: {err}"
+        );
+
+        // A changed thinning knob is refused by name as well.
+        let mut thinned = base.clone();
+        thinned.assign.point_thinning *= 2.0;
+        thinned.plan = Some(plan_path);
+        let err = convert_to_overviews(&input, dir.path().join("c.parquet"), &thinned)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("option "), "names the offending option: {err}");
+    }
+
+    /// The two flags are opposite ends of one run and cannot be combined.
+    #[test]
+    fn save_plan_and_plan_are_mutually_exclusive() {
+        use super::super::convert::convert_to_overviews;
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = convert_to_overviews(
+            dir.path().join("nope.parquet"),
+            dir.path().join("out.parquet"),
+            &ConvertOptions {
+                save_plan: Some(dir.path().join("p")),
+                plan: Some(dir.path().join("p")),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     /// Options the plan is explicitly reusable across must NOT be
