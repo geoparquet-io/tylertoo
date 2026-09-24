@@ -19,25 +19,26 @@
 //! this fixture every run completes in well under a second, so covering
 //! both costs nothing.
 //!
-//! The intermediate overview Parquet is deliberately **not** byte-compared
-//! here. Its GeoParquet footer's `geometry_types` field serializes a
-//! `HashSet<String>` (see `overview::writer`, whose test helpers
-//! `sorted_geometry_types` / `footer_geometry_types` exist specifically
-//! because that field's raw JSON is "not byte-comparable" — its own doc
-//! comment says so), so the raw overview bytes are not expected to be
-//! stable across process runs independent of anything this ticket fixes.
-//! That is a pre-existing, already-documented, and already-worked-around
-//! source of byte drift, unrelated to `assign.rs`'s `HashMap`. Confirmed
-//! empirically while building this test: the kept `--keep-overview`
-//! Parquet differed by a handful of bytes at RAYON_NUM_THREADS=8 (the
-//! `geometry_types` array elements in a different order) even though the
-//! exported PMTiles archive was still byte-identical. `tiles_facade.rs`'s
-//! own `tiles_keep_overview_retains_and_matches_two_step` test follows the
-//! same rule: it byte-compares the *PMTiles* output, never the
-//! intermediate overview file's raw bytes. The PMTiles archive is what the
+//! The intermediate overview Parquet (`--keep-overview`) IS now byte-compared
+//! too (tightened once #508 landed). It used to be excluded: the GeoParquet
+//! footer's `geometry_types` field serialized a `HashSet<String>` (see
+//! `overview::writer`), whose raw JSON element order varied run to run
+//! independent of anything this ticket touches — confirmed empirically while
+//! building this test, the kept `--keep-overview` Parquet differed by a
+//! handful of bytes at RAYON_NUM_THREADS=8 (the `geometry_types` array in a
+//! different order) even though the exported PMTiles archive was still
+//! byte-identical. #508 fixed that source at the writer
+//! (`geo_metadata_json_deterministic` sorts the array before it is ever
+//! serialized), so the overview file's raw bytes are now expected to be
+//! stable across thread counts too, and this test checks that directly
+//! rather than only inferring it from the exported PMTiles. `tiles_facade.rs`'s
+//! `tiles_keep_overview_retains_and_matches_two_step` test still only
+//! byte-compares the *PMTiles* output (a one-step-vs-two-step parity check,
+//! not a thread-count one) — that is an unrelated, narrower guarantee and is
+//! unaffected by this change. The PMTiles archive remains the primary
 //! byte-determinism promise in ARCHITECTURE.md, OVERVIEW_TUNING.md,
-//! bounded-memory.md, and cli.md is actually about, and what #423 asks
-//! this test to cover.
+//! bounded-memory.md, and cli.md, and what #423 asks this test to cover; the
+//! overview-file comparison is additional coverage, not a replacement.
 
 use std::path::Path;
 use std::process::Command;
@@ -54,7 +55,9 @@ fn tylertoo_bin() -> &'static str {
 }
 
 /// Runs one `tiles` conversion of `fixture` to `out` with a pinned
-/// `RAYON_NUM_THREADS`, and returns the PMTiles bytes.
+/// `RAYON_NUM_THREADS`, retaining the intermediate overview at `overview_out`
+/// (`--keep-overview`, #508), and returns `(pmtiles bytes, overview parquet
+/// bytes)`.
 ///
 /// `max_zoom` is per-caller: the `open-buildings` arm uses 14 (its features
 /// are tiny and only separate at high zoom), the `#460` arm a much lower one
@@ -64,10 +67,11 @@ fn tylertoo_bin() -> &'static str {
 fn run_tiles(
     fixture: &Path,
     out: &Path,
+    overview_out: &Path,
     threads: u32,
     no_streaming: bool,
     max_zoom: u8,
-) -> Vec<u8> {
+) -> (Vec<u8>, Vec<u8>) {
     let mut args = vec![
         "tiles".to_string(),
         fixture.to_str().unwrap().to_string(),
@@ -80,6 +84,8 @@ fn run_tiles(
         // count) share one layer name and are directly comparable.
         "--layer-name".to_string(),
         "det423".to_string(),
+        "--keep-overview".to_string(),
+        overview_out.to_str().unwrap().to_string(),
     ];
     if no_streaming {
         args.push("--no-streaming".to_string());
@@ -108,7 +114,13 @@ fn run_tiles(
         "RAYON_NUM_THREADS={threads} no_streaming={no_streaming}: output does not start with \
          the PMTiles v3 magic"
     );
-    bytes
+    let overview_bytes = std::fs::read(overview_out).expect("read kept overview output");
+    assert!(
+        overview_bytes.starts_with(b"PAR1"),
+        "RAYON_NUM_THREADS={threads} no_streaming={no_streaming}: kept overview does not start \
+         with the parquet magic"
+    );
+    (bytes, overview_bytes)
 }
 
 #[test]
@@ -125,15 +137,19 @@ fn pmtiles_output_is_byte_identical_across_thread_counts() {
         } else {
             "streaming"
         };
-        let mut baseline: Option<(u32, Vec<u8>)> = None;
+        let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
 
         for threads in [1u32, 2, 8] {
             let out = dir.path().join(format!("{engine}-t{threads}.pmtiles"));
-            let bytes = run_tiles(&fixture, &out, threads, no_streaming, 14);
+            let overview_out = dir
+                .path()
+                .join(format!("{engine}-t{threads}-overview.parquet"));
+            let (bytes, overview_bytes) =
+                run_tiles(&fixture, &out, &overview_out, threads, no_streaming, 14);
 
             match &baseline {
-                None => baseline = Some((threads, bytes)),
-                Some((base_threads, base_bytes)) => {
+                None => baseline = Some((threads, bytes, overview_bytes)),
+                Some((base_threads, base_bytes, base_overview_bytes)) => {
                     assert_eq!(
                         base_bytes.len(),
                         bytes.len(),
@@ -150,6 +166,18 @@ fn pmtiles_output_is_byte_identical_across_thread_counts() {
                          — #423 byte-determinism regression: a HashMap/HashSet iteration order is \
                          probably leaking into the output again",
                         bytes.len()
+                    );
+                    // #508: the intermediate overview's raw bytes must also be
+                    // stable across thread counts now that the writer sorts
+                    // `geometry_types` before serializing the footer.
+                    assert!(
+                        base_overview_bytes == &overview_bytes,
+                        "[{engine}] kept overview Parquet differs between \
+                         RAYON_NUM_THREADS={base_threads} ({} bytes) and RAYON_NUM_THREADS={threads} \
+                         ({} bytes) — #508 regression: the geo footer's `geometry_types` (or some \
+                         other HashMap/HashSet-backed field) is leaking nondeterministic order again",
+                        base_overview_bytes.len(),
+                        overview_bytes.len()
                     );
                 }
             }
@@ -183,14 +211,16 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
     // per run without weakening the coverage it exists for.
     const MAX_ZOOM: u8 = 8;
 
-    let mut baseline: Option<(u32, Vec<u8>)> = None;
+    let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
     for threads in [1u32, 2, 8] {
         let out = dir.path().join(format!("mada-t{threads}.pmtiles"));
-        let bytes = run_tiles(&fixture, &out, threads, false, MAX_ZOOM);
+        let overview_out = dir.path().join(format!("mada-t{threads}-overview.parquet"));
+        let (bytes, overview_bytes) =
+            run_tiles(&fixture, &out, &overview_out, threads, false, MAX_ZOOM);
 
         match &baseline {
-            None => baseline = Some((threads, bytes)),
-            Some((base_threads, base_bytes)) => {
+            None => baseline = Some((threads, bytes, overview_bytes)),
+            Some((base_threads, base_bytes, base_overview_bytes)) => {
                 assert_eq!(
                     base_bytes.len(),
                     bytes.len(),
@@ -209,11 +239,19 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
                      per-chunk result is being merged out of order",
                     bytes.len()
                 );
+                // The kept overview Parquet is the artifact pass 1 actually
+                // produces, so compare it directly too (#508 made its footer
+                // byte-stable; before that this would have failed for an
+                // unrelated reason).
+                assert!(
+                    base_overview_bytes == &overview_bytes,
+                    "kept overview Parquet differs between RAYON_NUM_THREADS={base_threads} \
+                     and RAYON_NUM_THREADS={threads} ({} vs {} bytes) — the parallel pass-1 \
+                     scan (#460) is not thread-count invariant",
+                    base_overview_bytes.len(),
+                    overview_bytes.len()
+                );
             }
         }
-        // The kept overview Parquet is NOT compared here — see the module
-        // docs: its GeoParquet footer's `geometry_types` still serializes a
-        // `HashSet`. Once that is deterministic, this arm should compare it
-        // too (it is the artifact pass 1 actually produces).
     }
 }

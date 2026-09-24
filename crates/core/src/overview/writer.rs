@@ -901,14 +901,18 @@ impl<W: Write + Send> OverviewWriter<W> {
         // parallel WKB path (#304) folds per-chunk contributions into
         // `geo_meta_acc`; the serial path accumulates inside the shared
         // encoder. A writer only ever populates one of the two (the encode
-        // concurrency is fixed at construction).
-        let geo_kv = match self.geo_meta_acc.take() {
-            Some(geo_meta) => KeyValue::new("geo".to_string(), serde_json::to_string(&geo_meta)?),
-            None => self
-                .encoder
-                .into_keyvalue()
-                .map_err(|e| WriterError::GeoParquet(e.to_string()))?,
+        // concurrency is fixed at construction). Either way, the metadata is
+        // serialized through `geo_metadata_json_deterministic` (#508) rather
+        // than the encoder's own `into_keyvalue`/`serde_json::to_string`, so
+        // the `geometry_types` array's element order is stable run to run.
+        let geo_meta = match self.geo_meta_acc.take() {
+            Some(geo_meta) => geo_meta,
+            None => self.encoder.into_geoparquet_metadata(),
         };
+        let geo_kv = KeyValue::new(
+            "geo".to_string(),
+            geo_metadata_json_deterministic(&geo_meta)?,
+        );
         self.writer.append_key_value_metadata(geo_kv);
 
         // `geo:overviews` footer key (§3).
@@ -1159,6 +1163,33 @@ fn fold_geo_metadata(
         }
     }
     Ok(())
+}
+
+/// Serialize the footer `geo` metadata deterministically (#508).
+///
+/// [`GeoParquetColumnMetadata::geometry_types`] is a `HashSet` (external
+/// `geoparquet` crate); its default `Serialize` impl emits a JSON array in
+/// hash-iteration order, which varies **run to run** — two byte-identical
+/// conversions of the same mixed-geometry input produced footers differing
+/// by exactly the `geometry_types` array's element order. Round-tripping
+/// through [`serde_json::Value`] first sorts every column's `geometry_types`
+/// array alphabetically before the final string encode, so the same input
+/// always produces the same footer bytes.
+///
+/// (`columns` itself is a `HashMap`, but `serde_json::Value`'s map type is a
+/// `BTreeMap` under this crate's default feature set — `to_value` already
+/// sorts column names by key, so only the array fields need an explicit
+/// sort.)
+fn geo_metadata_json_deterministic(geo_meta: &GeoParquetMetadata) -> Result<String, WriterError> {
+    let mut value = serde_json::to_value(geo_meta)?;
+    if let Some(cols) = value.get_mut("columns").and_then(|c| c.as_object_mut()) {
+        for col in cols.values_mut() {
+            if let Some(types) = col.get_mut("geometry_types").and_then(|t| t.as_array_mut()) {
+                types.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            }
+        }
+    }
+    Ok(serde_json::to_string(&value)?)
 }
 
 /// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
@@ -1636,8 +1667,29 @@ mod tests {
         serde_json::from_str(kv.value.as_ref().unwrap()).unwrap()
     }
 
-    /// A column's `geometry_types` from a raw footer `Value`, sorted (the set
-    /// has no deterministic JSON order).
+    /// The raw (unparsed) `geo` footer JSON string, for byte-identical
+    /// determinism checks (#508).
+    fn geo_footer_raw(path: &std::path::Path) -> String {
+        let file = File::open(path).unwrap();
+        let md = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        md.file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == "geo")
+            .expect("geo footer key present")
+            .value
+            .clone()
+            .expect("geo footer value present")
+    }
+
+    /// A column's `geometry_types` from a raw footer `Value`, sorted for an
+    /// order-independent comparison. `geo_metadata_json_deterministic` (#508,
+    /// fixed) already makes the written array order stable run to run, so
+    /// this sort is now belt-and-suspenders rather than load-bearing.
     fn footer_geometry_types(footer: &serde_json::Value, column: &str) -> Vec<String> {
         let mut types: Vec<String> = footer["columns"][column]["geometry_types"]
             .as_array()
@@ -1649,13 +1701,14 @@ mod tests {
         types
     }
 
-    /// Structural equality of two `geo` footers. The JSON strings are not
-    /// byte-comparable (`geometry_types` serializes a `HashSet`, whose order
-    /// varies run to run even for a serial build), so compare field-wise with
-    /// set semantics for the geometry types.
+    /// Structural equality of two `geo` footers, with set semantics for
+    /// `geometry_types`. Before #508 (fixed) the raw JSON strings were not
+    /// byte-comparable — `geometry_types` serialized a `HashSet` whose
+    /// iteration order varied run to run even for a serial build — so this
+    /// canonicalized comparison predates the fix; kept as an
+    /// order-independent structural check (real byte-identity is asserted
+    /// directly by `geometry_types_footer_order_is_deterministic_across_runs`).
     fn assert_geo_footer_eq(a: &serde_json::Value, b: &serde_json::Value, ctx: &str) {
-        // The raw JSON is not byte-comparable: `geometry_types` serializes a
-        // `HashSet` whose order varies run to run even for a serial build.
         // Canonicalize each column's `geometry_types` to a sorted array, then
         // compare the whole footer — version, primary_column, and every
         // column's encoding, geometry_types, bbox (`[null; 4]` on both, since
@@ -1858,6 +1911,91 @@ mod tests {
             assert_eq!(meta, serial_meta, "{ctx}: geo:overviews metadata differs");
             assert_geo_footer_eq(&serial_geo, &geo_footer(parallel.path()), &ctx);
         }
+    }
+
+    /// #508: two conversions of the same mixed Point+Polygon input must
+    /// produce a byte-identical `geo` footer. Before the fix,
+    /// `GeoParquetColumnMetadata::geometry_types` (a `HashSet`) serialized
+    /// its JSON array in hash-iteration order, which differs run to run even
+    /// for identical input and a serial (`encode_concurrency = 1`) write —
+    /// two runs of the same conversion differed by exactly the
+    /// `geometry_types` element order (12 footer bytes on the reported
+    /// fixture).
+    #[test]
+    fn geometry_types_footer_order_is_deterministic_across_runs() {
+        let schema = Arc::new(source_schema());
+        // Mixed Point (even ids) + Polygon (odd ids) geometries (`geom_for`).
+        let ids: Vec<i64> = (0..20).collect();
+
+        let write_once = || -> String {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let opts = duplicating_options();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for level in 0..3 {
+                let _ = writer
+                    .write_level(
+                        level,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            geo_footer_raw(tmp.path())
+        };
+
+        let first = write_once();
+        let second = write_once();
+        assert_eq!(
+            first, second,
+            "geo footer JSON differs across identical runs (#508)"
+        );
+
+        // Sanity: the fixture actually carries both geometry types, so the
+        // assertion above isn't vacuously true for a single-type array.
+        let parsed: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            footer_geometry_types(&parsed, "geometry"),
+            vec!["Point".to_string(), "Polygon".to_string()]
+        );
+    }
+
+    /// #508, parallel path: `fold_geo_metadata`'s `HashSet::extend` union
+    /// across encode chunks is another hash-order-dependent step upstream of
+    /// serialization; confirm it doesn't reintroduce nondeterminism once
+    /// multiple chunks (and therefore multiple unions) are involved.
+    #[test]
+    fn geometry_types_footer_order_is_deterministic_with_parallel_encode() {
+        let schema = Arc::new(source_schema());
+        let ids: Vec<i64> = (0..(WKB_ENCODE_CHUNK_ROWS as i64 + 37)).collect();
+
+        let write_once = || -> String {
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            let _ = writer
+                .write_level(
+                    0,
+                    Some(ids.len()),
+                    std::iter::once(source_batch(&schema, &ids)),
+                )
+                .unwrap();
+            for level in 1..3 {
+                let _ = writer
+                    .write_level(level, Some(1), std::iter::once(source_batch(&schema, &[0])))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            geo_footer_raw(tmp.path())
+        };
+
+        let first = write_once();
+        let second = write_once();
+        assert_eq!(
+            first, second,
+            "geo footer JSON differs across identical parallel-encode runs (#508)"
+        );
     }
 
     #[test]

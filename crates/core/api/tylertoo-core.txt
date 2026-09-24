@@ -994,6 +994,9 @@ pub tylertoo_core::overview::convert::ConvertError::Parquet(parquet::errors::Par
 pub tylertoo_core::overview::convert::ConvertError::PointCountColumnPresent
 pub tylertoo_core::overview::convert::ConvertError::Properties(tylertoo_core::overview::properties::PropertySelectionError)
 pub tylertoo_core::overview::convert::ConvertError::RankingConflict
+pub tylertoo_core::overview::convert::ConvertError::RowGroupCeilingUnreachable
+pub tylertoo_core::overview::convert::ConvertError::RowGroupCeilingUnreachable::ceiling: usize
+pub tylertoo_core::overview::convert::ConvertError::RowGroupCeilingUnreachable::levels: usize
 pub tylertoo_core::overview::convert::ConvertError::SortKeyColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::SortKeyColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::UnsupportedCrs
