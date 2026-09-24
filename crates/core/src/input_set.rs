@@ -489,6 +489,29 @@ impl ConvertSource {
             .sum())
     }
 
+    /// Per-part `(row count, row-group count)` straight from each part's
+    /// parquet footer, in read order.
+    ///
+    /// This is the content binding the convert plan's fingerprint pins
+    /// (#511). Both facts come from the footer the source has already
+    /// parsed, so they cost no extra I/O — and, unlike `fs::metadata`, they
+    /// are available for a **remote** part as well as a local file. A remote
+    /// object swapped under a plan changes its row count in every case that
+    /// would otherwise corrupt the replay (the row-indexed winner table is
+    /// addressed by row position).
+    pub fn part_row_counts(&self) -> Result<Vec<(i64, usize)>, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .map(|m| {
+                (
+                    m.parquet.file_metadata().num_rows(),
+                    m.parquet.num_row_groups(),
+                )
+            })
+            .collect())
+    }
+
     /// Per-part bbox row-group selection (#102): applies the single-file
     /// covering-statistics pruning to each part independently.
     /// `bbox_units` is `[xmin, ymin, xmax, ymax]` in the file CRS units.

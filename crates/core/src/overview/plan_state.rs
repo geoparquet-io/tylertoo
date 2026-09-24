@@ -104,16 +104,29 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 1;
 pub(super) struct InputFingerprint {
     /// The part's display name (local path, or remote URL).
     pub path: String,
-    /// File size in bytes. `None` for an input whose size cannot be stat'ed
-    /// (a remote object).
+    /// Size in bytes: the local file's length, or a remote object's
+    /// Content-Length as the input layer already holds it (#511). `None`
+    /// only when neither is obtainable.
     pub byte_len: Option<u64>,
-    /// Modification time in nanoseconds since the Unix epoch, when available.
+    /// Modification time in nanoseconds since the Unix epoch. Local files
+    /// only — an object store's `LastModified` is not plumbed through the
+    /// input layer, so this stays `None` for remote parts.
     pub mtime_nanos: Option<i128>,
     /// Row groups selected for this part by `--bbox` / `--filter` pruning.
     /// `None` = every row group.
     pub row_groups: Option<Vec<usize>>,
-    /// Row groups the part has in total.
+    /// Row groups the part has in total, from its parquet footer.
+    #[serde(default)]
     pub row_groups_total: Option<usize>,
+    /// Rows the part has in total, from its parquet footer (#511).
+    ///
+    /// **This is the load-bearing content binding for a remote part.** The
+    /// winner table `min_levels` is addressed by row *position*, so an input
+    /// swapped under a saved plan either silently corrupts the pyramid (fewer
+    /// rows) or indexes out of bounds (more rows). `fs::metadata` cannot see a
+    /// remote object at all; the footer's row count can, for free.
+    #[serde(default)]
+    pub num_rows: Option<i64>,
 }
 
 /// Everything that must be identical between the run that saved a plan and
@@ -137,13 +150,20 @@ pub(super) struct Fingerprint {
 
 impl Fingerprint {
     /// Capture the fingerprint of the run about to start.
+    ///
+    /// `flag` is the plan flag that asked for it (`"save-plan"` or
+    /// `"plan"`), used only in the remote-input honesty warning.
     pub fn capture(
         source: &ConvertSource,
         selected_row_groups: Option<&RowGroupSelection>,
         options: &ConvertOptions,
-    ) -> Self {
+        flag: &str,
+    ) -> Result<Self, ConvertError> {
         let parts = source.parts();
         let selected = selected_row_groups.map(RowGroupSelection::parts);
+        // Footer facts (rows, row groups) per part: free, and — unlike
+        // `fs::metadata` — available for remote objects too (#511).
+        let footer = source.part_row_counts()?;
         let inputs = parts
             .iter()
             .enumerate()
@@ -151,23 +171,45 @@ impl Fingerprint {
                 let path = part.display_name();
                 let meta = std::fs::metadata(&path).ok();
                 InputFingerprint {
-                    byte_len: meta.as_ref().map(std::fs::Metadata::len),
+                    // A remote object has no local metadata; its
+                    // Content-Length is already in hand from the HEAD /
+                    // prefix listing that opened it.
+                    byte_len: meta
+                        .as_ref()
+                        .map(std::fs::Metadata::len)
+                        .or_else(|| part.fetch_stats().map(|s| s.object_size)),
                     mtime_nanos: meta
                         .as_ref()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as i128),
                     row_groups: selected.and_then(|s| s.get(i).cloned()),
-                    row_groups_total: None,
+                    row_groups_total: footer.get(i).map(|&(_, groups)| groups),
+                    num_rows: footer.get(i).map(|&(rows, _)| rows),
                     path,
                 }
             })
             .collect();
-        Fingerprint {
+        warn_remote_binding(source, flag);
+        Ok(Fingerprint {
             tylertoo_version: env!("CARGO_PKG_VERSION").to_string(),
             options: options_digest(options),
             inputs,
+        })
+    }
+
+    /// Total rows across every part, when no part is row-group pruned.
+    ///
+    /// With `--bbox` / `--filter` pruning the run reads a subset of each
+    /// part, so the footer totals no longer describe the winner table's
+    /// domain and this returns `None`. Unpruned, it is exactly the number of
+    /// rows the plan's `min_levels` must cover — the cross-check that turns a
+    /// swapped input into an error rather than a corrupt pyramid (#511).
+    pub fn unpruned_total_rows(&self) -> Option<i64> {
+        if self.inputs.iter().any(|i| i.row_groups.is_some()) {
+            return None;
         }
+        self.inputs.iter().map(|i| i.num_rows).sum()
     }
 
     /// Verify `self` (loaded from a plan) against the current run's
@@ -216,6 +258,25 @@ fn verify_input(saved: &InputFingerprint, now: &InputFingerprint) -> Result<(), 
         return Err(mismatch("input path", &saved.path, &now.path));
     }
     let what = |field: &str| format!("input {:?} {field}", saved.path);
+    // #511: the content binding that also holds for a remote part, and the
+    // most informative thing to say first. The winner table is addressed by
+    // row position, so a changed row count is the difference between a
+    // correct replay and either a silently corrupted pyramid (fewer rows) or
+    // an out-of-bounds index (more rows).
+    if saved.num_rows != now.num_rows {
+        return Err(mismatch(
+            &what("row count"),
+            &opt_str(saved.num_rows),
+            &opt_str(now.num_rows),
+        ));
+    }
+    if saved.row_groups_total != now.row_groups_total {
+        return Err(mismatch(
+            &what("row group count"),
+            &opt_str(saved.row_groups_total),
+            &opt_str(now.row_groups_total),
+        ));
+    }
     if saved.byte_len != now.byte_len {
         return Err(mismatch(
             &what("byte_len"),
@@ -238,6 +299,36 @@ fn verify_input(saved: &InputFingerprint, now: &InputFingerprint) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// One-line honesty note about what a plan does and does not pin for a
+/// **remote** part (#511), emitted on save and on load alike.
+///
+/// A local file is pinned by path, size, mtime, row count and row-group
+/// layout. A remote object has no mtime and no ETag here — the input layer
+/// does not carry either past `connect()` — so its binding is URL,
+/// Content-Length, row count and row-group layout. That catches every
+/// replay that would corrupt the pyramid (the row-indexed winner table
+/// cannot survive a row-count change), but it does not catch an object
+/// rewritten in place with the identical size, row count and row-group
+/// layout.
+fn warn_remote_binding(source: &ConvertSource, flag: &str) {
+    let remote = source
+        .parts()
+        .iter()
+        .filter(|p| p.is_remote())
+        .map(|p| p.display_name())
+        .collect::<Vec<_>>();
+    let Some(first) = remote.first() else {
+        return;
+    };
+    log::warn!(
+        "--{flag}: {} remote input part(s) (e.g. {first}) are pinned by URL, object size, \
+         row count and row-group layout only — an object has no mtime here, so one rewritten \
+         in place with the same size and row count would NOT be detected. Local parts also \
+         pin mtime.",
+        remote.len(),
+    );
 }
 
 fn opt_str<T: std::fmt::Display>(v: Option<T>) -> String {
@@ -987,6 +1078,7 @@ mod tests {
                 mtime_nanos: Some(99),
                 row_groups: Some(vec![0, 2]),
                 row_groups_total: Some(3),
+                num_rows: Some(9),
             }],
         }
     }
@@ -1142,6 +1234,98 @@ mod tests {
 
         // Identical fingerprints verify.
         saved.verify(&tiny_fingerprint()).unwrap();
+    }
+
+    /// #511: the row count is the binding that survives a remote input, where
+    /// `fs::metadata` sees nothing. Both directions are refused by name —
+    /// fewer rows (which would silently truncate the pyramid) and more rows
+    /// (which would index the winner table out of bounds).
+    #[test]
+    fn plan_fingerprint_rejects_changed_row_count() {
+        let saved = tiny_fingerprint();
+
+        for rows in [Some(8), Some(10), None] {
+            let mut changed = tiny_fingerprint();
+            changed.inputs[0].num_rows = rows;
+            let err = touched_err(&saved, &changed);
+            assert!(err.contains("row count"), "names the field: {err}");
+            assert!(err.contains("/tmp/in.parquet"), "names the part: {err}");
+        }
+
+        let mut regrouped = tiny_fingerprint();
+        regrouped.inputs[0].row_groups_total = Some(4);
+        let err = touched_err(&saved, &regrouped);
+        assert!(err.contains("row group count"), "names the field: {err}");
+    }
+
+    /// #511: a remote part carries neither a local size nor an mtime, so the
+    /// row count / row-group layout IS the whole content binding — and it
+    /// must still refuse a swapped object.
+    #[test]
+    fn plan_fingerprint_binds_remote_shaped_part_by_row_count() {
+        let remote = |rows: i64, byte_len: Option<u64>| Fingerprint {
+            tylertoo_version: env!("CARGO_PKG_VERSION").to_string(),
+            options: BTreeMap::new(),
+            inputs: vec![InputFingerprint {
+                path: "s3://bucket/roads.parquet".to_string(),
+                // The metadata-unavailable branch: no local stat, so mtime is
+                // absent and the size is whatever the object store reported.
+                byte_len,
+                mtime_nanos: None,
+                row_groups: None,
+                row_groups_total: Some(12),
+                num_rows: Some(rows),
+            }],
+        };
+        // Same URL, same size, same row groups, different contents: the
+        // pre-#511 fingerprint accepted this and replayed into corruption.
+        let err = remote(1_000_000, Some(4096))
+            .verify(&remote(999_999, Some(4096)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row count"), "names the field: {err}");
+        assert!(err.contains("1000000") && err.contains("999999"), "{err}");
+
+        // And the size, when the object store does report one.
+        let err = remote(1_000_000, Some(4096))
+            .verify(&remote(1_000_000, Some(8192)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("byte_len"), "{err}");
+
+        // Unchanged verifies, with no local metadata anywhere.
+        remote(1_000_000, None)
+            .verify(&remote(1_000_000, None))
+            .unwrap();
+    }
+
+    /// The dataset-level cross-check: unpruned, the parts' footer row counts
+    /// sum to the winner table's domain; pruned, they cannot and must not be
+    /// compared.
+    #[test]
+    fn unpruned_total_rows_sums_only_without_pruning() {
+        let mut f = tiny_fingerprint();
+        f.inputs[0].row_groups = None;
+        assert_eq!(f.unpruned_total_rows(), Some(9));
+
+        f.inputs.push(InputFingerprint {
+            path: "/tmp/b.parquet".to_string(),
+            byte_len: None,
+            mtime_nanos: None,
+            row_groups: None,
+            row_groups_total: Some(1),
+            num_rows: Some(4),
+        });
+        assert_eq!(f.unpruned_total_rows(), Some(13));
+
+        // A pruned part makes the footer totals meaningless.
+        f.inputs[1].row_groups = Some(vec![0]);
+        assert_eq!(f.unpruned_total_rows(), None);
+
+        // As does a part whose footer row count is unavailable.
+        f.inputs[1].row_groups = None;
+        f.inputs[1].num_rows = None;
+        assert_eq!(f.unpruned_total_rows(), None);
     }
 
     fn touched_err(saved: &Fingerprint, current: &Fingerprint) -> String {
@@ -1418,22 +1602,45 @@ mod tests {
         )
         .unwrap();
 
-        // Rewrite the input with fewer features: same path, different bytes.
+        // #511's probe, both directions. Rewrite the input at the SAME path
+        // with FEWER rows: `min_levels` is indexed by row position, so a
+        // replay would silently truncate the pyramid. Then with MORE rows,
+        // which used to panic with an out-of-bounds index in pass 2. The
+        // error must name the row count, because that is the one term of the
+        // fingerprint a remote input also has (size/mtime do not survive an
+        // `s3://` display name).
+        let replay = |input: &std::path::Path, out: &str| {
+            convert_to_overviews(
+                input,
+                dir.path().join(out),
+                &ConvertOptions {
+                    plan: Some(plan_path.clone()),
+                    ..base.clone()
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
         write_input(&input, &point_fixture()[..100], true, None);
-        let err = convert_to_overviews(
-            &input,
-            dir.path().join("b.parquet"),
-            &ConvertOptions {
-                plan: Some(plan_path.clone()),
-                ..base.clone()
-            },
-        )
-        .unwrap_err()
-        .to_string();
+        let err = replay(&input, "b.parquet");
         assert!(
-            err.contains("byte_len") || err.contains("mtime"),
+            err.contains("row count"),
             "names the offending field: {err}"
         );
+        assert!(err.contains("100"), "names the new row count: {err}");
+
+        let mut more = point_fixture();
+        more.extend(point_fixture());
+        write_input(&input, &more, true, None);
+        let err = replay(&input, "b2.parquet");
+        assert!(
+            err.contains("row count"),
+            "names the offending field: {err}"
+        );
+
+        // Restore the original input for the options check below.
+        write_input(&input, &point_fixture(), true, None);
 
         // A changed thinning knob is refused by name as well.
         let mut thinned = base.clone();

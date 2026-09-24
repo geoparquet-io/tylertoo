@@ -1228,10 +1228,16 @@ fn resolve_plan_state(
 ) -> Result<PlanState, ConvertError> {
     // Captured before either branch: the load path compares the saved
     // fingerprint against it, the save path stores it.
+    let flag = if options.plan.is_some() {
+        "plan"
+    } else {
+        "save-plan"
+    };
     let fingerprint = (options.save_plan.is_some() || options.plan.is_some())
-        .then(|| Fingerprint::capture(inputs.source, inputs.selected_row_groups, options));
+        .then(|| Fingerprint::capture(inputs.source, inputs.selected_row_groups, options, flag))
+        .transpose()?;
     match &options.plan {
-        Some(path) => load_plan_state(path, fingerprint.expect("captured for --plan")),
+        Some(path) => load_plan_state(path, fingerprint.expect("captured for --plan"), options),
         None => run_pass1_and_assign(inputs, options, fingerprint, peak_rss_mib),
     }
 }
@@ -1365,7 +1371,11 @@ fn count_kinds(features: &[AssignFeature]) -> (usize, usize, usize) {
 
 /// The `--plan` path: pass 1 and the assignment are replaced wholesale by the
 /// saved artifact, after its fingerprint is verified against this run.
-fn load_plan_state(path: &Path, current: Fingerprint) -> Result<PlanState, ConvertError> {
+fn load_plan_state(
+    path: &Path,
+    current: Fingerprint,
+    options: &ConvertOptions,
+) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
     let plan = ConvertPlan::load(path)?;
     plan.fingerprint.verify(&current)?;
@@ -1377,6 +1387,40 @@ fn load_plan_state(path: &Path, current: Fingerprint) -> Result<PlanState, Conve
             plan.min_levels.len(),
             totals.n_rows,
         )));
+    }
+    // #511: the winner table is addressed by row position, so the plan's row
+    // domain must equal what THIS run will actually stream. The per-part row
+    // counts are already compared field by field above; this catches the
+    // dataset-level case the fingerprint cannot see on its own (a plan whose
+    // totals disagree with the inputs it names). Skipped when row groups are
+    // pruned, where the footers no longer describe the rows read.
+    if let Some(total) = current.unpruned_total_rows() {
+        if total != plan.min_levels.len() as i64 {
+            return Err(ConvertError::InvalidConfig(format!(
+                "--plan: {} holds {} winner-table row(s) but the input(s) named in it \
+                 have {total} row(s) now. Re-run without --plan (add --save-plan to write \
+                 a fresh one).",
+                path.display(),
+                plan.min_levels.len(),
+            )));
+        }
+    }
+    // #512: bound the cluster aggregate arity by this run's accumulate specs,
+    // rather than trusting the stride the plan's JSON block declares.
+    if let Some(tables) = &plan.cluster_tables {
+        let want = options.accumulate.len();
+        if let Some(got) = tables
+            .iter()
+            .flat_map(|t| t.values())
+            .map(|e| e.aggregates.len())
+            .find(|&n| n != want)
+        {
+            return Err(ConvertError::InvalidConfig(format!(
+                "--plan: {} has cluster entries carrying {got} aggregate(s) but this run \
+                 declares {want} --accumulate spec(s)",
+                path.display(),
+            )));
+        }
     }
     if plan.counts.len() != plan.level_specs.len() || plan.finest >= plan.level_specs.len() {
         return Err(ConvertError::InvalidConfig(format!(

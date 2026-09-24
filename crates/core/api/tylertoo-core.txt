@@ -403,6 +403,7 @@ pub fn tylertoo_core::input_set::ConvertSource::is_remote(&self) -> bool
 pub fn tylertoo_core::input_set::ConvertSource::key_value_metadata(&self) -> core::result::Result<core::option::Option<alloc::vec::Vec<parquet::file::metadata::KeyValue>>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::num_row_groups_total(&self) -> core::result::Result<usize, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::open_stream(&self, &tylertoo_core::input_set::ReadPlan<'_>) -> core::result::Result<tylertoo_core::input_set::SourceStream<'_>, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input_set::ConvertSource::part_row_counts(&self) -> core::result::Result<alloc::vec::Vec<(i64, usize)>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::parts(&self) -> &[tylertoo_core::input::InputSource]
 pub fn tylertoo_core::input_set::ConvertSource::resolve(&str) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::resolve_path(&std::path::Path) -> core::result::Result<Self, tylertoo_core::input::InputError>

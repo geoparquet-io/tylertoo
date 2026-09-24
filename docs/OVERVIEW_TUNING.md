@@ -1575,14 +1575,40 @@ exception — the plan carries the collected line geometries as WKB, so a
 line-heavy input produces a proportionally larger artifact.
 
 **The plan is verified, not trusted.** It stores a fingerprint: the tylertoo
-version, every thinning-relevant flag, and each input's path, size, mtime and
-pruned row groups. A mismatch is a hard error naming the field:
+version, every thinning-relevant flag, and each input's identity. A mismatch
+is a hard error naming the field:
 
 ```
 --plan: saved plan does not match this run: input "roads.parquet" mtime was
 "1790242802390408452" when the plan was saved but is "1790244114398193000"
 now. Re-run without --plan (add --save-plan to write a fresh one).
 ```
+
+**What "input identity" pins, exactly.** For every part — local file or
+remote object alike — the path/URL, the byte size, the **row count** and the
+**row-group count** read from the parquet footer, plus the row groups
+`--bbox`/`--filter` pruned to. A **local** part additionally pins its mtime.
+
+| | local file | remote object |
+|---|---|---|
+| path / URL | ✅ | ✅ |
+| byte size | ✅ (`stat`) | ✅ (Content-Length) |
+| row count | ✅ (footer) | ✅ (footer) |
+| row-group count + pruned selection | ✅ | ✅ |
+| mtime | ✅ | ❌ |
+| content hash / ETag | ❌ | ❌ |
+
+The row count is the load-bearing one: the winner table is one byte per input
+row, addressed by row *position*, so an input swapped under a saved plan
+either produces a silently wrong pyramid (fewer rows) or indexes out of
+bounds (more rows). Pinning the footer row count turns both into a named
+error, for remote inputs as well as local ones. tylertoo prints a one-line
+warning naming what is and is not pinned whenever a part is remote.
+
+Neither a local mtime+size nor a remote size+row-count is a content hash:
+`cp -p` / `rsync -a` preserve mtime and size, and an object can be rewritten
+in place with the same size and row count. Treat the fingerprint as a strong
+staleness check, not a cryptographic seal.
 
 Deliberately **not** fingerprinted, so one plan replays across them:
 `--profile`, `--row-group-size`, `--row-group-size-policy`,
