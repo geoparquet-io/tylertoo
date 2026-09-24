@@ -157,11 +157,15 @@ fn convert(
 
 /// Map a [`ConvertError`] to the Python exception type it deserves:
 /// user-input problems (bad options, missing/mistyped columns, invalid level
-/// plans) become `ValueError`; everything else (I/O, decode, writer) becomes
+/// plans, an input whose coordinates or CRS the tiler cannot work with)
+/// become `ValueError`; everything else (I/O, decode, writer) becomes
 /// `RuntimeError`.
 fn convert_error_to_py(e: ConvertError) -> PyErr {
     match e {
-        ConvertError::InvalidLevels(_)
+        // The input itself is the problem, not the run (#429).
+        ConvertError::AllFeaturesOutOfRange { .. }
+        | ConvertError::UnsupportedCrs { .. }
+        | ConvertError::InvalidLevels(_)
         | ConvertError::RankingConflict
         | ConvertError::ClusterPartitioningUnsupported
         | ConvertError::AccumulateWithoutCluster
@@ -214,6 +218,16 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     dict.set_item("total_compressed_bytes", report.total_compressed_bytes)?;
     dict.set_item("row_groups_total", report.row_groups_total)?;
     dict.set_item("row_groups_read", report.row_groups_read)?;
+    // Input-quality counters: antimeridian suspects (#188) and the two #429
+    // losses (outside the declared CRS's range; valid lon/lat outside the Web
+    // Mercator tiling domain). Python callers get the same honesty the CLI
+    // summary does.
+    dict.set_item(
+        "antimeridian_suspect_features",
+        report.antimeridian_suspect_features,
+    )?;
+    dict.set_item("out_of_range_features", report.out_of_range_features)?;
+    dict.set_item("unprojectable_features", report.unprojectable_features)?;
     dict.set_item("duration_secs", report.duration_secs)?;
     // Remote-input fetch counters (#210); None for local inputs.
     match &report.remote_fetch {
@@ -406,16 +420,22 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///     omitted because no feature is visible at their scale — the written
 ///     pyramid is auto-clamped to the non-empty levels), "input_features",
 ///     "total_rows", "total_vertices", "total_compressed_bytes",
-///     "row_groups_total", "row_groups_read", "duration_secs", and
-///     "remote_fetch" (None for local inputs; for remote URLs a dict with
-///     "requests", "bytes_fetched", "object_size").
+///     "row_groups_total", "row_groups_read",
+///     "antimeridian_suspect_features" (features whose bbox spans more than
+///     180° of longitude), "out_of_range_features" (features reaching beyond
+///     the declared CRS's coordinate range — dropped or clipped),
+///     "unprojectable_features" (features with valid lon/lat outside the Web
+///     Mercator tiling domain, |lat| > 85.05° — these cannot be tiled),
+///     "duration_secs", and "remote_fetch" (None for local inputs; for remote
+///     URLs a dict with "requests", "bytes_fetched", "object_size").
 ///
 /// Raises:
 ///     ValueError: Invalid options (bad mode/direction/op, conflicting or
 ///         incomplete ranking options, invalid level plan, missing or
-///         mistyped columns).
-///     RuntimeError: The conversion itself failed (I/O, decode, unsupported
-///         CRS, writer errors).
+///         mistyped columns), an unsupported input CRS, or an input where
+///         ≥99% of features cannot be tiled.
+///     RuntimeError: The conversion itself failed (I/O, decode, writer
+///         errors).
 ///
 /// Example:
 ///     >>> from tylertoo import overview

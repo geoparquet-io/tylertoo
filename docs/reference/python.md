@@ -69,12 +69,12 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 
 ###### **Returns:**
 
-`dict` — Conversion report with keys "mode", "levels" (list of dicts with "level", "gsd", "zoom", "feature_count", "vertex_count", "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels" (list of dicts with "planned_level", "gsd", "zoom": planned levels omitted because no feature is visible at their scale — the written pyramid is auto-clamped to the non-empty levels), "input_features", "total_rows", "total_vertices", "total_compressed_bytes", "row_groups_total", "row_groups_read", "duration_secs", and "remote_fetch" (None for local inputs; for remote URLs a dict with "requests", "bytes_fetched", "object_size").
+`dict` — Conversion report with keys "mode", "levels" (list of dicts with "level", "gsd", "zoom", "feature_count", "vertex_count", "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels" (list of dicts with "planned_level", "gsd", "zoom": planned levels omitted because no feature is visible at their scale — the written pyramid is auto-clamped to the non-empty levels), "input_features", "total_rows", "total_vertices", "total_compressed_bytes", "row_groups_total", "row_groups_read", "antimeridian_suspect_features" (features whose bbox spans more than 180° of longitude), "out_of_range_features" (features reaching beyond the declared CRS's coordinate range — dropped or clipped), "unprojectable_features" (features with valid lon/lat outside the Web Mercator tiling domain, |lat| > 85.05° — these cannot be tiled), "duration_secs", and "remote_fetch" (None for local inputs; for remote URLs a dict with "requests", "bytes_fetched", "object_size").
 
 ###### **Raises:**
 
-* `ValueError` — Invalid options (bad mode/direction/op, conflicting or incomplete ranking options, invalid level plan, missing or mistyped columns).
-* `RuntimeError` — The conversion itself failed (I/O, decode, unsupported CRS, writer errors).
+* `ValueError` — Invalid options (bad mode/direction/op, conflicting or incomplete ranking options, invalid level plan, missing or mistyped columns), an unsupported input CRS, or an input where ≥99% of features cannot be tiled.
+* `RuntimeError` — The conversion itself failed (I/O, decode, writer errors).
 
 ###### **Example:**
 
