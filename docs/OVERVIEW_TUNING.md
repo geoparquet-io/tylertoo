@@ -1568,11 +1568,27 @@ tylertoo overview roads.parquet roads-tuned.overview \
   --profile bounded --row-group-size 50000
 ```
 
-The artifact is one Arrow IPC file, sized by input **rows** rather than input
-bytes: one winner byte per row plus the small per-level side tables. A 28 MB
-/ 24k-feature polygon file yields a 49 KB plan. Line coalescing is the
-exception — the plan carries the collected line geometries as WKB, so a
-line-heavy input produces a proportionally larger artifact.
+The artifact is a magic + checksum header followed by one Arrow IPC file,
+sized by input **rows** rather than input bytes: one winner byte per row plus
+the small per-level side tables. A 28 MB / 24k-feature polygon file yields a
+49 KB plan. Line coalescing is the exception — the plan carries the collected
+line geometries as WKB, so a line-heavy input produces a proportionally
+larger artifact.
+
+**The file is checksummed.** A plan is meant to be copied to other machines,
+so `--plan` verifies an xxh3-64 over the whole payload before decoding any of
+it. A truncated, edited, or bit-rotted plan is one named error —
+
+```
+--plan /mnt/shared/roads.plan: is corrupt: the payload hashes to
+1f3c...  but the header records 90ab.... The file was truncated, edited, or
+damaged in transit — re-create it with --save-plan.
+```
+
+— rather than an arrow-internal panic. Every other structural problem (a
+plan that is not a plan, a foreign format version, an impossible level count
+or cluster stride, an unknown geometry-kind code) is likewise an error naming
+`--plan` and the path.
 
 **The plan is verified, not trusted.** It stores a fingerprint: the tylertoo
 version, every thinning-relevant flag, and each input's identity. A mismatch
