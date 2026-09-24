@@ -2,6 +2,28 @@
 //!
 //! This is a thin wrapper around the tylertoo-core library.
 
+/// Global allocator for static-musl builds (#480).
+///
+/// musl's `mallocng` deterministically fails *small* allocations once a large
+/// live heap has been fragmented by many threads: a 38.7M-polygon `tiles` run
+/// aborted with `memory allocation of 148448 bytes failed` at the identical
+/// input row across two runs, at 28.6 GB RSS on a node with 240 GB granted —
+/// >200 GB of headroom. mimalloc's segment/page allocator does not degrade
+/// that way, so the musl release binary uses it instead.
+///
+/// Scoped to `target_env = "musl"` on purpose: glibc, macOS and Windows builds
+/// keep the platform allocator (nothing to fix there), and the Python
+/// extension module never routes through this crate — a pyo3 `cdylib` must
+/// leave the host interpreter's allocator arrangements alone.
+///
+/// Excluded under `dhat-heap`: dhat installs its own `#[global_allocator]`
+/// in tylertoo-core (it must own the allocator to count anything), and rustc
+/// allows only one in the crate graph. Heap-profiling a musl binary therefore
+/// runs on dhat's allocator and loses this fix for the duration.
+#[cfg(all(target_env = "musl", not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
@@ -180,7 +202,9 @@ pub struct PyramidArgs {
     /// INPUT is either a GeoParquet source — tiled here, restricted to this
     /// band's zoom range — or a PMTiles archive already tiled for that range,
     /// which is merged as-is. Which one it is is detected from the file, not
-    /// the extension.
+    /// the extension. A source may be remote (`https://`, `s3://`, `gs://`),
+    /// read with byte-range requests like every other subcommand's input; a
+    /// band ARCHIVE must be local, since the merge reads it by offset.
     ///
     /// LAYER defaults to the file stem, and several bands may share one layer
     /// name (the usual case: a coarse and a fine aggregate that are the same
@@ -195,8 +219,21 @@ pub struct PyramidArgs {
     /// name inside the archive, or the merge is refused rather than write
     /// two layers of one name into a tile.
     ///
-    /// INPUT may not contain a `:`, which the spec cannot tell apart from the
-    /// LAYER separator; rename the file or point at it through a symlink.
+    /// Bands are emitted coarsest-first in the merged archive regardless of
+    /// listing order.
+    ///
+    /// Colons in INPUT: the LAYER is only split off the LAST `:` when what
+    /// follows it has no `/`, `\` or `:`, so a URL, a Windows drive and a
+    /// `2024:06/` directory stay whole. A drive-relative path with no `\`
+    /// after the drive, e.g. `C:data.parquet`, also stays whole: a single
+    /// ASCII letter before the last `:` is treated as a drive letter, not a
+    /// path, even though `data.parquet` alone would otherwise look like a
+    /// bare layer name. For the inputs that rule cannot express — one ENDING
+    /// in a bare colon segment, e.g. a Hive directory
+    /// `admin:country_code=BR` — spell the band `LO-HI=INPUT[=LAYER]`
+    /// instead: the range is split at the first `=` and the LAYER at the
+    /// last, again only when the segment after it has no `/`, `\` or `:`. An
+    /// INPUT that itself ends in `=VALUE` needs an explicit `=LAYER`.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
 
@@ -353,9 +390,10 @@ struct ExportPmtilesArgs {
     /// Partitions processed per band read during export (the export
     /// concurrency knob). `auto` (the default) preflights a memory budget:
     /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
-    /// only when RAM cannot be probed; override the RAM figure with
-    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// transients fit in a fraction of available RAM (container-aware: cgroup
+    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
+    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
+    /// Pass an explicit integer to override.
     /// Wider waves keep more cores busy at proportionally more peak memory
     /// (one wave of partitions resident). The chosen width and the preflight
     /// inputs are logged at export start. Output is byte-identical for every
@@ -976,7 +1014,8 @@ struct ConvertTuningArgs {
     /// with buffered output). `bounded` spills them to temporary Arrow IPC
     /// files (memory-capped; slight temp-I/O cost). `auto` (default) is
     /// workload-based: it estimates buffered output from feature and level
-    /// counts and spills when that exceeds a fraction of available RAM, so large
+    /// counts and spills when that exceeds a fraction of available RAM
+    /// (container-aware: cgroup v2/v1 limits are respected), so large
     /// duplicating runs prefer bounded instead of risking OOM (override the RAM
     /// figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical
     /// across profiles. No effect with --no-streaming.
@@ -1348,9 +1387,10 @@ struct TilesArgs {
     /// Partitions processed per band read during the export phase (the export
     /// concurrency knob). `auto` (the default) preflights a memory budget:
     /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (floor 6; fixed cap 16
-    /// only when RAM cannot be probed; override the RAM figure with
-    /// TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override.
+    /// transients fit in a fraction of available RAM (container-aware: cgroup
+    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
+    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
+    /// Pass an explicit integer to override.
     /// Wider waves keep more cores busy at proportionally more peak memory
     /// (one wave of partitions resident). The chosen width and the preflight
     /// inputs are logged at export start. Output is byte-identical for every
@@ -2274,6 +2314,30 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     Ok(())
 }
 
+/// If `spec` is the `LO-HI=INPUT=LAYER` escape form and `layer` is exactly
+/// the segment `Band::parse` peeled off its end, the `=LAYER` suffix that was
+/// stripped — for callers that want to hint "was this actually part of the
+/// path?" when the stripped-down input then fails an existence check.
+///
+/// Mirrors `Band::parse`'s own separator choice (`=` wins whichever of `:`
+/// and `=` appears first) without reaching into its private helpers: this is
+/// a best-effort hint, not a re-parse, so a false negative here just means no
+/// hint is offered, not a wrong answer.
+fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
+    let colon = spec.find(':');
+    let equals = spec.find('=');
+    let is_equals_form = match (colon, equals) {
+        (Some(c), Some(e)) => e < c,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if !is_equals_form {
+        return None;
+    }
+    let suffix = format!("={layer}");
+    spec.ends_with(&suffix).then_some(suffix)
+}
+
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
@@ -2306,11 +2370,34 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     // plain existence test, skipped for the three spellings where `exists()`
     // has no useful answer — a remote URL, a glob, and anything else the
     // reader resolves itself.
-    for b in &bands {
+    for (spec, b) in args.bands.iter().zip(&bands) {
         let spelled = b.input.to_string_lossy();
         let deferred = spelled.contains("://") || spelled.contains(['*', '?', '[']);
         if !deferred && !b.input.exists() {
-            anyhow::bail!("band input not found: {}", b.input.display());
+            let mut msg = format!("band input not found: {}", b.input.display());
+            // A bare Hive partition dir spec like
+            // `0-13=admin:country_code=BR` (no trailing filename) silently
+            // parses as INPUT=admin:country_code, LAYER=BR: the trailing
+            // `=BR` looked like an explicit layer, so it was stripped from
+            // the path. If that is what happened here, say so — a bare
+            // "not found" gives no hint that a layer was ever peeled off.
+            if let Some(suffix) = stripped_equals_layer_suffix(spec, &b.layer) {
+                let candidate = format!("{}{suffix}", b.input.display());
+                if std::path::Path::new(&candidate).exists() {
+                    msg.push_str(&format!(
+                        "\n  hint: {candidate:?} exists — the trailing {suffix:?} was \
+                         parsed as a layer name (LO-HI=INPUT=LAYER); if it is part of \
+                         the path, append an explicit =LAYER instead"
+                    ));
+                } else {
+                    msg.push_str(&format!(
+                        "\n  hint: the trailing {suffix:?} was parsed as a layer name \
+                         (LO-HI=INPUT=LAYER); if it is part of the path, append an \
+                         explicit =LAYER instead"
+                    ));
+                }
+            }
+            anyhow::bail!(msg);
         }
     }
 

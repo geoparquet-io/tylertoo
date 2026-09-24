@@ -28,6 +28,7 @@ use tempfile::NamedTempFile;
 
 use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
+use crate::input::url_scheme;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_writer::{
@@ -50,28 +51,47 @@ impl Band {
     /// which every write path now enforces at options validation.
     const MAX_ZOOM: u8 = crate::tile::MAX_ZOOM;
 
-    /// Parse `LO-HI:PATH[:LAYER]`. The layer is optional and defaults to the
-    /// input's file stem.
+    /// Parse a band spec. The layer is optional and defaults to the input's
+    /// file stem. Two spellings are accepted (#482):
     ///
-    /// The zoom range is split off first. What remains is the path, *unless*
-    /// its last colon-separated segment is a bare layer token — no `/`, `\` or
-    /// `:` — in which case that is the layer. Paths legitimately contain
-    /// colons: `s3://bucket/x.parquet`, `https://host/x.parquet`,
-    /// `C:\data\x.parquet`. Splitting on the last colon unconditionally
-    /// mangled every one of those, and remote sources are genuinely supported
-    /// downstream, so the grammar has to admit them.
+    /// * `LO-HI:INPUT[:LAYER]` — the usual one.
+    /// * `LO-HI=INPUT[=LAYER]` — an escape form for an INPUT the colon form
+    ///   cannot express, `=` being invalid in a zoom range.
     ///
-    /// One extra rule closes `C:data.parquet`, where the last segment *is* a
-    /// bare token: a single-ASCII-letter candidate path is a Windows drive, so
-    /// the whole remainder is the path. All of this is pure string work — no
-    /// filesystem access, so it behaves the same for a glob or a URL.
+    /// Which one a spec is in is decided by whichever of `:` and `=` closes
+    /// the zoom range, i.e. whichever comes first ([`band_separator`]).
+    ///
+    /// In the `:` form the remainder is the INPUT, *unless* its last
+    /// colon-separated segment is a bare layer token — no `/`, `\` or `:`.
+    /// Paths legitimately contain colons: `s3://bucket/x.parquet`,
+    /// `https://host/x.parquet`, `C:\data\x.parquet`. The rule is
+    /// scheme-aware: in a `scheme://…` remainder the scheme's own colon and
+    /// any colon inside the URL path (a port, a `2024:06` directory) are part
+    /// of the URL, and only a *last* colon followed by a segment with no `/`
+    /// starts a LAYER. One extra rule closes `C:data.parquet`, where the last
+    /// segment *is* a bare token: a single-ASCII-letter candidate path is a
+    /// Windows drive, so the whole remainder is the path.
+    ///
+    /// In the `=` form the range is split at the FIRST `=` and a LAYER at the
+    /// LAST `=`, and again only when the segment after it is a bare layer
+    /// token. That keeps a Hive path such as
+    /// `admin:country_code=BR/part.parquet` whole; an input that *ends* in
+    /// `=VALUE` is indistinguishable from a layer, so those need an explicit
+    /// trailing `=LAYER`.
+    ///
+    /// All of this is pure string work — no filesystem access, so it behaves
+    /// the same for a glob or a URL.
     pub fn parse(spec: &str) -> Result<Self, String> {
-        let (range, rest) = spec
-            .split_once(':')
-            .ok_or_else(|| format!("band {spec:?}: expected LO-HI:PATH[:LAYER]"))?;
-        let (lo, hi) = range
-            .split_once('-')
-            .ok_or_else(|| format!("band {spec:?}: zoom range must be LO-HI"))?;
+        let (sep, at) =
+            band_separator(spec).ok_or_else(|| format!("band {spec:?}: {BAND_FORMS}"))?;
+        let (range, rest) = spec.split_at(at);
+        let rest = &rest[sep.len_utf8()..];
+        let (lo, hi) = range.split_once('-').ok_or_else(|| {
+            format!(
+                "band {spec:?}: zoom range must be LO-HI; every band spec must \
+                 start with a LO-HI: (or LO-HI=) zoom range, e.g. \"0-5:{spec}\""
+            )
+        })?;
         let min_zoom: u8 = lo
             .trim()
             .parse()
@@ -90,29 +110,25 @@ impl Band {
             ));
         }
 
-        // A trailing colon is an empty layer name, not part of the path.
-        // Falling through would silently keep the colon in the path.
-        if rest.trim_end().ends_with(':') {
+        // A trailing separator is an empty layer name, not part of the path.
+        // Falling through would silently keep it in the path.
+        if rest.trim_end().ends_with(sep) {
             return Err(format!("band {spec:?}: empty layer name"));
         }
-        let (path, layer) = match rest.rsplit_once(':') {
-            // A bare final segment is a layer name, unless what precedes it is
-            // a lone drive letter.
-            Some((p, l)) if is_bare_layer_token(l) && !p.is_empty() && !is_drive_letter(p) => {
-                (p.trim(), Some(l.trim().to_string()))
-            }
-            _ => (rest.trim(), None),
+        let (path, layer) = match sep {
+            ':' => split_colon_form(rest),
+            _ => split_equals_form(rest),
         };
         if path.is_empty() {
             return Err(format!("band {spec:?}: empty input path"));
         }
         let layer = match layer {
-            Some(l) if l.is_empty() => return Err(format!("band {spec:?}: empty layer name")),
-            Some(l) => l,
+            Some("") => return Err(format!("band {spec:?}: empty layer name")),
+            Some(l) => l.to_string(),
             None => default_layer_for(path).ok_or_else(|| {
                 format!(
                     "band {spec:?}: cannot derive a layer name from {path:?}; \
-                     append :LAYER"
+                     append {sep}LAYER"
                 )
             })?,
         };
@@ -123,6 +139,78 @@ impl Band {
             min_zoom,
             max_zoom,
         })
+    }
+}
+
+/// Both accepted band spellings, named in every ill-formed-spec error so the
+/// escape form is discoverable from the message rather than the manual.
+const BAND_FORMS: &str = "expected LO-HI:INPUT[:LAYER] or LO-HI=INPUT[=LAYER]";
+
+/// Which separator closes the zoom range, and its byte offset.
+///
+/// A zoom range is digits and `-`, so whichever of `:` and `=` appears first
+/// is the one that closes it. That is what lets
+/// `0-13=admin:country_code=BR/part.parquet` be the `=` form while
+/// `0-9:/data/country_code=BR/part.parquet` stays the `:` form.
+fn band_separator(spec: &str) -> Option<(char, usize)> {
+    match (spec.find(':'), spec.find('=')) {
+        (Some(c), Some(e)) => Some(if e < c { ('=', e) } else { (':', c) }),
+        (Some(c), None) => Some((':', c)),
+        (None, Some(e)) => Some(('=', e)),
+        (None, None) => None,
+    }
+}
+
+/// Split `INPUT[:LAYER]` — see [`Band::parse`] for the rule.
+fn split_colon_form(rest: &str) -> (&str, Option<&str>) {
+    let rest = rest.trim();
+    if let Some(scheme) = url_scheme(rest) {
+        // Past the `scheme://`, so the scheme's own colon can never split.
+        //
+        // This branch is provably equivalent to the generic fallback below
+        // (rsplit_once(':') on the whole `rest`, minus the drive-letter
+        // carve-out which cannot fire here — a scheme is never one ASCII
+        // letter) for every realizable input: if `authority_and_path`
+        // contains a `:`, it is the last `:` in `rest` too, since nothing
+        // after the scheme prefix can contain one that isn't in it, so both
+        // splits land on the same byte. If it contains none, the fallback's
+        // rsplit_once(':') on `rest` finds the scheme's own colon instead,
+        // splitting off `"//" + authority_and_path` as the candidate
+        // layer — but that always contains the `/` from `"://"`, so
+        // `is_bare_layer_token` rejects it and the fallback also keeps
+        // `rest` whole. Kept as its own branch (rather than folded into the
+        // fallback) because slicing by byte offset here is clearer than
+        // re-deriving the scheme boundary from the split fallback would be.
+        let authority_and_path = &rest[scheme.len() + 3..];
+        return match authority_and_path.rsplit_once(':') {
+            // `is_bare_layer_token` rejects a segment containing `/`, which is
+            // what keeps a port (`host:8080/x.parquet`) and a colon inside the
+            // URL path out of the layer slot.
+            Some((p, l)) if is_bare_layer_token(l) => (
+                rest[..scheme.len() + 3 + p.len()].trim_end(),
+                Some(l.trim()),
+            ),
+            _ => (rest, None),
+        };
+    }
+    match rest.rsplit_once(':') {
+        // A bare final segment is a layer name, unless what precedes it is a
+        // lone drive letter.
+        Some((p, l)) if is_bare_layer_token(l) && !p.is_empty() && !is_drive_letter(p) => {
+            (p.trim(), Some(l.trim()))
+        }
+        _ => (rest, None),
+    }
+}
+
+/// Split `INPUT[=LAYER]` — see [`Band::parse`] for the rule.
+fn split_equals_form(rest: &str) -> (&str, Option<&str>) {
+    let rest = rest.trim();
+    match rest.rsplit_once('=') {
+        Some((p, l)) if is_bare_layer_token(l) && !p.trim().is_empty() => {
+            (p.trim(), Some(l.trim()))
+        }
+        _ => (rest, None),
     }
 }
 
@@ -165,6 +253,40 @@ fn default_layer_for(path: &str) -> Option<String> {
     }
 }
 
+/// Whether a band input is a URL rather than a local path (#482).
+///
+/// Shape only — the same test [`crate::input::InputSource::from_path`] makes,
+/// so what looks remote here is exactly what the reader will fetch. An
+/// unsupported scheme is reported there, by name, rather than silently
+/// becoming a path.
+fn is_remote_input(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| url_scheme(s).is_some())
+}
+
+/// The error for a remote band input that is plainly a PMTiles archive, or
+/// `None` when the input is fine.
+///
+/// A band archive is read as a local file — directories, then tile bytes by
+/// offset — so a remote one is not supported. It cannot be *sniffed* either
+/// without fetching, so this is the one place the extension is trusted: it
+/// only has to be good enough to replace a parquet reader's complaint about
+/// a magic number with a sentence that says what to do.
+fn remote_archive_rejection(input: &Path) -> Option<String> {
+    if !is_remote_input(input) {
+        return None;
+    }
+    let s = input.to_str()?;
+    // A query string or fragment is part of the URL, not of the name.
+    let name = s.split(['?', '#']).next().unwrap_or(s);
+    if !name.to_ascii_lowercase().ends_with(".pmtiles") {
+        return None;
+    }
+    Some(format!(
+        "band input {s:?}: a remote band must be GeoParquet; stage PMTiles \
+         archives locally and point the band at the local file"
+    ))
+}
+
 /// What a band's `input` actually is.
 ///
 /// The one-shot form (#345) takes GeoParquet sources and tiles them here; the
@@ -186,8 +308,26 @@ pub enum BandSource {
 /// — `.pmtiles` is a convention, not a guarantee — and everything that is not
 /// a readable local file (a glob, a directory, an `s3://` URL) can only be a
 /// GeoParquet source here, since a band archive is always one local file.
+///
+/// A `scheme://` input short-circuits to [`BandSource::Source`] (#482) without
+/// touching the filesystem: a band archive has to be read as a local file, so
+/// a remote input can only be a GeoParquet source, and the open below could
+/// only ever fail for it.
+///
+/// **This function does not reject a remote `.pmtiles` input** — it has no
+/// error case, only two classifications, and a `scheme://foo.pmtiles` input
+/// classifies as `Source` exactly like any other remote path (it will only
+/// fail later, obscurely, inside the parquet reader). [`validate_bands`]
+/// applies [`remote_archive_rejection`] up front to every band before any
+/// band is tiled; a caller that classifies bands without going through
+/// `validate_bands` first (or `build_pyramid`, which calls it) must apply
+/// `remote_archive_rejection` itself to get that check.
 pub fn classify_band_input(path: &Path) -> BandSource {
     use std::io::Read;
+
+    if is_remote_input(path) {
+        return BandSource::Source;
+    }
 
     let mut magic = [0u8; 7];
     match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)) {
@@ -213,6 +353,14 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 
 /// Reject two bands claiming one zoom **for the same layer**: each would write
 /// the same tile ids and the merge would silently keep whichever came last.
+/// Also rejects any band naming a remote `.pmtiles` archive (#482) — checked
+/// for every band up front, before any band is tiled.
+///
+/// The remote-archive check is pure string work (no I/O), so doing it here
+/// for all bands is free and catches a late band's bad input before an
+/// expensive earlier band is tiled — `build_pyramid` used to run this check
+/// per band interleaved with tiling, so a later band's error only surfaced
+/// after every band ahead of it had already converted.
 ///
 /// Bands naming *different* layers may share zooms (#385): that is
 /// tippecanoe's `-L`, several layers in one tile, and the merge concatenates
@@ -220,6 +368,11 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
     if bands.is_empty() {
         return Err("a pyramid needs at least one --band".to_string());
+    }
+    for band in bands {
+        if let Some(msg) = remote_archive_rejection(&band.input) {
+            return Err(msg);
+        }
     }
     let mut sorted: Vec<&Band> = bands.iter().collect();
     sorted.sort_by_key(|b| (b.min_zoom, b.max_zoom));
@@ -272,6 +425,100 @@ fn bands_share_zooms(bands: &[Band]) -> bool {
             .iter()
             .any(|b| a.min_zoom <= b.max_zoom && b.min_zoom <= a.max_zoom)
     })
+}
+
+/// Whether a band's layer name is simply its input's file stem — i.e. the
+/// spec almost certainly did not spell out a `:LAYER`.
+///
+/// DIVERGENCE FROM THE ISSUE (#405): the issue asks `Band::parse` to record
+/// the flag on `Band`. `Band`'s fields are public and the struct is
+/// exhaustively constructible, so a new field — public or private — is a
+/// major semver break that `cargo semver-checks` rejects without a version
+/// bump. The name is derived instead, with exactly the function `parse`
+/// itself would have used, which keeps the public API additive. The one
+/// inaccuracy is an explicit label that repeats the stem (`x.parquet:x`); it
+/// can only make the warning below appear where it was not needed, never
+/// suppress it where it was.
+fn layer_is_input_derived(band: &Band) -> bool {
+    band.input
+        .to_str()
+        .and_then(default_layer_for)
+        .is_some_and(|derived| derived == band.layer)
+}
+
+/// Whether two zoom ranges overlap *partially* — they share at least one
+/// zoom, but neither range contains the other.
+///
+/// Identical ranges and strict containment are excluded: both are the
+/// ordinary shape of deliberate layer stacking (tippecanoe's `-L`) — the same
+/// zooms, or one band's range nested inside another's, on purpose. A partial
+/// overlap (e.g. `0-5` and `5-13`, sharing only z5) is the shape an off-by-one
+/// range typo produces, so it is the only case worth flagging.
+fn zoom_ranges_partially_overlap(a: &Band, b: &Band) -> bool {
+    let overlaps = a.min_zoom <= b.max_zoom && b.min_zoom <= a.max_zoom;
+    let a_contains_b = a.min_zoom <= b.min_zoom && b.max_zoom <= a.max_zoom;
+    let b_contains_a = b.min_zoom <= a.min_zoom && a.max_zoom <= b.max_zoom;
+    overlaps && !a_contains_b && !b_contains_a
+}
+
+/// Index pairs into `bands` that *partially* share a zoom range — a proper,
+/// non-containment overlap — where at least one of the two was never spelled
+/// out in the spec (#405).
+///
+/// Bands in different layers are allowed to share zooms — that is
+/// tippecanoe's `-L`. But a band whose layer name came from its file stem did
+/// not *ask* to be its own layer, so `--band 0-5:coarse.parquet --band
+/// 5-13:fine.parquet` (one zoom too wide) quietly produces two layers instead
+/// of the error it used to. Identical ranges and strict containment are the
+/// documented multi-layer workflow (two bands, same or nested zoom range,
+/// different stem-derived layers) and are not reported — only a partial
+/// overlap, which is the shape a real off-by-one produces. Indices, not
+/// names, so a caller ([`build_pyramid`]) can also tell which *band* — not
+/// just which layer label — is on each side.
+fn implicit_overlap_pairs(bands: &[Band]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (i, a) in bands.iter().enumerate() {
+        for (j, b) in bands.iter().enumerate().skip(i + 1) {
+            let either_implicit = layer_is_input_derived(a) || layer_is_input_derived(b);
+            if zoom_ranges_partially_overlap(a, b) && a.layer != b.layer && either_implicit {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+/// Pairs of layer names for [`implicit_overlap_pairs`]. Pure so it can be
+/// tested directly; the caller warns rather than errors, since stem-named
+/// layers over one range are a legitimate workflow.
+fn implicit_layer_overlaps(bands: &[Band]) -> Vec<(String, String)> {
+    implicit_overlap_pairs(bands)
+        .into_iter()
+        .map(|(i, j)| (bands[i].layer.clone(), bands[j].layer.clone()))
+        .collect()
+}
+
+/// Say so, once, when `pairs` is non-empty — one line naming every offending
+/// pair, not one line per pair.
+fn warn_pairs(pairs: &[(String, String)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    let list = pairs
+        .iter()
+        .map(|(a, b)| format!("{a:?}/{b:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log::warn!(
+        "bands partially share a zoom range, so the archive gets two layers named after \
+         their inputs: {list}; if a pair is meant to be one layer give both the same \
+         explicit `:LAYER`, and if not, check the zoom ranges for an off-by-one"
+    );
+}
+
+/// Say so, once, when [`implicit_layer_overlaps`] finds anything.
+fn warn_implicit_layer_overlaps(bands: &[Band]) {
+    warn_pairs(&implicit_layer_overlaps(bands));
 }
 
 /// One layer's entry in the merged archive's `vector_layers`.
@@ -335,7 +582,14 @@ fn usable_bounds(header: &Header) -> Option<TileBounds> {
 
 impl BandArchive {
     /// Read `path` once: header, directories, metadata and bounds together.
-    fn open(path: &Path) -> Result<Self, Error> {
+    ///
+    /// `label` is the band's own `--band LO-HI:PATH:LAYER` name (or, for a
+    /// caller with no such label to check against, an empty string — which
+    /// never matches an `id`, so `fields` falls back to `vector_layers[0]`
+    /// exactly as before, still with the mismatch warning). It is used only
+    /// to pick the right `vector_layers` entry when the archive's metadata
+    /// carries several (see [`parse_layers`]).
+    fn open(path: &Path, label: &str) -> Result<Self, Error> {
         let bytes = std::fs::read(path)?;
         let header = Header::from_bytes(&bytes)
             .map_err(|e| Error::PMTilesWrite(format!("{}: {e}", path.display())))?;
@@ -412,7 +666,7 @@ impl BandArchive {
             header.json_metadata_length,
             "metadata",
         )?;
-        let (fields, layer_ids) = parse_layers(raw_meta, header.internal_compression, path)?;
+        let (fields, layer_ids) = parse_layers(raw_meta, header.internal_compression, path, label)?;
         let bounds = usable_bounds(&header);
 
         Ok(BandArchive {
@@ -480,7 +734,8 @@ impl BandArchive {
     }
 }
 
-/// Lift `vector_layers[0].fields` and every `vector_layers[*].id` out of a
+/// Lift the `vector_layers` entry whose `id` matches `label` — the band's
+/// `--band LO-HI:PATH:LAYER` name — and every `vector_layers[*].id`, out of a
 /// band archive's JSON metadata.
 ///
 /// Parsed with `serde_json` rather than scanned for `"fields":` and brace
@@ -488,10 +743,21 @@ impl BandArchive {
 /// underflowed on a `}` seen before any `{` (a panic in debug, a wrap and a
 /// silent `{}` in release), and it counted braces inside string literals, so a
 /// field *named* with a `}` truncated the object into invalid JSON.
+///
+/// An archive can carry several `vector_layers` entries (the shared-zoom
+/// path merges bands of different layers into one file, #385, and a band
+/// re-read from a previous pyramid run is exactly such a file). Picking
+/// `[0]` unconditionally lifted whichever layer happened to be first,
+/// regardless of which one `label` actually names — silently wrong the
+/// moment a band's label is not that first entry. `label` is matched
+/// against `id` instead; `[0]` is kept only as a last-resort fallback, with
+/// a warning naming the mismatch, for the case where nothing matches (e.g. a
+/// hand-built archive whose metadata never declared the label at all).
 fn parse_layers(
     raw: &[u8],
     internal: Compression,
     path: &Path,
+    label: &str,
 ) -> Result<(Value, Vec<String>), Error> {
     let plain = compression::decompress(raw, internal)
         .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))?;
@@ -508,8 +774,28 @@ fn parse_layers(
         }
     };
     let layers = parsed.get("vector_layers").and_then(Value::as_array);
-    let fields = layers
-        .and_then(|v| v.first())
+    let matching = layers.and_then(|v| {
+        v.iter()
+            .find(|l| l.get("id").and_then(Value::as_str) == Some(label))
+    });
+    let chosen = match (matching, layers.and_then(|v| v.first())) {
+        (Some(m), _) => Some(m),
+        (None, Some(first)) => {
+            log::warn!(
+                "{}: no vector_layers entry named {label:?}; using {:?} instead \
+                 ({} field(s) may not match this band's actual layer)",
+                path.display(),
+                first.get("id").and_then(Value::as_str).unwrap_or("?"),
+                first
+                    .get("fields")
+                    .and_then(Value::as_object)
+                    .map_or(0, serde_json::Map::len),
+            );
+            Some(first)
+        }
+        (None, None) => None,
+    };
+    let fields = chosen
         .and_then(|l| l.get("fields"))
         .filter(|f| f.is_object())
         .cloned()
@@ -595,15 +881,42 @@ pub fn build_pyramid(
     output: &Path,
     opts: &PyramidOptions,
 ) -> Result<PyramidReport, Error> {
+    // Validates every band up front, including (#482) that none names a
+    // remote `.pmtiles` archive — pure string work, so it is cheap to run for
+    // every band before any band is tiled, rather than interleaved with
+    // tiling below where a late band's bad input would only surface after
+    // every earlier band had already converted.
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
+
+    // Classified once, here, and reused below for the tiling loop: a band
+    // that is about to be tiled loses the filename it was declared with —
+    // `tiled` below replaces its `input` with a randomly-named temp archive
+    // — so `implicit_layer_overlaps`'s file-stem heuristic can no longer see
+    // it once that happens. Any overlapping pair with a to-be-tiled band on
+    // either side has to be warned about now, from the pre-conversion
+    // `bands`, or it is silently lost. Pairs where BOTH bands are already
+    // archives keep their real filenames in `tiled` unchanged, so
+    // `merge_bands`'s own check (below, via its `pub` entry point for
+    // library callers too) catches those — warning about them here as well
+    // would repeat the same finding twice.
+    let kinds: Vec<BandSource> = bands
+        .iter()
+        .map(|b| classify_band_input(&b.input))
+        .collect();
+    let source_involved: Vec<(String, String)> = implicit_overlap_pairs(bands)
+        .into_iter()
+        .filter(|&(i, j)| kinds[i] == BandSource::Source || kinds[j] == BandSource::Source)
+        .map(|(i, j)| (bands[i].layer.clone(), bands[j].layer.clone()))
+        .collect();
+    warn_pairs(&source_involved);
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
     // including the early-return paths below.
     let mut scratch: Vec<NamedTempFile> = Vec::new();
     let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
 
-    for band in bands {
-        if classify_band_input(&band.input) == BandSource::Archive {
+    for (band, kind) in bands.iter().zip(&kinds) {
+        if *kind == BandSource::Archive {
             log::info!(
                 "[pyramid] z{}-{} layer {:?}: using the pre-tiled archive {}",
                 band.min_zoom,
@@ -693,6 +1006,16 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     // but cover disjoint geography, which the per-tile collision check below
     // would never catch.
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
+    // The single call site for this warning: a direct library caller of this
+    // `pub fn` gets it here. `build_pyramid` calls this too, but has already
+    // warned (above, before conversion) about any pair involving a band it
+    // is about to tile — those lose their file-stem signal once `input`
+    // becomes a temp archive path, so this check would silently miss them.
+    // What this check still catches for a `build_pyramid` caller is a pair
+    // of pre-tiled archives passed straight through: their `input` is
+    // untouched, so the heuristic still applies, and it has not been checked
+    // yet at this point.
+    warn_implicit_layer_overlaps(bands);
 
     // StreamingPmtilesWriter, not PmtilesWriter: it spools tile bytes to a temp
     // file instead of holding every tile in RAM, and it deduplicates. The merge
@@ -726,7 +1049,7 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
         // the compressed archives, not the tile set.
         let archives: Vec<BandArchive> = bands
             .iter()
-            .map(|b| BandArchive::open(&b.input))
+            .map(|b| BandArchive::open(&b.input, &b.layer))
             .collect::<Result<_, _>>()?;
         // The `:LAYER` of a pre-tiled band is a label; the layer name inside
         // its tiles is whatever the archive was exported with. validate_bands
@@ -856,8 +1179,27 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     // zoom ranges make that impossible; this asserts it.
     let mut seen: BTreeMap<(u8, u32, u32), &str> = BTreeMap::new();
 
-    for band in bands {
-        let archive = BandArchive::open(&band.input)?;
+    // #404: coarsest band first, whatever order the caller listed them in.
+    // The writer appends tile data in add order and stamps the header
+    // `clustered`, which promises offsets monotonic in tile id — and tile ids
+    // ascend with zoom. `--band 6-13:fine --band 0-5:coarse` therefore wrote
+    // z6-13's bytes before z0-5's and go-pmtiles `verify` rejected the result
+    // as "out-of-order entry in clustered archive". The ranges are disjoint
+    // here (the shared-zoom path returned above), so sorting by `min_zoom`
+    // puts every band's tiles in ascending tile-id order. `validate_bands`
+    // sorts a copy of the same slice for its overlap check.
+    //
+    // This reordering is also what "first" means for [`union_fields`]'s
+    // keep-the-first-type-on-conflict rule on *this* path: `layers` below is
+    // pushed in this coarsest-first order, not listing order, so on a field
+    // type conflict the coarsest band's type wins — unlike the shared-zoom
+    // path above, where `layers` is pushed in the caller's own argument
+    // order (that path never reorders `bands`).
+    let mut ordered: Vec<&Band> = bands.iter().collect();
+    ordered.sort_by_key(|b| (b.min_zoom, b.max_zoom));
+
+    for band in ordered {
+        let archive = BandArchive::open(&band.input, &band.layer)?;
         if let Some(b) = archive.bounds {
             match union.as_mut() {
                 Some(u) => u.expand(&b),
@@ -921,6 +1263,65 @@ pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error
     )
 }
 
+/// Fold one band's `fields` object into the layer's accumulated one (#372).
+///
+/// A layer's bands are meant to be the same layer at different zooms, so
+/// `vector_layers[].fields` — what a client introspects to discover a layer's
+/// attributes — has to be their union. Keeping the first non-empty object
+/// instead dropped every other band's attributes, and #389 made even
+/// identical schemas diverge legitimately (`coalesced_count` is withheld from
+/// a band whose counter never went above 1).
+///
+/// A field two bands type differently is a genuine schema disagreement: keep
+/// the first and say so, rather than resolve it silently. "First" means
+/// whichever band this function was called for *first* — i.e. whichever
+/// band's `fields` was folded into `into` earliest by the `for l in layers`
+/// loop in [`finish_merge`] — and that loop order is **not** the same on the
+/// two merge paths: on the shared-zoom path (bands share a zoom, #385) it is
+/// argument order, the order `bands` was given to [`merge_bands`]; on the
+/// disjoint path it is coarsest-band-first, the `min_zoom`-sorted order
+/// `merge_bands` builds for tile-id ordering (#404), regardless of how the
+/// caller listed the bands. Both are "first bands processed", not "first
+/// bands as typed" — the disjoint path's sort runs before this ever sees a
+/// field.
+fn union_fields(into: &mut Value, from: Value, layer: &str) {
+    let Value::Object(from) = from else { return };
+    if !into.is_object() {
+        *into = json!({});
+    }
+    let Some(target) = into.as_object_mut() else {
+        return;
+    };
+    for (name, ty) in from {
+        match target.get(&name) {
+            None => {
+                target.insert(name, ty);
+            }
+            // `{first}`/`{ty}` would print through `Value`'s JSON `Display`,
+            // wrapping a string type like "Number" in literal double quotes
+            // ("Number" not Number). `field_type_str` unwraps a JSON string
+            // to its bare text and only falls back to the JSON form for a
+            // field type that is not (or no longer) a plain string.
+            Some(first) if *first != ty => log::warn!(
+                "layer {layer:?}: bands disagree on the type of field {name:?} \
+                 ({} and {}); keeping {}",
+                field_type_str(first),
+                field_type_str(&ty),
+                field_type_str(first),
+            ),
+            Some(_) => {}
+        }
+    }
+}
+
+/// A `vector_layers[].fields` value's bare text, without the JSON quoting
+/// `Value`'s `Display` would add around a string type like `"Number"`.
+fn field_type_str(v: &Value) -> String {
+    v.as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| v.to_string())
+}
+
 /// The tail shared by both merge paths: bounds, `vector_layers`, finalize.
 fn finish_merge(
     mut writer: StreamingPmtilesWriter,
@@ -949,9 +1350,7 @@ fn finish_merge(
             Some(m) => {
                 m.minzoom = m.minzoom.min(l.minzoom);
                 m.maxzoom = m.maxzoom.max(l.maxzoom);
-                if m.fields.as_object().is_some_and(|o| o.is_empty()) {
-                    m.fields = l.fields;
-                }
+                union_fields(&mut m.fields, l.fields, &l.id);
             }
             None => merged.push(l),
         }
@@ -1126,8 +1525,10 @@ mod tests {
         assert_eq!(archive_zooms(&out), vec![0, 1, 2, 3]);
 
         // Identical sources ⇒ identical tile sets ⇒ every tile carries both
-        // layers, in band order.
-        let archive = BandArchive::open(&out).unwrap();
+        // layers, in band order. Reading the merged output back like this
+        // has no single band label to match, so "" and the fallback-to-
+        // first-entry path are expected here.
+        let archive = BandArchive::open(&out, "").unwrap();
         let mut tiles = 0;
         archive
             .for_each_tile(|_, _, _, data| {
@@ -1386,7 +1787,7 @@ mod tests {
     /// Decode a merged tile's layer names in order.
     fn merged_layer_names(archive: &Path, z: u8, x: u32, y: u32) -> Vec<String> {
         use prost::Message;
-        let a = BandArchive::open(archive).unwrap();
+        let a = BandArchive::open(archive, "").unwrap();
         let mut found = None;
         a.for_each_tile(|tz, tx, ty, data| {
             if (tz, tx, ty) == (z, x, y) {
@@ -1928,5 +2329,429 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("past end of"), "{err}");
+    }
+
+    /// #404: the single-pass path copied each band's tiles in *argument*
+    /// order, so `--band 2-2:fine --band 0-1:coarse` wrote z2's tile data
+    /// before z0's while the writer stamps the header `clustered` — which
+    /// promises offsets monotonic in tile-id order. go-pmtiles `verify`
+    /// reported "out-of-order entry in clustered archive". Same clustered walk
+    /// as `merge_writes_shared_zoom_tiles_in_tile_id_order` (#392), on the
+    /// disjoint-band path.
+    #[test]
+    fn merge_writes_disjoint_bands_in_tile_id_order_given_fine_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let coarse = dir.path().join("coarse.pmtiles");
+        let fine = dir.path().join("fine.pmtiles");
+        // Every tile distinct, so nothing dedups and every offset is fresh.
+        for (path, label, tiles) in [
+            (
+                &coarse,
+                "coarse",
+                vec![(0u8, 0u32, 0u32), (1, 0, 0), (1, 1, 1)],
+            ),
+            (&fine, "fine", vec![(2, 0, 0), (2, 3, 3), (2, 1, 2)]),
+        ] {
+            let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+            w.set_layer_name(label);
+            w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+            for &(z, x, y) in &tiles {
+                w.add_tile(z, x, y, &layer_tile(&format!("{label}-{z}-{x}-{y}")))
+                    .unwrap();
+            }
+            w.finalize(path).unwrap();
+        }
+
+        let out = dir.path().join("merged.pmtiles");
+        // Fine band first: legal, and the zoom ranges are disjoint.
+        let report = merge_bands(
+            &[
+                Band::parse(&format!("2-2:{}:fine", fine.display())).unwrap(),
+                Band::parse(&format!("0-1:{}:coarse", coarse.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 6);
+
+        let bytes = std::fs::read(&out).unwrap();
+        let h = Header::from_bytes(&bytes).unwrap();
+        assert!(h.clustered, "the writer stamps every archive clustered");
+        let root = compression::decompress(
+            &bytes[h.root_dir_offset as usize..(h.root_dir_offset + h.root_dir_length) as usize],
+            h.internal_compression,
+        )
+        .unwrap();
+        let entries: Vec<(u64, u64, u32)> = decode_directory(&root)
+            .unwrap()
+            .iter()
+            .filter(|e| e.run_length > 0)
+            .map(|e| (e.tile_id, e.offset, e.length))
+            .collect();
+        assert_eq!(entries.len(), 6, "{entries:?}");
+        let mut seen = std::collections::HashSet::new();
+        let mut end = 0u64;
+        for &(id, offset, length) in &entries {
+            if seen.contains(&offset) {
+                continue;
+            }
+            assert_eq!(
+                offset, end,
+                "out-of-order entry in clustered archive at tile id {id}: {entries:?}"
+            );
+            seen.insert(offset);
+            end = offset + u64::from(length);
+        }
+    }
+
+    /// #372: two bands of one layer each declare their own attributes.
+    /// `vector_layers[].fields` is what a client introspects to discover a
+    /// layer's attributes, so it must be the union across the layer's bands —
+    /// taking the first non-empty one dropped every other band's fields.
+    #[test]
+    fn merged_layer_fields_are_the_union_across_bands() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        write_band(&a, "cells", &[(0, 0, 0)], bounds, &[("a", "Number")]);
+        write_band(&b, "cells", &[(1, 0, 0)], bounds, &[("b", "String")]);
+
+        let out = dir.path().join("merged.pmtiles");
+        merge_bands(
+            &[
+                Band::parse(&format!("0-0:{}:cells", a.display())).unwrap(),
+                Band::parse(&format!("1-1:{}:cells", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+
+        let meta = read_metadata(&out);
+        let v: Value = serde_json::from_str(&meta).unwrap();
+        let layers = v["vector_layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1, "{meta}");
+        assert_eq!(layers[0]["fields"]["a"], json!("Number"), "{meta}");
+        assert_eq!(
+            layers[0]["fields"]["b"],
+            json!("String"),
+            "the second band's fields must survive: {meta}"
+        );
+    }
+
+    /// A genuine schema disagreement between two bands of one layer keeps the
+    /// first band's type (and warns); it must not drop the field or invent a
+    /// union type.
+    #[test]
+    fn merged_layer_fields_keep_the_first_type_on_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        write_band(&a, "cells", &[(0, 0, 0)], bounds, &[("n", "Number")]);
+        write_band(&b, "cells", &[(1, 0, 0)], bounds, &[("n", "String")]);
+
+        let out = dir.path().join("merged.pmtiles");
+        merge_bands(
+            &[
+                Band::parse(&format!("0-0:{}:cells", a.display())).unwrap(),
+                Band::parse(&format!("1-1:{}:cells", b.display())).unwrap(),
+            ],
+            &out,
+        )
+        .unwrap();
+
+        let meta = read_metadata(&out);
+        let v: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(
+            v["vector_layers"][0]["fields"]["n"],
+            json!("Number"),
+            "{meta}"
+        );
+    }
+
+    /// S2-4: an archive re-read on the disjoint merge path can carry several
+    /// `vector_layers` entries (e.g. it is itself a previous pyramid's
+    /// output). `parse_layers` must pick the entry whose `id` matches the
+    /// band's own label, not blindly lift `vector_layers[0]` — that silently
+    /// attached the wrong layer's fields whenever the matching entry was not
+    /// first.
+    #[test]
+    fn parse_layers_selects_the_entry_matching_the_band_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("multi.pmtiles");
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+        w.set_vector_layers_json(
+            json!([
+                {"id": "alpha", "minzoom": 0, "maxzoom": 5, "fields": {"a": "Number"}},
+                {"id": "beta", "minzoom": 0, "maxzoom": 5, "fields": {"b": "String"}},
+            ])
+            .to_string(),
+        );
+        w.add_tile(0, 0, 0, &[0x1a, 0x02, 0x08, 0x01]).unwrap();
+        w.finalize(&archive).unwrap();
+
+        // "beta" is not vector_layers[0]; naive [0]-lifting would have
+        // attached "alpha"'s fields to a band labelled "beta".
+        let opened = BandArchive::open(&archive, "beta").unwrap();
+        assert_eq!(
+            opened.fields,
+            json!({"b": "String"}),
+            "must select the entry whose id matches the band's label, not [0]"
+        );
+
+        let opened = BandArchive::open(&archive, "alpha").unwrap();
+        assert_eq!(opened.fields, json!({"a": "Number"}));
+
+        // No entry named "gamma": falls back to [0] rather than erroring —
+        // the band's tiles are still usable even if its fields cannot be
+        // identified for certain — and logs the mismatch (not asserted
+        // here; log content isn't test-observable without a capturing
+        // logger).
+        let opened = BandArchive::open(&archive, "gamma").unwrap();
+        assert_eq!(opened.fields, json!({"a": "Number"}), "falls back to [0]");
+    }
+
+    /// #405: since bands in different layers may share zooms (#392), an
+    /// off-by-one range between two *unlabelled* bands silently turns one
+    /// intended layer into two named after the files. Nothing errors — the
+    /// split is legal, and stem-named layers are a real workflow — but the
+    /// condition is worth naming out loud.
+    #[test]
+    fn implicit_layer_overlap_is_reported() {
+        let parse = |specs: &[&str]| -> Vec<Band> {
+            specs.iter().map(|s| Band::parse(s).unwrap()).collect()
+        };
+
+        // The typo: 0-5 and 5-13 share z5, and neither band was labelled.
+        let bands = parse(&["0-5:coarse.parquet", "5-13:fine.parquet"]);
+        assert_eq!(
+            implicit_layer_overlaps(&bands),
+            vec![("coarse".to_string(), "fine".to_string())],
+            "an unlabelled overlap must be reported"
+        );
+
+        // Explicit labels: two layers over one range is the whole point of
+        // tippecanoe's -L, so say nothing.
+        let bands = parse(&["0-13:a.parquet:2024", "0-13:b.parquet:2025"]);
+        assert!(
+            implicit_layer_overlaps(&bands).is_empty(),
+            "explicitly labelled bands are intentional"
+        );
+
+        // One band labelled, one not: the unlabelled one is still the one
+        // that may be a typo, so the pair is still reported.
+        let bands = parse(&["0-5:coarse.parquet", "5-13:fine.parquet:features"]);
+        assert_eq!(
+            implicit_layer_overlaps(&bands),
+            vec![("coarse".to_string(), "features".to_string())],
+            "one implicit label in the pair is enough to report"
+        );
+
+        // Adjacent, not overlapping: the ordinary pyramid.
+        let bands = parse(&["0-4:coarse.parquet", "5-13:fine.parquet"]);
+        assert!(implicit_layer_overlaps(&bands).is_empty(), "no shared zoom");
+    }
+
+    /// S2-1: the fully-legitimate documented multi-layer workflow (the `-L`
+    /// shape from #385) is two bands over the *same* zoom range, or one
+    /// nested inside the other, each named after its own file — deliberate
+    /// stacking, not a typo. Only a *partial* overlap (neither range
+    /// contains the other) is the shape an off-by-one range produces, so
+    /// only that is reported. Both cases here are implicit on both sides
+    /// (unlike the explicit-label case in `implicit_layer_overlap_is_reported`),
+    /// so the suppression is entirely due to the zoom-range shape, not the
+    /// labels.
+    #[test]
+    fn identical_and_nested_ranges_are_not_reported() {
+        let parse = |specs: &[&str]| -> Vec<Band> {
+            specs.iter().map(|s| Band::parse(s).unwrap()).collect()
+        };
+
+        // Identical ranges: the same zooms, two stem-derived layers.
+        let bands = parse(&["0-13:coarse.parquet", "0-13:fine.parquet"]);
+        assert!(
+            implicit_layer_overlaps(&bands).is_empty(),
+            "identical zoom ranges are deliberate stacking, not a typo"
+        );
+
+        // Strict containment: one band's range nested inside the other's.
+        let bands = parse(&["0-13:coarse.parquet", "5-8:fine.parquet"]);
+        assert!(
+            implicit_layer_overlaps(&bands).is_empty(),
+            "one range containing the other is deliberate stacking, not a typo"
+        );
+
+        // The control case: a genuine partial overlap (this is the same
+        // 0-5/5-13 pair as above) still reports.
+        let bands = parse(&["0-5:coarse.parquet", "5-13:fine.parquet"]);
+        assert_eq!(
+            implicit_layer_overlaps(&bands),
+            vec![("coarse".to_string(), "fine".to_string())],
+            "a partial, non-containment overlap is still reported"
+        );
+    }
+
+    /// What the check reads instead of a flag on `Band`: whether the layer
+    /// name is exactly what the input would have derived.
+    #[test]
+    fn a_stem_named_layer_reads_as_implicit() {
+        let band = |spec: &str| Band::parse(spec).unwrap();
+        assert!(layer_is_input_derived(&band("0-5:x.parquet")), "stem");
+        assert!(
+            !layer_is_input_derived(&band("0-5:x.parquet:agg")),
+            "explicit label"
+        );
+        assert!(
+            layer_is_input_derived(&band("0-5:/data/cells/*.parquet")),
+            "a glob derives the directory name"
+        );
+    }
+
+    /// #482: a band must be able to name a remote input. The `:` form is
+    /// scheme-aware — after `LO-HI:`, a `scheme://` remainder splits a layer
+    /// off its LAST colon only when what follows carries no `/`.
+    #[test]
+    fn band_spec_names_remote_inputs() {
+        let ok = |spec: &str| Band::parse(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        let b = ok("0-13:https://data.source.coop/a/b.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("https://data.source.coop/a/b.parquet"),
+            "no layer segment: the whole remainder is the input"
+        );
+        assert_eq!(b.layer, "b");
+
+        let b = ok("0-13:https://x/y.parquet:fields");
+        assert_eq!(b.input, PathBuf::from("https://x/y.parquet"));
+        assert_eq!(b.layer, "fields");
+
+        let b = ok("0-13:s3://bucket/key.parquet:2024");
+        assert_eq!(b.input, PathBuf::from("s3://bucket/key.parquet"));
+        assert_eq!(b.layer, "2024");
+
+        let b = ok("0-13:gs://bucket/key.parquet");
+        assert_eq!(b.input, PathBuf::from("gs://bucket/key.parquet"));
+        assert_eq!(b.layer, "key");
+
+        // The last colon is inside the URL path, and the segment after it has
+        // a `/`, so it is not a layer.
+        let b = ok("0-13:https://host/2024:06/cells.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("https://host/2024:06/cells.parquet"),
+            "a colon inside the URL path is not a layer separator"
+        );
+        assert_eq!(b.layer, "cells");
+
+        // A port is part of the authority, not a layer.
+        let b = ok("0-13:http://localhost:8080/cells.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("http://localhost:8080/cells.parquet")
+        );
+        assert_eq!(b.layer, "cells");
+    }
+
+    /// #482: the `=` escape form, for inputs the `:` form cannot express.
+    ///
+    /// `LO-HI=INPUT[=LAYER]`: the range is split at the FIRST `=`, and a LAYER
+    /// at the LAST `=` only when the segment after it is a bare layer token
+    /// (no `/`, `\` or `:`). That keeps a Hive directory such as
+    /// `admin:country_code=BR/part.parquet` whole.
+    #[test]
+    fn band_spec_equals_form_escapes_colons() {
+        let ok = |spec: &str| Band::parse(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        let b = ok("0-13=local:odd:path.parquet=layer");
+        assert_eq!(b.input, PathBuf::from("local:odd:path.parquet"));
+        assert_eq!(b.layer, "layer");
+
+        let b = ok("0-13=admin:country_code=BR/part.parquet");
+        assert_eq!(
+            b.input,
+            PathBuf::from("admin:country_code=BR/part.parquet"),
+            "a Hive `=` inside the input keeps the input whole"
+        );
+        assert_eq!(b.layer, "part");
+
+        // No `=` beyond the separator: the whole remainder is the input.
+        let b = ok("0-9=/data/odd:dir/cells.parquet");
+        assert_eq!(b.input, PathBuf::from("/data/odd:dir/cells.parquet"));
+        assert_eq!(b.layer, "cells");
+
+        // Remote inputs work in this form too.
+        let b = ok("0-9=s3://bucket/a:b.parquet=agg");
+        assert_eq!(b.input, PathBuf::from("s3://bucket/a:b.parquet"));
+        assert_eq!(b.layer, "agg");
+
+        // The form is chosen by whichever separator ends the zoom range, so a
+        // `=` later in a `:` spec is just part of the input.
+        let b = ok("0-9:/data/country_code=BR/part.parquet");
+        assert_eq!(b.input, PathBuf::from("/data/country_code=BR/part.parquet"));
+
+        // Whitespace is trimmed on both sides of the split, as in the `:` form.
+        let b = ok("0-5= x.parquet = agg ");
+        assert_eq!(b.input, PathBuf::from("x.parquet"));
+        assert_eq!(b.layer, "agg");
+
+        for bad in [
+            "0-5=",           // empty input
+            "0-5=x.parquet=", // empty layer
+            "5-0=x.parquet",  // reversed range
+            "0-31=x.parquet", // above the zoom ceiling
+            "x=y.parquet",    // no range
+        ] {
+            assert!(Band::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// An ill-formed spec names both accepted forms, so the reader learns the
+    /// escape hatch from the error rather than the manual.
+    #[test]
+    fn band_spec_error_shows_both_forms() {
+        let err = Band::parse("0-5").unwrap_err();
+        assert!(err.contains("LO-HI:INPUT[:LAYER]"), "{err}");
+        assert!(err.contains("LO-HI=INPUT[=LAYER]"), "{err}");
+    }
+
+    /// #482: a remote input is a GeoParquet source, decided from the URL
+    /// shape alone — no local read, which for a URL could only ever fail.
+    #[test]
+    fn remote_band_input_is_a_source_without_a_local_read() {
+        for url in [
+            "https://data.source.coop/a/b.parquet",
+            "s3://bucket/key.parquet",
+            "gs://bucket/key.parquet",
+            "http://localhost:8080/cells.parquet",
+        ] {
+            assert_eq!(
+                classify_band_input(Path::new(url)),
+                BandSource::Source,
+                "{url}"
+            );
+        }
+    }
+
+    /// A remote PMTiles archive cannot be a band: the merge reads directories
+    /// and tile bytes out of a local file. Say so, instead of handing the URL
+    /// to the parquet reader.
+    #[test]
+    fn remote_pmtiles_band_is_rejected_with_a_clear_message() {
+        let msg = remote_archive_rejection(Path::new("https://host/tiles.pmtiles"))
+            .expect("a remote .pmtiles band must be rejected");
+        assert!(msg.contains("remote band must be GeoParquet"), "{msg}");
+        assert!(msg.contains("stage"), "{msg}");
+
+        assert!(
+            remote_archive_rejection(Path::new("https://host/cells.parquet")).is_none(),
+            "a remote GeoParquet band is fine"
+        );
+        assert!(
+            remote_archive_rejection(Path::new("/local/tiles.pmtiles")).is_none(),
+            "a local archive is the ordinary two-step form"
+        );
     }
 }

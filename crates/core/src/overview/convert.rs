@@ -2484,17 +2484,16 @@ pub(crate) fn detect_crs_from_kv(
 /// EPSG:3857). Matches the constant used by the export reprojection.
 const WEBMERC_HALF_M: f64 = 20_037_508.342_789_244;
 
-/// Web Mercator latitude clamp (the projection diverges at the poles).
-const WEBMERC_MAX_LAT: f64 = 85.051_128_779_806_59;
-
 /// Reproject one EPSG:4326 point (lon/lat degrees) to EPSG:3857 (meters) —
 /// the exact inverse of the export path's `webmerc_to_lnglat`. Latitude is
-/// clamped to the projection's valid range.
+/// clamped to [`crate::world_coord::MAX_LATITUDE`], the edge of the square
+/// world extent (the projection itself diverges at the poles).
 #[inline]
 fn lnglat_to_webmerc(lng: f64, lat: f64) -> (f64, f64) {
+    use crate::world_coord::MAX_LATITUDE;
     use std::f64::consts::{FRAC_PI_4, PI};
     let x = lng / 180.0 * WEBMERC_HALF_M;
-    let lat = lat.clamp(-WEBMERC_MAX_LAT, WEBMERC_MAX_LAT);
+    let lat = lat.clamp(-MAX_LATITUDE, MAX_LATITUDE);
     let y = (FRAC_PI_4 + lat.to_radians() / 2.0).tan().ln() / PI * WEBMERC_HALF_M;
     (x, y)
 }

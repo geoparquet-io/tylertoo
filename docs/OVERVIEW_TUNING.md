@@ -148,11 +148,29 @@ range; an archive is merged as-is. That keeps the older two-step workflow
 (tile each band yourself, then merge) working unchanged, and lets you mix:
 reuse last week's coarse archive and re-tile only the fine band.
 
+**A band source may be remote.** `--band 9-13:https://data.source.coop/…/features.parquet`
+streams with byte-range requests exactly as `tiles` and `overview` do, so a
+band no longer has to be staged locally first. A band *archive* must be local:
+the merge reads its directories and tile bytes by offset, so a remote
+`.pmtiles` band is refused with a message saying to stage it.
+
 `LAYER` defaults to the input's file stem — or, for a glob or a directory,
 the directory name, since a layer called `*` is not useful to a client. A path
 containing a colon (`s3://…`, `https://…`, `C:\…`) is fine; the layer is only
-split off when the last colon-separated segment looks like a layer id rather
-than part of a path. For a pre-tiled archive the layer is a *label*: the layer
+split off the **last** colon when what follows it has no `/`, `\` or `:`, so a
+URL's scheme, a port and a `2024:06/` directory all stay part of the input. A
+drive-relative path with no `\` after the drive, e.g. `C:data.parquet`, stays
+whole too: a single ASCII letter before the last colon is treated as a drive
+letter rather than a path, even though `data.parquet` alone would otherwise
+look like a bare layer name.
+The one shape that rule cannot express is an input *ending* in a bare colon
+segment — a Hive directory such as `admin:country_code=BR`. For those, spell
+the band with `=` instead: **`--band LO-HI=INPUT[=LAYER]`**, where the range is
+split at the first `=` and the layer at the last, again only when the segment
+after it has no `/`, `\` or `:`. That keeps
+`--band 0-13=admin:country_code=BR/part.parquet` whole; an input that itself
+ends in `=VALUE` is indistinguishable from a layer, so give it an explicit
+`=LAYER`. For a pre-tiled archive the layer is a *label*: the layer
 name inside its tiles is whatever the archive was exported with, and when bands
 share zooms the two must agree, or the combined tile would hold two layers of
 one name (which a client resolves by dropping one). A **gap** between bands is
@@ -1435,7 +1453,19 @@ compute stage and the write stage**:
   are the fallback when nothing was scanned. Partitioning additionally keeps
   its historical 2M-buffered-row spill floor. The decision (measured average,
   estimate, budget) is logged; `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the
-  detected available RAM.
+  detected available RAM. The probe is **container-aware** (#481): cgroup v2
+  (`memory.max` and `memory.high`, minimum along the cgroup path) and cgroup v1
+  (`memory.limit_in_bytes`) limits are respected, the binding cgroup's
+  non-reclaimable current usage is subtracted so the figure is *headroom*
+  rather than a ceiling the run may already be sitting near, and the budget is
+  `min(cgroup headroom, machine available)` — so a Slurm / Docker / k8s job
+  inside a 160 GiB cgroup on a 2 TB node no longer sizes against the node.
+  When the cgroup limit is the binding constraint, one info line says so
+  (`memory budget from cgroup limit: N GiB (machine has M GiB)`).
+  Note that `bounded` (and an `auto` that picks it) spills to the process temp
+  directory, which on many Slurm and Kubernetes nodes is a tmpfs `/tmp` — RAM
+  charged to the very same cgroup, so the spill does not relieve the limit.
+  Point `TMPDIR` (or `--spill-dir`) at real disk there.
 
 The profile also governs the **pass-1 level-assignment grids** (#306). Level
 assignment builds one cell-winner grid per coarse level, concurrently across
@@ -1465,6 +1495,17 @@ utilization when a few long-pole geometries otherwise stall the pipeline; each
 extra in-flight batch costs proportionally more peak RAM (`N × read_batch_size`
 rows resident). `--read-batch-size` (above) remains the rows-per-batch knob;
 `--in-flight-batches` is how many such batches coexist.
+
+⚠️ **musl binaries v0.7.1 and earlier — prefer `--profile bounded` on large
+duplicating runs.** The `x86_64-unknown-linux-musl` release binary up to and
+including v0.7.1 could abort with `memory allocation of N bytes failed` part
+way through pass 2 of a `speed`/`auto` run — musl's `mallocng` failing a small
+allocation under heavy multi-threaded fragmentation while tens of GB of
+headroom remained ([#480](https://github.com/geoparquet-io/tylertoo/issues/480)).
+`--profile bounded` avoids the in-RAM level buffering that triggers it. From
+the release after v0.7.1 the musl binary ships with mimalloc as its global
+allocator and no longer needs the workaround; other platforms were never
+affected.
 
 ⚠️ **Interaction — `speed` + partitioning on a multi-GB input is the
 memory-risky quadrant.** `speed` buffers whole output levels in RAM, and
@@ -1496,6 +1537,7 @@ that. If you force `speed` on a large partitioning run, watch peak RSS.
 | Conversion runs out of memory / swaps on a big file | streaming is already the default; LOWER `--read-batch-size`; make sure `--no-streaming` is NOT set |
 | Conversion is slow / uses only one core | the engine now reads the input once and parallelizes simplification across all cores; RAISE `--in-flight-batches` for more read/compute overlap |
 | Conversion runs out of memory in `speed` profile | `--profile bounded` (spills each level to temp files, caps RAM); `--profile auto` picks this automatically for large partitioning runs |
+| `memory allocation of N bytes failed` on a v0.7.1-or-earlier musl binary, with RAM to spare | `--profile bounded` — musl `mallocng` fragmentation, fixed after v0.7.1 by shipping mimalloc ([#480](https://github.com/geoparquet-io/tylertoo/issues/480)) |
 
 See `corpus/SWEEPS.md` for an empirical `--line-thinning` ×
 `--simplify-factor` sweep on Portland roads, and the Q2 section there for the

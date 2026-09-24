@@ -957,6 +957,7 @@ mod tests {
     use super::*;
     use crate::mvt::{command_encode, encode_geometry, zigzag_encode};
     use crate::tile::{tile_bounds, TileBounds};
+    use crate::world_coord::MAX_LATITUDE;
     use geo::{MultiLineString, MultiPoint, MultiPolygon};
 
     // ---- Coordinate transform ---------------------------------------------
@@ -970,7 +971,7 @@ mod tests {
     fn transform_tile_origin_of_world_tile_is_northwest_corner() {
         let (lon, lat) = tile_local_to_lonlat(0, 0, 0, 4096, 0, 0);
         assert!((lon - (-180.0)).abs() < 1e-9);
-        assert!((lat - 85.051_128_779_806_59).abs() < 1e-6); // top of Mercator
+        assert!((lat - MAX_LATITUDE).abs() < 1e-6); // top of Mercator
     }
 
     #[test]
