@@ -736,6 +736,172 @@ pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
     Some(entries)
 }
 
+/// Read every addressed directory entry out of a PMTiles archive's raw
+/// bytes: the root directory, with any leaf directory it points at expanded
+/// inline.
+///
+/// Entries come back in the order the root directory stores them, which is
+/// ascending tile id — the same order [`StreamingPmtilesWriter::entries_are_clustered`]
+/// walks, so a caller comparing the two notions of "clustered" is comparing
+/// like with like.
+///
+/// Bounded by two independent budgets (#417), mirroring the walk
+/// [`crate::pyramid::BandArchive::open`] used to perform inline before this
+/// was extracted: total expanded entries
+/// ([`max_expanded_entries`]) and leaf-directory count
+/// ([`MAX_LEAF_DIRECTORIES`]), since one huge leaf and a million tiny ones
+/// are different attacks. Multi-level leaf directories (a leaf pointing at
+/// another leaf) are rejected rather than silently mis-parsed as tiles — the
+/// spec allows arbitrary depth, but no writer here produces more than one
+/// level.
+pub(crate) fn read_all_entries(bytes: &[u8], header: &Header) -> Result<Vec<DirEntry>> {
+    let past_end = |what: &str| Error::PMTilesWrite(format!("{what} past end of archive"));
+    let slice = |off: u64, len: u64, what: &str| -> Result<&[u8]> {
+        // Both come from the archive; a `as usize` truncation on a 32-bit
+        // target would turn a wild offset into a plausible in-range one.
+        let start = usize::try_from(off).map_err(|_| past_end(what))?;
+        let end = usize::try_from(len)
+            .ok()
+            .and_then(|l| start.checked_add(l))
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| past_end(what))?;
+        Ok(&bytes[start..end])
+    };
+    // An entry's range must lie inside the section it is relative to, not
+    // merely inside the file: a leaf pointer aimed at the tile data would
+    // otherwise be parsed as a directory (#417).
+    let within = |off: u64, len: u64, section_len: u64, what: &str| -> Result<()> {
+        match off.checked_add(len) {
+            Some(end) if end <= section_len => Ok(()),
+            _ => Err(Error::PMTilesWrite(format!(
+                "{what} at {off} ({len} bytes) extends past its {section_len}-byte section"
+            ))),
+        }
+    };
+    let dir = |raw: &[u8], what: &str| -> Result<Vec<DirEntry>> {
+        let plain = compression::decompress_capped(
+            raw,
+            header.internal_compression,
+            compression::MAX_INTERNAL_BYTES,
+        )
+        .map_err(|e| Error::PMTilesWrite(format!("{what}: {e}")))?;
+        decode_directory(&plain).ok_or_else(|| Error::PMTilesWrite(format!("undecodable {what}")))
+    };
+
+    let root = dir(
+        slice(header.root_dir_offset, header.root_dir_length, "root dir")?,
+        "root dir",
+    )?;
+    // Entries accumulated across the walk are bounded by what the archive
+    // could legitimately address; the number of leaves is bounded
+    // separately, since an empty leaf costs no entries while still costing a
+    // bounded-but-real decompression apiece.
+    let entry_limit = max_expanded_entries(header);
+    let mut entry_budget = entry_limit;
+    let mut leaves_visited = 0usize;
+    let too_many_entries = || {
+        Error::PMTilesWrite(format!(
+            "directory entries exceed this archive's limit of {entry_limit} entries"
+        ))
+    };
+
+    let mut entries = Vec::new();
+    for e in root {
+        if e.run_length != 0 {
+            entry_budget = entry_budget.checked_sub(1).ok_or_else(too_many_entries)?;
+            entries.push(e);
+            continue;
+        }
+        leaves_visited += 1;
+        if leaves_visited > MAX_LEAF_DIRECTORIES {
+            return Err(Error::PMTilesWrite(format!(
+                "root directory points at more than {MAX_LEAF_DIRECTORIES} leaf directories"
+            )));
+        }
+        within(
+            e.offset,
+            u64::from(e.length),
+            header.leaf_dirs_length,
+            "leaf dir",
+        )?;
+        // Base and entry offset both come from the archive, so the sum is
+        // checked rather than wrapped into a plausible-looking one.
+        let leaf_at = header
+            .leaf_dirs_offset
+            .checked_add(e.offset)
+            .ok_or_else(|| Error::PMTilesWrite("leaf dir offset overflow".to_string()))?;
+        let leaf = slice(leaf_at, u64::from(e.length), "leaf dir")?;
+        let decoded = dir(leaf, "leaf dir")?;
+        // Spent before the entries are kept, not after: a root full of
+        // pointers at one 16 MiB leaf body is a ~50 KB file that would
+        // otherwise accumulate entries until the process died.
+        entry_budget = entry_budget
+            .checked_sub(decoded.len() as u64)
+            .ok_or_else(too_many_entries)?;
+        for inner in decoded {
+            // run_length 0 inside a leaf is a second-level leaf pointer. The
+            // spec allows arbitrarily deep directories; this reader handles
+            // one level, and falling through would emit directory bytes as a
+            // tile.
+            if inner.run_length == 0 {
+                return Err(Error::PMTilesWrite(
+                    "multi-level leaf directories are not supported".to_string(),
+                ));
+            }
+            entries.push(inner);
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Whether directory entries, in the order a reader walks them (ascending
+/// tile id), obey the PMTiles v3 "clustered" contract.
+///
+/// Mirrors go-pmtiles' `verify`: walking entries in order with a high-water
+/// mark on how far into the tile-data section has been read, each entry's
+/// offset must either extend that mark (`offset == end`, a freshly written
+/// tile) or point wholly inside bytes already accounted for (`offset +
+/// length <= end`, a deduplication back-reference — legal in a clustered
+/// archive, since a reader that already streamed those bytes can just reuse
+/// them). Anything else — an offset ahead of the mark, or a back-reference
+/// that pokes past it — means a client streaming tile data in directory
+/// order would have to seek backwards past unread bytes or forwards over a
+/// gap, which is exactly what "clustered" promises never happens.
+fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)>) -> bool {
+    let mut end = 0u64;
+    for (offset, length) in entries {
+        if offset == end {
+            end = end.saturating_add(length);
+        } else {
+            match offset.checked_add(length) {
+                Some(back_end) if back_end <= end => {} // dedup back-reference; `end` unchanged
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Whether the PMTiles archive at `path` is genuinely clustered, independent
+/// of what its header claims.
+///
+/// Re-derives the same [`offsets_are_clustered`] predicate
+/// [`StreamingPmtilesWriter::entries_are_clustered`] uses when it stamps the
+/// header, but from the bytes actually on disk via [`read_all_entries`] —
+/// so a writer bug that sets the flag wrong cannot also fool this check by
+/// sharing its assumptions. Intended for tests and tooling (a go-pmtiles
+/// `verify`-alike), not the write path itself.
+pub fn verify_clustered(path: &Path) -> Result<bool> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::PMTilesRead(format!("failed to read {}: {e}", path.display())))?;
+    let header = Header::from_bytes(&bytes)?;
+    let entries = read_all_entries(&bytes, &header)?;
+    Ok(offsets_are_clustered(
+        entries.iter().map(|e| (e.offset, u64::from(e.length))),
+    ))
+}
+
 // ============================================================================
 // Leaf Directory Support (Issue #88)
 // ============================================================================
@@ -1312,6 +1478,24 @@ impl PmtilesWriter {
         let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
         let tile_data_length = tile_data_buf.len() as u64;
 
+        // Unlike `StreamingPmtilesWriter` (which appends tiles in whatever
+        // order the caller discovers them, then sorts the *directory* by
+        // tile_id without touching already-written data offsets),
+        // `PmtilesWriter` is clustered by construction: `self.tiles` is a
+        // `BTreeMap`, so the loop above that filled `entries` and
+        // `tile_data_buf` already ran in ascending tile_id order, and each
+        // unique tile's offset was the buffer's length *at that point in the
+        // ascending walk* — i.e. offsets are monotonic in tile_id order, with
+        // duplicates back-referencing an earlier (smaller) offset. There is
+        // no order for it to disagree with, so no derivation is needed here;
+        // the assert below is a canary in case that invariant ever breaks
+        // (e.g. `entries` stops being built from a sorted iteration).
+        debug_assert!(
+            offsets_are_clustered(entries.iter().map(|e| (e.offset, u64::from(e.length)))),
+            "PmtilesWriter builds `entries` from a BTreeMap in tile_id order, \
+             which is clustered by construction"
+        );
+
         // Build header
         let header = Header {
             root_dir_offset,
@@ -1327,6 +1511,7 @@ impl PmtilesWriter {
             addressed_tiles_count: self.tiles.len() as u64,
             tile_entries_count: entries.len() as u64,
             tile_contents_count: unique_contents,
+            // See the `debug_assert!` above: clustered by construction.
             clustered: true,
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
@@ -1797,6 +1982,15 @@ impl StreamingPmtilesWriter {
         // and later adds yields the same final ordering as sorting once.
         self.entries.sort_by_key(|e| e.tile_id);
 
+        // Whether the directory this run is about to write is *actually*
+        // clustered — sorting by tile_id (above) does not imply it. Callers
+        // add tiles in whatever order they discover them (row-major per zoom
+        // for an export, tile-id order for a pyramid merge), and the offsets
+        // in `self.entries` reflect add order, not tile-id order. Deriving
+        // the header flag from those offsets, after the sort, means the flag
+        // can never claim more than the bytes on disk actually deliver.
+        let clustered = self.entries_are_clustered();
+
         // Build run-length encoded directory entries
         let dir_entries = self.build_directory_entries();
 
@@ -1845,7 +2039,7 @@ impl StreamingPmtilesWriter {
             addressed_tiles_count: self.stats.total_tiles,
             tile_entries_count: dir_entries.len() as u64,
             tile_contents_count: self.stats.unique_tiles,
-            clustered: true,
+            clustered,
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
@@ -1919,6 +2113,15 @@ impl StreamingPmtilesWriter {
             .map_err(|e| Error::PMTilesWrite(format!("Failed to publish archive: {}", e)))?;
 
         Ok(())
+    }
+
+    /// Whether `self.entries`, already sorted by tile_id, is genuinely
+    /// clustered: see [`offsets_are_clustered`] for the predicate. Must be
+    /// called after the tile_id sort in [`Self::write_archive`] — before it,
+    /// `self.entries` is in add order, which for an export is row-major per
+    /// zoom, not tile-id order, and the check would be meaningless.
+    fn entries_are_clustered(&self) -> bool {
+        offsets_are_clustered(self.entries.iter().map(|e| (e.offset, u64::from(e.length))))
     }
 
     /// Build directory entries with run-length encoding for consecutive identical tiles.
@@ -4119,5 +4322,127 @@ mod tests {
         let _ = fs::remove_file(&plain_path);
         let _ = fs::remove_file(&ckpt_path);
         let _ = fs::remove_file(&final_path);
+    }
+
+    // -------------------------------------------------------------------------
+    // Clustered header flag honesty
+    // -------------------------------------------------------------------------
+
+    /// An export adds tiles zoom-by-zoom in row-major `(x, y)` order, not
+    /// tile-id (Hilbert) order — but the writer used to stamp every archive
+    /// `clustered: true` regardless. Once `self.entries` is sorted by
+    /// tile_id for the directory, a row-major add order leaves offsets
+    /// scattered rather than monotonic, so a header claiming `clustered`
+    /// here would be a lie go-pmtiles' `verify` catches ("out-of-order entry
+    /// in clustered archive").
+    #[test]
+    fn clustered_false_when_tiles_added_row_major() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        // z2 has 16 tiles; row-major (y outer, x inner) add order is not
+        // Hilbert tile-id order at any zoom >= 1, so sorting by tile_id
+        // afterwards does not recover the order these offsets were assigned
+        // in. Distinct, differently-sized payloads so nothing dedups.
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let n = y * 4 + x;
+                let data = vec![n as u8; 20 + n as usize];
+                writer.add_tile(2, x, y, &data).unwrap();
+            }
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writer.finalize(tmp.path()).unwrap();
+
+        let bytes = fs::read(tmp.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            !header.clustered,
+            "row-major add order is not tile-id order; the header must not claim clustered"
+        );
+        assert_eq!(
+            header.clustered,
+            verify_clustered(tmp.path()).unwrap(),
+            "the writer's own flag must agree with what the bytes on disk deliver"
+        );
+    }
+
+    /// The counterpart to `clustered_false_when_tiles_added_row_major`:
+    /// tiles added in ascending tile-id order keep the directory's offsets
+    /// monotonic, so the archive genuinely is clustered and the header may
+    /// say so.
+    #[test]
+    fn clustered_true_when_added_in_tile_id_order() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        let mut tiles: Vec<(u8, u32, u32)> = (0..4u32)
+            .flat_map(|y| (0..4u32).map(move |x| (2u8, x, y)))
+            .collect();
+        tiles.sort_by_key(|&(z, x, y)| tile_id(z, x, y));
+
+        for (z, x, y) in &tiles {
+            let n = x + y * 4;
+            let data = vec![n as u8; 20 + n as usize];
+            writer.add_tile(*z, *x, *y, &data).unwrap();
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writer.finalize(tmp.path()).unwrap();
+
+        let bytes = fs::read(tmp.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            header.clustered,
+            "adding tiles in tile-id order keeps offsets monotonic"
+        );
+        assert_eq!(header.clustered, verify_clustered(tmp.path()).unwrap());
+    }
+
+    /// A dedup back-reference — an entry whose offset points at bytes
+    /// already accounted for, not at the running high-water mark — is legal
+    /// in a clustered archive (go-pmtiles' `verify` allows it explicitly).
+    /// Tiles are still added in tile-id order here; only the *content*
+    /// repeats, exercising the `offset + length <= end` branch of the
+    /// predicate rather than only the trivial always-append case covered by
+    /// `clustered_true_when_added_in_tile_id_order`.
+    #[test]
+    fn clustered_true_with_duplicate_backreference() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        let mut tiles: Vec<(u8, u32, u32)> = (0..4u32)
+            .flat_map(|y| (0..4u32).map(move |x| (2u8, x, y)))
+            .collect();
+        tiles.sort_by_key(|&(z, x, y)| tile_id(z, x, y));
+
+        let dup_data = vec![0xABu8; 32];
+        for (i, (z, x, y)) in tiles.iter().enumerate() {
+            // Every third tile repeats the same content, so the dedup
+            // back-reference points well behind the running high-water mark,
+            // not merely at the immediately preceding entry.
+            let data = if i % 3 == 0 {
+                dup_data.clone()
+            } else {
+                let n = x + y * 4;
+                vec![n as u8; 20 + n as usize]
+            };
+            writer.add_tile(*z, *x, *y, &data).unwrap();
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writer.finalize(tmp.path()).unwrap();
+
+        let bytes = fs::read(tmp.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            header.clustered,
+            "a dedup back-reference into already-written bytes is legal in a clustered archive"
+        );
+        assert_eq!(header.clustered, verify_clustered(tmp.path()).unwrap());
     }
 }
