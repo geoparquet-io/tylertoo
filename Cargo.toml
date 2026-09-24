@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 # Dependency-driven, not a policy choice: geoarrow/geoparquet 0.9 declare 1.95,
 # and cargo refuses to build a dependency whose rust-version exceeds ours. The
@@ -23,7 +23,7 @@ categories = ["science", "data-structures", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-tylertoo-core = { path = "crates/core", version = "0.9.0" }
+tylertoo-core = { path = "crates/core", version = "0.10.0" }
 
 # Core geospatial dependencies
 geoarrow = "0.9"

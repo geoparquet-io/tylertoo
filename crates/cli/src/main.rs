@@ -190,8 +190,11 @@ enum Command {
 /// a band is tiled verbatim by default.
 ///
 /// A band may point at GeoParquet (tiled here, one shot) or at a PMTiles
-/// archive already tiled for that range (merged as-is). The kind is detected
-/// from the file, so both spellings are just `--band LO-HI:PATH[:LAYER]`.
+/// archive already covering that range (merged as-is). The kind is detected
+/// from the file, so both spellings are just `--band LO-HI:PATH[:LAYER]`. A
+/// pre-tiled archive does not have to match the declared range exactly: it
+/// may hold MORE zooms than the band declares (a subrange — see
+/// `--allow-missing-zooms` for the reverse, an archive holding FEWER).
 #[derive(Parser, Debug)]
 pub struct PyramidArgs {
     /// Output PMTiles archive.
@@ -200,11 +203,23 @@ pub struct PyramidArgs {
     /// A band: `LO-HI:INPUT[:LAYER]`, repeatable.
     ///
     /// INPUT is either a GeoParquet source — tiled here, restricted to this
-    /// band's zoom range — or a PMTiles archive already tiled for that range,
-    /// which is merged as-is. Which one it is is detected from the file, not
-    /// the extension. A source may be remote (`https://`, `s3://`, `gs://`),
-    /// read with byte-range requests like every other subcommand's input; a
-    /// band ARCHIVE must be local, since the merge reads it by offset.
+    /// band's zoom range — or a PMTiles archive already covering that range,
+    /// which is merged as-is. For a pre-tiled archive the declared LO-HI does
+    /// not have to equal the archive's own zoom range exactly: an archive
+    /// that holds MORE zooms than LO-HI is a subrange — the documented way to
+    /// split one pre-tiled archive across several bands (e.g. two `--band`
+    /// entries pointing at the same z0-z13 archive, one declaring z0-5 and
+    /// the other z6-13) — and is accepted quietly. An archive that holds
+    /// FEWER zooms than LO-HI is an error by default: those missing zooms
+    /// would render silently empty, almost always because LO-HI disagrees
+    /// with what the archive was actually tiled with; pass
+    /// `--allow-missing-zooms` for a deliberately sparse pyramid. A LO-HI
+    /// that shares no zoom at all with the archive is always an error,
+    /// regardless of that flag. Which kind of INPUT this is is detected from
+    /// the file, not the extension. A source may be remote (`https://`,
+    /// `s3://`, `gs://`), read with byte-range requests like every other
+    /// subcommand's input; a band ARCHIVE must be local, since the merge
+    /// reads it by offset.
     ///
     /// LAYER defaults to the file stem, and several bands may share one layer
     /// name (the usual case: a coarse and a fine aggregate that are the same
@@ -257,6 +272,20 @@ pub struct PyramidArgs {
     /// Defaults to the system temp directory.
     #[arg(long, value_name = "DIR")]
     pub work_dir: Option<PathBuf>,
+
+    /// Allow a pre-tiled band's declared zoom range to overshoot what its
+    /// archive actually holds.
+    ///
+    /// Off by default: an overshooting band declares zooms its archive does
+    /// not have, and those zooms would render silently empty — almost always
+    /// a `--band` range that disagrees with what the archive was actually
+    /// tiled with, so it is a hard error unless this is set. Has no effect
+    /// on a band whose declared range shares no zoom at all with its
+    /// archive (that is always an error), nor on a band that declares a
+    /// subrange of its archive (that is always fine, with or without this
+    /// flag). Pass this only for a deliberately sparse pyramid.
+    #[arg(long)]
+    pub allow_missing_zooms: bool,
 
     /// Overwrite the output if it exists.
     #[arg(short, long)]
@@ -2497,6 +2526,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
             ..ExportOptions::default()
         },
         work_dir: args.work_dir.clone(),
+        allow_missing_zooms: args.allow_missing_zooms,
     };
 
     let report = build_pyramid(&bands, &args.output, &opts)

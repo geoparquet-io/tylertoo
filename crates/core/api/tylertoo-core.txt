@@ -2563,6 +2563,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::pyramid::Band
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pyramid::Band
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::Band
 pub struct tylertoo_core::pyramid::PyramidOptions
+pub tylertoo_core::pyramid::PyramidOptions::allow_missing_zooms: bool
 pub tylertoo_core::pyramid::PyramidOptions::convert: tylertoo_core::overview::convert::ConvertOptions
 pub tylertoo_core::pyramid::PyramidOptions::export: tylertoo_core::overview::export::ExportOptions
 pub tylertoo_core::pyramid::PyramidOptions::work_dir: core::option::Option<std::path::PathBuf>
@@ -2580,6 +2581,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::pyramid::PyramidOptions
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pyramid::PyramidOptions
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidOptions
 pub struct tylertoo_core::pyramid::PyramidReport
+pub tylertoo_core::pyramid::PyramidReport::bands_without_bounds: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::pyramid::PyramidReport::per_band_tiles: alloc::vec::Vec<(alloc::string::String, u8, u8, usize)>
 pub tylertoo_core::pyramid::PyramidReport::skipped: usize
 pub tylertoo_core::pyramid::PyramidReport::total_tiles: usize
@@ -2597,6 +2599,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidRep
 pub fn tylertoo_core::pyramid::build_pyramid(&[tylertoo_core::pyramid::Band], &std::path::Path, &tylertoo_core::pyramid::PyramidOptions) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::classify_band_input(&std::path::Path) -> tylertoo_core::pyramid::BandSource
 pub fn tylertoo_core::pyramid::merge_bands(&[tylertoo_core::pyramid::Band], &std::path::Path) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
+pub fn tylertoo_core::pyramid::merge_bands_with_options(&[tylertoo_core::pyramid::Band], &std::path::Path, bool) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::validate_bands(&[tylertoo_core::pyramid::Band]) -> core::result::Result<(), alloc::string::String>
 pub mod tylertoo_core::quality
 pub struct tylertoo_core::quality::CrsInfo
