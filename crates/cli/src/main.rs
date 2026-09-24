@@ -15,7 +15,12 @@
 /// keep the platform allocator (nothing to fix there), and the Python
 /// extension module never routes through this crate — a pyo3 `cdylib` must
 /// leave the host interpreter's allocator arrangements alone.
-#[cfg(target_env = "musl")]
+///
+/// Excluded under `dhat-heap`: dhat installs its own `#[global_allocator]`
+/// in tylertoo-core (it must own the allocator to count anything), and rustc
+/// allows only one in the crate graph. Heap-profiling a musl binary therefore
+/// runs on dhat's allocator and loses this fix for the duration.
+#[cfg(all(target_env = "musl", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

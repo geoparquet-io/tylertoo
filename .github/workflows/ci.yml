@@ -142,6 +142,13 @@ jobs:
         with:
           tool: cargo-shear
 
+      # The musl release binary carries a musl-only #[global_allocator]
+      # (#480) that no other job compiles. cargo check needs no musl linker,
+      # so this catches cfg mistakes (e.g. clashing with the dhat-heap
+      # allocator) without a full cross build.
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
       - name: Install similarity-rs
         run: cargo install similarity-rs --locked
 
@@ -175,6 +182,16 @@ jobs:
         # -D warnings also denies the curated [workspace.lints.clippy] set
         # (pedantic subset + cognitive_complexity) defined in Cargo.toml.
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Check musl target compiles (both allocator arrangements)
+        # The CLI's musl-only #[global_allocator] (#480) must coexist with
+        # the dhat-heap allocator cfg; neither combination is compiled by
+        # any other job. musl-tools provides musl-gcc for the -sys crates'
+        # C code (zstd, mimalloc).
+        run: |
+          sudo apt-get install -y musl-tools
+          cargo check --locked --target x86_64-unknown-linux-musl -p tylertoo
+          cargo check --locked --target x86_64-unknown-linux-musl -p tylertoo --features dhat-heap
 
       - name: Check for unused dependencies
         # cargo-shear, not cargo-machete: it also inspects
