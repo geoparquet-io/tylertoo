@@ -1250,6 +1250,9 @@ vertex-heavy polygon data; you rarely need to change it. LOWER it (e.g. 1024)
 on very memory-constrained machines or for monster geometries (a single batch
 of coastline-sized multipolygons can be large); RAISE it (e.g. 65536) only if
 profiling shows per-batch overhead dominating on a machine with RAM to spare.
+It also sets how finely pass 1 fans out: each batch is split across the rayon
+pool into chunks of `read_batch_size / threads` rows (clamped to 256..=1024),
+so lowering it for memory costs some pass-1 parallelism but never disables it.
 
 **`--no-streaming`** runs the original in-memory pipeline: the whole table and
 every decoded geometry are held at once (`O(dataset)` memory). It decodes each

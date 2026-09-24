@@ -1682,6 +1682,10 @@ struct ProfileJsonInputs<'a> {
     pass1_wall_secs: f64,
     /// Total INPUT rows pass 1 streamed (matches [`Pass1Output::num_rows`]).
     pass1_rows: usize,
+    /// `pass1.stage_secs` in the dump: CORE-SECONDS summed across the reader
+    /// thread and the rayon scan chunks (#460), NOT a wall-clock breakdown of
+    /// `phase_walls.pass1` — the stages overlap, so the sum is normally
+    /// larger. Same convention as `pass2_stage_secs`.
     pass1_stage_secs: Pass1StageSecs,
     pass2_wall_secs: f64,
     /// Total OUTPUT rows written across every level (throughput is measured
@@ -1703,6 +1707,10 @@ struct ProfileJsonInputs<'a> {
 /// measurement base for the perf series gated on these numbers (pass-1
 /// parallelization, pass-2 throughput, checkpoint work). An env var, not a
 /// CLI flag, so a diagnostics-only knob costs no CLI-doc churn.
+///
+/// Units: `phase_walls.*` are WALL seconds; both passes' `stage_secs.*` are
+/// CORE-seconds summed across threads (#460 made pass 1 match pass 2 here),
+/// so a pass's stage sum normally exceeds its `phase_walls` entry.
 ///
 /// Best-effort and silent-safe: profiling instrumentation must never fail a
 /// conversion, so an unset/blank env var is a no-op and an open/write error is
@@ -1979,8 +1987,10 @@ struct Pass1Output {
     /// RAM-vs-spill decision; near-free to collect (one buffer-size sum per
     /// batch — no re-encode).
     geom_bytes: u64,
-    /// Pass-1 stage wall-time split ([profile] / `TYLERTOO_PROFILE_JSON`
-    /// instrumentation, measurement base for the pass-1 parallelization work).
+    /// Pass-1 stage split in CORE-SECONDS ([profile] / `TYLERTOO_PROFILE_JSON`
+    /// instrumentation, measurement base for the pass-1 parallelization
+    /// work). Summed across threads, so it can exceed `phase_walls.pass1` —
+    /// see [`Pass1StageSecs`].
     pass1_stage_secs: Pass1StageSecs,
 }
 
@@ -2015,8 +2025,11 @@ struct Pass1Timers {
     assemble: AtomicU64,
 }
 
-/// Pass-1 stage wall-time split, in seconds — [`Pass1Timers`] snapshotted for
-/// callers outside this module ([profile] JSON dump).
+/// Pass-1 stage split, in **core-seconds** (summed across threads, not wall —
+/// see [`Pass1Timers`]) — snapshotted for callers outside this module
+/// ([profile] logging and the `TYLERTOO_PROFILE_JSON` dump). As of #460 the
+/// stages overlap: `read` runs on the reader thread while `decode`/`scan`
+/// run on rayon chunks, so their sum can exceed the pass's wall time.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Pass1StageSecs {
     pub(super) read: f64,
@@ -2138,16 +2151,43 @@ fn apply_entry_levels(
     Ok(())
 }
 
-/// Default rows per pass-1 scan chunk (#460): each read batch is sliced into
-/// chunks of this many rows and scanned (geometry decode + `scan_feature` +
-/// bbox/filter gating) in parallel across a rayon `par_iter`. 1024 is small
-/// enough that a batch (default 8192 rows, [`DEFAULT_READ_BATCH_SIZE`]) still
-/// fans out across a handful of cores, and large enough that per-chunk
-/// overhead (a `RecordBatch::slice` + a `Vec` allocation per output field)
+/// Upper bound on rows per pass-1 scan chunk (#460): each read batch is
+/// sliced into chunks of at most this many rows, each scanned (geometry
+/// decode, `scan_feature`, bbox/filter gating) in parallel across a rayon
+/// `par_iter`. Large enough that per-chunk overhead (a `RecordBatch::slice`,
+/// a `from_arrow_array` re-wrap, and a `Vec` allocation per output field)
 /// stays negligible next to the per-row work it parallelizes.
 ///
-/// [`DEFAULT_READ_BATCH_SIZE`]: super::convert::DEFAULT_READ_BATCH_SIZE
+/// The size actually used is [`adaptive_pass1_chunk_rows`], not this constant
+/// — see there for why a fixed 1024 under-fans out.
 const PASS1_CHUNK_ROWS: usize = 1024;
+
+/// Floor on rows per pass-1 scan chunk (#460 review, S3-c). Below roughly
+/// this many rows the fixed per-chunk overhead (slice + `from_arrow_array` +
+/// four `Vec` allocations, measured at ~8x the per-chunk cost of the decode
+/// itself on the geometry-union type) starts to eat the parallel win, so a
+/// tiny `--read-batch-size` gets fewer, fatter chunks rather than one task
+/// per handful of rows. 256 keeps a 512-row batch at 2 chunks (fan-out
+/// preserved) while never going below a chunk the decode can amortize.
+const MIN_PASS1_CHUNK_ROWS: usize = 256;
+
+/// Rows per pass-1 scan chunk for a given read-batch size: split the batch
+/// across the rayon pool rather than into fixed 1024-row pieces.
+///
+/// A fixed [`PASS1_CHUNK_ROWS`] fans a default 8192-row batch into only 8
+/// chunks — fewer than the cores on a typical machine — and silently
+/// disables chunking entirely for `--read-batch-size` below 1024, which is
+/// exactly what `docs/OVERVIEW_TUNING.md` tells users to do to cut memory.
+/// Clamped to [`MIN_PASS1_CHUNK_ROWS`]..=[`PASS1_CHUNK_ROWS`] so neither end
+/// degenerates.
+///
+/// The merge is size-invariant by construction (chunk-local indices, rebased
+/// in ascending chunk order), so this only moves the work split, never the
+/// output — pinned by the `run_pass1_with_chunk_rows` equivalence tests.
+fn adaptive_pass1_chunk_rows(read_batch_size: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    (read_batch_size.max(1) / threads).clamp(MIN_PASS1_CHUNK_ROWS, PASS1_CHUNK_ROWS)
+}
 
 /// One batch handed from the pass-1 reader thread to the parallel-scan
 /// consumer — mirrors [`pipeline::ReadMsg`], pass 2's equivalent.
@@ -2192,17 +2232,42 @@ struct ChunkScan {
     skipped_rows: usize,
 }
 
+/// Prefix a pass-1 geometry decode failure with the GLOBAL row range of the
+/// chunk it came from (#460 review): the underlying `batch_processor` message
+/// carries a *chunk-local* index, which on its own points a user at the wrong
+/// row of their file. A `GeoParquetRead` payload is unwrapped rather than
+/// nested so the sentence is not repeated twice.
+///
+/// Diagnostics only — see [`scan_chunk`]'s `diag_row_base`.
+fn decode_error_at_rows(diag_row_base: usize, chunk_len: usize, e: crate::Error) -> crate::Error {
+    let inner = match &e {
+        crate::Error::GeoParquetRead(msg) => msg.clone(),
+        other => other.to_string(),
+    };
+    crate::Error::GeoParquetRead(format!(
+        "rows {diag_row_base}..{}: {inner}",
+        diag_row_base + chunk_len
+    ))
+}
+
 /// Scan one chunk of a pass-1 batch: decode its geometry slice, then apply
 /// the attribute filter / null-or-invalid-geometry / regional-bbox gates and
 /// bucket each surviving row into a chunk-local [`AssignFeature`] — the
 /// per-row body of the pre-#460 `run_pass1` loop, unchanged in logic, just
 /// scoped to `[0, gcol.len())` instead of a whole batch so it can run as one
-/// rayon task among several. Never sees a global row or feature index (see
-/// [`ChunkScan`]).
+/// rayon task among several.
+///
+/// `diag_row_base` is the chunk's global first-row index and is **DIAGNOSTICS
+/// ONLY**: it is read exactly once, by [`decode_error_at_rows`], to name the
+/// row range in a decode failure. It must never enter index arithmetic —
+/// every index this function produces stays chunk-local and is rebased by the
+/// consumer ([`merge_pass1_chunks`]), which is what makes double-rebasing
+/// structurally impossible (see [`ChunkScan`]).
 #[allow(clippy::too_many_arguments)]
 fn scan_chunk(
     geom_field: &Field,
     gcol: &dyn Array,
+    diag_row_base: usize,
     filter_mask: Option<&[Option<bool>]>,
     bbox_units: Option<&[f64; 4]>,
     collect_lines: bool,
@@ -2211,10 +2276,16 @@ fn scan_chunk(
 ) -> Result<ChunkScan, ConvertError> {
     let chunk_len = gcol.len();
     let t_decode = Instant::now();
-    let garr = from_arrow_array(gcol, geom_field)
-        .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+    let garr = from_arrow_array(gcol, geom_field).map_err(|e| {
+        decode_error_at_rows(
+            diag_row_base,
+            chunk_len,
+            crate::Error::GeoParquetRead(format!("geometry decode: {e}")),
+        )
+    })?;
     let mut geoms_buf: Vec<Option<Geometry<f64>>> = Vec::with_capacity(chunk_len);
-    extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)?;
+    extract_geometries_opt_from_array(garr.as_ref(), &mut geoms_buf)
+        .map_err(|e| decode_error_at_rows(diag_row_base, chunk_len, e))?;
     Pass1Timers::add(&timers.decode, t_decode);
 
     let t_scan = Instant::now();
@@ -2313,7 +2384,7 @@ fn run_pass1(
         row_groups,
         bbox_units,
         filter,
-        PASS1_CHUNK_ROWS,
+        adaptive_pass1_chunk_rows(options.read_batch_size),
     )
 }
 
@@ -2410,8 +2481,6 @@ fn merge_pass1_chunks(
     chunk_results: Vec<Result<ChunkScan, ConvertError>>,
     ranges: &[(usize, usize)],
     base: usize,
-    n: usize,
-    want_areas: bool,
     features: &mut Vec<AssignFeature>,
     areas: &mut Vec<f32>,
     line_rows: &mut Vec<usize>,
@@ -2420,6 +2489,9 @@ fn merge_pass1_chunks(
     point_count: &mut usize,
     skipped_rows: &mut usize,
 ) -> Result<Vec<bool>, ConvertError> {
+    // The ranges tile the batch contiguously from 0, so the last one's end is
+    // the batch row count (0 for an empty batch).
+    let n = ranges.last().map_or(0, |&(start, len)| start + len);
     let mut kept_row = vec![false; n];
     for (ci, res) in chunk_results.into_iter().enumerate() {
         let chunk = res?;
@@ -2428,9 +2500,9 @@ fn merge_pass1_chunks(
         kept_row[start..start + chunk.kept_row.len()].copy_from_slice(&chunk.kept_row);
         *point_count += chunk.point_count;
         *skipped_rows += chunk.skipped_rows;
-        if want_areas {
-            areas.extend(chunk.areas);
-        }
+        // Empty unless the #384 accumulator is on, so no `want_areas` gate is
+        // needed here — an empty `extend` is a no-op.
+        areas.extend(chunk.areas);
         let feat_offset = features.len();
         for line in chunk.lines {
             line_rows.push(chunk_base + line.local_row);
@@ -2610,6 +2682,12 @@ fn run_pass1_with_chunk_rows(
                         scan_chunk(
                             &gfield,
                             gcol.as_ref(),
+                            // Diagnostics only (see `scan_chunk`): the chunk's
+                            // global first row, used solely to name the row
+                            // range in a decode error. NOT an index base —
+                            // the merge below still rebases every chunk-local
+                            // index itself.
+                            base + start,
                             mask_slice,
                             bbox_units,
                             collect_lines,
@@ -2628,8 +2706,6 @@ fn run_pass1_with_chunk_rows(
                     chunk_results,
                     &ranges,
                     base,
-                    n,
-                    want_areas,
                     &mut features,
                     &mut areas,
                     &mut line_rows,
@@ -3676,6 +3752,127 @@ mod tests {
              chunk_rows=usize::MAX (one per batch): serial={serial_chunks} \
              chunked={chunked_chunks} over {n} rows / {READ_BATCH_SIZE}-row \
              batches"
+        );
+    }
+    /// Hand-built GeoParquet with a WKB geometry column whose value at
+    /// `bad_row` is a zero-length (undecodable) payload and whose every other
+    /// row is a valid point — the only way to force a geometry DECODE error
+    /// at a chosen row index (the geoarrow builder `write_input*` uses cannot
+    /// emit a corrupt value). Mirrors `hostile::empty_wkb_value_errors_typed`.
+    fn write_input_with_corrupt_wkb(path: &Path, n: usize, bad_row: usize) {
+        use arrow_array::{BinaryArray, Int64Array};
+        use arrow_schema::DataType;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use std::sync::Arc;
+
+        fn point_wkb(x: f64, y: f64) -> Vec<u8> {
+            let mut v = Vec::with_capacity(21);
+            v.push(1u8); // little-endian
+            v.extend_from_slice(&1u32.to_le_bytes()); // wkbPoint
+            v.extend_from_slice(&x.to_le_bytes());
+            v.extend_from_slice(&y.to_le_bytes());
+            v
+        }
+
+        let payloads: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                if i == bad_row {
+                    Vec::new()
+                } else {
+                    point_wkb((i % 179) as f64 * 0.5 - 40.0, (i % 83) as f64 * 0.5 - 20.0)
+                }
+            })
+            .collect();
+
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            "ARROW:extension:name".to_string(),
+            "geoarrow.wkb".to_string(),
+        );
+        let geom_field = Field::new("geometry", DataType::Binary, true).with_metadata(md);
+        let schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(geom_field),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(BinaryArray::from_iter_values(payloads.iter())),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.append_key_value_metadata(KeyValue::new(
+            "geo".to_string(),
+            r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":[]}}}"#
+                .to_string(),
+        ));
+        writer.close().unwrap();
+    }
+
+    /// #460 review (S3-a): a geometry decode failure must name the row range
+    /// it came from in GLOBAL row terms. `scan_chunk` sees a sliced column,
+    /// so the index `batch_processor` formats is chunk-local — row 1500 of a
+    /// 3000-row input reported as "index 476" (1024 + 476) before the fix,
+    /// which sends a user looking at the wrong row of their file.
+    #[test]
+    fn pass1_decode_error_names_global_row_range() {
+        const N: usize = 3000;
+        const BAD_ROW: usize = 1500;
+        const CHUNK_ROWS: usize = 1024;
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_corrupt_wkb(tin.path(), N, BAD_ROW);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 6,
+            },
+            read_batch_size: 8192, // one batch: the chunk base is the only offset
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let pre = convert_preflight(&source, &options).unwrap();
+        let res = run_pass1_with_chunk_rows(
+            &source,
+            &pre.input_schema,
+            pre.geom_idx,
+            &pre.options,
+            &pre.acc_cols,
+            pre.selected_row_groups.as_ref(),
+            pre.bbox_units.as_ref(),
+            pre.bound_filter.as_ref(),
+            CHUNK_ROWS,
+        );
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("a zero-length WKB value must fail the pass-1 decode"),
+        };
+        let msg = err.to_string();
+
+        // The chunk holding row 1500 is rows 1024..2048 of the file.
+        let lo = BAD_ROW - BAD_ROW % CHUNK_ROWS;
+        let hi = (lo + CHUNK_ROWS).min(N);
+        assert!(
+            msg.contains(&format!("rows {lo}..{hi}")),
+            "decode error must name the global row range {lo}..{hi}; got: {msg}"
+        );
+        // The range must actually localize the failure (one chunk, and the
+        // bad row inside it) — "rows 0..3000" would satisfy the substring
+        // above while telling the user nothing.
+        assert!(hi - lo <= CHUNK_ROWS && (lo..hi).contains(&BAD_ROW));
+        // The chunk-local index the underlying decoder reports is left as-is
+        // on purpose (rebasing it would put row arithmetic back inside
+        // `scan_chunk`); the range prefix is what makes it interpretable.
+        assert!(
+            msg.contains(&format!("index {}", BAD_ROW - lo)),
+            "expected the (chunk-local) decoder index to survive the wrap; got: {msg}"
         );
     }
 }
