@@ -63,7 +63,7 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels, carried across tile seams so features don't clip at boundaries
 
   Default value: `8`
-* `--partition-wave <N|auto>` — Partitions processed per band read during the export phase (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
+* `--partition-wave <N|auto>` — Partitions processed per band read during the export phase (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
 
   Default value: `auto`
 * `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order (#361): `input` (default) or a property name, optionally `:asc` / `:desc`.
@@ -213,7 +213,7 @@ Generate PMTiles vector tiles (the default pipeline)
   Default value: `8192`
 * `--profile <PROFILE>` — Memory/throughput profile for the single-read pass-2 engine (#213/#212).
 
-   `speed` buffers each output level's rows in RAM (fastest; peak RAM grows with buffered output). `bounded` spills them to temporary Arrow IPC files (memory-capped; slight temp-I/O cost). `auto` (default) is workload-based: it estimates buffered output from feature and level counts and spills when that exceeds a fraction of available RAM, so large duplicating runs prefer bounded instead of risking OOM (override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical across profiles. No effect with --no-streaming.
+   `speed` buffers each output level's rows in RAM (fastest; peak RAM grows with buffered output). `bounded` spills them to temporary Arrow IPC files (memory-capped; slight temp-I/O cost). `auto` (default) is workload-based: it estimates buffered output from feature and level counts and spills when that exceeds a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected), so large duplicating runs prefer bounded instead of risking OOM (override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical across profiles. No effect with --no-streaming.
 
   Default value: `auto`
 
@@ -401,7 +401,7 @@ Build a multi-resolution overview GeoParquet file
   Default value: `8192`
 * `--profile <PROFILE>` — Memory/throughput profile for the single-read pass-2 engine (#213/#212).
 
-   `speed` buffers each output level's rows in RAM (fastest; peak RAM grows with buffered output). `bounded` spills them to temporary Arrow IPC files (memory-capped; slight temp-I/O cost). `auto` (default) is workload-based: it estimates buffered output from feature and level counts and spills when that exceeds a fraction of available RAM, so large duplicating runs prefer bounded instead of risking OOM (override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical across profiles. No effect with --no-streaming.
+   `speed` buffers each output level's rows in RAM (fastest; peak RAM grows with buffered output). `bounded` spills them to temporary Arrow IPC files (memory-capped; slight temp-I/O cost). `auto` (default) is workload-based: it estimates buffered output from feature and level counts and spills when that exceeds a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected), so large duplicating runs prefer bounded instead of risking OOM (override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical across profiles. No effect with --no-streaming.
 
   Default value: `auto`
 
@@ -460,7 +460,7 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
   Default value: `500K`
 * `--report <PATH>` — Write the JSON export report to this path
 * `--no-simple-clip-fastpath` — Disable the simple-clip fast path (issue #239), forcing the i_overlay boundary-bridge fallback on every polygon clip. The fast path is on by default (render-equivalent on simple rings); pass this only when you need byte-stable tile output, since the fast path rotates simple rings to a different start vertex
-* `--partition-wave <N|auto>` — Partitions processed per band read during export (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
+* `--partition-wave <N|auto>` — Partitions processed per band read during export (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
 
   Default value: `auto`
 * `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order (#361): `input` (default) or a property name, optionally `:asc` / `:desc`.
@@ -518,13 +518,13 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 
 * `--band <LO-HI:INPUT[:LAYER]>` — A band: `LO-HI:INPUT[:LAYER]`, repeatable.
 
-   INPUT is either a GeoParquet source — tiled here, restricted to this band's zoom range — or a PMTiles archive already tiled for that range, which is merged as-is. Which one it is is detected from the file, not the extension.
+   INPUT is either a GeoParquet source — tiled here, restricted to this band's zoom range — or a PMTiles archive already tiled for that range, which is merged as-is. Which one it is is detected from the file, not the extension. A source may be remote (`https://`, `s3://`, `gs://`), read with byte-range requests like every other subcommand's input; a band ARCHIVE must be local, since the merge reads it by offset.
 
    LAYER defaults to the file stem, and several bands may share one layer name (the usual case: a coarse and a fine aggregate that are the same layer to a client). Two bands in the SAME layer must not share a zoom -- they would write the same tile ids. Bands in DIFFERENT layers may (tippecanoe's -L): at the zooms they share, each tile carries every band's layer, so `--band 0-13:a.parquet:2024 --band 0-13:b.parquet:2025 --generalize` is one archive with two independently generalized layers. The per-tile size cap applies to each band's tiles before they are combined, not to the combined tile. For a pre-tiled archive LAYER is a label: when bands share zooms it must match the layer name inside the archive, or the merge is refused rather than write two layers of one name into a tile.
 
    Bands are emitted coarsest-first in the merged archive regardless of listing order.
 
-   INPUT may not contain a `:`, which the spec cannot tell apart from the LAYER separator; rename the file or point at it through a symlink.
+   Colons in INPUT: the LAYER is only split off the LAST `:` when what follows it has no `/`, `\` or `:`, so a URL, a Windows drive and a `2024:06/` directory stay whole. A drive-relative path with no `\` after the drive, e.g. `C:data.parquet`, also stays whole: a single ASCII letter before the last `:` is treated as a drive letter, not a path, even though `data.parquet` alone would otherwise look like a bare layer name. For the inputs that rule cannot express — one ENDING in a bare colon segment, e.g. a Hive directory `admin:country_code=BR` — spell the band `LO-HI=INPUT[=LAYER]` instead: the range is split at the first `=` and the LAYER at the last, again only when the segment after it has no `/`, `\` or `:`. An INPUT that itself ends in `=VALUE` needs an explicit `=LAYER`.
 * `--generalize` — Generalize each GeoParquet band with the normal ladder instead of tiling it verbatim.
 
    Off by default: a band's premise is that its input is already the right resolution for the zooms it owns, so thinning and simplifying it would re-introduce exactly what banding avoids. Pass this when a band is raw features spanning several zooms and you do want the ladder inside it.
