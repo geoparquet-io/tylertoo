@@ -598,13 +598,16 @@ impl LevelSink {
         })
     }
 
-    fn push(&mut self, batch: RecordBatch) -> Result<(), ConvertError> {
+    /// Push one output batch into the sink. Returns the bytes handed to the
+    /// spill writer (0 for the RAM path — nothing is measured there, since
+    /// the goal is accounting for previously-invisible spill I/O).
+    fn push(&mut self, batch: RecordBatch, timers: &Pass2Timers) -> Result<u64, ConvertError> {
         match self {
             LevelSink::Ram(v) => {
                 v.push(batch);
-                Ok(())
+                Ok(0)
             }
-            LevelSink::Spill(s) => s.push(&batch),
+            LevelSink::Spill(s) => s.push(&batch, timers),
         }
     }
 }
@@ -626,9 +629,15 @@ impl SpillState {
         Ok(SpillState { writer, temp })
     }
 
-    fn push(&mut self, batch: &RecordBatch) -> Result<(), ConvertError> {
+    /// Write one batch to the spill file, timing the I/O and reporting its
+    /// approximate in-memory byte size (profiling instrumentation: this write
+    /// was previously untimed and its bytes uncounted).
+    fn push(&mut self, batch: &RecordBatch, timers: &Pass2Timers) -> Result<u64, ConvertError> {
+        let bytes = batch.get_array_memory_size() as u64;
+        let t = Instant::now();
         self.writer.write(batch)?;
-        Ok(())
+        Pass2Timers::add_dur(timers.spill_write_cell(), t.elapsed());
+        Ok(bytes)
     }
 
     /// Finish writing and reopen the temp file for reading. The returned
@@ -644,11 +653,21 @@ impl SpillState {
     }
 }
 
+/// Per-level `(outcome, rows_written, vertex_count, spill_bytes_written)` plus
+/// the engine's aggregated [`Pass2Timers`], returned by [`run_pass2_buffered`]
+/// ([profile] / `TYLERTOO_PROFILE_JSON` instrumentation — the measurement base
+/// for the pass-2 throughput work). `spill_bytes_written` is 0 under
+/// [`SinkBacking::Ram`], since nothing is written to disk there.
+pub(super) struct Pass2EngineResult {
+    pub(super) levels: Vec<(LevelWriteOutcome, usize, usize, u64)>,
+    pub(super) timers: Pass2Timers,
+}
+
 /// Buffer + write levels `0..ctxs.len()` (all but the streamed finest level)
-/// from a single read of the input. Returns `(outcome, rows_written,
-/// vertex_count)` per level, in level order — the outcome flags a level the
-/// writer skipped because every candidate collapsed during simplification
-/// (#211).
+/// from a single read of the input. Returns per-level `(outcome,
+/// rows_written, vertex_count, spill_bytes_written)`, in level order — the
+/// outcome flags a level the writer skipped because every candidate collapsed
+/// during simplification (#211) — plus the engine's stage-timer snapshot.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_pass2_buffered(
     writer: &mut OverviewWriter<File>,
@@ -660,7 +679,7 @@ pub(super) fn run_pass2_buffered(
     in_flight: usize,
     backing: SinkBacking,
     out_schema: &Schema,
-) -> Result<Vec<(LevelWriteOutcome, usize, usize)>, ConvertError> {
+) -> Result<Pass2EngineResult, ConvertError> {
     let num_levels = ctxs.len();
     debug_assert_eq!(num_levels, hints.len());
 
@@ -673,6 +692,9 @@ pub(super) fn run_pass2_buffered(
     }
     let mut rows = vec![0usize; num_levels];
     let mut verts = vec![0usize; num_levels];
+    // Bytes handed to the spill writer, per level (previously uncounted).
+    // Stays all-zero under `SinkBacking::Ram`.
+    let mut spill_bytes = vec![0u64; num_levels];
 
     // Build the single-pass stream here (per-part bbox-selected row groups,
     // #102 — the same selection both passes use, so global row indices stay
@@ -688,7 +710,8 @@ pub(super) fn run_pass2_buffered(
     })?;
 
     // Consumer state borrowed mutably by the consumer closure below.
-    let (rows_ref, verts_ref, sinks_ref) = (&mut rows, &mut verts, &mut sinks);
+    let (rows_ref, verts_ref, sinks_ref, spill_bytes_ref) =
+        (&mut rows, &mut verts, &mut sinks, &mut spill_bytes);
     let timers_ref = &timers;
     let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
     scoped_pipe(
@@ -756,7 +779,7 @@ pub(super) fn run_pass2_buffered(
                     if let Some((out, v)) = out {
                         rows_ref[li] += out.num_rows();
                         verts_ref[li] += v;
-                        sinks_ref[li].push(out)?;
+                        spill_bytes_ref[li] += sinks_ref[li].push(out, timers_ref)?;
                     }
                 }
                 if last_progress.elapsed().as_secs() >= 10 {
@@ -779,19 +802,32 @@ pub(super) fn run_pass2_buffered(
     let mut outcomes = Vec::with_capacity(num_levels);
     for li in 0..num_levels {
         let sink = std::mem::replace(&mut sinks[li], LevelSink::Ram(Vec::new()));
-        outcomes.push(drain_sink(writer, li, hints[li], sink)?);
+        let t_drain_level = Instant::now();
+        let outcome = drain_sink(writer, li, hints[li], sink, &timers)?;
+        log::debug!(
+            "[profile] level {li}: rows={} spill={:.2} MiB drain={:.2}s",
+            rows[li],
+            spill_bytes[li] as f64 / (1024.0 * 1024.0),
+            t_drain_level.elapsed().as_secs_f64(),
+        );
+        outcomes.push(outcome);
     }
 
     timers.log_engine_summary(t_engine.elapsed().as_secs_f64(), rows.iter().sum());
-    Ok(outcomes
+    let levels = outcomes
         .into_iter()
-        .zip(rows.into_iter().zip(verts))
-        .map(|(outcome, (r, v))| (outcome, r, v))
-        .collect())
+        .zip(rows)
+        .zip(verts)
+        .zip(spill_bytes)
+        .map(|(((outcome, r), v), s)| (outcome, r, v, s))
+        .collect();
+    Ok(Pass2EngineResult { levels, timers })
 }
 
-/// Drain one level's sink into `writer.write_level`. The RAM path is
-/// infallible; the spill path reuses the error-parking discipline of
+/// Drain one level's sink into `writer.write_level`, timing the call into
+/// `timers.drain` (previously invisible: this runs serially, one level at a
+/// time, after the parallel read loop finishes). The RAM path is infallible;
+/// the spill path reuses the error-parking discipline of
 /// `write_level_streaming` because `write_level` consumes an infallible
 /// iterator but Arrow IPC read-back can fail.
 fn drain_sink(
@@ -799,10 +835,12 @@ fn drain_sink(
     level_idx: usize,
     hint: usize,
     sink: LevelSink,
+    timers: &Pass2Timers,
 ) -> Result<LevelWriteOutcome, ConvertError> {
-    match sink {
+    let t_drain = Instant::now();
+    let outcome = match sink {
         LevelSink::Ram(batches) => {
-            Ok(writer.write_level(level_idx, Some(hint), batches.into_iter())?)
+            writer.write_level(level_idx, Some(hint), batches.into_iter())?
         }
         LevelSink::Spill(state) => {
             // `_temp` keeps the spill file on disk until the reader is drained.
@@ -820,9 +858,11 @@ fn drain_sink(
             if let Some(e) = err.borrow_mut().take() {
                 return Err(e); // spill read error takes precedence over the writer's
             }
-            Ok(res?)
+            res?
         }
-    }
+    };
+    Pass2Timers::add_dur(timers.drain_cell(), t_drain.elapsed());
+    Ok(outcome)
 }
 
 #[cfg(test)]
