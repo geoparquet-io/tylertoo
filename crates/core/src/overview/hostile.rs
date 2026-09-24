@@ -227,10 +227,19 @@ fn nonfinite_coordinate_rows_skipped() {
         let mut geoms = spread_points(4);
         geoms.push(Some(Geometry::Point(Point::new(f64::NAN, 1.0))));
         geoms.push(Some(Geometry::Point(Point::new(2.0, f64::INFINITY))));
-        // Covering generation over NaN bboxes is itself hostile; skip it.
-        write_input(tin.path(), &geoms, false, None);
+        // WITH bbox covering (#428): the non-finite rows poison the generated
+        // bbox columns — the `+inf` y reaches the ymax statistic verbatim.
+        // Paired with a `--bbox` below so the row-group selector actually
+        // runs over those statistics: an infinite bound must be compared, not
+        // treated as a reason to prune, or the four good rows vanish with it.
+        write_input(tin.path(), &geoms, true, None);
 
-        let report = convert_to_overviews(tin.path(), tout.path(), &opts(streaming))
+        // Comfortably around the four good points at (-60,-30)..(0,6).
+        let o = ConvertOptions {
+            bbox: Some([-70.0, -40.0, 10.0, 20.0]),
+            ..opts(streaming)
+        };
+        let report = convert_to_overviews(tin.path(), tout.path(), &o)
             .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
         assert_eq!(report.input_features, 4, "streaming={streaming}");
 
@@ -1195,6 +1204,90 @@ fn entry_zoom_ladder_agrees_across_pipelines_when_rows_are_rejected() {
     assert!(
         per_engine[0].0.iter().any(|&c| c > 0),
         "precondition: the surviving strongest band must reach some level"
+    );
+}
+
+/// #428: NaN is how plenty of sources spell nodata in a float column, and one
+/// in the `--sort-key` column used to reach `Priority::beats`, which answers
+/// false in BOTH directions for it — not a strict weak order. The row that
+/// holds a cell then keeps it whatever its key says (so the documented
+/// "larger key wins" rule inverts wherever a NaN row comes first), and the
+/// `sort_by`s built on the same comparator are free to permute, which breaks
+/// the byte-identity contract between the two engines.
+///
+/// A NaN-keyed feature must be treated as KEYLESS — ranked with the rows that
+/// have no key at all — and never dropped: it is a feature with an unrankable
+/// attribute, not a bad feature.
+#[test]
+fn nan_sort_key_rows_are_keyless_not_dropped() {
+    // Three pairs, far enough apart to own a coarse cell each, close enough
+    // within a pair to contest one. The NaN row of each pair comes FIRST, so
+    // it is the incumbent every challenger has to beat.
+    let mut geoms = Vec::new();
+    let mut values = Vec::new();
+    for k in 0..3 {
+        let (x, y) = (-60.0 + k as f64 * 60.0, 10.0);
+        geoms.push(Some(Geometry::Point(Point::new(x, y))));
+        values.push(f64::NAN);
+        geoms.push(Some(Geometry::Point(Point::new(x + 0.0001, y + 0.0001))));
+        values.push(100.0 + k as f64);
+    }
+
+    let mut per_engine = Vec::new();
+    for streaming in [true, false] {
+        // Twice per engine: same input, same options, same answer — a
+        // comparator that is not a total order is free to differ here.
+        let mut per_run = Vec::new();
+        for _ in 0..2 {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            super::testutil::write_input_with_f64(tin.path(), &geoms, "rank", &values);
+            let o = ConvertOptions {
+                sort_key: Some("rank".to_string()),
+                ..opts(streaming)
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &o)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: conversion failed: {e}"));
+            assert_eq!(
+                report.input_features, 6,
+                "streaming={streaming}: a NaN sort key must not drop the feature"
+            );
+            validate_file(tout.path()).unwrap();
+
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            let levels = reader.num_levels();
+            let ids: Vec<Vec<i64>> = (0..levels)
+                .map(|l| {
+                    read_level_ids_geoms(tout.path(), l)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
+                })
+                .collect();
+            per_run.push(ids);
+        }
+        assert_eq!(
+            per_run[0], per_run[1],
+            "streaming={streaming}: two runs over the same input must agree"
+        );
+        per_engine.push(per_run.pop().unwrap());
+    }
+
+    assert_eq!(
+        per_engine[0], per_engine[1],
+        "streamed and buffered engines must place NaN-keyed rows identically"
+    );
+    let ids = &per_engine[0];
+    assert_eq!(
+        ids.last().unwrap(),
+        &vec![0, 1, 2, 3, 4, 5],
+        "the canonical level keeps every row, NaN key or not (got {ids:?})"
+    );
+    assert_eq!(
+        ids[0],
+        vec![1, 3, 5],
+        "each coarse cell goes to the row with a real key — a NaN ranks as a \
+         missing key, which loses to any key at all (got {ids:?})"
     );
 }
 

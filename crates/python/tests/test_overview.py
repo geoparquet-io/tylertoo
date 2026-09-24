@@ -495,6 +495,35 @@ class TestOverviewClassRankIntegration:
             )
             assert out.exists()
 
+    def test_overview_class_rank_rejects_non_finite(self):
+        """#428: NaN/inf ranks cannot be ordered against other classes.
+
+        A NaN rank is not comparable at all (the cell incumbent would
+        silently keep every cell it contests), and the ``unknown_rank``
+        derivation uses ``min()``, which ignores NaN — one would leave
+        unlisted values outranking every listed class.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "overview.parquet"
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with pytest.raises(ValueError, match="finite"):
+                    tylertoo.overview(
+                        str(ROADS),
+                        str(out),
+                        max_zoom=4,
+                        class_rank_column="geometry_type",
+                        class_ranks={"LineString": bad, "MultiLineString": 2.0},
+                    )
+                with pytest.raises(ValueError, match="finite"):
+                    tylertoo.overview(
+                        str(ROADS),
+                        str(out),
+                        max_zoom=4,
+                        class_rank_column="geometry_type",
+                        class_ranks={"LineString": 3.0},
+                        class_rank_unknown=bad,
+                    )
+
     def test_overview_class_rank_missing_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "overview.parquet"

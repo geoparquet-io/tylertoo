@@ -287,6 +287,11 @@ pub struct ConvertOptions {
     pub entry_zoom: Option<EntryZoomSpec>,
     /// Optional column name whose (numeric) value is used as the cell-winner
     /// sort key. Mutually exclusive with [`class_ranking`](Self::class_ranking).
+    ///
+    /// A null — or a NaN/infinite value, which is how a float column usually
+    /// spells nodata — is a *missing* key: the feature still appears, it just
+    /// loses any cell it contests to a feature that has a key
+    /// ([`extract_sort_keys`]).
     pub sort_key: Option<String>,
     /// Optional explicit categorical class ranking (Q1 tier 1). Mutually
     /// exclusive with [`sort_key`](Self::sort_key).
@@ -2886,9 +2891,50 @@ pub(super) fn count_vertices(g: &Geometry<f64>) -> usize {
     g.coords_count()
 }
 
-/// Extract an optional f64 sort key per row from a numeric Arrow column.
-/// Non-numeric columns and null values yield `None`.
+/// Extract an optional f64 **sort key** per row from a numeric Arrow column:
+/// [`extract_numeric_values`] with ±inf filed under "missing key" as well
+/// (#428).
+///
+/// A NaN must never reach the ranking comparator: [`super::assign::Priority`]
+/// answers "does not beat" in BOTH directions for one, which is not a strict
+/// weak order — the incumbent of a cell then keeps it whatever the keys say
+/// (inverting the documented "larger key wins" rule), and `sort_by` is
+/// entitled to permute or panic on it, which would break byte-identity
+/// between the two engines. Infinities are ordered, but they are nodata in
+/// this position just as much as a NaN is, and a rank of "larger than every
+/// real value" is not something an attribute column means to say.
+///
+/// A missing key ranks below every present key (`Priority::beats`: `Some`
+/// beats `None`), so a NaN-keyed feature ranks exactly where a null-keyed one
+/// does — and, like it, is never dropped.
+///
+/// The entry-zoom ladder reads its column through here too: a non-finite
+/// rung is not a rung. The **accumulate** columns do not — they aggregate
+/// rather than rank, so they take [`extract_numeric_values`] and keep ±inf;
+/// dropping it there would contradict the canonical level, which carries the
+/// source value verbatim.
 pub(super) fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
+    extract_numeric(col, true)
+}
+
+/// Extract an optional f64 value per row from a numeric Arrow column.
+/// Non-numeric columns, null values and NaNs yield `None`.
+///
+/// NaN is not a value any comparison can answer — it is how plenty of sources
+/// spell nodata in a float column — so it reads as *absent*, the same call
+/// the tile-order [`OrderKey`](super::export) makes. ±inf is kept: it is
+/// perfectly comparable, so the `--filter` path and the `--accumulate`
+/// aggregates that read columns through here neither drop matching rows nor
+/// disagree with the canonical level's verbatim value. The ranking family
+/// narrows this further; see [`extract_sort_keys`].
+pub(super) fn extract_numeric_values(col: &dyn Array) -> Vec<Option<f64>> {
+    extract_numeric(col, false)
+}
+
+/// Shared body of [`extract_numeric_values`] and [`extract_sort_keys`]: one
+/// pass over the column, with `finite_only` choosing how wide the "absent"
+/// bucket is (NaN alone, or NaN and ±inf).
+fn extract_numeric(col: &dyn Array, finite_only: bool) -> Vec<Option<f64>> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
         Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
@@ -2903,10 +2949,18 @@ pub(super) fn extract_sort_keys(col: &dyn Array) -> Vec<Option<f64>> {
             (0..n)
                 .map(|i| {
                     if a.is_null(i) {
-                        None
-                    } else {
-                        Some(a.value(i) as f64)
+                        return None;
                     }
+                    let v = a.value(i) as f64;
+                    // Neither test can fail for the integer types; free
+                    // there, and the one place a float column's nodata is
+                    // caught.
+                    let usable = if finite_only {
+                        v.is_finite()
+                    } else {
+                        !v.is_nan()
+                    };
+                    usable.then_some(v)
                 })
                 .collect()
         }};
@@ -3068,13 +3122,21 @@ pub(super) fn append_point_count_field(schema: &Schema) -> Schema {
 
 /// Per-feature accumulate values (one vector per spec, parallel to the rows),
 /// extracted from the resolved column indices of a batch-shaped table.
+///
+/// Read through [`extract_numeric_values`], not [`extract_sort_keys`] (#428):
+/// aggregation is not ranking. A NaN is skipped (it would poison every
+/// aggregate it touched, and it is nodata far more often than a value), but
+/// ±inf is a summand like any other — dropping it would make
+/// `--accumulate-attribute v:max` over `{1.0, +inf}` report `1.0` at the
+/// coarse levels while the canonical level, which copies the source value
+/// verbatim, still shows `inf`: a pyramid contradicting itself.
 pub(super) fn extract_accumulate_values(
     batch: &RecordBatch,
     acc_col_indices: &[usize],
 ) -> Vec<Vec<Option<f64>>> {
     acc_col_indices
         .iter()
-        .map(|&idx| extract_sort_keys(batch.column(idx).as_ref()))
+        .map(|&idx| extract_numeric_values(batch.column(idx).as_ref()))
         .collect()
 }
 
@@ -3997,6 +4059,68 @@ pub(super) fn fill_level_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #428: NaN is how plenty of sources spell nodata in a float column, and
+    /// it is not a value anything can rank — `Priority::beats` returns false
+    /// in BOTH directions for it, which is not a strict weak order. Sort-key
+    /// extraction files a non-finite value under "missing key", the same
+    /// place a null goes, so no comparator ever sees one.
+    #[test]
+    fn extract_sort_keys_files_non_finite_under_missing() {
+        use arrow_array::{Float32Array, Float64Array, Int64Array};
+
+        let col = Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            None,
+            Some(2.0),
+        ]);
+        assert_eq!(
+            extract_sort_keys(&col),
+            vec![Some(1.0), None, None, None, None, Some(2.0)],
+            "a NaN / infinite sort key ranks as a missing key"
+        );
+
+        let col = Float32Array::from(vec![Some(1.0f32), Some(f32::NAN)]);
+        assert_eq!(
+            extract_sort_keys(&col),
+            vec![Some(1.0), None],
+            "f32 columns widen to f64 and keep the same rule"
+        );
+
+        // Integers cannot be non-finite: unchanged.
+        let col = Int64Array::from(vec![Some(-1i64), None, Some(7)]);
+        assert_eq!(extract_sort_keys(&col), vec![Some(-1.0), None, Some(7.0)]);
+    }
+
+    /// The filter path reads the same columns but must NOT lose ±inf: it is a
+    /// perfectly comparable value there, and dropping it would be a silent
+    /// data loss of its own. Only NaN — which no comparison can answer — is
+    /// read as "no value" (UNKNOWN under the filter's Kleene logic).
+    #[test]
+    fn extract_numeric_values_keeps_infinities_but_not_nan() {
+        use arrow_array::Float64Array;
+
+        let col = Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            None,
+        ]);
+        assert_eq!(
+            extract_numeric_values(&col),
+            vec![
+                Some(1.0),
+                None,
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None
+            ]
+        );
+    }
 
     /// #274: proptest pinning `scan_feature` byte-equivalent to the three
     /// functions it fuses (`usable_geometry` + `geometry_bbox` + `feature_kind`).

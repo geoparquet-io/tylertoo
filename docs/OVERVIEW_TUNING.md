@@ -730,6 +730,16 @@ used is recorded in the footer `generalization.ranking` provenance.
 
 `--sort-key` and `--class-rank` are mutually exclusive.
 
+**Unrankable values.** A null ranks below every real key: a feature with no key
+still appears, it just loses any cell it contests to one that has a key. A NaN
+or infinity in a numeric column ranks the same way — those are how float
+columns usually spell nodata, and neither is a priority anything can compare
+against. Such a row is never dropped for it; it competes as a keyless feature.
+The entry-zoom ladder reads its column by the same rule, so a non-finite value
+is no rung. `--accumulate` is aggregation rather than ranking and is one notch
+looser: a NaN is skipped there too, but an infinity is a real summand (see
+[Clustering](#clustering---cluster---accumulate-attribute)).
+
 ---
 
 ## Density budget: `--drop-rate`, `--drop-gamma`, `--no-density-drop`
@@ -859,6 +869,12 @@ Notes:
   already-aggregated coarser values), so `mean` is exact at every level.
 - Null values don't contribute; a cluster whose members are all null keeps
   the winner's null. Non-accumulated columns keep the winner's own values.
+- A **NaN** doesn't contribute either — it is nodata far more often than a
+  value, and one would poison every aggregate it touched. It is not counted
+  as a contributor, so `mean` is the mean of the real values. **Infinities
+  are kept**: `±inf` is an ordinary summand here, so `value:max` over
+  `{1.0, +inf}` is `+inf` at every level, agreeing with the canonical level,
+  which carries the source value verbatim.
 - Aggregation is computed in `f64` and written back in the column's original
   type; a `mean` over an integer column rounds to the nearest integer
   (prefer float columns for `mean`).
@@ -1316,7 +1332,16 @@ engine involved):
 NULL value is UNKNOWN, `AND`/`OR`/`NOT` combine with Kleene logic, and a row
 is kept only when the whole predicate is TRUE. So `confidence > 0.8` drops
 null-confidence rows — and so does `NOT (confidence > 0.8)`. Use
-`IS NULL` / `IS NOT NULL` to test nulls explicitly.
+`IS NULL` / `IS NOT NULL` to test nulls explicitly. A NaN in a float column is
+UNKNOWN too — no comparison against it has an answer, and it is nodata far more
+often than it is a value. Infinities are ordinary values and compare normally.
+
+Note that this also makes `!=` (and `NOT IN`) drop NaN rows: `NaN != 5` is TRUE
+under IEEE-754, but UNKNOWN here, which is the SQL reading. And unlike a null,
+a NaN is a *present* value, so `IS NULL` does **not** match it while
+`IS NOT NULL` does. The two rules together mean **no predicate selects NaN
+rows**: they can only be kept by a predicate over some other column. Clean the
+column upstream (e.g. with `gpio`) if you need to address those rows.
 
 Like `--bbox`, the filter is two-stage:
 
