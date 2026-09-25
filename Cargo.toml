@@ -120,18 +120,6 @@ unnested_or_patterns = "warn"
 unused_self = "warn"
 zero_sized_map_values = "warn"
 
-# Profile for the slow end-to-end tests (.config/nextest.toml, the Slow
-# Tests CI job). They drive the debug CLI over real fixtures, and
-# optimized dependencies (arrow, parquet, geo, zstd, ...) cut each run by
-# ~1.5x (#524). Workspace crates stay at opt-level 0. Not the dev default:
-# on a 4-vCPU runner a cold dependency build goes from ~2 min to ~9.5 min,
-# which the fast tests (~30s total) do not earn back.
-[profile.slow-tests]
-inherits = "dev"
-
-[profile.slow-tests.package."*"]
-opt-level = 2
-
 [profile.release]
 lto = true
 codegen-units = 1

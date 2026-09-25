@@ -349,12 +349,13 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        # Own key: the slow-tests profile builds into target/slow-tests.
+        # Same key as the Test (<os>, stable) lane: same build, so this job
+        # starts from a warm target/ and compiles almost nothing.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-slow-tests-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-slow-tests-target-
+          key: ${{ runner.os }}-stable-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-stable-cargo-build-target-
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -374,7 +375,6 @@ jobs:
       - name: Run slow tests
         run: >-
           cargo nextest run --locked --all-features
-          --cargo-profile slow-tests
           --ignore-default-filter -E 'not default()'
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.

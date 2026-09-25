@@ -220,13 +220,32 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
     // per run without weakening the coverage it exists for.
     const MAX_ZOOM: u8 = 8;
 
-    let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
-    for threads in [1u32, 2, 8] {
-        let out = dir.path().join(format!("mada-t{threads}.pmtiles"));
-        let overview_out = dir.path().join(format!("mada-t{threads}-overview.parquet"));
-        let (bytes, overview_bytes) =
-            run_tiles(&fixture, &out, &overview_out, threads, false, MAX_ZOOM, &[]);
+    // The three runs are separate processes with their own pinned rayon
+    // pool, so they run concurrently: this test was the CI long pole at
+    // ~3-7 min run serially (#524). Contention changes timing only, and
+    // byte-identical output under any timing is what this test asserts.
+    let runs: Vec<(u32, Vec<u8>, Vec<u8>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = [1u32, 2, 8]
+            .into_iter()
+            .map(|threads| {
+                let (fixture, dir) = (&fixture, dir.path());
+                scope.spawn(move || {
+                    let out = dir.join(format!("mada-t{threads}.pmtiles"));
+                    let overview_out = dir.join(format!("mada-t{threads}-overview.parquet"));
+                    let (bytes, overview_bytes) =
+                        run_tiles(fixture, &out, &overview_out, threads, false, MAX_ZOOM, &[]);
+                    (threads, bytes, overview_bytes)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("tylertoo tiles run panicked"))
+            .collect()
+    });
 
+    let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
+    for (threads, bytes, overview_bytes) in runs {
         match &baseline {
             None => baseline = Some((threads, bytes, overview_bytes)),
             Some((base_threads, base_bytes, base_overview_bytes)) => {
