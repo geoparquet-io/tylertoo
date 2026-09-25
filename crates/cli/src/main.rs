@@ -1101,8 +1101,9 @@ struct ConvertTuningArgs {
     /// which level every input row enters at, the per-level counts, the
     /// clustering / coalescing / carrier side tables, the resolved ranking
     /// provenance and the dataset-wide tallies — plus a fingerprint of the
-    /// inputs and of every thinning-relevant flag. Re-running with --plan
-    /// then skips pass 1 and the assignment entirely.
+    /// inputs and of every thinning-relevant flag (see --plan for exactly
+    /// what the fingerprint pins). Re-running with --plan then skips pass 1
+    /// and the assignment entirely.
     ///
     /// The assignment is dataset-global: the density budget water-fills a
     /// super-cell budget over every candidate of a level, the level walk
@@ -1110,6 +1111,10 @@ struct ConvertTuningArgs {
     /// dense-ranks the whole column. A sharded build must therefore consume
     /// ONE plan rather than recompute the assignment per shard, or the
     /// shards' pyramids disagree.
+    ///
+    /// PATH's parent directory must exist and be writable; that is checked
+    /// up front, before anything is scanned. An existing plan at PATH is
+    /// overwritten, with a log line.
     #[arg(
         long,
         value_name = "PATH",
@@ -1122,12 +1127,23 @@ struct ConvertTuningArgs {
     /// the level assignment.
     ///
     /// The plan's fingerprint must match this run — the tylertoo version,
-    /// every thinning-relevant flag, and each input's path, size, mtime and
-    /// pruned row groups. A mismatch is a hard error naming the offending
-    /// field, so a stale plan never silently produces a different pyramid.
-    /// The write-side flags (--profile, --row-group-size,
-    /// --in-flight-batches, --spill-dir) are deliberately NOT fingerprinted,
-    /// so one plan can be replayed across them.
+    /// every thinning-relevant flag, and each input's identity. A mismatch is
+    /// a hard error naming the offending field, so a stale plan never
+    /// silently produces a different pyramid. The write-side flags
+    /// (--profile, --row-group-size, --in-flight-batches, --spill-dir) are
+    /// deliberately NOT fingerprinted, so one plan can be replayed across
+    /// them.
+    ///
+    /// What "input identity" pins: for every part, local or remote, the
+    /// path/URL, the byte size, the row count and the row-group layout from
+    /// the parquet footer, plus the row groups --bbox/--filter pruned to.
+    /// A local part additionally pins its mtime. A remote object has no
+    /// mtime and no ETag here, so an object rewritten in place with the same
+    /// size, row count and row-group layout is NOT detected; tylertoo warns
+    /// when any part is remote.
+    ///
+    /// PATH must be a readable convert plan; that is checked up front,
+    /// before the input is opened.
     #[arg(
         long,
         value_name = "PATH",

@@ -110,14 +110,55 @@ Pass 1 and the assignment can be **persisted and replayed** (`plan_state.rs`,
   recomputed the assignment locally would fold over its own subset and reach a
   different answer, so a sharded build MUST consume one global plan.
 
-The artifact is a single Arrow IPC file: the row-indexed winner table as a
-`UInt8` section, the side tables (per-row kinds, tiny-polygon carriers,
-cluster tables, the coalesce line scratch as WKB) as further sections, and
-the scalars, ranking provenance and fingerprint as JSON in the schema
-metadata under a versioned key. Loading verifies the fingerprint (tylertoo
-version, every thinning-relevant option field by field, and each input part's
-path / size / mtime / selected row groups) and hard-errors naming the
-offending field rather than running stale.
+The artifact is an 8-byte magic plus an xxh3-64 checksum, then a single Arrow
+IPC file: the row-indexed winner table as a `UInt8` section, the side tables
+(per-row kinds, tiny-polygon carriers, cluster tables, the coalesce line
+scratch as WKB) as further sections, and the scalars, ranking provenance and
+fingerprint as JSON in the schema metadata under a versioned key.
+
+A plan is read as **hostile input** (#512), to the bar #417/#489/#430 hold
+PMTiles reading to: the checksum is verified before a byte reaches an arrow
+decoder, and every structural check past it — one-row batch, level count
+inside `MAX_LEVELS`, `checked_mul` on the cluster stride, known geometry-kind
+codes, no nulls in a non-nullable section — is an error naming `--plan` and
+the path, never a panic.
+
+A checksum is an *integrity* check, never a *consistency* one — anyone who
+can forge a plan can re-checksum it — so the row-indexed sections are also
+checked against each other and against the run. `kinds` must be exactly as
+long as `min_levels` (both are addressed by raw row position in pass 2's
+batch fan-out), and the plan's row domain is compared against the sum of
+`num_rows()` over the row groups *this* run selected. That comparison runs
+unconditionally: it was once gated on an unpruned-footer total, which meant
+`--bbox` / `--filter` turned it off entirely and a forged plan reached an
+out-of-bounds index in pass 2. The remaining sections cannot index out of
+bounds by construction — `carriers` is bounded by the level count and only
+`binary_search`ed, and the coalesce and cluster sections are length-matched
+at rebuild and keyed through a `HashMap`.
+
+Loading also verifies the fingerprint (tylertoo version, every
+thinning-relevant option field by field, and each input part's identity) and
+hard-errors naming the offending field rather than running stale. Input
+identity is, for local files **and** remote objects alike, the path/URL, the
+byte size, the footer **row count**, the footer row-group count and the
+selected row groups, plus mtime for a local file (#511). The row count is the
+load-bearing term: the winner table is addressed by row *position*, so it is
+the only cheap fact that catches a swapped remote object — `fs::metadata` on
+an `s3://` display name sees nothing. There is no ETag or object mtime term
+(neither is plumbed past `RemoteSource::connect`), so a remote part gets a
+one-line warning on save and load naming what is and is not pinned.
+
+Both paths are preflighted in `validate_options` (#513), alongside the #272
+`--spill-dir` check: `--plan` must be readable and carry the plan magic, and
+`--save-plan` must be writable — its parent must exist and accept a write,
+*and*, when the target file already exists, that file itself must open for
+writing. `--save-plan` is written only *after* pass 1 and the assignment, so
+a bad target used to cost the whole scan. An existing plan is overwritten
+with a log line, matching how `overview`/`tiles` treat their own outputs; the
+preflight only ever observes, so it never truncates the plan it probes. The
+magic's last byte is the format version and is matched separately from the
+`TTPLAN\0` prefix, so a plan from a future tylertoo reports its version
+rather than "bad magic bytes".
 
 Peak memory is `O(read batch + winner tables)` — Moldova (632k polygons,
 38M vertices) converts to a z0–14 pyramid in ~45 s / ~1.4 GB peak RSS on a 16-core machine

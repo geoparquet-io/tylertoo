@@ -1568,21 +1568,68 @@ tylertoo overview roads.parquet roads-tuned.overview \
   --profile bounded --row-group-size 50000
 ```
 
-The artifact is one Arrow IPC file, sized by input **rows** rather than input
-bytes: one winner byte per row plus the small per-level side tables. A 28 MB
-/ 24k-feature polygon file yields a 49 KB plan. Line coalescing is the
-exception — the plan carries the collected line geometries as WKB, so a
-line-heavy input produces a proportionally larger artifact.
+The artifact is a magic + checksum header followed by one Arrow IPC file,
+sized by input **rows** rather than input bytes: one winner byte per row plus
+the small per-level side tables. A 28 MB / 24k-feature polygon file yields a
+49 KB plan. Line coalescing is the exception — the plan carries the collected
+line geometries as WKB, so a line-heavy input produces a proportionally
+larger artifact.
+
+**The file is checksummed.** A plan is meant to be copied to other machines,
+so `--plan` verifies an xxh3-64 over the whole payload before decoding any of
+it. A truncated, edited, or bit-rotted plan is one named error —
+
+```
+--plan /mnt/shared/roads.plan: is corrupt: the payload hashes to
+1f3c...  but the header records 90ab.... The file was truncated, edited, or
+damaged in transit — re-create it with --save-plan.
+```
+
+— rather than an arrow-internal panic. Every other structural problem (a
+plan that is not a plan, a foreign format version, an impossible level count
+or cluster stride, an unknown geometry-kind code, row-indexed sections of
+disagreeing length) is likewise an error naming `--plan` and the path.
+
+The checksum proves the file is the one that was written; it proves nothing
+about whether the file makes sense. So the plan's row domain is also compared
+against the rows this run will actually read — the sum over the row groups
+`--bbox` / `--filter` selected — every time, pruned or not.
 
 **The plan is verified, not trusted.** It stores a fingerprint: the tylertoo
-version, every thinning-relevant flag, and each input's path, size, mtime and
-pruned row groups. A mismatch is a hard error naming the field:
+version, every thinning-relevant flag, and each input's identity. A mismatch
+is a hard error naming the field:
 
 ```
 --plan: saved plan does not match this run: input "roads.parquet" mtime was
 "1790242802390408452" when the plan was saved but is "1790244114398193000"
 now. Re-run without --plan (add --save-plan to write a fresh one).
 ```
+
+**What "input identity" pins, exactly.** For every part — local file or
+remote object alike — the path/URL, the byte size, the **row count** and the
+**row-group count** read from the parquet footer, plus the row groups
+`--bbox`/`--filter` pruned to. A **local** part additionally pins its mtime.
+
+| | local file | remote object |
+|---|---|---|
+| path / URL | ✅ | ✅ |
+| byte size | ✅ (`stat`) | ✅ (Content-Length) |
+| row count | ✅ (footer) | ✅ (footer) |
+| row-group count + pruned selection | ✅ | ✅ |
+| mtime | ✅ | ❌ |
+| content hash / ETag | ❌ | ❌ |
+
+The row count is the load-bearing one: the winner table is one byte per input
+row, addressed by row *position*, so an input swapped under a saved plan
+either produces a silently wrong pyramid (fewer rows) or indexes out of
+bounds (more rows). Pinning the footer row count turns both into a named
+error, for remote inputs as well as local ones. tylertoo prints a one-line
+warning naming what is and is not pinned whenever a part is remote.
+
+Neither a local mtime+size nor a remote size+row-count is a content hash:
+`cp -p` / `rsync -a` preserve mtime and size, and an object can be rewritten
+in place with the same size and row count. Treat the fingerprint as a strong
+staleness check, not a cryptographic seal.
 
 Deliberately **not** fingerprinted, so one plan replays across them:
 `--profile`, `--row-group-size`, `--row-group-size-policy`,
@@ -1603,6 +1650,19 @@ shard the same one.
 
 Both flags require the streaming pipeline (they are its pass-1 stage), they
 are mutually exclusive, and they are available on `overview` and `tiles`.
+
+**Both paths are checked before anything is scanned.** `--save-plan` is
+written only once pass 1 *and* the assignment are complete, so pointing it at
+an unmounted volume used to cost the entire scan and then leave you with no
+plan **and** no overview. Its parent directory must therefore exist and be
+writable at option-validation time — and if a plan is already sitting at that
+path, it must itself be writable, since it is about to be clobbered. `--plan`
+must be a readable convert plan (magic bytes checked, with a future format
+version named as such) — same fail-fast contract as `--spill-dir`.
+An existing plan at `--save-plan PATH` is **overwritten**, with a log line;
+that matches how `overview` and `tiles` treat their own outputs (only
+`pyramid`, which merges several archives, gates overwrites behind
+`-f/--force`).
 Not yet exposed in the Python bindings.
 
 ---

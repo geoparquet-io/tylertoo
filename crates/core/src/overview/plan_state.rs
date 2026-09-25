@@ -32,7 +32,9 @@
 //!
 //! # Format
 //!
-//! One Arrow IPC **file** holding a single record batch whose every column is
+//! An 8-byte magic ([`PLAN_MAGIC`]) and an xxh3-64 checksum of everything
+//! after it, then one Arrow IPC **file** holding a single record batch whose
+//! every column is
 //! a `LargeList` carrying one whole side table as a single list value (`null`
 //! when the section does not apply). Scalars, the fingerprint, and the
 //! provenance blocks travel as JSON under the schema metadata key
@@ -43,13 +45,23 @@
 //! exist in every batch, and an all-null `Int64` column still costs 8 bytes
 //! per row on disk.
 //!
+//! # Reading a plan is reading hostile input
+//!
+//! A plan travels between machines (the sharding motivation) and is named by
+//! a user-supplied `--plan PATH`, so it is held to the bar #417/#489/#430
+//! set for PMTiles reading: **hostile input produces an error, never a
+//! panic**. The checksum is verified before a single byte reaches an Arrow
+//! decoder, and every structural check past it reports through [`plan_err`],
+//! naming the flag and the path. See the `plan_rejects_*` tests (#512).
+//!
 //! # Fingerprint
 //!
 //! Loading a plan whose fingerprint does not match the current run is a hard
 //! error naming the offending field — never a silent stale run. The
 //! fingerprint pins the tylertoo version, every thinning-relevant option, and
-//! each input part's identity (path, byte length, mtime, selected row
-//! groups). See [`Fingerprint`].
+//! each input part's identity: path/URL, byte size, footer row count, footer
+//! row-group count and selected row groups for every part, plus mtime for a
+//! local file. See [`Fingerprint`].
 //!
 //! # Known gap (follow-up)
 //!
@@ -66,7 +78,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -97,23 +109,143 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 
 /// On-disk format version of the plan artifact. Bump on any incompatible
 /// change to the section layout or the JSON block.
-pub(super) const PLAN_FORMAT_VERSION: u32 = 1;
+///
+/// v2 wrapped the Arrow IPC payload in the [`PLAN_MAGIC`] + checksum header
+/// (#512) and added the per-part row count to the fingerprint (#511).
+pub(super) const PLAN_FORMAT_VERSION: u32 = 2;
+
+/// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
+///
+/// A plan travels between machines (the sharding motivation) and is named by
+/// a user-supplied `--plan PATH`, so the reader must be able to say "this is
+/// not a plan" and "this plan is damaged" *before* handing a single byte to
+/// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
+/// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x02";
+
+/// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
+/// version byte.
+///
+/// Readers match on THIS and then compare the version byte separately, so a
+/// plan written by a future tylertoo is reported as "format v3" rather than
+/// as "bad magic bytes" — the latter sends whoever reads the message looking
+/// for a corrupt file instead of a version skew.
+pub(super) const PLAN_MAGIC_PREFIX: &[u8; 7] = b"TTPLAN\x00";
+
+/// [`PLAN_FORMAT_VERSION`] as it appears in the magic's last byte.
+pub(super) const PLAN_FORMAT_VERSION_BYTE: u8 = PLAN_FORMAT_VERSION as u8;
+
+const _: () = assert!(
+    PLAN_MAGIC[PLAN_MAGIC_PREFIX.len()] == PLAN_FORMAT_VERSION_BYTE,
+    "PLAN_MAGIC's version byte must track PLAN_FORMAT_VERSION"
+);
+
+/// Bytes ahead of the IPC payload: [`PLAN_MAGIC`] (8) + the payload's
+/// xxh3-64 checksum, little-endian (8).
+const PLAN_HEADER_LEN: usize = 16;
+
+/// Read `r` to the end, returning the xxh3-64 of what it yielded.
+///
+/// Streamed in fixed-size chunks rather than slurped: the artifact is
+/// O(input rows), and a planet-scale plan must not be materialized twice
+/// just to be checksummed.
+fn hash_payload<R: Read>(mut r: R) -> std::io::Result<u64> {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hasher.digest());
+        }
+        hasher.update(&buf[..n]);
+    }
+}
+
+/// A `Read + Seek` view of `inner` with its first `offset` bytes hidden.
+///
+/// Arrow's `FileWriter` records each block's position relative to the start
+/// of the stream it wrote to, and `FileReader` seeks to those positions
+/// absolutely — so the IPC payload has to look like it begins at byte 0.
+/// This shim is what lets the plan carry its magic + checksum header in
+/// front of an otherwise ordinary Arrow IPC file.
+struct Offset<R> {
+    inner: R,
+    offset: u64,
+}
+
+impl<R: Read> Read for Offset<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for Offset<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let abs = match pos {
+            SeekFrom::Start(n) => {
+                let target = self.offset.checked_add(n).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek past u64::MAX")
+                })?;
+                self.inner.seek(SeekFrom::Start(target))?
+            }
+            other => self.inner.seek(other)?,
+        };
+        Ok(abs.saturating_sub(self.offset))
+    }
+}
+
+/// The plan's IPC payload as arrow wants to see it: byte 0 = the first IPC
+/// byte, with the header hidden.
+fn ipc_view(file: File) -> Offset<BufReader<File>> {
+    Offset {
+        inner: BufReader::new(file),
+        offset: PLAN_HEADER_LEN as u64,
+    }
+}
+
+/// Every plan-reader failure, named and carrying the `--plan` path.
+///
+/// The bar #417/#489/#430 set for PMTiles reading — "hostile input errors,
+/// never panics" — applies here too: a sharded build that ships one damaged
+/// plan to a worker must abort with a message naming the flag and the file,
+/// not an arrow-internal index panic.
+fn plan_err(path: &Path, what: &str) -> ConvertError {
+    ConvertError::InvalidConfig(format!("--plan {}: {what}", path.display()))
+}
+
+/// The `--save-plan` counterpart of [`plan_err`].
+fn save_plan_err(path: &Path, what: &str) -> ConvertError {
+    ConvertError::InvalidConfig(format!("--save-plan {}: {what}", path.display()))
+}
 
 /// Identity of one input part, as of the run that produced the plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct InputFingerprint {
     /// The part's display name (local path, or remote URL).
     pub path: String,
-    /// File size in bytes. `None` for an input whose size cannot be stat'ed
-    /// (a remote object).
+    /// Size in bytes: the local file's length, or a remote object's
+    /// Content-Length as the input layer already holds it (#511). `None`
+    /// only when neither is obtainable.
     pub byte_len: Option<u64>,
-    /// Modification time in nanoseconds since the Unix epoch, when available.
+    /// Modification time in nanoseconds since the Unix epoch. Local files
+    /// only — an object store's `LastModified` is not plumbed through the
+    /// input layer, so this stays `None` for remote parts.
     pub mtime_nanos: Option<i128>,
     /// Row groups selected for this part by `--bbox` / `--filter` pruning.
     /// `None` = every row group.
     pub row_groups: Option<Vec<usize>>,
-    /// Row groups the part has in total.
+    /// Row groups the part has in total, from its parquet footer.
+    #[serde(default)]
     pub row_groups_total: Option<usize>,
+    /// Rows the part has in total, from its parquet footer (#511).
+    ///
+    /// **This is the load-bearing content binding for a remote part.** The
+    /// winner table `min_levels` is addressed by row *position*, so an input
+    /// swapped under a saved plan either silently corrupts the pyramid (fewer
+    /// rows) or indexes out of bounds (more rows). `fs::metadata` cannot see a
+    /// remote object at all; the footer's row count can, for free.
+    #[serde(default)]
+    pub num_rows: Option<i64>,
 }
 
 /// Everything that must be identical between the run that saved a plan and
@@ -137,13 +269,20 @@ pub(super) struct Fingerprint {
 
 impl Fingerprint {
     /// Capture the fingerprint of the run about to start.
+    ///
+    /// `flag` is the plan flag that asked for it (`"save-plan"` or
+    /// `"plan"`), used only in the remote-input honesty warning.
     pub fn capture(
         source: &ConvertSource,
         selected_row_groups: Option<&RowGroupSelection>,
         options: &ConvertOptions,
-    ) -> Self {
+        flag: &str,
+    ) -> Result<Self, ConvertError> {
         let parts = source.parts();
         let selected = selected_row_groups.map(RowGroupSelection::parts);
+        // Footer facts (rows, row groups) per part: free, and — unlike
+        // `fs::metadata` — available for remote objects too (#511).
+        let footer = source.part_row_counts()?;
         let inputs = parts
             .iter()
             .enumerate()
@@ -151,23 +290,31 @@ impl Fingerprint {
                 let path = part.display_name();
                 let meta = std::fs::metadata(&path).ok();
                 InputFingerprint {
-                    byte_len: meta.as_ref().map(std::fs::Metadata::len),
+                    // A remote object has no local metadata; its
+                    // Content-Length is already in hand from the HEAD /
+                    // prefix listing that opened it.
+                    byte_len: meta
+                        .as_ref()
+                        .map(std::fs::Metadata::len)
+                        .or_else(|| part.fetch_stats().map(|s| s.object_size)),
                     mtime_nanos: meta
                         .as_ref()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as i128),
                     row_groups: selected.and_then(|s| s.get(i).cloned()),
-                    row_groups_total: None,
+                    row_groups_total: footer.get(i).map(|&(_, groups)| groups),
+                    num_rows: footer.get(i).map(|&(rows, _)| rows),
                     path,
                 }
             })
             .collect();
-        Fingerprint {
+        warn_remote_binding(source, flag);
+        Ok(Fingerprint {
             tylertoo_version: env!("CARGO_PKG_VERSION").to_string(),
             options: options_digest(options),
             inputs,
-        }
+        })
     }
 
     /// Verify `self` (loaded from a plan) against the current run's
@@ -216,6 +363,25 @@ fn verify_input(saved: &InputFingerprint, now: &InputFingerprint) -> Result<(), 
         return Err(mismatch("input path", &saved.path, &now.path));
     }
     let what = |field: &str| format!("input {:?} {field}", saved.path);
+    // #511: the content binding that also holds for a remote part, and the
+    // most informative thing to say first. The winner table is addressed by
+    // row position, so a changed row count is the difference between a
+    // correct replay and either a silently corrupted pyramid (fewer rows) or
+    // an out-of-bounds index (more rows).
+    if saved.num_rows != now.num_rows {
+        return Err(mismatch(
+            &what("row count"),
+            &opt_str(saved.num_rows),
+            &opt_str(now.num_rows),
+        ));
+    }
+    if saved.row_groups_total != now.row_groups_total {
+        return Err(mismatch(
+            &what("row group count"),
+            &opt_str(saved.row_groups_total),
+            &opt_str(now.row_groups_total),
+        ));
+    }
     if saved.byte_len != now.byte_len {
         return Err(mismatch(
             &what("byte_len"),
@@ -238,6 +404,36 @@ fn verify_input(saved: &InputFingerprint, now: &InputFingerprint) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// One-line honesty note about what a plan does and does not pin for a
+/// **remote** part (#511), emitted on save and on load alike.
+///
+/// A local file is pinned by path, size, mtime, row count and row-group
+/// layout. A remote object has no mtime and no ETag here — the input layer
+/// does not carry either past `connect()` — so its binding is URL,
+/// Content-Length, row count and row-group layout. That catches every
+/// replay that would corrupt the pyramid (the row-indexed winner table
+/// cannot survive a row-count change), but it does not catch an object
+/// rewritten in place with the identical size, row count and row-group
+/// layout.
+fn warn_remote_binding(source: &ConvertSource, flag: &str) {
+    let remote = source
+        .parts()
+        .iter()
+        .filter(|p| p.is_remote())
+        .map(|p| p.display_name())
+        .collect::<Vec<_>>();
+    let Some(first) = remote.first() else {
+        return;
+    };
+    log::warn!(
+        "--{flag}: {} remote input part(s) (e.g. {first}) are pinned by URL, object size, \
+         row count and row-group layout only — an object has no mtime here, so one rewritten \
+         in place with the same size and row count would NOT be detected. Local parts also \
+         pin mtime.",
+        remote.len(),
+    );
 }
 
 fn opt_str<T: std::fmt::Display>(v: Option<T>) -> String {
@@ -728,54 +924,186 @@ impl ConvertPlan {
         ];
 
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let file = File::create(path)?;
-        let mut w = FileWriter::try_new(BufWriter::new(file), &schema)?;
-        w.write(&batch)?;
-        w.finish()?;
-        Ok(())
+        write_plan_file(path, &schema, &batch)
     }
 
     /// Read a plan back from `path`.
+    ///
+    /// The file is *verified* before it is decoded: magic bytes, then an
+    /// xxh3-64 over the whole Arrow IPC payload. Only then does any byte
+    /// reach an arrow decoder, and every structural check past that point
+    /// reports through [`plan_err`] — a hostile or damaged plan is an error
+    /// naming `--plan` and the path, never a panic (#512).
     pub fn load(path: &Path) -> Result<ConvertPlan, ConvertError> {
-        let file = File::open(path)?;
-        let mut reader = FileReader::try_new(BufReader::new(file), None)?;
+        let mut file = File::open(path).map_err(|e| plan_err(path, &format!("{e}")))?;
+        let mut header = [0u8; PLAN_HEADER_LEN];
+        file.read_exact(&mut header).map_err(|_| {
+            plan_err(
+                path,
+                "is too short to be a tylertoo convert plan (no header)",
+            )
+        })?;
+        if !header.starts_with(PLAN_MAGIC_PREFIX) {
+            return Err(plan_err(
+                path,
+                "is not a tylertoo convert plan (bad magic bytes). Plans written by an \
+                 older tylertoo must be re-created with --save-plan.",
+            ));
+        }
+        // Version byte, read separately from the prefix so a FUTURE format is
+        // named as such instead of being reported as corruption.
+        let version = header[PLAN_MAGIC_PREFIX.len()];
+        if version != PLAN_FORMAT_VERSION_BYTE {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "is a tylertoo convert plan in format v{version}, but this tylertoo \
+                     reads v{PLAN_FORMAT_VERSION_BYTE}. Re-create it with --save-plan."
+                ),
+            ));
+        }
+        let want = u64::from_le_bytes(
+            header[PLAN_MAGIC.len()..]
+                .try_into()
+                .expect("header is 8 + 8 bytes"),
+        );
+        // Seek explicitly to the payload rather than relying on the cursor
+        // the header read happened to leave behind (a `try_clone` shares the
+        // file offset, so this worked only as a side effect of the
+        // `read_exact` above). The writer states the same offset the same
+        // way; an implicit, asymmetric version of it is one refactor away
+        // from hashing the header too and failing every load.
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))
+            .map_err(|e| plan_err(path, &format!("reading it failed: {e}")))?;
+        let got = hash_payload(BufReader::new(
+            file.try_clone()
+                .map_err(|e| plan_err(path, &format!("{e}")))?,
+        ))
+        .map_err(|e| plan_err(path, &format!("reading it failed: {e}")))?;
+        if got != want {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "is corrupt: the payload hashes to {got:016x} but the header records \
+                     {want:016x}. The file was truncated, edited, or damaged in transit — \
+                     re-create it with --save-plan."
+                ),
+            ));
+        }
+        let mut reader = FileReader::try_new(ipc_view(file), None)
+            .map_err(|e| plan_err(path, &format!("the Arrow IPC payload is unreadable: {e}")))?;
         let schema = reader.schema();
         let meta_json = schema.metadata().get(PLAN_META_KEY).ok_or_else(|| {
-            ConvertError::InvalidConfig(format!(
-                "--plan: {} is not a tylertoo convert plan (no {PLAN_META_KEY} metadata)",
-                path.display()
-            ))
+            plan_err(
+                path,
+                &format!("is not a tylertoo convert plan (no {PLAN_META_KEY} metadata)"),
+            )
         })?;
         let meta: PlanMeta = serde_json::from_str(meta_json)
-            .map_err(|e| ConvertError::InvalidConfig(format!("--plan: unreadable plan: {e}")))?;
+            .map_err(|e| plan_err(path, &format!("its metadata block is unreadable: {e}")))?;
         if meta.version != PLAN_FORMAT_VERSION {
-            return Err(ConvertError::InvalidConfig(format!(
-                "--plan: {} was written by plan format v{} but this tylertoo reads v{PLAN_FORMAT_VERSION}",
-                path.display(),
-                meta.version,
-            )));
+            return Err(plan_err(
+                path,
+                &format!(
+                    "was written by plan format v{} but this tylertoo reads \
+                     v{PLAN_FORMAT_VERSION}",
+                    meta.version,
+                ),
+            ));
+        }
+        // The JSON block is user-reachable input too: `num_levels` sizes an
+        // allocation and `finest`/`counts` index it, so bound them here
+        // rather than trusting them into a `vec![_; n]`.
+        if meta.num_levels != meta.level_specs.len() {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "declares {} level(s) but carries {} level spec(s)",
+                    meta.num_levels,
+                    meta.level_specs.len(),
+                ),
+            ));
+        }
+        if meta.num_levels > super::convert::MAX_LEVELS {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "declares {} level(s); at most {} are supported",
+                    meta.num_levels,
+                    super::convert::MAX_LEVELS,
+                ),
+            ));
         }
         let batch = reader
             .next()
-            .transpose()?
-            .ok_or_else(|| ConvertError::InvalidConfig("--plan: empty plan file".to_string()))?;
+            .transpose()
+            .map_err(|e| plan_err(path, &format!("its record batch is unreadable: {e}")))?
+            .ok_or_else(|| plan_err(path, "holds no record batch"))?;
+        // Every section is one list VALUE of a single-row batch. A zero-row
+        // batch is schema-valid and used to panic inside arrow at
+        // `list.value(0)`.
+        if batch.num_rows() != 1 {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "holds a {}-row record batch; a plan is exactly one row",
+                    batch.num_rows(),
+                ),
+            ));
+        }
 
-        let min_levels: Vec<u8> = u8_section(&batch, "min_levels")?.unwrap_or_default();
-        let kinds = u8_section(&batch, "kinds")?
-            .map(|codes| codes.into_iter().map(kind_from_code).collect::<Vec<_>>());
+        let min_levels: Vec<u8> = u8_section(&batch, "min_levels", path)?.unwrap_or_default();
+        let kinds = u8_section(&batch, "kinds", path)?
+            .map(|codes| {
+                codes
+                    .into_iter()
+                    .map(|c| kind_from_code(c, path))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
 
-        let carrier_offsets = u64_section(&batch, "carrier_offsets")?.unwrap_or_default();
-        let carrier_rows = u64_section(&batch, "carrier_rows")?.unwrap_or_default();
-        let carriers = rebuild_carriers(&carrier_offsets, &carrier_rows, meta.num_levels)?;
+        // #512 follow-up: `kinds` is addressed by the SAME row position as
+        // `min_levels` (`finest.kinds[g]` in pass 2's batch fan-out), so a
+        // checksum-valid plan whose `kinds` is short is an out-of-bounds index
+        // waiting to happen — the checksum proves the bytes are the ones that
+        // were written, never that they are consistent.
+        //
+        // The other sections were audited for the same hole and are already
+        // closed: `carriers` is bounded by `meta.num_levels` in
+        // `rebuild_carriers` and its row values are only ever `binary_search`ed
+        // (`is_carrier`); the coalesce sections are length-matched against each
+        // other in `rebuild_coalesce` and their row values key a `HashMap`; the
+        // cluster sections are length-matched in `rebuild_cluster_tables` and
+        // are likewise `HashMap`-keyed by row. Polygon `areas` never reach the
+        // artifact — they are consumed into `carriers` before the plan is
+        // built. `min_levels` and `kinds` are the only two indexed by raw row.
+        if let Some(kinds) = &kinds {
+            if kinds.len() != min_levels.len() {
+                return Err(plan_err(
+                    path,
+                    &format!(
+                        "does not match itself: section \"kinds\" holds {} row(s) but section \
+                         \"min_levels\" holds {}. Every row-indexed section must cover the \
+                         same input rows — re-create the plan with --save-plan.",
+                        kinds.len(),
+                        min_levels.len(),
+                    ),
+                ));
+            }
+        }
+
+        let carrier_offsets = u64_section(&batch, "carrier_offsets", path)?.unwrap_or_default();
+        let carrier_rows = u64_section(&batch, "carrier_rows", path)?.unwrap_or_default();
+        let carriers = rebuild_carriers(&carrier_offsets, &carrier_rows, meta.num_levels, path)?;
 
         let cluster_tables = if meta.has_cluster {
-            Some(rebuild_cluster_tables(&batch, &meta)?)
+            Some(rebuild_cluster_tables(&batch, &meta, path)?)
         } else {
             None
         };
 
         let coalesce = if meta.has_coalesce {
-            Some(rebuild_coalesce(&batch)?)
+            Some(rebuild_coalesce(&batch, path)?)
         } else {
             None
         };
@@ -807,26 +1135,87 @@ fn kind_code(k: FeatureKind) -> u8 {
     }
 }
 
-fn kind_from_code(c: u8) -> FeatureKind {
+/// Write one record batch to `path` as a plan artifact: the [`PLAN_MAGIC`]
+/// header, the Arrow IPC payload, then the payload's checksum patched back
+/// into the header.
+///
+/// Two-pass rather than buffering the payload in RAM: the artifact is
+/// O(input rows) and `save` runs at pass 1's memory peak, so an extra whole
+/// copy of it is exactly what a planet-scale run cannot afford.
+fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<(), ConvertError> {
+    let file = File::create(path).map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    let mut w = BufWriter::new(file);
+    w.write_all(PLAN_MAGIC)
+        .and_then(|()| w.write_all(&0u64.to_le_bytes()))
+        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    // Arrow's own errors carry no path: `--save-plan /mnt/full/x.plan` used to
+    // fail with a bare "No space left on device" naming neither the flag nor
+    // the file. Every arrow step is prefixed the same way the io steps are.
+    let arrow = |e: arrow_schema::ArrowError| save_plan_err(path, &format!("{e}"));
+    let mut ipc = FileWriter::try_new(w, schema).map_err(arrow)?;
+    ipc.write(batch).map_err(arrow)?;
+    ipc.finish().map_err(arrow)?;
+    let mut w = ipc.into_inner().map_err(arrow)?;
+    w.flush()
+        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    drop(w);
+
+    let checksum = (|| -> std::io::Result<u64> {
+        let mut f = File::open(path)?;
+        f.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))?;
+        hash_payload(BufReader::new(f))
+    })()
+    .map_err(|e| save_plan_err(path, &format!("checksumming what was written failed: {e}")))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    f.seek(SeekFrom::Start(PLAN_MAGIC.len() as u64))
+        .and_then(|_| f.write_all(&checksum.to_le_bytes()))
+        .and_then(|()| f.flush())
+        .map_err(|e| save_plan_err(path, &format!("writing the checksum failed: {e}")))?;
+    Ok(())
+}
+
+/// Decode a geometry-kind byte. Unknown codes are **rejected**: silently
+/// folding them to `Point` (#512) would reroute Q3 coalescing and the
+/// polygon carriers on a byte the checksum had not yet caught.
+fn kind_from_code(c: u8, path: &Path) -> Result<FeatureKind, ConvertError> {
     match c {
-        1 => FeatureKind::Line,
-        2 => FeatureKind::Polygon,
-        _ => FeatureKind::Point,
+        0 => Ok(FeatureKind::Point),
+        1 => Ok(FeatureKind::Line),
+        2 => Ok(FeatureKind::Polygon),
+        other => Err(plan_err(
+            path,
+            &format!("section \"kinds\" holds the unknown geometry-kind code {other}"),
+        )),
     }
 }
 
 /// The single list value of `name`, or `None` when the section is absent.
-fn section(batch: &RecordBatch, name: &str) -> Result<Option<arrow_array::ArrayRef>, ConvertError> {
-    let idx = batch.schema().index_of(name).map_err(|_| {
-        ConvertError::InvalidConfig(format!("--plan: plan file is missing section {name:?}"))
-    })?;
+fn section(
+    batch: &RecordBatch,
+    name: &str,
+    path: &Path,
+) -> Result<Option<arrow_array::ArrayRef>, ConvertError> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| plan_err(path, &format!("is missing section {name:?}")))?;
     let col = batch.column(idx);
     let list = col
         .as_any()
         .downcast_ref::<LargeListArray>()
-        .ok_or_else(|| {
-            ConvertError::InvalidConfig(format!("--plan: section {name:?} has the wrong layout"))
-        })?;
+        .ok_or_else(|| plan_err(path, &format!("section {name:?} has the wrong layout")))?;
+    // `value(0)` on an empty list array indexes arrow's offset buffer out of
+    // bounds and panics (#512). The caller guarantees a one-row batch; this
+    // is the local guard that makes the indexing itself total.
+    if list.is_empty() {
+        return Err(plan_err(
+            path,
+            &format!("section {name:?} carries no list value"),
+        ));
+    }
     if list.is_null(0) {
         return Ok(None);
     }
@@ -835,15 +1224,29 @@ fn section(batch: &RecordBatch, name: &str) -> Result<Option<arrow_array::ArrayR
 
 macro_rules! typed_section {
     ($fn_name:ident, $arr:ty, $native:ty) => {
-        fn $fn_name(batch: &RecordBatch, name: &str) -> Result<Option<Vec<$native>>, ConvertError> {
-            let Some(values) = section(batch, name)? else {
+        /// A non-nullable typed section. Nulls are **rejected**: `values()`
+        /// discards the null mask, so a nulled `min_level` would decode as
+        /// level 0 — the coarsest level, i.e. drawn everywhere (#512).
+        fn $fn_name(
+            batch: &RecordBatch,
+            name: &str,
+            path: &Path,
+        ) -> Result<Option<Vec<$native>>, ConvertError> {
+            let Some(values) = section(batch, name, path)? else {
                 return Ok(None);
             };
             let a = values.as_any().downcast_ref::<$arr>().ok_or_else(|| {
-                ConvertError::InvalidConfig(format!(
-                    "--plan: section {name:?} has the wrong value type"
-                ))
+                plan_err(path, &format!("section {name:?} has the wrong value type"))
             })?;
+            if a.null_count() > 0 {
+                return Err(plan_err(
+                    path,
+                    &format!(
+                        "section {name:?} holds {} null value(s); it must not be nullable",
+                        a.null_count(),
+                    ),
+                ));
+            }
             Ok(Some(a.values().to_vec()))
         }
     };
@@ -854,22 +1257,20 @@ typed_section!(u64_section, UInt64Array, u64);
 typed_section!(u32_section, UInt32Array, u32);
 typed_section!(i64_section, Int64Array, i64);
 
-/// A nullable `Float64` section, preserving nulls.
+/// A nullable `Float64` section, preserving nulls (a missing aggregate / a
+/// missing sort key are both real values here).
 fn f64_opt_section(
     batch: &RecordBatch,
     name: &str,
+    path: &Path,
 ) -> Result<Option<Vec<Option<f64>>>, ConvertError> {
-    let Some(values) = section(batch, name)? else {
+    let Some(values) = section(batch, name, path)? else {
         return Ok(None);
     };
     let a = values
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or_else(|| {
-            ConvertError::InvalidConfig(format!(
-                "--plan: section {name:?} has the wrong value type"
-            ))
-        })?;
+        .ok_or_else(|| plan_err(path, &format!("section {name:?} has the wrong value type")))?;
     Ok(Some(a.iter().collect()))
 }
 
@@ -877,20 +1278,25 @@ fn rebuild_carriers(
     offsets: &[u64],
     rows: &[u64],
     num_levels: usize,
+    path: &Path,
 ) -> Result<Vec<Vec<usize>>, ConvertError> {
-    if offsets.len() != num_levels + 1 {
-        return Err(ConvertError::InvalidConfig(format!(
-            "--plan: carrier offsets have {} entries but the plan has {num_levels} level(s)",
-            offsets.len(),
-        )));
+    let want = num_levels
+        .checked_add(1)
+        .ok_or_else(|| plan_err(path, "declares an impossible level count"))?;
+    if offsets.len() != want {
+        return Err(plan_err(
+            path,
+            &format!(
+                "carrier offsets have {} entries but the plan has {num_levels} level(s)",
+                offsets.len(),
+            ),
+        ));
     }
     let mut out = Vec::with_capacity(num_levels);
     for w in offsets.windows(2) {
         let (a, b) = (w[0] as usize, w[1] as usize);
         if a > b || b > rows.len() {
-            return Err(ConvertError::InvalidConfig(
-                "--plan: carrier offsets are out of range".to_string(),
-            ));
+            return Err(plan_err(path, "carrier offsets are out of range"));
         }
         out.push(rows[a..b].iter().map(|&r| r as usize).collect());
     }
@@ -900,20 +1306,39 @@ fn rebuild_carriers(
 fn rebuild_cluster_tables(
     batch: &RecordBatch,
     meta: &PlanMeta,
+    path: &Path,
 ) -> Result<ClusterTables, ConvertError> {
-    let levels = u32_section(batch, "cluster_level")?.unwrap_or_default();
-    let rows = u64_section(batch, "cluster_row")?.unwrap_or_default();
-    let counts = i64_section(batch, "cluster_point_count")?.unwrap_or_default();
-    let aggs = f64_opt_section(batch, "cluster_agg")?.unwrap_or_default();
+    let levels = u32_section(batch, "cluster_level", path)?.unwrap_or_default();
+    let rows = u64_section(batch, "cluster_row", path)?.unwrap_or_default();
+    let counts = i64_section(batch, "cluster_point_count", path)?.unwrap_or_default();
+    let aggs = f64_opt_section(batch, "cluster_agg", path)?.unwrap_or_default();
     let stride = meta.cluster_agg_stride;
     if levels.len() != rows.len() || levels.len() != counts.len() {
-        return Err(ConvertError::InvalidConfig(
-            "--plan: cluster sections have mismatched lengths".to_string(),
-        ));
+        return Err(plan_err(path, "cluster sections have mismatched lengths"));
     }
-    if aggs.len() != levels.len() * stride {
-        return Err(ConvertError::InvalidConfig(
-            "--plan: cluster aggregate section has the wrong length".to_string(),
+    // `levels.len() * stride` with a JSON-supplied stride overflowed in debug
+    // and wrapped past this very length guard in release (#512). Checked, a
+    // hostile stride simply cannot name a length the section has.
+    let want = levels.len().checked_mul(stride).ok_or_else(|| {
+        plan_err(
+            path,
+            &format!(
+                "declares {} aggregate(s) per cluster entry over {} entries, which is not a \
+                 possible section length",
+                stride,
+                levels.len(),
+            ),
+        )
+    })?;
+    if aggs.len() != want {
+        return Err(plan_err(
+            path,
+            &format!(
+                "cluster aggregate section holds {} value(s) but the plan declares {} entries \
+                 × {stride} aggregate(s) = {want}",
+                aggs.len(),
+                levels.len(),
+            ),
         ));
     }
     let mut tables: ClusterTables = vec![HashMap::new(); meta.num_levels];
@@ -925,12 +1350,20 @@ fn rebuild_cluster_tables(
     {
         let level = level as usize;
         let table = tables.get_mut(level).ok_or_else(|| {
-            ConvertError::InvalidConfig(format!("--plan: cluster entry names level {level}"))
+            plan_err(
+                path,
+                &format!(
+                    "a cluster entry names level {level}, but the plan has {} level(s)",
+                    meta.num_levels,
+                ),
+            )
         })?;
         table.insert(
             row as usize,
             ClusterEntry {
                 point_count,
+                // In range: `aggs.len() == levels.len() * stride` exactly,
+                // and `i < levels.len()`.
                 aggregates: aggs[i * stride..(i + 1) * stride].to_vec(),
             },
         );
@@ -938,32 +1371,42 @@ fn rebuild_cluster_tables(
     Ok(tables)
 }
 
-fn rebuild_coalesce(batch: &RecordBatch) -> Result<CoalescePlan, ConvertError> {
-    let rows: Vec<usize> = u64_section(batch, "coalesce_row")?
+fn rebuild_coalesce(batch: &RecordBatch, path: &Path) -> Result<CoalescePlan, ConvertError> {
+    let rows: Vec<usize> = u64_section(batch, "coalesce_row", path)?
         .unwrap_or_default()
         .into_iter()
         .map(|r| r as usize)
         .collect();
-    let sort_keys = f64_opt_section(batch, "coalesce_sort_key")?.unwrap_or_default();
-    let groups = u32_section(batch, "coalesce_group")?;
-    let wkb = match section(batch, "coalesce_wkb")? {
+    let sort_keys = f64_opt_section(batch, "coalesce_sort_key", path)?.unwrap_or_default();
+    let groups = u32_section(batch, "coalesce_group", path)?;
+    let wkb = match section(batch, "coalesce_wkb", path)? {
         None => Vec::new(),
         Some(values) => {
             let a = values
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| {
-                    ConvertError::InvalidConfig(
-                        "--plan: section \"coalesce_wkb\" has the wrong value type".to_string(),
-                    )
+                    plan_err(path, "section \"coalesce_wkb\" has the wrong value type")
                 })?;
+            if a.null_count() > 0 {
+                return Err(plan_err(
+                    path,
+                    &format!(
+                        "section \"coalesce_wkb\" holds {} null geometry/geometries",
+                        a.null_count(),
+                    ),
+                ));
+            }
             (0..a.len()).map(|i| a.value(i).to_vec()).collect()
         }
     };
     if wkb.len() != rows.len() || sort_keys.len() != rows.len() {
-        return Err(ConvertError::InvalidConfig(
-            "--plan: coalesce sections have mismatched lengths".to_string(),
-        ));
+        return Err(plan_err(path, "coalesce sections have mismatched lengths"));
+    }
+    if let Some(g) = &groups {
+        if g.len() != rows.len() {
+            return Err(plan_err(path, "coalesce sections have mismatched lengths"));
+        }
     }
     Ok(CoalescePlan {
         rows,
@@ -987,6 +1430,7 @@ mod tests {
                 mtime_nanos: Some(99),
                 row_groups: Some(vec![0, 2]),
                 row_groups_total: Some(3),
+                num_rows: Some(9),
             }],
         }
     }
@@ -1144,6 +1588,69 @@ mod tests {
         saved.verify(&tiny_fingerprint()).unwrap();
     }
 
+    /// #511: the row count is the binding that survives a remote input, where
+    /// `fs::metadata` sees nothing. Both directions are refused by name —
+    /// fewer rows (which would silently truncate the pyramid) and more rows
+    /// (which would index the winner table out of bounds).
+    #[test]
+    fn plan_fingerprint_rejects_changed_row_count() {
+        let saved = tiny_fingerprint();
+
+        for rows in [Some(8), Some(10), None] {
+            let mut changed = tiny_fingerprint();
+            changed.inputs[0].num_rows = rows;
+            let err = touched_err(&saved, &changed);
+            assert!(err.contains("row count"), "names the field: {err}");
+            assert!(err.contains("/tmp/in.parquet"), "names the part: {err}");
+        }
+
+        let mut regrouped = tiny_fingerprint();
+        regrouped.inputs[0].row_groups_total = Some(4);
+        let err = touched_err(&saved, &regrouped);
+        assert!(err.contains("row group count"), "names the field: {err}");
+    }
+
+    /// #511: a remote part carries neither a local size nor an mtime, so the
+    /// row count / row-group layout IS the whole content binding — and it
+    /// must still refuse a swapped object.
+    #[test]
+    fn plan_fingerprint_binds_remote_shaped_part_by_row_count() {
+        let remote = |rows: i64, byte_len: Option<u64>| Fingerprint {
+            tylertoo_version: env!("CARGO_PKG_VERSION").to_string(),
+            options: BTreeMap::new(),
+            inputs: vec![InputFingerprint {
+                path: "s3://bucket/roads.parquet".to_string(),
+                // The metadata-unavailable branch: no local stat, so mtime is
+                // absent and the size is whatever the object store reported.
+                byte_len,
+                mtime_nanos: None,
+                row_groups: None,
+                row_groups_total: Some(12),
+                num_rows: Some(rows),
+            }],
+        };
+        // Same URL, same size, same row groups, different contents: the
+        // pre-#511 fingerprint accepted this and replayed into corruption.
+        let err = remote(1_000_000, Some(4096))
+            .verify(&remote(999_999, Some(4096)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row count"), "names the field: {err}");
+        assert!(err.contains("1000000") && err.contains("999999"), "{err}");
+
+        // And the size, when the object store does report one.
+        let err = remote(1_000_000, Some(4096))
+            .verify(&remote(1_000_000, Some(8192)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("byte_len"), "{err}");
+
+        // Unchanged verifies, with no local metadata anywhere.
+        remote(1_000_000, None)
+            .verify(&remote(1_000_000, None))
+            .unwrap();
+    }
+
     fn touched_err(saved: &Fingerprint, current: &Fingerprint) -> String {
         saved.verify(current).unwrap_err().to_string()
     }
@@ -1178,6 +1685,269 @@ mod tests {
         other.tylertoo_version = "0.0.1-not-this".to_string();
         let err = touched_err(&saved, &other);
         assert!(err.contains("tylertoo_version"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // #512: hostile / damaged plan files. A plan travels between machines
+    // and is named by a user-supplied `--plan PATH`, so the reader is held
+    // to the bar #417/#489 set for PMTiles reading: hostile input produces
+    // an ERROR naming the flag and the path, never a panic.
+    // ------------------------------------------------------------------
+
+    /// Re-open a saved plan's IPC payload, so a test can forge a hostile
+    /// variant of a *real* artifact.
+    fn reopen(path: &Path) -> (Arc<Schema>, RecordBatch) {
+        let mut r = FileReader::try_new(ipc_view(File::open(path).unwrap()), None).unwrap();
+        let schema = r.schema();
+        let batch = r.next().unwrap().unwrap();
+        (schema, batch)
+    }
+
+    /// The forge: write `columns` under `meta_json` with a *valid* header
+    /// and checksum, so the load under test reaches the decoder rather than
+    /// tripping the corruption guard first.
+    fn forge(path: &Path, meta_json: &str, columns: Vec<arrow_array::ArrayRef>) {
+        let schema = Arc::new(plan_schema(meta_json.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        write_plan_file(path, &schema, &batch).unwrap();
+    }
+
+    /// The saved plan's metadata JSON, as a mutable value.
+    fn meta_of(schema: &Schema) -> serde_json::Value {
+        serde_json::from_str(schema.metadata().get(PLAN_META_KEY).unwrap()).unwrap()
+    }
+
+    fn load_err(path: &Path) -> String {
+        let err = ConvertPlan::load(path).unwrap_err().to_string();
+        assert!(err.contains("--plan"), "names the flag: {err}");
+        assert!(
+            err.contains(&path.display().to_string()),
+            "names the path: {err}"
+        );
+        err
+    }
+
+    /// Class (a): a schema-valid plan whose record batch has ZERO rows used
+    /// to panic inside arrow at `list.value(0)`.
+    #[test]
+    fn plan_rejects_zero_row_batch() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let plan = tiny_plan();
+        plan.save(f.path()).unwrap();
+        let (schema, _) = reopen(f.path());
+        let empty = RecordBatch::new_empty(schema.clone());
+        write_plan_file(f.path(), &schema, &empty).unwrap();
+        let err = load_err(f.path());
+        assert!(err.contains("0-row"), "{err}");
+    }
+
+    /// Class (b): `levels.len() * cluster_agg_stride` with a stride read
+    /// from the JSON block overflowed in debug and wrapped past the length
+    /// guard into an out-of-range slice in release.
+    #[test]
+    fn plan_rejects_hostile_cluster_agg_stride() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tiny_plan().save(f.path()).unwrap();
+        let (schema, batch) = reopen(f.path());
+        let columns = batch.columns().to_vec();
+
+        // usize::MAX × 2 entries: the multiplication itself overflows.
+        let mut meta = meta_of(&schema);
+        meta["cluster_agg_stride"] = serde_json::json!(usize::MAX);
+        forge(
+            f.path(),
+            &serde_json::to_string(&meta).unwrap(),
+            columns.clone(),
+        );
+        let err = load_err(f.path());
+        assert!(err.contains("not a possible section length"), "{err}");
+
+        // Large but non-overflowing: caught by the length comparison.
+        let mut meta = meta_of(&schema);
+        meta["cluster_agg_stride"] = serde_json::json!(1_000_000u64);
+        forge(f.path(), &serde_json::to_string(&meta).unwrap(), columns);
+        let err = load_err(f.path());
+        assert!(err.contains("cluster aggregate section"), "{err}");
+    }
+
+    /// Class (c): a single flipped byte anywhere in the payload used to be
+    /// accepted (121/203 positions), quietly wrong, or panic inside arrow's
+    /// buffer/IPC decoders (11/203). The checksum turns every one of those
+    /// into the same named error, before a byte reaches a decoder.
+    #[test]
+    fn plan_rejects_a_flipped_byte() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tiny_plan().save(f.path()).unwrap();
+        let original = std::fs::read(f.path()).unwrap();
+
+        // The whole sweep the issue ran, deterministically: flip bit 0 of
+        // EVERY byte of the payload and require the same named error each
+        // time. Nothing is accepted, and nothing panics.
+        for at in PLAN_HEADER_LEN..original.len() {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0x01;
+            std::fs::write(f.path(), &bytes).unwrap();
+            let err = ConvertPlan::load(f.path()).unwrap_err().to_string();
+            assert!(err.contains("is corrupt"), "byte {at}: {err}");
+        }
+
+        // The checksum field itself, and the magic.
+        for at in PLAN_MAGIC.len()..PLAN_HEADER_LEN {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0xff;
+            std::fs::write(f.path(), &bytes).unwrap();
+            assert!(load_err(f.path()).contains("is corrupt"), "byte {at}");
+        }
+        // The magic PREFIX: not a plan at all.
+        for at in 0..PLAN_MAGIC_PREFIX.len() {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0xff;
+            std::fs::write(f.path(), &bytes).unwrap();
+            assert!(load_err(f.path()).contains("bad magic"), "byte {at}");
+        }
+        // ...and the version byte that closes it: a plan in a format this
+        // build does not read, reported as the version skew it is rather
+        // than as corruption.
+        let at = PLAN_MAGIC_PREFIX.len();
+        let mut bytes = original.clone();
+        bytes[at] = PLAN_FORMAT_VERSION_BYTE + 1;
+        std::fs::write(f.path(), &bytes).unwrap();
+        let err = load_err(f.path());
+        assert!(
+            err.contains(&format!("format v{}", PLAN_FORMAT_VERSION_BYTE + 1)),
+            "names the version it found: {err}"
+        );
+        assert!(!err.contains("bad magic"), "{err}");
+
+        // Truncation, and a file that is not a plan at all.
+        std::fs::write(f.path(), &original[..PLAN_HEADER_LEN + 8]).unwrap();
+        assert!(load_err(f.path()).contains("is corrupt"));
+        std::fs::write(f.path(), b"hello").unwrap();
+        assert!(load_err(f.path()).contains("too short"));
+        std::fs::write(f.path(), b"").unwrap();
+        assert!(load_err(f.path()).contains("too short"));
+
+        // Restored, it loads again — the guard is not simply refusing.
+        std::fs::write(f.path(), &original).unwrap();
+        assert_eq!(ConvertPlan::load(f.path()).unwrap(), tiny_plan());
+    }
+
+    /// Class (d): an unknown geometry-kind byte silently decoded as `Point`,
+    /// rerouting Q3 coalescing and the polygon carriers.
+    #[test]
+    fn plan_rejects_unknown_kind_code() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let plan = tiny_plan();
+        plan.save(f.path()).unwrap();
+        let (schema, batch) = reopen(f.path());
+        let mut columns = batch.columns().to_vec();
+        let mut b = LargeListBuilder::new(UInt8Builder::new());
+        b.values().append_slice(&[0, 1, 2, 7, 1, 1, 2, 2, 1]);
+        b.append(true);
+        columns[schema.index_of("kinds").unwrap()] = Arc::new(b.finish());
+        forge(
+            f.path(),
+            &serde_json::to_string(&meta_of(&schema)).unwrap(),
+            columns,
+        );
+        let err = load_err(f.path());
+        assert!(err.contains("unknown geometry-kind code 7"), "{err}");
+    }
+
+    /// Class (e): a plan whose ROW-INDEXED sections disagree with each other.
+    ///
+    /// The checksum (#512) proves the bytes are the ones that were written;
+    /// it proves nothing about whether they are consistent, and anyone who
+    /// can forge a plan can re-checksum it. `kinds` is addressed by the same
+    /// row position as `min_levels` (`finest.kinds[g]` in pass 2's batch
+    /// fan-out), so a short `kinds` was an out-of-bounds index — a PANIC —
+    /// reached through a fully valid header.
+    #[test]
+    fn plan_rejects_row_sections_of_disagreeing_length() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let plan = tiny_plan();
+        assert_eq!(
+            plan.kinds.as_ref().unwrap().len(),
+            plan.min_levels.len(),
+            "precondition: the honest plan agrees with itself"
+        );
+        plan.save(f.path()).unwrap();
+        let (schema, batch) = reopen(f.path());
+        let mut columns = batch.columns().to_vec();
+
+        // One row short of `min_levels`, checksum repaired by `forge`.
+        let mut b = LargeListBuilder::new(UInt8Builder::new());
+        b.values().append_slice(&[0, 1, 2, 1, 1, 1, 2, 2]);
+        b.append(true);
+        columns[schema.index_of("kinds").unwrap()] = Arc::new(b.finish());
+        forge(
+            f.path(),
+            &serde_json::to_string(&meta_of(&schema)).unwrap(),
+            columns,
+        );
+        let err = load_err(f.path());
+        assert!(err.contains("does not match itself"), "{err}");
+        assert!(
+            err.contains("\"kinds\" holds 8") && err.contains("\"min_levels\" holds 9"),
+            "names both sections and both lengths: {err}"
+        );
+    }
+
+    /// Class (d'): `typed_section!` read `values()`, which discards the null
+    /// mask — a nulled `min_level` decoded as level 0, the coarsest level,
+    /// i.e. the feature drawn everywhere.
+    #[test]
+    fn plan_rejects_nulls_in_a_non_nullable_section() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tiny_plan().save(f.path()).unwrap();
+        let (schema, batch) = reopen(f.path());
+        let mut columns = batch.columns().to_vec();
+        let mut b = LargeListBuilder::new(UInt8Builder::new());
+        for (i, v) in [0u8, 1, 2, 255, 1, 0, 2, 2, 1].into_iter().enumerate() {
+            if i == 3 {
+                b.values().append_null();
+            } else {
+                b.values().append_value(v);
+            }
+        }
+        b.append(true);
+        columns[schema.index_of("min_levels").unwrap()] = Arc::new(b.finish());
+        forge(
+            f.path(),
+            &serde_json::to_string(&meta_of(&schema)).unwrap(),
+            columns,
+        );
+        let err = load_err(f.path());
+        assert!(err.contains("min_levels") && err.contains("null"), "{err}");
+    }
+
+    /// The JSON block sizes allocations and indexes them; a hostile level
+    /// count must not reach `vec![_; n]`.
+    #[test]
+    fn plan_rejects_hostile_level_count() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tiny_plan().save(f.path()).unwrap();
+        let (schema, batch) = reopen(f.path());
+        let columns = batch.columns().to_vec();
+
+        let mut meta = meta_of(&schema);
+        meta["num_levels"] = serde_json::json!(usize::MAX);
+        forge(
+            f.path(),
+            &serde_json::to_string(&meta).unwrap(),
+            columns.clone(),
+        );
+        let err = load_err(f.path());
+        assert!(err.contains("level spec(s)"), "{err}");
+
+        // Consistent with `level_specs`, but past the 255-level ceiling.
+        let mut meta = meta_of(&schema);
+        let specs: Vec<(f64, Option<u8>)> = (0..300).map(|i| (1.0 + f64::from(i), None)).collect();
+        meta["num_levels"] = serde_json::json!(300);
+        meta["level_specs"] = serde_json::to_value(&specs).unwrap();
+        forge(f.path(), &serde_json::to_string(&meta).unwrap(), columns);
+        let err = load_err(f.path());
+        assert!(err.contains("at most 255"), "{err}");
     }
 
     /// A different plan-format version is refused rather than misread.
@@ -1390,6 +2160,155 @@ mod tests {
         );
     }
 
+    /// Forge a plan that is already on disk: truncate the named row-indexed
+    /// sections by one row, optionally dropping `totals.n_rows` to match, and
+    /// repair the header checksum. The result is a plan any reader accepts as
+    /// intact — which is the whole point: a checksum is an integrity check,
+    /// not a consistency check, and anyone who can edit a plan can re-compute
+    /// it.
+    fn forge_shorter_plan(path: &Path, sections: &[&str], fix_totals: bool) {
+        let (schema, batch) = reopen(path);
+        let mut columns = batch.columns().to_vec();
+        for name in sections {
+            let idx = schema.index_of(name).unwrap();
+            let values = u8_section(&batch, name, path).unwrap().unwrap();
+            let mut b = LargeListBuilder::new(UInt8Builder::new());
+            b.values().append_slice(&values[..values.len() - 1]);
+            b.append(true);
+            columns[idx] = Arc::new(b.finish());
+        }
+        let mut meta = meta_of(&schema);
+        if fix_totals {
+            let n = meta["totals"]["n_rows"].as_u64().unwrap();
+            meta["totals"]["n_rows"] = serde_json::json!(n - 1);
+        }
+        forge(path, &serde_json::to_string(&meta).unwrap(), columns);
+    }
+
+    /// The review's first forge probe, end to end: a checksum-VALID plan
+    /// whose `kinds` is one row short of `min_levels`, replayed with NO
+    /// pruning. Pass 2's batch fan-out does `finest.kinds[g]` for every row
+    /// it reads, so this used to be an out-of-bounds PANIC on the last row —
+    /// reached through a header that verified perfectly.
+    #[test]
+    fn convert_with_forged_short_kinds_is_refused() {
+        use super::super::convert::{convert_to_overviews, LevelPlan};
+        use super::super::testutil::write_input;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // Lines: coalescing is what puts `kinds` on the pass-2 hot path.
+        write_input(&input, &line_fixture(), true, None);
+        let plan_path = dir.path().join("convert.plan");
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 7,
+            },
+            ..Default::default()
+        };
+        convert_to_overviews(
+            &input,
+            dir.path().join("a.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        forge_shorter_plan(&plan_path, &["kinds"], false);
+
+        let err = convert_to_overviews(
+            &input,
+            dir.path().join("b.parquet"),
+            &ConvertOptions {
+                plan: Some(plan_path),
+                ..base
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--plan"), "names the flag: {err}");
+        assert!(err.contains("does not match"), "{err}");
+        assert!(err.contains("kinds"), "names the section: {err}");
+    }
+
+    /// The review's second forge probe: the same class of forgery under
+    /// `--bbox`. The dataset-level row-domain check used to be gated on
+    /// `unpruned_total_rows()`, which gives up the moment ANY part is
+    /// row-group pruned — so the one structural check between a forged plan
+    /// and an out-of-bounds index in pass 2 simply did not run under
+    /// `--bbox` / `--filter`. The identical forgery WITHOUT a bbox was caught
+    /// cleanly, which is what made it a hole rather than a gap.
+    #[test]
+    fn convert_with_forged_truncated_tables_is_refused_under_bbox() {
+        use super::super::convert::{convert_to_overviews, LevelPlan};
+        use super::super::testutil::write_input;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &point_fixture(), true, None);
+        let plan_path = dir.path().join("convert.plan");
+        // A bbox that keeps every row: pruning is what disabled the check,
+        // not the rows it removes.
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 7,
+            },
+            bbox: Some([-180.0, -90.0, 180.0, 90.0]),
+            ..Default::default()
+        };
+        convert_to_overviews(
+            &input,
+            dir.path().join("a.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        let saved = ConvertPlan::load(&plan_path).unwrap();
+        assert!(
+            saved.fingerprint.inputs[0].row_groups.is_some(),
+            "precondition: --bbox really did record a row-group selection"
+        );
+
+        // Truncate BOTH row-indexed sections and the declared row total, so
+        // every other consistency check still passes and only the row-domain
+        // check can catch it.
+        let mut sections = vec!["min_levels"];
+        if saved.kinds.is_some() {
+            sections.push("kinds");
+        }
+        forge_shorter_plan(&plan_path, &sections, true);
+        let forged =
+            ConvertPlan::load(&plan_path).expect("the forgery loads: it is self-consistent");
+        assert_eq!(forged.min_levels.len(), saved.min_levels.len() - 1);
+
+        let err = convert_to_overviews(
+            &input,
+            dir.path().join("b.parquet"),
+            &ConvertOptions {
+                plan: Some(plan_path),
+                ..base
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--plan"), "names the flag: {err}");
+        assert!(err.contains("does not match"), "{err}");
+        assert!(
+            err.contains(&format!("{} winner-table", saved.min_levels.len() - 1)),
+            "names what the plan holds: {err}"
+        );
+        assert!(
+            err.contains(&format!("{} row(s)", saved.min_levels.len())),
+            "names what this run will read: {err}"
+        );
+    }
+
     /// Replaying a plan against a *changed* input is refused, naming the
     /// field — the end-to-end form of the fingerprint unit tests.
     #[test]
@@ -1418,22 +2337,45 @@ mod tests {
         )
         .unwrap();
 
-        // Rewrite the input with fewer features: same path, different bytes.
+        // #511's probe, both directions. Rewrite the input at the SAME path
+        // with FEWER rows: `min_levels` is indexed by row position, so a
+        // replay would silently truncate the pyramid. Then with MORE rows,
+        // which used to panic with an out-of-bounds index in pass 2. The
+        // error must name the row count, because that is the one term of the
+        // fingerprint a remote input also has (size/mtime do not survive an
+        // `s3://` display name).
+        let replay = |input: &std::path::Path, out: &str| {
+            convert_to_overviews(
+                input,
+                dir.path().join(out),
+                &ConvertOptions {
+                    plan: Some(plan_path.clone()),
+                    ..base.clone()
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
         write_input(&input, &point_fixture()[..100], true, None);
-        let err = convert_to_overviews(
-            &input,
-            dir.path().join("b.parquet"),
-            &ConvertOptions {
-                plan: Some(plan_path.clone()),
-                ..base.clone()
-            },
-        )
-        .unwrap_err()
-        .to_string();
+        let err = replay(&input, "b.parquet");
         assert!(
-            err.contains("byte_len") || err.contains("mtime"),
+            err.contains("row count"),
             "names the offending field: {err}"
         );
+        assert!(err.contains("100"), "names the new row count: {err}");
+
+        let mut more = point_fixture();
+        more.extend(point_fixture());
+        write_input(&input, &more, true, None);
+        let err = replay(&input, "b2.parquet");
+        assert!(
+            err.contains("row count"),
+            "names the offending field: {err}"
+        );
+
+        // Restore the original input for the options check below.
+        write_input(&input, &point_fixture(), true, None);
 
         // A changed thinning knob is refused by name as well.
         let mut thinned = base.clone();
