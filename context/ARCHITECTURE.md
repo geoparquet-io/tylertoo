@@ -231,6 +231,14 @@ compute. `checkpoint` and `finalize` route through the same assembler, so the
 final archive is **byte-identical** whether or not any checkpoints were taken
 (verified on madagascar-adm4).
 
+The snapshot is **`<output>.partial`**, not `<output>`: since #459 export uses
+the tail-directory layout (below), where that file is the live archive rather
+than a scratch copy. It is complete and readable as of the last checkpoint.
+Between checkpoints its prefix is stale — the tiles added since are on disk but
+unreferenced, and the metadata/leaf sections the header points at have been
+overwritten by those tiles — so an interrupted run salvages back to the last
+checkpoint, not to the last tile. Each checkpoint logs the path.
+
 ### Validate (`overview/check.rs`)
 
 `tylertoo validate` checks a file against spec §6.2: footer schema, level
@@ -351,14 +359,57 @@ in `benchmarks/overview/RESULTS.md` (a 631k-feature file's footer dropped
 
 ## StreamingPmtilesWriter
 
-The writer's archive assembly (sort entries → header + directory + metadata →
-copy tile data) lives in a non-consuming `write_archive`, written to a sibling
-`<output>.partial` and atomically renamed over the target. `finalize` runs it
-once then drops the temp file; `checkpoint` (#229) runs it repeatedly without
-consuming the writer, so a kill mid-write never corrupts a previously
-checkpointed archive. Tile ids are unique, so re-sorting entries between
-checkpoints is deterministic — the final bytes are identical regardless of how
-many checkpoints ran.
+The writer's archive assembly (sort entries → header + directories + metadata →
+place tile data) lives in a non-consuming `write_archive`. `finalize` runs it
+once and publishes; `checkpoint` (#229) runs it repeatedly without consuming the
+writer. Tile ids are unique, so re-sorting entries between checkpoints is
+deterministic — the final bytes are identical regardless of how many
+checkpoints ran.
+
+**Two layouts (#459).** Which one a writer uses is fixed at construction.
+
+*Packed* (`new` / `with_temp_dir`): tiles spool to a scratch file in `TMPDIR`
+and assembly writes `header | root | metadata | leaves | tile data` into a
+sibling `<output>.partial`, then renames it over the target. Each assembly
+copies the whole spool, so a run with *n* checkpoints writes the tile data
+*n+1* times. Used by `tylertoo merge` and the pyramid builder, which have no
+output path to reserve against when the writer is created.
+
+*Tail-directory* (`with_tail_layout`, what export uses): tiles append straight
+into `<output>.partial` after a reserved 16 KiB prefix and are **never copied
+again**.
+
+```text
+[0]      header (127 B)
+[127]    root directory
+[..]     zero padding        <- the one slack go-pmtiles verify tolerates
+[16384]  tile data           <- written once
+[..]     json metadata       }  rebuilt each checkpoint; the next tiles
+[..]     leaf directories    }  simply overwrite them
+```
+
+A checkpoint truncates the old tail, appends a fresh metadata + leaves at the
+data end, then rewrites the 16 KiB prefix — O(directory), independent of how
+much tile data is on disk. Under the packed layout a planet-scale run
+(~100 GB of tiles, a dozen checkpoints) spent hundreds of gigabytes of write
+I/O on salvage alone; here it is a few megabytes per checkpoint.
+
+Three things make it legal. Directory entry offsets are relative to
+`tile_data_offset`, so moving the section rewrites nothing inside the
+directories (dedup back-references included). `make_root_leaves` already sizes
+the root against `16384 - 127` and spills into leaves to stay there, so
+`header + root` fits the prefix by construction — the writer asserts it anyway
+and falls back to the packed layout rather than overrunning into tile data.
+And go-pmtiles `verify` (verify.go v1.31.2, L84-89) accepts a file whose length
+is either `127 + root + metadata + leaves + tile_data` **or**
+`16384 + metadata + leaves + tile_data`, and nothing else: the prefix padding
+is the only gap an archive may contain, which is exactly what this layout uses.
+
+The cost is a 16 KiB floor on archive size (a 1.6 KB export becomes 17.8 KB)
+and a spool that lives beside the output rather than in `TMPDIR`. Ordering
+gives crash-consistency for free: the tail is flushed before the prefix that
+points at it, and the prefix lives entirely below offset 16384, so a torn
+prefix write cannot touch a tile byte — the next checkpoint rebuilds both.
 
 Export's PMTiles v3 writer streams tile data to a temp file, builds the
 directory incrementally, and deduplicates tiles by XXH3 hash → file offset,

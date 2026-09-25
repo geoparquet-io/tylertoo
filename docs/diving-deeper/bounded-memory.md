@@ -41,6 +41,24 @@ charged to the same cgroup, so spilling there buys nothing and can itself
 trigger the kill. Point `TMPDIR` (or `--spill-dir`) at real disk on those
 machines.
 
+**Export writes its tiles once, beside the output.** The PMTiles writer used to
+spool tile bytes to `TMPDIR` and copy the whole spool into the archive on every
+checkpoint, so a long run's salvage snapshots cost more write I/O than the tiles
+themselves. Export now appends tile bytes straight into `<output>.partial` after
+a reserved 16 KiB header/directory prefix and never moves them again; a
+checkpoint rewrites only that prefix and re-appends the metadata and leaf
+directories at the file's tail. Two practical consequences: the space the
+archive needs is on the **output** filesystem, not `TMPDIR`, and every archive
+has a 16 KiB floor (invisible at any real size — it is the same 16 KiB every
+PMTiles client fetches on its first request).
+
+**An interrupted export salvages from `<output>.partial`.** After each finished
+zoom (throttled to once a minute) export logs a line naming that file, which is
+a complete, readable PMTiles archive capped at the zooms finished so far — open
+it, serve it, or rename it. It is current as of the **last checkpoint**, not the
+last tile: tiles written since are on disk but not yet indexed. A run that
+finishes normally renames the file over `<output>`, so it is gone.
+
 **Remote input stages to a local spill file.** A remote convert fetches each
 column chunk it touches into a temporary file, growing to roughly one times the
 touched bytes. Later passes then re-read from local disk instead of the network.
