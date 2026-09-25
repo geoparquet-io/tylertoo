@@ -1537,7 +1537,9 @@ fn finish_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pmtiles_writer::{decode_directory, tile_id_to_zxy, DirEntry, MAX_LEAF_DIRECTORIES};
+    use crate::pmtiles_writer::{
+        decode_directory, offsets_are_clustered, tile_id_to_zxy, DirEntry, MAX_LEAF_DIRECTORIES,
+    };
     use std::collections::HashMap;
 
     /// A band input is classified by content, not by name: `.pmtiles` is a
@@ -2123,19 +2125,14 @@ mod tests {
             .map(|e| (e.tile_id, e.offset, e.length))
             .collect();
         assert_eq!(entries.len(), 4, "{entries:?}");
-        let mut seen = std::collections::HashSet::new();
-        let mut end = 0u64;
-        for &(id, offset, length) in &entries {
-            if seen.contains(&offset) {
-                continue;
-            }
-            assert_eq!(
-                offset, end,
-                "out-of-order entry in clustered archive at tile id {id}: {entries:?}"
-            );
-            seen.insert(offset);
-            end = offset + u64::from(length);
-        }
+        assert!(
+            offsets_are_clustered(
+                entries
+                    .iter()
+                    .map(|&(_, offset, length)| (offset, u64::from(length)))
+            ),
+            "out-of-order entry in clustered archive: {entries:?}"
+        );
     }
 
     /// For a pre-tiled band the `:LAYER` in `--band` is a label; the MVT layer
@@ -2936,19 +2933,14 @@ mod tests {
             .map(|e| (e.tile_id, e.offset, e.length))
             .collect();
         assert_eq!(entries.len(), 6, "{entries:?}");
-        let mut seen = std::collections::HashSet::new();
-        let mut end = 0u64;
-        for &(id, offset, length) in &entries {
-            if seen.contains(&offset) {
-                continue;
-            }
-            assert_eq!(
-                offset, end,
-                "out-of-order entry in clustered archive at tile id {id}: {entries:?}"
-            );
-            seen.insert(offset);
-            end = offset + u64::from(length);
-        }
+        assert!(
+            offsets_are_clustered(
+                entries
+                    .iter()
+                    .map(|&(_, offset, length)| (offset, u64::from(length)))
+            ),
+            "out-of-order entry in clustered archive: {entries:?}"
+        );
     }
 
     /// #372: two bands of one layer each declare their own attributes.

@@ -13,7 +13,7 @@ use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
 use crate::tile::TileBounds;
 use crate::world_coord::MAX_LATITUDE;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -919,26 +919,53 @@ pub(crate) fn read_all_entries_from<S: ArchiveBytes + ?Sized>(
 /// Whether directory entries, in the order a reader walks them (ascending
 /// tile id), obey the PMTiles v3 "clustered" contract.
 ///
-/// Mirrors go-pmtiles' `verify`: walking entries in order with a high-water
-/// mark on how far into the tile-data section has been read, each entry's
-/// offset must either extend that mark (`offset == end`, a freshly written
-/// tile) or point wholly inside bytes already accounted for (`offset +
-/// length <= end`, a deduplication back-reference — legal in a clustered
-/// archive, since a reader that already streamed those bytes can just reuse
-/// them). Anything else — an offset ahead of the mark, or a back-reference
-/// that pokes past it — means a client streaming tile data in directory
-/// order would have to seek backwards past unread bytes or forwards over a
-/// gap, which is exactly what "clustered" promises never happens.
-fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)>) -> bool {
+/// Enforces the rule go-pmtiles' `verify` *intends* for a clustered archive:
+/// walking entries in order with a high-water mark on how far into the
+/// tile-data section has been read, each entry's offset must either extend
+/// that mark (`offset == end`, a freshly written tile) or exactly match an
+/// offset already seen earlier in the walk *with the same length* (a
+/// deduplication back-reference to a whole prior tile — legal in a
+/// clustered archive, since a reader that already streamed those bytes can
+/// just reuse them verbatim). Anything else — an offset ahead of the mark,
+/// a back-reference into the *middle* of an earlier tile rather than its
+/// exact start, or one that claims a different number of bytes than the
+/// tile it points at — means a client streaming tile data in directory
+/// order would have to seek backwards past unread bytes, forwards over a
+/// gap, or land mid-tile or past a tile's end, which is exactly what
+/// "clustered" promises never happens.
+///
+/// # Relationship to go-pmtiles
+///
+/// The shipped go-pmtiles clustered check is **inert**: `pmtiles/verify.go:111`
+/// does `offsets.Add(e.Offset)` for *every* entry before the
+/// `!offsets.Contains(e.Offset)` test at `pmtiles/verify.go:126-133`, so by
+/// the time the guarded branch is reached the current entry's own offset is
+/// always already in the set and the `e.Offset != currentOffset` complaint
+/// can never fire. Even if it did, it is a `logger.Printf` warning, not an
+/// error. So this predicate is not a port of what go-pmtiles *does* — it is
+/// the rule go-pmtiles is written to express, actually enforced.
+///
+/// The seen-set is also populated differently on purpose: go-pmtiles adds
+/// every entry's offset, this adds only fresh appends. The two are
+/// equivalent for the test that matters, because a legal back-reference
+/// points at an offset that was already appended (and therefore already
+/// seen), and an illegal one is exactly the case go-pmtiles' unconditional
+/// `Add` masks.
+pub(crate) fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)>) -> bool {
     let mut end = 0u64;
+    // offset -> length of the tile appended at that offset. The length is
+    // tracked, not just the offset, so a back-reference must name a whole
+    // prior tile rather than a prefix or an overrun of one.
+    let mut seen: HashMap<u64, u64> = HashMap::new();
     for (offset, length) in entries {
         if offset == end {
+            seen.insert(offset, length);
             end = end.saturating_add(length);
+        } else if seen.get(&offset) == Some(&length) {
+            // dedup back-reference to an exact previously-seen entry offset
+            // *and* its exact length; `end` unchanged
         } else {
-            match offset.checked_add(length) {
-                Some(back_end) if back_end <= end => {} // dedup back-reference; `end` unchanged
-                _ => return false,
-            }
+            return false;
         }
     }
     true
@@ -953,11 +980,41 @@ fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)>) -> bool 
 /// so a writer bug that sets the flag wrong cannot also fool this check by
 /// sharing its assumptions. Intended for tests and tooling (a go-pmtiles
 /// `verify`-alike), not the write path itself.
+///
+/// On top of the ordering predicate this also checks the two archive-level
+/// invariants go-pmtiles `verify` enforces around it, because an archive
+/// that fails either is one the tool rejects outright:
+///
+/// * every entry lies inside the tile-data section —
+///   `offset + length <= header.tile_data_length` (`pmtiles/verify.go:122-124`);
+/// * `header.tile_contents_count` equals the number of *distinct* offsets
+///   the directory references (`pmtiles/verify.go:148-150`, a hard error
+///   there). This is what catches a writer that stored the same content
+///   twice and left one copy unreferenced.
 pub fn verify_clustered(path: &Path) -> Result<bool> {
     let bytes = std::fs::read(path)
         .map_err(|e| Error::PMTilesRead(format!("failed to read {}: {e}", path.display())))?;
     let header = Header::from_bytes(&bytes)?;
     let entries = read_all_entries(&bytes, &header)?;
+
+    // Every entry must lie wholly inside the tile-data section. `checked_add`
+    // so an offset/length pair that wraps u64 fails rather than aliasing a
+    // small in-range end.
+    for e in &entries {
+        match e.offset.checked_add(u64::from(e.length)) {
+            Some(end) if end <= header.tile_data_length => {}
+            _ => return Ok(false),
+        }
+    }
+
+    // The header's stored-blob count must match the directory's distinct
+    // referenced offsets: a mismatch means bytes in the tile-data section
+    // that nothing points at (or a miscount), which go-pmtiles hard-errors.
+    let distinct_offsets: HashSet<u64> = entries.iter().map(|e| e.offset).collect();
+    if distinct_offsets.len() as u64 != header.tile_contents_count {
+        return Ok(false);
+    }
+
     Ok(offsets_are_clustered(
         entries.iter().map(|e| (e.offset, u64::from(e.length))),
     ))
@@ -1436,20 +1493,57 @@ impl PmtilesWriter {
         let mut unique_contents = 0u64;
 
         if self.dedup_enabled {
-            // With deduplication: store unique tiles, reference duplicates
-            for (&id, entry) in &self.tiles {
-                let (offset, length) = if let Some(ref data) = entry.data {
-                    // Unique tile - write to buffer and record location
+            // With deduplication: store unique tiles, reference duplicates.
+            //
+            // Two passes (#516): a duplicate's tile_id is not necessarily
+            // greater than the tile_id of the tile that carries its bytes --
+            // which one "carries" the data is decided by add order
+            // (whichever `add_tile` call for a given hash happened first),
+            // not by tile_id. A single pass over `self.tiles` in tile_id
+            // order can therefore reach a duplicate before its carrier and
+            // find no entry in `hash_to_offset` yet.
+            //
+            // Pass 1: write every carrying tile's bytes and record its
+            // offset, walking tile_id order (matters for determinism and
+            // clusteredness, not byte correctness -- pass 2 resolves every
+            // hash regardless of the order this pass visits carriers in).
+            //
+            // First carrier wins: more than one tile can hold data for the
+            // same hash (`add_tile_compressed` never consults the dedup
+            // cache, so two identical pre-compressed blobs both arrive
+            // carrying bytes). Storing each of them and letting the last
+            // `insert` win would append dead bytes nothing references and
+            // leave `tile_contents_count` above the directory's distinct
+            // offset count -- which go-pmtiles `verify` rejects outright.
+            // Skipping the later carriers deduplicates them instead.
+            for entry in self.tiles.values() {
+                if let Some(ref data) = entry.data {
+                    if hash_to_offset.contains_key(&entry.hash) {
+                        // another carrier already stored these bytes
+                        continue;
+                    }
                     let offset = tile_data_buf.len() as u64;
                     let length = data.len() as u32;
                     tile_data_buf.extend_from_slice(data);
                     hash_to_offset.insert(entry.hash, (offset, length));
                     unique_contents += 1;
-                    (offset, length)
-                } else {
-                    // Duplicate tile - look up existing location
-                    *hash_to_offset.get(&entry.hash).expect("Hash must exist")
-                };
+                }
+            }
+
+            // Pass 2: build directory entries in tile_id order. Every hash
+            // now resolves, regardless of how add order and tile_id order
+            // related to each other.
+            for (&id, entry) in &self.tiles {
+                // Not infallible: re-adding a tile_id with different content
+                // replaces the only `TileEntry` that carried some earlier
+                // hash's bytes, orphaning any duplicate still pointing at it.
+                let (offset, length) = *hash_to_offset.get(&entry.hash).ok_or_else(|| {
+                    Error::PMTilesWrite(format!(
+                        "no stored bytes for tile id {id} (content hash {:#018x}): \
+                         its carrier tile was overwritten by a later add",
+                        entry.hash
+                    ))
+                })?;
 
                 // Check if this can extend the previous entry's run_length
                 // (same offset = same content, consecutive tile_id)
@@ -1474,7 +1568,19 @@ impl PmtilesWriter {
         } else {
             // Without deduplication: store every tile
             for (&id, entry) in &self.tiles {
-                let data = entry.data.as_ref().expect("Non-dedup tiles must have data");
+                // Not infallible either: `enable_deduplication(false)` after
+                // tiles were added leaves behind entries recorded as
+                // references to a carrier tile, with no data of their own,
+                // which this branch has no `hash_to_offset` to resolve.
+                let data = entry.data.as_ref().ok_or_else(|| {
+                    Error::PMTilesWrite(format!(
+                        "no stored bytes for tile id {id} (content hash {:#018x}): \
+                         it was recorded as a deduplication reference to a carrier \
+                         tile, but this archive is being written with deduplication \
+                         disabled",
+                        entry.hash
+                    ))
+                })?;
                 entries.push(DirEntry {
                     tile_id: id,
                     offset: tile_data_buf.len() as u64,
@@ -1539,23 +1645,33 @@ impl PmtilesWriter {
         let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
         let tile_data_length = tile_data_buf.len() as u64;
 
-        // Unlike `StreamingPmtilesWriter` (which appends tiles in whatever
-        // order the caller discovers them, then sorts the *directory* by
-        // tile_id without touching already-written data offsets),
-        // `PmtilesWriter` is clustered by construction: `self.tiles` is a
-        // `BTreeMap`, so the loop above that filled `entries` and
-        // `tile_data_buf` already ran in ascending tile_id order, and each
-        // unique tile's offset was the buffer's length *at that point in the
-        // ascending walk* — i.e. offsets are monotonic in tile_id order, with
-        // duplicates back-referencing an earlier (smaller) offset. There is
-        // no order for it to disagree with, so no derivation is needed here;
-        // the assert below is a canary in case that invariant ever breaks
-        // (e.g. `entries` stops being built from a sorted iteration).
-        debug_assert!(
-            offsets_are_clustered(entries.iter().map(|e| (e.offset, u64::from(e.length)))),
-            "PmtilesWriter builds `entries` from a BTreeMap in tile_id order, \
-             which is clustered by construction"
-        );
+        // Without deduplication, `self.tiles` (a `BTreeMap`) walked in
+        // tile_id order is clustered by construction: each tile's offset is
+        // the buffer's length at that point in the ascending walk, so
+        // offsets are strictly monotonic. With deduplication (#516), a
+        // duplicate's tile_id can fall anywhere relative to the tile_id of
+        // the tile that carries its bytes (carrying is decided by add
+        // order), so a duplicate can be the first entry, in tile_id order,
+        // to reference an offset that some *other* hash's carrier claimed
+        // later in the walk -- a legitimate multi-hash interleaving the
+        // panic this predicate replaced would have hit too. So this is
+        // derived honestly from the entries actually written, the same way
+        // `StreamingPmtilesWriter::entries_are_clustered` does, rather than
+        // asserted.
+        let clustered =
+            offsets_are_clustered(entries.iter().map(|e| (e.offset, u64::from(e.length))));
+
+        // A non-clustered archive is still valid, but it costs readers extra
+        // seeks, so say so rather than shipping the regression silently --
+        // the same signal `StreamingPmtilesWriter::write_archive` emits.
+        if !clustered {
+            log::warn!(
+                "PMTiles writer: {} is not clustered -- a duplicate's bytes are \
+                 carried by a tile that sorts after it, so a streaming reader must \
+                 seek backwards; readers still serve every tile correctly",
+                path.display()
+            );
+        }
 
         // Build header
         let header = Header {
@@ -1572,8 +1688,7 @@ impl PmtilesWriter {
             addressed_tiles_count: self.tiles.len() as u64,
             tile_entries_count: entries.len() as u64,
             tile_contents_count: unique_contents,
-            // See the `debug_assert!` above: clustered by construction.
-            clustered: true,
+            clustered,
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
@@ -1748,6 +1863,12 @@ pub struct StreamingPmtilesWriter {
     /// [`Self::entries_are_clustered`], so a violation here is a perf/quality
     /// regression, not a correctness bug worth a release-mode cost).
     expect_clustered: bool,
+    /// Whether every `add_tile*` so far arrived with a strictly greater tile
+    /// id than the one before it. Tracked unconditionally (unlike
+    /// `expect_clustered`, which only *asserts* it) because it makes the
+    /// header's `clustered` byte an O(1) determination on the production
+    /// path: see [`Self::write_archive`].
+    adds_ascending: bool,
 }
 
 impl StreamingPmtilesWriter {
@@ -1794,6 +1915,7 @@ impl StreamingPmtilesWriter {
             total_features: 0,
             finalized: false,
             expect_clustered: false,
+            adds_ascending: true,
         })
     }
 
@@ -1804,22 +1926,29 @@ impl StreamingPmtilesWriter {
         self.expect_clustered = expect;
     }
 
+    /// Record that `id` is about to be added: maintain `adds_ascending`, and
     /// `debug_assert!` that `id` continues the ascending run this writer was
-    /// told to expect, given the most recently added entry (if any).
+    /// told to expect (when `expect_clustered` is set), given the most
+    /// recently added entry (if any).
+    ///
+    /// `adds_ascending` is maintained whether or not the caller opted into
+    /// the assertion, because [`Self::write_archive`] uses it to skip the
+    /// O(unique-offsets) clustered predicate entirely.
     #[inline]
-    fn check_expect_clustered(&self, id: u64) {
-        if !self.expect_clustered {
+    fn note_add(&mut self, id: u64) {
+        let Some(last_id) = self.entries.last().map(|e| e.tile_id) else {
+            return;
+        };
+        if id > last_id {
             return;
         }
-        if let Some(last) = self.entries.last() {
-            debug_assert!(
-                id > last.tile_id,
-                "expect_clustered: tile id {id} did not continue the ascending run \
-                 (last added was {}); the caller opted into tile-id-ordered adds \
-                 but did not deliver them",
-                last.tile_id
-            );
-        }
+        self.adds_ascending = false;
+        debug_assert!(
+            !self.expect_clustered,
+            "expect_clustered: tile id {id} did not continue the ascending run \
+             (last added was {last_id}); the caller opted into tile-id-ordered adds \
+             but did not deliver them"
+        );
     }
 
     /// Get the path to the temp file (for testing).
@@ -1938,7 +2067,7 @@ impl StreamingPmtilesWriter {
         feature_count: usize,
     ) -> std::io::Result<()> {
         let id = checked_tile_id(z, x, y)?;
-        self.check_expect_clustered(id);
+        self.note_add(id);
 
         let temp_file = self
             .temp_file
@@ -2014,7 +2143,7 @@ impl StreamingPmtilesWriter {
         feature_count: usize,
     ) -> std::io::Result<()> {
         let id = checked_tile_id(z, x, y)?;
-        self.check_expect_clustered(id);
+        self.note_add(id);
 
         let temp_file = self
             .temp_file
@@ -2124,9 +2253,24 @@ impl StreamingPmtilesWriter {
         // Deriving the header flag from those offsets, after the sort, means
         // the flag can never claim more than the bytes on disk actually
         // deliver.
-        let clustered = self.entries_are_clustered();
+        //
+        // Fast path: ascending adds imply clustered by construction, so the
+        // production case (#506 export, #510 merge) never pays for the
+        // predicate. Each add either appends fresh bytes at `current_offset`
+        // -- which is exactly the running end of the tile data -- or is a
+        // dedup back-reference to the *exact* offset and length some earlier
+        // add recorded in `dedup_cache`. Both are what
+        // `offsets_are_clustered` accepts, and ascending adds mean the
+        // tile_id sort above left the entries in add order, so walking the
+        // directory walks the appends in the order they happened. The
+        // predicate stays as the honest fallback for out-of-order callers
+        // (and as what `verify_clustered` re-derives from disk), but it
+        // allocates a hash map proportional to the unique-offset count --
+        // measured ~2.4 GB steady at planet scale, at peak RSS -- so it must
+        // not run when the answer is already known.
+        let clustered = self.adds_ascending || self.entries_are_clustered();
 
-        // `expect_clustered`'s `debug_assert!` (in `check_expect_clustered`)
+        // `expect_clustered`'s `debug_assert!` (in `note_add`)
         // catches an ordering regression while adding tiles, but only in a
         // debug build — a release build silently ships a `clustered: false`
         // archive with no signal at all (#506 review, F6). This is the
@@ -4596,9 +4740,25 @@ mod tests {
         assert_eq!(header.clustered, verify_clustered(tmp.path()).unwrap());
     }
 
+    /// #516: go-pmtiles' `verify` accepts a back-reference only to an
+    /// *exact* previously-seen entry offset, not to any offset that merely
+    /// falls within bytes already accounted for. An entry pointing into the
+    /// middle of an earlier tile — offset 5 landing inside a first tile that
+    /// spans bytes [0, 10) — used to pass `offsets_are_clustered` (it
+    /// satisfied `offset + length <= end`) but must fail here, since no
+    /// reader ever wrote an entry whose offset was exactly 5.
+    #[test]
+    fn offsets_are_clustered_rejects_backreference_into_tile_middle() {
+        assert!(!offsets_are_clustered([(0, 10), (5, 3)]));
+        // The exact start of the first tile is still a legal back-reference.
+        assert!(offsets_are_clustered([(0, 10), (0, 10)]));
+        // A fresh append after a legal dedup is still fine too.
+        assert!(offsets_are_clustered([(0, 10), (0, 10), (10, 4)]));
+    }
+
     /// F8 (#506 review): `set_expect_clustered(true)` pins a real ordering
     /// contract, not just documentation -- two out-of-order adds must trip
-    /// the `debug_assert!` in `check_expect_clustered`. Debug-only: with
+    /// the `debug_assert!` in `note_add`. Debug-only: with
     /// assertions disabled the panic never fires (see [`Self::write_archive`]'s
     /// `log::warn!` for the release-mode fallback signal instead), so this
     /// test only runs in a debug build.
@@ -4615,5 +4775,338 @@ mod tests {
         // order.
         writer.add_tile(2, 3, 3, &[1, 2, 3]).unwrap();
         let _ = writer.add_tile(2, 0, 0, &[4, 5, 6]);
+    }
+
+    // -------------------------------------------------------------------------
+    // #516: PmtilesWriter dedup panics on out-of-order adds
+    // -------------------------------------------------------------------------
+
+    /// Offset-assignment regression for the two-pass rewrite (#516): the same
+    /// tiles as `test_writer_dedup_run_length_consecutive` (every duplicate
+    /// added after its carrier -- a "currently-working" input under the
+    /// pre-#516 single-pass code too). A change here means the two-pass
+    /// assignment altered the layout for an input the single-pass code
+    /// already wrote correctly, which it must not.
+    ///
+    /// Pinned structurally -- the decoded directory tuples and the tile-data
+    /// section bytes -- rather than as a whole-file length plus xxh3 (#516
+    /// review, S4). A whole-file pin also fails whenever the metadata JSON or
+    /// the compression library's output shifts by a byte, neither of which
+    /// this test has anything to say about; what #516 touched is which offset
+    /// each directory entry gets, and that is what is pinned.
+    #[test]
+    fn dedup_two_pass_offset_assignment_preserves_layout_for_existing_working_input() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+        let tile = vec![0x1a, 0x10];
+        writer.add_tile(1, 0, 0, &tile).unwrap();
+        writer.add_tile(1, 0, 1, &tile).unwrap();
+        writer.add_tile(1, 1, 1, &tile).unwrap();
+        writer.add_tile(1, 1, 0, &tile).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        writer.write_to_file(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+
+        // The four z1 tile ids are 1..=4 and all four share one blob at
+        // offset 0, so the directory collapses to a single run-length-4
+        // entry -- exactly what the pre-#516 single-pass code produced.
+        let expected_blob = compression::compress(&tile, Compression::Gzip).unwrap();
+        let entries = read_all_entries(&bytes, &header).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.tile_id, e.offset, e.length, e.run_length))
+                .collect::<Vec<_>>(),
+            vec![(1u64, 0u64, expected_blob.len() as u32, 4u32)],
+            "one blob at offset 0, addressed by a single run of four consecutive tile ids"
+        );
+
+        let tile_data = &bytes[header.tile_data_offset as usize
+            ..(header.tile_data_offset + header.tile_data_length) as usize];
+        assert_eq!(
+            tile_data,
+            &expected_blob[..],
+            "the tile-data section must be exactly the one shared compressed blob"
+        );
+        assert_eq!(header.addressed_tiles_count, 4);
+        assert_eq!(header.tile_entries_count, 1);
+        assert_eq!(header.tile_contents_count, 1);
+    }
+
+    /// #516 repro: `hash_to_offset.get(&entry.hash).expect("Hash must exist")`
+    /// panicked when a duplicate's tile_id was lower than the tile_id of the
+    /// tile that carries the bytes, because `self.tiles` (a `BTreeMap`) is
+    /// walked in tile_id order and the single pass had not yet recorded the
+    /// carrier's offset when it reached the duplicate. `add_tile(2,3,3,...)`
+    /// then `add_tile(0,0,0,...)` with identical content is exactly that:
+    /// the second add's tile_id (0) is lower than the first's, but the first
+    /// add is the one that carries the bytes (it was added -- and hashed --
+    /// first).
+    #[test]
+    fn dedup_survives_duplicate_with_lower_tile_id_than_its_carrier() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        writer.add_tile(2, 3, 3, b"shared").unwrap();
+        writer.add_tile(0, 0, 0, b"shared").unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        writer.write_to_file(path).expect("must not panic (#516)");
+
+        let stats = writer.dedup_stats();
+        assert_eq!(stats.total_tiles, 2);
+        assert_eq!(
+            stats.unique_tiles, 1,
+            "identical content must collapse to one stored blob"
+        );
+        assert_eq!(stats.duplicates_eliminated, 1);
+
+        let bytes = fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+
+        assert_eq!(header.addressed_tiles_count, 2, "both tiles are addressed");
+        assert_eq!(
+            header.tile_contents_count, 1,
+            "only one unique blob is stored, regardless of which tile_id carried it"
+        );
+        let actually_clustered = verify_clustered(path).unwrap();
+        assert!(
+            actually_clustered,
+            "a single unique blob referenced by two tile_ids is trivially clustered"
+        );
+        assert_eq!(
+            header.clustered, actually_clustered,
+            "the header's own clustered claim must match the independent, file-side check"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // #516 review: pass-1 carrier clobber, strict predicate, O(1) clustered
+    // -------------------------------------------------------------------------
+
+    /// The predicate must reject a back-reference that names an offset it has
+    /// seen but not the whole tile stored there (#516 review, S3-3). Before
+    /// this, `[(0, 10), (0, 25)]` verified as clustered: the second entry's
+    /// offset was in the seen set, and nothing checked that 25 bytes from
+    /// offset 0 is a different (and, at 25 > 10, out-of-bounds) blob than the
+    /// 10-byte tile actually written there. The doc comment already promised
+    /// "a whole prior tile"; now the code enforces it.
+    #[test]
+    fn offsets_are_clustered_rejects_backreference_with_mismatched_length() {
+        // Same offset, longer than the tile actually stored there.
+        assert!(!offsets_are_clustered([(0, 10), (0, 25)]));
+        // Same offset, shorter -- a prefix of a prior tile is not a tile.
+        assert!(!offsets_are_clustered([(0, 10), (10, 5), (10, 999)]));
+        // An exact whole-tile back-reference, then a fresh append: still fine.
+        assert!(offsets_are_clustered([(0, 10), (0, 10), (10, 4)]));
+    }
+
+    /// Two carriers for one hash must not each write their bytes (#516
+    /// review, S2). `add_tile_compressed` never consults the dedup cache, so
+    /// two identical pre-compressed blobs both arrive as `TileEntry`s holding
+    /// data. Pass 1 used to `insert` per carrier, last write winning: the
+    /// first blob's bytes stayed in the tile-data section with nothing
+    /// pointing at them, and `tile_contents_count` (2) outran the directory's
+    /// distinct offset count (1) -- which go-pmtiles `verify` rejects with a
+    /// hard error, not a warning. First-carrier-wins is strictly better than
+    /// the pre-#516 behaviour: it actually deduplicates the second blob.
+    #[test]
+    fn dedup_pass_one_stores_shared_bytes_once_across_carriers() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+        let blob = compression::compress(b"identical tile bytes", Compression::Gzip).unwrap();
+        writer.add_tile_compressed(1, 0, 0, blob.clone()).unwrap();
+        writer.add_tile_compressed(1, 1, 0, blob.clone()).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        writer.write_to_file(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+
+        // z1 tile ids 1 and 4 are not consecutive, so no run-length merge --
+        // two entries sharing the single blob at offset 0.
+        let entries = read_all_entries(&bytes, &header).unwrap();
+        let len = blob.len() as u32;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.tile_id, e.offset, e.length, e.run_length))
+                .collect::<Vec<_>>(),
+            vec![(1u64, 0u64, len, 1u32), (4u64, 0u64, len, 1u32)],
+            "both carriers must reference the one stored blob"
+        );
+
+        assert_eq!(
+            header.tile_data_length,
+            blob.len() as u64,
+            "the second carrier's bytes must not be appended as dead weight"
+        );
+        let distinct: HashSet<u64> = entries.iter().map(|e| e.offset).collect();
+        assert_eq!(
+            distinct.len() as u64,
+            header.tile_contents_count,
+            "go-pmtiles `verify` hard-errors when TileContentsCount disagrees with \
+             the directory's distinct referenced offsets (pmtiles/verify.go:148-150)"
+        );
+        assert_eq!(header.tile_contents_count, 1);
+        assert_eq!(header.addressed_tiles_count, 2);
+        assert!(header.clustered, "one blob, referenced twice, is clustered");
+        assert!(
+            verify_clustered(path).unwrap(),
+            "the file-side re-derivation must agree with the header"
+        );
+    }
+
+    /// Re-adding a tile id with different content replaces the only
+    /// `TileEntry` that carried an earlier hash's bytes, orphaning the
+    /// duplicate still pointing at it. That used to `expect`-panic in pass 2
+    /// (#516 review, S3-1); `write_to_file` already returns `Result`, so it
+    /// must report the orphan rather than abort the process.
+    #[test]
+    fn dedup_errors_when_a_carrier_tile_is_overwritten() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        writer.add_tile(0, 0, 0, b"XXXX").unwrap(); // carries hash(XXXX)
+        writer.add_tile(1, 0, 0, b"XXXX").unwrap(); // duplicate, no data
+        writer.add_tile(0, 0, 0, b"YYYY").unwrap(); // replaces the carrier
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let err = writer
+            .write_to_file(tmp.path())
+            .expect_err("the orphaned hash must surface as an error, not a panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("carrier"),
+            "the error must name the cause (an overwritten carrier tile), got: {msg}"
+        );
+    }
+
+    /// The scenario the pass-2 comment describes, pinned (#516 review, S3-6):
+    /// a duplicate whose carrier sorts *after* it, interleaved with a second
+    /// hash whose carrier sorts between them. `(2,3,3)` carries `X`, `(1,0,0)`
+    /// carries `Y`, `(0,0,0)` duplicates `X`. In tile-id order the directory
+    /// reads `[0 -> offset(X), 1 -> offset(Y)=0, 15 -> offset(X)]`, whose very
+    /// first entry already points past the frontier: legitimately unclustered,
+    /// and both the header and the file-side check must say so rather than
+    /// claim otherwise. The archive is still byte-correct -- every tile serves
+    /// its own content -- it just costs a reader a backward seek.
+    #[test]
+    fn interleaved_carriers_produce_an_honestly_unclustered_archive() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        writer.add_tile(2, 3, 3, b"XXXXXXXX").unwrap();
+        writer.add_tile(1, 0, 0, b"YYYYYYYY").unwrap();
+        writer.add_tile(0, 0, 0, b"XXXXXXXX").unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        writer.write_to_file(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+
+        assert!(
+            !header.clustered,
+            "the header must not claim clustered for an interleaved dedup layout"
+        );
+        assert!(
+            !verify_clustered(path).unwrap(),
+            "and the independent file-side check must agree"
+        );
+
+        // Byte correctness is untouched: each tile id still serves its own
+        // content, unclustered or not.
+        let entries = read_all_entries(&bytes, &header).unwrap();
+        let expected: Vec<(u64, &[u8])> = vec![
+            (tile_id(0, 0, 0), b"XXXXXXXX".as_slice()),
+            (tile_id(1, 0, 0), b"YYYYYYYY".as_slice()),
+            (tile_id(2, 3, 3), b"XXXXXXXX".as_slice()),
+        ];
+        assert_eq!(entries.len(), expected.len());
+        for (e, (want_id, want_bytes)) in entries.iter().zip(expected) {
+            assert_eq!(e.tile_id, want_id);
+            let start = (header.tile_data_offset + e.offset) as usize;
+            let raw = &bytes[start..start + e.length as usize];
+            let served = compression::decompress(raw, header.tile_compression).unwrap();
+            assert_eq!(
+                served, want_bytes,
+                "tile id {} must serve its own content",
+                e.tile_id
+            );
+        }
+    }
+
+    /// Ascending adds imply a clustered archive by construction, so
+    /// `write_archive` reads the tracked flag instead of building the
+    /// predicate's offset map -- ~2.4 GB of it at planet scale, at peak RSS
+    /// (#516 review, S3-4). The derived header byte must be identical either
+    /// way, which the file-side `verify_clustered` (which always runs the
+    /// predicate) confirms here.
+    #[test]
+    fn streaming_writer_derives_clustered_from_ascending_adds() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+
+        // Ascending tile ids: z0 (0,0)=0, z1 (0,0)=1, z1 (0,1)=2, z1 (1,1)=3.
+        // The third add repeats the first's content, so the directory carries
+        // a dedup back-reference to offset 0 -- the case the predicate exists
+        // for, and the one the fast path must still get right.
+        writer.add_tile(0, 0, 0, b"aaaa").unwrap();
+        writer.add_tile(1, 0, 0, b"bbbb").unwrap();
+        writer.add_tile(1, 0, 1, b"aaaa").unwrap();
+        writer.add_tile(1, 1, 1, b"cccc").unwrap();
+        assert!(
+            writer.adds_ascending,
+            "every add continued the ascending run"
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        writer.finalize(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(header.clustered, "ascending adds are clustered");
+        assert!(
+            verify_clustered(&path).unwrap(),
+            "and the predicate, re-derived from disk, must reach the same answer \
+             the O(1) fast path did"
+        );
+    }
+
+    /// The counterpart: an out-of-order caller clears `adds_ascending`, so the
+    /// flag short-circuit cannot fire and the honest predicate decides. It
+    /// must derive `false` here, not inherit an optimistic default.
+    #[test]
+    fn streaming_writer_out_of_order_adds_fall_back_to_the_predicate() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+
+        // z2 (3,3)=15 added before z1 (0,0)=1: the bytes land in add order,
+        // so after the tile_id sort the first entry points past the frontier.
+        writer.add_tile(2, 3, 3, b"aaaa").unwrap();
+        writer.add_tile(1, 0, 0, b"bbbb").unwrap();
+        assert!(
+            !writer.adds_ascending,
+            "a descending add must clear the fast-path flag"
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        writer.finalize(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            !header.clustered,
+            "the fallback predicate must report the archive as it is"
+        );
+        assert!(!verify_clustered(&path).unwrap(), "and the file agrees");
     }
 }
