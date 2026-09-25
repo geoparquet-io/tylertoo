@@ -233,7 +233,7 @@ pub fn simplify_for_level(
 /// they fed in — for FTW-like small polygons at minimum vertex count,
 /// adjacent ladder levels often produce identical output, so this turns an
 /// O(levels) chain of deep clones into O(1) allocations plus refcount bumps.
-pub fn simplify_for_level_checked(
+pub(crate) fn simplify_for_level_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
     crs: Crs,
@@ -489,7 +489,7 @@ pub fn simplify_step(
 /// points fall through to [`simplify_for_level_checked`], which passes them
 /// through untouched — matching the "coarser steps pass the point through
 /// untouched" cascade semantics documented on [`simplify_cascade`].
-pub fn simplify_checked(
+pub(crate) fn simplify_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
     crs: Crs,
