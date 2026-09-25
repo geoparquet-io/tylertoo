@@ -2038,15 +2038,19 @@ impl StreamingPmtilesWriter {
     /// [`Self::checkpoint`] and [`Self::finalize`] must be called with the
     /// same `output_path`; a different one is an error, since the reservation
     /// was made in this file.
+    ///
+    /// Creating the writer touches the output's directory, so an unwritable or
+    /// missing one fails *here* rather than after the run has done all its
+    /// work. It does not create the directory: a typo in the path should stop
+    /// the run, not invent a folder.
     pub fn with_tail_layout(output_path: &Path, compression: Compression) -> std::io::Result<Self> {
         let partial_path = partial_path_for(output_path);
-        if let Some(parent) = partial_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        let mut file = File::create(&partial_path)?;
+        let mut file = File::create(&partial_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot create {}: {e}", partial_path.display()),
+            )
+        })?;
         // Reserve the prefix eagerly, as zeros. Writing it now (rather than
         // seeking past it) means the first checkpoint's padding is already
         // zero-filled and the file never contains a sparse hole whose
