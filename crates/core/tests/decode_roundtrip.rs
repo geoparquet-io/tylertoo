@@ -713,3 +713,64 @@ fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
     assert_eq!(theirs_report.features_written, ours_report.features_written);
     assert_eq!(theirs_report.features_written, u64::from(N));
 }
+
+/// The raw `geo` footer value of a GeoParquet file, exactly as written.
+fn geo_footer_json(path: &Path) -> String {
+    let file = std::fs::File::open(path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .expect("decoded output must carry footer key-value metadata")
+        .iter()
+        .find(|kv| kv.key == "geo")
+        .expect("decoded output must carry a `geo` footer key")
+        .value
+        .clone()
+        .expect("`geo` footer key must have a value")
+}
+
+/// #508 (review S2): the decode writer's footer must be byte-stable.
+///
+/// `GeoParquetColumnMetadata::geometry_types` is a `HashSet`; its default
+/// `Serialize` emits the array in hash-iteration order, which varies between
+/// sets even within one process. `overview::writer` routes around that
+/// (`geo_metadata_json_deterministic`), but `decode` writes its own
+/// GeoParquet through the encoder's `into_keyvalue()` — and a decoded
+/// archive is the COMMON mixed-geometry case (points, lines and polygons all
+/// land in one output file), so the flip is not an edge case here.
+///
+/// Four decodes of the same archive in one process: a single differing
+/// footer is a failure.
+#[test]
+fn decode_geo_footer_is_byte_stable_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let pmtiles = build_archive(&dir, None);
+
+    let mut baseline: Option<String> = None;
+    for run in 0..4 {
+        let out = dir.path().join(format!("decoded-{run}.parquet"));
+        decode_pmtiles(&pmtiles, &out, &DecodeOptions::default()).unwrap();
+        let geo = geo_footer_json(&out);
+        // Guard against a vacuous pass: the fixture must actually produce
+        // more than one geometry type, or there is no order to get wrong.
+        let parsed: serde_json::Value = serde_json::from_str(&geo).unwrap();
+        let types = parsed["columns"]["geometry"]["geometry_types"]
+            .as_array()
+            .expect("geometry_types array");
+        assert!(
+            types.len() > 1,
+            "fixture must decode to MIXED geometry types for this test to mean \
+             anything; got {types:?}"
+        );
+        match &baseline {
+            None => baseline = Some(geo),
+            Some(first) => assert_eq!(
+                first, &geo,
+                "run {run}: the decoded `geo` footer differs from run 0 — a \
+                 HashSet iteration order is leaking into the output bytes"
+            ),
+        }
+    }
+}

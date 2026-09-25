@@ -996,6 +996,9 @@ pub tylertoo_core::overview::convert::ConvertError::Parquet(parquet::errors::Par
 pub tylertoo_core::overview::convert::ConvertError::PointCountColumnPresent
 pub tylertoo_core::overview::convert::ConvertError::Properties(tylertoo_core::overview::properties::PropertySelectionError)
 pub tylertoo_core::overview::convert::ConvertError::RankingConflict
+pub tylertoo_core::overview::convert::ConvertError::RowGroupCeilingUnreachable
+pub tylertoo_core::overview::convert::ConvertError::RowGroupCeilingUnreachable::ceiling: usize
+pub tylertoo_core::overview::convert::ConvertError::RowGroupCeilingUnreachable::levels: usize
 pub tylertoo_core::overview::convert::ConvertError::SortKeyColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::SortKeyColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::UnsupportedCrs
@@ -1123,6 +1126,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::
 pub struct tylertoo_core::overview::convert::ConvertReport
 pub tylertoo_core::overview::convert::ConvertReport::antimeridian_suspect_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::duration_secs: f64
+pub tylertoo_core::overview::convert::ConvertReport::effective_max_row_group_size: core::option::Option<usize>
 pub tylertoo_core::overview::convert::ConvertReport::input_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::levels: alloc::vec::Vec<tylertoo_core::overview::convert::LevelReport>
 pub tylertoo_core::overview::convert::ConvertReport::mode: tylertoo_core::overview::level::Mode

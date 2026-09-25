@@ -93,6 +93,18 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 /// Default maximum row-group size in rows (§4.5, configurable).
 pub const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 10_000;
 
+/// Safety ceiling for the projected total row-group count across every level
+/// (#507). Parquet's row-group ordinal is an `i16`, so a file holds at most
+/// 32,768 row groups (ordinals 0..=32,767); we preflight against 32,000 — 768
+/// row groups of headroom — before pass 2 opens the output file, so a
+/// planet-scale run that would blow the real limit is caught (and the cap
+/// auto-scaled) in milliseconds instead of after hours of writing.
+///
+/// The headroom matters because the projection is fed pass 1's
+/// pre-simplification winner hints: it is an upper bound on the written
+/// row-group count, not an exact prediction.
+pub(crate) const SAFE_ROW_GROUP_CEILING: usize = 32_000;
+
 /// Maximum rows per parallel WKB-encode chunk (#304). Incoming batches are
 /// split at this grain before being dispatched to the Rayon pool, so even the
 /// buffered engine's one-batch-per-level shape parallelizes, and one in-flight
@@ -894,14 +906,18 @@ impl<W: Write + Send> OverviewWriter<W> {
         // parallel WKB path (#304) folds per-chunk contributions into
         // `geo_meta_acc`; the serial path accumulates inside the shared
         // encoder. A writer only ever populates one of the two (the encode
-        // concurrency is fixed at construction).
-        let geo_kv = match self.geo_meta_acc.take() {
-            Some(geo_meta) => KeyValue::new("geo".to_string(), serde_json::to_string(&geo_meta)?),
-            None => self
-                .encoder
-                .into_keyvalue()
-                .map_err(|e| WriterError::GeoParquet(e.to_string()))?,
+        // concurrency is fixed at construction). Either way, the metadata is
+        // serialized through `geo_metadata_json_deterministic` (#508) rather
+        // than the encoder's own `into_keyvalue`/`serde_json::to_string`, so
+        // the `geometry_types` array's element order is stable run to run.
+        let geo_meta = match self.geo_meta_acc.take() {
+            Some(geo_meta) => geo_meta,
+            None => self.encoder.into_geoparquet_metadata(),
         };
+        let geo_kv = KeyValue::new(
+            "geo".to_string(),
+            geo_metadata_json_deterministic(&geo_meta)?,
+        );
         self.writer.append_key_value_metadata(geo_kv);
 
         // `geo:overviews` footer key (§3).
@@ -1154,6 +1170,70 @@ fn fold_geo_metadata(
     Ok(())
 }
 
+/// Serialize the footer `geo` metadata deterministically (#508).
+///
+/// [`GeoParquetColumnMetadata::geometry_types`] is a `HashSet` (external
+/// `geoparquet` crate); its default `Serialize` impl emits a JSON array in
+/// hash-iteration order, which varies **run to run** — two byte-identical
+/// conversions of the same mixed-geometry input produced footers differing
+/// by exactly the `geometry_types` array's element order. Round-tripping
+/// through [`serde_json::Value`] first sorts every column's `geometry_types`
+/// array alphabetically before the final string encode, so the same input
+/// always produces the same footer bytes.
+///
+/// Used by [`crate::decode`] too: the decode writer emits its own GeoParquet
+/// footer, and a decoded archive is the common MIXED-geometry case (points,
+/// lines and polygons from one PMTiles archive all land in one file), so it
+/// is if anything more exposed to the flip than the overview writer is.
+///
+/// (`columns` itself is a `HashMap`, but `serde_json::Value`'s map type is a
+/// `BTreeMap` under this crate's default feature set — `to_value` already
+/// sorts column names by key. The explicit `sort_keys` below makes that
+/// independent of the feature set: enabling `serde_json/preserve_order`
+/// anywhere in the dependency graph would silently switch `Value::Object` to
+/// an insertion-ordered map and put the `HashMap`'s order straight back into
+/// the footer. The `BTreeMap` default is the backup explanation, not the
+/// guarantee.)
+pub(crate) fn geo_metadata_json_deterministic(
+    geo_meta: &GeoParquetMetadata,
+) -> Result<String, WriterError> {
+    let mut value = serde_json::to_value(geo_meta)?;
+    sort_keys(&mut value);
+    if let Some(cols) = value.get_mut("columns").and_then(|c| c.as_object_mut()) {
+        for col in cols.values_mut() {
+            if let Some(types) = col.get_mut("geometry_types").and_then(|t| t.as_array_mut()) {
+                types.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            }
+        }
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
+/// Recursively sort every JSON object's keys, for [`geo_metadata_json_deterministic`].
+///
+/// A no-op under `serde_json`'s default `BTreeMap`-backed `Value::Object`
+/// (already sorted); it exists so the footer stays deterministic if the
+/// `preserve_order` feature is ever switched on somewhere in the graph.
+fn sort_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(map)
+                .into_iter()
+                .map(|(k, mut v)| {
+                    sort_keys(&mut v);
+                    (k, v)
+                })
+                .collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (k, v) in entries {
+                map.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sort_keys),
+        _ => {}
+    }
+}
+
 /// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
 /// extension type). Mirrors the geoparquet encoder's detection.
 fn geometry_columns(schema: &Schema) -> Vec<String> {
@@ -1238,6 +1318,104 @@ fn rg_row_target(max_row_group_size: usize, level_row_hint: Option<usize>) -> us
         }
         _ => cap,
     }
+}
+
+/// Projected total row groups across every level (#507), mirroring
+/// `write_level`'s own split arithmetic: [`effective_rg_cap`] gives each
+/// level's cap, and a level with `counts[l]` rows becomes
+/// `ceil(counts[l] / cap)` row groups (0 for an empty/omitted level, §7.3) —
+/// the same count `rg_row_target` produces (a level that fits in one row
+/// group needs exactly `ceil(n / cap) == 1` groups too). `level_zooms` and
+/// `finest_zoom` are the per-level / finest-level zoom metadata
+/// [`RowGroupSizePolicy::ZoomScaled`] reads; `level_zooms.len()` must equal
+/// `counts.len()`.
+pub(crate) fn projected_row_groups(
+    counts: &[usize],
+    base_cap: usize,
+    policy: RowGroupSizePolicy,
+    level_zooms: &[Option<u8>],
+    finest_zoom: Option<u8>,
+) -> usize {
+    // The doc contract above: one zoom per level. `zip` would silently
+    // truncate to the shorter side and under-count the projection — the one
+    // direction that matters, since the caller preflights against a ceiling.
+    debug_assert_eq!(
+        counts.len(),
+        level_zooms.len(),
+        "projected_row_groups: one zoom per level"
+    );
+    counts
+        .iter()
+        .zip(level_zooms)
+        .map(|(&n, &zoom)| {
+            if n == 0 {
+                return 0;
+            }
+            let cap = effective_rg_cap(base_cap, policy, zoom, finest_zoom).max(1);
+            n.div_ceil(cap)
+        })
+        .sum()
+}
+
+/// The smallest row-group base cap `>= base_cap` under which
+/// [`projected_row_groups`] fits within `ceiling` (#507's auto-scale, option
+/// 2 of the issue). `Some(base_cap)` unchanged when it already fits — callers
+/// compare the result to `base_cap` to decide whether to warn.
+///
+/// `None` only when raising the cap can never help: every non-empty level
+/// contributes at least one row group regardless of cap (a level fitting in
+/// one row group already IS one row group), so more non-empty levels than
+/// `ceiling` is unfixable by this knob alone. In practice this can't happen —
+/// levels are bounded by [`crate::tile::MAX_ZOOM`], far below `ceiling` — but
+/// callers still surface it as an actionable error rather than looping
+/// forever or silently under-shooting.
+pub(crate) fn autoscale_cap(
+    counts: &[usize],
+    base_cap: usize,
+    policy: RowGroupSizePolicy,
+    level_zooms: &[Option<u8>],
+    finest_zoom: Option<u8>,
+    ceiling: usize,
+) -> Option<usize> {
+    let fits =
+        |cap: usize| projected_row_groups(counts, cap, policy, level_zooms, finest_zoom) <= ceiling;
+    if fits(base_cap) {
+        return Some(base_cap);
+    }
+    let nonempty_levels = counts.iter().filter(|&&n| n > 0).count();
+    if nonempty_levels > ceiling {
+        return None;
+    }
+    // `projected_row_groups` is non-increasing as the base cap rises: every
+    // level's effective cap (`effective_rg_cap`) is non-decreasing in
+    // `base_cap` (`Constant` returns it verbatim; `ZoomScaled` multiplies it
+    // by a fixed power), so binary search for the minimal fitting cap.
+    //
+    // `hi` = the largest level count always fits: at `base_cap == max(counts)`
+    // every level's effective cap is `>= base_cap >= counts[l]` (the
+    // multiplier in `ZoomScaled` only ever scales a level's cap UP from
+    // `base_cap`, and the finest level's cap equals `base_cap` exactly), so
+    // every non-empty level becomes exactly one row group — `nonempty_levels`
+    // total, already proven `<= ceiling` above.
+    let mut lo = base_cap.saturating_add(1);
+    let mut hi = counts.iter().copied().max().unwrap_or(base_cap).max(lo);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(round_up_clean(lo))
+}
+
+/// Round a row-group cap up to a clean multiple of 1,000 (#507): a tidy value
+/// for the warning log / CLI suggestion. Never rounds below `n`, so the
+/// result still fits (`projected_row_groups` is non-increasing in the cap).
+fn round_up_clean(n: usize) -> usize {
+    const STEP: usize = 1_000;
+    n.div_ceil(STEP).saturating_mul(STEP)
 }
 
 /// Build [`WriterProperties`]: ZSTD, no dictionary on geometry + bbox columns
@@ -1539,8 +1717,29 @@ mod tests {
         serde_json::from_str(kv.value.as_ref().unwrap()).unwrap()
     }
 
-    /// A column's `geometry_types` from a raw footer `Value`, sorted (the set
-    /// has no deterministic JSON order).
+    /// The raw (unparsed) `geo` footer JSON string, for byte-identical
+    /// determinism checks (#508).
+    fn geo_footer_raw(path: &std::path::Path) -> String {
+        let file = File::open(path).unwrap();
+        let md = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        md.file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == "geo")
+            .expect("geo footer key present")
+            .value
+            .clone()
+            .expect("geo footer value present")
+    }
+
+    /// A column's `geometry_types` from a raw footer `Value`, sorted for an
+    /// order-independent comparison. `geo_metadata_json_deterministic` (#508,
+    /// fixed) already makes the written array order stable run to run, so
+    /// this sort is now belt-and-suspenders rather than load-bearing.
     fn footer_geometry_types(footer: &serde_json::Value, column: &str) -> Vec<String> {
         let mut types: Vec<String> = footer["columns"][column]["geometry_types"]
             .as_array()
@@ -1552,13 +1751,14 @@ mod tests {
         types
     }
 
-    /// Structural equality of two `geo` footers. The JSON strings are not
-    /// byte-comparable (`geometry_types` serializes a `HashSet`, whose order
-    /// varies run to run even for a serial build), so compare field-wise with
-    /// set semantics for the geometry types.
+    /// Structural equality of two `geo` footers, with set semantics for
+    /// `geometry_types`. Before #508 (fixed) the raw JSON strings were not
+    /// byte-comparable — `geometry_types` serialized a `HashSet` whose
+    /// iteration order varied run to run even for a serial build — so this
+    /// canonicalized comparison predates the fix; kept as an
+    /// order-independent structural check (real byte-identity is asserted
+    /// directly by `geometry_types_footer_order_is_deterministic_across_runs`).
     fn assert_geo_footer_eq(a: &serde_json::Value, b: &serde_json::Value, ctx: &str) {
-        // The raw JSON is not byte-comparable: `geometry_types` serializes a
-        // `HashSet` whose order varies run to run even for a serial build.
         // Canonicalize each column's `geometry_types` to a sorted array, then
         // compare the whole footer — version, primary_column, and every
         // column's encoding, geometry_types, bbox (`[null; 4]` on both, since
@@ -1761,6 +1961,91 @@ mod tests {
             assert_eq!(meta, serial_meta, "{ctx}: geo:overviews metadata differs");
             assert_geo_footer_eq(&serial_geo, &geo_footer(parallel.path()), &ctx);
         }
+    }
+
+    /// #508: two conversions of the same mixed Point+Polygon input must
+    /// produce a byte-identical `geo` footer. Before the fix,
+    /// `GeoParquetColumnMetadata::geometry_types` (a `HashSet`) serialized
+    /// its JSON array in hash-iteration order, which differs run to run even
+    /// for identical input and a serial (`encode_concurrency = 1`) write —
+    /// two runs of the same conversion differed by exactly the
+    /// `geometry_types` element order (12 footer bytes on the reported
+    /// fixture).
+    #[test]
+    fn geometry_types_footer_order_is_deterministic_across_runs() {
+        let schema = Arc::new(source_schema());
+        // Mixed Point (even ids) + Polygon (odd ids) geometries (`geom_for`).
+        let ids: Vec<i64> = (0..20).collect();
+
+        let write_once = || -> String {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let opts = duplicating_options();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for level in 0..3 {
+                let _ = writer
+                    .write_level(
+                        level,
+                        Some(ids.len()),
+                        std::iter::once(source_batch(&schema, &ids)),
+                    )
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            geo_footer_raw(tmp.path())
+        };
+
+        let first = write_once();
+        let second = write_once();
+        assert_eq!(
+            first, second,
+            "geo footer JSON differs across identical runs (#508)"
+        );
+
+        // Sanity: the fixture actually carries both geometry types, so the
+        // assertion above isn't vacuously true for a single-type array.
+        let parsed: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            footer_geometry_types(&parsed, "geometry"),
+            vec!["Point".to_string(), "Polygon".to_string()]
+        );
+    }
+
+    /// #508, parallel path: `fold_geo_metadata`'s `HashSet::extend` union
+    /// across encode chunks is another hash-order-dependent step upstream of
+    /// serialization; confirm it doesn't reintroduce nondeterminism once
+    /// multiple chunks (and therefore multiple unions) are involved.
+    #[test]
+    fn geometry_types_footer_order_is_deterministic_with_parallel_encode() {
+        let schema = Arc::new(source_schema());
+        let ids: Vec<i64> = (0..(WKB_ENCODE_CHUNK_ROWS as i64 + 37)).collect();
+
+        let write_once = || -> String {
+            let mut opts = duplicating_options();
+            opts.encode_concurrency = 4;
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            let _ = writer
+                .write_level(
+                    0,
+                    Some(ids.len()),
+                    std::iter::once(source_batch(&schema, &ids)),
+                )
+                .unwrap();
+            for level in 1..3 {
+                let _ = writer
+                    .write_level(level, Some(1), std::iter::once(source_batch(&schema, &[0])))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            geo_footer_raw(tmp.path())
+        };
+
+        let first = write_once();
+        let second = write_once();
+        assert_eq!(
+            first, second,
+            "geo footer JSON differs across identical parallel-encode runs (#508)"
+        );
     }
 
     #[test]
@@ -2354,6 +2639,206 @@ mod tests {
         assert_eq!(
             effective_rg_cap(usize::MAX / 2, ZoomScaled, Some(0), Some(30)),
             usize::MAX
+        );
+    }
+
+    /// #507: [`projected_row_groups`] must predict exactly the row-group
+    /// count the real writer produces under [`RowGroupSizePolicy::Constant`]
+    /// — the preflight is only useful if its math matches `write_level`'s.
+    #[test]
+    fn projected_row_groups_matches_actual_writer_output() {
+        let counts = [3usize, 10, 17];
+        let cap = 4;
+        let opts = {
+            let mut o = duplicating_options();
+            o.max_row_group_size = cap;
+            o
+        };
+        let zooms: Vec<Option<u8>> = opts.levels.iter().map(|l| l.zoom).collect();
+        let finest_zoom = opts.levels.last().and_then(|l| l.zoom);
+        let projected = projected_row_groups(
+            &counts,
+            cap,
+            opts.row_group_size_policy,
+            &zooms,
+            finest_zoom,
+        );
+        // Level 0: ceil(3/4)=1, level 1: ceil(10/4)=3, level 2: ceil(17/4)=5.
+        assert_eq!(projected, 1 + 3 + 5);
+
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for (level, &n) in counts.iter().enumerate() {
+                let ids: Vec<i64> = (0..n as i64).collect();
+                let _ = writer
+                    .write_level(level, Some(n), std::iter::once(source_batch(&schema, &ids)))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert_eq!(pm.num_row_groups(), projected);
+    }
+
+    /// Same equivalence check under [`RowGroupSizePolicy::ZoomScaled`], where
+    /// each level's effective cap differs.
+    #[test]
+    fn projected_row_groups_matches_actual_writer_output_zoom_scaled() {
+        let counts = [10usize, 10, 17];
+        let cap = 4;
+        let opts = {
+            let mut o = duplicating_options();
+            o.max_row_group_size = cap;
+            o.row_group_size_policy = RowGroupSizePolicy::ZoomScaled;
+            o
+        };
+        let zooms: Vec<Option<u8>> = opts.levels.iter().map(|l| l.zoom).collect();
+        let finest_zoom = opts.levels.last().and_then(|l| l.zoom);
+        let projected = projected_row_groups(
+            &counts,
+            cap,
+            opts.row_group_size_policy,
+            &zooms,
+            finest_zoom,
+        );
+
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for (level, &n) in counts.iter().enumerate() {
+                let ids: Vec<i64> = (0..n as i64).collect();
+                let _ = writer
+                    .write_level(level, Some(n), std::iter::once(source_batch(&schema, &ids)))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert_eq!(pm.num_row_groups(), projected);
+    }
+
+    #[test]
+    fn autoscale_cap_noop_when_already_fits() {
+        let counts = [100usize, 200, 300];
+        let zooms = [Some(2u8), Some(4u8), Some(6u8)];
+        let got = autoscale_cap(
+            &counts,
+            100,
+            RowGroupSizePolicy::Constant,
+            &zooms,
+            Some(6),
+            32_000,
+        );
+        assert_eq!(got, Some(100));
+    }
+
+    /// #507's core scenario: a base cap that would blow the safety ceiling
+    /// gets raised to the smallest clean-multiple cap that fits.
+    #[test]
+    fn autoscale_cap_raises_cap_to_fit_ceiling() {
+        // 3 levels of 1,000 rows each, cap 1: 3,000 row groups — above a
+        // ceiling of 10.
+        let counts = [1_000usize, 1_000, 1_000];
+        let zooms = [Some(2u8), Some(4u8), Some(6u8)];
+        let ceiling = 10;
+        let cap = autoscale_cap(
+            &counts,
+            1,
+            RowGroupSizePolicy::Constant,
+            &zooms,
+            Some(6),
+            ceiling,
+        )
+        .expect("autoscale should find a fitting cap");
+        assert!(cap > 1);
+        assert_eq!(
+            cap % 1_000,
+            0,
+            "cap should round to a clean multiple: {cap}"
+        );
+        let projected =
+            projected_row_groups(&counts, cap, RowGroupSizePolicy::Constant, &zooms, Some(6));
+        assert!(
+            projected <= ceiling,
+            "projected {projected} > ceiling {ceiling}"
+        );
+    }
+
+    /// No cap can help when the non-empty level count alone exceeds the
+    /// ceiling — every non-empty level always contributes >= 1 row group.
+    #[test]
+    fn autoscale_cap_none_when_levels_alone_exceed_ceiling() {
+        let counts = [1usize, 1, 1, 1, 1];
+        let zooms = [Some(0u8), Some(1u8), Some(2u8), Some(3u8), Some(4u8)];
+        let got = autoscale_cap(
+            &counts,
+            10,
+            RowGroupSizePolicy::Constant,
+            &zooms,
+            Some(4),
+            2,
+        );
+        assert_eq!(got, None);
+    }
+
+    /// End-to-end (#507): forcing a tiny base cap (`--row-group-size 1`)
+    /// against a tiny mocked ceiling — far below the real 32,768 parquet
+    /// limit, so the test runs in milliseconds — proves the writer succeeds
+    /// and stays within the ceiling once its cap is auto-scaled, instead of
+    /// producing far more row groups than the ceiling allows.
+    #[test]
+    fn autoscaled_cap_keeps_writer_output_within_ceiling() {
+        let counts = [20usize, 20, 20];
+        let base_cap = 1;
+        let ceiling = 5;
+        let mut opts = duplicating_options();
+        let zooms: Vec<Option<u8>> = opts.levels.iter().map(|l| l.zoom).collect();
+        let finest_zoom = opts.levels.last().and_then(|l| l.zoom);
+        let cap = autoscale_cap(
+            &counts,
+            base_cap,
+            opts.row_group_size_policy,
+            &zooms,
+            finest_zoom,
+            ceiling,
+        )
+        .expect("autoscale should find a fitting cap");
+        opts.max_row_group_size = cap;
+
+        let schema = Arc::new(source_schema());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+            for (level, &n) in counts.iter().enumerate() {
+                let ids: Vec<i64> = (0..n as i64).collect();
+                let outcome = writer
+                    .write_level(level, Some(n), std::iter::once(source_batch(&schema, &ids)))
+                    .unwrap();
+                assert_eq!(outcome, LevelWriteOutcome::Written);
+            }
+            writer.finish().unwrap();
+        }
+
+        let file = File::open(tmp.path()).unwrap();
+        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert!(
+            pm.num_row_groups() <= ceiling,
+            "row groups {} exceed the mocked ceiling {ceiling}",
+            pm.num_row_groups()
         );
     }
 

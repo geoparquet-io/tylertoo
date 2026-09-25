@@ -191,6 +191,8 @@ Generate PMTiles vector tiles (the default pipeline)
 
    Interpreted per level: a level with at most this many rows is written as a single row group; a larger level is split into roughly uniform row groups of at most this size. Coarse bands (few features) therefore become one broad row group; fine bands keep tight per-row-group bbox statistics.
 
+   This is a request, not a guarantee: it may be raised automatically to fit parquet's row-group ceiling of 32,768 groups per file (a warning says so, and the conversion report records the cap actually used).
+
   Default value: `10000`
 * `--row-group-size-policy <ROW_GROUP_SIZE_POLICY>` — Per-level row-group sizing policy (#202).
 
@@ -392,6 +394,8 @@ Build a multi-resolution overview GeoParquet file
 * `--row-group-size <ROW_GROUP_SIZE>` — Maximum output row-group size in rows.
 
    Interpreted per level: a level with at most this many rows is written as a single row group; a larger level is split into roughly uniform row groups of at most this size. Coarse bands (few features) therefore become one broad row group; fine bands keep tight per-row-group bbox statistics.
+
+   This is a request, not a guarantee: it may be raised automatically to fit parquet's row-group ceiling of 32,768 groups per file (a warning says so, and the conversion report records the cap actually used).
 
   Default value: `10000`
 * `--row-group-size-policy <ROW_GROUP_SIZE_POLICY>` — Per-level row-group sizing policy (#202).

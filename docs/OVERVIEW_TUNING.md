@@ -1173,6 +1173,25 @@ suppressed by default (below), even hundreds of row groups keep the footer
 small, so there is rarely a reason to raise it. LOWER it if you serve tiny
 viewports over a high-latency store and want tighter pruning.
 
+**The value is a request, not a guarantee (#507).** A Parquet file holds at
+most 32,768 row groups (the row-group ordinal is an `i16`), and a very low
+`--row-group-size` on a planet-scale input can project past that. Before pass 2
+opens the output file, the converter projects the total row-group count from
+pass 1's per-level winner counts and compares it against a 32,000-group
+preflight ceiling (headroom, because that projection is a pre-simplification
+upper bound rather than an exact count). If the projection is over, the cap is
+**auto-scaled up** to the smallest clean value that fits, with a `warn`-level
+log line naming the old and new values. The cap actually used is recorded as
+`effective_max_row_group_size` in `--report` JSON and printed as a summary
+note, so the raise is visible after the run rather than only in the log.
+
+A raised cap costs memory: the writer holds a whole row group in RAM before
+flushing it, so peak write memory scales with the cap. If that matters more
+than the file layout, cut the projected row-group count at the source
+instead — fewer levels (`--min-zoom` / `--max-zoom`), or
+`--row-group-size-policy zoom-scaled` (below), which already gives coarse
+bands far larger caps.
+
 ### `--row-group-size-policy` (default `constant`): per-level cap scaling
 
 Controls how the `--row-group-size` cap is applied across levels (#202):

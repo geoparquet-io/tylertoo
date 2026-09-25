@@ -979,6 +979,10 @@ struct ConvertTuningArgs {
     /// a single row group; a larger level is split into roughly uniform row
     /// groups of at most this size. Coarse bands (few features) therefore become
     /// one broad row group; fine bands keep tight per-row-group bbox statistics.
+    ///
+    /// This is a request, not a guarantee: it may be raised automatically to fit
+    /// parquet's row-group ceiling of 32,768 groups per file (a warning says so,
+    /// and the conversion report records the cap actually used).
     #[arg(long, default_value = "10000", help_heading = "Output layout")]
     row_group_size: usize,
 
@@ -2043,6 +2047,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         }
     }
 
+    if let Some(note) = row_group_autoscale_note(&convert_report) {
+        println!("{note}");
+    }
+
     // A combined report so the one-step run captures both halves the two-step
     // chain would write (`overview --report` + `export-pmtiles --report`).
     if let Some(report_path) = &args.report {
@@ -2058,6 +2066,23 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// One-line note for the #507 auto-scale, printed on both the `overview` and
+/// `tiles` summaries. `None` when the requested `--row-group-size` was used
+/// verbatim, so the common run prints nothing.
+fn row_group_autoscale_note(
+    report: &tylertoo_core::overview::convert::ConvertReport,
+) -> Option<String> {
+    report.effective_max_row_group_size.map(|cap| {
+        format!(
+            "  note: --row-group-size raised to {} so the output stays under parquet's \
+             row-group ceiling (see the warning above); pass --row-group-size {} to make \
+             it explicit",
+            format_number(cap as u64),
+            cap
+        )
+    })
 }
 
 /// The tile-count line of the `tiles` summary (#429).
@@ -2194,6 +2219,10 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             report.skipped_empty_levels.len(),
             planned.join(", ")
         );
+    }
+
+    if let Some(note) = row_group_autoscale_note(&report) {
+        println!("{note}");
     }
 
     if let Some(report_path) = &args.report {
