@@ -30,6 +30,12 @@ geoarrow = "0.9"
 geoarrow-array = "0.9"
 geo-traits = "0.3"
 geoparquet = "0.9"
+# arrow-rs is pinned to 59 by the geoarrow stack above, NOT by choice: geoarrow
+# 0.9 and geoparquet 0.9 declare `arrow-* = "^59"` / `parquet = "^59"`, which
+# cargo cannot unify with 60.x. Moving these to 60 on their own links two arrow
+# majors into one binary and breaks every type that crosses the geoparquet
+# boundary (see #476, and the `ignore:` rationale in .github/dependabot.yml).
+# Bump arrow-rs and geoarrow together, once geoarrow-rs supports arrow 60.
 parquet = "59"
 arrow-schema = "59"
 arrow-array = "59"
