@@ -120,6 +120,14 @@ const PARTITIONING_GEOM_FACTOR: u64 = 4;
 
 /// Fraction of *available* system RAM the estimated buffered-output set may
 /// occupy before `Auto` spills to a temp file instead of holding it in RAM.
+///
+/// **Headroom.** This budget is charged twice over. The pass-2 sink is what it
+/// is for, but the pass-2 read-ahead ([`READ_BUDGET_FRACTION`]) takes a slice
+/// of the same number *on top* of the sink — 10% of it, half that under an
+/// explicit `bounded` profile. Both slices are modelled, not measured, with
+/// the same per-row estimate ([`estimate_buffered_bytes`]); the 0.4 of
+/// available RAM this fraction leaves unclaimed is what absorbs the error in
+/// both, plus the in-flight batches and the rayon pool's transients.
 const AUTO_RAM_FRACTION: f64 = 0.6;
 
 /// Budget used when available RAM cannot be probed (non-Linux, or
@@ -592,6 +600,10 @@ pub(super) struct ReadTuning {
     /// used only to size the read-ahead against the memory budget. `None`
     /// falls back to [`READ_ROW_BYTES_FALLBACK`].
     pub(super) avg_geom_bytes: Option<u64>,
+    /// The run's requested memory profile. `Bounded` means the caller asked
+    /// for memory over speed, so a worker's read-ahead queue is capped lower
+    /// (see [`READ_AHEAD_BOUNDED_MAX_BATCHES`]).
+    pub(super) profile: MemoryProfile,
 }
 
 /// Whether [`read_in_order`]'s consumer wants more batches.
@@ -606,7 +618,27 @@ pub(super) enum ReadFlow {
 /// purpose: the read-ahead competes with the pass-2 output sink, which is what
 /// the budget is really for (#294), and a read that is `workers` × deeper than
 /// before must not be what pushes a bounded run into swap.
+///
+/// This is a *model* bound, not a measured guarantee: it bounds
+/// `workers × depth × batch_size × per_row`, where `per_row` is the estimate
+/// in [`resolve_read_shape`]. A schema whose non-geometry columns cost far
+/// more per row than the model assumes is priced too cheaply and the read-ahead
+/// will exceed 10% of the budget. See the per-row note there.
 const READ_BUDGET_FRACTION: f64 = 0.10;
+
+/// Ceiling on a worker's read-ahead under an explicit `bounded` profile: the
+/// caller asked for memory over speed, so a rich machine does not get to build
+/// the full [`READ_AHEAD_MAX_BATCHES`] queue per worker.
+///
+/// This caps the *generous* end and nothing else. Halving the budget slice
+/// instead — the other obvious way to make the read-ahead profile-aware — was
+/// measured and rejected: with the calibrated per-row cost below, halving took
+/// a 58-column fixture from 3 reader threads to none under `bounded`, and
+/// `bounded` is the profile this whole parallel read exists to speed up (#494's
+/// Brazil measurement is a `--profile bounded` run). A ceiling on depth never
+/// costs a worker, and it only binds when `affordable / workers` was already
+/// above it.
+const READ_AHEAD_BOUNDED_MAX_BATCHES: usize = READ_AHEAD_MAX_BATCHES / 2;
 
 /// Floor on a worker's read-ahead, in batches. Below this a worker cannot hold
 /// even a small segment, so it stalls mid-segment and its read does not
@@ -617,9 +649,11 @@ const READ_AHEAD_MIN_BATCHES: usize = 4;
 /// tolerance for longer consumer stalls, and the cost is resident Arrow data.
 const READ_AHEAD_MAX_BATCHES: usize = 32;
 
-/// Assumed decoded bytes per input row when pass 1 measured nothing (an empty
-/// scan, or the `--plan` path). Deliberately generous: over-estimating costs
-/// reader workers, under-estimating costs RAM.
+/// Assumed decoded GEOMETRY bytes per input row when pass 1 measured nothing
+/// (an empty scan, or the `--plan` path). Deliberately generous:
+/// over-estimating costs reader workers, under-estimating costs RAM. The
+/// non-geometry per-row term ([`SINK_ROW_OVERHEAD_BYTES`]) is added on top,
+/// measured or not.
 const READ_ROW_BYTES_FALLBACK: u64 = 1024;
 
 /// A resolved parallel-read shape: how many workers, how deep each one's
@@ -647,27 +681,48 @@ struct ReadShape {
 /// can hold [`READ_AHEAD_MIN_BATCHES`], and the depth is what is left over.
 fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let batch_size = tuning.batch_size.max(1);
-    // Pass 1 measures the ENCODED geometry; a decoded batch also carries the
-    // property columns, offsets and validity, so double it for the estimate
-    // (same high bias as the sink's per-row model, and for the same reason).
-    let per_row = tuning
+    // Per-row cost of a RESIDENT decoded batch, priced exactly like the sink's
+    // measured-path model (`estimate_buffered_bytes`): a fixed non-geometry
+    // term plus the measured encoded geometry, doubled.
+    //
+    // `SINK_ROW_OVERHEAD_BYTES` is not decoration. Pass 1 measures ONLY the
+    // geometry column, and a read batch carries every projected column — a
+    // 58-column schema's properties, offsets, dictionaries and validity
+    // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone
+    // under-charged wide schemas by 17-232× against
+    // `get_array_memory_size()`, which is how a bounded run at DEFAULTS could
+    // model 21 MiB of read-ahead and resident +370 MiB. The model is still a
+    // model — it assumes the sink's 4 KiB/row non-geometry term covers the
+    // input's too — but it is now the same model, wrong in the same direction,
+    // as the budget it is being charged against.
+    let geom_per_row = tuning
         .avg_geom_bytes
         .filter(|&b| b > 0)
-        .map_or(READ_ROW_BYTES_FALLBACK, |b| b.saturating_mul(2))
-        .max(1);
+        .map_or(READ_ROW_BYTES_FALLBACK, |b| b.saturating_mul(2));
+    let per_row = SINK_ROW_OVERHEAD_BYTES.saturating_add(geom_per_row).max(1);
     let per_batch = (batch_size as u64).saturating_mul(per_row).max(1);
     let budget = (auto_budget_bytes(available_memory_bytes()) as f64 * READ_BUDGET_FRACTION) as u64;
     let affordable = (budget / per_batch).max(1) as usize;
+    let max_depth = match tuning.profile {
+        MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
+        MemoryProfile::Auto | MemoryProfile::Speed => READ_AHEAD_MAX_BATCHES,
+    };
 
-    let mut workers = tuning.workers.max(1);
-    while workers > 1 && affordable / workers < READ_AHEAD_MIN_BATCHES {
-        workers -= 1;
-    }
-    let depth = (affordable / workers).clamp(READ_AHEAD_MIN_BATCHES, READ_AHEAD_MAX_BATCHES);
+    // Closed form of "drop workers until each one can hold the floor":
+    // `affordable / w >= READ_AHEAD_MIN_BATCHES` ⟺ `w <= affordable /
+    // READ_AHEAD_MIN_BATCHES` (integer division, both sides). Written as a
+    // decrementing loop this was O(workers) — unbounded, since an explicit
+    // `--read-workers` is the caller's number, and `--read-workers
+    // 18446744073709551615` hung the process before it read a byte.
+    let workers = tuning
+        .workers
+        .max(1)
+        .min((affordable / READ_AHEAD_MIN_BATCHES).max(1));
+    let depth = (affordable / workers).clamp(READ_AHEAD_MIN_BATCHES, max_depth);
     ReadShape {
         workers,
         depth,
-        segment_target_rows: depth.saturating_sub(1).max(1) * batch_size,
+        segment_target_rows: depth.saturating_sub(1).max(1).saturating_mul(batch_size),
     }
 }
 
@@ -707,9 +762,11 @@ enum SegMsg {
 /// **Gating.** Remote inputs read sequentially regardless of `workers`:
 /// `SourceStream` releases a part's in-memory read cache when it finishes that
 /// part, so concurrent readers over one remote source would evict each other's
-/// fetched chunks (and the pass-0 staging that normally makes remote reads
-/// local is per-part, not per-run). Local inputs — including a remote input
-/// already staged to local disk — take the parallel path.
+/// fetched chunks. This holds even after pass-0 staging: staging fills the
+/// remote source's own chunk cache and disk spill, it does not turn the
+/// `InputSource` into a `Local` one, so `is_remote()` stays true and a remote
+/// convert's pass-2 read is ALWAYS sequential. Only inputs that were local to
+/// begin with take the parallel path.
 pub(super) fn read_in_order<F>(
     source: &ConvertSource,
     row_groups: Option<&RowGroupSelection>,
@@ -738,7 +795,7 @@ where
     let workers = shape.workers.min(segments.len());
     log::info!(
         "[convert] pass 2 read: {workers} reader thread(s) over {} segment(s) \
-         (~{} row(s) each, {} batch(es) in flight per reader)",
+         (~{} row(s) each, {} read-ahead batch(es) per reader)",
         segments.len(),
         shape.segment_target_rows,
         shape.depth,
@@ -791,6 +848,14 @@ where
             None => return Ok(()),
             Some(Err(e)) => return Err(e.into()),
             Some(Ok(batch)) => {
+                // An empty batch carries no rows and no offset advance, so
+                // delivering one is a no-op the parallel merge does not make
+                // either ([`Regrouper::push`] drops it). Skipping keeps the
+                // two paths' delivered batch sequences identical even if a
+                // reader ever hands one back.
+                if batch.num_rows() == 0 {
+                    continue;
+                }
                 let read_dur = t_read.elapsed();
                 let offset = row_offset;
                 row_offset += batch.num_rows();
@@ -810,6 +875,17 @@ where
 /// segments that come next. Each worker has its own channel: a single shared
 /// queue would let a worker several segments ahead consume the whole budget
 /// and starve the worker the merge is actually waiting for.
+///
+/// **The assignment is static round-robin — there is no work stealing.** A
+/// worker that draws an unusually expensive segment (a badly compressed row
+/// group, a vertex-heavy run) stalls the merge behind it even while the other
+/// workers sit on full queues with nothing to do. Read-ahead absorbs most of
+/// it: the merge keeps draining the queues of the segments that follow, which
+/// is `depth` batches per worker of slack. Segments are also size-capped, not
+/// count-capped ([`ConvertSource::read_segments`]), so the variance is in
+/// decode cost rather than row count. Worth revisiting only if a profile shows
+/// the merge waiting — the fix (a shared work queue plus a reorder buffer)
+/// costs exactly the in-order simplicity this merge is built on.
 fn read_in_parallel<F>(
     source: &ConvertSource,
     segments: &[ReadSegment],
@@ -829,9 +905,13 @@ where
         for w in 0..workers {
             let (tx, rx) = crossbeam_channel::bounded::<SegMsg>(depth);
             rxs.push(rx);
-            scope.spawn(move || {
-                read_segments_for_worker(source, segments, batch_size, workers, w, &tx)
-            });
+            // Named so a stack dump, `perf`, or an OS thread listing tells a
+            // reader worker apart from the rayon pool and the spill writers.
+            std::thread::Builder::new()
+                .name(format!("tylertoo-read-{w}"))
+                .spawn_scoped(scope, move || {
+                    read_segments_for_worker(source, segments, batch_size, workers, w, &tx)
+                })?;
         }
 
         let mut regroup = Regrouper::default();
@@ -839,7 +919,29 @@ where
         let mut pending_read = Duration::ZERO;
         let mut current_part: Option<usize> = None;
 
+        let mut prev_rg: Option<usize> = None;
         for (seq, segment) in segments.iter().enumerate() {
+            // The merge's correctness rests entirely on `read_segments`
+            // emitting parts in order and, within a part, ascending disjoint
+            // row-group runs — a cross-module contract that is otherwise only
+            // stated in prose. Enforce it here so a change on either side
+            // fails a debug build instead of silently reordering rows.
+            if let Some(prev) = current_part {
+                debug_assert!(
+                    segment.part >= prev,
+                    "read_segments must emit parts in order: part {} after part {prev}",
+                    segment.part
+                );
+                debug_assert!(
+                    segment.part > prev
+                        || prev_rg.is_none()
+                        || segment.row_groups.first().copied() > prev_rg,
+                    "read_segments must emit ascending, disjoint row-group runs \
+                     within a part: {:?} after row group {prev_rg:?}",
+                    segment.row_groups.first()
+                );
+            }
+            prev_rg = segment.row_groups.last().copied();
             // A part boundary is a batch boundary: the sequential reader opens
             // a fresh reader per part, so a part's last batch is short.
             if current_part != Some(segment.part) {
@@ -855,6 +957,14 @@ where
             }
             loop {
                 match rxs[seq % workers].recv() {
+                    // A disconnected channel means the worker returned without
+                    // sending `End`, which it does only by panicking: the
+                    // typed error below is returned, unwinds out of the scope,
+                    // and `thread::scope`'s join then re-raises the worker's
+                    // panic, superseding it. That precedence is intended — the
+                    // panic is the cause and this is the symptom — so the
+                    // message only has to be right for the impossible case
+                    // where the worker somehow returned cleanly.
                     Err(_) => {
                         return Err(internal(
                             "a pass-2 reader worker ended without closing its segment",
@@ -901,7 +1011,7 @@ fn read_segments_for_worker(
 ) {
     let mut seq = w;
     while seq < segments.len() {
-        let mut stream = match source.open_segment(&segments[seq], batch_size, None) {
+        let mut stream = match source.open_segment(&segments[seq], batch_size) {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx.send(SegMsg::Err(e.into()));
@@ -1071,6 +1181,7 @@ mod read_tests {
                 // Tiny rows: the read-ahead sizing must not silently collapse
                 // the worker count in these fixtures.
                 avg_geom_bytes: Some(8),
+                profile: MemoryProfile::Auto,
             },
             |batch, offset, _dur| {
                 if let Some(d) = stall {
@@ -1114,6 +1225,7 @@ mod read_tests {
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
+            profile: MemoryProfile::Auto,
         });
         let segments = source
             .read_segments(None, shape.segment_target_rows)
@@ -1239,6 +1351,7 @@ mod read_tests {
                     batch_size: 64,
                     workers: 4,
                     avg_geom_bytes: Some(8),
+                    profile: MemoryProfile::Auto,
                 },
                 |_batch, _offset, _dur| {
                     seen += 1;
@@ -1267,6 +1380,7 @@ mod read_tests {
             batch_size: 8192,
             workers: 4,
             avg_geom_bytes: Some(64),
+            profile: MemoryProfile::Auto,
         });
         assert!(shape.workers >= 1 && shape.workers <= 4);
         assert!(shape.depth >= READ_AHEAD_MIN_BATCHES);
@@ -1288,6 +1402,7 @@ mod read_tests {
             // 512 MiB per row: nothing is affordable.
             workers: 4,
             avg_geom_bytes: Some(512 * 1024 * 1024),
+            profile: MemoryProfile::Auto,
         });
         assert_eq!(shape.workers, 1, "an unaffordable read-ahead drops workers");
         assert!(shape.segment_target_rows >= 1);
@@ -1492,6 +1607,13 @@ impl Drop for SpillState {
     /// error that got us here is the one worth reporting — but a panic inside
     /// the writer is re-raised only when we are not already unwinding, since
     /// panicking in a `Drop` during an unwind aborts the process.
+    ///
+    /// The `resume_unwind` on the non-unwinding path is therefore deliberate,
+    /// not an oversight: a writer thread that panicked while the driver was
+    /// merely dropping its sinks has lost data, and swallowing that would turn
+    /// a crash into a silently truncated level. The double-panic abort is the
+    /// only case worth suppressing, and `thread::panicking()` is exactly that
+    /// guard.
     fn drop(&mut self) {
         self.tx = None;
         let Some(handle) = self.handle.take() else {
@@ -1690,6 +1812,15 @@ fn drain_sink(
             // Joining the writer here also folds its encode+write core-seconds
             // into `timers.spill_write`, so the stage split still accounts for
             // the I/O now that it no longer runs on the consumer thread.
+            //
+            // Known, bounded double-count: the join's own wait sits inside
+            // `t_drain` AND the joined writer's `write_time` lands in
+            // `spill_write`, so the two stages overlap by however long the
+            // writer was still behind at drain time — at most
+            // `SPILL_QUEUE_DEPTH + 1` batches' worth of encode. Left in place
+            // deliberately: excluding it would mean splitting the join out of
+            // the drain timer and losing the (real) wall time the drain spends
+            // waiting, which is the thing the drain counter exists to show.
             let (mut reader, _temp) = state.into_reader(timers)?;
             let err: std::cell::RefCell<Option<ConvertError>> = std::cell::RefCell::new(None);
             let iter = std::iter::from_fn(|| match reader.next() {

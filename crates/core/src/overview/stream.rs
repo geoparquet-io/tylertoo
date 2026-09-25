@@ -662,6 +662,7 @@ fn run_pass2_levels(
         batch_size: options.read_batch_size.max(1),
         workers: resolve_read_workers(options.read_workers),
         avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+        profile: options.profile,
     };
     let (level_stats, engine_timers): (Vec<LevelStat>, Pass2Timers) = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
@@ -3125,6 +3126,14 @@ fn run_pass1_with_chunk_rows(
 #[derive(Default)]
 pub(super) struct Pass2Timers {
     /// Parquet read + Arrow decode of the raw batch (`reader.next()`).
+    ///
+    /// Core-seconds, not wall: with `--read-workers > 1` this accumulates on
+    /// the reader worker threads (#494) and can exceed the pass's wall time —
+    /// that is the point, since it is what the parallel read overlaps. The
+    /// in-order merge's own cost (the `concat_batches` splice at a worker
+    /// seam, and the time the merge spends parked on `recv`) is deliberately
+    /// NOT counted here: the splice is charged to nobody, and counting the
+    /// `recv` wait would double-count time the workers are already reporting.
     read: AtomicU64,
     /// Winner selection + geometry take/decode to `geo::Geometry`.
     decode: AtomicU64,
@@ -3136,8 +3145,11 @@ pub(super) struct Pass2Timers {
     /// append). Previously invisible: it runs after the read loop finishes,
     /// one level at a time.
     drain: AtomicU64,
-    /// The bounded-profile Arrow IPC spill write (`SpillState::push`), on the
-    /// consumer thread. Previously invisible and byte-uncounted.
+    /// The bounded-profile Arrow IPC spill write: encode + write on the
+    /// per-level spill-writer thread (#494), folded in when that thread is
+    /// joined (`SpillState::into_reader`), not as batches are pushed. So it is
+    /// core-seconds off the consumer's critical path — it no longer runs in
+    /// `SpillState::push` and no longer runs on the consumer thread.
     spill_write: AtomicU64,
     /// Cascade-fold steps ([`process_batch_cascade`], #499) that reused
     /// (`Arc::clone`) the previous step's geometry because simplification
@@ -3422,7 +3434,7 @@ fn write_level_streaming(
                 |batch, offset, read_dur| {
                     if last_progress.elapsed().as_secs() >= 10 {
                         last_progress = Instant::now();
-                        log::info!("[convert] level {level_idx}: {offset} input row(s) scanned",);
+                        log::info!("[convert] level {level_idx}: {offset} input row(s) scanned");
                     }
                     Pass2Timers::add_dur(&timers.read, read_dur);
                     match process_level_batch(&batch, offset, ctx, timers)? {

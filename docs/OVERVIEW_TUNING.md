@@ -1255,11 +1255,11 @@ Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
-| `--read-batch-size N` | `8192` | rows per read batch | **bigger = faster-ish, more memory** |
+| `--read-batch-size N` | `8192` | rows per read batch (max 1048576) | **bigger = faster-ish, more memory** |
 | `--no-streaming` | off | flag | revert to the one-pass in-memory pipeline |
 | `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
 | `--in-flight-batches N\|auto` | `auto` | read batches in flight (auto = cores, clamped 4–16) | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
-| `--read-workers N\|auto` | `auto` | pass-2 reader threads (auto = cores/4, capped at 4) | parallel input read — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
+| `--read-workers N\|auto` | `auto` | pass-2 reader threads (auto = cores/4, capped at 4; explicit capped at 2× cores) | parallel input read — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
 
 **`--read-batch-size`** bounds the transient working set of both passes: each
 batch is decoded, filtered, simplified, and written before the next is read.
@@ -1545,7 +1545,10 @@ utilization when a few long-pole geometries otherwise stall the pipeline; each
 extra in-flight batch costs proportionally more peak RAM (`N × read_batch_size`
 rows resident, per pass — passes 1 and 2 never run concurrently, so this does
 not double). `--read-batch-size` (above) remains the rows-per-batch knob;
-`--in-flight-batches` is how many such batches coexist.
+`--in-flight-batches` is how many such batches coexist. Since #494 it is not
+the only resident-batch term: pass 2's readers hold `--read-workers` × their
+queue depth on top of it, and under `bounded` each level's spill writer holds
+up to three more (two queued plus the one it is encoding).
 
 **`--read-workers`** splits the pass-2 *read itself* across threads (#494).
 Parquet row groups are independently readable, so several threads can decode
@@ -1555,7 +1558,10 @@ output is byte-identical for every value (`crates/cli/tests/thread_count_determi
 checks `1` against `2` and `4` directly). `auto` takes a quarter of the
 machine's cores, capped at 4 — a reader thread decompresses and decodes, so it
 competes with the pool doing the simplification it is feeding, and past a
-handful of streams the device queue is saturated anyway.
+handful of streams the device queue is saturated anyway. An explicit value is
+honoured up to a ceiling of **2× the machine's cores** (at least 4); above that
+the CLI rejects it and the library clamps with a warning, because every worker
+is a thread plus its own read-ahead queue.
 
 Two things bound the win, both worth knowing before reaching for a bigger
 number:
@@ -1569,12 +1575,24 @@ number:
 - **The memory budget.** The read-ahead is sized against the same
   fraction-of-available-RAM budget the pass-2 sink uses (10% of it), so a small
   box, or a wide/vertex-heavy input, quietly gets fewer workers rather than a
-  larger resident set.
+  larger resident set. Under an explicit `--profile bounded` a worker's queue
+  is additionally capped at half its usual maximum depth.
+
+  That bound is a **model**, not a measurement: the budget is charged
+  `workers × depth × read_batch_size × per_row`, and `per_row` is the sink's
+  own estimate — a fixed ~4 KiB non-geometry term plus twice pass 1's measured
+  per-row geometry bytes. A schema whose non-geometry columns cost far more
+  than that term is priced too cheaply and the read-ahead can exceed its
+  nominal share. On a run sized to the last hundred MB, measure; on a wide
+  schema, `--read-workers 1` removes the term entirely.
 
 Remote inputs always read sequentially: a remote source's parts share one
 in-memory chunk cache that concurrent readers would evict out from under each
-other. Stage to local disk first (which a remote convert already does) and the
-local re-read parallelizes normally.
+other. **Staging does not change this.** A remote convert's pass-0 staging
+fills that same per-part cache and its disk spill; it does not turn the source
+into a local one, so the pass-2 read stays sequential for the whole run. If you
+want the parallel read on remote data, land the file locally yourself (`gpio`,
+`aws s3 cp`) and convert from the local path.
 
 ⚠️ **musl binaries v0.7.1 and earlier — prefer `--profile bounded` on large
 duplicating runs.** The `x86_64-unknown-linux-musl` release binary up to and

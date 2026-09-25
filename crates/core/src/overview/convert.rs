@@ -469,8 +469,10 @@ pub struct ConvertOptions {
     /// `1` reproduces the single sequential reader byte-for-byte, and so does
     /// every other value — workers own disjoint runs of row groups and an
     /// in-order merge re-chunks their output into exactly the batch sequence
-    /// one reader would have produced. Ignored for remote inputs (see
-    /// [`super::pipeline`]) and when `streaming` is `false`.
+    /// one reader would have produced. Explicit values are honoured up to
+    /// [`read_workers_ceiling`] and clamped (with a warning) above it. Ignored
+    /// for remote inputs (see [`super::pipeline`]) and when `streaming` is
+    /// `false`.
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -646,14 +648,29 @@ pub const READ_WORKERS_AUTO: usize = 0;
 /// resident batches rather than throughput.
 pub const READ_WORKERS_MAX: usize = 4;
 
+/// Hard ceiling on an EXPLICIT `read_workers` value (the auto path has its own,
+/// much lower, [`READ_WORKERS_MAX`]).
+///
+/// Twice the machine's cores, never below [`READ_WORKERS_MAX`]. An explicit
+/// value is the caller's call and is honoured up to here; past it the number is
+/// not a tuning choice but a typo or an overflowing computation, and every
+/// worker is a thread plus its own read-ahead queue.
+pub fn read_workers_ceiling() -> usize {
+    std::thread::available_parallelism()
+        .map_or(READ_WORKERS_MAX, |n| n.get().saturating_mul(2))
+        .max(READ_WORKERS_MAX)
+}
+
 /// Resolve a requested pass-2 reader-thread count to a concrete one.
 ///
 /// [`READ_WORKERS_AUTO`] (0) takes a QUARTER of the machine's cores, clamped
 /// to `[1, READ_WORKERS_MAX]` — a quarter because pass 2's readers run
 /// alongside the rayon pool that does the per-batch simplification, and taking
 /// a larger share slows the compute it is feeding (12 cores → 3 readers). Any
-/// explicit positive value is honoured verbatim; the caller opted in to the
-/// memory cost, which the engine still bounds against the memory budget.
+/// explicit positive value is honoured verbatim **up to
+/// [`read_workers_ceiling`]**; the caller opted in to the memory cost, which
+/// the engine still bounds against the memory budget. Above the ceiling the
+/// value is clamped and a warning is logged.
 ///
 /// Output is byte-identical for every value — see [`super::pipeline`]'s
 /// in-order merge, and the `--read-workers 1` vs `4` byte comparison in
@@ -665,7 +682,15 @@ pub fn resolve_read_workers(requested: usize) -> usize {
             .unwrap_or(1)
             .clamp(1, READ_WORKERS_MAX)
     } else {
-        requested.max(1)
+        let ceiling = read_workers_ceiling();
+        let resolved = requested.clamp(1, ceiling);
+        if resolved != requested {
+            log::warn!(
+                "[convert] read_workers {requested} is above the ceiling of {ceiling} \
+                 (2× this machine's cores); using {resolved}"
+            );
+        }
+        resolved
     }
 }
 
@@ -7900,17 +7925,42 @@ mod tests {
         );
     }
 
-    /// Pipelined output must be invariant to batching/overlap knobs
-    /// (`read_batch_size`, `in_flight_batches`) — proving the ordered-sink /
-    /// no-reorder-buffer invariant holds regardless of how the single read is
-    /// chunked or how many batches overlap in flight.
+    /// Pipelined output must be invariant to batching/overlap/read knobs
+    /// (`read_batch_size`, `in_flight_batches`, `read_workers`) — proving the
+    /// ordered-sink / no-reorder-buffer invariant holds regardless of how the
+    /// single read is chunked, how many batches overlap in flight, or how many
+    /// threads produced them.
+    ///
+    /// The fixture is written with SMALL ROW GROUPS on purpose. Every other
+    /// real-data fixture in this suite is a single row group, which cannot be
+    /// split at all — a `read_workers` sweep over one of those exercises the
+    /// sequential path four times and proves nothing about the in-order merge.
     #[test]
     fn pipelined_invariant_to_batching_knobs() {
         use super::super::stream::Pass2Strategy;
+        use crate::input_set::ConvertSource;
 
         let geoms = grid_points(600);
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        write_input(tin.path(), &geoms, false, None);
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // 15 row groups of 40 rows: splittable at every read-ahead depth the
+        // memory model can pick (its segment target is `(depth - 1) ×
+        // read_batch_size`, i.e. 21 rows at the floor depth of 4 and 217 at
+        // the ceiling of 32 for the reference `read_batch_size` of 7).
+        write_input_partition(&input, &geoms, 0..geoms.len(), Some(40));
+
+        // Guard the guard: if this fixture ever stops splitting, the
+        // read_workers arms below silently become a sequential-path sweep.
+        let src = ConvertSource::resolve(input.to_str().unwrap()).unwrap();
+        for target in [3 * 7, 31 * 7] {
+            let segments = src.read_segments(None, target).unwrap();
+            assert!(
+                segments.len() > 1,
+                "fixture must split into reader segments at target {target}: got {} segment(s)",
+                segments.len()
+            );
+        }
+        drop(src);
 
         let base = ConvertOptions {
             mode: Mode::Duplicating,
@@ -7921,28 +7971,40 @@ mod tests {
             ..Default::default()
         };
 
-        let convert = |read_batch_size: usize, in_flight_batches: usize| {
+        let convert = |read_batch_size: usize, in_flight_batches: usize, read_workers: usize| {
             let opts = ConvertOptions {
                 read_batch_size,
                 in_flight_batches,
+                read_workers,
                 ..base.clone()
             };
             let out = tempfile::NamedTempFile::new().unwrap();
-            convert_to_overviews_strategy(tin.path(), out.path(), &opts, Pass2Strategy::Pipelined)
+            convert_to_overviews_strategy(&input, out.path(), &opts, Pass2Strategy::Pipelined)
                 .unwrap();
             out
         };
 
-        let reference = convert(7, 1);
-        // ifb = 0 is the IN_FLIGHT_BATCHES_AUTO sentinel: it must produce the
-        // same output as any explicit depth (auto only changes overlap, not
-        // level assignment or write order).
-        for (rbs, ifb) in [(64usize, 4usize), (4096, 8), (8192, 0)] {
-            let candidate = convert(rbs, ifb);
+        // The reference is the single sequential reader at the smallest
+        // chunking, which is the shape every other arm must reproduce.
+        let reference = convert(7, 1, 1);
+        // `ifb`/`workers` of 0 are the AUTO sentinels: they must produce the
+        // same output as any explicit value (auto only changes overlap and
+        // thread count, not level assignment or write order). The small
+        // `read_batch_size` arms are the ones that actually take the parallel
+        // path — a large batch makes the whole fixture one segment again.
+        for (rbs, ifb, workers) in [
+            (7usize, 1usize, 2usize),
+            (7, 4, 4),
+            (7, 2, 0),
+            (64, 4, 3),
+            (4096, 8, 2),
+            (8192, 0, 0),
+        ] {
+            let candidate = convert(rbs, ifb, workers);
             assert_outputs_equivalent(
                 reference.path(),
                 candidate.path(),
-                &format!("read_batch_size={rbs} in_flight_batches={ifb}"),
+                &format!("read_batch_size={rbs} in_flight_batches={ifb} read_workers={workers}"),
             );
         }
     }
@@ -7970,6 +8032,43 @@ mod tests {
             resolve_in_flight_batches(IN_FLIGHT_BATCHES_MAX + 100),
             IN_FLIGHT_BATCHES_MAX + 100
         );
+    }
+
+    /// The `--read-workers` resolution contract (#494): auto stays inside the
+    /// conservative cap, explicit values are honoured, and an explicit value
+    /// above the ceiling is clamped rather than spawning it (or, as the
+    /// decrement loop in `resolve_read_shape` used to, hanging on it).
+    #[test]
+    fn resolve_read_workers_auto_and_explicit() {
+        // Auto takes a quarter of the cores, clamped to [1, READ_WORKERS_MAX].
+        let auto = resolve_read_workers(READ_WORKERS_AUTO);
+        assert!(
+            (1..=READ_WORKERS_MAX).contains(&auto),
+            "auto read-workers {auto} outside [1, {READ_WORKERS_MAX}]"
+        );
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        assert_eq!(
+            auto,
+            (cores / 4).clamp(1, READ_WORKERS_MAX),
+            "auto must equal a quarter of the core count, clamped"
+        );
+
+        // The ceiling is at least the auto cap, and at least 2 cores' worth.
+        let ceiling = read_workers_ceiling();
+        assert!(ceiling >= READ_WORKERS_MAX);
+
+        // Explicit values pass through verbatim up to the ceiling — including
+        // above the AUTO cap, which is the whole point of passing one.
+        assert_eq!(resolve_read_workers(1), 1);
+        assert_eq!(resolve_read_workers(ceiling), ceiling);
+        assert_eq!(resolve_read_workers(READ_WORKERS_MAX), READ_WORKERS_MAX);
+
+        // Above the ceiling: clamped, never honoured. `usize::MAX` is the
+        // regression case — it used to drive an O(workers) decrement loop.
+        assert_eq!(resolve_read_workers(ceiling + 1), ceiling);
+        assert_eq!(resolve_read_workers(usize::MAX), ceiling);
     }
 
     #[test]

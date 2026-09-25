@@ -91,7 +91,8 @@ fn size_limit_opt(n: usize) -> Option<usize> {
 }
 
 /// Parse `--in-flight-batches`: `auto` (→ the core-sized sentinel 0) or an
-/// explicit positive integer. See [`resolve_in_flight_batches`] for how the
+/// explicit positive integer. See
+/// [`tylertoo_core::overview::convert::resolve_in_flight_batches`] for how the
 /// sentinel is expanded at pass-2 setup.
 fn parse_in_flight_batches(s: &str) -> Result<usize, String> {
     if s.eq_ignore_ascii_case("auto") {
@@ -104,15 +105,46 @@ fn parse_in_flight_batches(s: &str) -> Result<usize, String> {
     }
 }
 
+/// Parse `--read-batch-size`: a positive row count, capped at
+/// [`READ_BATCH_SIZE_MAX`].
+///
+/// A batch is fully resident and several coexist (in flight, plus the readers'
+/// read-ahead), so an absurd row count is an out-of-memory abort rather than a
+/// tuning choice — better rejected at parse time with the ceiling named.
+fn parse_read_batch_size(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("read-batch-size must be >= 1".to_string()),
+        Ok(n) if n > READ_BATCH_SIZE_MAX => Err(format!(
+            "read-batch-size must be <= {READ_BATCH_SIZE_MAX} (a batch is fully resident)"
+        )),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("expected a positive integer, got `{s}`")),
+    }
+}
+
+/// Ceiling on `--read-batch-size`. One million rows of even trivial geometry
+/// is already a multi-hundred-MB batch; past that the knob stops bounding
+/// memory and starts defeating it.
+const READ_BATCH_SIZE_MAX: usize = 1_048_576;
+
 /// Parse `--read-workers`: `auto` (→ the core-sized sentinel 0) or an
-/// explicit positive integer. See [`resolve_read_workers`] for how the
-/// sentinel is expanded at pass-2 setup.
+/// explicit positive integer, capped at
+/// [`tylertoo_core::overview::convert::read_workers_ceiling`] (2× this
+/// machine's cores). See
+/// [`tylertoo_core::overview::convert::resolve_read_workers`] for how the
+/// sentinel is expanded at pass-2 setup; the core clamps out-of-range values
+/// with a warning, and this mirrors the bound as a clear parse error.
 fn parse_read_workers(s: &str) -> Result<usize, String> {
     if s.eq_ignore_ascii_case("auto") {
         return Ok(tylertoo_core::overview::convert::READ_WORKERS_AUTO);
     }
+    let ceiling = tylertoo_core::overview::convert::read_workers_ceiling();
     match s.parse::<usize>() {
         Ok(0) => Err("read-workers must be `auto` or >= 1".to_string()),
+        Ok(n) if n > ceiling => Err(format!(
+            "read-workers must be `auto` or 1..={ceiling} (2× this machine's cores); \
+             every worker is a thread plus its own read-ahead queue"
+        )),
         Ok(n) => Ok(n),
         Err(_) => Err(format!("expected `auto` or a positive integer, got `{s}`")),
     }
@@ -1104,11 +1136,13 @@ struct ConvertTuningArgs {
     /// LARGER batches amortize per-batch overhead (slightly faster) at the
     /// cost of proportionally more peak memory; SMALLER batches bound memory
     /// tighter. The default (8192) keeps per-batch transients in the tens of
-    /// MB even for vertex-heavy polygon data. No effect with --no-streaming.
+    /// MB even for vertex-heavy polygon data. Capped at 1048576 rows. No
+    /// effect with --no-streaming.
     #[arg(
         long,
         value_name = "ROWS",
         default_value = "8192",
+        value_parser = parse_read_batch_size,
         help_heading = "Memory & performance"
     )]
     read_batch_size: usize,
@@ -1141,7 +1175,10 @@ struct ConvertTuningArgs {
     /// improves core utilization on long-pole geometries at proportionally
     /// more peak memory (in-flight-batches × read-batch-size rows resident,
     /// PER PASS — passes 1 and 2 never run concurrently, so this does not
-    /// double). The chosen depth and detected core count are logged at the
+    /// double). This is no longer the only resident-batch term: pass 2's
+    /// readers hold their own read-ahead on top (--read-workers × its queue
+    /// depth), and under --profile bounded each level's spill writer holds up
+    /// to 3 more. The chosen depth and detected core count are logged at the
     /// start of each pass. No effect with --no-streaming.
     #[arg(
         long,
@@ -1159,17 +1196,22 @@ struct ConvertTuningArgs {
     /// read order. `auto` (the default) takes a quarter of the machine's
     /// cores, capped at 4 — readers decompress and decode, so they compete
     /// with the pool doing the simplification they are feeding. `1` is the
-    /// single sequential reader.
+    /// single sequential reader. An explicit value is honoured up to a ceiling
+    /// of 2× this machine's cores (at least 4); above that it is rejected.
     ///
     /// Output is byte-identical for every value: workers own disjoint runs of
     /// row groups and the merge reproduces exactly the batch sequence one
     /// reader would have produced.
     ///
     /// Remote inputs always read sequentially (concurrent readers over one
-    /// remote source evict each other's fetched chunks). The read-ahead is
-    /// sized against the same memory budget the pass-2 sink uses, so a small
-    /// box quietly gets fewer workers. Helps most when the input's row groups
-    /// are small relative to that budget — `gpio` writes well-sized ones.
+    /// remote source evict each other's fetched chunks) — including a remote
+    /// input the run has staged to local disk, since staging is per-part and
+    /// the source stays remote. The read-ahead is sized against a modelled
+    /// slice of the same memory budget the pass-2 sink uses (and each worker's
+    /// queue is capped shallower under --profile bounded), so a small box, or a
+    /// wide input, quietly gets fewer workers. Helps most when the input's row
+    /// groups are small relative to that budget — `gpio` writes well-sized
+    /// ones.
     #[arg(
         long,
         value_name = "N|auto",
@@ -3298,6 +3340,42 @@ mod tests {
         // Explicit 0 is rejected (use `auto`); non-numeric is rejected.
         assert!(parse_in_flight_batches("0").is_err());
         assert!(parse_in_flight_batches("banana").is_err());
+    }
+
+    #[test]
+    fn parse_read_workers_accepts_auto_and_positive() {
+        // `auto` maps to the core-sized sentinel; case-insensitive.
+        assert_eq!(
+            parse_read_workers("auto").unwrap(),
+            tylertoo_core::overview::convert::READ_WORKERS_AUTO
+        );
+        assert_eq!(parse_read_workers("AUTO").unwrap(), 0);
+        // Explicit positive integers pass through, up to the ceiling.
+        assert_eq!(parse_read_workers("1").unwrap(), 1);
+        let ceiling = tylertoo_core::overview::convert::read_workers_ceiling();
+        assert_eq!(parse_read_workers(&ceiling.to_string()).unwrap(), ceiling);
+        // Explicit 0 is rejected (use `auto`); non-numeric is rejected; a
+        // value above the ceiling is rejected with the ceiling named, rather
+        // than reaching the engine as a thread count.
+        assert!(parse_read_workers("0").is_err());
+        assert!(parse_read_workers("banana").is_err());
+        let err = parse_read_workers(&usize::MAX.to_string()).unwrap_err();
+        assert!(
+            err.contains(&ceiling.to_string()),
+            "the rejection must name the ceiling, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_read_batch_size_rejects_zero_and_absurd() {
+        assert_eq!(parse_read_batch_size("8192").unwrap(), 8192);
+        assert_eq!(
+            parse_read_batch_size(&READ_BATCH_SIZE_MAX.to_string()).unwrap(),
+            READ_BATCH_SIZE_MAX
+        );
+        assert!(parse_read_batch_size("0").is_err());
+        assert!(parse_read_batch_size("banana").is_err());
+        assert!(parse_read_batch_size(&(READ_BATCH_SIZE_MAX + 1).to_string()).is_err());
     }
 
     #[test]
