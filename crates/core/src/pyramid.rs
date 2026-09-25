@@ -520,44 +520,85 @@ fn warn_implicit_layer_overlaps(bands: &[Band]) {
     warn_pairs(&implicit_layer_overlaps(bands));
 }
 
-/// How a band's declared `min_zoom..=max_zoom` relates to the zoom range its
-/// archive actually holds (`header.min_zoom..=header.max_zoom`), for a
-/// pre-tiled band (#495).
+/// How a band's declared `min_zoom..=max_zoom` relates to what its archive
+/// actually contains, for a pre-tiled band (#495, reworked for #514).
 ///
-/// This is a three-way contract, not a binary match/mismatch:
+/// Since #380/#390 an archive's header `min_zoom..=max_zoom` is only a
+/// *declaration*: a writer widens it over an empty zoom so a client sees the
+/// range it was told to expect even where nothing was written. Keying this
+/// contract off that field alone produced two opposite bugs for the very
+/// same underlying tiles: a widened header made an effectively-empty band
+/// look like a legitimate subrange (accepted silently, contributing nothing,
+/// while the merged metadata still declared it); an honest, narrow header
+/// made a band that fully covered the archive's real tiles look like an
+/// error. #514 classifies against the archive's *actual* tile range —
+/// [`ArchiveIndex::actual_zoom_range`] — instead, and falls back to the
+/// header's declared range only for the one thing actual content cannot
+/// decide: whether a band that misses every real tile was at least within
+/// what the archive was declared to cover.
 ///
-/// * [`Disjoint`](Self::Disjoint) — the two ranges share no zoom at all.
-///   There is no interpretation under which this band could write anything;
-///   always an error.
-/// * [`Overshoot`](Self::Overshoot) — the ranges overlap, but the band
-///   declares at least one zoom the archive does not have. Those zooms
-///   would render silently empty, which is almost always a `--band` range
-///   that disagrees with what the archive was actually tiled with. An error
-///   by default; downgradable to a warning for a deliberately sparse
+/// * [`Disjoint`](Self::Disjoint) — the band shares no zoom with what the
+///   archive *declares*, let alone what it actually holds. There is no
+///   interpretation under which this band could write anything; always an
+///   error.
+/// * [`EmptyArchive`](Self::EmptyArchive) — the archive holds no tiles at
+///   all, whatever its header says. Treated like [`Overshoot`](Self::Overshoot):
+///   an error by default, downgradable with `--allow-missing-zooms`.
+/// * [`DeclaredButEmpty`](Self::DeclaredButEmpty) — the band shares no zoom
+///   with what the archive actually holds, but does share one with what its
+///   header declares. The band contributes nothing, which is always worth a
+///   warning, but is not a configuration error: the header's own
+///   declaration says this span may legitimately be empty (#380's "an empty
+///   zoom is just an absent tile", applied to a `--band` range instead of a
+///   whole archive). Never gated behind a flag — there is no real tile to
+///   lose.
+/// * [`Overshoot`](Self::Overshoot) — the band overlaps the archive's actual
+///   tiles, but does not cover all of them: some zoom the archive genuinely
+///   holds falls outside the band's declared range and would be dropped. An
+///   error by default; downgradable to a warning for a deliberately sparse
 ///   pyramid.
-/// * [`Subrange`](Self::Subrange) — the band's range is fully contained in
-///   the archive's. Fully supported and unremarkable: it is the documented
-///   way to split one pre-tiled archive across several bands (e.g. two
-///   `--band` entries pointing at the same z0-z13 archive, one declaring
-///   z0-5 and the other z6-13). The per-tile drop count at the merge site
-///   still applies (tiles outside the declared subrange are not copied),
-///   but only at `log::info`.
+/// * [`Subrange`](Self::Subrange) — the band's range and the archive's
+///   actual range contain one another (either direction). Fully supported
+///   and unremarkable: a band narrower than the archive's actual tiles is
+///   the documented way to split one pre-tiled archive across several bands
+///   (e.g. two `--band` entries pointing at the same z0-z13 archive, one
+///   declaring z0-5 and the other z6-13); a band wider than the archive's
+///   actual tiles simply declares zooms the archive never wrote, which is
+///   harmless since nothing real falls outside it. The per-tile drop count
+///   at the merge site still applies in the narrower direction (tiles
+///   outside the declared subrange are not copied), but only at
+///   `log::info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RangeFit {
     Disjoint,
+    EmptyArchive,
+    DeclaredButEmpty,
     Overshoot,
     Subrange,
 }
 
-/// Classify `band`'s declared range against an archive's actual
-/// `min_zoom..=max_zoom`. See [`RangeFit`].
-fn band_archive_range_fit(band: &Band, archive_min: u8, archive_max: u8) -> RangeFit {
-    if band.max_zoom < archive_min || band.min_zoom > archive_max {
-        RangeFit::Disjoint
-    } else if band.min_zoom < archive_min || band.max_zoom > archive_max {
-        RangeFit::Overshoot
-    } else {
+/// Classify `band`'s declared range against an archive's declared header
+/// range (`declared`) and its actual tile range (`actual`, `None` when the
+/// archive holds no tiles). See [`RangeFit`].
+fn band_archive_range_fit(band: &Band, declared: (u8, u8), actual: Option<(u8, u8)>) -> RangeFit {
+    let (d_lo, d_hi) = declared;
+    let Some((a_lo, a_hi)) = actual else {
+        return RangeFit::EmptyArchive;
+    };
+    let overlaps_actual = band.min_zoom <= a_hi && band.max_zoom >= a_lo;
+    if !overlaps_actual {
+        return if band.min_zoom <= d_hi && band.max_zoom >= d_lo {
+            RangeFit::DeclaredButEmpty
+        } else {
+            RangeFit::Disjoint
+        };
+    }
+    let band_covers_actual = band.min_zoom <= a_lo && band.max_zoom >= a_hi;
+    let actual_covers_band = a_lo <= band.min_zoom && a_hi >= band.max_zoom;
+    if band_covers_actual || actual_covers_band {
         RangeFit::Subrange
+    } else {
+        RangeFit::Overshoot
     }
 }
 
@@ -570,49 +611,96 @@ fn zoom_span(lo: u8, hi: u8) -> String {
     }
 }
 
-/// The zoom(s) an [`RangeFit::Overshoot`] band declares that its archive does
-/// not hold, for the error/warning message.
-fn missing_zoom_span(band: &Band, archive_min: u8, archive_max: u8) -> String {
+/// The zoom(s) an [`RangeFit::Overshoot`] band's archive genuinely holds but
+/// the band's declared range excludes -- real tiles that would be dropped --
+/// for the error/warning message.
+///
+/// Reversed from #495's `missing_zoom_span`: that function reported the
+/// zooms the *band* declared beyond the *header*, back when `Overshoot` meant
+/// "band wider than archive". #514 redefines `Overshoot` as "archive's
+/// actual tiles wider than band" (see [`RangeFit`]), so this reports the
+/// other direction -- the archive's actual span outside the band.
+fn dropped_zoom_span(band: &Band, actual_min: u8, actual_max: u8) -> String {
     let mut parts = Vec::new();
-    if band.min_zoom < archive_min {
-        parts.push(zoom_span(band.min_zoom, archive_min - 1));
+    if actual_min < band.min_zoom {
+        parts.push(zoom_span(actual_min, band.min_zoom - 1));
     }
-    if band.max_zoom > archive_max {
-        parts.push(zoom_span(archive_max + 1, band.max_zoom));
+    if actual_max > band.max_zoom {
+        parts.push(zoom_span(band.max_zoom + 1, actual_max));
     }
     parts.join(" and ")
 }
 
-/// Validate one band's declared zoom range against what its archive actually
-/// holds (issue #495), right after [`BandArchive::open`] has read the
-/// header. See [`RangeFit`] for the three-way contract this enforces.
+/// Validate one band's declared zoom range against its archive's declared
+/// header range and its actual tile range (#495, reworked for #514), right
+/// after [`BandArchive::open`] has read both. See [`RangeFit`] for the
+/// five-way contract this enforces.
 ///
-/// `allow_missing_zooms` downgrades the [`RangeFit::Overshoot`] case from an
-/// error to a warning, for a caller building a deliberately sparse pyramid.
-/// It has no effect on [`RangeFit::Disjoint`], which is always an error —
-/// there is no flag that makes an impossible range possible.
+/// `allow_missing_zooms` downgrades [`RangeFit::Overshoot`] and
+/// [`RangeFit::EmptyArchive`] from an error to a warning, for a caller
+/// building a deliberately sparse pyramid. It has no effect on
+/// [`RangeFit::Disjoint`], which is always an error -- there is no flag that
+/// makes an impossible range possible -- nor on [`RangeFit::DeclaredButEmpty`],
+/// which is never an error in the first place.
 fn check_band_zoom_range(
     band: &Band,
-    header: &Header,
+    archive: &BandArchive,
     allow_missing_zooms: bool,
 ) -> Result<(), Error> {
-    let (a_lo, a_hi) = (header.min_zoom, header.max_zoom);
-    match band_archive_range_fit(band, a_lo, a_hi) {
+    let header = archive.header();
+    let declared = (header.min_zoom, header.max_zoom);
+    let actual = archive.actual_zoom_range()?;
+    match band_archive_range_fit(band, declared, actual) {
         RangeFit::Subrange => Ok(()),
         RangeFit::Disjoint => Err(Error::PMTilesWrite(format!(
-            "band {:?} ({}) declares {} but that archive holds {}, entirely outside \
+            "band {:?} ({}) declares {} but that archive declares {}, entirely outside \
              the band's range; there is no zoom this band could write",
             band.layer,
             band.input.display(),
             zoom_span(band.min_zoom, band.max_zoom),
-            zoom_span(a_lo, a_hi),
+            zoom_span(declared.0, declared.1),
         ))),
-        RangeFit::Overshoot => {
-            let missing = missing_zoom_span(band, a_lo, a_hi);
+        RangeFit::EmptyArchive => {
             if allow_missing_zooms {
                 log::warn!(
-                    "band {:?} declares {} but {} holds {}; zooms {missing} will be \
-                     silently empty (allowed by --allow-missing-zooms)",
+                    "band {:?} declares {} but {} holds no tiles at all; this band will \
+                     contribute nothing (allowed by --allow-missing-zooms)",
+                    band.layer,
+                    zoom_span(band.min_zoom, band.max_zoom),
+                    band.input.display(),
+                );
+                Ok(())
+            } else {
+                Err(Error::PMTilesWrite(format!(
+                    "band {:?} declares {} but {} holds no tiles at all; pass \
+                     --allow-missing-zooms (or set PyramidOptions::allow_missing_zooms) for \
+                     a deliberately sparse pyramid",
+                    band.layer,
+                    zoom_span(band.min_zoom, band.max_zoom),
+                    band.input.display(),
+                )))
+            }
+        }
+        RangeFit::DeclaredButEmpty => {
+            log::warn!(
+                "band {:?} declares {} but {} holds no tiles in that span (its header \
+                 declares {}); this band will contribute nothing",
+                band.layer,
+                zoom_span(band.min_zoom, band.max_zoom),
+                band.input.display(),
+                zoom_span(declared.0, declared.1),
+            );
+            Ok(())
+        }
+        RangeFit::Overshoot => {
+            // Only reachable when `actual` is `Some` (`EmptyArchive` is
+            // matched above), so this unwrap cannot fail.
+            let (a_lo, a_hi) = actual.expect("Overshoot implies a non-empty actual range");
+            let dropped = dropped_zoom_span(band, a_lo, a_hi);
+            if allow_missing_zooms {
+                log::warn!(
+                    "band {:?} declares {} but {} holds {}; zooms {dropped} will be \
+                     silently dropped (allowed by --allow-missing-zooms)",
                     band.layer,
                     zoom_span(band.min_zoom, band.max_zoom),
                     band.input.display(),
@@ -621,8 +709,8 @@ fn check_band_zoom_range(
                 Ok(())
             } else {
                 Err(Error::PMTilesWrite(format!(
-                    "band {:?} declares {} but {} holds {}; zooms {missing} would be \
-                     silently empty; pass --allow-missing-zooms (or set \
+                    "band {:?} declares {} but {} holds {}; zooms {dropped} would be \
+                     silently dropped; pass --allow-missing-zooms (or set \
                      PyramidOptions::allow_missing_zooms) for a deliberately sparse pyramid",
                     band.layer,
                     zoom_span(band.min_zoom, band.max_zoom),
@@ -847,6 +935,12 @@ impl BandArchive {
     /// The archive's own header bounds, when they describe a real box.
     fn bounds(&self) -> Option<TileBounds> {
         self.index.bounds()
+    }
+
+    /// The archive's actual zoom range -- see
+    /// [`ArchiveIndex::actual_zoom_range`].
+    fn actual_zoom_range(&self) -> Result<Option<(u8, u8)>, Error> {
+        self.index.actual_zoom_range()
     }
 
     /// Hand every addressed tile to `f` as `(z, x, y, still-compressed bytes)`.
@@ -1089,6 +1183,25 @@ pub fn build_pyramid(
         .collect();
     warn_pairs(&source_involved);
 
+    // #514: validate every pre-tiled Archive band's declared zoom range now,
+    // before any Source band below is tiled. A header plus directory read is
+    // a few hundred bytes even for a dense pyramid — cheap enough to spend on
+    // every Archive band up front — whereas the equivalent check inside
+    // `merge_bands_with_options` used to run only after every GeoParquet
+    // band in the build had already been fully converted and exported. On a
+    // mixed build a typo'd `--band` range on one archive therefore surfaced
+    // only after the other bands' hours of tiling were already sunk.
+    // `merge_bands_with_options` still repeats this exact check on `tiled`
+    // below — that is `merge_bands`'s own contract for a caller who invokes
+    // it directly, skipping `build_pyramid` entirely — so the redundancy
+    // here is intentional.
+    for (band, kind) in bands.iter().zip(&kinds) {
+        if *kind == BandSource::Archive {
+            let archive = BandArchive::open(&band.input, &band.layer)?;
+            check_band_zoom_range(band, &archive, opts.allow_missing_zooms)?;
+        }
+    }
+
     // Keeps every intermediate alive for the merge and unlinks them on drop —
     // including the early-return paths below.
     let mut scratch: Vec<NamedTempFile> = Vec::new();
@@ -1224,6 +1337,19 @@ pub fn merge_bands_with_options(
     if let Some(min_zoom) = bands.iter().map(|b| b.min_zoom).min() {
         writer.set_declared_min_zoom(min_zoom);
     }
+    // #514's mirror at the top end: `--allow-missing-zooms` lets a band
+    // declare deeper zooms than its archive actually has (`RangeFit::Overshoot`,
+    // downgraded by the flag), and `LayerMeta` below always uses the band's
+    // own `max_zoom` for `vector_layers[].maxzoom` regardless of what the
+    // archive holds. Without this, the header's `max_zoom` stayed pinned to
+    // the deepest tile actually copied, so a client reading the header (the
+    // pmtiles JS protocol builds TileJSON from it) disagreed with one
+    // building it from `vector_layers`. Declared wins at both ends, same as
+    // the minimum: the writer widens over empty zooms and never narrows over
+    // real tiles.
+    if let Some(max_zoom) = bands.iter().map(|b| b.max_zoom).max() {
+        writer.set_declared_max_zoom(max_zoom);
+    }
     let mut layers: Vec<LayerMeta> = Vec::new();
     let mut per_band = Vec::new();
     let mut skipped_total = 0usize;
@@ -1247,7 +1373,7 @@ pub fn merge_bands_with_options(
         // #495: catch a band whose declared range the archive cannot honor
         // before any tile is touched.
         for (band, archive) in bands.iter().zip(&archives) {
-            check_band_zoom_range(band, archive.header(), allow_missing_zooms)?;
+            check_band_zoom_range(band, archive, allow_missing_zooms)?;
         }
         // validate_bands only sees the labels, not what is actually inside
         // each archive's tiles; this is the check that catches the mismatch.
@@ -1379,7 +1505,7 @@ pub fn merge_bands_with_options(
         let archive = BandArchive::open(&band.input, &band.layer)?;
         // #495: catch a band whose declared range the archive cannot honor
         // before any tile is touched.
-        check_band_zoom_range(band, archive.header(), allow_missing_zooms)?;
+        check_band_zoom_range(band, &archive, allow_missing_zooms)?;
         track_band_bounds(band, &archive, &mut union, &mut bands_without_bounds);
         let mut n = 0usize;
         let mut skipped = 0usize;
@@ -1813,6 +1939,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("overlap at zoom 3"), "{err}");
+        assert!(!out.exists(), "nothing should be written on a bad plan");
+    }
+
+    /// #514 issue #4: a pre-tiled Archive band's zoom range is validated
+    /// before any Source band is tiled, not only inside `merge_bands` after
+    /// every GeoParquet band has already been fully converted and exported.
+    ///
+    /// Ordering observable: the Source band here points at a GeoParquet file
+    /// that does not exist, so tiling it fails immediately with a "convert
+    /// failed" error. The Archive band's range is disjoint from its
+    /// archive's declared header. If the archive's range were only checked
+    /// at the merge site (the old behavior), `build_pyramid`'s sequential
+    /// loop would reach and fail on the Source band first, and the error
+    /// returned would be the "convert failed" one. Getting the zoom-range
+    /// error instead proves the Archive band was validated up front, before
+    /// the Source band was ever touched.
+    #[test]
+    fn build_pyramid_validates_archive_band_ranges_before_tiling_source_bands() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let archive = dir.path().join("archive.pmtiles");
+        write_band(
+            &archive,
+            "pre",
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        // Never written -- if this band were tiled at all, `convert` would
+        // fail on the missing file before the archive band's range is even
+        // looked at.
+        let missing_source = dir.path().join("does-not-exist.parquet");
+        let out = dir.path().join("out.pmtiles");
+
+        let err = build_pyramid(
+            &[
+                Band {
+                    input: missing_source,
+                    layer: "fine".to_string(),
+                    min_zoom: 6,
+                    max_zoom: 7,
+                },
+                Band {
+                    input: archive,
+                    layer: "pre".to_string(),
+                    min_zoom: 8,
+                    max_zoom: 10,
+                },
+            ],
+            &out,
+            &PyramidOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("z8-10") && msg.contains("z3-5") && msg.contains("declares"),
+            "expected the archive band's zoom-range error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("convert failed"),
+            "the Source band must not have been tiled yet: {msg}"
+        );
         assert!(!out.exists(), "nothing should be written on a bad plan");
     }
 
@@ -2315,6 +2504,33 @@ mod tests {
         w.finalize(path).unwrap();
     }
 
+    /// Like [`write_band`], but able to declare a min and/or max zoom beyond
+    /// the tiles actually written -- what a real per-band export does under
+    /// #380 (min) and its #514 mirror (max), and what an externally-produced
+    /// archive might do honestly (both `None`) or with a widened header.
+    fn write_band_declared_range(
+        path: &Path,
+        layer: &str,
+        tiles: &[(u8, u32, u32)],
+        bounds: TileBounds,
+        declared_min_zoom: Option<u8>,
+        declared_max_zoom: Option<u8>,
+    ) {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name(layer);
+        w.set_bounds(&bounds);
+        if let Some(z) = declared_min_zoom {
+            w.set_declared_min_zoom(z);
+        }
+        if let Some(z) = declared_max_zoom {
+            w.set_declared_max_zoom(z);
+        }
+        for (z, x, y) in tiles {
+            w.add_tile(*z, *x, *y, &[0x1a, 0x02, 0x08, 0x01]).unwrap();
+        }
+        w.finalize(path).unwrap();
+    }
+
     fn read_metadata(path: &Path) -> String {
         let bytes = std::fs::read(path).unwrap();
         let h = Header::from_bytes(&bytes).unwrap();
@@ -2499,11 +2715,13 @@ mod tests {
         assert_eq!(report.skipped, 2);
     }
 
-    // ---- band zoom-range contract (#495) -----------------------------------
+    // ---- band zoom-range contract (#495, reworked for #514) ---------------
 
     /// A band whose declared range shares no zoom at all with what its
-    /// archive holds is always an error -- there is no interpretation, and
-    /// no flag, under which it could write anything.
+    /// archive *declares* is always an error -- there is no interpretation,
+    /// and no flag, under which it could write anything. The message now
+    /// says "declares", not "holds": #514 stopped treating the header as a
+    /// fact about actual content.
     #[test]
     fn band_zoom_range_disjoint_from_archive_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -2523,18 +2741,27 @@ mod tests {
         )
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("z8-10") && msg.contains("z3-5"), "{msg}");
+        assert!(
+            msg.contains("z8-10") && msg.contains("z3-5") && msg.contains("declares"),
+            "{msg}"
+        );
         assert!(!out.exists(), "nothing should be written on a bad plan");
     }
 
-    /// A band that declares zooms its archive does not have -- but still
-    /// overlaps it -- is an error by default: those zooms would render
-    /// silently empty, which is almost always a `--band` range that
-    /// disagrees with what the archive was actually tiled with.
+    /// #514 S2: the false reject. A band that declares a wider range than
+    /// its archive's header (honest here -- the header matches the actual
+    /// tiles exactly) used to hard-error, on the theory that the extra zooms
+    /// would render silently empty. But the band's range fully *covers* the
+    /// archive's actual tiles: nothing real falls outside it, so nothing is
+    /// silently lost. This is now accepted -- no error, and no flag needed --
+    /// because #514 classifies against the archive's actual content, not its
+    /// declared header.
     #[test]
-    fn band_zoom_range_overshooting_archive_errors() {
+    fn band_wider_than_archive_actual_range_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("archive.pmtiles");
+        // Honest header: no declared min/max beyond the tiles actually
+        // written, so header == actual == z3-5.
         write_band(
             &src,
             "agg",
@@ -2543,50 +2770,121 @@ mod tests {
             &[],
         );
 
-        // Declares z2-5; the archive only holds z3-5, so z2 is missing.
+        // Declares z2-5; the archive only holds z3-5, but the band still
+        // covers every actual tile the archive has.
         let out = dir.path().join("merged.pmtiles");
-        let err = merge_bands(
+        let report = merge_bands(
             &[Band::parse(&format!("2-5:{}:agg", src.display())).unwrap()],
             &out,
         )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("z2-5") && msg.contains("z3-5") && msg.contains("silently empty"),
-            "{msg}"
-        );
-        assert!(!out.exists(), "nothing should be written on a bad plan");
+        .unwrap();
+        assert_eq!(report.total_tiles, 3, "every tile the archive actually has");
+        assert_eq!(report.skipped, 0, "nothing outside the band's range exists");
+        assert!(out.exists());
     }
 
-    /// The same overshoot as above, but with `allow_missing_zooms` set: the
-    /// build proceeds, the missing zoom is only a warning, and the archive is
-    /// written with whatever tiles the (narrower) source actually has.
+    /// #514 S1: the false accept, the core defect. A header widened over an
+    /// empty span (#380) can make a band that shares no zoom with the
+    /// archive's *actual* tiles look like an ordinary subrange of the
+    /// *declared* header -- and the old header-keyed check accepted it
+    /// silently, contributing zero tiles while the merged metadata still
+    /// declared the band's full range. #514 classifies against actual
+    /// content first: this is now [`RangeFit::DeclaredButEmpty`], which
+    /// still proceeds (the header's own declaration says this span may
+    /// legitimately be empty) but always warns.
     #[test]
-    fn band_overshoot_allowed_with_flag_warns() {
+    fn band_disjoint_from_actual_but_within_declared_header_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("archive.pmtiles");
+        // Widened header: declares z0-6, but the only tiles ever written are
+        // z5-6 -- exactly #380's "coarse zooms generalized to nothing".
+        write_band_declared_range(
+            &src,
+            "coarse",
+            &[(5, 1, 1), (6, 2, 2)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            Some(0),
+            Some(6),
+        );
+
+        // Declares z0-4: a legitimate subrange of the *declared* z0-6
+        // header, but shares no zoom with the archive's actual z5-6 tiles.
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands(
+            &[Band::parse(&format!("0-4:{}:coarse", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 0, "this band contributes nothing");
+        assert_eq!(
+            report.skipped, 2,
+            "both of the archive's tiles are outside the band's declared range"
+        );
+        assert!(out.exists(), "a declared-but-empty span is not an error");
+    }
+
+    /// A band that overlaps the archive's actual tiles but does not cover
+    /// all of them -- some real, already-tiled zoom would fall outside the
+    /// band's range and be dropped -- is an error by default: this is the
+    /// genuine "missing zoom" case #495 exists to catch.
+    #[test]
+    fn band_partially_overlapping_archive_actual_range_errors() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("archive.pmtiles");
         write_band(
             &src,
             "agg",
-            &[(3, 1, 1), (4, 2, 2), (5, 4, 4)],
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4), (6, 8, 8)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        // Declares z0-4: overlaps the archive's actual z3-6 at z3-4, but
+        // z5-6 -- real tiles -- fall outside the band and would be dropped.
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[Band::parse(&format!("0-4:{}:agg", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("z0-4") && msg.contains("z3-6") && msg.contains("z5-6"),
+            "{msg}"
+        );
+        assert!(!out.exists(), "nothing should be written on a bad plan");
+    }
+
+    /// The same partial overlap as above, but with `allow_missing_zooms`
+    /// set: the build proceeds, the dropped zooms are only a warning, and
+    /// the archive is written with whatever falls inside the band's range.
+    #[test]
+    fn band_partial_overlap_allowed_with_flag_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("archive.pmtiles");
+        write_band(
+            &src,
+            "agg",
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4), (6, 8, 8)],
             TileBounds::new(-1.0, -1.0, 1.0, 1.0),
             &[],
         );
 
         let out = dir.path().join("merged.pmtiles");
         let report = merge_bands_with_options(
-            &[Band::parse(&format!("2-5:{}:agg", src.display())).unwrap()],
+            &[Band::parse(&format!("0-4:{}:agg", src.display())).unwrap()],
             &out,
             true,
         )
         .unwrap();
-        assert_eq!(report.total_tiles, 3, "every tile the archive actually has");
+        assert_eq!(report.total_tiles, 2, "only z3 and z4 fall inside the band");
+        assert_eq!(report.skipped, 2, "z5 and z6 were dropped");
         assert!(out.exists());
     }
 
-    /// A band declaring a strict subrange of what its archive holds is fully
-    /// supported and unremarkable -- the documented way to split one
-    /// pre-tiled archive across several bands. No error, and the merge
+    /// A band declaring a strict subrange of what its archive actually holds
+    /// is fully supported and unremarkable -- the documented way to split
+    /// one pre-tiled archive across several bands. No error, and the merge
     /// proceeds normally; tiles outside the declared subrange are still
     /// dropped and counted in `skipped`, just without the old "different
     /// range" framing.
@@ -2602,7 +2900,7 @@ mod tests {
             &[],
         );
 
-        // z3-4 is a strict subrange of the archive's z3-5.
+        // z3-4 is a strict subrange of the archive's actual z3-5.
         let out = dir.path().join("merged.pmtiles");
         let report = merge_bands(
             &[Band::parse(&format!("3-4:{}:agg", src.display())).unwrap()],
@@ -2614,6 +2912,84 @@ mod tests {
             "z5 tile outside the declared subrange"
         );
         assert_eq!(report.skipped, 1);
+    }
+
+    /// #514 issue #2: a zero-tile archive used to finalize as header z0-0,
+    /// which produced an inconsistent, half-unbypassable classification --
+    /// `Overshoot` (flag-clearable) for a band spanning z0, `Disjoint`
+    /// (always an error, message falsely claiming "that archive holds z0")
+    /// for a band starting above z0. Both are now the same
+    /// [`RangeFit::EmptyArchive`]: a dedicated "holds no tiles" message,
+    /// bypassable with `--allow-missing-zooms` regardless of whether the
+    /// band's range happens to include z0.
+    #[test]
+    fn empty_archive_is_classified_consistently_and_bypassable() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty.pmtiles");
+        write_band(&src, "agg", &[], TileBounds::new(-1.0, -1.0, 1.0, 1.0), &[]);
+
+        // A band starting above z0 used to hard-error as `Disjoint`, with no
+        // way to opt past it.
+        let out = dir.path().join("merged.pmtiles");
+        let err = merge_bands(
+            &[Band::parse(&format!("3-7:{}:agg", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no tiles"), "{msg}");
+        assert!(!out.exists());
+
+        // With the flag, it is bypassable like any other `Overshoot`.
+        let report = merge_bands_with_options(
+            &[Band::parse(&format!("3-7:{}:agg", src.display())).unwrap()],
+            &out,
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 0);
+        assert!(out.exists());
+    }
+
+    /// #514 issue #3: `--allow-missing-zooms` let a band declare deeper
+    /// zooms than its archive actually has, but the merged header's
+    /// `max_zoom` used to stay pinned to the deepest tile actually copied
+    /// while `vector_layers[].maxzoom` used the band's declared value --
+    /// disagreeing at the top end the way #380 already prevented at the
+    /// bottom. `set_declared_max_zoom` (mirroring #380's
+    /// `set_declared_min_zoom`) fixes it: declared wins at both ends.
+    #[test]
+    fn merge_declares_the_bands_max_zoom_even_when_deep_zooms_are_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("archive.pmtiles");
+        // Actual tiles only reach z6; the band declares z3-10.
+        write_band(
+            &src,
+            "agg",
+            &[(3, 1, 1), (4, 2, 2), (5, 4, 4), (6, 8, 8)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        let out = dir.path().join("merged.pmtiles");
+        merge_bands_with_options(
+            &[Band::parse(&format!("4-10:{}:agg", src.display())).unwrap()],
+            &out,
+            true, // z3 falls outside the band -- a genuine `Overshoot`.
+        )
+        .unwrap();
+
+        let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(
+            h.max_zoom, 10,
+            "header must declare the band's max, not the deepest tile"
+        );
+
+        let meta: Value = serde_json::from_str(&read_metadata(&out)).unwrap();
+        assert_eq!(
+            meta["vector_layers"][0]["maxzoom"], 10,
+            "vector_layers must agree with the header"
+        );
     }
 
     /// A band archive with no usable bounds used to vanish from the merged

@@ -2190,6 +2190,38 @@ fn tiles_summary_line(
     }
 }
 
+/// The pyramid build's skipped-tile line, if any (#514 S3).
+///
+/// `report.skipped` counts every tile a band's archive held outside that
+/// band's declared zoom range — which, since #495, is *also* the documented
+/// way to split one pre-tiled archive across several `--band` entries (one
+/// declaring z0-5, another z6-13, both pointing at the same z0-13 archive).
+/// In that workflow every tile the merge keeps came from some band's
+/// declared subrange skipping the rest, so `skipped` reaching `total_tiles`
+/// is routine, not a sign anything vanished — the old unconditional `!`
+/// alarm read as one regardless. When the two coincide this says so plainly
+/// instead; a smaller skip count is still worth the alarm, since it is more
+/// likely a stray off-by-one than a deliberate split.
+fn pyramid_skip_message(skipped: usize, total_tiles: usize) -> Option<String> {
+    if skipped == 0 {
+        return None;
+    }
+    if skipped == total_tiles {
+        Some(format!(
+            "  {} tile(s) fell outside a band's declared subrange and were skipped \
+             (expected when splitting one pre-tiled archive across several bands)",
+            format_number(skipped as u64)
+        ))
+    } else {
+        // Almost always a --minzoom/--maxzoom that disagrees with --band, so
+        // this belongs on stdout next to the counts, not only in the log.
+        Some(format!(
+            "  ! {} tile(s) dropped: outside the declared band zoom ranges",
+            format_number(skipped as u64)
+        ))
+    }
+}
+
 /// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
 fn run_overview(args: OverviewArgs) -> Result<()> {
     use tylertoo_core::overview::level::Mode;
@@ -2688,13 +2720,8 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
             format_number(*n as u64)
         );
     }
-    if report.skipped > 0 {
-        // Almost always a --minzoom/--maxzoom that disagrees with --band, so
-        // this belongs on stdout next to the counts, not only in the log.
-        println!(
-            "  ! {} tile(s) dropped: outside the declared band zoom ranges",
-            format_number(report.skipped as u64)
-        );
+    if let Some(line) = pyramid_skip_message(report.skipped, report.total_tiles) {
+        println!("{line}");
     }
     println!(
         "✓ Built {} band(s) → {} ({} tiles)",
@@ -4034,6 +4061,37 @@ mod tests {
                 && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
             "{both}"
         );
+    }
+
+    // --- #514 S3: the pyramid skip line ---------------------------------
+
+    /// Nothing skipped, nothing printed.
+    #[test]
+    fn pyramid_skip_message_is_silent_when_nothing_was_skipped() {
+        assert_eq!(pyramid_skip_message(0, 100), None);
+        assert_eq!(pyramid_skip_message(0, 0), None);
+    }
+
+    /// The documented way to split one pre-tiled archive across several
+    /// `--band` entries means every kept tile came from some band's declared
+    /// subrange skipping the rest -- `skipped` reaching `total_tiles` is
+    /// routine there, not a sign anything vanished, so it gets a plain note
+    /// instead of the "!" alarm.
+    #[test]
+    fn pyramid_skip_message_downgrades_the_subrange_split_case() {
+        let msg = pyramid_skip_message(7, 7).unwrap();
+        assert!(!msg.contains('!'), "{msg}");
+        assert!(msg.contains("7") && msg.contains("skipped"), "{msg}");
+    }
+
+    /// A skip count short of the total is more likely a stray
+    /// `--minzoom`/`--maxzoom` mismatch than a deliberate split, so it keeps
+    /// the "!" alarm.
+    #[test]
+    fn pyramid_skip_message_keeps_the_alarm_when_skipped_is_short_of_total() {
+        let msg = pyramid_skip_message(3, 100).unwrap();
+        assert!(msg.contains('!'), "{msg}");
+        assert!(msg.contains("dropped"), "{msg}");
     }
 
     /// #510 review, S3-7: `merge`'s "input is also the output" guard compared
