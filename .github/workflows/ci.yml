@@ -281,9 +281,21 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-nextest
+
       - name: Run all tests (excluding slow regression tests)
         # Large polygon regression tests are run manually - see tests/fixtures/realdata/README.md
-        run: cargo test --locked --all-features -- --skip large_polygon_regression
+        # nextest runs every test from every binary in parallel.
+        run: >-
+          cargo nextest run --locked --all-features
+          -E 'not test(large_polygon_regression)'
+
+      - name: Run doctests
+        # nextest does not run doctests.
+        run: cargo test --locked --all-features --doc
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.
@@ -470,25 +482,47 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
 
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        # Own key: llvm-cov builds into target/llvm-cov-target with
+        # instrumentation flags, so the Test job's cache does not help.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ runner.os }}-llvm-cov-target-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Install protoc
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Install cargo-llvm-cov
-        # Prebuilt binary via install-action; compiling it from source
+      - name: Install cargo-llvm-cov and cargo-nextest
+        # Prebuilt binaries via install-action; compiling them from source
         # costs minutes on every run.
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Generate coverage
         # Source-based instrumentation (#524). tarpaulin ran the suite under
         # ptrace and needed --timeout 300 for the #460 determinism e2e; it
         # was the CI long pole at ~11 min. llvm-cov also counts the CLI
         # subprocesses those e2e tests spawn, which tarpaulin could not.
+        # nextest runs every test from every binary in parallel; cargo test
+        # runs the test binaries one after another.
         run: >-
-          cargo llvm-cov --all-features --workspace
+          cargo llvm-cov nextest --all-features --workspace
           --exclude tylertoo-python
           --lcov --output-path lcov.info
 
