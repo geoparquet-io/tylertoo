@@ -228,32 +228,40 @@ struct BboxCovering {
     ymax: Vec<String>,
 }
 
-/// Parse the covering specification from GeoParquet geo metadata JSON.
-///
-/// Returns `None` if the metadata doesn't contain covering information.
+/// Parse the covering specification from GeoParquet geo metadata JSON, for
+/// ONE named geometry column.
 ///
 /// # Arguments
 ///
 /// * `geo_json` - The JSON string from the "geo" key-value metadata
+/// * `geom_column` - the column whose covering is wanted: for pruning, the
+///   column the rest of the pipeline will actually read
+///   ([`resolve_geometry_column_name`]). `None` means the caller has no
+///   column in hand, and then the spec-REQUIRED `primary_column` is the only
+///   thing consulted.
+///
+/// There is deliberately **no** "first column that happens to declare a
+/// covering" fallback (#519). A file with a `centroid` covering beside a
+/// `geom_shape` the pipeline reads got pruned on the centroid's envelope —
+/// silent data loss — and, with two covered columns, the fallback scanned a
+/// `HashMap`'s values, so *which* wrong column won varied run to run. A
+/// column with no covering of its own simply has no tier-1 bounds; the row
+/// group is then read, which is always correct.
 ///
 /// # Returns
 ///
-/// `Ok(Some(CoveringSpec))` if covering metadata is present and valid,
-/// `Ok(None)` if no covering metadata exists,
+/// `Ok(Some(CoveringSpec))` if that column declares a valid covering,
+/// `Ok(None)` if it does not (or is absent from the metadata),
 /// `Err` if the JSON is malformed.
-pub fn parse_covering_metadata(geo_json: &str) -> Result<Option<CoveringSpec>, Error> {
+pub fn parse_covering_metadata(
+    geo_json: &str,
+    geom_column: Option<&str>,
+) -> Result<Option<CoveringSpec>, Error> {
     let metadata: GeoMetadata = serde_json::from_str(geo_json)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
 
-    // Find the geometry column (use primary_column if specified, otherwise first with covering)
-    let geom_column = if let Some(ref primary) = metadata.primary_column {
-        metadata.columns.get(primary)
-    } else {
-        // Find first column with covering metadata
-        metadata.columns.values().find(|col| col.covering.is_some())
-    };
-
-    let Some(column) = geom_column else {
+    let name = geom_column.or(metadata.primary_column.as_deref());
+    let Some(column) = name.and_then(|n| metadata.columns.get(n)) else {
         return Ok(None);
     };
 
@@ -427,7 +435,10 @@ pub fn extract_row_group_bounds_from_metadata(
         return Ok(vec![None; num_row_groups]);
     };
 
-    let covering = parse_covering_metadata(&geo_json)?;
+    // Tier 1 must prune on the column the reader reads, not on whichever
+    // column happens to declare a covering first (#519).
+    let geom_column = resolve_geometry_column_name(metadata);
+    let covering = parse_covering_metadata(&geo_json, geom_column.as_deref())?;
     let Some(covering) = covering else {
         // No covering metadata - return all None
         return Ok(vec![None; num_row_groups]);
@@ -504,67 +515,108 @@ pub fn get_geo_metadata(metadata: &ParquetMetaData) -> Result<Option<String>, Er
 // unavailable; [`crate::overview::convert::select_input_row_groups`] is the
 // production entry point that calls it.
 
-/// Parquet leaf-column index of the file's GeoParquet 2.0 geometry column,
-/// found directly from its `LogicalType::Geometry` / `Geography` annotation
-/// in the raw Parquet schema — no "geo" JSON required, which is exactly the
-/// shape of a pure GeoParquet 2.0 file. When several columns carry the
-/// annotation, a column literally named "geometry" wins; otherwise the
-/// first one found in schema order. Mirrors
-/// [`crate::overview::convert::find_geometry_column`]'s Arrow-schema
-/// equivalent for the legacy WKB/GeoArrow path.
-pub(crate) fn find_native_geometry_leaf_column(
-    metadata: &ParquetMetaData,
-) -> Option<(usize, LogicalType)> {
-    let schema = metadata.file_metadata().schema_descr();
-    let num_columns = schema.num_columns();
-    let mut first: Option<(usize, LogicalType)> = None;
+/// The geometry column the rest of the conversion will actually read,
+/// resolved ONCE from the footer so that pruning can never operate on a
+/// different column than the reader (#518).
+///
+/// Priority, matching [`crate::overview::convert::find_geometry_column`]
+/// exactly (which consults the same "geo" metadata through the Arrow
+/// schema):
+///
+/// 1. the "geo" JSON `primary_column`, when it names a real root column —
+///    the GeoParquet spec makes this field REQUIRED, so it is the
+///    authoritative answer whenever a "geo" key exists at all (and tier 1
+///    already prunes on exactly this column's covering);
+/// 2. otherwise a root column literally named "geometry";
+/// 3. otherwise the first root column whose name contains "geom".
+///
+/// `None` means "cannot tell" — which is also the case in which the
+/// pipeline itself fails with `NoGeometryColumn`, so refusing to prune
+/// costs nothing.
+pub(crate) fn resolve_geometry_column_name(metadata: &ParquetMetaData) -> Option<String> {
+    let root = metadata.file_metadata().schema_descr().root_schema();
+    let names: Vec<&str> = root.get_fields().iter().map(|f| f.name()).collect();
 
-    for col_idx in 0..num_columns {
-        let col = schema.column(col_idx);
-        let Some(lt) = col.logical_type_ref() else {
-            continue;
-        };
-        if !matches!(lt, LogicalType::Geometry(_) | LogicalType::Geography(_)) {
-            continue;
-        }
-        if col.name() == "geometry" {
-            return Some((col_idx, lt.clone()));
-        }
-        if first.is_none() {
-            first = Some((col_idx, lt.clone()));
+    if let Ok(Some(geo_json)) = get_geo_metadata(metadata) {
+        if let Some(primary) = primary_geometry_column(&geo_json) {
+            if names.contains(&primary.as_str()) {
+                return Some(primary);
+            }
         }
     }
-
-    first
+    geometry_column_by_name(&names).map(str::to_string)
 }
 
-/// A minimal CRS-string classifier for `LogicalType::Geometry(crs)` /
-/// `Geography(crs)` annotations, recognizing only the two CRSs
-/// [`crate::overview::level::Crs`] supports. Anything else — a PROJJSON
-/// blob, an unrecognized authority:code string, garbage — reads as `None`
-/// ("unresolvable"); [`native_geo_crs_matches`] treats that as "never
-/// guess" and skips tier-2 pruning entirely. Mirrors the identifier set
-/// `crate::quality::is_wgs84_identifier` recognizes for the legacy "geo"
-/// JSON CRS field and the substring match
-/// `crate::overview::convert::detect_crs_from_kv` uses for EPSG:3857,
-/// duplicated here (rather than exposed cross-module) to keep this change
-/// additive-only.
+/// The "geo" JSON `primary_column`, if the metadata parses and declares one.
+fn primary_geometry_column(geo_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(geo_json)
+        .ok()?
+        .get("primary_column")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The name-only half of [`crate::overview::convert::find_geometry_column`],
+/// shared so the two can never drift: exact "geometry", else the first name
+/// containing "geom".
+pub(crate) fn geometry_column_by_name<'a>(names: &[&'a str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find(|n| **n == "geometry")
+        .or_else(|| names.iter().find(|n| n.contains("geom")))
+        .copied()
+}
+
+/// Parquet leaf-column index of `geom_column`'s GeoParquet 2.0 geometry
+/// annotation (`LogicalType::Geometry` / `Geography`) — no "geo" JSON
+/// required, which is exactly the shape of a pure GeoParquet 2.0 file.
+///
+/// The leaf MUST belong to `geom_column` (matched on the schema path's root
+/// component): a file with several annotated columns — say a `centroid`
+/// alongside the real `geom_shape` — otherwise prunes on whichever envelope
+/// happens to come first in schema order while the pipeline reads a
+/// different column, silently dropping every matching feature (#518). No
+/// match means no tier-2 pruning, never a guess.
+pub(crate) fn find_native_geometry_leaf_column(
+    metadata: &ParquetMetaData,
+    geom_column: &str,
+) -> Option<(usize, LogicalType)> {
+    let schema = metadata.file_metadata().schema_descr();
+
+    (0..schema.num_columns()).find_map(|col_idx| {
+        let col = schema.column(col_idx);
+        let lt = col.logical_type_ref()?;
+        if !matches!(lt, LogicalType::Geometry(_) | LogicalType::Geography(_)) {
+            return None;
+        }
+        // `parts()[0]` is the root field: the leaf itself for a top-level
+        // primitive column, the enclosing field for a nested one.
+        if col.path().parts().first().map(String::as_str) != Some(geom_column) {
+            return None;
+        }
+        Some((col_idx, lt.clone()))
+    })
+}
+
+/// CRS classification for `LogicalType::Geometry(crs)` / `Geography(crs)`
+/// annotations, mapped onto the two CRSs [`crate::overview::level::Crs`]
+/// supports. `None` means "unresolvable" and
+/// [`native_geo_crs_matches`] turns that into "never guess" — tier-2
+/// pruning is skipped entirely.
+///
+/// Delegates to [`crate::quality::classify_crs_identifier`], the single
+/// classifier shared with the legacy "geo" JSON path. It used to be a
+/// verbatim copy of an older substring match that tested `contains("WGS 84")`
+/// BEFORE `contains("3857")` — and EPSG:3857's PROJJSON (what arrow-rs
+/// inlines here) is named "WGS 84 / Pseudo-Mercator", so a Web Mercator file
+/// classified as lon/lat and its meter envelopes were filtered against a
+/// degree bbox: every row group pruned, a successful EMPTY archive (#518).
 fn crs_identifier_kind(id: &str) -> Option<Crs> {
-    let up = id.to_uppercase();
-    if up == "EPSG:4326"
-        || up == "OGC:CRS84"
-        || up == "CRS84"
-        || up == "URN:OGC:DEF:CRS:OGC::CRS84"
-        || up == "URN:OGC:DEF:CRS:EPSG::4326"
-        || up.contains("WGS 84")
-        || up.contains("WGS84")
-    {
-        return Some(Crs::Epsg4326);
+    match crate::quality::classify_crs_identifier(id) {
+        crate::quality::CrsKind::Wgs84 => Some(Crs::Epsg4326),
+        crate::quality::CrsKind::WebMercator => Some(Crs::Epsg3857),
+        crate::quality::CrsKind::Unknown => None,
     }
-    if up.contains("3857") || up.contains("900913") {
-        return Some(Crs::Epsg3857);
-    }
-    None
 }
 
 /// Whether a native geometry column's declared CRS is consistent with
@@ -643,12 +695,22 @@ pub(crate) fn geo_statistics_bounds(
 /// file: a file with partial covering-column coverage still gets tier 2 for
 /// whichever row groups tier 1 missed.
 ///
-/// Tier 2 fires only when the geometry column's declared CRS is consistent
-/// with `session_crs` ([`native_geo_crs_matches`]); an unresolvable or
-/// mismatched CRS skips tier 2 file-wide rather than guessing.
+/// Tier 2 fires only when (a) the annotated leaf belongs to `geom_column` —
+/// the column the pipeline actually reads, resolved once by
+/// [`resolve_geometry_column_name`] — and (b) its declared CRS is consistent
+/// with `session_crs` ([`native_geo_crs_matches`]). A different column, an
+/// unresolvable CRS or a mismatched one all skip tier 2 file-wide rather
+/// than guess (#518). `geom_column: None` ("couldn't resolve") likewise
+/// skips it.
+///
+/// Tier 1 applies the same rule from inside
+/// [`extract_row_group_bounds_from_metadata`], which resolves the column
+/// itself and asks [`parse_covering_metadata`] for THAT column's covering
+/// (#519 — it used to accept any column's, `primary_column` or not).
 pub(crate) fn extract_row_group_bounds_tiered(
     metadata: &ParquetMetaData,
     session_crs: Crs,
+    geom_column: Option<&str>,
 ) -> Vec<Option<RowGroupBounds>> {
     let tier1 = extract_row_group_bounds_from_metadata(metadata)
         .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]);
@@ -656,7 +718,8 @@ pub(crate) fn extract_row_group_bounds_tiered(
         return tier1; // fully covered — tier 2 would be wasted work
     }
 
-    let tier2 = find_native_geometry_leaf_column(metadata)
+    let tier2 = geom_column
+        .and_then(|name| find_native_geometry_leaf_column(metadata, name))
         .filter(|(_, lt)| native_geo_crs_matches(lt, session_crs))
         .map(|(geom_idx, _)| geo_statistics_bounds(metadata, geom_idx));
 
@@ -820,7 +883,7 @@ mod tests {
             "version": "1.1.0"
         }"#;
 
-        let result = parse_covering_metadata(geo_json).unwrap();
+        let result = parse_covering_metadata(geo_json, Some("geometry")).unwrap();
         assert!(result.is_some());
 
         let spec = result.unwrap();
@@ -841,14 +904,74 @@ mod tests {
             "primary_column": "geometry"
         }"#;
 
-        let result = parse_covering_metadata(geo_json).unwrap();
+        let result = parse_covering_metadata(geo_json, Some("geometry")).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_covering_metadata_invalid_json() {
-        let result = parse_covering_metadata("not valid json");
+        let result = parse_covering_metadata("not valid json", Some("geometry"));
         assert!(result.is_err());
+    }
+
+    /// #519: a covering belonging to ANOTHER column is not this column's
+    /// covering. The old "first column with a covering" fallback handed the
+    /// `centroid` covering to a pipeline reading `geom_shape`, and pruned
+    /// against an envelope of points that are not the data.
+    #[test]
+    fn parse_covering_metadata_refuses_another_columns_covering() {
+        let geo_json = r#"{
+            "version": "1.1.0",
+            "columns": {
+                "centroid": {
+                    "encoding": "WKB",
+                    "covering": { "bbox": {
+                        "xmin": ["centroid_bbox", "xmin"],
+                        "ymin": ["centroid_bbox", "ymin"],
+                        "xmax": ["centroid_bbox", "xmax"],
+                        "ymax": ["centroid_bbox", "ymax"]
+                    }}
+                },
+                "geom_shape": { "encoding": "WKB" }
+            }
+        }"#;
+        assert_eq!(
+            parse_covering_metadata(geo_json, Some("geom_shape")).unwrap(),
+            None,
+            "geom_shape declares no covering of its own"
+        );
+        assert!(parse_covering_metadata(geo_json, Some("centroid"))
+            .unwrap()
+            .is_some());
+        // No primary_column and no column in hand ⇒ nothing to key off.
+        assert_eq!(parse_covering_metadata(geo_json, None).unwrap(), None);
+    }
+
+    /// The same shape, but with TWO covered columns: the old `HashMap`
+    /// `values()` scan picked a different one run to run (iteration order is
+    /// randomized per process), so a bbox extract's output depended on the
+    /// hash seed. The resolved-column lookup is a function of the input.
+    #[test]
+    fn parse_covering_metadata_is_deterministic_with_two_covered_columns() {
+        let geo_json = r#"{
+            "version": "1.1.0",
+            "columns": {
+                "centroid": { "covering": { "bbox": {
+                    "xmin": ["c", "xmin"], "ymin": ["c", "ymin"],
+                    "xmax": ["c", "xmax"], "ymax": ["c", "ymax"]
+                }}},
+                "geom_shape": { "covering": { "bbox": {
+                    "xmin": ["g", "xmin"], "ymin": ["g", "ymin"],
+                    "xmax": ["g", "xmax"], "ymax": ["g", "ymax"]
+                }}}
+            }
+        }"#;
+        for _ in 0..16 {
+            let spec = parse_covering_metadata(geo_json, Some("geom_shape"))
+                .unwrap()
+                .expect("geom_shape declares a covering");
+            assert_eq!(spec.xmin_path, vec!["g", "xmin"]);
+        }
     }
 
     #[test]
@@ -1551,7 +1674,11 @@ mod tests {
         ];
         let metadata = metadata_with_tiered_stats(None, false, &specs);
 
-        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
         assert_eq!(
             bounds,
             vec![
@@ -1602,7 +1729,11 @@ mod tests {
         }];
         let metadata = metadata_with_tiered_stats(None, true, &specs);
 
-        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
         assert_eq!(
             bounds,
             vec![Some(RowGroupBounds {
@@ -1649,7 +1780,11 @@ mod tests {
         ];
         let metadata = metadata_with_tiered_stats(None, true, &specs);
 
-        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
         assert_eq!(
             bounds[0].as_ref().map(|b| (b.xmin, b.ymax)),
             Some((0.0, 10.0)),
@@ -1719,7 +1854,11 @@ mod tests {
             num_rows: 100,
         }];
         let metadata = metadata_with_tiered_stats(None, false, &specs);
-        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
         let b = bounds[0].as_ref().expect("native stats must be read");
         assert_eq!((b.xmin, b.xmax), (170.0, -170.0), "inversion preserved");
 
@@ -1748,7 +1887,11 @@ mod tests {
         // (e.g. because there is no "geo" JSON at all to say otherwise).
         let metadata = metadata_with_tiered_stats(Some("EPSG:3857"), false, &specs);
 
-        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
         assert_eq!(
             bounds,
             vec![None],
@@ -1757,7 +1900,11 @@ mod tests {
 
         // Consistent CRS: tier 2 fires normally.
         let metadata_ok = metadata_with_tiered_stats(Some("EPSG:3857"), false, &specs);
-        let bounds_ok = extract_row_group_bounds_tiered(&metadata_ok, Crs::Epsg3857);
+        let bounds_ok = extract_row_group_bounds_tiered(
+            &metadata_ok,
+            Crs::Epsg3857,
+            resolve_geometry_column_name(&metadata_ok).as_deref(),
+        );
         assert!(
             bounds_ok[0].is_some(),
             "a matching CRS must let tier 2 through"
@@ -1776,7 +1923,11 @@ mod tests {
         // A CRS this crate cannot classify (e.g. a state-plane code).
         let metadata = metadata_with_tiered_stats(Some("EPSG:2154"), false, &specs);
         for crs in [Crs::Epsg4326, Crs::Epsg3857] {
-            let bounds = extract_row_group_bounds_tiered(&metadata, crs);
+            let bounds = extract_row_group_bounds_tiered(
+                &metadata,
+                crs,
+                resolve_geometry_column_name(&metadata).as_deref(),
+            );
             assert_eq!(bounds, vec![None], "unresolvable CRS must skip tier 2");
         }
     }
@@ -1819,7 +1970,11 @@ mod tests {
         let file_meta = FileMetaData::new(2, 10, None, None, descr, None);
         let metadata = ParquetMetaData::new(file_meta, vec![rg]);
 
-        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
         assert_eq!(bounds, vec![None], "Geography columns must never prune");
     }
 
@@ -1849,7 +2004,11 @@ mod tests {
         ];
         let metadata = metadata_with_tiered_stats(None, false, &specs);
 
-        let bounds = extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
         assert_eq!(bounds, vec![None, None]);
 
         // A tiny, far-away bbox would prune everything if stats existed;
@@ -1863,6 +2022,355 @@ mod tests {
             vec![0, 1],
             "stats-free GeoParquet 2.0 must degrade to reading everything"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Tier 1 must prune on the column the pipeline READS (#519)
+    // -------------------------------------------------------------------------
+
+    /// Synthetic GeoParquet 1.1 footer whose schema is
+    /// `[c_xmin, c_ymin, c_xmax, c_ymax (DOUBLE), centroid, geom_shape]`, with
+    /// covering-column statistics for the `centroid` column only. The "geo"
+    /// JSON declares `centroid`'s covering and — deliberately — **no**
+    /// `primary_column`, the shape that made tier 1 fall back to "whichever
+    /// column declares a covering".
+    fn metadata_with_centroid_covering(bbox: (f64, f64, f64, f64)) -> ParquetMetaData {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
+        };
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        let mut fields: Vec<Arc<Type>> = ["c_xmin", "c_ymin", "c_xmax", "c_ymax"]
+            .iter()
+            .map(|n| {
+                Arc::new(
+                    Type::primitive_type_builder(n, PhysicalType::DOUBLE)
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        for n in ["centroid", "geom_shape"] {
+            fields.push(Arc::new(
+                Type::primitive_type_builder(n, PhysicalType::BYTE_ARRAY)
+                    .build()
+                    .unwrap(),
+            ));
+        }
+        let schema = Type::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+
+        let (xmin, ymin, xmax, ymax) = bbox;
+        let mut columns: Vec<ColumnChunkMetaData> = [xmin, ymin, xmax, ymax]
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                ColumnChunkMetaData::builder(descr.column(i))
+                    .set_statistics(Statistics::double(Some(v), Some(v), None, Some(0), false))
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        for i in 4..6 {
+            columns.push(
+                ColumnChunkMetaData::builder(descr.column(i))
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let rg = RowGroupMetaData::builder(descr.clone())
+            .set_num_rows(10)
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+
+        let geo_json = r#"{"version":"1.1.0","columns":{
+            "centroid":{"encoding":"WKB","covering":{"bbox":{
+                "xmin":["c_xmin"],"ymin":["c_ymin"],
+                "xmax":["c_xmax"],"ymax":["c_ymax"]}}},
+            "geom_shape":{"encoding":"WKB"}}}"#;
+        let kv = Some(vec![KeyValue::new("geo".to_string(), geo_json.to_string())]);
+        let file_meta = FileMetaData::new(2, 10, None, kv, descr, None);
+        ParquetMetaData::new(file_meta, vec![rg])
+    }
+
+    /// #519: the centroids sit at (100..110, 60..70); the shapes they
+    /// summarize span the whole world for all pruning knows, because
+    /// `geom_shape` declares no covering. A bbox over the shapes must KEEP
+    /// the row group. Tier 1 used to take the `centroid` covering (first
+    /// column with one, `primary_column` absent) and prune the row group
+    /// away — the reader would have found the features, pruning never let it
+    /// look.
+    #[test]
+    fn tier1_ignores_another_columns_covering() {
+        let metadata = metadata_with_centroid_covering((100.0, 60.0, 110.0, 70.0));
+        assert_eq!(
+            resolve_geometry_column_name(&metadata).as_deref(),
+            Some("geom_shape"),
+            "the pipeline reads geom_shape (the first `geom*` name)"
+        );
+        assert_eq!(
+            extract_row_group_bounds_from_metadata(&metadata).unwrap(),
+            vec![None],
+            "geom_shape declares no covering ⇒ no tier-1 bounds"
+        );
+        assert_eq!(
+            crate::overview::convert::select_input_row_groups(&metadata, &[0.0, 0.0, 1.0, 1.0]),
+            vec![0],
+            "pruning on the centroid covering is silent data loss"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Tier 2 must prune on the column the pipeline READS (#518)
+    // -------------------------------------------------------------------------
+
+    /// Synthetic GeoParquet 2.0 footer with TWO annotated geometry columns —
+    /// `centroid` at leaf 0 and `geom_shape` at leaf 1 — each carrying its
+    /// own native `geo_statistics` bbox, in
+    /// [`parquet::geospatial::bounding_box::BoundingBox::new`]'s
+    /// `(xmin, xmax, ymin, ymax)` order. `geo_json` optionally attaches a
+    /// "geo" key declaring a `primary_column`.
+    fn metadata_with_two_geometry_columns(
+        centroid: Option<(f64, f64, f64, f64)>,
+        shape: Option<(f64, f64, f64, f64)>,
+        geo_json: Option<&str>,
+    ) -> ParquetMetaData {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
+        };
+        use parquet::geospatial::bounding_box::BoundingBox;
+        use parquet::geospatial::statistics::GeospatialStatistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        let fields: Vec<Arc<Type>> = ["centroid", "geom_shape"]
+            .iter()
+            .map(|n| {
+                Arc::new(
+                    Type::primitive_type_builder(n, PhysicalType::BYTE_ARRAY)
+                        .with_logical_type(Some(LogicalType::geometry(None)))
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let schema = Type::group_type_builder("schema")
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+
+        let columns: Vec<ColumnChunkMetaData> = [centroid, shape]
+            .into_iter()
+            .enumerate()
+            .map(|(i, bbox)| {
+                let mut b = ColumnChunkMetaData::builder(descr.column(i));
+                if let Some((xmin, xmax, ymin, ymax)) = bbox {
+                    b = b.set_geo_statistics(Box::new(GeospatialStatistics::new(
+                        Some(BoundingBox::new(xmin, xmax, ymin, ymax)),
+                        None,
+                    )));
+                }
+                b.build().unwrap()
+            })
+            .collect();
+        let rg = RowGroupMetaData::builder(descr.clone())
+            .set_num_rows(10)
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+        let kv = geo_json.map(|g| vec![KeyValue::new("geo".to_string(), g.to_string())]);
+        let file_meta = FileMetaData::new(2, 10, None, kv, descr, None);
+        ParquetMetaData::new(file_meta, vec![rg])
+    }
+
+    /// #518 (1) — the motivating probe. A file with `centroid` (leaf 0) and
+    /// `geom_shape` (leaf 1) both annotated: the pipeline reads `geom_shape`
+    /// (the first name containing "geom"), so pruning must use THAT
+    /// envelope. The old "first annotated leaf in schema order" rule pruned
+    /// on the far-away centroid envelope instead, and every matching feature
+    /// vanished from the output.
+    #[test]
+    fn tier2_prunes_on_the_column_the_pipeline_reads() {
+        // Centroids parked far away; the shapes span [0,10]².
+        let metadata = metadata_with_two_geometry_columns(
+            Some((100.0, 110.0, 60.0, 70.0)),
+            Some((0.0, 10.0, 0.0, 10.0)),
+            None,
+        );
+        assert_eq!(
+            resolve_geometry_column_name(&metadata).as_deref(),
+            Some("geom_shape"),
+            "no geo JSON ⇒ the `geom*` heuristic, matching find_geometry_column"
+        );
+
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
+        assert_eq!(
+            bounds[0].as_ref().map(|b| (b.xmin, b.ymin, b.xmax, b.ymax)),
+            Some((0.0, 0.0, 10.0, 10.0)),
+            "tier 2 must read geom_shape's envelope, not the centroid's"
+        );
+
+        let selected =
+            crate::overview::convert::select_input_row_groups(&metadata, &[0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(
+            selected,
+            vec![0],
+            "a bbox over the shapes must KEEP the row group (silent data loss otherwise)"
+        );
+    }
+
+    /// The same file with a "geo" JSON naming `geom_shape` as the primary
+    /// column: the declaration is authoritative and reaches the same answer.
+    #[test]
+    fn tier2_follows_the_geo_json_primary_column() {
+        let geo = r#"{"version":"1.1.0","primary_column":"geom_shape","columns":{"geom_shape":{"encoding":"WKB"}}}"#;
+        let metadata = metadata_with_two_geometry_columns(
+            Some((100.0, 110.0, 60.0, 70.0)),
+            Some((0.0, 10.0, 0.0, 10.0)),
+            Some(geo),
+        );
+        assert_eq!(
+            resolve_geometry_column_name(&metadata).as_deref(),
+            Some("geom_shape")
+        );
+        let selected =
+            crate::overview::convert::select_input_row_groups(&metadata, &[0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(selected, vec![0]);
+
+        // A primary_column naming the centroid makes the centroid the column
+        // the pipeline reads too (find_geometry_column honors it), so
+        // pruning on the centroid envelope is then the CORRECT answer.
+        let geo_centroid = r#"{"version":"1.1.0","primary_column":"centroid","columns":{"centroid":{"encoding":"WKB"}}}"#;
+        let metadata = metadata_with_two_geometry_columns(
+            Some((100.0, 110.0, 60.0, 70.0)),
+            Some((0.0, 10.0, 0.0, 10.0)),
+            Some(geo_centroid),
+        );
+        assert_eq!(
+            resolve_geometry_column_name(&metadata).as_deref(),
+            Some("centroid")
+        );
+        assert_eq!(
+            crate::overview::convert::select_input_row_groups(
+                &metadata,
+                &[105.0, 65.0, 106.0, 66.0]
+            ),
+            vec![0],
+        );
+    }
+
+    /// Only the WRONG column is annotated: tier 2 must stand down entirely
+    /// (no bounds ⇒ the row group is read), never fall back to whatever
+    /// annotated leaf it can find.
+    #[test]
+    fn tier2_skipped_when_only_another_column_is_annotated() {
+        let metadata =
+            metadata_with_two_geometry_columns(Some((100.0, 110.0, 60.0, 70.0)), None, None);
+        let bounds = extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg4326,
+            resolve_geometry_column_name(&metadata).as_deref(),
+        );
+        assert_eq!(
+            bounds,
+            vec![None],
+            "geom_shape has no geo_statistics ⇒ no tier-2 bounds at all"
+        );
+        assert_eq!(
+            crate::overview::convert::select_input_row_groups(&metadata, &[0.0, 0.0, 1.0, 1.0]),
+            vec![0],
+            "must degrade to reading the row group"
+        );
+
+        // And an unresolvable geometry column skips tier 2 outright.
+        assert_eq!(
+            extract_row_group_bounds_tiered(&metadata, Crs::Epsg4326, None),
+            vec![None]
+        );
+    }
+
+    /// #518 (4): arrow-rs writes an unset Parquet `Geometry` CRS as the
+    /// literal "srid:0", which the spec defines as OGC:CRS84. Reading it as
+    /// "unclassifiable" disabled tier 2 on the single most common
+    /// GeoParquet 2.0 shape there is.
+    #[test]
+    fn srid_zero_is_the_lonlat_default() {
+        let specs = [
+            TieredRowGroupSpec {
+                covering: None,
+                native: Some((0.0, 10.0, 0.0, 10.0)),
+                num_rows: 10,
+            },
+            TieredRowGroupSpec {
+                covering: None,
+                native: Some((50.0, 60.0, 50.0, 60.0)),
+                num_rows: 10,
+            },
+        ];
+        for crs in ["srid:0", ""] {
+            let metadata = metadata_with_tiered_stats(Some(crs), false, &specs);
+            let bounds = extract_row_group_bounds_tiered(
+                &metadata,
+                Crs::Epsg4326,
+                resolve_geometry_column_name(&metadata).as_deref(),
+            );
+            assert!(
+                bounds.iter().all(Option::is_some),
+                "{crs:?} means unset ⇒ OGC:CRS84, so tier 2 must fire"
+            );
+            assert_eq!(
+                crate::overview::convert::select_input_row_groups(&metadata, &[0.0, 0.0, 1.0, 1.0]),
+                vec![0],
+                "{crs:?}: pruning must be active"
+            );
+        }
+    }
+
+    /// The tier-2 CRS gate now runs through
+    /// `quality::classify_crs_identifier`: a Web Mercator column must not
+    /// be mistaken for lon/lat because its PROJJSON says "WGS 84 /
+    /// Pseudo-Mercator" (#518 (2)).
+    #[test]
+    fn tier2_classifies_pseudo_mercator_projjson_as_3857() {
+        let specs = [TieredRowGroupSpec {
+            covering: None,
+            native: Some((-1.0e7, -1.0e7 + 10.0, -1.0e7, -1.0e7 + 10.0)),
+            num_rows: 10,
+        }];
+        let projjson = r#"{"type":"ProjectedCRS","name":"WGS 84 / Pseudo-Mercator","id":{"authority":"EPSG","code":3857}}"#;
+        let metadata = metadata_with_tiered_stats(Some(projjson), false, &specs);
+
+        // Session says degrees: the column is meters, so tier 2 stands down
+        // rather than filtering meters against a degree bbox (which pruned
+        // every row group into a silently EMPTY archive).
+        assert_eq!(
+            extract_row_group_bounds_tiered(
+                &metadata,
+                Crs::Epsg4326,
+                resolve_geometry_column_name(&metadata).as_deref()
+            ),
+            vec![None],
+        );
+        // Session says meters: consistent, so tier 2 fires.
+        assert!(extract_row_group_bounds_tiered(
+            &metadata,
+            Crs::Epsg3857,
+            resolve_geometry_column_name(&metadata).as_deref()
+        )[0]
+        .is_some());
     }
 
     // -------------------------------------------------------------------------
@@ -1894,13 +2402,12 @@ mod tests {
                     lng_max: qx0.max(qx1),
                     lat_max: qy0.max(qy1),
                 };
-                // Model exactly what GeoParquet 2.0 native geo_statistics
-                // holds per row group: the tight envelope of its rows.
-                // `geo_statistics_bounds` reads that envelope verbatim
-                // (proven by the deterministic tests above), so testing the
-                // envelope + `RowGroupBounds::intersects` here covers the
-                // same invariant end to end without needing real parquet
-                // I/O (unavailable — see `metadata_with_tiered_stats`).
+                // Scope (#519): this case exercises the *intersection
+                // predicate* over tight per-row-group envelopes — the
+                // arithmetic core, including the antimeridian wraparound and
+                // NaN rules. It deliberately does NOT go through
+                // `extract_row_group_bounds_tiered`; the sibling property
+                // below does that over real `ParquetMetaData`.
                 let bounds: Vec<RowGroupBounds> = groups
                     .iter()
                     .enumerate()
@@ -1929,6 +2436,84 @@ mod tests {
                 prop_assert!(
                     truth.is_subset(&selected),
                     "pruned a row group with a truly matching point: truth={truth:?} selected={selected:?}"
+                );
+            }
+        }
+
+        // The same invariant, but driven through the REAL tiered path
+        // (#519): synthetic-but-genuine `ParquetMetaData` carrying native
+        // `geo_statistics` on two geometry columns, fed to
+        // `select_input_row_groups` — CRS detection, column resolution, tier
+        // selection and all.
+        //
+        // Both columns get an envelope, and the "geo" JSON's
+        // `primary_column` varies over {absent, centroid, geom_shape}, so the
+        // property sees every combination of "annotated column" and "column
+        // the pipeline reads". Truth is the points of the column the READER
+        // would read — which is what pruning must never drop. A prune keyed
+        // off the other column's envelope violates it, which is exactly the
+        // #518/#519 bug class.
+        proptest! {
+            #[test]
+            fn tiered_selection_never_drops_a_true_match(
+                centroid_pts in proptest::collection::vec((-100.0f64..100.0, -100.0f64..100.0), 1..5),
+                shape_pts in proptest::collection::vec((-100.0f64..100.0, -100.0f64..100.0), 1..5),
+                primary_idx in 0usize..3,
+                qx0 in -100.0f64..100.0, qx1 in -100.0f64..100.0,
+                qy0 in -100.0f64..100.0, qy1 in -100.0f64..100.0,
+            ) {
+                /// `(xmin, xmax, ymin, ymax)` — `BoundingBox::new`'s order.
+                fn envelope(pts: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+                    (
+                        pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                        pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
+                        pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                        pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+                    )
+                }
+
+                let primary = [None, Some("centroid"), Some("geom_shape")][primary_idx];
+                let geo_json = primary.map(|p| {
+                    format!(
+                        r#"{{"version":"1.1.0","primary_column":"{p}","columns":{{"{p}":{{"encoding":"WKB"}}}}}}"#
+                    )
+                });
+                let metadata = metadata_with_two_geometry_columns(
+                    Some(envelope(&centroid_pts)),
+                    Some(envelope(&shape_pts)),
+                    geo_json.as_deref(),
+                );
+
+                // The column the READER reads: `primary_column` when
+                // declared, else the `geom*` heuristic.
+                let read_column = primary.unwrap_or("geom_shape");
+                let resolved = resolve_geometry_column_name(&metadata);
+                prop_assert_eq!(
+                    resolved.as_deref(),
+                    Some(read_column),
+                    "pruning and the reader must agree on the column"
+                );
+                let read_pts = if read_column == "centroid" {
+                    &centroid_pts
+                } else {
+                    &shape_pts
+                };
+
+                let filter = TileBounds {
+                    lng_min: qx0.min(qx1),
+                    lat_min: qy0.min(qy1),
+                    lng_max: qx0.max(qx1),
+                    lat_max: qy0.max(qy1),
+                };
+                let selected = crate::overview::convert::select_input_row_groups(
+                    &metadata,
+                    &[filter.lng_min, filter.lat_min, filter.lng_max, filter.lat_max],
+                );
+                let truly_matches = read_pts.iter().any(|&p| point_in_bbox(p, &filter));
+                prop_assert!(
+                    !truly_matches || selected == vec![0],
+                    "pruned the only row group although {read_column} has a matching point: \
+                     read_pts={read_pts:?} filter={filter:?} selected={selected:?}"
                 );
             }
         }

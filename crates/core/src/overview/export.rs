@@ -3976,27 +3976,29 @@ fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyV
 
 /// Detect the overview file's CRS. A null/absent CRS is GeoParquet's default
 /// EPSG:4326. EPSG:3857 is accepted (reprojected on read); anything else errors.
+///
+/// Classification is [`crate::quality::classify_crs_info`], the single shared
+/// classifier — NOT a local substring match (#519). The hand-rolled
+/// `identifier.contains("3857")` this replaces never saw a PROJJSON blob
+/// whose `id` is structured rather than spelled out in the string, which is
+/// exactly what an overview converted from a Web Mercator input now declares.
 fn detect_crs(path: &Path) -> Result<Crs, ExportError> {
+    use crate::quality::CrsKind;
+
     let info = crate::quality::extract_crs(path).map_err(ExportError::Core)?;
-    if info.is_wgs84 {
-        return Ok(Crs::Epsg4326);
+    match crate::quality::classify_crs_info(&info) {
+        CrsKind::Wgs84 => Ok(Crs::Epsg4326),
+        CrsKind::WebMercator => Ok(Crs::Epsg3857),
+        // A null CRS (identifier None, name None) is the GeoParquet default
+        // 4326 — the long-standing export default, kept deliberately.
+        CrsKind::Unknown if info.identifier.is_none() && info.name.is_none() => Ok(Crs::Epsg4326),
+        CrsKind::Unknown => Err(ExportError::UnsupportedCrs {
+            crs: info
+                .identifier
+                .or(info.name)
+                .unwrap_or_else(|| "unknown".to_string()),
+        }),
     }
-    if let Some(id) = &info.identifier {
-        let up = id.to_uppercase();
-        if up.contains("3857") || up.contains("900913") {
-            return Ok(Crs::Epsg3857);
-        }
-    }
-    // A null CRS (identifier None, name None) is the GeoParquet default 4326.
-    if info.identifier.is_none() && info.name.is_none() {
-        return Ok(Crs::Epsg4326);
-    }
-    Err(ExportError::UnsupportedCrs {
-        crs: info
-            .identifier
-            .or(info.name)
-            .unwrap_or_else(|| "unknown".to_string()),
-    })
 }
 
 /// Reproject one EPSG:3857 point (meters) to EPSG:4326 (lon/lat degrees).
@@ -7128,5 +7130,146 @@ mod tests {
             msg.contains("--feature-order") && msg.contains("\"id\""),
             "{msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // CRS detection (#519)
+    // ------------------------------------------------------------------
+
+    /// Write a minimal GeoParquet file whose geometry column declares
+    /// `crs_metadata`, so [`detect_crs`] has a real footer to read.
+    fn write_crs_fixture(path: &Path, md: Option<geoarrow::datatypes::Metadata>) {
+        use geoparquet::writer::{
+            GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
+        };
+        use parquet::arrow::ArrowWriter;
+
+        let geoms = [Geometry::Point(Point::new(0.0, 0.0))];
+        let arr = match md {
+            Some(md) => {
+                let mut b =
+                    GeometryBuilder::new(GeometryType::new(Arc::new(md))).with_prefer_multi(false);
+                b.extend_from_iter(geoms.iter().map(Some));
+                b.finish()
+            }
+            None => build_geometry_array(&geoms),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(arr.data_type().to_field("geometry", true)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![0i64])), arr.to_array_ref()],
+        )
+        .unwrap();
+        let opts = GeoParquetWriterOptionsBuilder::default()
+            .set_encoding(GeoParquetWriterEncoding::WKB)
+            .build();
+        let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &opts).unwrap();
+        let target = encoder.target_schema();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(path).unwrap(), target, None).unwrap();
+        w.write(&encoder.encode_record_batch(&batch).unwrap())
+            .unwrap();
+        w.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+        w.close().unwrap();
+    }
+
+    /// #519 S3-A: `detect_crs` used to run its own `identifier.contains("3857")`
+    /// substring match, which is blind to a PROJJSON `crs` whose EPSG code
+    /// lives in a structured `id` — precisely what an overview converted from
+    /// a Web Mercator input now declares. It must go through the shared
+    /// [`crate::quality::classify_crs_info`] classifier instead.
+    #[test]
+    fn detect_crs_classifies_pseudo_mercator_projjson() {
+        let projjson = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "id": { "authority": "EPSG", "code": 3857 }
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_crs_fixture(
+            tmp.path(),
+            Some(geoarrow::datatypes::Metadata::new(
+                geoarrow::datatypes::Crs::from_projjson(projjson),
+                None,
+            )),
+        );
+        assert_eq!(detect_crs(tmp.path()).unwrap(), Crs::Epsg3857);
+
+        // The case the substring matcher could not see at all: PROJJSON with
+        // NO structured id, so the identifier falls back to the *name* — no
+        // "3857" anywhere in the string.
+        let no_id = tempfile::NamedTempFile::new().unwrap();
+        write_crs_fixture(
+            no_id.path(),
+            Some(geoarrow::datatypes::Metadata::new(
+                geoarrow::datatypes::Crs::from_projjson(serde_json::json!({
+                    "type": "ProjectedCRS",
+                    "name": "WGS 84 / Pseudo-Mercator"
+                })),
+                None,
+            )),
+        );
+        assert_eq!(
+            detect_crs(no_id.path()).unwrap(),
+            Crs::Epsg3857,
+            "a Pseudo-Mercator PROJJSON with no id is still Web Mercator"
+        );
+
+        // ESRI's own Web Mercator code (#519 S4), as PROJJSON — the only
+        // representation `geoparquet`'s default CRS transform writes.
+        let esri = tempfile::NamedTempFile::new().unwrap();
+        write_crs_fixture(
+            esri.path(),
+            Some(geoarrow::datatypes::Metadata::new(
+                geoarrow::datatypes::Crs::from_projjson(serde_json::json!({
+                    "type": "ProjectedCRS",
+                    "name": "WGS_1984_Web_Mercator_Auxiliary_Sphere",
+                    "id": { "authority": "ESRI", "code": 102100 }
+                })),
+                None,
+            )),
+        );
+        assert_eq!(detect_crs(esri.path()).unwrap(), Crs::Epsg3857);
+
+        // 4326 PROJJSON is still lon/lat...
+        let tmp4326 = tempfile::NamedTempFile::new().unwrap();
+        write_crs_fixture(
+            tmp4326.path(),
+            Some(geoarrow::datatypes::Metadata::new(
+                geoarrow::datatypes::Crs::from_projjson(serde_json::json!({
+                    "type": "GeographicCRS",
+                    "name": "WGS 84",
+                    "id": { "authority": "EPSG", "code": 4326 }
+                })),
+                None,
+            )),
+        );
+        assert_eq!(detect_crs(tmp4326.path()).unwrap(), Crs::Epsg4326);
+
+        // ...a file declaring no CRS at all is the GeoParquet default 4326...
+        let bare = tempfile::NamedTempFile::new().unwrap();
+        write_crs_fixture(bare.path(), None);
+        assert_eq!(detect_crs(bare.path()).unwrap(), Crs::Epsg4326);
+
+        // ...and a genuinely unsupported CRS is still a loud error.
+        let utm = tempfile::NamedTempFile::new().unwrap();
+        write_crs_fixture(
+            utm.path(),
+            Some(geoarrow::datatypes::Metadata::new(
+                geoarrow::datatypes::Crs::from_projjson(serde_json::json!({
+                    "type": "ProjectedCRS",
+                    "name": "WGS 84 / UTM zone 33N",
+                    "id": { "authority": "EPSG", "code": 32633 }
+                })),
+                None,
+            )),
+        );
+        assert!(matches!(
+            detect_crs(utm.path()),
+            Err(ExportError::UnsupportedCrs { .. })
+        ));
     }
 }

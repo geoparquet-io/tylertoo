@@ -150,10 +150,11 @@ pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
         },
     }
 
-    // Covering declared (§4.4).
+    // Covering declared (§4.4) — on the PRIMARY column, which §4.4 is about
+    // and which the overviews this validates always declare.
     let covering = geo_json
         .as_deref()
-        .and_then(|j| parse_covering_metadata(j).ok().flatten());
+        .and_then(|j| parse_covering_metadata(j, None).ok().flatten());
     match &covering {
         Some(_) => report.pass("geoparquet_covering_declared", "bbox covering declared"),
         None => report.fail(
