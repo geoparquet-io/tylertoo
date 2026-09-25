@@ -117,6 +117,21 @@ assignment — the single largest phase on a planet-scale run — had no entry
 at all. `crates/cli/tests/profile_json_dump.rs::profile_json_written_and_parses`
 asserts the partition.
 
+> **`pass2.stage_secs.read` changed meaning in #536.** It is now the *summed
+> core-seconds of the reader worker threads* (`--read-workers`, #494), not the
+> time one consumer thread observed itself waiting for batches. With several
+> workers decoding at once the number goes UP while the pass gets faster, so
+> comparing a dump from before #536 against one from after will read a
+> ~+35% `read` as a regression when it is the opposite. Compare
+> `phase_walls.pass2` across such a pair instead, and treat `stage_secs.read`
+> as a core-seconds figure only. Two costs sit outside that window on purpose:
+> the in-order merge's splice at a worker seam, and opening each segment's
+> reader — the latter is now a bare `File::open` over already-parsed footer
+> metadata (#536 stopped re-parsing the footer per segment, ~5.5 s of CPU on
+> the Brazil fixture), so it is negligible rather than merely uncounted.
+> `pass2.stage_secs.spill_write` likewise moved off the consumer thread onto
+> each level's spill writer and is folded in when that thread is joined.
+
 `pass1.stage_secs` and `pass2.stage_secs` are independent stage splits —
 they do not need to sum to their phase's `rows_per_sec` denominator or to
 `phase_walls`, since stages overlap across a producer/consumer pipeline

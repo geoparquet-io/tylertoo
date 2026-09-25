@@ -95,6 +95,23 @@ verbatim (spec §2.4).
    serial engine that re-reads the input once per level is retained as the
    equivalence-tested reference.
 
+   Since #494 the read side of that sentence is wider than one thread. Pass 2
+   splits the selected row groups into ordered **segments** (`input_set.rs`,
+   runs of one part's row groups capped at what a reader can buffer ahead) and
+   hands them to up to N **reader workers** (`--read-workers`, auto =
+   `min(cores / 4, 4)`) round-robin, each with its own bounded read-ahead
+   channel sized against a modelled slice of the memory budget. The producer
+   thread **merges** the workers' output in segment order and re-chunks it
+   (`Regrouper`) into exactly the batch sequence one sequential reader would
+   have produced — batch boundaries are load-bearing, because the writer issues
+   one column-writer call per slice and parquet checks its page limits per
+   call — then pushes it through the same bounded pipe to the consumer. On the
+   sink side each level's `bounded`-profile spill is written by its own
+   spill-writer thread behind a `bounded(2)` queue, so the consumer hands the
+   batch over instead of encoding it. Output is byte-identical for every worker
+   count; remote inputs read sequentially regardless (their parts share one
+   chunk cache that concurrent readers would evict).
+
 Pass 1 and the assignment can be **persisted and replayed** (`plan_state.rs`,
 `--save-plan` / `--plan`). Two reasons:
 
@@ -461,6 +478,10 @@ crates/core/src/
 │   └── writer.rs       #   Level-banded GeoParquet writer
 ├── input.rs            # Input source abstraction: local file or remote
 │                       # object (s3/https/gs) via byte-range reads (#210)
+├── input_set.rs        # ConvertSource: one file/object or an ordered set of
+│                       # partitions read as one dataset (v0.7); owns the
+│                       # per-part footer cache, the sequential SourceStream,
+│                       # and the pass-2 reader segments (#494)
 ├── batch_processor.rs  # GeoArrow batch → geo::Geometry decoding
 ├── clip.rs             # Geometry clipping (dispatcher)
 ├── ioverlay_clip.rs    # i_overlay-based robust polygon clipping
