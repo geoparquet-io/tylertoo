@@ -1441,20 +1441,36 @@ impl PmtilesWriter {
         let mut unique_contents = 0u64;
 
         if self.dedup_enabled {
-            // With deduplication: store unique tiles, reference duplicates
-            for (&id, entry) in &self.tiles {
-                let (offset, length) = if let Some(ref data) = entry.data {
-                    // Unique tile - write to buffer and record location
+            // With deduplication: store unique tiles, reference duplicates.
+            //
+            // Two passes (#516): a duplicate's tile_id is not necessarily
+            // greater than the tile_id of the tile that carries its bytes --
+            // which one "carries" the data is decided by add order
+            // (whichever `add_tile` call for a given hash happened first),
+            // not by tile_id. A single pass over `self.tiles` in tile_id
+            // order can therefore reach a duplicate before its carrier and
+            // find no entry in `hash_to_offset` yet.
+            //
+            // Pass 1: write every carrying tile's bytes and record its
+            // offset, walking tile_id order (matters only for determinism,
+            // not correctness -- this pass never reads `hash_to_offset`).
+            for entry in self.tiles.values() {
+                if let Some(ref data) = entry.data {
                     let offset = tile_data_buf.len() as u64;
                     let length = data.len() as u32;
                     tile_data_buf.extend_from_slice(data);
                     hash_to_offset.insert(entry.hash, (offset, length));
                     unique_contents += 1;
-                    (offset, length)
-                } else {
-                    // Duplicate tile - look up existing location
-                    *hash_to_offset.get(&entry.hash).expect("Hash must exist")
-                };
+                }
+            }
+
+            // Pass 2: build directory entries in tile_id order. Every hash
+            // now resolves, regardless of how add order and tile_id order
+            // related to each other.
+            for (&id, entry) in &self.tiles {
+                let (offset, length) = *hash_to_offset
+                    .get(&entry.hash)
+                    .expect("pass 1 recorded an offset for every hash in self.tiles");
 
                 // Check if this can extend the previous entry's run_length
                 // (same offset = same content, consecutive tile_id)
@@ -1544,23 +1560,21 @@ impl PmtilesWriter {
         let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
         let tile_data_length = tile_data_buf.len() as u64;
 
-        // Unlike `StreamingPmtilesWriter` (which appends tiles in whatever
-        // order the caller discovers them, then sorts the *directory* by
-        // tile_id without touching already-written data offsets),
-        // `PmtilesWriter` is clustered by construction: `self.tiles` is a
-        // `BTreeMap`, so the loop above that filled `entries` and
-        // `tile_data_buf` already ran in ascending tile_id order, and each
-        // unique tile's offset was the buffer's length *at that point in the
-        // ascending walk* — i.e. offsets are monotonic in tile_id order, with
-        // duplicates back-referencing an earlier (smaller) offset. There is
-        // no order for it to disagree with, so no derivation is needed here;
-        // the assert below is a canary in case that invariant ever breaks
-        // (e.g. `entries` stops being built from a sorted iteration).
-        debug_assert!(
-            offsets_are_clustered(entries.iter().map(|e| (e.offset, u64::from(e.length)))),
-            "PmtilesWriter builds `entries` from a BTreeMap in tile_id order, \
-             which is clustered by construction"
-        );
+        // Without deduplication, `self.tiles` (a `BTreeMap`) walked in
+        // tile_id order is clustered by construction: each tile's offset is
+        // the buffer's length at that point in the ascending walk, so
+        // offsets are strictly monotonic. With deduplication (#516), a
+        // duplicate's tile_id can fall anywhere relative to the tile_id of
+        // the tile that carries its bytes (carrying is decided by add
+        // order), so a duplicate can be the first entry, in tile_id order,
+        // to reference an offset that some *other* hash's carrier claimed
+        // later in the walk -- a legitimate multi-hash interleaving the
+        // panic this predicate replaced would have hit too. So this is
+        // derived honestly from the entries actually written, the same way
+        // `StreamingPmtilesWriter::entries_are_clustered` does, rather than
+        // asserted.
+        let clustered =
+            offsets_are_clustered(entries.iter().map(|e| (e.offset, u64::from(e.length))));
 
         // Build header
         let header = Header {
@@ -1577,8 +1591,7 @@ impl PmtilesWriter {
             addressed_tiles_count: self.tiles.len() as u64,
             tile_entries_count: entries.len() as u64,
             tile_contents_count: unique_contents,
-            // See the `debug_assert!` above: clustered by construction.
-            clustered: true,
+            clustered,
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
@@ -4636,5 +4649,95 @@ mod tests {
         // order.
         writer.add_tile(2, 3, 3, &[1, 2, 3]).unwrap();
         let _ = writer.add_tile(2, 0, 0, &[4, 5, 6]);
+    }
+
+    // -------------------------------------------------------------------------
+    // #516: PmtilesWriter dedup panics on out-of-order adds
+    // -------------------------------------------------------------------------
+
+    /// Byte-stability regression for the two-pass offset-assignment fix
+    /// (#516): the same tiles as `test_writer_dedup_run_length_consecutive`
+    /// (every duplicate added after its carrier -- a "currently-working"
+    /// input under the pre-#516 single-pass code too), hashed with the same
+    /// `TileHasher` (xxh3) the writer itself uses for content-addressing.
+    /// The expected hash and length were captured by running this exact
+    /// scenario against the pre-fix `write_to_file` (the version with
+    /// `hash_to_offset.get(...).expect("Hash must exist")`) before switching
+    /// it to the two-pass assignment. A change here means the two-pass
+    /// rewrite altered output for an input the single-pass code already
+    /// handled correctly, which it must not.
+    #[test]
+    fn dedup_two_pass_offset_assignment_preserves_bytes_for_existing_working_input() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+        let tile = vec![0x1a, 0x10];
+        writer.add_tile(1, 0, 0, &tile).unwrap();
+        writer.add_tile(1, 0, 1, &tile).unwrap();
+        writer.add_tile(1, 1, 1, &tile).unwrap();
+        writer.add_tile(1, 1, 0, &tile).unwrap();
+
+        let path = Path::new("/tmp/test-pmtiles-516-byte-stability.pmtiles");
+        let _ = fs::remove_file(path);
+        writer.write_to_file(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_eq!(bytes.len(), 281, "output length must be unchanged by #516");
+        assert_eq!(
+            TileHasher::hash(&bytes),
+            15_382_129_263_914_387_794,
+            "output bytes must be unchanged by #516 for an input the old single-pass code \
+             already wrote correctly"
+        );
+    }
+
+    /// #516 repro: `hash_to_offset.get(&entry.hash).expect("Hash must exist")`
+    /// panicked when a duplicate's tile_id was lower than the tile_id of the
+    /// tile that carries the bytes, because `self.tiles` (a `BTreeMap`) is
+    /// walked in tile_id order and the single pass had not yet recorded the
+    /// carrier's offset when it reached the duplicate. `add_tile(2,3,3,...)`
+    /// then `add_tile(0,0,0,...)` with identical content is exactly that:
+    /// the second add's tile_id (0) is lower than the first's, but the first
+    /// add is the one that carries the bytes (it was added -- and hashed --
+    /// first).
+    #[test]
+    fn dedup_survives_duplicate_with_lower_tile_id_than_its_carrier() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        writer.add_tile(2, 3, 3, b"shared").unwrap();
+        writer.add_tile(0, 0, 0, b"shared").unwrap();
+
+        let path = Path::new("/tmp/test-pmtiles-516-descending-ids.pmtiles");
+        let _ = fs::remove_file(path);
+        writer.write_to_file(path).expect("must not panic (#516)");
+
+        let stats = writer.dedup_stats();
+        assert_eq!(stats.total_tiles, 2);
+        assert_eq!(
+            stats.unique_tiles, 1,
+            "identical content must collapse to one stored blob"
+        );
+        assert_eq!(stats.duplicates_eliminated, 1);
+
+        let bytes = fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+
+        assert_eq!(header.addressed_tiles_count, 2, "both tiles are addressed");
+        assert_eq!(
+            header.tile_contents_count, 1,
+            "only one unique blob is stored, regardless of which tile_id carried it"
+        );
+        let actually_clustered = verify_clustered(path).unwrap();
+        assert!(
+            actually_clustered,
+            "a single unique blob referenced by two tile_ids is trivially clustered"
+        );
+        assert_eq!(
+            header.clustered, actually_clustered,
+            "the header's own clustered claim must match the independent, file-side check"
+        );
+
+        let _ = fs::remove_file(path);
     }
 }
