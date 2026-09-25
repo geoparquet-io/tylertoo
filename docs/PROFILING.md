@@ -86,6 +86,12 @@ not "the run was not profiled".
       "build": 0.00177,             // under the pipelined engine, so these
       "drain": 0.0,                 // are core-seconds that can exceed
       "spill_write": 0.0            // phase_walls.pass2's wall time
+    },
+    "identical_steps": {            // cascade-fold steps that reused the
+      "shared": 1632,               // previous level's geometry (#499);
+      "total": 26909,               // 0/0 when the fold never ran: a Serial
+                                    // run, or a single-level ladder
+      "ratio": 0.0606
     }
   },
   "levels": [                       // per WRITTEN level, writer order

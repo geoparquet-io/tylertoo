@@ -361,3 +361,91 @@ fn failed_run_leaves_no_zero_byte_profile_json() {
             .unwrap_or(0)
     );
 }
+
+/// #499: `pass2.identical_steps` — the cascade fold's Arc-sharing counters.
+///
+/// This needs its own run because it needs a MULTI-level ladder. The
+/// `--max-zoom 6` run in `profile_json_written_and_parses` emits a single
+/// level for this fixture, so `run_pass2_buffered` (and with it
+/// `process_batch_cascade`, the only thing that moves these counters) never
+/// executes and the dump legitimately reports `0/0`. `--max-zoom 12` emits
+/// four levels, so the fold actually runs.
+#[test]
+fn profile_json_reports_cascade_identical_steps() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out.pmtiles");
+    let profile_json = dir.path().join("profile.jsonl");
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "12",
+        ])
+        .env("TYLERTOO_PROFILE_JSON", &profile_json)
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(
+        output.status.success(),
+        "tiles exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let contents = std::fs::read_to_string(&profile_json)
+        .unwrap_or_else(|e| panic!("read TYLERTOO_PROFILE_JSON file {profile_json:?}: {e}"));
+    let line = contents
+        .lines()
+        .next()
+        .expect("one JSON line must be written");
+    let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+
+    let level_count = value["levels"]
+        .as_array()
+        .expect("levels must be an array")
+        .len();
+    assert!(
+        level_count > 1,
+        "this test needs a multi-level ladder for the cascade fold to run, \
+         got {level_count} level(s): {value}"
+    );
+
+    let identical = &value["pass2"]["identical_steps"];
+    let shared = identical["shared"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("pass2.identical_steps.shared must be an integer: {value}"));
+    let total = identical["total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("pass2.identical_steps.total must be an integer: {value}"));
+    let ratio = identical["ratio"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("pass2.identical_steps.ratio must be a number: {value}"));
+
+    assert!(
+        total > 0,
+        "pass2.identical_steps.total must be > 0 once the cascade fold runs: {value}"
+    );
+    assert!(
+        shared <= total,
+        "pass2.identical_steps.shared ({shared}) must not exceed total ({total}): {value}"
+    );
+    assert!(
+        ratio.is_finite() && (0.0..=1.0).contains(&ratio),
+        "pass2.identical_steps.ratio ({ratio}) must be finite in [0, 1]: {value}"
+    );
+    // `ratio` is the derived view of the two counters; it must agree with them
+    // rather than drift as an independently-computed number.
+    let expected = shared as f64 / total as f64;
+    assert!(
+        (ratio - expected).abs() < 1e-9,
+        "pass2.identical_steps.ratio ({ratio}) must equal shared/total ({expected}): {value}"
+    );
+}

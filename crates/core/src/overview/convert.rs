@@ -2640,6 +2640,11 @@ fn write_emitted_levels(
 ) -> Result<Vec<LevelReport>, ConvertError> {
     let mut level_reports = Vec::with_capacity(emitted.len());
     for (level_idx, e) in emitted.iter().enumerate() {
+        // `build_level_batch` takes `Arc<Geometry<f64>>` so the streaming
+        // cascade fold can share allocations across levels (#499); this
+        // in-memory path has nothing to share, so it just wraps each owned
+        // geometry once here (`EmittedLevel::geoms` stays a plain
+        // `Vec<Geometry<f64>>` — out of scope for #499's compute-side PR).
         let mut batch = build_level_batch(
             inputs.source_schema,
             inputs.full,
@@ -3827,13 +3832,20 @@ pub(super) fn build_source_schema(
 
 /// Assemble one level's record batch: non-geometry columns via `take` on the
 /// selected indices (preserving input order), geometry rebuilt from `geoms`.
+///
+/// `geoms` is `Arc<Geometry<f64>>` rather than an owned `Geometry<f64>`
+/// (#499): the pipelined cascade fold ([`super::stream::process_batch_cascade`])
+/// shares one allocation across every ladder level a feature survives
+/// unchanged, and this assembly step only ever needs a `&Geometry<f64>` to
+/// feed the Arrow builder — taking ownership here would force a clone right
+/// back out of the very allocation the fold shared to avoid.
 pub(super) fn build_level_batch(
     source_schema: &Schema,
     full: &RecordBatch,
     non_geom_cols: &[usize],
     geom_idx: usize,
     indices: &[usize],
-    geoms: &[Geometry<f64>],
+    geoms: &[impl std::borrow::Borrow<Geometry<f64>>],
 ) -> Result<RecordBatch, ConvertError> {
     let take_idx = UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
 
@@ -3850,7 +3862,7 @@ pub(super) fn build_level_batch(
                     .unwrap_or_default(),
             ));
             let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-            b.extend_from_iter(geoms.iter().map(Some));
+            b.extend_from_iter(geoms.iter().map(|g| Some(g.borrow())));
             columns.push(b.finish().to_array_ref());
         } else {
             let src_col = *non_geom_iter.next().expect("non-geom column index");
@@ -7726,6 +7738,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Many minimal-vertex squares (FTW-like: 4-point rings RDP can't shrink
+    /// without collapsing them entirely) spread across a wide grid so none
+    /// collide during simplification. Adjacent ladder levels commonly
+    /// simplify these to byte-identical geometry — exactly the case #499's
+    /// cascade Arc-sharing targets.
+    fn minimal_square_fixture(n: usize) -> Vec<Geometry<f64>> {
+        let mut geoms = Vec::with_capacity(n);
+        for i in 0..n {
+            let cx = -170.0 + (i % 20) as f64 * 17.0;
+            let cy = -80.0 + (i / 20) as f64 * 15.0;
+            let half = 0.05; // ~5.5km diagonal: survives many fine levels
+                             // unchanged, then drops once the visibility gate passes it.
+            let ext = LineString::from(vec![
+                (cx - half, cy - half),
+                (cx + half, cy - half),
+                (cx + half, cy + half),
+                (cx - half, cy + half),
+                (cx - half, cy - half),
+            ]);
+            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+        }
+        geoms
+    }
+
+    /// #499: the pipelined cascade fold's Arc-sharing of identical
+    /// simplification steps must not change a single output byte. FTW-shaped
+    /// minimal-vertex squares exercise the sharing path hard — RDP can't
+    /// remove any more vertices from a 4-point ring without collapsing it, so
+    /// most of a long ladder's levels produce identical geometry. Serial
+    /// (`process_level_batch`, never shares — the "forced-clone" reference
+    /// path) must still match Pipelined (`process_batch_cascade`, shares via
+    /// `Arc`) row-for-row and level-for-level.
+    #[test]
+    fn cascade_shared_steps_produce_identical_batches() {
+        use super::super::stream::Pass2Strategy;
+
+        let geoms = minimal_square_fixture(80);
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 12,
+            },
+            ..Default::default()
+        };
+
+        let serial_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews_strategy(tin.path(), serial_out.path(), &opts, Pass2Strategy::Serial)
+            .unwrap();
+        let piped_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews_strategy(
+            tin.path(),
+            piped_out.path(),
+            &opts,
+            Pass2Strategy::Pipelined,
+        )
+        .unwrap();
+
+        assert_outputs_equivalent(serial_out.path(), piped_out.path(), "minimal_square_ladder");
+    }
+
+    /// Cascade revive-semantics guard (#499): the fold's Point / Square band
+    /// steps revive from canonical geometry when the fine-level fold already
+    /// dropped a feature (see `simplify_cascade`'s doc comment) — sharing
+    /// must not collapse a revived step onto an earlier dropped one. A ladder
+    /// with Geometry levels at the fine end, a Square band in the middle, and
+    /// a Point band at the coarse end exercises every representation
+    /// transition the fold's `has_band_upto` / revival logic handles.
+    #[test]
+    fn cascade_mixed_point_square_bands_pipelined_matches_serial() {
+        use super::super::stream::Pass2Strategy;
+
+        let geoms = polygon_fixture();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let opts = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 10,
+            },
+            // Fine levels (7-10) default to full geometry; 4-6 replace
+            // below-tolerance polygons with placeholder squares; 1-3 replace
+            // every polygon with its representative point.
+            representation: vec![
+                band(1, 3, Representation::Point),
+                band(4, 6, Representation::Square),
+            ],
+            ..Default::default()
+        };
+
+        let serial_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews_strategy(tin.path(), serial_out.path(), &opts, Pass2Strategy::Serial)
+            .unwrap();
+        let piped_out = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews_strategy(
+            tin.path(),
+            piped_out.path(),
+            &opts,
+            Pass2Strategy::Pipelined,
+        )
+        .unwrap();
+
+        assert_outputs_equivalent(
+            serial_out.path(),
+            piped_out.path(),
+            "mixed_point_square_bands",
+        );
     }
 
     /// Pipelined output must be invariant to batching/overlap knobs

@@ -52,6 +52,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -87,7 +88,8 @@ use super::pipeline;
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals};
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
-    validation_skip_count, CascadeStep, CollapseMode, Representation, Simplified, SimplifyOptions,
+    simplify_step_checked, validation_skip_count, CascadeStep, CollapseMode, Representation,
+    Simplified, SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
@@ -1836,6 +1838,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
         pass2_wall_secs: ctx.t_pass2.elapsed().as_secs_f64(),
         pass2_rows: ctx.pass2_rows,
         pass2_stage_secs: ctx.pass2_engine_timers.stage_secs(),
+        pass2_cascade_step_counts: ctx.pass2_engine_timers.cascade_step_counts(),
         writer_finish_secs: ctx.t_finish.elapsed().as_secs_f64(),
         total_secs: ctx.start.elapsed().as_secs_f64(),
         levels: ctx
@@ -1866,6 +1869,12 @@ struct ProfileJsonInputs<'a> {
     /// in output rows, matching the `[profile] pass2 engine` log).
     pass2_rows: usize,
     pass2_stage_secs: Pass2StageSecs,
+    /// `(shared, total)` cascade-fold `Keep` steps (#499,
+    /// `pass2.identical_steps` in the dump). Only the pipelined engine's
+    /// cascade fold ([`process_batch_cascade`]) records these, so `(0, 0)`
+    /// means the fold never ran: a Serial-engine run, or a single-level
+    /// ladder (where `run_pass2_buffered` is skipped entirely).
+    pass2_cascade_step_counts: (u64, u64),
     writer_finish_secs: f64,
     total_secs: f64,
     /// Per WRITTEN level, in writer order (matches `ConvertReport.levels`):
@@ -1970,6 +1979,12 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
         .iter()
         .map(|&(rows, spill_bytes)| serde_json::json!({"rows": rows, "spill_bytes": spill_bytes}))
         .collect();
+    let (cascade_steps_shared, cascade_steps_total) = inputs.pass2_cascade_step_counts;
+    let cascade_share_ratio = if cascade_steps_total > 0 {
+        cascade_steps_shared as f64 / cascade_steps_total as f64
+    } else {
+        0.0
+    };
     let value = serde_json::json!({
         "timestamp": timestamp,
         "phase_walls": {
@@ -1999,6 +2014,17 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
                 "build": inputs.pass2_stage_secs.build,
                 "drain": inputs.pass2_stage_secs.drain,
                 "spill_write": inputs.pass2_stage_secs.spill_write,
+            },
+            // Cascade-fold Arc-sharing (#499, compute side): how many of the
+            // fold's `Keep` steps reused the previous step's geometry
+            // (`Arc::clone`) instead of retaining a fresh allocation, because
+            // simplification removed nothing. `(0, 0)` whenever the fold never
+            // ran: a Serial-engine run (the reference engine doesn't share —
+            // see `process_level_batch`), or a single-level ladder.
+            "identical_steps": {
+                "shared": cascade_steps_shared,
+                "total": cascade_steps_total,
+                "ratio": cascade_share_ratio,
             },
         },
         "levels": levels_json,
@@ -3036,9 +3062,11 @@ fn run_pass1_with_chunk_rows(
 // Pass 2: per-level streaming filter → simplify → write
 // ============================================================================
 
-/// Wall-time accumulators for pass-2 stages ([profile] logging), stored as
-/// nanoseconds. Atomic so the pipelined engine ([`super::pipeline`]) can share
-/// one set across the parallel per-level processing of a batch; the serial
+/// Pass-2 [profile] counters: wall-time accumulators per stage (stored as
+/// nanoseconds), plus two cascade-fold step counters (#499) that piggyback on
+/// the same shared-atomics lifecycle rather than nanosecond timings. Atomic so
+/// the pipelined engine ([`super::pipeline`]) can share one set across the
+/// parallel per-level processing of a batch; the serial
 /// [`write_level_streaming`] path uses it single-threaded.
 #[derive(Default)]
 pub(super) struct Pass2Timers {
@@ -3057,6 +3085,15 @@ pub(super) struct Pass2Timers {
     /// The bounded-profile Arrow IPC spill write (`SpillState::push`), on the
     /// consumer thread. Previously invisible and byte-uncounted.
     spill_write: AtomicU64,
+    /// Cascade-fold steps ([`process_batch_cascade`], #499) that reused
+    /// (`Arc::clone`) the previous step's geometry because simplification
+    /// removed nothing, instead of retaining a fresh allocation. Wired into
+    /// the `TYLERTOO_PROFILE_JSON` dump (`pass2.identical_steps`) so a run
+    /// quantifies its own share-vs-clone ratio.
+    cascade_steps_shared: AtomicU64,
+    /// Total cascade-fold `Keep` steps evaluated ([`process_batch_cascade`]);
+    /// the denominator for `cascade_steps_shared`.
+    cascade_steps_total: AtomicU64,
 }
 
 /// Pass-2 engine stage wall-time split, in seconds — [`Pass2Timers`]
@@ -3091,6 +3128,25 @@ impl Pass2Timers {
     pub(super) fn spill_write_cell(&self) -> &AtomicU64 {
         &self.spill_write
     }
+    /// Record a batch's worth of cascade-fold `Keep` steps (#499): `shared`
+    /// reused the previous step's `Arc<Geometry>` because simplification
+    /// removed nothing; `total` is every `Keep` step evaluated. Called once
+    /// per batch from [`process_batch_cascade`] (after summing across that
+    /// batch's parallel per-feature folds), not once per step, to keep the
+    /// atomics off the hot per-feature path.
+    pub(super) fn record_cascade_steps(&self, shared: u64, total: u64) {
+        self.cascade_steps_shared
+            .fetch_add(shared, Ordering::Relaxed);
+        self.cascade_steps_total.fetch_add(total, Ordering::Relaxed);
+    }
+    /// Snapshot `(shared, total)` cascade-fold step counts (#499,
+    /// `TYLERTOO_PROFILE_JSON`'s `pass2.identical_steps`).
+    pub(super) fn cascade_step_counts(&self) -> (u64, u64) {
+        (
+            self.cascade_steps_shared.load(Ordering::Relaxed),
+            self.cascade_steps_total.load(Ordering::Relaxed),
+        )
+    }
     /// Fold this timer set's per-stage totals into `other` (adds, never
     /// overwrites). Used to combine the finest level's own
     /// [`write_level_streaming`] timers into the pipelined engine's
@@ -3117,6 +3173,14 @@ impl Pass2Timers {
         other
             .spill_write
             .fetch_add(self.spill_write.load(Ordering::Relaxed), Ordering::Relaxed);
+        other.cascade_steps_shared.fetch_add(
+            self.cascade_steps_shared.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        other.cascade_steps_total.fetch_add(
+            self.cascade_steps_total.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
     pub(super) fn stage_secs(&self) -> Pass2StageSecs {
         Pass2StageSecs {
@@ -3500,12 +3564,22 @@ pub(super) fn process_level_batch(
 /// project source columns, splice the geometry column, then append
 /// cluster / coalesced-count columns. Shared by [`process_level_batch`] and
 /// [`process_batch_cascade`].
+///
+/// `kept_geoms` is borrowed and generic over `Borrow<Geometry<f64>>` (#499):
+/// [`process_batch_cascade`] shares one allocation across every ladder level
+/// whose step removed nothing and so passes `&[Arc<Geometry<f64>>]`, while
+/// [`process_level_batch`] owns its geometries outright and passes
+/// `&[Geometry<f64>]`. Note that the owned side is NOT a Serial-only path:
+/// the pipelined production engine streams its finest level through
+/// `write_level_streaming` -> `process_level_batch` as well. Assembly must not
+/// undo either caller's choice by deep-cloning or re-wrapping on the way into
+/// the Arrow builder.
 fn assemble_level_batch(
     batch: &RecordBatch,
     row_offset: usize,
     ctx: &LevelStreamCtx<'_>,
     kept_idx: &[usize],
-    kept_geoms: &[Geometry<f64>],
+    kept_geoms: &[impl std::borrow::Borrow<Geometry<f64>>],
 ) -> Result<RecordBatch, ConvertError> {
     let mut out_batch = build_level_batch(
         ctx.source_schema,
@@ -3534,6 +3608,27 @@ fn assemble_level_batch(
         }
     }
     Ok(out_batch)
+}
+
+/// One cascade-fold step's result, sharing (`Arc`) the kept geometry instead
+/// of owning a deep clone (#499).
+///
+/// The fold in [`process_batch_cascade`] used to store `Simplified` directly,
+/// which owns a `Geometry<f64>` — cheap for one step, but the fold pushes one
+/// entry per feature *per level*, and adjacent ladder levels commonly
+/// simplify to the exact same geometry (small polygons already at minimum
+/// vertex count, point bands that pass a point through untouched). Wrapping
+/// the kept geometry in `Arc` lets every level after the first unchanged step
+/// reuse that one allocation (`Arc::clone`, a refcount bump) instead of
+/// retaining its own copy, cutting peak RSS and allocator traffic on
+/// FTW-shaped data without changing a single output byte.
+enum SharedStep {
+    /// Geometry survives at this level — shared with whichever earlier fold
+    /// step (or the canonical decode) first produced this exact value.
+    Keep(Arc<Geometry<f64>>),
+    /// Geometry is not meaningful at this level (mirrors
+    /// [`Simplified::Dropped`]).
+    Dropped,
 }
 
 /// Pipelined-engine batch processor for cascading simplification (#218).
@@ -3604,8 +3699,11 @@ pub(super) fn process_batch_cascade(
         }
     }
 
-    // Decode only the selected rows' geometries, once for all levels.
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(selected.len());
+    // Decode only the selected rows' geometries, once for all levels. Wrapped
+    // in `Arc` immediately (#499): the fold below shares this same
+    // allocation via `Arc::clone` for every level a feature survives
+    // unchanged, instead of deep-cloning canonical geometry once per level.
+    let mut geoms_owned: Vec<Geometry<f64>> = Vec::with_capacity(selected.len());
     if !selected.is_empty() {
         let take_idx = UInt32Array::from(selected.iter().map(|&i| i as u32).collect::<Vec<_>>());
         let geom_taken = take(batch.column(finest.geom_idx).as_ref(), &take_idx, None)?;
@@ -3613,8 +3711,9 @@ pub(super) fn process_batch_cascade(
         let gfield = schema.field(finest.geom_idx);
         let garr = from_arrow_array(geom_taken.as_ref(), gfield)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-        extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
+        extract_geometries_from_array(garr.as_ref(), &mut geoms_owned)?;
     }
+    let geoms: Vec<Arc<Geometry<f64>>> = geoms_owned.into_iter().map(Arc::new).collect();
     Pass2Timers::add(&timers.decode, t_decode);
 
     // --- Per-feature incremental fold, fine→coarse, parallel over features.
@@ -3638,14 +3737,24 @@ pub(super) fn process_batch_cascade(
         v
     };
     let t_simplify = Instant::now();
-    let folds: Vec<Vec<Simplified>> = geoms
+    // Keep step semantics in lock-step with `super::simplify::simplify_cascade`;
+    // equivalence is enforced by `overview::convert::tests::pipelined_matches_serial`.
+    // Per-feature fold, `(steps, shared_count, total_count)`. `.collect()` on
+    // this `zip` (an `IndexedParallelIterator`) preserves ascending `pos`
+    // order exactly like the pre-#499 `Vec<Vec<Simplified>>` collect did —
+    // load-bearing, since `folds[pos]` below is indexed by that position.
+    // The two per-feature counters (#499's `identical_steps` profile metric)
+    // are summed in a plain sequential pass after collecting, rather than
+    // via a rayon `fold`/`reduce` that could reorder `folds`.
+    let per_feature: Vec<(Vec<SharedStep>, u64, u64)> = geoms
         .par_iter()
         .zip(&selected)
         .map(|(g, &i)| {
             let ml = finest.min_levels[row_offset + i];
-            let mut out: Vec<Simplified> = Vec::with_capacity(ctxs.len());
-            let mut current: Option<Geometry<f64>> = None;
+            let mut out: Vec<SharedStep> = Vec::with_capacity(ctxs.len());
+            let mut current: Option<Arc<Geometry<f64>>> = None;
             let mut alive = true;
+            let (mut shared, mut total) = (0u64, 0u64);
             for (li, ctx) in ctxs.iter().enumerate().rev() {
                 if ml > ctx.orig_level {
                     break; // duplicating membership is a contiguous fine suffix
@@ -3653,31 +3762,60 @@ pub(super) fn process_batch_cascade(
                 if !alive && !has_band_upto[li] {
                     break; // only geometry ctxs remain: dropped stays dropped
                 }
-                let step = if !alive && ctx.repr == Representation::Geometry {
-                    Simplified::Dropped
+                if !alive && ctx.repr == Representation::Geometry {
+                    out.push(SharedStep::Dropped);
+                    continue;
+                }
+                // `base` is the Arc this step folds from: the previous step's
+                // shared geometry when alive, or the canonical geometry `g`
+                // when reviving a dropped fold at a Point / Square band.
+                let base: &Arc<Geometry<f64>> = if alive {
+                    current.as_ref().unwrap_or(g)
                 } else {
-                    let input = if alive {
-                        current.as_ref().unwrap_or(g)
-                    } else {
-                        g // revive from canonical (Point / Square band)
-                    };
-                    simplify_step(input, ctx.gsd_m, ctx.crs, ctx.simplify, ctx.repr)
+                    g
                 };
+                let (step, unchanged) = simplify_step_checked(
+                    base.as_ref(),
+                    ctx.gsd_m,
+                    ctx.crs,
+                    ctx.simplify,
+                    ctx.repr,
+                );
                 match step {
                     Simplified::Keep(s) => {
-                        out.push(Simplified::Keep(s.clone()));
-                        current = Some(s);
+                        total += 1;
+                        // No removal ⇒ the output is value-identical to
+                        // `base` — share its allocation instead of retaining
+                        // the fresh (but structurally identical) `s` that
+                        // simplification just built.
+                        let arc = if unchanged {
+                            shared += 1;
+                            Arc::clone(base)
+                        } else {
+                            Arc::new(s)
+                        };
+                        out.push(SharedStep::Keep(Arc::clone(&arc)));
+                        current = Some(arc);
                         alive = true;
                     }
                     Simplified::Dropped => {
-                        out.push(Simplified::Dropped);
+                        out.push(SharedStep::Dropped);
                         alive = false;
                     }
                 }
             }
-            out
+            (out, shared, total)
         })
         .collect();
+    let mut folds: Vec<Vec<SharedStep>> = Vec::with_capacity(per_feature.len());
+    let mut shared_count = 0u64;
+    let mut total_count = 0u64;
+    for (out, s, t) in per_feature {
+        folds.push(out);
+        shared_count += s;
+        total_count += t;
+    }
+    timers.record_cascade_steps(shared_count, total_count);
     Pass2Timers::add(&timers.simplify, t_simplify);
 
     // --- Assemble every level's batch, in the per-level selection's
@@ -3689,7 +3827,7 @@ pub(super) fn process_batch_cascade(
         .map(|(li, ctx)| {
             let depth = ctxs.len() - 1 - li;
             let mut kept_idx: Vec<usize> = Vec::new();
-            let mut kept_geoms: Vec<Geometry<f64>> = Vec::new();
+            let mut kept_geoms: Vec<Arc<Geometry<f64>>> = Vec::new();
             let mut verts = 0usize;
             for (i, &pos) in pos_of_row.iter().enumerate() {
                 let g = row_offset + i;
@@ -3698,28 +3836,33 @@ pub(super) fn process_batch_cascade(
                         if let Some((merged, _)) = table.get(&g) {
                             verts += count_vertices(merged);
                             kept_idx.push(i);
-                            kept_geoms.push(merged.clone());
+                            kept_geoms.push(Arc::new(merged.clone()));
                         }
                         continue;
                     }
                 }
                 if ctx.min_levels[g] <= ctx.orig_level {
                     debug_assert_ne!(pos, u32::MAX, "member row missing from cascade superset");
-                    if let Some(Simplified::Keep(s)) = folds[pos as usize].get(depth) {
+                    if let Some(SharedStep::Keep(s)) = folds[pos as usize].get(depth) {
                         verts += count_vertices(s);
                         kept_idx.push(i);
-                        kept_geoms.push(s.clone());
+                        // Cheap: a refcount bump, not a deep clone — the
+                        // whole point of `SharedStep` (#499).
+                        kept_geoms.push(Arc::clone(s));
                     }
                 } else if ctx.is_carrier_row(g) {
                     // #384: not a member, but the carrier of its cell's
                     // dropped area — one placeholder square.
                     debug_assert_ne!(pos, u32::MAX, "carrier row missing from cascade superset");
-                    if let Some(sq) =
-                        carrier_square(&geoms[pos as usize], ctx.gsd_m, ctx.crs, ctx.simplify)
-                    {
+                    if let Some(sq) = carrier_square(
+                        geoms[pos as usize].as_ref(),
+                        ctx.gsd_m,
+                        ctx.crs,
+                        ctx.simplify,
+                    ) {
                         verts += count_vertices(&sq);
                         kept_idx.push(i);
-                        kept_geoms.push(sq);
+                        kept_geoms.push(Arc::new(sq));
                     }
                 }
             }
