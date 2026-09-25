@@ -410,6 +410,12 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
 ///         double). Defaults to 0, which auto-sizes to the machine's
 ///         available cores (clamped to 4..=16); pass an explicit positive
 ///         integer to override.
+///     read_workers (int, optional): Reader threads pass 2 splits the input
+///         across (#494). Output is byte-identical for every value — workers
+///         own disjoint runs of row groups and an in-order merge reproduces
+///         the single reader's batch sequence exactly. Defaults to 0, which
+///         takes a quarter of the machine's cores (capped at 4); remote
+///         inputs always read sequentially.
 ///     spill_dir (str or os.PathLike, optional): Directory for the
 ///         remote-input spill file. A remote convert stages every fetched
 ///         chunk on local disk (≈1x the touched input bytes) so later passes
@@ -496,6 +502,7 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     filter=None,
     profile="auto",
     in_flight_batches=0,
+    read_workers=0,
     spill_dir=None,
 ))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
@@ -544,6 +551,7 @@ fn overview(
     filter: Option<String>,
     profile: &str,
     in_flight_batches: usize,
+    read_workers: usize,
     spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
     let mode = match mode {
@@ -728,6 +736,7 @@ fn overview(
         read_batch_size,
         profile,
         in_flight_batches,
+        read_workers,
         cluster,
         accumulate,
         coalesce_lines,

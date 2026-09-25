@@ -77,14 +77,16 @@ use super::convert::{
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
     count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
     extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
-    overture_road_ranking, record_level_outcome, resolve_reserved_column_collisions, scan_feature,
-    validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies,
-    ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
-    LevelReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    overture_road_ranking, record_level_outcome, resolve_read_workers,
+    resolve_reserved_column_collisions, scan_feature, validate_cluster_schema,
+    validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies, ClassRanking, CoalesceTable,
+    ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport, SkippedLevelReport,
+    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
 use super::pipeline;
+use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals};
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
@@ -652,6 +654,15 @@ fn run_pass2_levels(
     strategy: Pass2Strategy,
 ) -> Result<(Vec<LevelStat>, Pass2Timers), ConvertError> {
     let n = ctxs.len();
+    // How pass 2 reads the input: the batch chunking (identical for every
+    // worker count), the resolved reader-thread count (#494), and pass 1's
+    // measured geometry weight, which is what sizes the read-ahead against
+    // the memory budget.
+    let read_tuning = ReadTuning {
+        batch_size: options.read_batch_size.max(1),
+        workers: resolve_read_workers(options.read_workers),
+        avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+    };
     let (level_stats, engine_timers): (Vec<LevelStat>, Pass2Timers) = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
         Pass2Strategy::Serial => (
@@ -663,7 +674,7 @@ fn run_pass2_levels(
                         i,
                         hints[i],
                         source,
-                        options.read_batch_size,
+                        read_tuning,
                         in_flight_batches,
                         selected_row_groups,
                         ctx,
@@ -702,7 +713,7 @@ fn run_pass2_levels(
                     &ctxs[..n - 1],
                     &hints[..n - 1],
                     source,
-                    options.read_batch_size,
+                    read_tuning,
                     selected_row_groups,
                     in_flight_batches,
                     backing,
@@ -717,7 +728,7 @@ fn run_pass2_levels(
                 n - 1,
                 hints[n - 1],
                 source,
-                options.read_batch_size,
+                read_tuning,
                 in_flight_batches,
                 selected_row_groups,
                 &ctxs[n - 1],
@@ -3350,7 +3361,7 @@ fn write_level_streaming(
     level_idx: usize,
     hint: usize,
     source: &ConvertSource,
-    read_batch_size: usize,
+    read_tuning: ReadTuning,
     in_flight: usize,
     row_groups: Option<&RowGroupSelection>,
     ctx: &LevelStreamCtx<'_>,
@@ -3395,47 +3406,41 @@ fn write_level_streaming(
         // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
         // notably `timers`, read back afterwards — stay valid.
         |tx: &Sender<Processed>| -> Result<(), ConvertError> {
-            // Regional extract (#102): read the same per-part bbox-selected
-            // row groups as pass 1, so the winner tables' global row indices
-            // line up.
-            let mut reader = source.open_stream(&ReadPlan {
-                batch_size: read_batch_size.max(1),
-                projection: None,
-                row_groups,
-            })?;
-            let mut row_offset = 0usize;
             // Heartbeat (#242): the finest level re-streams the whole
             // input; keep the operator informed on planet-scale files
             // (quiet on small ones).
             let mut last_progress = Instant::now();
-            loop {
-                if last_progress.elapsed().as_secs() >= 10 {
-                    last_progress = Instant::now();
-                    log::info!(
-                        "[convert] level {level_idx}: {row_offset} input \
-                             row(s) scanned",
-                    );
-                }
-                let t_read = Instant::now();
-                let batch = match reader.next() {
-                    None => return Ok(()),
-                    Some(Err(e)) => return Err(e.into()),
-                    Some(Ok(b)) => b,
-                };
-                Pass2Timers::add(&timers.read, t_read);
-                let offset = row_offset;
-                row_offset += batch.num_rows();
-                match process_level_batch(&batch, offset, ctx, timers)? {
-                    None => continue, // no members of this level in the batch
-                    Some((out, verts)) => {
-                        // Writer gone (it errored and dropped the receiver):
-                        // stop; the writer's error is reported by the caller.
-                        if tx.send(Processed { batch: out, verts }).is_err() {
-                            return Ok(());
-                        }
+            // Regional extract (#102): read the same per-part bbox-selected
+            // row groups as pass 1, so the winner tables' global row indices
+            // line up. One reader, or several merged back into the identical
+            // batch sequence (#494) — `read_tuning` decides, and the decision
+            // never reaches the output.
+            read_in_order(
+                source,
+                row_groups,
+                read_tuning,
+                |batch, offset, read_dur| {
+                    if last_progress.elapsed().as_secs() >= 10 {
+                        last_progress = Instant::now();
+                        log::info!("[convert] level {level_idx}: {offset} input row(s) scanned",);
                     }
-                }
-            }
+                    Pass2Timers::add_dur(&timers.read, read_dur);
+                    match process_level_batch(&batch, offset, ctx, timers)? {
+                        // No members of this level in the batch.
+                        None => Ok(ReadFlow::Continue),
+                        Some((out, verts)) => Ok(
+                            // Writer gone (it errored and dropped the
+                            // receiver): stop; the writer's error is reported
+                            // by the caller.
+                            if tx.send(Processed { batch: out, verts }).is_err() {
+                                ReadFlow::Stop
+                            } else {
+                                ReadFlow::Continue
+                            },
+                        ),
+                    }
+                },
+            )
         },
         // Writer (this thread): drain processed batches in order. Dropping
         // the producer's sender (EOF, error, or writer-gone) fuses `recv`;

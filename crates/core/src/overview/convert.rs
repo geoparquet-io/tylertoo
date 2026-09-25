@@ -463,6 +463,15 @@ pub struct ConvertOptions {
     /// proportionally more peak memory (`in_flight_batches × read_batch_size`
     /// rows resident). No effect when `streaming` is `false`.
     pub in_flight_batches: usize,
+    /// Number of concurrent reader threads pass 2 splits the input across
+    /// (#494). Default [`READ_WORKERS_AUTO`], which
+    /// [`resolve_read_workers`] expands to `min(cores / 4, READ_WORKERS_MAX)`;
+    /// `1` reproduces the single sequential reader byte-for-byte, and so does
+    /// every other value — workers own disjoint runs of row groups and an
+    /// in-order merge re-chunks their output into exactly the batch sequence
+    /// one reader would have produced. Ignored for remote inputs (see
+    /// [`super::pipeline`]) and when `streaming` is `false`.
+    pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
     /// other point features in their cell: the output gains a `point_count`
@@ -624,6 +633,42 @@ pub fn resolve_in_flight_batches(requested: usize) -> usize {
     }
 }
 
+/// Sentinel for [`ConvertOptions::read_workers`] requesting automatic sizing
+/// (see [`resolve_read_workers`]). The library default.
+pub const READ_WORKERS_AUTO: usize = 0;
+
+/// Ceiling on auto-sized pass-2 reader threads (#494).
+///
+/// A reader worker is a decompress+decode thread, not an I/O-wait thread: it
+/// competes with the rayon compute pool for cores, and the merge that puts its
+/// output back in order is itself single-threaded. Past a handful of
+/// concurrent streams an NVMe queue is saturated anyway, so more workers buy
+/// resident batches rather than throughput.
+pub const READ_WORKERS_MAX: usize = 4;
+
+/// Resolve a requested pass-2 reader-thread count to a concrete one.
+///
+/// [`READ_WORKERS_AUTO`] (0) takes a QUARTER of the machine's cores, clamped
+/// to `[1, READ_WORKERS_MAX]` — a quarter because pass 2's readers run
+/// alongside the rayon pool that does the per-batch simplification, and taking
+/// a larger share slows the compute it is feeding (12 cores → 3 readers). Any
+/// explicit positive value is honoured verbatim; the caller opted in to the
+/// memory cost, which the engine still bounds against the memory budget.
+///
+/// Output is byte-identical for every value — see [`super::pipeline`]'s
+/// in-order merge, and the `--read-workers 1` vs `4` byte comparison in
+/// `crates/cli/tests/thread_count_determinism.rs`.
+pub fn resolve_read_workers(requested: usize) -> usize {
+    if requested == READ_WORKERS_AUTO {
+        std::thread::available_parallelism()
+            .map(|n| n.get() / 4)
+            .unwrap_or(1)
+            .clamp(1, READ_WORKERS_MAX)
+    } else {
+        requested.max(1)
+    }
+}
+
 impl ConvertOptions {
     /// Turn off the whole generalization ladder: tile this input **exactly as
     /// given** at every level (#345 / #360).
@@ -727,6 +772,7 @@ impl Default for ConvertOptions {
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             profile: MemoryProfile::Auto,
             in_flight_batches: IN_FLIGHT_BATCHES_AUTO,
+            read_workers: READ_WORKERS_AUTO,
             cluster: false,
             accumulate: Vec::new(),
             coalesce_lines: true,

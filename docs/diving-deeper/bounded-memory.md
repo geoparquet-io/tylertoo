@@ -124,6 +124,17 @@ peak memory, since each in-flight batch stays resident (per pass; passes 1 and
 2 never run concurrently, so this does not double). The chosen depth prints at
 the start of each pass.
 
+**`--read-workers N|auto`.** How many threads pass 2 reads the input with.
+Parquet row groups are independently readable, so several threads decode
+disjoint runs of them and an in-order merge puts the batches back in read order
+— the output is byte-identical for every value. `auto` takes a quarter of the
+cores, capped at 4. The read-ahead this needs (each worker buffers its run
+ahead of the merge) is sized against the same available-RAM budget the pass-2
+sink uses, taking 10% of it, so a constrained box gets fewer workers rather
+than a bigger resident set. Remote inputs read sequentially regardless: their
+parts share one in-memory chunk cache that concurrent readers would evict out
+from under each other.
+
 ### Placing spill files
 
 **`--spill-dir <path>`.** Where the remote-input stage file lands, and on

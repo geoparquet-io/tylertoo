@@ -104,6 +104,20 @@ fn parse_in_flight_batches(s: &str) -> Result<usize, String> {
     }
 }
 
+/// Parse `--read-workers`: `auto` (→ the core-sized sentinel 0) or an
+/// explicit positive integer. See [`resolve_read_workers`] for how the
+/// sentinel is expanded at pass-2 setup.
+fn parse_read_workers(s: &str) -> Result<usize, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(tylertoo_core::overview::convert::READ_WORKERS_AUTO);
+    }
+    match s.parse::<usize>() {
+        Ok(0) => Err("read-workers must be `auto` or >= 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("expected `auto` or a positive integer, got `{s}`")),
+    }
+}
+
 /// Parse `--partition-wave`: `auto` (→ the core-sized sentinel
 /// [`tylertoo_core::overview::export::PARTITION_WAVE_AUTO`]) or an explicit
 /// positive integer. See [`tylertoo_core::overview::export::resolve_partition_wave`]
@@ -1138,6 +1152,33 @@ struct ConvertTuningArgs {
     )]
     in_flight_batches: usize,
 
+    /// Reader threads pass 2 splits the input across (issue #494).
+    ///
+    /// Parquet row groups are independently readable, so pass 2 can read the
+    /// input with several threads at once and merge their batches back into
+    /// read order. `auto` (the default) takes a quarter of the machine's
+    /// cores, capped at 4 — readers decompress and decode, so they compete
+    /// with the pool doing the simplification they are feeding. `1` is the
+    /// single sequential reader.
+    ///
+    /// Output is byte-identical for every value: workers own disjoint runs of
+    /// row groups and the merge reproduces exactly the batch sequence one
+    /// reader would have produced.
+    ///
+    /// Remote inputs always read sequentially (concurrent readers over one
+    /// remote source evict each other's fetched chunks). The read-ahead is
+    /// sized against the same memory budget the pass-2 sink uses, so a small
+    /// box quietly gets fewer workers. Helps most when the input's row groups
+    /// are small relative to that budget — `gpio` writes well-sized ones.
+    #[arg(
+        long,
+        value_name = "N|auto",
+        default_value = "auto",
+        value_parser = parse_read_workers,
+        help_heading = "Memory & performance"
+    )]
+    read_workers: usize,
+
     /// Directory for the remote-input spill file (issues #219/#272).
     ///
     /// A remote convert stages every fetched column chunk in an anonymous
@@ -1406,6 +1447,7 @@ impl ConvertTuningArgs {
             read_batch_size: self.read_batch_size,
             profile,
             in_flight_batches: self.in_flight_batches,
+            read_workers: self.read_workers,
             cluster: self.cluster,
             accumulate,
             coalesce_lines,

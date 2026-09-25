@@ -1195,6 +1195,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::plan: core::option::Option
 pub tylertoo_core::overview::convert::ConvertOptions::profile: tylertoo_core::overview::level::MemoryProfile
 pub tylertoo_core::overview::convert::ConvertOptions::properties: tylertoo_core::overview::properties::PropertySelection
 pub tylertoo_core::overview::convert::ConvertOptions::read_batch_size: usize
+pub tylertoo_core::overview::convert::ConvertOptions::read_workers: usize
 pub tylertoo_core::overview::convert::ConvertOptions::representation: alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>
 pub tylertoo_core::overview::convert::ConvertOptions::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
 pub tylertoo_core::overview::convert::ConvertOptions::save_plan: core::option::Option<std::path::PathBuf>
@@ -1318,12 +1319,15 @@ pub const tylertoo_core::overview::convert::DEFAULT_READ_BATCH_SIZE: usize
 pub const tylertoo_core::overview::convert::IN_FLIGHT_BATCHES_AUTO: usize
 pub const tylertoo_core::overview::convert::IN_FLIGHT_BATCHES_MAX: usize
 pub const tylertoo_core::overview::convert::IN_FLIGHT_BATCHES_MIN: usize
+pub const tylertoo_core::overview::convert::READ_WORKERS_AUTO: usize
+pub const tylertoo_core::overview::convert::READ_WORKERS_MAX: usize
 pub fn tylertoo_core::overview::convert::convert_to_overviews(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_source(&tylertoo_core::input::InputSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_sources(&tylertoo_core::input_set::ConvertSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::overture_road_ranking(alloc::string::String) -> tylertoo_core::overview::convert::ClassRanking
 pub fn tylertoo_core::overview::convert::parse_representation_spec(&str) -> core::result::Result<alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>, alloc::string::String>
 pub fn tylertoo_core::overview::convert::resolve_in_flight_batches(usize) -> usize
+pub fn tylertoo_core::overview::convert::resolve_read_workers(usize) -> usize
 pub mod tylertoo_core::overview::export
 pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)

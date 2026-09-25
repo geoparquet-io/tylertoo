@@ -164,6 +164,23 @@ impl RowGroupSelection {
     }
 }
 
+/// One reader worker's unit of work: a contiguous run of ONE part's selected
+/// row groups (#494).
+///
+/// A run never straddles a part boundary, so parallel readers can be merged
+/// back into the exact order [`SourceStream`] would have produced: parts stay
+/// sequential, and within a part the runs are ascending and disjoint.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadSegment {
+    /// Index into [`ConvertSource::parts`].
+    pub(crate) part: usize,
+    /// The part's LOCAL row-group indices, ascending.
+    pub(crate) row_groups: Vec<usize>,
+    /// Rows the run holds, per the footer. Sizing only — the merge counts the
+    /// rows it actually sees.
+    pub(crate) rows: usize,
+}
+
 /// How to read a [`ConvertSource`]: batch size, optional root-column
 /// projection (identical schemas make one index set valid for every part),
 /// and optional per-part row-group selection.
@@ -676,6 +693,81 @@ impl ConvertSource {
             part_idx: 0,
             current: None,
             done: false,
+        })
+    }
+
+    /// Split this source's selected row groups into ordered reader segments
+    /// of roughly `target_rows` rows each (#494).
+    ///
+    /// Segments are emitted in exactly the order [`SourceStream`] would read
+    /// them — parts in order, row groups ascending within a part — and never
+    /// straddle a part boundary, which is what lets a set of parallel readers
+    /// be merged back into a single in-order stream. A row group is never
+    /// split, so a segment can exceed `target_rows` (a part whose row groups
+    /// are larger than the target yields one segment per row group); a part
+    /// with an empty selection yields no segments at all, matching the
+    /// sequential reader, which never opens it.
+    pub(crate) fn read_segments(
+        &self,
+        selection: Option<&RowGroupSelection>,
+        target_rows: usize,
+    ) -> Result<Vec<ReadSegment>, InputError> {
+        let target_rows = target_rows.max(1);
+        let metas = self.metas()?;
+        let mut out = Vec::new();
+        for (part, meta) in metas.iter().enumerate() {
+            let selected: Vec<usize> = match selection {
+                Some(sel) => sel.0[part].clone(),
+                None => (0..meta.parquet.num_row_groups()).collect(),
+            };
+            let (mut run, mut run_rows) = (Vec::new(), 0usize);
+            for rg in selected {
+                run.push(rg);
+                run_rows += meta.parquet.row_group(rg).num_rows().max(0) as usize;
+                if run_rows >= target_rows {
+                    out.push(ReadSegment {
+                        part,
+                        row_groups: std::mem::take(&mut run),
+                        rows: run_rows,
+                    });
+                    run_rows = 0;
+                }
+            }
+            if !run.is_empty() {
+                out.push(ReadSegment {
+                    part,
+                    row_groups: run,
+                    rows: run_rows,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open a batch stream over exactly one [`ReadSegment`].
+    ///
+    /// Expressed as an ordinary [`ReadPlan`] whose row-group selection is
+    /// empty for every part but the segment's, so the reader construction,
+    /// projection composition and part skipping are the single-stream ones —
+    /// there is no second way to open an input.
+    ///
+    /// Callers running several of these CONCURRENTLY over the same source must
+    /// be local-only: `SourceStream` releases a part's in-memory read cache
+    /// when it finishes that part, which is a no-op for a local file but would
+    /// have concurrent remote readers evicting each other's fetched chunks.
+    pub(crate) fn open_segment(
+        &self,
+        segment: &ReadSegment,
+        batch_size: usize,
+        projection: Option<&[usize]>,
+    ) -> Result<SourceStream<'_>, InputError> {
+        let mut per_part = vec![Vec::new(); self.parts().len()];
+        per_part[segment.part].clone_from(&segment.row_groups);
+        let selection = RowGroupSelection::from_parts(per_part);
+        self.open_stream(&ReadPlan {
+            batch_size,
+            projection,
+            row_groups: Some(&selection),
         })
     }
 

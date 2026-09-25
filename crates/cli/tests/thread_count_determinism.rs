@@ -71,6 +71,7 @@ fn run_tiles(
     threads: u32,
     no_streaming: bool,
     max_zoom: u8,
+    extra: &[&str],
 ) -> (Vec<u8>, Vec<u8>) {
     let mut args = vec![
         "tiles".to_string(),
@@ -90,6 +91,7 @@ fn run_tiles(
     if no_streaming {
         args.push("--no-streaming".to_string());
     }
+    args.extend(extra.iter().map(|a| (*a).to_string()));
 
     let output = Command::new(tylertoo_bin())
         .args(&args)
@@ -144,8 +146,15 @@ fn pmtiles_output_is_byte_identical_across_thread_counts() {
             let overview_out = dir
                 .path()
                 .join(format!("{engine}-t{threads}-overview.parquet"));
-            let (bytes, overview_bytes) =
-                run_tiles(&fixture, &out, &overview_out, threads, no_streaming, 14);
+            let (bytes, overview_bytes) = run_tiles(
+                &fixture,
+                &out,
+                &overview_out,
+                threads,
+                no_streaming,
+                14,
+                &[],
+            );
 
             match &baseline {
                 None => baseline = Some((threads, bytes, overview_bytes)),
@@ -216,7 +225,7 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
         let out = dir.path().join(format!("mada-t{threads}.pmtiles"));
         let overview_out = dir.path().join(format!("mada-t{threads}-overview.parquet"));
         let (bytes, overview_bytes) =
-            run_tiles(&fixture, &out, &overview_out, threads, false, MAX_ZOOM);
+            run_tiles(&fixture, &out, &overview_out, threads, false, MAX_ZOOM, &[]);
 
         match &baseline {
             None => baseline = Some((threads, bytes, overview_bytes)),
@@ -250,6 +259,148 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
                      scan (#460) is not thread-count invariant",
                     base_overview_bytes.len(),
                     overview_bytes.len()
+                );
+            }
+        }
+    }
+}
+
+/// #494: byte-determinism across `--read-workers`.
+///
+/// Pass 2 can now read the input with several threads at once, each owning a
+/// disjoint run of row groups, and merge their batches back into read order.
+/// The merge re-chunks, because batch boundaries are not cosmetic: the
+/// overview writer issues one column-writer call per slice it is handed and
+/// parquet checks its data-page limits per call, so the same rows arriving in
+/// different chunks can produce different pages — and therefore different
+/// bytes. This test is the end-to-end statement of the contract the unit tests
+/// in `overview::pipeline::read_tests` make structurally.
+///
+/// **The input has to be splittable.** Every real-data fixture is a single row
+/// group, which the reader cannot split at all — a comparison against one of
+/// those would pass no matter what the merge did. So the test builds its own
+/// multi-row-group input first, with `tylertoo overview --row-group-size`, and
+/// then reads it back with a read batch size that divides neither the row
+/// group nor the segment: every worker seam then lands mid-batch, which is
+/// exactly the case the merge has to splice.
+#[test]
+fn pmtiles_output_is_byte_identical_across_read_worker_counts() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // --- A multi-row-group input, built from the fixture. ---
+    let multi = dir.path().join("multi-rowgroup.parquet");
+    let build = Command::new(tylertoo_bin())
+        .args([
+            "overview",
+            fixture.to_str().unwrap(),
+            multi.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "6",
+            // Small enough that the 1000-row fixture yields many row groups,
+            // which is what gives the reader something to split.
+            "--row-group-size",
+            "50",
+        ])
+        .output()
+        .expect("build a multi-row-group input");
+    assert!(
+        build.status.success(),
+        "building the multi-row-group input failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    // Read batch size 13: coprime with the 50-row row groups, so no segment
+    // boundary can accidentally land on a batch boundary.
+    let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
+    for workers in [1u32, 2, 4] {
+        let out = dir.path().join(format!("rw{workers}.pmtiles"));
+        let overview_out = dir.path().join(format!("rw{workers}-overview.parquet"));
+        let (bytes, overview_bytes) = run_tiles(
+            &multi,
+            &out,
+            &overview_out,
+            4,
+            false,
+            8,
+            &[
+                "--read-workers",
+                &workers.to_string(),
+                "--read-batch-size",
+                "13",
+            ],
+        );
+        match &baseline {
+            None => baseline = Some((workers, bytes, overview_bytes)),
+            Some((base_workers, base_bytes, base_overview_bytes)) => {
+                assert!(
+                    base_bytes == &bytes,
+                    "PMTiles output differs between --read-workers {base_workers} ({} bytes) \
+                     and --read-workers {workers} ({} bytes) — the parallel pass-2 read (#494) \
+                     is not worker-count invariant: the in-order merge is delivering a \
+                     different batch sequence than one reader would",
+                    base_bytes.len(),
+                    bytes.len()
+                );
+                assert!(
+                    base_overview_bytes == &overview_bytes,
+                    "kept overview Parquet differs between --read-workers {base_workers} \
+                     ({} bytes) and --read-workers {workers} ({} bytes) — #494 regression",
+                    base_overview_bytes.len(),
+                    overview_bytes.len()
+                );
+            }
+        }
+    }
+}
+
+/// The multi-part half of #494: a worker must never carry rows across a part
+/// boundary, because the sequential reader opens a fresh reader per part and
+/// so ends every part on a short batch. Three copies of the fixture in one
+/// directory resolve to a three-part source, which is enough segments for the
+/// parallel path to engage.
+#[test]
+fn multi_part_output_is_byte_identical_across_read_worker_counts() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parts = dir.path().join("parts");
+    std::fs::create_dir(&parts).expect("create parts dir");
+    for i in 0..3 {
+        std::fs::copy(&fixture, parts.join(format!("p{i}.parquet"))).expect("copy part");
+    }
+
+    let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
+    for workers in [1u32, 3] {
+        let out = dir.path().join(format!("mp{workers}.pmtiles"));
+        let overview_out = dir.path().join(format!("mp{workers}-overview.parquet"));
+        let (bytes, overview_bytes) = run_tiles(
+            &parts,
+            &out,
+            &overview_out,
+            4,
+            false,
+            8,
+            &[
+                "--read-workers",
+                &workers.to_string(),
+                "--read-batch-size",
+                "300",
+            ],
+        );
+        match &baseline {
+            None => baseline = Some((workers, bytes, overview_bytes)),
+            Some((base_workers, base_bytes, base_overview_bytes)) => {
+                assert!(
+                    base_bytes == &bytes && base_overview_bytes == &overview_bytes,
+                    "multi-part output differs between --read-workers {base_workers} and \
+                     --read-workers {workers} — a reader worker is carrying rows across a \
+                     part boundary (#494)"
                 );
             }
         }

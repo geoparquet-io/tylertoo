@@ -228,6 +228,15 @@ Generate PMTiles vector tiles (the default pipeline)
    `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
 
   Default value: `auto`
+* `--read-workers <N|auto>` — Reader threads pass 2 splits the input across (issue #494).
+
+   Parquet row groups are independently readable, so pass 2 can read the input with several threads at once and merge their batches back into read order. `auto` (the default) takes a quarter of the machine's cores, capped at 4 — readers decompress and decode, so they compete with the pool doing the simplification they are feeding. `1` is the single sequential reader.
+
+   Output is byte-identical for every value: workers own disjoint runs of row groups and the merge reproduces exactly the batch sequence one reader would have produced.
+
+   Remote inputs always read sequentially (concurrent readers over one remote source evict each other's fetched chunks). The read-ahead is sized against the same memory budget the pass-2 sink uses, so a small box quietly gets fewer workers. Helps most when the input's row groups are small relative to that budget — `gpio` writes well-sized ones.
+
+  Default value: `auto`
 * `--spill-dir <PATH>` — Directory for the remote-input spill file (issues #219/#272).
 
    A remote convert stages every fetched column chunk in an anonymous temp file — growing to ≈1× the touched input bytes (the whole object for a full-file convert; only the covering row groups with --bbox) — so later passes re-read from local disk instead of the network. By default it lives under the process temp dir ($TMPDIR); point this at a volume with enough room (a free-space preflight warns about a projected shortfall). The directory must exist. Local inputs never spill.
@@ -430,6 +439,15 @@ Build a multi-resolution overview GeoParquet file
 * `--in-flight-batches <N|auto>` — Read batches allowed in flight through the streaming pipeline at once (read/compute-overlap knob; bounded-channel depth) — pass 1's scan and pass 2's per-level fan-out both use it.
 
    `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
+
+  Default value: `auto`
+* `--read-workers <N|auto>` — Reader threads pass 2 splits the input across (issue #494).
+
+   Parquet row groups are independently readable, so pass 2 can read the input with several threads at once and merge their batches back into read order. `auto` (the default) takes a quarter of the machine's cores, capped at 4 — readers decompress and decode, so they compete with the pool doing the simplification they are feeding. `1` is the single sequential reader.
+
+   Output is byte-identical for every value: workers own disjoint runs of row groups and the merge reproduces exactly the batch sequence one reader would have produced.
+
+   Remote inputs always read sequentially (concurrent readers over one remote source evict each other's fetched chunks). The read-ahead is sized against the same memory budget the pass-2 sink uses, so a small box quietly gets fewer workers. Helps most when the input's row groups are small relative to that budget — `gpio` writes well-sized ones.
 
   Default value: `auto`
 * `--spill-dir <PATH>` — Directory for the remote-input spill file (issues #219/#272).

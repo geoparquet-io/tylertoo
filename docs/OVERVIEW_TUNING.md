@@ -1247,7 +1247,7 @@ By default the converter runs a **two-pass streaming pipeline** (H3):
    output drains to the writer in level order. The finest (canonical) level is
    verbatim and streamed to the writer last. An older engine that re-read the
    input once *per level* survives only as the equivalence-tested reference
-   path — see [Performance profiles](#performance-profiles---profile---in-flight-batches).
+   path — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers).
 
 Peak memory is `O(read batch + winner tables)` instead of `O(dataset)`: on the
 Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
@@ -1257,8 +1257,9 @@ Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
 |------|---------|-------|-----------|
 | `--read-batch-size N` | `8192` | rows per read batch | **bigger = faster-ish, more memory** |
 | `--no-streaming` | off | flag | revert to the one-pass in-memory pipeline |
-| `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles---profile---in-flight-batches) |
-| `--in-flight-batches N\|auto` | `auto` | read batches in flight (auto = cores, clamped 4–16) | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches) |
+| `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
+| `--in-flight-batches N\|auto` | `auto` | read batches in flight (auto = cores, clamped 4–16) | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
+| `--read-workers N\|auto` | `auto` | pass-2 reader threads (auto = cores/4, capped at 4) | parallel input read — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
 
 **`--read-batch-size`** bounds the transient working set of both passes: each
 batch is decoded, filtered, simplified, and written before the next is read.
@@ -1461,11 +1462,12 @@ not a typo.
 
 ---
 
-## Performance profiles: `--profile`, `--in-flight-batches`
+## Performance profiles: `--profile`, `--in-flight-batches`, `--read-workers`
 
 Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),
 these never change the output's content: **the produced file is byte-identical
-across every profile, `--in-flight-batches` value, and thread count.** They
+across every profile, `--in-flight-batches` value, `--read-workers` value,
+and thread count.** They
 control only how fast the conversion runs and how much memory it uses while
 running.
 
@@ -1534,6 +1536,7 @@ the wave schedule never changes the output.
 |------|---------|-------|-----------|
 | `--profile speed\|bounded\|auto` | `auto` | preset | `speed` = fastest, most RAM; `bounded` = capped RAM, temp I/O |
 | `--in-flight-batches N` | `4` | read batches in flight | **bigger = more overlap + core use, more memory** |
+| `--read-workers N\|auto` | `auto` | pass-2 reader threads | **more = more read throughput, more resident batches** |
 
 **`--in-flight-batches`** is the primary read/compute-overlap knob: it sets how
 many Arrow read batches may be moving through the pipeline at once (the
@@ -1544,6 +1547,35 @@ extra in-flight batch costs proportionally more peak RAM (`N × read_batch_size`
 rows resident, per pass — passes 1 and 2 never run concurrently, so this does
 not double). `--read-batch-size` (above) remains the rows-per-batch knob;
 `--in-flight-batches` is how many such batches coexist.
+
+**`--read-workers`** splits the pass-2 *read itself* across threads (#494).
+Parquet row groups are independently readable, so several threads can decode
+disjoint runs of them at once; an in-order merge then reassembles the batches
+into exactly the sequence a single reader would have produced, which is why the
+output is byte-identical for every value (`crates/cli/tests/thread_count_determinism.rs`
+checks `1` against `2` and `4` directly). `auto` takes a quarter of the
+machine's cores, capped at 4 — a reader thread decompresses and decodes, so it
+competes with the pool doing the simplification it is feeding, and past a
+handful of streams the device queue is saturated anyway.
+
+Two things bound the win, both worth knowing before reaching for a bigger
+number:
+
+- **Row-group size.** A worker buffers its run ahead of the merge, so a run has
+  to fit in that worker's queue; a row group larger than the queue makes the
+  worker park mid-run and the reads serialize again (a `[convert] pass 2 read:`
+  debug line says so when it happens). Inputs written by `gpio` have
+  well-sized row groups; a single-row-group file cannot be split at all and
+  reads sequentially whatever you ask for.
+- **The memory budget.** The read-ahead is sized against the same
+  fraction-of-available-RAM budget the pass-2 sink uses (10% of it), so a small
+  box, or a wide/vertex-heavy input, quietly gets fewer workers rather than a
+  larger resident set.
+
+Remote inputs always read sequentially: a remote source's parts share one
+in-memory chunk cache that concurrent readers would evict out from under each
+other. Stage to local disk first (which a remote convert already does) and the
+local re-read parallelizes normally.
 
 ⚠️ **musl binaries v0.7.1 and earlier — prefer `--profile bounded` on large
 duplicating runs.** The `x86_64-unknown-linux-musl` release binary up to and
