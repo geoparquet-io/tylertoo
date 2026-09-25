@@ -5,7 +5,9 @@
 #   version-check   version fields stay in sync across the workspace
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
 #                   Cargo.toml [workspace.lints]), cargo-machete, unit tests
-#   Test            full test matrix (ubuntu/macos x stable/beta)
+#   Test            full test matrix (ubuntu/macos x stable/beta), minus
+#                   the slow set in .config/nextest.toml
+#   Slow Tests      that slow set, once, on ubuntu stable
 #   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
 #   Reference Docs  the committed CLI + Python reference (docs/reference/)
@@ -296,6 +298,70 @@ jobs:
       - name: Run doctests
         # nextest does not run doctests.
         run: cargo test --locked --all-features --doc
+
+  # The slow end-to-end tests listed in .config/nextest.toml. They run once
+  # here, beside the Test matrix, so no other job waits on them (#524).
+  slow-tests:
+    name: Slow Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        # Same key as the Test (ubuntu-latest, stable) lane: same build.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ runner.os }}-stable-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-nextest
+
+      - name: Run slow tests
+        run: >-
+          cargo nextest run --locked --all-features
+          --ignore-default-filter -E 'not default()'
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.

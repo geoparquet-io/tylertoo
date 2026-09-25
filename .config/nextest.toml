@@ -1,0 +1,22 @@
+# cargo-nextest configuration.
+#
+# The default filter leaves out the slow end-to-end tests: each drives the
+# CLI or the full pipeline over a real-data fixture and takes 20s to 7 min
+# on a CI runner (#524). Together they are ~75% of the suite's test-seconds.
+# The Test matrix and Coverage run the default set. The Slow Tests job in
+# ci.yml runs only this set, once, on ubuntu stable:
+#
+#   cargo nextest run --ignore-default-filter -E 'not default()'
+#
+# Mark a new slow test by adding it here. Plain `cargo test` ignores this
+# file and runs everything.
+[profile.default]
+default-filter = """
+not (
+    binary(thread_count_determinism)
+  | binary(shard_merge_parity)
+  | binary(sharded_builds)
+  | test(=header_clustered_flag_matches_the_actual_entry_layout)
+  | test(=test_real_data_conversion_keeps_the_root_directory_small)
+)
+"""
