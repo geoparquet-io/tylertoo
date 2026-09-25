@@ -540,10 +540,16 @@ fn warn_implicit_layer_overlaps(bands: &[Band]) {
 /// * [`Disjoint`](Self::Disjoint) — the band shares no zoom with what the
 ///   archive *declares*, let alone what it actually holds. There is no
 ///   interpretation under which this band could write anything; always an
-///   error.
+///   error — including when the archive turns out to hold no tiles at all,
+///   which does not make an impossible range possible and so must not
+///   divert the band to a flag-downgradable classification.
 /// * [`EmptyArchive`](Self::EmptyArchive) — the archive holds no tiles at
-///   all, whatever its header says. Treated like [`Overshoot`](Self::Overshoot):
-///   an error by default, downgradable with `--allow-missing-zooms`.
+///   all, and the band's range does at least fall within what its header
+///   declares (or that header declares nothing usable: a zero-tile archive
+///   finalizes as z0-0 however it was written, so z0-0 here is an absent
+///   declaration rather than a claim about z0). Treated like
+///   [`Overshoot`](Self::Overshoot): an error by default, downgradable with
+///   `--allow-missing-zooms`.
 /// * [`DeclaredButEmpty`](Self::DeclaredButEmpty) — the band shares no zoom
 ///   with what the archive actually holds, but does share one with what its
 ///   header declares. The band contributes nothing, which is always worth a
@@ -582,12 +588,38 @@ enum RangeFit {
 /// archive holds no tiles). See [`RangeFit`].
 fn band_archive_range_fit(band: &Band, declared: (u8, u8), actual: Option<(u8, u8)>) -> RangeFit {
     let (d_lo, d_hi) = declared;
+    let overlaps_declared = band.min_zoom <= d_hi && band.max_zoom >= d_lo;
     let Some((a_lo, a_hi)) = actual else {
-        return RangeFit::EmptyArchive;
+        // An empty archive used to short-circuit to `EmptyArchive` before
+        // declared-disjointness was ever considered, which let
+        // `--allow-missing-zooms` wave through a band that shares no zoom
+        // with even what the archive declares -- a range
+        // [`check_band_zoom_range`] promises no flag can make possible.
+        // Disjointness is settled first here instead.
+        //
+        // With one exception, and it is why the short-circuit looked right:
+        // a zero-tile archive finalizes as header z0-0 *whatever* range it
+        // was told to declare (the writer widens over empty zooms, but with
+        // no tile to widen from `set_declared_min_zoom` leaves no trace), so
+        // `(0, 0)` alongside no tiles is the absence of a declaration, not a
+        // claim about z0. #514 issue #2 turns on exactly that: a band above
+        // z0 hard-errored as `Disjoint` with a message falsely claiming the
+        // archive declared z0. Any other range did come from somewhere --
+        // an externally produced archive -- and is a real declaration to be
+        // held to.
+        return if declared == (0, 0) || overlaps_declared {
+            RangeFit::EmptyArchive
+        } else {
+            RangeFit::Disjoint
+        };
     };
+    // Checked against the archive's *actual* tiles first, and only then
+    // against its declaration: a band overlapping real tiles can demonstrably
+    // write something, so it is never `Disjoint`, even if a lying header
+    // declares a range those tiles fall outside.
     let overlaps_actual = band.min_zoom <= a_hi && band.max_zoom >= a_lo;
     if !overlaps_actual {
-        return if band.min_zoom <= d_hi && band.max_zoom >= d_lo {
+        return if overlaps_declared {
             RangeFit::DeclaredButEmpty
         } else {
             RangeFit::Disjoint
@@ -642,16 +674,21 @@ fn dropped_zoom_span(band: &Band, actual_min: u8, actual_max: u8) -> String {
 /// [`RangeFit::Disjoint`], which is always an error -- there is no flag that
 /// makes an impossible range possible -- nor on [`RangeFit::DeclaredButEmpty`],
 /// which is never an error in the first place.
+///
+/// Returns the classification it accepted, so the merge loop below can tell
+/// *why* a band skipped tiles rather than inferring it from the count. See
+/// [`log_band_skip`].
 fn check_band_zoom_range(
     band: &Band,
     archive: &BandArchive,
     allow_missing_zooms: bool,
-) -> Result<(), Error> {
+) -> Result<RangeFit, Error> {
     let header = archive.header();
     let declared = (header.min_zoom, header.max_zoom);
     let actual = archive.actual_zoom_range()?;
-    match band_archive_range_fit(band, declared, actual) {
-        RangeFit::Subrange => Ok(()),
+    let fit = band_archive_range_fit(band, declared, actual);
+    match fit {
+        RangeFit::Subrange => Ok(fit),
         RangeFit::Disjoint => Err(Error::PMTilesWrite(format!(
             "band {:?} ({}) declares {} but that archive declares {}, entirely outside \
              the band's range; there is no zoom this band could write",
@@ -669,7 +706,7 @@ fn check_band_zoom_range(
                     zoom_span(band.min_zoom, band.max_zoom),
                     band.input.display(),
                 );
-                Ok(())
+                Ok(fit)
             } else {
                 Err(Error::PMTilesWrite(format!(
                     "band {:?} declares {} but {} holds no tiles at all; pass \
@@ -690,7 +727,7 @@ fn check_band_zoom_range(
                 band.input.display(),
                 zoom_span(declared.0, declared.1),
             );
-            Ok(())
+            Ok(fit)
         }
         RangeFit::Overshoot => {
             // Only reachable when `actual` is `Some` (`EmptyArchive` is
@@ -706,7 +743,7 @@ fn check_band_zoom_range(
                     band.input.display(),
                     zoom_span(a_lo, a_hi),
                 );
-                Ok(())
+                Ok(fit)
             } else {
                 Err(Error::PMTilesWrite(format!(
                     "band {:?} declares {} but {} holds {}; zooms {dropped} would be \
@@ -746,12 +783,23 @@ fn track_band_bounds(
     }
 }
 
-/// Log a subrange band's skipped-tile count, at info (#495): by the time
-/// this runs, [`check_band_zoom_range`] has already ruled out every case
-/// except a genuine subrange, so this is the documented "split one archive
-/// across several bands" workflow, never an anomaly.
-fn log_subrange_skip(band: &Band, skipped: usize) {
-    if skipped == 0 {
+/// Log a band's skipped-tile count, keyed on the [`RangeFit`]
+/// [`check_band_zoom_range`] accepted it under (#495, corrected for #514).
+///
+/// Only [`RangeFit::Subrange`] gets the benign "split one archive across
+/// several bands" line, and only at `log::info`: that is the documented
+/// workflow, where the tiles left behind belong to a sibling band. The doc
+/// here used to claim `check_band_zoom_range` had "already ruled out every
+/// case except a genuine subrange", which stopped being true the moment
+/// #514 added the flag-downgraded and declared-but-empty acceptances. A
+/// [`RangeFit::DeclaredButEmpty`] band in particular drops *every* tile its
+/// archive holds and contributes nothing -- the #514 S1 false-accept --
+/// and reporting that as ordinary subrange use is precisely the reassurance
+/// that hid it. Those cases were already warned about, accurately and by
+/// name, when they were classified; saying it again here in weaker words
+/// would only bury the warning.
+fn log_band_skip(band: &Band, skipped: usize, fit: RangeFit) {
+    if skipped == 0 || fit != RangeFit::Subrange {
         return;
     }
     log::info!(
@@ -1184,17 +1232,29 @@ pub fn build_pyramid(
     warn_pairs(&source_involved);
 
     // #514: validate every pre-tiled Archive band's declared zoom range now,
-    // before any Source band below is tiled. A header plus directory read is
-    // a few hundred bytes even for a dense pyramid — cheap enough to spend on
-    // every Archive band up front — whereas the equivalent check inside
+    // before any Source band below is tiled. The equivalent check inside
     // `merge_bands_with_options` used to run only after every GeoParquet
-    // band in the build had already been fully converted and exported. On a
-    // mixed build a typo'd `--band` range on one archive therefore surfaced
-    // only after the other bands' hours of tiling were already sunk.
-    // `merge_bands_with_options` still repeats this exact check on `tiled`
-    // below — that is `merge_bands`'s own contract for a caller who invokes
-    // it directly, skipping `build_pyramid` entirely — so the redundancy
-    // here is intentional.
+    // band in the build had already been fully converted and exported, so on
+    // a mixed build a typo'd `--band` range on one archive surfaced only
+    // after the other bands' hours of tiling were already sunk.
+    //
+    // KNOWN DUPLICATED I/O (#527 review): this is not free, and the earlier
+    // "a few hundred bytes" note was wrong. `BandArchive::open` reads the
+    // root directory, walks *every* leaf directory and parses the metadata,
+    // so for a deep archive it is megabytes of directory, expanded into an
+    // entry per tile run — and `merge_bands_with_options` opens the same
+    // archives again moments later, because a direct `merge_bands` caller
+    // that never goes through `build_pyramid` must get the same check.
+    //
+    // The handle is deliberately dropped rather than threaded into the
+    // merge. Keeping it would hold every band's expanded directory resident
+    // for the whole tiling phase, and the disjoint-zoom merge path below
+    // opens one band at a time on purpose: holding them all at once is
+    // exactly the residency #498 removed (fine for a hand-built band,
+    // hopeless for a multi-gigabyte one). Paying one extra directory walk
+    // per Archive band is the cheaper half of that trade — it is bounded by
+    // the directories alone, never the tile bodies, and it buys failing
+    // before any band is converted or any tile is read.
     for (band, kind) in bands.iter().zip(&kinds) {
         if *kind == BandSource::Archive {
             let archive = BandArchive::open(&band.input, &band.layer)?;
@@ -1371,10 +1431,14 @@ pub fn merge_bands_with_options(
             .map(|b| BandArchive::open(&b.input, &b.layer))
             .collect::<Result<_, _>>()?;
         // #495: catch a band whose declared range the archive cannot honor
-        // before any tile is touched.
-        for (band, archive) in bands.iter().zip(&archives) {
-            check_band_zoom_range(band, archive, allow_missing_zooms)?;
-        }
+        // before any tile is touched. The accepted classifications are kept
+        // for `log_band_skip` below, which must not describe a band that
+        // contributed nothing as ordinary subrange use.
+        let fits = bands
+            .iter()
+            .zip(&archives)
+            .map(|(band, archive)| check_band_zoom_range(band, archive, allow_missing_zooms))
+            .collect::<Result<Vec<_>, _>>()?;
         // validate_bands only sees the labels, not what is actually inside
         // each archive's tiles; this is the check that catches the mismatch.
         check_shared_zoom_layer_labels(bands, &archives)?;
@@ -1409,7 +1473,7 @@ pub fn merge_bands_with_options(
                 counts[bi] += 1;
                 Ok(())
             })?;
-            log_subrange_skip(band, skipped);
+            log_band_skip(band, skipped, fits[bi]);
             skipped_total += skipped;
             layers.push(LayerMeta {
                 id: band.layer.clone(),
@@ -1505,7 +1569,7 @@ pub fn merge_bands_with_options(
         let archive = BandArchive::open(&band.input, &band.layer)?;
         // #495: catch a band whose declared range the archive cannot honor
         // before any tile is touched.
-        check_band_zoom_range(band, &archive, allow_missing_zooms)?;
+        let fit = check_band_zoom_range(band, &archive, allow_missing_zooms)?;
         track_band_bounds(band, &archive, &mut union, &mut bands_without_bounds);
         let mut n = 0usize;
         let mut skipped = 0usize;
@@ -1532,7 +1596,7 @@ pub fn merge_bands_with_options(
             n += 1;
             Ok(())
         })?;
-        log_subrange_skip(band, skipped);
+        log_band_skip(band, skipped, fit);
         skipped_total += skipped;
         per_band.push((band.layer.clone(), band.min_zoom, band.max_zoom, n));
         layers.push(LayerMeta {
@@ -2949,6 +3013,126 @@ mod tests {
         .unwrap();
         assert_eq!(report.total_tiles, 0);
         assert!(out.exists());
+    }
+
+    /// The [`RangeFit`] matrix, straight off the pure classifier -- the
+    /// value the merge loop now keys its skipped-tile logging on
+    /// ([`log_band_skip`]), so a misclassification here is what would let a
+    /// band that contributed nothing be reported as an ordinary subrange.
+    #[test]
+    fn range_fit_classifies_each_case() {
+        let band = |lo: u8, hi: u8| Band {
+            input: PathBuf::from("x.pmtiles"),
+            layer: "agg".to_string(),
+            min_zoom: lo,
+            max_zoom: hi,
+        };
+        let fit = band_archive_range_fit;
+
+        // No tiles, no usable declaration (z0-0 is what the writer emits for
+        // a zero-tile archive whatever it was told): bypassable.
+        assert_eq!(fit(&band(3, 7), (0, 0), None), RangeFit::EmptyArchive);
+        // No tiles, but a real declaration the band falls inside.
+        assert_eq!(fit(&band(3, 7), (0, 10), None), RangeFit::EmptyArchive);
+        // No tiles and a real declaration the band falls entirely outside:
+        // impossible, and no flag may bypass it (#527 review, finding 1).
+        assert_eq!(fit(&band(0, 2), (8, 10), None), RangeFit::Disjoint);
+
+        // Shares no zoom with the actual tiles, but does with the header.
+        assert_eq!(
+            fit(&band(0, 2), (0, 10), Some((5, 6))),
+            RangeFit::DeclaredButEmpty
+        );
+        // Shares no zoom with either.
+        assert_eq!(fit(&band(0, 2), (5, 10), Some((5, 6))), RangeFit::Disjoint);
+        // Overlaps real tiles despite a header that excludes them: it can
+        // write something, so never `Disjoint`.
+        assert_eq!(fit(&band(5, 5), (0, 1), Some((5, 5))), RangeFit::Subrange);
+
+        // Containment either way is a subrange; partial overlap overshoots.
+        assert_eq!(fit(&band(0, 5), (0, 13), Some((0, 13))), RangeFit::Subrange);
+        assert_eq!(fit(&band(0, 13), (3, 6), Some((3, 6))), RangeFit::Subrange);
+        assert_eq!(fit(&band(0, 4), (3, 6), Some((3, 6))), RangeFit::Overshoot);
+    }
+
+    /// #527 review, finding 1: the empty-archive short-circuit ran *before*
+    /// declared-disjointness was considered, so a band sharing no zoom with
+    /// even what the archive declares was classified
+    /// [`RangeFit::EmptyArchive`] -- and `--allow-missing-zooms` then waved
+    /// through a range [`check_band_zoom_range`] documents as impossible
+    /// under every flag. Disjointness wins now, so this stays a hard error
+    /// with the flag set.
+    ///
+    /// The header is patched by hand because tylertoo's own writer cannot
+    /// produce this: a zero-tile archive finalizes as z0-0 whatever
+    /// `set_declared_min_zoom` was told (see
+    /// [`empty_archive_is_classified_consistently_and_bypassable`], which
+    /// pins the z0-0 case to `EmptyArchive`). An externally produced archive
+    /// can declare a range it does not fill, and that declaration is real.
+    #[test]
+    fn empty_archive_with_a_real_declaration_stays_disjoint_under_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty.pmtiles");
+        write_band(&src, "agg", &[], TileBounds::new(-1.0, -1.0, 1.0, 1.0), &[]);
+        // Header bytes 100/101 are min_zoom/max_zoom (PMTiles v3, no
+        // checksum over them): declare z8-10 while holding nothing.
+        let mut bytes = std::fs::read(&src).unwrap();
+        bytes[100] = 8;
+        bytes[101] = 10;
+        std::fs::write(&src, &bytes).unwrap();
+
+        let band = Band::parse(&format!("0-2:{}:agg", src.display())).unwrap();
+        let out = dir.path().join("merged.pmtiles");
+
+        // Without the flag: an error, as before.
+        let err = merge_bands(std::slice::from_ref(&band), &out).unwrap_err();
+        assert!(err.to_string().contains("z8-10"), "{err}");
+
+        // With the flag: still an error. This is the regression -- it used
+        // to succeed, writing an archive whose only band could never have
+        // contributed a tile.
+        let err = merge_bands_with_options(std::slice::from_ref(&band), &out, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("z0-2") && msg.contains("z8-10") && msg.contains("no zoom"),
+            "expected the disjoint error, got: {msg}"
+        );
+        assert!(
+            !out.exists(),
+            "nothing should be written on an impossible plan"
+        );
+    }
+
+    /// A band overlapping the archive's *actual* tiles is never `Disjoint`,
+    /// even when a lying header declares a range those tiles fall outside:
+    /// it can demonstrably write something, so the "there is no zoom this
+    /// band could write" verdict would be false. Guards the ordering inside
+    /// [`band_archive_range_fit`] against being "simplified" to check the
+    /// declaration first.
+    #[test]
+    fn a_band_over_real_tiles_is_never_disjoint_despite_a_lying_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("liar.pmtiles");
+        write_band(
+            &src,
+            "agg",
+            &[(5, 4, 4)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+        // Declare z0-1 while actually holding z5.
+        let mut bytes = std::fs::read(&src).unwrap();
+        bytes[100] = 0;
+        bytes[101] = 1;
+        std::fs::write(&src, &bytes).unwrap();
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands(
+            &[Band::parse(&format!("5-5:{}:agg", src.display())).unwrap()],
+            &out,
+        )
+        .unwrap();
+        assert_eq!(report.total_tiles, 1, "the real z5 tile is written");
     }
 
     /// #514 issue #3: `--allow-missing-zooms` let a band declare deeper
