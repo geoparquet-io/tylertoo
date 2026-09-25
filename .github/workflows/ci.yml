@@ -7,7 +7,7 @@
 #                   Cargo.toml [workspace.lints]), cargo-machete, unit tests
 #   Test            full test matrix (ubuntu/macos x stable/beta), minus
 #                   the slow set in .config/nextest.toml
-#   Slow Tests      that slow set, once, on ubuntu stable
+#   Slow Tests      that slow set, on ubuntu/macos stable
 #   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
 #   Reference Docs  the committed CLI + Python reference (docs/reference/)
@@ -300,11 +300,17 @@ jobs:
         # nextest does not run doctests.
         run: cargo test --locked --all-features --doc
 
-  # The slow end-to-end tests listed in .config/nextest.toml. They run once
-  # here, beside the Test matrix, so no other job waits on them (#524).
+  # The slow end-to-end tests listed in .config/nextest.toml. They run here,
+  # beside the Test matrix, so no other job waits on them (#524). Stable
+  # only, on both OSes: the set holds the determinism and shard-parity
+  # tests, which guard platform-sensitive behavior.
   slow-tests:
-    name: Slow Tests
-    runs-on: ubuntu-latest
+    name: Slow Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -350,10 +356,15 @@ jobs:
           key: ${{ runner.os }}-slow-tests-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-slow-tests-target-
 
-      - name: Install protoc
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18

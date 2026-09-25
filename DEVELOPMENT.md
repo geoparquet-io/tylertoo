@@ -81,8 +81,8 @@ cargo test --package tylertoo --test tiles_facade
 CI runs the tests with [cargo-nextest](https://nexte.st), split in two.
 The Test matrix (ubuntu/macos × stable/beta) runs everything except
 `large_polygon_regression` and the slow end-to-end set listed in
-`.config/nextest.toml`. The Slow Tests job runs that set once, on ubuntu
-stable. Let CI run both. To run the slow set locally:
+`.config/nextest.toml`. The Slow Tests job runs that set on ubuntu and
+macOS, stable only. Let CI run both. To run the slow set locally:
 
 ```bash
 cargo nextest run --all-features \
