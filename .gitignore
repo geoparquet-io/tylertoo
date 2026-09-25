@@ -36,8 +36,6 @@ tests/fixtures/large/
 *.mvt
 
 # Coverage
-tarpaulin-report.html
-cobertura.xml
 lcov.info
 
 # Benchmarks

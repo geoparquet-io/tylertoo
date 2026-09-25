@@ -148,9 +148,11 @@ cargo semver-checks check-release \
 cargo build --features dhat-heap
 
 # Coverage (informational; CI uploads to codecov)
-cargo install cargo-tarpaulin   # once (CI uses a prebuilt binary)
-cargo tarpaulin --out xml --all-features --workspace \
-  --exclude tylertoo-python
+cargo install cargo-llvm-cov    # once (CI uses a prebuilt binary)
+rustup component add llvm-tools-preview
+cargo llvm-cov --all-features --workspace \
+  --exclude tylertoo-python \
+  --lcov --output-path lcov.info
 ```
 
 Some thresholds are **ratchets** set at current-code level and marked

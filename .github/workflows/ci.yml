@@ -11,7 +11,7 @@
 #   Reference Docs  the committed CLI + Python reference (docs/reference/)
 #                   still match regeneration from source (clap help strings +
 #                   pyo3 docstrings); fails on drift
-#   Coverage        cargo-tarpaulin -> codecov
+#   Coverage        cargo-llvm-cov -> lcov -> codecov (informational)
 #   Profiling       dhat-heap feature keeps compiling
 #   Security Audit  cargo-audit + cargo-deny (advisories/licenses/bans/sources)
 #   CI Lint         zizmor (GitHub Actions security linter) on this repo's
@@ -468,29 +468,34 @@ jobs:
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
+          components: llvm-tools-preview
 
       - name: Install protoc
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Install tarpaulin
-        # Prebuilt binary via install-action; `cargo install cargo-tarpaulin`
-        # was several minutes of compile time on every run.
+      - name: Install cargo-llvm-cov
+        # Prebuilt binary via install-action; compiling it from source
+        # costs minutes on every run.
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
-          tool: cargo-tarpaulin
+          tool: cargo-llvm-cov
 
       - name: Generate coverage
-        # --timeout 300: tarpaulin's 60s default per-test timeout is too tight
-        # for the thread-count determinism e2e (multiple instrumented CLI
-        # subprocess runs over the 17k-row madagascar fixture, #460).
-        run: cargo tarpaulin --out xml --all-features --workspace --exclude tylertoo-python --timeout 300
+        # Source-based instrumentation (#524). tarpaulin ran the suite under
+        # ptrace and needed --timeout 300 for the #460 determinism e2e; it
+        # was the CI long pole at ~11 min. llvm-cov also counts the CLI
+        # subprocesses those e2e tests spawn, which tarpaulin could not.
+        run: >-
+          cargo llvm-cov --all-features --workspace
+          --exclude tylertoo-python
+          --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          files: ./cobertura.xml
+          files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false  # Don't fail if token not configured
 

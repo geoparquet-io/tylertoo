@@ -79,7 +79,7 @@ memory-stats = "1.2"
 proptest = "1"
 
 # Note: Install these separately with cargo install:
-# - cargo-tarpaulin (coverage)
+# - cargo-llvm-cov (coverage)
 # - cargo-mutants (mutation testing)
 # - cargo-watch (auto-run tests)
 
