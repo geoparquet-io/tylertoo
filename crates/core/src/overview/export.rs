@@ -935,7 +935,16 @@ fn export_pmtiles_impl(
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
-    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
+    // #459: the tail-directory layout. Tile bytes append straight into
+    // `<output>.partial` after a reserved 16 KiB prefix and are never copied
+    // again, so a per-level checkpoint rewrites only the header, root
+    // directory, metadata and leaves — O(directory), not O(tile data). Under
+    // the old spooled layout each checkpoint re-copied the entire spool, so a
+    // planet-scale run with a dozen checkpoints spent hundreds of gigabytes of
+    // write I/O on salvage alone. Side effect worth knowing: the spool now
+    // lives beside the output rather than in `TMPDIR`.
+    let mut writer =
+        StreamingPmtilesWriter::with_tail_layout(output_path.as_ref(), Compression::Gzip)?;
     // #506: export now adds every tile in ascending PMTiles tile-id (Hilbert)
     // order — per zoom via `tile_key`, and zooms ascend across levels — so
     // the archive is genuinely clustered. Debug-only: catches an ordering
@@ -1090,9 +1099,13 @@ fn export_pmtiles_impl(
             writer.checkpoint(output_path.as_ref())?;
             last_checkpoint = Instant::now();
             log::info!(
-                "[export] checkpoint written: zooms {}..={} salvageable ({:.2}s)",
+                "[export] checkpoint written: zooms {}..={} salvageable at {} ({:.2}s)",
                 coarsest_zoom,
                 plan.zoom,
+                writer
+                    .salvage_path()
+                    .unwrap_or(output_path.as_ref())
+                    .display(),
                 t_ckpt.elapsed().as_secs_f64(),
             );
         }
@@ -4330,6 +4343,28 @@ mod tests {
     ///   `clustered: false -> true`. Only the ORDER tiles were written in
     ///   (and therefore their byte offsets) changed, not what any tile
     ///   contains.
+    ///
+    /// REPIN (#459, tail-directory layout): export now writes the archive in
+    /// the tail layout — `header | root | zero padding | tile data @16384 |
+    /// metadata | leaves` — so that a checkpoint rewrites only the prefix and
+    /// the tail instead of re-copying every tile byte. The *sections* moved;
+    /// nothing inside them did. Verified before re-blessing by dumping both
+    /// trees on this exact fixture (pre-change `ce11a1d5f51410d2`, this tree
+    /// `16b372437283d228`):
+    /// * All 13 `z/x/y -> hash(decompressed tile bytes)` pairs are identical,
+    ///   same 13 keys, same 13 hashes, same lengths.
+    /// * The whole **tile-data section** hashes the same on both trees
+    ///   (`68c6b75f056eb29f`, 1303 bytes) — byte-for-byte, in the same order.
+    /// * The root directory (`4e367810b90b24df`) and the compressed metadata
+    ///   (`4c71bb05cb6e3e99`) are unchanged too; directory entry offsets are
+    ///   relative to `tile_data_offset`, so moving the section does not
+    ///   rewrite them.
+    /// * `clustered` and `verify_clustered()` are both still `true`.
+    ///
+    /// The only differences: `tile_data_offset` 348 -> 16384, and the file
+    /// grows by the 16,201 zero bytes of prefix padding (1651 -> 17852). That
+    /// padding is the one slack go-pmtiles' `verify` accepts (verify.go
+    /// L84-89) — `pmtiles verify` passes on the new archive.
     #[test]
     fn export_archive_matches_pre_refactor_reference() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4349,12 +4384,11 @@ mod tests {
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            // RE-BLESSED (#506): tiles are now written in ascending PMTiles
-            // tile-id order rather than row-major (x, y) order, which moves
-            // every tile's on-disk offset and flips the `clustered` header
-            // byte true. See the REPIN note above this test for the content
-            // vs. layout verification performed before re-blessing.
-            "ce11a1d5f51410d2",
+            // RE-BLESSED (#459): the archive's SECTIONS moved (tail layout),
+            // its contents did not -- the tile-data section, root directory
+            // and metadata all hash the same as before. See the REPIN note
+            // above this test for the full before/after evidence.
+            "16b372437283d228",
             "archive bytes diverged from the pre-refactor reference"
         );
 
