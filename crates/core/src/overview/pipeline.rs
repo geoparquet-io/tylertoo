@@ -19,8 +19,10 @@
 //!   giant-geometry long pole at one level overlaps the other levels' work;
 //! - each level's finished output batches accumulate in an ordered **sink**
 //!   (RAM under the `speed` profile, spilled to a temporary Arrow IPC file under
-//!   `bounded`), and after the read completes the sinks drain into the writer in
-//!   level order (writers demand levels 0,1,2… contiguously).
+//!   `bounded` — by a dedicated per-level writer thread, so the consumer hands
+//!   the batch over instead of encoding it, #494), and after the read completes
+//!   the sinks drain into the writer in level order (writers demand levels
+//!   0,1,2… contiguously).
 //!
 //! Output is **byte-identical** to the serial path: within a batch the ascending
 //! `selected` order and `process_level_batch`'s order-preserving `par_iter` are
@@ -584,72 +586,203 @@ struct ReadMsg {
 /// One level's ordered output buffer.
 enum LevelSink {
     Ram(Vec<RecordBatch>),
-    // Boxed: arrow 59 grew `StreamWriter`, taking `SpillState` past clippy's
-    // large_enum_variant threshold, so every Ram variant would otherwise carry
-    // the spill variant's footprint.
-    Spill(Box<SpillState>),
+    // Not boxed: `SpillState` used to own the arrow `StreamWriter` inline,
+    // which (arrow 59) pushed the variant past clippy's large_enum_variant
+    // threshold. The writer now lives on the spill thread, leaving a sender
+    // and a join handle here.
+    Spill(SpillState),
 }
 
 impl LevelSink {
     fn new(backing: SinkBacking, out_schema: &Schema) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
-            SinkBacking::Spill => LevelSink::Spill(Box::new(SpillState::new(out_schema)?)),
+            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema)?),
         })
     }
 
     /// Push one output batch into the sink. Returns the bytes handed to the
     /// spill writer (0 for the RAM path — nothing is measured there, since
     /// the goal is accounting for previously-invisible spill I/O).
-    fn push(&mut self, batch: RecordBatch, timers: &Pass2Timers) -> Result<u64, ConvertError> {
+    fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         match self {
             LevelSink::Ram(v) => {
                 v.push(batch);
                 Ok(0)
             }
-            LevelSink::Spill(s) => s.push(&batch, timers),
+            LevelSink::Spill(s) => s.push(batch),
         }
     }
 }
 
-/// A level spilled to a temporary Arrow IPC stream file. The write handle and
-/// the read handle are independent `reopen()`s of the same temp file; Arrow IPC
-/// is a lossless value round-trip, so the reloaded batches are identical to the
-/// buffered ones and the final Parquet encode stays byte-identical.
+/// An invariant this module owns was broken — never reachable from user input,
+/// so it carries no advice, only the broken invariant.
+fn internal(what: &str) -> ConvertError {
+    ConvertError::Io(std::io::Error::other(format!("internal: {what}")))
+}
+
+/// Batches a level's spill-writer thread may hold ahead of the consumer.
+///
+/// The queue exists to absorb write jitter (an fsync-adjacent stall, a
+/// compaction pause on the temp filesystem), not to buffer a level's output:
+/// depth 2 is one batch being encoded plus one waiting, which is enough to
+/// keep the writer busy while the consumer builds the next batch, and it caps
+/// the extra resident set at `2 × out_batch × spilled_levels` — a bounded
+/// profile spills EVERY buffered level, so a deeper queue multiplies by the
+/// level count and would undo what the bounded profile is for.
+const SPILL_QUEUE_DEPTH: usize = 2;
+
+/// A level spilled to a temporary Arrow IPC stream file, written by a
+/// dedicated thread. The write handle and the read handle are independent
+/// `reopen()`s of the same temp file; Arrow IPC is a lossless value round-trip,
+/// so the reloaded batches are identical to the buffered ones and the final
+/// Parquet encode stays byte-identical.
+///
+/// **Why a thread (#494).** The Arrow IPC encode+write used to run inline in
+/// [`LevelSink::push`], i.e. on the single consumer thread that also drives
+/// every level's per-batch compute — 65.7 core-seconds of a 403-second bounded
+/// Brazil-55M pass 2, all of it blocking the one thread the whole pipeline is
+/// serialized through. Handing each level's batches to its own writer over a
+/// bounded channel takes that off the critical path without changing a byte:
+/// one sender, one receiver, FIFO, so the level's batches reach the file in
+/// exactly the order the consumer produced them.
 struct SpillState {
-    writer: StreamWriter<BufWriter<File>>,
+    /// `None` once the stream has been closed — by [`SpillState::into_reader`],
+    /// or by a `push` that joined the writer to report its error.
+    tx: Option<Sender<RecordBatch>>,
+    /// `None` once joined. The writer returns the temp file it finished plus
+    /// the core-seconds it spent encoding and writing (folded into
+    /// `Pass2Timers::spill_write` at join time, since the thread cannot borrow
+    /// the driver's timers).
+    handle: Option<std::thread::JoinHandle<Result<SpillWriterDone, ConvertError>>>,
+}
+
+/// What a finished spill-writer thread hands back.
+struct SpillWriterDone {
     temp: NamedTempFile,
+    /// Core-seconds spent in Arrow IPC encode + write on the writer thread.
+    write_time: Duration,
 }
 
 impl SpillState {
     fn new(out_schema: &Schema) -> Result<Self, ConvertError> {
         let temp = NamedTempFile::new()?;
         let write_handle = temp.reopen()?;
+        // Constructed on the caller's thread so a broken spill directory or an
+        // unwritable temp file fails the conversion here, with the caller's
+        // error handling, rather than inside a thread nobody has joined yet.
         let writer = StreamWriter::try_new(BufWriter::new(write_handle), out_schema)?;
-        Ok(SpillState { writer, temp })
+        Self::spawn(writer, temp)
     }
 
-    /// Write one batch to the spill file, timing the I/O and reporting its
-    /// approximate in-memory byte size (profiling instrumentation: this write
-    /// was previously untimed and its bytes uncounted).
-    fn push(&mut self, batch: &RecordBatch, timers: &Pass2Timers) -> Result<u64, ConvertError> {
+    /// Start the writer thread for an already-opened IPC stream.
+    ///
+    /// Generic over the stream's sink for one reason: a spill write fails only
+    /// on I/O the production path cannot provoke on demand (a full disk, a
+    /// spill directory yanked mid-run), so the failure-surfacing contract is
+    /// untestable without being able to hand the writer a sink that fails.
+    /// Production monomorphizes this exactly once, over `BufWriter<File>`.
+    fn spawn<W: std::io::Write + Send + 'static>(
+        mut writer: StreamWriter<W>,
+        temp: NamedTempFile,
+    ) -> Result<Self, ConvertError> {
+        let (tx, rx) = crossbeam_channel::bounded::<RecordBatch>(SPILL_QUEUE_DEPTH);
+        let handle = std::thread::Builder::new()
+            .name("tylertoo-spill".to_string())
+            .spawn(move || -> Result<SpillWriterDone, ConvertError> {
+                let mut write_time = Duration::ZERO;
+                for batch in rx.iter() {
+                    let t = Instant::now();
+                    writer.write(&batch)?;
+                    write_time += t.elapsed();
+                }
+                let t = Instant::now();
+                writer.finish()?; // writes EOS + flushes the BufWriter
+                drop(writer); // close the write handle
+                write_time += t.elapsed();
+                Ok(SpillWriterDone { temp, write_time })
+            })?;
+        Ok(SpillState {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+
+    /// Hand one batch to this level's writer thread, reporting its approximate
+    /// in-memory byte size. Blocks only when the writer is [`SPILL_QUEUE_DEPTH`]
+    /// batches behind.
+    ///
+    /// A closed channel means the writer thread already returned — necessarily
+    /// with an error, since it only stops early on one — so the send failure is
+    /// resolved by joining and reporting that error rather than by inventing a
+    /// "channel closed" of its own (the #486 surfacing rule: report the cause,
+    /// never the symptom).
+    fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         let bytes = batch.get_array_memory_size() as u64;
-        let t = Instant::now();
-        self.writer.write(batch)?;
-        Pass2Timers::add_dur(timers.spill_write_cell(), t.elapsed());
+        let Some(tx) = &self.tx else {
+            return Err(internal("spill sink pushed after it was closed"));
+        };
+        if tx.send(batch).is_err() {
+            self.tx = None; // release the writer's receiver before joining
+                            // The writer stops early only on an error, so `?` here IS the
+                            // report; falling through means it finished cleanly with the
+                            // stream still open, which it cannot do.
+            self.join()?;
+            return Err(internal("spill writer stopped without reporting an error"));
+        }
         Ok(bytes)
     }
 
-    /// Finish writing and reopen the temp file for reading. The returned
+    /// Join the writer thread, resuming its panic on this thread rather than
+    /// flattening it into an error. `Ok(None)` when it was already joined.
+    fn join(&mut self) -> Result<Option<SpillWriterDone>, ConvertError> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(None);
+        };
+        match handle.join() {
+            Ok(res) => res.map(Some),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Close the stream, join the writer, and reopen the temp file for reading,
+    /// folding the writer's core-seconds into `timers`. The returned
     /// [`NamedTempFile`] must be held until the reader is exhausted so the file
     /// is not unlinked mid-read (and is cleaned up on drop afterwards).
-    fn into_reader(self) -> Result<(StreamReader<BufReader<File>>, NamedTempFile), ConvertError> {
-        let SpillState { mut writer, temp } = self;
-        writer.finish()?; // writes EOS + flushes the BufWriter to the file
-        drop(writer); // close the write handle
-        let read_handle = temp.reopen()?;
+    fn into_reader(
+        mut self,
+        timers: &Pass2Timers,
+    ) -> Result<(StreamReader<BufReader<File>>, NamedTempFile), ConvertError> {
+        // Dropping the sender is what ends the writer's `rx.iter()`; without it
+        // the join below would never return.
+        self.tx = None;
+        let done = self
+            .join()?
+            .ok_or_else(|| internal("spill writer joined twice"))?;
+        Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
+        let read_handle = done.temp.reopen()?;
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
-        Ok((reader, temp))
+        Ok((reader, done.temp))
+    }
+}
+
+impl Drop for SpillState {
+    /// A sink abandoned on an error path (or an unwind) must not leave its
+    /// writer thread parked on a receiver that never disconnects: drop the
+    /// sender first, then join. Failures are already lost on this path — the
+    /// error that got us here is the one worth reporting — but a panic inside
+    /// the writer is re-raised only when we are not already unwinding, since
+    /// panicking in a `Drop` during an unwind aborts the process.
+    fn drop(&mut self) {
+        self.tx = None;
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if let Err(payload) = handle.join() {
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 }
 
@@ -779,7 +912,7 @@ pub(super) fn run_pass2_buffered(
                     if let Some((out, v)) = out {
                         rows_ref[li] += out.num_rows();
                         verts_ref[li] += v;
-                        spill_bytes_ref[li] += sinks_ref[li].push(out, timers_ref)?;
+                        spill_bytes_ref[li] += sinks_ref[li].push(out)?;
                     }
                 }
                 if last_progress.elapsed().as_secs() >= 10 {
@@ -844,7 +977,10 @@ fn drain_sink(
         }
         LevelSink::Spill(state) => {
             // `_temp` keeps the spill file on disk until the reader is drained.
-            let (mut reader, _temp) = state.into_reader()?;
+            // Joining the writer here also folds its encode+write core-seconds
+            // into `timers.spill_write`, so the stage split still accounts for
+            // the I/O now that it no longer runs on the consumer thread.
+            let (mut reader, _temp) = state.into_reader(timers)?;
             let err: std::cell::RefCell<Option<ConvertError>> = std::cell::RefCell::new(None);
             let iter = std::iter::from_fn(|| match reader.next() {
                 None => None,
@@ -863,6 +999,145 @@ fn drain_sink(
     };
     Pass2Timers::add_dur(timers.drain_cell(), t_drain.elapsed());
     Ok(outcome)
+}
+
+/// The off-thread spill writer (#494): order, accounting, and how a failing
+/// or abandoned writer surfaces.
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    fn schema(name: &str) -> Schema {
+        Schema::new(vec![Field::new(name, DataType::Int64, false)])
+    }
+
+    /// One batch holding `ids`, against `schema`.
+    fn batch(schema: &Schema, ids: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(ids)) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    /// The load-bearing property: a level's batches must come back out of the
+    /// spill file in exactly the order they were pushed. The writer runs on
+    /// its own thread now, so "the consumer wrote it" and "the file has it"
+    /// are no longer the same moment — but one sender over a FIFO channel to
+    /// one writer keeps the sequence, and `into_reader` joins before reading.
+    #[test]
+    fn spill_writer_preserves_push_order() {
+        let s = schema("id");
+        let mut sink = SpillState::new(&s).unwrap();
+        // Comfortably more than SPILL_QUEUE_DEPTH, so the consumer really does
+        // block on a full queue and the two threads interleave.
+        let pushed: Vec<Vec<i64>> = (0..64i64).map(|i| vec![i * 10, i * 10 + 1]).collect();
+        let mut bytes = 0u64;
+        for ids in &pushed {
+            bytes += sink.push(batch(&s, ids.clone())).unwrap();
+        }
+        let timers = Pass2Timers::default();
+        let (reader, _temp) = sink.into_reader(&timers).unwrap();
+        let got: Vec<Vec<i64>> = reader
+            .map(|b| {
+                let b = b.unwrap();
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec();
+                col
+            })
+            .collect();
+        assert_eq!(got, pushed, "spill read-back must match push order exactly");
+        assert!(
+            bytes > 0,
+            "push must report the in-memory bytes it handed on"
+        );
+        assert!(
+            timers.stage_secs().spill_write > 0.0,
+            "the writer thread's encode+write core-seconds must be folded back \
+             into the stage split at join time — otherwise moving the I/O off \
+             the consumer thread would simply make it invisible again"
+        );
+    }
+
+    /// A sink that accepts the IPC header and then fails — the shape of a
+    /// spill filesystem that fills up mid-level.
+    struct FailsAfter {
+        remaining: usize,
+    }
+
+    impl std::io::Write for FailsAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("spill device is out of space"));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that fails mid-stream must surface ITS error, not a derived
+    /// "channel closed" (#486): a failed `send` only means the thread already
+    /// returned, so the sink joins it and reports what it returned. Before the
+    /// writer moved off the consumer thread this was simply `push`'s own `?`;
+    /// the thread must not have made the failure quieter.
+    #[test]
+    fn spill_writer_error_surfaces_as_the_writers_own_error() {
+        let s = schema("id");
+        // Enough budget for the IPC schema message, not for the batches.
+        let writer = StreamWriter::try_new(FailsAfter { remaining: 512 }, &s).unwrap();
+        let mut sink = SpillState::spawn(writer, NamedTempFile::new().unwrap()).unwrap();
+        // The queue absorbs the first pushes, so the error lands on a later
+        // push or at join — either way it must be the writer's own.
+        let mut err = None;
+        for _ in 0..(SPILL_QUEUE_DEPTH + 16) {
+            if let Err(e) = sink.push(batch(&s, vec![1, 2, 3])) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = match err {
+            Some(e) => e,
+            None => sink
+                .into_reader(&Pass2Timers::default())
+                .expect_err("a writer whose sink failed must fail the sink"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of space"),
+            "the writer's own I/O error must be what surfaces, got: {msg}"
+        );
+        assert!(
+            !msg.contains("internal:"),
+            "an internal placeholder must never stand in for the writer's own \
+             error, got: {msg}"
+        );
+    }
+
+    /// A sink abandoned without `into_reader` (an error path, or an unwind)
+    /// must still join its writer rather than leaving a thread parked on a
+    /// receiver that never disconnects. The test body is the assertion: a
+    /// `Drop` that forgot to drop the sender first would hang here.
+    #[test]
+    fn dropping_a_sink_joins_its_writer() {
+        let s = schema("id");
+        let mut sink = SpillState::new(&s).unwrap();
+        for i in 0..8i64 {
+            sink.push(batch(&s, vec![i])).unwrap();
+        }
+        drop(sink);
+    }
 }
 
 #[cfg(test)]
