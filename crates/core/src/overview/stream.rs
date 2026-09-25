@@ -87,9 +87,9 @@ use super::pipe::scoped_pipe;
 use super::pipeline;
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals};
 use super::simplify::{
-    carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_checked,
-    simplify_step, validation_skip_count, CascadeStep, CollapseMode, Representation, Simplified,
-    SimplifyOptions,
+    carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
+    simplify_step_checked, validation_skip_count, CascadeStep, CollapseMode, Representation,
+    Simplified, SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
@@ -1871,8 +1871,9 @@ struct ProfileJsonInputs<'a> {
     pass2_stage_secs: Pass2StageSecs,
     /// `(shared, total)` cascade-fold `Keep` steps (#499,
     /// `pass2.identical_steps` in the dump). Only the pipelined engine's
-    /// cascade fold ([`process_batch_cascade`]) records these; a Serial-only
-    /// run reports `(0, 0)`.
+    /// cascade fold ([`process_batch_cascade`]) records these, so `(0, 0)`
+    /// means the fold never ran: a Serial-engine run, or a single-level
+    /// ladder (where `run_pass2_buffered` is skipped entirely).
     pass2_cascade_step_counts: (u64, u64),
     writer_finish_secs: f64,
     total_secs: f64,
@@ -2017,8 +2018,9 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
             // Cascade-fold Arc-sharing (#499, compute side): how many of the
             // fold's `Keep` steps reused the previous step's geometry
             // (`Arc::clone`) instead of retaining a fresh allocation, because
-            // simplification removed nothing. `(0, 0)` on a Serial-only run
-            // (the reference engine doesn't share — see `process_level_batch`).
+            // simplification removed nothing. `(0, 0)` whenever the fold never
+            // ran: a Serial-engine run (the reference engine doesn't share —
+            // see `process_level_batch`), or a single-level ladder.
             "identical_steps": {
                 "shared": cascade_steps_shared,
                 "total": cascade_steps_total,
@@ -3060,9 +3062,11 @@ fn run_pass1_with_chunk_rows(
 // Pass 2: per-level streaming filter → simplify → write
 // ============================================================================
 
-/// Wall-time accumulators for pass-2 stages ([profile] logging), stored as
-/// nanoseconds. Atomic so the pipelined engine ([`super::pipeline`]) can share
-/// one set across the parallel per-level processing of a batch; the serial
+/// Pass-2 [profile] counters: wall-time accumulators per stage (stored as
+/// nanoseconds), plus two cascade-fold step counters (#499) that piggyback on
+/// the same shared-atomics lifecycle rather than nanosecond timings. Atomic so
+/// the pipelined engine ([`super::pipeline`]) can share one set across the
+/// parallel per-level processing of a batch; the serial
 /// [`write_level_streaming`] path uses it single-threaded.
 #[derive(Default)]
 pub(super) struct Pass2Timers {
@@ -3551,11 +3555,6 @@ pub(super) fn process_level_batch(
     Pass2Timers::add(&timers.simplify, t_simplify);
 
     let t_build = Instant::now();
-    // `assemble_level_batch` takes `Arc<Geometry<f64>>` so the (hot,
-    // pipelined) cascade fold can share allocations across levels (#499);
-    // this Serial reference path has nothing to share, so it just wraps each
-    // owned geometry once here.
-    let kept_geoms: Vec<Arc<Geometry<f64>>> = kept_geoms.into_iter().map(Arc::new).collect();
     let out_batch = assemble_level_batch(batch, row_offset, ctx, &kept_idx, &kept_geoms)?;
     Pass2Timers::add(&timers.build, t_build);
     Ok(Some((out_batch, verts)))
@@ -3566,16 +3565,21 @@ pub(super) fn process_level_batch(
 /// cluster / coalesced-count columns. Shared by [`process_level_batch`] and
 /// [`process_batch_cascade`].
 ///
-/// `kept_geoms` is `Arc<Geometry<f64>>` rather than an owned `Geometry<f64>`
-/// (#499): the cascade fold shares one allocation across every ladder level
-/// whose step removed nothing, and this assembly step must not undo that by
-/// deep-cloning on the way into the Arrow builder.
+/// `kept_geoms` is borrowed and generic over `Borrow<Geometry<f64>>` (#499):
+/// [`process_batch_cascade`] shares one allocation across every ladder level
+/// whose step removed nothing and so passes `&[Arc<Geometry<f64>>]`, while
+/// [`process_level_batch`] owns its geometries outright and passes
+/// `&[Geometry<f64>]`. Note that the owned side is NOT a Serial-only path:
+/// the pipelined production engine streams its finest level through
+/// `write_level_streaming` -> `process_level_batch` as well. Assembly must not
+/// undo either caller's choice by deep-cloning or re-wrapping on the way into
+/// the Arrow builder.
 fn assemble_level_batch(
     batch: &RecordBatch,
     row_offset: usize,
     ctx: &LevelStreamCtx<'_>,
     kept_idx: &[usize],
-    kept_geoms: &[Arc<Geometry<f64>>],
+    kept_geoms: &[impl std::borrow::Borrow<Geometry<f64>>],
 ) -> Result<RecordBatch, ConvertError> {
     let mut out_batch = build_level_batch(
         ctx.source_schema,
@@ -3733,6 +3737,8 @@ pub(super) fn process_batch_cascade(
         v
     };
     let t_simplify = Instant::now();
+    // Keep step semantics in lock-step with `super::simplify::simplify_cascade`;
+    // equivalence is enforced by `overview::convert::tests::pipelined_matches_serial`.
     // Per-feature fold, `(steps, shared_count, total_count)`. `.collect()` on
     // this `zip` (an `IndexedParallelIterator`) preserves ascending `pos`
     // order exactly like the pre-#499 `Vec<Vec<Simplified>>` collect did —
@@ -3768,8 +3774,13 @@ pub(super) fn process_batch_cascade(
                 } else {
                     g
                 };
-                let (step, unchanged) =
-                    simplify_checked(base.as_ref(), ctx.gsd_m, ctx.crs, ctx.simplify, ctx.repr);
+                let (step, unchanged) = simplify_step_checked(
+                    base.as_ref(),
+                    ctx.gsd_m,
+                    ctx.crs,
+                    ctx.simplify,
+                    ctx.repr,
+                );
                 match step {
                     Simplified::Keep(s) => {
                         total += 1;

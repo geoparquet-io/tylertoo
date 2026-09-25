@@ -2645,14 +2645,13 @@ fn write_emitted_levels(
         // in-memory path has nothing to share, so it just wraps each owned
         // geometry once here (`EmittedLevel::geoms` stays a plain
         // `Vec<Geometry<f64>>` — out of scope for #499's compute-side PR).
-        let arc_geoms: Vec<Arc<Geometry<f64>>> = e.geoms.iter().cloned().map(Arc::new).collect();
         let mut batch = build_level_batch(
             inputs.source_schema,
             inputs.full,
             inputs.non_geom_cols,
             inputs.geom_idx,
             &e.indices,
-            &arc_geoms,
+            &e.geoms,
         )?;
         if let Some(tables) = inputs.cluster_tables {
             // Canonical level: singleton clusters, columns verbatim (§2.4).
@@ -3846,7 +3845,7 @@ pub(super) fn build_level_batch(
     non_geom_cols: &[usize],
     geom_idx: usize,
     indices: &[usize],
-    geoms: &[Arc<Geometry<f64>>],
+    geoms: &[impl std::borrow::Borrow<Geometry<f64>>],
 ) -> Result<RecordBatch, ConvertError> {
     let take_idx = UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
 
@@ -3863,7 +3862,7 @@ pub(super) fn build_level_batch(
                     .unwrap_or_default(),
             ));
             let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-            b.extend_from_iter(geoms.iter().map(|g| Some(g.as_ref())));
+            b.extend_from_iter(geoms.iter().map(|g| Some(g.borrow())));
             columns.push(b.finish().to_array_ref());
         } else {
             let src_col = *non_geom_iter.next().expect("non-geom column index");
