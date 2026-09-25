@@ -4758,7 +4758,7 @@ mod tests {
 
     /// F8 (#506 review): `set_expect_clustered(true)` pins a real ordering
     /// contract, not just documentation -- two out-of-order adds must trip
-    /// the `debug_assert!` in `check_expect_clustered`. Debug-only: with
+    /// the `debug_assert!` in `note_add`. Debug-only: with
     /// assertions disabled the panic never fires (see [`Self::write_archive`]'s
     /// `log::warn!` for the release-mode fallback signal instead), so this
     /// test only runs in a debug build.
@@ -4781,19 +4781,21 @@ mod tests {
     // #516: PmtilesWriter dedup panics on out-of-order adds
     // -------------------------------------------------------------------------
 
-    /// Byte-stability regression for the two-pass offset-assignment fix
-    /// (#516): the same tiles as `test_writer_dedup_run_length_consecutive`
-    /// (every duplicate added after its carrier -- a "currently-working"
-    /// input under the pre-#516 single-pass code too), hashed with the same
-    /// `TileHasher` (xxh3) the writer itself uses for content-addressing.
-    /// The expected hash and length were captured by running this exact
-    /// scenario against the pre-fix `write_to_file` (the version with
-    /// `hash_to_offset.get(...).expect("Hash must exist")`) before switching
-    /// it to the two-pass assignment. A change here means the two-pass
-    /// rewrite altered output for an input the single-pass code already
-    /// handled correctly, which it must not.
+    /// Offset-assignment regression for the two-pass rewrite (#516): the same
+    /// tiles as `test_writer_dedup_run_length_consecutive` (every duplicate
+    /// added after its carrier -- a "currently-working" input under the
+    /// pre-#516 single-pass code too). A change here means the two-pass
+    /// assignment altered the layout for an input the single-pass code
+    /// already wrote correctly, which it must not.
+    ///
+    /// Pinned structurally -- the decoded directory tuples and the tile-data
+    /// section bytes -- rather than as a whole-file length plus xxh3 (#516
+    /// review, S4). A whole-file pin also fails whenever the metadata JSON or
+    /// the compression library's output shifts by a byte, neither of which
+    /// this test has anything to say about; what #516 touched is which offset
+    /// each directory entry gets, and that is what is pinned.
     #[test]
-    fn dedup_two_pass_offset_assignment_preserves_bytes_for_existing_working_input() {
+    fn dedup_two_pass_offset_assignment_preserves_layout_for_existing_working_input() {
         let mut writer = PmtilesWriter::new();
         writer.enable_deduplication(true);
         let tile = vec![0x1a, 0x10];
@@ -4802,19 +4804,36 @@ mod tests {
         writer.add_tile(1, 1, 1, &tile).unwrap();
         writer.add_tile(1, 1, 0, &tile).unwrap();
 
-        let path = Path::new("/tmp/test-pmtiles-516-byte-stability.pmtiles");
-        let _ = fs::remove_file(path);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
         writer.write_to_file(path).unwrap();
         let bytes = fs::read(path).unwrap();
-        let _ = fs::remove_file(path);
+        let header = Header::from_bytes(&bytes).unwrap();
 
-        assert_eq!(bytes.len(), 281, "output length must be unchanged by #516");
+        // The four z1 tile ids are 1..=4 and all four share one blob at
+        // offset 0, so the directory collapses to a single run-length-4
+        // entry -- exactly what the pre-#516 single-pass code produced.
+        let expected_blob = compression::compress(&tile, Compression::Gzip).unwrap();
+        let entries = read_all_entries(&bytes, &header).unwrap();
         assert_eq!(
-            TileHasher::hash(&bytes),
-            15_382_129_263_914_387_794,
-            "output bytes must be unchanged by #516 for an input the old single-pass code \
-             already wrote correctly"
+            entries
+                .iter()
+                .map(|e| (e.tile_id, e.offset, e.length, e.run_length))
+                .collect::<Vec<_>>(),
+            vec![(1u64, 0u64, expected_blob.len() as u32, 4u32)],
+            "one blob at offset 0, addressed by a single run of four consecutive tile ids"
         );
+
+        let tile_data = &bytes[header.tile_data_offset as usize
+            ..(header.tile_data_offset + header.tile_data_length) as usize];
+        assert_eq!(
+            tile_data,
+            &expected_blob[..],
+            "the tile-data section must be exactly the one shared compressed blob"
+        );
+        assert_eq!(header.addressed_tiles_count, 4);
+        assert_eq!(header.tile_entries_count, 1);
+        assert_eq!(header.tile_contents_count, 1);
     }
 
     /// #516 repro: `hash_to_offset.get(&entry.hash).expect("Hash must exist")`
@@ -4834,8 +4853,8 @@ mod tests {
         writer.add_tile(2, 3, 3, b"shared").unwrap();
         writer.add_tile(0, 0, 0, b"shared").unwrap();
 
-        let path = Path::new("/tmp/test-pmtiles-516-descending-ids.pmtiles");
-        let _ = fs::remove_file(path);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
         writer.write_to_file(path).expect("must not panic (#516)");
 
         let stats = writer.dedup_stats();
@@ -4863,7 +4882,231 @@ mod tests {
             header.clustered, actually_clustered,
             "the header's own clustered claim must match the independent, file-side check"
         );
+    }
 
-        let _ = fs::remove_file(path);
+    // -------------------------------------------------------------------------
+    // #516 review: pass-1 carrier clobber, strict predicate, O(1) clustered
+    // -------------------------------------------------------------------------
+
+    /// The predicate must reject a back-reference that names an offset it has
+    /// seen but not the whole tile stored there (#516 review, S3-3). Before
+    /// this, `[(0, 10), (0, 25)]` verified as clustered: the second entry's
+    /// offset was in the seen set, and nothing checked that 25 bytes from
+    /// offset 0 is a different (and, at 25 > 10, out-of-bounds) blob than the
+    /// 10-byte tile actually written there. The doc comment already promised
+    /// "a whole prior tile"; now the code enforces it.
+    #[test]
+    fn offsets_are_clustered_rejects_backreference_with_mismatched_length() {
+        // Same offset, longer than the tile actually stored there.
+        assert!(!offsets_are_clustered([(0, 10), (0, 25)]));
+        // Same offset, shorter -- a prefix of a prior tile is not a tile.
+        assert!(!offsets_are_clustered([(0, 10), (10, 5), (10, 999)]));
+        // An exact whole-tile back-reference, then a fresh append: still fine.
+        assert!(offsets_are_clustered([(0, 10), (0, 10), (10, 4)]));
+    }
+
+    /// Two carriers for one hash must not each write their bytes (#516
+    /// review, S2). `add_tile_compressed` never consults the dedup cache, so
+    /// two identical pre-compressed blobs both arrive as `TileEntry`s holding
+    /// data. Pass 1 used to `insert` per carrier, last write winning: the
+    /// first blob's bytes stayed in the tile-data section with nothing
+    /// pointing at them, and `tile_contents_count` (2) outran the directory's
+    /// distinct offset count (1) -- which go-pmtiles `verify` rejects with a
+    /// hard error, not a warning. First-carrier-wins is strictly better than
+    /// the pre-#516 behaviour: it actually deduplicates the second blob.
+    #[test]
+    fn dedup_pass_one_stores_shared_bytes_once_across_carriers() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+        let blob = compression::compress(b"identical tile bytes", Compression::Gzip).unwrap();
+        writer.add_tile_compressed(1, 0, 0, blob.clone()).unwrap();
+        writer.add_tile_compressed(1, 1, 0, blob.clone()).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        writer.write_to_file(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+
+        // z1 tile ids 1 and 4 are not consecutive, so no run-length merge --
+        // two entries sharing the single blob at offset 0.
+        let entries = read_all_entries(&bytes, &header).unwrap();
+        let len = blob.len() as u32;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.tile_id, e.offset, e.length, e.run_length))
+                .collect::<Vec<_>>(),
+            vec![(1u64, 0u64, len, 1u32), (4u64, 0u64, len, 1u32)],
+            "both carriers must reference the one stored blob"
+        );
+
+        assert_eq!(
+            header.tile_data_length,
+            blob.len() as u64,
+            "the second carrier's bytes must not be appended as dead weight"
+        );
+        let distinct: HashSet<u64> = entries.iter().map(|e| e.offset).collect();
+        assert_eq!(
+            distinct.len() as u64,
+            header.tile_contents_count,
+            "go-pmtiles `verify` hard-errors when TileContentsCount disagrees with \
+             the directory's distinct referenced offsets (pmtiles/verify.go:148-150)"
+        );
+        assert_eq!(header.tile_contents_count, 1);
+        assert_eq!(header.addressed_tiles_count, 2);
+        assert!(header.clustered, "one blob, referenced twice, is clustered");
+        assert!(
+            verify_clustered(path).unwrap(),
+            "the file-side re-derivation must agree with the header"
+        );
+    }
+
+    /// Re-adding a tile id with different content replaces the only
+    /// `TileEntry` that carried an earlier hash's bytes, orphaning the
+    /// duplicate still pointing at it. That used to `expect`-panic in pass 2
+    /// (#516 review, S3-1); `write_to_file` already returns `Result`, so it
+    /// must report the orphan rather than abort the process.
+    #[test]
+    fn dedup_errors_when_a_carrier_tile_is_overwritten() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        writer.add_tile(0, 0, 0, b"XXXX").unwrap(); // carries hash(XXXX)
+        writer.add_tile(1, 0, 0, b"XXXX").unwrap(); // duplicate, no data
+        writer.add_tile(0, 0, 0, b"YYYY").unwrap(); // replaces the carrier
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let err = writer
+            .write_to_file(tmp.path())
+            .expect_err("the orphaned hash must surface as an error, not a panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("carrier"),
+            "the error must name the cause (an overwritten carrier tile), got: {msg}"
+        );
+    }
+
+    /// The scenario the pass-2 comment describes, pinned (#516 review, S3-6):
+    /// a duplicate whose carrier sorts *after* it, interleaved with a second
+    /// hash whose carrier sorts between them. `(2,3,3)` carries `X`, `(1,0,0)`
+    /// carries `Y`, `(0,0,0)` duplicates `X`. In tile-id order the directory
+    /// reads `[0 -> offset(X), 1 -> offset(Y)=0, 15 -> offset(X)]`, whose very
+    /// first entry already points past the frontier: legitimately unclustered,
+    /// and both the header and the file-side check must say so rather than
+    /// claim otherwise. The archive is still byte-correct -- every tile serves
+    /// its own content -- it just costs a reader a backward seek.
+    #[test]
+    fn interleaved_carriers_produce_an_honestly_unclustered_archive() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        writer.add_tile(2, 3, 3, b"XXXXXXXX").unwrap();
+        writer.add_tile(1, 0, 0, b"YYYYYYYY").unwrap();
+        writer.add_tile(0, 0, 0, b"XXXXXXXX").unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        writer.write_to_file(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+
+        assert!(
+            !header.clustered,
+            "the header must not claim clustered for an interleaved dedup layout"
+        );
+        assert!(
+            !verify_clustered(path).unwrap(),
+            "and the independent file-side check must agree"
+        );
+
+        // Byte correctness is untouched: each tile id still serves its own
+        // content, unclustered or not.
+        let entries = read_all_entries(&bytes, &header).unwrap();
+        let expected: Vec<(u64, &[u8])> = vec![
+            (tile_id(0, 0, 0), b"XXXXXXXX".as_slice()),
+            (tile_id(1, 0, 0), b"YYYYYYYY".as_slice()),
+            (tile_id(2, 3, 3), b"XXXXXXXX".as_slice()),
+        ];
+        assert_eq!(entries.len(), expected.len());
+        for (e, (want_id, want_bytes)) in entries.iter().zip(expected) {
+            assert_eq!(e.tile_id, want_id);
+            let start = (header.tile_data_offset + e.offset) as usize;
+            let raw = &bytes[start..start + e.length as usize];
+            let served = compression::decompress(raw, header.tile_compression).unwrap();
+            assert_eq!(
+                served, want_bytes,
+                "tile id {} must serve its own content",
+                e.tile_id
+            );
+        }
+    }
+
+    /// Ascending adds imply a clustered archive by construction, so
+    /// `write_archive` reads the tracked flag instead of building the
+    /// predicate's offset map -- ~2.4 GB of it at planet scale, at peak RSS
+    /// (#516 review, S3-4). The derived header byte must be identical either
+    /// way, which the file-side `verify_clustered` (which always runs the
+    /// predicate) confirms here.
+    #[test]
+    fn streaming_writer_derives_clustered_from_ascending_adds() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+
+        // Ascending tile ids: z0 (0,0)=0, z1 (0,0)=1, z1 (0,1)=2, z1 (1,1)=3.
+        // The third add repeats the first's content, so the directory carries
+        // a dedup back-reference to offset 0 -- the case the predicate exists
+        // for, and the one the fast path must still get right.
+        writer.add_tile(0, 0, 0, b"aaaa").unwrap();
+        writer.add_tile(1, 0, 0, b"bbbb").unwrap();
+        writer.add_tile(1, 0, 1, b"aaaa").unwrap();
+        writer.add_tile(1, 1, 1, b"cccc").unwrap();
+        assert!(
+            writer.adds_ascending,
+            "every add continued the ascending run"
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        writer.finalize(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(header.clustered, "ascending adds are clustered");
+        assert!(
+            verify_clustered(&path).unwrap(),
+            "and the predicate, re-derived from disk, must reach the same answer \
+             the O(1) fast path did"
+        );
+    }
+
+    /// The counterpart: an out-of-order caller clears `adds_ascending`, so the
+    /// flag short-circuit cannot fire and the honest predicate decides. It
+    /// must derive `false` here, not inherit an optimistic default.
+    #[test]
+    fn streaming_writer_out_of_order_adds_fall_back_to_the_predicate() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+
+        // z2 (3,3)=15 added before z1 (0,0)=1: the bytes land in add order,
+        // so after the tile_id sort the first entry points past the frontier.
+        writer.add_tile(2, 3, 3, b"aaaa").unwrap();
+        writer.add_tile(1, 0, 0, b"bbbb").unwrap();
+        assert!(
+            !writer.adds_ascending,
+            "a descending add must clear the fast-path flag"
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        writer.finalize(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            !header.clustered,
+            "the fallback predicate must report the archive as it is"
+        );
+        assert!(!verify_clustered(&path).unwrap(), "and the file agrees");
     }
 }

@@ -4420,12 +4420,16 @@ mod tests {
     /// of each other, not because export guarantees it. The real predicate
     /// this test checks is [`crate::pmtiles_writer::verify_clustered`], the
     /// same file-side re-derivation the header's own `clustered` byte is
-    /// checked against — plus, since the #506 review, the *strict* walk
-    /// go-pmtiles `verify` itself performs (every first-seen offset equals
-    /// the running end of the data written so far; a repeated offset is a
-    /// dedup back-reference and is skipped). `verify_clustered` is laxer
-    /// than that today (#516), so pinning the tool's rule here keeps this
-    /// test from blessing an archive go-pmtiles would refuse.
+    /// checked against.
+    ///
+    /// Since #516 landed, `verify_clustered` *is* the strict walk — every
+    /// first-seen offset must equal the running end of the data written so
+    /// far, and a repeated offset must name a whole prior tile — so this
+    /// test pins the tool's rule through the shared
+    /// [`crate::pmtiles_writer::offsets_are_clustered`] predicate rather
+    /// than re-implementing it. What remains to check separately is byte
+    /// accounting: the predicate proves no entry lands in a gap, not that
+    /// the section has no trailing bytes nothing references.
     #[test]
     fn export_emits_tiles_in_ascending_tile_id() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4439,7 +4443,8 @@ mod tests {
 
         use crate::compression;
         use crate::pmtiles_writer::{
-            decode_directory, tile_id_to_zxy, verify_clustered, DirEntry, Header,
+            decode_directory, offsets_are_clustered, tile_id_to_zxy, verify_clustered, DirEntry,
+            Header,
         };
         let bytes = std::fs::read(tout.path()).unwrap();
         let header = Header::from_bytes(&bytes).unwrap();
@@ -4486,37 +4491,32 @@ mod tests {
              it is not"
         );
 
-        // ...and the same walk go-pmtiles `verify` performs, pinned directly
-        // (#506 review, F4 follow-up). `verify_clustered` currently accepts a
-        // strictly weaker predicate than go-pmtiles does (#516): it tolerates
-        // an entry whose offset merely REPEATS an earlier one, whereas
-        // go-pmtiles requires that every FIRST-SEEN offset equal the running
-        // end of the previously written blob. Copied from
-        // `pyramid::tests::merge_writes_disjoint_bands_in_tile_id_order_given_fine_first`
-        // so this test keeps holding the tool's line even if #516 changes the
-        // library-side helper.
-        let mut seen_offsets = std::collections::HashSet::new();
-        let mut end = 0u64;
+        // ...and the same rule go-pmtiles `verify` is written to express,
+        // pinned through the shared predicate rather than a third hand-rolled
+        // walk (#516 review). Before #516 this test re-implemented the strict
+        // walk because `verify_clustered` was laxer than the tool; #516 made
+        // the library-side helper strict, so the hand-rolled copy would only
+        // drift from the thing it is meant to pin.
+        assert!(
+            offsets_are_clustered(entries.iter().map(|e| (e.offset, u64::from(e.length)))),
+            "out-of-order entry in clustered archive (first tile id {}, z/x/y {:?}): \
+             every first-seen offset must be the running end of the tile data \
+             written so far, and a repeat must name a whole prior tile",
+            entries[0].tile_id,
+            tile_id_to_zxy(entries[0].tile_id).unwrap()
+        );
+
+        // Byte accounting, which the ordering predicate does not cover: the
+        // distinct offsets the directory references must tile the whole
+        // tile-data section, leaving no unreferenced trailing bytes.
+        let mut blobs: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for e in &entries {
-            if !seen_offsets.insert(e.offset) {
-                // A dedup back-reference to bytes already written: legal, and
-                // it does not advance the frontier.
-                continue;
-            }
-            assert_eq!(
-                e.offset,
-                end,
-                "out-of-order entry in clustered archive at tile id {} (z/x/y {:?}): \
-                 go-pmtiles `verify` rejects a first-seen offset that is not the \
-                 running end of the tile data written so far",
-                e.tile_id,
-                tile_id_to_zxy(e.tile_id).unwrap()
-            );
-            end = e.offset + u64::from(e.length);
+            blobs.insert(e.offset, u64::from(e.length));
         }
+        let accounted: u64 = blobs.values().sum();
         assert_eq!(
-            end, header.tile_data_length,
-            "the walk must account for every byte of the tile-data section"
+            accounted, header.tile_data_length,
+            "the referenced blobs must account for every byte of the tile-data section"
         );
     }
 
