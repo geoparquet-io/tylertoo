@@ -696,17 +696,26 @@ impl ConvertSource {
         })
     }
 
-    /// Split this source's selected row groups into ordered reader segments
-    /// of roughly `target_rows` rows each (#494).
+    /// Split this source's selected row groups into ordered reader segments of
+    /// **at most** `target_rows` rows each (#494).
     ///
     /// Segments are emitted in exactly the order [`SourceStream`] would read
     /// them — parts in order, row groups ascending within a part — and never
     /// straddle a part boundary, which is what lets a set of parallel readers
-    /// be merged back into a single in-order stream. A row group is never
-    /// split, so a segment can exceed `target_rows` (a part whose row groups
-    /// are larger than the target yields one segment per row group); a part
-    /// with an empty selection yields no segments at all, matching the
-    /// sequential reader, which never opens it.
+    /// be merged back into a single in-order stream. A part with an empty
+    /// selection yields no segments at all, matching the sequential reader,
+    /// which never opens it.
+    ///
+    /// **`target_rows` is a ceiling, not an average.** The caller sets it to
+    /// what one reader can buffer ahead of the merge, and a segment that does
+    /// not fit there makes its worker park mid-segment — which serializes the
+    /// reads again, the exact thing the split exists to avoid. So a row group
+    /// that would take the run past the target starts a new run instead of
+    /// joining it, even though the run is then well under target (51 200-row
+    /// row groups against a 65 536-row target give one row group per segment,
+    /// not two overshooting to 102 400). The one unavoidable exception is a
+    /// single row group larger than the target: row groups are never split, so
+    /// that segment overshoots and the caller's warning fires.
     pub(crate) fn read_segments(
         &self,
         selection: Option<&RowGroupSelection>,
@@ -722,9 +731,8 @@ impl ConvertSource {
             };
             let (mut run, mut run_rows) = (Vec::new(), 0usize);
             for rg in selected {
-                run.push(rg);
-                run_rows += meta.parquet.row_group(rg).num_rows().max(0) as usize;
-                if run_rows >= target_rows {
+                let rows = meta.parquet.row_group(rg).num_rows().max(0) as usize;
+                if !run.is_empty() && run_rows + rows > target_rows {
                     out.push(ReadSegment {
                         part,
                         row_groups: std::mem::take(&mut run),
@@ -732,6 +740,8 @@ impl ConvertSource {
                     });
                     run_rows = 0;
                 }
+                run.push(rg);
+                run_rows += rows;
             }
             if !run.is_empty() {
                 out.push(ReadSegment {
@@ -1670,6 +1680,90 @@ mod tests {
             row_groups: None,
         };
         assert_eq!(stream_ids(&src, &plan), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    // --- reader segments (#494) ------------------------------------------
+
+    /// Write `rows` rows into `path` with `rg_rows` rows per row group.
+    fn write_rowgroups(path: &Path, rows: i64, rg_rows: usize) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rg_rows))
+            .build();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// `target_rows` is a CEILING. A run that would overshoot it starts a new
+    /// segment instead, because the caller sizes the target to what a reader
+    /// can buffer ahead of the merge — an overshooting segment parks its
+    /// worker mid-run and serializes the reads again.
+    #[test]
+    fn read_segments_never_overshoot_the_target() {
+        let dir = tmpdir();
+        let f = dir.path().join("a.parquet");
+        // 8 row groups of 100 rows, target 150: two row groups would be 200.
+        write_rowgroups(&f, 800, 100);
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let segments = src.read_segments(None, 150).unwrap();
+        assert_eq!(segments.len(), 8, "one row group per segment: {segments:?}");
+        assert!(segments.iter().all(|s| s.rows == 100 && s.part == 0));
+        // A target that fits two row groups takes two.
+        let segments = src.read_segments(None, 200).unwrap();
+        assert_eq!(segments.len(), 4);
+        assert!(segments.iter().all(|s| s.rows == 200));
+        // Row groups stay in ascending order and cover the selection exactly.
+        let all: Vec<usize> = segments
+            .iter()
+            .flat_map(|s| s.row_groups.iter().copied())
+            .collect();
+        assert_eq!(all, (0..8).collect::<Vec<_>>());
+    }
+
+    /// A row group larger than the target is the one case a segment may
+    /// overshoot: row groups are never split.
+    #[test]
+    fn read_segments_keep_an_oversize_row_group_whole() {
+        let dir = tmpdir();
+        let f = dir.path().join("a.parquet");
+        write_rowgroups(&f, 600, 300);
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let segments = src.read_segments(None, 50).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert!(segments.iter().all(|s| s.rows == 300));
+    }
+
+    /// Segments never straddle a part, and a part whose selection is empty
+    /// contributes none — the sequential reader never opens it either.
+    #[test]
+    fn read_segments_respect_parts_and_selection() {
+        let dir = tmpdir();
+        write_rowgroups(&dir.path().join("p0.parquet"), 400, 100);
+        write_rowgroups(&dir.path().join("p1.parquet"), 200, 100);
+        write_rowgroups(&dir.path().join("p2.parquet"), 300, 100);
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+
+        let segments = src.read_segments(None, 1000).unwrap();
+        assert_eq!(
+            segments.iter().map(|s| s.part).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "one segment per part when the target swallows a whole part"
+        );
+
+        // Part 1 pruned away entirely.
+        let selection = RowGroupSelection::from_parts(vec![vec![0, 1], Vec::new(), vec![2]]);
+        let segments = src.read_segments(Some(&selection), 1000).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].part, 0);
+        assert_eq!(segments[0].row_groups, vec![0, 1]);
+        assert_eq!(segments[1].part, 2);
+        assert_eq!(segments[1].row_groups, vec![2]);
     }
 
     #[test]

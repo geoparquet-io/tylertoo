@@ -1467,9 +1467,8 @@ not a typo.
 Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),
 these never change the output's content: **the produced file is byte-identical
 across every profile, `--in-flight-batches` value, `--read-workers` value,
-and thread count.** They
-control only how fast the conversion runs and how much memory it uses while
-running.
+and thread count.** They control only how fast the conversion runs and how
+much memory it uses while running.
 
 The rewritten pass-2 engine reads the input Parquet **once** and pipelines
 Parquet read/decode with per-feature simplification fanned out across **all
