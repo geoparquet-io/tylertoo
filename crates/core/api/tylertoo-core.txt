@@ -2,6 +2,7 @@ pub mod tylertoo_core
 pub mod tylertoo_core::archive_index
 pub struct tylertoo_core::archive_index::ArchiveIndex
 impl tylertoo_core::archive_index::ArchiveIndex
+pub fn tylertoo_core::archive_index::ArchiveIndex::actual_zoom_range(&self) -> tylertoo_core::Result<core::option::Option<(u8, u8)>>
 pub fn tylertoo_core::archive_index::ArchiveIndex::bounds(&self) -> core::option::Option<tylertoo_core::tile::TileBounds>
 pub fn tylertoo_core::archive_index::ArchiveIndex::bytes_read(&self) -> u64
 pub fn tylertoo_core::archive_index::ArchiveIndex::entries(&self) -> &[tylertoo_core::pmtiles_writer::DirEntry]
