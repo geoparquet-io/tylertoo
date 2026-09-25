@@ -2136,7 +2136,7 @@ fn resolve_shard_job(
     shard_plan: Option<&Path>,
     max_zoom: u8,
 ) -> Result<Option<ShardJob>> {
-    use tylertoo_core::shard::{ShardPlan, ShardRole};
+    use tylertoo_core::shard::ShardRole;
 
     let Some(shard) = shard else {
         // clap's `requires` makes the reverse pairing impossible, but a plan
@@ -2151,7 +2151,16 @@ fn resolve_shard_job(
     };
     let plan_path = shard_plan.expect("clap requires --shard-plan alongside --shard");
     let role = ShardRole::parse(shard)?;
-    let plan = ShardPlan::load(plan_path)?;
+
+    // Bind the plan to the input, the same way the convert plan binds itself:
+    // a plan cut for a different (or since-rewritten) file is an error here
+    // rather than a fleet that each tiles something slightly different.
+    let source = match spec {
+        InputSpec::Path(p) => tylertoo_core::input_set::ConvertSource::resolve_path(p)?,
+        InputSpec::Manifest(p) => tylertoo_core::input_set::ConvertSource::from_manifest(p)?,
+    };
+    let (plan, range) = tylertoo_core::shard::resolve_range(plan_path, role, Some(&source))?;
+
     anyhow::ensure!(
         plan.pivot_zoom <= max_zoom,
         "--shard-plan {} was cut at pivot z{} but this build stops at --max-zoom {max_zoom}: \
@@ -2160,20 +2169,6 @@ fn resolve_shard_job(
         plan_path.display(),
         plan.pivot_zoom,
     );
-
-    // Bind the plan to the input, the same way the convert plan binds itself.
-    match spec {
-        InputSpec::Path(p) => {
-            let source = tylertoo_core::input_set::ConvertSource::resolve_path(p)?;
-            plan.verify_source(&source, plan_path)?;
-        }
-        InputSpec::Manifest(p) => {
-            let source = tylertoo_core::input_set::ConvertSource::from_manifest(p)?;
-            plan.verify_source(&source, plan_path)?;
-        }
-    }
-
-    let range = plan.range_for(role, plan_path)?;
     Ok(Some(ShardJob {
         role,
         range,
