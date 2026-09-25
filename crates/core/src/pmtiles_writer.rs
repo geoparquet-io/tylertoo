@@ -15,7 +15,7 @@ use crate::world_coord::MAX_LATITUDE;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// PMTiles v3 magic number
@@ -1028,6 +1028,27 @@ pub fn verify_clustered(path: &Path) -> Result<bool> {
 /// PMTiles header is 127 bytes, leaving 16384 - 127 = 16257 bytes for root directory.
 const MAX_ROOT_DIR_BYTES: usize = 16384 - 127;
 
+/// Bytes a **tail-layout** archive reserves up front for its header and root
+/// directory (#459), zero-padded to the boundary.
+///
+/// 16,384 is not a round number picked for looks. It is the initial range
+/// request every PMTiles client makes, the budget [`MAX_ROOT_DIR_BYTES`]
+/// already sizes the root against — and, decisively, the *only* padding
+/// go-pmtiles' `verify` tolerates. `verify.go` (v1.31.2, L84-89) accepts a
+/// file whose length equals either
+///
+/// ```text
+/// 127 + root + metadata + leaves + tile_data        // the packed layout
+/// 16384     + metadata + leaves + tile_data         // this one
+/// ```
+///
+/// and rejects everything else, so an archive may have slack *here* and
+/// nowhere else. That is what makes the tail layout possible: tile data can
+/// start at a fixed offset known before the first tile is written, which is
+/// what lets a checkpoint rewrite only the prefix and the tail instead of
+/// re-copying every tile byte.
+pub const TAIL_LAYOUT_PREFIX_BYTES: u64 = 16384;
+
 /// Initial leaf size when partitioning entries (matches tippecanoe)
 const INITIAL_LEAF_SIZE: usize = 4096;
 
@@ -1772,6 +1793,15 @@ pub struct StreamingWriteStats {
     pub bytes_written: u64,
     /// Bytes saved by deduplication
     pub bytes_saved_dedup: u64,
+    /// Bytes written by archive assembly — every `checkpoint` plus the
+    /// closing `finalize` (#459).
+    ///
+    /// This is the I/O a salvageable run costs *on top of* `bytes_written`,
+    /// and the number the tail layout exists to shrink. Under the packed
+    /// layout it grows as `checkpoints × tile_data`; under the tail layout it
+    /// grows as `checkpoints × (16 KiB + metadata + leaves)`, independent of
+    /// how much tile data is on disk.
+    pub checkpoint_bytes_written: u64,
 }
 
 impl StreamingWriteStats {
@@ -1869,6 +1899,84 @@ pub struct StreamingPmtilesWriter {
     /// header's `clustered` byte an O(1) determination on the production
     /// path: see [`Self::write_archive`].
     adds_ascending: bool,
+    /// Where the tile spool lives and how assembly reaches the output (#459).
+    layout: SpoolLayout,
+    /// How many tail-layout checkpoints have landed. `Drop` keeps
+    /// `<output>.partial` only once there is at least one — before that the
+    /// file is a bare prefix of zeros plus loose tile bytes, not an archive
+    /// anyone could salvage.
+    tail_checkpoints: u64,
+    /// Whether a tail-layout writer has fallen back to the packed layout (the
+    /// root directory outgrew the reserved prefix). Latched, because the
+    /// fallback publishes to the output path and there is no salvage artifact
+    /// beside it any more.
+    tail_fell_back: bool,
+    /// Test hook: pretend the root directory overran the 16 KiB prefix, to
+    /// exercise the packed-layout fallback. `make_root_leaves` will not
+    /// produce such a root in practice, and the fallback must still be
+    /// covered.
+    force_tail_root_overflow: bool,
+}
+
+/// Where a [`StreamingPmtilesWriter`]'s tile spool lives, and therefore what
+/// assembling an archive costs (#459).
+#[derive(Debug, Clone)]
+enum SpoolLayout {
+    /// The spool is a scratch file in a temp directory, and the archive is
+    /// assembled by writing header + directories + metadata and then copying
+    /// the whole spool after them. Every checkpoint pays for the copy, so a
+    /// run with *n* checkpoints writes the tile data *n+1* times.
+    ///
+    /// This is the original layout, kept verbatim for callers that hand the
+    /// writer no output path up front (`tylertoo merge`, the pyramid builder,
+    /// every existing test) and as the fallback if the root directory ever
+    /// outgrows the tail layout's prefix.
+    Spooled,
+    /// The spool **is** the output's tile-data section: tiles append into
+    /// `<output>.partial` from [`TAIL_LAYOUT_PREFIX_BYTES`] onward and are
+    /// never copied again. Assembly rewrites the 16 KiB prefix (header + root
+    /// directory) and re-appends metadata + leaf directories at the tail, so a
+    /// checkpoint costs O(directory) rather than O(tile data).
+    Tail {
+        /// The output this writer was created for. Assembly refuses a
+        /// different path: the prefix was reserved in *this* file, so writing
+        /// elsewhere would mean copying after all.
+        output_path: PathBuf,
+    },
+}
+
+/// Everything an archive needs besides the tile bytes, built once per
+/// assembly pass and placed by whichever layout is in use.
+struct ArchiveSections {
+    /// Compressed root directory (tile entries, or leaf pointers).
+    root_bytes: Vec<u8>,
+    /// Compressed leaf directories, concatenated; empty when none are needed.
+    leaves_bytes: Vec<u8>,
+    /// Compressed metadata JSON.
+    metadata: Vec<u8>,
+    /// Directory entries after run-length encoding — the header's
+    /// `tile_entries_count`.
+    dir_entry_count: u64,
+    /// The honestly-derived `clustered` header flag.
+    clustered: bool,
+}
+
+/// Which layout an assembly pass actually used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveWriteMode {
+    /// Prefix + tail rewritten in place in `<output>.partial`.
+    Tail,
+    /// Packed archive built elsewhere and renamed over the output.
+    FullCopy,
+}
+
+/// `<output>.partial` — the sibling file archive assembly writes before
+/// publishing. Under the tail layout it is also the live spool and the
+/// mid-run salvage artifact.
+fn partial_path_for(output_path: &Path) -> PathBuf {
+    let mut os = output_path.as_os_str().to_owned();
+    os.push(".partial");
+    PathBuf::from(os)
 }
 
 impl StreamingPmtilesWriter {
@@ -1895,7 +2003,74 @@ impl StreamingPmtilesWriter {
         let file = File::create(&temp_path)?;
         let temp_file = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
 
-        Ok(Self {
+        Ok(Self::from_spool(
+            temp_file,
+            temp_path,
+            compression,
+            SpoolLayout::Spooled,
+        ))
+    }
+
+    /// Create a writer whose tile spool **is** the output archive (#459).
+    ///
+    /// Instead of spooling tiles to a scratch file and copying them into the
+    /// output on every `checkpoint`, this opens `<output_path>.partial`,
+    /// reserves the first [`TAIL_LAYOUT_PREFIX_BYTES`] for the header and root
+    /// directory, and appends tile bytes straight after it. Assembly then
+    /// rewrites only that prefix and re-appends metadata + leaf directories at
+    /// the file's tail, so each checkpoint costs O(directory size) instead of
+    /// O(tile data) — the difference between a planet-scale run re-copying
+    /// tens of gigabytes per checkpoint and writing a few megabytes.
+    ///
+    /// Two consequences worth knowing:
+    ///
+    /// * **The spool lives next to the output, not in `TMPDIR`.** The target
+    ///   filesystem needs room for the archive; a small `/tmp` no longer
+    ///   matters.
+    /// * **`<output>.partial` is the salvage artifact** ([`Self::salvage_path`]):
+    ///   a complete, readable archive as of the last checkpoint. Between
+    ///   checkpoints its prefix is stale — the tiles added since are on disk
+    ///   but unreferenced, and the metadata/leaf sections it points at have
+    ///   been overwritten by those tiles — so a crash mid-level salvages back
+    ///   to the last checkpoint, not to the last tile. The next checkpoint
+    ///   rebuilds both from the (untouched) tile data.
+    ///
+    /// [`Self::checkpoint`] and [`Self::finalize`] must be called with the
+    /// same `output_path`; a different one is an error, since the reservation
+    /// was made in this file.
+    pub fn with_tail_layout(output_path: &Path, compression: Compression) -> std::io::Result<Self> {
+        let partial_path = partial_path_for(output_path);
+        if let Some(parent) = partial_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let mut file = File::create(&partial_path)?;
+        // Reserve the prefix eagerly, as zeros. Writing it now (rather than
+        // seeking past it) means the first checkpoint's padding is already
+        // zero-filled and the file never contains a sparse hole whose
+        // contents depend on the filesystem.
+        file.write_all(&vec![0u8; TAIL_LAYOUT_PREFIX_BYTES as usize])?;
+        let temp_file = BufWriter::with_capacity(64 * 1024, file);
+
+        Ok(Self::from_spool(
+            temp_file,
+            partial_path,
+            compression,
+            SpoolLayout::Tail {
+                output_path: output_path.to_path_buf(),
+            },
+        ))
+    }
+
+    fn from_spool(
+        temp_file: BufWriter<File>,
+        temp_path: PathBuf,
+        compression: Compression,
+        layout: SpoolLayout,
+    ) -> Self {
+        Self {
             temp_file: Some(temp_file),
             temp_path,
             entries: Vec::new(),
@@ -1916,7 +2091,34 @@ impl StreamingPmtilesWriter {
             finalized: false,
             expect_clustered: false,
             adds_ascending: true,
-        })
+            layout,
+            tail_checkpoints: 0,
+            tail_fell_back: false,
+            force_tail_root_overflow: false,
+        }
+    }
+
+    /// Where a mid-run salvage archive can be found, for a writer created with
+    /// [`Self::with_tail_layout`]: `<output>.partial`, valid as of the last
+    /// [`Self::checkpoint`].
+    ///
+    /// `None` for the spooled layout — and for a tail-layout writer that has
+    /// fallen back to it — because those checkpoints publish to the output
+    /// path itself.
+    pub fn salvage_path(&self) -> Option<&Path> {
+        match self.layout {
+            SpoolLayout::Tail { .. } if !self.tail_fell_back => Some(&self.temp_path),
+            _ => None,
+        }
+    }
+
+    /// Test hook: pretend the root directory overran the reserved prefix, so
+    /// the packed-layout fallback is reachable. `make_root_leaves` sizes the
+    /// root against `16384 - 127` and will not produce an oversized one, which
+    /// is exactly why the fallback needs a hook to cover.
+    #[cfg(test)]
+    fn force_tail_root_overflow(&mut self) {
+        self.force_tail_root_overflow = true;
     }
 
     /// Opt into the debug-only ascending-tile-id assertion (#506): see the
@@ -2197,11 +2399,26 @@ impl StreamingPmtilesWriter {
         // Assemble the complete archive (byte-identical to the last checkpoint,
         // if any). This flushes the temp buffer in place but leaves the handle
         // open so we can close it deterministically below.
-        self.write_archive(output_path)?;
+        let mode = self.write_archive(output_path)?;
 
-        // Close and remove the temp file now that the run is complete.
+        // Close the spool handle before touching the file by path.
         drop(self.temp_file.take());
-        let _ = std::fs::remove_file(&self.temp_path);
+
+        match mode {
+            // Tail layout: the spool already *is* the finished archive, sitting
+            // at `<output>.partial`. Publishing is one rename — no copy, and no
+            // window in which the output exists but is incomplete.
+            ArchiveWriteMode::Tail => {
+                std::fs::rename(&self.temp_path, output_path).map_err(|e| {
+                    Error::PMTilesWrite(format!("Failed to publish archive: {}", e))
+                })?;
+            }
+            // Packed layout: the archive was assembled elsewhere and already
+            // renamed over the output; the spool is now dead weight.
+            ArchiveWriteMode::FullCopy => {
+                let _ = std::fs::remove_file(&self.temp_path);
+            }
+        }
 
         // Mark as finalized so Drop doesn't try to clean up again
         self.finalized = true;
@@ -2219,19 +2436,75 @@ impl StreamingPmtilesWriter {
     /// assembler, so the final archive is byte-identical whether or not any
     /// intermediate checkpoints were taken.
     ///
-    /// The archive is written to a sibling `<output>.partial` file and then
-    /// atomically renamed over `output_path`, so a kill mid-write never
-    /// corrupts a previously-checkpointed archive.
+    /// Under the spooled layout the archive is written to a sibling
+    /// `<output>.partial` file and then atomically renamed over `output_path`,
+    /// so a kill mid-write never corrupts a previously-checkpointed archive.
+    /// Under the tail layout (#459) `<output>.partial` *is* the live archive
+    /// and is left in place — see [`Self::with_tail_layout`] and
+    /// [`Self::salvage_path`].
     pub fn checkpoint(&mut self, output_path: &Path) -> Result<()> {
-        self.write_archive(output_path)
+        self.write_archive(output_path)?;
+        Ok(())
     }
 
     /// Shared archive assembler backing both [`checkpoint`](Self::checkpoint)
     /// and [`finalize`](Self::finalize). Flushes the temp buffer in place (the
-    /// handle stays open so the writer remains usable) and writes the header,
-    /// directory, metadata and tile data to `output_path` atomically.
-    fn write_archive(&mut self, output_path: &Path) -> Result<()> {
-        // Flush buffered tile bytes to the temp file on disk without consuming
+    /// handle stays open so the writer remains usable), builds the header,
+    /// directories and metadata, then hands them to whichever layout this
+    /// writer uses. Returns the layout actually used, which is what tells
+    /// `finalize` whether publishing is a rename or already done.
+    fn write_archive(&mut self, output_path: &Path) -> Result<ArchiveWriteMode> {
+        let sections = self.build_sections(output_path)?;
+
+        // The tail layout is legal only while header + root fit the reserved
+        // prefix. `make_root_leaves` targets exactly that budget
+        // (`MAX_ROOT_DIR_BYTES == 16384 - 127`) and spills into leaves to stay
+        // under it, so this holds by construction. If it ever stops holding,
+        // writing the root anyway would run it into the tile data: fall back to
+        // the packed layout — a slow checkpoint beats a corrupt archive.
+        let root_fits = !self.force_tail_root_overflow
+            && (HEADER_BYTES as u64 + sections.root_bytes.len() as u64) <= TAIL_LAYOUT_PREFIX_BYTES;
+
+        match &self.layout {
+            SpoolLayout::Tail {
+                output_path: reserved,
+            } => {
+                if reserved != output_path {
+                    return Err(Error::PMTilesWrite(format!(
+                        "tail-layout writer reserved its prefix in {} but was asked to write {}; \
+                         a tail-layout writer can only publish the output it was created for",
+                        partial_path_for(reserved).display(),
+                        output_path.display()
+                    )));
+                }
+                if !root_fits {
+                    log::error!(
+                        "PMTiles writer: root directory ({} bytes) does not fit the \
+                         {TAIL_LAYOUT_PREFIX_BYTES}-byte tail-layout prefix; falling back to \
+                         the packed layout, which re-copies the tile data on every checkpoint",
+                        sections.root_bytes.len()
+                    );
+                    self.tail_fell_back = true;
+                    self.write_packed_archive(&sections, output_path)?;
+                    return Ok(ArchiveWriteMode::FullCopy);
+                }
+                self.write_tail_archive(&sections)?;
+                self.tail_checkpoints += 1;
+                Ok(ArchiveWriteMode::Tail)
+            }
+            SpoolLayout::Spooled => {
+                self.write_packed_archive(&sections, output_path)?;
+                Ok(ArchiveWriteMode::FullCopy)
+            }
+        }
+    }
+
+    /// Flush the spool and build everything an archive needs besides the tile
+    /// bytes: the root and leaf directories, the metadata JSON, and the
+    /// honestly-derived `clustered` flag. Layout-independent, so both layouts
+    /// write the same directories over the same tile bytes.
+    fn build_sections(&mut self, output_path: &Path) -> Result<ArchiveSections> {
+        // Flush buffered tile bytes to the spool on disk without consuming
         // the handle — the writer must stay usable after a checkpoint.
         match self.temp_file.as_mut() {
             Some(tf) => tf
@@ -2252,7 +2525,8 @@ impl StreamingPmtilesWriter {
         // offsets in `self.entries` reflect add order, not tile-id order.
         // Deriving the header flag from those offsets, after the sort, means
         // the flag can never claim more than the bytes on disk actually
-        // deliver.
+        // deliver. Layout-independent: the tail layout shifts where tile
+        // data *starts*, not the relative offsets these entries hold (#459).
         //
         // Fast path: ascending adds imply clustered by construction, so the
         // production case (#506 export, #510 merge) never pays for the
@@ -2303,41 +2577,47 @@ impl StreamingPmtilesWriter {
             compression::compress(metadata.as_bytes(), self.internal_compression)
                 .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
 
-        // Calculate section offsets
-        // Layout: Header | Root Dir | Metadata | Leaf Dirs | Tile Data
-        let root_dir_offset = 127u64;
-        let root_dir_length = dir_layout.root_bytes.len() as u64;
-        let metadata_offset = root_dir_offset + root_dir_length;
-        let metadata_length = compressed_metadata.len() as u64;
-        let leaf_dirs_offset = metadata_offset + metadata_length;
-        let leaf_dirs_length = dir_layout.leaves_bytes.len() as u64;
-        let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
-        let tile_data_length = self.current_offset;
+        Ok(ArchiveSections {
+            root_bytes: dir_layout.root_bytes,
+            leaves_bytes: dir_layout.leaves_bytes,
+            metadata: compressed_metadata,
+            dir_entry_count: dir_entries.len() as u64,
+            clustered,
+        })
+    }
 
-        // Build header
-        let header = Header {
-            root_dir_offset,
-            root_dir_length,
+    /// Stamp the header for a given section placement. The caller decides
+    /// where the sections sit; everything else — counts, zoom range, bounds,
+    /// compression — is the writer's state and is identical across layouts.
+    fn build_header(
+        &self,
+        sections: &ArchiveSections,
+        metadata_offset: u64,
+        leaf_dirs_offset: u64,
+        tile_data_offset: u64,
+    ) -> Header {
+        Header {
+            root_dir_offset: HEADER_BYTES as u64,
+            root_dir_length: sections.root_bytes.len() as u64,
             json_metadata_offset: metadata_offset,
-            json_metadata_length: metadata_length,
+            json_metadata_length: sections.metadata.len() as u64,
             // Always the section position, never 0.
             //
             // go-pmtiles REJECTS an archive whose leaf-directory offset is 0:
             //
             //     Failed to verify archive, Leaf directories offset=0 must not be 0
             //
-            // Pointing it at the (empty) leaf section instead -- which is where
-            // leaves would start, between the metadata and the tile data --
-            // verifies clean. Zeroing it affected every small archive written
-            // through this path, which is the production one.
+            // Pointing it at the (empty) leaf section instead verifies clean.
+            // Zeroing it affected every small archive written through this
+            // path, which is the production one.
             leaf_dirs_offset,
-            leaf_dirs_length,
+            leaf_dirs_length: sections.leaves_bytes.len() as u64,
             tile_data_offset,
-            tile_data_length,
+            tile_data_length: self.current_offset,
             addressed_tiles_count: self.stats.total_tiles,
-            tile_entries_count: dir_entries.len() as u64,
+            tile_entries_count: sections.dir_entry_count,
             tile_contents_count: self.stats.unique_tiles,
-            clustered,
+            clustered: sections.clustered,
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
@@ -2354,46 +2634,140 @@ impl StreamingPmtilesWriter {
             },
             center_lon: (self.bounds.lng_min + self.bounds.lng_max) / 2.0,
             center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
+        }
+    }
+
+    /// Tail-directory assembly (#459): rewrite only the prefix and the tail.
+    ///
+    /// ```text
+    /// [0]      header (127 B)
+    /// [127]    root directory
+    /// [..]     zero padding            <- the only slack go-pmtiles tolerates
+    /// [16384]  tile data               <- written once, never copied
+    /// [..]     json metadata           }  rebuilt each checkpoint;
+    /// [..]     leaf directories        }  overwritten by the next tiles
+    /// ```
+    ///
+    /// Order matters for crash-consistency: the tail is written and flushed
+    /// *before* the prefix that points at it, and the prefix lives entirely
+    /// below offset 16384, so a torn prefix write cannot touch a tile byte.
+    /// The next checkpoint rebuilds both from the tile data, which is the only
+    /// section this function never writes.
+    fn write_tail_archive(&mut self, sections: &ArchiveSections) -> Result<()> {
+        let data_end = TAIL_LAYOUT_PREFIX_BYTES + self.current_offset;
+        let metadata_offset = data_end;
+        let leaf_dirs_offset = metadata_offset + sections.metadata.len() as u64;
+        let header = self.build_header(
+            sections,
+            metadata_offset,
+            leaf_dirs_offset,
+            TAIL_LAYOUT_PREFIX_BYTES,
+        );
+
+        // A second handle: the spool's own `BufWriter` keeps its cursor at the
+        // tile-data end so the next `add_tile` appends straight over the tail
+        // we are about to write, which is exactly what makes the tail cheap.
+        let mut file = File::options()
+            .write(true)
+            .open(&self.temp_path)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to reopen partial: {}", e)))?;
+
+        // Drop the previous checkpoint's tail before appending this one, so the
+        // file length is always exactly `16384 + tile + metadata + leaves` —
+        // go-pmtiles' padded-length rule admits no other slack.
+        file.set_len(data_end)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to truncate tail: {}", e)))?;
+        file.seek(SeekFrom::Start(data_end))
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to seek to tail: {}", e)))?;
+        file.write_all(&sections.metadata)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
+        file.write_all(&sections.leaves_bytes)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e)))?;
+        file.sync_data()
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to sync tail: {}", e)))?;
+
+        // Publish by overwriting the prefix last, in one write: until the
+        // header lands, the archive still describes the previous checkpoint.
+        let mut prefix = vec![0u8; TAIL_LAYOUT_PREFIX_BYTES as usize];
+        prefix[..HEADER_BYTES].copy_from_slice(&header.to_bytes());
+        prefix[HEADER_BYTES..HEADER_BYTES + sections.root_bytes.len()]
+            .copy_from_slice(&sections.root_bytes);
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to seek to prefix: {}", e)))?;
+        file.write_all(&prefix)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write prefix: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to sync archive: {}", e)))?;
+
+        self.stats.checkpoint_bytes_written += prefix.len() as u64
+            + sections.metadata.len() as u64
+            + sections.leaves_bytes.len() as u64;
+
+        Ok(())
+    }
+
+    /// Packed assembly: `Header | Root | Metadata | Leaves | Tile Data`, built
+    /// in a sibling file and atomically renamed over `output_path`. Every call
+    /// copies the whole tile spool, which is what #459 exists to avoid — this
+    /// path remains for the spooled layout (callers that never hand the writer
+    /// an output path up front) and as the tail layout's fallback.
+    fn write_packed_archive(
+        &mut self,
+        sections: &ArchiveSections,
+        output_path: &Path,
+    ) -> Result<()> {
+        let metadata_offset = HEADER_BYTES as u64 + sections.root_bytes.len() as u64;
+        let leaf_dirs_offset = metadata_offset + sections.metadata.len() as u64;
+        let tile_data_offset = leaf_dirs_offset + sections.leaves_bytes.len() as u64;
+        let header = self.build_header(
+            sections,
+            metadata_offset,
+            leaf_dirs_offset,
+            tile_data_offset,
+        );
+
+        let partial_path = match &self.layout {
+            SpoolLayout::Spooled => partial_path_for(output_path),
+            // The tail layout's spool IS `<output>.partial`; assembling into it
+            // would mean writing over the file we are reading the tile data
+            // from. Use a distinct sibling for the (never-in-practice) fallback.
+            SpoolLayout::Tail { .. } => {
+                let mut os = output_path.as_os_str().to_owned();
+                os.push(".partial-packed");
+                PathBuf::from(os)
+            }
         };
 
-        // Assemble into a sibling `<output>.partial` file, then atomically
-        // rename over `output_path`. A kill mid-write leaves any previously
-        // checkpointed archive at `output_path` intact.
-        let partial_path = {
-            let mut os = output_path.as_os_str().to_owned();
-            os.push(".partial");
-            PathBuf::from(os)
-        };
         let output_file = File::create(&partial_path)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to create output file: {}", e)))?;
         let mut writer = BufWriter::new(output_file);
 
-        // Write header
         writer
             .write_all(&header.to_bytes())
             .map_err(|e| Error::PMTilesWrite(format!("Failed to write header: {}", e)))?;
-
-        // Write root directory
         writer
-            .write_all(&dir_layout.root_bytes)
+            .write_all(&sections.root_bytes)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to write root directory: {}", e)))?;
-
-        // Write metadata
         writer
-            .write_all(&compressed_metadata)
+            .write_all(&sections.metadata)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
-
-        // Write leaf directories (if any)
-        if !dir_layout.leaves_bytes.is_empty() {
-            writer.write_all(&dir_layout.leaves_bytes).map_err(|e| {
+        if !sections.leaves_bytes.is_empty() {
+            writer.write_all(&sections.leaves_bytes).map_err(|e| {
                 Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e))
             })?;
         }
 
-        // Copy tile data from temp file
+        // Copy tile data from the spool. Under the tail layout the tile bytes
+        // start after the reserved prefix rather than at byte 0.
         let mut temp_reader = File::open(&self.temp_path)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to reopen temp file: {}", e)))?;
-        std::io::copy(&mut temp_reader, &mut writer)
+        let data_start = self.spool_data_start();
+        if data_start > 0 {
+            temp_reader
+                .seek(SeekFrom::Start(data_start))
+                .map_err(|e| Error::PMTilesWrite(format!("Failed to seek temp file: {}", e)))?;
+        }
+        std::io::copy(&mut temp_reader.take(self.current_offset), &mut writer)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to copy tile data: {}", e)))?;
 
         writer
@@ -2406,7 +2780,17 @@ impl StreamingPmtilesWriter {
         std::fs::rename(&partial_path, output_path)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to publish archive: {}", e)))?;
 
+        self.stats.checkpoint_bytes_written += tile_data_offset + self.current_offset;
+
         Ok(())
+    }
+
+    /// Byte offset at which tile data begins inside this writer's spool file.
+    fn spool_data_start(&self) -> u64 {
+        match self.layout {
+            SpoolLayout::Tail { .. } => TAIL_LAYOUT_PREFIX_BYTES,
+            SpoolLayout::Spooled => 0,
+        }
     }
 
     /// Whether `self.entries`, already sorted by tile_id, is genuinely
@@ -2483,9 +2867,28 @@ impl StreamingPmtilesWriter {
 
 impl Drop for StreamingPmtilesWriter {
     fn drop(&mut self) {
-        // Clean up temp file if it still exists (e.g., if finalize wasn't called)
-        if !self.finalized {
-            let _ = std::fs::remove_file(&self.temp_path);
+        if self.finalized {
+            return;
+        }
+        match self.layout {
+            // A scratch file in TMPDIR: nothing to salvage, always remove it.
+            SpoolLayout::Spooled => {
+                let _ = std::fs::remove_file(&self.temp_path);
+            }
+            // `<output>.partial` is the salvage artifact (#459) — but only once
+            // a checkpoint has made it an archive. Before that it is a prefix
+            // of zeros plus loose tile bytes, which would just be litter beside
+            // the user's output.
+            SpoolLayout::Tail { .. } => {
+                if self.tail_checkpoints == 0 {
+                    let _ = std::fs::remove_file(&self.temp_path);
+                } else {
+                    log::info!(
+                        "[pmtiles] run ended without finalize; salvageable archive left at {}",
+                        self.temp_path.display()
+                    );
+                }
+            }
         }
     }
 }
@@ -2612,6 +3015,355 @@ mod tests {
     }
     use super::*;
     use std::fs;
+
+    // -------------------------------------------------------------------------
+    // Tail-directory layout (#459)
+    // -------------------------------------------------------------------------
+
+    /// A deterministic, dedup-proof tile payload: distinct bytes AND distinct
+    /// length per index, so no two tiles collide in the dedup cache and a
+    /// mis-resolved directory entry yields visibly wrong bytes.
+    fn tail_payload(i: u32) -> Vec<u8> {
+        vec![(i % 251) as u8 + 1; 200 + (i as usize % 97)]
+    }
+
+    /// `(z, x, y)` for the i-th tile of the tail-layout fixtures, ascending in
+    /// PMTiles tile id so the writer's clustered contract holds.
+    fn tail_coord(i: u32) -> (u8, u32, u32) {
+        let (z, x, y) = tile_id_to_zxy(tile_id(8, 0, 0) + u64::from(i)).unwrap();
+        (z, x, y)
+    }
+
+    /// Every tile an archive addresses, read the way a client does: parse the
+    /// header, walk root + leaf directories, slice at `tile_data_offset`.
+    fn read_archive_tiles(bytes: &[u8]) -> HashMap<u64, Vec<u8>> {
+        let header = Header::from_bytes(bytes).expect("header must parse");
+        let entries = read_all_entries(bytes, &header).expect("directories must decode");
+        let mut out = HashMap::new();
+        for e in &entries {
+            for r in 0..u64::from(e.run_length.max(1)) {
+                let start = (header.tile_data_offset + e.offset) as usize;
+                let end = start + e.length as usize;
+                assert!(end <= bytes.len(), "entry points past EOF");
+                out.insert(e.tile_id + r, bytes[start..end].to_vec());
+            }
+        }
+        out
+    }
+
+    /// Both layouts must produce the same *archive*, and the tail layout must
+    /// produce the same bytes whether or not checkpoints ran along the way.
+    /// The whole point of #459 is that checkpoints stop costing tile-data I/O —
+    /// not that they change what lands on disk.
+    #[test]
+    fn tail_checkpoint_then_finalize_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_ckpt = dir.path().join("with.pmtiles");
+        let without = dir.path().join("without.pmtiles");
+
+        for (out, checkpoints) in [(&with_ckpt, true), (&without, false)] {
+            let mut w = StreamingPmtilesWriter::with_tail_layout(out, Compression::Gzip).unwrap();
+            w.set_layer_name("tail");
+            w.set_expect_clustered(true);
+            for i in 0..40u32 {
+                let (z, x, y) = tail_coord(i);
+                w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+                if checkpoints && i % 7 == 0 {
+                    w.checkpoint(out).unwrap();
+                }
+            }
+            w.finalize(out).unwrap();
+        }
+
+        assert_eq!(
+            fs::read(&with_ckpt).unwrap(),
+            fs::read(&without).unwrap(),
+            "checkpointing must not change the final archive"
+        );
+        // And the spool must be gone: `<output>.partial` is renamed into place.
+        assert!(!with_ckpt.with_extension("pmtiles.partial").exists());
+    }
+
+    /// The mid-run salvage artifact is `<output>.partial`, and it must be a
+    /// *complete, readable* archive as of every checkpoint — not merely a file
+    /// whose header parses.
+    #[test]
+    fn tail_checkpoint_partial_is_a_valid_archive_at_every_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("salvage.pmtiles");
+        let partial = dir.path().join("salvage.pmtiles.partial");
+
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.set_layer_name("tail");
+        w.set_expect_clustered(true);
+        assert_eq!(w.salvage_path(), Some(partial.as_path()));
+
+        for i in 0..24u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+            w.checkpoint(&out).unwrap();
+
+            let bytes = fs::read(&partial).unwrap();
+            let tiles = read_archive_tiles(&bytes);
+            assert_eq!(
+                tiles.len(),
+                i as usize + 1,
+                "checkpoint {i}: every tile added so far must be addressable"
+            );
+            for j in 0..=i {
+                let (z, x, y) = tail_coord(j);
+                let raw = tiles.get(&tile_id(z, x, y)).expect("tile must be present");
+                let plain = compression::decompress_capped(
+                    raw,
+                    Compression::Gzip,
+                    compression::MAX_TILE_BYTES,
+                )
+                .unwrap();
+                assert_eq!(plain, tail_payload(j), "checkpoint {i}: tile {j} bytes");
+            }
+            // Metadata must survive at the tail too, not just the directories.
+            let header = Header::from_bytes(&bytes).unwrap();
+            let meta = compression::decompress_capped(
+                &bytes[header.json_metadata_offset as usize
+                    ..(header.json_metadata_offset + header.json_metadata_length) as usize],
+                header.internal_compression,
+                compression::MAX_INTERNAL_BYTES,
+            )
+            .unwrap();
+            assert!(String::from_utf8(meta)
+                .unwrap()
+                .contains("\"vector_layers\""));
+        }
+        w.finalize(&out).unwrap();
+        assert!(!partial.exists(), "finalize renames the partial into place");
+    }
+
+    /// The layout contract go-pmtiles `verify` enforces (verify.go v1.31.2,
+    /// L84-89): a file's length must equal either `127 + root + metadata +
+    /// leaves + tile_data` or `16384 + metadata + leaves + tile_data`. The tail
+    /// layout targets the second form, so the sections must be exactly
+    /// contiguous from offset 16384 on, with the *only* slack being the
+    /// zero-padding between the root directory and 16384.
+    #[test]
+    fn tail_layout_sections_are_contiguous_and_sum_to_file_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("contig.pmtiles");
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.set_layer_name("tail");
+        w.set_expect_clustered(true);
+        // Enough entries to spill into leaf directories, so the leaf section is
+        // non-empty and its placement at the tail is actually exercised.
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..30_000u32 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = 64 + (rng >> 33) as usize % 512;
+            let (z, x, y) = tile_id_to_zxy(tile_id(14, 0, 0) + u64::from(i) * 7).unwrap();
+            w.add_tile_precompressed(z, x, y, u64::from(i), &vec![(i % 251) as u8; len], len, 1)
+                .unwrap();
+        }
+        w.finalize(&out).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        let h = Header::from_bytes(&bytes).unwrap();
+        assert_eq!(h.root_dir_offset, HEADER_BYTES as u64);
+        assert!(
+            h.leaf_dirs_length > 0,
+            "this fixture must spill into leaves"
+        );
+        assert!(
+            h.root_dir_offset + h.root_dir_length <= TAIL_LAYOUT_PREFIX_BYTES,
+            "root must fit the 16 KiB prefix"
+        );
+        assert_eq!(h.tile_data_offset, TAIL_LAYOUT_PREFIX_BYTES);
+        assert_eq!(
+            h.json_metadata_offset,
+            h.tile_data_offset + h.tile_data_length
+        );
+        assert_eq!(
+            h.leaf_dirs_offset,
+            h.json_metadata_offset + h.json_metadata_length
+        );
+        assert_eq!(
+            bytes.len() as u64,
+            TAIL_LAYOUT_PREFIX_BYTES
+                + h.json_metadata_length
+                + h.leaf_dirs_length
+                + h.tile_data_length,
+            "file length must match go-pmtiles' padded-length formula"
+        );
+        // The padding between root and tile data must be zeros, not stale bytes.
+        let pad_start = (h.root_dir_offset + h.root_dir_length) as usize;
+        assert!(bytes[pad_start..TAIL_LAYOUT_PREFIX_BYTES as usize]
+            .iter()
+            .all(|&b| b == 0));
+        assert!(h.clustered);
+        assert!(verify_clustered(&out).unwrap());
+        assert_eq!(read_archive_tiles(&bytes).len(), 30_000);
+    }
+
+    /// The tail layout is only legal while the root directory fits the 16 KiB
+    /// prefix. `make_root_leaves` guarantees that today, but the tail writer
+    /// must not corrupt an archive if it ever stops doing so: it falls back to
+    /// the packed full-copy layout rather than overrunning the prefix.
+    #[test]
+    fn tail_root_overflow_falls_back_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("overflow.pmtiles");
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.set_layer_name("tail");
+        w.force_tail_root_overflow();
+        for i in 0..20u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+        }
+        w.checkpoint(&out).unwrap();
+        // The fallback publishes to `output_path` itself (the packed layout
+        // cannot be written over the spool it reads from), and leaves a valid
+        // archive there.
+        let ckpt = read_archive_tiles(&fs::read(&out).unwrap());
+        assert_eq!(ckpt.len(), 20);
+        assert_eq!(
+            w.salvage_path(),
+            None,
+            "a fallen-back writer publishes to the output, so there is no \
+             `.partial` to point a salvage at"
+        );
+
+        w.finalize(&out).unwrap();
+        let bytes = fs::read(&out).unwrap();
+        let h = Header::from_bytes(&bytes).unwrap();
+        assert_ne!(
+            h.tile_data_offset, TAIL_LAYOUT_PREFIX_BYTES,
+            "the fallback must use the packed layout, not the tail layout"
+        );
+        assert_eq!(
+            bytes.len() as u64,
+            HEADER_BYTES as u64
+                + h.root_dir_length
+                + h.json_metadata_length
+                + h.leaf_dirs_length
+                + h.tile_data_length,
+            "the fallback must produce a packed, gap-free archive"
+        );
+        let tiles = read_archive_tiles(&bytes);
+        assert_eq!(tiles.len(), 20);
+        for i in 0..20u32 {
+            let (z, x, y) = tail_coord(i);
+            let plain = compression::decompress_capped(
+                &tiles[&tile_id(z, x, y)],
+                Compression::Gzip,
+                compression::MAX_TILE_BYTES,
+            )
+            .unwrap();
+            assert_eq!(plain, tail_payload(i));
+        }
+        assert!(!out.with_extension("pmtiles.partial").exists());
+    }
+
+    /// The point of #459, measured: a checkpoint must cost O(directory), not
+    /// O(tile spool). Under the old layout each checkpoint re-copied the whole
+    /// spool, so N checkpoints over a G-byte spool wrote ~N*G bytes.
+    #[test]
+    fn tail_checkpoint_io_is_directory_sized_not_spool_sized() {
+        let dir = tempfile::tempdir().unwrap();
+        let tail_out = dir.path().join("tail.pmtiles");
+        let packed_out = dir.path().join("packed.pmtiles");
+
+        // ~4 MB of incompressible-ish tile data, checkpointed 8 times.
+        let add_all = |w: &mut StreamingPmtilesWriter, out: &Path| {
+            let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+            for i in 0..800u32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let len = 4096 + (rng >> 33) as usize % 2048;
+                let (z, x, y) = tile_id_to_zxy(tile_id(12, 0, 0) + u64::from(i)).unwrap();
+                w.add_tile_precompressed(
+                    z,
+                    x,
+                    y,
+                    u64::from(i),
+                    &vec![(i % 251) as u8; len],
+                    len,
+                    1,
+                )
+                .unwrap();
+                if i % 100 == 99 {
+                    w.checkpoint(out).unwrap();
+                }
+            }
+        };
+
+        let mut tail =
+            StreamingPmtilesWriter::with_tail_layout(&tail_out, Compression::Gzip).unwrap();
+        add_all(&mut tail, &tail_out);
+        let tail_ckpt_bytes = tail.stats().checkpoint_bytes_written;
+        let spool_bytes = tail.stats().bytes_written;
+        tail.finalize(&tail_out).unwrap();
+
+        // The legacy spooled layout, same tiles, for the before/after number.
+        let mut packed = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        add_all(&mut packed, &packed_out);
+        let packed_ckpt_bytes = packed.stats().checkpoint_bytes_written;
+        packed.finalize(&packed_out).unwrap();
+
+        // 8 checkpoints over a spool that grows to ~4 MB. The packed layout
+        // re-copies the whole spool every time, so it writes the triangular
+        // sum `Σ k/8 · spool = 4.5 · spool` — the quadratic growth #459 is
+        // about. The tail layout writes only the 16 KiB prefix + tail sections.
+        assert!(
+            packed_ckpt_bytes > 4 * spool_bytes,
+            "packed checkpoints should re-copy the spool each time \
+             (wrote {packed_ckpt_bytes} over a {spool_bytes}-byte spool)"
+        );
+        assert!(
+            tail_ckpt_bytes < spool_bytes / 4,
+            "tail checkpoints must be directory-sized, not spool-sized \
+             (wrote {tail_ckpt_bytes} over a {spool_bytes}-byte spool)"
+        );
+        // Measured on this fixture: a 4,083,340-byte spool costs 18,399,629
+        // bytes of packed checkpoint I/O and 132,263 bytes of tail checkpoint
+        // I/O — 139x less, and the gap widens with every additional gigabyte
+        // of tiles, because only one of the two scales with them.
+        //
+        // Same archive content either way.
+        assert_eq!(
+            read_archive_tiles(&fs::read(&tail_out).unwrap()),
+            read_archive_tiles(&fs::read(&packed_out).unwrap()),
+        );
+    }
+
+    /// A torn prefix write (killed between the tail write and the prefix
+    /// write) must leave the tile data intact: the prefix is the only thing
+    /// rewritten in place, and it lives entirely below offset 16384.
+    #[test]
+    fn tail_torn_prefix_leaves_tile_data_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("torn.pmtiles");
+        let partial = dir.path().join("torn.pmtiles.partial");
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.set_layer_name("tail");
+        for i in 0..16u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+        }
+        w.checkpoint(&out).unwrap();
+        let good = fs::read(&partial).unwrap();
+
+        // Simulate the tear: scribble over the prefix, then re-checkpoint.
+        {
+            let mut f = fs::OpenOptions::new().write(true).open(&partial).unwrap();
+            f.write_all(&[0xABu8; 4096]).unwrap();
+        }
+        w.checkpoint(&out).unwrap();
+        assert_eq!(
+            fs::read(&partial).unwrap(),
+            good,
+            "the next checkpoint must rebuild prefix and tail from intact tile data"
+        );
+    }
 
     // -------------------------------------------------------------------------
     // Task 7: Header and Structures Tests

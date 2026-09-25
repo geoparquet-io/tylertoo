@@ -2585,6 +2585,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_with_coun
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut self, &std::path::Path) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::salvage_path(&self) -> core::option::Option<&std::path::Path>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_max_zoom(&mut self, u8)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
@@ -2594,6 +2595,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mu
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::stats(&self) -> &tylertoo_core::pmtiles_writer::StreamingWriteStats
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::temp_path(&self) -> &std::path::Path
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::with_tail_layout(&std::path::Path, tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::with_temp_dir(tylertoo_core::compression::Compression, std::path::PathBuf) -> core::io::error::Result<Self>
 impl core::ops::drop::Drop for tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::drop(&mut self)
@@ -2607,6 +2609,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::Str
 pub struct tylertoo_core::pmtiles_writer::StreamingWriteStats
 pub tylertoo_core::pmtiles_writer::StreamingWriteStats::bytes_saved_dedup: u64
 pub tylertoo_core::pmtiles_writer::StreamingWriteStats::bytes_written: u64
+pub tylertoo_core::pmtiles_writer::StreamingWriteStats::checkpoint_bytes_written: u64
 pub tylertoo_core::pmtiles_writer::StreamingWriteStats::total_tiles: u64
 pub tylertoo_core::pmtiles_writer::StreamingWriteStats::unique_tiles: u64
 impl tylertoo_core::pmtiles_writer::StreamingWriteStats
@@ -2628,6 +2631,7 @@ pub const tylertoo_core::pmtiles_writer::HEADER_BYTES: usize
 pub const tylertoo_core::pmtiles_writer::MAX_EXPANDED_TILE_ENTRIES: u64
 pub const tylertoo_core::pmtiles_writer::MAX_LEAF_DIRECTORIES: usize
 pub const tylertoo_core::pmtiles_writer::MAX_TILE_ID_ZOOM: u8
+pub const tylertoo_core::pmtiles_writer::TAIL_LAYOUT_PREFIX_BYTES: u64
 pub fn tylertoo_core::pmtiles_writer::decode_directory(&[u8]) -> core::option::Option<alloc::vec::Vec<tylertoo_core::pmtiles_writer::DirEntry>>
 pub fn tylertoo_core::pmtiles_writer::decode_varint(&[u8]) -> core::option::Option<(u64, usize)>
 pub fn tylertoo_core::pmtiles_writer::encode_directory(&[tylertoo_core::pmtiles_writer::DirEntry]) -> alloc::vec::Vec<u8>
@@ -3148,6 +3152,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_with_coun
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut self, &std::path::Path) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::salvage_path(&self) -> core::option::Option<&std::path::Path>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_max_zoom(&mut self, u8)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
@@ -3157,6 +3162,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mu
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::stats(&self) -> &tylertoo_core::pmtiles_writer::StreamingWriteStats
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::temp_path(&self) -> &std::path::Path
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::with_tail_layout(&std::path::Path, tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::with_temp_dir(tylertoo_core::compression::Compression, std::path::PathBuf) -> core::io::error::Result<Self>
 impl core::ops::drop::Drop for tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::drop(&mut self)
@@ -3170,6 +3176,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::Str
 pub struct tylertoo_core::StreamingWriteStats
 pub tylertoo_core::StreamingWriteStats::bytes_saved_dedup: u64
 pub tylertoo_core::StreamingWriteStats::bytes_written: u64
+pub tylertoo_core::StreamingWriteStats::checkpoint_bytes_written: u64
 pub tylertoo_core::StreamingWriteStats::total_tiles: u64
 pub tylertoo_core::StreamingWriteStats::unique_tiles: u64
 impl tylertoo_core::pmtiles_writer::StreamingWriteStats
