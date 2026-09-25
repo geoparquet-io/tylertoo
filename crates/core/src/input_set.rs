@@ -764,6 +764,19 @@ impl ConvertSource {
     /// selection yields no segments at all, matching the sequential reader,
     /// which never opens it.
     ///
+    /// **That ordering promise is load-bearing twice over.** The parallel
+    /// merge re-derives each batch's `row_offset` by counting rows over the
+    /// merged stream from zero, so it is only the plan's addressing if the
+    /// merged order is the sequential order. And a sharded build (#498)
+    /// depends on the same property from the other side: the segments are cut
+    /// from the row groups THIS run selected (bbox ∩ filter ∩ shard range), so
+    /// a shard's `row_offset` counts its own narrower stream — which is
+    /// exactly the stream
+    /// [`overview::plan_state::rebase_plan_for_shard`](crate::overview::plan_state)
+    /// re-addresses the convert plan's row-indexed tables onto, in the same
+    /// part-then-ascending-row-group order. If either side's ordering ever
+    /// changed, every shard would read the wrong winner byte — silently.
+    ///
     /// **`target_rows` is a ceiling, not an average.** The caller sets it to
     /// what one reader can buffer ahead of the merge, and a segment that does
     /// not fit there makes its worker park mid-segment — which serializes the

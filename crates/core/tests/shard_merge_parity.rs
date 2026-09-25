@@ -95,11 +95,29 @@ enum Flavor {
     ClusteredPoints,
 }
 
+/// Pass-2 reader threads for every convert this oracle runs.
+///
+/// `TYLERTOO_TEST_READ_WORKERS` overrides the default so the whole suite can
+/// be run against the sequential reader (`1`) and against #494's parallel
+/// segment merge (`4`). That distinction matters here more than anywhere
+/// else: the parallel merge re-derives each batch's `row_offset` by counting
+/// rows over the merged stream from zero, and a shard's stream is the pruned
+/// one — so a merge that ever counted ABSOLUTE file rows instead would give
+/// every segment after the first the wrong winner byte, on pruning shards
+/// only. Byte parity under both settings is what rules that out.
+fn read_workers() -> usize {
+    std::env::var("TYLERTOO_TEST_READ_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(tylertoo_core::overview::convert::READ_WORKERS_AUTO)
+}
+
 fn convert_options(build: Build) -> ConvertOptions {
     let levels = LevelPlan::ZoomRange {
         min_zoom: build.min_zoom,
         max_zoom: build.max_zoom,
     };
+    let read_workers = read_workers();
     match build.flavor {
         // A chain is a new geometry spanning every row it merged, which no
         // single row group's bbox bounds — so `--shard` refuses a plan that
@@ -108,15 +126,18 @@ fn convert_options(build: Build) -> ConvertOptions {
         // a polygon input produces an empty-but-present section.
         Flavor::NoCoalesce => ConvertOptions {
             levels,
+            read_workers,
             coalesce_lines: false,
             ..Default::default()
         },
         Flavor::Defaults => ConvertOptions {
             levels,
+            read_workers,
             ..Default::default()
         },
         Flavor::Carriers => ConvertOptions {
             levels,
+            read_workers,
             coalesce_lines: false,
             simplify: SimplifyOptions {
                 collapse: CollapseMode::Square,
@@ -126,6 +147,7 @@ fn convert_options(build: Build) -> ConvertOptions {
         },
         Flavor::ClusteredPoints => ConvertOptions {
             levels,
+            read_workers,
             coalesce_lines: false,
             cluster: true,
             accumulate: vec![AccumulateSpec {

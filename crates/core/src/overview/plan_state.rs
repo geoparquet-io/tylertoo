@@ -474,6 +474,14 @@ fn verify_input(
 /// reader streams parts in order and, within a part, the selected groups in
 /// ascending index order), so the shard's domain is a handful of runs rather
 /// than a per-row bitmap — however many rows the dataset has.
+///
+/// **That construction is a cross-module contract**, and since #494 it holds
+/// for the parallel pass-2 read too: `ConvertSource::read_segments` cuts the
+/// SELECTED row groups into segments in exactly that order and the merge
+/// counts `row_offset` over them from zero, so a shard's row stream is its
+/// own selected groups in part-then-ascending order — precisely the order the
+/// runs below are built in. See that function's docs for the other half of
+/// the invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeptRun {
     /// Where the run starts in the **plan's** row stream.
