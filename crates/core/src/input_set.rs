@@ -41,7 +41,9 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+};
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 
@@ -104,6 +106,12 @@ struct PartMeta {
     schema: SchemaRef,
     /// Parsed parquet metadata (row groups, key-value metadata).
     parquet: Arc<ParquetMetaData>,
+    /// The same footer in the shape the arrow reader wants, so opening a
+    /// reader over this part never re-parses it ([`InputSource::open_with_metadata`]).
+    /// Load-bearing for the pass-2 parallel read (#494), which opens one
+    /// reader per segment: a 1084-segment run parsed the footer 1084 times,
+    /// twice per conversion.
+    reader: ArrowReaderMetadata,
 }
 
 /// An ordered set of parquet partitions (local files and/or remote
@@ -201,6 +209,9 @@ pub struct ReadPlan<'a> {
 /// memory stays bounded by one part's working set.
 pub struct SourceStream<'a> {
     parts: &'a [InputSource],
+    /// Each part's already-parsed footer, parallel to `parts`, so opening a
+    /// part's reader costs a `File::open` and nothing else (#494 follow-up).
+    metas: Vec<ArrowReaderMetadata>,
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
@@ -685,8 +696,17 @@ impl ConvertSource {
             (Some(base), None) => Some(base.to_vec()),
             (Some(base), Some(cols)) => Some(cols.iter().map(|&c| base[c]).collect()),
         };
+        // Footers are parsed once per source (lazily for `Single`, at
+        // construction for `Multi`); every reader this stream opens reuses
+        // them rather than re-decoding O(row_groups × columns) of thrift.
+        let metas = self
+            .metas()?
+            .iter()
+            .map(|m| m.reader.clone())
+            .collect::<Vec<_>>();
         Ok(SourceStream {
             parts,
+            metas,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
             batch_size: plan.batch_size.max(1),
@@ -759,7 +779,10 @@ impl ConvertSource {
     /// Expressed as an ordinary [`ReadPlan`] whose row-group selection is
     /// empty for every part but the segment's, so the reader construction,
     /// projection composition and part skipping are the single-stream ones —
-    /// there is no second way to open an input.
+    /// there is no second way to open an input. The plan's own projection is
+    /// always `None`: the source's `column_projection` (#386) is what restricts
+    /// the columns, and `open_stream` composes it, exactly as it does for the
+    /// sequential read this must reproduce.
     ///
     /// Callers running several of these CONCURRENTLY over the same source must
     /// be local-only: `SourceStream` releases a part's in-memory read cache
@@ -769,14 +792,13 @@ impl ConvertSource {
         &self,
         segment: &ReadSegment,
         batch_size: usize,
-        projection: Option<&[usize]>,
     ) -> Result<SourceStream<'_>, InputError> {
         let mut per_part = vec![Vec::new(); self.parts().len()];
         per_part[segment.part].clone_from(&segment.row_groups);
         let selection = RowGroupSelection::from_parts(per_part);
         self.open_stream(&ReadPlan {
             batch_size,
-            projection,
+            projection: None,
             row_groups: Some(&selection),
         })
     }
@@ -798,9 +820,15 @@ impl ConvertSource {
 /// footer after the first open.
 fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     let builder = source.open()?;
+    let parquet = builder.metadata().clone();
+    // Re-derives the arrow schema from the footer we already have — no I/O,
+    // no second footer parse — so every later reader over this part can be
+    // built with `new_with_metadata`.
+    let reader = ArrowReaderMetadata::try_new(parquet.clone(), ArrowReaderOptions::new())?;
     Ok(PartMeta {
         schema: builder.schema().clone(),
-        parquet: builder.metadata().clone(),
+        parquet,
+        reader,
     })
 }
 
@@ -1032,7 +1060,7 @@ impl SourceStream<'_> {
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
     fn open_part(&self, i: usize) -> Result<ParquetRecordBatchReader, InputError> {
-        let mut builder = self.parts[i].open()?;
+        let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
         if let Some(cols) = &self.projection {
             let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
             builder = builder.with_projection(mask);
@@ -1686,18 +1714,12 @@ mod tests {
 
     /// Write `rows` rows into `path` with `rg_rows` rows per row group.
     fn write_rowgroups(path: &Path, rows: i64, rg_rows: usize) {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_parquet(
+            path,
+            vec![Field::new("id", DataType::Int64, false)],
             vec![Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef],
-        )
-        .unwrap();
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(rg_rows))
-            .build();
-        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
+            Some(rg_rows),
+        );
     }
 
     /// `target_rows` is a CEILING. A run that would overshoot it starts a new

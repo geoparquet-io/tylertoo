@@ -49,7 +49,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::reader::{ChunkReader, Length};
 use serde::Serialize;
@@ -250,6 +250,11 @@ impl InputSource {
     /// Local: opens the file and parses the footer (cheap, OS page cache).
     /// Remote: reuses a cached parsed footer after the first open, so the
     /// multi-pass streaming pipeline pays the footer fetch only once.
+    ///
+    /// Callers that open the same input REPEATEDLY — the pass-2 reader
+    /// segments, above all — should use [`Self::open_with_metadata`] instead:
+    /// a local footer parse is cheap once and quadratic in row groups times
+    /// columns when paid per reader.
     pub fn open(&self) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
@@ -257,6 +262,37 @@ impl InputSource {
                 Ok(ParquetRecordBatchReaderBuilder::try_new(
                     InputReader::Local(file),
                 )?)
+            }
+            #[cfg(feature = "remote")]
+            InputSource::Remote(r) => r.open_builder(),
+        }
+    }
+
+    /// Open a parquet reader builder over this input using ALREADY-PARSED
+    /// footer metadata.
+    ///
+    /// "Cheap, OS page cache" is true of the file *read*, not of the parse:
+    /// `ParquetMetaDataReader` decodes every row group's every column chunk
+    /// descriptor, so a footer parse costs O(row_groups × columns) and the
+    /// thrift decode of a many-row-group footer is measurable — 6.5-19 s for
+    /// 1084 segment opens on the #494 Brazil fixture, paid once per reader
+    /// opened. The caller already holds the parsed footer
+    /// (`input_set::PartMeta`), so hand it over instead.
+    ///
+    /// Remote inputs ignore `meta` and take [`Self::open`]'s path: it already
+    /// caches its `ArrowReaderMetadata`, and opening also re-sizes the chunk
+    /// cache from the footer, which is load-bearing (#261).
+    pub(crate) fn open_with_metadata(
+        &self,
+        meta: &ArrowReaderMetadata,
+    ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
+        match self {
+            InputSource::Local(p) => {
+                let file = File::open(p)?;
+                Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    InputReader::Local(file),
+                    meta.clone(),
+                ))
             }
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.open_builder(),
