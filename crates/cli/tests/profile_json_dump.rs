@@ -199,6 +199,56 @@ fn profile_json_written_and_parses() {
          are missing from the dump: {value}"
     );
 
+    // --- #533 regression guard: the phase walls must partition the run. ---
+    //
+    // Every entry of `phase_walls` is a DISJOINT wall-clock window of the same
+    // conversion, so their sum can never exceed `total`. Before #533 the
+    // pass-1 wall was an `Instant` carried all the way to the end of the run
+    // and elapsed there, so `phase_walls.pass1` silently swallowed the level
+    // assignment, all of pass 2 and `writer.finish()` — it was ≈ `total`, the
+    // sum was ≈ 2× `total`, `pass1.rows_per_sec` was wrong by the same factor,
+    // and the assignment (the single largest stage on a planet-scale run) had
+    // no entry at all. The tolerance is a hair over 1.0 only to absorb the
+    // handful of microseconds of bookkeeping between the phase boundaries.
+    let wall = |name: &str| -> f64 {
+        value["phase_walls"][name]
+            .as_f64()
+            .unwrap_or_else(|| panic!("phase_walls.{name} must be a number: {value}"))
+    };
+    let (pass1_wall, assign_wall, writer_finish_wall, total_wall) = (
+        wall("pass1"),
+        wall("assign"),
+        wall("writer_finish"),
+        wall("total"),
+    );
+    for (name, secs) in [
+        ("pass1", pass1_wall),
+        ("assign", assign_wall),
+        ("pass2", pass2_wall),
+        ("writer_finish", writer_finish_wall),
+        ("total", total_wall),
+    ] {
+        assert!(
+            secs >= 0.0 && secs.is_finite(),
+            "phase_walls.{name} must be a finite, non-negative duration: {value}"
+        );
+    }
+    let walls_sum = pass1_wall + assign_wall + pass2_wall + writer_finish_wall;
+    assert!(
+        walls_sum <= total_wall * 1.01,
+        "phase_walls must be disjoint windows of the run: \
+         pass1 ({pass1_wall:.6}s) + assign ({assign_wall:.6}s) + \
+         pass2 ({pass2_wall:.6}s) + writer_finish ({writer_finish_wall:.6}s) \
+         = {walls_sum:.6}s exceeds total ({total_wall:.6}s) — a phase wall is \
+         being elapsed after its phase ended (#533): {value}"
+    );
+    assert!(
+        pass1_wall < total_wall,
+        "phase_walls.pass1 ({pass1_wall:.6}s) must be strictly less than total \
+         ({total_wall:.6}s): a pass-1 wall that equals the whole run is the \
+         #533 signature: {value}"
+    );
+
     // The startup preflight probes writability with a uniquely named SIBLING
     // file and removes it again; nothing of its own may survive the run.
     let strays: Vec<String> = std::fs::read_dir(dir.path())

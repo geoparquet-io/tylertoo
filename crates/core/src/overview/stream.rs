@@ -1313,9 +1313,17 @@ struct PlanState {
     /// Bbox-derived tallies for the report (#188 / #429).
     tallies: BboxTallies,
     pass1_stage_secs: Pass1StageSecs,
-    /// When this stage started, so the `[profile]` dump reports the wall time
-    /// of whichever path ran (near-zero for a loaded plan).
-    t_pass1: Instant,
+    /// Wall time of the pass-1 SCAN alone — from the first read to the last
+    /// feature folded in, stopping before the level assignment (#533). A
+    /// `Duration`, not an `Instant`: the dump used to carry the start instant
+    /// to the end of the run and elapse it there, so `phase_walls.pass1`
+    /// silently swallowed the assignment, pass 2 and `writer.finish()`.
+    /// Near-zero for a loaded `--plan`, which replaces both stages.
+    pass1_wall: Duration,
+    /// Wall time of the level assignment (`resolve_winner_tables`): winner
+    /// resolution, the density budget, carriers and cluster tables. Zero on
+    /// the `--plan` path, where the artifact stands in for it.
+    assign_wall: Duration,
 }
 
 /// Run pass 1 + the level assignment, or load the artifact that stands in for
@@ -1397,12 +1405,16 @@ fn run_pass1_and_assign(
     // run in total info-level silence — on planet-scale inputs that was tens
     // of minutes with no output.
     log::info!("[convert] scan complete: {num_features} feature(s) from {num_rows} row(s)");
+    // The pass-1 wall STOPS here, at the end of the scan (#533) — everything
+    // after this point belongs to the `assign` phase or to pass 2.
+    let pass1_wall = t_pass1.elapsed();
     log::debug!(
         "[profile] pass1 stream+scan: {:.2}s",
-        t_pass1.elapsed().as_secs_f64()
+        pass1_wall.as_secs_f64()
     );
     log_phase_rss("pass1 scan", peak_rss_mib);
 
+    let t_assign = Instant::now();
     let tables = resolve_winner_tables(
         &mut features,
         acc_values,
@@ -1413,6 +1425,9 @@ fn run_pass1_and_assign(
         options,
         peak_rss_mib,
     )?;
+    // Stops before `--save-plan` serialization, which is I/O for an opt-in
+    // artifact rather than part of the assignment itself.
+    let assign_wall = t_assign.elapsed();
 
     // Persisted here, the first moment the assignment is complete and before
     // pass 2 touches anything: what survives resolve_winner_tables IS the
@@ -1457,7 +1472,8 @@ fn run_pass1_and_assign(
         geom_bytes,
         tallies,
         pass1_stage_secs,
-        t_pass1,
+        pass1_wall,
+        assign_wall,
     })
 }
 
@@ -1577,7 +1593,9 @@ fn load_plan_state(
             max_abs_out_of_range: 0.0,
         },
         pass1_stage_secs: Pass1StageSecs::default(),
-        t_pass1,
+        // The load stands in for the scan; the assignment did not run at all.
+        pass1_wall: t_pass1.elapsed(),
+        assign_wall: Duration::ZERO,
     })
 }
 
@@ -1632,7 +1650,8 @@ pub(crate) fn convert_streaming_strategy(
         geom_bytes,
         tallies,
         pass1_stage_secs,
-        t_pass1,
+        pass1_wall,
+        assign_wall,
     } = resolve_plan_state(
         &Pass1Inputs {
             source,
@@ -1745,17 +1764,19 @@ pub(crate) fn convert_streaming_strategy(
         return Err(ConvertError::NoData);
     }
 
-    log::debug!(
-        "[profile] pass2 total: {:.2}s",
-        t_pass2.elapsed().as_secs_f64()
-    );
+    // Pass 2's wall STOPS here (#533): the writer finish that follows is its
+    // own phase, and what comes after it (`fill_level_bytes`, the report
+    // sums) belongs to neither.
+    let pass2_wall = t_pass2.elapsed();
+    log::debug!("[profile] pass2 total: {:.2}s", pass2_wall.as_secs_f64());
     log_phase_rss("pass2 (output sink)", &mut peak_rss_mib);
 
     let t_finish = Instant::now();
     let meta = writer.finish()?;
+    let writer_finish_wall = t_finish.elapsed();
     log::debug!(
         "[profile] writer.finish: {:.2}s",
-        t_finish.elapsed().as_secs_f64()
+        writer_finish_wall.as_secs_f64()
     );
     log_phase_rss("writer.finish", &mut peak_rss_mib);
     log::info!(
@@ -1774,13 +1795,14 @@ pub(crate) fn convert_streaming_strategy(
     // Zero effect on output bytes.
     emit_profile_json(ProfileJsonContext {
         options,
-        t_pass1,
+        pass1_wall,
         pass1_rows: num_rows,
         pass1_stage_secs,
-        t_pass2,
+        assign_wall,
+        pass2_wall,
         pass2_rows: total_rows,
         pass2_engine_timers: &pass2_engine_timers,
-        t_finish,
+        writer_finish_wall,
         start,
         level_reports: &level_reports,
         level_spill_bytes: &level_spill_bytes,
@@ -1813,13 +1835,18 @@ pub(crate) fn convert_streaming_strategy(
 /// many field computations).
 struct ProfileJsonContext<'a> {
     options: &'a ConvertOptions,
-    t_pass1: Instant,
+    /// Each phase's own wall window, captured AT the phase boundary (#533).
+    /// These used to be the phases' start `Instant`s, elapsed here — which
+    /// made every one of them run to the end of the conversion.
+    pass1_wall: Duration,
     pass1_rows: usize,
     pass1_stage_secs: Pass1StageSecs,
-    t_pass2: Instant,
+    assign_wall: Duration,
+    pass2_wall: Duration,
     pass2_rows: usize,
     pass2_engine_timers: &'a Pass2Timers,
-    t_finish: Instant,
+    writer_finish_wall: Duration,
+    /// The one genuine end-of-run instant: `total` is elapsed here.
     start: Instant,
     level_reports: &'a [LevelReport],
     level_spill_bytes: &'a [u64],
@@ -1827,19 +1854,22 @@ struct ProfileJsonContext<'a> {
     in_flight_batches: usize,
 }
 
-/// Turn a [`ProfileJsonContext`] into [`ProfileJsonInputs`] (elapsing the
-/// `Instant`s at the call site) and hand it to [`write_profile_json`].
+/// Turn a [`ProfileJsonContext`] into [`ProfileJsonInputs`] and hand it to
+/// [`write_profile_json`]. Every phase wall arrives already captured at its
+/// own boundary (#533); only `total` is elapsed here, and it is the only
+/// window that legitimately ends now.
 fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
     write_profile_json(ProfileJsonInputs {
         options: ctx.options,
-        pass1_wall_secs: ctx.t_pass1.elapsed().as_secs_f64(),
+        pass1_wall_secs: ctx.pass1_wall.as_secs_f64(),
         pass1_rows: ctx.pass1_rows,
         pass1_stage_secs: ctx.pass1_stage_secs,
-        pass2_wall_secs: ctx.t_pass2.elapsed().as_secs_f64(),
+        assign_wall_secs: ctx.assign_wall.as_secs_f64(),
+        pass2_wall_secs: ctx.pass2_wall.as_secs_f64(),
         pass2_rows: ctx.pass2_rows,
         pass2_stage_secs: ctx.pass2_engine_timers.stage_secs(),
         pass2_cascade_step_counts: ctx.pass2_engine_timers.cascade_step_counts(),
-        writer_finish_secs: ctx.t_finish.elapsed().as_secs_f64(),
+        writer_finish_secs: ctx.writer_finish_wall.as_secs_f64(),
         total_secs: ctx.start.elapsed().as_secs_f64(),
         levels: ctx
             .level_reports
@@ -1856,6 +1886,8 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
 /// diagnostics dump otherwise needs an unreasonable number of loose scalars.
 struct ProfileJsonInputs<'a> {
     options: &'a ConvertOptions,
+    /// Wall seconds of the pass-1 SCAN alone (#533) — the level assignment
+    /// that follows it has its own entry.
     pass1_wall_secs: f64,
     /// Total INPUT rows pass 1 streamed (matches [`Pass1Output::num_rows`]).
     pass1_rows: usize,
@@ -1864,6 +1896,11 @@ struct ProfileJsonInputs<'a> {
     /// `phase_walls.pass1` — the stages overlap, so the sum is normally
     /// larger. Same convention as `pass2_stage_secs`.
     pass1_stage_secs: Pass1StageSecs,
+    /// Wall seconds of the level assignment (`resolve_winner_tables`): winner
+    /// resolution, the density budget, carriers and cluster tables. On a
+    /// planet-scale run this is one of the largest phases, and before #533 it
+    /// had no entry at all — it was hidden inside `pass1`.
+    assign_wall_secs: f64,
     pass2_wall_secs: f64,
     /// Total OUTPUT rows written across every level (throughput is measured
     /// in output rows, matching the `[profile] pass2 engine` log).
@@ -1987,8 +2024,14 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
     };
     let value = serde_json::json!({
         "timestamp": timestamp,
+        // Disjoint wall-clock windows of one conversion, in run order, so
+        // `pass1 + assign + pass2 + writer_finish <= total` always holds
+        // (#533 — before that fix each window ran to the end of the run and
+        // the four over-counted `total` by ~2x). The remainder of `total` is
+        // the preflight, the writer setup and the closing report sums.
         "phase_walls": {
             "pass1": inputs.pass1_wall_secs,
+            "assign": inputs.assign_wall_secs,
             "pass2": inputs.pass2_wall_secs,
             "writer_finish": inputs.writer_finish_secs,
             "total": inputs.total_secs,

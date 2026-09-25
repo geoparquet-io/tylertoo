@@ -59,11 +59,13 @@ not "the run was not profiled".
 ```jsonc
 {
   "timestamp": 1790248637.27,       // UNIX epoch seconds
-  "phase_walls": {                  // wall-clock time per top-level phase
-    "pass1": 0.0297,
-    "pass2": 0.0228,
-    "writer_finish": 0.0005,
-    "total": 0.0310
+  "phase_walls": {                  // DISJOINT wall-clock windows, run order
+    "pass1": 0.0068,                // the scan alone (stops at scan end)
+    "assign": 0.0021,               // resolve_winner_tables: winners, the
+                                    // density budget, carriers, clusters
+    "pass2": 0.0228,                // the level build (stops before finish)
+    "writer_finish": 0.0005,        // writer.finish() alone
+    "total": 0.0330                 // the whole conversion
   },
   "pass1": {
     "rows": 1000,                   // input rows streamed
@@ -103,6 +105,17 @@ not "the run was not profiled".
   "memory_profile": "auto"          // the resolved MemoryProfile
 }
 ```
+
+The four `phase_walls` phases are **disjoint** windows of one conversion, so
+`pass1 + assign + pass2 + writer_finish <= total` always holds; the
+remainder of `total` is the preflight, the writer setup and the closing
+report sums. Until #533 each phase carried its *start* instant to the end of
+the run and elapsed it there, so `pass1` silently covered the assignment,
+all of pass 2 and `writer.finish()` (≈ `total`), the four over-counted
+`total` by ~2×, `pass1.rows_per_sec` was wrong by the same factor, and the
+assignment — the single largest phase on a planet-scale run — had no entry
+at all. `crates/cli/tests/profile_json_dump.rs::profile_json_written_and_parses`
+asserts the partition.
 
 `pass1.stage_secs` and `pass2.stage_secs` are independent stage splits —
 they do not need to sum to their phase's `rows_per_sec` denominator or to
