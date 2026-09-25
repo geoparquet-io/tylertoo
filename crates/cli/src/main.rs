@@ -2368,7 +2368,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // #498: a data shard owns no zoom coarser than the pivot, so that is
         // what it declares — claiming the coarse job's half would misdescribe
         // an archive that holds none of it.
-        min_zoom: args.gsd.is_none().then(|| match tile_range {
+        min_zoom: args.gsd.is_none().then_some(match tile_range {
             Some(r) => r.pivot_zoom,
             None => args.min_zoom,
         }),
