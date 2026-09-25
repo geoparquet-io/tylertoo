@@ -341,17 +341,13 @@ impl Fingerprint {
         for (key, saved) in &self.options {
             match current.options.get(key) {
                 Some(now) if now == saved => {}
-                Some(now) => return Err(mismatch(&format!("option {key}"), saved, now)),
-                None => return Err(mismatch(&format!("option {key}"), saved, "<absent>")),
+                Some(now) => return Err(option_mismatch(key, saved, now)),
+                None => return Err(option_mismatch(key, saved, "<absent>")),
             }
         }
         for key in current.options.keys() {
             if !self.options.contains_key(key) {
-                return Err(mismatch(
-                    &format!("option {key}"),
-                    "<absent>",
-                    &current.options[key],
-                ));
+                return Err(option_mismatch(key, "<absent>", &current.options[key]));
             }
         }
         if self.inputs.len() != current.inputs.len() {
@@ -611,16 +607,42 @@ pub(super) fn rebase_plan_for_shard(
         return Ok(plan_cursor);
     }
 
-    fn compact<T: Copy>(src: &[T], runs: &[KeptRun], len: usize) -> Vec<T> {
+    // Fallible rather than a slice index: `runs` is derived from the plan's
+    // own row-group table and `src` from a different section of the same
+    // file, so a truncated or hand-edited plan can make them disagree. The
+    // bar #417/#489/#430 set for hostile archives — "named error, never a
+    // panic" — applies to a plan shipped to a worker just as much.
+    fn compact<T: Copy>(
+        what: &str,
+        src: &[T],
+        runs: &[KeptRun],
+        len: usize,
+        named: &str,
+    ) -> Result<Vec<T>, ConvertError> {
         let mut out = Vec::with_capacity(len);
         for r in runs {
-            out.extend_from_slice(&src[r.plan_base..r.plan_base + r.len]);
+            let end = r.plan_base + r.len;
+            if end > src.len() {
+                return Err(ConvertError::InvalidConfig(format!(
+                    "--plan: {named}'s {what} table holds {} entr(y/ies) but the row groups it \
+                     was saved over reach row {end}. The plan is truncated or inconsistent; \
+                     re-run without --plan (add --save-plan to write a fresh one).",
+                    src.len(),
+                )));
+            }
+            out.extend_from_slice(&src[r.plan_base..end]);
         }
-        out
+        Ok(out)
     }
-    plan.min_levels = compact(&plan.min_levels, &runs, shard_cursor);
+    plan.min_levels = compact("winner", &plan.min_levels, &runs, shard_cursor, &named())?;
     if let Some(kinds) = &plan.kinds {
-        plan.kinds = Some(compact(kinds, &runs, shard_cursor));
+        plan.kinds = Some(compact(
+            "geometry-kind",
+            kinds,
+            &runs,
+            shard_cursor,
+            &named(),
+        )?);
     }
 
     // Side tables are keyed by the same row index, so they move with it.
@@ -644,10 +666,20 @@ pub(super) fn rebase_plan_for_shard(
     }
     // Line coalescing is refused alongside `--shard` up front (a merged chain
     // spans whatever rows the chain touched, which no single row group's bbox
-    // bounds), so this section must be absent by the time we get here.
+    // bounds), so no CHAIN can survive to here.
+    //
+    // A *present but empty* section can, and does, on the default workflow:
+    // `coalesce_lines` is on by default, so a polygon dataset saves a
+    // coalesce section carrying zero rows, and `load_plan_state` — which
+    // gates on `!c.rows.is_empty()`, correctly — lets it through. An
+    // `is_none()` assertion here therefore panicked every debug-build shard
+    // of an ordinary polygon fleet while release builds ran correctly, which
+    // is the worst possible split. Assert what is actually required: nothing
+    // to re-address.
     debug_assert!(
-        plan.coalesce.is_none(),
-        "--shard with line coalescing must have been refused in validate_options"
+        plan.coalesce.as_ref().is_none_or(|c| c.rows.is_empty()),
+        "load_plan_state must have refused a --shard run whose plan carries coalesced chains \
+         before it reached the re-addressing"
     );
 
     // The totals describe what this run will read, not the dataset: they feed
@@ -662,6 +694,19 @@ pub(super) fn rebase_plan_for_shard(
         .count();
     let ratio = shard_cursor as f64 / plan_cursor as f64;
     plan.totals.geom_bytes = (plan.totals.geom_bytes as f64 * ratio).round() as u64;
+    // The per-level winner counts are a *sizing hint* downstream
+    // (`partition_emitted_levels` → `EmitLevel::hint` → the writer's row-group
+    // sizing), so a one-sixteenth shard carrying the global count would size
+    // every level for sixteen times the rows it will write. Prorated by the
+    // same ratio — but never from non-zero to zero: `counts[l] == 0` is ALSO
+    // the level-omission decision (§7.3), and that decision is the coarse
+    // job's dataset-global one, not something a shard may relit. A level the
+    // plan says has winners keeps at least one here whatever the ratio.
+    for c in &mut plan.counts {
+        if *c > 0 {
+            *c = ((*c as f64 * ratio).round() as usize).max(1);
+        }
+    }
     plan.totals.n_rows = shard_cursor;
     plan.totals.n_features = assigned;
     plan.totals.skipped_rows = shard_cursor - assigned;
@@ -745,6 +790,37 @@ fn opt_str<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or_else(|| "<none>".to_string(), |v| v.to_string())
 }
 
+/// An options-map mismatch, with the shard cut called out by name.
+///
+/// #498: "the plan and the shard plan disagree" is a different mistake from
+/// "somebody changed `--density`", and the fix is different too — so the one
+/// key whose mismatch means a MIS-CUT FLEET says so, naming both digests,
+/// rather than being reported as an opaque option string.
+fn option_mismatch(key: &str, saved: &str, now: &str) -> ConvertError {
+    if key != SHARD_PLAN_DIGEST_KEY {
+        return mismatch(&format!("option {key}"), saved, now);
+    }
+    let what = match (saved, now) {
+        (NO_SHARD_PLAN, _) => "the convert plan was saved WITHOUT a shard plan, so it is not a \
+                               sharded fleet's plan at all"
+            .to_string(),
+        (_, NO_SHARD_PLAN) => {
+            format!(
+                "the convert plan was saved for cut {saved}, but this run was given no \
+                     --shard-plan"
+            )
+        }
+        _ => format!("the convert plan records cut {saved}, but --shard-plan cuts {now}"),
+    };
+    ConvertError::InvalidConfig(format!(
+        "--plan: this run's shard plan is not the one the convert plan was saved with: {what}. \
+         Every job of a fleet must be given the SAME shards.json — a re-cut plan moves the \
+         range boundaries, so the jobs would overlap at some seams and leave holes at others. \
+         Use the shard plan the coarse job ran with, or re-run the whole fleet (coarse job \
+         included) against the new cut."
+    ))
+}
+
 fn mismatch(field: &str, saved: &str, now: &str) -> ConvertError {
     ConvertError::InvalidConfig(format!(
         "--plan: saved plan does not match this run: {field} was {saved:?} when the plan was \
@@ -791,8 +867,25 @@ fn options_digest(o: &ConvertOptions) -> BTreeMap<String, String> {
     // Simplification runs in pass 2, but the level plan's omission decision
     // (#211) and the coalesce chain counts both read it, so it belongs here.
     put("simplify", format!("{:?}", o.simplify));
+    // #498: the CUT, not this job's slice of it. See
+    // `ConvertOptions::shard_plan_digest` for why one is fingerprinted and
+    // the other cannot be.
+    // A bare string rather than `{:?}` of the Option: this one appears in a
+    // message an operator reads, and `Some("bb4f28d7918e9ff5")` is not it.
+    put(
+        SHARD_PLAN_DIGEST_KEY,
+        o.shard_plan_digest
+            .clone()
+            .unwrap_or_else(|| NO_SHARD_PLAN.to_string()),
+    );
     m
 }
+
+/// The [`options_digest`] key carrying the shard plan's cut digest (#498).
+pub(super) const SHARD_PLAN_DIGEST_KEY: &str = "shard_plan_digest";
+
+/// The cut-digest value recorded by a run that was given no shard plan.
+const NO_SHARD_PLAN: &str = "none";
 
 /// Dataset-wide tallies pass 2 and the convert report need, which otherwise
 /// only exist while the pass-1 feature scratch is alive.
