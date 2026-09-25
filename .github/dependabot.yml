@@ -47,6 +47,35 @@ updates:
       all-cargo-deps:
         patterns:
           - "*"
+    ignore:
+      # arrow-rs majors are held at 59 until the geoarrow-rs stack catches up.
+      #
+      # geoarrow 0.9 / geoarrow-array 0.9 / geoarrow-schema 0.9 / geoparquet 0.9
+      # (all latest as of 2026-09) declare `arrow-* = "^59"` and
+      # `parquet = "^59"`. Cargo cannot unify ^59 with 60.x, so bumping our
+      # workspace to arrow 60 links BOTH majors into one binary: geoparquet's
+      # reader hands back parquet-59/arrow-59 types while our own code speaks
+      # arrow-60. Every type that crosses that boundary — RecordBatch, Schema,
+      # Field, ArrayRef, FileMetaData, KeyValue — stops matching.
+      #
+      # That is exactly why #476 (the grouped 59.3.0 -> 60.0.0 bump) fails to
+      # compile: 119 errors in `cargo check --workspace --all-targets`, every
+      # one of them a "there are multiple different versions of crate X in the
+      # dependency graph" mismatch. None are arrow-60 API changes — there is
+      # nothing on our side to port. The group already pairs arrow-* with
+      # geoarrow*, but grouping alone cannot help while no arrow-60-compatible
+      # geoarrow release exists to pair with.
+      #
+      # Lift this the moment geoarrow-rs ships an arrow-60 release (watch
+      # https://github.com/geoarrow/geoarrow-rs — as of 2026-09 neither its
+      # main branch nor any open PR targets arrow 60), then land arrow-rs and
+      # geoarrow together in a single PR.
+      #
+      # Minor/patch bumps within 59.x are unaffected and still flow normally.
+      - dependency-name: "arrow-*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
 
   # Python dev tooling (crates/python: pyproject.toml + uv.lock; the shipped
   # wheel has no Python runtime deps, so this is all dev/lint tooling)
