@@ -64,7 +64,7 @@ use geo::{
 pub use super::level::{Crs, METERS_PER_DEGREE};
 
 /// Process-wide count of polygons that exhausted every epsilon-backoff retry
-/// (see [`simplify_polygon_impl`]) and were kept at full resolution.
+/// (see [`simplify_polygon_impl_checked`]) and were kept at full resolution.
 ///
 /// Callers (e.g. the streaming convert loop) log deltas of
 /// [`full_resolution_fallback_count`] at debug level to expose how often the
@@ -219,8 +219,8 @@ pub fn simplify_for_level(
 }
 
 /// Like [`simplify_for_level`], but also reports whether the returned
-/// geometry is value-identical to `geom` (#499, compute side of the ladder
-/// amplification issue #499): `unchanged == true` means the output is a
+/// geometry is value-identical to `geom` (#499, the compute side of the
+/// ladder amplification issue): `unchanged == true` means the output is a
 /// value-identical clone of the input — no vertex was dropped, no ring
 /// collapsed, no disposition changed. Cheap: every case below is decided
 /// from a `Vec::len()` comparison the simplification call already computed
@@ -233,7 +233,7 @@ pub fn simplify_for_level(
 /// they fed in — for FTW-like small polygons at minimum vertex count,
 /// adjacent ladder levels often produce identical output, so this turns an
 /// O(levels) chain of deep clones into O(1) allocations plus refcount bumps.
-pub(crate) fn simplify_for_level_checked(
+pub(super) fn simplify_for_level_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
     crs: Crs,
@@ -272,6 +272,7 @@ pub(crate) fn simplify_for_level_checked(
             if kept.is_empty() {
                 (Simplified::Dropped, false)
             } else {
+                // defensive: already implied by the arms above
                 unchanged &= kept.len() == mls.0.len();
                 (
                     Simplified::Keep(Geometry::MultiLineString(MultiLineString::new(kept))),
@@ -317,6 +318,7 @@ pub(crate) fn simplify_for_level_checked(
                 }
             }
             if !kept.is_empty() {
+                // defensive: already implied by the arms above
                 unchanged &= kept.len() == mp.0.len();
                 (
                     Simplified::Keep(Geometry::MultiPolygon(MultiPolygon::new(kept))),
@@ -476,7 +478,7 @@ pub fn simplify_step(
     opts: &SimplifyOptions,
     repr: Representation,
 ) -> Simplified {
-    simplify_checked(geom, gsd_meters, crs, opts, repr).0
+    simplify_step_checked(geom, gsd_meters, crs, opts, repr).0
 }
 
 /// Like [`simplify_step`], but also reports whether the output is
@@ -489,7 +491,7 @@ pub fn simplify_step(
 /// points fall through to [`simplify_for_level_checked`], which passes them
 /// through untouched — matching the "coarser steps pass the point through
 /// untouched" cascade semantics documented on [`simplify_cascade`].
-pub(crate) fn simplify_checked(
+pub(super) fn simplify_step_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
     crs: Crs,
@@ -551,6 +553,10 @@ pub(crate) fn simplify_checked(
 ///
 /// An empty chain is the identity (bit-identical clone), matching
 /// [`simplify_for_level`]'s canonical path at zero tolerance.
+///
+/// Keep step semantics in lock-step with the inline fold in
+/// `overview::stream::process_batch_cascade`; equivalence is enforced by
+/// `overview::convert::tests::pipelined_matches_serial`.
 pub fn simplify_cascade(
     geom: &Geometry<f64>,
     steps_fine_to_coarse: &[CascadeStep],
@@ -640,6 +646,10 @@ fn simplify_linestring_checked(ls: &LineString<f64>, tol: f64) -> Option<(LineSt
         return None;
     }
     let unchanged = simplified.0.len() == ls.0.len();
+    debug_assert!(
+        !unchanged || simplified == *ls,
+        "RDP subsequence invariant broken: unchanged must mean value identity (#499)"
+    );
     Some((simplified, unchanged))
 }
 
@@ -701,6 +711,13 @@ fn capped_is_valid(candidate: &Polygon<f64>) -> bool {
 /// identical geometry — validation of the candidate is then redundant (the
 /// input is assumed valid, and re-checking it is exactly the H3(c) profile's
 /// dominant cost at fine GSDs).
+///
+/// Since #499 this result also decides whether the cascade fold shares one
+/// `Arc<Geometry<f64>>` across ladder levels, so it must never be `true`
+/// unless the candidate is value-identical to `original`. That rests entirely
+/// on the RDP ordered-subsequence premise above — a `geo` upgrade that ever
+/// moved or replaced a retained vertex would break it, which is why both
+/// checked paths carry a `debug_assert!` comparing the values outright.
 fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool {
     candidate.exterior().0.len() == original.exterior().0.len()
         && candidate.interiors().len() == original.interiors().len()
@@ -755,7 +772,7 @@ fn simplify_polygon_impl(
     simplify_polygon_impl_checked(poly, tol, mode, repair).0
 }
 
-/// Like [`simplify_polygon_impl`], but also reports whether the kept
+/// Like `simplify_polygon_impl`, but also reports whether the kept
 /// geometry is value-identical to `poly` (#499): `true` for the
 /// RDP-removed-nothing candidate ([`polygon_unchanged`]) and the
 /// full-resolution fallback (both literally the same rings as `poly`);
@@ -806,6 +823,10 @@ fn simplify_polygon_impl_checked(
         }
 
         let unchanged = polygon_unchanged(&candidate, poly);
+        debug_assert!(
+            !unchanged || candidate == *poly,
+            "RDP subsequence invariant broken: unchanged must mean value identity (#499)"
+        );
         if unchanged || capped_is_valid(&candidate) {
             return (Simplified::Keep(Geometry::Polygon(candidate)), unchanged);
         }
@@ -1994,21 +2015,21 @@ mod tests {
         }
     }
 
-    // ---- `simplify_checked` (#499 compute-side: cascade Arc-sharing) ------
+    // ---- `simplify_step_checked` (#499 compute-side: cascade Arc-sharing) --
     //
     // `unchanged == true` means the returned geometry is value-identical to
     // the input — the sharing decision the cascade fold makes in
     // `process_batch_cascade`.
 
     #[test]
-    fn simplify_checked_reports_no_removal_for_minimal_geometry() {
+    fn simplify_step_checked_reports_no_removal_for_minimal_geometry() {
         // A 4-point square (the minimum valid ring) can't lose any more
         // vertices to RDP without collapsing entirely, so a tolerance that
         // keeps it alive must report `unchanged == true`.
         let poly = Geometry::Polygon(square(0.0, 0.0, 50.0));
         let opts = SimplifyOptions::default();
         let (out, unchanged) =
-            simplify_checked(&poly, 10.0, Crs::Epsg3857, &opts, Representation::Geometry);
+            simplify_step_checked(&poly, 10.0, Crs::Epsg3857, &opts, Representation::Geometry);
         assert!(unchanged, "minimal ring should report no removal");
         match out {
             Simplified::Keep(Geometry::Polygon(p)) => {
@@ -2019,29 +2040,29 @@ mod tests {
     }
 
     #[test]
-    fn simplify_checked_reports_removal_when_rdp_drops_vertices() {
+    fn simplify_step_checked_reports_removal_when_rdp_drops_vertices() {
         let line = Geometry::LineString(wiggly_line(200, 50.0));
         let opts = SimplifyOptions::default();
         let (out, unchanged) =
-            simplify_checked(&line, 500.0, Crs::Epsg3857, &opts, Representation::Geometry);
+            simplify_step_checked(&line, 500.0, Crs::Epsg3857, &opts, Representation::Geometry);
         assert!(!unchanged, "coarse GSD should remove vertices");
         assert!(line_len(&out) < 200);
     }
 
     #[test]
-    fn simplify_checked_canonical_level_reports_no_removal() {
+    fn simplify_step_checked_canonical_level_reports_no_removal() {
         // gsd == 0 is the canonical/identity path: always a bit-identical
         // clone, so always "no removal" regardless of geometry.
         let line = Geometry::LineString(wiggly_line(200, 50.0));
         let opts = SimplifyOptions::default();
         let (out, unchanged) =
-            simplify_checked(&line, 0.0, Crs::Epsg3857, &opts, Representation::Geometry);
+            simplify_step_checked(&line, 0.0, Crs::Epsg3857, &opts, Representation::Geometry);
         assert!(unchanged);
         assert_eq!(line_len(&out), 200);
     }
 
     #[test]
-    fn simplify_checked_point_revival_step_is_unchanged() {
+    fn simplify_step_checked_point_revival_step_is_unchanged() {
         // A polygon on a `Point` step is a representation change (not
         // unchanged); but a *second* `Point` step over the resulting Point
         // (the "coarser steps pass the point through untouched" cascade
@@ -2050,7 +2071,7 @@ mod tests {
         let poly = Geometry::Polygon(square(0.0, 0.0, 5.0));
         let opts = SimplifyOptions::default();
         let (first, first_unchanged) =
-            simplify_checked(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Point);
+            simplify_step_checked(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Point);
         assert!(
             !first_unchanged,
             "polygon -> point is a representation change"
@@ -2058,7 +2079,7 @@ mod tests {
         let Simplified::Keep(point_geom) = first else {
             panic!("expected the polygon to revive to a point");
         };
-        let (second, second_unchanged) = simplify_checked(
+        let (second, second_unchanged) = simplify_step_checked(
             &point_geom,
             200.0,
             Crs::Epsg3857,
@@ -2070,23 +2091,5 @@ mod tests {
             "a point passed through a coarser Point step is untouched"
         );
         assert_eq!(second, Simplified::Keep(point_geom));
-    }
-
-    #[test]
-    fn simplify_checked_matches_unchecked_simplify_step() {
-        // `simplify_checked(..).0` must be exactly what `simplify_step`
-        // returns — the checked variant must not change behavior, only add
-        // the `unchanged` flag.
-        let poly = Geometry::Polygon(square(0.0, 0.0, 5.0));
-        let opts = SimplifyOptions::default();
-        for (gsd, repr) in [
-            (10.0, Representation::Geometry),
-            (100.0, Representation::Point),
-            (10.0, Representation::Square),
-        ] {
-            let expected = simplify_step(&poly, gsd, Crs::Epsg3857, &opts, repr);
-            let (actual, _) = simplify_checked(&poly, gsd, Crs::Epsg3857, &opts, repr);
-            assert_eq!(actual, expected, "gsd={gsd} repr={repr:?}");
-        }
     }
 }
