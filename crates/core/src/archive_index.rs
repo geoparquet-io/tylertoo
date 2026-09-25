@@ -349,6 +349,33 @@ impl ArchiveIndex {
         }
         Ok(range)
     }
+
+    /// The archive's actual zoom range -- the lowest and highest zoom among
+    /// tiles the directory addresses -- `None` when the archive holds no
+    /// tiles at all.
+    ///
+    /// This is the archive's *actual* content, as opposed to
+    /// `header().min_zoom..=header().max_zoom`, which since #380/#390 is only
+    /// a *declaration*: a writer widens it over an empty zoom so a client
+    /// sees the range it was told to expect even where nothing was written
+    /// (`set_declared_min_zoom`/`set_declared_max_zoom`). The pyramid band
+    /// contract (#514) keys off this instead, so a widened header can no
+    /// longer make an empty band look like a legitimate subrange, and an
+    /// honest, narrow header can no longer make a band that fully covers the
+    /// archive's real tiles look like an error.
+    ///
+    /// Free of any run-length-expansion cost beyond [`Self::tile_id_range`]:
+    /// tile ids are Hilbert-curve blocks per zoom, monotonic in zoom, so the
+    /// lowest and highest id decode straight to the archive's actual min and
+    /// max zoom.
+    pub fn actual_zoom_range(&self) -> Result<Option<(u8, u8)>> {
+        let Some((lo, hi)) = self.tile_id_range()? else {
+            return Ok(None);
+        };
+        let (lo_z, _, _) = tile_id_to_zxy(lo)?;
+        let (hi_z, _, _) = tile_id_to_zxy(hi)?;
+        Ok(Some((lo_z, hi_z)))
+    }
 }
 
 /// [`ArchiveIndex::tiles`]'s iterator: directory entries expanded into
@@ -598,5 +625,30 @@ mod tests {
         let ids: Vec<u64> = idx.tiles().map(|t| t.unwrap().id).collect();
         assert_eq!(lo, *ids.iter().min().unwrap());
         assert_eq!(hi, *ids.iter().max().unwrap());
+    }
+
+    /// #514: the pyramid band contract needs the archive's *actual* zoom
+    /// range, not its (possibly widened) declared header range. This decodes
+    /// straight from [`ArchiveIndex::tile_id_range`], with no extra cost.
+    #[test]
+    fn actual_zoom_range_spans_the_lowest_and_highest_tile_zoom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.pmtiles");
+        write_archive(&path, &[(5, 0, 0), (3, 1, 1), (7, 2, 2)], 32);
+
+        let idx = ArchiveIndex::open(&path).unwrap();
+        assert_eq!(idx.actual_zoom_range().unwrap(), Some((3, 7)));
+    }
+
+    /// An archive with no tiles at all has no actual zoom range -- `None`,
+    /// not `(0, 0)`, so a caller cannot mistake "empty" for "z0 only".
+    #[test]
+    fn actual_zoom_range_is_none_for_an_empty_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.pmtiles");
+        write_archive(&path, &[], 32);
+
+        let idx = ArchiveIndex::open(&path).unwrap();
+        assert_eq!(idx.actual_zoom_range().unwrap(), None);
     }
 }
