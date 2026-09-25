@@ -292,7 +292,7 @@ is what the `--bbox`-band workaround #498 describes could not do (it includes
 every feature whose bbox intersects the band, so a straddler appears twice in
 the merged edge tiles).
 
-Three architectural decisions are load-bearing:
+Four architectural decisions are load-bearing:
 
 1. **A shard MUST consume a convert plan.** The level assignment threads
    dataset-wide fold state (see the `plan_state.rs` note above), so a shard
@@ -315,6 +315,30 @@ Three architectural decisions are load-bearing:
    before `plan_partitions` cuts it — so an out-of-range tile is never
    clipped, encoded or hashed, and each wave's band read prunes with it. A
    shard costs its share of the export, not all of it.
+4. **The fleet is bound to one cut by the convert plan.** `ShardPlan::cut_digest`
+   is an xxh3-64 over the canonical cut (pivot zoom + the lo/hi sequence, and
+   nothing advisory), and the CLI stamps it into the convert plan's
+   fingerprint options map under `shard_plan_digest` — on the coarse job,
+   which writes the plan, and on every data shard, which must present the
+   same one. "Same convert plan ⇒ same cut" is therefore true by
+   construction: a `shards.json` re-cut mid-build is a named error rather
+   than a fleet whose archives overlap at some seams and leave holes at
+   others. `ConvertOptions::shard` itself is deliberately *not* fingerprinted
+   — it is per-job, and every shard of a fleet has a different one.
+
+**The coarse job is a full monolithic convert.** `--shard coarse` restricts
+the EXPORT to zooms below the pivot; the convert reads every row, runs the
+whole assignment and writes the whole intermediate. A shallower `--max-zoom`
+is not a workaround either — the level plan is fingerprinted, so such a plan
+is refused by every shard. Sharding therefore parallelizes the export and the
+shard converts and buys restartability; it does not (yet) make the first job
+cheap. #541 tracks the convert-side level ceiling that would.
+
+**An empty data shard succeeds.** The cut must tile the pivot zoom with no
+gap, so a concentrated dataset leaves some ranges owning no rows. Those jobs
+write a valid tile-less archive (`export::write_empty_archive`) and exit 0;
+`merge` excludes a tile-less input from the zoom union, the bounds union and
+the layer declarations alike.
 
 **v1 restriction: line coalescing.** A coalesced chain is a new geometry
 spanning every row it merged, which no single input row group's bbox bounds.

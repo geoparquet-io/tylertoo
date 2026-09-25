@@ -1,4 +1,4 @@
-# Sharded builds: one dataset, a fleet of machines
+# Sharded builds across a fleet
 
 A single `tylertoo tiles` run is one process on one machine. That is the right
 shape up to a surprising size — a 19.5M-polygon country converts in about an
@@ -8,9 +8,13 @@ convert of it projects to somewhere between one and three days: past every
 normal HPC scheduling window, and with nothing to show for it if the job dies
 at hour 40.
 
-Sharding splits that one run into N independent jobs that can run at the same
-time on N machines, plus a merge measured in minutes. This page is the recipe
-and the reasoning behind it.
+Sharding splits the **tiling** into N independent jobs that run at the same
+time on N machines, plus a merge measured in minutes — and makes a failed job
+one `sbatch --array=7` away from fixed instead of a day thrown away. What it
+does **not** do yet is make the first job cheap: read
+[what sharding costs](#what-sharding-actually-buys-you) before planning a
+fleet around it. This page is the recipe, the honest arithmetic, and the
+reasoning behind both.
 
 ## The shape of a shard
 
@@ -79,8 +83,17 @@ tylertoo tiles fields.parquet coarse.pmtiles \
 ```
 
 This job does two things: it builds the zooms below the pivot (z0–z5 here), and
-it writes `convert.plan` — the artifact every shard then consumes. It reads the
-whole input, because the level assignment has to.
+it writes `convert.plan` — the artifact every shard then consumes.
+
+**It is a full monolithic convert.** It reads the whole input because the level
+assignment has to, and it runs the *whole* assignment and the *whole* pass 2 —
+`--shard coarse` restricts only which zooms reach the archive, not how much
+work the convert does. Asking for a shallower pyramid here does not help
+either: the shards' convert plan is fingerprinted on the level plan, so a
+coarse job run with a smaller `--max-zoom` produces a plan every shard
+refuses. Making this job genuinely cheap needs a convert-side level ceiling,
+which is
+[issue #541](https://github.com/geoparquet-io/tylertoo/issues/541).
 
 ### 2. The shards (N runs, in parallel)
 
@@ -131,10 +144,34 @@ mis-specified fleet — the same shard listed twice, a shard left over from an
 earlier run — is an error naming both archives, not an archive whose tiles
 silently shadow each other.
 
-The projected shape for a planet-scale build: coarse job ~1 h, 16 shards in
-parallel ~1–2 h each, merge ~minutes. What used to be "days, and everything is
-lost if it dies" becomes "an afternoon, and a failed shard is one `sbatch
---array=7` away from fixed".
+## What sharding actually buys you
+
+Being precise about this, because the obvious reading of the recipe above is
+wrong in a way that will cost you a scheduling window.
+
+The coarse job costs **about what a monolithic convert costs**. It reads every
+row, runs the full level assignment, and writes the full intermediate
+overview; only the export half is restricted to the zooms below the pivot. So
+for a build whose convert dominates — which is the planet-scale case — the
+fleet's wall clock is still bounded below by one whole convert.
+
+What you get for that:
+
+- **The export and the shard converts parallelize.** Each shard reads only the
+  row groups its range reaches (on `gpio`-optimized input that is a real
+  fraction of the file) and exports only its own tiles, so the finest, most
+  expensive zooms are built N-ways in parallel.
+- **Restartability, which is the bigger prize at this scale.** A monolithic
+  run that dies at hour 40 has nothing to show for it. Here a failed shard is
+  one array-task re-run, against plan files that are already on disk.
+- **Bounded per-job memory and disk**, so a fleet fits scheduling windows and
+  node limits that one enormous job does not.
+
+What you do **not** get yet is a cheap coarse job.
+[#541](https://github.com/geoparquet-io/tylertoo/issues/541) tracks the
+convert-side level ceiling that would make `--shard coarse` stop at the pivot
+instead of building the whole pyramid; until it lands, budget the coarse job
+as a full convert of the input.
 
 ## Why a shard must consume the convert plan
 
@@ -158,9 +195,25 @@ exist at which zoom. The seams would not line up — subtly, in a way no tile
 count would reveal. So the assignment is computed **once**, by the coarse job,
 and every shard replays it.
 
-The plan is [fingerprinted and checksummed](../OVERVIEW_TUNING.md), so a shard
-given the wrong plan, a stale plan, or a plan for a since-rewritten input
-fails immediately and by name.
+The **convert plan** (`convert.plan`) is fingerprinted and checksummed: an
+xxh3-64 over its payload, plus a fingerprint pinning the tylertoo version,
+every thinning option, and each input part's path, size, mtime, row count and
+row-group layout. A shard given the wrong plan, a stale plan, or a plan for a
+since-rewritten input fails immediately and by name.
+
+The **shard plan** (`shards.json`) is a different, smaller artifact and binds
+itself differently: a `format` discriminator and a version, a structural check
+that its ranges tile the pivot zoom exactly (no gap, no overlap), and a
+per-part input binding (path, row count, row-group count). It carries no
+checksum — it is small, human-readable JSON, and a corrupted one fails the
+structure check rather than passing unnoticed.
+
+The two are tied together so a fleet cannot straddle two different cuts: the
+coarse job stamps an xxh3-64 digest of the cut — the pivot zoom and the lo/hi
+sequence, nothing else — into the convert plan's fingerprint, and every shard
+must present a `shards.json` with the same digest. Re-cutting the plan
+mid-build is therefore an error naming both digests, not a fleet whose
+archives overlap at some seams and leave holes at others.
 
 ## How a shard replays a plan it only partly reads
 
@@ -208,6 +261,14 @@ row-group argument that makes ordinary features safe covers them unchanged: a
 representative near a seam is read by both neighbours, and each emits only its
 own tiles.
 
+**A shard that owns no rows succeeds.** The cut has to tile the pivot zoom with
+no gap, so `shard-plan` cuts N ranges whatever the data looks like and a
+concentrated dataset leaves some of them empty. Those jobs exit 0 and write a
+valid, tile-less archive; `merge` skips it for the zoom range, the bounds and
+the layer declarations alike. `shard-plan` warns at cut time when it produces
+such ranges, which is the signal that a smaller `--shards` would balance the
+fleet better.
+
 **`--tile-buffer` is capped at 512 tile pixels.** A shard prunes its input to
 the row groups within two pivot tiles of its range; a wider buffer could pull
 geometry into one of its tiles from a row group it never read, so the tile
@@ -230,11 +291,26 @@ monolithic run of the same input with the same options, asserting:
 - identical per-zoom tile counts;
 - **byte-identical tile bodies**, tile by tile.
 
+…and, on the archive rather than the tiles: the same declared zoom range, the
+same bounds, and the same `vector_layers` as the monolithic archive.
+
 Tile counts alone would not be enough: a seam bug moves geometry between
 neighbouring tiles while keeping every count the same. Byte equality is what
-catches it. Two fixtures run it — real admin polygons with seams cutting
-through them, and a world-spanning grid whose row groups actually prune, so
-both the clipping path and the plan-re-addressing path are covered.
+catches it. Several fixtures run it — real admin polygons with seams cutting
+through them, a world-spanning polygon grid whose row groups actually prune
+(with every knob at its defaults, with `--collapse-square` carriers, and with
+coalescing off), and a generated point grid with `--cluster
+--accumulate-attribute`, so all four of the plan's row-indexed side tables are
+exercised.
+
+**What is *not* claimed: the merged FILE is not byte-identical to a monolithic
+one.** The tile bodies are; the container is not. A merged archive is
+assembled from N inputs, so its directory layout, its deduplication accounting
+and its tile order within a zoom differ, and it currently carries **no
+tilestats** — `merge` unions the inputs' `vector_layers` but does not
+recompute per-layer attribute statistics. If a downstream consumer needs
+tilestats, generate them from the merged archive rather than expecting them to
+survive the merge.
 
 ## Choosing the pieces
 
@@ -242,10 +318,12 @@ both the clipping path and the plan-re-addressing path are covered.
 |---|---|
 | `--shards N` | Fleet size. One job per shard plus the coarse job. |
 | `--pivot Z` | Where the split falls. Shards own `[Z, --max-zoom]`; the coarse job owns `[0, Z-1]`. Aim for a few tiles of data per shard; z4–z8 in practice. |
-| `--shard coarse` | The job that owns the zooms above the pivot and writes the convert plan. |
+| `--shard coarse` | The job that owns the zooms coarser than the pivot and writes the convert plan. |
 | `--shard I/N` | Data shard `I`. Requires `--plan`. |
 
 For a cut you want to choose by hand rather than have balanced for you,
 `export-pmtiles --tile-range LO..HI` takes two tile ids at one zoom directly,
-and `--max-zoom` on the same command is the coarse half's complement. `tiles
---shard` is the same mechanism with the bookkeeping done for you.
+and `--zoom-ceiling Z` on the same command is the coarse half's complement.
+(It is a *ceiling*, not a `--max-zoom`: unlike `--min-zoom`, which only widens
+what the header declares, this decides which zooms are actually emitted.)
+`tiles --shard` is the same mechanism with the bookkeeping done for you.
