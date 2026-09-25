@@ -1339,6 +1339,15 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     // its own row groups would reach a different answer and its pyramid would
     // disagree with its siblings' at the seams. Refused here rather than
     // producing a plausible-looking archive that is quietly wrong.
+    if options.shard.is_some() && options.save_plan.is_some() {
+        return Err(ConvertError::InvalidConfig(
+            "--shard and --save-plan are mutually exclusive: a shard reads a subset of the \
+             input, so the plan it would write covers only that subset and is useless to the \
+             rest of the fleet. The coarse job, which reads everything, is the run that writes \
+             the plan."
+                .to_string(),
+        ));
+    }
     if options.shard.is_some() && options.plan.is_none() {
         return Err(ConvertError::InvalidConfig(
             "--shard requires --plan: the level assignment is dataset-global (the density \
@@ -1347,15 +1356,6 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
              so every shard of a fleet must consume ONE plan rather than recompute the \
              assignment over its own subset. Run the coarse job first with --save-plan, then \
              give every shard that plan with --plan."
-                .to_string(),
-        ));
-    }
-    if options.shard.is_some() && options.save_plan.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "--shard and --save-plan are mutually exclusive: a shard reads a subset of the \
-             input, so the plan it would write covers only that subset and is useless to the \
-             rest of the fleet. The coarse job, which reads everything, is the run that writes \
-             the plan."
                 .to_string(),
         ));
     }

@@ -16,6 +16,7 @@ This document contains the help content for the `tylertoo` command-line program.
 * [`tylertoo decode`↴](#tylertoo-decode)
 * [`tylertoo pyramid`↴](#tylertoo-pyramid)
 * [`tylertoo merge`↴](#tylertoo-merge)
+* [`tylertoo shard-plan`↴](#tylertoo-shard-plan)
 
 ## `tylertoo`
 
@@ -34,6 +35,7 @@ Top-level CLI: a default (bare) tile pipeline plus subcommands.
 * `decode` — Decode a PMTiles vector-tile archive back to GeoParquet
 * `pyramid` — Build a multi-band pyramid: several inputs, each owning a zoom range, one archive (issue #345)
 * `merge` — Concatenate disjoint PMTiles archives into one (issue #498)
+* `shard-plan` — Cut a dataset's tile space into N disjoint shards (issue #498)
 
 
 
@@ -75,6 +77,14 @@ Generate PMTiles vector tiles (the default pipeline)
   Default value: `input`
 * `--report <PATH>` — Write a JSON report to this path: a combined object with a `convert` section (the overview build, matching `overview --report`) and an `export` section (the PMTiles export, matching `export-pmtiles --report`), so the one-step run captures both halves the two-step chain would
 * `--keep-overview <PATH>` — Write the intermediate overview GeoParquet to PATH and RETAIN it, instead of a temp file removed after the export — one run then yields both artifacts: the reusable multi-resolution overview (queryable, re-exportable, see `tylertoo overview`) and the PMTiles. The PMTiles output is identical either way. Without this flag the intermediate is written to --spill-dir if given, else $TMPDIR if set, else the output directory, and deleted once the export finishes (see the note on the materialized intermediate under --spill-dir)
+* `--shard <I/N|coarse>` — Build one job of a sharded fleet (#498): `I/N` for data shard I of N, or `coarse` for the job that owns the zooms above the pivot.
+
+   Requires --shard-plan. A data shard additionally requires --plan: the level assignment is dataset-global (the density budget water-fills a super-cell over every candidate of a level, the level walk carries a running kept count, --magnitude-ladder dense-ranks the whole column), so a shard that recomputed it over its own rows would disagree with its siblings and the seams would not line up. The coarse job, which reads the whole input anyway, is the run that writes that plan with --save-plan.
+
+   A data shard reads only the row groups whose bbox reaches its range and emits only the tiles its range owns. Features are kept WHOLE: one straddling a seam is read and clipped by both neighbours, and each emits only its own tiles — so there is no border double-inclusion to dedup afterwards, and the merge is a blob copy.
+
+   The three build steps, after `tylertoo shard-plan` has cut the plan: (1) `--shard coarse --shard-plan shards.json --save-plan convert.plan`; (2) one job per shard, `--shard $i/16 --shard-plan shards.json --plan convert.plan`; (3) `tylertoo merge out.pmtiles coarse.pmtiles shard-*.pmtiles`. See the Sharded builds guide for the full recipe
+* `--shard-plan <PATH>` — The shard plan every job of the fleet shares, from `tylertoo shard-plan`. It fixes the pivot zoom and the N tile-id ranges, so the jobs agree on the cut by construction
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
 
@@ -520,6 +530,14 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
    MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a nested choropleth usually wants — with ties kept in input order so output stays deterministic.
 
   Default value: `input`
+* `--tile-range <LO..HI>` — Emit only the tiles in this PMTiles tile-id range (#498): `LO..HI`, two tile ids AT THE SAME ZOOM.
+
+   That zoom is the pivot. The range then owns every descendant of those tiles at every deeper zoom — a subtree's ids are contiguous on the Hilbert curve, so the restriction is an exact interval test at each zoom, not a bounding approximation. Tiles COARSER than the pivot are outside the range and are not emitted.
+
+   Ranges that partition the pivot zoom partition every deeper zoom, so the resulting archives are disjoint by construction and `tylertoo merge` concatenates them without re-encoding anything. `tiles --shard` derives this automatically from a shard plan; this flag is the manual form, for a cut you want to choose yourself
+* `--max-zoom <ZOOM>` — Emit only the tiles at or below this zoom (#498) — the coarse half of a sharded build, complementing --tile-range's finer half.
+
+   Distinct from building a shallower pyramid: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive
 
 
 
@@ -607,6 +625,29 @@ Concatenate disjoint PMTiles archives into one (issue #498)
 
    Includes per-zoom tile counts, which are what a sharded build is checked against: merging N shards must yield the same tiles per zoom as tiling the whole input in one pass.
 * `-f`, `--force` — Overwrite the output if it exists
+
+
+
+## `tylertoo shard-plan`
+
+Cut a dataset's tile space into N disjoint shards (issue #498)
+
+**Usage:** `tylertoo shard-plan [OPTIONS] --output <PATH> --shards <N> <INPUT>`
+
+###### **Arguments:**
+
+* `<INPUT>` — Input GeoParquet file (the same input every job of the fleet tiles)
+
+###### **Options:**
+
+* `-o`, `--output <PATH>` — Where to write the shard plan
+* `--shards <N>` — How many data shards to cut. One `tiles --shard i/N` job per shard, plus one `--shard coarse` job; all N+1 archives merge in one step
+* `--pivot <ZOOM>` — Zoom to cut at. Shards own zooms [PIVOT, --max-zoom]; the coarse job owns [0, PIVOT-1].
+
+   Pick it so each shard holds a few tiles' worth of data: too coarse and the fleet cannot be balanced (there are not enough tiles to cut), too fine and the coarse job is doing most of the build on its own. z4-z8 covers every realistic fleet size.
+
+  Default value: `6`
+* `-f`, `--force` — Overwrite an existing plan at --output
 
 
 

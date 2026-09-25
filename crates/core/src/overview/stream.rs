@@ -1262,7 +1262,11 @@ fn convert_preflight(
     let row_groups_read = selected_row_groups
         .as_ref()
         .map_or(row_groups_total, RowGroupSelection::total_selected);
-    if selected_row_groups.is_some() {
+    // Gated on the two prunings this line NAMES, not on the selection being
+    // present: a `--shard` run prunes too, and reporting its selection as an
+    // "attribute filter" would send whoever read the log looking for a
+    // `--filter` that was never passed. The shard has its own line below.
+    if options.bbox.is_some() || bound_filter.is_some() {
         let what = super::convert::pruning_label(options.bbox.is_some(), bound_filter.is_some());
         log::info!("{what} filter: reading {row_groups_read}/{row_groups_total} input row groups");
     }

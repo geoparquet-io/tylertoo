@@ -365,6 +365,8 @@ impl core::convert::From<parquet::errors::ParquetError> for tylertoo_core::input
 pub fn tylertoo_core::input::InputError::from(parquet::errors::ParquetError) -> Self
 impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::input::InputError) -> Self
+impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::shard::ShardError
+pub fn tylertoo_core::shard::ShardError::from(tylertoo_core::input::InputError) -> Self
 impl core::error::Error for tylertoo_core::input::InputError
 pub fn tylertoo_core::input::InputError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for tylertoo_core::input::InputError
@@ -459,6 +461,8 @@ pub fn tylertoo_core::input_set::ConvertSource::key_value_metadata(&self) -> cor
 pub fn tylertoo_core::input_set::ConvertSource::num_row_groups_total(&self) -> core::result::Result<usize, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::open_stream(&self, &tylertoo_core::input_set::ReadPlan<'_>) -> core::result::Result<tylertoo_core::input_set::SourceStream<'_>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::part_row_counts(&self) -> core::result::Result<alloc::vec::Vec<(i64, usize)>, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input_set::ConvertSource::part_row_group_bounds(&self) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>>, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input_set::ConvertSource::part_row_group_row_counts(&self) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<i64>>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::parts(&self) -> &[tylertoo_core::input::InputSource]
 pub fn tylertoo_core::input_set::ConvertSource::resolve(&str) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::resolve_path(&std::path::Path) -> core::result::Result<Self, tylertoo_core::input::InputError>
@@ -1199,6 +1203,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::read_workers: usize
 pub tylertoo_core::overview::convert::ConvertOptions::representation: alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>
 pub tylertoo_core::overview::convert::ConvertOptions::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
 pub tylertoo_core::overview::convert::ConvertOptions::save_plan: core::option::Option<std::path::PathBuf>
+pub tylertoo_core::overview::convert::ConvertOptions::shard: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::convert::ConvertOptions::simplify: tylertoo_core::overview::simplify::SimplifyOptions
 pub tylertoo_core::overview::convert::ConvertOptions::sort_key: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::convert::ConvertOptions::spill_dir: core::option::Option<std::path::PathBuf>
@@ -1339,6 +1344,9 @@ pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::d
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declared: u8
+pub tylertoo_core::overview::export::ExportError::EmptyTileRange
+pub tylertoo_core::overview::export::ExportError::EmptyTileRange::coarsest: u8
+pub tylertoo_core::overview::export::ExportError::EmptyTileRange::finest: u8
 pub tylertoo_core::overview::export::ExportError::Io(core::io::error::Error)
 pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive
 pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive::gsd: f64
@@ -1420,7 +1428,9 @@ pub tylertoo_core::overview::export::ExportOptions::partition_wave: usize
 pub tylertoo_core::overview::export::ExportOptions::properties: tylertoo_core::overview::properties::PropertySelection
 pub tylertoo_core::overview::export::ExportOptions::simple_clip_fastpath: bool
 pub tylertoo_core::overview::export::ExportOptions::tile_buffer: u32
+pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>
+pub tylertoo_core::overview::export::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl core::clone::Clone for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::clone(&self) -> tylertoo_core::overview::export::ExportOptions
 impl core::default::Default for tylertoo_core::overview::export::ExportOptions
@@ -2743,6 +2753,212 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::crs_info_from_kv_metadata(core::option::Option<&alloc::vec::Vec<parquet::file::metadata::KeyValue>>) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::quality::extract_crs(&std::path::Path) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::quality::validate_wgs84(&std::path::Path) -> tylertoo_core::Result<()>
+pub mod tylertoo_core::shard
+pub enum tylertoo_core::shard::ShardError
+pub tylertoo_core::shard::ShardError::BadShardSelector
+pub tylertoo_core::shard::ShardError::BadShardSelector::value: alloc::string::String
+pub tylertoo_core::shard::ShardError::BadTileId
+pub tylertoo_core::shard::ShardError::BadTileId::id: u64
+pub tylertoo_core::shard::ShardError::BadTileId::reason: alloc::string::String
+pub tylertoo_core::shard::ShardError::BadTileRange
+pub tylertoo_core::shard::ShardError::BadTileRange::value: alloc::string::String
+pub tylertoo_core::shard::ShardError::EmptyTileRange
+pub tylertoo_core::shard::ShardError::EmptyTileRange::hi: u64
+pub tylertoo_core::shard::ShardError::EmptyTileRange::lo: u64
+pub tylertoo_core::shard::ShardError::Input(tylertoo_core::input::InputError)
+pub tylertoo_core::shard::ShardError::Io
+pub tylertoo_core::shard::ShardError::Io::path: alloc::string::String
+pub tylertoo_core::shard::ShardError::Io::source: core::io::error::Error
+pub tylertoo_core::shard::ShardError::Malformed
+pub tylertoo_core::shard::ShardError::Malformed::path: alloc::string::String
+pub tylertoo_core::shard::ShardError::Malformed::what: alloc::string::String
+pub tylertoo_core::shard::ShardError::PivotNotCoarser
+pub tylertoo_core::shard::ShardError::PivotNotCoarser::max_zoom: u8
+pub tylertoo_core::shard::ShardError::PivotNotCoarser::pivot: u8
+pub tylertoo_core::shard::ShardError::PivotOutOfRange
+pub tylertoo_core::shard::ShardError::PivotOutOfRange::pivot: u8
+pub tylertoo_core::shard::ShardError::ShardCountMismatch
+pub tylertoo_core::shard::ShardError::ShardCountMismatch::index: usize
+pub tylertoo_core::shard::ShardError::ShardCountMismatch::path: alloc::string::String
+pub tylertoo_core::shard::ShardError::ShardCountMismatch::plan_shards: usize
+pub tylertoo_core::shard::ShardError::ShardCountMismatch::shards: usize
+pub tylertoo_core::shard::ShardError::ShardCountOutOfRange
+pub tylertoo_core::shard::ShardError::ShardCountOutOfRange::max: u64
+pub tylertoo_core::shard::ShardError::ShardCountOutOfRange::pivot: u8
+pub tylertoo_core::shard::ShardError::ShardCountOutOfRange::shards: usize
+pub tylertoo_core::shard::ShardError::ShardIndexOutOfRange
+pub tylertoo_core::shard::ShardError::ShardIndexOutOfRange::index: usize
+pub tylertoo_core::shard::ShardError::ShardIndexOutOfRange::shards: usize
+pub tylertoo_core::shard::ShardError::SourceMismatch
+pub tylertoo_core::shard::ShardError::SourceMismatch::field: alloc::string::String
+pub tylertoo_core::shard::ShardError::SourceMismatch::now: alloc::string::String
+pub tylertoo_core::shard::ShardError::SourceMismatch::path: alloc::string::String
+pub tylertoo_core::shard::ShardError::SourceMismatch::saved: alloc::string::String
+pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch
+pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch::hi: u64
+pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch::hi_zoom: u8
+pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch::lo: u64
+pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch::lo_zoom: u8
+impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::shard::ShardError
+pub fn tylertoo_core::shard::ShardError::from(tylertoo_core::input::InputError) -> Self
+impl core::error::Error for tylertoo_core::shard::ShardError
+pub fn tylertoo_core::shard::ShardError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for tylertoo_core::shard::ShardError
+pub fn tylertoo_core::shard::ShardError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::shard::ShardError
+pub fn tylertoo_core::shard::ShardError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::shard::ShardError
+impl core::marker::Send for tylertoo_core::shard::ShardError
+impl core::marker::Sync for tylertoo_core::shard::ShardError
+impl core::marker::Unpin for tylertoo_core::shard::ShardError
+impl core::marker::UnsafeUnpin for tylertoo_core::shard::ShardError
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::ShardError
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::ShardError
+pub enum tylertoo_core::shard::ShardRole
+pub tylertoo_core::shard::ShardRole::Coarse
+pub tylertoo_core::shard::ShardRole::Shard
+pub tylertoo_core::shard::ShardRole::Shard::index: usize
+pub tylertoo_core::shard::ShardRole::Shard::shards: usize
+impl tylertoo_core::shard::ShardRole
+pub fn tylertoo_core::shard::ShardRole::is_coarse(self) -> bool
+pub fn tylertoo_core::shard::ShardRole::parse(&str) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
+impl core::clone::Clone for tylertoo_core::shard::ShardRole
+pub fn tylertoo_core::shard::ShardRole::clone(&self) -> tylertoo_core::shard::ShardRole
+impl core::cmp::Eq for tylertoo_core::shard::ShardRole
+impl core::cmp::PartialEq for tylertoo_core::shard::ShardRole
+pub fn tylertoo_core::shard::ShardRole::eq(&self, &tylertoo_core::shard::ShardRole) -> bool
+impl core::fmt::Debug for tylertoo_core::shard::ShardRole
+pub fn tylertoo_core::shard::ShardRole::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::shard::ShardRole
+pub fn tylertoo_core::shard::ShardRole::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::shard::ShardRole
+impl core::marker::StructuralPartialEq for tylertoo_core::shard::ShardRole
+impl core::marker::Freeze for tylertoo_core::shard::ShardRole
+impl core::marker::Send for tylertoo_core::shard::ShardRole
+impl core::marker::Sync for tylertoo_core::shard::ShardRole
+impl core::marker::Unpin for tylertoo_core::shard::ShardRole
+impl core::marker::UnsafeUnpin for tylertoo_core::shard::ShardRole
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::ShardRole
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::ShardRole
+pub struct tylertoo_core::shard::ShardInput
+pub tylertoo_core::shard::ShardInput::num_rows: i64
+pub tylertoo_core::shard::ShardInput::path: alloc::string::String
+pub tylertoo_core::shard::ShardInput::row_groups: usize
+impl core::clone::Clone for tylertoo_core::shard::ShardInput
+pub fn tylertoo_core::shard::ShardInput::clone(&self) -> tylertoo_core::shard::ShardInput
+impl core::cmp::Eq for tylertoo_core::shard::ShardInput
+impl core::cmp::PartialEq for tylertoo_core::shard::ShardInput
+pub fn tylertoo_core::shard::ShardInput::eq(&self, &tylertoo_core::shard::ShardInput) -> bool
+impl core::fmt::Debug for tylertoo_core::shard::ShardInput
+pub fn tylertoo_core::shard::ShardInput::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::shard::ShardInput
+impl serde_core::ser::Serialize for tylertoo_core::shard::ShardInput
+pub fn tylertoo_core::shard::ShardInput::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::shard::ShardInput
+pub fn tylertoo_core::shard::ShardInput::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::shard::ShardInput
+impl core::marker::Send for tylertoo_core::shard::ShardInput
+impl core::marker::Sync for tylertoo_core::shard::ShardInput
+impl core::marker::Unpin for tylertoo_core::shard::ShardInput
+impl core::marker::UnsafeUnpin for tylertoo_core::shard::ShardInput
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::ShardInput
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::ShardInput
+pub struct tylertoo_core::shard::ShardPlan
+pub tylertoo_core::shard::ShardPlan::estimated_rows_total: u64
+pub tylertoo_core::shard::ShardPlan::format: alloc::string::String
+pub tylertoo_core::shard::ShardPlan::inputs: alloc::vec::Vec<tylertoo_core::shard::ShardInput>
+pub tylertoo_core::shard::ShardPlan::pivot_zoom: u8
+pub tylertoo_core::shard::ShardPlan::ranges: alloc::vec::Vec<tylertoo_core::shard::ShardRange>
+pub tylertoo_core::shard::ShardPlan::unplaced_rows: u64
+pub tylertoo_core::shard::ShardPlan::version: u32
+impl tylertoo_core::shard::ShardPlan
+pub fn tylertoo_core::shard::ShardPlan::compute(&tylertoo_core::input_set::ConvertSource, u8, usize) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::ShardPlan::load(&std::path::Path) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::ShardPlan::range(&self, usize) -> core::result::Result<tylertoo_core::shard::TileRange, tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::ShardPlan::range_for(&self, tylertoo_core::shard::ShardRole, &std::path::Path) -> core::result::Result<core::option::Option<tylertoo_core::shard::TileRange>, tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::ShardPlan::save(&self, &std::path::Path) -> core::result::Result<(), tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::ShardPlan::shards(&self) -> usize
+pub fn tylertoo_core::shard::ShardPlan::verify_source(&self, &tylertoo_core::input_set::ConvertSource, &std::path::Path) -> core::result::Result<(), tylertoo_core::shard::ShardError>
+impl core::clone::Clone for tylertoo_core::shard::ShardPlan
+pub fn tylertoo_core::shard::ShardPlan::clone(&self) -> tylertoo_core::shard::ShardPlan
+impl core::cmp::Eq for tylertoo_core::shard::ShardPlan
+impl core::cmp::PartialEq for tylertoo_core::shard::ShardPlan
+pub fn tylertoo_core::shard::ShardPlan::eq(&self, &tylertoo_core::shard::ShardPlan) -> bool
+impl core::fmt::Debug for tylertoo_core::shard::ShardPlan
+pub fn tylertoo_core::shard::ShardPlan::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::shard::ShardPlan
+impl serde_core::ser::Serialize for tylertoo_core::shard::ShardPlan
+pub fn tylertoo_core::shard::ShardPlan::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::shard::ShardPlan
+pub fn tylertoo_core::shard::ShardPlan::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::shard::ShardPlan
+impl core::marker::Send for tylertoo_core::shard::ShardPlan
+impl core::marker::Sync for tylertoo_core::shard::ShardPlan
+impl core::marker::Unpin for tylertoo_core::shard::ShardPlan
+impl core::marker::UnsafeUnpin for tylertoo_core::shard::ShardPlan
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::ShardPlan
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::ShardPlan
+pub struct tylertoo_core::shard::ShardRange
+pub tylertoo_core::shard::ShardRange::estimated_rows: u64
+pub tylertoo_core::shard::ShardRange::hi: u64
+pub tylertoo_core::shard::ShardRange::lo: u64
+impl core::clone::Clone for tylertoo_core::shard::ShardRange
+pub fn tylertoo_core::shard::ShardRange::clone(&self) -> tylertoo_core::shard::ShardRange
+impl core::cmp::Eq for tylertoo_core::shard::ShardRange
+impl core::cmp::PartialEq for tylertoo_core::shard::ShardRange
+pub fn tylertoo_core::shard::ShardRange::eq(&self, &tylertoo_core::shard::ShardRange) -> bool
+impl core::fmt::Debug for tylertoo_core::shard::ShardRange
+pub fn tylertoo_core::shard::ShardRange::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::shard::ShardRange
+impl serde_core::ser::Serialize for tylertoo_core::shard::ShardRange
+pub fn tylertoo_core::shard::ShardRange::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::shard::ShardRange
+pub fn tylertoo_core::shard::ShardRange::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::shard::ShardRange
+impl core::marker::Send for tylertoo_core::shard::ShardRange
+impl core::marker::Sync for tylertoo_core::shard::ShardRange
+impl core::marker::Unpin for tylertoo_core::shard::ShardRange
+impl core::marker::UnsafeUnpin for tylertoo_core::shard::ShardRange
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::ShardRange
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::ShardRange
+pub struct tylertoo_core::shard::TileRange
+pub tylertoo_core::shard::TileRange::hi: u64
+pub tylertoo_core::shard::TileRange::lo: u64
+pub tylertoo_core::shard::TileRange::pivot_zoom: u8
+impl tylertoo_core::shard::TileRange
+pub fn tylertoo_core::shard::TileRange::bounds(&self) -> tylertoo_core::tile::TileBounds
+pub fn tylertoo_core::shard::TileRange::contains(&self, u8, u64) -> bool
+pub fn tylertoo_core::shard::TileRange::ids_at(&self, u8) -> core::option::Option<core::ops::range::RangeInclusive<u64>>
+pub fn tylertoo_core::shard::TileRange::new(u8, u64, u64) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::TileRange::parse(&str) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::TileRange::pivot_tiles(&self) -> u64
+pub fn tylertoo_core::shard::TileRange::tile_bounds(&self) -> tylertoo_core::tile::TileBounds
+pub fn tylertoo_core::shard::TileRange::whole_zoom(u8) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
+impl core::clone::Clone for tylertoo_core::shard::TileRange
+pub fn tylertoo_core::shard::TileRange::clone(&self) -> tylertoo_core::shard::TileRange
+impl core::cmp::Eq for tylertoo_core::shard::TileRange
+impl core::cmp::PartialEq for tylertoo_core::shard::TileRange
+pub fn tylertoo_core::shard::TileRange::eq(&self, &tylertoo_core::shard::TileRange) -> bool
+impl core::fmt::Debug for tylertoo_core::shard::TileRange
+pub fn tylertoo_core::shard::TileRange::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::shard::TileRange
+pub fn tylertoo_core::shard::TileRange::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::shard::TileRange
+impl core::marker::StructuralPartialEq for tylertoo_core::shard::TileRange
+impl serde_core::ser::Serialize for tylertoo_core::shard::TileRange
+pub fn tylertoo_core::shard::TileRange::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::shard::TileRange
+pub fn tylertoo_core::shard::TileRange::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::shard::TileRange
+impl core::marker::Send for tylertoo_core::shard::TileRange
+impl core::marker::Sync for tylertoo_core::shard::TileRange
+impl core::marker::Unpin for tylertoo_core::shard::TileRange
+impl core::marker::UnsafeUnpin for tylertoo_core::shard::TileRange
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::TileRange
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::TileRange
+pub const tylertoo_core::shard::MAX_SHARD_PIVOT_ZOOM: u8
+pub const tylertoo_core::shard::SHARD_PLAN_VERSION: u32
+pub fn tylertoo_core::shard::resolve_range(&std::path::Path, tylertoo_core::shard::ShardRole, core::option::Option<&tylertoo_core::input_set::ConvertSource>) -> core::result::Result<(tylertoo_core::shard::ShardPlan, core::option::Option<tylertoo_core::shard::TileRange>), tylertoo_core::shard::ShardError>
 pub mod tylertoo_core::sutherland_hodgman
 pub struct tylertoo_core::sutherland_hodgman::ClipCoord
 pub tylertoo_core::sutherland_hodgman::ClipCoord::x: i64

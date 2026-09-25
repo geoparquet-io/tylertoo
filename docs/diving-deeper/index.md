@@ -19,6 +19,9 @@ so read the ones that match what you are doing.
 - [Keeping memory bounded](bounded-memory.md) — the streaming model
   (memory ≈ O(row group)), the two-pass structure, and what to do when a file is
   too big for RAM.
+- [Sharded builds across a fleet](sharded-builds.md) — splitting one dataset
+  into N independent jobs by tile id, why every shard must consume one convert
+  plan, and the blob-copy merge that puts them back together.
 - [How tylertoo relates to tippecanoe](tippecanoe.md) — a factual capability
   comparison: what each tool does, what only tylertoo does, and which
   quality-ladder concepts are shared.

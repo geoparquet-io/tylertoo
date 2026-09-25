@@ -219,6 +219,8 @@ enum Command {
     Pyramid(PyramidArgs),
     /// Concatenate disjoint PMTiles archives into one (issue #498).
     Merge(MergeArgs),
+    /// Cut a dataset's tile space into N disjoint shards (issue #498).
+    ShardPlan(ShardPlanArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
     /// Compiled only under the `gen-docs` feature; used by CI to regenerate
@@ -453,6 +455,45 @@ struct DecodeArgs {
     files_from: Option<PathBuf>,
 }
 
+/// Arguments for `tylertoo shard-plan` — step 0 of a sharded build (#498).
+///
+/// Cuts the pivot zoom's tile-id space into N contiguous runs of roughly equal
+/// estimated rows and writes them as a small JSON artifact. Every job of the
+/// fleet is then given that one file, so all of them agree on the cut by
+/// construction rather than by each recomputing an estimate.
+///
+/// Reads parquet **footers only** — no data page is touched — so planning a
+/// planet-scale input takes seconds.
+#[derive(Parser, Debug)]
+pub struct ShardPlanArgs {
+    /// Input GeoParquet file (the same input every job of the fleet tiles).
+    #[arg(value_name = "INPUT")]
+    pub input: PathBuf,
+
+    /// Where to write the shard plan.
+    #[arg(short, long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// How many data shards to cut. One `tiles --shard i/N` job per shard,
+    /// plus one `--shard coarse` job; all N+1 archives merge in one step.
+    #[arg(long, value_name = "N")]
+    pub shards: usize,
+
+    /// Zoom to cut at. Shards own zooms [PIVOT, --max-zoom]; the coarse job
+    /// owns [0, PIVOT-1].
+    ///
+    /// Pick it so each shard holds a few tiles' worth of data: too coarse and
+    /// the fleet cannot be balanced (there are not enough tiles to cut), too
+    /// fine and the coarse job is doing most of the build on its own. z4-z8
+    /// covers every realistic fleet size.
+    #[arg(long, value_name = "ZOOM", default_value = "6")]
+    pub pivot: u8,
+
+    /// Overwrite an existing plan at --output.
+    #[arg(short, long)]
+    pub force: bool,
+}
+
 /// Arguments for `tylertoo export-pmtiles`.
 #[derive(Parser, Debug)]
 struct ExportPmtilesArgs {
@@ -546,6 +587,33 @@ struct ExportPmtilesArgs {
     /// deterministic.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
+
+    /// Emit only the tiles in this PMTiles tile-id range (#498): `LO..HI`,
+    /// two tile ids AT THE SAME ZOOM.
+    ///
+    /// That zoom is the pivot. The range then owns every descendant of those
+    /// tiles at every deeper zoom — a subtree's ids are contiguous on the
+    /// Hilbert curve, so the restriction is an exact interval test at each
+    /// zoom, not a bounding approximation. Tiles COARSER than the pivot are
+    /// outside the range and are not emitted.
+    ///
+    /// Ranges that partition the pivot zoom partition every deeper zoom, so
+    /// the resulting archives are disjoint by construction and `tylertoo
+    /// merge` concatenates them without re-encoding anything. `tiles --shard`
+    /// derives this automatically from a shard plan; this flag is the manual
+    /// form, for a cut you want to choose yourself
+    #[arg(long, value_name = "LO..HI")]
+    tile_range: Option<String>,
+
+    /// Emit only the tiles at or below this zoom (#498) — the coarse half of
+    /// a sharded build, complementing --tile-range's finer half.
+    ///
+    /// Distinct from building a shallower pyramid: the overview file still
+    /// holds every level (its convert plan is the one the shards consume, and
+    /// the level plan is fingerprinted), and this only decides which of them
+    /// reach the archive
+    #[arg(long, value_name = "ZOOM")]
+    max_zoom: Option<u8>,
 
     /// Not supported here (single-file subcommand); accepted so the error
     /// can point at `overview`/`tiles` instead of clap's generic message.
@@ -1502,6 +1570,10 @@ impl ConvertTuningArgs {
             spill_dir: self.spill_dir.clone(),
             save_plan: self.save_plan.clone(),
             plan: self.plan.clone(),
+            // Set by `tiles` from --shard / --shard-plan (#498); the shared
+            // tuning set does not own it, since `overview` has no export to
+            // restrict and so no shard to be.
+            shard: None,
         };
 
         // Logged because "no features were dropped" is a surprising thing to
@@ -1666,6 +1738,43 @@ struct TilesArgs {
     #[arg(long, value_name = "PATH")]
     keep_overview: Option<PathBuf>,
 
+    /// Build one job of a sharded fleet (#498): `I/N` for data shard I of N,
+    /// or `coarse` for the job that owns the zooms above the pivot.
+    ///
+    /// Requires --shard-plan. A data shard additionally requires --plan: the
+    /// level assignment is dataset-global (the density budget water-fills a
+    /// super-cell over every candidate of a level, the level walk carries a
+    /// running kept count, --magnitude-ladder dense-ranks the whole column),
+    /// so a shard that recomputed it over its own rows would disagree with
+    /// its siblings and the seams would not line up. The coarse job, which
+    /// reads the whole input anyway, is the run that writes that plan with
+    /// --save-plan.
+    ///
+    /// A data shard reads only the row groups whose bbox reaches its range
+    /// and emits only the tiles its range owns. Features are kept WHOLE: one
+    /// straddling a seam is read and clipped by both neighbours, and each
+    /// emits only its own tiles — so there is no border double-inclusion to
+    /// dedup afterwards, and the merge is a blob copy.
+    ///
+    /// The three build steps, after `tylertoo shard-plan` has cut the plan:
+    /// (1) `--shard coarse --shard-plan shards.json --save-plan convert.plan`;
+    /// (2) one job per shard, `--shard $i/16 --shard-plan shards.json --plan
+    /// convert.plan`; (3) `tylertoo merge out.pmtiles coarse.pmtiles
+    /// shard-*.pmtiles`. See the Sharded builds guide for the full recipe
+    #[arg(
+        long,
+        value_name = "I/N|coarse",
+        requires = "shard_plan",
+        help_heading = "Sharded builds"
+    )]
+    shard: Option<String>,
+
+    /// The shard plan every job of the fleet shares, from `tylertoo
+    /// shard-plan`. It fixes the pivot zoom and the N tile-id ranges, so the
+    /// jobs agree on the cut by construction
+    #[arg(long, value_name = "PATH", help_heading = "Sharded builds")]
+    shard_plan: Option<PathBuf>,
+
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
     verbose: bool,
@@ -1693,6 +1802,7 @@ fn main() -> Result<()> {
         Command::Decode(args) => run_decode(args),
         Command::Pyramid(args) => run_pyramid(args),
         Command::Merge(args) => run_merge(args),
+        Command::ShardPlan(args) => run_shard_plan(args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
         Command::GenReferenceDocs => {
@@ -1733,7 +1843,7 @@ where
     // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
     // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
     // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 9] = [
+    const SUBCOMMANDS: [&str; 10] = [
         "tiles",
         "overview",
         "validate",
@@ -1741,6 +1851,7 @@ where
         "decode",
         "pyramid",
         "merge",
+        "shard-plan",
         "gen-reference-docs",
         "help",
     ];
@@ -2002,6 +2113,74 @@ fn warn_intermediate_space(spec: &InputSpec, dir: &std::path::Path) {
 /// via [`tempfile::NamedTempFile`]'s drop guard. Its path and size are
 /// always logged, and a free-space preflight warns when the chosen volume
 /// looks too small for it (#314).
+/// Which job of a sharded fleet this `tiles` run is, and the slice of the
+/// tile space it owns (#498).
+#[derive(Debug, Clone, Copy)]
+struct ShardJob {
+    role: tylertoo_core::shard::ShardRole,
+    /// The data shard's range, or `None` for the coarse job — which owns the
+    /// zooms below the pivot instead, and expresses that as an export ceiling.
+    range: Option<tylertoo_core::shard::TileRange>,
+    pivot: u8,
+}
+
+/// Resolve `--shard` / `--shard-plan` into a [`ShardJob`], failing fast on
+/// everything that can be known before a byte of input is read.
+///
+/// The shard plan is verified against the input here as well, so a plan cut
+/// for a different (or since-rewritten) file is an error in milliseconds
+/// rather than a fleet of jobs that each tile something slightly different.
+fn resolve_shard_job(
+    spec: &InputSpec,
+    shard: Option<&str>,
+    shard_plan: Option<&Path>,
+    max_zoom: u8,
+) -> Result<Option<ShardJob>> {
+    use tylertoo_core::shard::{ShardPlan, ShardRole};
+
+    let Some(shard) = shard else {
+        // clap's `requires` makes the reverse pairing impossible, but a plan
+        // with no role is a silent no-op worth naming.
+        anyhow::ensure!(
+            shard_plan.is_none(),
+            "--shard-plan needs --shard to say which job this is: `--shard coarse` for the run \
+             that owns the zooms above the pivot and writes the convert plan, or `--shard I/N` \
+             for data shard I"
+        );
+        return Ok(None);
+    };
+    let plan_path = shard_plan.expect("clap requires --shard-plan alongside --shard");
+    let role = ShardRole::parse(shard)?;
+    let plan = ShardPlan::load(plan_path)?;
+    anyhow::ensure!(
+        plan.pivot_zoom <= max_zoom,
+        "--shard-plan {} was cut at pivot z{} but this build stops at --max-zoom {max_zoom}: \
+         the shards would own no zoom at all. Re-cut the plan with a coarser --pivot, or raise \
+         --max-zoom.",
+        plan_path.display(),
+        plan.pivot_zoom,
+    );
+
+    // Bind the plan to the input, the same way the convert plan binds itself.
+    match spec {
+        InputSpec::Path(p) => {
+            let source = tylertoo_core::input_set::ConvertSource::resolve_path(p)?;
+            plan.verify_source(&source, plan_path)?;
+        }
+        InputSpec::Manifest(p) => {
+            let source = tylertoo_core::input_set::ConvertSource::from_manifest(p)?;
+            plan.verify_source(&source, plan_path)?;
+        }
+    }
+
+    let range = plan.range_for(role, plan_path)?;
+    Ok(Some(ShardJob {
+        role,
+        range,
+        pivot: plan.pivot_zoom,
+    }))
+}
+
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
     use tylertoo_core::overview::level::Mode;
@@ -2027,9 +2206,38 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // exported to per-tile MVT). Every other convert knob comes from the
     // shared tuning set, so `tiles` matches the two-step overview → export.
     let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
-    let options = args
+    let mut options = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
+
+    // #498: which job of a sharded fleet this is, and the slice of the tile
+    // space it owns. Resolved before any work, against the plan every job of
+    // the fleet shares, so a mis-specified `--shard 4/8` against a 16-way plan
+    // fails in milliseconds rather than after an hour of tiling.
+    let shard = resolve_shard_job(
+        &spec,
+        args.shard.as_deref(),
+        args.shard_plan.as_deref(),
+        args.max_zoom,
+    )?;
+    if let Some(job) = &shard {
+        options.shard = job.range;
+        log::info!(
+            "[tiles] shard job {}: {}",
+            job.role,
+            match job.range {
+                Some(r) => format!(
+                    "zooms z{}..=z{} of tile range {r}",
+                    job.pivot, args.max_zoom
+                ),
+                None => format!(
+                    "zooms z{}..=z{}",
+                    args.min_zoom,
+                    job.pivot.saturating_sub(1)
+                ),
+            }
+        );
+    }
 
     // #386: the property selection is applied at convert, so an excluded
     // column is already gone from the intermediate when export would sort
@@ -2130,11 +2338,24 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // #380: the archive declares the zoom range that was asked for, even
         // when the coarsest levels generalized to nothing and were omitted
         // from the overview. Only a zoom plan has a requested minimum zoom.
-        min_zoom: args.gsd.is_none().then_some(args.min_zoom),
+        //
+        // #498: a data shard owns no zoom coarser than the pivot, so that is
+        // what it declares — claiming the coarse job's half would misdescribe
+        // an archive that holds none of it.
+        min_zoom: args.gsd.is_none().then(|| match &shard {
+            Some(job) if job.range.is_some() => job.pivot,
+            _ => args.min_zoom,
+        }),
 
         // The property selection was applied on convert (#386): the
         // intermediate overview already carries only the kept columns.
         properties: Default::default(),
+
+        // #498: the two complementary halves of a sharded build. A data shard
+        // takes its range; the coarse job takes everything below the pivot.
+        tile_range: shard.and_then(|job| job.range),
+        zoom_ceiling: shard
+            .and_then(|job| job.range.is_none().then(|| job.pivot.saturating_sub(1))),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -2674,6 +2895,12 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
             exclude: args.exclude_property.clone(),
             exclude_all: args.exclude_all_properties,
         },
+        tile_range: args
+            .tile_range
+            .as_deref()
+            .map(tylertoo_core::shard::TileRange::parse)
+            .transpose()?,
+        zoom_ceiling: args.max_zoom,
     };
 
     println!(
@@ -2905,6 +3132,69 @@ fn preflight_writable(path: &Path) -> Result<()> {
 
 /// Run `tylertoo merge`: several disjoint PMTiles archives → one (thin facade
 /// over `tylertoo_core::merge::merge_shards`).
+/// `tylertoo shard-plan` — step 0 of a sharded build (#498).
+fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
+    use tylertoo_core::shard::ShardPlan;
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    anyhow::ensure!(
+        args.input.exists(),
+        "input {} does not exist",
+        args.input.display()
+    );
+    anyhow::ensure!(
+        args.force || !args.output.exists(),
+        "{} already exists; pass -f/--force to overwrite it. Every job of a fleet must be given \
+         the SAME shard plan, so replacing one mid-build silently re-cuts the tile space.",
+        args.output.display()
+    );
+    preflight_writable(&args.output)?;
+
+    let source = tylertoo_core::input_set::ConvertSource::resolve_path(&args.input)?;
+    let plan = ShardPlan::compute(&source, args.pivot, args.shards)?;
+    plan.save(&args.output)?;
+
+    println!(
+        "Cut {} shard(s) at pivot z{} for {}",
+        plan.shards(),
+        plan.pivot_zoom,
+        args.input.display()
+    );
+    let total = plan.estimated_rows_total.max(1);
+    for (i, r) in plan.ranges.iter().enumerate() {
+        println!(
+            "  shard {i:<3} tiles {}..={}  ({:>5} pivot tile(s), ~{} row(s), {:.1}%)",
+            r.lo,
+            r.hi,
+            r.hi - r.lo + 1,
+            r.estimated_rows,
+            100.0 * r.estimated_rows as f64 / total as f64,
+        );
+    }
+    if plan.unplaced_rows > 0 {
+        println!(
+            "\n⚠ ~{} row(s) could not be placed: their row groups carry no usable bbox \
+             statistics, so they were spread evenly instead of balanced. Run the input through \
+             `gpio optimize` to give every row group a covering, and the cut improves for free.",
+            plan.unplaced_rows
+        );
+    }
+    println!("\n✓ wrote {}", args.output.display());
+    println!(
+        "\nNext:\n  \
+         tylertoo tiles {} coarse.pmtiles --shard coarse --shard-plan {} --save-plan convert.plan\n  \
+         tylertoo tiles {} shard-$i.pmtiles --shard $i/{} --shard-plan {} --plan convert.plan\n  \
+         tylertoo merge out.pmtiles coarse.pmtiles shard-*.pmtiles",
+        args.input.display(),
+        args.output.display(),
+        args.input.display(),
+        plan.shards(),
+        args.output.display(),
+    );
+    Ok(())
+}
+
 fn run_merge(args: MergeArgs) -> Result<()> {
     use tylertoo_core::merge::{merge_shards, MergeOptions};
 

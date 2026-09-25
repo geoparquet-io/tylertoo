@@ -1716,6 +1716,14 @@ over its own subset would reach a different answer, and the shards' pyramids
 would disagree. Compute the assignment once, save the plan, and give every
 shard the same one.
 
+That is exactly what `tiles --shard` does, and it refuses to run without
+`--plan` rather than let the mistake through. A shard also *narrows* the
+plan's row-group selection — it reads only the groups whose bbox reaches its
+tile range — so the fingerprint compares that one term as a subset relation
+and the plan's row-indexed tables are re-addressed onto the shard's shorter
+row stream before pass 2. See [Sharded builds across a
+fleet](diving-deeper/sharded-builds.md) for the whole recipe.
+
 Both flags require the streaming pipeline (they are its pass-1 stage), they
 are mutually exclusive, and they are available on `overview` and `tiles`.
 
