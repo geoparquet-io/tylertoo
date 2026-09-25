@@ -90,11 +90,13 @@ otherwise size the run correctly. Unset it and let the probe read the cgroup.
 
 ### Overlapping read and compute
 
-**`--in-flight-batches N|auto`.** How many read batches move through the pass-2
-pipeline at once. `auto` sizes this to the core count, clamped to 4 through 16.
-Raising it improves core utilization on long-pole geometries at proportionally
-more peak memory, since each in-flight batch stays resident. The chosen depth
-prints at pass-2 start.
+**`--in-flight-batches N|auto`.** How many read batches move through the
+streaming pipeline at once — pass 1's scan and pass 2's per-level fan-out both
+use it. `auto` sizes this to the core count, clamped to 4 through 16. Raising
+it improves core utilization on long-pole geometries at proportionally more
+peak memory, since each in-flight batch stays resident (per pass; passes 1 and
+2 never run concurrently, so this does not double). The chosen depth prints at
+the start of each pass.
 
 ### Placing spill files
 

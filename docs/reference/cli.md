@@ -219,9 +219,9 @@ Generate PMTiles vector tiles (the default pipeline)
 
   Possible values: `auto`, `speed`, `bounded`
 
-* `--in-flight-batches <N|auto>` — Read batches allowed in flight through the pass-2 pipeline at once (read/compute-overlap knob; bounded-channel depth).
+* `--in-flight-batches <N|auto>` — Read batches allowed in flight through the streaming pipeline at once (read/compute-overlap knob; bounded-channel depth) — pass 1's scan and pass 2's per-level fan-out both use it.
 
-   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident). The chosen depth and detected core count are logged at pass-2 start. No effect with --no-streaming.
+   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
 
   Default value: `auto`
 * `--spill-dir <PATH>` — Directory for the remote-input spill file (issues #219/#272).
@@ -415,9 +415,9 @@ Build a multi-resolution overview GeoParquet file
 
   Possible values: `auto`, `speed`, `bounded`
 
-* `--in-flight-batches <N|auto>` — Read batches allowed in flight through the pass-2 pipeline at once (read/compute-overlap knob; bounded-channel depth).
+* `--in-flight-batches <N|auto>` — Read batches allowed in flight through the streaming pipeline at once (read/compute-overlap knob; bounded-channel depth) — pass 1's scan and pass 2's per-level fan-out both use it.
 
-   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident). The chosen depth and detected core count are logged at pass-2 start. No effect with --no-streaming.
+   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
 
   Default value: `auto`
 * `--spill-dir <PATH>` — Directory for the remote-input spill file (issues #219/#272).

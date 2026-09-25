@@ -7405,6 +7405,153 @@ mod tests {
         assert_streaming_equivalent(tin.path(), &base);
     }
 
+    /// A dense grid of points, close enough together that many of them
+    /// collide into the same coarse-level winner cell.
+    fn dense_point_grid(n_side: usize, spacing: f64) -> Vec<Geometry<f64>> {
+        (0..n_side)
+            .flat_map(|i| (0..n_side).map(move |j| (i, j)))
+            .map(|(i, j)| Geometry::Point(Point::new(i as f64 * spacing, j as f64 * spacing)))
+            .collect()
+    }
+
+    /// #460 (pass-1 parallelization) oracle: with no sort key and
+    /// `no_auto_rank`, every feature's `sort_key` is `None` (`RankPlan::SizeFallback`
+    /// with points — no bbox area to measure), so `Priority::beats` falls
+    /// through entirely to `stable_hash(AssignFeature::index)` for every
+    /// cell-winner tie. `AssignFeature::index` is exactly the value the
+    /// chunked pass-1 scan (`overview::stream::run_pass1`) rebases per chunk
+    /// (`chunk_base + i`, #460) — any off-by-one or double-rebase there would
+    /// silently reshuffle which point wins each cell, which this test would
+    /// catch as a row-level mismatch between the streaming and in-memory
+    /// engines. 3,025 points (> `PASS1_CHUNK_ROWS` = 1024, the PRODUCTION
+    /// chunk size — this exercises `run_pass1` itself, not the
+    /// `run_pass1_with_chunk_rows` test hook) packed into a ~0.027° box, so
+    /// level 0 alone forces thousands of ties into a handful of cells.
+    #[test]
+    fn pass1_chunked_scan_matches_in_memory_for_size_fallback_ties() {
+        let geoms = dense_point_grid(55, 0.0005); // 3,025 points
+        assert!(geoms.len() > 1024, "must exceed the production chunk size");
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 6,
+            },
+            no_auto_rank: true, // no sort key: force RankPlan::SizeFallback
+            ..Default::default()
+        };
+        assert_streaming_equivalent(tin.path(), &base);
+    }
+
+    /// Many small, mutually isolated chains of touching line segments, laid
+    /// out on a grid so no two chains' endpoints coincide (coalescing would
+    /// silently merge across chains, and the test would no longer isolate
+    /// what it wants to check). Each chain reproduces `fragment_chain_geoms`'s
+    /// proven-working shape (6 segments of 0.01°, well above the coarse-level
+    /// line visibility gate as a merged chain, below it as fragments).
+    fn many_fragment_chains(
+        cols: usize,
+        rows: usize,
+        chain_len: usize,
+        spacing: f64,
+    ) -> Vec<Geometry<f64>> {
+        let mut geoms = Vec::with_capacity(cols * rows * chain_len);
+        for r in 0..rows {
+            for c in 0..cols {
+                let base_x = c as f64 * spacing;
+                let base_y = r as f64 * spacing;
+                for i in 0..chain_len {
+                    let x0 = base_x + i as f64 * 0.01;
+                    geoms.push(Geometry::LineString(LineString::from(vec![
+                        (x0, base_y),
+                        (x0 + 0.01, base_y),
+                    ])));
+                }
+            }
+        }
+        geoms
+    }
+
+    /// A grid of small, mutually isolated polygons, sized to collapse to a
+    /// placeholder square (`CollapseMode::Square`) at the coarser levels of
+    /// the test's zoom range.
+    fn many_small_polygons(n: usize, cols: usize, spacing: f64, half: f64) -> Vec<Geometry<f64>> {
+        (0..n)
+            .map(|i| {
+                let (row, col) = (i / cols, i % cols);
+                let cx = -60.0 + col as f64 * spacing;
+                let cy = -40.0 - row as f64 * spacing;
+                let ext = LineString::from(vec![
+                    (cx - half, cy - half),
+                    (cx + half, cy - half),
+                    (cx + half, cy + half),
+                    (cx - half, cy + half),
+                    (cx - half, cy - half),
+                ]);
+                Geometry::Polygon(Polygon::new(ext, vec![]))
+            })
+            .collect()
+    }
+
+    /// #460 (pass-1 parallelization) oracle: line coalescing (Q3, the
+    /// `line_rows`/`line_feat_pos`/`line_geoms` rebasing in
+    /// `merge_pass1_chunks`) and the tiny-polygon accumulator (#384, the
+    /// `want_areas`/`areas` rebasing) are pass 1's other two order-sensitive
+    /// merges besides `AssignFeature::index` — this exercises both at once, at
+    /// the PRODUCTION chunk size (1,800 lines + 400 polygons = 2,200 rows >
+    /// `PASS1_CHUNK_ROWS` = 1024). `assert_streaming_equivalent` is the
+    /// independent oracle (in-memory buffered engine, never calls
+    /// `run_pass1`); the `coalesced_count` check after it guards against the
+    /// comparison going vacuous (both engines agreeing only because nothing
+    /// actually coalesced).
+    #[test]
+    fn pass1_chunked_scan_matches_in_memory_for_coalescing_and_tiny_polygons() {
+        let mut geoms = many_fragment_chains(20, 15, 6, 0.5); // 1,800 line fragments
+        let n_lines = geoms.len();
+        geoms.extend(many_small_polygons(400, 20, 0.3, 0.02));
+        assert!(geoms.len() > 1024, "must exceed the production chunk size");
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            no_auto_rank: true,
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Square, // #384 tiny-polygon accumulator on
+                ..Default::default()
+            },
+            ..Default::default() // coalesce_lines is on by default
+        };
+        assert_streaming_equivalent(tin.path(), &base);
+
+        // Guard against a vacuous pass: the coarse levels must actually show
+        // at least one coalesced (merged) line, not just N singletons.
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(
+            tin.path(),
+            tout.path(),
+            &ConvertOptions {
+                streaming: true,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let coarse_counts = read_coalesced_counts(&reader, 0);
+        assert!(
+            coarse_counts.iter().any(|&c| c > 1),
+            "fixture must produce at least one coalesced (merged) line at the \
+             coarsest level, or this test cannot catch a coalesce-rebasing \
+             regression: counts={coarse_counts:?}"
+        );
+        assert!(n_lines > 0, "sanity: fixture must include lines");
+    }
+
     #[test]
     fn streaming_auto_rank_matches_in_memory() {
         // Auto-detected Overture road-class ranking must resolve identically in

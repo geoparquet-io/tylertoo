@@ -54,13 +54,20 @@ fn tylertoo_bin() -> &'static str {
 }
 
 /// Runs one `tiles` conversion of `fixture` to `out` with a pinned
-/// `RAYON_NUM_THREADS` and streaming engine, and returns the PMTiles bytes.
+/// `RAYON_NUM_THREADS`, and returns the PMTiles bytes.
 ///
-/// Zoom is capped at 14 and the fixture (`open-buildings.parquet`, the
-/// smallest committed real fixture with enough features/levels to make
-/// `assign_levels`' per-level parallel wave non-trivial) is small enough
-/// that this completes in well under a second per call.
-fn run_tiles(fixture: &Path, out: &Path, threads: u32, no_streaming: bool) -> Vec<u8> {
+/// `max_zoom` is per-caller: the `open-buildings` arm uses 14 (its features
+/// are tiny and only separate at high zoom), the `#460` arm a much lower one
+/// (its fixture is 17k admin polygons — the point there is the pass-1 row
+/// count, not the tile depth, and a deep pyramid would only make the test
+/// slow).
+fn run_tiles(
+    fixture: &Path,
+    out: &Path,
+    threads: u32,
+    no_streaming: bool,
+    max_zoom: u8,
+) -> Vec<u8> {
     let mut args = vec![
         "tiles".to_string(),
         fixture.to_str().unwrap().to_string(),
@@ -68,7 +75,7 @@ fn run_tiles(fixture: &Path, out: &Path, threads: u32, no_streaming: bool) -> Ve
         "--min-zoom".to_string(),
         "0".to_string(),
         "--max-zoom".to_string(),
-        "14".to_string(),
+        max_zoom.to_string(),
         // Fixed so the streaming and non-streaming runs (and every thread
         // count) share one layer name and are directly comparable.
         "--layer-name".to_string(),
@@ -122,7 +129,7 @@ fn pmtiles_output_is_byte_identical_across_thread_counts() {
 
         for threads in [1u32, 2, 8] {
             let out = dir.path().join(format!("{engine}-t{threads}.pmtiles"));
-            let bytes = run_tiles(&fixture, &out, threads, no_streaming);
+            let bytes = run_tiles(&fixture, &out, threads, no_streaming, 14);
 
             match &baseline {
                 None => baseline = Some((threads, bytes)),
@@ -147,5 +154,66 @@ fn pmtiles_output_is_byte_identical_across_thread_counts() {
                 }
             }
         }
+    }
+}
+
+/// #460 review (S2-X1 / S3-b): the arm above is **vacuous for the parallel
+/// pass-1 scan**. `open-buildings.parquet` holds 1000 rows — fewer than one
+/// pass-1 scan chunk — so every batch is a single chunk at every thread
+/// count, and the `par_iter` it is supposed to guard never has more than one
+/// task to order. A merge or rebase that broke chunk-index rebasing would
+/// sail straight through it.
+///
+/// `fieldmaps-madagascar-adm4.parquet` (17,465 rows) splits into real chunks,
+/// so the chunked merge, the interner/ladder serial seam, and the
+/// `stable_hash(index)` tie-break all actually vary with the thread count
+/// here. Streaming only: `--no-streaming` runs the in-memory pipeline, which
+/// has no pass-1 chunking to guard (the arm above already covers that engine
+/// for `assign_levels`).
+#[test]
+fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
+    let Some(fixture) = fixture::realdata("fieldmaps-madagascar-adm4.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Low max-zoom: the pass-1 scan (what chunks) reads every input row
+    // regardless of zoom, while pass 2 and the tile build scale with the
+    // pyramid depth — so a shallow pyramid keeps this test to a few seconds
+    // per run without weakening the coverage it exists for.
+    const MAX_ZOOM: u8 = 8;
+
+    let mut baseline: Option<(u32, Vec<u8>)> = None;
+    for threads in [1u32, 2, 8] {
+        let out = dir.path().join(format!("mada-t{threads}.pmtiles"));
+        let bytes = run_tiles(&fixture, &out, threads, false, MAX_ZOOM);
+
+        match &baseline {
+            None => baseline = Some((threads, bytes)),
+            Some((base_threads, base_bytes)) => {
+                assert_eq!(
+                    base_bytes.len(),
+                    bytes.len(),
+                    "PMTiles size differs between RAYON_NUM_THREADS={base_threads} ({} bytes) \
+                     and RAYON_NUM_THREADS={threads} ({} bytes) — the parallel pass-1 scan \
+                     (#460) is not thread-count invariant",
+                    base_bytes.len(),
+                    bytes.len()
+                );
+                assert!(
+                    base_bytes == &bytes,
+                    "PMTiles output differs between RAYON_NUM_THREADS={base_threads} and \
+                     RAYON_NUM_THREADS={threads} (same {} byte length, different content) — \
+                     the parallel pass-1 scan (#460) is not thread-count invariant: a \
+                     chunk-local index is probably reaching an accumulator unrebased, or a \
+                     per-chunk result is being merged out of order",
+                    bytes.len()
+                );
+            }
+        }
+        // The kept overview Parquet is NOT compared here — see the module
+        // docs: its GeoParquet footer's `geometry_types` still serializes a
+        // `HashSet`. Once that is deterministic, this arm should compare it
+        // too (it is the artifact pass 1 actually produces).
     }
 }

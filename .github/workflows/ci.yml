@@ -482,7 +482,10 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Generate coverage
-        run: cargo tarpaulin --out xml --all-features --workspace --exclude tylertoo-python
+        # --timeout 300: tarpaulin's 60s default per-test timeout is too tight
+        # for the thread-count determinism e2e (multiple instrumented CLI
+        # subprocess runs over the 17k-row madagascar fixture, #460).
+        run: cargo tarpaulin --out xml --all-features --workspace --exclude tylertoo-python --timeout 300
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
