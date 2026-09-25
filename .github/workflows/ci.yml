@@ -168,7 +168,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install protoc
         run: |
@@ -269,7 +269,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -500,7 +500,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-llvm-cov-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-llvm-cov-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install protoc
         run: |

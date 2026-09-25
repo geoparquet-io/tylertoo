@@ -120,6 +120,13 @@ unnested_or_patterns = "warn"
 unused_self = "warn"
 zero_sized_map_values = "warn"
 
+# Optimize dependencies (arrow, parquet, geo, zstd, ...) in dev and test
+# builds. The e2e tests drive the debug CLI over real fixtures, and
+# unoptimized dependencies made them the CI long pole (#524). Workspace
+# crates stay at opt-level 0, so they still debug and instrument cleanly.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 lto = true
 codegen-units = 1
