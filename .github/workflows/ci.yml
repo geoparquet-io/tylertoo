@@ -578,8 +578,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # cargo-semver-checks resolves its baseline from a git revision,
-          # so the job needs main's history, not just this commit.
+          # Full history kept: the (currently disabled, see below) semver
+          # gate resolves its baseline from a git revision.
           fetch-depth: 0
 
       - name: Install Rust
@@ -587,10 +587,10 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install cargo-audit, cargo-deny, and cargo-semver-checks
+      - name: Install cargo-audit and cargo-deny
         uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
-          tool: cargo-audit,cargo-deny,cargo-semver-checks
+          tool: cargo-audit,cargo-deny
 
       # Cargo.lock is committed, so there is nothing to generate here: the
       # audits below run against the exact versions we build and ship. This
@@ -607,24 +607,26 @@ jobs:
       - name: Run cargo deny (advisories, licenses, bans, sources)
         run: cargo deny check
 
-      - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Check for breaking API changes
-        # Compares tylertoo-core's public API against main and fails on a
-        # breaking change that the version bump does not allow. Pre-1.0, a
-        # breaking change requires a MINOR bump.
-        #
-        # The baseline is a git revision, not crates.io: tylertoo-core is
-        # unpublished, so the default registry lookup finds nothing. On a
-        # push to main the baseline is HEAD, which passes trivially; the PR
-        # run is the gate that matters.
-        run: |
-          cargo semver-checks check-release \
-            --package tylertoo-core \
-            --baseline-rev origin/main
+      # SEMVER GATE DISABLED until the v0.9 "freeze" milestone (#436/#437).
+      #
+      # cargo-semver-checks (vs --baseline-rev origin/main) required a
+      # version bump in every PR that broke tylertoo-core's public API.
+      # Pre-freeze, the public surface is deliberately still in flux
+      # (#437 shrinks it; #436 makes it evolvable), so the gate forced a
+      # hand-bump per breaking PR and marched the workspace version from
+      # 0.8 to 0.12 with no releases behind it — more pain than value.
+      # Re-enable when the v0.9 API freeze lands: restore the
+      # cargo-semver-checks tool in the install step above and this step:
+      #
+      #   - name: Check for breaking API changes
+      #     run: |
+      #       cargo semver-checks check-release \
+      #         --package tylertoo-core \
+      #         --baseline-rev origin/main
+      #
+      # The committed public-api baseline job below stays: API changes are
+      # still surfaced in review via api/tylertoo-core.txt diffs — they just
+      # no longer force a version bump.
 
   # Public API surface: fail when tylertoo-core's exported API drifts from the
   # committed baseline. This is a REVIEW gate, not a ban on growth — an
