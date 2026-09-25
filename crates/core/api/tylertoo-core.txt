@@ -1368,6 +1368,9 @@ pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::knob: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::name: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::Reader(tylertoo_core::overview::reader::ReaderError)
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
 pub tylertoo_core::overview::export::ExportError::UnknownProperty
 pub tylertoo_core::overview::export::ExportError::UnknownProperty::available: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::UnknownProperty::name: alloc::string::String
@@ -2957,7 +2960,9 @@ impl core::marker::UnsafeUnpin for tylertoo_core::shard::TileRange
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::TileRange
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::TileRange
 pub const tylertoo_core::shard::MAX_SHARD_PIVOT_ZOOM: u8
+pub const tylertoo_core::shard::MAX_SHARD_TILE_BUFFER_PX: u32
 pub const tylertoo_core::shard::SHARD_PLAN_VERSION: u32
+pub const tylertoo_core::shard::SHARD_READ_MARGIN_TILES: f64
 pub fn tylertoo_core::shard::resolve_range(&std::path::Path, tylertoo_core::shard::ShardRole, core::option::Option<&tylertoo_core::input_set::ConvertSource>) -> core::result::Result<(tylertoo_core::shard::ShardPlan, core::option::Option<tylertoo_core::shard::TileRange>), tylertoo_core::shard::ShardError>
 pub mod tylertoo_core::sutherland_hodgman
 pub struct tylertoo_core::sutherland_hodgman::ClipCoord

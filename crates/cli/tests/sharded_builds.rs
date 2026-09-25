@@ -429,6 +429,64 @@ fn export_tile_range_restricts_and_rejects_mixed_zooms() {
     assert!(out.contains("same zoom"), "{out}");
 }
 
+/// A `--tile-buffer` wider than a shard's read-pruning margin is refused.
+///
+/// A shard prunes its input to the row groups within two pivot tiles of its
+/// range; a buffer wider than that could pull geometry into one of its tiles
+/// from a row group it never read, and the tile would come out missing
+/// geometry the monolithic run has. Silently wrong is the failure mode this
+/// prevents, so it is an error, not a warning.
+#[test]
+fn a_tile_buffer_wider_than_the_shard_margin_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let overview = dir.path().join("ov.parquet");
+    let (ok, out) = run(&[
+        "overview",
+        grid().to_str().unwrap(),
+        overview.to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "4",
+    ]);
+    assert!(ok, "{out}");
+
+    let (ok, out) = run(&[
+        "export-pmtiles",
+        overview.to_str().unwrap(),
+        dir.path().join("wide.pmtiles").to_str().unwrap(),
+        "--tile-range",
+        "5..12",
+        "--tile-buffer",
+        "513",
+    ]);
+    assert!(!ok, "a 513px buffer must be refused under --tile-range");
+    assert!(
+        out.contains("too wide for a sharded build") && out.contains("512"),
+        "{out}"
+    );
+
+    // Exactly at the bound is fine, and so is any buffer without a range.
+    let (ok, out) = run(&[
+        "export-pmtiles",
+        overview.to_str().unwrap(),
+        dir.path().join("at-bound.pmtiles").to_str().unwrap(),
+        "--tile-range",
+        "5..12",
+        "--tile-buffer",
+        "512",
+    ]);
+    assert!(ok, "512 is the bound, not past it: {out}");
+    let (ok, out) = run(&[
+        "export-pmtiles",
+        overview.to_str().unwrap(),
+        dir.path().join("unsharded.pmtiles").to_str().unwrap(),
+        "--tile-buffer",
+        "600",
+    ]);
+    assert!(ok, "the bound only applies to a sharded export: {out}");
+}
+
 /// Total tiles from an `export-pmtiles` run's summary line.
 fn count_tiles(stdout: &str) -> usize {
     stdout

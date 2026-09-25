@@ -407,6 +407,20 @@ pub enum ExportError {
         gsd: f64,
     },
 
+    /// `--tile-buffer` is wider than a shard's read-pruning margin (#498).
+    #[error(
+        "--tile-buffer {buffer} is too wide for a sharded build: a shard prunes its input to \
+         the row groups within {max} tile pixels of its range, so a wider buffer could pull \
+         geometry into a tile from a row group the shard never read. Lower --tile-buffer to \
+         {max} or less (the default is 8), or build without --tile-range."
+    )]
+    TileBufferTooWideForShard {
+        /// The requested buffer, in tile pixels.
+        buffer: u32,
+        /// [`crate::shard::MAX_SHARD_TILE_BUFFER_PX`].
+        max: u32,
+    },
+
     /// A shard restriction leaves no zoom to emit at all (#498).
     #[error(
         "this export would emit no zoom at all: the restriction starts at z{coarsest} and \
@@ -1012,6 +1026,20 @@ fn export_pmtiles_impl(
         return Err(ExportError::EmptyTileRange {
             coarsest: coarsest_zoom,
             finest: max_zoom,
+        });
+    }
+    // #498: the read-pruning safety bound, enforced at the one place that can
+    // see both halves. A shard's convert prunes input row groups against its
+    // tile range widened by `SHARD_READ_MARGIN_TILES` pivot tiles; a buffer
+    // wider than that margin would let a feature render into a shard's tile
+    // from a row group the shard never read, and the tile would come out
+    // missing geometry the monolithic run has. Refused rather than silently
+    // wrong.
+    if options.tile_range.is_some() && options.tile_buffer > crate::shard::MAX_SHARD_TILE_BUFFER_PX
+    {
+        return Err(ExportError::TileBufferTooWideForShard {
+            buffer: options.tile_buffer,
+            max: crate::shard::MAX_SHARD_TILE_BUFFER_PX,
         });
     }
     // #380: the archive may declare a coarser minimum than the file holds.

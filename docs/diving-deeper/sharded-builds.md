@@ -208,6 +208,13 @@ row-group argument that makes ordinary features safe covers them unchanged: a
 representative near a seam is read by both neighbours, and each emits only its
 own tiles.
 
+**`--tile-buffer` is capped at 512 tile pixels.** A shard prunes its input to
+the row groups within two pivot tiles of its range; a wider buffer could pull
+geometry into one of its tiles from a row group it never read, so the tile
+would come out missing geometry the monolithic run has. 512 is two full tile
+widths, against a default of 8 — anything past it is refused rather than
+silently wrong.
+
 The Python bindings do not expose sharding yet, the same as the convert plan it
 depends on.
 

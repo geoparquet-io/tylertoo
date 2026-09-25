@@ -96,6 +96,30 @@ const SHARD_PLAN_FORMAT: &str = "tylertoo-shard-plan";
 /// for any real fleet size is z4–z8.
 pub const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 
+/// How far past its own tiles a shard widens the bbox it prunes input row
+/// groups against, in whole **pivot** tiles.
+///
+/// This is the safety bound of the whole read-pruning argument, so it is worth
+/// stating exactly. The export clips each feature to its tile's bounds widened
+/// by `tile_width(zoom) × tile_buffer / 256`, so a feature outside a tile can
+/// still render into it — and a shard that pruned away that feature's row
+/// group would emit a tile missing geometry the monolithic run has. The pivot
+/// zoom has the widest tiles of any zoom a shard owns, so its buffer is the
+/// largest absolute margin any of them needs.
+///
+/// Two pivot tiles therefore covers every `--tile-buffer` up to **512** tile
+/// pixels — two full tile widths, against a default of 8 and a tippecanoe
+/// default of 5. `MaxTileBufferForShard` refuses anything past it rather than
+/// silently dropping tiles, so the bound is enforced, not merely assumed.
+///
+/// The cost of the margin is bounded and small: a couple more row groups read
+/// per shard, on an input whose row groups are Hilbert-compact.
+pub const SHARD_READ_MARGIN_TILES: f64 = 2.0;
+
+/// The largest `--tile-buffer` (in tile pixels) a sharded build may use, given
+/// [`SHARD_READ_MARGIN_TILES`]. See that constant for the derivation.
+pub const MAX_SHARD_TILE_BUFFER_PX: u32 = 512;
+
 /// Everything that can go wrong cutting, reading or applying a shard plan.
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
@@ -459,18 +483,19 @@ impl TileRange {
         out.unwrap_or_else(|| TileBounds::new(-180.0, -90.0, 180.0, 90.0))
     }
 
-    /// [`TileRange::tile_bounds`] widened by one whole pivot tile on every
-    /// side — the bbox a shard prunes its **input row groups** against.
+    /// [`TileRange::tile_bounds`] widened by [`SHARD_READ_MARGIN_TILES`] pivot
+    /// tiles on every side — the bbox a shard prunes its **input row groups**
+    /// against.
     ///
     /// The margin is what makes the pruning safe rather than merely tight: a
     /// feature just outside a tile still renders into it through the export's
     /// edge buffer, so a row group whose bbox only grazes the run has to be
-    /// read. One whole tile is orders of magnitude more than the buffer needs
-    /// (which is single-digit tile *pixels*), and over-inclusion costs a read,
-    /// never a tile.
+    /// read. Over-inclusion costs a read; under-inclusion costs a tile, so the
+    /// margin is deliberately far wider than the buffer it covers — see
+    /// [`SHARD_READ_MARGIN_TILES`] for the exact bound.
     pub fn bounds(&self) -> TileBounds {
         let b = self.tile_bounds();
-        let margin = 360.0 / 2f64.powi(i32::from(self.pivot_zoom));
+        let margin = SHARD_READ_MARGIN_TILES * 360.0 / 2f64.powi(i32::from(self.pivot_zoom));
         TileBounds::new(
             (b.lng_min - margin).max(-180.0),
             (b.lat_min - margin).max(-90.0),
