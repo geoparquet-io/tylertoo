@@ -2196,17 +2196,22 @@ fn tiles_summary_line(
 /// band's declared zoom range — which, since #495, is *also* the documented
 /// way to split one pre-tiled archive across several `--band` entries (one
 /// declaring z0-5, another z6-13, both pointing at the same z0-13 archive).
-/// In that workflow every tile the merge keeps came from some band's
-/// declared subrange skipping the rest, so `skipped` reaching `total_tiles`
-/// is routine, not a sign anything vanished — the old unconditional `!`
-/// alarm read as one regardless. When the two coincide this says so plainly
-/// instead; a smaller skip count is still worth the alarm, since it is more
-/// likely a stray off-by-one than a deliberate split.
-fn pyramid_skip_message(skipped: usize, total_tiles: usize) -> Option<String> {
+/// In that workflow the tiles a band leaves behind are picked up by its
+/// sibling, so nothing vanished and the old unconditional `!` alarm read as
+/// one regardless.
+///
+/// `archive_split` says whether the build actually is that workflow — see
+/// [`bands_split_one_archive`]. This used to key off `skipped ==
+/// total_tiles`, which is a count coincidence rather than evidence: a
+/// single band allowed to overshoot by `--allow-missing-zooms` hits it as
+/// soon as it happens to keep as many tiles as it drops (a z3-6 archive
+/// under a z0-4 band keeps 2 and skips 2), and printed the reassuring
+/// "expected when splitting" line for tiles that really were silently lost.
+fn pyramid_skip_message(skipped: usize, archive_split: bool) -> Option<String> {
     if skipped == 0 {
         return None;
     }
-    if skipped == total_tiles {
+    if archive_split {
         Some(format!(
             "  {} tile(s) fell outside a band's declared subrange and were skipped \
              (expected when splitting one pre-tiled archive across several bands)",
@@ -2220,6 +2225,28 @@ fn pyramid_skip_message(skipped: usize, total_tiles: usize) -> Option<String> {
             format_number(skipped as u64)
         ))
     }
+}
+
+/// Whether this build genuinely splits one pre-tiled archive across several
+/// bands — two or more `--band` entries that are PMTiles archives and
+/// resolve to the same file (#527 review, finding 2).
+///
+/// That, not a skipped-tile count, is what makes
+/// [`pyramid_skip_message`]'s reassuring wording true: the tiles one band
+/// drops are the ones its sibling keeps. Paths are compared through
+/// [`canonical_key`], so `./a.pmtiles` and `a.pmtiles` are one archive.
+/// Only `BandSource::Archive` bands count — a GeoParquet band is tiled to
+/// its own declared range, so it never skips anything and listing one twice
+/// is not a split.
+fn bands_split_one_archive(bands: &[tylertoo_core::pyramid::Band]) -> bool {
+    use std::collections::HashSet;
+    use tylertoo_core::pyramid::{classify_band_input, BandSource};
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    bands
+        .iter()
+        .filter(|b| classify_band_input(&b.input) == BandSource::Archive)
+        .any(|b| !seen.insert(canonical_key(&b.input)))
 }
 
 /// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
@@ -2720,7 +2747,11 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
             format_number(*n as u64)
         );
     }
-    if let Some(line) = pyramid_skip_message(report.skipped, report.total_tiles) {
+    // Only consulted when something was skipped: `classify_band_input`
+    // opens each band's first bytes, which is pointless when there is no
+    // line to print.
+    let split = report.skipped > 0 && bands_split_one_archive(&bands);
+    if let Some(line) = pyramid_skip_message(report.skipped, split) {
         println!("{line}");
     }
     println!(
@@ -4068,30 +4099,85 @@ mod tests {
     /// Nothing skipped, nothing printed.
     #[test]
     fn pyramid_skip_message_is_silent_when_nothing_was_skipped() {
-        assert_eq!(pyramid_skip_message(0, 100), None);
-        assert_eq!(pyramid_skip_message(0, 0), None);
+        assert_eq!(pyramid_skip_message(0, true), None);
+        assert_eq!(pyramid_skip_message(0, false), None);
     }
 
     /// The documented way to split one pre-tiled archive across several
-    /// `--band` entries means every kept tile came from some band's declared
-    /// subrange skipping the rest -- `skipped` reaching `total_tiles` is
-    /// routine there, not a sign anything vanished, so it gets a plain note
-    /// instead of the "!" alarm.
+    /// `--band` entries means the tiles one band drops are the ones its
+    /// sibling keeps -- nothing vanished, so it gets a plain note instead of
+    /// the "!" alarm.
     #[test]
     fn pyramid_skip_message_downgrades_the_subrange_split_case() {
-        let msg = pyramid_skip_message(7, 7).unwrap();
+        let msg = pyramid_skip_message(7, true).unwrap();
         assert!(!msg.contains('!'), "{msg}");
         assert!(msg.contains("7") && msg.contains("skipped"), "{msg}");
     }
 
-    /// A skip count short of the total is more likely a stray
-    /// `--minzoom`/`--maxzoom` mismatch than a deliberate split, so it keeps
-    /// the "!" alarm.
+    /// Anything that is not a genuine split keeps the "!" alarm: the tiles
+    /// really are gone and no sibling band picked them up.
     #[test]
-    fn pyramid_skip_message_keeps_the_alarm_when_skipped_is_short_of_total() {
-        let msg = pyramid_skip_message(3, 100).unwrap();
+    fn pyramid_skip_message_keeps_the_alarm_without_a_split() {
+        let msg = pyramid_skip_message(3, false).unwrap();
         assert!(msg.contains('!'), "{msg}");
         assert!(msg.contains("dropped"), "{msg}");
+    }
+
+    /// #527 review, finding 2: the reassuring line used to be keyed on
+    /// `skipped == total_tiles`, a count coincidence. A single band that
+    /// `--allow-missing-zooms` let overshoot hits it whenever it happens to
+    /// keep as many tiles as it drops -- core's own
+    /// `band_partial_overlap_allowed_with_flag_warns` is exactly that shape:
+    /// a z3-6 archive under a z0-4 band keeps 2 and skips 2 -- and the two
+    /// silently lost tiles were reported as an expected split. Equal counts
+    /// alone must not downgrade the alarm.
+    #[test]
+    fn pyramid_skip_message_does_not_trust_equal_counts() {
+        let msg = pyramid_skip_message(2, false).unwrap();
+        assert!(
+            msg.contains('!'),
+            "kept == dropped is not evidence of a split: {msg}"
+        );
+    }
+
+    /// The split signal is two `--band` entries naming the same archive,
+    /// however each one spells the path. A band listed once is not a split,
+    /// and neither is a GeoParquet source listed twice (it is tiled to its
+    /// own range and never skips anything).
+    #[test]
+    fn bands_split_one_archive_detects_a_shared_archive() {
+        use tylertoo_core::pyramid::Band;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("pre.pmtiles");
+        // `classify_band_input` sniffs the magic; the rest is never read.
+        std::fs::write(&archive, b"PMTiles\x03").unwrap();
+        let source = dir.path().join("cells.parquet");
+        std::fs::write(&source, b"PAR1").unwrap();
+
+        let band = |lo: u8, hi: u8, p: PathBuf| Band {
+            input: p,
+            layer: "agg".to_string(),
+            min_zoom: lo,
+            max_zoom: hi,
+        };
+
+        assert!(!bands_split_one_archive(&[band(0, 13, archive.clone())]));
+        assert!(bands_split_one_archive(&[
+            band(0, 5, archive.clone()),
+            band(6, 13, archive.clone()),
+        ]));
+        // Same file, different spelling of the path.
+        let dotted = dir.path().join(".").join("pre.pmtiles");
+        assert!(bands_split_one_archive(&[
+            band(0, 5, archive.clone()),
+            band(6, 13, dotted),
+        ]));
+        // A GeoParquet source twice is not an archive split.
+        assert!(!bands_split_one_archive(&[
+            band(0, 5, source.clone()),
+            band(6, 13, source),
+        ]));
     }
 
     /// #510 review, S3-7: `merge`'s "input is also the output" guard compared
