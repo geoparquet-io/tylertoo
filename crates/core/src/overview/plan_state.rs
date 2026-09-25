@@ -590,20 +590,16 @@ pub(super) fn rebase_plan_for_shard(
         return Ok(plan_cursor);
     }
 
-    let take = |src: &[u8]| -> Vec<u8> {
-        let mut out = Vec::with_capacity(shard_cursor);
-        for r in &runs {
+    fn compact<T: Copy>(src: &[T], runs: &[KeptRun], len: usize) -> Vec<T> {
+        let mut out = Vec::with_capacity(len);
+        for r in runs {
             out.extend_from_slice(&src[r.plan_base..r.plan_base + r.len]);
         }
         out
-    };
-    plan.min_levels = take(&plan.min_levels);
+    }
+    plan.min_levels = compact(&plan.min_levels, &runs, shard_cursor);
     if let Some(kinds) = &plan.kinds {
-        let mut out = Vec::with_capacity(shard_cursor);
-        for r in &runs {
-            out.extend_from_slice(&kinds[r.plan_base..r.plan_base + r.len]);
-        }
-        plan.kinds = Some(out);
+        plan.kinds = Some(compact(kinds, &runs, shard_cursor));
     }
 
     // Side tables are keyed by the same row index, so they move with it.

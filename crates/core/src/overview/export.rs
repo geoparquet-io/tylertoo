@@ -829,12 +829,6 @@ fn export_pmtiles_with_partition_target(
     )
 }
 
-/// Plan every level's partitions and wave width.
-///
-/// `ceiling_wave` is the resolved `--partition-wave` upper bound. On `auto`
-/// each level narrows it further from its own densest partition (#311); an
-/// explicit wave is honoured verbatim.
-#[allow(clippy::too_many_arguments)]
 /// Drop every scanned tile this export does not own (#498).
 ///
 /// Two independent restrictions, both no-ops when unset:
@@ -852,13 +846,9 @@ fn export_pmtiles_with_partition_target(
 /// extent with the range's tile extent instead keeps each shard honest while
 /// still unioning back to exactly the monolithic bbox, because the ranges
 /// cover the pivot zoom completely.
-fn restrict_scans_to_range(
-    scans: &mut [LevelScan],
-    level_zooms: &[u8],
-    options: &ExportOptions,
-) -> Result<(), ExportError> {
+fn restrict_scans_to_range(scans: &mut [LevelScan], level_zooms: &[u8], options: &ExportOptions) {
     if options.tile_range.is_none() && options.zoom_ceiling.is_none() {
-        return Ok(());
+        return;
     }
     let range_bounds = options.tile_range.as_ref().map(|r| r.tile_bounds());
     let mut kept = 0usize;
@@ -894,9 +884,14 @@ fn restrict_scans_to_range(
             .as_ref()
             .map_or(String::new(), |r| format!(" (range {r})"))
     );
-    Ok(())
 }
 
+/// Plan every level's partitions and wave width.
+///
+/// `ceiling_wave` is the resolved `--partition-wave` upper bound. On `auto`
+/// each level narrows it further from its own densest partition (#311); an
+/// explicit wave is honoured verbatim.
+#[allow(clippy::too_many_arguments)]
 fn plan_levels(
     scans: &[LevelScan],
     meta: &OverviewsMeta,
@@ -1129,7 +1124,7 @@ fn export_pmtiles_impl(
     // the restriction free rather than a filter bolted on at write time: an
     // out-of-range tile is never planned, so it is never clipped, encoded,
     // hashed or read for.
-    restrict_scans_to_range(&mut scans, &level_zooms, options)?;
+    restrict_scans_to_range(&mut scans, &level_zooms, options);
     let scans = scans;
 
     let mut overall_bounds: Option<TileBounds> = None;
