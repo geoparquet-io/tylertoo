@@ -59,11 +59,13 @@ not "the run was not profiled".
 ```jsonc
 {
   "timestamp": 1790248637.27,       // UNIX epoch seconds
-  "phase_walls": {                  // wall-clock time per top-level phase
-    "pass1": 0.0297,
-    "pass2": 0.0228,
-    "writer_finish": 0.0005,
-    "total": 0.0310
+  "phase_walls": {                  // DISJOINT wall-clock windows, run order
+    "pass1": 0.0068,                // the scan alone (stops at scan end)
+    "assign": 0.0021,               // resolve_winner_tables: winners, the
+                                    // density budget, carriers, clusters
+    "pass2": 0.0228,                // the level build (stops before finish)
+    "writer_finish": 0.0005,        // writer.finish() alone
+    "total": 0.0330                 // the whole conversion
   },
   "pass1": {
     "rows": 1000,                   // input rows streamed
@@ -103,6 +105,32 @@ not "the run was not profiled".
   "memory_profile": "auto"          // the resolved MemoryProfile
 }
 ```
+
+The four `phase_walls` phases are **disjoint** windows of one conversion, so
+`pass1 + assign + pass2 + writer_finish <= total` always holds; the
+remainder of `total` is the preflight, the writer setup and the closing
+report sums. Until #533 each phase carried its *start* instant to the end of
+the run and elapsed it there, so `pass1` silently covered the assignment,
+all of pass 2 and `writer.finish()` (≈ `total`), the four over-counted
+`total` by ~2×, `pass1.rows_per_sec` was wrong by the same factor, and the
+assignment — the single largest phase on a planet-scale run — had no entry
+at all. `crates/cli/tests/profile_json_dump.rs::profile_json_written_and_parses`
+asserts the partition.
+
+> **`pass2.stage_secs.read` changed meaning in #536.** It is now the *summed
+> core-seconds of the reader worker threads* (`--read-workers`, #494), not the
+> time one consumer thread observed itself waiting for batches. With several
+> workers decoding at once the number goes UP while the pass gets faster, so
+> comparing a dump from before #536 against one from after will read a
+> ~+35% `read` as a regression when it is the opposite. Compare
+> `phase_walls.pass2` across such a pair instead, and treat `stage_secs.read`
+> as a core-seconds figure only. Two costs sit outside that window on purpose:
+> the in-order merge's splice at a worker seam, and opening each segment's
+> reader — the latter is now a bare `File::open` over already-parsed footer
+> metadata (#536 stopped re-parsing the footer per segment, ~5.5 s of CPU on
+> the Brazil fixture), so it is negligible rather than merely uncounted.
+> `pass2.stage_secs.spill_write` likewise moved off the consumer thread onto
+> each level's spill writer and is folded in when that thread is joined.
 
 `pass1.stage_secs` and `pass2.stage_secs` are independent stage splits —
 they do not need to sum to their phase's `rows_per_sec` denominator or to

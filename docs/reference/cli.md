@@ -212,7 +212,7 @@ Generate PMTiles vector tiles (the default pipeline)
    By default the converter streams the input twice: pass 1 builds the per-feature winner tables (level assignment + density budget) holding only bboxes/kinds/sort-keys; pass 2 re-reads the input per level and simplifies + writes batch-by-batch. Peak memory is O(read batch + winner tables) instead of O(dataset) — e.g. Moldova (632k polygons) drops from ~5.4 GB to well under 1 GB peak RSS. Output is equivalent (same level assignments, rows, and footer). This flag reverts to the original in-memory pipeline, which decodes the whole dataset once and may be marginally faster on small inputs that comfortably fit in RAM.
 * `--read-batch-size <ROWS>` — Rows per Arrow read batch in the streaming pipeline (both passes).
 
-   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. No effect with --no-streaming.
+   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. Capped at 1048576 rows. No effect with --no-streaming.
 
   Default value: `8192`
 * `--profile <PROFILE>` — Memory/throughput profile for the single-read pass-2 engine (#213/#212).
@@ -225,7 +225,16 @@ Generate PMTiles vector tiles (the default pipeline)
 
 * `--in-flight-batches <N|auto>` — Read batches allowed in flight through the streaming pipeline at once (read/compute-overlap knob; bounded-channel depth) — pass 1's scan and pass 2's per-level fan-out both use it.
 
-   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
+   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). This is no longer the only resident-batch term: pass 2's readers hold their own read-ahead on top (--read-workers × its queue depth), and under --profile bounded each level's spill writer holds up to 3 more. The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
+
+  Default value: `auto`
+* `--read-workers <N|auto>` — Reader threads pass 2 splits the input across (issue #494).
+
+   Parquet row groups are independently readable, so pass 2 can read the input with several threads at once and merge their batches back into read order. `auto` (the default) takes a quarter of the machine's cores, capped at 4 — readers decompress and decode, so they compete with the pool doing the simplification they are feeding. `1` is the single sequential reader. An explicit value is honoured up to a ceiling of 2× this machine's cores (at least 4); above that it is rejected.
+
+   Output is byte-identical for every value: workers own disjoint runs of row groups and the merge reproduces exactly the batch sequence one reader would have produced.
+
+   Remote inputs always read sequentially (concurrent readers over one remote source evict each other's fetched chunks) — including a remote input the run has staged to local disk, since staging is per-part and the source stays remote. The read-ahead is sized against a modelled slice of the same memory budget the pass-2 sink uses (and each worker's queue is capped shallower under --profile bounded), so a small box, or a wide input, quietly gets fewer workers. Helps most when the input's row groups are small relative to that budget — `gpio` writes well-sized ones.
 
   Default value: `auto`
 * `--spill-dir <PATH>` — Directory for the remote-input spill file (issues #219/#272).
@@ -416,7 +425,7 @@ Build a multi-resolution overview GeoParquet file
    By default the converter streams the input twice: pass 1 builds the per-feature winner tables (level assignment + density budget) holding only bboxes/kinds/sort-keys; pass 2 re-reads the input per level and simplifies + writes batch-by-batch. Peak memory is O(read batch + winner tables) instead of O(dataset) — e.g. Moldova (632k polygons) drops from ~5.4 GB to well under 1 GB peak RSS. Output is equivalent (same level assignments, rows, and footer). This flag reverts to the original in-memory pipeline, which decodes the whole dataset once and may be marginally faster on small inputs that comfortably fit in RAM.
 * `--read-batch-size <ROWS>` — Rows per Arrow read batch in the streaming pipeline (both passes).
 
-   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. No effect with --no-streaming.
+   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. Capped at 1048576 rows. No effect with --no-streaming.
 
   Default value: `8192`
 * `--profile <PROFILE>` — Memory/throughput profile for the single-read pass-2 engine (#213/#212).
@@ -429,7 +438,16 @@ Build a multi-resolution overview GeoParquet file
 
 * `--in-flight-batches <N|auto>` — Read batches allowed in flight through the streaming pipeline at once (read/compute-overlap knob; bounded-channel depth) — pass 1's scan and pass 2's per-level fan-out both use it.
 
-   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
+   `auto` (the default) sizes this to the machine's available cores (clamped to 4..=16); pass an explicit integer to override. Higher improves core utilization on long-pole geometries at proportionally more peak memory (in-flight-batches × read-batch-size rows resident, PER PASS — passes 1 and 2 never run concurrently, so this does not double). This is no longer the only resident-batch term: pass 2's readers hold their own read-ahead on top (--read-workers × its queue depth), and under --profile bounded each level's spill writer holds up to 3 more. The chosen depth and detected core count are logged at the start of each pass. No effect with --no-streaming.
+
+  Default value: `auto`
+* `--read-workers <N|auto>` — Reader threads pass 2 splits the input across (issue #494).
+
+   Parquet row groups are independently readable, so pass 2 can read the input with several threads at once and merge their batches back into read order. `auto` (the default) takes a quarter of the machine's cores, capped at 4 — readers decompress and decode, so they compete with the pool doing the simplification they are feeding. `1` is the single sequential reader. An explicit value is honoured up to a ceiling of 2× this machine's cores (at least 4); above that it is rejected.
+
+   Output is byte-identical for every value: workers own disjoint runs of row groups and the merge reproduces exactly the batch sequence one reader would have produced.
+
+   Remote inputs always read sequentially (concurrent readers over one remote source evict each other's fetched chunks) — including a remote input the run has staged to local disk, since staging is per-part and the source stays remote. The read-ahead is sized against a modelled slice of the same memory budget the pass-2 sink uses (and each worker's queue is capped shallower under --profile bounded), so a small box, or a wide input, quietly gets fewer workers. Helps most when the input's row groups are small relative to that budget — `gpio` writes well-sized ones.
 
   Default value: `auto`
 * `--spill-dir <PATH>` — Directory for the remote-input spill file (issues #219/#272).

@@ -124,6 +124,41 @@ peak memory, since each in-flight batch stays resident (per pass; passes 1 and
 2 never run concurrently, so this does not double). The chosen depth prints at
 the start of each pass.
 
+It is no longer the only resident-batch term, though. Pass 2's readers hold
+their own read-ahead on top of it (`--read-workers` × that worker's queue
+depth), and under `bounded` each level's spill writer can hold up to three more
+batches — two queued plus the one it is encoding. When you are counting
+resident batches, count all three.
+
+**`--read-workers N|auto`.** How many threads pass 2 reads the input with.
+Parquet row groups are independently readable, so several threads decode
+disjoint runs of them and an in-order merge puts the batches back in read order
+— the output is byte-identical for every value. `auto` takes a quarter of the
+cores, capped at 4; an explicit value is honoured up to 2× the machine's cores.
+
+The read-ahead this needs (each worker buffers its run ahead of the merge) is
+sized against the same available-RAM budget the pass-2 sink uses, taking 10% of
+it. So a constrained box gets fewer workers rather than a bigger resident set.
+Under an explicit `--profile bounded` a worker's queue is additionally capped
+at half its usual maximum depth, so a machine with RAM to spare does not build
+the deepest read-ahead under the profile that exists to cap memory.
+
+That bound is a **model**, not a measurement. The budget is charged
+`workers × depth × read-batch-size × per_row`, where `per_row` is the same
+estimate the sink uses: a fixed ~4 KiB non-geometry term plus twice pass 1's
+measured per-row geometry bytes. An input whose non-geometry columns cost much
+more than that — a very wide schema, big strings, many dictionaries — is priced
+too cheaply, and the read-ahead will exceed its nominal share. If you are
+sizing a run to the last hundred MB on a wide schema, measure rather than trust
+the fraction, and `--read-workers 1` removes the term entirely.
+
+Remote inputs read sequentially regardless: their parts share one in-memory
+chunk cache that concurrent readers would evict out from under each other.
+Staging the input to local disk first does **not** change this — staging fills
+that same cache and its disk spill, it does not turn a remote source into a
+local one — so a remote convert's pass-2 read is always sequential. Only inputs
+that were local to begin with read in parallel.
+
 ### Placing spill files
 
 **`--spill-dir <path>`.** Where the remote-input stage file lands, and on

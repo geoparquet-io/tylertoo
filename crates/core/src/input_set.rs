@@ -41,7 +41,9 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+};
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 
@@ -104,6 +106,12 @@ struct PartMeta {
     schema: SchemaRef,
     /// Parsed parquet metadata (row groups, key-value metadata).
     parquet: Arc<ParquetMetaData>,
+    /// The same footer in the shape the arrow reader wants, so opening a
+    /// reader over this part never re-parses it ([`InputSource::open_with_metadata`]).
+    /// Load-bearing for the pass-2 parallel read (#494), which opens one
+    /// reader per segment: a 1084-segment run parsed the footer 1084 times,
+    /// twice per conversion.
+    reader: ArrowReaderMetadata,
 }
 
 /// An ordered set of parquet partitions (local files and/or remote
@@ -164,6 +172,23 @@ impl RowGroupSelection {
     }
 }
 
+/// One reader worker's unit of work: a contiguous run of ONE part's selected
+/// row groups (#494).
+///
+/// A run never straddles a part boundary, so parallel readers can be merged
+/// back into the exact order [`SourceStream`] would have produced: parts stay
+/// sequential, and within a part the runs are ascending and disjoint.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadSegment {
+    /// Index into [`ConvertSource::parts`].
+    pub(crate) part: usize,
+    /// The part's LOCAL row-group indices, ascending.
+    pub(crate) row_groups: Vec<usize>,
+    /// Rows the run holds, per the footer. Sizing only — the merge counts the
+    /// rows it actually sees.
+    pub(crate) rows: usize,
+}
+
 /// How to read a [`ConvertSource`]: batch size, optional root-column
 /// projection (identical schemas make one index set valid for every part),
 /// and optional per-part row-group selection.
@@ -184,6 +209,9 @@ pub struct ReadPlan<'a> {
 /// memory stays bounded by one part's working set.
 pub struct SourceStream<'a> {
     parts: &'a [InputSource],
+    /// Each part's already-parsed footer, parallel to `parts`, so opening a
+    /// part's reader costs a `File::open` and nothing else (#494 follow-up).
+    metas: Vec<ArrowReaderMetadata>,
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
@@ -668,14 +696,110 @@ impl ConvertSource {
             (Some(base), None) => Some(base.to_vec()),
             (Some(base), Some(cols)) => Some(cols.iter().map(|&c| base[c]).collect()),
         };
+        // Footers are parsed once per source (lazily for `Single`, at
+        // construction for `Multi`); every reader this stream opens reuses
+        // them rather than re-decoding O(row_groups × columns) of thrift.
+        let metas = self
+            .metas()?
+            .iter()
+            .map(|m| m.reader.clone())
+            .collect::<Vec<_>>();
         Ok(SourceStream {
             parts,
+            metas,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
             batch_size: plan.batch_size.max(1),
             part_idx: 0,
             current: None,
             done: false,
+        })
+    }
+
+    /// Split this source's selected row groups into ordered reader segments of
+    /// **at most** `target_rows` rows each (#494).
+    ///
+    /// Segments are emitted in exactly the order [`SourceStream`] would read
+    /// them — parts in order, row groups ascending within a part — and never
+    /// straddle a part boundary, which is what lets a set of parallel readers
+    /// be merged back into a single in-order stream. A part with an empty
+    /// selection yields no segments at all, matching the sequential reader,
+    /// which never opens it.
+    ///
+    /// **`target_rows` is a ceiling, not an average.** The caller sets it to
+    /// what one reader can buffer ahead of the merge, and a segment that does
+    /// not fit there makes its worker park mid-segment — which serializes the
+    /// reads again, the exact thing the split exists to avoid. So a row group
+    /// that would take the run past the target starts a new run instead of
+    /// joining it, even though the run is then well under target (51 200-row
+    /// row groups against a 65 536-row target give one row group per segment,
+    /// not two overshooting to 102 400). The one unavoidable exception is a
+    /// single row group larger than the target: row groups are never split, so
+    /// that segment overshoots and the caller's warning fires.
+    pub(crate) fn read_segments(
+        &self,
+        selection: Option<&RowGroupSelection>,
+        target_rows: usize,
+    ) -> Result<Vec<ReadSegment>, InputError> {
+        let target_rows = target_rows.max(1);
+        let metas = self.metas()?;
+        let mut out = Vec::new();
+        for (part, meta) in metas.iter().enumerate() {
+            let selected: Vec<usize> = match selection {
+                Some(sel) => sel.0[part].clone(),
+                None => (0..meta.parquet.num_row_groups()).collect(),
+            };
+            let (mut run, mut run_rows) = (Vec::new(), 0usize);
+            for rg in selected {
+                let rows = meta.parquet.row_group(rg).num_rows().max(0) as usize;
+                if !run.is_empty() && run_rows + rows > target_rows {
+                    out.push(ReadSegment {
+                        part,
+                        row_groups: std::mem::take(&mut run),
+                        rows: run_rows,
+                    });
+                    run_rows = 0;
+                }
+                run.push(rg);
+                run_rows += rows;
+            }
+            if !run.is_empty() {
+                out.push(ReadSegment {
+                    part,
+                    row_groups: run,
+                    rows: run_rows,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open a batch stream over exactly one [`ReadSegment`].
+    ///
+    /// Expressed as an ordinary [`ReadPlan`] whose row-group selection is
+    /// empty for every part but the segment's, so the reader construction,
+    /// projection composition and part skipping are the single-stream ones —
+    /// there is no second way to open an input. The plan's own projection is
+    /// always `None`: the source's `column_projection` (#386) is what restricts
+    /// the columns, and `open_stream` composes it, exactly as it does for the
+    /// sequential read this must reproduce.
+    ///
+    /// Callers running several of these CONCURRENTLY over the same source must
+    /// be local-only: `SourceStream` releases a part's in-memory read cache
+    /// when it finishes that part, which is a no-op for a local file but would
+    /// have concurrent remote readers evicting each other's fetched chunks.
+    pub(crate) fn open_segment(
+        &self,
+        segment: &ReadSegment,
+        batch_size: usize,
+    ) -> Result<SourceStream<'_>, InputError> {
+        let mut per_part = vec![Vec::new(); self.parts().len()];
+        per_part[segment.part].clone_from(&segment.row_groups);
+        let selection = RowGroupSelection::from_parts(per_part);
+        self.open_stream(&ReadPlan {
+            batch_size,
+            projection: None,
+            row_groups: Some(&selection),
         })
     }
 
@@ -696,9 +820,15 @@ impl ConvertSource {
 /// footer after the first open.
 fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     let builder = source.open()?;
+    let parquet = builder.metadata().clone();
+    // Re-derives the arrow schema from the footer we already have — no I/O,
+    // no second footer parse — so every later reader over this part can be
+    // built with `new_with_metadata`.
+    let reader = ArrowReaderMetadata::try_new(parquet.clone(), ArrowReaderOptions::new())?;
     Ok(PartMeta {
         schema: builder.schema().clone(),
-        parquet: builder.metadata().clone(),
+        parquet,
+        reader,
     })
 }
 
@@ -930,7 +1060,7 @@ impl SourceStream<'_> {
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
     fn open_part(&self, i: usize) -> Result<ParquetRecordBatchReader, InputError> {
-        let mut builder = self.parts[i].open()?;
+        let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
         if let Some(cols) = &self.projection {
             let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
             builder = builder.with_projection(mask);
@@ -1578,6 +1708,84 @@ mod tests {
             row_groups: None,
         };
         assert_eq!(stream_ids(&src, &plan), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    // --- reader segments (#494) ------------------------------------------
+
+    /// Write `rows` rows into `path` with `rg_rows` rows per row group.
+    fn write_rowgroups(path: &Path, rows: i64, rg_rows: usize) {
+        write_parquet(
+            path,
+            vec![Field::new("id", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef],
+            Some(rg_rows),
+        );
+    }
+
+    /// `target_rows` is a CEILING. A run that would overshoot it starts a new
+    /// segment instead, because the caller sizes the target to what a reader
+    /// can buffer ahead of the merge — an overshooting segment parks its
+    /// worker mid-run and serializes the reads again.
+    #[test]
+    fn read_segments_never_overshoot_the_target() {
+        let dir = tmpdir();
+        let f = dir.path().join("a.parquet");
+        // 8 row groups of 100 rows, target 150: two row groups would be 200.
+        write_rowgroups(&f, 800, 100);
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let segments = src.read_segments(None, 150).unwrap();
+        assert_eq!(segments.len(), 8, "one row group per segment: {segments:?}");
+        assert!(segments.iter().all(|s| s.rows == 100 && s.part == 0));
+        // A target that fits two row groups takes two.
+        let segments = src.read_segments(None, 200).unwrap();
+        assert_eq!(segments.len(), 4);
+        assert!(segments.iter().all(|s| s.rows == 200));
+        // Row groups stay in ascending order and cover the selection exactly.
+        let all: Vec<usize> = segments
+            .iter()
+            .flat_map(|s| s.row_groups.iter().copied())
+            .collect();
+        assert_eq!(all, (0..8).collect::<Vec<_>>());
+    }
+
+    /// A row group larger than the target is the one case a segment may
+    /// overshoot: row groups are never split.
+    #[test]
+    fn read_segments_keep_an_oversize_row_group_whole() {
+        let dir = tmpdir();
+        let f = dir.path().join("a.parquet");
+        write_rowgroups(&f, 600, 300);
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let segments = src.read_segments(None, 50).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert!(segments.iter().all(|s| s.rows == 300));
+    }
+
+    /// Segments never straddle a part, and a part whose selection is empty
+    /// contributes none — the sequential reader never opens it either.
+    #[test]
+    fn read_segments_respect_parts_and_selection() {
+        let dir = tmpdir();
+        write_rowgroups(&dir.path().join("p0.parquet"), 400, 100);
+        write_rowgroups(&dir.path().join("p1.parquet"), 200, 100);
+        write_rowgroups(&dir.path().join("p2.parquet"), 300, 100);
+        let src = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+
+        let segments = src.read_segments(None, 1000).unwrap();
+        assert_eq!(
+            segments.iter().map(|s| s.part).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "one segment per part when the target swallows a whole part"
+        );
+
+        // Part 1 pruned away entirely.
+        let selection = RowGroupSelection::from_parts(vec![vec![0, 1], Vec::new(), vec![2]]);
+        let segments = src.read_segments(Some(&selection), 1000).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].part, 0);
+        assert_eq!(segments[0].row_groups, vec![0, 1]);
+        assert_eq!(segments[1].part, 2);
+        assert_eq!(segments[1].row_groups, vec![2]);
     }
 
     #[test]

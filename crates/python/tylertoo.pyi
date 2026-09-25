@@ -63,6 +63,7 @@ def overview(
     filter: str | None = None,
     profile: str = "auto",
     in_flight_batches: int = 0,
+    read_workers: int = 0,
     spill_dir: str | Path | None = None,
 ) -> dict[str, Any]: ...
 def export_pmtiles(

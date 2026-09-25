@@ -19,8 +19,10 @@
 //!   giant-geometry long pole at one level overlaps the other levels' work;
 //! - each level's finished output batches accumulate in an ordered **sink**
 //!   (RAM under the `speed` profile, spilled to a temporary Arrow IPC file under
-//!   `bounded`), and after the read completes the sinks drain into the writer in
-//!   level order (writers demand levels 0,1,2… contiguously).
+//!   `bounded` — by a dedicated per-level writer thread, so the consumer hands
+//!   the batch over instead of encoding it, #494), and after the read completes
+//!   the sinks drain into the writer in level order (writers demand levels
+//!   0,1,2… contiguously).
 //!
 //! Output is **byte-identical** to the serial path: within a batch the ascending
 //! `selected` order and `process_level_batch`'s order-preserving `par_iter` are
@@ -44,7 +46,7 @@ use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
-use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
+use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
@@ -118,6 +120,14 @@ const PARTITIONING_GEOM_FACTOR: u64 = 4;
 
 /// Fraction of *available* system RAM the estimated buffered-output set may
 /// occupy before `Auto` spills to a temp file instead of holding it in RAM.
+///
+/// **Headroom.** This budget is charged twice over. The pass-2 sink is what it
+/// is for, but the pass-2 read-ahead ([`READ_BUDGET_FRACTION`]) takes a slice
+/// of the same number *on top* of the sink — 10% of it, half that under an
+/// explicit `bounded` profile. Both slices are modelled, not measured, with
+/// the same per-row estimate ([`estimate_buffered_bytes`]); the 0.4 of
+/// available RAM this fraction leaves unclaimed is what absorbs the error in
+/// both, plus the in-flight batches and the rayon pool's transients.
 const AUTO_RAM_FRACTION: f64 = 0.6;
 
 /// Budget used when available RAM cannot be probed (non-Linux, or
@@ -573,6 +583,832 @@ pub(super) fn resolve_backing(
     }
 }
 
+// ============================================================================
+// Ordered input reading: one sequential reader, or several merged in order
+// ============================================================================
+
+/// What the caller wants from [`read_in_order`], and what it knows about the
+/// rows it is about to read.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ReadTuning {
+    /// Rows per delivered batch. The merge reproduces this chunking exactly,
+    /// however many workers actually read.
+    pub(super) batch_size: usize,
+    /// Reader threads asked for (already resolved; `1` = sequential).
+    pub(super) workers: usize,
+    /// Pass 1's measured average encoded-geometry bytes per input row (#305),
+    /// used only to size the read-ahead against the memory budget. `None`
+    /// falls back to [`READ_ROW_BYTES_FALLBACK`].
+    pub(super) avg_geom_bytes: Option<u64>,
+    /// The run's requested memory profile. `Bounded` means the caller asked
+    /// for memory over speed, so a worker's read-ahead queue is capped lower
+    /// (see [`READ_AHEAD_BOUNDED_MAX_BATCHES`]).
+    pub(super) profile: MemoryProfile,
+}
+
+/// Whether [`read_in_order`]'s consumer wants more batches.
+pub(super) enum ReadFlow {
+    Continue,
+    /// The consumer hung up (its own downstream is gone). Not an error: the
+    /// real one is reported by whoever owns the downstream.
+    Stop,
+}
+
+/// Share of the memory budget the pass-2 read-ahead may hold. Small on
+/// purpose: the read-ahead competes with the pass-2 output sink, which is what
+/// the budget is really for (#294), and a read that is `workers` × deeper than
+/// before must not be what pushes a bounded run into swap.
+///
+/// This is a *model* bound, not a measured guarantee: it bounds
+/// `workers × depth × batch_size × per_row`, where `per_row` is the estimate
+/// in [`resolve_read_shape`]. A schema whose non-geometry columns cost far
+/// more per row than the model assumes is priced too cheaply and the read-ahead
+/// will exceed 10% of the budget. See the per-row note there.
+const READ_BUDGET_FRACTION: f64 = 0.10;
+
+/// Ceiling on a worker's read-ahead under an explicit `bounded` profile: the
+/// caller asked for memory over speed, so a rich machine does not get to build
+/// the full [`READ_AHEAD_MAX_BATCHES`] queue per worker.
+///
+/// This caps the *generous* end and nothing else. Halving the budget slice
+/// instead — the other obvious way to make the read-ahead profile-aware — was
+/// measured and rejected: with the calibrated per-row cost below, halving took
+/// a 58-column fixture from 3 reader threads to none under `bounded`, and
+/// `bounded` is the profile this whole parallel read exists to speed up (#494's
+/// Brazil measurement is a `--profile bounded` run). A ceiling on depth never
+/// costs a worker, and it only binds when `affordable / workers` was already
+/// above it.
+const READ_AHEAD_BOUNDED_MAX_BATCHES: usize = READ_AHEAD_MAX_BATCHES / 2;
+
+/// Floor on a worker's read-ahead, in batches. Below this a worker cannot hold
+/// even a small segment, so it stalls mid-segment and its read does not
+/// overlap anything — at which point a worker is worse than no worker.
+const READ_AHEAD_MIN_BATCHES: usize = 4;
+
+/// Ceiling on a worker's read-ahead, in batches. A deeper queue only buys
+/// tolerance for longer consumer stalls, and the cost is resident Arrow data.
+const READ_AHEAD_MAX_BATCHES: usize = 32;
+
+/// Assumed decoded GEOMETRY bytes per input row when pass 1 measured nothing
+/// (an empty scan, or the `--plan` path). Deliberately generous:
+/// over-estimating costs reader workers, under-estimating costs RAM. The
+/// non-geometry per-row term ([`SINK_ROW_OVERHEAD_BYTES`]) is added on top,
+/// measured or not.
+const READ_ROW_BYTES_FALLBACK: u64 = 1024;
+
+/// A resolved parallel-read shape: how many workers, how deep each one's
+/// queue is, and how large a segment may be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadShape {
+    workers: usize,
+    depth: usize,
+    segment_target_rows: usize,
+}
+
+/// Size the parallel read against the memory budget.
+///
+/// The load-bearing relationship is `segment_target_rows <= (depth - 1) *
+/// batch_size`: **a segment must fit in its worker's queue**. Workers own
+/// disjoint segments but the merge consumes them strictly in order, so a
+/// worker whose queue fills before its segment ends simply parks until the
+/// merge reaches it — every worker takes its turn and the read is sequential
+/// again, with extra threads. Sized this way a worker finishes its segment
+/// into the queue and starts the next one, which is what makes the reads
+/// actually concurrent.
+///
+/// Everything else falls out of that: the budget fixes how many batches may
+/// be resident at once, workers are dropped (never below 1) until each one
+/// can hold [`READ_AHEAD_MIN_BATCHES`], and the depth is what is left over.
+fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
+    let batch_size = tuning.batch_size.max(1);
+    // Per-row cost of a RESIDENT decoded batch, priced exactly like the sink's
+    // measured-path model (`estimate_buffered_bytes`): a fixed non-geometry
+    // term plus the measured encoded geometry, doubled.
+    //
+    // `SINK_ROW_OVERHEAD_BYTES` is not decoration. Pass 1 measures ONLY the
+    // geometry column, and a read batch carries every projected column — a
+    // 58-column schema's properties, offsets, dictionaries and validity
+    // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone
+    // under-charged wide schemas by 17-232× against
+    // `get_array_memory_size()`, which is how a bounded run at DEFAULTS could
+    // model 21 MiB of read-ahead and resident +370 MiB. The model is still a
+    // model — it assumes the sink's 4 KiB/row non-geometry term covers the
+    // input's too — but it is now the same model, wrong in the same direction,
+    // as the budget it is being charged against.
+    let geom_per_row = tuning
+        .avg_geom_bytes
+        .filter(|&b| b > 0)
+        .map_or(READ_ROW_BYTES_FALLBACK, |b| b.saturating_mul(2));
+    let per_row = SINK_ROW_OVERHEAD_BYTES.saturating_add(geom_per_row).max(1);
+    let per_batch = (batch_size as u64).saturating_mul(per_row).max(1);
+    let budget = (auto_budget_bytes(available_memory_bytes()) as f64 * READ_BUDGET_FRACTION) as u64;
+    let affordable = (budget / per_batch).max(1) as usize;
+    let max_depth = match tuning.profile {
+        MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
+        MemoryProfile::Auto | MemoryProfile::Speed => READ_AHEAD_MAX_BATCHES,
+    };
+
+    // Closed form of "drop workers until each one can hold the floor":
+    // `affordable / w >= READ_AHEAD_MIN_BATCHES` ⟺ `w <= affordable /
+    // READ_AHEAD_MIN_BATCHES` (integer division, both sides). Written as a
+    // decrementing loop this was O(workers) — unbounded, since an explicit
+    // `--read-workers` is the caller's number, and `--read-workers
+    // 18446744073709551615` hung the process before it read a byte.
+    let workers = tuning
+        .workers
+        .max(1)
+        .min((affordable / READ_AHEAD_MIN_BATCHES).max(1));
+    let depth = (affordable / workers).clamp(READ_AHEAD_MIN_BATCHES, max_depth);
+    ReadShape {
+        workers,
+        depth,
+        segment_target_rows: depth.saturating_sub(1).max(1).saturating_mul(batch_size),
+    }
+}
+
+/// One worker's report on one segment.
+enum SegMsg {
+    /// A batch as the worker's own reader produced it, with the time that
+    /// read cost (core-seconds for the [profile] split).
+    Batch(RecordBatch, Duration),
+    /// The segment is complete; the merge moves on to the next one.
+    End,
+    Err(ConvertError),
+}
+
+/// Deliver every selected input row to `on_batch`, in exact read order, in
+/// batches of exactly `tuning.batch_size` rows (the last batch of each part
+/// short) — reading with one sequential reader or with several concurrent
+/// ones, identically either way.
+///
+/// **Why this exists (#494).** Pass 2 read the input from a single thread
+/// iterating one `ParquetRecordBatchReader`: 110.6 of the 403 wall seconds of
+/// a bounded Brazil-55M pass 2, and the largest single stage in the profile.
+/// Parquet row groups are independently readable, so the work parallelizes —
+/// the hard part is putting it back together.
+///
+/// **Why the merge re-chunks.** The sequential reader chains all of a part's
+/// selected row groups into one continuous decode, so its batches are exactly
+/// `batch_size` rows regardless of where the row-group boundaries fall.
+/// Workers reading disjoint runs necessarily produce a short batch at each
+/// run's end, and those boundaries are NOT free: the overview writer slices
+/// its row groups out of the batches it is handed, one `write` call per slice,
+/// and parquet checks its data-page limits per call — so a differently-chunked
+/// stream of the same rows can produce different page boundaries and therefore
+/// different bytes. The merge therefore re-assembles the exact chunking a
+/// single reader would have produced. Batches that already line up are passed
+/// through untouched; only the batch straddling a worker seam is copied.
+///
+/// **Gating.** Remote inputs read sequentially regardless of `workers`:
+/// `SourceStream` releases a part's in-memory read cache when it finishes that
+/// part, so concurrent readers over one remote source would evict each other's
+/// fetched chunks. This holds even after pass-0 staging: staging fills the
+/// remote source's own chunk cache and disk spill, it does not turn the
+/// `InputSource` into a `Local` one, so `is_remote()` stays true and a remote
+/// convert's pass-2 read is ALWAYS sequential. Only inputs that were local to
+/// begin with take the parallel path.
+pub(super) fn read_in_order<F>(
+    source: &ConvertSource,
+    row_groups: Option<&RowGroupSelection>,
+    tuning: ReadTuning,
+    mut on_batch: F,
+) -> Result<(), ConvertError>
+where
+    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
+{
+    let batch_size = tuning.batch_size.max(1);
+    let shape = resolve_read_shape(tuning);
+    let parallel = shape.workers > 1 && !source.is_remote();
+    if tuning.workers > 1 && source.is_remote() {
+        log::info!(
+            "[convert] pass 2: reading sequentially — parallel reads are local-only \
+             (a remote source's parts share one chunk cache)"
+        );
+    }
+    if !parallel {
+        return read_sequentially(source, row_groups, batch_size, &mut on_batch);
+    }
+    let segments = source.read_segments(row_groups, shape.segment_target_rows)?;
+    if segments.len() < 2 {
+        return read_sequentially(source, row_groups, batch_size, &mut on_batch);
+    }
+    let workers = shape.workers.min(segments.len());
+    log::info!(
+        "[convert] pass 2 read: {workers} reader thread(s) over {} segment(s) \
+         (~{} row(s) each, {} read-ahead batch(es) per reader)",
+        segments.len(),
+        shape.segment_target_rows,
+        shape.depth,
+    );
+    // A row group larger than a worker's whole queue cannot be buffered ahead,
+    // so that worker parks mid-segment until the merge reaches it and the
+    // reads serialize again. Worth saying out loud: it is a property of the
+    // INPUT's row-group sizing, and `gpio` can fix it at the source.
+    let queue_rows = shape.depth.saturating_mul(batch_size);
+    if let Some(biggest) = segments.iter().map(|s| s.rows).max() {
+        if biggest > queue_rows {
+            log::debug!(
+                "[convert] pass 2 read: largest segment is {biggest} row(s) but a \
+                 reader can buffer only {queue_rows} — reads will only partly \
+                 overlap (the input's row groups are large relative to the \
+                 read-ahead budget)"
+            );
+        }
+    }
+    read_in_parallel(
+        source,
+        &segments,
+        batch_size,
+        workers,
+        shape.depth,
+        &mut on_batch,
+    )
+}
+
+/// The pre-#494 path, unchanged and still the reference: one reader, one
+/// thread, batches straight through.
+fn read_sequentially<F>(
+    source: &ConvertSource,
+    row_groups: Option<&RowGroupSelection>,
+    batch_size: usize,
+    on_batch: &mut F,
+) -> Result<(), ConvertError>
+where
+    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
+{
+    let mut reader = source.open_stream(&ReadPlan {
+        batch_size,
+        projection: None,
+        row_groups,
+    })?;
+    let mut row_offset = 0usize;
+    loop {
+        let t_read = Instant::now();
+        match reader.next() {
+            None => return Ok(()),
+            Some(Err(e)) => return Err(e.into()),
+            Some(Ok(batch)) => {
+                // An empty batch carries no rows and no offset advance, so
+                // delivering one is a no-op the parallel merge does not make
+                // either ([`Regrouper::push`] drops it). Skipping keeps the
+                // two paths' delivered batch sequences identical even if a
+                // reader ever hands one back.
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let read_dur = t_read.elapsed();
+                let offset = row_offset;
+                row_offset += batch.num_rows();
+                if matches!(on_batch(batch, offset, read_dur)?, ReadFlow::Stop) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// `workers` readers over disjoint segments, merged back into read order on
+/// this thread.
+///
+/// Segment `i` is read by worker `i % workers`, so while the merge drains
+/// worker 0's segment the other workers are filling their queues with the
+/// segments that come next. Each worker has its own channel: a single shared
+/// queue would let a worker several segments ahead consume the whole budget
+/// and starve the worker the merge is actually waiting for.
+///
+/// **The assignment is static round-robin — there is no work stealing.** A
+/// worker that draws an unusually expensive segment (a badly compressed row
+/// group, a vertex-heavy run) stalls the merge behind it even while the other
+/// workers sit on full queues with nothing to do. Read-ahead absorbs most of
+/// it: the merge keeps draining the queues of the segments that follow, which
+/// is `depth` batches per worker of slack. Segments are also size-capped, not
+/// count-capped ([`ConvertSource::read_segments`]), so the variance is in
+/// decode cost rather than row count. Worth revisiting only if a profile shows
+/// the merge waiting — the fix (a shared work queue plus a reorder buffer)
+/// costs exactly the in-order simplicity this merge is built on.
+fn read_in_parallel<F>(
+    source: &ConvertSource,
+    segments: &[ReadSegment],
+    batch_size: usize,
+    workers: usize,
+    depth: usize,
+    on_batch: &mut F,
+) -> Result<(), ConvertError>
+where
+    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
+{
+    std::thread::scope(|scope| -> Result<(), ConvertError> {
+        // Receivers live in THIS frame, so returning by any path — including
+        // an unwind — drops them before the scope joins, releasing any worker
+        // parked in `send` (the `super::pipe` liveness contract, #362).
+        let mut rxs = Vec::with_capacity(workers);
+        for w in 0..workers {
+            let (tx, rx) = crossbeam_channel::bounded::<SegMsg>(depth);
+            rxs.push(rx);
+            // Named so a stack dump, `perf`, or an OS thread listing tells a
+            // reader worker apart from the rayon pool and the spill writers.
+            std::thread::Builder::new()
+                .name(format!("tylertoo-read-{w}"))
+                .spawn_scoped(scope, move || {
+                    read_segments_for_worker(source, segments, batch_size, workers, w, &tx)
+                })?;
+        }
+
+        let mut regroup = Regrouper::default();
+        let mut row_offset = 0usize;
+        let mut pending_read = Duration::ZERO;
+        let mut current_part: Option<usize> = None;
+
+        let mut prev_rg: Option<usize> = None;
+        for (seq, segment) in segments.iter().enumerate() {
+            // The merge's correctness rests entirely on `read_segments`
+            // emitting parts in order and, within a part, ascending disjoint
+            // row-group runs — a cross-module contract that is otherwise only
+            // stated in prose. Enforce it here so a change on either side
+            // fails a debug build instead of silently reordering rows.
+            if let Some(prev) = current_part {
+                debug_assert!(
+                    segment.part >= prev,
+                    "read_segments must emit parts in order: part {} after part {prev}",
+                    segment.part
+                );
+                debug_assert!(
+                    segment.part > prev
+                        || prev_rg.is_none()
+                        || segment.row_groups.first().copied() > prev_rg,
+                    "read_segments must emit ascending, disjoint row-group runs \
+                     within a part: {:?} after row group {prev_rg:?}",
+                    segment.row_groups.first()
+                );
+            }
+            prev_rg = segment.row_groups.last().copied();
+            // A part boundary is a batch boundary: the sequential reader opens
+            // a fresh reader per part, so a part's last batch is short.
+            if current_part != Some(segment.part) {
+                if let Some(tail) = regroup.take_all()? {
+                    if matches!(
+                        deliver(tail, &mut row_offset, &mut pending_read, on_batch)?,
+                        ReadFlow::Stop
+                    ) {
+                        return Ok(());
+                    }
+                }
+                current_part = Some(segment.part);
+            }
+            loop {
+                match rxs[seq % workers].recv() {
+                    // A disconnected channel means the worker returned without
+                    // sending `End`, which it does only by panicking: the
+                    // typed error below is returned, unwinds out of the scope,
+                    // and `thread::scope`'s join then re-raises the worker's
+                    // panic, superseding it. That precedence is intended — the
+                    // panic is the cause and this is the symptom — so the
+                    // message only has to be right for the impossible case
+                    // where the worker somehow returned cleanly.
+                    Err(_) => {
+                        return Err(internal(
+                            "a pass-2 reader worker ended without closing its segment",
+                        ))
+                    }
+                    Ok(SegMsg::Err(e)) => return Err(e),
+                    Ok(SegMsg::End) => break,
+                    Ok(SegMsg::Batch(batch, read_dur)) => {
+                        pending_read += read_dur;
+                        regroup.push(batch);
+                        while regroup.rows >= batch_size {
+                            let out = regroup.take(batch_size)?;
+                            if matches!(
+                                deliver(out, &mut row_offset, &mut pending_read, on_batch)?,
+                                ReadFlow::Stop
+                            ) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(tail) = regroup.take_all()? {
+            deliver(tail, &mut row_offset, &mut pending_read, on_batch)?;
+        }
+        Ok(())
+    })
+}
+
+/// Worker `w`: read segments `w, w + workers, …` in order, streaming each
+/// one's batches over `tx` and closing it with [`SegMsg::End`].
+///
+/// A send failure means the merge hung up (it errored, or the consumer
+/// stopped), so the worker returns quietly — the real error belongs to
+/// whoever hung up, exactly as in [`super::pipe`].
+fn read_segments_for_worker(
+    source: &ConvertSource,
+    segments: &[ReadSegment],
+    batch_size: usize,
+    workers: usize,
+    w: usize,
+    tx: &Sender<SegMsg>,
+) {
+    let mut seq = w;
+    while seq < segments.len() {
+        let mut stream = match source.open_segment(&segments[seq], batch_size) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(SegMsg::Err(e.into()));
+                return;
+            }
+        };
+        loop {
+            let t_read = Instant::now();
+            match stream.next() {
+                None => break,
+                Some(Err(e)) => {
+                    let _ = tx.send(SegMsg::Err(e.into()));
+                    return;
+                }
+                Some(Ok(batch)) => {
+                    if tx.send(SegMsg::Batch(batch, t_read.elapsed())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        if tx.send(SegMsg::End).is_err() {
+            return;
+        }
+        seq += workers;
+    }
+}
+
+/// Hand one re-assembled batch to the consumer, advancing the global row
+/// offset and attributing the read time accumulated since the previous one.
+/// The per-batch attribution is arbitrary; the SUM is what the [profile]
+/// stage split reports, and it is exact.
+fn deliver<F>(
+    batch: RecordBatch,
+    row_offset: &mut usize,
+    pending_read: &mut Duration,
+    on_batch: &mut F,
+) -> Result<ReadFlow, ConvertError>
+where
+    F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
+{
+    let offset = *row_offset;
+    *row_offset += batch.num_rows();
+    on_batch(batch, offset, std::mem::take(pending_read))
+}
+
+/// The in-order merge's re-chunker: a FIFO of batch slices that hands back
+/// runs of an exact row count.
+///
+/// Batches that already line up cost nothing — [`Regrouper::take`] returns the
+/// queued batch itself when it holds exactly the requested rows — so in the
+/// common case (row groups an exact multiple of the batch size, or a seam that
+/// happens to land on one) nothing is copied at all. Only a run spanning a
+/// worker seam is concatenated.
+#[derive(Default)]
+struct Regrouper {
+    queue: std::collections::VecDeque<RecordBatch>,
+    rows: usize,
+}
+
+impl Regrouper {
+    fn push(&mut self, batch: RecordBatch) {
+        if batch.num_rows() > 0 {
+            self.rows += batch.num_rows();
+            self.queue.push_back(batch);
+        }
+    }
+
+    /// Remove and return exactly `n` rows from the front. `n` must be `<=
+    /// self.rows`.
+    fn take(&mut self, n: usize) -> Result<RecordBatch, ConvertError> {
+        debug_assert!(n > 0 && n <= self.rows);
+        let front = self
+            .queue
+            .front()
+            .ok_or_else(|| internal("regrouper asked for rows it does not hold"))?;
+        if front.num_rows() == n {
+            self.rows -= n;
+            return self
+                .queue
+                .pop_front()
+                .ok_or_else(|| internal("regrouper queue vanished"));
+        }
+        let schema = front.schema();
+        let mut parts: Vec<RecordBatch> = Vec::new();
+        let mut need = n;
+        while need > 0 {
+            let batch = self
+                .queue
+                .pop_front()
+                .ok_or_else(|| internal("regrouper ran out of rows mid-take"))?;
+            if batch.num_rows() <= need {
+                need -= batch.num_rows();
+                parts.push(batch);
+            } else {
+                parts.push(batch.slice(0, need));
+                let rest = batch.slice(need, batch.num_rows() - need);
+                self.queue.push_front(rest);
+                need = 0;
+            }
+        }
+        self.rows -= n;
+        Ok(arrow_select::concat::concat_batches(&schema, &parts)?)
+    }
+
+    /// Remove and return everything queued, or `None` when empty.
+    fn take_all(&mut self) -> Result<Option<RecordBatch>, ConvertError> {
+        if self.rows == 0 {
+            return Ok(None);
+        }
+        self.take(self.rows).map(Some)
+    }
+}
+
+/// The ordered parallel reader (#494): that `--read-workers N` delivers
+/// exactly what one reader delivers, whatever N is and however unevenly the
+/// workers are paced.
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, Field};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    /// Write `rows` sequentially-numbered rows into `path`, `rg_rows` per row
+    /// group — the shape that decides how the input can be split.
+    fn write_input(path: &std::path::Path, rows: i64, rg_rows: usize) {
+        let s = schema();
+        let batch = RecordBatch::try_new(
+            s.clone(),
+            vec![Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rg_rows))
+            .build();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), s, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// `(row counts per delivered batch, the ids in delivery order, the
+    /// row offsets each batch was announced at)`.
+    type Delivered = (Vec<usize>, Vec<i64>, Vec<usize>);
+
+    /// Read `source` through [`read_in_order`] with a forced shape, optionally
+    /// pausing in the consumer to pace the workers unevenly.
+    fn read_all(
+        source: &ConvertSource,
+        batch_size: usize,
+        workers: usize,
+        stall: Option<Duration>,
+    ) -> Delivered {
+        let (mut counts, mut ids, mut offsets) = (Vec::new(), Vec::new(), Vec::new());
+        read_in_order(
+            source,
+            None,
+            ReadTuning {
+                batch_size,
+                workers,
+                // Tiny rows: the read-ahead sizing must not silently collapse
+                // the worker count in these fixtures.
+                avg_geom_bytes: Some(8),
+                profile: MemoryProfile::Auto,
+            },
+            |batch, offset, _dur| {
+                if let Some(d) = stall {
+                    std::thread::sleep(d);
+                }
+                counts.push(batch.num_rows());
+                offsets.push(offset);
+                ids.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+                Ok(ReadFlow::Continue)
+            },
+        )
+        .unwrap();
+        (counts, ids, offsets)
+    }
+
+    /// The whole contract in one assertion: for a batch size that does NOT
+    /// divide the row-group size — so every worker seam falls mid-batch and
+    /// the merge has to splice — 2, 3 and 4 workers must deliver byte-for-byte
+    /// what 1 worker delivers, batch boundaries included. Batch boundaries are
+    /// not cosmetic: the overview writer issues one column-writer call per
+    /// slice it is handed, and parquet checks its data-page limits per call.
+    #[test]
+    fn parallel_reads_reproduce_the_sequential_batch_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        // 9 row groups of 700 rows; batch 128 divides neither 700 nor 6300.
+        write_input(&path, 6300, 700);
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        // Guard the guard: if the read-ahead sizing ever leaves this fixture
+        // with a single segment, the comparison below is vacuous.
+        let shape = resolve_read_shape(ReadTuning {
+            batch_size: 128,
+            workers: 4,
+            avg_geom_bytes: Some(8),
+            profile: MemoryProfile::Auto,
+        });
+        let segments = source
+            .read_segments(None, shape.segment_target_rows)
+            .unwrap();
+        assert!(
+            segments.len() > 1 && shape.workers > 1,
+            "fixture must actually split: {} segment(s), {} worker(s)",
+            segments.len(),
+            shape.workers
+        );
+        let seam: usize = segments[0].rows;
+        assert_ne!(
+            seam % 128,
+            0,
+            "the seam must fall mid-batch, or the merge's splice path is never taken"
+        );
+        let reference = read_all(&source, 128, 1, None);
+        assert_eq!(
+            reference.0.iter().sum::<usize>(),
+            6300,
+            "the reference read must cover every row"
+        );
+        assert_eq!(
+            *reference.0.last().unwrap(),
+            6300 % 128,
+            "only the final batch may be short"
+        );
+        for workers in [2usize, 3, 4] {
+            let got = read_all(&source, 128, workers, None);
+            assert_eq!(
+                got, reference,
+                "--read-workers {workers} must deliver the same batches, ids and \
+                 row offsets as a single reader"
+            );
+        }
+    }
+
+    /// Uneven pacing is the interesting case for an in-order merge: a
+    /// consumer that stalls lets the fast workers run far ahead and fill their
+    /// queues, so the merge sees segments arrive wildly out of completion
+    /// order. Delivery order must not notice.
+    #[test]
+    fn in_order_merge_survives_uneven_worker_pacing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        write_input(&path, 4000, 333);
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let reference = read_all(&source, 64, 1, None);
+        let paced = read_all(&source, 64, 4, Some(Duration::from_micros(200)));
+        assert_eq!(
+            paced, reference,
+            "a stalling consumer must not reorder or re-chunk the stream"
+        );
+    }
+
+    /// Parts are read sequentially and a part's last batch is short, so a part
+    /// boundary is a batch boundary — a merge that let rows flow across one
+    /// would produce a different (and wrong) chunking.
+    #[test]
+    fn part_boundaries_stay_batch_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three parts, none a multiple of the batch size.
+        for (i, rows) in [(0, 500i64), (1, 301), (2, 777)] {
+            write_input(&dir.path().join(format!("p{i}.parquet")), rows, 120);
+        }
+        let source = ConvertSource::resolve(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(source.parts().len(), 3, "fixture must resolve to 3 parts");
+        let reference = read_all(&source, 64, 1, None);
+        // Per part: full 64-row batches then a short tail.
+        let expected: Vec<usize> = [500usize, 301, 777]
+            .iter()
+            .flat_map(|&n| {
+                let mut v = vec![64; n / 64];
+                if n % 64 != 0 {
+                    v.push(n % 64);
+                }
+                v
+            })
+            .collect();
+        assert_eq!(
+            reference.0, expected,
+            "the sequential reader must end each part on a short batch"
+        );
+        for workers in [2usize, 4] {
+            assert_eq!(
+                read_all(&source, 64, workers, None),
+                reference,
+                "--read-workers {workers} must not carry rows across a part boundary"
+            );
+        }
+    }
+
+    /// `--read-workers 1` is the reference path, not a one-worker instance of
+    /// the parallel one: it must open a single stream and hand its batches
+    /// straight through.
+    #[test]
+    fn one_worker_is_the_sequential_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        write_input(&path, 1000, 250);
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let (counts, ids, offsets) = read_all(&source, 300, 1, None);
+        assert_eq!(counts, vec![300, 300, 300, 100]);
+        assert_eq!(offsets, vec![0, 300, 600, 900]);
+        assert_eq!(ids, (0..1000i64).collect::<Vec<_>>());
+    }
+
+    /// A consumer that stops mid-stream must not hang: the workers are parked
+    /// on full queues, and dropping the receivers is what releases them.
+    #[test]
+    fn a_stopping_consumer_releases_the_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        write_input(&path, 20_000, 500);
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<usize>(1);
+        std::thread::spawn(move || {
+            let mut seen = 0usize;
+            read_in_order(
+                &source,
+                None,
+                ReadTuning {
+                    batch_size: 64,
+                    workers: 4,
+                    avg_geom_bytes: Some(8),
+                    profile: MemoryProfile::Auto,
+                },
+                |_batch, _offset, _dur| {
+                    seen += 1;
+                    Ok(if seen >= 3 {
+                        ReadFlow::Stop
+                    } else {
+                        ReadFlow::Continue
+                    })
+                },
+            )
+            .unwrap();
+            let _ = done_tx.send(seen);
+        });
+        let seen = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a stopping consumer must not deadlock its reader workers");
+        assert_eq!(seen, 3);
+    }
+
+    /// The read-ahead sizing is what makes the parallelism real: a segment
+    /// must fit in its worker's queue, and the worker count must fall rather
+    /// than the per-worker queue going below the useful floor.
+    #[test]
+    fn read_shape_keeps_segments_inside_the_queue() {
+        let shape = resolve_read_shape(ReadTuning {
+            batch_size: 8192,
+            workers: 4,
+            avg_geom_bytes: Some(64),
+            profile: MemoryProfile::Auto,
+        });
+        assert!(shape.workers >= 1 && shape.workers <= 4);
+        assert!(shape.depth >= READ_AHEAD_MIN_BATCHES);
+        assert!(shape.depth <= READ_AHEAD_MAX_BATCHES);
+        assert!(
+            shape.segment_target_rows <= (shape.depth - 1) * 8192,
+            "a segment that cannot fit in its worker's queue makes the worker \
+             park mid-segment, which serializes the reads again"
+        );
+    }
+
+    /// A per-row estimate large enough that even one worker's floor queue
+    /// exceeds the budget still yields a usable (single-worker) shape rather
+    /// than zero workers or a zero-length segment.
+    #[test]
+    fn read_shape_degrades_to_one_worker_under_memory_pressure() {
+        let shape = resolve_read_shape(ReadTuning {
+            batch_size: 8192,
+            // 512 MiB per row: nothing is affordable.
+            workers: 4,
+            avg_geom_bytes: Some(512 * 1024 * 1024),
+            profile: MemoryProfile::Auto,
+        });
+        assert_eq!(shape.workers, 1, "an unaffordable read-ahead drops workers");
+        assert!(shape.segment_target_rows >= 1);
+    }
+}
+
 /// A message from the reader thread: one raw input batch, its cumulative row
 /// offset, and how long the read+decode took (for [profile] accounting).
 struct ReadMsg {
@@ -584,72 +1420,210 @@ struct ReadMsg {
 /// One level's ordered output buffer.
 enum LevelSink {
     Ram(Vec<RecordBatch>),
-    // Boxed: arrow 59 grew `StreamWriter`, taking `SpillState` past clippy's
-    // large_enum_variant threshold, so every Ram variant would otherwise carry
-    // the spill variant's footprint.
-    Spill(Box<SpillState>),
+    // Not boxed: `SpillState` used to own the arrow `StreamWriter` inline,
+    // which (arrow 59) pushed the variant past clippy's large_enum_variant
+    // threshold. The writer now lives on the spill thread, leaving a sender
+    // and a join handle here.
+    Spill(SpillState),
 }
 
 impl LevelSink {
     fn new(backing: SinkBacking, out_schema: &Schema) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
-            SinkBacking::Spill => LevelSink::Spill(Box::new(SpillState::new(out_schema)?)),
+            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema)?),
         })
     }
 
     /// Push one output batch into the sink. Returns the bytes handed to the
     /// spill writer (0 for the RAM path — nothing is measured there, since
     /// the goal is accounting for previously-invisible spill I/O).
-    fn push(&mut self, batch: RecordBatch, timers: &Pass2Timers) -> Result<u64, ConvertError> {
+    fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         match self {
             LevelSink::Ram(v) => {
                 v.push(batch);
                 Ok(0)
             }
-            LevelSink::Spill(s) => s.push(&batch, timers),
+            LevelSink::Spill(s) => s.push(batch),
         }
     }
 }
 
-/// A level spilled to a temporary Arrow IPC stream file. The write handle and
-/// the read handle are independent `reopen()`s of the same temp file; Arrow IPC
-/// is a lossless value round-trip, so the reloaded batches are identical to the
-/// buffered ones and the final Parquet encode stays byte-identical.
+/// An invariant this module owns was broken — never reachable from user input,
+/// so it carries no advice, only the broken invariant.
+fn internal(what: &str) -> ConvertError {
+    ConvertError::Io(std::io::Error::other(format!("internal: {what}")))
+}
+
+/// Batches a level's spill-writer thread may hold ahead of the consumer.
+///
+/// The queue exists to absorb write jitter (an fsync-adjacent stall, a
+/// compaction pause on the temp filesystem), not to buffer a level's output:
+/// depth 2 is one batch being encoded plus one waiting, which is enough to
+/// keep the writer busy while the consumer builds the next batch, and it caps
+/// the extra resident set at `2 × out_batch × spilled_levels` — a bounded
+/// profile spills EVERY buffered level, so a deeper queue multiplies by the
+/// level count and would undo what the bounded profile is for.
+const SPILL_QUEUE_DEPTH: usize = 2;
+
+/// A level spilled to a temporary Arrow IPC stream file, written by a
+/// dedicated thread. The write handle and the read handle are independent
+/// `reopen()`s of the same temp file; Arrow IPC is a lossless value round-trip,
+/// so the reloaded batches are identical to the buffered ones and the final
+/// Parquet encode stays byte-identical.
+///
+/// **Why a thread (#494).** The Arrow IPC encode+write used to run inline in
+/// [`LevelSink::push`], i.e. on the single consumer thread that also drives
+/// every level's per-batch compute — 65.7 core-seconds of a 403-second bounded
+/// Brazil-55M pass 2, all of it blocking the one thread the whole pipeline is
+/// serialized through. Handing each level's batches to its own writer over a
+/// bounded channel takes that off the critical path without changing a byte:
+/// one sender, one receiver, FIFO, so the level's batches reach the file in
+/// exactly the order the consumer produced them.
 struct SpillState {
-    writer: StreamWriter<BufWriter<File>>,
+    /// `None` once the stream has been closed — by [`SpillState::into_reader`],
+    /// or by a `push` that joined the writer to report its error.
+    tx: Option<Sender<RecordBatch>>,
+    /// `None` once joined. The writer returns the temp file it finished plus
+    /// the core-seconds it spent encoding and writing (folded into
+    /// `Pass2Timers::spill_write` at join time, since the thread cannot borrow
+    /// the driver's timers).
+    handle: Option<std::thread::JoinHandle<Result<SpillWriterDone, ConvertError>>>,
+}
+
+/// What a finished spill-writer thread hands back.
+struct SpillWriterDone {
     temp: NamedTempFile,
+    /// Core-seconds spent in Arrow IPC encode + write on the writer thread.
+    write_time: Duration,
 }
 
 impl SpillState {
     fn new(out_schema: &Schema) -> Result<Self, ConvertError> {
         let temp = NamedTempFile::new()?;
         let write_handle = temp.reopen()?;
+        // Constructed on the caller's thread so a broken spill directory or an
+        // unwritable temp file fails the conversion here, with the caller's
+        // error handling, rather than inside a thread nobody has joined yet.
         let writer = StreamWriter::try_new(BufWriter::new(write_handle), out_schema)?;
-        Ok(SpillState { writer, temp })
+        Self::spawn(writer, temp)
     }
 
-    /// Write one batch to the spill file, timing the I/O and reporting its
-    /// approximate in-memory byte size (profiling instrumentation: this write
-    /// was previously untimed and its bytes uncounted).
-    fn push(&mut self, batch: &RecordBatch, timers: &Pass2Timers) -> Result<u64, ConvertError> {
+    /// Start the writer thread for an already-opened IPC stream.
+    ///
+    /// Generic over the stream's sink for one reason: a spill write fails only
+    /// on I/O the production path cannot provoke on demand (a full disk, a
+    /// spill directory yanked mid-run), so the failure-surfacing contract is
+    /// untestable without being able to hand the writer a sink that fails.
+    /// Production monomorphizes this exactly once, over `BufWriter<File>`.
+    fn spawn<W: std::io::Write + Send + 'static>(
+        mut writer: StreamWriter<W>,
+        temp: NamedTempFile,
+    ) -> Result<Self, ConvertError> {
+        let (tx, rx) = crossbeam_channel::bounded::<RecordBatch>(SPILL_QUEUE_DEPTH);
+        let handle = std::thread::Builder::new()
+            .name("tylertoo-spill".to_string())
+            .spawn(move || -> Result<SpillWriterDone, ConvertError> {
+                let mut write_time = Duration::ZERO;
+                for batch in rx.iter() {
+                    let t = Instant::now();
+                    writer.write(&batch)?;
+                    write_time += t.elapsed();
+                }
+                let t = Instant::now();
+                writer.finish()?; // writes EOS + flushes the BufWriter
+                drop(writer); // close the write handle
+                write_time += t.elapsed();
+                Ok(SpillWriterDone { temp, write_time })
+            })?;
+        Ok(SpillState {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+
+    /// Hand one batch to this level's writer thread, reporting its approximate
+    /// in-memory byte size. Blocks only when the writer is [`SPILL_QUEUE_DEPTH`]
+    /// batches behind.
+    ///
+    /// A closed channel means the writer thread already returned — necessarily
+    /// with an error, since it only stops early on one — so the send failure is
+    /// resolved by joining and reporting that error rather than by inventing a
+    /// "channel closed" of its own (the #486 surfacing rule: report the cause,
+    /// never the symptom).
+    fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         let bytes = batch.get_array_memory_size() as u64;
-        let t = Instant::now();
-        self.writer.write(batch)?;
-        Pass2Timers::add_dur(timers.spill_write_cell(), t.elapsed());
+        let Some(tx) = &self.tx else {
+            return Err(internal("spill sink pushed after it was closed"));
+        };
+        if tx.send(batch).is_err() {
+            self.tx = None; // release the writer's receiver before joining
+                            // The writer stops early only on an error, so `?` here IS the
+                            // report; falling through means it finished cleanly with the
+                            // stream still open, which it cannot do.
+            self.join()?;
+            return Err(internal("spill writer stopped without reporting an error"));
+        }
         Ok(bytes)
     }
 
-    /// Finish writing and reopen the temp file for reading. The returned
+    /// Join the writer thread, resuming its panic on this thread rather than
+    /// flattening it into an error. `Ok(None)` when it was already joined.
+    fn join(&mut self) -> Result<Option<SpillWriterDone>, ConvertError> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(None);
+        };
+        match handle.join() {
+            Ok(res) => res.map(Some),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Close the stream, join the writer, and reopen the temp file for reading,
+    /// folding the writer's core-seconds into `timers`. The returned
     /// [`NamedTempFile`] must be held until the reader is exhausted so the file
     /// is not unlinked mid-read (and is cleaned up on drop afterwards).
-    fn into_reader(self) -> Result<(StreamReader<BufReader<File>>, NamedTempFile), ConvertError> {
-        let SpillState { mut writer, temp } = self;
-        writer.finish()?; // writes EOS + flushes the BufWriter to the file
-        drop(writer); // close the write handle
-        let read_handle = temp.reopen()?;
+    fn into_reader(
+        mut self,
+        timers: &Pass2Timers,
+    ) -> Result<(StreamReader<BufReader<File>>, NamedTempFile), ConvertError> {
+        // Dropping the sender is what ends the writer's `rx.iter()`; without it
+        // the join below would never return.
+        self.tx = None;
+        let done = self
+            .join()?
+            .ok_or_else(|| internal("spill writer joined twice"))?;
+        Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
+        let read_handle = done.temp.reopen()?;
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
-        Ok((reader, temp))
+        Ok((reader, done.temp))
+    }
+}
+
+impl Drop for SpillState {
+    /// A sink abandoned on an error path (or an unwind) must not leave its
+    /// writer thread parked on a receiver that never disconnects: drop the
+    /// sender first, then join. Failures are already lost on this path — the
+    /// error that got us here is the one worth reporting — but a panic inside
+    /// the writer is re-raised only when we are not already unwinding, since
+    /// panicking in a `Drop` during an unwind aborts the process.
+    ///
+    /// The `resume_unwind` on the non-unwinding path is therefore deliberate,
+    /// not an oversight: a writer thread that panicked while the driver was
+    /// merely dropping its sinks has lost data, and swallowing that would turn
+    /// a crash into a silently truncated level. The double-panic abort is the
+    /// only case worth suppressing, and `thread::panicking()` is exactly that
+    /// guard.
+    fn drop(&mut self) {
+        self.tx = None;
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if let Err(payload) = handle.join() {
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 }
 
@@ -674,7 +1648,7 @@ pub(super) fn run_pass2_buffered(
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
     source: &ConvertSource,
-    read_batch_size: usize,
+    read_tuning: ReadTuning,
     selected_row_groups: Option<&RowGroupSelection>,
     in_flight: usize,
     backing: SinkBacking,
@@ -696,19 +1670,6 @@ pub(super) fn run_pass2_buffered(
     // Stays all-zero under `SinkBacking::Ram`.
     let mut spill_bytes = vec![0u64; num_levels];
 
-    // Build the single-pass stream here (per-part bbox-selected row groups,
-    // #102 — the same selection both passes use, so global row indices stay
-    // aligned), then hand it to a dedicated reader thread. A synchronous
-    // Parquet reader driven from a dedicated thread (not the rayon pool)
-    // keeps reads from being head-of-line blocked behind compute work. The
-    // stream borrows `source` (multi-partition sources open part i+1 lazily),
-    // so the reader runs on a scoped thread.
-    let mut reader = source.open_stream(&ReadPlan {
-        batch_size: read_batch_size.max(1),
-        projection: None,
-        row_groups: selected_row_groups,
-    })?;
-
     // Consumer state borrowed mutably by the consumer closure below.
     let (rows_ref, verts_ref, sinks_ref, spill_bytes_ref) =
         (&mut rows, &mut verts, &mut sinks, &mut spill_bytes);
@@ -716,31 +1677,35 @@ pub(super) fn run_pass2_buffered(
     let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
     scoped_pipe(
         in_flight,
+        // Producer: the input, in read order, over the per-part bbox-selected
+        // row groups (#102 — the same selection both passes use, so global row
+        // indices stay aligned). `read_in_order` is either one synchronous
+        // Parquet reader on this thread (the reference path) or several
+        // concurrent ones merged back into the identical batch sequence
+        // (#494); either way the reader lives off the rayon pool, so reads are
+        // never head-of-line blocked behind compute work.
         |tx: &Sender<ReadMsg>| -> Result<(), ConvertError> {
-            let mut row_offset = 0usize;
-            loop {
-                let t_read = Instant::now();
-                match reader.next() {
-                    None => break,
-                    Some(Ok(batch)) => {
-                        let read_dur = t_read.elapsed();
-                        let offset = row_offset;
-                        row_offset += batch.num_rows();
+            read_in_order(
+                source,
+                selected_row_groups,
+                read_tuning,
+                |batch, row_offset, read_dur| {
+                    Ok(
                         if tx
                             .send(ReadMsg {
-                                row_offset: offset,
+                                row_offset,
                                 batch,
                                 read_dur,
                             })
                             .is_err()
                         {
-                            break; // consumer dropped the receiver (error path)
-                        }
-                    }
-                    Some(Err(e)) => return Err(e.into()),
-                }
-            }
-            Ok(())
+                            ReadFlow::Stop // consumer dropped the receiver (error path)
+                        } else {
+                            ReadFlow::Continue
+                        },
+                    )
+                },
+            )
         },
         // Consumer: process batches in read order; parallelize within each
         // batch. Because batches arrive in order and are appended before the
@@ -779,7 +1744,7 @@ pub(super) fn run_pass2_buffered(
                     if let Some((out, v)) = out {
                         rows_ref[li] += out.num_rows();
                         verts_ref[li] += v;
-                        spill_bytes_ref[li] += sinks_ref[li].push(out, timers_ref)?;
+                        spill_bytes_ref[li] += sinks_ref[li].push(out)?;
                     }
                 }
                 if last_progress.elapsed().as_secs() >= 10 {
@@ -844,7 +1809,19 @@ fn drain_sink(
         }
         LevelSink::Spill(state) => {
             // `_temp` keeps the spill file on disk until the reader is drained.
-            let (mut reader, _temp) = state.into_reader()?;
+            // Joining the writer here also folds its encode+write core-seconds
+            // into `timers.spill_write`, so the stage split still accounts for
+            // the I/O now that it no longer runs on the consumer thread.
+            //
+            // Known, bounded double-count: the join's own wait sits inside
+            // `t_drain` AND the joined writer's `write_time` lands in
+            // `spill_write`, so the two stages overlap by however long the
+            // writer was still behind at drain time — at most
+            // `SPILL_QUEUE_DEPTH + 1` batches' worth of encode. Left in place
+            // deliberately: excluding it would mean splitting the join out of
+            // the drain timer and losing the (real) wall time the drain spends
+            // waiting, which is the thing the drain counter exists to show.
+            let (mut reader, _temp) = state.into_reader(timers)?;
             let err: std::cell::RefCell<Option<ConvertError>> = std::cell::RefCell::new(None);
             let iter = std::iter::from_fn(|| match reader.next() {
                 None => None,
@@ -863,6 +1840,145 @@ fn drain_sink(
     };
     Pass2Timers::add_dur(timers.drain_cell(), t_drain.elapsed());
     Ok(outcome)
+}
+
+/// The off-thread spill writer (#494): order, accounting, and how a failing
+/// or abandoned writer surfaces.
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    fn schema(name: &str) -> Schema {
+        Schema::new(vec![Field::new(name, DataType::Int64, false)])
+    }
+
+    /// One batch holding `ids`, against `schema`.
+    fn batch(schema: &Schema, ids: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(ids)) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    /// The load-bearing property: a level's batches must come back out of the
+    /// spill file in exactly the order they were pushed. The writer runs on
+    /// its own thread now, so "the consumer wrote it" and "the file has it"
+    /// are no longer the same moment — but one sender over a FIFO channel to
+    /// one writer keeps the sequence, and `into_reader` joins before reading.
+    #[test]
+    fn spill_writer_preserves_push_order() {
+        let s = schema("id");
+        let mut sink = SpillState::new(&s).unwrap();
+        // Comfortably more than SPILL_QUEUE_DEPTH, so the consumer really does
+        // block on a full queue and the two threads interleave.
+        let pushed: Vec<Vec<i64>> = (0..64i64).map(|i| vec![i * 10, i * 10 + 1]).collect();
+        let mut bytes = 0u64;
+        for ids in &pushed {
+            bytes += sink.push(batch(&s, ids.clone())).unwrap();
+        }
+        let timers = Pass2Timers::default();
+        let (reader, _temp) = sink.into_reader(&timers).unwrap();
+        let got: Vec<Vec<i64>> = reader
+            .map(|b| {
+                let b = b.unwrap();
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec();
+                col
+            })
+            .collect();
+        assert_eq!(got, pushed, "spill read-back must match push order exactly");
+        assert!(
+            bytes > 0,
+            "push must report the in-memory bytes it handed on"
+        );
+        assert!(
+            timers.stage_secs().spill_write > 0.0,
+            "the writer thread's encode+write core-seconds must be folded back \
+             into the stage split at join time — otherwise moving the I/O off \
+             the consumer thread would simply make it invisible again"
+        );
+    }
+
+    /// A sink that accepts the IPC header and then fails — the shape of a
+    /// spill filesystem that fills up mid-level.
+    struct FailsAfter {
+        remaining: usize,
+    }
+
+    impl std::io::Write for FailsAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("spill device is out of space"));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that fails mid-stream must surface ITS error, not a derived
+    /// "channel closed" (#486): a failed `send` only means the thread already
+    /// returned, so the sink joins it and reports what it returned. Before the
+    /// writer moved off the consumer thread this was simply `push`'s own `?`;
+    /// the thread must not have made the failure quieter.
+    #[test]
+    fn spill_writer_error_surfaces_as_the_writers_own_error() {
+        let s = schema("id");
+        // Enough budget for the IPC schema message, not for the batches.
+        let writer = StreamWriter::try_new(FailsAfter { remaining: 512 }, &s).unwrap();
+        let mut sink = SpillState::spawn(writer, NamedTempFile::new().unwrap()).unwrap();
+        // The queue absorbs the first pushes, so the error lands on a later
+        // push or at join — either way it must be the writer's own.
+        let mut err = None;
+        for _ in 0..(SPILL_QUEUE_DEPTH + 16) {
+            if let Err(e) = sink.push(batch(&s, vec![1, 2, 3])) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = match err {
+            Some(e) => e,
+            None => sink
+                .into_reader(&Pass2Timers::default())
+                .expect_err("a writer whose sink failed must fail the sink"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of space"),
+            "the writer's own I/O error must be what surfaces, got: {msg}"
+        );
+        assert!(
+            !msg.contains("internal:"),
+            "an internal placeholder must never stand in for the writer's own \
+             error, got: {msg}"
+        );
+    }
+
+    /// A sink abandoned without `into_reader` (an error path, or an unwind)
+    /// must still join its writer rather than leaving a thread parked on a
+    /// receiver that never disconnects. The test body is the assertion: a
+    /// `Drop` that forgot to drop the sender first would hang here.
+    #[test]
+    fn dropping_a_sink_joins_its_writer() {
+        let s = schema("id");
+        let mut sink = SpillState::new(&s).unwrap();
+        for i in 0..8i64 {
+            sink.push(batch(&s, vec![i])).unwrap();
+        }
+        drop(sink);
+    }
 }
 
 #[cfg(test)]
