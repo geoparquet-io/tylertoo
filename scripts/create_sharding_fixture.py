@@ -24,10 +24,17 @@ Why a purpose-built fixture rather than one of the real-data ones:
 Rows are sorted by longitude, so each row group is a narrow vertical band —
 the shape a ``gpio``-optimized input has, and the shape that makes row-group
 pruning bite.
+
+**Regenerating changes the bytes.** Parquet encoding, compression and
+statistics all depend on the pyarrow (and arrow-cpp) version, so re-running
+this will produce a file that differs from the committed one even with no
+change here. That is fine — the tests assert properties, not bytes — but do
+not expect ``git diff`` to come back empty.
 """
 
 import json
 import math
+import struct
 from pathlib import Path
 
 import pyarrow as pa
@@ -50,15 +57,45 @@ ROW_GROUP_SIZE = 72  # -> 20 row groups
 
 
 def wkb_polygon(ring):
-    """Little-endian WKB for a Polygon with one ring (closed by the caller)."""
+    """Little-endian WKB for a Polygon with one ring (closed by the caller).
+
+    ``struct.pack`` rather than poking at a pyarrow buffer: the buffer trick
+    produced NATIVE-endian doubles inside a little-endian-declared WKB, so the
+    fixture would have been silently corrupt on a big-endian host — and it
+    depended on pyarrow's internal buffer layout for no gain.
+    """
     out = bytearray()
     out += b"\x01"  # little endian
     out += (3).to_bytes(4, "little")  # Polygon
     out += (1).to_bytes(4, "little")  # one ring
     out += len(ring).to_bytes(4, "little")
     for x, y in ring:
-        out += bytearray(memoryview(pa.array([x, y], type=pa.float64()).buffers()[1])[:16])
+        out += struct.pack("<dd", x, y)
     return bytes(out)
+
+
+def _f32(v):
+    """`v` as pyarrow will store it in a float32 column."""
+    return struct.unpack("<f", struct.pack("<f", v))[0]
+
+
+def f32_down(v):
+    """A float32 <= v — the right rounding for a covering's MIN.
+
+    Nudged by 1e-6 RELATIVE, which is ~16 float32 ulps (float32 carries about
+    1.2e-7 relative precision), so the result is certainly below `v` while
+    still being a change of ~1e-4 metres at these magnitudes. Widening a
+    covering is free; shrinking one drops row groups a query really does
+    reach.
+    """
+    f = _f32(v)
+    return f if f <= v else _f32(f - abs(f) * 1e-6 - 1e-30)
+
+
+def f32_up(v):
+    """A float32 >= v — the right rounding for a covering's MAX."""
+    f = _f32(v)
+    return f if f >= v else _f32(f + abs(f) * 1e-6 + 1e-30)
 
 
 def square(cx, cy, half_w, half_h):
@@ -89,11 +126,17 @@ for j in range(ROWS):
                 # and one that is NOT correlated with position.
                 "weight": float((i * 7 + j * 13) % 97),
                 "geometry": wkb_polygon(ring),
+                # The covering columns are float32, and the coordinates are
+                # float64: round the envelope OUTWARD on the way down. A
+                # covering is a conservative bound, and round-to-nearest can
+                # shrink it — a reader that prunes against a too-small bbox
+                # drops a row group whose features really do reach the query,
+                # which in a sharded build is a tile missing geometry.
                 "bbox": {
-                    "xmin": min(xs),
-                    "ymin": min(ys),
-                    "xmax": max(xs),
-                    "ymax": max(ys),
+                    "xmin": f32_down(min(xs)),
+                    "ymin": f32_down(min(ys)),
+                    "xmax": f32_up(max(xs)),
+                    "ymax": f32_up(max(ys)),
                 },
             }
         )

@@ -300,34 +300,43 @@ fn shard_with_coalesced_lines_in_the_plan_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let shard_plan = dir.path().join("shards.json");
     let convert_plan = dir.path().join("convert.plan");
+    // Pivot z6: this fixture's features are only visible from z5, so a
+    // coarser pivot would leave the coarse job with no level to export and
+    // the test would fail for a reason that has nothing to do with
+    // coalescing.
     let (ok, out) = run(&[
         "shard-plan",
         lines.to_str().unwrap(),
         "--shards",
         "2",
         "--pivot",
-        "3",
+        "6",
         "-o",
         shard_plan.to_str().unwrap(),
     ]);
     assert!(ok, "{out}");
 
-    // Coalescing on (the default), so the plan carries chains. Written by a
-    // plain run rather than the coarse job: this test is about what a SHARD
-    // does with such a plan, and a coarse job's own zoom range is beside the
-    // point.
+    // Coalescing on (the default), so the plan carries chains. Written by the
+    // COARSE JOB of this fleet, which is the only run whose plan a shard will
+    // accept: the shard plan's cut digest is part of the convert plan's
+    // fingerprint (#498), so a plan saved by an unsharded run is refused
+    // before the coalescing rule is ever reached.
     let (ok, out) = run(&[
         "tiles",
         lines.to_str().unwrap(),
-        dir.path().join("whole.pmtiles").to_str().unwrap(),
+        dir.path().join("coarse.pmtiles").to_str().unwrap(),
         "--min-zoom",
         "0",
         "--max-zoom",
         "6",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
         "--save-plan",
         convert_plan.to_str().unwrap(),
     ]);
-    assert!(ok, "the plan-writing run must succeed: {out}");
+    assert!(ok, "the plan-writing coarse job must succeed: {out}");
 
     let (ok, out) = run(&[
         "tiles",
@@ -353,6 +362,14 @@ fn shard_with_coalesced_lines_in_the_plan_is_refused() {
 
 /// `export-pmtiles --tile-range LO..HI` is the manual form of a shard's
 /// restriction: two tile ids at one zoom, which then own every descendant.
+///
+/// Deliberately NOT re-deriving the tile arithmetic from the summary lines:
+/// `shard_merge_parity.rs` already proves the halves partition the whole,
+/// tile body by tile body, against a monolithic control. Parsing stdout to
+/// re-prove it here bought a second, weaker copy of that oracle and a
+/// dependence on the exact shape of a human-readable line. What is left is
+/// what only a CLI test can say: the flag reaches core, the restriction
+/// actually restricts, and a malformed range is refused.
 #[test]
 fn export_tile_range_restricts_and_rejects_mixed_zooms() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -368,9 +385,6 @@ fn export_tile_range_restricts_and_rejects_mixed_zooms() {
     ]);
     assert!(ok, "{out}");
 
-    // z2's ids are 5..=20. Take the first half and the second half; together
-    // they must account for every tile the unrestricted export emits at
-    // z2..z4, and neither alone may hold a z0 or z1 tile.
     let whole = dir.path().join("whole-export.pmtiles");
     let (ok, out) = run(&[
         "export-pmtiles",
@@ -378,43 +392,27 @@ fn export_tile_range_restricts_and_rejects_mixed_zooms() {
         whole.to_str().unwrap(),
     ]);
     assert!(ok, "{out}");
-    let whole_zooms = per_zoom(&out);
-    let whole_total = count_tiles(&out);
-    let above_pivot: usize = whole_zooms
-        .iter()
-        .filter(|(z, _)| *z < 2)
-        .map(|(_, n)| n)
-        .sum();
-    assert!(
-        above_pivot > 0,
-        "the control must hold tiles above the pivot"
-    );
 
-    let mut halves = 0usize;
-    for (lo, hi) in [(5u64, 12u64), (13, 20)] {
-        let part = dir.path().join(format!("part-{lo}.pmtiles"));
-        let (ok, out) = run(&[
-            "export-pmtiles",
-            overview.to_str().unwrap(),
-            part.to_str().unwrap(),
-            "--tile-range",
-            &format!("{lo}..{hi}"),
-        ]);
-        assert!(ok, "{out}");
-        for (z, n) in per_zoom(&out) {
-            assert!(
-                z >= 2 || n == 0,
-                "a range whose pivot is z2 must emit nothing at z{z}, got {n}: {out}"
-            );
-        }
-        halves += count_tiles(&out);
+    // z2's ids are 5..=20; take the first half. It must emit nothing above
+    // its pivot, and strictly fewer tiles than the unrestricted control.
+    let part = dir.path().join("part.pmtiles");
+    let (ok, out) = run(&[
+        "export-pmtiles",
+        overview.to_str().unwrap(),
+        part.to_str().unwrap(),
+        "--tile-range",
+        "5..12",
+    ]);
+    assert!(ok, "{out}");
+    for (z, n) in per_zoom(&out) {
+        assert!(
+            z >= 2 || n == 0,
+            "a range whose pivot is z2 must emit nothing at z{z}, got {n}: {out}"
+        );
     }
-    // The two halves partition z2 and everything below it; what is left over
-    // is exactly the zooms above the pivot, which no z2 range owns.
-    assert_eq!(
-        halves + above_pivot,
-        whole_total,
-        "the two halves plus the zooms above the pivot must account for every tile"
+    assert!(
+        part.metadata().unwrap().len() < whole.metadata().unwrap().len(),
+        "a restricted export must be smaller than the whole"
     );
 
     // Two ids at different zooms is not a range.
@@ -427,6 +425,54 @@ fn export_tile_range_restricts_and_rejects_mixed_zooms() {
     ]);
     assert!(!ok);
     assert!(out.contains("same zoom"), "{out}");
+}
+
+/// `--zoom-ceiling` is the coarse half's complement, and is named a ceiling
+/// because — unlike `--min-zoom`, which only widens what the header declares
+/// — it decides which zooms are actually emitted.
+#[test]
+fn export_zoom_ceiling_emits_only_the_coarse_half() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let overview = dir.path().join("ov.parquet");
+    let (ok, out) = run(&[
+        "overview",
+        grid().to_str().unwrap(),
+        overview.to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "4",
+    ]);
+    assert!(ok, "{out}");
+
+    let (ok, out) = run(&[
+        "export-pmtiles",
+        overview.to_str().unwrap(),
+        dir.path().join("coarse.pmtiles").to_str().unwrap(),
+        "--zoom-ceiling",
+        "1",
+    ]);
+    assert!(ok, "{out}");
+    for (z, n) in per_zoom(&out) {
+        assert!(
+            z <= 1 || n == 0,
+            "z{z} is past the ceiling but holds {n}: {out}"
+        );
+    }
+
+    // A ceiling below the file's coarsest level leaves nothing to emit, and
+    // says so by name rather than writing an archive with no tiles in it.
+    let (ok, out) = run(&[
+        "export-pmtiles",
+        overview.to_str().unwrap(),
+        dir.path().join("none.pmtiles").to_str().unwrap(),
+        "--tile-range",
+        "5..12",
+        "--zoom-ceiling",
+        "1",
+    ]);
+    assert!(!ok, "a z2 range under a z1 ceiling emits nothing: {out}");
+    assert!(out.contains("would emit no zoom at all"), "{out}");
 }
 
 /// A `--tile-buffer` wider than a shard's read-pruning margin is refused.
@@ -487,16 +533,6 @@ fn a_tile_buffer_wider_than_the_shard_margin_is_refused() {
     assert!(ok, "the bound only applies to a sharded export: {out}");
 }
 
-/// Total tiles from an `export-pmtiles` run's summary line.
-fn count_tiles(stdout: &str) -> usize {
-    stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("✓ "))
-        .and_then(|l| l.split_whitespace().next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("no summary line in: {stdout}"))
-}
-
 /// Per-zoom `(zoom, tile_count)` from an `export-pmtiles` summary.
 fn per_zoom(stdout: &str) -> Vec<(u8, usize)> {
     stdout
@@ -517,4 +553,299 @@ fn per_zoom(stdout: &str) -> Vec<(u8, usize)> {
             Some((z, n))
         })
         .collect()
+}
+
+/// Cut a shard plan for the grid fixture, returning its path.
+fn cut_plan(dir: &Path, shards: &str, pivot: &str) -> PathBuf {
+    let plan = dir.join(format!("shards-{shards}-{pivot}.json"));
+    let (ok, out) = run(&[
+        "shard-plan",
+        grid().to_str().unwrap(),
+        "--shards",
+        shards,
+        "--pivot",
+        pivot,
+        "-o",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "shard-plan failed: {out}");
+    plan
+}
+
+/// The coarse job owns `[--min-zoom, pivot - 1]`. A pivot at or below the
+/// requested minimum leaves it nothing to build — and without a fail-fast the
+/// whole convert (hours, on the inputs this feature exists for) runs before
+/// the export refuses an empty restriction.
+#[test]
+fn a_coarse_job_with_no_zoom_to_build_fails_before_converting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plan = cut_plan(dir.path(), "2", "3");
+    let out_path = dir.path().join("coarse.pmtiles");
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        out_path.to_str().unwrap(),
+        "--min-zoom",
+        "3",
+        "--max-zoom",
+        "5",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        plan.to_str().unwrap(),
+        "--save-plan",
+        dir.path().join("convert.plan").to_str().unwrap(),
+    ]);
+    assert!(!ok, "a coarse job owning no zoom must be refused: {out}");
+    assert!(
+        out.contains("has no zoom to build") && out.contains("pivot is z3"),
+        "{out}"
+    );
+    assert!(!out_path.exists(), "nothing must be written");
+    assert!(
+        !dir.path().join("convert.plan").exists(),
+        "and no convert plan either"
+    );
+}
+
+/// `shard-plan` resolves its input exactly as `tiles` does, `--files-from`
+/// manifests included — otherwise a fleet reading a manifest could not be
+/// planned at all, and the plan's per-part input binding would have nothing
+/// to bind to.
+#[test]
+fn shard_plan_accepts_a_files_from_manifest_and_binds_to_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("parts.txt");
+    std::fs::write(
+        &manifest,
+        format!("# one part\n{}\n", grid().to_str().unwrap()),
+    )
+    .unwrap();
+
+    let plan = dir.path().join("shards.json");
+    let (ok, out) = run(&[
+        "shard-plan",
+        "--files-from",
+        manifest.to_str().unwrap(),
+        "--shards",
+        "2",
+        "--pivot",
+        "3",
+        "-o",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "a manifest-driven shard-plan must work: {out}");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert_eq!(json["inputs"].as_array().unwrap().len(), 1, "{json}");
+
+    // And the plan the manifest produced is accepted by a `tiles --shard`
+    // run reading the same manifest: the round trip is what makes a
+    // multi-part fleet possible at all.
+    let (ok, out) = run(&[
+        "tiles",
+        "--files-from",
+        manifest.to_str().unwrap(),
+        dir.path().join("out.pmtiles").to_str().unwrap(),
+        "--max-zoom",
+        "4",
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        plan.to_str().unwrap(),
+    ]);
+    // It gets past every plan check and stops at the one remaining
+    // requirement, which is what "the plan was accepted" looks like here.
+    assert!(!ok);
+    assert!(
+        out.contains("--shard requires --plan"),
+        "the manifest plan must be accepted, leaving only the --plan rule: {out}"
+    );
+}
+
+/// A fleet is bound to ONE cut. The coarse job stamps the shard plan's cut
+/// digest into the convert plan's fingerprint, so a shard handed a
+/// differently-cut `shards.json` is refused by name instead of quietly
+/// building tiles that overlap its siblings' and leave holes elsewhere.
+#[test]
+fn a_shard_given_a_different_cut_than_the_plan_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let two = cut_plan(dir.path(), "2", "3");
+    let four = cut_plan(dir.path(), "4", "3");
+    let convert_plan = dir.path().join("convert.plan");
+
+    // The coarse job, run against the two-way cut.
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        dir.path().join("coarse.pmtiles").to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "4",
+        "--no-coalesce-lines",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        two.to_str().unwrap(),
+        "--save-plan",
+        convert_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "the coarse job must succeed: {out}");
+
+    // A shard of the FOUR-way cut, handed that plan: same input, same
+    // options, different cut.
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        dir.path().join("wrong.pmtiles").to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "4",
+        "--no-coalesce-lines",
+        "--shard",
+        "0/4",
+        "--shard-plan",
+        four.to_str().unwrap(),
+        "--plan",
+        convert_plan.to_str().unwrap(),
+    ]);
+    assert!(!ok, "a re-cut shard plan must be refused: {out}");
+    assert!(
+        out.contains("not the one the convert plan was saved with"),
+        "the error must name the mismatch: {out}"
+    );
+
+    // The matching cut is accepted, and the shard builds.
+    let shard0 = dir.path().join("shard-0.pmtiles");
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        shard0.to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "4",
+        "--no-coalesce-lines",
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        two.to_str().unwrap(),
+        "--plan",
+        convert_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "the matching cut must build: {out}");
+    assert!(shard0.exists());
+}
+
+/// A shard whose range owns no input rows **succeeds**, writing a valid empty
+/// archive.
+///
+/// `shard-plan` cuts N ranges whatever the data looks like — an empty RANGE
+/// is legal, a gap is not — so a `--bbox`-narrowed (or simply concentrated)
+/// dataset routinely leaves some shards with nothing. Failing them would mean
+/// an array job whose red squares mean "correct", and a merge input list the
+/// operator has to hand-edit. The whole fleet, empty shard included, must
+/// merge and verify.
+#[test]
+fn a_shard_that_owns_no_rows_writes_an_empty_archive_and_the_fleet_still_merges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plan = cut_plan(dir.path(), "4", "3");
+    let convert_plan = dir.path().join("convert.plan");
+    // A bbox confining the build to one corner of the world, so most of the
+    // four ranges own nothing at all.
+    // `--bbox=` rather than `--bbox -175,...`: a leading minus is a flag to
+    // clap otherwise.
+    let bbox = "-175,-70,-120,-20";
+
+    let coarse = dir.path().join("coarse.pmtiles");
+    let common = |extra: &[&str], out: &Path| -> Vec<String> {
+        let mut v: Vec<String> = vec![
+            "tiles".into(),
+            grid().to_str().unwrap().into(),
+            out.to_str().unwrap().into(),
+            "--min-zoom".into(),
+            "0".into(),
+            "--max-zoom".into(),
+            "4".into(),
+            format!("--bbox={bbox}"),
+            "--no-coalesce-lines".into(),
+            "--shard-plan".into(),
+            plan.to_str().unwrap().into(),
+        ];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    };
+    let argv = common(
+        &[
+            "--shard",
+            "coarse",
+            "--save-plan",
+            convert_plan.to_str().unwrap(),
+        ],
+        &coarse,
+    );
+    let (ok, out) = run(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(ok, "coarse job: {out}");
+
+    let mut archives = vec![coarse];
+    let mut empties = 0usize;
+    for i in 0..4 {
+        let shard = dir.path().join(format!("shard-{i}.pmtiles"));
+        let argv = common(
+            &[
+                "--shard",
+                &format!("{i}/4"),
+                "--plan",
+                convert_plan.to_str().unwrap(),
+            ],
+            &shard,
+        );
+        let (ok, out) = run(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(
+            ok,
+            "shard {i} must exit 0 even with nothing to build: {out}"
+        );
+        assert!(shard.exists(), "shard {i} must write an archive: {out}");
+        if out.contains("owns no input rows") {
+            empties += 1;
+            assert!(
+                out.contains("wrote an empty archive"),
+                "an empty shard must say so plainly: {out}"
+            );
+        }
+        archives.push(shard);
+    }
+    assert!(
+        empties > 0,
+        "this fixture/bbox is meant to leave at least one shard empty; if the cut changed, \
+         pick a narrower bbox"
+    );
+
+    let merged = dir.path().join("merged.pmtiles");
+    let mut argv: Vec<String> = vec!["merge".into(), merged.to_str().unwrap().into()];
+    argv.extend(archives.iter().map(|p| p.to_str().unwrap().to_string()));
+    let (ok, out) = run(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(ok, "the fleet must merge with an empty shard in it: {out}");
+
+    // "Valid empty archive" is not a figure of speech: the merge above opened
+    // and validated every input's header and directories, and the bytes below
+    // are the PMTiles v3 magic. An empty shard is a real archive that happens
+    // to hold nothing, not a zero-byte placeholder.
+    for a in &archives {
+        let head = std::fs::read(a).expect("read archive");
+        assert!(
+            head.len() > 127,
+            "{}: too small to be an archive",
+            a.display()
+        );
+        assert_eq!(
+            &head[..7],
+            b"PMTiles",
+            "{}: not a PMTiles archive",
+            a.display()
+        );
+        assert_eq!(head[7], 3, "{}: not PMTiles v3", a.display());
+    }
 }
