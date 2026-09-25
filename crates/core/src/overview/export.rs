@@ -422,12 +422,18 @@ pub enum ExportError {
     },
 
     /// A shard restriction leaves no zoom to emit at all (#498).
+    ///
+    /// Named for the *restriction*, not the range: this is not
+    /// [`crate::shard::ShardError::EmptyTileRange`] (a range whose LO is past
+    /// its HI, which is a malformed range). The range here is perfectly
+    /// well-formed — it simply has no overlap with the zooms the overview
+    /// file holds.
     #[error(
         "this export would emit no zoom at all: the restriction starts at z{coarsest} and \
          stops at z{finest}. A --tile-range's pivot must be no finer than the overview's \
          finest level, and a coarse job's zoom ceiling no coarser than its coarsest."
     )]
-    EmptyTileRange {
+    RestrictionEmitsNoZoom {
         /// The coarsest zoom the restriction would emit.
         coarsest: u8,
         /// The finest zoom the restriction would emit.
@@ -884,10 +890,7 @@ fn restrict_scans_to_range(scans: &mut [LevelScan], level_zooms: &[u8], options:
         if scan.tile_counts.is_empty() {
             scan.bounds = None;
         } else if let (Some(b), Some(rb)) = (scan.bounds.as_mut(), range_bounds.as_ref()) {
-            b.lng_min = b.lng_min.max(rb.lng_min);
-            b.lat_min = b.lat_min.max(rb.lat_min);
-            b.lng_max = b.lng_max.min(rb.lng_max);
-            b.lat_max = b.lat_max.min(rb.lat_max);
+            *b = b.intersect(rb);
         }
     }
     log::info!(
@@ -898,6 +901,43 @@ fn restrict_scans_to_range(scans: &mut [LevelScan], level_zooms: &[u8], options:
             .as_ref()
             .map_or(String::new(), |r| format!(" (range {r})"))
     );
+}
+
+/// Write a valid, **tile-less** PMTiles archive (#498).
+///
+/// A sharded build cuts N ranges that tile the pivot zoom with no gap, so a
+/// dataset concentrated in one corner of the world leaves some of those
+/// ranges owning no input rows at all. That is a legal outcome of a legal
+/// cut, and the job that draws such a range has to produce something: an
+/// array job whose "correct" outcome is a failed task, and a merge whose
+/// input list the operator has to hand-edit, is the alternative.
+///
+/// The archive is byte-valid and simply holds nothing: same tile type, same
+/// compression and the same declared layer as a real export of the same
+/// fleet, so `tylertoo merge` accepts it in the same list as its siblings
+/// (and, seeing no tiles, excludes it from the merged zoom range, bounds and
+/// layer declarations rather than letting an empty job widen them).
+///
+/// `min_zoom`/`max_zoom` are what the archive DECLARES — for a data shard,
+/// its own `[pivot, max_zoom]` half. Bounds are deliberately left unset: an
+/// archive with no tiles has no extent, and claiming its range's extent would
+/// widen the merged bbox on the word of a job that contributed nothing.
+pub fn write_empty_archive(
+    output: &Path,
+    layer_name: &str,
+    min_zoom: u8,
+    max_zoom: u8,
+) -> Result<(), ExportError> {
+    // Gzip and the tail layout, matching `export_pmtiles` exactly —
+    // `merge_shards` refuses inputs whose tile compression disagrees, so an
+    // empty shard written any other way would break the very merge it exists
+    // to keep working.
+    let mut writer = StreamingPmtilesWriter::with_tail_layout(output, Compression::Gzip)?;
+    writer.set_layer_name(layer_name);
+    writer.set_declared_min_zoom(min_zoom);
+    writer.set_declared_max_zoom(max_zoom);
+    writer.finalize(output)?;
+    Ok(())
 }
 
 /// Plan every level's partitions and wave width.
@@ -1015,7 +1055,7 @@ fn export_pmtiles_impl(
     // the pivot however coarse the overview file is (the coarser levels belong
     // to the coarse job), and the coarse job stops at the ceiling.
     let coarsest_zoom = match options.tile_range.as_ref() {
-        Some(r) => level_zooms[0].max(r.pivot_zoom),
+        Some(r) => level_zooms[0].max(r.pivot_zoom()),
         None => level_zooms[0],
     };
     let max_zoom = match options.zoom_ceiling {
@@ -1023,7 +1063,7 @@ fn export_pmtiles_impl(
         None => level_zooms[num_levels - 1],
     };
     if coarsest_zoom > max_zoom {
-        return Err(ExportError::EmptyTileRange {
+        return Err(ExportError::RestrictionEmitsNoZoom {
             coarsest: coarsest_zoom,
             finest: max_zoom,
         });
