@@ -313,7 +313,7 @@ pub fn simplify_for_level_checked(
                         unchanged = false;
                         kept.extend(parts.0);
                     }
-                    (Simplified::Keep(_), _) | (Simplified::Dropped, _) => unchanged = false,
+                    (Simplified::Keep(_) | Simplified::Dropped, _) => unchanged = false,
                 }
             }
             if !kept.is_empty() {
