@@ -247,7 +247,7 @@ pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
 /// minus 1, folded into a `+ hilbert_idx + 1` for `z >= 1`; both forms agree
 /// for every `z`, this one included at `z = 0`).
 #[inline]
-fn hilbert_zoom_base(z: u8) -> u64 {
+pub(crate) fn hilbert_zoom_base(z: u8) -> u64 {
     ((1u64 << (2 * u32::from(z))) - 1) / 3
 }
 

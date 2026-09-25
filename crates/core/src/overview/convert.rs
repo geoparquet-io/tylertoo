@@ -2948,14 +2948,7 @@ pub(crate) fn select_input_row_groups(
     metadata: &parquet::file::metadata::ParquetMetaData,
     bbox_units: &[f64; 4],
 ) -> Vec<usize> {
-    let geom_column = crate::covering::resolve_geometry_column_name(metadata);
-    let bounds = match detect_crs_from_kv(metadata.file_metadata().key_value_metadata()) {
-        Ok(crs) => {
-            crate::covering::extract_row_group_bounds_tiered(metadata, crs, geom_column.as_deref())
-        }
-        Err(_) => crate::covering::extract_row_group_bounds_from_metadata(metadata)
-            .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]),
-    };
+    let bounds = input_row_group_bounds(metadata);
     let filter = crate::tile::TileBounds {
         lng_min: bbox_units[0],
         lat_min: bbox_units[1],
@@ -2968,6 +2961,30 @@ pub(crate) fn select_input_row_groups(
             None => true, // no stats — must read to stay correct
         })
         .collect()
+}
+
+/// Per-row-group bboxes for one part, from footer metadata only.
+///
+/// The extraction half of [`select_input_row_groups`], split out because the
+/// shard planner (#498) wants the same bboxes for a different purpose: it
+/// spreads each group's rows over the pivot tiles the bbox covers to balance
+/// the cut. Both callers therefore see exactly the same view of the input,
+/// which matters — a shard prunes against a bbox derived from the very ranges
+/// this estimate produced.
+///
+/// Entry `i` is row group `i`'s bbox, or `None` when neither statistics tier
+/// can supply one.
+pub(crate) fn input_row_group_bounds(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+) -> Vec<Option<crate::covering::RowGroupBounds>> {
+    let geom_column = crate::covering::resolve_geometry_column_name(metadata);
+    match detect_crs_from_kv(metadata.file_metadata().key_value_metadata()) {
+        Ok(crs) => {
+            crate::covering::extract_row_group_bounds_tiered(metadata, crs, geom_column.as_deref())
+        }
+        Err(_) => crate::covering::extract_row_group_bounds_from_metadata(metadata)
+            .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]),
+    }
 }
 
 /// Parse + bind [`ConvertOptions::filter`] (#315) against the (possibly

@@ -580,6 +580,44 @@ impl ConvertSource {
             .sum())
     }
 
+    /// Per-part, per-row-group bboxes straight from the footers — the input
+    /// the shard planner (#498) balances its cut on.
+    ///
+    /// Entry `[p][g]` is part `p`'s row group `g`, or `None` when neither
+    /// statistics tier can supply a bbox. Footer-only, so a planet-scale
+    /// input costs one footer fetch per part and no data page is read.
+    pub fn part_row_group_bounds(
+        &self,
+    ) -> Result<Vec<Vec<Option<crate::covering::RowGroupBounds>>>, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .map(|m| crate::overview::convert::input_row_group_bounds(&m.parquet))
+            .collect())
+    }
+
+    /// Per-part, per-row-group row counts straight from the footers.
+    ///
+    /// Entry `[p][g]` is part `p`'s row group `g`'s `num_rows`. This is what
+    /// turns a row-group *index* into a row *offset*, which is what a shard
+    /// needs to re-address a global convert plan onto the subset of row groups
+    /// it reads (#498): the plan's winner table is indexed by row position
+    /// within the plan's own selected stream, so a shard has to know where
+    /// each of its groups sits in that stream, not merely which groups it has.
+    pub fn part_row_group_row_counts(&self) -> Result<Vec<Vec<i64>>, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .map(|m| {
+                m.parquet
+                    .row_groups()
+                    .iter()
+                    .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                    .collect()
+            })
+            .collect())
+    }
+
     /// Per-part bbox row-group selection (#102): applies the single-file
     /// covering-statistics pruning to each part independently.
     /// `bbox_units` is `[xmin, ymin, xmax, ymax]` in the file CRS units.
