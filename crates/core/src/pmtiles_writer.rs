@@ -922,23 +922,28 @@ pub(crate) fn read_all_entries_from<S: ArchiveBytes + ?Sized>(
 /// Mirrors go-pmtiles' `verify`: walking entries in order with a high-water
 /// mark on how far into the tile-data section has been read, each entry's
 /// offset must either extend that mark (`offset == end`, a freshly written
-/// tile) or point wholly inside bytes already accounted for (`offset +
-/// length <= end`, a deduplication back-reference — legal in a clustered
-/// archive, since a reader that already streamed those bytes can just reuse
-/// them). Anything else — an offset ahead of the mark, or a back-reference
-/// that pokes past it — means a client streaming tile data in directory
-/// order would have to seek backwards past unread bytes or forwards over a
-/// gap, which is exactly what "clustered" promises never happens.
-fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)>) -> bool {
+/// tile) or exactly match an offset already seen earlier in the walk (a
+/// deduplication back-reference to a whole prior tile — legal in a
+/// clustered archive, since a reader that already streamed those bytes can
+/// just reuse them verbatim). Anything else — an offset ahead of the mark,
+/// or a back-reference into the *middle* of an earlier tile rather than its
+/// exact start — means a client streaming tile data in directory order
+/// would have to seek backwards past unread bytes, forwards over a gap, or
+/// land mid-tile, which is exactly what "clustered" promises never
+/// happens. go-pmtiles' `verify` checks the exact-offset form, not merely
+/// "inside bytes already accounted for"; this mirrors that.
+pub(crate) fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)>) -> bool {
     let mut end = 0u64;
+    let mut seen = std::collections::HashSet::new();
     for (offset, length) in entries {
         if offset == end {
+            seen.insert(offset);
             end = end.saturating_add(length);
+        } else if seen.contains(&offset) {
+            // dedup back-reference to an exact previously-seen entry offset;
+            // `end` unchanged
         } else {
-            match offset.checked_add(length) {
-                Some(back_end) if back_end <= end => {} // dedup back-reference; `end` unchanged
-                _ => return false,
-            }
+            return false;
         }
     }
     true
@@ -4594,6 +4599,22 @@ mod tests {
             "a dedup back-reference into already-written bytes is legal in a clustered archive"
         );
         assert_eq!(header.clustered, verify_clustered(tmp.path()).unwrap());
+    }
+
+    /// #516: go-pmtiles' `verify` accepts a back-reference only to an
+    /// *exact* previously-seen entry offset, not to any offset that merely
+    /// falls within bytes already accounted for. An entry pointing into the
+    /// middle of an earlier tile — offset 5 landing inside a first tile that
+    /// spans bytes [0, 10) — used to pass `offsets_are_clustered` (it
+    /// satisfied `offset + length <= end`) but must fail here, since no
+    /// reader ever wrote an entry whose offset was exactly 5.
+    #[test]
+    fn offsets_are_clustered_rejects_backreference_into_tile_middle() {
+        assert!(!offsets_are_clustered([(0, 10), (5, 3)]));
+        // The exact start of the first tile is still a legal back-reference.
+        assert!(offsets_are_clustered([(0, 10), (0, 10)]));
+        // A fresh append after a legal dedup is still fine too.
+        assert!(offsets_are_clustered([(0, 10), (0, 10), (10, 4)]));
     }
 
     /// F8 (#506 review): `set_expect_clustered(true)` pins a real ordering
