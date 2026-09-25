@@ -319,7 +319,18 @@ impl Fingerprint {
 
     /// Verify `self` (loaded from a plan) against the current run's
     /// fingerprint. Any mismatch is a hard error naming the offending field.
+    #[cfg(test)]
     pub fn verify(&self, current: &Fingerprint) -> Result<(), ConvertError> {
+        self.verify_with(current, SelectionRule::Identical)
+    }
+
+    /// [`Fingerprint::verify`], with an explicit rule for the one term a
+    /// shard is allowed to narrow.
+    pub fn verify_with(
+        &self,
+        current: &Fingerprint,
+        selection: SelectionRule,
+    ) -> Result<(), ConvertError> {
         if self.tylertoo_version != current.tylertoo_version {
             return Err(mismatch(
                 "tylertoo_version",
@@ -330,17 +341,13 @@ impl Fingerprint {
         for (key, saved) in &self.options {
             match current.options.get(key) {
                 Some(now) if now == saved => {}
-                Some(now) => return Err(mismatch(&format!("option {key}"), saved, now)),
-                None => return Err(mismatch(&format!("option {key}"), saved, "<absent>")),
+                Some(now) => return Err(option_mismatch(key, saved, now)),
+                None => return Err(option_mismatch(key, saved, "<absent>")),
             }
         }
         for key in current.options.keys() {
             if !self.options.contains_key(key) {
-                return Err(mismatch(
-                    &format!("option {key}"),
-                    "<absent>",
-                    &current.options[key],
-                ));
+                return Err(option_mismatch(key, "<absent>", &current.options[key]));
             }
         }
         if self.inputs.len() != current.inputs.len() {
@@ -351,14 +358,46 @@ impl Fingerprint {
             ));
         }
         for (saved, now) in self.inputs.iter().zip(&current.inputs) {
-            verify_input(saved, now)?;
+            verify_input(saved, now, selection)?;
         }
         Ok(())
     }
 }
 
+/// How strictly the fingerprint's per-part row-group selection is compared.
+///
+/// Every other term stays an equality: a shard tiles the *same* input with the
+/// *same* thinning options as the plan, and only narrows which row groups it
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SelectionRule {
+    /// The ordinary rule: the run must read exactly the row groups the plan
+    /// was saved over. Anything else means the plan's row-indexed winner table
+    /// no longer lines up with the stream, which is the corruption #511/#512
+    /// exist to catch.
+    Identical,
+    /// The shard rule (#498): the run may read a **subset** of the plan's row
+    /// groups, and nothing outside them.
+    ///
+    /// This is the only relaxation a `--shard` run gets, and it is safe for
+    /// exactly one reason: the plan records the selection it was saved over,
+    /// so a shard can compute where each of its groups sits in the plan's row
+    /// stream and re-address the winner table onto its own
+    /// ([`rebase_plan_for_shard`]). A *superset* — a row the plan never saw —
+    /// has no winner byte at all and is refused here.
+    ///
+    /// Narrowing is also what makes a shard cheaper than the whole build: the
+    /// subset is the row groups whose bbox reaches the shard's tile range, and
+    /// a row group outside it cannot contribute to any tile the shard owns.
+    SubsetAllowed,
+}
+
 /// Per-part fingerprint comparison, field by field.
-fn verify_input(saved: &InputFingerprint, now: &InputFingerprint) -> Result<(), ConvertError> {
+fn verify_input(
+    saved: &InputFingerprint,
+    now: &InputFingerprint,
+    selection: SelectionRule,
+) -> Result<(), ConvertError> {
     if saved.path != now.path {
         return Err(mismatch("input path", &saved.path, &now.path));
     }
@@ -396,14 +435,333 @@ fn verify_input(saved: &InputFingerprint, now: &InputFingerprint) -> Result<(), 
             &opt_str(now.mtime_nanos),
         ));
     }
-    if saved.row_groups != now.row_groups {
-        return Err(mismatch(
-            &what("selected row groups"),
-            &format!("{:?}", saved.row_groups),
-            &format!("{:?}", now.row_groups),
-        ));
+    match selection {
+        SelectionRule::Identical => {
+            if saved.row_groups != now.row_groups {
+                return Err(mismatch(
+                    &what("selected row groups"),
+                    &format!("{:?}", saved.row_groups),
+                    &format!("{:?}", now.row_groups),
+                ));
+            }
+        }
+        SelectionRule::SubsetAllowed => {
+            if let Some(extra) = selection_excess(
+                saved.row_groups.as_deref(),
+                now.row_groups.as_deref(),
+                saved.row_groups_total,
+            ) {
+                return Err(ConvertError::InvalidConfig(format!(
+                    "--plan: this shard would read row group {extra} of input {:?}, which the \
+                     plan was not saved over (the plan covers {}). A shard may only narrow the \
+                     plan's row-group selection, never widen it — the winner table has no row \
+                     for a group pass 1 never saw. Re-save the plan over the full input.",
+                    saved.path,
+                    match &saved.row_groups {
+                        Some(list) => format!("{} group(s): {list:?}", list.len()),
+                        None => "every row group".to_string(),
+                    }
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+/// One contiguous run of the plan's row stream that a shard also reads.
+///
+/// A row group is contiguous in the plan's row stream by construction (the
+/// reader streams parts in order and, within a part, the selected groups in
+/// ascending index order), so the shard's domain is a handful of runs rather
+/// than a per-row bitmap — however many rows the dataset has.
+///
+/// **That construction is a cross-module contract**, and since #494 it holds
+/// for the parallel pass-2 read too: `ConvertSource::read_segments` cuts the
+/// SELECTED row groups into segments in exactly that order and the merge
+/// counts `row_offset` over them from zero, so a shard's row stream is its
+/// own selected groups in part-then-ascending order — precisely the order the
+/// runs below are built in. See that function's docs for the other half of
+/// the invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeptRun {
+    /// Where the run starts in the **plan's** row stream.
+    plan_base: usize,
+    /// Where the same run starts in the **shard's** row stream.
+    shard_base: usize,
+    /// Rows in the run.
+    len: usize,
+}
+
+/// Re-address a global convert plan onto the subset of row groups a shard
+/// reads (#498) — the piece that makes a sharded build correct rather than
+/// merely parallel.
+///
+/// # The problem
+///
+/// Every row-indexed section of a plan is addressed by row *position within
+/// the row stream the plan was saved over*, not by absolute file row number:
+/// pass 2 tags each batch with a running `row_offset` and looks up
+/// `min_levels[row_offset + i]`. A shard that prunes row groups streams
+/// *fewer* rows, so its own `row_offset` counts a different sequence — row 0
+/// of the shard is whatever its first selected group starts at, which in the
+/// plan's stream might be row 4 million. Handing the plan over unchanged
+/// would silently read the wrong winner byte for nearly every feature: not a
+/// crash, a quietly wrong pyramid.
+///
+/// # The fix
+///
+/// The plan records the row-group selection it was saved over, and row-group
+/// row counts are footer facts. That is enough to compute where each of the
+/// shard's groups sits in the plan's stream and to rewrite the plan's
+/// sections into the shard's addressing before pass 2 ever runs. Afterwards
+/// the shard is, to everything downstream, an ordinary `--plan` run whose
+/// selection happens to be narrower — including for the row-domain check,
+/// which is re-run against the compacted tables.
+///
+/// The values are never recomputed, only moved: which level a row enters at
+/// stays the dataset-global decision the coarse job made. Rows the shard does
+/// not read are dropped, which is sound because a row group is pruned only
+/// when its bbox does not reach the shard's tile range, and a feature inside
+/// that bbox cannot land in a tile the shard owns.
+///
+/// Returns the compacted row count.
+pub(super) fn rebase_plan_for_shard(
+    plan: &mut ConvertPlan,
+    source: &ConvertSource,
+    shard_selection: Option<&RowGroupSelection>,
+    path: &Path,
+) -> Result<usize, ConvertError> {
+    let rg_rows = source.part_row_group_row_counts()?;
+    let named = || path.display().to_string();
+
+    // Walk the PLAN's stream in read order, marking the runs the shard keeps.
+    let mut runs: Vec<KeptRun> = Vec::new();
+    let mut plan_cursor = 0usize;
+    let mut shard_cursor = 0usize;
+    for (part_idx, part_rows) in rg_rows.iter().enumerate() {
+        let plan_groups: Vec<usize> = match plan.fingerprint.inputs.get(part_idx) {
+            Some(fp) => match &fp.row_groups {
+                Some(list) => list.clone(),
+                None => (0..part_rows.len()).collect(),
+            },
+            None => {
+                return Err(ConvertError::InvalidConfig(format!(
+                    "--plan: {} names {} input part(s) but this run has at least {}",
+                    named(),
+                    plan.fingerprint.inputs.len(),
+                    part_idx + 1,
+                )))
+            }
+        };
+        // The plan's selection decides where every row sits in the plan's
+        // stream, so a forged one that repeated or reordered a group would
+        // silently shift every offset after it. The reader streams a part's
+        // selected groups in ascending index order, so that is the only shape
+        // a real plan can have — anything else is an error, not a base to
+        // compute from. (A plan is hostile input: #512.)
+        if plan_groups.windows(2).any(|w| w[0] >= w[1])
+            || plan_groups.last().is_some_and(|&g| g >= part_rows.len())
+        {
+            return Err(ConvertError::InvalidConfig(format!(
+                "--plan: {} records part {part_idx}'s selected row groups as {plan_groups:?}, \
+                 which is not a strictly ascending list of that part's {} group(s). Row \
+                 positions in the plan's tables are derived from this order, so it cannot be \
+                 trusted when it is not one.",
+                named(),
+                part_rows.len(),
+            )));
+        }
+        // A BTreeSet rather than a linear scan: a planet-scale input has
+        // hundreds of thousands of row groups, and `contains` per group would
+        // make this quadratic in the one place that walks all of them.
+        let shard_groups: Option<std::collections::BTreeSet<usize>> = shard_selection
+            .map(RowGroupSelection::parts)
+            .and_then(|p| p.get(part_idx))
+            .map(|v| v.iter().copied().collect());
+        for g in plan_groups {
+            let rows = part_rows.get(g).copied().unwrap_or(0).max(0) as usize;
+            let kept = shard_groups.as_ref().is_none_or(|s| s.contains(&g));
+            if kept && rows > 0 {
+                // Extend the previous run when the groups are adjacent in
+                // BOTH streams, so a shard that keeps everything collapses to
+                // a single run and costs one memcpy.
+                match runs.last_mut() {
+                    Some(last) if last.plan_base + last.len == plan_cursor => last.len += rows,
+                    _ => runs.push(KeptRun {
+                        plan_base: plan_cursor,
+                        shard_base: shard_cursor,
+                        len: rows,
+                    }),
+                }
+                shard_cursor += rows;
+            }
+            plan_cursor += rows;
+        }
+    }
+
+    if plan_cursor != plan.min_levels.len() {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan: {} holds {} winner-table row(s) but the row group(s) it was saved over \
+             hold {plan_cursor} row(s). Re-run without --plan (add --save-plan to write a \
+             fresh one).",
+            named(),
+            plan.min_levels.len(),
+        )));
+    }
+
+    // Nothing was pruned: the shard reads exactly the plan's stream, so the
+    // addressing already matches and there is nothing to move.
+    if shard_cursor == plan_cursor {
+        return Ok(plan_cursor);
+    }
+
+    // Fallible rather than a slice index: `runs` is derived from the plan's
+    // own row-group table and `src` from a different section of the same
+    // file, so a truncated or hand-edited plan can make them disagree. The
+    // bar #417/#489/#430 set for hostile archives — "named error, never a
+    // panic" — applies to a plan shipped to a worker just as much.
+    fn compact<T: Copy>(
+        what: &str,
+        src: &[T],
+        runs: &[KeptRun],
+        len: usize,
+        named: &str,
+    ) -> Result<Vec<T>, ConvertError> {
+        let mut out = Vec::with_capacity(len);
+        for r in runs {
+            let end = r.plan_base + r.len;
+            if end > src.len() {
+                return Err(ConvertError::InvalidConfig(format!(
+                    "--plan: {named}'s {what} table holds {} entr(y/ies) but the row groups it \
+                     was saved over reach row {end}. The plan is truncated or inconsistent; \
+                     re-run without --plan (add --save-plan to write a fresh one).",
+                    src.len(),
+                )));
+            }
+            out.extend_from_slice(&src[r.plan_base..end]);
+        }
+        Ok(out)
+    }
+    plan.min_levels = compact("winner", &plan.min_levels, &runs, shard_cursor, &named())?;
+    if let Some(kinds) = &plan.kinds {
+        plan.kinds = Some(compact(
+            "geometry-kind",
+            kinds,
+            &runs,
+            shard_cursor,
+            &named(),
+        )?);
+    }
+
+    // Side tables are keyed by the same row index, so they move with it.
+    // A key outside the shard's runs belongs to a row the shard does not
+    // read and is dropped.
+    for level in &mut plan.carriers {
+        let mut out: Vec<usize> = level
+            .iter()
+            .filter_map(|&row| shard_row(&runs, row))
+            .collect();
+        out.sort_unstable();
+        *level = out;
+    }
+    if let Some(tables) = &mut plan.cluster_tables {
+        for table in tables.iter_mut() {
+            *table = table
+                .drain()
+                .filter_map(|(row, entry)| shard_row(&runs, row).map(|r| (r, entry)))
+                .collect();
+        }
+    }
+    // Line coalescing is refused alongside `--shard` up front (a merged chain
+    // spans whatever rows the chain touched, which no single row group's bbox
+    // bounds), so no CHAIN can survive to here.
+    //
+    // A *present but empty* section can, and does, on the default workflow:
+    // `coalesce_lines` is on by default, so a polygon dataset saves a
+    // coalesce section carrying zero rows, and `load_plan_state` — which
+    // gates on `!c.rows.is_empty()`, correctly — lets it through. An
+    // `is_none()` assertion here therefore panicked every debug-build shard
+    // of an ordinary polygon fleet while release builds ran correctly, which
+    // is the worst possible split. Assert what is actually required: nothing
+    // to re-address.
+    debug_assert!(
+        plan.coalesce.as_ref().is_none_or(|c| c.rows.is_empty()),
+        "load_plan_state must have refused a --shard run whose plan carries coalesced chains \
+         before it reached the re-addressing"
+    );
+
+    // The totals describe what this run will read, not the dataset: they feed
+    // the report and the pass-2 RAM-vs-spill decision, and a global
+    // `geom_bytes` on a one-sixteenth shard would send every shard to disk.
+    // The two counts are exact (recounted from the compacted winner table);
+    // `geom_bytes` is prorated, which is all it ever was — an estimate.
+    let assigned = plan
+        .min_levels
+        .iter()
+        .filter(|&&ml| ml != super::stream::UNASSIGNED_LEVEL)
+        .count();
+    let ratio = shard_cursor as f64 / plan_cursor as f64;
+    plan.totals.geom_bytes = (plan.totals.geom_bytes as f64 * ratio).round() as u64;
+    // The per-level winner counts are a *sizing hint* downstream
+    // (`partition_emitted_levels` → `EmitLevel::hint` → the writer's row-group
+    // sizing), so a one-sixteenth shard carrying the global count would size
+    // every level for sixteen times the rows it will write. Prorated by the
+    // same ratio — but never from non-zero to zero: `counts[l] == 0` is ALSO
+    // the level-omission decision (§7.3), and that decision is the coarse
+    // job's dataset-global one, not something a shard may relit. A level the
+    // plan says has winners keeps at least one here whatever the ratio.
+    for c in &mut plan.counts {
+        if *c > 0 {
+            *c = ((*c as f64 * ratio).round() as usize).max(1);
+        }
+    }
+    plan.totals.n_rows = shard_cursor;
+    plan.totals.n_features = assigned;
+    plan.totals.skipped_rows = shard_cursor - assigned;
+    log::info!(
+        "[convert] shard: re-addressed the convert plan onto {shard_cursor} of its \
+         {plan_cursor} row(s) in {} contiguous run(s); {assigned} feature(s) to build",
+        runs.len()
+    );
+    Ok(shard_cursor)
+}
+
+/// Map a plan-stream row index into the shard's stream, or `None` when the
+/// shard does not read that row.
+fn shard_row(runs: &[KeptRun], row: usize) -> Option<usize> {
+    // Rightmost run starting at or before `row`.
+    let idx = runs
+        .partition_point(|r| r.plan_base <= row)
+        .checked_sub(1)?;
+    let r = runs[idx];
+    (row < r.plan_base + r.len).then(|| r.shard_base + (row - r.plan_base))
+}
+
+/// The first row group `now` selects that `saved` did not, or `None` when
+/// `now` is a subset of `saved`.
+///
+/// `None` on either side means "every row group", so `saved = None` accepts
+/// anything within `total`, and `now = None` is a subset only when `saved`
+/// already covered everything.
+fn selection_excess(
+    saved: Option<&[usize]>,
+    now: Option<&[usize]>,
+    total: Option<usize>,
+) -> Option<usize> {
+    let within_total = |g: usize| total.is_none_or(|t| g < t);
+    match (saved, now) {
+        (None, None) => None,
+        (None, Some(now)) => now.iter().copied().find(|&g| !within_total(g)),
+        (Some(saved), now_sel) => {
+            let saved: std::collections::BTreeSet<usize> = saved.iter().copied().collect();
+            match now_sel {
+                Some(now) => now.iter().copied().find(|g| !saved.contains(g)),
+                // "Every row group" is a subset only when the plan already
+                // held every row group.
+                None => (0..total.unwrap_or(0)).find(|g| !saved.contains(g)),
+            }
+        }
+    }
 }
 
 /// One-line honesty note about what a plan does and does not pin for a
@@ -438,6 +796,37 @@ fn warn_remote_binding(source: &ConvertSource, flag: &str) {
 
 fn opt_str<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or_else(|| "<none>".to_string(), |v| v.to_string())
+}
+
+/// An options-map mismatch, with the shard cut called out by name.
+///
+/// #498: "the plan and the shard plan disagree" is a different mistake from
+/// "somebody changed `--density`", and the fix is different too — so the one
+/// key whose mismatch means a MIS-CUT FLEET says so, naming both digests,
+/// rather than being reported as an opaque option string.
+fn option_mismatch(key: &str, saved: &str, now: &str) -> ConvertError {
+    if key != SHARD_PLAN_DIGEST_KEY {
+        return mismatch(&format!("option {key}"), saved, now);
+    }
+    let what = match (saved, now) {
+        (NO_SHARD_PLAN, _) => "the convert plan was saved WITHOUT a shard plan, so it is not a \
+                               sharded fleet's plan at all"
+            .to_string(),
+        (_, NO_SHARD_PLAN) => {
+            format!(
+                "the convert plan was saved for cut {saved}, but this run was given no \
+                     --shard-plan"
+            )
+        }
+        _ => format!("the convert plan records cut {saved}, but --shard-plan cuts {now}"),
+    };
+    ConvertError::InvalidConfig(format!(
+        "--plan: this run's shard plan is not the one the convert plan was saved with: {what}. \
+         Every job of a fleet must be given the SAME shards.json — a re-cut plan moves the \
+         range boundaries, so the jobs would overlap at some seams and leave holes at others. \
+         Use the shard plan the coarse job ran with, or re-run the whole fleet (coarse job \
+         included) against the new cut."
+    ))
 }
 
 fn mismatch(field: &str, saved: &str, now: &str) -> ConvertError {
@@ -486,8 +875,25 @@ fn options_digest(o: &ConvertOptions) -> BTreeMap<String, String> {
     // Simplification runs in pass 2, but the level plan's omission decision
     // (#211) and the coalesce chain counts both read it, so it belongs here.
     put("simplify", format!("{:?}", o.simplify));
+    // #498: the CUT, not this job's slice of it. See
+    // `ConvertOptions::shard_plan_digest` for why one is fingerprinted and
+    // the other cannot be.
+    // A bare string rather than `{:?}` of the Option: this one appears in a
+    // message an operator reads, and `Some("bb4f28d7918e9ff5")` is not it.
+    put(
+        SHARD_PLAN_DIGEST_KEY,
+        o.shard_plan_digest
+            .clone()
+            .unwrap_or_else(|| NO_SHARD_PLAN.to_string()),
+    );
     m
 }
+
+/// The [`options_digest`] key carrying the shard plan's cut digest (#498).
+pub(super) const SHARD_PLAN_DIGEST_KEY: &str = "shard_plan_digest";
+
+/// The cut-digest value recorded by a run that was given no shard plan.
+const NO_SHARD_PLAN: &str = "none";
 
 /// Dataset-wide tallies pass 2 and the convert report need, which otherwise
 /// only exist while the pass-1 feature scratch is alive.
@@ -1653,6 +2059,165 @@ mod tests {
 
     fn touched_err(saved: &Fingerprint, current: &Fingerprint) -> String {
         saved.verify(current).unwrap_err().to_string()
+    }
+
+    /// The #498 relaxation, stated as a pair: a shard may NARROW the plan's
+    /// row-group selection and may not widen it. Outside shard mode the rule
+    /// stays an equality, so the narrowing that is fine for a shard is still
+    /// refused for an ordinary `--plan` replay.
+    #[test]
+    fn shard_mode_accepts_a_subset_of_the_plans_row_groups_and_nothing_else() {
+        let with = |groups: Option<Vec<usize>>| {
+            let mut fp = tiny_fingerprint();
+            fp.inputs[0].row_groups = groups;
+            fp
+        };
+        let saved = with(Some(vec![0, 2, 3]));
+
+        // Narrower: accepted under the shard rule, refused under the
+        // ordinary one.
+        let narrower = with(Some(vec![2]));
+        saved
+            .verify_with(&narrower, SelectionRule::SubsetAllowed)
+            .expect("a shard may read a subset of the plan's row groups");
+        let err = saved
+            .verify_with(&narrower, SelectionRule::Identical)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("selected row groups"), "{err}");
+
+        // Identical: accepted under both.
+        saved
+            .verify_with(&saved, SelectionRule::SubsetAllowed)
+            .unwrap();
+
+        // Wider: refused even under the shard rule, naming the row group the
+        // plan has no winner byte for.
+        let wider = with(Some(vec![0, 1, 2, 3]));
+        let err = saved
+            .verify_with(&wider, SelectionRule::SubsetAllowed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("row group 1") && err.contains("never saw"),
+            "must name the offending group: {err}"
+        );
+
+        // "Every row group" is a subset only of a plan that held every one.
+        let err = saved
+            .verify_with(&with(None), SelectionRule::SubsetAllowed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row group 1"), "{err}");
+        with(None)
+            .verify_with(&with(Some(vec![0, 1, 2])), SelectionRule::SubsetAllowed)
+            .expect("a plan over everything accepts any subset");
+    }
+
+    #[test]
+    fn selection_excess_is_a_subset_test() {
+        // saved = all, now = some: fine while inside the total.
+        assert_eq!(selection_excess(None, Some(&[0, 2]), Some(3)), None);
+        assert_eq!(selection_excess(None, Some(&[0, 7]), Some(3)), Some(7));
+        // saved = some, now = subset / superset.
+        assert_eq!(selection_excess(Some(&[0, 2]), Some(&[2]), Some(3)), None);
+        assert_eq!(
+            selection_excess(Some(&[0, 2]), Some(&[1]), Some(3)),
+            Some(1)
+        );
+        // saved = some, now = all.
+        assert_eq!(selection_excess(Some(&[0, 1, 2]), None, Some(3)), None);
+        assert_eq!(selection_excess(Some(&[0, 2]), None, Some(3)), Some(1));
+    }
+
+    /// A plan is hostile input, and the shard re-addressing computes row
+    /// offsets from the selection the plan RECORDS — so a forged selection
+    /// that repeats, reorders or overruns its part is refused rather than used
+    /// as a base to shift every later offset by.
+    #[test]
+    fn shard_rebase_refuses_a_forged_row_group_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (source, _guard) = one_part_source(&dir, &[3, 4, 2]);
+        for forged in [
+            vec![0usize, 0, 2], // repeated
+            vec![2usize, 0],    // out of order
+            vec![0usize, 1, 9], // past the part's row groups
+        ] {
+            let mut plan = tiny_plan();
+            plan.fingerprint.inputs[0].row_groups = Some(forged.clone());
+            plan.min_levels = vec![0; 9];
+            let err = rebase_plan_for_shard(&mut plan, &source, None, Path::new("forged.plan"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("strictly ascending"),
+                "selection {forged:?} must be refused: {err}"
+            );
+        }
+    }
+
+    /// A single-part `ConvertSource` over a parquet file whose row groups hold
+    /// `rows_per_group` rows each — the footer facts the re-addressing reads.
+    fn one_part_source(
+        dir: &tempfile::TempDir,
+        rows_per_group: &[usize],
+    ) -> (ConvertSource, std::path::PathBuf) {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let path = dir.path().join("parts.parquet");
+        let file = File::create(&path).expect("create");
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_group[0].max(1)))
+            .build();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .expect("writer");
+        for &n in rows_per_group {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![0i64; n]))],
+            )
+            .expect("batch");
+            w.write(&batch).expect("write");
+            w.flush().expect("flush");
+        }
+        w.close().expect("close");
+        let source = ConvertSource::resolve_path(&path).expect("source");
+        (source, path)
+    }
+
+    /// The re-addressing itself, on a hand-built domain: the plan's stream is
+    /// row groups `[0, 1, 2]` of 3, 4 and 2 rows; the shard reads `[0, 2]`.
+    /// Every kept row must carry the winner byte it had in the plan, and
+    /// every side-table key must follow it.
+    #[test]
+    fn shard_row_mapping_moves_values_without_recomputing_them() {
+        // Plan stream: rows 0..2 (group 0), 3..6 (group 1), 7..8 (group 2).
+        // Shard keeps groups 0 and 2, so plan rows 0,1,2,7,8 become shard
+        // rows 0,1,2,3,4.
+        let runs = vec![
+            KeptRun {
+                plan_base: 0,
+                shard_base: 0,
+                len: 3,
+            },
+            KeptRun {
+                plan_base: 7,
+                shard_base: 3,
+                len: 2,
+            },
+        ];
+        assert_eq!(shard_row(&runs, 0), Some(0));
+        assert_eq!(shard_row(&runs, 2), Some(2));
+        // Rows of the pruned group map nowhere.
+        for row in 3..7 {
+            assert_eq!(shard_row(&runs, row), None, "plan row {row}");
+        }
+        assert_eq!(shard_row(&runs, 7), Some(3));
+        assert_eq!(shard_row(&runs, 8), Some(4));
+        // Past the end.
+        assert_eq!(shard_row(&runs, 9), None);
     }
 
     #[test]

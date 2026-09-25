@@ -219,6 +219,8 @@ enum Command {
     Pyramid(PyramidArgs),
     /// Concatenate disjoint PMTiles archives into one (issue #498).
     Merge(MergeArgs),
+    /// Cut a dataset's tile space into N disjoint shards (issue #498).
+    ShardPlan(ShardPlanArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
     /// Compiled only under the `gen-docs` feature; used by CI to regenerate
@@ -453,6 +455,56 @@ struct DecodeArgs {
     files_from: Option<PathBuf>,
 }
 
+/// Arguments for `tylertoo shard-plan` — step 0 of a sharded build (#498).
+///
+/// Cuts the pivot zoom's tile-id space into N contiguous runs of roughly equal
+/// estimated rows and writes them as a small JSON artifact. Every job of the
+/// fleet is then given that one file, so all of them agree on the cut by
+/// construction rather than by each recomputing an estimate.
+///
+/// Reads parquet **footers only** — no data page is touched — so planning a
+/// planet-scale input takes seconds.
+#[derive(Parser, Debug)]
+pub struct ShardPlanArgs {
+    /// Input GeoParquet (the same input every job of the fleet tiles): a
+    /// local file, a directory or glob of partitions, or a remote URL
+    /// (s3://, https://, gs://). Resolved exactly as `tiles` resolves it, so
+    /// a plan can be cut for whatever a fleet will actually read.
+    /// Omit when --files-from is given.
+    #[arg(value_name = "INPUT", required_unless_present = "files_from")]
+    pub input: Option<PathBuf>,
+
+    /// Plan for the inputs listed in this manifest instead of a positional
+    /// INPUT: one local path or remote URL per line, order preserved
+    /// VERBATIM (it defines the dataset row order). Same manifest every job
+    /// of the fleet is given — the plan binds itself to it part by part.
+    #[arg(long, value_name = "PATH")]
+    pub files_from: Option<PathBuf>,
+
+    /// Where to write the shard plan.
+    #[arg(short, long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// How many data shards to cut. One `tiles --shard i/N` job per shard,
+    /// plus one `--shard coarse` job; all N+1 archives merge in one step.
+    #[arg(long, value_name = "N")]
+    pub shards: usize,
+
+    /// Zoom to cut at. Shards own zooms [PIVOT, --max-zoom]; the coarse job
+    /// owns [0, PIVOT-1].
+    ///
+    /// Pick it so each shard holds a few tiles' worth of data: too coarse and
+    /// the fleet cannot be balanced (there are not enough tiles to cut), too
+    /// fine and the coarse job is doing most of the build on its own. z4-z8
+    /// covers every realistic fleet size.
+    #[arg(long, value_name = "ZOOM", default_value = "6")]
+    pub pivot: u8,
+
+    /// Overwrite an existing plan at --output.
+    #[arg(short, long)]
+    pub force: bool,
+}
+
 /// Arguments for `tylertoo export-pmtiles`.
 #[derive(Parser, Debug)]
 struct ExportPmtilesArgs {
@@ -546,6 +598,36 @@ struct ExportPmtilesArgs {
     /// deterministic.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
+
+    /// Emit only the tiles in this PMTiles tile-id range (#498): `LO..HI`,
+    /// two tile ids AT THE SAME ZOOM.
+    ///
+    /// That zoom is the pivot. The range then owns every descendant of those
+    /// tiles at every deeper zoom — a subtree's ids are contiguous on the
+    /// Hilbert curve, so the restriction is an exact interval test at each
+    /// zoom, not a bounding approximation. Tiles COARSER than the pivot are
+    /// outside the range and are not emitted.
+    ///
+    /// Ranges that partition the pivot zoom partition every deeper zoom, so
+    /// the resulting archives are disjoint by construction and `tylertoo
+    /// merge` concatenates them without re-encoding anything. `tiles --shard`
+    /// derives this automatically from a shard plan; this flag is the manual
+    /// form, for a cut you want to choose yourself
+    #[arg(long, value_name = "LO..HI")]
+    tile_range: Option<String>,
+
+    /// Emit only the tiles at or below this zoom (#498) — the coarse half of
+    /// a sharded build, complementing --tile-range's finer half.
+    ///
+    /// Named a CEILING, not --max-zoom, because it is the opposite of
+    /// --min-zoom here: --min-zoom only widens what the header DECLARES,
+    /// while this one decides which zooms are actually emitted. Distinct from
+    /// building a shallower pyramid too: the overview file still holds every
+    /// level (its convert plan is the one the shards consume, and the level
+    /// plan is fingerprinted), and this only decides which of them reach the
+    /// archive
+    #[arg(long, value_name = "ZOOM")]
+    zoom_ceiling: Option<u8>,
 
     /// Not supported here (single-file subcommand); accepted so the error
     /// can point at `overview`/`tiles` instead of clap's generic message.
@@ -1502,6 +1584,11 @@ impl ConvertTuningArgs {
             spill_dir: self.spill_dir.clone(),
             save_plan: self.save_plan.clone(),
             plan: self.plan.clone(),
+            // Set by `tiles` from --shard / --shard-plan (#498); the shared
+            // tuning set does not own it, since `overview` has no export to
+            // restrict and so no shard to be.
+            shard: None,
+            shard_plan_digest: None,
         };
 
         // Logged because "no features were dropped" is a surprising thing to
@@ -1666,6 +1753,66 @@ struct TilesArgs {
     #[arg(long, value_name = "PATH")]
     keep_overview: Option<PathBuf>,
 
+    /// Build one job of a sharded fleet (#498): `I/N` for data shard I of N,
+    /// or `coarse` for the job that owns the zooms coarser than the pivot.
+    ///
+    /// Requires --shard-plan. A data shard additionally requires --plan: the
+    /// level assignment is dataset-global (the density budget water-fills a
+    /// super-cell over every candidate of a level, the level walk carries a
+    /// running kept count, --magnitude-ladder dense-ranks the whole column),
+    /// so a shard that recomputed it over its own rows would disagree with
+    /// its siblings and the seams would not line up. The coarse job, which
+    /// reads the whole input anyway, is the run that writes that plan with
+    /// --save-plan.
+    ///
+    /// A data shard reads only the row groups whose bbox reaches its range
+    /// and emits only the tiles its range owns. Features are kept WHOLE: one
+    /// straddling a seam is read and clipped by both neighbours, and each
+    /// emits only its own tiles — so there is no border double-inclusion to
+    /// dedup afterwards, and the merge is a blob copy.
+    ///
+    /// The three build steps, after `tylertoo shard-plan` has cut the plan:
+    /// (1) `--shard coarse --shard-plan shards.json --save-plan convert.plan`;
+    /// (2) one job per shard, `--shard $i/16 --shard-plan shards.json --plan
+    /// convert.plan`; (3) `tylertoo merge out.pmtiles coarse.pmtiles
+    /// shard-*.pmtiles`. See the Sharded builds guide for the full recipe
+    #[arg(
+        long,
+        value_name = "I/N|coarse",
+        requires = "shard_plan",
+        help_heading = "Sharded builds"
+    )]
+    shard: Option<String>,
+
+    /// The shard plan every job of the fleet shares, from `tylertoo
+    /// shard-plan`. It fixes the pivot zoom and the N tile-id ranges, so the
+    /// jobs agree on the cut by construction
+    #[arg(long, value_name = "PATH", help_heading = "Sharded builds")]
+    shard_plan: Option<PathBuf>,
+
+    /// Emit only the tiles in this PMTiles tile-id range: `LO..HI`, two tile
+    /// ids AT THE SAME ZOOM (#498). The manual form of a shard's restriction,
+    /// for a cut you want to choose yourself.
+    ///
+    /// That zoom is the pivot, and the range owns every descendant of those
+    /// tiles at every deeper zoom; tiles coarser than the pivot are outside it
+    /// and are not emitted. Ranges that partition the pivot zoom partition
+    /// every deeper zoom, so the archives are disjoint by construction and
+    /// `tylertoo merge` concatenates them without re-encoding.
+    ///
+    /// This restricts the EXPORT only. `--shard` is the form that also prunes
+    /// the convert's input to the row groups the range can reach, which is
+    /// what makes a shard cheaper than the whole build rather than merely
+    /// narrower — prefer it unless you are cutting by hand. The two are
+    /// mutually exclusive: `--shard` derives its range from the shard plan
+    #[arg(
+        long,
+        value_name = "LO..HI",
+        conflicts_with = "shard",
+        help_heading = "Sharded builds"
+    )]
+    tile_range: Option<String>,
+
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
     verbose: bool,
@@ -1693,6 +1840,7 @@ fn main() -> Result<()> {
         Command::Decode(args) => run_decode(args),
         Command::Pyramid(args) => run_pyramid(args),
         Command::Merge(args) => run_merge(args),
+        Command::ShardPlan(args) => run_shard_plan(args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
         Command::GenReferenceDocs => {
@@ -1733,7 +1881,7 @@ where
     // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
     // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
     // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 9] = [
+    const SUBCOMMANDS: [&str; 10] = [
         "tiles",
         "overview",
         "validate",
@@ -1741,6 +1889,7 @@ where
         "decode",
         "pyramid",
         "merge",
+        "shard-plan",
         "gen-reference-docs",
         "help",
     ];
@@ -1786,6 +1935,15 @@ enum InputSpec {
 }
 
 impl InputSpec {
+    /// The input as the user wrote it, for messages that name it in full
+    /// (a re-runnable command line, not a summary line).
+    fn display(&self) -> String {
+        match self {
+            InputSpec::Path(p) => p.display().to_string(),
+            InputSpec::Manifest(p) => format!("--files-from {}", p.display()),
+        }
+    }
+
     /// Label for summary lines (input file name or manifest file name).
     fn label(&self) -> String {
         let p = match self {
@@ -1827,6 +1985,28 @@ fn resolve_io(
     }
 }
 
+/// `shard-plan`'s input resolution: a positional INPUT or a `--files-from`
+/// manifest, exactly the pair `tiles` accepts, minus the OUTPUT (which
+/// `shard-plan` takes as `-o`).
+fn resolve_io_for_planning(
+    input: Option<PathBuf>,
+    files_from: Option<PathBuf>,
+) -> Result<InputSpec> {
+    match (input, files_from) {
+        (Some(i), None) => Ok(InputSpec::Path(i)),
+        (None, Some(m)) => Ok(InputSpec::Manifest(m)),
+        (Some(i), Some(m)) => anyhow::bail!(
+            "--files-from conflicts with the positional INPUT: got both {} and the manifest \
+             {}; pass one",
+            i.display(),
+            m.display()
+        ),
+        // Unreachable via clap (`required_unless_present`), kept for direct
+        // callers/tests.
+        (None, None) => anyhow::bail!("INPUT is required (or --files-from <PATH>)"),
+    }
+}
+
 /// Convert via the core pipeline, dispatching on the input shape: a path
 /// (file/dir/glob/URL/prefix, resolved by core) or a `--files-from`
 /// manifest (explicit ordered file list, order preserved verbatim).
@@ -1835,6 +2015,23 @@ fn run_convert(
     output: &std::path::Path,
     options: &tylertoo_core::overview::convert::ConvertOptions,
 ) -> Result<tylertoo_core::overview::convert::ConvertReport> {
+    run_convert_typed(spec, output, options)
+        .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
+}
+
+/// [`run_convert`] keeping the typed error.
+///
+/// `tiles --shard` has to tell "this shard owns no rows" (a legal, expected
+/// outcome) apart from every other failure, and the `anyhow` wrapper above
+/// erases exactly that distinction.
+fn run_convert_typed(
+    spec: &InputSpec,
+    output: &std::path::Path,
+    options: &tylertoo_core::overview::convert::ConvertOptions,
+) -> std::result::Result<
+    tylertoo_core::overview::convert::ConvertReport,
+    tylertoo_core::overview::convert::ConvertError,
+> {
     use tylertoo_core::input_set::ConvertSource;
     use tylertoo_core::overview::convert::{
         convert_to_overviews, convert_to_overviews_sources, ConvertError,
@@ -1846,7 +2043,71 @@ fn run_convert(
             .map_err(ConvertError::from)
             .and_then(|source| convert_to_overviews_sources(&source, output, options)),
     }
-    .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
+}
+
+/// One line naming which half of the tile space this job owns (#498), logged
+/// before any work so a fleet's logs say what each task was for.
+fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: u8) {
+    log::info!(
+        "[tiles] shard job {}: {}",
+        job.role,
+        match job.range {
+            Some(r) => format!("zooms z{}..=z{max_zoom} of tile range {r}", job.pivot),
+            None => format!("zooms z{min_zoom}..=z{}", job.pivot.saturating_sub(1)),
+        }
+    );
+}
+
+/// Finish an empty data shard: a valid tile-less archive, a clear line about
+/// why, and exit 0 (#498).
+///
+/// See [`tylertoo_core::overview::export::write_empty_archive`] for why this
+/// is a success rather than a failure.
+fn write_empty_shard(
+    output: &std::path::Path,
+    layer_name: &str,
+    job: &ShardJob,
+    range: tylertoo_core::shard::TileRange,
+    max_zoom: u8,
+    why: &tylertoo_core::overview::convert::ConvertError,
+) -> Result<()> {
+    tylertoo_core::overview::export::write_empty_archive(
+        output,
+        layer_name,
+        range.pivot_zoom(),
+        max_zoom,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to write the empty shard archive: {e}"))?;
+    log::info!(
+        "[tiles] shard {} owns no input rows ({why}); wrote an empty archive",
+        job.role
+    );
+    println!(
+        "✓ shard {} owns no input rows; wrote an empty archive at {}",
+        job.role,
+        output.display()
+    );
+    println!(
+        "  z{}..z{max_zoom} declared, 0 tiles. This is normal for a cut whose data is \
+         concentrated elsewhere — `tylertoo merge` skips a tile-less input.",
+        range.pivot_zoom(),
+    );
+    Ok(())
+}
+
+/// `true` when a convert failed only because it had nothing to write.
+///
+/// Two spellings of the same outcome, depending on how far the run got before
+/// it noticed: `NoData` when no level has a winner, `AllLevelsEmpty` when
+/// every declared level turned out empty at write time. Both mean "zero rows
+/// reached the output", which for a data shard is not an error at all.
+fn convert_produced_nothing(e: &tylertoo_core::overview::convert::ConvertError) -> bool {
+    use tylertoo_core::overview::convert::ConvertError;
+    use tylertoo_core::overview::writer::WriterError;
+    matches!(
+        e,
+        ConvertError::NoData | ConvertError::Writer(WriterError::AllLevelsEmpty { .. })
+    )
 }
 
 /// Resolve the level plan shared by `overview` and `tiles`: an explicit
@@ -2002,6 +2263,100 @@ fn warn_intermediate_space(spec: &InputSpec, dir: &std::path::Path) {
 /// via [`tempfile::NamedTempFile`]'s drop guard. Its path and size are
 /// always logged, and a free-space preflight warns when the chosen volume
 /// looks too small for it (#314).
+/// Which job of a sharded fleet this `tiles` run is, and the slice of the
+/// tile space it owns (#498).
+#[derive(Debug, Clone)]
+struct ShardJob {
+    role: tylertoo_core::shard::ShardRole,
+    /// The data shard's range, or `None` for the coarse job — which owns the
+    /// zooms below the pivot instead, and expresses that as an export ceiling.
+    range: Option<tylertoo_core::shard::TileRange>,
+    pivot: u8,
+    /// `ShardPlan::cut_digest_hex` — the fleet-wide identity of the cut.
+    cut_digest: String,
+}
+
+/// Resolve `--shard` / `--shard-plan` into a [`ShardJob`], failing fast on
+/// everything that can be known before a byte of input is read.
+///
+/// The shard plan is verified against the input here as well, so a plan cut
+/// for a different (or since-rewritten) file is an error in milliseconds
+/// rather than a fleet of jobs that each tile something slightly different.
+fn resolve_shard_job(
+    spec: &InputSpec,
+    shard: Option<&str>,
+    shard_plan: Option<&Path>,
+    min_zoom: u8,
+    max_zoom: u8,
+) -> Result<Option<ShardJob>> {
+    use tylertoo_core::shard::ShardRole;
+
+    let Some(shard) = shard else {
+        // clap's `requires` makes the reverse pairing impossible, but a plan
+        // with no role is a silent no-op worth naming.
+        anyhow::ensure!(
+            shard_plan.is_none(),
+            "--shard-plan needs --shard to say which job this is: `--shard coarse` for the run \
+             that owns the zooms coarser than the pivot and writes the convert plan, or \
+             `--shard I/N` \
+             for data shard I"
+        );
+        return Ok(None);
+    };
+    let plan_path = shard_plan.expect("clap requires --shard-plan alongside --shard");
+    let role = ShardRole::parse(shard)?;
+
+    // Bind the plan to the input, the same way the convert plan binds itself:
+    // a plan cut for a different (or since-rewritten) file is an error here
+    // rather than a fleet that each tiles something slightly different.
+    let source = resolve_convert_source(spec)?;
+    let (plan, range) = tylertoo_core::shard::resolve_range(plan_path, role, Some(&source))?;
+
+    // Core owns the pivot-vs-finest-zoom rule (inclusive: pivot == max_zoom
+    // leaves every shard exactly one zoom, which is legal), so the Rust API
+    // gets the same guard and the CLI only surfaces it.
+    plan.check_max_zoom(max_zoom, plan_path)?;
+    // The coarse job's own half, checked with the same "before a byte is
+    // read" discipline. It owns [min_zoom, pivot - 1]; a pivot at or below
+    // the requested minimum leaves it nothing, and without this the whole
+    // convert runs — potentially for hours — before the export refuses an
+    // empty zoom restriction.
+    if matches!(role, ShardRole::Coarse) {
+        anyhow::ensure!(
+            plan.pivot_zoom > min_zoom,
+            "--shard coarse with --shard-plan {} has no zoom to build: the coarse job owns \
+             z{min_zoom}..z{}, and the plan's pivot is z{}. Lower --min-zoom, or re-cut the \
+             plan with a finer --pivot.",
+            plan_path.display(),
+            plan.pivot_zoom.saturating_sub(1),
+            plan.pivot_zoom,
+        );
+    }
+    Ok(Some(ShardJob {
+        role,
+        range,
+        pivot: plan.pivot_zoom,
+        // #498: the digest of the CUT, stamped into the convert plan's
+        // fingerprint so the fleet is bound to one `shards.json` by
+        // construction. Set on the coarse job (which writes the plan) and on
+        // every data shard (which must present the same cut).
+        cut_digest: plan.cut_digest_hex(),
+    }))
+}
+
+/// Resolve an [`InputSpec`] to the core's [`ConvertSource`], the one way.
+///
+/// Shared by `tiles --shard` and `shard-plan` so the two can never disagree
+/// about what an input *is* — a shard plan cut over a manifest has to bind to
+/// the same part list the shard jobs will read.
+fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::ConvertSource> {
+    use tylertoo_core::input_set::ConvertSource;
+    Ok(match spec {
+        InputSpec::Path(p) => ConvertSource::resolve_path(p)?,
+        InputSpec::Manifest(p) => ConvertSource::from_manifest(p)?,
+    })
+}
+
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
     use tylertoo_core::overview::level::Mode;
@@ -2027,9 +2382,41 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // exported to per-tile MVT). Every other convert knob comes from the
     // shared tuning set, so `tiles` matches the two-step overview → export.
     let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
-    let options = args
+    let mut options = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
+
+    // #498: which job of a sharded fleet this is, and the slice of the tile
+    // space it owns. Resolved before any work, against the plan every job of
+    // the fleet shares, so a mis-specified `--shard 4/8` against a 16-way plan
+    // fails in milliseconds rather than after an hour of tiling.
+    let shard = resolve_shard_job(
+        &spec,
+        args.shard.as_deref(),
+        args.shard_plan.as_deref(),
+        args.min_zoom,
+        args.max_zoom,
+    )?;
+    // A data shard's range prunes the convert's reads as well as the export;
+    // a hand-written `--tile-range` restricts the export only (the two flags
+    // conflict, so at most one is set).
+    let tile_range = match (&shard, &args.tile_range) {
+        (Some(job), _) => job.range,
+        (None, Some(text)) => Some(tylertoo_core::shard::TileRange::parse(text)?),
+        (None, None) => None,
+    };
+    if let Some(job) = &shard {
+        options.shard = job.range;
+        // #498: fingerprinted, unlike `shard` itself — the cut is fleet-wide,
+        // this job's slice of it is not. The coarse job writes it into the
+        // plan; every shard has to present the same one.
+        options.shard_plan_digest = Some(job.cut_digest.clone());
+        log_shard_job(job, args.min_zoom, args.max_zoom);
+    }
+
+    // The data shard's own range, kept past `tile_range`'s move into
+    // `ExportOptions`: the empty-shard branch below needs the pivot zoom.
+    let shard_range = shard.as_ref().and_then(|job| job.range);
 
     // #386: the property selection is applied at convert, so an excluded
     // column is already gone from the intermediate when export would sort
@@ -2091,7 +2478,23 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     warn_intermediate_space(&spec, &overview_dir);
 
-    let convert_report = run_convert(&spec, &overview_path, &options)?;
+    let convert_report = match run_convert_typed(&spec, &overview_path, &options) {
+        Ok(report) => report,
+        // #498: a shard whose range owns no input rows is a legal outcome of
+        // a legal cut, not a failure. `shard-plan` deliberately cuts N ranges
+        // whatever the data looks like — an empty RANGE is legal while a gap
+        // is not — so a concentrated dataset routinely leaves some shards
+        // with nothing. Failing them would mean an array job with red squares
+        // in it that mean "correct", and a merge the operator has to
+        // hand-edit. Write the valid empty archive the merge already tolerates
+        // and exit 0.
+        Err(e) if shard_range.is_some() && convert_produced_nothing(&e) => {
+            let job = shard.as_ref().expect("a range implies a shard job");
+            let range = shard_range.expect("checked by the guard");
+            return write_empty_shard(&output, &layer_name, job, range, args.max_zoom, &e);
+        }
+        Err(e) => anyhow::bail!("overview conversion failed: {e}"),
+    };
 
     // #314: the disk cost of the one-shot facade must not be silent — name
     // the intermediate's path and size, and its fate.
@@ -2130,11 +2533,25 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // #380: the archive declares the zoom range that was asked for, even
         // when the coarsest levels generalized to nothing and were omitted
         // from the overview. Only a zoom plan has a requested minimum zoom.
-        min_zoom: args.gsd.is_none().then_some(args.min_zoom),
+        //
+        // #498: a data shard owns no zoom coarser than the pivot, so that is
+        // what it declares — claiming the coarse job's half would misdescribe
+        // an archive that holds none of it.
+        min_zoom: args.gsd.is_none().then_some(match tile_range {
+            Some(r) => r.pivot_zoom(),
+            None => args.min_zoom,
+        }),
 
         // The property selection was applied on convert (#386): the
         // intermediate overview already carries only the kept columns.
         properties: Default::default(),
+
+        // #498: the two complementary halves of a sharded build. A data shard
+        // (or a hand-written --tile-range) takes its range; the coarse job
+        // takes everything below the pivot.
+        tile_range,
+        zoom_ceiling: shard
+            .and_then(|job| job.range.is_none().then(|| job.pivot.saturating_sub(1))),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -2674,6 +3091,12 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
             exclude: args.exclude_property.clone(),
             exclude_all: args.exclude_all_properties,
         },
+        tile_range: args
+            .tile_range
+            .as_deref()
+            .map(tylertoo_core::shard::TileRange::parse)
+            .transpose()?,
+        zoom_ceiling: args.zoom_ceiling,
     };
 
     println!(
@@ -2905,6 +3328,84 @@ fn preflight_writable(path: &Path) -> Result<()> {
 
 /// Run `tylertoo merge`: several disjoint PMTiles archives → one (thin facade
 /// over `tylertoo_core::merge::merge_shards`).
+/// `tylertoo shard-plan` — step 0 of a sharded build (#498).
+fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
+    use tylertoo_core::shard::ShardPlan;
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // No `exists()` precheck: a shard plan is cut for whatever a fleet will
+    // read, which may be a directory, a glob, an s3:// prefix or a manifest.
+    // `ConvertSource::resolve` names a bad input far better than a bare
+    // stat() ever could, and is the same resolution `tiles` performs.
+    let spec = resolve_io_for_planning(args.input, args.files_from)?;
+    anyhow::ensure!(
+        args.force || !args.output.exists(),
+        "{} already exists; pass -f/--force to overwrite it. Every job of a fleet must be given \
+         the SAME shard plan, so replacing one mid-build silently re-cuts the tile space.",
+        args.output.display()
+    );
+    preflight_writable(&args.output)?;
+
+    let source = resolve_convert_source(&spec)?;
+    let plan = ShardPlan::compute(&source, args.pivot, args.shards)?;
+    plan.save(&args.output)?;
+
+    let input_label = spec.display();
+    println!(
+        "Cut {} shard(s) at pivot z{} for {input_label}",
+        plan.shards(),
+        plan.pivot_zoom,
+    );
+    let total = plan.estimated_rows_total.max(1);
+    for (i, r) in plan.ranges.iter().enumerate() {
+        println!(
+            "  shard {i:<3} tiles {}..={}  ({:>5} pivot tile(s), ~{} row(s), {:.1}%)",
+            r.lo,
+            r.hi,
+            r.hi - r.lo + 1,
+            r.estimated_rows,
+            100.0 * r.estimated_rows as f64 / total as f64,
+        );
+    }
+    if plan.unplaced_rows > 0 {
+        println!(
+            "\n  ! ~{} row(s) could not be placed: their row groups carry no usable bbox \
+             statistics (or cover so much of the pivot zoom that they name no cut point), so \
+             they were spread evenly instead of balanced. Run the input through `gpio \
+             optimize` to give every row group a tight covering, and the cut improves for \
+             free.",
+            plan.unplaced_rows
+        );
+    }
+    // A range with no estimated rows is legal — the cut has to tile the pivot
+    // zoom with no gap, so a dataset concentrated in one corner leaves the
+    // rest of the fleet empty — but it is also almost always a sign the fleet
+    // is too large for the data. Those jobs still run (and now exit 0 with an
+    // empty archive), so the only place to notice is here, at cut time.
+    let empty = plan.ranges.iter().filter(|r| r.estimated_rows == 0).count();
+    if empty > 0 {
+        println!(
+            "\n  ! {empty} of {} shard(s) are empty of data: their ranges own pivot tiles the \
+             estimator places no rows in. Those jobs will run, find nothing and write a valid \
+             empty archive (the merge skips it), so nothing breaks — but a smaller --shards, \
+             or a finer --pivot on a concentrated dataset, would balance the fleet better.",
+            plan.shards(),
+        );
+    }
+    println!("\n✓ wrote {}", args.output.display());
+    println!(
+        "\nNext:\n  \
+         tylertoo tiles {input_label} coarse.pmtiles --shard coarse --shard-plan {} --save-plan convert.plan\n  \
+         tylertoo tiles {input_label} shard-$i.pmtiles --shard $i/{} --shard-plan {} --plan convert.plan\n  \
+         tylertoo merge out.pmtiles coarse.pmtiles shard-*.pmtiles",
+        args.output.display(),
+        plan.shards(),
+        args.output.display(),
+    );
+    Ok(())
+}
+
 fn run_merge(args: MergeArgs) -> Result<()> {
     use tylertoo_core::merge::{merge_shards, MergeOptions};
 
@@ -4151,7 +4652,16 @@ mod tests {
         //   tile-size-limit    -> reachable on `tiles` as --max-tile-size (the
         //                         two are hidden aliases of each other), so the
         //                         cap IS present, just under the other spelling.
-        let allow: BTreeSet<&str> = ["mode", "cogp-compat", "tile-size-limit"]
+        //   zoom-ceiling       -> the coarse half of a sharded build (#498).
+        //                         `tiles` already owns --max-zoom, which means
+        //                         "build this deep", and derives the export
+        //                         ceiling from `--shard coarse` against the
+        //                         shard plan's pivot. A second flag carrying a
+        //                         zoom number with the OPPOSITE meaning is the
+        //                         exact footgun the rename off --max-zoom was
+        //                         meant to remove. The mechanism is reachable
+        //                         on `tiles`; only this spelling of it is not.
+        let allow: BTreeSet<&str> = ["mode", "cogp-compat", "tile-size-limit", "zoom-ceiling"]
             .into_iter()
             .collect();
 

@@ -61,6 +61,7 @@ nav:
       - Tuning what appears at each zoom: diving-deeper/tuning-zoom.md
       - Tiling remote and multi-file inputs: diving-deeper/remote-and-multi-file.md
       - Keeping memory bounded: diving-deeper/bounded-memory.md
+      - Sharded builds across a fleet: diving-deeper/sharded-builds.md
       - How tylertoo relates to tippecanoe: diving-deeper/tippecanoe.md
   - Reference:
       - reference/index.md

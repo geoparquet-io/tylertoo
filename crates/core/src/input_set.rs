@@ -580,6 +580,44 @@ impl ConvertSource {
             .sum())
     }
 
+    /// Per-part, per-row-group bboxes straight from the footers — the input
+    /// the shard planner (#498) balances its cut on.
+    ///
+    /// Entry `[p][g]` is part `p`'s row group `g`, or `None` when neither
+    /// statistics tier can supply a bbox. Footer-only, so a planet-scale
+    /// input costs one footer fetch per part and no data page is read.
+    pub(crate) fn part_row_group_bounds(
+        &self,
+    ) -> Result<Vec<Vec<Option<crate::covering::RowGroupBounds>>>, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .map(|m| crate::overview::convert::input_row_group_bounds(&m.parquet))
+            .collect())
+    }
+
+    /// Per-part, per-row-group row counts straight from the footers.
+    ///
+    /// Entry `[p][g]` is part `p`'s row group `g`'s `num_rows`. This is what
+    /// turns a row-group *index* into a row *offset*, which is what a shard
+    /// needs to re-address a global convert plan onto the subset of row groups
+    /// it reads (#498): the plan's winner table is indexed by row position
+    /// within the plan's own selected stream, so a shard has to know where
+    /// each of its groups sits in that stream, not merely which groups it has.
+    pub(crate) fn part_row_group_row_counts(&self) -> Result<Vec<Vec<i64>>, InputError> {
+        Ok(self
+            .metas()?
+            .iter()
+            .map(|m| {
+                m.parquet
+                    .row_groups()
+                    .iter()
+                    .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                    .collect()
+            })
+            .collect())
+    }
+
     /// Per-part bbox row-group selection (#102): applies the single-file
     /// covering-statistics pruning to each part independently.
     /// `bbox_units` is `[xmin, ymin, xmax, ymax]` in the file CRS units.
@@ -725,6 +763,19 @@ impl ConvertSource {
     /// be merged back into a single in-order stream. A part with an empty
     /// selection yields no segments at all, matching the sequential reader,
     /// which never opens it.
+    ///
+    /// **That ordering promise is load-bearing twice over.** The parallel
+    /// merge re-derives each batch's `row_offset` by counting rows over the
+    /// merged stream from zero, so it is only the plan's addressing if the
+    /// merged order is the sequential order. And a sharded build (#498)
+    /// depends on the same property from the other side: the segments are cut
+    /// from the row groups THIS run selected (bbox ∩ filter ∩ shard range), so
+    /// a shard's `row_offset` counts its own narrower stream — which is
+    /// exactly the stream
+    /// [`overview::plan_state::rebase_plan_for_shard`](crate::overview::plan_state)
+    /// re-addresses the convert plan's row-indexed tables onto, in the same
+    /// part-then-ascending-row-group order. If either side's ordering ever
+    /// changed, every shard would read the wrong winner byte — silently.
     ///
     /// **`target_rows` is a ceiling, not an average.** The caller sets it to
     /// what one reader can buffer ahead of the merge, and a segment that does

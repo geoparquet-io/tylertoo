@@ -276,6 +276,85 @@ banding/row-group alignment, canonical fidelity, monotonicity, cluster
 `point_count` sum invariant (§12.1), coalescing `coalesced_count` rules
 (§13), bbox covering.
 
+### Sharded builds (`shard.rs`, `tiles --shard`, #498)
+
+A shard is a contiguous run of **pivot-zoom tile ids**, and with it every
+descendant of those ids at every deeper zoom. The Hilbert nesting property
+(`tile::node_id_range`) makes a node's descendants an *exact* contiguous
+interval at every deeper zoom, so N runs partitioning the pivot zoom partition
+every deeper zoom — shards are disjoint by construction rather than by bbox
+intersection, and `merge.rs` puts them back together by blob copy.
+
+The consequence that matters: features stay **whole** through convert and
+clip. A feature crossing a seam is read by both neighbouring shards and
+clipped normally by both; each emits only the tiles its own range owns. That
+is what the `--bbox`-band workaround #498 describes could not do (it includes
+every feature whose bbox intersects the band, so a straddler appears twice in
+the merged edge tiles).
+
+Four architectural decisions are load-bearing:
+
+1. **A shard MUST consume a convert plan.** The level assignment threads
+   dataset-wide fold state (see the `plan_state.rs` note above), so a shard
+   that recomputed it locally would disagree with its siblings at the seams —
+   invisibly, since no tile count would change. `--shard` without `--plan` is
+   refused in `validate_options`. One coarse job owns zooms `[0, pivot-1]`,
+   reads the whole input, and is the run that writes the plan.
+2. **Row indices are the plan's, not the shard's.** Every row-indexed plan
+   section is addressed by row *position within the stream the plan was saved
+   over*. A shard prunes row groups, so its stream is shorter and its own
+   `row_offset` counts a different sequence. `plan_state::rebase_plan_for_shard`
+   re-addresses the plan onto the shard's stream — the plan records its own
+   selection, row-group row counts are footer facts, so the shard's rows are a
+   handful of contiguous runs and the winner table, kinds, carriers and
+   cluster tables move with them. Values are moved, never recomputed. The
+   fingerprint's one relaxation (`SelectionRule::SubsetAllowed`) exists for
+   this and nothing else: a shard may narrow the plan's row-group selection,
+   never widen it.
+3. **The restriction is applied at export PLAN time**, to `LevelScan::tile_counts`
+   before `plan_partitions` cuts it — so an out-of-range tile is never
+   clipped, encoded or hashed, and each wave's band read prunes with it. A
+   shard costs its share of the export, not all of it.
+4. **The fleet is bound to one cut by the convert plan.** `ShardPlan::cut_digest`
+   is an xxh3-64 over the canonical cut (pivot zoom + the lo/hi sequence, and
+   nothing advisory), and the CLI stamps it into the convert plan's
+   fingerprint options map under `shard_plan_digest` — on the coarse job,
+   which writes the plan, and on every data shard, which must present the
+   same one. "Same convert plan ⇒ same cut" is therefore true by
+   construction: a `shards.json` re-cut mid-build is a named error rather
+   than a fleet whose archives overlap at some seams and leave holes at
+   others. `ConvertOptions::shard` itself is deliberately *not* fingerprinted
+   — it is per-job, and every shard of a fleet has a different one.
+
+**The coarse job is a full monolithic convert.** `--shard coarse` restricts
+the EXPORT to zooms below the pivot; the convert reads every row, runs the
+whole assignment and writes the whole intermediate. A shallower `--max-zoom`
+is not a workaround either — the level plan is fingerprinted, so such a plan
+is refused by every shard. Sharding therefore parallelizes the export and the
+shard converts and buys restartability; it does not (yet) make the first job
+cheap. #541 tracks the convert-side level ceiling that would.
+
+**An empty data shard succeeds.** The cut must tile the pivot zoom with no
+gap, so a concentrated dataset leaves some ranges owning no rows. Those jobs
+write a valid tile-less archive (`export::write_empty_archive`) and exit 0;
+`merge` excludes a tile-less input from the zoom union, the bounds union and
+the layer declarations alike.
+
+**v1 restriction: line coalescing.** A coalesced chain is a new geometry
+spanning every row it merged, which no single input row group's bbox bounds.
+The shard holding the chain's row would emit tiles past its range while its
+neighbour emitted none — a gap at the seam. A shard against a plan carrying
+chains is refused, naming `--no-coalesce-lines`. Clustering, accumulation and
+tiny-polygon carriers are supported: each keys off one input row whose own
+bbox bounds it, so the row-group argument that makes ordinary features safe
+covers them unchanged.
+
+The acceptance test is `crates/core/tests/shard_merge_parity.rs`: coarse + N
+shards + one merge vs. a monolithic run, asserting pairwise-disjoint ids,
+exact coverage, identical per-zoom counts and **byte-identical tile bodies**.
+Counts alone would not do — a seam bug moves geometry between neighbouring
+tiles while keeping every count the same.
+
 ## Known Divergences from Tippecanoe (overview pipeline)
 
 | Area | Our approach | Tippecanoe | Notes |
@@ -493,6 +572,11 @@ crates/core/src/
 ├── decode.rs           # PMTiles → GeoParquet decoding (#112)
 ├── pyramid.rs          # Multi-band pyramids: merge per-band PMTiles archives
 │                       # with disjoint zoom ranges into one archive (#345)
+├── shard.rs            # Cut a dataset's tile space into N disjoint shards
+│                       # (#498): density-balanced pivot-zoom ranges from
+│                       # footer statistics alone, the TileRange a shard's
+│                       # convert/export is restricted to, and the small
+│                       # checked JSON plan every job of a fleet shares
 ├── merge.rs            # Concatenate PMTiles archives holding DISJOINT tile
 │                       # ids into one, by blob copy — the second half of a
 │                       # sharded build (#498). Disjointness is validated
@@ -509,7 +593,7 @@ crates/core/src/
 └── wkb.rs              # WKB round-trip helpers
 
 crates/cli/src/main.rs  # Subcommands: tiles (facade), overview, validate,
-                        # export-pmtiles, decode, pyramid, merge
+                        # export-pmtiles, decode, pyramid, merge, shard-plan
 crates/python/src/lib.rs # pyo3 bindings: convert (facade), overview,
                         # export_pmtiles, validate
 ```

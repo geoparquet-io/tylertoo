@@ -161,13 +161,20 @@ pub fn merge_shards(
     // that in drags the merged minimum to z0, so the output claims zooms the
     // build never produced on the word of a shard that contributed nothing.
     let mut declared: Vec<(u8, u8)> = Vec::with_capacity(indexes.len());
+    // Computed once and reused: the same "did this input contribute anything"
+    // question decides the zoom union AND which layer declarations are folded
+    // in (see `collect_layers`).
+    let mut has_tiles: Vec<bool> = Vec::with_capacity(indexes.len());
     for idx in &indexes {
-        if idx.tile_id_range().map_err(|e| at(idx, e))?.is_some() {
+        let tiles = idx.tile_id_range().map_err(|e| at(idx, e))?.is_some();
+        has_tiles.push(tiles);
+        if tiles {
             declared.push((idx.header().min_zoom, idx.header().max_zoom));
         } else {
             log::warn!(
-                "{}: holds no tiles; it is excluded from the merged archive's zoom range \
-                 (an empty archive's header reads as the writer's z0..z0 sentinel)",
+                "{}: holds no tiles; it is excluded from the merged archive's zoom range and \
+                 layer declarations (an empty archive's header reads as the writer's z0..z0 \
+                 sentinel)",
                 idx.path().display()
             );
         }
@@ -216,7 +223,7 @@ pub fn merge_shards(
     // otherwise produce byte-different archives whenever the inputs declare
     // more than one distinct layer between them. (With a single shared layer
     // — the normal shard case — order was already immaterial.)
-    let mut layers = collect_layers(&indexes);
+    let mut layers = collect_layers(&indexes, &has_tiles);
     layers.sort_by(|a, b| a.id.cmp(&b.id));
     if let Some(first) = layers.first().map(|l| l.id.clone()) {
         // Only the metadata's `name`; `vector_layers` below is authoritative
@@ -373,9 +380,18 @@ fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Er
 /// copyable, they just describe no fields — but it is worth a warning, since
 /// a merged archive that declares no layers renders as nothing in most
 /// clients.
-fn collect_layers(indexes: &[ArchiveIndex]) -> Vec<LayerMeta> {
+/// `has_tiles[i]` says whether input `i` contributed any tile; a tile-less
+/// one is skipped for the same reason the zoom union skips it (#498). An
+/// empty shard's metadata carries the writer's z0..z0 sentinel in its layer
+/// entries, and folding that in drags the merged `vector_layers` minzoom to
+/// z0 — the layer then claims zooms the build never produced, on the word of
+/// a job that produced nothing.
+fn collect_layers(indexes: &[ArchiveIndex], has_tiles: &[bool]) -> Vec<LayerMeta> {
     let mut layers = Vec::new();
-    for idx in indexes {
+    for (i, idx) in indexes.iter().enumerate() {
+        if !has_tiles.get(i).copied().unwrap_or(true) {
+            continue;
+        }
         let Some(meta) = idx.metadata_json() else {
             log::warn!(
                 "{}: metadata is absent or not valid JSON; its layers are not declared in the \
@@ -774,6 +790,46 @@ mod tests {
         );
         let h = header_of(&out);
         assert_eq!((h.min_zoom, h.max_zoom), (6, 6), "{h:?}");
+    }
+
+    /// The layer half of the same rule the zoom union already had: an empty
+    /// shard's `vector_layers` entry carries the writer's z0..z0 sentinel, so
+    /// folding it in made the merged LAYER claim z0 while the merged HEADER
+    /// correctly said z6 — a mismatch a client reads as "this layer exists at
+    /// z0" and then finds nothing there.
+    #[test]
+    fn merge_shards_ignores_tile_less_inputs_in_the_layer_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.pmtiles");
+        let empty = dir.path().join("empty.pmtiles");
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        write_shard(
+            &real,
+            "l",
+            &[(6, 0, 0), (6, 1, 1)],
+            bounds,
+            &[("a", "String")],
+        );
+        write_shard_with(&empty, "l", &[], Some(bounds), &[], Compression::Gzip);
+
+        let out = dir.path().join("merged.pmtiles");
+        merge_shards(
+            &[real.clone(), empty.clone()],
+            &out,
+            &MergeOptions::default(),
+        )
+        .unwrap();
+
+        let meta = ArchiveIndex::open(&out).unwrap().metadata_json().unwrap();
+        let arr = meta["vector_layers"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "one layer, not one per input: {meta}");
+        let layer = &arr[0];
+        assert_eq!(
+            layer["minzoom"],
+            json!(6),
+            "an empty shard must not drag minzoom to z0: {layer}"
+        );
+        assert_eq!(layer["maxzoom"], json!(6), "{layer}");
     }
 
     /// S2-2 (rev6 review): #498's shards are cut by pivot subtree, not by a

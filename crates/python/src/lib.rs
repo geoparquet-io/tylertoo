@@ -126,6 +126,11 @@ fn convert(
         // coarsest levels generalized to nothing.
         min_zoom: Some(min_zoom),
         properties: Default::default(),
+        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
+        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
+        // and `export-pmtiles --tile-range`.
+        tile_range: None,
+        zoom_ceiling: None,
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -752,6 +757,10 @@ fn overview(
         // Python surface yet; follow-up.
         save_plan: None,
         plan: None,
+        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
+        // convert plan they depend on.
+        shard: None,
+        shard_plan_digest: None,
     };
 
     // `str` stays the single-input path (files, directories, globs, remote
@@ -884,6 +893,11 @@ fn export_pmtiles(
         // #380: the declared minimum; None keeps the coarsest level's zoom.
         min_zoom,
         properties: Default::default(),
+        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
+        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
+        // and `export-pmtiles --tile-range`.
+        tile_range: None,
+        zoom_ceiling: None,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

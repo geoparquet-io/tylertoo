@@ -169,6 +169,22 @@ impl TileBounds {
         self.lat_max = self.lat_max.max(other.lat_max);
     }
 
+    /// The overlap of two bounding boxes.
+    ///
+    /// The dual of [`TileBounds::expand`], and no more clever: it can return
+    /// an *invalid* box (one whose min is past its max) when the two do not
+    /// overlap, which [`TileBounds::is_valid`] reports. Callers that narrow a
+    /// box they already know overlaps — a shard clipping a level's extent to
+    /// its own range (#498) — want exactly this.
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            lng_min: self.lng_min.max(other.lng_min),
+            lat_min: self.lat_min.max(other.lat_min),
+            lng_max: self.lng_max.min(other.lng_max),
+            lat_max: self.lat_max.min(other.lat_max),
+        }
+    }
+
     /// Get the width in degrees
     pub fn width(&self) -> f64 {
         self.lng_max - self.lng_min
@@ -247,7 +263,7 @@ pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
 /// minus 1, folded into a `+ hilbert_idx + 1` for `z >= 1`; both forms agree
 /// for every `z`, this one included at `z = 0`).
 #[inline]
-fn hilbert_zoom_base(z: u8) -> u64 {
+pub(crate) fn hilbert_zoom_base(z: u8) -> u64 {
     ((1u64 << (2 * u32::from(z))) - 1) / 3
 }
 
