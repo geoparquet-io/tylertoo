@@ -215,38 +215,74 @@ pub fn simplify_for_level(
     crs: Crs,
     opts: &SimplifyOptions,
 ) -> Simplified {
+    simplify_for_level_checked(geom, gsd_meters, crs, opts).0
+}
+
+/// Like [`simplify_for_level`], but also reports whether the returned
+/// geometry is value-identical to `geom` (#499, compute side of the ladder
+/// amplification issue #499): `unchanged == true` means the output is a
+/// value-identical clone of the input — no vertex was dropped, no ring
+/// collapsed, no disposition changed. Cheap: every case below is decided
+/// from a `Vec::len()` comparison the simplification call already computed
+/// ([`polygon_unchanged`], [`simplify_linestring_checked`]), never a
+/// coordinate-by-coordinate diff.
+///
+/// Callers that fold a geometry through several levels (the cascade fold,
+/// [`super::stream::process_batch_cascade`]) use `unchanged == true` to skip
+/// retaining a fresh allocation and instead share (`Arc::clone`) the input
+/// they fed in — for FTW-like small polygons at minimum vertex count,
+/// adjacent ladder levels often produce identical output, so this turns an
+/// O(levels) chain of deep clones into O(1) allocations plus refcount bumps.
+pub fn simplify_for_level_checked(
+    geom: &Geometry<f64>,
+    gsd_meters: f64,
+    crs: Crs,
+    opts: &SimplifyOptions,
+) -> (Simplified, bool) {
     let tol = world_tolerance(gsd_meters, crs, opts);
 
     // Canonical / identity path (spec §2.4, Q1): a zero tolerance means "this
     // is the canonical level" — return the geometry bit-identical, with no
     // simplification, gating, or dropping.
     if tol <= 0.0 {
-        return Simplified::Keep(geom.clone());
+        return (Simplified::Keep(geom.clone()), true);
     }
 
     match geom {
         // Points carry no reducible vertices and are never gated (spec §2.1).
-        Geometry::Point(_) | Geometry::MultiPoint(_) => Simplified::Keep(geom.clone()),
+        Geometry::Point(_) | Geometry::MultiPoint(_) => (Simplified::Keep(geom.clone()), true),
 
-        Geometry::LineString(ls) => match simplify_linestring_impl(ls, tol) {
-            Some(out) => Simplified::Keep(Geometry::LineString(out)),
-            None => Simplified::Dropped,
+        Geometry::LineString(ls) => match simplify_linestring_checked(ls, tol) {
+            Some((out, unchanged)) => (Simplified::Keep(Geometry::LineString(out)), unchanged),
+            None => (Simplified::Dropped, false),
         },
 
         Geometry::MultiLineString(mls) => {
-            let kept: Vec<LineString<f64>> = mls
-                .0
-                .iter()
-                .filter_map(|ls| simplify_linestring_impl(ls, tol))
-                .collect();
+            let mut kept: Vec<LineString<f64>> = Vec::with_capacity(mls.0.len());
+            let mut unchanged = true;
+            for ls in &mls.0 {
+                match simplify_linestring_checked(ls, tol) {
+                    Some((out, part_unchanged)) => {
+                        unchanged &= part_unchanged;
+                        kept.push(out);
+                    }
+                    None => unchanged = false,
+                }
+            }
             if kept.is_empty() {
-                Simplified::Dropped
+                (Simplified::Dropped, false)
             } else {
-                Simplified::Keep(Geometry::MultiLineString(MultiLineString::new(kept)))
+                unchanged &= kept.len() == mls.0.len();
+                (
+                    Simplified::Keep(Geometry::MultiLineString(MultiLineString::new(kept))),
+                    unchanged,
+                )
             }
         }
 
-        Geometry::Polygon(poly) => simplify_polygon_impl(poly, tol, opts.collapse, opts.cascade),
+        Geometry::Polygon(poly) => {
+            simplify_polygon_impl_checked(poly, tol, opts.collapse, opts.cascade)
+        }
 
         Geometry::MultiPolygon(mp) => {
             // Per-part disposition: a collapsed *part* is dropped (never
@@ -262,25 +298,37 @@ pub fn simplify_for_level(
                 CollapseMode::Square => CollapseMode::Square,
                 _ => CollapseMode::Drop,
             };
-            let kept: Vec<Polygon<f64>> =
-                mp.0.iter()
-                    .flat_map(
-                        |p| match simplify_polygon_impl(p, tol, part_mode, opts.cascade) {
-                            Simplified::Keep(Geometry::Polygon(poly)) => vec![poly],
-                            Simplified::Keep(Geometry::MultiPolygon(parts)) => parts.0,
-                            _ => Vec::new(),
-                        },
-                    )
-                    .collect();
+            let mut kept: Vec<Polygon<f64>> = Vec::with_capacity(mp.0.len());
+            let mut unchanged = true;
+            for p in &mp.0 {
+                match simplify_polygon_impl_checked(p, tol, part_mode, opts.cascade) {
+                    (Simplified::Keep(Geometry::Polygon(poly)), part_unchanged) => {
+                        unchanged &= part_unchanged;
+                        kept.push(poly);
+                    }
+                    (Simplified::Keep(Geometry::MultiPolygon(parts)), _) => {
+                        // A repaired part expanding into several — always a
+                        // structural change even if some sub-parts, taken in
+                        // isolation, would compare unchanged.
+                        unchanged = false;
+                        kept.extend(parts.0);
+                    }
+                    (Simplified::Keep(_), _) | (Simplified::Dropped, _) => unchanged = false,
+                }
+            }
             if !kept.is_empty() {
-                Simplified::Keep(Geometry::MultiPolygon(MultiPolygon::new(kept)))
+                unchanged &= kept.len() == mp.0.len();
+                (
+                    Simplified::Keep(Geometry::MultiPolygon(MultiPolygon::new(kept))),
+                    unchanged,
+                )
             } else {
                 match opts.collapse {
                     // Every part had its own dither under Square; nothing more.
-                    CollapseMode::Drop | CollapseMode::Square => Simplified::Dropped,
+                    CollapseMode::Drop | CollapseMode::Square => (Simplified::Dropped, false),
                     CollapseMode::Point => match mp.centroid() {
-                        Some(pt) => Simplified::Keep(Geometry::Point(pt)),
-                        None => Simplified::Dropped,
+                        Some(pt) => (Simplified::Keep(Geometry::Point(pt)), false),
+                        None => (Simplified::Dropped, false),
                     },
                 }
             }
@@ -288,7 +336,7 @@ pub fn simplify_for_level(
 
         // GeometryCollection / Line / Rect / Triangle: out of scope for v0.1;
         // pass through untouched.
-        other => Simplified::Keep(other.clone()),
+        other => (Simplified::Keep(other.clone()), true),
     }
 }
 
@@ -428,13 +476,33 @@ pub fn simplify_step(
     opts: &SimplifyOptions,
     repr: Representation,
 ) -> Simplified {
+    simplify_checked(geom, gsd_meters, crs, opts, repr).0
+}
+
+/// Like [`simplify_step`], but also reports whether the output is
+/// value-identical to `geom` (`unchanged == true`) — see
+/// [`simplify_for_level_checked`] (#499). A [`Representation::Point`] step's
+/// polygon-to-point conversion always counts as changed (the geometry type
+/// differs from the input); a *point* revisited by a later `Point` step
+/// correctly reports `unchanged == true`, since
+/// [`polygonal_representative_point`] only matches polygonal input and
+/// points fall through to [`simplify_for_level_checked`], which passes them
+/// through untouched — matching the "coarser steps pass the point through
+/// untouched" cascade semantics documented on [`simplify_cascade`].
+pub fn simplify_checked(
+    geom: &Geometry<f64>,
+    gsd_meters: f64,
+    crs: Crs,
+    opts: &SimplifyOptions,
+    repr: Representation,
+) -> (Simplified, bool) {
     match repr {
-        Representation::Geometry => simplify_for_level(geom, gsd_meters, crs, opts),
+        Representation::Geometry => simplify_for_level_checked(geom, gsd_meters, crs, opts),
         Representation::Point => {
             if let Some(out) = polygonal_representative_point(geom) {
-                return out;
+                return (out, false);
             }
-            simplify_for_level(geom, gsd_meters, crs, opts)
+            simplify_for_level_checked(geom, gsd_meters, crs, opts)
         }
         // Square (#279): normal simplification with the below-tolerance
         // disposition forced to area-dithered placeholder squares at this
@@ -444,7 +512,7 @@ pub fn simplify_step(
                 collapse: CollapseMode::Square,
                 ..*opts
             };
-            simplify_for_level(geom, gsd_meters, crs, &opts)
+            simplify_for_level_checked(geom, gsd_meters, crs, &opts)
         }
     }
 }
@@ -547,11 +615,17 @@ fn polygon_diag(poly: &Polygon<f64>) -> f64 {
 
 /// Simplify a single LineString, returning `None` when it should be dropped:
 /// degenerate (`< 2` points or all coincident) or below the visibility gate.
+/// Also reports whether RDP removed any vertices (`unchanged == false` when
+/// it did) — cheap, since `geo`'s RDP output is always an ordered subsequence
+/// of the input (endpoints included), so equal vertex counts imply an
+/// identical linestring, a `Vec::len()` comparison rather than a
+/// coordinate-by-coordinate diff (mirrors [`polygon_unchanged`]'s reasoning
+/// for rings, #499).
 ///
 /// Adapted from `crate::simplify`'s degenerate-linestring guard (which returns
 /// the input unchanged for `< 2` points to avoid a `geo::Simplify` panic);
 /// here the level path instead *drops* sub-visible lines and reports it.
-fn simplify_linestring_impl(ls: &LineString<f64>, tol: f64) -> Option<LineString<f64>> {
+fn simplify_linestring_checked(ls: &LineString<f64>, tol: f64) -> Option<(LineString<f64>, bool)> {
     if ls.0.len() < MIN_LINESTRING_POINTS {
         return None;
     }
@@ -565,7 +639,8 @@ fn simplify_linestring_impl(ls: &LineString<f64>, tol: f64) -> Option<LineString
     if simplified.0.len() < MIN_LINESTRING_POINTS || linestring_diag(&simplified) <= 0.0 {
         return None;
     }
-    Some(simplified)
+    let unchanged = simplified.0.len() == ls.0.len();
+    Some((simplified, unchanged))
 }
 
 /// Number of epsilon halvings tried when RDP produces an invalid
@@ -666,14 +741,35 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
 /// ~96% of coarse-level simplification cost. A consequence: an *invalid
 /// source* polygon whose candidates all fail validation is now kept verbatim
 /// (like the canonical level does) instead of being collapsed/dropped.
+///
+/// Only [`simplify_polygon_impl_checked`] is used outside tests now (#499);
+/// this thin wrapper is kept for the tests below that don't care about the
+/// `unchanged` flag.
+#[cfg(test)]
 fn simplify_polygon_impl(
     poly: &Polygon<f64>,
     tol: f64,
     mode: CollapseMode,
     repair: bool,
 ) -> Simplified {
+    simplify_polygon_impl_checked(poly, tol, mode, repair).0
+}
+
+/// Like [`simplify_polygon_impl`], but also reports whether the kept
+/// geometry is value-identical to `poly` (#499): `true` for the
+/// RDP-removed-nothing candidate ([`polygon_unchanged`]) and the
+/// full-resolution fallback (both literally the same rings as `poly`);
+/// `false` for every collapse, repair, or vertex-removing candidate. Feeds
+/// the cascade fold's Arc-sharing decision in
+/// [`super::stream::process_batch_cascade`].
+fn simplify_polygon_impl_checked(
+    poly: &Polygon<f64>,
+    tol: f64,
+    mode: CollapseMode,
+    repair: bool,
+) -> (Simplified, bool) {
     if polygon_diag(poly) < tol {
-        return collapse_polygon(poly, mode, tol);
+        return (collapse_polygon(poly, mode, tol), false);
     }
 
     // Gates are level properties, so they stay at `tol` even when the RDP
@@ -706,11 +802,12 @@ fn simplify_polygon_impl(
         if candidate.exterior().0.len() < MIN_POLYGON_RING_POINTS
             || candidate.unsigned_area() < min_area
         {
-            return collapse_polygon(poly, mode, tol);
+            return (collapse_polygon(poly, mode, tol), false);
         }
 
-        if polygon_unchanged(&candidate, poly) || capped_is_valid(&candidate) {
-            return Simplified::Keep(Geometry::Polygon(candidate));
+        let unchanged = polygon_unchanged(&candidate, poly);
+        if unchanged || capped_is_valid(&candidate) {
+            return (Simplified::Keep(Geometry::Polygon(candidate)), unchanged);
         }
         invalid_candidate = Some(candidate);
         eps *= 0.5;
@@ -723,10 +820,10 @@ fn simplify_polygon_impl(
                 "overview simplify: repaired self-intersecting RDP candidate \
                  instead of keeping full resolution"
             );
-            return Simplified::Keep(repaired);
+            return (Simplified::Keep(repaired), false);
         }
         // Repair left nothing above the gates (self-canceling sliver).
-        return collapse_polygon(poly, mode, tol);
+        return (collapse_polygon(poly, mode, tol), false);
     }
 
     // Every retry self-intersected: keep the original geometry rather than
@@ -737,7 +834,7 @@ fn simplify_polygon_impl(
          keeping full-resolution geometry",
         INVALID_RETRY_HALVINGS + 1
     );
-    Simplified::Keep(Geometry::Polygon(poly.clone()))
+    (Simplified::Keep(Geometry::Polygon(poly.clone())), true)
 }
 
 /// Resolve an invalid RDP candidate's self-crossings into their valid
@@ -1894,6 +1991,102 @@ mod tests {
                 );
             }
             other => panic!("expected Keep(repaired geometry), got {other:?}"),
+        }
+    }
+
+    // ---- `simplify_checked` (#499 compute-side: cascade Arc-sharing) ------
+    //
+    // `unchanged == true` means the returned geometry is value-identical to
+    // the input — the sharing decision the cascade fold makes in
+    // `process_batch_cascade`.
+
+    #[test]
+    fn simplify_checked_reports_no_removal_for_minimal_geometry() {
+        // A 4-point square (the minimum valid ring) can't lose any more
+        // vertices to RDP without collapsing entirely, so a tolerance that
+        // keeps it alive must report `unchanged == true`.
+        let poly = Geometry::Polygon(square(0.0, 0.0, 50.0));
+        let opts = SimplifyOptions::default();
+        let (out, unchanged) =
+            simplify_checked(&poly, 10.0, Crs::Epsg3857, &opts, Representation::Geometry);
+        assert!(unchanged, "minimal ring should report no removal");
+        match out {
+            Simplified::Keep(Geometry::Polygon(p)) => {
+                assert_eq!(p.exterior().0.len(), 5, "ring should be untouched");
+            }
+            other => panic!("expected Keep(Polygon), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simplify_checked_reports_removal_when_rdp_drops_vertices() {
+        let line = Geometry::LineString(wiggly_line(200, 50.0));
+        let opts = SimplifyOptions::default();
+        let (out, unchanged) =
+            simplify_checked(&line, 500.0, Crs::Epsg3857, &opts, Representation::Geometry);
+        assert!(!unchanged, "coarse GSD should remove vertices");
+        assert!(line_len(&out) < 200);
+    }
+
+    #[test]
+    fn simplify_checked_canonical_level_reports_no_removal() {
+        // gsd == 0 is the canonical/identity path: always a bit-identical
+        // clone, so always "no removal" regardless of geometry.
+        let line = Geometry::LineString(wiggly_line(200, 50.0));
+        let opts = SimplifyOptions::default();
+        let (out, unchanged) =
+            simplify_checked(&line, 0.0, Crs::Epsg3857, &opts, Representation::Geometry);
+        assert!(unchanged);
+        assert_eq!(line_len(&out), 200);
+    }
+
+    #[test]
+    fn simplify_checked_point_revival_step_is_unchanged() {
+        // A polygon on a `Point` step is a representation change (not
+        // unchanged); but a *second* `Point` step over the resulting Point
+        // (the "coarser steps pass the point through untouched" cascade
+        // semantics) must report `unchanged == true`, since points are never
+        // touched by `simplify_for_level`.
+        let poly = Geometry::Polygon(square(0.0, 0.0, 5.0));
+        let opts = SimplifyOptions::default();
+        let (first, first_unchanged) =
+            simplify_checked(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Point);
+        assert!(
+            !first_unchanged,
+            "polygon -> point is a representation change"
+        );
+        let Simplified::Keep(point_geom) = first else {
+            panic!("expected the polygon to revive to a point");
+        };
+        let (second, second_unchanged) = simplify_checked(
+            &point_geom,
+            200.0,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Point,
+        );
+        assert!(
+            second_unchanged,
+            "a point passed through a coarser Point step is untouched"
+        );
+        assert_eq!(second, Simplified::Keep(point_geom));
+    }
+
+    #[test]
+    fn simplify_checked_matches_unchecked_simplify_step() {
+        // `simplify_checked(..).0` must be exactly what `simplify_step`
+        // returns — the checked variant must not change behavior, only add
+        // the `unchanged` flag.
+        let poly = Geometry::Polygon(square(0.0, 0.0, 5.0));
+        let opts = SimplifyOptions::default();
+        for (gsd, repr) in [
+            (10.0, Representation::Geometry),
+            (100.0, Representation::Point),
+            (10.0, Representation::Square),
+        ] {
+            let expected = simplify_step(&poly, gsd, Crs::Epsg3857, &opts, repr);
+            let (actual, _) = simplify_checked(&poly, gsd, Crs::Epsg3857, &opts, repr);
+            assert_eq!(actual, expected, "gsd={gsd} repr={repr:?}");
         }
     }
 }
