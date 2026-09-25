@@ -86,6 +86,7 @@ stable. Let CI run both. To run the slow set locally:
 
 ```bash
 cargo nextest run --all-features \
+  --cargo-profile slow-tests \
   --ignore-default-filter -E 'not default()'
 ```
 
