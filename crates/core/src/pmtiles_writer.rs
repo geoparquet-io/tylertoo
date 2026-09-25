@@ -386,17 +386,20 @@ fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
 ///
 /// Implementation follows the standard Hilbert curve algorithm:
 /// https://en.wikipedia.org/wiki/Hilbert_curve
-fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
+pub(crate) fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
     // #371: `1u32 << z` overflows at z32 — in release it masks the shift to
     // `z & 31`, so z32 yields n = 1 and every tile id in the archive is wrong
     // with no diagnostic. u64 covers the whole z<=31 PMTiles address space.
     //
-    // The assert and the clamp are both unreachable today: `tile_id`, the only
-    // caller, returns the out-of-range sentinel before it gets here. They are
-    // kept as the function's own guard rail — the assert states the contract
-    // for a future second caller, and the clamp keeps release builds total
-    // (an unclamped `1u64 << z` still masks for z >= 64) rather than silently
-    // resuming with a wrong `n`.
+    // The assert and the clamp are unreachable through either of this
+    // function's two callers, both of which bound `z` themselves before
+    // calling in: `tile_id` returns the out-of-range sentinel before it gets
+    // here, and `crate::tile::node_id_range` (#506) carries the identical
+    // debug_assert + clamp pair on its own `target_z` before it does. They
+    // are kept as this function's own guard rail regardless — the assert
+    // restates the contract at the point that actually needs it, and the
+    // clamp keeps a release build total (an unclamped `1u64 << z` still
+    // masks for z >= 64) rather than silently resuming with a wrong `n`.
     debug_assert!(z <= MAX_TILE_ID_ZOOM, "tile_id must bound z first (#371)");
     let n: u64 = 1u64 << z.min(MAX_TILE_ID_ZOOM);
     let mut rx: u64;
@@ -1673,6 +1676,16 @@ pub struct StreamingPmtilesWriter {
     total_features: u64,
     /// Whether finalize has been called (prevents double cleanup)
     finalized: bool,
+    /// Debug-only ordering contract (#506): when set, every `add_tile*` call
+    /// `debug_assert!`s its tile id is strictly greater than the previous
+    /// one. A caller that has arranged to add tiles in ascending PMTiles
+    /// tile-id (Hilbert) order — the export path, after this PR — opts in so
+    /// an ordering regression fails fast in a debug build instead of quietly
+    /// shipping a `clustered: false` archive. Never checked in release (the
+    /// `clustered` header byte is derived honestly regardless, via
+    /// [`Self::entries_are_clustered`], so a violation here is a perf/quality
+    /// regression, not a correctness bug worth a release-mode cost).
+    expect_clustered: bool,
 }
 
 impl StreamingPmtilesWriter {
@@ -1717,7 +1730,33 @@ impl StreamingPmtilesWriter {
             stats: StreamingWriteStats::default(),
             total_features: 0,
             finalized: false,
+            expect_clustered: false,
         })
+    }
+
+    /// Opt into the debug-only ascending-tile-id assertion (#506): see the
+    /// `expect_clustered` field doc for what it checks and why it is
+    /// debug-only.
+    pub fn set_expect_clustered(&mut self, expect: bool) {
+        self.expect_clustered = expect;
+    }
+
+    /// `debug_assert!` that `id` continues the ascending run this writer was
+    /// told to expect, given the most recently added entry (if any).
+    #[inline]
+    fn check_expect_clustered(&self, id: u64) {
+        if !self.expect_clustered {
+            return;
+        }
+        if let Some(last) = self.entries.last() {
+            debug_assert!(
+                id > last.tile_id,
+                "expect_clustered: tile id {id} did not continue the ascending run \
+                 (last added was {}); the caller opted into tile-id-ordered adds \
+                 but did not deliver them",
+                last.tile_id
+            );
+        }
     }
 
     /// Get the path to the temp file (for testing).
@@ -1807,12 +1846,14 @@ impl StreamingPmtilesWriter {
         data: &[u8],
         feature_count: usize,
     ) -> std::io::Result<()> {
+        let id = checked_tile_id(z, x, y)?;
+        self.check_expect_clustered(id);
+
         let temp_file = self
             .temp_file
             .as_mut()
             .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
 
-        let id = checked_tile_id(z, x, y)?;
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
 
@@ -1881,12 +1922,14 @@ impl StreamingPmtilesWriter {
         raw_len: usize,
         feature_count: usize,
     ) -> std::io::Result<()> {
+        let id = checked_tile_id(z, x, y)?;
+        self.check_expect_clustered(id);
+
         let temp_file = self
             .temp_file
             .as_mut()
             .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
 
-        let id = checked_tile_id(z, x, y)?;
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
 
@@ -1984,12 +2027,32 @@ impl StreamingPmtilesWriter {
 
         // Whether the directory this run is about to write is *actually*
         // clustered — sorting by tile_id (above) does not imply it. Callers
-        // add tiles in whatever order they discover them (row-major per zoom
-        // for an export, tile-id order for a pyramid merge), and the offsets
-        // in `self.entries` reflect add order, not tile-id order. Deriving
-        // the header flag from those offsets, after the sort, means the flag
-        // can never claim more than the bytes on disk actually deliver.
+        // add tiles in whatever order they discover them (ascending tile id
+        // for export, since #506; tile-id order for a pyramid merge), and the
+        // offsets in `self.entries` reflect add order, not tile-id order.
+        // Deriving the header flag from those offsets, after the sort, means
+        // the flag can never claim more than the bytes on disk actually
+        // deliver.
         let clustered = self.entries_are_clustered();
+
+        // `expect_clustered`'s `debug_assert!` (in `check_expect_clustered`)
+        // catches an ordering regression while adding tiles, but only in a
+        // debug build — a release build silently ships a `clustered: false`
+        // archive with no signal at all (#506 review, F6). This is the
+        // release-mode fallback: the caller promised ascending adds and the
+        // derived flag says the promise was not kept, so say so at `warn`
+        // rather than staying silent. Not an error — the archive is still
+        // valid, just not what the caller asked for.
+        if self.expect_clustered && !clustered {
+            log::warn!(
+                "PMTiles writer: caller opted into ascending-tile-id adds \
+                 (expect_clustered) for {}, but the written archive is not \
+                 actually clustered -- an add arrived out of tile-id order \
+                 and this build has debug assertions disabled, so the \
+                 regression only surfaces here",
+                output_path.display()
+            );
+        }
 
         // Build run-length encoded directory entries
         let dir_entries = self.build_directory_entries();
@@ -2118,8 +2181,12 @@ impl StreamingPmtilesWriter {
     /// Whether `self.entries`, already sorted by tile_id, is genuinely
     /// clustered: see [`offsets_are_clustered`] for the predicate. Must be
     /// called after the tile_id sort in [`Self::write_archive`] — before it,
-    /// `self.entries` is in add order, which for an export is row-major per
-    /// zoom, not tile-id order, and the check would be meaningless.
+    /// `self.entries` is in add order, which is not necessarily tile-id order
+    /// for every caller (a pyramid merge, say, may still add out of order),
+    /// and the check would be meaningless. Export itself now adds in
+    /// ascending tile-id order already (#506), but this function does not —
+    /// and should not — assume that of every caller; it re-derives the truth
+    /// from the sorted offsets regardless of how `self.entries` got here.
     fn entries_are_clustered(&self) -> bool {
         offsets_are_clustered(self.entries.iter().map(|e| (e.offset, u64::from(e.length))))
     }
@@ -4444,5 +4511,26 @@ mod tests {
             "a dedup back-reference into already-written bytes is legal in a clustered archive"
         );
         assert_eq!(header.clustered, verify_clustered(tmp.path()).unwrap());
+    }
+
+    /// F8 (#506 review): `set_expect_clustered(true)` pins a real ordering
+    /// contract, not just documentation -- two out-of-order adds must trip
+    /// the `debug_assert!` in `check_expect_clustered`. Debug-only: with
+    /// assertions disabled the panic never fires (see [`Self::write_archive`]'s
+    /// `log::warn!` for the release-mode fallback signal instead), so this
+    /// test only runs in a debug build.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "did not continue the ascending run")]
+    fn expect_clustered_panics_on_out_of_order_adds() {
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("test");
+        writer.set_expect_clustered(true);
+
+        // z2 tile ids: (0,0)=5, (3,3)=15 (per `tile_id`'s own doc example).
+        // Adding the higher id first, then a lower one, is strictly out of
+        // order.
+        writer.add_tile(2, 3, 3, &[1, 2, 3]).unwrap();
+        let _ = writer.add_tile(2, 0, 0, &[4, 5, 6]);
     }
 }

@@ -15,22 +15,26 @@
 //!    this module treats both modes identically: "read level `k`, emit tiles
 //!    at level `k`'s zoom".
 //! 3. **Partition pass**: split the zoom's tiles into contiguous ascending
-//!    `(x, y)` ranges of roughly [`DEFAULT_PARTITION_TARGET`] members each, then
-//!    process them in **waves** of [`resolve_partition_wave`] partitions. Each wave
-//!    reads the band **once** (row groups pruned to the wave's combined bbox),
-//!    splits every feature into its tiles with a **top-down recursive quadtree
-//!    cascade** (see [`feature_tile_members`]) — each feature clipped once per
-//!    pyramid level into an already-reduced child region down to the target
-//!    zoom, so a vertex takes part in `O(depth)` clips rather than
-//!    `O(tiles_spanned)` (issue #226) — and *routes* each resulting member to
-//!    its owning partition (see [`process_wave`]). Sharing one read+decode
-//!    across a wave replaces the old per-partition re-read (issue #228): a level
-//!    now costs `ceil(P / PARTITION_WAVE)` band reads, not `P`. The per-tile
-//!    clips reuse the [`clip_geometry_simple`] entry point, MVT-encode via
-//!    [`crate::mvt`], and each finished partition's tiles stream immediately to
-//!    [`StreamingPmtilesWriter`]. Tiles are written in ascending `(x, y)` order
-//!    per zoom — the historical order — so the archive's tile-data layout,
-//!    deduplication, and directory are unchanged.
+//!    PMTiles tile-id (Hilbert) ranges of roughly [`DEFAULT_PARTITION_TARGET`]
+//!    members each, then process them in **waves** of
+//!    [`resolve_partition_wave`] partitions. Each wave reads the band **once**
+//!    (row groups pruned to the wave's combined bbox), splits every feature
+//!    into its tiles with a **top-down recursive quadtree cascade** (see
+//!    [`feature_tile_members`]) — each feature clipped once per pyramid level
+//!    into an already-reduced child region down to the target zoom, so a
+//!    vertex takes part in `O(depth)` clips rather than `O(tiles_spanned)`
+//!    (issue #226) — and *routes* each resulting member to its owning
+//!    partition (see [`process_wave`]). Sharing one read+decode across a wave
+//!    replaces the old per-partition re-read (issue #228): a level now costs
+//!    `ceil(P / PARTITION_WAVE)` band reads, not `P`. The per-tile clips reuse
+//!    the [`clip_geometry_simple`] entry point, MVT-encode via [`crate::mvt`],
+//!    and each finished partition's tiles stream immediately to
+//!    [`StreamingPmtilesWriter`]. Tiles are written in ascending PMTiles
+//!    tile-id order per zoom, and levels export in ascending zoom, so the
+//!    whole archive is added in globally ascending tile-id order — the
+//!    archive is genuinely `clustered: true` (#506; before that it was
+//!    row-major `(x, y)` order, an arbitrary historical layout with no such
+//!    guarantee).
 //!
 //!    In **partitioning** mode the per-level wave read walks the accumulating
 //!    row-group prefix (§5.1), so a coarse row group would be re-read and
@@ -374,6 +378,43 @@ pub enum ExportError {
         ceiling: u8,
     },
 
+    /// Two levels resolve to the same (or a non-increasing) zoom (#506
+    /// follow-up).
+    ///
+    /// `zoom_for_level`'s §3.3 validation only requires `gsd` to be strictly
+    /// decreasing across levels, not that the ZOOM it rounds to (the §5.2
+    /// inverse) is distinct per level: two GSDs close enough to round to the
+    /// same integer zoom, or two GSDs both coarser than the zoom-0
+    /// threshold, both pass that check and both resolve here to the same
+    /// zoom. Export keys each level's tiles by PMTiles tile id within that
+    /// level's own zoom and streams levels ascending (#506); a duplicate
+    /// zoom would write that zoom's tile ids a second time. Before #506 this
+    /// silently clobbered directory entries (both levels used the same
+    /// row-major `(x, y)` key, so the second level's write just overwrote
+    /// the first level's slot in the directory — latent tile-data
+    /// corruption with no error). Since #506 it instead trips the writer's
+    /// ascending-tile-id `debug_assert!` in a debug build. Neither is
+    /// acceptable: reject it here, with a real error, before any scan runs.
+    #[error(
+        "overview levels {previous_level} (gsd {previous_gsd} m) and {level} (gsd {gsd} m) \
+         both resolve to zoom {zoom}; every level must resolve to a distinct, strictly \
+         increasing zoom"
+    )]
+    LevelZoomsNotAscending {
+        /// Index of the earlier, colliding level.
+        previous_level: usize,
+        /// The earlier level's resolved zoom (equal to `zoom`).
+        previous_zoom: u8,
+        /// The earlier level's GSD.
+        previous_gsd: f64,
+        /// Index of the later, colliding level.
+        level: usize,
+        /// The later level's resolved zoom (equal to `previous_zoom`).
+        zoom: u8,
+        /// The later level's GSD.
+        gsd: f64,
+    },
+
     #[error(
         "included property {name:?} is not a property this overview file exports \
          (exportable: {available})"
@@ -477,11 +518,12 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 
 /// Members-per-partition target for the partitioned streaming export (H3(b)).
 ///
-/// Each zoom's tiles are split into contiguous `(x, y)` ranges whose summed
-/// (feature × tile) member counts reach at least this value; partitions are
-/// processed one at a time and streamed to the writer, so this bounds the
-/// per-partition working set (clipped geometries + encoded tiles) instead of
-/// holding the whole zoom in memory.
+/// Each zoom's tiles are split into contiguous PMTiles tile-id ranges (#506;
+/// row-major `(x, y)` ranges before it) whose summed (feature × tile) member
+/// counts reach at least this value; partitions are processed one at a time
+/// and streamed to the writer, so this bounds the per-partition working set
+/// (clipped geometries + encoded tiles) instead of holding the whole zoom in
+/// memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
 /// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing
@@ -758,8 +800,9 @@ fn plan_levels(
         .map(|(level_idx, scan)| {
             let zoom = zoom_for_level(meta, level_idx)?;
 
-            // Split the zoom's tiles into contiguous ascending (x, y) ranges
-            // of roughly `partition_target` members each.
+            // Split the zoom's tiles into contiguous ascending PMTiles
+            // tile-id ranges (#506) of roughly `partition_target` members
+            // each.
             let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
 
             // Per-level memory guard (#311): on `auto`, narrow the wave from
@@ -822,8 +865,31 @@ fn export_pmtiles_impl(
     // #371: every level's zoom is resolved (and ceiling-checked) before any
     // scan runs — a level whose GSD implies a zoom past `MAX_ZOOM` fails here
     // rather than producing an archive with wrapped tile ids.
-    let coarsest_zoom = zoom_for_level(&meta, 0)?;
-    let max_zoom = zoom_for_level(&meta, num_levels - 1)?;
+    //
+    // #506 follow-up: `OverviewsMeta::validate` (run by `OverviewReader::open`
+    // above) only requires `gsd` to be strictly decreasing across levels, not
+    // that the ZOOM each one derives to is distinct — two GSDs close enough
+    // to round to the same integer zoom both pass that check. Resolve every
+    // level's zoom here and require strict ascent before any scan runs; see
+    // [`ExportError::LevelZoomsNotAscending`] for what a collision used to do
+    // silently (pre-#506) and what it does now if left unrejected.
+    let level_zooms: Vec<u8> = (0..num_levels)
+        .map(|level_idx| zoom_for_level(&meta, level_idx))
+        .collect::<Result<_, _>>()?;
+    for i in 1..level_zooms.len() {
+        if level_zooms[i] <= level_zooms[i - 1] {
+            return Err(ExportError::LevelZoomsNotAscending {
+                previous_level: i - 1,
+                previous_zoom: level_zooms[i - 1],
+                previous_gsd: meta.levels[i - 1].gsd,
+                level: i,
+                zoom: level_zooms[i],
+                gsd: meta.levels[i].gsd,
+            });
+        }
+    }
+    let coarsest_zoom = level_zooms[0];
+    let max_zoom = level_zooms[num_levels - 1];
     // #380: the archive may declare a coarser minimum than the file holds.
     let min_zoom = match options.min_zoom {
         // #371: the declared minimum is a written header field, so it obeys the
@@ -870,6 +936,12 @@ fn export_pmtiles_impl(
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
+    // #506: export now adds every tile in ascending PMTiles tile-id (Hilbert)
+    // order — per zoom via `tile_key`, and zooms ascend across levels — so
+    // the archive is genuinely clustered. Debug-only: catches an ordering
+    // regression here rather than downstream as a quietly `clustered: false`
+    // archive.
+    writer.set_expect_clustered(true);
     writer.set_layer_name(&options.layer_name);
     writer.set_declared_min_zoom(min_zoom);
     // #359: which name each column is published under. Derived once from the
@@ -1182,14 +1254,45 @@ fn export_level(
 // Partitioned tiling + encoding (H3(b))
 // ============================================================================
 
-/// Pack a tile `(x, y)` into a single ordered key. Ordering by this key equals
-/// ordering by the `(x, y)` tuple — the historical per-zoom write order (the
-/// old per-zoom `BTreeMap<(u32, u32), _>` iteration order). Preserving it
-/// keeps the archive's tile-data layout, deduplication, and directory
-/// byte-identical.
+/// A tile's key in the per-zoom scan/partition/emit maps: its PMTiles tile id
+/// ([`crate::pmtiles_writer::tile_id`]), i.e. its position on the zoom's
+/// Hilbert curve plus the cumulative base of shallower zooms.
+///
+/// Every per-zoom `BTreeMap<u64, _>` this module keys on `tile_key` — the
+/// scan pass's tile counts, partition `[key_lo, key_hi]` windows, member
+/// routing — therefore walks tiles in ascending PMTiles tile-id order, and
+/// `export_level` writes them to the archive in exactly that order (levels
+/// export in ascending zoom, and every id at zoom `z` is less than every id
+/// at zoom `z + 1`). That is what makes the export archive genuinely
+/// `clustered: true` (#506) — the derived header flag from #501 comes out
+/// true because the bytes really are laid out that way, not because it is
+/// asserted.
+///
+/// DIVERGENCE FROM the pre-#506 key: this used to be the row-major pack
+/// `(x << 32) | y`, chosen only to preserve a specific historical byte
+/// layout. Switching to the tile id changes that layout (tile data now lands
+/// in Hilbert order, which is spatially compact rather than column-striped)
+/// but is otherwise a drop-in replacement — every consumer only ever compared
+/// keys or looked one up, never split it into `x`/`y` bit-fields, except
+/// [`plan_partitions`] and [`encode_members`]/[`tile_mvt`] (test-only), which
+/// now decode a key back to `(x, y)` via
+/// [`crate::pmtiles_writer::tile_id_to_zxy`] instead of unpacking bits.
 #[inline]
-fn tile_key(x: u32, y: u32) -> u64 {
-    ((x as u64) << 32) | y as u64
+fn tile_key(x: u32, y: u32, zoom: u8) -> u64 {
+    crate::pmtiles_writer::tile_id(zoom, x, y)
+}
+
+/// Inverse of [`tile_key`]: recover a tile's `(x, y)` at the zoom the key was
+/// built for. `zoom` is the caller's own authority (the per-zoom map's zoom),
+/// used only to `debug_assert` the id actually decodes to it — every key this
+/// module produces came from `tile_key(_, _, zoom)`, so a mismatch would mean
+/// a key leaked from the wrong zoom's map.
+#[inline]
+fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
+    let (z, x, y) = crate::pmtiles_writer::tile_id_to_zxy(key)
+        .expect("tile_key output must always decode back to a valid tile id");
+    debug_assert_eq!(z, zoom, "key {key} decoded to zoom {z}, expected {zoom}");
+    (x, y)
 }
 
 /// One tile member: a feature's clipped geometry destined for the tile with
@@ -1210,7 +1313,8 @@ struct LevelScan {
     feature_count: usize,
     /// Union of feature bboxes (`None` when no feature has one).
     bounds: Option<TileBounds>,
-    /// Member count per tile key, ascending `(x, y)`.
+    /// Member count per tile key, ascending PMTiles tile id (#506; ascending
+    /// `(x, y)` before it).
     tile_counts: BTreeMap<u64, usize>,
 }
 
@@ -2085,7 +2189,7 @@ fn size_bboxes(
                     // archive's advertised bbox.
                     let ranges = member_ranges(bbox, zoom, opts);
                     for tc in tiles_in_ranges(&ranges, zoom) {
-                        *counts.entry(tile_key(tc.x, tc.y)).or_insert(0) += 1;
+                        *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
                     }
                 }
                 (bounds, counts)
@@ -2153,8 +2257,16 @@ fn scan_level(
     Ok(scan)
 }
 
-/// Split a zoom's tiles (ascending key order) into contiguous partitions of at
-/// least `partition_target` members each (the last partition may be smaller).
+/// Split a zoom's tiles (ascending key order — since #506, ascending PMTiles
+/// tile id / Hilbert order) into contiguous partitions of at least
+/// `partition_target` members each (the last partition may be smaller).
+///
+/// Because Hilbert order is spatially compact rather than column-striped, a
+/// partition's bbox (recomputed below as the union of its member tiles'
+/// bounds, same as before) is now typically a blocky region instead of a tall
+/// thin strip — which tends to prune more row groups on the wave read, a
+/// measurable side effect of this key change rather than something planned
+/// for here.
 fn plan_partitions(
     tile_counts: &BTreeMap<u64, usize>,
     zoom: u8,
@@ -2164,7 +2276,8 @@ fn plan_partitions(
     let mut out: Vec<Partition> = Vec::new();
     let mut cur: Option<Partition> = None;
     for (&key, &count) in tile_counts {
-        let tb = TileCoord::new((key >> 32) as u32, key as u32, zoom).bounds();
+        let (x, y) = key_to_xy(key, zoom);
+        let tb = TileCoord::new(x, y, zoom).bounds();
         match cur.as_mut() {
             Some(p) => {
                 p.key_hi = key;
@@ -2205,7 +2318,7 @@ fn plan_partitions(
 /// Each partition is then grouped-by-tile and MVT-encoded in parallel exactly
 /// as a standalone partition would be. Returns one `Vec<EncodedTile>` per
 /// partition, in the wave's ascending partition order, each in ascending
-/// `(x, y)` order.
+/// PMTiles tile-id order.
 ///
 /// This replaces the old per-partition re-read (issue #228): instead of `P`
 /// independent band reads + decodes per level, a wave of `partition_wave`
@@ -2592,7 +2705,7 @@ fn feature_tile_members_direct(
     out: &mut Vec<(u64, Geometry<f64>)>,
 ) {
     for tc in tiles_in_ranges(ranges, zoom) {
-        let key = tile_key(tc.x, tc.y);
+        let key = tile_key(tc.x, tc.y, zoom);
         if key < key_lo || key > key_hi {
             continue;
         }
@@ -2662,24 +2775,20 @@ fn node_overlaps_ranges(node: TileCoord, zoom: u8, ranges: &BboxTileRanges) -> b
 }
 
 /// `true` when tile node `(x, y, z)`'s descendant-leaf key range overlaps the
-/// partition key window `[key_lo, key_hi]`. Keys are `x`-major
-/// (`(x << 32) | y`), so a node's subtree spans `[min_key, max_key]` with
-/// `min = (x_lo << 32) | y_lo`, `max = (x_hi << 32) | y_hi`. The test is
-/// conservative (the subtree key range has row-major gaps), which only lets a
-/// branch be visited — the exact leaf key guard drops any non-member — so it
-/// never skips a needed tile. It is what keeps a giant feature's per-partition
-/// work bounded to the partition's slice instead of re-walking the whole
-/// subtree once per partition it spans.
+/// partition key window `[key_lo, key_hi]`. Keys are PMTiles tile ids
+/// (#506), so a node's subtree spans an EXACT contiguous interval at `zoom`
+/// — [`crate::tile::node_id_range`] — rather than the conservative,
+/// gap-riddled bounding box the row-major key used to produce. The test is
+/// therefore now precise, not just safe: it never skips a needed tile (the
+/// exact leaf key guard still drops any non-member on top of this), and it no
+/// longer visits branches whose subtree merely bounds, without overlapping,
+/// the window. It is what keeps a giant feature's per-partition work bounded
+/// to the partition's slice instead of re-walking the whole subtree once per
+/// partition it spans.
 #[inline]
 fn node_key_overlaps(node: TileCoord, zoom: u8, key_lo: u64, key_hi: u64) -> bool {
-    let shift = (zoom - node.z) as u32;
-    let x_lo = (node.x as u64) << shift;
-    let x_hi = (((node.x as u64) + 1) << shift) - 1;
-    let y_lo = (node.y as u64) << shift;
-    let y_hi = (((node.y as u64) + 1) << shift) - 1;
-    let min_key = (x_lo << 32) | y_lo;
-    let max_key = (x_hi << 32) | y_hi;
-    max_key >= key_lo && min_key <= key_hi
+    let range = crate::tile::node_id_range(node, zoom);
+    *range.start() <= key_hi && key_lo <= *range.end()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2706,7 +2815,7 @@ fn split_feature_into_tiles(
     if node.z == zoom {
         // Leaf tile. The prune above already proved this tile is in the
         // feature's target set; enforce the exact partition key window here.
-        let key = tile_key(node.x, node.y);
+        let key = tile_key(node.x, node.y, zoom);
         if key < key_lo || key > key_hi {
             return;
         }
@@ -3149,7 +3258,7 @@ fn encode_members(
     groups
         .into_par_iter()
         .filter_map(|g| {
-            let (x, y) = ((g[0].key >> 32) as u32, g[0].key as u32);
+            let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
             let (data, count, oversized) = encode_tile(g, &tb, opts);
             if count == 0 {
@@ -4202,6 +4311,25 @@ mod tests {
     /// flipping byte 96 of the new archive back to `1` reproduces the prior
     /// hash (`0dfdf8a0bb941a0c`) exactly. No tile data, directory entry, or
     /// metadata byte changed.
+    ///
+    /// REPIN (#506, tile-id-ordered export): tiles are now added to the
+    /// writer in ascending PMTiles tile-id (Hilbert) order per zoom instead
+    /// of row-major `(x, y)` order, so the on-disk directory and tile-data
+    /// layout changes even though the tile *set* does not — hence a new
+    /// archive hash. Verified before re-blessing (both checks below already
+    /// assert `total_tiles == 13` and every counted tile has features > 0,
+    /// so this note only adds the two checks those don't cover):
+    /// * `verify_clustered(path)` and `header.clustered` are both now
+    ///   `true` for this archive (they were both honestly `false` before
+    ///   #506, per the REPIN note above and `pmtiles_clustered.rs`).
+    /// * Per-tile MVT **content** is unchanged: dumping
+    ///   `z/x/y -> hash(decompressed tile bytes)` for all 13 tiles on this
+    ///   exact fixture, on the pre-#506 tree and on this tree, produces the
+    ///   same 13 `(z, x, y)` keys with the same 13 content hashes in both
+    ///   dumps — the only difference between the two runs is
+    ///   `clustered: false -> true`. Only the ORDER tiles were written in
+    ///   (and therefore their byte offsets) changed, not what any tile
+    ///   contains.
     #[test]
     fn export_archive_matches_pre_refactor_reference() {
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -4221,12 +4349,12 @@ mod tests {
         let bytes = std::fs::read(tout.path()).unwrap();
         assert_eq!(
             format!("{:016x}", crate::dedup::TileHasher::hash(&bytes)),
-            // RE-BLESSED: the `clustered` header byte (offset 96) is now
-            // derived from the directory's actual offset layout instead of a
-            // hardcoded `true` (see the REPIN note above this test). One
-            // header byte; no tile data moved, and the per-tile assertions
-            // below are unchanged.
-            "f0394915010f49bd",
+            // RE-BLESSED (#506): tiles are now written in ascending PMTiles
+            // tile-id order rather than row-major (x, y) order, which moves
+            // every tile's on-disk offset and flips the `clustered` header
+            // byte true. See the REPIN note above this test for the content
+            // vs. layout verification performed before re-blessing.
+            "ce11a1d5f51410d2",
             "archive bytes diverged from the pre-refactor reference"
         );
 
@@ -4271,6 +4399,155 @@ mod tests {
         assert_eq!(
             seen, 13,
             "every counted tile must be addressable in the archive"
+        );
+    }
+
+    /// The PMTiles directory is always sorted by tile id (a writer invariant
+    /// independent of add order — see `StreamingPmtilesWriter::write_archive`
+    /// — and the format's own contract), so walking it ascending is not by
+    /// itself evidence of #506. What #506 changes is whether the underlying
+    /// tile DATA is laid out in that same order.
+    ///
+    /// That is NOT the same claim as "every entry's offset is >= the
+    /// previous entry's offset" (#506 review, F4): a deduplication
+    /// back-reference legally points an entry at an EARLIER tile's already-written
+    /// bytes (`offsets_are_clustered`'s own contract — see
+    /// `pmtiles_writer::verify_clustered`), and that is still a `clustered`
+    /// archive under the PMTiles v3 definition (a forward-streaming reader
+    /// just re-serves bytes it already has buffered). A raw offset-monotonicity
+    /// assertion here would be too strict — it happened to hold on this
+    /// fixture only because none of its 13 tiles are non-adjacent duplicates
+    /// of each other, not because export guarantees it. The real predicate
+    /// this test checks is [`crate::pmtiles_writer::verify_clustered`], the
+    /// same file-side re-derivation the header's own `clustered` byte is
+    /// checked against — plus, since the #506 review, the *strict* walk
+    /// go-pmtiles `verify` itself performs (every first-seen offset equals
+    /// the running end of the data written so far; a repeated offset is a
+    /// dedup back-reference and is skipped). `verify_clustered` is laxer
+    /// than that today (#516), so pinning the tool's rule here keeps this
+    /// test from blessing an archive go-pmtiles would refuse.
+    #[test]
+    fn export_emits_tiles_in_ascending_tile_id() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(tin.path());
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            ..Default::default()
+        };
+        export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+
+        use crate::compression;
+        use crate::pmtiles_writer::{
+            decode_directory, tile_id_to_zxy, verify_clustered, DirEntry, Header,
+        };
+        let bytes = std::fs::read(tout.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        let root = compression::decompress_capped(
+            &bytes[header.root_dir_offset as usize
+                ..(header.root_dir_offset + header.root_dir_length) as usize],
+            header.internal_compression,
+            compression::MAX_INTERNAL_BYTES,
+        )
+        .unwrap();
+        let entries = decode_directory(&root).expect("root directory must decode");
+        assert!(
+            entries.iter().all(|e| e.run_length > 0),
+            "fixture must fit the root directory; this walk does not follow leaves"
+        );
+        assert!(
+            entries.len() >= 8,
+            "fixture must exercise several tiles across multiple zooms, got {}",
+            entries.len()
+        );
+
+        // The directory is always sorted by tile id (a writer invariant, not
+        // specific to #506) -- asserted here as a sanity check on the walk
+        // itself, not as the test's main claim.
+        let mut prev: Option<&DirEntry> = None;
+        for e in &entries {
+            if let Some(p) = prev {
+                assert!(
+                    e.tile_id > p.tile_id,
+                    "directory entries must be strictly ascending by tile id"
+                );
+            }
+            prev = Some(e);
+        }
+
+        // The actual #506 claim: the tile DATA is genuinely laid out in
+        // ascending tile-id order, dedup back-references included --
+        // `verify_clustered` re-derives this from the offsets directly
+        // rather than assuming raw monotonicity.
+        assert!(
+            verify_clustered(tout.path()).unwrap(),
+            "export must write tile data in genuinely clustered (ascending \
+             tile-id) order -- verify_clustered on the exported archive says \
+             it is not"
+        );
+
+        // ...and the same walk go-pmtiles `verify` performs, pinned directly
+        // (#506 review, F4 follow-up). `verify_clustered` currently accepts a
+        // strictly weaker predicate than go-pmtiles does (#516): it tolerates
+        // an entry whose offset merely REPEATS an earlier one, whereas
+        // go-pmtiles requires that every FIRST-SEEN offset equal the running
+        // end of the previously written blob. Copied from
+        // `pyramid::tests::merge_writes_disjoint_bands_in_tile_id_order_given_fine_first`
+        // so this test keeps holding the tool's line even if #516 changes the
+        // library-side helper.
+        let mut seen_offsets = std::collections::HashSet::new();
+        let mut end = 0u64;
+        for e in &entries {
+            if !seen_offsets.insert(e.offset) {
+                // A dedup back-reference to bytes already written: legal, and
+                // it does not advance the frontier.
+                continue;
+            }
+            assert_eq!(
+                e.offset,
+                end,
+                "out-of-order entry in clustered archive at tile id {} (z/x/y {:?}): \
+                 go-pmtiles `verify` rejects a first-seen offset that is not the \
+                 running end of the tile data written so far",
+                e.tile_id,
+                tile_id_to_zxy(e.tile_id).unwrap()
+            );
+            end = e.offset + u64::from(e.length);
+        }
+        assert_eq!(
+            end, header.tile_data_length,
+            "the walk must account for every byte of the tile-data section"
+        );
+    }
+
+    /// The counterpart to [`export_emits_tiles_in_ascending_tile_id`]: the
+    /// header's derived `clustered` byte (#501) must now come out `true` for
+    /// a real export, and must agree with the independent file-side
+    /// [`crate::pmtiles_writer::verify_clustered`] re-derivation.
+    /// `pmtiles_clustered.rs` pins the same claim on a real-world fixture;
+    /// this is the always-available oracle on the in-memory one.
+    #[test]
+    fn export_header_clustered_is_true() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(tin.path());
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            ..Default::default()
+        };
+        export_pmtiles(tin.path(), tout.path(), &opts).unwrap();
+
+        use crate::pmtiles_writer::{verify_clustered, Header};
+        let bytes = std::fs::read(tout.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            header.clustered,
+            "export archive must be genuinely clustered (#506)"
+        );
+        assert_eq!(
+            header.clustered,
+            verify_clustered(tout.path()).unwrap(),
+            "the header's claim must match the independent file-side re-derivation"
         );
     }
 
@@ -4498,7 +4775,7 @@ mod tests {
     /// quantized output the archive would carry, so byte-equality here means
     /// tile-output equivalence.
     fn tile_mvt(key: u64, geom: &Geometry<f64>, zoom: u8, opts: &ExportOptions) -> Vec<u8> {
-        let (x, y) = ((key >> 32) as u32, key as u32);
+        let (x, y) = key_to_xy(key, zoom);
         let tb = TileCoord::new(x, y, zoom).bounds();
         let m = Member {
             key,
@@ -4521,12 +4798,11 @@ mod tests {
         dk.sort_unstable();
         assert_eq!(rk, dk, "tile key set diverges at z{zoom}");
         for k in rk {
+            let (kx, ky) = key_to_xy(k, zoom);
             assert_eq!(
                 tile_mvt(k, &rec[&k], zoom, opts),
                 tile_mvt(k, &dir[&k], zoom, opts),
-                "tile ({}, {}) MVT diverges at z{zoom}",
-                (k >> 32) as u32,
-                k as u32,
+                "tile ({kx}, {ky}) MVT diverges at z{zoom}",
             );
         }
     }
@@ -4676,8 +4952,8 @@ mod tests {
         // Buffer in degrees at z1: tile_width * buffer_px / 256
         // = 180 * 8 / 256 = 5.625°.
         let buffer_deg = buffer_deg_at_zoom(zoom, &opts);
-        let west = tile_key(0, 0);
-        let east = tile_key(1, 0);
+        let west = tile_key(0, 0, zoom);
+        let east = tile_key(1, 0, zoom);
 
         // Inside (0,0)'s buffer, and inside (1,0) proper.
         let inside = 0.9 * buffer_deg;
@@ -5718,7 +5994,7 @@ mod tests {
 
         let tc = TileCoord::new(tiles[0].x, tiles[0].y, 4);
         let member = Member {
-            key: tile_key(tiles[0].x, tiles[0].y),
+            key: tile_key(tiles[0].x, tiles[0].y, 4),
             seq: 0,
             geom: poly.clone(),
             props: Arc::new(vec![]),
@@ -6335,7 +6611,7 @@ mod tests {
         ];
         for (i, g) in geoms.into_iter().enumerate() {
             let m = Member {
-                key: tile_key(7, 11) + i as u64,
+                key: tile_key(7, 11, 5) + i as u64,
                 seq: u64::MAX - i as u64,
                 geom: g,
                 props: Arc::new(props.clone()),
@@ -7016,6 +7292,83 @@ mod tests {
                     level: 1,
                     implied: 33,
                     ceiling: 30,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// #506 follow-up (F1): `OverviewsMeta::validate` only requires `gsd` to
+    /// be strictly decreasing across levels, not that the derived ZOOM is
+    /// distinct — two GSDs close enough to round to the same integer zoom
+    /// both pass it. Pre-#506 this silently wrote that zoom's tiles twice,
+    /// clobbering directory entries with no error (both levels shared the
+    /// same row-major key); post-#506 it instead trips the writer's
+    /// ascending-tile-id `debug_assert!`. Either way it must be a clean,
+    /// named `ExportError`, caught before any scan runs.
+    #[test]
+    fn export_rejects_levels_whose_derived_zooms_collide() {
+        // Guard the fixture's own premise: both GSDs must round to z4 and
+        // must be strictly decreasing (gsd(4) is the exact z4 value; scaling
+        // it up by less than sqrt(2) keeps the derived zoom at 4, since the
+        // z3/z4 rounding boundary sits at gsd(4) * sqrt(2)). If a future
+        // change to the GSD/zoom formula moves this, the test fails loudly
+        // here instead of silently stopping to exercise the collision.
+        let gsd_a = gsd(4) * 1.10;
+        let gsd_b = gsd(4) * 1.02;
+        assert!(
+            gsd_a > gsd_b,
+            "fixture premise: levels must stay coarse -> fine (gsd strictly decreasing)"
+        );
+        assert_eq!(
+            zoom_for_gsd(gsd_a).round() as u8,
+            4,
+            "fixture premise: gsd_a must derive to z4"
+        );
+        assert_eq!(
+            zoom_for_gsd(gsd_b).round() as u8,
+            4,
+            "fixture premise: gsd_b must derive to z4"
+        );
+
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let schema = Arc::new(source_schema());
+        // No explicit zoom on either level: both derive from gsd, and both
+        // derive to z4.
+        let specs = vec![LevelSpec::new(gsd_a, None), LevelSpec::new(gsd_b, None)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = OverviewWriter::create(
+            tin.path(),
+            &schema,
+            OverviewWriterOptions::new(Mode::Duplicating, specs),
+        )
+        .unwrap();
+        for k in 0..2 {
+            assert_eq!(
+                writer
+                    .write_level(
+                        k,
+                        Some(1),
+                        std::iter::once(batch(&schema, &[0], std::slice::from_ref(&a))),
+                    )
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let err = export_pmtiles(tin.path(), tout.path(), &ExportOptions::default())
+            .expect_err("two levels deriving the same zoom must be refused");
+        assert!(
+            matches!(
+                err,
+                ExportError::LevelZoomsNotAscending {
+                    previous_level: 0,
+                    previous_zoom: 4,
+                    level: 1,
+                    zoom: 4,
                     ..
                 }
             ),

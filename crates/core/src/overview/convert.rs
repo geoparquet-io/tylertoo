@@ -135,6 +135,13 @@ impl LevelPlan {
                 }
             }
             LevelPlan::Gsds(gsds) => {
+                // #506: the exporter derives each level's zoom from its GSD
+                // through the §5.2 inverse below and keys that level's tiles
+                // by PMTiles tile id *within* it, so two levels sharing a
+                // zoom write that zoom's ids twice. `previous` carries the
+                // last level's `(index, gsd, derived zoom)` so the collision
+                // is named here rather than at export, after a full scan.
+                let mut previous: Option<(usize, f64, i64)> = None;
                 for (i, &g) in gsds.iter().enumerate() {
                     // #371: a non-finite GSD has no meaningful zoom — `inf`
                     // inverts to z = -inf, which is below the ceiling, so it
@@ -156,6 +163,24 @@ impl LevelPlan {
                             ceiling,
                         });
                     }
+                    // Mirror `export::zoom_for_level`'s `implied.max(0)`: a
+                    // GSD coarser than the zoom-0 threshold inverts to a
+                    // negative zoom and is clamped to 0, so two such levels
+                    // collide on z0 just as surely as `--gsd 20,19` collides
+                    // on z11.
+                    let derived = z.max(0.0) as i64;
+                    if let Some((prev_i, prev_g, prev_z)) = previous {
+                        if derived <= prev_z {
+                            return Err(ConvertError::InvalidLevels(format!(
+                                "overview levels {prev_i} (gsd {prev_g} m, zoom {prev_z}) and \
+                                 {i} (gsd {g} m, zoom {derived}) do not resolve to strictly \
+                                 increasing Web Mercator zooms; every gsd level must map to a \
+                                 distinct zoom (spec §5.2), or the export writes one zoom's \
+                                 tile ids twice"
+                            )));
+                        }
+                    }
+                    previous = Some((i, g, derived));
                 }
             }
         }
@@ -5191,6 +5216,48 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("0.000005"), "error names the gsd: {msg}");
         assert!(msg.contains("33"), "error names the implied zoom: {msg}");
+    }
+
+    /// #506: `--gsd` levels whose GSDs are distinct but round to the SAME Web
+    /// Mercator zoom (§5.2 inverse) used to convert happily and only blow up
+    /// at export (`ExportError::LevelZoomsNotAscending`) — after a full scan —
+    /// or, before #506, silently clobber that zoom's directory entries.
+    /// `--gsd 20,19` is the smallest reproducer: both round to z11. Rejected
+    /// at options validation, before the input is opened.
+    #[test]
+    fn validate_options_rejects_gsd_levels_colliding_on_one_zoom() {
+        let err = validate_options(&ConvertOptions {
+            levels: LevelPlan::Gsds(vec![20.0, 19.0]),
+            ..Default::default()
+        })
+        .expect_err("--gsd 20,19 must be rejected");
+        assert!(matches!(err, ConvertError::InvalidLevels(_)), "got: {err}");
+        let msg = err.to_string();
+        for needle in ["20", "19", "11"] {
+            assert!(msg.contains(needle), "error names {needle}: {msg}");
+        }
+
+        // The other collision shape: two GSDs both coarser than the zoom-0
+        // threshold. `zoom_for_level` clamps a negative implied zoom to 0, so
+        // both levels land on z0; this check mirrors that clamp.
+        let err = validate_options(&ConvertOptions {
+            levels: LevelPlan::Gsds(vec![1.0e8, 5.0e7]),
+            ..Default::default()
+        })
+        .expect_err("two sub-z0 gsds must be rejected");
+        assert!(matches!(err, ConvertError::InvalidLevels(_)), "got: {err}");
+        assert!(err.to_string().contains("zoom 0"), "got: {err}");
+
+        // A ladder whose levels resolve to distinct, ascending zooms is
+        // untouched.
+        validate_options(&ConvertOptions {
+            levels: LevelPlan::Gsds(vec![
+                gsd_with_base(4, GSD_TILE_BASE),
+                gsd_with_base(6, GSD_TILE_BASE),
+            ]),
+            ..Default::default()
+        })
+        .expect("a ladder with distinct zooms must be accepted");
     }
 
     /// The ceiling is inclusive, and a plan that reaches it resolves to the

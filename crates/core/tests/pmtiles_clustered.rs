@@ -3,19 +3,23 @@
 //! PMTiles v3's `clustered` byte promises a reader that tile data can be
 //! streamed in directory order (ascending tile id) without seeking backward
 //! past unread bytes — go-pmtiles `verify` checks exactly this. The writer
-//! used to stamp every archive `clustered: true` unconditionally, but a real
-//! export adds tiles zoom-by-zoom in row-major `(x, y)` order, not tile-id
-//! (Hilbert) order, so the directory's offsets are not actually monotonic
-//! once sorted by tile id. On this fixture that is not a corner case: of the
-//! archive's directory entries, thousands are non-monotonic in tile-id order
-//! (measured at 5,007 of 10,075 while diagnosing this bug).
+//! used to stamp every archive `clustered: true` unconditionally; #501 made
+//! the header derive the flag honestly from the directory's actual offset
+//! layout instead, and at that point a real export was genuinely `false`: it
+//! added tiles zoom-by-zoom in row-major `(x, y)` order, not tile-id
+//! (Hilbert) order, so the directory's offsets were not monotonic once
+//! sorted by tile id. On this fixture that was not a corner case: of the
+//! archive's directory entries, thousands were non-monotonic in tile-id
+//! order (measured at 5,007 of 10,075 while diagnosing that bug).
 //!
-//! This test does not assert the flag is `true` — today it is honestly
-//! `false` for an export, and a follow-up PR that writes tiles in tile-id
-//! order will flip it. What it asserts is that the header's claim matches
-//! reality: `header.clustered` must equal an independent, file-side
-//! re-derivation of the same predicate ([`verify_clustered`]), so the writer
-//! and a go-pmtiles-style verifier can never disagree about one archive.
+//! #506 closes the gap on the other side: export now adds tiles in ascending
+//! PMTiles tile-id order per zoom (levels export in ascending zoom, so this
+//! holds globally too), so the archive is genuinely clustered and the header
+//! flag comes out `true`. This test asserts both halves of that: the flag is
+//! `true`, AND it still matches the independent, file-side re-derivation of
+//! the same predicate ([`verify_clustered`]) — so the writer and a
+//! go-pmtiles-style verifier can never disagree about one archive, in either
+//! direction.
 
 use tylertoo_core::pmtiles_writer::verify_clustered;
 
@@ -60,6 +64,11 @@ fn header_clustered_flag_matches_the_actual_entry_layout() {
     let actually_clustered =
         verify_clustered(output.path()).expect("verify_clustered on the exported archive");
 
+    assert!(
+        header.clustered,
+        "export now writes tiles in ascending PMTiles tile-id order (#506); \
+         a real export archive must be genuinely clustered"
+    );
     assert_eq!(
         header.clustered, actually_clustered,
         "the header's `clustered` claim must match what the directory's own \

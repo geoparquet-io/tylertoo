@@ -1248,6 +1248,13 @@ pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::ceiling
 pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::gsd: f64
 pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::implied: i64
 pub tylertoo_core::overview::export::ExportError::LevelZoomAboveCeiling::level: usize
+pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending
+pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::gsd: f64
+pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::level: usize
+pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_gsd: f64
+pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_level: usize
+pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_zoom: u8
+pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::zoom: u8
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::knob: alloc::string::String
@@ -2485,6 +2492,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &st
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mut self, &str)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
@@ -3045,6 +3053,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &st
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mut self, &str)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
