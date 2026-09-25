@@ -549,13 +549,34 @@ pub(super) fn rebase_plan_for_shard(
                 )))
             }
         };
-        let shard_groups: Option<&[usize]> = shard_selection
+        // The plan's selection decides where every row sits in the plan's
+        // stream, so a forged one that repeated or reordered a group would
+        // silently shift every offset after it. The reader streams a part's
+        // selected groups in ascending index order, so that is the only shape
+        // a real plan can have — anything else is an error, not a base to
+        // compute from. (A plan is hostile input: #512.)
+        if plan_groups.windows(2).any(|w| w[0] >= w[1])
+            || plan_groups.last().is_some_and(|&g| g >= part_rows.len())
+        {
+            return Err(ConvertError::InvalidConfig(format!(
+                "--plan: {} records part {part_idx}'s selected row groups as {plan_groups:?}, \
+                 which is not a strictly ascending list of that part's {} group(s). Row \
+                 positions in the plan's tables are derived from this order, so it cannot be \
+                 trusted when it is not one.",
+                named(),
+                part_rows.len(),
+            )));
+        }
+        // A BTreeSet rather than a linear scan: a planet-scale input has
+        // hundreds of thousands of row groups, and `contains` per group would
+        // make this quadratic in the one place that walks all of them.
+        let shard_groups: Option<std::collections::BTreeSet<usize>> = shard_selection
             .map(RowGroupSelection::parts)
             .and_then(|p| p.get(part_idx))
-            .map(Vec::as_slice);
+            .map(|v| v.iter().copied().collect());
         for g in plan_groups {
             let rows = part_rows.get(g).copied().unwrap_or(0).max(0) as usize;
-            let kept = shard_groups.is_none_or(|s| s.contains(&g));
+            let kept = shard_groups.as_ref().is_none_or(|s| s.contains(&g));
             if kept && rows > 0 {
                 // Extend the previous run when the groups are adjacent in
                 // BOTH streams, so a shard that keeps everything collapses to
@@ -2006,6 +2027,63 @@ mod tests {
         // saved = some, now = all.
         assert_eq!(selection_excess(Some(&[0, 1, 2]), None, Some(3)), None);
         assert_eq!(selection_excess(Some(&[0, 2]), None, Some(3)), Some(1));
+    }
+
+    /// A plan is hostile input, and the shard re-addressing computes row
+    /// offsets from the selection the plan RECORDS — so a forged selection
+    /// that repeats, reorders or overruns its part is refused rather than used
+    /// as a base to shift every later offset by.
+    #[test]
+    fn shard_rebase_refuses_a_forged_row_group_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (source, _guard) = one_part_source(&dir, &[3, 4, 2]);
+        for forged in [
+            vec![0usize, 0, 2], // repeated
+            vec![2usize, 0],    // out of order
+            vec![0usize, 1, 9], // past the part's row groups
+        ] {
+            let mut plan = tiny_plan();
+            plan.fingerprint.inputs[0].row_groups = Some(forged.clone());
+            plan.min_levels = vec![0; 9];
+            let err = rebase_plan_for_shard(&mut plan, &source, None, Path::new("forged.plan"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("strictly ascending"),
+                "selection {forged:?} must be refused: {err}"
+            );
+        }
+    }
+
+    /// A single-part `ConvertSource` over a parquet file whose row groups hold
+    /// `rows_per_group` rows each — the footer facts the re-addressing reads.
+    fn one_part_source(
+        dir: &tempfile::TempDir,
+        rows_per_group: &[usize],
+    ) -> (ConvertSource, std::path::PathBuf) {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let path = dir.path().join("parts.parquet");
+        let file = File::create(&path).expect("create");
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_group[0].max(1)))
+            .build();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .expect("writer");
+        for &n in rows_per_group {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![0i64; n]))],
+            )
+            .expect("batch");
+            w.write(&batch).expect("write");
+            w.flush().expect("flush");
+        }
+        w.close().expect("close");
+        let source = ConvertSource::resolve_path(&path).expect("source");
+        (source, path)
     }
 
     /// The re-addressing itself, on a hand-built domain: the plan's stream is
