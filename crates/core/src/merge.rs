@@ -178,6 +178,10 @@ pub fn merge_shards(
     let max_zoom = declared.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
     writer.set_declared_min_zoom(min_zoom);
     writer.set_declared_max_zoom(max_zoom);
+    // The k-way heap emits ids in ascending order, so the merge is clustered
+    // by construction; #506's hook turns that doc claim into a checked
+    // contract (debug assertion per add, release warn at finalize).
+    writer.set_expect_clustered(true);
 
     let mut inputs_without_bounds = Vec::new();
     let mut union: Option<TileBounds> = None;
