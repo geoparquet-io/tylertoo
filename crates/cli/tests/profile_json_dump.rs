@@ -114,4 +114,250 @@ fn profile_json_written_and_parses() {
             "level.spill_bytes must be a number: {value}"
         );
     }
+
+    // --- #517 S1 regression guard: pass2.stage_secs must not silently omit
+    // the finest level. ---
+    //
+    // With this exact fixture (`open-buildings.parquet`, z0..z6) the pass-2
+    // plan resolves to exactly ONE overview level, so the "buffered"
+    // levels-0..n-1 engine never runs (`run_pass2_levels`'s Pipelined branch
+    // takes its `n == 1` arm) and every measured stage second comes from
+    // `write_level_streaming` alone. That makes this fixture/zoom-range combo
+    // the sharpest possible witness for the #517 bug: before the fix,
+    // `write_level_streaming` built its own *local* `Pass2Timers` that never
+    // reached the accumulator returned to `emit_profile_json`, so
+    // `pass2.stage_secs.{read,decode,simplify,build}` were not just small but
+    // *exactly* 0.0 — confirmed by re-running this exact scenario against the
+    // pre-fix code. `pass2.rows` and `phase_walls.pass2`, computed
+    // independently, were unaffected, which is exactly the inconsistency the
+    // issue named. A plain positivity check is deterministic (no timing
+    // threshold to tune, so it can't flake on a slow/loaded CI runner) and
+    // would have failed 100% of the time pre-fix.
+    // PRECONDITION for the guard below. The assertions that follow are sharp
+    // ONLY while this fixture/zoom-range plans exactly ONE level: with two or
+    // more levels the buffered engine also runs and contributes non-zero
+    // stage seconds of its own, so `> 0.0` would hold even with the finest
+    // level's timers dropped again (probed: all four assertions pass against
+    // the pre-fix code on a 6-level run). If this trips, re-pick the fixture
+    // or the zoom range to restore a single-level plan — do not relax the
+    // assertions. See the fixture comment above.
+    assert_eq!(
+        levels.len(),
+        1,
+        "the #517 S1 guard below is only sharp on a ONE-level plan (see the \
+         comment above): this run planned {} levels, so re-pick the fixture / \
+         zoom range rather than weakening the assertions: {value}",
+        levels.len()
+    );
+
+    let stage = &value["pass2"]["stage_secs"];
+    let stage_field = |name: &str| -> f64 {
+        stage[name]
+            .as_f64()
+            .unwrap_or_else(|| panic!("pass2.stage_secs.{name} must be a number: {value}"))
+    };
+    let (read, decode, simplify, build) = (
+        stage_field("read"),
+        stage_field("decode"),
+        stage_field("simplify"),
+        stage_field("build"),
+    );
+    let stage_sum = read + decode + simplify + build;
+    assert!(
+        stage_sum > 0.0,
+        "pass2.stage_secs (read+decode+simplify+build) must be > 0 for a run \
+         that processed {} row(s) — 0.0 is the exact pre-#517-fix value when \
+         the (here, only) level streamed through write_level_streaming never \
+         folds its timers into the dump: {value}",
+        value["pass2"]["rows"]
+    );
+    // `decode` (Arrow take + geometry decode) and `build` (output batch
+    // assembly) run unconditionally for every row this level writes,
+    // verbatim or simplified — named individually because the issue's own
+    // probe showed exactly these two fields pinned near-zero.
+    assert!(
+        decode > 0.0,
+        "pass2.stage_secs.decode must be > 0 (#517 regression guard): {value}"
+    );
+    assert!(
+        build > 0.0,
+        "pass2.stage_secs.build must be > 0 (#517 regression guard): {value}"
+    );
+
+    // Loosely relate the stage split back to the independently-measured
+    // pass-2 wall time (`phase_walls.pass2`): the threshold is deliberately
+    // generous (1%) so it never flakes on a slow CI runner — its only job is
+    // to catch a stage split that is *present* but implausibly tiny next to
+    // the wall clock, the failure mode this consistency check exists for.
+    let pass2_wall = value["phase_walls"]["pass2"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("phase_walls.pass2 must be a number: {value}"));
+    assert!(
+        stage_sum > pass2_wall * 0.01,
+        "pass2.stage_secs sum ({stage_sum:.6}s) is implausibly small next to \
+         phase_walls.pass2 ({pass2_wall:.6}s) — looks like a level's timers \
+         are missing from the dump: {value}"
+    );
+
+    // The startup preflight probes writability with a uniquely named SIBLING
+    // file and removes it again; nothing of its own may survive the run.
+    let strays: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.starts_with(".tylertoo-profile-json-probe."))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the TYLERTOO_PROFILE_JSON preflight must leave no probe file behind, \
+         found: {strays:?}"
+    );
+}
+
+/// #517 S2: an unwritable `TYLERTOO_PROFILE_JSON` path must be reported
+/// LOUDLY at conversion *start*, not only via the pre-existing single
+/// `log::warn` at the very end of the run (verified in the issue: exit 0,
+/// profiling data silently gone). A typo'd path in a multi-hour benchmark
+/// sweep must not lose its data quietly.
+///
+/// This does not — and must not — fail the conversion: a diagnostics-only
+/// knob can never gate production output, so the run still exits 0 and
+/// produces the pmtiles output.
+#[test]
+fn unwritable_profile_json_path_warns_loudly_at_startup() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out.pmtiles");
+    // A path whose parent directory does not exist: `OpenOptions::open` with
+    // `create(true)` cannot create missing parent directories, so this is
+    // unwritable the same way a typo'd path segment would be.
+    let bad_profile_json = dir.path().join("does-not-exist").join("profile.jsonl");
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "6",
+        ])
+        .env("TYLERTOO_PROFILE_JSON", &bad_profile_json)
+        .output()
+        .expect("run tylertoo tiles");
+
+    // The knob must never gate production output.
+    assert!(
+        output.status.success(),
+        "an unwritable TYLERTOO_PROFILE_JSON must not fail the conversion, \
+         got {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        out.exists(),
+        "the pmtiles output must still be produced despite the profiling \
+         knob being broken"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+
+    // The loud, immediate notice (S2's fix): unmistakable text, distinct from
+    // the pre-existing end-of-run warning below.
+    let startup_warning_line = lines
+        .iter()
+        .position(|l| l.contains("NOT WRITABLE"))
+        .unwrap_or_else(|| {
+            panic!("expected a loud 'NOT WRITABLE' warning in stderr, got:\n{stderr}")
+        });
+
+    // The pre-existing end-of-run warning (`write_profile_json`'s own
+    // `open` failure) must still fire too — this test asserts the startup
+    // notice is now ADDITIONAL, not a replacement.
+    let end_of_run_warning_line = lines
+        .iter()
+        .position(|l| l.contains("TYLERTOO_PROFILE_JSON open") && l.contains("failed"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the pre-existing end-of-run \
+                 'TYLERTOO_PROFILE_JSON open ... failed' warning in stderr \
+                 too, got:\n{stderr}"
+            )
+        });
+
+    // "Immediate": the startup notice must land at (or very near) the start
+    // of the run, strictly before the end-of-run one — not just be present
+    // somewhere in the log.
+    assert!(
+        startup_warning_line < end_of_run_warning_line,
+        "the loud startup warning (line {startup_warning_line}) must appear \
+         before the pre-existing end-of-run warning (line \
+         {end_of_run_warning_line}): {stderr}"
+    );
+    // Loose bound on "at the start": before pass 2 begins (a mid-run stage
+    // that logs its own line), not merely somewhere before the final
+    // end-of-run warning.
+    let pass2_start_line = lines.iter().position(|l| l.contains("[convert] pass 2:"));
+    if let Some(pass2_start_line) = pass2_start_line {
+        assert!(
+            startup_warning_line < pass2_start_line,
+            "the startup warning (line {startup_warning_line}) must precede \
+             pass 2 starting (line {pass2_start_line}) to be a true startup \
+             preflight, not a late-run notice: {stderr}"
+        );
+    }
+}
+
+/// #517 S4 / cross-review: the startup preflight must OBSERVE the dump path,
+/// never create it. The first version opened the target itself with
+/// `create(true).append(true)`, so any run that then failed — or any pipeline
+/// that never reaches `write_profile_json` — left a stray ZERO-BYTE
+/// `profile.jsonl` behind, which reads as "a dump was written and it is
+/// empty" rather than "no dump was written". Probe-and-remove (the shape
+/// `--save-plan` uses, #513) fixes that.
+#[test]
+fn failed_run_leaves_no_zero_byte_profile_json() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile_json = dir.path().join("profile.jsonl");
+    // A writable profile path, but an overview output under a directory that
+    // does not exist: option validation passes (so the preflight runs), the
+    // conversion then fails long before the dump would be appended.
+    let out = dir.path().join("no-such-dir").join("out.parquet");
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "overview",
+            fixture.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "6",
+        ])
+        .env("TYLERTOO_PROFILE_JSON", &profile_json)
+        .output()
+        .expect("run tylertoo overview");
+    assert!(
+        !output.status.success(),
+        "this scenario must FAIL the conversion (unwritable overview output), \
+         otherwise it does not exercise the stray-file path: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !profile_json.exists(),
+        "a preflight must not create the dump file: {profile_json:?} exists \
+         ({} bytes) after a failed run that never wrote a profile line",
+        std::fs::metadata(&profile_json)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    );
 }

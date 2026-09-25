@@ -1169,6 +1169,11 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
                 .to_string(),
         ));
     }
+    // #517 S2: the `TYLERTOO_PROFILE_JSON` dump is appended once, at the very
+    // end of a possibly multi-hour run. Probe its path here, with the other
+    // path preflights, so a typo'd or unwritable target is loud immediately.
+    // Non-fatal by design: a diagnostics-only knob never gates output.
+    super::stream::preflight_profile_json_path();
     // Zoom-band representation selector (#317 / #279).
     if !options.representation.is_empty() {
         if matches!(options.mode, Mode::Partitioning)
@@ -2165,6 +2170,17 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // is kept as the reference implementation (`streaming: false`).
     if options.streaming {
         return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
+    }
+
+    // #517: the profile dump is emitted by the streaming pipeline only — the
+    // in-memory reference path has no `Pass2Timers`/phase-wall instrumentation
+    // to dump. Say so rather than exiting 0 with an empty (or untouched) file
+    // and letting an operator conclude the knob is broken.
+    if std::env::var_os("TYLERTOO_PROFILE_JSON").is_some_and(|v| !v.is_empty()) {
+        log::warn!(
+            "[profile] TYLERTOO_PROFILE_JSON is set but the profile dump only \
+             covers the streaming pipeline; --no-streaming writes no dump"
+        );
     }
 
     // The in-memory reference path below predates multi-partition input

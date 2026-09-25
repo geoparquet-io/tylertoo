@@ -579,7 +579,11 @@ fn run_pass2_levels(
                         selected_row_groups,
                         ctx,
                     )
-                    .map(|(o, r, v)| (o, r, v, 0u64))
+                    // Serial is a reference/test path (pre-#213 behavior, no
+                    // buffered engine); it never feeds `TYLERTOO_PROFILE_JSON`
+                    // in production, so its per-level timers are discarded
+                    // rather than accumulated.
+                    .map(|(o, r, v, _timers)| (o, r, v, 0u64))
                 })
                 .collect::<Result<_, _>>()?,
             Pass2Timers::default(),
@@ -619,7 +623,7 @@ fn run_pass2_levels(
             } else {
                 (Vec::new(), Pass2Timers::default())
             };
-            let (o, r, v) = write_level_streaming(
+            let (o, r, v, finest_timers) = write_level_streaming(
                 writer,
                 n - 1,
                 hints[n - 1],
@@ -629,6 +633,12 @@ fn run_pass2_levels(
                 selected_row_groups,
                 &ctxs[n - 1],
             )?;
+            // #517 S1: the finest level's own stage timers never otherwise
+            // reach `engine_timers` (`run_pass2_buffered` only covers levels
+            // `0..n-1`) — fold them in so `pass2.stage_secs` in the
+            // `TYLERTOO_PROFILE_JSON` dump accounts for every level, matching
+            // `pass2.rows` and `phase_walls.pass2`, which already do.
+            finest_timers.fold_into(&engine_timers);
             stats.push((o, r, v, 0u64));
             (stats, engine_timers)
         }
@@ -1703,6 +1713,69 @@ struct ProfileJsonInputs<'a> {
     in_flight_batches: usize,
 }
 
+/// Validate `TYLERTOO_PROFILE_JSON` at option-validation time (#517 S2), if
+/// set — called once from `overview::convert::validate_options`, alongside
+/// the `--plan` / `--save-plan` preflights (#513), so every path preflight in
+/// the convert front end runs in one place and in the same shape.
+///
+/// [`write_profile_json`] only runs once, at the very end of the run — an
+/// unwritable path (typo, missing directory, read-only mount, permissions)
+/// was previously reported by a single `log::warn` there, easy to miss in a
+/// multi-hour batch/benchmark run that otherwise exits 0 with its profiling
+/// data silently gone. This probes the same path in the same mode (append)
+/// immediately, so an operator sees the problem before spending the run, not
+/// after. Deliberately does not fail the conversion — a diagnostics-only knob
+/// must never gate production output — but the warning is made hard to miss.
+///
+/// Probe-and-remove, matching `preflight_save_plan_writable`: an existing
+/// target is opened for append exactly as the dump will open it, and a
+/// MISSING one is probed through a uniquely named *sibling* that is removed
+/// again. An earlier version opened the target itself with `create(true)`,
+/// which left a stray zero-byte dump file behind whenever the run then failed
+/// (or the pipeline never reached the dump at all) — a preflight must observe
+/// the filesystem, not change it.
+pub(super) fn preflight_profile_json_path() {
+    let Ok(path) = std::env::var("TYLERTOO_PROFILE_JSON") else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    let path = Path::new(&path);
+    let probed = if path.exists() {
+        // Same mode `write_profile_json` uses, minus `create`: nothing on
+        // disk changes, and a directory (or a read-only file) still fails here.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map(|_| ())
+    } else {
+        // `Path::parent` yields `Some("")` for a bare file name: that is `.`.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let probe = parent.join(format!(
+            ".tylertoo-profile-json-probe.{}.{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::File::create(&probe).map(|_| {
+            let _ = std::fs::remove_file(&probe);
+        })
+    };
+    if let Err(e) = probed {
+        let path = path.display();
+        log::warn!(
+            "[profile] ################################################\n\
+             [profile] TYLERTOO_PROFILE_JSON={path} is NOT WRITABLE: {e}\n\
+             [profile] Profiling data for THIS RUN will be LOST — the \
+             conversion will still proceed and complete normally.\n\
+             [profile] ################################################"
+        );
+    }
+}
+
 /// Append one JSON object (one line) with this conversion's stage timing and
 /// throughput to the file named by `TYLERTOO_PROFILE_JSON`, if set — the
 /// measurement base for the perf series gated on these numbers (pass-1
@@ -2450,6 +2523,33 @@ impl Pass2Timers {
     pub(super) fn spill_write_cell(&self) -> &AtomicU64 {
         &self.spill_write
     }
+    /// Fold this timer set's per-stage totals into `other` (adds, never
+    /// overwrites). Used to combine the finest level's own
+    /// [`write_level_streaming`] timers into the pipelined engine's
+    /// accumulator ([profile] / `TYLERTOO_PROFILE_JSON`, #517 S1) — without
+    /// this, `pass2.stage_secs` in the dump omitted the finest — and largest
+    /// — level entirely, while `pass2.rows` and `phase_walls.pass2` already
+    /// included it.
+    pub(super) fn fold_into(&self, other: &Pass2Timers) {
+        other
+            .read
+            .fetch_add(self.read.load(Ordering::Relaxed), Ordering::Relaxed);
+        other
+            .decode
+            .fetch_add(self.decode.load(Ordering::Relaxed), Ordering::Relaxed);
+        other
+            .simplify
+            .fetch_add(self.simplify.load(Ordering::Relaxed), Ordering::Relaxed);
+        other
+            .build
+            .fetch_add(self.build.load(Ordering::Relaxed), Ordering::Relaxed);
+        other
+            .drain
+            .fetch_add(self.drain.load(Ordering::Relaxed), Ordering::Relaxed);
+        other
+            .spill_write
+            .fetch_add(self.spill_write.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
     pub(super) fn stage_secs(&self) -> Pass2StageSecs {
         Pass2StageSecs {
             read: Self::secs(&self.read),
@@ -2565,7 +2665,10 @@ impl LevelStreamCtx<'_> {
 
 /// Stream one level from the input file into the writer. Returns the writer
 /// outcome (a level whose every candidate collapses during simplification is
-/// skipped, #211) plus `(rows_written, vertex_count)`.
+/// skipped, #211), `(rows_written, vertex_count)`, plus this level's own
+/// [`Pass2Timers`] (#517 S1) — the caller folds it into the shared
+/// `TYLERTOO_PROFILE_JSON` accumulator, since the finest level streamed here
+/// never otherwise reaches `run_pass2_buffered`'s returned timers.
 #[allow(clippy::too_many_arguments)]
 fn write_level_streaming(
     writer: &mut OverviewWriter<File>,
@@ -2576,13 +2679,17 @@ fn write_level_streaming(
     in_flight: usize,
     row_groups: Option<&RowGroupSelection>,
     ctx: &LevelStreamCtx<'_>,
-) -> Result<(LevelWriteOutcome, usize, usize), ConvertError> {
+) -> Result<(LevelWriteOutcome, usize, usize, Pass2Timers), ConvertError> {
     let rows = Cell::new(0usize);
     let vertices = Cell::new(0usize);
     // Writer-thread time spent blocked waiting on the producer; the writer's
     // own busy time is `total - recv_wait` ([profile] logging).
     let recv_wait_ns = Cell::new(0u64);
-    let timers = Pass2Timers::default();
+    // Owned here (returned to the caller at the end); `timers` below is a `&`
+    // to it, shared into the producer closure and used for the per-level
+    // debug line — NLL ends that borrow before the move on return.
+    let level_timers = Pass2Timers::default();
+    let timers = &level_timers;
     let fallbacks_before = full_resolution_fallback_count();
     let t_level = Instant::now();
 
@@ -2601,10 +2708,10 @@ fn write_level_streaming(
     // and therefore row-group boundaries — are byte-identical to a serial
     // build. Channel depth bounds read/compute run-ahead the same way the
     // buffered engine's reader channel does.
-    // Shared by reference into the producer thread (a `&Pass2Timers` is `Copy`,
-    // so the producer closure copies the borrow and leaves `timers` owned here
-    // for the post-scope read).
-    let timers = &timers;
+    // `timers` (bound above as `&level_timers`) is shared by reference into
+    // the producer thread: a `&Pass2Timers` is `Copy`, so the producer
+    // closure copies the borrow and leaves `level_timers` owned here for the
+    // post-scope read and the return value below.
     let outcome = scoped_pipe(
         in_flight,
         // Producer: read + process, in order, until EOF or the writer
@@ -2709,7 +2816,7 @@ fn write_level_streaming(
              resolution (invalid RDP candidate after all epsilon retries)"
         );
     }
-    Ok((outcome, rows.get(), vertices.get()))
+    Ok((outcome, rows.get(), vertices.get(), level_timers))
 }
 
 /// Process one input batch for one level: select the level's members from the
