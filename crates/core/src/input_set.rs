@@ -586,7 +586,7 @@ impl ConvertSource {
     /// Entry `[p][g]` is part `p`'s row group `g`, or `None` when neither
     /// statistics tier can supply a bbox. Footer-only, so a planet-scale
     /// input costs one footer fetch per part and no data page is read.
-    pub fn part_row_group_bounds(
+    pub(crate) fn part_row_group_bounds(
         &self,
     ) -> Result<Vec<Vec<Option<crate::covering::RowGroupBounds>>>, InputError> {
         Ok(self
@@ -604,7 +604,7 @@ impl ConvertSource {
     /// it reads (#498): the plan's winner table is indexed by row position
     /// within the plan's own selected stream, so a shard has to know where
     /// each of its groups sits in that stream, not merely which groups it has.
-    pub fn part_row_group_row_counts(&self) -> Result<Vec<Vec<i64>>, InputError> {
+    pub(crate) fn part_row_group_row_counts(&self) -> Result<Vec<Vec<i64>>, InputError> {
         Ok(self
             .metas()?
             .iter()

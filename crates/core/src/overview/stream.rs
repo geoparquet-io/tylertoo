@@ -412,7 +412,7 @@ fn select_row_groups_streaming(
     };
     let shard_selection: Option<RowGroupSelection> = match shard {
         Some(range) => {
-            let b = range.bounds();
+            let b = range.read_bounds();
             let units = super::convert::bbox_to_crs_units(
                 &[b.lng_min, b.lat_min, b.lng_max, b.lat_max],
                 crs,

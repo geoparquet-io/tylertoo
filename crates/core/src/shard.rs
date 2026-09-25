@@ -80,7 +80,7 @@ use crate::input_set::ConvertSource;
 use crate::tile::{hilbert_zoom_base, tile_ranges_for_bbox, TileBounds, TileCoord};
 
 /// Format version of the shard-plan JSON artifact.
-pub const SHARD_PLAN_VERSION: u32 = 1;
+pub(crate) const SHARD_PLAN_VERSION: u32 = 1;
 
 /// The `"format"` discriminator written into every shard plan, so a JSON file
 /// that is not one is named as such rather than deserializing into surprise.
@@ -94,7 +94,7 @@ const SHARD_PLAN_FORMAT: &str = "tylertoo-shard-plan";
 /// walks bounded (z10 is 1,048,576 tiles). It is far above anything useful: a
 /// pivot is meant to sit where the dataset has a few tiles per shard, which
 /// for any real fleet size is z4–z8.
-pub const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
+pub(crate) const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 
 /// How far past its own tiles a shard widens the bbox it prunes input row
 /// groups against, in whole **pivot** tiles.
@@ -109,23 +109,25 @@ pub const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 ///
 /// Two pivot tiles therefore covers every `--tile-buffer` up to **512** tile
 /// pixels — two full tile widths, against a default of 8 and a tippecanoe
-/// default of 5. `MaxTileBufferForShard` refuses anything past it rather than
-/// silently dropping tiles, so the bound is enforced, not merely assumed.
+/// default of 5.
+/// [`ExportError::TileBufferTooWideForShard`](crate::overview::export::ExportError::TileBufferTooWideForShard)
+/// refuses anything past it rather than silently dropping tiles, so the bound
+/// is enforced, not merely assumed.
 ///
 /// The cost of the margin is bounded and small: a couple more row groups read
 /// per shard, on an input whose row groups are Hilbert-compact.
-pub const SHARD_READ_MARGIN_TILES: f64 = 2.0;
+pub(crate) const SHARD_READ_MARGIN_TILES: f64 = 2.0;
 
 /// The largest `--tile-buffer` (in tile pixels) a sharded build may use, given
 /// [`SHARD_READ_MARGIN_TILES`]. See that constant for the derivation.
-pub const MAX_SHARD_TILE_BUFFER_PX: u32 = 512;
+pub(crate) const MAX_SHARD_TILE_BUFFER_PX: u32 = 512;
 
 /// Everything that can go wrong cutting, reading or applying a shard plan.
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
-    /// `--shard-pivot` outside `1..=`[`MAX_SHARD_PIVOT_ZOOM`].
+    /// `--pivot` outside `1..=`[`MAX_SHARD_PIVOT_ZOOM`].
     #[error(
-        "--shard-pivot {pivot} is out of range: the pivot zoom must be between 1 and \
+        "--pivot {pivot} is out of range: the pivot zoom must be between 1 and \
          {MAX_SHARD_PIVOT_ZOOM}. A pivot wants to sit where the dataset has a few tiles per \
          shard, which is z4-z8 for any realistic fleet size."
     )]
@@ -134,18 +136,41 @@ pub enum ShardError {
         pivot: u8,
     },
 
-    /// The pivot is not strictly coarser than the build's finest zoom.
+    /// A tile-id range whose ids imply a pivot zoom outside
+    /// `1..=`[`MAX_SHARD_PIVOT_ZOOM`].
+    ///
+    /// Distinct from [`ShardError::PivotOutOfRange`] because no `--pivot` was
+    /// typed here: the pivot zoom is *derived* from the two tile ids, so
+    /// naming that flag would send the reader looking for something they
+    /// never passed.
     #[error(
-        "--shard-pivot {pivot} must be coarser than --max-zoom {max_zoom}: shards own zooms \
-         [{pivot}, {max_zoom}] and the coarse job owns [0, {}], so a pivot at or past the \
-         finest zoom leaves the shards one zoom or nothing to build.",
-        pivot.saturating_sub(1)
+        "these tile ids sit at z{pivot}, which cannot be a pivot zoom: the pivot zoom must be \
+         between 1 and {MAX_SHARD_PIVOT_ZOOM}. (z0 is the single world tile — a range there is \
+         the whole build, not a shard of it.)"
+    )]
+    TileRangePivotOutOfRange {
+        /// The pivot zoom the ids implied.
+        pivot: u8,
+    },
+
+    /// The plan's pivot is finer than the build's finest zoom, so the shards
+    /// would own no zoom at all.
+    ///
+    /// Inclusive: `pivot == max_zoom` is legal and gives every shard exactly
+    /// one zoom to build. Only a pivot strictly past the finest zoom is an
+    /// error. Raised by [`ShardPlan::check_max_zoom`].
+    #[error(
+        "--shard-plan {path} was cut at pivot z{pivot} but this build stops at --max-zoom \
+         {max_zoom}: the shards would own no zoom at all. Re-cut the plan with a coarser \
+         --pivot, or raise --max-zoom."
     )]
     PivotNotCoarser {
         /// The rejected pivot zoom.
         pivot: u8,
         /// The build's finest zoom.
         max_zoom: u8,
+        /// The plan's path, for the message.
+        path: String,
     },
 
     /// `--shards N` was zero or larger than the pivot zoom's tile count.
@@ -195,7 +220,8 @@ pub enum ShardError {
     /// `--shard` could not be parsed.
     #[error(
         "--shard {value:?} is not a shard selector: write `I/N` (for example `0/16`) for one \
-         of the N data shards, or `coarse` for the job that owns the zooms above the pivot and \
+         of the N data shards, or `coarse` for the job that owns the zooms coarser than the \
+         pivot and \
          writes the convert plan."
     )]
     BadShardSelector {
@@ -231,8 +257,8 @@ pub enum ShardError {
         hi_zoom: u8,
     },
 
-    /// A `--tile-range` whose low id is past its high id.
-    #[error("--tile-range {lo}..{hi}: the range is empty (LO must not exceed HI).")]
+    /// A tile-id range whose low id is past its high id.
+    #[error("tile-id range {lo}..{hi} is empty: LO must not exceed HI.")]
     EmptyTileRange {
         /// The low id.
         lo: u64,
@@ -326,11 +352,6 @@ impl ShardRole {
         }
         Ok(ShardRole::Shard { index, shards })
     }
-
-    /// `true` for the coarse job.
-    pub fn is_coarse(self) -> bool {
-        matches!(self, ShardRole::Coarse)
-    }
 }
 
 impl fmt::Display for ShardRole {
@@ -348,21 +369,58 @@ impl fmt::Display for ShardRole {
 /// This is what an export is restricted to. Zooms **below** `pivot_zoom` are
 /// outside the range entirely — [`TileRange::ids_at`] returns `None` for them
 /// — which is how a data shard declines the coarse job's zooms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The fields are private and the only way in is [`TileRange::new`] /
+/// [`TileRange::parse`], so a `TileRange` in hand is always a *validated*
+/// one: a real pivot zoom, two ids that really sit at it, and `lo <= hi`.
+/// Deserialization routes through the same constructor (see the manual
+/// `Deserialize` below) rather than populating the fields directly, because a
+/// hand-edited plan is exactly where an unvalidated range would come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TileRange {
     /// The zoom `lo` and `hi` are tile ids at.
-    pub pivot_zoom: u8,
+    pivot_zoom: u8,
     /// First pivot-zoom tile id in the run, inclusive.
-    pub lo: u64,
+    lo: u64,
     /// Last pivot-zoom tile id in the run, inclusive.
-    pub hi: u64,
+    hi: u64,
+}
+
+impl<'de> Deserialize<'de> for TileRange {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // A shadow struct with the same shape, so the wire format is
+        // unchanged and every field still has to be present — but the values
+        // reach `TileRange` only through the validating constructor.
+        #[derive(Deserialize)]
+        struct Raw {
+            pivot_zoom: u8,
+            lo: u64,
+            hi: u64,
+        }
+        let raw = Raw::deserialize(d)?;
+        TileRange::new(raw.pivot_zoom, raw.lo, raw.hi).map_err(serde::de::Error::custom)
+    }
 }
 
 impl TileRange {
+    /// The zoom `lo` and `hi` are tile ids at.
+    pub fn pivot_zoom(&self) -> u8 {
+        self.pivot_zoom
+    }
+
+    /// First pivot-zoom tile id in the run, inclusive.
+    pub fn lo(&self) -> u64 {
+        self.lo
+    }
+
+    /// Last pivot-zoom tile id in the run, inclusive.
+    pub fn hi(&self) -> u64 {
+        self.hi
+    }
+
     /// Build a range from two tile ids at `pivot_zoom`.
     pub fn new(pivot_zoom: u8, lo: u64, hi: u64) -> Result<Self, ShardError> {
         if pivot_zoom == 0 || pivot_zoom > MAX_SHARD_PIVOT_ZOOM {
-            return Err(ShardError::PivotOutOfRange { pivot: pivot_zoom });
+            return Err(ShardError::TileRangePivotOutOfRange { pivot: pivot_zoom });
         }
         if lo > hi {
             return Err(ShardError::EmptyTileRange { lo, hi });
@@ -390,9 +448,14 @@ impl TileRange {
         };
         let (lo_s, hi_s) = value.trim().split_once("..").ok_or_else(bad)?;
         let lo: u64 = lo_s.trim().parse().map_err(|_| bad())?;
+        // `..=` is accepted as a synonym for `..` (both are inclusive here),
+        // but only ONE `=`: `strip_prefix` rather than `trim_start_matches`,
+        // so `5..==12` is the typo it looks like rather than silently the
+        // same range.
+        let hi_s = hi_s.trim();
         let hi: u64 = hi_s
-            .trim()
-            .trim_start_matches('=')
+            .strip_prefix('=')
+            .unwrap_or(hi_s)
             .parse()
             .map_err(|_| bad())?;
         if lo > hi {
@@ -420,9 +483,14 @@ impl TileRange {
     }
 
     /// The whole pivot zoom — the range a one-shard fleet owns.
+    ///
+    /// Test-only: production always cuts ranges through [`ShardPlan`], and a
+    /// one-shard "fleet" is not a thing anyone runs. It exists because the
+    /// partition property is most cleanly stated against the whole zoom.
+    #[cfg(test)]
     pub fn whole_zoom(pivot_zoom: u8) -> Result<Self, ShardError> {
         if pivot_zoom == 0 || pivot_zoom > MAX_SHARD_PIVOT_ZOOM {
-            return Err(ShardError::PivotOutOfRange { pivot: pivot_zoom });
+            return Err(ShardError::TileRangePivotOutOfRange { pivot: pivot_zoom });
         }
         let base = hilbert_zoom_base(pivot_zoom);
         TileRange::new(pivot_zoom, base, base + zoom_tile_count(pivot_zoom) - 1)
@@ -442,23 +510,26 @@ impl TileRange {
     /// (see [`crate::tile::node_id_range`]), and a contiguous run of `h`
     /// concatenates those blocks into one contiguous interval.
     pub fn ids_at(&self, zoom: u8) -> Option<RangeInclusive<u64>> {
-        if zoom < self.pivot_zoom {
+        if zoom < self.pivot_zoom || zoom > crate::tile::MAX_ZOOM {
             return None;
         }
+        // Every step is checked rather than merely argued to be in range.
+        // `4^30 < 2^61` makes the argument true for every zoom this crate can
+        // write, and `zoom > MAX_ZOOM` is already out above — but `zoom` is a
+        // plain `u8` reaching here from an overview file's level table, and
+        // "unreachable" arithmetic that panics on a hostile input is the bug
+        // class #417/#430 exist to prevent.
         let base_pivot = hilbert_zoom_base(self.pivot_zoom);
         let base_zoom = hilbert_zoom_base(zoom);
         let delta = u32::from(zoom - self.pivot_zoom);
-        // Bounded by 4^zoom <= 4^30 < 2^61 for every zoom this crate writes:
-        // `h_hi + 1 <= 4^pivot` and `span = 4^(zoom - pivot)`.
-        let span = 1u64 << (2 * delta);
-        let h_lo = self.lo - base_pivot;
-        let h_hi = self.hi - base_pivot;
-        Some(base_zoom + h_lo * span..=base_zoom + (h_hi + 1) * span - 1)
-    }
-
-    /// `true` when the tile with id `id` at `zoom` belongs to this range.
-    pub fn contains(&self, zoom: u8, id: u64) -> bool {
-        self.ids_at(zoom).is_some_and(|r| r.contains(&id))
+        let span = 1u64.checked_shl(2 * delta)?;
+        let h_lo = self.lo.checked_sub(base_pivot)?;
+        let h_hi = self.hi.checked_sub(base_pivot)?;
+        let start = base_zoom.checked_add(h_lo.checked_mul(span)?)?;
+        let end = base_zoom
+            .checked_add(h_hi.checked_add(1)?.checked_mul(span)?)?
+            .checked_sub(1)?;
+        Some(start..=end)
     }
 
     /// The exact geographic extent of the run's pivot tiles.
@@ -493,7 +564,11 @@ impl TileRange {
     /// read. Over-inclusion costs a read; under-inclusion costs a tile, so the
     /// margin is deliberately far wider than the buffer it covers — see
     /// [`SHARD_READ_MARGIN_TILES`] for the exact bound.
-    pub fn bounds(&self) -> TileBounds {
+    ///
+    /// Named for what it is *for*: this is the READ bbox, not the range's
+    /// extent. [`TileRange::tile_bounds`] is the exact extent, and is what an
+    /// archive advertises.
+    pub fn read_bounds(&self) -> TileBounds {
         let b = self.tile_bounds();
         let margin = SHARD_READ_MARGIN_TILES * 360.0 / 2f64.powi(i32::from(self.pivot_zoom));
         TileBounds::new(
@@ -566,7 +641,9 @@ pub struct ShardPlan {
     pub ranges: Vec<ShardRange>,
     /// The input the plan was cut for.
     pub inputs: Vec<ShardInput>,
-    /// Rows the estimator saw in total (the sum the cut was balanced on).
+    /// Rows the estimator saw in total (the sum the cut was balanced on) —
+    /// placed rows plus [`unplaced_rows`](Self::unplaced_rows), so a shard's
+    /// share of it is a true share and the N shares sum to 100%.
     pub estimated_rows_total: u64,
     /// Rows whose row group carried no usable bbox statistics and were
     /// therefore spread uniformly over the covered extent rather than placed.
@@ -581,6 +658,60 @@ impl ShardPlan {
     /// How many shards the plan cuts.
     pub fn shards(&self) -> usize {
         self.ranges.len()
+    }
+
+    /// A stable 64-bit digest of **the cut itself** — the pivot zoom and the
+    /// lo/hi sequence, and nothing else (#498).
+    ///
+    /// This is what binds a fleet to one cut. The coarse job stamps it into
+    /// the convert plan's fingerprint, and every data shard has to present
+    /// the same one, so "same convert plan ⇒ same cut" holds by construction
+    /// rather than by the operator remembering not to re-run `shard-plan`
+    /// mid-build. Two plans cut from the same input with the same `--shards`
+    /// and `--pivot` agree; a re-cut with a different `--shards`, a different
+    /// `--pivot`, or a since-rebalanced input does not.
+    ///
+    /// Deliberately NOT over the whole artifact: `estimated_rows` and the
+    /// input fingerprint are advisory, and a plan re-cut to identical ranges
+    /// with a different estimate is the same cut. What must match is which
+    /// tiles each job owns.
+    pub fn cut_digest(&self) -> u64 {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        // Domain-separated and length-prefixed, so no two different cuts can
+        // serialize to the same byte string.
+        h.update(b"tylertoo-shard-cut/v1");
+        h.update(&[self.pivot_zoom]);
+        h.update(&(self.ranges.len() as u64).to_le_bytes());
+        for r in &self.ranges {
+            h.update(&r.lo.to_le_bytes());
+            h.update(&r.hi.to_le_bytes());
+        }
+        h.digest()
+    }
+
+    /// [`ShardPlan::cut_digest`] as the fixed-width hex string the convert
+    /// plan's fingerprint records.
+    pub fn cut_digest_hex(&self) -> String {
+        format!("{:016x}", self.cut_digest())
+    }
+
+    /// Refuse a plan whose pivot is finer than the build's finest zoom.
+    ///
+    /// Inclusive: `pivot == max_zoom` leaves every shard exactly one zoom,
+    /// which is legal (and is what a one-zoom fleet looks like). Only a pivot
+    /// strictly past `max_zoom` leaves the shards nothing at all.
+    ///
+    /// Lives here rather than in the CLI so the Rust API gets the same guard,
+    /// and so the variant that names it is constructed where it is decided.
+    pub fn check_max_zoom(&self, max_zoom: u8, path: &Path) -> Result<(), ShardError> {
+        if self.pivot_zoom > max_zoom {
+            return Err(ShardError::PivotNotCoarser {
+                pivot: self.pivot_zoom,
+                max_zoom,
+                path: path.display().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The [`TileRange`] shard `index` owns.
@@ -633,19 +764,16 @@ impl ShardPlan {
         }
 
         let per_part = source.part_row_group_bounds()?;
-        let weights = estimate_pivot_weights(&per_part, pivot_zoom);
+        // Real per-group row counts, so a group with no usable bbox is still
+        // weighted by what it actually holds rather than by "one average
+        // group" (#498 review): the footers are already parsed, so this is
+        // free, and on an input where MOST groups lack statistics the
+        // difference is the whole balance.
+        let per_part_rows = source.part_row_group_row_counts()?;
+        let weights = estimate_pivot_weights(&per_part, &per_part_rows, pivot_zoom);
         let ranges = cut_ranges(&weights, pivot_zoom, shards);
 
-        let inputs = source
-            .parts()
-            .iter()
-            .zip(source.part_row_counts()?)
-            .map(|(part, (num_rows, row_groups))| ShardInput {
-                path: part.display_name(),
-                num_rows,
-                row_groups,
-            })
-            .collect();
+        let inputs = shard_inputs(source)?;
 
         Ok(ShardPlan {
             format: SHARD_PLAN_FORMAT.to_string(),
@@ -653,7 +781,10 @@ impl ShardPlan {
             pivot_zoom,
             ranges,
             inputs,
-            estimated_rows_total: weights.placed_total.round() as u64,
+            // Placed AND spread: the per-shard `estimated_rows` include
+            // their share of the spread rows, so a total that excluded them
+            // made the reported percentages sum past 100%.
+            estimated_rows_total: (weights.placed_total + weights.unplaced).round() as u64,
             unplaced_rows: weights.unplaced.round() as u64,
         })
     }
@@ -753,16 +884,7 @@ impl ShardPlan {
     /// Check the plan was cut for the input this run is about to read.
     pub fn verify_source(&self, source: &ConvertSource, path: &Path) -> Result<(), ShardError> {
         let named = || path.display().to_string();
-        let now: Vec<ShardInput> = source
-            .parts()
-            .iter()
-            .zip(source.part_row_counts()?)
-            .map(|(part, (num_rows, row_groups))| ShardInput {
-                path: part.display_name(),
-                num_rows,
-                row_groups,
-            })
-            .collect();
+        let now = shard_inputs(source)?;
         if now.len() != self.inputs.len() {
             return Err(ShardError::SourceMismatch {
                 path: named(),
@@ -798,6 +920,24 @@ impl ShardPlan {
         }
         Ok(())
     }
+}
+
+/// The input identity a plan records, and the one a run presents back.
+///
+/// One builder for both sides on purpose: `compute` writing it one way and
+/// `verify_source` reading it another is precisely how an input-binding check
+/// stops binding anything.
+fn shard_inputs(source: &ConvertSource) -> Result<Vec<ShardInput>, ShardError> {
+    Ok(source
+        .parts()
+        .iter()
+        .zip(source.part_row_counts()?)
+        .map(|(part, (num_rows, row_groups))| ShardInput {
+            path: part.display_name(),
+            num_rows,
+            row_groups,
+        })
+        .collect())
 }
 
 /// Convenience: load a plan and resolve one role's range in one step.
@@ -839,83 +979,136 @@ struct PivotWeights {
 /// sorting gives each row group a compact bbox); unsorted input makes it
 /// worse, and the plan reports how much of the dataset could not be placed at
 /// all so the difference is visible rather than silently absorbed.
+///
+/// `per_part_rows[p][g]` is part `p`'s row group `g`'s footer row count,
+/// parallel to `per_part`. It is what lets a group with no usable bbox still
+/// carry its real weight into the spread.
+///
+/// Cost: one `BTreeMap` update per covered pivot tile, with no intermediate
+/// `Vec` per group, and a group covering more than
+/// [`MAX_GROUP_PIVOT_TILES`] tiles is spread flat instead of enumerated —
+/// see that constant.
 fn estimate_pivot_weights(
     per_part: &[Vec<Option<crate::covering::RowGroupBounds>>],
+    per_part_rows: &[Vec<i64>],
     pivot_zoom: u8,
 ) -> PivotWeights {
     let mut w = PivotWeights::default();
     let mut covered: Option<TileBounds> = None;
-    let mut placed_groups = 0usize;
-    let mut blind_groups = 0usize;
+    // Rows held back for the flat spread at the end: groups with no usable
+    // bbox, and groups whose bbox is so broad that enumerating it would cost
+    // more than the signal is worth.
+    let mut spread_rows = 0f64;
 
-    for rg in per_part.iter().flatten() {
-        let Some(rg) = rg else {
-            // No usable bbox: the group's position is unknown. `RowGroupBounds`
-            // is also what carries `num_rows`, so an absent entry carries no
-            // count either — held back and weighted below as one average
-            // group, so it nudges the cut without inventing volume.
-            blind_groups += 1;
-            continue;
-        };
-        let bbox = TileBounds::new(rg.xmin, rg.ymin, rg.xmax, rg.ymax);
-        if !bbox.is_valid() {
-            blind_groups += 1;
-            continue;
-        }
-        let tiles = pivot_tiles_for_bbox(&bbox, pivot_zoom);
-        if tiles.is_empty() {
-            blind_groups += 1;
-            continue;
-        }
-        match &mut covered {
-            Some(acc) => acc.expand(&bbox),
-            None => covered = Some(bbox),
-        }
-        placed_groups += 1;
-        let share = rg.num_rows as f64 / tiles.len() as f64;
-        w.placed_total += rg.num_rows as f64;
-        for id in tiles {
-            *w.per_tile.entry(id).or_insert(0.0) += share;
+    for (p, groups) in per_part.iter().enumerate() {
+        for (g, rg) in groups.iter().enumerate() {
+            // The footer count, which exists whether or not the bbox does.
+            let footer_rows = per_part_rows
+                .get(p)
+                .and_then(|v| v.get(g))
+                .copied()
+                .unwrap_or(0)
+                .max(0) as f64;
+            let Some(rg) = rg else {
+                spread_rows += footer_rows;
+                continue;
+            };
+            let bbox = TileBounds::new(rg.xmin, rg.ymin, rg.xmax, rg.ymax);
+            if !bbox.is_valid() {
+                spread_rows += footer_rows;
+                continue;
+            }
+            let ranges = tile_ranges_for_bbox(&bbox, pivot_zoom);
+            let tiles = pivot_tile_count(&ranges);
+            if tiles == 0 {
+                spread_rows += footer_rows;
+                continue;
+            }
+            let rows = rg.num_rows as f64;
+            if tiles > MAX_GROUP_PIVOT_TILES {
+                // Broad enough to carry no cut-point signal worth a million
+                // map updates. Held back for the same flat spread the
+                // statistics-less groups get, and counted as unplaced so the
+                // plan says out loud that it happened.
+                match &mut covered {
+                    Some(acc) => acc.expand(&bbox),
+                    None => covered = Some(bbox),
+                }
+                spread_rows += rows;
+                continue;
+            }
+            match &mut covered {
+                Some(acc) => acc.expand(&bbox),
+                None => covered = Some(bbox),
+            }
+            w.placed_total += rows;
+            let share = rows / tiles as f64;
+            for_each_pivot_tile(&ranges, pivot_zoom, |id| {
+                *w.per_tile.entry(id).or_insert(0.0) += share;
+            });
         }
     }
 
-    // Blind groups spread uniformly over the extent the rest of the file
+    // Held-back groups spread uniformly over the extent the rest of the file
     // covers. With no statistics anywhere the extent is the world and the cut
     // degrades to equal id width — the honest answer, and `unplaced_rows`
-    // says so out loud.
-    if blind_groups > 0 {
+    // says so out loud. Enumerated ONCE, however many groups fed it.
+    if spread_rows > 0.0 {
         let extent = covered.unwrap_or_else(|| TileBounds::new(-180.0, -85.0, 180.0, 85.0));
-        let tiles = pivot_tiles_for_bbox(&extent, pivot_zoom);
-        if !tiles.is_empty() {
-            let avg = if placed_groups == 0 {
-                1.0
-            } else {
-                w.placed_total / placed_groups as f64
-            };
-            let total = avg * blind_groups as f64;
-            w.unplaced = total;
-            let share = total / tiles.len() as f64;
-            for id in tiles {
+        let ranges = tile_ranges_for_bbox(&extent, pivot_zoom);
+        let tiles = pivot_tile_count(&ranges);
+        if tiles > 0 {
+            w.unplaced = spread_rows;
+            let share = spread_rows / tiles as f64;
+            for_each_pivot_tile(&ranges, pivot_zoom, |id| {
                 *w.per_tile.entry(id).or_insert(0.0) += share;
-            }
+            });
         }
     }
     w
 }
 
-/// The pivot-zoom tile ids a bbox covers.
-fn pivot_tiles_for_bbox(bbox: &TileBounds, pivot_zoom: u8) -> Vec<u64> {
-    let ranges = tile_ranges_for_bbox(bbox, pivot_zoom);
-    let bands = std::iter::once(ranges.x).chain(ranges.x2);
-    let mut out = Vec::new();
-    for (x0, x1) in bands {
+/// Past this many pivot tiles, a single row group's bbox is spread flat
+/// rather than enumerated tile by tile.
+///
+/// Two reasons, and the second is the real one. The cheap one: the pivot zoom
+/// holds up to `4^`[`MAX_SHARD_PIVOT_ZOOM`] = 1,048,576 tiles, and a
+/// planet-scale input has hundreds of thousands of row groups — a world-bbox
+/// group enumerated per tile would be `10^11` map updates for an estimate
+/// nobody's correctness depends on. The real one: a group spanning more than
+/// 4,096 pivot tiles has already lost every cut point it could have named. A
+/// fleet is tens of shards, not thousands, so such a group is diffuse at the
+/// scale the cut works at, and flat is what it actually looks like.
+const MAX_GROUP_PIVOT_TILES: u64 = 4096;
+
+/// How many pivot-zoom tiles a [`BboxTileRanges`] covers — arithmetic, with
+/// no enumeration, so the threshold above can be tested before paying for it.
+fn pivot_tile_count(ranges: &crate::tile::BboxTileRanges) -> u64 {
+    let height = u64::from(ranges.y.1.saturating_sub(ranges.y.0)) + 1;
+    let width: u64 = std::iter::once(ranges.x)
+        .chain(ranges.x2)
+        .map(|(x0, x1)| u64::from(x1.saturating_sub(x0)) + 1)
+        .sum();
+    width.saturating_mul(height)
+}
+
+/// Call `f` with every pivot-zoom tile id a [`BboxTileRanges`] covers.
+///
+/// A closure rather than a returned `Vec`: this runs once per row group on an
+/// input that may have hundreds of thousands of them, and the intermediate
+/// allocation was pure overhead.
+fn for_each_pivot_tile(
+    ranges: &crate::tile::BboxTileRanges,
+    pivot_zoom: u8,
+    mut f: impl FnMut(u64),
+) {
+    for (x0, x1) in std::iter::once(ranges.x).chain(ranges.x2) {
         for x in x0..=x1 {
             for y in ranges.y.0..=ranges.y.1 {
-                out.push(crate::pmtiles_writer::tile_id(pivot_zoom, x, y));
+                f(crate::pmtiles_writer::tile_id(pivot_zoom, x, y));
             }
         }
     }
-    out
 }
 
 /// Cut the pivot zoom into `shards` contiguous id runs of roughly equal
@@ -1139,7 +1332,11 @@ mod tests {
     fn estimator_spreads_each_row_group_over_its_covered_tiles() {
         let pivot = 2u8;
         // One row group over a bbox, one with no statistics at all.
-        let w = estimate_pivot_weights(&[vec![Some(rgb(-180.0, 0.0, -90.0, 66.0, 400))]], pivot);
+        let w = estimate_pivot_weights(
+            &[vec![Some(rgb(-180.0, 0.0, -90.0, 66.0, 400))]],
+            &[vec![400]],
+            pivot,
+        );
         let total: f64 = w.per_tile.values().sum();
         assert!(
             (total - 400.0).abs() < 1e-6,
@@ -1167,7 +1364,7 @@ mod tests {
     #[test]
     fn cut_with_no_statistics_falls_back_to_equal_width() {
         let pivot = 3u8;
-        let weights = estimate_pivot_weights(&[vec![None, None]], pivot);
+        let weights = estimate_pivot_weights(&[vec![None, None]], &[vec![7, 11]], pivot);
         let ranges = cut_ranges(&weights, pivot, 4);
         let widths: Vec<u64> = ranges.iter().map(|r| r.hi - r.lo + 1).collect();
         assert_eq!(widths, vec![16, 16, 16, 16], "z3 has 64 tiles");
@@ -1194,7 +1391,7 @@ mod tests {
         let pivot = 2u8;
         let base = hilbert_zoom_base(pivot);
         let r = TileRange::new(pivot, base, base).unwrap();
-        let b = r.bounds();
+        let b = r.read_bounds();
         let (_, x, y) = crate::pmtiles_writer::tile_id_to_zxy(base).unwrap();
         let tb = TileCoord::new(x, y, pivot).bounds();
         assert!(b.lng_min <= tb.lng_min && b.lng_max >= tb.lng_max);
@@ -1265,6 +1462,164 @@ mod tests {
         plan.save(&path).unwrap();
         let err = ShardPlan::load(&path).unwrap_err().to_string();
         assert!(err.contains("no gap and no overlap"), "{err}");
+    }
+
+    /// The cut digest names the CUT and nothing else: the same pivot and the
+    /// same ranges agree however the plan got there, a different cut does
+    /// not, and the advisory estimates do not enter into it.
+    #[test]
+    fn cut_digest_covers_the_cut_and_only_the_cut() {
+        let plan = |pivot: u8, shards: usize| ShardPlan {
+            format: SHARD_PLAN_FORMAT.to_string(),
+            version: SHARD_PLAN_VERSION,
+            pivot_zoom: pivot,
+            ranges: cut_ranges(&PivotWeights::default(), pivot, shards),
+            inputs: vec![],
+            estimated_rows_total: 0,
+            unplaced_rows: 0,
+        };
+        let a = plan(3, 4);
+        assert_eq!(
+            a.cut_digest(),
+            plan(3, 4).cut_digest(),
+            "same cut, same digest"
+        );
+        assert_ne!(
+            a.cut_digest(),
+            plan(3, 2).cut_digest(),
+            "--shards must move it"
+        );
+        assert_ne!(
+            a.cut_digest(),
+            plan(4, 4).cut_digest(),
+            "--pivot must move it"
+        );
+
+        // Advisory fields are NOT in it: a re-cut that lands on identical
+        // ranges with a different estimate is the same cut.
+        let mut same_cut_other_estimate = plan(3, 4);
+        same_cut_other_estimate.estimated_rows_total = 999;
+        same_cut_other_estimate.unplaced_rows = 7;
+        same_cut_other_estimate.inputs = vec![ShardInput {
+            path: "elsewhere.parquet".to_string(),
+            num_rows: 5,
+            row_groups: 1,
+        }];
+        assert_eq!(a.cut_digest(), same_cut_other_estimate.cut_digest());
+
+        // Moving a boundary by one tile, keeping the partition valid, is a
+        // different cut — this is the case the binding exists for.
+        let mut moved = plan(3, 4);
+        moved.ranges[0].hi += 1;
+        moved.ranges[1].lo += 1;
+        assert_ne!(
+            a.cut_digest(),
+            moved.cut_digest(),
+            "a moved seam is a new cut"
+        );
+
+        // Hex form is fixed width, so a fingerprint string never varies in
+        // shape.
+        assert_eq!(a.cut_digest_hex().len(), 16);
+    }
+
+    /// The pivot-vs-finest-zoom rule is INCLUSIVE: `pivot == max_zoom` leaves
+    /// every shard exactly one zoom, which is legal.
+    #[test]
+    fn check_max_zoom_is_inclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shards.json");
+        let plan = ShardPlan {
+            format: SHARD_PLAN_FORMAT.to_string(),
+            version: SHARD_PLAN_VERSION,
+            pivot_zoom: 4,
+            ranges: cut_ranges(&PivotWeights::default(), 4, 2),
+            inputs: vec![],
+            estimated_rows_total: 0,
+            unplaced_rows: 0,
+        };
+        assert!(plan.check_max_zoom(5, &path).is_ok());
+        assert!(
+            plan.check_max_zoom(4, &path).is_ok(),
+            "one zoom is still a zoom"
+        );
+        let err = plan.check_max_zoom(3, &path).unwrap_err().to_string();
+        assert!(
+            err.contains("pivot z4") && err.contains("--max-zoom 3"),
+            "{err}"
+        );
+    }
+
+    /// `..=` is one `=`, not "any number of them", and a `TileRange` from a
+    /// hand-edited plan is validated on the way in rather than trusted.
+    #[test]
+    fn tile_range_parse_and_deserialize_are_both_validating() {
+        let lo = crate::pmtiles_writer::tile_id(4, 0, 0);
+        let hi = crate::pmtiles_writer::tile_id(4, 3, 3);
+        assert_eq!(
+            TileRange::parse(&format!("{lo}..={hi}")).unwrap(),
+            TileRange::new(4, lo, hi).unwrap(),
+            "`..=` is an accepted synonym for `..`"
+        );
+        assert!(
+            TileRange::parse(&format!("{lo}..=={hi}")).is_err(),
+            "a second `=` is the typo it looks like"
+        );
+
+        // Deserialization routes through `new`, so a JSON range that is not a
+        // range is an error, not a struct.
+        let bad = format!(r#"{{"pivot_zoom":4,"lo":{hi},"hi":{lo}}}"#);
+        let err = serde_json::from_str::<TileRange>(&bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is empty"), "{err}");
+        let wrong_zoom = format!(r#"{{"pivot_zoom":5,"lo":{lo},"hi":{hi}}}"#);
+        assert!(serde_json::from_str::<TileRange>(&wrong_zoom).is_err());
+        // z0 has no pivot, and says so without naming a flag nobody typed.
+        let z0 = r#"{"pivot_zoom":0,"lo":0,"hi":0}"#;
+        let err = serde_json::from_str::<TileRange>(z0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be a pivot zoom"), "{err}");
+        assert!(!err.contains("--pivot"), "no flag was typed here: {err}");
+    }
+
+    /// `ids_at` is total: no zoom, however absurd, panics it.
+    #[test]
+    fn ids_at_never_panics_on_an_out_of_range_zoom() {
+        let r = TileRange::new(3, hilbert_zoom_base(3), hilbert_zoom_base(3) + 3).unwrap();
+        for z in 0..=u8::MAX {
+            let ids = r.ids_at(z);
+            assert_eq!(
+                ids.is_some(),
+                (3..=crate::tile::MAX_ZOOM).contains(&z),
+                "z{z}"
+            );
+        }
+    }
+
+    /// The duality the whole range algebra rests on: `hilbert_zoom_base(z)`
+    /// is exactly the id `pmtiles_writer::tile_id` gives the first tile of
+    /// zoom `z`, and the zoom holds `4^z` consecutive ids after it.
+    ///
+    /// Two modules, two derivations (a closed form here, a Hilbert walk
+    /// there). If they ever drift, every `ids_at` interval silently addresses
+    /// the wrong tiles — so it is pinned here rather than assumed.
+    #[test]
+    fn hilbert_zoom_base_is_the_writers_first_tile_id() {
+        for z in 0..=10u8 {
+            let base = hilbert_zoom_base(z);
+            let ids: std::collections::BTreeSet<u64> = (0..1u32 << z)
+                .flat_map(|x| (0..1u32 << z).map(move |y| crate::pmtiles_writer::tile_id(z, x, y)))
+                .collect();
+            assert_eq!(ids.len() as u64, zoom_tile_count(z), "z{z} tile count");
+            assert_eq!(*ids.first().unwrap(), base, "z{z} first id");
+            assert_eq!(
+                *ids.last().unwrap(),
+                base + zoom_tile_count(z) - 1,
+                "z{z} last id"
+            );
+        }
     }
 
     #[test]

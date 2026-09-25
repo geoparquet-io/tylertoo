@@ -760,6 +760,7 @@ fn overview(
         // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
         // convert plan they depend on.
         shard: None,
+        shard_plan_digest: None,
     };
 
     // `str` stays the single-input path (files, directories, globs, remote

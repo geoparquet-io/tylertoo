@@ -615,6 +615,23 @@ pub struct ConvertOptions {
     /// reads, which the fingerprint check accepts as a subset relation rather
     /// than an equality (see `plan_state::SelectionRule`). Default `None`.
     pub shard: Option<TileRange>,
+    /// [`crate::shard::ShardPlan::cut_digest_hex`] of the shard plan this run
+    /// was given, binding the whole fleet to **one cut** (#498).
+    ///
+    /// Unlike [`shard`](Self::shard) — which is per-job and therefore cannot
+    /// be fingerprinted — the *cut* is shared: every job of a fleet is handed
+    /// the same `shards.json`, so the digest of its pivot zoom and range
+    /// sequence is a fleet-wide constant. Recording it in the convert plan's
+    /// fingerprint makes "same convert plan ⇒ same cut" true by
+    /// construction: the coarse job stamps it in with `--save-plan`, and a
+    /// data shard presenting a differently-cut plan is refused by name
+    /// instead of quietly building tiles that overlap or miss its siblings'.
+    ///
+    /// Set by the CLI from `--shard-plan`, on the coarse job and the data
+    /// shards alike. `None` for an unsharded run, which is itself part of the
+    /// binding: a plan saved without a shard plan cannot be consumed by a
+    /// shard, and vice versa. Default `None`.
+    pub shard_plan_digest: Option<String>,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -833,6 +850,7 @@ impl Default for ConvertOptions {
             save_plan: None,
             plan: None,
             shard: None,
+            shard_plan_digest: None,
         }
     }
 }
