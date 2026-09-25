@@ -437,17 +437,13 @@ impl TileRange {
         self.ids_at(zoom).is_some_and(|r| r.contains(&id))
     }
 
-    /// The geographic extent of the run's pivot tiles, widened by one pivot
-    /// tile on every side.
+    /// The exact geographic extent of the run's pivot tiles.
     ///
-    /// This is the bbox a shard prunes its input row groups against. The
-    /// margin is what makes the pruning **safe** rather than merely tight: a
-    /// feature just outside a tile still renders into it through the export's
-    /// edge buffer, so a row group whose bbox only grazes the run has to be
-    /// read. One whole tile is far more than the buffer needs (the buffer is
-    /// single-digit tile *pixels*) and over-inclusion costs a read, never a
-    /// tile.
-    pub fn bounds(&self) -> TileBounds {
+    /// This is what a shard archive advertises as its bounds (intersected with
+    /// the data's own extent). Because the N ranges cover the pivot zoom
+    /// completely, unioning the shards' bounds back at merge time reproduces
+    /// the monolithic bbox rather than N overlapping world-sized ones.
+    pub fn tile_bounds(&self) -> TileBounds {
         let mut out: Option<TileBounds> = None;
         for id in self.lo..=self.hi {
             let Ok((z, x, y)) = crate::pmtiles_writer::tile_id_to_zxy(id) else {
@@ -460,9 +456,20 @@ impl TileRange {
                 None => out = Some(tb),
             }
         }
-        let Some(b) = out else {
-            return TileBounds::new(-180.0, -90.0, 180.0, 90.0);
-        };
+        out.unwrap_or_else(|| TileBounds::new(-180.0, -90.0, 180.0, 90.0))
+    }
+
+    /// [`TileRange::tile_bounds`] widened by one whole pivot tile on every
+    /// side — the bbox a shard prunes its **input row groups** against.
+    ///
+    /// The margin is what makes the pruning safe rather than merely tight: a
+    /// feature just outside a tile still renders into it through the export's
+    /// edge buffer, so a row group whose bbox only grazes the run has to be
+    /// read. One whole tile is orders of magnitude more than the buffer needs
+    /// (which is single-digit tile *pixels*), and over-inclusion costs a read,
+    /// never a tile.
+    pub fn bounds(&self) -> TileBounds {
+        let b = self.tile_bounds();
         let margin = 360.0 / 2f64.powi(i32::from(self.pivot_zoom));
         TileBounds::new(
             (b.lng_min - margin).max(-180.0),

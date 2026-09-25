@@ -51,6 +51,7 @@ use crate::input_set::ConvertSource;
 use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_opt_from_array;
+use crate::shard::TileRange;
 use crate::tile::MAX_ZOOM;
 
 use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
@@ -593,6 +594,27 @@ pub struct ConvertOptions {
     /// [`save_plan`](Self::save_plan). Streaming pipeline only. Default
     /// `None`.
     pub plan: Option<PathBuf>,
+    /// Convert one shard of a sharded build (#498): read only the row groups
+    /// whose bbox reaches this tile range, and re-address the `--plan`
+    /// accordingly.
+    ///
+    /// Set on the **data shards** of a fleet, never on the coarse job (which
+    /// reads the whole input and is the run that writes the plan). Requires
+    /// [`plan`](Self::plan): the level assignment is dataset-global, so a
+    /// shard that recomputed it over its own subset would disagree with its
+    /// siblings. `--shard` without `--plan` is a hard error.
+    ///
+    /// Pruning here is what makes a shard cheaper than the whole build, and
+    /// it is safe because a row group is dropped only when its bbox — widened
+    /// by a whole pivot tile, far past the export's edge buffer — does not
+    /// reach the range. A feature inside such a group cannot land in a tile
+    /// this shard owns.
+    ///
+    /// This is **not** fingerprinted: the shard tiles the same input with the
+    /// same thinning options as the plan and only narrows which row groups it
+    /// reads, which the fingerprint check accepts as a subset relation rather
+    /// than an equality (see `plan_state::SelectionRule`). Default `None`.
+    pub shard: Option<TileRange>,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -810,6 +832,7 @@ impl Default for ConvertOptions {
             spill_dir: None,
             save_plan: None,
             plan: None,
+            shard: None,
         }
     }
 }
@@ -1308,6 +1331,33 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     }
     if let Some(path) = &options.save_plan {
         preflight_save_plan_writable(path)?;
+    }
+    // #498: a shard MUST consume one global plan. The assignment threads
+    // dataset-wide fold state (the density budget's water-fill, the level
+    // walk's running kept count, the ladder's global dense rank, the ranking
+    // auto-detection's vocabulary scan), so a shard that recomputed it over
+    // its own row groups would reach a different answer and its pyramid would
+    // disagree with its siblings' at the seams. Refused here rather than
+    // producing a plausible-looking archive that is quietly wrong.
+    if options.shard.is_some() && options.plan.is_none() {
+        return Err(ConvertError::InvalidConfig(
+            "--shard requires --plan: the level assignment is dataset-global (the density \
+             budget water-fills a super-cell over every candidate of a level, the level walk \
+             carries a running kept count, --magnitude-ladder dense-ranks the whole column), \
+             so every shard of a fleet must consume ONE plan rather than recompute the \
+             assignment over its own subset. Run the coarse job first with --save-plan, then \
+             give every shard that plan with --plan."
+                .to_string(),
+        ));
+    }
+    if options.shard.is_some() && options.save_plan.is_some() {
+        return Err(ConvertError::InvalidConfig(
+            "--shard and --save-plan are mutually exclusive: a shard reads a subset of the \
+             input, so the plan it would write covers only that subset and is useless to the \
+             rest of the fleet. The coarse job, which reads everything, is the run that writes \
+             the plan."
+                .to_string(),
+        ));
     }
 
     // #517 S2: the `TYLERTOO_PROFILE_JSON` dump is appended once, at the very

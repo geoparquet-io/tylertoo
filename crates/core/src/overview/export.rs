@@ -236,6 +236,42 @@ pub struct ExportOptions {
     /// them. The overview file is untouched. Default: keep everything the
     /// file exports.
     pub properties: PropertySelection,
+    /// Emit only the tiles inside this pivot-zoom range — one shard of a
+    /// sharded build (#498).
+    ///
+    /// Tiles at zooms **coarser than the pivot** are outside every range, so a
+    /// shard never emits them; one coarse job owns them via
+    /// [`zoom_ceiling`](Self::zoom_ceiling). At every zoom from the pivot
+    /// down, the range names an *exact* contiguous tile-id interval
+    /// ([`crate::shard::TileRange::ids_at`]), and N ranges that partition the
+    /// pivot zoom partition every deeper zoom — so the shards' archives are
+    /// disjoint by construction and merge by blob copy.
+    ///
+    /// Features are kept **whole** through convert and clip: a feature
+    /// straddling a seam is read by both neighbouring shards and clipped
+    /// normally by both; each then emits only the tiles its own range owns.
+    /// That is what makes the seam exact rather than double-counted (the flaw
+    /// in the `--bbox`-band workaround this replaces).
+    ///
+    /// The restriction is applied at **plan time**, before any clipping: the
+    /// per-zoom tile-count map the partitions are cut from is filtered first,
+    /// so out-of-range tiles are never clipped, encoded or hashed, and each
+    /// wave's band read prunes to the shard's narrower bbox. A shard therefore
+    /// costs roughly its share of the export, not the whole of it.
+    ///
+    /// Default `None` (emit everything).
+    pub tile_range: Option<crate::shard::TileRange>,
+    /// Emit only the tiles at or below this zoom — the coarse half of a
+    /// sharded build (#498).
+    ///
+    /// Set to `pivot - 1` on the coarse job, which owns the zooms no shard
+    /// does. The convert feeding it must still run the whole zoom range (its
+    /// plan is the one every shard consumes, and the level plan is
+    /// fingerprinted), so the ceiling belongs here, on the export, rather
+    /// than on `--max-zoom`.
+    ///
+    /// Default `None` (no ceiling).
+    pub zoom_ceiling: Option<u8>,
 }
 
 impl Default for ExportOptions {
@@ -250,6 +286,8 @@ impl Default for ExportOptions {
             feature_order: FeatureOrder::default(),
             min_zoom: None,
             properties: PropertySelection::default(),
+            tile_range: None,
+            zoom_ceiling: None,
         }
     }
 }
@@ -367,6 +405,19 @@ pub enum ExportError {
         level: usize,
         /// The level's recorded GSD.
         gsd: f64,
+    },
+
+    /// A shard restriction leaves no zoom to emit at all (#498).
+    #[error(
+        "this export would emit no zoom at all: the restriction starts at z{coarsest} and \
+         stops at z{finest}. A --tile-range's pivot must be no finer than the overview's \
+         finest level, and a coarse job's zoom ceiling no coarser than its coarsest."
+    )]
+    EmptyTileRange {
+        /// The coarsest zoom the restriction would emit.
+        coarsest: u8,
+        /// The finest zoom the restriction would emit.
+        finest: u8,
     },
 
     /// `--min-zoom` is above [`crate::tile::MAX_ZOOM`] (#371).
@@ -784,6 +835,68 @@ fn export_pmtiles_with_partition_target(
 /// each level narrows it further from its own densest partition (#311); an
 /// explicit wave is honoured verbatim.
 #[allow(clippy::too_many_arguments)]
+/// Drop every scanned tile this export does not own (#498).
+///
+/// Two independent restrictions, both no-ops when unset:
+///
+/// * [`ExportOptions::zoom_ceiling`] — the coarse job keeps zooms `<= ceiling`.
+/// * [`ExportOptions::tile_range`] — a data shard keeps, at each zoom from the
+///   pivot down, the tile ids the range owns. Zooms coarser than the pivot are
+///   outside every range and are dropped wholesale, which is precisely the
+///   half the coarse job keeps: the two restrictions are complements, so a
+///   coarse job plus N shards emit each tile exactly once.
+///
+/// A level's `bounds` are narrowed with its tiles. Bounds are the archive's
+/// advertised extent, and unioning N shards' full-dataset extents would
+/// advertise every shard as covering the whole world. Intersecting the data
+/// extent with the range's tile extent instead keeps each shard honest while
+/// still unioning back to exactly the monolithic bbox, because the ranges
+/// cover the pivot zoom completely.
+fn restrict_scans_to_range(
+    scans: &mut [LevelScan],
+    level_zooms: &[u8],
+    options: &ExportOptions,
+) -> Result<(), ExportError> {
+    if options.tile_range.is_none() && options.zoom_ceiling.is_none() {
+        return Ok(());
+    }
+    let range_bounds = options.tile_range.as_ref().map(|r| r.tile_bounds());
+    let mut kept = 0usize;
+    let mut dropped = 0usize;
+    for (scan, &zoom) in scans.iter_mut().zip(level_zooms) {
+        let ids = match options.tile_range.as_ref() {
+            Some(r) => r.ids_at(zoom),
+            None => None,
+        };
+        let above_ceiling = options.zoom_ceiling.is_some_and(|c| zoom > c);
+        let before = scan.tile_counts.len();
+        if above_ceiling || (options.tile_range.is_some() && ids.is_none()) {
+            scan.tile_counts.clear();
+        } else if let Some(ids) = ids {
+            scan.tile_counts.retain(|key, _| ids.contains(key));
+        }
+        dropped += before - scan.tile_counts.len();
+        kept += scan.tile_counts.len();
+        if scan.tile_counts.is_empty() {
+            scan.bounds = None;
+        } else if let (Some(b), Some(rb)) = (scan.bounds.as_mut(), range_bounds.as_ref()) {
+            b.lng_min = b.lng_min.max(rb.lng_min);
+            b.lat_min = b.lat_min.max(rb.lat_min);
+            b.lng_max = b.lng_max.min(rb.lng_max);
+            b.lat_max = b.lat_max.min(rb.lat_max);
+        }
+    }
+    log::info!(
+        "[export] shard restriction: keeping {kept} tile(s), dropping {dropped} that belong to \
+         another job{}",
+        options
+            .tile_range
+            .as_ref()
+            .map_or(String::new(), |r| format!(" (range {r})"))
+    );
+    Ok(())
+}
+
 fn plan_levels(
     scans: &[LevelScan],
     meta: &OverviewsMeta,
@@ -888,8 +1001,24 @@ fn export_pmtiles_impl(
             });
         }
     }
-    let coarsest_zoom = level_zooms[0];
-    let max_zoom = level_zooms[num_levels - 1];
+    // #498: the zooms this export will actually emit, which is what #380's
+    // declared-minimum rules must be measured against. A data shard starts at
+    // the pivot however coarse the overview file is (the coarser levels belong
+    // to the coarse job), and the coarse job stops at the ceiling.
+    let coarsest_zoom = match options.tile_range.as_ref() {
+        Some(r) => level_zooms[0].max(r.pivot_zoom),
+        None => level_zooms[0],
+    };
+    let max_zoom = match options.zoom_ceiling {
+        Some(c) => level_zooms[num_levels - 1].min(c),
+        None => level_zooms[num_levels - 1],
+    };
+    if coarsest_zoom > max_zoom {
+        return Err(ExportError::EmptyTileRange {
+            coarsest: coarsest_zoom,
+            finest: max_zoom,
+        });
+    }
     // #380: the archive may declare a coarser minimum than the file holds.
     let min_zoom = match options.min_zoom {
         // #371: the declared minimum is a written header field, so it obeys the
@@ -988,11 +1117,20 @@ fn export_pmtiles_impl(
     // includes it. O(#tiles) memory per level; the per-level `LevelScan`s are
     // byte-identical to independent per-level scans.
     let t_scan = Instant::now();
-    let scans = scan_all_levels(&reader, crs, &meta, options)?;
+    let mut scans = scan_all_levels(&reader, crs, &meta, options)?;
     log::info!(
         "[export] scan complete: {num_levels} levels, single read, {:.2}s",
         t_scan.elapsed().as_secs_f64()
     );
+
+    // #498: a sharded build's export owns a slice of the tile space, not all
+    // of it. Restricting the SCAN — the per-zoom tile-count map every
+    // partition, key window and wave-read bbox is derived from — is what makes
+    // the restriction free rather than a filter bolted on at write time: an
+    // out-of-range tile is never planned, so it is never clipped, encoded,
+    // hashed or read for.
+    restrict_scans_to_range(&mut scans, &level_zooms, options)?;
+    let scans = scans;
 
     let mut overall_bounds: Option<TileBounds> = None;
     for scan in &scans {

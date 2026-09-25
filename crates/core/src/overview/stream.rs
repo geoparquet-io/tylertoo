@@ -87,7 +87,7 @@ use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
 use super::pipeline;
 use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
-use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals};
+use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
     simplify_step_checked, validation_skip_count, CascadeStep, CollapseMode, Representation,
@@ -99,7 +99,7 @@ use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriter
 /// or non-finite geometry — skipped in pass 1). It matches no level in either
 /// mode: [`super::convert::MAX_LEVELS`] caps the plan at 255 levels, so the
 /// finest level index is at most 254.
-const UNASSIGNED_LEVEL: u8 = u8::MAX;
+pub(super) const UNASSIGNED_LEVEL: u8 = u8::MAX;
 
 /// A level actually emitted to the output (levels with zero winners are
 /// omitted and renumbered, spec §7.3, matching the in-memory path).
@@ -385,11 +385,22 @@ fn build_writer_options_with_ceiling(
 
 /// Combined per-part footer-statistics row-group selection for the streaming
 /// path: bbox covering pruning (#102) intersected with attribute-filter
-/// statistics pushdown (#315). `None` when neither pruning is active.
+/// statistics pushdown (#315) and, on a data shard, with the shard's own tile
+/// range (#498). `None` when none of the three is active.
+///
+/// The shard term is the one that is *not* fingerprinted: `--bbox` and
+/// `--filter` change which features exist and so change the assignment, but a
+/// shard reads a subset of the same dataset under the same assignment. That
+/// asymmetry is why the plan's fingerprint compares the selection as a subset
+/// relation in shard mode instead of an equality, and why the plan's
+/// row-indexed tables are then re-addressed onto the subset rather than
+/// re-derived over it.
 fn select_row_groups_streaming(
     source: &ConvertSource,
     bbox_units: Option<&[f64; 4]>,
     filter: Option<&super::filter::BoundFilter>,
+    shard: Option<&crate::shard::TileRange>,
+    crs: Crs,
 ) -> Result<Option<RowGroupSelection>, ConvertError> {
     let bbox_selection: Option<RowGroupSelection> = match bbox_units {
         Some(bb) => Some(source.select_row_groups(bb)?),
@@ -399,12 +410,21 @@ fn select_row_groups_streaming(
         Some(f) => Some(source.select_row_groups_matching(f)?),
         None => None,
     };
-    Ok(match (bbox_selection, filter_selection) {
-        (Some(a), Some(b)) => Some(a.intersect(&b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    })
+    let shard_selection: Option<RowGroupSelection> = match shard {
+        Some(range) => {
+            let b = range.bounds();
+            let units = super::convert::bbox_to_crs_units(
+                &[b.lng_min, b.lat_min, b.lng_max, b.lat_max],
+                crs,
+            );
+            Some(source.select_row_groups(&units)?)
+        }
+        None => None,
+    };
+    Ok([bbox_selection, filter_selection, shard_selection]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| a.intersect(&b)))
 }
 
 /// Unsigned area of a polygonal geometry in CRS units², 0 for anything else
@@ -1232,14 +1252,25 @@ fn convert_preflight(
     let bbox_units = options
         .bbox
         .map(|b| super::convert::bbox_to_crs_units(&b, crs));
-    let selected_row_groups =
-        select_row_groups_streaming(source, bbox_units.as_ref(), bound_filter.as_ref())?;
+    let selected_row_groups = select_row_groups_streaming(
+        source,
+        bbox_units.as_ref(),
+        bound_filter.as_ref(),
+        options.shard.as_ref(),
+        crs,
+    )?;
     let row_groups_read = selected_row_groups
         .as_ref()
         .map_or(row_groups_total, RowGroupSelection::total_selected);
     if selected_row_groups.is_some() {
         let what = super::convert::pruning_label(options.bbox.is_some(), bound_filter.is_some());
         log::info!("{what} filter: reading {row_groups_read}/{row_groups_total} input row groups");
+    }
+    if let Some(range) = &options.shard {
+        log::info!(
+            "[convert] shard {range}: reading {row_groups_read}/{row_groups_total} input row \
+             groups (the groups whose bbox reaches this shard's tile range)"
+        );
     }
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
@@ -1512,15 +1543,24 @@ fn load_plan_state(
     selected_row_groups: Option<&RowGroupSelection>,
 ) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
-    let plan = ConvertPlan::load(path)?;
-    plan.fingerprint.verify(&current)?;
-    let totals = plan.totals;
-    if plan.min_levels.len() != totals.n_rows {
+    let mut plan = ConvertPlan::load(path)?;
+    // #498: a data shard narrows the plan's row-group selection and nothing
+    // else, so that one fingerprint term is compared as a subset relation
+    // instead of an equality. Every other term — the tylertoo version, every
+    // thinning option, each part's path, size, mtime, row count and row-group
+    // count — stays an exact match.
+    let selection_rule = if options.shard.is_some() {
+        SelectionRule::SubsetAllowed
+    } else {
+        SelectionRule::Identical
+    };
+    plan.fingerprint.verify_with(&current, selection_rule)?;
+    if plan.min_levels.len() != plan.totals.n_rows {
         return Err(ConvertError::InvalidConfig(format!(
             "--plan: {} holds {} winner-table row(s) but claims {} input row(s)",
             path.display(),
             plan.min_levels.len(),
-            totals.n_rows,
+            plan.totals.n_rows,
         )));
     }
     // #511/#512: the winner table is addressed by row position, so the plan's
@@ -1536,6 +1576,32 @@ fn load_plan_state(
     // simply did not run. The gate is gone: sum `num_rows()` over the row
     // groups this run SELECTED, which is exactly pass 1's row domain, pruned
     // or not, and costs nothing (the footers are already parsed).
+    //
+    // A shard reads FEWER rows than the plan on purpose, so the comparison
+    // moves: the plan's domain is first checked against the row groups the
+    // PLAN was saved over (inside `rebase_plan_for_shard`), the row-indexed
+    // sections are then re-addressed onto this shard's narrower stream, and
+    // the equality below is what proves the re-addressing landed — the
+    // compacted table must be exactly as long as what the shard will read.
+    if options.shard.is_some() {
+        if plan.coalesce.as_ref().is_some_and(|c| !c.rows.is_empty()) {
+            return Err(ConvertError::InvalidConfig(format!(
+                "--shard is not supported with line coalescing: {} carries {} coalesced line \
+                 chain(s). A chain is a NEW geometry spanning every row it merged, so no \
+                 single input row group's bbox bounds it — the shard that holds the chain's \
+                 row would emit tiles outside its own range while the neighbouring shard, \
+                 which never reads that row, would emit none, leaving a gap at the seam. \
+                 Re-run the whole fleet (including the coarse job, so the plan matches) with \
+                 --no-coalesce-lines.",
+                path.display(),
+                plan.coalesce.as_ref().map_or(0, |c| c.rows.len()),
+            )));
+        }
+        super::plan_state::rebase_plan_for_shard(&mut plan, source, selected_row_groups, path)?;
+    }
+    // Captured after the shard re-addressing, so the report and the pass-2
+    // memory estimate describe what THIS run will read.
+    let totals = plan.totals;
     let will_stream = source.selected_row_count(selected_row_groups)?;
     if will_stream != plan.min_levels.len() as i64 {
         return Err(ConvertError::InvalidConfig(format!(
