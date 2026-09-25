@@ -38,6 +38,7 @@ pub mod vector_tile {
     include!(concat!(env!("OUT_DIR"), "/vector_tile.rs"));
 }
 
+pub mod archive_index;
 pub mod batch_processor;
 pub mod clip;
 pub mod compression;
@@ -48,6 +49,7 @@ pub mod fs_probe;
 pub mod input;
 pub mod input_set;
 pub mod ioverlay_clip;
+pub mod merge;
 pub mod mvt;
 pub mod overview;
 pub mod pmtiles_writer;

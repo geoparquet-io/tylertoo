@@ -15,6 +15,7 @@ This document contains the help content for the `tylertoo` command-line program.
 * [`tylertoo export-pmtiles`↴](#tylertoo-export-pmtiles)
 * [`tylertoo decode`↴](#tylertoo-decode)
 * [`tylertoo pyramid`↴](#tylertoo-pyramid)
+* [`tylertoo merge`↴](#tylertoo-merge)
 
 ## `tylertoo`
 
@@ -32,6 +33,7 @@ Top-level CLI: a default (bare) tile pipeline plus subcommands.
 * `export-pmtiles` — Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `decode` — Decode a PMTiles vector-tile archive back to GeoParquet
 * `pyramid` — Build a multi-band pyramid: several inputs, each owning a zoom range, one archive (issue #345)
+* `merge` — Concatenate disjoint PMTiles archives into one (issue #498)
 
 
 
@@ -565,6 +567,27 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 * `--allow-missing-zooms` — Allow a pre-tiled band's declared zoom range to overshoot what its archive actually holds.
 
    Off by default: an overshooting band declares zooms its archive does not have, and those zooms would render silently empty — almost always a `--band` range that disagrees with what the archive was actually tiled with, so it is a hard error unless this is set. Has no effect on a band whose declared range shares no zoom at all with its archive (that is always an error), nor on a band that declares a subrange of its archive (that is always fine, with or without this flag). Pass this only for a deliberately sparse pyramid.
+* `-f`, `--force` — Overwrite the output if it exists
+
+
+
+## `tylertoo merge`
+
+Concatenate disjoint PMTiles archives into one (issue #498)
+
+**Usage:** `tylertoo merge [OPTIONS] <OUTPUT> <INPUT>...`
+
+###### **Arguments:**
+
+* `<OUTPUT>` — Output PMTiles archive
+* `<INPUT>` — Input PMTiles archives, two or more. They must hold disjoint tile ids and agree on tile type and tile compression; the merged archive's bounds are the union of theirs, its zoom range the union of the ranges they declare, and its `vector_layers` the union of theirs (layers sharing an id collapse into one entry spanning their combined zooms, with their fields unioned)
+
+###### **Options:**
+
+* `--work-dir <DIR>` — Directory for the merge's spool file, which holds the merged tile data until the archive is assembled. Defaults to the system temp directory — worth setting when the output is large and `/tmp` is a small tmpfs
+* `--report <PATH>` — Write the JSON merge report to this path.
+
+   Includes per-zoom tile counts, which are what a sharded build is checked against: merging N shards must yield the same tiles per zoom as tiling the whole input in one pass.
 * `-f`, `--force` — Overwrite the output if it exists
 
 

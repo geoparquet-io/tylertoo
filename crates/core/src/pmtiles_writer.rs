@@ -8,7 +8,7 @@
 //! - Configurable compression (gzip, brotli, zstd) for both directories and tiles
 //! - Clustered mode for efficient sequential reads
 
-use crate::compression::{self, Compression};
+use crate::compression::{self, Compression, MAX_INTERNAL_BYTES};
 use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
 use crate::tile::TileBounds;
 use crate::world_coord::MAX_LATITUDE;
@@ -36,6 +36,13 @@ pub enum TileType {
 
 // Compression enum is now imported from crate::compression
 
+/// The PMTiles v3 header's fixed on-disk size.
+///
+/// A reader that fetches the header before it knows anything else about the
+/// archive — e.g. [`crate::archive_index::ArchiveIndex`] — needs exactly this
+/// many bytes. See [`Header`] for the layout.
+pub const HEADER_BYTES: usize = 127;
+
 /// PMTiles v3 header (127 bytes)
 ///
 /// Layout follows the spec exactly:
@@ -46,6 +53,8 @@ pub enum TileType {
 /// - Bytes 100-101: Zoom levels
 /// - Bytes 102-117: Bounds (min_lon, min_lat, max_lon, max_lat as i32 * 10_000_000)
 /// - Bytes 118-126: Center (zoom, lon, lat)
+///
+/// Its on-disk size is fixed: [`HEADER_BYTES`].
 #[derive(Debug, Clone)]
 pub struct Header {
     pub root_dir_offset: u64,
@@ -758,17 +767,66 @@ pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
 /// spec allows arbitrary depth, but no writer here produces more than one
 /// level.
 pub(crate) fn read_all_entries(bytes: &[u8], header: &Header) -> Result<Vec<DirEntry>> {
+    read_all_entries_from(&bytes, header)
+}
+
+/// Where [`read_all_entries_from`] gets the bytes it needs.
+///
+/// A whole archive in memory (`&[u8]`) and a `File` read by offset
+/// ([`crate::archive_index::ArchiveIndex`]) answer this identically, which is
+/// the point: the directory walk — and every ceiling and error message #417
+/// put on it — is written once and both readers inherit it. Only the *four*
+/// ranges a walk actually touches (root dir, each leaf dir) are ever fetched,
+/// so the file-backed source never materializes tile data.
+///
+/// Callers bounds-check `offset + len` against [`Self::total_len`] before
+/// calling, so an implementation may assume the range is in bounds.
+pub(crate) trait ArchiveBytes {
+    /// The archive's total size in bytes.
+    fn total_len(&self) -> u64;
+    /// `len` bytes at `offset`, borrowed when the source already holds them.
+    fn read_range(&self, offset: usize, len: usize) -> Result<std::borrow::Cow<'_, [u8]>>;
+}
+
+impl ArchiveBytes for &[u8] {
+    fn total_len(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn read_range(&self, offset: usize, len: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
+        Ok(std::borrow::Cow::Borrowed(&self[offset..offset + len]))
+    }
+}
+
+/// [`read_all_entries`] over any [`ArchiveBytes`] source.
+pub(crate) fn read_all_entries_from<S: ArchiveBytes + ?Sized>(
+    src: &S,
+    header: &Header,
+) -> Result<Vec<DirEntry>> {
     let past_end = |what: &str| Error::PMTilesWrite(format!("{what} past end of archive"));
-    let slice = |off: u64, len: u64, what: &str| -> Result<&[u8]> {
+    let slice = |off: u64, len: u64, what: &str| -> Result<std::borrow::Cow<'_, [u8]>> {
+        // #417, extended in #510: the declared length is checked against the
+        // internal-section ceiling BEFORE anything is allocated. Bounding it
+        // by the file's own length is no bound at all for a file-backed
+        // source — a header claiming a 256 MiB root directory made a reader
+        // allocate 256 MiB per archive, and a merge opens every shard at
+        // once. The section is decompressed under the same ceiling anyway, so
+        // a compressed body larger than it cannot be a legitimate directory.
+        if len > MAX_INTERNAL_BYTES {
+            return Err(Error::PMTilesWrite(format!(
+                "{what} claims {len} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
+                 ceiling on an archive's internal sections"
+            )));
+        }
         // Both come from the archive; a `as usize` truncation on a 32-bit
         // target would turn a wild offset into a plausible in-range one.
         let start = usize::try_from(off).map_err(|_| past_end(what))?;
         let end = usize::try_from(len)
             .ok()
             .and_then(|l| start.checked_add(l))
-            .filter(|&e| e <= bytes.len())
+            .filter(|&e| u64::try_from(e).is_ok_and(|e| e <= src.total_len()))
             .ok_or_else(|| past_end(what))?;
-        Ok(&bytes[start..end])
+        src.read_range(start, end - start)
     };
     // An entry's range must lie inside the section it is relative to, not
     // merely inside the file: a leaf pointer aimed at the tile data would
@@ -792,7 +850,7 @@ pub(crate) fn read_all_entries(bytes: &[u8], header: &Header) -> Result<Vec<DirE
     };
 
     let root = dir(
-        slice(header.root_dir_offset, header.root_dir_length, "root dir")?,
+        &slice(header.root_dir_offset, header.root_dir_length, "root dir")?,
         "root dir",
     )?;
     // Entries accumulated across the walk are bounded by what the archive
@@ -834,7 +892,7 @@ pub(crate) fn read_all_entries(bytes: &[u8], header: &Header) -> Result<Vec<DirE
             .checked_add(e.offset)
             .ok_or_else(|| Error::PMTilesWrite("leaf dir offset overflow".to_string()))?;
         let leaf = slice(leaf_at, u64::from(e.length), "leaf dir")?;
-        let decoded = dir(leaf, "leaf dir")?;
+        let decoded = dir(&leaf, "leaf dir")?;
         // Spent before the entries are kept, not after: a root full of
         // pointers at one 16 MiB leaf body is a ~50 KB file that would
         // otherwise accumulate entries until the process died.
@@ -1656,6 +1714,10 @@ pub struct StreamingPmtilesWriter {
     /// Minimum zoom the archive *declares* even when no tile exists there
     /// (#380): the header and `vector_layers` cover `min(declared, seen)`.
     declared_min_zoom: Option<u8>,
+    /// Maximum zoom the archive *declares* even when no tile exists there —
+    /// the mirror of `declared_min_zoom`, used by `tylertoo merge` to union
+    /// the shards' declared ranges rather than the tiles' observed one.
+    declared_max_zoom: Option<u8>,
     /// Geographic bounds
     bounds: TileBounds,
     /// Layer name for metadata
@@ -1721,6 +1783,7 @@ impl StreamingPmtilesWriter {
             min_zoom: 255,
             max_zoom: 0,
             declared_min_zoom: None,
+            declared_max_zoom: None,
             bounds: TileBounds::empty(),
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
@@ -1781,6 +1844,21 @@ impl StreamingPmtilesWriter {
         self.declared_min_zoom = Some(zoom);
     }
 
+    /// Declare a maximum zoom for the archive regardless of which zooms end
+    /// up holding tiles — the mirror of [`Self::set_declared_min_zoom`], for
+    /// the same reason at the other end of the range.
+    ///
+    /// `tylertoo merge` needs it: the merged header's zoom range is the union
+    /// of the shards' *declared* ranges, and a shard covering a sliver of the
+    /// world legitimately has no tile at its own deepest zoom. Deriving the
+    /// merged maximum from the deepest tile actually copied would quietly
+    /// narrow the range every such shard set declares. Like the minimum, a
+    /// declared value can only widen: a declaration coarser than a written
+    /// tile is ignored.
+    pub fn set_declared_max_zoom(&mut self, zoom: u8) {
+        self.declared_max_zoom = Some(zoom);
+    }
+
     /// The header's minimum zoom: the coarsest tile written, widened by any
     /// declared minimum. An archive with no tiles is z0..z0 whatever was
     /// declared — its max zoom collapses to 0, and a declared minimum above
@@ -1792,6 +1870,19 @@ impl StreamingPmtilesWriter {
         match self.declared_min_zoom {
             Some(d) => self.min_zoom.min(d),
             None => self.min_zoom,
+        }
+    }
+
+    /// The header's maximum zoom: the deepest tile written, widened by any
+    /// declared maximum. An archive with no tiles is z0..z0, matching
+    /// [`Self::header_min_zoom`].
+    fn header_max_zoom(&self) -> u8 {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        match self.declared_max_zoom {
+            Some(d) => self.max_zoom.max(d),
+            None => self.max_zoom,
         }
     }
 
@@ -2107,11 +2198,7 @@ impl StreamingPmtilesWriter {
             tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
             min_zoom: self.header_min_zoom(),
-            max_zoom: if self.max_zoom == 0 && self.entries.is_empty() {
-                0
-            } else {
-                self.max_zoom
-            },
+            max_zoom: self.header_max_zoom(),
             min_lon: self.bounds.lng_min,
             min_lat: self.bounds.lat_min,
             max_lon: self.bounds.lng_max,
@@ -2119,7 +2206,7 @@ impl StreamingPmtilesWriter {
             center_zoom: if self.entries.is_empty() {
                 0
             } else {
-                (self.header_min_zoom() + self.max_zoom) / 2
+                (self.header_min_zoom() + self.header_max_zoom()) / 2
             },
             center_lon: (self.bounds.lng_min + self.bounds.lng_max) / 2.0,
             center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
@@ -2221,11 +2308,7 @@ impl StreamingPmtilesWriter {
     /// Build metadata JSON string.
     fn build_metadata_json(&self) -> String {
         let min_z = self.header_min_zoom();
-        let max_z = if self.max_zoom == 0 && self.entries.is_empty() {
-            0
-        } else {
-            self.max_zoom
-        };
+        let max_z = self.header_max_zoom();
 
         let tilestats_json = self.build_tilestats_json();
         let vector_layers = match &self.vector_layers_json {

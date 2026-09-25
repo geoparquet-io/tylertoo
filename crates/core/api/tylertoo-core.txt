@@ -1,4 +1,58 @@
 pub mod tylertoo_core
+pub mod tylertoo_core::archive_index
+pub struct tylertoo_core::archive_index::ArchiveIndex
+impl tylertoo_core::archive_index::ArchiveIndex
+pub fn tylertoo_core::archive_index::ArchiveIndex::bounds(&self) -> core::option::Option<tylertoo_core::tile::TileBounds>
+pub fn tylertoo_core::archive_index::ArchiveIndex::bytes_read(&self) -> u64
+pub fn tylertoo_core::archive_index::ArchiveIndex::entries(&self) -> &[tylertoo_core::pmtiles_writer::DirEntry]
+pub fn tylertoo_core::archive_index::ArchiveIndex::header(&self) -> &tylertoo_core::pmtiles_writer::Header
+pub fn tylertoo_core::archive_index::ArchiveIndex::metadata_json(&self) -> core::option::Option<serde_json::value::Value>
+pub fn tylertoo_core::archive_index::ArchiveIndex::metadata_raw(&self) -> &[u8]
+pub fn tylertoo_core::archive_index::ArchiveIndex::open(&std::path::Path) -> tylertoo_core::Result<Self>
+pub fn tylertoo_core::archive_index::ArchiveIndex::path(&self) -> &std::path::Path
+pub fn tylertoo_core::archive_index::ArchiveIndex::read_range(&self, core::ops::range::Range<usize>) -> tylertoo_core::Result<alloc::vec::Vec<u8>>
+pub fn tylertoo_core::archive_index::ArchiveIndex::tile_id_range(&self) -> tylertoo_core::Result<core::option::Option<(u64, u64)>>
+pub fn tylertoo_core::archive_index::ArchiveIndex::tiles(&self) -> tylertoo_core::archive_index::TileIter<'_>
+impl !core::marker::Freeze for tylertoo_core::archive_index::ArchiveIndex
+impl core::marker::Send for tylertoo_core::archive_index::ArchiveIndex
+impl core::marker::Sync for tylertoo_core::archive_index::ArchiveIndex
+impl core::marker::Unpin for tylertoo_core::archive_index::ArchiveIndex
+impl core::marker::UnsafeUnpin for tylertoo_core::archive_index::ArchiveIndex
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::archive_index::ArchiveIndex
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::archive_index::ArchiveIndex
+pub struct tylertoo_core::archive_index::TileIter<'a>
+impl core::iter::traits::iterator::Iterator for tylertoo_core::archive_index::TileIter<'_>
+pub type tylertoo_core::archive_index::TileIter<'_>::Item = core::result::Result<tylertoo_core::archive_index::TileRef, tylertoo_core::Error>
+pub fn tylertoo_core::archive_index::TileIter<'_>::next(&mut self) -> core::option::Option<Self::Item>
+impl<'a> core::marker::Freeze for tylertoo_core::archive_index::TileIter<'a>
+impl<'a> core::marker::Send for tylertoo_core::archive_index::TileIter<'a>
+impl<'a> core::marker::Sync for tylertoo_core::archive_index::TileIter<'a>
+impl<'a> core::marker::Unpin for tylertoo_core::archive_index::TileIter<'a>
+impl<'a> core::marker::UnsafeUnpin for tylertoo_core::archive_index::TileIter<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::archive_index::TileIter<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for tylertoo_core::archive_index::TileIter<'a>
+pub struct tylertoo_core::archive_index::TileRef
+pub tylertoo_core::archive_index::TileRef::id: u64
+pub tylertoo_core::archive_index::TileRef::range: core::ops::range::Range<usize>
+pub tylertoo_core::archive_index::TileRef::x: u32
+pub tylertoo_core::archive_index::TileRef::y: u32
+pub tylertoo_core::archive_index::TileRef::z: u8
+impl core::clone::Clone for tylertoo_core::archive_index::TileRef
+pub fn tylertoo_core::archive_index::TileRef::clone(&self) -> tylertoo_core::archive_index::TileRef
+impl core::cmp::Eq for tylertoo_core::archive_index::TileRef
+impl core::cmp::PartialEq for tylertoo_core::archive_index::TileRef
+pub fn tylertoo_core::archive_index::TileRef::eq(&self, &tylertoo_core::archive_index::TileRef) -> bool
+impl core::fmt::Debug for tylertoo_core::archive_index::TileRef
+pub fn tylertoo_core::archive_index::TileRef::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::archive_index::TileRef
+impl core::marker::Freeze for tylertoo_core::archive_index::TileRef
+impl core::marker::Send for tylertoo_core::archive_index::TileRef
+impl core::marker::Sync for tylertoo_core::archive_index::TileRef
+impl core::marker::Unpin for tylertoo_core::archive_index::TileRef
+impl core::marker::UnsafeUnpin for tylertoo_core::archive_index::TileRef
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::archive_index::TileRef
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::archive_index::TileRef
+pub fn tylertoo_core::archive_index::usable_bounds(&tylertoo_core::pmtiles_writer::Header) -> core::option::Option<tylertoo_core::tile::TileBounds>
 pub mod tylertoo_core::batch_processor
 pub fn tylertoo_core::batch_processor::extract_geometries_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<geo_types::geometry::Geometry<f64>>) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::batch_processor::extract_geometries_opt_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<core::option::Option<geo_types::geometry::Geometry<f64>>>) -> tylertoo_core::Result<()>
@@ -499,6 +553,46 @@ pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geom
 pub fn tylertoo_core::ioverlay_clip::clip_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::ioverlay_clip::union_polygons_ioverlay(&[geo_types::geometry::polygon::Polygon<f64>]) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub mod tylertoo_core::merge
+pub struct tylertoo_core::merge::MergeOptions
+pub tylertoo_core::merge::MergeOptions::work_dir: core::option::Option<std::path::PathBuf>
+impl core::clone::Clone for tylertoo_core::merge::MergeOptions
+pub fn tylertoo_core::merge::MergeOptions::clone(&self) -> tylertoo_core::merge::MergeOptions
+impl core::default::Default for tylertoo_core::merge::MergeOptions
+pub fn tylertoo_core::merge::MergeOptions::default() -> tylertoo_core::merge::MergeOptions
+impl core::fmt::Debug for tylertoo_core::merge::MergeOptions
+pub fn tylertoo_core::merge::MergeOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::merge::MergeOptions
+impl core::marker::Send for tylertoo_core::merge::MergeOptions
+impl core::marker::Sync for tylertoo_core::merge::MergeOptions
+impl core::marker::Unpin for tylertoo_core::merge::MergeOptions
+impl core::marker::UnsafeUnpin for tylertoo_core::merge::MergeOptions
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::merge::MergeOptions
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::merge::MergeOptions
+pub struct tylertoo_core::merge::MergeReport
+pub tylertoo_core::merge::MergeReport::bytes_written: u64
+pub tylertoo_core::merge::MergeReport::duration_secs: f64
+pub tylertoo_core::merge::MergeReport::inputs: usize
+pub tylertoo_core::merge::MergeReport::inputs_without_bounds: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_core::merge::MergeReport::max_zoom: u8
+pub tylertoo_core::merge::MergeReport::min_zoom: u8
+pub tylertoo_core::merge::MergeReport::per_zoom_tile_counts: alloc::collections::btree::map::BTreeMap<u8, u64>
+pub tylertoo_core::merge::MergeReport::tiles_total: u64
+pub tylertoo_core::merge::MergeReport::unique_tiles: u64
+impl core::clone::Clone for tylertoo_core::merge::MergeReport
+pub fn tylertoo_core::merge::MergeReport::clone(&self) -> tylertoo_core::merge::MergeReport
+impl core::fmt::Debug for tylertoo_core::merge::MergeReport
+pub fn tylertoo_core::merge::MergeReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::merge::MergeReport
+pub fn tylertoo_core::merge::MergeReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::merge::MergeReport
+impl core::marker::Send for tylertoo_core::merge::MergeReport
+impl core::marker::Sync for tylertoo_core::merge::MergeReport
+impl core::marker::Unpin for tylertoo_core::merge::MergeReport
+impl core::marker::UnsafeUnpin for tylertoo_core::merge::MergeReport
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::merge::MergeReport
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::merge::MergeReport
+pub fn tylertoo_core::merge::merge_shards(&[std::path::PathBuf], &std::path::Path, &tylertoo_core::merge::MergeOptions) -> tylertoo_core::Result<tylertoo_core::merge::MergeReport>
 pub mod tylertoo_core::mvt
 pub enum tylertoo_core::mvt::PropertyValue
 pub tylertoo_core::mvt::PropertyValue::Bool(bool)
@@ -2491,6 +2585,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut se
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_max_zoom(&mut self, u8)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
@@ -2528,6 +2623,7 @@ impl core::marker::Unpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
+pub const tylertoo_core::pmtiles_writer::HEADER_BYTES: usize
 pub const tylertoo_core::pmtiles_writer::MAX_EXPANDED_TILE_ENTRIES: u64
 pub const tylertoo_core::pmtiles_writer::MAX_LEAF_DIRECTORIES: usize
 pub const tylertoo_core::pmtiles_writer::MAX_TILE_ID_ZOOM: u8
@@ -3052,6 +3148,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut se
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::new(tylertoo_core::compression::Compression) -> core::io::error::Result<Self>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_max_zoom(&mut self, u8)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_zoom(&mut self, u8)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)

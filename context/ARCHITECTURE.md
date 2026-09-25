@@ -404,6 +404,15 @@ crates/core/src/
 ├── decode.rs           # PMTiles → GeoParquet decoding (#112)
 ├── pyramid.rs          # Multi-band pyramids: merge per-band PMTiles archives
 │                       # with disjoint zoom ranges into one archive (#345)
+├── merge.rs            # Concatenate PMTiles archives holding DISJOINT tile
+│                       # ids into one, by blob copy — the second half of a
+│                       # sharded build (#498). Disjointness is validated
+│                       # per tile id as the k-way merge runs (shard id sets
+│                       # are disjoint but NOT contiguous ranges);
+│                       # overlapping inputs are pyramid.rs's job
+├── archive_index.rs    # Read a PMTiles archive's header + directories and
+│                       # fetch tile bodies by offset; what lets pyramid.rs
+│                       # and merge.rs work on archives bigger than RAM
 ├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)
 ├── compression.rs      # gzip/brotli/zstd compression
 ├── dedup.rs            # Tile deduplication (XXH3)
@@ -411,7 +420,7 @@ crates/core/src/
 └── wkb.rs              # WKB round-trip helpers
 
 crates/cli/src/main.rs  # Subcommands: tiles (facade), overview, validate,
-                        # export-pmtiles, decode, pyramid
+                        # export-pmtiles, decode, pyramid, merge
 crates/python/src/lib.rs # pyo3 bindings: convert (facade), overview,
                         # export_pmtiles, validate
 ```
