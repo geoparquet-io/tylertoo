@@ -1863,6 +1863,12 @@ pub struct StreamingPmtilesWriter {
     /// [`Self::entries_are_clustered`], so a violation here is a perf/quality
     /// regression, not a correctness bug worth a release-mode cost).
     expect_clustered: bool,
+    /// Whether every `add_tile*` so far arrived with a strictly greater tile
+    /// id than the one before it. Tracked unconditionally (unlike
+    /// `expect_clustered`, which only *asserts* it) because it makes the
+    /// header's `clustered` byte an O(1) determination on the production
+    /// path: see [`Self::write_archive`].
+    adds_ascending: bool,
 }
 
 impl StreamingPmtilesWriter {
@@ -1909,6 +1915,7 @@ impl StreamingPmtilesWriter {
             total_features: 0,
             finalized: false,
             expect_clustered: false,
+            adds_ascending: true,
         })
     }
 
@@ -1919,22 +1926,29 @@ impl StreamingPmtilesWriter {
         self.expect_clustered = expect;
     }
 
+    /// Record that `id` is about to be added: maintain `adds_ascending`, and
     /// `debug_assert!` that `id` continues the ascending run this writer was
-    /// told to expect, given the most recently added entry (if any).
+    /// told to expect (when `expect_clustered` is set), given the most
+    /// recently added entry (if any).
+    ///
+    /// `adds_ascending` is maintained whether or not the caller opted into
+    /// the assertion, because [`Self::write_archive`] uses it to skip the
+    /// O(unique-offsets) clustered predicate entirely.
     #[inline]
-    fn check_expect_clustered(&self, id: u64) {
-        if !self.expect_clustered {
+    fn note_add(&mut self, id: u64) {
+        let Some(last_id) = self.entries.last().map(|e| e.tile_id) else {
+            return;
+        };
+        if id > last_id {
             return;
         }
-        if let Some(last) = self.entries.last() {
-            debug_assert!(
-                id > last.tile_id,
-                "expect_clustered: tile id {id} did not continue the ascending run \
-                 (last added was {}); the caller opted into tile-id-ordered adds \
-                 but did not deliver them",
-                last.tile_id
-            );
-        }
+        self.adds_ascending = false;
+        debug_assert!(
+            !self.expect_clustered,
+            "expect_clustered: tile id {id} did not continue the ascending run \
+             (last added was {last_id}); the caller opted into tile-id-ordered adds \
+             but did not deliver them"
+        );
     }
 
     /// Get the path to the temp file (for testing).
@@ -2053,7 +2067,7 @@ impl StreamingPmtilesWriter {
         feature_count: usize,
     ) -> std::io::Result<()> {
         let id = checked_tile_id(z, x, y)?;
-        self.check_expect_clustered(id);
+        self.note_add(id);
 
         let temp_file = self
             .temp_file
@@ -2129,7 +2143,7 @@ impl StreamingPmtilesWriter {
         feature_count: usize,
     ) -> std::io::Result<()> {
         let id = checked_tile_id(z, x, y)?;
-        self.check_expect_clustered(id);
+        self.note_add(id);
 
         let temp_file = self
             .temp_file
@@ -2239,9 +2253,24 @@ impl StreamingPmtilesWriter {
         // Deriving the header flag from those offsets, after the sort, means
         // the flag can never claim more than the bytes on disk actually
         // deliver.
-        let clustered = self.entries_are_clustered();
+        //
+        // Fast path: ascending adds imply clustered by construction, so the
+        // production case (#506 export, #510 merge) never pays for the
+        // predicate. Each add either appends fresh bytes at `current_offset`
+        // -- which is exactly the running end of the tile data -- or is a
+        // dedup back-reference to the *exact* offset and length some earlier
+        // add recorded in `dedup_cache`. Both are what
+        // `offsets_are_clustered` accepts, and ascending adds mean the
+        // tile_id sort above left the entries in add order, so walking the
+        // directory walks the appends in the order they happened. The
+        // predicate stays as the honest fallback for out-of-order callers
+        // (and as what `verify_clustered` re-derives from disk), but it
+        // allocates a hash map proportional to the unique-offset count --
+        // measured ~2.4 GB steady at planet scale, at peak RSS -- so it must
+        // not run when the answer is already known.
+        let clustered = self.adds_ascending || self.entries_are_clustered();
 
-        // `expect_clustered`'s `debug_assert!` (in `check_expect_clustered`)
+        // `expect_clustered`'s `debug_assert!` (in `note_add`)
         // catches an ordering regression while adding tiles, but only in a
         // debug build — a release build silently ships a `clustered: false`
         // archive with no signal at all (#506 review, F6). This is the
