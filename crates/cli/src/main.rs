@@ -4652,7 +4652,16 @@ mod tests {
         //   tile-size-limit    -> reachable on `tiles` as --max-tile-size (the
         //                         two are hidden aliases of each other), so the
         //                         cap IS present, just under the other spelling.
-        let allow: BTreeSet<&str> = ["mode", "cogp-compat", "tile-size-limit"]
+        //   zoom-ceiling       -> the coarse half of a sharded build (#498).
+        //                         `tiles` already owns --max-zoom, which means
+        //                         "build this deep", and derives the export
+        //                         ceiling from `--shard coarse` against the
+        //                         shard plan's pivot. A second flag carrying a
+        //                         zoom number with the OPPOSITE meaning is the
+        //                         exact footgun the rename off --max-zoom was
+        //                         meant to remove. The mechanism is reachable
+        //                         on `tiles`; only this spelling of it is not.
+        let allow: BTreeSet<&str> = ["mode", "cogp-compat", "tile-size-limit", "zoom-ceiling"]
             .into_iter()
             .collect();
 
