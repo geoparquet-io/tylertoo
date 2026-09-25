@@ -77,7 +77,7 @@ Generate PMTiles vector tiles (the default pipeline)
   Default value: `input`
 * `--report <PATH>` — Write a JSON report to this path: a combined object with a `convert` section (the overview build, matching `overview --report`) and an `export` section (the PMTiles export, matching `export-pmtiles --report`), so the one-step run captures both halves the two-step chain would
 * `--keep-overview <PATH>` — Write the intermediate overview GeoParquet to PATH and RETAIN it, instead of a temp file removed after the export — one run then yields both artifacts: the reusable multi-resolution overview (queryable, re-exportable, see `tylertoo overview`) and the PMTiles. The PMTiles output is identical either way. Without this flag the intermediate is written to --spill-dir if given, else $TMPDIR if set, else the output directory, and deleted once the export finishes (see the note on the materialized intermediate under --spill-dir)
-* `--shard <I/N|coarse>` — Build one job of a sharded fleet (#498): `I/N` for data shard I of N, or `coarse` for the job that owns the zooms above the pivot.
+* `--shard <I/N|coarse>` — Build one job of a sharded fleet (#498): `I/N` for data shard I of N, or `coarse` for the job that owns the zooms coarser than the pivot.
 
    Requires --shard-plan. A data shard additionally requires --plan: the level assignment is dataset-global (the density budget water-fills a super-cell over every candidate of a level, the level walk carries a running kept count, --magnitude-ladder dense-ranks the whole column), so a shard that recomputed it over its own rows would disagree with its siblings and the seams would not line up. The coarse job, which reads the whole input anyway, is the run that writes that plan with --save-plan.
 
@@ -540,9 +540,9 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
    That zoom is the pivot. The range then owns every descendant of those tiles at every deeper zoom — a subtree's ids are contiguous on the Hilbert curve, so the restriction is an exact interval test at each zoom, not a bounding approximation. Tiles COARSER than the pivot are outside the range and are not emitted.
 
    Ranges that partition the pivot zoom partition every deeper zoom, so the resulting archives are disjoint by construction and `tylertoo merge` concatenates them without re-encoding anything. `tiles --shard` derives this automatically from a shard plan; this flag is the manual form, for a cut you want to choose yourself
-* `--max-zoom <ZOOM>` — Emit only the tiles at or below this zoom (#498) — the coarse half of a sharded build, complementing --tile-range's finer half.
+* `--zoom-ceiling <ZOOM>` — Emit only the tiles at or below this zoom (#498) — the coarse half of a sharded build, complementing --tile-range's finer half.
 
-   Distinct from building a shallower pyramid: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive
+   Named a CEILING, not --max-zoom, because it is the opposite of --min-zoom here: --min-zoom only widens what the header DECLARES, while this one decides which zooms are actually emitted. Distinct from building a shallower pyramid too: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive
 
 
 
@@ -637,14 +637,15 @@ Concatenate disjoint PMTiles archives into one (issue #498)
 
 Cut a dataset's tile space into N disjoint shards (issue #498)
 
-**Usage:** `tylertoo shard-plan [OPTIONS] --output <PATH> --shards <N> <INPUT>`
+**Usage:** `tylertoo shard-plan [OPTIONS] --output <PATH> --shards <N> [INPUT]`
 
 ###### **Arguments:**
 
-* `<INPUT>` — Input GeoParquet file (the same input every job of the fleet tiles)
+* `<INPUT>` — Input GeoParquet (the same input every job of the fleet tiles): a local file, a directory or glob of partitions, or a remote URL (s3://, https://, gs://). Resolved exactly as `tiles` resolves it, so a plan can be cut for whatever a fleet will actually read. Omit when --files-from is given
 
 ###### **Options:**
 
+* `--files-from <PATH>` — Plan for the inputs listed in this manifest instead of a positional INPUT: one local path or remote URL per line, order preserved VERBATIM (it defines the dataset row order). Same manifest every job of the fleet is given — the plan binds itself to it part by part
 * `-o`, `--output <PATH>` — Where to write the shard plan
 * `--shards <N>` — How many data shards to cut. One `tiles --shard i/N` job per shard, plus one `--shard coarse` job; all N+1 archives merge in one step
 * `--pivot <ZOOM>` — Zoom to cut at. Shards own zooms [PIVOT, --max-zoom]; the coarse job owns [0, PIVOT-1].

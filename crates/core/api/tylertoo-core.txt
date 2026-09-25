@@ -461,8 +461,6 @@ pub fn tylertoo_core::input_set::ConvertSource::key_value_metadata(&self) -> cor
 pub fn tylertoo_core::input_set::ConvertSource::num_row_groups_total(&self) -> core::result::Result<usize, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::open_stream(&self, &tylertoo_core::input_set::ReadPlan<'_>) -> core::result::Result<tylertoo_core::input_set::SourceStream<'_>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::part_row_counts(&self) -> core::result::Result<alloc::vec::Vec<(i64, usize)>, tylertoo_core::input::InputError>
-pub fn tylertoo_core::input_set::ConvertSource::part_row_group_bounds(&self) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>>, tylertoo_core::input::InputError>
-pub fn tylertoo_core::input_set::ConvertSource::part_row_group_row_counts(&self) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<i64>>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::parts(&self) -> &[tylertoo_core::input::InputSource]
 pub fn tylertoo_core::input_set::ConvertSource::resolve(&str) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::resolve_path(&std::path::Path) -> core::result::Result<Self, tylertoo_core::input::InputError>
@@ -1204,6 +1202,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::representation: alloc::vec
 pub tylertoo_core::overview::convert::ConvertOptions::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
 pub tylertoo_core::overview::convert::ConvertOptions::save_plan: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::convert::ConvertOptions::shard: core::option::Option<tylertoo_core::shard::TileRange>
+pub tylertoo_core::overview::convert::ConvertOptions::shard_plan_digest: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::convert::ConvertOptions::simplify: tylertoo_core::overview::simplify::SimplifyOptions
 pub tylertoo_core::overview::convert::ConvertOptions::sort_key: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::convert::ConvertOptions::spill_dir: core::option::Option<std::path::PathBuf>
@@ -1344,9 +1343,6 @@ pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::d
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declared: u8
-pub tylertoo_core::overview::export::ExportError::EmptyTileRange
-pub tylertoo_core::overview::export::ExportError::EmptyTileRange::coarsest: u8
-pub tylertoo_core::overview::export::ExportError::EmptyTileRange::finest: u8
 pub tylertoo_core::overview::export::ExportError::Io(core::io::error::Error)
 pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive
 pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive::gsd: f64
@@ -1368,6 +1364,9 @@ pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::knob: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::name: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::Reader(tylertoo_core::overview::reader::ReaderError)
+pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom
+pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::coarsest: u8
+pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::finest: u8
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
@@ -1501,6 +1500,7 @@ pub const tylertoo_core::overview::export::PARTITION_WAVE_FALLBACK_MAX: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize
 pub fn tylertoo_core::overview::export::export_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportReport, tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::resolve_partition_wave(usize) -> usize
+pub fn tylertoo_core::overview::export::write_empty_archive(&std::path::Path, &str, u8, u8) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::zoom_for_level(&tylertoo_core::overview::level::OverviewsMeta, usize) -> core::result::Result<u8, tylertoo_core::overview::export::ExportError>
 pub mod tylertoo_core::overview::filter
 pub enum tylertoo_core::overview::filter::CmpOp
@@ -2777,6 +2777,7 @@ pub tylertoo_core::shard::ShardError::Malformed::path: alloc::string::String
 pub tylertoo_core::shard::ShardError::Malformed::what: alloc::string::String
 pub tylertoo_core::shard::ShardError::PivotNotCoarser
 pub tylertoo_core::shard::ShardError::PivotNotCoarser::max_zoom: u8
+pub tylertoo_core::shard::ShardError::PivotNotCoarser::path: alloc::string::String
 pub tylertoo_core::shard::ShardError::PivotNotCoarser::pivot: u8
 pub tylertoo_core::shard::ShardError::PivotOutOfRange
 pub tylertoo_core::shard::ShardError::PivotOutOfRange::pivot: u8
@@ -2797,6 +2798,8 @@ pub tylertoo_core::shard::ShardError::SourceMismatch::field: alloc::string::Stri
 pub tylertoo_core::shard::ShardError::SourceMismatch::now: alloc::string::String
 pub tylertoo_core::shard::ShardError::SourceMismatch::path: alloc::string::String
 pub tylertoo_core::shard::ShardError::SourceMismatch::saved: alloc::string::String
+pub tylertoo_core::shard::ShardError::TileRangePivotOutOfRange
+pub tylertoo_core::shard::ShardError::TileRangePivotOutOfRange::pivot: u8
 pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch
 pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch::hi: u64
 pub tylertoo_core::shard::ShardError::TileRangeZoomMismatch::hi_zoom: u8
@@ -2823,7 +2826,6 @@ pub tylertoo_core::shard::ShardRole::Shard
 pub tylertoo_core::shard::ShardRole::Shard::index: usize
 pub tylertoo_core::shard::ShardRole::Shard::shards: usize
 impl tylertoo_core::shard::ShardRole
-pub fn tylertoo_core::shard::ShardRole::is_coarse(self) -> bool
 pub fn tylertoo_core::shard::ShardRole::parse(&str) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
 impl core::clone::Clone for tylertoo_core::shard::ShardRole
 pub fn tylertoo_core::shard::ShardRole::clone(&self) -> tylertoo_core::shard::ShardRole
@@ -2875,7 +2877,10 @@ pub tylertoo_core::shard::ShardPlan::ranges: alloc::vec::Vec<tylertoo_core::shar
 pub tylertoo_core::shard::ShardPlan::unplaced_rows: u64
 pub tylertoo_core::shard::ShardPlan::version: u32
 impl tylertoo_core::shard::ShardPlan
+pub fn tylertoo_core::shard::ShardPlan::check_max_zoom(&self, u8, &std::path::Path) -> core::result::Result<(), tylertoo_core::shard::ShardError>
 pub fn tylertoo_core::shard::ShardPlan::compute(&tylertoo_core::input_set::ConvertSource, u8, usize) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
+pub fn tylertoo_core::shard::ShardPlan::cut_digest(&self) -> u64
+pub fn tylertoo_core::shard::ShardPlan::cut_digest_hex(&self) -> alloc::string::String
 pub fn tylertoo_core::shard::ShardPlan::load(&std::path::Path) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
 pub fn tylertoo_core::shard::ShardPlan::range(&self, usize) -> core::result::Result<tylertoo_core::shard::TileRange, tylertoo_core::shard::ShardError>
 pub fn tylertoo_core::shard::ShardPlan::range_for(&self, tylertoo_core::shard::ShardRole, &std::path::Path) -> core::result::Result<core::option::Option<tylertoo_core::shard::TileRange>, tylertoo_core::shard::ShardError>
@@ -2925,18 +2930,16 @@ impl core::marker::UnsafeUnpin for tylertoo_core::shard::ShardRange
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::ShardRange
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::ShardRange
 pub struct tylertoo_core::shard::TileRange
-pub tylertoo_core::shard::TileRange::hi: u64
-pub tylertoo_core::shard::TileRange::lo: u64
-pub tylertoo_core::shard::TileRange::pivot_zoom: u8
 impl tylertoo_core::shard::TileRange
-pub fn tylertoo_core::shard::TileRange::bounds(&self) -> tylertoo_core::tile::TileBounds
-pub fn tylertoo_core::shard::TileRange::contains(&self, u8, u64) -> bool
+pub fn tylertoo_core::shard::TileRange::hi(&self) -> u64
 pub fn tylertoo_core::shard::TileRange::ids_at(&self, u8) -> core::option::Option<core::ops::range::RangeInclusive<u64>>
+pub fn tylertoo_core::shard::TileRange::lo(&self) -> u64
 pub fn tylertoo_core::shard::TileRange::new(u8, u64, u64) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
 pub fn tylertoo_core::shard::TileRange::parse(&str) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
 pub fn tylertoo_core::shard::TileRange::pivot_tiles(&self) -> u64
+pub fn tylertoo_core::shard::TileRange::pivot_zoom(&self) -> u8
+pub fn tylertoo_core::shard::TileRange::read_bounds(&self) -> tylertoo_core::tile::TileBounds
 pub fn tylertoo_core::shard::TileRange::tile_bounds(&self) -> tylertoo_core::tile::TileBounds
-pub fn tylertoo_core::shard::TileRange::whole_zoom(u8) -> core::result::Result<Self, tylertoo_core::shard::ShardError>
 impl core::clone::Clone for tylertoo_core::shard::TileRange
 pub fn tylertoo_core::shard::TileRange::clone(&self) -> tylertoo_core::shard::TileRange
 impl core::cmp::Eq for tylertoo_core::shard::TileRange
@@ -2951,7 +2954,7 @@ impl core::marker::StructuralPartialEq for tylertoo_core::shard::TileRange
 impl serde_core::ser::Serialize for tylertoo_core::shard::TileRange
 pub fn tylertoo_core::shard::TileRange::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::shard::TileRange
-pub fn tylertoo_core::shard::TileRange::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+pub fn tylertoo_core::shard::TileRange::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 impl core::marker::Freeze for tylertoo_core::shard::TileRange
 impl core::marker::Send for tylertoo_core::shard::TileRange
 impl core::marker::Sync for tylertoo_core::shard::TileRange
@@ -2959,10 +2962,6 @@ impl core::marker::Unpin for tylertoo_core::shard::TileRange
 impl core::marker::UnsafeUnpin for tylertoo_core::shard::TileRange
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::TileRange
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::TileRange
-pub const tylertoo_core::shard::MAX_SHARD_PIVOT_ZOOM: u8
-pub const tylertoo_core::shard::MAX_SHARD_TILE_BUFFER_PX: u32
-pub const tylertoo_core::shard::SHARD_PLAN_VERSION: u32
-pub const tylertoo_core::shard::SHARD_READ_MARGIN_TILES: f64
 pub fn tylertoo_core::shard::resolve_range(&std::path::Path, tylertoo_core::shard::ShardRole, core::option::Option<&tylertoo_core::input_set::ConvertSource>) -> core::result::Result<(tylertoo_core::shard::ShardPlan, core::option::Option<tylertoo_core::shard::TileRange>), tylertoo_core::shard::ShardError>
 pub mod tylertoo_core::sutherland_hodgman
 pub struct tylertoo_core::sutherland_hodgman::ClipCoord
@@ -3001,6 +3000,7 @@ impl tylertoo_core::tile::TileBounds
 pub fn tylertoo_core::tile::TileBounds::empty() -> Self
 pub fn tylertoo_core::tile::TileBounds::expand(&mut self, &Self)
 pub fn tylertoo_core::tile::TileBounds::height(&self) -> f64
+pub fn tylertoo_core::tile::TileBounds::intersect(&self, &Self) -> Self
 pub fn tylertoo_core::tile::TileBounds::is_valid(&self) -> bool
 pub fn tylertoo_core::tile::TileBounds::new(f64, f64, f64, f64) -> Self
 pub fn tylertoo_core::tile::TileBounds::width(&self) -> f64
