@@ -53,11 +53,19 @@ has a 16 KiB floor (invisible at any real size — it is the same 16 KiB every
 PMTiles client fetches on its first request).
 
 **An interrupted export salvages from `<output>.partial`.** After each finished
-zoom (throttled to once a minute) export logs a line naming that file, which is
-a complete, readable PMTiles archive capped at the zooms finished so far — open
-it, serve it, or rename it. It is current as of the **last checkpoint**, not the
-last tile: tiles written since are on disk but not yet indexed. A run that
-finishes normally renames the file over `<output>`, so it is gone.
+zoom (throttled to once a minute) export logs a line naming that file. If the
+run was interrupted with no tile written since that checkpoint, it is a
+complete, readable PMTiles archive capped at the zooms finished so far — open
+it, serve it, or rename it. If tiles *were* written since, those tiles have
+overwritten the index sections at the file's tail, and the file is deliberately
+made **invalid**: every PMTiles reader will reject it. That is the guarantee
+worth knowing — the file is never quietly wrong, so if it opens, trust it. A
+run that finishes normally renames the file over `<output>`, so it is gone.
+
+If an earlier crashed run already left a `<output>.partial` behind, starting a
+new export to the same output moves it to `<output>.partial.prev` instead of
+overwriting it, so a rerun cannot destroy what you were about to salvage. A
+successful run deletes that copy once the real output is in place.
 
 **Remote input stages to a local spill file.** A remote convert fetches each
 column chunk it touches into a temporary file, growing to roughly one times the

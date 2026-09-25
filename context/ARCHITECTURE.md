@@ -233,11 +233,24 @@ final archive is **byte-identical** whether or not any checkpoints were taken
 
 The snapshot is **`<output>.partial`**, not `<output>`: since #459 export uses
 the tail-directory layout (below), where that file is the live archive rather
-than a scratch copy. It is complete and readable as of the last checkpoint.
-Between checkpoints its prefix is stale — the tiles added since are on disk but
-unreferenced, and the metadata/leaf sections the header points at have been
-overwritten by those tiles — so an interrupted run salvages back to the last
-checkpoint, not to the last tile. Each checkpoint logs the path.
+than a scratch copy. The guarantee is stated precisely, because the middle case
+is the dangerous one:
+
+* **No tile added since the last checkpoint** — the file is a complete,
+  readable archive capped at the zooms finished so far.
+* **Tiles added since** — the file is **detectably invalid**. The first append
+  after a checkpoint overwrites the metadata and leaf sections the header
+  points at, so it first zeroes the prefix's magic; every reader then rejects
+  the file instead of following stale leaf pointers into tile bytes and
+  returning plausible garbage. The next checkpoint rebuilds prefix and tail
+  from the (untouched) tile data and the file is an archive again.
+
+So an interrupted run salvages back to the last checkpoint or to nothing —
+never to something that reads but lies. Each checkpoint logs the path. A
+`<output>.partial` left by an earlier run is moved to `<output>.partial.prev`
+when the next run opens the same output rather than being truncated, so a
+scripted rerun does not destroy the crashed run's only recoverable output; a
+successful finalize removes it.
 
 ### Validate (`overview/check.rs`)
 
@@ -410,6 +423,10 @@ and a spool that lives beside the output rather than in `TMPDIR`. Ordering
 gives crash-consistency for free: the tail is flushed before the prefix that
 points at it, and the prefix lives entirely below offset 16384, so a torn
 prefix write cannot touch a tile byte — the next checkpoint rebuilds both.
+Symmetrically, the first tile appended after a checkpoint zeroes the prefix's
+magic before writing a byte, which is what keeps the salvage file either valid
+or *detectably* invalid rather than valid-looking and wrong (see the checkpoint
+section above). One `open`+`write` per checkpoint interval, not per tile.
 
 Export's PMTiles v3 writer streams tile data to a temp file, builds the
 directory incrementally, and deduplicates tiles by XXH3 hash → file offset,

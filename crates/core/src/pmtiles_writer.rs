@@ -1911,6 +1911,21 @@ pub struct StreamingPmtilesWriter {
     /// fallback publishes to the output path and there is no salvage artifact
     /// beside it any more.
     tail_fell_back: bool,
+    /// Whether `<output>.partial`'s on-disk prefix currently describes
+    /// something that is *not* a valid archive (#528 review, F1).
+    ///
+    /// The tail layout's whole point is that the next tile bytes land on top
+    /// of the last checkpoint's metadata and leaf directories. The moment
+    /// that happens the header still sitting in the prefix points at sections
+    /// that no longer exist, so a reader following it resolves into tile
+    /// bytes and hands back garbage *without noticing*. Rather than let the
+    /// salvage artifact degrade from "valid" to "silently wrong", the first
+    /// append after a checkpoint zeroes the prefix's magic first
+    /// ([`Self::invalidate_tail_prefix_before_append`]); this flag is what
+    /// keeps that to one syscall per checkpoint interval instead of one per
+    /// tile. Starts `true` because a freshly reserved prefix is all zeros,
+    /// which is already no archive at all.
+    tail_dirty: bool,
     /// Test hook: pretend the root directory overran the 16 KiB prefix, to
     /// exercise the packed-layout fallback. `make_root_leaves` will not
     /// produce such a root in practice, and the fallback must still be
@@ -1979,6 +1994,16 @@ fn partial_path_for(output_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// `<output>.partial.prev` — where a *previous* run's salvage archive is
+/// stepped aside to when a new tail-layout writer opens the same output
+/// (#528 review, F2). At most one generation is kept, and a successful
+/// `finalize` removes it.
+fn prev_partial_path_for(output_path: &Path) -> PathBuf {
+    let mut os = output_path.as_os_str().to_owned();
+    os.push(".partial.prev");
+    PathBuf::from(os)
+}
+
 impl StreamingPmtilesWriter {
     /// Create a new streaming writer with the specified compression.
     ///
@@ -2027,13 +2052,21 @@ impl StreamingPmtilesWriter {
     /// * **The spool lives next to the output, not in `TMPDIR`.** The target
     ///   filesystem needs room for the archive; a small `/tmp` no longer
     ///   matters.
-    /// * **`<output>.partial` is the salvage artifact** ([`Self::salvage_path`]):
-    ///   a complete, readable archive as of the last checkpoint. Between
-    ///   checkpoints its prefix is stale — the tiles added since are on disk
-    ///   but unreferenced, and the metadata/leaf sections it points at have
-    ///   been overwritten by those tiles — so a crash mid-level salvages back
-    ///   to the last checkpoint, not to the last tile. The next checkpoint
-    ///   rebuilds both from the (untouched) tile data.
+    /// * **`<output>.partial` is the salvage artifact** ([`Self::salvage_path`]),
+    ///   with exactly this guarantee: it is a complete, readable archive as
+    ///   of the last checkpoint *if no tile has been appended since*, and
+    ///   otherwise it is **detectably invalid** — never valid-looking and
+    ///   wrong. The first append after a checkpoint overwrites the
+    ///   metadata/leaf sections the prefix points at, so that append first
+    ///   zeroes the prefix's magic
+    ///   ([`Self::invalidate_tail_prefix_before_append`]) and every reader
+    ///   rejects the file until the next checkpoint rebuilds the prefix and
+    ///   tail from the (untouched) tile data. A crash mid-level therefore
+    ///   salvages back to the last checkpoint, or to nothing — not to
+    ///   plausible garbage.
+    /// * **A previous run's `<output>.partial` is not destroyed.** If one is
+    ///   found here it is moved to `<output>.partial.prev` before this run
+    ///   reserves its prefix; a successful [`Self::finalize`] removes it.
     ///
     /// [`Self::checkpoint`] and [`Self::finalize`] must be called with the
     /// same `output_path`; a different one is an error, since the reservation
@@ -2045,6 +2078,30 @@ impl StreamingPmtilesWriter {
     /// the run, not invent a folder.
     pub fn with_tail_layout(output_path: &Path, compression: Compression) -> std::io::Result<Self> {
         let partial_path = partial_path_for(output_path);
+
+        // A `<output>.partial` already sitting here is a previous run's
+        // salvage archive — the thing #459 exists to leave behind. Creating
+        // this writer truncates that file, so a scripted rerun would destroy
+        // the crashed run's only recoverable output *before* producing
+        // anything of its own (#528 review, F2). Step it aside instead. One
+        // generation is kept; a successful `finalize` removes it. (The
+        // alternative, opening the spool lazily, would mean `temp_file: None`
+        // no longer meant "finalized" throughout the writer.)
+        if std::fs::metadata(&partial_path).is_ok_and(|m| m.len() > 0) {
+            let prev = prev_partial_path_for(output_path);
+            match std::fs::rename(&partial_path, &prev) {
+                Ok(()) => log::info!(
+                    "[pmtiles] an earlier run left {}; moved to {} before starting",
+                    partial_path.display(),
+                    prev.display()
+                ),
+                Err(e) => log::warn!(
+                    "[pmtiles] could not move the earlier {} aside ({e}); it will be overwritten",
+                    partial_path.display()
+                ),
+            }
+        }
+
         let mut file = File::create(&partial_path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -2098,13 +2155,17 @@ impl StreamingPmtilesWriter {
             layout,
             tail_checkpoints: 0,
             tail_fell_back: false,
+            tail_dirty: true,
             force_tail_root_overflow: false,
         }
     }
 
     /// Where a mid-run salvage archive can be found, for a writer created with
     /// [`Self::with_tail_layout`]: `<output>.partial`, valid as of the last
-    /// [`Self::checkpoint`].
+    /// [`Self::checkpoint`] — provided no tile has been added since that
+    /// checkpoint, in which case the file is instead *detectably* invalid.
+    /// See [`Self::with_tail_layout`] for why the guarantee is stated that
+    /// way.
     ///
     /// `None` for the spooled layout — and for a tail-layout writer that has
     /// fallen back to it — because those checkpoints publish to the output
@@ -2255,6 +2316,48 @@ impl StreamingPmtilesWriter {
         &self.stats
     }
 
+    /// Make `<output>.partial` **detectably** invalid before the first tile
+    /// byte that will overwrite a checkpoint's tail (#528 review, F1).
+    ///
+    /// Under the tail layout, metadata and leaf directories live immediately
+    /// after the tile data, and the next append lands on top of them. Until
+    /// that append the file is a valid archive as of the last checkpoint —
+    /// the property #459 sells. The instant it happens, the header still in
+    /// the prefix describes sections that are now tile bytes, and a reader
+    /// walking its leaf pointers resolves into that garbage and returns wrong
+    /// tiles rather than an error. "Valid, one level stale" silently becoming
+    /// "readable and wrong" is the worst of the three outcomes, so we trade
+    /// it for the third: zero the prefix's magic (and version) so every
+    /// reader — ours, go-pmtiles, any salvage tool — rejects the file cleanly
+    /// until the next checkpoint rewrites the whole prefix anyway.
+    ///
+    /// Ordering is the point: this write must land *before* the tile bytes,
+    /// never after, or a crash in between is exactly the case it exists to
+    /// prevent. It goes through its own handle, so it reaches the file while
+    /// the tile bytes are still in the spool's `BufWriter`. It is not
+    /// `fsync`ed: this guards process death (OOM kill, SIGINT, panic), where
+    /// the page cache survives and write order is all that matters, and
+    /// syncing would flush every dirty tile page in a multi-gigabyte file on
+    /// what is meant to be a cheap path.
+    ///
+    /// `tail_dirty` keeps this to one `open`+`write` per checkpoint interval
+    /// — once per zoom level in practice — rather than one per tile.
+    fn invalidate_tail_prefix_before_append(&mut self) -> std::io::Result<()> {
+        if self.tail_dirty {
+            return Ok(());
+        }
+        if let SpoolLayout::Tail { .. } = self.layout {
+            // Opening for write starts at offset 0; magic is bytes 0..7 and
+            // the version byte is 7.
+            File::options()
+                .write(true)
+                .open(&self.temp_path)?
+                .write_all(&[0u8; 8])?;
+        }
+        self.tail_dirty = true;
+        Ok(())
+    }
+
     /// Add a tile (writes immediately to temp file if unique).
     ///
     /// Tiles are compressed and written immediately. Duplicate tiles
@@ -2275,10 +2378,9 @@ impl StreamingPmtilesWriter {
         let id = checked_tile_id(z, x, y)?;
         self.note_add(id);
 
-        let temp_file = self
-            .temp_file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
+        if self.temp_file.is_none() {
+            return Err(std::io::Error::other("Writer already finalized"));
+        }
 
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
@@ -2302,11 +2404,17 @@ impl StreamingPmtilesWriter {
             return Ok(());
         }
 
-        // New unique tile - compress and write to temp file
+        // New unique tile - compress and write to temp file. A dedup hit
+        // above writes nothing, so it leaves any checkpointed archive intact;
+        // only an append can clobber the tail, and only that path invalidates.
         let compressed = compression::compress(data, self.tile_compression)?;
         let compressed_len = compressed.len() as u32;
 
-        temp_file.write_all(&compressed)?;
+        self.invalidate_tail_prefix_before_append()?;
+        self.temp_file
+            .as_mut()
+            .expect("checked above")
+            .write_all(&compressed)?;
 
         // Record in dedup cache and directory
         let offset = self.current_offset;
@@ -2351,10 +2459,9 @@ impl StreamingPmtilesWriter {
         let id = checked_tile_id(z, x, y)?;
         self.note_add(id);
 
-        let temp_file = self
-            .temp_file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
+        if self.temp_file.is_none() {
+            return Err(std::io::Error::other("Writer already finalized"));
+        }
 
         self.stats.total_tiles += 1;
         self.total_features += feature_count as u64;
@@ -2376,7 +2483,11 @@ impl StreamingPmtilesWriter {
 
         // New unique tile - write the pre-compressed bytes verbatim.
         let compressed_len = compressed.len() as u32;
-        temp_file.write_all(compressed)?;
+        self.invalidate_tail_prefix_before_append()?;
+        self.temp_file
+            .as_mut()
+            .expect("checked above")
+            .write_all(compressed)?;
 
         let offset = self.current_offset;
         self.dedup_cache.insert(hash, (offset, compressed_len));
@@ -2413,9 +2524,22 @@ impl StreamingPmtilesWriter {
             // at `<output>.partial`. Publishing is one rename — no copy, and no
             // window in which the output exists but is incomplete.
             ArchiveWriteMode::Tail => {
+                // A failed rename leaves a *complete, correct* archive at
+                // `self.temp_path`. Say so in the error: the only other
+                // mention of the path is a `log::info!` in `Drop`, which is a
+                // no-op for Python callers and embedders with no log backend
+                // installed (#528 review, F3).
                 std::fs::rename(&self.temp_path, output_path).map_err(|e| {
-                    Error::PMTilesWrite(format!("Failed to publish archive: {}", e))
+                    Error::PMTilesWrite(format!(
+                        "Failed to publish archive: {}; the complete archive was written to {} \
+                         -- rename it manually",
+                        e,
+                        self.temp_path.display()
+                    ))
                 })?;
+                // The output is now complete, so a previous run's salvage
+                // copy of the same output is dead weight (#528 review, F2).
+                let _ = std::fs::remove_file(prev_partial_path_for(output_path));
             }
             // Packed layout: the archive was assembled elsewhere and already
             // renamed over the output; the spool is now dead weight.
@@ -2703,6 +2827,10 @@ impl StreamingPmtilesWriter {
         file.sync_all()
             .map_err(|e| Error::PMTilesWrite(format!("Failed to sync archive: {}", e)))?;
 
+        // The prefix on disk now describes this file exactly, so the file is
+        // a valid archive again until the next append lands on the tail.
+        self.tail_dirty = false;
+
         self.stats.checkpoint_bytes_written += prefix.len() as u64
             + sections.metadata.len() as u64
             + sections.leaves_bytes.len() as u64;
@@ -2886,6 +3014,13 @@ impl Drop for StreamingPmtilesWriter {
             SpoolLayout::Tail { .. } => {
                 if self.tail_checkpoints == 0 {
                     let _ = std::fs::remove_file(&self.temp_path);
+                } else if self.tail_dirty {
+                    log::info!(
+                        "[pmtiles] run ended without finalize, mid-level; {} holds the tile \
+                         data but its header was invalidated by the tiles added after the \
+                         last checkpoint, so it is not a readable archive",
+                        self.temp_path.display()
+                    );
                 } else {
                     log::info!(
                         "[pmtiles] run ended without finalize; salvageable archive left at {}",
@@ -3090,6 +3225,190 @@ mod tests {
 
     /// The mid-run salvage artifact is `<output>.partial`, and it must be a
     /// *complete, readable* archive as of every checkpoint — not merely a file
+    /// The salvage artifact must never degrade from "valid" to
+    /// "valid-looking and wrong" (#528 review, F1).
+    ///
+    /// The first tile appended after a checkpoint lands on top of that
+    /// checkpoint's metadata and leaf directories, while the header in the
+    /// prefix still points at them. Without the invalidating write, a crash
+    /// in that window leaves a file whose magic, header and root directory
+    /// all parse, whose leaf pointers resolve into tile bytes, and which
+    /// therefore hands back garbage tiles with no error anywhere. Two things
+    /// are pinned here: the file is *rejected* in that window, and it is a
+    /// real archive again once the next checkpoint lands.
+    #[test]
+    fn tail_partial_is_detectably_invalid_between_checkpoint_and_next_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("salvage.pmtiles");
+        let partial = dir.path().join("salvage.pmtiles.partial");
+
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.set_layer_name("tail");
+
+        for i in 0..6u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+        }
+        w.checkpoint(&out).unwrap();
+
+        // Baseline: a checkpoint with nothing added after it IS a valid
+        // archive -- the existing property, kept pinned right here so the
+        // two halves of the guarantee cannot drift apart.
+        let bytes = fs::read(&partial).unwrap();
+        Header::from_bytes(&bytes).expect("checkpoint alone leaves a valid archive");
+        assert_eq!(read_archive_tiles(&bytes).len(), 6);
+
+        // One more add, no checkpoint: the tail is now being overwritten, so
+        // the file must be rejected rather than read.
+        let (z, x, y) = tail_coord(6);
+        w.add_tile(z, x, y, &tail_payload(6)).unwrap();
+
+        let bytes = fs::read(&partial).unwrap();
+        assert_ne!(
+            &bytes[0..7],
+            b"PMTiles",
+            "the first post-checkpoint add must invalidate the on-disk prefix"
+        );
+        assert!(
+            Header::from_bytes(&bytes).is_err(),
+            "a partial written past its last checkpoint must be detectably invalid, \
+             not silently readable"
+        );
+
+        // Simulate the crash: drop without finalizing. The file stays (a
+        // checkpoint landed, so there are tiles worth keeping) and stays
+        // invalid -- nothing repairs it behind our back.
+        drop(w);
+        assert!(partial.exists(), "a checkpointed partial survives the drop");
+        assert!(
+            Header::from_bytes(&fs::read(&partial).unwrap()).is_err(),
+            "dropping the writer must not resurrect a half-overwritten archive"
+        );
+    }
+
+    /// The invalidation is one write on a cold path, and the next checkpoint
+    /// undoes it: after checkpoint -> add -> checkpoint the partial is a
+    /// valid archive holding *both* generations of tiles.
+    #[test]
+    fn tail_partial_becomes_valid_again_at_the_next_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("again.pmtiles");
+        let partial = dir.path().join("again.pmtiles.partial");
+
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.set_layer_name("tail");
+
+        for i in 0..4u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+        }
+        w.checkpoint(&out).unwrap();
+
+        for i in 4..9u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+        }
+        assert!(
+            Header::from_bytes(&fs::read(&partial).unwrap()).is_err(),
+            "invalid while the tail is being overwritten"
+        );
+
+        w.checkpoint(&out).unwrap();
+        let bytes = fs::read(&partial).unwrap();
+        let tiles = read_archive_tiles(&bytes);
+        assert_eq!(tiles.len(), 9, "both generations are addressable again");
+        for j in 0..9u32 {
+            let (z, x, y) = tail_coord(j);
+            let raw = tiles.get(&tile_id(z, x, y)).expect("tile present");
+            let plain =
+                compression::decompress_capped(raw, Compression::Gzip, compression::MAX_TILE_BYTES)
+                    .unwrap();
+            assert_eq!(plain, tail_payload(j), "tile {j} bytes after re-checkpoint");
+        }
+
+        w.finalize(&out).unwrap();
+        Header::from_bytes(&fs::read(&out).unwrap()).unwrap();
+    }
+
+    /// A duplicate tile writes no bytes, so it cannot clobber the tail and
+    /// must leave the checkpointed archive readable. The invalidation belongs
+    /// to the append path only.
+    #[test]
+    fn tail_partial_survives_a_dedup_only_add_after_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dedup.pmtiles");
+        let partial = dir.path().join("dedup.pmtiles.partial");
+
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        w.set_layer_name("tail");
+        for i in 0..4u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+        }
+        w.checkpoint(&out).unwrap();
+
+        // Same bytes as tile 0 -- a dedup hit: a directory entry, no append.
+        let (z, x, y) = tail_coord(9);
+        w.add_tile(z, x, y, &tail_payload(0)).unwrap();
+
+        let bytes = fs::read(&partial).unwrap();
+        Header::from_bytes(&bytes).expect("a dedup-only add writes nothing, so nothing is stale");
+        assert_eq!(
+            read_archive_tiles(&bytes).len(),
+            4,
+            "still the last checkpoint's archive, unharmed"
+        );
+    }
+
+    /// Constructing a writer must not destroy the previous run's salvage
+    /// archive (#528 review, F2). `<output>.partial` is stepped aside to
+    /// `<output>.partial.prev` before the new run reserves its prefix.
+    #[test]
+    fn constructing_a_tail_writer_preserves_an_earlier_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rerun.pmtiles");
+        let partial = dir.path().join("rerun.pmtiles.partial");
+        let prev = dir.path().join("rerun.pmtiles.partial.prev");
+
+        // A crashed run's salvage archive, left behind.
+        {
+            let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+            w.set_layer_name("first");
+            for i in 0..5u32 {
+                let (z, x, y) = tail_coord(i);
+                w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+            }
+            w.checkpoint(&out).unwrap();
+        }
+        let salvaged = fs::read(&partial).unwrap();
+        assert_eq!(read_archive_tiles(&salvaged).len(), 5);
+
+        // The rerun.
+        let mut w = StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap();
+        assert!(
+            prev.exists(),
+            "the earlier salvage archive must be moved aside, not truncated"
+        );
+        assert_eq!(
+            fs::read(&prev).unwrap(),
+            salvaged,
+            "moved aside byte-for-byte"
+        );
+
+        w.set_layer_name("second");
+        for i in 0..3u32 {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+        }
+        w.finalize(&out).unwrap();
+
+        assert_eq!(read_archive_tiles(&fs::read(&out).unwrap()).len(), 3);
+        assert!(
+            !prev.exists(),
+            "a successful finalize clears the superseded salvage copy"
+        );
+    }
+
     /// whose header parses.
     #[test]
     fn tail_checkpoint_partial_is_a_valid_archive_at_every_step() {
