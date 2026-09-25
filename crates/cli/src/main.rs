@@ -1775,6 +1775,29 @@ struct TilesArgs {
     #[arg(long, value_name = "PATH", help_heading = "Sharded builds")]
     shard_plan: Option<PathBuf>,
 
+    /// Emit only the tiles in this PMTiles tile-id range: `LO..HI`, two tile
+    /// ids AT THE SAME ZOOM (#498). The manual form of a shard's restriction,
+    /// for a cut you want to choose yourself.
+    ///
+    /// That zoom is the pivot, and the range owns every descendant of those
+    /// tiles at every deeper zoom; tiles coarser than the pivot are outside it
+    /// and are not emitted. Ranges that partition the pivot zoom partition
+    /// every deeper zoom, so the archives are disjoint by construction and
+    /// `tylertoo merge` concatenates them without re-encoding.
+    ///
+    /// This restricts the EXPORT only. `--shard` is the form that also prunes
+    /// the convert's input to the row groups the range can reach, which is
+    /// what makes a shard cheaper than the whole build rather than merely
+    /// narrower — prefer it unless you are cutting by hand. The two are
+    /// mutually exclusive: `--shard` derives its range from the shard plan
+    #[arg(
+        long,
+        value_name = "LO..HI",
+        conflicts_with = "shard",
+        help_heading = "Sharded builds"
+    )]
+    tile_range: Option<String>,
+
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
     verbose: bool,
@@ -2215,6 +2238,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         args.shard_plan.as_deref(),
         args.max_zoom,
     )?;
+    // A data shard's range prunes the convert's reads as well as the export;
+    // a hand-written `--tile-range` restricts the export only (the two flags
+    // conflict, so at most one is set).
+    let tile_range = match (&shard, &args.tile_range) {
+        (Some(job), _) => job.range,
+        (None, Some(text)) => Some(tylertoo_core::shard::TileRange::parse(text)?),
+        (None, None) => None,
+    };
     if let Some(job) = &shard {
         options.shard = job.range;
         log::info!(
@@ -2337,9 +2368,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // #498: a data shard owns no zoom coarser than the pivot, so that is
         // what it declares — claiming the coarse job's half would misdescribe
         // an archive that holds none of it.
-        min_zoom: args.gsd.is_none().then(|| match &shard {
-            Some(job) if job.range.is_some() => job.pivot,
-            _ => args.min_zoom,
+        min_zoom: args.gsd.is_none().then(|| match tile_range {
+            Some(r) => r.pivot_zoom,
+            None => args.min_zoom,
         }),
 
         // The property selection was applied on convert (#386): the
@@ -2347,8 +2378,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         properties: Default::default(),
 
         // #498: the two complementary halves of a sharded build. A data shard
-        // takes its range; the coarse job takes everything below the pivot.
-        tile_range: shard.and_then(|job| job.range),
+        // (or a hand-written --tile-range) takes its range; the coarse job
+        // takes everything below the pivot.
+        tile_range,
         zoom_ceiling: shard
             .and_then(|job| job.range.is_none().then(|| job.pivot.saturating_sub(1))),
     };

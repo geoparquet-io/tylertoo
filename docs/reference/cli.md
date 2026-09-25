@@ -85,6 +85,11 @@ Generate PMTiles vector tiles (the default pipeline)
 
    The three build steps, after `tylertoo shard-plan` has cut the plan: (1) `--shard coarse --shard-plan shards.json --save-plan convert.plan`; (2) one job per shard, `--shard $i/16 --shard-plan shards.json --plan convert.plan`; (3) `tylertoo merge out.pmtiles coarse.pmtiles shard-*.pmtiles`. See the Sharded builds guide for the full recipe
 * `--shard-plan <PATH>` — The shard plan every job of the fleet shares, from `tylertoo shard-plan`. It fixes the pivot zoom and the N tile-id ranges, so the jobs agree on the cut by construction
+* `--tile-range <LO..HI>` — Emit only the tiles in this PMTiles tile-id range: `LO..HI`, two tile ids AT THE SAME ZOOM (#498). The manual form of a shard's restriction, for a cut you want to choose yourself.
+
+   That zoom is the pivot, and the range owns every descendant of those tiles at every deeper zoom; tiles coarser than the pivot are outside it and are not emitted. Ranges that partition the pivot zoom partition every deeper zoom, so the archives are disjoint by construction and `tylertoo merge` concatenates them without re-encoding.
+
+   This restricts the EXPORT only. `--shard` is the form that also prunes the convert's input to the row groups the range can reach, which is what makes a shard cheaper than the whole build rather than merely narrower — prefer it unless you are cutting by hand. The two are mutually exclusive: `--shard` derives its range from the shard plan
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
 
