@@ -1,0 +1,1574 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-26T20:41:10Z",
+  "machine": {
+    "platform": "macOS-15.6-arm64-arm-64bit",
+    "python": "3.11.11",
+    "cpu_count": 12,
+    "cpu": "Apple M3 Pro",
+    "ram_gb": 18
+  },
+  "tylertoo": {
+    "binary": "<repo>/target/release/tylertoo",
+    "version": "tylertoo 0.11.0",
+    "git_sha": "044360d"
+  },
+  "tippecanoe": {
+    "binary": "<repo>/benchmarks/e2e/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+    "version": "tippecanoe v2.79.0",
+    "tag": "2.79.0",
+    "sha": "68ab8dcc229f95b8b25877697d5e8d66783af503"
+  },
+  "settings": {
+    "min_zoom": 0,
+    "max_zoom": 14,
+    "tile_buffer": 8,
+    "max_tile_bytes": 500000,
+    "repeat": 3,
+    "warm_cache": true,
+    "tippecanoe_extra": []
+  },
+  "datasets": {
+    "madagascar-adm4": {
+      "input": "<repo>/tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet",
+      "input_bytes": 28373319,
+      "note": "17,465 MultiPolygon admin-4 boundaries, 28 MB (FieldMaps)",
+      "layer": "adm4",
+      "tylertoo": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet",
+          "<work>/madagascar-adm4.tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "adm4",
+          "--tile-buffer",
+          "8",
+          "--max-tile-size",
+          "500000",
+          "--report",
+          "<work>/madagascar-adm4.tylertoo.report.json",
+          "--force"
+        ],
+        "runs": 3,
+        "wall_median_s": 1.6142651250120252,
+        "wall_min_s": 1.595708291977644,
+        "wall_max_s": 1.7984789579641074,
+        "peak_rss_bytes": 796737536,
+        "wall_all_s": [
+          1.7984789579641074,
+          1.595708291977644,
+          1.6142651250120252
+        ],
+        "output_bytes": 104408664,
+        "per_zoom": {
+          "by_zoom": {
+            "1": {
+              "tiles": 1,
+              "total_bytes": 4357,
+              "max_bytes": 4357
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 16477,
+              "max_bytes": 16477
+            },
+            "3": {
+              "tiles": 2,
+              "total_bytes": 30390,
+              "max_bytes": 18049
+            },
+            "4": {
+              "tiles": 4,
+              "total_bytes": 34723,
+              "max_bytes": 15611
+            },
+            "5": {
+              "tiles": 4,
+              "total_bytes": 33390,
+              "max_bytes": 17009
+            },
+            "6": {
+              "tiles": 6,
+              "total_bytes": 46752,
+              "max_bytes": 18099
+            },
+            "7": {
+              "tiles": 15,
+              "total_bytes": 92361,
+              "max_bytes": 14399
+            },
+            "8": {
+              "tiles": 42,
+              "total_bytes": 182691,
+              "max_bytes": 10352
+            },
+            "9": {
+              "tiles": 138,
+              "total_bytes": 381538,
+              "max_bytes": 10726
+            },
+            "10": {
+              "tiles": 487,
+              "total_bytes": 860561,
+              "max_bytes": 9833
+            },
+            "11": {
+              "tiles": 1705,
+              "total_bytes": 2190260,
+              "max_bytes": 11154
+            },
+            "12": {
+              "tiles": 6037,
+              "total_bytes": 6576878,
+              "max_bytes": 9431
+            },
+            "13": {
+              "tiles": 24489,
+              "total_bytes": 23176559,
+              "max_bytes": 6887
+            },
+            "14": {
+              "tiles": 113993,
+              "total_bytes": 97717362,
+              "max_bytes": 9505
+            }
+          },
+          "tiles_total": 146924
+        },
+        "phases": {
+          "convert_wall_s": 0.36610375,
+          "export_wall_s": 1.226423083,
+          "input_features": 17465,
+          "row_groups_read": 1,
+          "row_groups_total": 1,
+          "total_tiles": 146924,
+          "total_tile_features": 353062,
+          "oversized_tiles": 0
+        }
+      },
+      "tylertoo_quality_matched": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet",
+          "<work>/madagascar-adm4.tylertoo-qm.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "adm4",
+          "--tile-buffer",
+          "8",
+          "--max-tile-size",
+          "500000",
+          "--report",
+          "<work>/madagascar-adm4.tylertoo-qm.report.json",
+          "--force",
+          "--verbatim",
+          "--simplify-factor",
+          "1.0"
+        ],
+        "runs": 3,
+        "wall_median_s": 2.6724256249144673,
+        "wall_min_s": 2.559825791977346,
+        "wall_max_s": 3.4046515830559656,
+        "peak_rss_bytes": 875118592,
+        "wall_all_s": [
+          2.559825791977346,
+          3.4046515830559656,
+          2.6724256249144673
+        ],
+        "output_bytes": 123734794,
+        "per_zoom": {
+          "by_zoom": {
+            "1": {
+              "tiles": 1,
+              "total_bytes": 4357,
+              "max_bytes": 4357
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 41698,
+              "max_bytes": 41698
+            },
+            "3": {
+              "tiles": 2,
+              "total_bytes": 203097,
+              "max_bytes": 127184
+            },
+            "4": {
+              "tiles": 4,
+              "total_bytes": 377881,
+              "max_bytes": 135949
+            },
+            "5": {
+              "tiles": 4,
+              "total_bytes": 404266,
+              "max_bytes": 154454
+            },
+            "6": {
+              "tiles": 7,
+              "total_bytes": 574069,
+              "max_bytes": 165810
+            },
+            "7": {
+              "tiles": 16,
+              "total_bytes": 1064715,
+              "max_bytes": 157391
+            },
+            "8": {
+              "tiles": 44,
+              "total_bytes": 1362630,
+              "max_bytes": 127312
+            },
+            "9": {
+              "tiles": 149,
+              "total_bytes": 1849164,
+              "max_bytes": 92226
+            },
+            "10": {
+              "tiles": 524,
+              "total_bytes": 2730396,
+              "max_bytes": 52760
+            },
+            "11": {
+              "tiles": 1944,
+              "total_bytes": 4775098,
+              "max_bytes": 35060
+            },
+            "12": {
+              "tiles": 7441,
+              "total_bytes": 10541697,
+              "max_bytes": 21384
+            },
+            "13": {
+              "tiles": 28922,
+              "total_bytes": 29245398,
+              "max_bytes": 14217
+            },
+            "14": {
+              "tiles": 113993,
+              "total_bytes": 97717362,
+              "max_bytes": 9505
+            }
+          },
+          "tiles_total": 153052
+        },
+        "phases": {
+          "convert_wall_s": 0.550640542,
+          "export_wall_s": 2.1020875,
+          "input_features": 17465,
+          "row_groups_read": 1,
+          "row_groups_total": 1,
+          "total_tiles": 153052,
+          "total_tile_features": 554772,
+          "oversized_tiles": 10
+        }
+      },
+      "convert_fgb_candidates": {
+        "ogr2ogr": {
+          "argv": [
+            "ogr2ogr",
+            "-f",
+            "FlatGeobuf",
+            "<work>/madagascar-adm4.ogr.fgb",
+            "<repo>/tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet"
+          ],
+          "runs": 3,
+          "wall_median_s": 0.18624154198914766,
+          "wall_min_s": 0.17273049999494106,
+          "wall_max_s": 0.18655462504830211,
+          "peak_rss_bytes": 208289792,
+          "wall_all_s": [
+            0.18655462504830211,
+            0.18624154198914766,
+            0.17273049999494106
+          ],
+          "output_bytes": 45246920,
+          "tool": "ogr2ogr",
+          "path": "<work>/madagascar-adm4.ogr.fgb"
+        },
+        "gpio": {
+          "tool": "gpio",
+          "failed": true,
+          "argv": [
+            "gpio",
+            "convert",
+            "flatgeobuf",
+            "<repo>/tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet",
+            "<work>/madagascar-adm4.gpio.fgb",
+            "--overwrite"
+          ],
+          "stderr_tail": "ge unshared data size\n                   0  average unshared stack size\n               12164  page reclaims\n                3245  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                4824  voluntary context switches\n                6899  involuntary context switches\n          8806457910  instructions retired\n          2988002751  cycles elapsed\n           132532480  peak memory footprint\n"
+        }
+      },
+      "convert_fgb": {
+        "argv": [
+          "ogr2ogr",
+          "-f",
+          "FlatGeobuf",
+          "<work>/madagascar-adm4.ogr.fgb",
+          "<repo>/tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.18624154198914766,
+        "wall_min_s": 0.17273049999494106,
+        "wall_max_s": 0.18655462504830211,
+        "peak_rss_bytes": 208289792,
+        "wall_all_s": [
+          0.18655462504830211,
+          0.18624154198914766,
+          0.17273049999494106
+        ],
+        "output_bytes": 45246920,
+        "tool": "ogr2ogr",
+        "path": "<work>/madagascar-adm4.ogr.fgb"
+      },
+      "tippecanoe_fgb": {
+        "argv": [
+          "<repo>/benchmarks/e2e/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+          "-o",
+          "<work>/madagascar-adm4.tippecanoe-fgb.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "adm4",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "<work>/madagascar-adm4.ogr.fgb"
+        ],
+        "runs": 3,
+        "wall_median_s": 20.04921733296942,
+        "wall_min_s": 19.704326666076668,
+        "wall_max_s": 22.805854541948065,
+        "peak_rss_bytes": 432979968,
+        "wall_all_s": [
+          22.805854541948065,
+          20.04921733296942,
+          19.704326666076668
+        ],
+        "output_bytes": 158355648,
+        "per_zoom": {
+          "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 141584,
+              "max_bytes": 141584
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 379579,
+              "max_bytes": 379579
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 403467,
+              "max_bytes": 403467
+            },
+            "3": {
+              "tiles": 2,
+              "total_bytes": 540249,
+              "max_bytes": 417252
+            },
+            "4": {
+              "tiles": 4,
+              "total_bytes": 688974,
+              "max_bytes": 408102
+            },
+            "5": {
+              "tiles": 4,
+              "total_bytes": 637288,
+              "max_bytes": 407265
+            },
+            "6": {
+              "tiles": 7,
+              "total_bytes": 855544,
+              "max_bytes": 398954
+            },
+            "7": {
+              "tiles": 16,
+              "total_bytes": 2177251,
+              "max_bytes": 376659
+            },
+            "8": {
+              "tiles": 44,
+              "total_bytes": 2562225,
+              "max_bytes": 245212
+            },
+            "9": {
+              "tiles": 149,
+              "total_bytes": 3346172,
+              "max_bytes": 173011
+            },
+            "10": {
+              "tiles": 524,
+              "total_bytes": 4619948,
+              "max_bytes": 96238
+            },
+            "11": {
+              "tiles": 1943,
+              "total_bytes": 7242408,
+              "max_bytes": 63472
+            },
+            "12": {
+              "tiles": 7440,
+              "total_bytes": 14342850,
+              "max_bytes": 39029
+            },
+            "13": {
+              "tiles": 28920,
+              "total_bytes": 36817523,
+              "max_bytes": 24370
+            },
+            "14": {
+              "tiles": 113991,
+              "total_bytes": 115557676,
+              "max_bytes": 12660
+            }
+          },
+          "tiles_total": 153047
+        }
+      },
+      "tippecanoe_e2e": {
+        "wall_median_s": 20.235458874958567,
+        "peak_rss_bytes": 432979968,
+        "converter": "ogr2ogr",
+        "note": "parquet->fgb (fastest available converter) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
+      },
+      "convert_geojsonseq": {
+        "argv": [
+          "ogr2ogr",
+          "-f",
+          "GeoJSONSeq",
+          "<work>/madagascar-adm4.geojsonseq",
+          "<repo>/tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet"
+        ],
+        "runs": 3,
+        "wall_median_s": 2.0725063749123365,
+        "wall_min_s": 2.062834332929924,
+        "wall_max_s": 2.1460401670774445,
+        "peak_rss_bytes": 178208768,
+        "wall_all_s": [
+          2.1460401670774445,
+          2.0725063749123365,
+          2.062834332929924
+        ],
+        "output_bytes": 78691284
+      },
+      "tippecanoe_geojsonseq": {
+        "argv": [
+          "<repo>/benchmarks/e2e/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+          "-o",
+          "<work>/madagascar-adm4.tippecanoe-geojson.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "adm4",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "-P",
+          "<work>/madagascar-adm4.geojsonseq"
+        ],
+        "runs": 3,
+        "wall_median_s": 23.58501629100647,
+        "wall_min_s": 22.41288162500132,
+        "wall_max_s": 31.72651616705116,
+        "peak_rss_bytes": 927154176,
+        "wall_all_s": [
+          23.58501629100647,
+          31.72651616705116,
+          22.41288162500132
+        ],
+        "output_bytes": 150736908,
+        "per_zoom": {
+          "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 130775,
+              "max_bytes": 130775
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 340458,
+              "max_bytes": 340458
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 410082,
+              "max_bytes": 410082
+            },
+            "3": {
+              "tiles": 2,
+              "total_bytes": 553396,
+              "max_bytes": 425375
+            },
+            "4": {
+              "tiles": 4,
+              "total_bytes": 712614,
+              "max_bytes": 418432
+            },
+            "5": {
+              "tiles": 4,
+              "total_bytes": 659674,
+              "max_bytes": 418367
+            },
+            "6": {
+              "tiles": 7,
+              "total_bytes": 880243,
+              "max_bytes": 404833
+            },
+            "7": {
+              "tiles": 16,
+              "total_bytes": 2027453,
+              "max_bytes": 345653
+            },
+            "8": {
+              "tiles": 44,
+              "total_bytes": 2417918,
+              "max_bytes": 226555
+            },
+            "9": {
+              "tiles": 149,
+              "total_bytes": 3137796,
+              "max_bytes": 162796
+            },
+            "10": {
+              "tiles": 524,
+              "total_bytes": 4292774,
+              "max_bytes": 91915
+            },
+            "11": {
+              "tiles": 1943,
+              "total_bytes": 6722621,
+              "max_bytes": 60544
+            },
+            "12": {
+              "tiles": 7440,
+              "total_bytes": 13426329,
+              "max_bytes": 37079
+            },
+            "13": {
+              "tiles": 28920,
+              "total_bytes": 34976065,
+              "max_bytes": 22982
+            },
+            "14": {
+              "tiles": 113991,
+              "total_bytes": 111370185,
+              "max_bytes": 11610
+            }
+          },
+          "tiles_total": 153047
+        }
+      },
+      "ratios": {
+        "e2e_speedup": 12.535399892757905,
+        "tiles_only_speedup": 12.420027554532014,
+        "input_conversion_share_of_tippecanoe_e2e": 0.009203722195774965,
+        "archive_size_ratio_tylertoo_over_tippecanoe": 0.6593302185217922,
+        "e2e_speedup_quality_matched": 7.571944635730027,
+        "tiles_only_speedup_quality_matched": 7.50225456082098,
+        "archive_size_ratio_quality_matched": 0.7813727869055861
+      }
+    },
+    "open-buildings": {
+      "input": "<repo>/tests/fixtures/realdata/open-buildings.parquet",
+      "input_bytes": 145816,
+      "note": "1,000 Polygon building footprints, 143 KB (Google Open Buildings)",
+      "layer": "buildings",
+      "tylertoo": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/tests/fixtures/realdata/open-buildings.parquet",
+          "<work>/open-buildings.tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "buildings",
+          "--tile-buffer",
+          "8",
+          "--max-tile-size",
+          "500000",
+          "--report",
+          "<work>/open-buildings.tylertoo.report.json",
+          "--force"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.03041004203259945,
+        "wall_min_s": 0.029285458964295685,
+        "wall_max_s": 0.030523792025633156,
+        "peak_rss_bytes": 29818880,
+        "wall_all_s": [
+          0.03041004203259945,
+          0.030523792025633156,
+          0.029285458964295685
+        ],
+        "output_bytes": 111145,
+        "per_zoom": {
+          "by_zoom": {
+            "9": {
+              "tiles": 2,
+              "total_bytes": 384,
+              "max_bytes": 192
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 1362,
+              "max_bytes": 728
+            },
+            "11": {
+              "tiles": 2,
+              "total_bytes": 5654,
+              "max_bytes": 3533
+            },
+            "12": {
+              "tiles": 4,
+              "total_bytes": 12524,
+              "max_bytes": 6831
+            },
+            "13": {
+              "tiles": 20,
+              "total_bytes": 25004,
+              "max_bytes": 9138
+            },
+            "14": {
+              "tiles": 52,
+              "total_bytes": 49606,
+              "max_bytes": 9994
+            }
+          },
+          "tiles_total": 82
+        },
+        "phases": {
+          "convert_wall_s": 0.006389666,
+          "export_wall_s": 0.015435542,
+          "input_features": 1000,
+          "row_groups_read": 1,
+          "row_groups_total": 1,
+          "total_tiles": 82,
+          "total_tile_features": 2339,
+          "oversized_tiles": 0
+        }
+      },
+      "tylertoo_quality_matched": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/tests/fixtures/realdata/open-buildings.parquet",
+          "<work>/open-buildings.tylertoo-qm.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "buildings",
+          "--tile-buffer",
+          "8",
+          "--max-tile-size",
+          "500000",
+          "--report",
+          "<work>/open-buildings.tylertoo-qm.report.json",
+          "--force",
+          "--verbatim",
+          "--simplify-factor",
+          "1.0"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.031258624978363514,
+        "wall_min_s": 0.030519708059728146,
+        "wall_max_s": 0.0317254998954013,
+        "peak_rss_bytes": 31473664,
+        "wall_all_s": [
+          0.0317254998954013,
+          0.031258624978363514,
+          0.030519708059728146
+        ],
+        "output_bytes": 127387,
+        "per_zoom": {
+          "by_zoom": {
+            "9": {
+              "tiles": 2,
+              "total_bytes": 384,
+              "max_bytes": 192
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 1362,
+              "max_bytes": 728
+            },
+            "11": {
+              "tiles": 2,
+              "total_bytes": 5743,
+              "max_bytes": 3622
+            },
+            "12": {
+              "tiles": 4,
+              "total_bytes": 19676,
+              "max_bytes": 11731
+            },
+            "13": {
+              "tiles": 20,
+              "total_bytes": 34005,
+              "max_bytes": 13828
+            },
+            "14": {
+              "tiles": 52,
+              "total_bytes": 49606,
+              "max_bytes": 9994
+            }
+          },
+          "tiles_total": 82
+        },
+        "phases": {
+          "convert_wall_s": 0.00648925,
+          "export_wall_s": 0.016749417,
+          "input_features": 1000,
+          "row_groups_read": 1,
+          "row_groups_total": 1,
+          "total_tiles": 82,
+          "total_tile_features": 2898,
+          "oversized_tiles": 0
+        }
+      },
+      "convert_fgb_candidates": {
+        "ogr2ogr": {
+          "argv": [
+            "ogr2ogr",
+            "-f",
+            "FlatGeobuf",
+            "<work>/open-buildings.ogr.fgb",
+            "<repo>/tests/fixtures/realdata/open-buildings.parquet"
+          ],
+          "runs": 3,
+          "wall_median_s": 0.06204604194499552,
+          "wall_min_s": 0.0616170420544222,
+          "wall_max_s": 0.06345549994148314,
+          "peak_rss_bytes": 56262656,
+          "wall_all_s": [
+            0.06204604194499552,
+            0.0616170420544222,
+            0.06345549994148314
+          ],
+          "output_bytes": 275192,
+          "tool": "ogr2ogr",
+          "path": "<work>/open-buildings.ogr.fgb"
+        },
+        "gpio": {
+          "argv": [
+            "gpio",
+            "convert",
+            "flatgeobuf",
+            "<repo>/tests/fixtures/realdata/open-buildings.parquet",
+            "<work>/open-buildings.gpio.fgb",
+            "--overwrite"
+          ],
+          "runs": 3,
+          "wall_median_s": 0.27407141600269824,
+          "wall_min_s": 0.2693644589744508,
+          "wall_max_s": 0.2780710409861058,
+          "peak_rss_bytes": 127860736,
+          "wall_all_s": [
+            0.2780710409861058,
+            0.2693644589744508,
+            0.27407141600269824
+          ],
+          "output_bytes": 290832,
+          "tool": "gpio",
+          "path": "<work>/open-buildings.gpio.fgb"
+        }
+      },
+      "convert_fgb": {
+        "argv": [
+          "ogr2ogr",
+          "-f",
+          "FlatGeobuf",
+          "<work>/open-buildings.ogr.fgb",
+          "<repo>/tests/fixtures/realdata/open-buildings.parquet"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.06204604194499552,
+        "wall_min_s": 0.0616170420544222,
+        "wall_max_s": 0.06345549994148314,
+        "peak_rss_bytes": 56262656,
+        "wall_all_s": [
+          0.06204604194499552,
+          0.0616170420544222,
+          0.06345549994148314
+        ],
+        "output_bytes": 275192,
+        "tool": "ogr2ogr",
+        "path": "<work>/open-buildings.ogr.fgb"
+      },
+      "tippecanoe_fgb": {
+        "argv": [
+          "<repo>/benchmarks/e2e/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+          "-o",
+          "<work>/open-buildings.tippecanoe-fgb.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "buildings",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "<work>/open-buildings.ogr.fgb"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.22038783296011388,
+        "wall_min_s": 0.2126180420164019,
+        "wall_max_s": 0.224298374960199,
+        "peak_rss_bytes": 145932288,
+        "wall_all_s": [
+          0.2126180420164019,
+          0.224298374960199,
+          0.22038783296011388
+        ],
+        "output_bytes": 182502,
+        "per_zoom": {
+          "by_zoom": {
+            "5": {
+              "tiles": 1,
+              "total_bytes": 210,
+              "max_bytes": 210
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 358,
+              "max_bytes": 358
+            },
+            "7": {
+              "tiles": 1,
+              "total_bytes": 798,
+              "max_bytes": 798
+            },
+            "8": {
+              "tiles": 1,
+              "total_bytes": 2523,
+              "max_bytes": 2523
+            },
+            "9": {
+              "tiles": 2,
+              "total_bytes": 10762,
+              "max_bytes": 7484
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 18750,
+              "max_bytes": 12890
+            },
+            "11": {
+              "tiles": 3,
+              "total_bytes": 26140,
+              "max_bytes": 17616
+            },
+            "12": {
+              "tiles": 7,
+              "total_bytes": 34071,
+              "max_bytes": 17982
+            },
+            "13": {
+              "tiles": 20,
+              "total_bytes": 38756,
+              "max_bytes": 15519
+            },
+            "14": {
+              "tiles": 52,
+              "total_bytes": 48197,
+              "max_bytes": 9698
+            }
+          },
+          "tiles_total": 90
+        }
+      },
+      "tippecanoe_e2e": {
+        "wall_median_s": 0.2824338749051094,
+        "peak_rss_bytes": 145932288,
+        "converter": "ogr2ogr",
+        "note": "parquet->fgb (fastest available converter) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
+      },
+      "convert_geojsonseq": {
+        "argv": [
+          "ogr2ogr",
+          "-f",
+          "GeoJSONSeq",
+          "<work>/open-buildings.geojsonseq",
+          "<repo>/tests/fixtures/realdata/open-buildings.parquet"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.0726018330315128,
+        "wall_min_s": 0.07062650006264448,
+        "wall_max_s": 0.07262662495486438,
+        "peak_rss_bytes": 56180736,
+        "wall_all_s": [
+          0.07262662495486438,
+          0.07062650006264448,
+          0.0726018330315128
+        ],
+        "output_bytes": 452324
+      },
+      "tippecanoe_geojsonseq": {
+        "argv": [
+          "<repo>/benchmarks/e2e/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+          "-o",
+          "<work>/open-buildings.tippecanoe-geojson.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "buildings",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "-P",
+          "<work>/open-buildings.geojsonseq"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.20687779097352177,
+        "wall_min_s": 0.20643370901234448,
+        "wall_max_s": 0.21782500005792826,
+        "peak_rss_bytes": 146309120,
+        "wall_all_s": [
+          0.21782500005792826,
+          0.20643370901234448,
+          0.20687779097352177
+        ],
+        "output_bytes": 168923,
+        "per_zoom": {
+          "by_zoom": {
+            "5": {
+              "tiles": 1,
+              "total_bytes": 190,
+              "max_bytes": 190
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 320,
+              "max_bytes": 320
+            },
+            "7": {
+              "tiles": 1,
+              "total_bytes": 724,
+              "max_bytes": 724
+            },
+            "8": {
+              "tiles": 1,
+              "total_bytes": 2314,
+              "max_bytes": 2314
+            },
+            "9": {
+              "tiles": 2,
+              "total_bytes": 9804,
+              "max_bytes": 6761
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 16973,
+              "max_bytes": 11615
+            },
+            "11": {
+              "tiles": 3,
+              "total_bytes": 23911,
+              "max_bytes": 16071
+            },
+            "12": {
+              "tiles": 7,
+              "total_bytes": 31591,
+              "max_bytes": 16561
+            },
+            "13": {
+              "tiles": 20,
+              "total_bytes": 36130,
+              "max_bytes": 14403
+            },
+            "14": {
+              "tiles": 52,
+              "total_bytes": 45020,
+              "max_bytes": 9070
+            }
+          },
+          "tiles_total": 90
+        }
+      },
+      "ratios": {
+        "e2e_speedup": 9.287520043620503,
+        "tiles_only_speedup": 7.247205798790379,
+        "input_conversion_share_of_tippecanoe_e2e": 0.21968342843379327,
+        "archive_size_ratio_tylertoo_over_tippecanoe": 0.6090070245805526,
+        "e2e_speedup_quality_matched": 9.03539023551431,
+        "tiles_only_speedup_quality_matched": 7.050464731339308,
+        "archive_size_ratio_quality_matched": 0.698003309552772
+      }
+    },
+    "road-detections": {
+      "input": "<repo>/tests/fixtures/realdata/road-detections.parquet",
+      "input_bytes": 91694,
+      "note": "1,000 LineString road detections, 90 KB",
+      "layer": "roads",
+      "tylertoo": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/tests/fixtures/realdata/road-detections.parquet",
+          "<work>/road-detections.tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "roads",
+          "--tile-buffer",
+          "8",
+          "--max-tile-size",
+          "500000",
+          "--report",
+          "<work>/road-detections.tylertoo.report.json",
+          "--force"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.04057399998418987,
+        "wall_min_s": 0.04053791693877429,
+        "wall_max_s": 0.04270450002513826,
+        "peak_rss_bytes": 33488896,
+        "wall_all_s": [
+          0.04270450002513826,
+          0.04057399998418987,
+          0.04053791693877429
+        ],
+        "output_bytes": 123227,
+        "per_zoom": {
+          "by_zoom": {
+            "5": {
+              "tiles": 1,
+              "total_bytes": 177,
+              "max_bytes": 177
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 581,
+              "max_bytes": 581
+            },
+            "7": {
+              "tiles": 2,
+              "total_bytes": 2553,
+              "max_bytes": 1767
+            },
+            "8": {
+              "tiles": 2,
+              "total_bytes": 4500,
+              "max_bytes": 3875
+            },
+            "9": {
+              "tiles": 2,
+              "total_bytes": 5822,
+              "max_bytes": 5078
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 6214,
+              "max_bytes": 5596
+            },
+            "11": {
+              "tiles": 5,
+              "total_bytes": 9233,
+              "max_bytes": 5883
+            },
+            "12": {
+              "tiles": 7,
+              "total_bytes": 13563,
+              "max_bytes": 5907
+            },
+            "13": {
+              "tiles": 15,
+              "total_bytes": 23507,
+              "max_bytes": 4326
+            },
+            "14": {
+              "tiles": 41,
+              "total_bytes": 40488,
+              "max_bytes": 3956
+            }
+          },
+          "tiles_total": 78
+        },
+        "phases": {
+          "convert_wall_s": 0.014040666,
+          "export_wall_s": 0.018617292,
+          "input_features": 1000,
+          "row_groups_read": 1,
+          "row_groups_total": 1,
+          "total_tiles": 78,
+          "total_tile_features": 3787,
+          "oversized_tiles": 0
+        }
+      },
+      "tylertoo_quality_matched": {
+        "argv": [
+          "<repo>/target/release/tylertoo",
+          "tiles",
+          "<repo>/tests/fixtures/realdata/road-detections.parquet",
+          "<work>/road-detections.tylertoo-qm.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "roads",
+          "--tile-buffer",
+          "8",
+          "--max-tile-size",
+          "500000",
+          "--report",
+          "<work>/road-detections.tylertoo-qm.report.json",
+          "--force",
+          "--verbatim",
+          "--simplify-factor",
+          "1.0"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.03805716603528708,
+        "wall_min_s": 0.03752133308444172,
+        "wall_max_s": 0.038498915964737535,
+        "peak_rss_bytes": 30638080,
+        "wall_all_s": [
+          0.03805716603528708,
+          0.038498915964737535,
+          0.03752133308444172
+        ],
+        "output_bytes": 172371,
+        "per_zoom": {
+          "by_zoom": {
+            "4": {
+              "tiles": 1,
+              "total_bytes": 157,
+              "max_bytes": 157
+            },
+            "5": {
+              "tiles": 1,
+              "total_bytes": 451,
+              "max_bytes": 451
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 1446,
+              "max_bytes": 1446
+            },
+            "7": {
+              "tiles": 2,
+              "total_bytes": 4781,
+              "max_bytes": 3445
+            },
+            "8": {
+              "tiles": 2,
+              "total_bytes": 7235,
+              "max_bytes": 6360
+            },
+            "9": {
+              "tiles": 2,
+              "total_bytes": 11302,
+              "max_bytes": 10248
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 14613,
+              "max_bytes": 13727
+            },
+            "11": {
+              "tiles": 5,
+              "total_bytes": 22839,
+              "max_bytes": 14621
+            },
+            "12": {
+              "tiles": 7,
+              "total_bytes": 24095,
+              "max_bytes": 10715
+            },
+            "13": {
+              "tiles": 15,
+              "total_bytes": 29288,
+              "max_bytes": 5347
+            },
+            "14": {
+              "tiles": 41,
+              "total_bytes": 39586,
+              "max_bytes": 3933
+            }
+          },
+          "tiles_total": 79
+        },
+        "phases": {
+          "convert_wall_s": 0.008827875,
+          "export_wall_s": 0.021096542,
+          "input_features": 1000,
+          "row_groups_read": 1,
+          "row_groups_total": 1,
+          "total_tiles": 79,
+          "total_tile_features": 7570,
+          "oversized_tiles": 0
+        }
+      },
+      "convert_fgb_candidates": {
+        "ogr2ogr": {
+          "argv": [
+            "ogr2ogr",
+            "-f",
+            "FlatGeobuf",
+            "<work>/road-detections.ogr.fgb",
+            "<repo>/tests/fixtures/realdata/road-detections.parquet"
+          ],
+          "runs": 3,
+          "wall_median_s": 0.06223641708493233,
+          "wall_min_s": 0.06198908307123929,
+          "wall_max_s": 0.06485924997832626,
+          "peak_rss_bytes": 55869440,
+          "wall_all_s": [
+            0.06485924997832626,
+            0.06198908307123929,
+            0.06223641708493233
+          ],
+          "output_bytes": 218864,
+          "tool": "ogr2ogr",
+          "path": "<work>/road-detections.ogr.fgb"
+        },
+        "gpio": {
+          "argv": [
+            "gpio",
+            "convert",
+            "flatgeobuf",
+            "<repo>/tests/fixtures/realdata/road-detections.parquet",
+            "<work>/road-detections.gpio.fgb",
+            "--overwrite"
+          ],
+          "runs": 3,
+          "wall_median_s": 0.2917232500622049,
+          "wall_min_s": 0.2844322499586269,
+          "wall_max_s": 0.30357016692869365,
+          "peak_rss_bytes": 128811008,
+          "wall_all_s": [
+            0.30357016692869365,
+            0.2844322499586269,
+            0.2917232500622049
+          ],
+          "output_bytes": 234816,
+          "tool": "gpio",
+          "path": "<work>/road-detections.gpio.fgb"
+        }
+      },
+      "convert_fgb": {
+        "argv": [
+          "ogr2ogr",
+          "-f",
+          "FlatGeobuf",
+          "<work>/road-detections.ogr.fgb",
+          "<repo>/tests/fixtures/realdata/road-detections.parquet"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.06223641708493233,
+        "wall_min_s": 0.06198908307123929,
+        "wall_max_s": 0.06485924997832626,
+        "peak_rss_bytes": 55869440,
+        "wall_all_s": [
+          0.06485924997832626,
+          0.06198908307123929,
+          0.06223641708493233
+        ],
+        "output_bytes": 218864,
+        "tool": "ogr2ogr",
+        "path": "<work>/road-detections.ogr.fgb"
+      },
+      "tippecanoe_fgb": {
+        "argv": [
+          "<repo>/benchmarks/e2e/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+          "-o",
+          "<work>/road-detections.tippecanoe-fgb.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "roads",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "<work>/road-detections.ogr.fgb"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.2139162920648232,
+        "wall_min_s": 0.20297529106028378,
+        "wall_max_s": 0.22539350006263703,
+        "peak_rss_bytes": 147816448,
+        "wall_all_s": [
+          0.2139162920648232,
+          0.20297529106028378,
+          0.22539350006263703
+        ],
+        "output_bytes": 214387,
+        "per_zoom": {
+          "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 603,
+              "max_bytes": 603
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 815,
+              "max_bytes": 815
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 1395,
+              "max_bytes": 1395
+            },
+            "3": {
+              "tiles": 1,
+              "total_bytes": 2663,
+              "max_bytes": 2663
+            },
+            "4": {
+              "tiles": 1,
+              "total_bytes": 4254,
+              "max_bytes": 4254
+            },
+            "5": {
+              "tiles": 1,
+              "total_bytes": 6098,
+              "max_bytes": 6098
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 8580,
+              "max_bytes": 8580
+            },
+            "7": {
+              "tiles": 2,
+              "total_bytes": 14599,
+              "max_bytes": 11004
+            },
+            "8": {
+              "tiles": 2,
+              "total_bytes": 14950,
+              "max_bytes": 13336
+            },
+            "9": {
+              "tiles": 2,
+              "total_bytes": 16477,
+              "max_bytes": 15079
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 17744,
+              "max_bytes": 16773
+            },
+            "11": {
+              "tiles": 5,
+              "total_bytes": 26319,
+              "max_bytes": 17204
+            },
+            "12": {
+              "tiles": 7,
+              "total_bytes": 27157,
+              "max_bytes": 12363
+            },
+            "13": {
+              "tiles": 15,
+              "total_bytes": 31320,
+              "max_bytes": 5746
+            },
+            "14": {
+              "tiles": 40,
+              "total_bytes": 39596,
+              "max_bytes": 3953
+            }
+          },
+          "tiles_total": 82
+        }
+      },
+      "tippecanoe_e2e": {
+        "wall_median_s": 0.27615270914975554,
+        "peak_rss_bytes": 147816448,
+        "converter": "ogr2ogr",
+        "note": "parquet->fgb (fastest available converter) then fgb->pmtiles, run as two processes; peak RSS is the larger of the two stages, not their sum"
+      },
+      "convert_geojsonseq": {
+        "argv": [
+          "ogr2ogr",
+          "-f",
+          "GeoJSONSeq",
+          "<work>/road-detections.geojsonseq",
+          "<repo>/tests/fixtures/realdata/road-detections.parquet"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.06973912508692592,
+        "wall_min_s": 0.06967291689943522,
+        "wall_max_s": 0.06981358304619789,
+        "peak_rss_bytes": 55263232,
+        "wall_all_s": [
+          0.06967291689943522,
+          0.06981358304619789,
+          0.06973912508692592
+        ],
+        "output_bytes": 337620
+      },
+      "tippecanoe_geojsonseq": {
+        "argv": [
+          "<repo>/benchmarks/e2e/.tools/tippecanoe-2.79.0/bin/tippecanoe",
+          "-o",
+          "<work>/road-detections.tippecanoe-geojson.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "roads",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "-P",
+          "<work>/road-detections.geojsonseq"
+        ],
+        "runs": 3,
+        "wall_median_s": 0.20926987507846206,
+        "wall_min_s": 0.20102808403316885,
+        "wall_max_s": 0.2154505419312045,
+        "peak_rss_bytes": 141361152,
+        "wall_all_s": [
+          0.20102808403316885,
+          0.2154505419312045,
+          0.20926987507846206
+        ],
+        "output_bytes": 187108,
+        "per_zoom": {
+          "by_zoom": {
+            "0": {
+              "tiles": 1,
+              "total_bytes": 496,
+              "max_bytes": 496
+            },
+            "1": {
+              "tiles": 1,
+              "total_bytes": 678,
+              "max_bytes": 678
+            },
+            "2": {
+              "tiles": 1,
+              "total_bytes": 1142,
+              "max_bytes": 1142
+            },
+            "3": {
+              "tiles": 1,
+              "total_bytes": 2133,
+              "max_bytes": 2133
+            },
+            "4": {
+              "tiles": 1,
+              "total_bytes": 3435,
+              "max_bytes": 3435
+            },
+            "5": {
+              "tiles": 1,
+              "total_bytes": 4975,
+              "max_bytes": 4975
+            },
+            "6": {
+              "tiles": 1,
+              "total_bytes": 7036,
+              "max_bytes": 7036
+            },
+            "7": {
+              "tiles": 2,
+              "total_bytes": 12066,
+              "max_bytes": 9103
+            },
+            "8": {
+              "tiles": 2,
+              "total_bytes": 12587,
+              "max_bytes": 11169
+            },
+            "9": {
+              "tiles": 2,
+              "total_bytes": 14066,
+              "max_bytes": 12822
+            },
+            "10": {
+              "tiles": 2,
+              "total_bytes": 15348,
+              "max_bytes": 14459
+            },
+            "11": {
+              "tiles": 5,
+              "total_bytes": 23040,
+              "max_bytes": 15074
+            },
+            "12": {
+              "tiles": 7,
+              "total_bytes": 24002,
+              "max_bytes": 10949
+            },
+            "13": {
+              "tiles": 15,
+              "total_bytes": 28121,
+              "max_bytes": 5129
+            },
+            "14": {
+              "tiles": 40,
+              "total_bytes": 36161,
+              "max_bytes": 3338
+            }
+          },
+          "tiles_total": 82
+        }
+      },
+      "ratios": {
+        "e2e_speedup": 6.806149486305557,
+        "tiles_only_speedup": 5.272250508901715,
+        "input_conversion_share_of_tippecanoe_e2e": 0.22536956916537793,
+        "archive_size_ratio_tylertoo_over_tippecanoe": 0.5747876503705915,
+        "e2e_speedup_quality_matched": 7.256260460742223,
+        "tiles_only_speedup_quality_matched": 5.620920166952982,
+        "archive_size_ratio_quality_matched": 0.8040179675073582
+      }
+    }
+  }
+}

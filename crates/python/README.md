@@ -50,6 +50,13 @@ covers preparing your own input and the two-step overview workflow.
 **tylertoo** takes its name from ["Tippecanoe and Tyler Too"](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too),
 the 1840 U.S. campaign slogan. It's a nod to [tippecanoe](https://github.com/felt/tippecanoe),
 the vector-tile tool this project measures itself against — tylertoo runs alongside it.
+The head-to-head is measured, not asserted: `benchmarks/e2e/` pins tippecanoe
+2.79.0 by commit and reports wall time, peak RSS, archive size and per-zoom
+tile parity, with the asymmetries that cannot be closed listed rather than
+buried
+([results](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md),
+[method](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/README.md),
+[how the two tools line up](https://geoparquet-io.github.io/tylertoo/diving-deeper/tippecanoe/)).
 
 **Features:**
 - COG-style multi-resolution **overviews embedded in GeoParquet** (`tylertoo overview`) — the file stays valid, exact, SQL-queryable GeoParquet
