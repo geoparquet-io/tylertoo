@@ -61,10 +61,33 @@ cargo build --release          # Release build
 cargo fmt --all                # Format (required before commit)
 ```
 
-### Tests: targeted only
+### Tests: quick and full tiers
 
-The full suite is slow (real parquet I/O, full pipeline runs, nested
-parallelism). Run targeted tests:
+The suite is split into two [cargo-nextest](https://nexte.st) profiles
+defined in `.config/nextest.toml` (#457):
+
+- **`quick`** — unit tests plus every integration-test binary that's fast
+  (seconds, not minutes). This is what `cargo nextest run` (no `--profile`)
+  runs too, and what you should run constantly during development:
+
+  ```bash
+  cargo nextest run --profile quick
+  # or, equivalently, just:
+  cargo nextest run
+  ```
+
+- **`full`** — `quick` plus the slow end-to-end set: tests that drive the
+  CLI or the full pipeline over real-data fixtures with real parquet I/O
+  and nested parallelism (20s–7min each). Run it before landing a change to
+  pipeline internals, sharding, or anything platform-sensitive
+  (determinism, shard-merge parity), or let CI's Slow Tests job prove it:
+
+  ```bash
+  cargo nextest run --profile full
+  ```
+
+Targeted runs are still the fastest inner loop — a specific test or module,
+via either `cargo test` or nextest's own filter syntax:
 
 ```bash
 # A specific test
@@ -78,19 +101,21 @@ cargo test --package tylertoo-core overview::cluster:: -- --nocapture
 cargo test --package tylertoo --test tiles_facade
 ```
 
-CI runs the tests with [cargo-nextest](https://nexte.st), split in two.
-The Test matrix (ubuntu/macos × stable/beta) runs everything except
-`large_polygon_regression` and the slow end-to-end set listed in
-`.config/nextest.toml`. The Slow Tests job runs that set on ubuntu and
-macOS, stable only. Let CI run both. To run the slow set locally:
+Plain `cargo test`/`cargo test --lib` ignores `nextest.toml` and always
+runs everything in whatever target it's pointed at — but `--lib` itself
+stays fast, because the slow, real-I/O pipeline suites live in
+`crates/*/tests/*.rs` (separate binaries, e.g. `overview_hostile.rs`)
+rather than `#[cfg(test)]` modules inside `src/`.
 
-```bash
-cargo nextest run --all-features \
-  --ignore-default-filter -E 'not default()'
-```
+CI mirrors the tiers: the Test matrix (ubuntu/macos × stable/beta) runs
+`quick`; the Slow Tests job runs exactly the set `quick` excludes, on
+ubuntu and macOS stable. Together they cover `full`. Let CI run both rather
+than running `full` locally on every change.
 
-When a new test takes more than ~20s in CI, add it to the default filter
-in `.config/nextest.toml`.
+When a new test takes more than ~20s, add it to the slow set in
+`.config/nextest.toml` (both the `quick`-exclusion in `[profile.default]`
+and, if it's a new binary/test name, nowhere else needed — `full`'s
+`default-filter = "all()"` picks it up automatically).
 
 ### Benchmarks
 

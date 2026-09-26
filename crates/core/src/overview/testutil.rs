@@ -1,9 +1,14 @@
-//! Shared test fixtures for the crate's tests.
+//! Shared test fixtures for the crate's in-tree (`#[cfg(test)]`) unit tests.
 //!
 //! Compiled under `cfg(test)` only. Lives here rather than being re-created
-//! per test module: several suites (`overview::hostile`, `pyramid`) need the
-//! same "write a small GeoParquet" primitive, and three copies of a fixture
-//! writer drift.
+//! per test module: several suites (`overview::convert`, `overview::plan_state`,
+//! `pyramid`) need the same "write a small GeoParquet" primitive, and
+//! several copies of a fixture writer drift.
+//!
+//! This module is `pub(crate)`, so it is invisible to the integration-test
+//! binaries under `crates/core/tests/` (they link only against the crate's
+//! public API). `crates/core/tests/overview_hostile.rs` keeps its own copy
+//! of `write_input`/`write_input_with_f64` for exactly that reason (#457).
 
 use std::path::Path;
 use std::sync::Arc;

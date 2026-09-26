@@ -68,11 +68,35 @@ let geom: geo::Geometry = geozero::wkb::Wkb(wkb.to_vec()).to_geo();
 
 Document all divergences in `context/ARCHITECTURE.md`.
 
-### 4. Test Execution: Targeted Tests Only
+### 4. Test Execution: Quick Tier by Default, Full Tier When It Matters
 
-**Tests are SLOW.** The full suite runs integration tests with real parquet I/O, full pipeline execution, and nested parallelism (cargo test threads × Rayon threads × I/O threads).
+Tests are split into two [cargo-nextest](https://nexte.st) tiers, defined in
+`.config/nextest.toml` (#457). The slow, real-I/O pipeline suites live in
+`crates/*/tests/*.rs` (separate binaries, e.g. `overview_hostile.rs`), not in
+`#[cfg(test)]` modules inside `src/` — so `cargo test --lib` stays fast no
+matter which tool runs it.
 
-**NEVER run the full test suite.** Always run targeted tests:
+- **`quick`** — unit tests plus every fast integration-test binary
+  (seconds, not minutes). Run this constantly:
+
+  ```bash
+  cargo nextest run --profile quick
+  # or, equivalently:
+  cargo nextest run
+  ```
+
+- **`full`** — `quick` plus the slow end-to-end set: real parquet I/O, full
+  pipeline execution, nested parallelism (cargo test threads × Rayon threads
+  × I/O threads), 20s–7min per test. Run it before landing a change to
+  pipeline internals, sharding, or anything platform-sensitive
+  (determinism, shard-merge parity) — otherwise let CI's Slow Tests job
+  prove it rather than melting your laptop on every commit:
+
+  ```bash
+  cargo nextest run --profile full
+  ```
+
+For the tightest inner loop, target a single test or module directly:
 
 ```bash
 # GOOD: Run specific test
@@ -80,10 +104,6 @@ cargo test --package tylertoo-core batch_processor::tests::test_specific_thing -
 
 # GOOD: Run tests in a specific module
 cargo test --package tylertoo-core covering:: -- --nocapture
-
-# BAD: Runs everything, takes forever
-cargo test
-cargo test --package tylertoo-core
 ```
 
 **When to skip tests entirely:**
@@ -93,6 +113,9 @@ cargo test --package tylertoo-core
 - Changes already verified by `cargo check` or `cargo build`
 
 **Use `cargo check` liberally** — it's fast and catches most errors without running tests.
+
+When a new test takes more than ~20s, add it to the slow set in
+`.config/nextest.toml` so it lands in `full`, not `quick`.
 
 ## Architecture
 
@@ -122,8 +145,10 @@ cargo build                   # Build debug
 cargo build --release         # Build release
 cargo fmt --all               # Format (required before commit)
 
-# Tests - ALWAYS targeted (see Critical Constraint #4)
-cargo test --package tylertoo-core <module>::<test> -- --nocapture
+# Tests - quick tier by default, full tier when it matters (see Critical Constraint #4)
+cargo nextest run --profile quick             # or: cargo nextest run
+cargo nextest run --profile full              # slow end-to-end suites too
+cargo test --package tylertoo-core <module>::<test> -- --nocapture  # one test
 
 # Benchmarks (slow - only run when needed)
 cargo bench --package tylertoo-core --bench <name> -- "<filter>"
