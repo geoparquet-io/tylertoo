@@ -326,13 +326,74 @@ Four architectural decisions are load-bearing:
    others. `ConvertOptions::shard` itself is deliberately *not* fingerprinted
    — it is per-job, and every shard of a fleet has a different one.
 
-**The coarse job is a full monolithic convert.** `--shard coarse` restricts
-the EXPORT to zooms below the pivot; the convert reads every row, runs the
-whole assignment and writes the whole intermediate. A shallower `--max-zoom`
-is not a workaround either — the level plan is fingerprinted, so such a plan
-is refused by every shard. Sharding therefore parallelizes the export and the
-shard converts and buys restartability; it does not (yet) make the first job
-cheap. #541 tracks the convert-side level ceiling that would.
+**The coarse job caps pass 2 at the pivot — full assign, partial ladder**
+(#541). `ConvertOptions::zoom_ceiling` (set by the CLI for `--shard coarse`,
+mirroring `ExportOptions::zoom_ceiling`) truncates the level set pass 2
+materializes to the levels the coarse job actually exports. Three things make
+this safe, and each is load-bearing:
+
+1. **Pass 1 and the assignment stay full-range**, and so does the artifact
+   `--save-plan` writes. The assignment is dataset-global (the density budget
+   water-fills a super-cell over every candidate of a level, the level walk
+   carries a running kept count, tie-breaks hash global row indices), so a
+   coarse job that assigned only its own zooms would hand its shards a
+   different pyramid. The ceiling is therefore **excluded from
+   `options_digest`**: a capped coarse job and a full run save a
+   byte-identical plan, asserted directly in `tests/shard_merge_parity.rs`.
+2. **The cascade's fine steps are still computed.** A coarse level's geometry
+   is canonical geometry folded through every finer level's GSD in turn
+   (#218), so the chain is built over the WHOLE planned ladder and only the
+   *materialization* is truncated. In the pipelined engine the steps finer
+   than the deepest buffered level become a `prefix` that
+   `process_batch_cascade` folds first, from canonical geometry — exactly
+   what `simplify_cascade` does for that level on the Serial path. The prefix
+   is empty for an uncapped run, so nothing about a non-sharded build
+   changes. What *is* skipped for free: the cascade superset narrows from
+   "member of the finest non-canonical level" (nearly every row) to "member
+   of the deepest kept level" (a thinned fraction), so far fewer geometries
+   are decoded and folded at all.
+3. **The finest kept level joins the buffered set.** The pipelined engine
+   streams its last level separately only because it is the verbatim
+   canonical one, far too large to buffer. Under a ceiling the deepest level
+   is an ordinary simplified one, so in duplicating mode `run_pass2_levels`
+   buffers every level and pass 2 costs **one** read of the input instead of
+   two (the ceiling is duplicating-only: `validate_options` refuses it with
+   partitioning, and with a data shard range).
+
+What it does **not** skip, stated precisely because the cost model is easy to
+overstate: pass 2's one read is still a full-width read of the input — every
+row group the run selected, every projected column, decoded (there is no
+`RowSelection`; the cascade-superset narrowing happens *after* decode, and
+most of what is decoded is then discarded). So the coarse job costs *pass 1 +
+assign over the whole input, plus one full-width read of the input in pass 2,
+plus generalization/encode/write for the coarse levels only*. Its peak memory
+is the monolithic pass-1/assign peak, not a bounded per-job figure (size it
+with #549's preflight). The savings scale with how aggressively the coarse
+levels thin: under `--no-drop` or a loose density budget the coarse levels
+hold most rows and little is saved.
+
+**The capped file describes itself** (#541 review). When the ceiling truncates
+the plan, the footer records `generalization.zoom_ceiling`; the validator
+reports the file as non-conforming (`complete_pyramid`: the finest level is
+not the canonical one, so §2.4 cannot hold — `canonical_level` still reads
+`L-1` because §3.4 requires it), and `export_pmtiles` refuses it unless its
+own ceiling is at or coarser than the recorded one. A `--keep-overview` of a
+coarse job therefore cannot pass for a complete pyramid. A ceiling that leaves
+nothing to write returns `ConvertError::NothingAtOrBelowCeiling` (after any
+`--save-plan`), which the CLI turns into an empty coarse archive, exactly as
+it does for an empty data shard.
+
+**`coalesced_count` publication is decided from the conversion, not the
+file** (#541 review). The export withholds the counter when it never left 1
+(#379). That used to be read from row-group statistics of whichever levels
+the file holds, so a capped coarse job — whose merges typically all happen
+finer than the ceiling — withheld a column the monolithic build published,
+and the coarse tiles differed. The converter now records
+`coalescing.merged` (any chain > 1 at any planned non-canonical level; the
+unmaterialized levels' chain tables are built, checked and dropped,
+short-circuiting at the first merge) and the export prefers it, falling back
+to the statistic for older files. Data shards are unaffected in practice:
+they refuse any plan carrying coalesce rows, so no shard ever merges.
 
 **An empty data shard succeeds.** The cut must tile the pivot zoom with no
 gap, so a concentrated dataset leaves some ranges owning no rows. Those jobs

@@ -218,6 +218,23 @@ pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
 
         // Explicit mode/canonical_level consistency (§3.4).
         check_mode_canonical(meta, &mut report);
+
+        // #541 review: a partial overview (convert-side zoom ceiling) cannot
+        // satisfy §2.4 — its finest level is a simplified one, not the
+        // verbatim source — so it is not a conforming file, however sound its
+        // structure. Only reported when the footer marks it; complete files
+        // get no extra entry.
+        if let Some(z) = meta.generalization.as_ref().and_then(|g| g.zoom_ceiling) {
+            report.fail(
+                "complete_pyramid",
+                format!(
+                    "partial overview: built with a zoom ceiling of z{z} (the coarse job of \
+                     a sharded build), so no level finer than z{z} was written and the \
+                     finest level is not the canonical source level (§2.4); export it only \
+                     with a zoom ceiling of at most z{z}"
+                ),
+            );
+        }
     }
 
     // --- cogp compatibility key agreement (§3.1). ----------------------------
@@ -1096,6 +1113,7 @@ mod tests {
             }),
             coalescing: None,
             renamed_columns: None,
+            zoom_ceiling: None,
         });
 
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
@@ -1294,8 +1312,10 @@ mod tests {
                 junction_angle: Some(0.0),
                 max_level_rows: Some(2_000_000),
                 coalesced_count_column: "coalesced_count".to_string(),
+                merged: None,
             }),
             renamed_columns: None,
+            zoom_ceiling: None,
         });
 
         let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();

@@ -1089,6 +1089,8 @@ pub tylertoo_core::overview::convert::ConvertError::Io(core::io::error::Error)
 pub tylertoo_core::overview::convert::ConvertError::MultiPartitionRequiresStreaming
 pub tylertoo_core::overview::convert::ConvertError::NoData
 pub tylertoo_core::overview::convert::ConvertError::NoGeometryColumn
+pub tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling
+pub tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling::ceiling: u8
 pub tylertoo_core::overview::convert::ConvertError::Parquet(parquet::errors::ParquetError)
 pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded
 pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::estimated_bytes: u64
@@ -1211,6 +1213,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::simplify: tylertoo_core::o
 pub tylertoo_core::overview::convert::ConvertOptions::sort_key: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::convert::ConvertOptions::spill_dir: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::convert::ConvertOptions::streaming: bool
+pub tylertoo_core::overview::convert::ConvertOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::is_verbatim(&self) -> bool
 pub fn tylertoo_core::overview::convert::ConvertOptions::verbatim(self) -> Self
@@ -1364,6 +1367,9 @@ pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previo
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_zoom: u8
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::zoom: u8
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn
+pub tylertoo_core::overview::export::ExportError::PartialOverview
+pub tylertoo_core::overview::export::ExportError::PartialOverview::recorded: u8
+pub tylertoo_core::overview::export::ExportError::PartialOverview::requested: core::option::Option<u8>
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::knob: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::PropertyRequiredByKnob::name: alloc::string::String
@@ -1883,6 +1889,7 @@ pub tylertoo_core::overview::level::CoalescingProvenance::coalesced_count_column
 pub tylertoo_core::overview::level::CoalescingProvenance::enabled: bool
 pub tylertoo_core::overview::level::CoalescingProvenance::junction_angle: core::option::Option<f64>
 pub tylertoo_core::overview::level::CoalescingProvenance::max_level_rows: core::option::Option<u64>
+pub tylertoo_core::overview::level::CoalescingProvenance::merged: core::option::Option<bool>
 pub tylertoo_core::overview::level::CoalescingProvenance::snap_tolerance_gsd_factor: f64
 impl core::clone::Clone for tylertoo_core::overview::level::CoalescingProvenance
 pub fn tylertoo_core::overview::level::CoalescingProvenance::clone(&self) -> tylertoo_core::overview::level::CoalescingProvenance
@@ -1936,6 +1943,7 @@ pub tylertoo_core::overview::level::Generalization::levels: alloc::vec::Vec<tyle
 pub tylertoo_core::overview::level::Generalization::ranking: core::option::Option<tylertoo_core::overview::level::RankingProvenance>
 pub tylertoo_core::overview::level::Generalization::renamed_columns: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub tylertoo_core::overview::level::Generalization::representation: core::option::Option<alloc::vec::Vec<tylertoo_core::overview::level::RepresentationBandProvenance>>
+pub tylertoo_core::overview::level::Generalization::zoom_ceiling: core::option::Option<u8>
 impl core::clone::Clone for tylertoo_core::overview::level::Generalization
 pub fn tylertoo_core::overview::level::Generalization::clone(&self) -> tylertoo_core::overview::level::Generalization
 impl core::cmp::PartialEq for tylertoo_core::overview::level::Generalization

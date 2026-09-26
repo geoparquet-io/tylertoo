@@ -631,7 +631,9 @@ struct ExportPmtilesArgs {
     /// building a shallower pyramid too: the overview file still holds every
     /// level (its convert plan is the one the shards consume, and the level
     /// plan is fingerprinted), and this only decides which of them reach the
-    /// archive
+    /// archive. A partial overview kept from a `tiles --shard coarse` run
+    /// holds only the levels up to its own ceiling and can only be exported
+    /// with this set at or below that ceiling
     #[arg(long, value_name = "ZOOM")]
     zoom_ceiling: Option<u8>,
 
@@ -1595,6 +1597,10 @@ impl ConvertTuningArgs {
             // restrict and so no shard to be.
             shard: None,
             shard_plan_digest: None,
+            // Likewise #541's convert-side level ceiling: it exists to make
+            // `tiles --shard coarse` stop at the pivot, and `overview` has
+            // no shard role to derive one from.
+            zoom_ceiling: None,
         };
 
         // Logged because "no features were dropped" is a surprising thing to
@@ -2131,6 +2137,39 @@ fn write_empty_shard(
     Ok(())
 }
 
+/// Finish an empty coarse job: a valid tile-less archive over the zooms it
+/// owns (`--min-zoom` up to just below the pivot), and exit 0 (#541 review).
+///
+/// The coarse job's convert-plan (`--save-plan`) has already been written by
+/// the time this runs, so the fleet is intact; the coarse half simply holds
+/// no tile. `tylertoo merge` skips a tile-less input.
+fn write_empty_coarse(
+    output: &std::path::Path,
+    layer_name: &str,
+    job: &ShardJob,
+    min_zoom: u8,
+    why: &tylertoo_core::overview::convert::ConvertError,
+) -> Result<()> {
+    let max_zoom = job.pivot.saturating_sub(1);
+    tylertoo_core::overview::export::write_empty_archive(output, layer_name, min_zoom, max_zoom)
+        .map_err(|e| anyhow::anyhow!("failed to write the empty coarse archive: {e}"))?;
+    log::info!(
+        "[tiles] shard job {} has nothing to write ({why}); wrote an empty archive",
+        job.role
+    );
+    println!(
+        "✓ coarse job has no features at z{min_zoom}..z{max_zoom}; wrote an empty archive at {}",
+        output.display()
+    );
+    println!(
+        "  Every feature first appears at or past the pivot z{}, so the data shards hold \
+         all of it. Any --save-plan was written as usual; `tylertoo merge` skips a \
+         tile-less input.",
+        job.pivot
+    );
+    Ok(())
+}
+
 /// `true` when a convert failed only because it had nothing to write.
 ///
 /// Two spellings of the same outcome, depending on how far the run got before
@@ -2451,6 +2490,20 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // this job's slice of it is not. The coarse job writes it into the
         // plan; every shard has to present the same one.
         options.shard_plan_digest = Some(job.cut_digest.clone());
+        // #541: the coarse job builds only the levels it exports. Its pass 1
+        // and level assignment stay full-range, so the plan it saves is
+        // byte-identical to a full run's and every data shard consumes it
+        // unchanged. `resolve_shard_job` has already refused a pivot at or
+        // below --min-zoom, and a GSD ladder has no zoom to cap against.
+        //
+        // Only on the streaming pipeline: `--no-streaming` (the in-memory
+        // reference path) builds every planned level, so the coarse job falls
+        // back to the uncapped convert there. Its tiles are identical either
+        // way — the export's own ceiling below is what bounds them — it just
+        // pays for the finer levels, which is what the user opted into.
+        if job.range.is_none() && args.gsd.is_none() && options.streaming {
+            options.zoom_ceiling = Some(job.pivot.saturating_sub(1));
+        }
         log_shard_job(job, args.min_zoom, args.max_zoom);
     }
 
@@ -2532,6 +2585,16 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             let job = shard.as_ref().expect("a range implies a shard job");
             let range = shard_range.expect("checked by the guard");
             return write_empty_shard(&output, &layer_name, job, range, args.max_zoom, &e);
+        }
+        // #541 review: the coarse job's counterpart. Its convert stops at the
+        // pivot, and when every feature first appears finer than that (#211
+        // auto-clamp took every coarse level) there is nothing for it to
+        // write — but pass 1, the assignment and `--save-plan` all ran and
+        // are valid, and the shards still have their work. Same legal
+        // outcome as an empty data shard, same answer.
+        Err(e @ tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling { .. }) => {
+            let job = shard.as_ref().expect("only the coarse job sets a ceiling");
+            return write_empty_coarse(&output, &layer_name, job, args.min_zoom, &e);
         }
         Err(e) => anyhow::bail!("overview conversion failed: {e}"),
     };

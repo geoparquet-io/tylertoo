@@ -66,6 +66,26 @@ struct Build {
     expect_row_group_pruning: bool,
     /// Which of the plan's row-indexed side tables this build exercises.
     flavor: Flavor,
+    /// #541: run the coarse job with a **convert-side level ceiling**, so it
+    /// materializes only the levels it exports instead of the whole
+    /// monolithic pyramid.
+    ///
+    /// Two things then have to hold, and both are asserted: the capped job's
+    /// tiles are still byte-identical to the monolithic ones (the ladder
+    /// cascade folds canonical geometry through every finer level's GSD, so
+    /// skipping those levels' OUTPUT must not skip their fold STEPS), and the
+    /// convert plan it saves is **byte-identical** to the one a full coarse
+    /// job saves — the data shards consume that plan unchanged, and a ceiling
+    /// that leaked into it would give the whole fleet a different pyramid.
+    coarse_level_ceiling: bool,
+}
+
+/// The same build with #541's convert-side ceiling on the coarse job.
+fn capped(build: Build) -> Build {
+    Build {
+        coarse_level_ceiling: true,
+        ..build
+    }
 }
 
 /// The conversion knob set under test.
@@ -226,6 +246,56 @@ fn build_shard(
     archive
 }
 
+/// #541: run the coarse job with a convert-side level ceiling, and assert
+/// the two things the fleet depends on before handing its overview back.
+///
+/// `full_plan` is the plan the same job saved WITHOUT the ceiling. The capped
+/// job must save that file byte for byte: a data shard verifies the
+/// fingerprint and then reads the plan's row-indexed tables verbatim, so "the
+/// coarse job may build fewer levels" is only true if the artifact does not
+/// move. The second assertion is that the cap actually bit — otherwise the
+/// tile-body parity the caller goes on to check would prove nothing about
+/// #541.
+fn level_capped_coarse_overview(
+    input: &Path,
+    dir: &Path,
+    build: Build,
+    full_plan: &Path,
+) -> PathBuf {
+    let pivot = build.pivot;
+    let capped_overview = dir.join("coarse.parquet");
+    let capped_plan = dir.join("coarse.plan");
+    let report = convert_to_overviews(
+        input,
+        &capped_overview,
+        &ConvertOptions {
+            save_plan: Some(capped_plan.clone()),
+            zoom_ceiling: Some(pivot - 1),
+            ..convert_options(build)
+        },
+    )
+    .expect("level-capped coarse convert");
+    assert_eq!(
+        std::fs::read(full_plan).expect("full plan"),
+        std::fs::read(&capped_plan).expect("capped plan"),
+        "the level-capped coarse job must save the plan a full coarse job saves"
+    );
+    assert!(
+        report
+            .levels
+            .iter()
+            .all(|l| l.zoom.is_some_and(|z| z < pivot)),
+        "the capped coarse job built a level at or past the pivot z{pivot}: {:?}",
+        report.levels.iter().map(|l| l.zoom).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "[oracle] level ceiling z{}: coarse job built {} level(s), plan byte-identical",
+        pivot - 1,
+        report.levels.len()
+    );
+    capped_overview
+}
+
 /// The oracle.
 fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     let Build {
@@ -235,6 +305,7 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
         shards,
         expect_row_group_pruning,
         flavor,
+        coarse_level_ceiling,
     } = build;
     let dir = tempfile::tempdir().expect("tempdir");
     let dir = dir.path();
@@ -269,11 +340,12 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
 
     // --- Step 1: the coarse job. ---------------------------------------
     // It reads the whole input, writes the convert plan every shard consumes,
-    // and exports the zooms below the pivot. Its overview file is also, by
-    // construction, exactly the monolithic one — same input, same options — so
-    // the control export below reuses it rather than converting twice.
+    // and exports the zooms below the pivot. The UNCAPPED coarse job's
+    // overview file is also, by construction, exactly the monolithic one —
+    // same input, same options — so the control export below reuses it rather
+    // than converting twice.
     let convert_plan = dir.join("convert.plan");
-    let overview = dir.join("coarse.parquet");
+    let overview = dir.join("mono.parquet");
     convert_to_overviews(
         input,
         &overview,
@@ -284,9 +356,17 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     )
     .expect("coarse convert");
 
+    // #541: the same job again, this time materializing only the levels it
+    // exports. Everything the fleet depends on has to be unchanged.
+    let coarse_overview = if coarse_level_ceiling {
+        level_capped_coarse_overview(input, dir, build, &convert_plan)
+    } else {
+        overview.clone()
+    };
+
     let coarse = dir.join("coarse.pmtiles");
     export_pmtiles(
-        &overview,
+        &coarse_overview,
         &coarse,
         &ExportOptions {
             zoom_ceiling: Some(pivot - 1),
@@ -686,6 +766,7 @@ fn madagascar(shards: usize) -> Option<(PathBuf, Build)> {
             shards,
             expect_row_group_pruning: false,
             flavor: Flavor::NoCoalesce,
+            coarse_level_ceiling: false,
         },
     ))
 }
@@ -711,6 +792,7 @@ fn grid_build(shards: usize, flavor: Flavor) -> Build {
         shards,
         expect_row_group_pruning: true,
         flavor,
+        coarse_level_ceiling: false,
     }
 }
 
@@ -731,6 +813,37 @@ fn sharded_build_matches_monolithic_with_three_shards() {
         return;
     };
     assert_sharded_build_matches_monolithic(&input, build);
+}
+
+/// #541, N = 2: the coarse job caps pass 2 at the pivot.
+///
+/// Same fleet, same merge, same bar — but the coarse job now builds only the
+/// levels it exports. Madagascar is the right fixture for it: real polygons
+/// whose vertices actually move under the ladder cascade, so a fold that
+/// dropped the unmaterialized fine steps would shift geometry at every coarse
+/// zoom and die on the byte comparison.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_with_two_shards() {
+    let Some((input, build)) = madagascar(2) else {
+        return;
+    };
+    assert_sharded_build_matches_monolithic(&input, capped(build));
+}
+
+/// #541, N = 3: two seams and a level-capped coarse job.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_with_three_shards() {
+    let Some((input, build)) = madagascar(3) else {
+        return;
+    };
+    assert_sharded_build_matches_monolithic(&input, capped(build));
+}
+
+/// #541 where the shards also **prune**: the capped coarse job and the plan
+/// re-addressing have to hold at the same time, under every knob's default.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_when_shards_prune() {
+    assert_sharded_build_matches_monolithic(&grid(), capped(grid_build(3, Flavor::Defaults)));
 }
 
 /// The **pruning** half of the oracle: a world-spanning grid whose 20 row
@@ -796,4 +909,181 @@ fn sharded_build_matches_monolithic_with_clustered_points() {
     let input = dir.path().join("points.parquet");
     write_point_grid(&input);
     assert_sharded_build_matches_monolithic(&input, grid_build(3, Flavor::ClusteredPoints));
+}
+
+/// Short connected line chains plus a few long lines, written at test time.
+///
+/// Every chain is 30 end-to-end ~111 m segments: fine levels merge each into
+/// one feature with `coalesced_count = 30`, while coarse levels drop or keep
+/// the chain without merging. The long lines keep the coarse levels
+/// populated.
+fn write_line_chains(path: &Path) {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let linestring = |pts: &[(f64, f64)]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(9 + 16 * pts.len());
+        out.push(1u8); // little endian
+        out.extend_from_slice(&2u32.to_le_bytes()); // LineString
+        out.extend_from_slice(&(pts.len() as u32).to_le_bytes());
+        for &(x, y) in pts {
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        out
+    };
+    let mut geoms: Vec<Vec<u8>> = Vec::new();
+    for c in 0..6 {
+        let (x0, y0) = (-50.0 + c as f64 * 17.0, -20.0 + c as f64 * 8.0);
+        for k in 0..30 {
+            let x = x0 + k as f64 * 0.001;
+            geoms.push(linestring(&[(x, y0), (x + 0.001, y0)]));
+        }
+    }
+    for l in 0..4 {
+        let y = -60.0 + l as f64 * 35.0;
+        geoms.push(linestring(&[(-120.0, y), (-60.0, y + 5.0), (0.0, y - 3.0)]));
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("geometry", DataType::Binary, false),
+    ]));
+    let ids: ArrayRef = Arc::new(Int64Array::from(
+        (0..geoms.len() as i64).collect::<Vec<_>>(),
+    ));
+    let geometry: ArrayRef = Arc::new(BinaryArray::from(
+        geoms.iter().map(|g| g.as_slice()).collect::<Vec<_>>(),
+    ));
+    let geo = serde_json::json!({
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {
+            "encoding": "WKB",
+            "geometry_types": ["LineString"],
+            "crs": serde_json::Value::Null,
+        }}
+    });
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, geometry]).expect("line batch");
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        )]))
+        .build();
+    let file = std::fs::File::create(path).expect("create line fixture");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).expect("arrow writer");
+    w.write(&batch).expect("write lines");
+    w.close().expect("close line fixture");
+}
+
+/// #541 review (S1): the level-capped coarse job over **coalesced line
+/// chains**, coalescing on (the default).
+///
+/// Only the coarse half: a data shard refuses a plan that carries coalesced
+/// chains (see `shard_with_coalesced_lines_in_the_plan_is_refused`), so no
+/// full fleet can be built over this input. But the coarse job itself runs
+/// with chains, and its tiles must still match the monolithic build's at
+/// every zoom it owns. They did not: the export decided whether to publish
+/// `coalesced_count` from the file's own row-group statistics, and the
+/// chains here merge only finer than the pivot — so the capped file's
+/// counter never left 1, the column was withheld, and every coarse tile
+/// differed from the monolithic one.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
+    use tylertoo_core::overview::reader::OverviewReader;
+
+    const PIVOT: u8 = 7;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path();
+    let input = dir.join("chains.parquet");
+    write_line_chains(&input);
+    let build = Build {
+        min_zoom: 1,
+        max_zoom: 12,
+        pivot: PIVOT,
+        shards: 1,
+        expect_row_group_pruning: false,
+        flavor: Flavor::Defaults,
+        coarse_level_ceiling: true,
+    };
+    let opts = convert_options(build);
+    assert!(opts.coalesce_lines, "the point is coalescing ON");
+
+    let mono_overview = dir.join("mono.parquet");
+    let full_plan = dir.join("full.plan");
+    convert_to_overviews(
+        &input,
+        &mono_overview,
+        &ConvertOptions {
+            save_plan: Some(full_plan.clone()),
+            ..opts
+        },
+    )
+    .expect("monolithic convert");
+    let coarse_overview = level_capped_coarse_overview(&input, dir, build, &full_plan);
+
+    // The premise: the two files' own counters disagree, so a publish
+    // decision read from them would too.
+    let max = |p: &Path| {
+        OverviewReader::open(p)
+            .expect("open overview")
+            .int_column_max("coalesced_count")
+    };
+    assert!(
+        max(&mono_overview).is_some_and(|m| m > 1),
+        "the chains must merge somewhere in the monolithic build"
+    );
+    assert_eq!(
+        max(&coarse_overview),
+        Some(1),
+        "the chains must merge only past the pivot, or this oracle proves nothing"
+    );
+
+    let mono = dir.join("mono.pmtiles");
+    export_pmtiles(
+        &mono_overview,
+        &mono,
+        &ExportOptions {
+            min_zoom: Some(build.min_zoom),
+            ..export_options()
+        },
+    )
+    .expect("monolithic export");
+    let coarse = dir.join("coarse.pmtiles");
+    export_pmtiles(
+        &coarse_overview,
+        &coarse,
+        &ExportOptions {
+            zoom_ceiling: Some(PIVOT - 1),
+            min_zoom: Some(build.min_zoom),
+            ..export_options()
+        },
+    )
+    .expect("coarse export");
+
+    let want: BTreeMap<u8, BTreeMap<u64, Vec<u8>>> = tiles_of(&mono)
+        .into_iter()
+        .filter(|(z, _)| *z < PIVOT)
+        .collect();
+    let got = tiles_of(&coarse);
+    assert!(
+        want.values().map(BTreeMap::len).sum::<usize>() > 0,
+        "the monolithic coarse zooms are empty; the oracle would prove nothing"
+    );
+    assert_eq!(
+        got.keys().collect::<Vec<_>>(),
+        want.keys().collect::<Vec<_>>(),
+        "the coarse job must hold exactly the monolithic coarse zooms"
+    );
+    for (z, tiles) in &want {
+        assert_eq!(
+            &got[z], tiles,
+            "z{z}: the capped coarse job's tiles differ from the monolithic build's"
+        );
+    }
 }
