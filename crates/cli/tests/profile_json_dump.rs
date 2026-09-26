@@ -23,18 +23,42 @@ fn tylertoo_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tylertoo")
 }
 
-#[test]
-fn profile_json_written_and_parses() {
-    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
-        return;
-    };
-
+/// Run `tiles` on `fixture` with `--report` and `TYLERTOO_PROFILE_JSON` set,
+/// and return the tempdir (kept alive so its files survive for the caller's
+/// own follow-up checks), the parsed `--report` JSON, and the two parsed
+/// profile JSONL lines (convert, export).
+///
+/// Shared by [`profile_json_written_and_parses`] and
+/// [`profile_json_export_section_parses`] (#535 step 1) purely to keep each
+/// test's own assertions under clippy's function-length/cognitive-complexity
+/// ceiling instead of piling both phases' checks into one function — each
+/// call is still its own fresh subprocess (see the module doc: this MUST
+/// stay a subprocess test), so the two tests remain fully independent.
+///
+/// #535 step 1: a one-shot `tiles` run now writes TWO JSONL lines to
+/// `TYLERTOO_PROFILE_JSON` — convert's (unchanged schema, emitted the instant
+/// `convert_to_overviews` finishes) followed by export's own. See
+/// `write_export_profile_json`'s doc and `docs/PROFILING.md`'s "Two JSONL
+/// lines for one `tiles` run" section for why this is two lines rather than
+/// one merged object: convert's line is already on disk by the time export
+/// starts, and merging would mean threading convert's report through the
+/// export call chain purely to serve profiling.
+fn run_tiles_with_profile(
+    fixture: &std::path::Path,
+    min_zoom: &str,
+    max_zoom: &str,
+) -> (
+    tempfile::TempDir,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("out.pmtiles");
     let profile_json = dir.path().join("profile.jsonl");
-    // `--report` writes the combined convert+export JSON report, whose
-    // `convert.levels` length is the independent source of truth this test
-    // checks the profile dump's `levels` array against.
+    // `--report` writes the combined convert+export JSON report, the
+    // independent source of truth both callers check the profile dump
+    // against.
     let report_json = dir.path().join("report.json");
 
     let output = Command::new(tylertoo_bin())
@@ -43,9 +67,9 @@ fn profile_json_written_and_parses() {
             fixture.to_str().unwrap(),
             out.to_str().unwrap(),
             "--min-zoom",
-            "0",
+            min_zoom,
             "--max-zoom",
-            "6",
+            max_zoom,
             "--report",
             report_json.to_str().unwrap(),
         ])
@@ -61,30 +85,14 @@ fn profile_json_written_and_parses() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // --- The independent source of truth: the --report's convert.levels. ---
     let report_contents = std::fs::read_to_string(&report_json).expect("read --report JSON output");
     let report: serde_json::Value =
         serde_json::from_str(&report_contents).expect("valid --report JSON");
-    let report_level_count = report["convert"]["levels"]
-        .as_array()
-        .expect("report convert.levels must be an array")
-        .len();
 
-    // --- The profile dump. ---
-    //
-    // #535 step 1: a one-shot `tiles` run now writes TWO JSONL lines to
-    // `TYLERTOO_PROFILE_JSON` — convert's (unchanged schema, emitted the
-    // instant `convert_to_overviews` finishes) followed by export's own
-    // (added here). See `write_export_profile_json`'s doc and
-    // `docs/PROFILING.md`'s "Two JSONL lines for one `tiles` run" section for
-    // why this is two lines rather than one merged object: convert's line is
-    // already on disk by the time export starts, and merging would mean
-    // threading convert's report through the export call chain purely to
-    // serve profiling.
     let contents = std::fs::read_to_string(&profile_json)
         .unwrap_or_else(|e| panic!("read TYLERTOO_PROFILE_JSON file {profile_json:?}: {e}"));
     let mut lines = contents.lines();
-    let line = lines
+    let convert_line = lines
         .next()
         .expect("one JSON line must be written for convert");
     let export_line = lines
@@ -94,7 +102,26 @@ fn profile_json_written_and_parses() {
         lines.next().is_none(),
         "exactly two JSON objects (convert, export) for one `tiles` conversion, got: {contents:?}"
     );
-    let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+    let convert: serde_json::Value = serde_json::from_str(convert_line).expect("valid JSON");
+    let export: serde_json::Value =
+        serde_json::from_str(export_line).expect("export profile line must be valid JSON");
+
+    (dir, report, convert, export)
+}
+
+#[test]
+fn profile_json_written_and_parses() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let (dir, report, value, _export_value) = run_tiles_with_profile(&fixture, "0", "6");
+
+    // --- The independent source of truth: the --report's convert.levels. ---
+    let report_level_count = report["convert"]["levels"]
+        .as_array()
+        .expect("report convert.levels must be an array")
+        .len();
 
     let pass1_rows_per_sec = value["pass1"]["rows_per_sec"]
         .as_f64()
@@ -264,13 +291,33 @@ fn profile_json_written_and_parses() {
          #533 signature: {value}"
     );
 
-    // --- #535 step 1: the export profile line. ---
-    //
-    // Independent source of truth: the SAME `--report`'s `export.zooms`,
-    // `export.total_tiles` and `export.total_tile_features` this test already
-    // parsed `report` from above.
-    let export_value: serde_json::Value =
-        serde_json::from_str(export_line).expect("export profile line must be valid JSON");
+    // The startup preflight probes writability with a uniquely named SIBLING
+    // file and removes it again; nothing of its own may survive the run.
+    let strays: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.starts_with(".tylertoo-profile-json-probe."))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the TYLERTOO_PROFILE_JSON preflight must leave no probe file behind, \
+         found: {strays:?}"
+    );
+}
+
+/// #535 step 1: the export profile line (the second of the two JSONL lines
+/// [`run_tiles_with_profile`] returns for one `tiles` run — see its doc).
+///
+/// Independent source of truth: the SAME `--report`'s `export.zooms`,
+/// `export.total_tiles` and `export.total_tile_features` this test parses
+/// `report` from.
+#[test]
+fn profile_json_export_section_parses() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let (_dir, report, _convert_value, export_value) = run_tiles_with_profile(&fixture, "0", "6");
     let export = &export_value["export"];
     assert!(
         export.is_object(),
@@ -302,7 +349,7 @@ fn profile_json_written_and_parses() {
     assert!(
         export_stage_sum > 0.0,
         "export.stage_secs (band_read+clip+encode+spool_write) must be > 0 for \
-         a run that wrote {report_level_count} level(s) of tiles: {export_value}"
+         a run that wrote tiles: {export_value}"
     );
 
     let report_export_zooms = report["export"]["zooms"]
@@ -376,19 +423,6 @@ fn profile_json_written_and_parses() {
     assert!(
         export["checkpoints"].is_u64(),
         "export.checkpoints must be a number: {export_value}"
-    );
-
-    // The startup preflight probes writability with a uniquely named SIBLING
-    // file and removes it again; nothing of its own may survive the run.
-    let strays: Vec<String> = std::fs::read_dir(dir.path())
-        .expect("read tempdir")
-        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
-        .filter(|n| n.starts_with(".tylertoo-profile-json-probe."))
-        .collect();
-    assert!(
-        strays.is_empty(),
-        "the TYLERTOO_PROFILE_JSON preflight must leave no probe file behind, \
-         found: {strays:?}"
     );
 }
 
