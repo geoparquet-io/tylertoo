@@ -61,36 +61,74 @@ cargo build --release          # Release build
 cargo fmt --all                # Format (required before commit)
 ```
 
-### Tests: targeted only
+### Tests: targeted first, quick/full tiers before commit
 
-The full suite is slow (real parquet I/O, full pipeline runs, nested
-parallelism). Run targeted tests:
-
-```bash
-# A specific test
-cargo test --package tylertoo-core \
-  overview::assign::tests::some_test -- --nocapture
-
-# A module
-cargo test --package tylertoo-core overview::cluster:: -- --nocapture
-
-# The CLI facade integration test
-cargo test --package tylertoo --test tiles_facade
-```
-
-CI runs the tests with [cargo-nextest](https://nexte.st), split in two.
-The Test matrix (ubuntu/macos × stable/beta) runs everything except
-`large_polygon_regression` and the slow end-to-end set listed in
-`.config/nextest.toml`. The Slow Tests job runs that set on ubuntu and
-macOS, stable only. Let CI run both. To run the slow set locally:
+Tier runs use [cargo-nextest](https://nexte.st):
 
 ```bash
-cargo nextest run --all-features \
-  --ignore-default-filter -E 'not default()'
+cargo install cargo-nextest --locked
 ```
 
-When a new test takes more than ~20s in CI, add it to the default filter
-in `.config/nextest.toml`.
+The suite is split into two nextest profiles defined in
+`.config/nextest.toml` (#457). Work in this order:
+
+1. **Inner loop (TDD red/green): targeted tests only** — a specific test,
+   module, or integration binary, via `cargo test` or nextest's filter
+   syntax:
+
+   ```bash
+   # A specific test
+   cargo test --package tylertoo-core \
+     overview::assign::tests::some_test -- --nocapture
+
+   # A module
+   cargo test --package tylertoo-core overview::cluster:: -- --nocapture
+   cargo nextest run -E 'test(overview::cluster::)'
+
+   # One integration-test binary
+   cargo test --package tylertoo-core --test overview_hostile
+   cargo test --package tylertoo --test tiles_facade
+   ```
+
+2. **Before commit/push: the `quick` tier** — unit tests plus every
+   integration-test binary except the known-slow set. It is also what plain
+   `cargo nextest run` (no `--profile`) runs. It is ~1400 tests and takes
+   minutes including compiling every integration binary, so it is a
+   pre-commit gate, not something to run after every edit:
+
+   ```bash
+   cargo nextest run --profile quick
+   ```
+
+3. **`full`, only when it matters** — `quick` plus the slow end-to-end set:
+   tests that drive the CLI or the full pipeline over real-data fixtures
+   with real parquet I/O and nested parallelism (20s–7min each). Run it
+   before landing a change to pipeline internals, sharding, determinism, or
+   anything platform-sensitive (shard-merge parity); otherwise let CI's
+   Slow Tests job prove it:
+
+   ```bash
+   cargo nextest run --profile full
+   ```
+
+Plain `cargo test` ignores `nextest.toml`: it runs everything in whatever
+target it's pointed at, slow tests included, with no timeout. Use it for
+targeted runs and `cargo nextest run` for the tiers. The slowest end-to-end
+suites (e.g. `thread_count_determinism`, `shard_merge_parity`) live in
+`crates/*/tests/*.rs` as separate binaries, so `cargo test --lib` stays
+reasonably fast — but `--lib` still includes some real-parquet I/O tests
+(e.g. in `overview::convert`).
+
+CI mirrors the tiers: the Test matrix (ubuntu/macos × stable/beta) runs
+`quick`; the Slow Tests job runs exactly the set `quick` excludes, on
+ubuntu and macOS stable. Together they cover `full`.
+
+When a new test takes more than ~20s, add it to the slow set in
+`.config/nextest.toml`: the `default-filter` exclusion in
+`[profile.default]` (which `quick` inherits) and the matching
+`[[profile.default.overrides]]` filter that gives slow tests a longer
+timeout. `full` needs no edit — its `default-filter = "all()"` picks the
+new test up automatically.
 
 ### Benchmarks
 
