@@ -7,8 +7,9 @@
 //!
 //! This module is `pub(crate)`, so it is invisible to the integration-test
 //! binaries under `crates/core/tests/` (they link only against the crate's
-//! public API). `crates/core/tests/overview_hostile.rs` keeps its own copy
-//! of `write_input`/`write_input_with_f64` for exactly that reason (#457).
+//! public API). `crates/core/tests/overview_hostile.rs` compiles this same
+//! file in via `#[path]` instead (#457), so keep it free of `crate::` /
+//! `super::` imports: std and external crates only.
 
 use std::path::Path;
 use std::sync::Arc;

@@ -6,8 +6,8 @@
 //! ...) with real parquet I/O, each case run through both the in-memory and
 //! streaming engines. That bulk moved to
 //! `crates/core/tests/overview_hostile.rs` (#457) so it stops running on
-//! every `cargo test --lib`; nextest's `full` profile (and plain
-//! `cargo test`) still cover it.
+//! every `cargo test --lib`. It is still fast, so nextest's `quick` profile
+//! (and therefore `full`, and plain `cargo test`) covers it.
 //!
 //! What is left here calls `pub(super)` helpers in [`super::convert`]
 //! (bbox/CRS range classification, the all-lost gate) that are not part of
