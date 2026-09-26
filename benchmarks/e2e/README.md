@@ -145,9 +145,11 @@ Recorded per dataset, per stage, in `results.json`:
   (default 3) timed runs after one discarded warm-up; `min`, `max` and every
   individual run are kept.
 - **peak RSS** — from `/usr/bin/time` (`-l` on Darwin, `-v` on GNU), i.e. the
-  kernel's `ru_maxrss`, not sampled. For the two-process tippecanoe pipeline
-  the reported figure is the **larger of the two stages**, not their sum,
-  because they never run concurrently.
+  kernel's `ru_maxrss`, not sampled. Reported as the **maximum across the
+  repeats** (a peak is a peak; taking its median would understate it), which
+  is why wall is a median and memory is not. For the two-process tippecanoe
+  pipeline the reported figure is the **larger of the two stages**, not their
+  sum, because they never run concurrently.
 - **output archive size** — bytes on disk.
 - **per-zoom tile counts and stored bytes** — from `tylertoo stats --json`,
   which reads PMTiles directory entries only. The *same code* reads both

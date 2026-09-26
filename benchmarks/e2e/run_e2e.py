@@ -174,8 +174,7 @@ class CommandFailed(RuntimeError):
         self.argv, self.rc, self.tail = argv, rc, tail
 
 
-def measure(argv: list[str], *, stdout_path: Path | None = None,
-            unlink_first: Path | None = None) -> dict:
+def measure(argv: list[str], *, unlink_first: Path | None = None) -> dict:
     """Run argv once under /usr/bin/time; return wall seconds + peak RSS.
 
     Wall comes from perf_counter (identical semantics on every platform);
@@ -190,12 +189,9 @@ def measure(argv: list[str], *, stdout_path: Path | None = None,
         unlink_first.unlink(missing_ok=True)
     wrapped = ["/usr/bin/time", _time_flag(), *argv]
     with tempfile.TemporaryFile("w+") as err:
-        out = open(stdout_path, "wb") if stdout_path else subprocess.DEVNULL
         t0 = time.perf_counter()
-        rc = subprocess.call(wrapped, stdout=out, stderr=err)
+        rc = subprocess.call(wrapped, stdout=subprocess.DEVNULL, stderr=err)
         wall = time.perf_counter() - t0
-        if stdout_path:
-            out.close()
         err.seek(0)
         errtext = err.read()
     if rc != 0:
