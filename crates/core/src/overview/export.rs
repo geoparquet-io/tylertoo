@@ -279,6 +279,35 @@ pub struct ExportOptions {
     ///
     /// Default `None` (no ceiling).
     pub zoom_ceiling: Option<u8>,
+    /// Carry a property column through as the MVT feature `id` on every tile
+    /// the feature appears in, at every zoom (#443; tippecanoe's
+    /// `--use-attribute-for-id`). Matched against the property name as the
+    /// tile would publish it -- the same naming `--feature-order` /
+    /// `--include-property` / `--exclude-property` use -- and independent of
+    /// any suppression already recorded for that column: an explicit
+    /// `--feature-id` always wins over the #379 auto-suppression heuristic
+    /// and over a `--include-property` / `--exclude-property` naming the same
+    /// column (see [`resolve_feature_id_index`]).
+    ///
+    /// The named column must be an integer type (`Int8`..`Int64` or
+    /// `UInt8`..`UInt64`) and every value a non-null, non-negative integer --
+    /// MVT's feature id is `uint64`. A violation is a hard export error naming
+    /// the column and (for a per-row violation) the offending row's file scan
+    /// order, rather than silently reinterpreting or dropping it; see
+    /// [`resolve_feature_id_value`] for exactly what is checked and the
+    /// DIVERGENCE FROM TIPPECANOE note on why this is stricter than
+    /// `--use-attribute-for-id`.
+    ///
+    /// The column is moved to the feature id, never *also* published as a
+    /// regular tile property (tippecanoe's behaviour) -- it is stripped from
+    /// `vector_layers` and from every tile's tags regardless of the property
+    /// selection in force.
+    ///
+    /// Default `None`: every feature keeps the tile-local member index it has
+    /// always had (unique only within a single tile/zoom pair -- see
+    /// [`build_mvt`]). Whether that no-flag default should instead omit the
+    /// id entirely is an open question (#443) this option does not decide.
+    pub feature_id: Option<String>,
 }
 
 impl Default for ExportOptions {
@@ -295,6 +324,7 @@ impl Default for ExportOptions {
             properties: PropertySelection::default(),
             tile_range: None,
             zoom_ceiling: None,
+            feature_id: None,
         }
     }
 }
@@ -532,6 +562,71 @@ pub enum ExportError {
          drop the knob"
     )]
     PropertyRequiredByKnob { name: String, knob: String },
+
+    /// `--feature-id <name>` (#443) names no property this export could read.
+    #[error(
+        "feature-id column {name:?} is not a property of this export (available: {available})"
+    )]
+    FeatureIdColumnNotFound { name: String, available: String },
+
+    /// `--feature-id`'s column is not an integer type (#443): MVT feature ids
+    /// are `uint64`, so a string, float, boolean, temporal or decimal column
+    /// cannot represent one.
+    #[error(
+        "feature-id column {name:?} has type {data_type} -- MVT feature ids must come from an \
+         integer column (Int8/16/32/64 or UInt8/16/32/64)"
+    )]
+    FeatureIdColumnNotInteger { name: String, data_type: String },
+
+    /// A `--feature-id` row was null (#443). MVT feature ids are non-optional
+    /// `uint64`s, so a missing value cannot be encoded; this is a hard error
+    /// rather than a silent per-feature fallback to the tile-local index.
+    #[error(
+        "feature-id column {column:?} is null at row {row} (file scan order): every feature \
+         needs an id when --feature-id is set"
+    )]
+    FeatureIdNull { column: String, row: u64 },
+
+    /// A `--feature-id` row was negative (#443). See
+    /// [`resolve_feature_id_value`] for why this is an error rather than
+    /// tippecanoe's silent two's-complement reinterpretation.
+    #[error(
+        "feature-id column {column:?} is negative ({value}) at row {row} (file scan order): \
+         MVT feature ids are unsigned 64-bit integers"
+    )]
+    FeatureIdNegative {
+        column: String,
+        row: u64,
+        value: i64,
+    },
+
+    /// A `--feature-id` row held a non-integer property value (string, float,
+    /// bool, ...). Reachable from the `Feature`-based test-support path
+    /// (no Arrow schema to gate on); on the production Arrow path this is
+    /// defensive, since [`ExportError::FeatureIdColumnNotInteger`] already
+    /// gates the whole column.
+    #[error(
+        "feature-id column {column:?} is not an integer ({value}) at row {row} (file scan \
+         order): MVT feature ids must be non-negative integers"
+    )]
+    FeatureIdNotInteger {
+        column: String,
+        row: u64,
+        value: String,
+    },
+
+    /// `--feature-id` and `--feature-order` name the same column (#443).
+    /// `--feature-id` strips the column from the tile's properties (it is
+    /// never also published), which is exactly what `--feature-order`
+    /// [`FeatureOrder::Column`] needs to read to sort by it -- combining them
+    /// on the same column is therefore rejected rather than silently
+    /// producing input-order tiles.
+    #[error(
+        "--feature-id and --feature-order both name {name:?}: --feature-id removes the column \
+         from the tile properties --feature-order needs to sort by, so the two cannot share a \
+         column"
+    )]
+    FeatureIdConflictsWithFeatureOrder { name: String },
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -1199,12 +1294,39 @@ fn export_pmtiles_impl(
     // file's own rename provenance so a standalone `export-pmtiles` on an
     // overview written by an earlier run restores names just as `tiles` does.
     // #386: then the caller's include/exclude, matched on the published names.
-    let published = PublishedNames::from_reader(&reader).with_selection(
+    let mut published = PublishedNames::from_reader(&reader).with_selection(
         reader.schema(),
         geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?,
         &options.properties,
         &options.feature_order,
     )?;
+
+    // #443: resolve and validate `--feature-id` up front (schema-only checks
+    // -- per-row null/negative/non-integer values are caught during the
+    // scan), and unconditionally withhold the column from the tile
+    // properties/`vector_layers` metadata it would otherwise still publish
+    // under (see `resolve_feature_id_index`'s doc for why this always wins
+    // over the ordinary property selection).
+    if let Some(name) = &options.feature_id {
+        if let FeatureOrder::Column {
+            name: order_name, ..
+        } = &options.feature_order
+        {
+            if order_name == name {
+                return Err(ExportError::FeatureIdConflictsWithFeatureOrder { name: name.clone() });
+            }
+        }
+        let geom_idx = geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?;
+        let idx = resolve_feature_id_index(reader.schema(), geom_idx, &published, name)?;
+        let dt = reader.schema().field(idx).data_type();
+        if !is_integer_scalar(dt) {
+            return Err(ExportError::FeatureIdColumnNotInteger {
+                name: name.clone(),
+                data_type: format!("{dt:?}"),
+            });
+        }
+        published.suppress(reader.schema().field(idx).name());
+    }
 
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
@@ -1736,13 +1858,19 @@ fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
 
 /// One tile member: a feature's clipped geometry destined for the tile with
 /// key `key`, the feature's band-order sequence number (stable within-tile
-/// ordering), and the feature's MVT properties (shared across the feature's
-/// tile copies).
+/// ordering), the feature's MVT properties (shared across the feature's tile
+/// copies), and its resolved `--feature-id` (#443), if any -- also shared
+/// across every tile/zoom copy of the feature, which is what makes the id
+/// stable across tile and zoom boundaries.
 struct Member {
     key: u64,
     seq: u64,
     geom: Geometry<f64>,
     props: Arc<Vec<(String, PropertyValue)>>,
+    /// `Some` on every member when [`ExportOptions::feature_id`] is set
+    /// (validated at extraction time, #443); `None` when it is not, in which
+    /// case [`build_mvt`] falls back to the tile-local member index.
+    id: Option<u64>,
 }
 
 /// One level's result from the scan pass ([`scan_all_levels`]).
@@ -1968,11 +2096,19 @@ fn encode_geometry(buf: &mut Vec<u8>, g: &Geometry<f64>) {
     }
 }
 
-/// Serialize one member: key, seq, properties, geometry. Property floats spill
-/// as bit patterns for the same exactness guarantee as coordinates.
+/// Serialize one member: key, seq, feature id, properties, geometry.
+/// Property floats spill as bit patterns for the same exactness guarantee as
+/// coordinates.
 fn encode_member(buf: &mut Vec<u8>, m: &Member) {
     put_u64(buf, m.key);
     put_u64(buf, m.seq);
+    match m.id {
+        Some(id) => {
+            buf.push(1);
+            put_u64(buf, id);
+        }
+        None => buf.push(0),
+    }
     put_u32(buf, m.props.len() as u32);
     for (name, v) in m.props.iter() {
         put_u32(buf, name.len() as u32);
@@ -2136,6 +2272,11 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
 fn decode_member(cur: &mut SpillCursor<'_>) -> Result<Member, ExportError> {
     let key = cur.u64()?;
     let seq = cur.u64()?;
+    let id = match cur.u8()? {
+        0 => None,
+        1 => Some(cur.u64()?),
+        _ => return Err(spill_corrupt()),
+    };
     let n_props = cur.u32()? as usize;
     let mut props = Vec::with_capacity(n_props);
     for _ in 0..n_props {
@@ -2157,6 +2298,7 @@ fn decode_member(cur: &mut SpillCursor<'_>) -> Result<Member, ExportError> {
         seq,
         geom,
         props: Arc::new(props),
+        id,
     })
 }
 
@@ -2471,7 +2613,17 @@ fn fanout_batch_members(
     let t_route = Instant::now();
     let flushed_before = store.flush_time;
     let prop_cols = property_columns(&schema, geom_idx, published);
-    let routed = route_fanout_rows(batch, &prop_cols, plans, &targets, per_level, seq, store);
+    let id_col = extract_feature_id_column(&schema, geom_idx, published, opts, batch)?;
+    let routed = route_fanout_rows(
+        batch,
+        &prop_cols,
+        id_col.as_ref(),
+        plans,
+        &targets,
+        per_level,
+        seq,
+        store,
+    );
     let flushed = store.flush_time.saturating_sub(flushed_before);
     add_nanos(&timers.decode, t_route.elapsed().saturating_sub(flushed));
     routed
@@ -2487,6 +2639,7 @@ type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
 fn route_fanout_rows(
     batch: &RecordBatch,
     prop_cols: &[(usize, String)],
+    id_col: Option<&(String, Vec<Option<PropertyValue>>)>,
     plans: &[LevelPlan],
     targets: &[usize],
     mut per_level: Vec<RowMembers>,
@@ -2511,6 +2664,12 @@ fn route_fanout_rows(
             *seq += 1;
             continue;
         }
+        // #443: resolved once per row (band-order `*seq` names the row in
+        // the error, matching every member the row produces).
+        let id = match id_col {
+            None => None,
+            Some((name, col)) => Some(resolve_feature_id_value(col[row].as_ref(), name, *seq)?),
+        };
         let mut props = Vec::with_capacity(extracted.len());
         for (name, col) in &extracted {
             if let Some(v) = &col[row] {
@@ -2532,6 +2691,7 @@ fn route_fanout_rows(
                         seq: *seq,
                         geom,
                         props: Arc::clone(&props),
+                        id,
                     },
                 )?;
             }
@@ -3053,6 +3213,7 @@ fn collect_wave_members(
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members.
     let prop_cols = property_columns(&schema, geom_idx, ctx.published);
+    let id_col = extract_feature_id_column(&schema, geom_idx, ctx.published, ctx.opts, batch)?;
     let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
         Vec::with_capacity(prop_cols.len());
     for &(idx, ref name) in &prop_cols {
@@ -3063,6 +3224,11 @@ fn collect_wave_members(
             *seq += 1;
             continue;
         }
+        // #443: see `route_fanout_rows`'s identical resolution.
+        let id = match &id_col {
+            None => None,
+            Some((name, col)) => Some(resolve_feature_id_value(col[row].as_ref(), name, *seq)?),
+        };
         let mut props = Vec::with_capacity(extracted.len());
         for (name, col) in &extracted {
             if let Some(v) = &col[row] {
@@ -3076,6 +3242,7 @@ fn collect_wave_members(
                 seq: *seq,
                 geom,
                 props: Arc::clone(&props),
+                id,
             });
         }
         *seq += 1;
@@ -4007,7 +4174,10 @@ fn build_mvt<'a>(
 ) -> Vec<u8> {
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
     for (i, m) in members.into_iter().enumerate() {
-        layer.add_feature(Some(i as u64), &m.geom, &m.props, tb);
+        // #443: a resolved `--feature-id` always wins; the no-flag default
+        // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
+        let id = m.id.unwrap_or(i as u64);
+        layer.add_feature(Some(id), &m.geom, &m.props, tb);
     }
     let mut tb_builder = TileBuilder::new();
     tb_builder.add_layer(layer.build());
@@ -4021,17 +4191,40 @@ fn build_mvt<'a>(
 /// Test-support: the pre-partitioning in-memory reference path — build every
 /// member for a fully materialized feature slice at `zoom` (unbounded key
 /// range) and encode via the production member machinery.
+///
+/// #443: resolves `opts.feature_id` directly against `f.props` (there is no
+/// Arrow schema on this path), stripping the named property out of the
+/// member's tags exactly as the production Arrow path does -- so this
+/// exercises the same "moved, not copied" contract with the same error type.
 #[cfg(test)]
-fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> Vec<EncodedTile> {
+fn encode_level_tiles(
+    features: &[Feature],
+    zoom: u8,
+    opts: &ExportOptions,
+) -> Result<Vec<EncodedTile>, ExportError> {
     let mut members = Vec::new();
     for (fi, f) in features.iter().enumerate() {
-        let props = Arc::new(f.props.clone());
+        let seq = fi as u64;
+        let id = match &opts.feature_id {
+            None => None,
+            Some(name) => Some(resolve_feature_id_value(
+                find_property_value(&f.props, name),
+                name,
+                seq,
+            )?),
+        };
+        let props: Vec<(String, PropertyValue)> = match &opts.feature_id {
+            Some(name) => f.props.iter().filter(|(n, _)| n != name).cloned().collect(),
+            None => f.props.clone(),
+        };
+        let props = Arc::new(props);
         for (key, geom) in feature_tile_members(&f.geom, zoom, opts, 0, u64::MAX) {
             members.push(Member {
                 key,
-                seq: fi as u64,
+                seq,
                 geom,
                 props: Arc::clone(&props),
+                id,
             });
         }
     }
@@ -4049,7 +4242,19 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
         )
         .expect("gzip roundtrip of just-compressed tile");
     }
-    tiles
+    Ok(tiles)
+}
+
+/// Find a named property's value in an unindexed `(name, value)` list —
+/// shared by the [`encode_level_tiles`] test-support path and
+/// [`resolve_feature_id_value`] callers that only have `Feature.props`, not
+/// an Arrow column, to look in.
+#[cfg(test)]
+fn find_property_value<'a>(
+    props: &'a [(String, PropertyValue)],
+    name: &str,
+) -> Option<&'a PropertyValue> {
+    props.iter().find(|(n, _)| n == name).map(|(_, v)| v)
 }
 
 /// Test-support: read every feature (geometry + carried properties) of a level
@@ -4399,6 +4604,15 @@ impl PublishedNames {
         self.suppressed.contains(schema_name)
     }
 
+    /// Withhold a schema column from the tiles entirely (#443: a
+    /// `--feature-id` column is moved to the feature id and must never also
+    /// publish as a regular property, so this is applied unconditionally
+    /// after resolving it -- regardless of what the ordinary property
+    /// selection already decided for that column).
+    fn suppress(&mut self, schema_name: &str) {
+        self.suppressed.insert(schema_name.to_string());
+    }
+
     /// The MVT key for a schema field name.
     fn publish<'a>(&'a self, schema_name: &'a str) -> &'a str {
         self.restored
@@ -4429,6 +4643,131 @@ fn property_columns(
         })
         .map(|(i, f)| (i, published.publish(f.name()).to_string()))
         .collect()
+}
+
+/// Resolve `--feature-id <name>` (#443) against `schema`, matched by its
+/// *published* name -- the same matching `--feature-order` /
+/// `--include-property` / `--exclude-property` use -- independent of any
+/// suppression already recorded on `published`.
+///
+/// That independence is deliberate: an explicit `--feature-id` always wins
+/// over the #379 auto-suppression heuristic and over an
+/// `--include-property` / `--exclude-property` naming the same column,
+/// mirroring tippecanoe's `--use-attribute-for-id`, which extracts the named
+/// attribute before its own `-x`/`-y`/`-X` filter is even consulted
+/// (`serial.cpp`'s `attribute_for_id` block runs first and `continue`s past
+/// the filter for that key). So naming the id column in `--include-property`
+/// or `--exclude-property` is a harmless no-op, never an error -- it is
+/// removed from the property set either way (the caller unconditionally
+/// [`PublishedNames::suppress`]es it after this resolves).
+fn resolve_feature_id_index(
+    schema: &Schema,
+    geom_idx: usize,
+    published: &PublishedNames,
+    name: &str,
+) -> Result<usize, ExportError> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|&(i, f)| {
+            i != geom_idx
+                && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+                && published.publish(f.name()) == name
+        })
+        .map(|(i, _)| i)
+        .ok_or_else(|| ExportError::FeatureIdColumnNotFound {
+            name: name.to_string(),
+            available: property_columns(schema, geom_idx, published)
+                .into_iter()
+                .map(|(_, n)| format!("{n:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+}
+
+/// The eight Arrow integer types a `--feature-id` column may have (#443).
+/// MVT's feature id is `uint64`, but a signed column is allowed too --
+/// [`resolve_feature_id_value`] rejects a negative value from one -- since
+/// GeoParquet integer ids are usually signed.
+fn is_integer_scalar(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+/// The `--feature-id` column's raw per-row values for one batch (#443), or
+/// `None` when `opts.feature_id` is unset. Errors if the named column is
+/// missing or not an integer type; per-row null/negative/non-integer values
+/// are [`resolve_feature_id_value`]'s job, once the row is actually needed.
+fn extract_feature_id_column(
+    schema: &Schema,
+    geom_idx: usize,
+    published: &PublishedNames,
+    opts: &ExportOptions,
+    batch: &RecordBatch,
+) -> Result<Option<(String, Vec<Option<PropertyValue>>)>, ExportError> {
+    let Some(name) = &opts.feature_id else {
+        return Ok(None);
+    };
+    let idx = resolve_feature_id_index(schema, geom_idx, published, name)?;
+    let dt = schema.field(idx).data_type();
+    if !is_integer_scalar(dt) {
+        return Err(ExportError::FeatureIdColumnNotInteger {
+            name: name.clone(),
+            data_type: format!("{dt:?}"),
+        });
+    }
+    Ok(Some((
+        name.clone(),
+        extract_property_column(batch.column(idx)),
+    )))
+}
+
+/// Convert one `--feature-id` row's raw property value into the MVT `u64`
+/// feature id, or a descriptive error naming the column and the row's file
+/// scan order (#443).
+///
+/// DIVERGENCE FROM TIPPECANOE: `--use-attribute-for-id` only *warns* on a
+/// non-numeric or fractional id attribute and, for a numeric string, feeds it
+/// through `strtoull`, which for a leading `-` computes the value's
+/// two's-complement unsigned reinterpretation and accepts it whenever
+/// printing that value back out reproduces the input string (`serial.cpp`'s
+/// `attribute_for_id` block) -- so `"-5"` quietly becomes id
+/// `18446744073709551611` with no error at all. Issue #443 asks for hard
+/// errors on null/negative/non-integer ids instead of reproducing that
+/// silent reinterpretation.
+fn resolve_feature_id_value(
+    value: Option<&PropertyValue>,
+    column: &str,
+    row: u64,
+) -> Result<u64, ExportError> {
+    match value {
+        None => Err(ExportError::FeatureIdNull {
+            column: column.to_string(),
+            row,
+        }),
+        Some(PropertyValue::UInt(u)) => Ok(*u),
+        Some(PropertyValue::Int(i)) if *i >= 0 => Ok(*i as u64),
+        Some(PropertyValue::Int(i)) => Err(ExportError::FeatureIdNegative {
+            column: column.to_string(),
+            row,
+            value: *i,
+        }),
+        Some(other) => Err(ExportError::FeatureIdNotInteger {
+            column: column.to_string(),
+            row,
+            value: format!("{other:?}"),
+        }),
+    }
 }
 
 /// MVT-encodable Arrow scalar types.
@@ -5548,6 +5887,7 @@ mod tests {
             seq: 0,
             geom: geom.clone(),
             props: Arc::new(Vec::new()),
+            id: None,
         };
         build_mvt(std::iter::once(&m), &tb, opts)
     }
@@ -6603,7 +6943,7 @@ mod tests {
 
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let feats = read_level_features(&reader, 0, Crs::Epsg4326).unwrap();
-        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default());
+        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default()).unwrap();
         assert_eq!(tiles.len(), 1);
 
         let decoded = decode_tile(&tiles[0].data);
@@ -6666,7 +7006,7 @@ mod tests {
         assert_eq!(feats.len(), 2);
 
         // Level 0 -> zoom 2. Two far-apart points => two distinct tiles.
-        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default());
+        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default()).unwrap();
         assert_eq!(tiles.len(), 2, "two far-apart points => two tiles");
         for t in &tiles {
             assert_eq!(t.feature_count, 1);
@@ -6711,7 +7051,7 @@ mod tests {
 
         let opts = ExportOptions::default();
         // Level 1 -> zoom 4.
-        let tiles = encode_level_tiles(&feats, 4, &opts);
+        let tiles = encode_level_tiles(&feats, 4, &opts).unwrap();
         assert!(tiles.len() >= 2, "wide line must span multiple tiles");
         let extent = opts.extent as i32;
         let slack = extent * opts.tile_buffer as i32 / 256 + 4;
@@ -6754,7 +7094,7 @@ mod tests {
             props: vec![],
         }];
         let opts = ExportOptions::default();
-        let tiles = encode_level_tiles(&feats, 4, &opts);
+        let tiles = encode_level_tiles(&feats, 4, &opts).unwrap();
         assert_eq!(tiles.len(), 1, "fully-contained feature => exactly 1 tile");
         assert_eq!(tiles[0].feature_count, 1);
 
@@ -6764,6 +7104,7 @@ mod tests {
             seq: 0,
             geom: poly.clone(),
             props: Arc::new(vec![]),
+            id: None,
         };
         let expected = build_mvt([&member], &tc.bounds(), &opts);
         assert_eq!(
@@ -6782,7 +7123,7 @@ mod tests {
             props: vec![],
         }];
         let opts = ExportOptions::default();
-        let tiles = encode_level_tiles(&feats, 4, &opts);
+        let tiles = encode_level_tiles(&feats, 4, &opts).unwrap();
         assert!(tiles.len() >= 2, "seam-crossing line must span tiles");
         let extent = opts.extent as i32;
         // The buffer is in TILE PIXELS; in MVT units that is
@@ -6827,7 +7168,7 @@ mod tests {
             tile_size_limit: None,
             ..Default::default()
         };
-        let none = encode_level_tiles(&feats, 6, &no_limit);
+        let none = encode_level_tiles(&feats, 6, &no_limit).unwrap();
         assert!(none.iter().all(|t| !t.oversized));
         let full_count: usize = none.iter().map(|t| t.feature_count).sum();
 
@@ -6836,7 +7177,7 @@ mod tests {
             tile_size_limit: Some(64),
             ..Default::default()
         };
-        let limited = encode_level_tiles(&feats, 6, &opts);
+        let limited = encode_level_tiles(&feats, 6, &opts).unwrap();
         assert!(
             limited.iter().any(|t| t.oversized),
             "tiny --tile-size-limit must trip the valve"
@@ -6866,6 +7207,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(x, y)),
             props: Arc::new(Vec::new()),
+            id: None,
         }
     }
 
@@ -6879,6 +7221,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)),
             props: Arc::new(vec![("level".to_string(), PropertyValue::Double(level))]),
+            id: None,
         }
     }
 
@@ -7034,6 +7377,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(0.0, 0.0)),
             props: Arc::new(vec![("level".to_string(), PropertyValue::Double(level))]),
+            id: None,
         };
         // Tile 1's low value must not migrate ahead of tile 0's high value.
         let mut members = vec![mk(1, 0, 0.1), mk(0, 1, 0.9), mk(0, 2, 0.2)];
@@ -7063,6 +7407,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(0.0, 0.0)),
             props: Arc::new(vec![("n".to_string(), v)]),
+            id: None,
         };
         let members = vec![
             mk(0, PropertyValue::Int(10)),
@@ -7140,6 +7485,7 @@ mod tests {
                     seq: n as u64,
                     geom: Geometry::LineString(LineString::from(coords)),
                     props: Arc::new(Vec::new()),
+                    id: None,
                 }
             })
             .collect();
@@ -7246,6 +7592,7 @@ mod tests {
                     seq: i,
                     geom: Geometry::LineString(coords.into_iter().collect()),
                     props: Arc::new(vec![("level".to_string(), PropertyValue::Double(i as f64))]),
+                    id: None,
                 }
             })
             .collect();
@@ -7376,11 +7723,16 @@ mod tests {
             ("b".to_string(), PropertyValue::Bool(true)),
         ];
         for (i, g) in geoms.into_iter().enumerate() {
+            // #443: every other member carries a `--feature-id` value, so the
+            // roundtrip covers both `Some` and `None` through the spill wire
+            // format.
+            let id = (i % 2 == 0).then_some(u64::MAX - 7 - i as u64);
             let m = Member {
                 key: tile_key(7, 11, 5) + i as u64,
                 seq: u64::MAX - i as u64,
                 geom: g,
                 props: Arc::new(props.clone()),
+                id,
             };
             let mut buf = Vec::new();
             encode_member(&mut buf, &m);
@@ -7389,6 +7741,10 @@ mod tests {
             assert!(cur.is_empty(), "trailing bytes after decode (geometry {i})");
             assert_eq!(back.key, m.key);
             assert_eq!(back.seq, m.seq);
+            assert_eq!(
+                back.id, m.id,
+                "feature id must survive the spill (geometry {i})"
+            );
             assert_eq!(*back.props, *m.props);
             let mut buf2 = Vec::new();
             encode_member(&mut buf2, &back);
@@ -7413,6 +7769,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(seq as f64, -1.0)),
             props: Arc::new(vec![("id".to_string(), PropertyValue::Int(seq as i64))]),
+            id: None,
         };
         store.push(0, 0, mk(0, 0)).unwrap();
         store.push(0, 1, mk(1, 1)).unwrap();
@@ -8406,5 +8763,303 @@ mod tests {
             detect_crs(utm.path()),
             Err(ExportError::UnsupportedCrs { .. })
         ));
+    }
+
+    // ========================================================================
+    // `--feature-id` (#443): stable MVT feature ids
+    // ========================================================================
+
+    /// Happy path: a non-negative int/uint value becomes its own `u64` id.
+    #[test]
+    fn feature_id_value_accepts_uint_and_nonneg_int() {
+        assert_eq!(
+            resolve_feature_id_value(Some(&PropertyValue::UInt(42)), "id", 0).unwrap(),
+            42
+        );
+        assert_eq!(
+            resolve_feature_id_value(Some(&PropertyValue::Int(42)), "id", 0).unwrap(),
+            42
+        );
+        assert_eq!(
+            resolve_feature_id_value(Some(&PropertyValue::Int(0)), "id", 0).unwrap(),
+            0
+        );
+    }
+
+    /// A null value is a hard error naming the column and the row.
+    #[test]
+    fn feature_id_value_rejects_null() {
+        let err = resolve_feature_id_value(None, "id", 7).unwrap_err();
+        match err {
+            ExportError::FeatureIdNull { column, row } => {
+                assert_eq!(column, "id");
+                assert_eq!(row, 7);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A negative value is a hard error -- DIVERGENCE FROM TIPPECANOE, which
+    /// silently reinterprets it as a huge unsigned id instead of rejecting it
+    /// (see `resolve_feature_id_value`'s doc comment).
+    #[test]
+    fn feature_id_value_rejects_negative() {
+        let err = resolve_feature_id_value(Some(&PropertyValue::Int(-5)), "id", 3).unwrap_err();
+        match err {
+            ExportError::FeatureIdNegative { column, row, value } => {
+                assert_eq!(column, "id");
+                assert_eq!(row, 3);
+                assert_eq!(value, -5);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A non-integer value (string, float, bool) is a hard error.
+    #[test]
+    fn feature_id_value_rejects_non_integer() {
+        for bad in [
+            PropertyValue::String("abc".to_string()),
+            PropertyValue::Double(1.5),
+            PropertyValue::Float(1.5),
+            PropertyValue::Bool(true),
+        ] {
+            let err = resolve_feature_id_value(Some(&bad), "id", 1).unwrap_err();
+            assert!(
+                matches!(err, ExportError::FeatureIdNotInteger { .. }),
+                "unexpected {err:?} for {bad:?}"
+            );
+        }
+    }
+
+    /// `--feature-id` matches by *published* name and ignores any
+    /// suppression already recorded: naming the id column in
+    /// `--include-property` / `--exclude-property` (which end up as
+    /// suppression either way) must not hide it from `--feature-id`.
+    #[test]
+    fn feature_id_index_resolves_independent_of_suppression() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            geometry_field(),
+        ]);
+        let mut published = PublishedNames::identity();
+        published.suppress("id");
+        let idx = resolve_feature_id_index(&schema, 2, &published, "id").unwrap();
+        assert_eq!(idx, 0);
+    }
+
+    /// Naming a column that is not in the schema is a clear error listing
+    /// what is available.
+    #[test]
+    fn feature_id_index_errors_naming_available_columns() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            geometry_field(),
+        ]);
+        let published = PublishedNames::identity();
+        let err = resolve_feature_id_index(&schema, 2, &published, "nope").unwrap_err();
+        match err {
+            ExportError::FeatureIdColumnNotFound { name, available } => {
+                assert_eq!(name, "nope");
+                assert!(available.contains("\"id\""));
+                assert!(available.contains("\"name\""));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The encode path: a feature's `--feature-id` value becomes the MVT
+    /// feature id at every zoom it is encoded at, and the id column is never
+    /// also published as a regular tag.
+    #[test]
+    fn feature_id_reaches_the_decoded_tile_at_every_zoom_and_is_not_duplicated() {
+        let feats = vec![
+            Feature {
+                geom: Geometry::Point(Point::new(-120.0, 40.0)),
+                props: vec![
+                    ("id".to_string(), PropertyValue::Int(4242)),
+                    ("name".to_string(), PropertyValue::String("a".to_string())),
+                ],
+            },
+            Feature {
+                geom: Geometry::Point(Point::new(120.0, -40.0)),
+                props: vec![
+                    ("id".to_string(), PropertyValue::UInt(7)),
+                    ("name".to_string(), PropertyValue::String("b".to_string())),
+                ],
+            },
+        ];
+        let opts = ExportOptions {
+            feature_id: Some("id".to_string()),
+            ..Default::default()
+        };
+        for zoom in [2u8, 4u8] {
+            let tiles = encode_level_tiles(&feats, zoom, &opts).unwrap();
+            let mut seen_ids: Vec<u64> = Vec::new();
+            for t in &tiles {
+                let decoded = decode_tile(&t.data);
+                let keys = &decoded.layers[0].keys;
+                for f in &decoded.layers[0].features {
+                    seen_ids.push(f.id.expect("feature-id column must produce an MVT id"));
+                    let tag_names: Vec<&str> = f
+                        .tags
+                        .iter()
+                        .step_by(2)
+                        .map(|&k| keys[k as usize].as_str())
+                        .collect();
+                    assert!(
+                        !tag_names.contains(&"id"),
+                        "the feature-id column must not also be a tile property at z{zoom}"
+                    );
+                    assert!(
+                        tag_names.contains(&"name"),
+                        "other properties must still be published at z{zoom}"
+                    );
+                }
+            }
+            seen_ids.sort_unstable();
+            assert_eq!(
+                seen_ids,
+                vec![7, 4242],
+                "both feature ids present at z{zoom}"
+            );
+        }
+    }
+
+    /// A null/negative/non-integer `--feature-id` value fails the export
+    /// rather than falling back to the tile-local index.
+    #[test]
+    fn feature_id_error_path_names_the_column_and_row() {
+        let feats = vec![Feature {
+            geom: Geometry::Point(Point::new(-120.0, 40.0)),
+            props: vec![("id".to_string(), PropertyValue::Int(-1))],
+        }];
+        let opts = ExportOptions {
+            feature_id: Some("id".to_string()),
+            ..Default::default()
+        };
+        let err = encode_level_tiles(&feats, 4, &opts).err().unwrap();
+        match err {
+            ExportError::FeatureIdNegative { column, row, value } => {
+                assert_eq!(column, "id");
+                assert_eq!(row, 0);
+                assert_eq!(value, -1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// End-to-end through `export_pmtiles`: an id column also named in
+    /// `--feature-order` is rejected up front rather than silently breaking
+    /// the sort.
+    #[test]
+    fn feature_id_conflicts_with_feature_order_on_the_same_column() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tmp.path(),
+            &[(
+                vec![1, 2],
+                vec![
+                    Geometry::Point(Point::new(-120.0, 40.0)),
+                    Geometry::Point(Point::new(120.0, -40.0)),
+                ],
+            )],
+        );
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            feature_id: Some("id".to_string()),
+            feature_order: FeatureOrder::Column {
+                name: "id".to_string(),
+                descending: false,
+            },
+            ..Default::default()
+        };
+        let err = export_pmtiles(tmp.path(), out.path(), &opts).unwrap_err();
+        assert!(matches!(
+            err,
+            ExportError::FeatureIdConflictsWithFeatureOrder { name } if name == "id"
+        ));
+    }
+
+    /// `--feature-id` naming a column absent from the overview file's schema
+    /// is a clear error, not a silent fallback.
+    #[test]
+    fn feature_id_unknown_column_is_rejected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tmp.path(),
+            &[(
+                vec![1, 2],
+                vec![
+                    Geometry::Point(Point::new(-120.0, 40.0)),
+                    Geometry::Point(Point::new(120.0, -40.0)),
+                ],
+            )],
+        );
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            feature_id: Some("nope".to_string()),
+            ..Default::default()
+        };
+        let err = export_pmtiles(tmp.path(), out.path(), &opts).unwrap_err();
+        assert!(matches!(err, ExportError::FeatureIdColumnNotFound { name, .. } if name == "nope"));
+    }
+
+    /// `--feature-id` naming a non-integer column (the fixture's `name`, a
+    /// string) is rejected at export setup, before any row is scanned.
+    #[test]
+    fn feature_id_non_integer_column_is_rejected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tmp.path(),
+            &[(
+                vec![1, 2],
+                vec![
+                    Geometry::Point(Point::new(-120.0, 40.0)),
+                    Geometry::Point(Point::new(120.0, -40.0)),
+                ],
+            )],
+        );
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            feature_id: Some("name".to_string()),
+            ..Default::default()
+        };
+        let err = export_pmtiles(tmp.path(), out.path(), &opts).unwrap_err();
+        assert!(matches!(
+            err,
+            ExportError::FeatureIdColumnNotInteger { name, .. } if name == "name"
+        ));
+    }
+
+    /// `--feature-id` naming a column also listed in `--exclude-property`
+    /// still works: tippecanoe extracts the id attribute before its own
+    /// filter runs, so this must be a harmless no-op, not an error.
+    #[test]
+    fn feature_id_column_named_in_exclude_property_still_works() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tmp.path(),
+            &[(
+                vec![1, 2],
+                vec![
+                    Geometry::Point(Point::new(-120.0, 40.0)),
+                    Geometry::Point(Point::new(120.0, -40.0)),
+                ],
+            )],
+        );
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            feature_id: Some("id".to_string()),
+            properties: PropertySelection {
+                exclude: vec!["id".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = export_pmtiles(tmp.path(), out.path(), &opts).unwrap();
+        assert!(report.total_tiles > 0);
     }
 }

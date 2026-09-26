@@ -621,6 +621,27 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
 
+    /// Carry a property column through as the MVT feature `id` on every tile
+    /// the feature appears in, at every zoom (#443; tippecanoe's
+    /// `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover,
+    /// selection, joins) keys correctly across tile and zoom boundaries.
+    ///
+    /// Matched against the property name as the tile publishes it -- the
+    /// same naming `--feature-order` / `--include-property` /
+    /// `--exclude-property` use -- and it always wins over those flags
+    /// naming the same column (harmless no-op, never an error). The column
+    /// must be an integer type and every value a non-null, non-negative
+    /// integer (MVT feature ids are `uint64`); a violation fails the export
+    /// naming the column and the offending row. The column is moved to the
+    /// id, never also published as a regular property (tippecanoe's
+    /// behaviour) -- repeat it under two names in the source data if both
+    /// are wanted.
+    ///
+    /// Unset (the default) keeps the pre-#443 tile-local member index --
+    /// unique only within a single tile/zoom pair.
+    #[arg(long, value_name = "COLUMN")]
+    feature_id: Option<String>,
+
     /// Emit only the tiles in this PMTiles tile-id range (#498): `LO..HI`,
     /// two tile ids AT THE SAME ZOOM.
     ///
@@ -1781,6 +1802,32 @@ struct TilesArgs {
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
 
+    /// Carry a property column through as the MVT feature `id` on every tile
+    /// the feature appears in, at every zoom (#443; tippecanoe's
+    /// `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover,
+    /// selection, joins) keys correctly across tile and zoom boundaries.
+    ///
+    /// Matched against the property name as the tile publishes it -- the
+    /// same naming `--feature-order` / `--include-property` /
+    /// `--exclude-property` use. The column must survive the convert step's
+    /// own property selection to reach the export that reads it (naming a
+    /// column `--exclude-property` already dropped is an error, same as
+    /// `--feature-order`); an export-time `--include-property` /
+    /// `--exclude-property` naming this column is instead a harmless no-op,
+    /// since the id is always moved out of the properties regardless.
+    ///
+    /// The column must be an integer type and every value a non-null,
+    /// non-negative integer (MVT feature ids are `uint64`); a violation fails
+    /// the export naming the column and the offending row. The column is
+    /// moved to the id, never also published as a regular property
+    /// (tippecanoe's behaviour) -- repeat it under two names in the source
+    /// data if both are wanted.
+    ///
+    /// Unset (the default) keeps the pre-#443 tile-local member index --
+    /// unique only within a single tile/zoom pair.
+    #[arg(long, value_name = "COLUMN")]
+    feature_id: Option<String>,
+
     /// Write a JSON report to this path: a combined object with a `convert`
     /// section (the overview build, matching `overview --report`) and an
     /// `export` section (the PMTiles export, matching `export-pmtiles
@@ -2549,6 +2596,19 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
              selection or drop the knob"
         );
     }
+    // #443: same reasoning as `--feature-order` above -- `--feature-id`'s
+    // column must physically survive the convert step to reach the export
+    // that moves it to the id. This is convert-time-only: it does not apply
+    // to export-pmtiles's OWN --include-property/--exclude-property, which
+    // `ExportOptions::feature_id` always overrides regardless (the column
+    // already exists in the intermediate file either way).
+    if let Some(name) = &args.feature_id {
+        anyhow::ensure!(
+            options.properties.keeps(name),
+            "property {name:?} is excluded but --feature-id reads it; keep it in the \
+             selection or drop the flag"
+        );
+    }
 
     // Intermediate overview file (#314): retained at --keep-overview when
     // given; otherwise a temp file in --spill-dir / $TMPDIR / the output
@@ -2681,6 +2741,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         tile_range,
         zoom_ceiling: shard
             .and_then(|job| job.range.is_none().then(|| job.pivot.saturating_sub(1))),
+        feature_id: args.feature_id.clone(),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -3229,6 +3290,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
             .map(tylertoo_core::shard::TileRange::parse)
             .transpose()?,
         zoom_ceiling: args.zoom_ceiling,
+        feature_id: args.feature_id.clone(),
     };
 
     println!(
@@ -4059,6 +4121,23 @@ mod tests {
         let mut argv = vec!["tylertoo", "tiles", "in.parquet", "out.pmtiles"];
         argv.extend_from_slice(&["--feature-order", "level:dsc"]);
         assert!(Cli::try_parse_from(argv).is_err());
+    }
+
+    /// #443: the flag has to actually reach `ExportOptions` on both
+    /// `tiles` and `export-pmtiles`, not just parse.
+    #[test]
+    fn feature_id_flag_reaches_both_commands() {
+        assert_eq!(parse_tiles(&[]).feature_id, None);
+        assert_eq!(parse_export(&[]).feature_id, None);
+
+        assert_eq!(
+            parse_tiles(&["--feature-id", "osm_id"]).feature_id,
+            Some("osm_id".to_string())
+        );
+        assert_eq!(
+            parse_export(&["--feature-id", "osm_id"]).feature_id,
+            Some("osm_id".to_string())
+        );
     }
 
     #[test]
