@@ -1262,12 +1262,14 @@ enum ScalarKey {
 }
 
 impl ScalarKey {
-    /// The key for a non-string value; `None` for [`PropertyValue::String`],
-    /// which [`LayerBuilder`] indexes by the string itself.
+    /// The key for a non-string value. [`PropertyValue::String`] never
+    /// reaches here: [`LayerBuilder`] indexes strings by the string itself.
     #[inline]
-    fn of(value: &PropertyValue) -> Option<Self> {
-        Some(match value {
-            PropertyValue::String(_) => return None,
+    fn of(value: &PropertyValue) -> Self {
+        match value {
+            PropertyValue::String(_) => {
+                unreachable!("string values are indexed by LayerBuilder::string_index")
+            }
             PropertyValue::Float(f) => Self::Float(if f.is_nan() {
                 f32::NAN.to_bits()
             } else {
@@ -1281,7 +1283,7 @@ impl ScalarKey {
             PropertyValue::Int(i) => Self::Int(*i),
             PropertyValue::UInt(u) => Self::UInt(*u),
             PropertyValue::Bool(b) => Self::Bool(*b),
-        })
+        }
     }
 }
 
@@ -1349,8 +1351,7 @@ impl LayerBuilder {
                 }
             },
             _ => {
-                let key =
-                    ScalarKey::of(value).expect("the String variant is handled by the arm above");
+                let key = ScalarKey::of(value);
                 match self.scalar_index.get(&key) {
                     Some(&idx) => idx,
                     None => {
@@ -2743,7 +2744,7 @@ mod tests {
         r
     }
 
-    /// The bit-keyed value dedup must assign exactly the indexes the pre-#461
+    /// The bit-keyed value dedup must assign exactly the indexes the pre-#535
     /// `format!("{value:?}")` key did, for every value shape that could
     /// plausibly alias: the two float widths carrying the same number, signed
     /// vs unsigned integers at the same magnitude, `0.0` against `-0.0`,
@@ -2782,7 +2783,7 @@ mod tests {
             "fixture must be a second, distinct NaN encoding"
         );
 
-        // Reference: the pre-#461 single `format!`-keyed map.
+        // Reference: the pre-#535 single `format!`-keyed map.
         let mut reference_index: HashMap<String, u32> = HashMap::new();
         let mut reference_next = 0u32;
         let expected: Vec<u32> = values
@@ -2821,11 +2822,13 @@ mod tests {
     fn node_ring_sweep_matches_all_pairs_reference() {
         let mut seed = 0x0d0d_1234_5678_u64;
         let mut touched = 0usize;
-        for case in 0..600 {
+        let mut swept = 0usize;
+        for case in 0..784 {
             // Alternate a tiny grid (frequent exact collinearity → T-touches)
-            // with a wider one, and cross the sweep threshold in ring size.
+            // with a wider one, and walk EVERY ring size 3..=100 (eight rings
+            // each), both sides of the sweep threshold.
             let grid = if case % 2 == 0 { 8 } else { 40 } as u32;
-            let n = 3 + (lcg(&mut seed) % 90) as usize;
+            let n = 3 + (case / 2) % 98;
             let mut pts: Vec<(i32, i32)> = Vec::new();
             let mut guard = 0;
             while pts.len() < n && guard < 4000 {
@@ -2857,12 +2860,13 @@ mod tests {
             let expected = apply_node_inserts(ring.clone(), all_pairs);
             if expected.len() != ring.len() {
                 touched += 1;
+                swept += usize::from(n > NODE_SWEEP_MIN_EDGES);
             }
             assert_eq!(node_ring(ring.clone()), expected, "ring={ring:?}");
         }
         assert!(
-            touched > 20,
-            "too few noded rings to be meaningful: {touched}"
+            touched > 20 && swept > 10,
+            "too few noded rings to be meaningful: {touched} ({swept} past the sweep threshold)"
         );
     }
 

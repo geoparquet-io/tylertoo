@@ -1853,15 +1853,24 @@ const MEMBER_STORE_RAM_BUDGET: usize = 128 * 1024 * 1024;
 /// backpressure knob, mirroring `overview/pipeline.rs`.
 const SINGLE_READ_IN_FLIGHT: usize = 4;
 
-/// Bounded-channel depth between the band reader thread and the clip/route
-/// consumer of one **duplicating**-mode wave ([`process_wave`], #535).
+/// Bounded-channel depth between the reader thread and the consumer of one
+/// **duplicating**-mode wave ([`process_wave`], #535) and of the fan-out bbox
+/// scan ([`scan_all_levels`]).
 ///
-/// Deliberately shallower than [`SINGLE_READ_IN_FLIGHT`]: this path is the one
-/// that also holds a whole wave's members in RAM, so extra in-flight batches
-/// land on top of the peak the wave-width preflight budgeted. Two is all the
-/// overlap needs — one batch being clipped while the next is read — and it
-/// bounds the extra transient at two `EXPORT_BATCH_SIZE` Arrow batches per
-/// wave, which is noise next to the wave's own member buffer.
+/// Deliberately shallower than [`SINGLE_READ_IN_FLIGHT`]. The wave path also
+/// holds a whole wave's members in RAM, and the scan runs before any wave
+/// preflight, so in-flight batches on either land outside what the wave-width
+/// preflight ([`memory_safe_level_wave`]) budgets. Two is all the overlap
+/// needs — one batch being consumed while the next is read.
+///
+/// The live Arrow batches per pipe are bounded by **depth + 2**, not depth:
+/// `depth` queued in the channel, one the producer has finished decoding and
+/// is blocked sending, and one the consumer is working on — so up to four
+/// `EXPORT_BATCH_SIZE` batches here. For a wave that is noise next to its own
+/// member buffer and is not folded into the preflight estimate; the scan
+/// additionally projects its read to the geometry column
+/// ([`OverviewReader::read_band_projected`]), so its batches carry no
+/// property columns.
 const WAVE_READ_IN_FLIGHT: usize = 2;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
@@ -2605,13 +2614,26 @@ fn scan_all_levels(
     // in exactly the order the serial loop did and the `LevelScan`s come out
     // identical — not merely equivalent under the commutativity argument in
     // this function's docs.
+    //
+    // Memory (#559 review): the scan needs only each feature's bbox, so the
+    // read is projected to the geometry column — [`decode_batch_bboxes`] reads
+    // nothing else — and the pipe is the shallow [`WAVE_READ_IN_FLIGHT`]: this
+    // runs before any wave preflight, so its in-flight batches are unbudgeted.
+    // Projection keeps every row and the geometry column's field (name and
+    // metadata), so the decoded bboxes — and the scan — are unchanged. With no
+    // recognizable geometry column the read stays unprojected, so the error
+    // surfaces from the decode exactly as before.
+    let geom_root = geometry_index(reader.schema());
     let scans_ref = &mut scans;
     let zooms_ref = &zooms;
     scoped_pipe(
-        SINGLE_READ_IN_FLIGHT,
+        WAVE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for j in 0..num_levels {
-                let band_reader = reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE)?;
+                let band_reader = match geom_root {
+                    Some(g) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, &[g])?,
+                    None => reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE)?,
+                };
                 for batch in band_reader {
                     if tx.send((j, batch?)).is_err() {
                         return Ok(()); // consumer dropped the receiver
@@ -5382,6 +5404,123 @@ mod tests {
             std::fs::read(t_narrow.path()).unwrap(),
             std::fs::read(t_wide.path()).unwrap(),
             "archive bytes diverge between wave widths 1 and 16"
+        );
+    }
+
+    /// Rewrite overview file `src` to `dst` row group for row group (same
+    /// boundaries, schema and footer keys), blanking the WKB geometry of
+    /// global row `bad_row` — an undecodable value the export's geometry
+    /// decode rejects with a typed error.
+    fn rewrite_with_blank_geometry(src: &Path, dst: &Path, bad_row: usize) {
+        use arrow_array::{Array, BinaryArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+
+        let probe = ParquetRecordBatchReaderBuilder::try_new(File::open(src).unwrap()).unwrap();
+        let schema = probe.schema().clone();
+        let num_rgs = probe.metadata().num_row_groups();
+        let kvs: Vec<KeyValue> = probe
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|kv| kv.key != "ARROW:schema")
+            .collect();
+        let geom_idx = schema.index_of("geometry").unwrap();
+
+        let mut writer =
+            ArrowWriter::try_new(File::create(dst).unwrap(), schema.clone(), None).unwrap();
+        let mut row0 = 0usize;
+        for rg in 0..num_rgs {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(src).unwrap())
+                .unwrap()
+                .with_row_groups(vec![rg])
+                .with_batch_size(usize::MAX >> 1)
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let n = batch.num_rows();
+                let batch = if (row0..row0 + n).contains(&bad_row) {
+                    let geoms = batch
+                        .column(geom_idx)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .expect("overview geometry is WKB Binary");
+                    let blanked: BinaryArray = (0..n)
+                        .map(|i| {
+                            Some(if row0 + i == bad_row {
+                                &[] as &[u8]
+                            } else {
+                                geoms.value(i)
+                            })
+                        })
+                        .collect();
+                    let mut cols = batch.columns().to_vec();
+                    cols[geom_idx] = Arc::new(blanked);
+                    RecordBatch::try_new(schema.clone(), cols).unwrap()
+                } else {
+                    batch
+                };
+                row0 += n;
+                writer.write(&batch).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        for kv in kvs {
+            writer.append_key_value_metadata(kv);
+        }
+        writer.close().unwrap();
+    }
+
+    /// #362's shape at the #535 read/compute pipe in [`scan_all_levels`]: the
+    /// consumer (bbox decode) fails several batches in — past the pipe's
+    /// depth — while the producer still has batches left to read. Its error
+    /// must come back promptly, not wedge the producer in `send`.
+    ///
+    /// The scan is the site an export reaches first (it decodes every
+    /// geometry before any wave runs). [`process_wave`]'s pipe is the same
+    /// shape — [`scoped_pipe`] owning the receiver, a producer that treats a
+    /// failed `send` as a clean stop — and the helper itself is covered by
+    /// `pipe::tests`.
+    #[test]
+    fn scan_consumer_error_mid_read_returns_promptly() {
+        const BATCHES: usize = 10;
+        let n = BATCHES * EXPORT_BATCH_SIZE;
+        // Fourth batch: past depth + 2 in flight, with six batches unread.
+        let bad_row = 3 * EXPORT_BATCH_SIZE + 17;
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let geoms: Vec<Geometry<f64>> = (0..n)
+            .map(|i| {
+                Geometry::Point(Point::new(
+                    (i % 359) as f64 * 0.5 - 90.0,
+                    (i % 157) as f64 * 0.5 - 39.0,
+                ))
+            })
+            .collect();
+        let good = tempfile::NamedTempFile::new().unwrap();
+        write_mode_fixture(good.path(), &[(ids, geoms)], Mode::Duplicating, 10_000);
+        let bad = tempfile::NamedTempFile::new().unwrap();
+        rewrite_with_blank_geometry(good.path(), bad.path(), bad_row);
+        let bad_path = bad.path().to_path_buf();
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let _ = done_tx.send(export_pmtiles(&bad_path, out.path(), &Default::default()));
+        });
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("export deadlocked on a mid-read consumer error (#362 shape)");
+        let err = result.expect_err("a blank WKB value must fail the export");
+        // The decode's index is batch-local: 17 pins the failure to the bad
+        // row inside the fourth batch, i.e. the consumer's error, surfaced.
+        assert!(
+            err.to_string().contains("Invalid geometry at index 17"),
+            "expected the consumer's geometry-decode error, got: {err}"
         );
     }
 
