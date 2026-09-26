@@ -28,12 +28,9 @@ fn tylertoo_bin() -> &'static str {
 /// own follow-up checks), the parsed `--report` JSON, and the two parsed
 /// profile JSONL lines (convert, export).
 ///
-/// Shared by [`profile_json_written_and_parses`] and
-/// [`profile_json_export_section_parses`] (#535 step 1) purely to keep each
-/// test's own assertions under clippy's function-length/cognitive-complexity
-/// ceiling instead of piling both phases' checks into one function — each
-/// call is still its own fresh subprocess (see the module doc: this MUST
-/// stay a subprocess test), so the two tests remain fully independent.
+/// [`profile_json_written_and_parses`] runs it once and checks both lines
+/// from that single subprocess run (see the module doc: this MUST stay a
+/// subprocess test).
 ///
 /// #535 step 1: a one-shot `tiles` run now writes TWO JSONL lines to
 /// `TYLERTOO_PROFILE_JSON` — convert's (unchanged schema, emitted the instant
@@ -109,14 +106,54 @@ fn run_tiles_with_profile(
     (dir, report, convert, export)
 }
 
+/// One `tiles` run, both of its profile lines: convert's
+/// ([`check_convert_line`]), export's ([`check_export_line`]), and the fields
+/// that pair them (#535 review).
 #[test]
 fn profile_json_written_and_parses() {
     let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
         return;
     };
 
-    let (dir, report, value, _export_value) = run_tiles_with_profile(&fixture, "0", "6");
+    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6");
 
+    // --- Pairing: both lines of one `tiles` process share a `run_id` and
+    // say which phase they are. ---
+    assert_eq!(
+        convert["phase"], "convert",
+        "first line must be phase=convert: {convert}"
+    );
+    assert_eq!(
+        export["phase"], "export",
+        "second line must be phase=export: {export}"
+    );
+    let run_id = convert["run_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("convert line must carry a string run_id: {convert}"));
+    assert!(!run_id.is_empty(), "run_id must be non-empty: {convert}");
+    assert_eq!(
+        export["run_id"].as_str(),
+        Some(run_id),
+        "the convert and export lines of ONE `tiles` run must share a run_id: \
+         convert={convert} export={export}"
+    );
+    assert!(
+        export["output"]
+            .as_str()
+            .is_some_and(|o| o.ends_with("out.pmtiles")),
+        "export line must name its output archive: {export}"
+    );
+
+    check_convert_line(dir.path(), &report, &convert);
+    check_export_line(&report, &export);
+}
+
+/// The convert line of [`profile_json_written_and_parses`]'s `tiles` run.
+fn check_convert_line(
+    dir: &std::path::Path,
+    report: &serde_json::Value,
+    value: &serde_json::Value,
+) {
     // --- The independent source of truth: the --report's convert.levels. ---
     let report_level_count = report["convert"]["levels"]
         .as_array()
@@ -293,7 +330,7 @@ fn profile_json_written_and_parses() {
 
     // The startup preflight probes writability with a uniquely named SIBLING
     // file and removes it again; nothing of its own may survive the run.
-    let strays: Vec<String> = std::fs::read_dir(dir.path())
+    let strays: Vec<String> = std::fs::read_dir(dir)
         .expect("read tempdir")
         .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
         .filter(|n| n.starts_with(".tylertoo-profile-json-probe."))
@@ -305,19 +342,10 @@ fn profile_json_written_and_parses() {
     );
 }
 
-/// #535 step 1: the export profile line (the second of the two JSONL lines
-/// [`run_tiles_with_profile`] returns for one `tiles` run — see its doc).
-///
-/// Independent source of truth: the SAME `--report`'s `export.zooms`,
-/// `export.total_tiles` and `export.total_tile_features` this test parses
-/// `report` from.
-#[test]
-fn profile_json_export_section_parses() {
-    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
-        return;
-    };
-
-    let (_dir, report, _convert_value, export_value) = run_tiles_with_profile(&fixture, "0", "6");
+/// #535: the export profile line of [`profile_json_written_and_parses`]'s
+/// `tiles` run (the second of the two JSONL lines — see
+/// [`run_tiles_with_profile`]), checked against the SAME `--report`.
+fn check_export_line(report: &serde_json::Value, export_value: &serde_json::Value) {
     let export = &export_value["export"];
     assert!(
         export.is_object(),
@@ -330,12 +358,23 @@ fn profile_json_export_section_parses() {
             .as_f64()
             .unwrap_or_else(|| panic!("export.stage_secs.{name} must be a number: {export_value}"))
     };
-    let (band_read, clip, encode, spool_write) = (
-        export_stage_field("band_read"),
-        export_stage_field("clip"),
-        export_stage_field("encode"),
-        export_stage_field("spool_write"),
-    );
+    // `tiles` exports a duplicating-mode overview, so every stage of the
+    // per-wave path runs; the partitioning-only ones (`spill_*`) are present
+    // but 0 here — see `profile_json_export_line_partitioning_mode`.
+    for name in ["band_read", "decode", "clip", "encode", "spool_write"] {
+        assert!(
+            export_stage_field(name) > 0.0,
+            "export.stage_secs.{name} must be > 0 for a run that wrote tiles: {export_value}"
+        );
+    }
+    for name in ["spill_write", "spill_read"] {
+        assert!(
+            export_stage_field(name) >= 0.0,
+            "export.stage_secs.{name} must be a non-negative number: {export_value}"
+        );
+    }
+    assert_eq!(export["mode"], "duplicating", "{export_value}");
+    check_export_phase_walls(export_value);
     // `checkpoint` is legitimately 0.0 on a short run that never crosses
     // `CHECKPOINT_INTERVAL` (this fixture's z0..z6 export is far too fast to),
     // so it is checked for presence/type only, not included in the sum-must-
@@ -344,12 +383,6 @@ fn profile_json_export_section_parses() {
     assert!(
         checkpoint >= 0.0,
         "export.stage_secs.checkpoint must be a non-negative number: {export_value}"
-    );
-    let export_stage_sum = band_read + clip + encode + spool_write;
-    assert!(
-        export_stage_sum > 0.0,
-        "export.stage_secs (band_read+clip+encode+spool_write) must be > 0 for \
-         a run that wrote tiles: {export_value}"
     );
 
     let report_export_zooms = report["export"]["zooms"]
@@ -390,10 +423,11 @@ fn profile_json_export_section_parses() {
         );
     }
 
-    // The report's own totals are the independent source of truth these two
-    // sums must agree with — same tile/feature counts, computed by the
-    // profile dump's own per-level bookkeeping in `export_level` rather than
-    // by `ZoomReport`'s.
+    // NOT an independent recount: `per_zoom` and the report's `ZoomReport`s
+    // are built from the same per-level counters in `export_level`. What this
+    // pins is the plumbing — every exported zoom has an entry, and the
+    // entries carry (and serialize) those counters rather than something
+    // else.
     let report_total_tiles = report["export"]["total_tiles"]
         .as_u64()
         .expect("report export.total_tiles must be a number");
@@ -423,6 +457,144 @@ fn profile_json_export_section_parses() {
     assert!(
         export["checkpoints"].is_u64(),
         "export.checkpoints must be a number: {export_value}"
+    );
+    assert!(
+        export["threads"].as_u64().is_some_and(|t| t >= 1),
+        "export.threads must be a positive number: {export_value}"
+    );
+    assert!(
+        export["peak_rss_mib"].is_null()
+            || export["peak_rss_mib"].as_f64().is_some_and(|m| m > 0.0),
+        "export.peak_rss_mib must be a positive number or null: {export_value}"
+    );
+}
+
+/// `export.phase_walls` are disjoint wall windows of the export, so they
+/// must sum to no more than `total` (and `total` must be positive). Returns
+/// the walls object for mode-specific checks by the caller.
+fn check_export_phase_walls(export_value: &serde_json::Value) -> &serde_json::Value {
+    let walls = &export_value["export"]["phase_walls"];
+    let wall = |name: &str| -> f64 {
+        let secs = walls[name].as_f64().unwrap_or_else(|| {
+            panic!("export.phase_walls.{name} must be a number: {export_value}")
+        });
+        assert!(
+            secs >= 0.0 && secs.is_finite(),
+            "export.phase_walls.{name} must be finite and non-negative: {export_value}"
+        );
+        secs
+    };
+    let total = wall("total");
+    assert!(
+        total > 0.0,
+        "export.phase_walls.total must be > 0: {export_value}"
+    );
+    let sum = wall("scan") + wall("fill") + wall("levels") + wall("finalize");
+    assert!(
+        sum <= total * 1.01,
+        "export.phase_walls must be disjoint windows: scan+fill+levels+finalize \
+         ({sum:.6}s) exceeds total ({total:.6}s): {export_value}"
+    );
+    walls
+}
+
+/// #535 review: the partitioning-mode export path — the single-read fill
+/// (`fill_member_store` / `fanout_batch_members`) and the per-wave drain from
+/// the member store (`encode_wave_from_store`) — which `tiles` never takes
+/// (it always converts in duplicating mode). Two-step by hand: `overview
+/// --mode partitioning`, then a separate `export-pmtiles` process, both
+/// appending to the same `TYLERTOO_PROFILE_JSON`.
+#[test]
+fn profile_json_export_line_partitioning_mode() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let overview = dir.path().join("overview.parquet");
+    let out = dir.path().join("out.pmtiles");
+    let profile_json = dir.path().join("profile.jsonl");
+    for args in [
+        vec![
+            "overview",
+            fixture.to_str().unwrap(),
+            overview.to_str().unwrap(),
+            "--mode",
+            "partitioning",
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "12",
+        ],
+        vec![
+            "export-pmtiles",
+            overview.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ],
+    ] {
+        let output = Command::new(tylertoo_bin())
+            .args(&args)
+            .env("TYLERTOO_PROFILE_JSON", &profile_json)
+            .output()
+            .expect("run tylertoo");
+        assert!(
+            output.status.success(),
+            "{} exited with {}: {}",
+            args[0],
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let contents = std::fs::read_to_string(&profile_json).expect("read TYLERTOO_PROFILE_JSON");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every profile line must be valid JSON"))
+        .collect();
+    let of_phase = |phase: &str| -> Vec<&serde_json::Value> {
+        lines.iter().filter(|v| v["phase"] == phase).collect()
+    };
+    let (converts, exports) = (of_phase("convert"), of_phase("export"));
+    assert_eq!(
+        (lines.len(), converts.len(), exports.len()),
+        (2, 1, 1),
+        "overview + export-pmtiles must write exactly one convert and one export line: {contents}"
+    );
+    let export_value = exports[0];
+    // Two processes, two runs: `run_id` must tell them apart.
+    assert_ne!(
+        converts[0]["run_id"], export_value["run_id"],
+        "separate processes must get distinct run_ids: {contents}"
+    );
+    assert!(
+        export_value["run_id"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "export line must carry a run_id: {export_value}"
+    );
+
+    let export = &export_value["export"];
+    assert_eq!(export["mode"], "partitioning", "{export_value}");
+    let stage = |name: &str| -> f64 {
+        export["stage_secs"][name]
+            .as_f64()
+            .unwrap_or_else(|| panic!("export.stage_secs.{name} must be a number: {export_value}"))
+    };
+    for name in ["band_read", "decode", "clip", "encode", "spool_write"] {
+        assert!(
+            stage(name) > 0.0,
+            "export.stage_secs.{name} must be > 0 on the partitioning path: {export_value}"
+        );
+    }
+    assert!(stage("spill_read") >= 0.0 && stage("spill_write") >= 0.0);
+    let walls = check_export_phase_walls(export_value);
+    assert!(
+        walls["fill"].as_f64().is_some_and(|f| f > 0.0),
+        "phase_walls.fill must be > 0: the single-read fill must have run: {export_value}"
+    );
+    assert!(
+        export["per_zoom"].as_array().is_some_and(|z| z.len() > 1),
+        "this test needs a multi-level export: {export_value}"
     );
 }
 
