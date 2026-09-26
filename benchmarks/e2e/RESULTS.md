@@ -261,8 +261,9 @@ Within a single run (3 timed repeats after a warm-up), on `madagascar-adm4`:
 Between two full runs an hour apart on the same idle laptop, tylertoo's
 `madagascar-adm4` median moved 2.34 s → 1.61 s and the defaults ratio moved
 10.4× → 12.5× (tippecanoe moved 23.93 s → 20.05 s over the same pair).
-**A single-digit ratio measured on a laptop carries roughly ±20%.** That is why §"What to quote" gives a band, and why no row here should
-be quoted to two significant figures.
+**A single-digit ratio measured on a laptop carries roughly ±20%.** That is
+why "What to quote" above gives a band, and why no row here should be quoted
+to two significant figures.
 
 ## 8. What this does not measure
 
