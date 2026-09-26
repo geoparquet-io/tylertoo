@@ -462,51 +462,81 @@ fn node_ring(ring: TileRing) -> TileRing {
     if n > NODE_MAX_EDGES {
         return ring;
     }
+    let inserts = if n <= NODE_SWEEP_MIN_EDGES {
+        node_inserts_all_pairs(&ring, n)
+    } else {
+        node_inserts_sweep(&ring, n)
+    };
+    apply_node_inserts(ring, inserts)
+}
+
+/// Every vertex against every edge — `O(n²)` [`node_insert`] calls, all in
+/// registers and without allocating beyond the result.
+///
+/// The whole of [`node_ring`] until #535, and still the cheapest thing to do
+/// for a short ring. It is also the oracle [`node_inserts_sweep`] is tested
+/// against, which is why it stays here rather than being inlined.
+fn node_inserts_all_pairs(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
     // (edge index, position along the edge, vertex) for every insertion.
     let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
-    if n <= NODE_SWEEP_MIN_EDGES {
-        for k in 0..n {
-            for i in 0..n {
-                if let Some(ins) = node_insert(&ring, n, k, i) {
-                    inserts.push(ins);
-                }
-            }
-        }
-    } else {
-        // x-sorted sweep (#535). The all-pairs scan above is `O(n²)`, and on a
-        // 3.07 M-feature z0–13 export it was the single hottest thing in the
-        // whole encode stage (32 core-seconds, 15e9 inner iterations) — the
-        // coalesced overview polygons carry exterior rings of thousands of
-        // edges, and those few rings dominate the `n²` sum.
-        //
-        // An insertion needs the vertex inside the edge's bounding box, so a
-        // vertex can only match edges whose x-span covers it. Sorting the
-        // vertices by x once makes each edge's candidate vertices a contiguous
-        // slice, cutting the scan to `O(n log n + Σ candidates)`.
-        //
-        // The emitted set is unchanged: the per-pair test is the same
-        // [`node_insert`], every box-overlapping pair is still visited, and
-        // only the ORDER of discovery differs — which `inserts.sort_unstable()`
-        // below normalizes (equal tuples are indistinguishable), so the noded
-        // ring comes out vertex-for-vertex identical.
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_unstable_by_key(|&k| ring[k as usize].0);
-        let xs: Vec<i32> = order.iter().map(|&k| ring[k as usize].0).collect();
+    for k in 0..n {
         for i in 0..n {
-            let bx = edge_box(ring[i], ring[i + 1]);
-            let lo = xs.partition_point(|&x| x < bx.0);
-            let hi = xs.partition_point(|&x| x <= bx.2);
-            for &k in &order[lo..hi] {
-                if let Some(ins) = node_insert(&ring, n, k as usize, i) {
-                    inserts.push(ins);
-                }
+            if let Some(ins) = node_insert(ring, n, k, i) {
+                inserts.push(ins);
             }
         }
     }
+    inserts
+}
+
+/// [`node_inserts_all_pairs`] by x-sorted sweep (#535).
+///
+/// The all-pairs scan is `O(n²)`, and on a 3.07 M-feature z0–13 export it was
+/// the single hottest thing in the whole encode stage (32 core-seconds, 15e9
+/// inner iterations) — the coalesced overview polygons carry exterior rings of
+/// thousands of edges, and those few rings dominate the `n²` sum.
+///
+/// An insertion needs the vertex inside the edge's bounding box, so a vertex
+/// can only match edges whose x-span covers it. Sorting the vertices by x once
+/// makes each edge's candidate vertices a contiguous slice, cutting the scan to
+/// `O(n log n + Σ candidates)`.
+///
+/// The result is the same **multiset** as the all-pairs scan: the per-pair test
+/// is the same [`node_insert`] and every box-overlapping pair is still visited,
+/// so only the order of discovery differs — which [`apply_node_inserts`]'s sort
+/// normalizes.
+fn node_inserts_sweep(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
+    let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_unstable_by_key(|&k| ring[k as usize].0);
+    let xs: Vec<i32> = order.iter().map(|&k| ring[k as usize].0).collect();
+    for i in 0..n {
+        let bx = edge_box(ring[i], ring[i + 1]);
+        let lo = xs.partition_point(|&x| x < bx.0);
+        let hi = xs.partition_point(|&x| x <= bx.2);
+        for &k in &order[lo..hi] {
+            if let Some(ins) = node_insert(ring, n, k as usize, i) {
+                inserts.push(ins);
+            }
+        }
+    }
+    inserts
+}
+
+/// Splice [`node_insert`] results into `ring`: each `(edge index, position
+/// along the edge, vertex)` lands inside the edge it was found on, in order
+/// along that edge, with a vertex already present not repeated.
+///
+/// The sort is what makes the enumeration order in [`node_ring`] irrelevant:
+/// the tuples carry their own position, and equal tuples (the same vertex
+/// value found from two ring positions) are indistinguishable, so any
+/// discovery order splices to the same ring.
+fn apply_node_inserts(ring: TileRing, mut inserts: Vec<(usize, i64, (i32, i32))>) -> TileRing {
     if inserts.is_empty() {
         return ring;
     }
     inserts.sort_unstable();
+    let n = ring.len() - 1;
     let mut out: TileRing = Vec::with_capacity(ring.len() + inserts.len());
     let mut next = 0;
     for (i, &v0) in ring[..n].iter().enumerate() {
@@ -2779,58 +2809,14 @@ mod tests {
         );
     }
 
-    /// The pre-#535 all-pairs [`node_ring`]: every vertex against every edge.
-    /// Retained as the byte-identity oracle for the x-sorted sweep.
-    fn node_ring_quadratic(ring: TileRing) -> TileRing {
-        let n = ring.len() - 1;
-        if n > NODE_MAX_EDGES {
-            return ring;
-        }
-        let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
-        for (k, &v) in ring[..n].iter().enumerate() {
-            for i in 0..n {
-                if i == k || (i + 1) % n == k {
-                    continue;
-                }
-                let (a, b) = (ring[i], ring[i + 1]);
-                let bx = edge_box(a, b);
-                if v.0 < bx.0 || v.0 > bx.2 || v.1 < bx.1 || v.1 > bx.3 || v == a || v == b {
-                    continue;
-                }
-                let cross = (i64::from(b.0) - i64::from(a.0)) * (i64::from(v.1) - i64::from(a.1))
-                    - (i64::from(b.1) - i64::from(a.1)) * (i64::from(v.0) - i64::from(a.0));
-                if cross == 0 {
-                    let along = (i64::from(v.0) - i64::from(a.0)).abs()
-                        + (i64::from(v.1) - i64::from(a.1)).abs();
-                    inserts.push((i, along, v));
-                }
-            }
-        }
-        if inserts.is_empty() {
-            return ring;
-        }
-        inserts.sort_unstable();
-        let mut out: TileRing = Vec::with_capacity(ring.len() + inserts.len());
-        let mut next = 0;
-        for (i, &v0) in ring[..n].iter().enumerate() {
-            out.push(v0);
-            while next < inserts.len() && inserts[next].0 == i {
-                let v = inserts[next].2;
-                if out.last() != Some(&v) {
-                    out.push(v);
-                }
-                next += 1;
-            }
-        }
-        let first = out[0];
-        out.push(first);
-        out
-    }
-
-    /// The x-sorted sweep must return exactly what the all-pairs scan did,
-    /// vertex-for-vertex, on rings big enough to take the sweep branch and on
-    /// rings small enough to take the direct branch — including the
-    /// T-touch-heavy ones a tiny coordinate grid manufactures.
+    /// The x-sorted sweep must find exactly the insertions the all-pairs scan
+    /// found, and node the ring to exactly the same vertices — on rings big
+    /// enough to take the sweep branch in production and on rings small enough
+    /// to take the direct one, including the T-touch-heavy ones a tiny
+    /// coordinate grid manufactures.
+    ///
+    /// Both enumerations are run explicitly, so the check does not depend on
+    /// which branch [`node_ring`] happens to pick at a given size.
     #[test]
     fn node_ring_sweep_matches_all_pairs_reference() {
         let mut seed = 0x0d0d_1234_5678_u64;
@@ -2856,7 +2842,19 @@ mod tests {
                 continue;
             }
             let ring = closed(&pts);
-            let expected = node_ring_quadratic(ring.clone());
+            let n = ring.len() - 1;
+
+            // The insertion multisets must agree (sorted, because the sweep
+            // discovers them edge-major and the scan vertex-major).
+            let mut all_pairs = node_inserts_all_pairs(&ring, n);
+            let mut sweep = node_inserts_sweep(&ring, n);
+            all_pairs.sort_unstable();
+            sweep.sort_unstable();
+            assert_eq!(sweep, all_pairs, "insertions diverged, ring={ring:?}");
+
+            // ...and so must the noded rings, including via the branch
+            // `node_ring` actually takes at this size.
+            let expected = apply_node_inserts(ring.clone(), all_pairs);
             if expected.len() != ring.len() {
                 touched += 1;
             }
