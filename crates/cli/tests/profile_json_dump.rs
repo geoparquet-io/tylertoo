@@ -71,13 +71,28 @@ fn profile_json_written_and_parses() {
         .len();
 
     // --- The profile dump. ---
+    //
+    // #535 step 1: a one-shot `tiles` run now writes TWO JSONL lines to
+    // `TYLERTOO_PROFILE_JSON` — convert's (unchanged schema, emitted the
+    // instant `convert_to_overviews` finishes) followed by export's own
+    // (added here). See `write_export_profile_json`'s doc and
+    // `docs/PROFILING.md`'s "Two JSONL lines for one `tiles` run" section for
+    // why this is two lines rather than one merged object: convert's line is
+    // already on disk by the time export starts, and merging would mean
+    // threading convert's report through the export call chain purely to
+    // serve profiling.
     let contents = std::fs::read_to_string(&profile_json)
         .unwrap_or_else(|e| panic!("read TYLERTOO_PROFILE_JSON file {profile_json:?}: {e}"));
     let mut lines = contents.lines();
-    let line = lines.next().expect("one JSON line must be written");
+    let line = lines
+        .next()
+        .expect("one JSON line must be written for convert");
+    let export_line = lines
+        .next()
+        .expect("a second JSON line must be written for export (#535 step 1)");
     assert!(
         lines.next().is_none(),
-        "exactly one JSON object for one conversion, got: {contents:?}"
+        "exactly two JSON objects (convert, export) for one `tiles` conversion, got: {contents:?}"
     );
     let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
 
@@ -247,6 +262,120 @@ fn profile_json_written_and_parses() {
         "phase_walls.pass1 ({pass1_wall:.6}s) must be strictly less than total \
          ({total_wall:.6}s): a pass-1 wall that equals the whole run is the \
          #533 signature: {value}"
+    );
+
+    // --- #535 step 1: the export profile line. ---
+    //
+    // Independent source of truth: the SAME `--report`'s `export.zooms`,
+    // `export.total_tiles` and `export.total_tile_features` this test already
+    // parsed `report` from above.
+    let export_value: serde_json::Value =
+        serde_json::from_str(export_line).expect("export profile line must be valid JSON");
+    let export = &export_value["export"];
+    assert!(
+        export.is_object(),
+        "the second profile line must have an `export` object: {export_value}"
+    );
+
+    let stage = &export["stage_secs"];
+    let export_stage_field = |name: &str| -> f64 {
+        stage[name]
+            .as_f64()
+            .unwrap_or_else(|| panic!("export.stage_secs.{name} must be a number: {export_value}"))
+    };
+    let (band_read, clip, encode, spool_write) = (
+        export_stage_field("band_read"),
+        export_stage_field("clip"),
+        export_stage_field("encode"),
+        export_stage_field("spool_write"),
+    );
+    // `checkpoint` is legitimately 0.0 on a short run that never crosses
+    // `CHECKPOINT_INTERVAL` (this fixture's z0..z6 export is far too fast to),
+    // so it is checked for presence/type only, not included in the sum-must-
+    // be-positive guard below.
+    let checkpoint = export_stage_field("checkpoint");
+    assert!(
+        checkpoint >= 0.0,
+        "export.stage_secs.checkpoint must be a non-negative number: {export_value}"
+    );
+    let export_stage_sum = band_read + clip + encode + spool_write;
+    assert!(
+        export_stage_sum > 0.0,
+        "export.stage_secs (band_read+clip+encode+spool_write) must be > 0 for \
+         a run that wrote {report_level_count} level(s) of tiles: {export_value}"
+    );
+
+    let report_export_zooms = report["export"]["zooms"]
+        .as_array()
+        .expect("report export.zooms must be an array");
+    let per_zoom = export["per_zoom"]
+        .as_array()
+        .unwrap_or_else(|| panic!("export.per_zoom must be an array: {export_value}"));
+    assert_eq!(
+        per_zoom.len(),
+        report_export_zooms.len(),
+        "export.per_zoom length must match --report's export.zooms length: {export_value}"
+    );
+
+    let mut per_zoom_tiles_sum: u64 = 0;
+    let mut per_zoom_features_sum: u64 = 0;
+    for z in per_zoom {
+        assert!(
+            z["zoom"].is_u64(),
+            "export.per_zoom[].zoom must be a number: {export_value}"
+        );
+        let wall_secs = z["wall_secs"].as_f64().unwrap_or_else(|| {
+            panic!("export.per_zoom[].wall_secs must be a number: {export_value}")
+        });
+        assert!(
+            wall_secs >= 0.0 && wall_secs.is_finite(),
+            "export.per_zoom[].wall_secs must be finite and non-negative: {export_value}"
+        );
+        per_zoom_tiles_sum += z["tiles"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("export.per_zoom[].tiles must be a number: {export_value}"));
+        per_zoom_features_sum += z["features"].as_u64().unwrap_or_else(|| {
+            panic!("export.per_zoom[].features must be a number: {export_value}")
+        });
+        assert!(
+            z["bytes"].is_u64(),
+            "export.per_zoom[].bytes must be a number: {export_value}"
+        );
+    }
+
+    // The report's own totals are the independent source of truth these two
+    // sums must agree with — same tile/feature counts, computed by the
+    // profile dump's own per-level bookkeeping in `export_level` rather than
+    // by `ZoomReport`'s.
+    let report_total_tiles = report["export"]["total_tiles"]
+        .as_u64()
+        .expect("report export.total_tiles must be a number");
+    let report_total_tile_features = report["export"]["total_tile_features"]
+        .as_u64()
+        .expect("report export.total_tile_features must be a number");
+    assert_eq!(
+        per_zoom_tiles_sum, report_total_tiles,
+        "sum of export.per_zoom[].tiles must match --report's export.total_tiles: {export_value}"
+    );
+    assert_eq!(
+        per_zoom_features_sum, report_total_tile_features,
+        "sum of export.per_zoom[].features must match --report's \
+         export.total_tile_features: {export_value}"
+    );
+
+    assert!(
+        export["waves_total"].as_u64().is_some_and(|w| w >= 1),
+        "export.waves_total must be a number >= 1 for a run that wrote tiles: {export_value}"
+    );
+    assert!(
+        export["partition_wave_width"]
+            .as_u64()
+            .is_some_and(|w| w >= 1),
+        "export.partition_wave_width must be a positive number: {export_value}"
+    );
+    assert!(
+        export["checkpoints"].is_u64(),
+        "export.checkpoints must be a number: {export_value}"
     );
 
     // The startup preflight probes writability with a uniquely named SIBLING

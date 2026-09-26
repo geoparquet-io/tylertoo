@@ -32,15 +32,21 @@ the benchmark docs.
 
 ## Structured JSON Profile Dump (`TYLERTOO_PROFILE_JSON`)
 
-Set `TYLERTOO_PROFILE_JSON=<path>` and every `overview`/`tiles` conversion
-run through the **streaming pipeline** (the default) appends one JSON object
-(one line, JSONL) to that file — the measurement base the perf series
-(pass-1 parallelization, pass-2 throughput, checkpoint work) is gated on:
+Set `TYLERTOO_PROFILE_JSON=<path>` and every `overview`/`tiles`/`export-pmtiles`
+conversion run through the **streaming pipeline** (the default) appends a JSON
+object (one line, JSONL) to that file — the measurement base the perf series
+(pass-1 parallelization, pass-2 throughput, checkpoint work, and — since #535
+— export throughput) is gated on. `overview` (convert only) and
+`export-pmtiles` (export only) each append exactly one line; a one-shot
+`tiles` run appends **two** — convert's, then export's — see "Two JSONL lines
+for one `tiles` run" below for why:
 
 ```bash
 TYLERTOO_PROFILE_JSON=/tmp/profile.jsonl \
   tylertoo tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 10
-cat /tmp/profile.jsonl | python3 -m json.tool
+# JSONL: one object per line, so pretty-print line by line (or `jq -s .`
+# to load the whole file as an array of the two objects `tiles` writes).
+while read -r line; do echo "$line" | python3 -m json.tool; done < /tmp/profile.jsonl
 ```
 
 It is an env var rather than a CLI flag so this diagnostics-only knob costs
@@ -166,6 +172,123 @@ has no field in the dump, whose `pass2.stage_secs` covers producer-side
 stages only. Where the log and the dump disagree in shape like this, the log
 is the finer-grained view and the JSON is the stable, parseable one; only
 the JSON is covered by tests.
+
+### Export phase (#535)
+
+`export::export_pmtiles` (the `export-pmtiles` CLI subcommand, and the second
+half of `tiles`) writes its own `export` object to the same
+`TYLERTOO_PROFILE_JSON` file, gated behind the same env var and with the same
+best-effort/silent-safe contract (an unset/blank var is a no-op; an
+open/write error is only logged; this can never fail a conversion or change
+its output bytes):
+
+```jsonc
+{
+  "timestamp": 1790403985.86,
+  "export": {
+    "stage_secs": {           // CORE-SECONDS, same convention as pass2's —
+      "band_read": 0.62,      // see the callout below
+      "clip": 1.55,
+      "encode": 2.23,
+      "spool_write": 0.0028,
+      "checkpoint": 0.0
+    },
+    "per_zoom": [              // one entry per exported zoom, coarse -> fine
+      { "zoom": 1, "wall_secs": 0.012, "tiles": 1, "features": 40, "bytes": 4372 },
+      { "zoom": 10, "wall_secs": 2.41, "tiles": 524, "features": 26839, "bytes": 4049886 }
+      // ...
+    ],
+    "waves_total": 10,         // sum of every level's wave-loop iterations
+    "partition_wave_width": 12,// the resolved partition-wave CEILING (see below)
+    "checkpoints": 0           // writer.checkpoint() calls, NOT counting finalize
+  }
+}
+```
+
+**Stages**, matching the wave loop in `crates/core/src/overview/export.rs`:
+
+- `band_read` — reading overview rows for a wave: the
+  `ParquetRecordBatchReader::next()` calls alone, in both the legacy
+  per-level wave read (`process_wave`, duplicating-mode overview files) and
+  the single-read fan-out's producer thread (`fill_member_store`,
+  partitioning-mode overview files, #235). In partitioning mode almost all of
+  this stage's time lands before the per-level loop even starts, since #235
+  front-loads every band into one read; a duplicating-mode export earns it
+  per wave instead. Either way it lands in the same bucket.
+- `clip` — `feature_tile_members` (the `split_feature_into_tiles` recursive
+  quadtree cascade) plus the row-member materialization/routing around it, in
+  `collect_wave_members` (legacy path) and `fanout_batch_members` (single-read
+  path). The single-read path's number also includes `MemberStore::push`,
+  which occasionally flushes a spill segment to disk under RAM pressure —
+  that I/O is folded in here rather than split into its own stage in this
+  first cut.
+- `encode` — `encode_members`: MVT encode + gzip compression, timed per
+  partition-bucket from inside the rayon `into_par_iter().map(...)` that
+  drives it.
+- `spool_write` — the serial `writer.add_tile_precompressed` calls in
+  `export_level`'s per-wave write loop.
+- `checkpoint` — `writer.checkpoint(...)` calls (the throttled #229/#459
+  salvage snapshots), NOT the final `writer.finalize(...)`, which is a
+  distinct, unthrottled, always-once step. **Legitimately 0.0** on any export
+  that finishes before `CHECKPOINT_INTERVAL` elapses — a short run (like the
+  Madagascar fixture above) never checkpoints at all, and `finalize` does all
+  the work; see `checkpoints` (the call count) for the same fact as an
+  integer instead of a duration.
+
+> **`export.stage_secs` is CORE-SECONDS, same convention as
+> `pass2.stage_secs`** (see that section above): `clip` and `encode` in
+> particular run inside a rayon `into_par_iter().map(...)`, so their sums
+> routinely EXCEED a level's own wall time under parallelism — that is the
+> point (it is what the parallelism buys), not a bug. `band_read` and
+> `clip`/`collect_wave_members` in the legacy per-wave path are each timed as
+> one span per wave/batch on whichever thread runs it, which is why
+> `band_read` and `clip` can interleave without one blocking the other's
+> clock: they are two separate `Instant` windows within the same wave, not a
+> shared one.
+
+`export.per_zoom[].bytes` is **compressed** bytes (the gzipped tile actually
+written to the archive), not the raw pre-gzip MVT size — matching what
+`spool_write` actually copies and what the archive's own size accounting
+uses elsewhere.
+
+`export.partition_wave_width` is the resolved partition-wave **ceiling**
+(`resolve_and_log_partition_wave`'s return — `auto` or an explicit
+`--partition-wave`), a single scalar for the whole export. It is not each
+level's own auto-narrowed width: `memory_safe_level_wave` (#311) can narrow a
+level's actual wave below this ceiling based on that level's own density: the
+dump doesn't carry that per-level detail yet.
+
+`crates/cli/tests/profile_json_dump.rs::profile_json_written_and_parses`
+covers this section: it asserts the `export` object parses, `per_zoom`'s
+length matches `--report`'s `export.zooms` length, the stage-second sum is
+positive, and the sum of `per_zoom[].tiles`/`.features` matches
+`--report`'s `export.total_tiles`/`.total_tile_features`.
+
+#### Two JSONL lines for one `tiles` run
+
+A one-shot `tiles` conversion now appends **two** JSON lines to
+`TYLERTOO_PROFILE_JSON`, not one: convert's (the object documented above,
+unchanged) followed by export's (`{"timestamp": ..., "export": {...}}`).
+
+This is a deliberate, considered choice, not an oversight. Convert's line is
+written by `emit_profile_json`/`write_profile_json` the instant
+`convert_streaming_strategy` returns — before `tiles` even calls
+`export_pmtiles`, since convert has no idea export is coming next. Making the
+two phases share ONE JSON object would mean either (a) delaying convert's
+write until export also finishes, which means threading export's completion
+back into `convert_to_overviews` — a layering violation, since convert has no
+business knowing about export — or (b) having the `tiles` CLI facade hold
+both halves and write once — plausible, but it would move the write out of
+`overview::convert`/`overview::export` entirely and into the CLI, which is
+exactly backwards for a library-first design (`export-pmtiles` and the
+Python bindings call `export_pmtiles` directly, with no facade in between, so
+the write has to happen inside `overview::export` regardless of who called
+it). A second, independently-written line costs neither of those, at the
+price of one extra `readlines()` for a consumer that wants both phases: read
+every line, keyed by which top-level fields it has (`pass1`/`pass2` vs
+`export`). A standalone `export-pmtiles` run (no preceding convert in this
+process) writes exactly one `export`-only line, the same shape as the second
+line of a `tiles` run.
 
 ## Wall-Time Profiling with cargo-flamegraph
 
