@@ -286,3 +286,97 @@ fn tiles_rejects_feature_order_on_an_excluded_property() {
         "nothing else must be written: {leftovers:?}"
     );
 }
+
+/// #551: `tiles` refuses to clobber an existing output unless `-f/--force`
+/// is given, matching `pyramid`/`merge`/`shard-plan`.
+#[test]
+fn tiles_refuses_existing_output_without_force_and_overwrites_with_it() {
+    let Some(fixture) = fixture::realdata("road-detections.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.pmtiles");
+    std::fs::write(&output, b"stale, not a real archive").expect("seed stale output");
+
+    let without_force = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--max-zoom",
+            "3",
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(
+        !without_force.status.success(),
+        "tiles must refuse to overwrite an existing output without --force"
+    );
+    let stderr = String::from_utf8_lossy(&without_force.stderr);
+    assert!(
+        stderr.contains("--force"),
+        "error should point at --force, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        b"stale, not a real archive",
+        "the existing output must be left untouched when the run is refused"
+    );
+
+    let with_force = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--max-zoom",
+            "3",
+            "-f",
+        ])
+        .status()
+        .expect("run tylertoo tiles -f");
+    assert!(
+        with_force.success(),
+        "tiles -f should overwrite existing output"
+    );
+
+    let bytes = std::fs::read(&output).expect("read output pmtiles");
+    assert_eq!(&bytes[..PMTILES_MAGIC.len()], PMTILES_MAGIC);
+}
+
+/// An existing *directory* at the output path is refused up front, even with
+/// `-f`: the final rename can never replace it, so the run must not spend a
+/// whole convert + export before failing (#557 review).
+#[test]
+fn tiles_refuses_a_directory_output_even_with_force() {
+    let Some(fixture) = fixture::realdata("road-detections.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.pmtiles");
+    std::fs::create_dir(&output).expect("create directory at output path");
+
+    let run = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--max-zoom",
+            "3",
+            "-f",
+        ])
+        .output()
+        .expect("run tylertoo tiles -f");
+    assert!(
+        !run.status.success(),
+        "tiles must refuse a directory output"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("is a directory"), "got: {stderr}");
+    assert!(
+        !stderr.contains("Generating") && !stderr.contains("Converting"),
+        "should bail before any work, got: {stderr}"
+    );
+    assert!(output.is_dir(), "the directory must be left alone");
+}

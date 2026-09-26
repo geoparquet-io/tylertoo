@@ -214,6 +214,25 @@ enum Command {
     ExportPmtiles(ExportPmtilesArgs),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
+    /// Per-zoom tile-weight report for a PMTiles archive (issue #552).
+    ///
+    /// For each zoom: tile count, total, mean, p50, p99 and max tile size, plus
+    /// the largest individual tiles (`--largest N`). Sizes are STORED
+    /// (compressed) bytes per addressed tile, read from the directory entries
+    /// alone -- no tile is decompressed or even read. Run-length members and
+    /// deduplicated tiles each count at the full length of their shared body,
+    /// so `tiles x mean` (the `total` column) is the bytes a client would
+    /// fetch and can exceed the archive's size on disk.
+    ///
+    /// Percentiles are nearest-rank: pN is the smallest size such that at
+    /// least ceil(N/100 x tiles) of the zoom's tiles are no larger. Largest
+    /// tiles are ordered by size descending, ties by ascending PMTiles tile
+    /// id (lower zoom first, then Hilbert order).
+    ///
+    /// Memory and time are proportional to the archive's directory entries,
+    /// not its tile count: runs are aggregated with their multiplicity, never
+    /// expanded.
+    Stats(StatsArgs),
     /// Build a multi-band pyramid: several inputs, each owning a zoom range,
     /// one archive (issue #345).
     Pyramid(PyramidArgs),
@@ -1636,6 +1655,24 @@ struct ValidateArgs {
     files_from: Option<PathBuf>,
 }
 
+/// Arguments for `tylertoo stats` (see the `Command::Stats` docs for the
+/// report's semantics). Walks the archive's header and directory entries only
+/// (the same `ArchiveIndex` machinery `merge`/`pyramid` use).
+#[derive(Parser, Debug)]
+struct StatsArgs {
+    /// PMTiles archive to report on.
+    #[arg(value_name = "ARCHIVE")]
+    archive: PathBuf,
+
+    /// How many of the largest tiles (by stored size) to list.
+    #[arg(long, value_name = "N", default_value = "10")]
+    largest: usize,
+
+    /// Print the report as JSON instead of a human-readable table.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `tylertoo tiles` — the one-shot GeoParquet → PMTiles facade.
 ///
 /// This is a thin wrapper that runs `overview` (convert) into a temporary
@@ -1827,6 +1864,10 @@ struct TilesArgs {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    force: bool,
+
     #[command(flatten)]
     tuning: ConvertTuningArgs,
 }
@@ -1848,6 +1889,7 @@ fn main() -> Result<()> {
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Decode(args) => run_decode(args),
+        Command::Stats(args) => run_stats(args),
         Command::Pyramid(args) => run_pyramid(args),
         Command::Merge(args) => run_merge(args),
         Command::ShardPlan(args) => run_shard_plan(args),
@@ -1891,12 +1933,13 @@ where
     // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
     // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
     // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 10] = [
+    const SUBCOMMANDS: [&str; 11] = [
         "tiles",
         "overview",
         "validate",
         "export-pmtiles",
         "decode",
+        "stats",
         "pyramid",
         "merge",
         "shard-plan",
@@ -2400,6 +2443,22 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
     })
 }
 
+/// `tiles` output gate (#551): an existing file is refused unless `force`.
+/// A directory can never be replaced by the final rename, `--force` or not,
+/// so it is refused up front instead of after a whole convert + export.
+fn check_tiles_output(output: &Path, force: bool) -> Result<()> {
+    if output.is_dir() {
+        anyhow::bail!(
+            "{} is a directory; the output must be a PMTiles file path",
+            output.display()
+        );
+    }
+    if output.exists() && !force {
+        anyhow::bail!("{} exists (use --force to overwrite)", output.display());
+    }
+    Ok(())
+}
+
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
     use tylertoo_core::overview::level::Mode;
@@ -2407,6 +2466,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
+
+    check_tiles_output(&output, args.force)?;
 
     // Derive the layer name from the input if not given: file stem for a
     // single file, last path segment for a directory or s3://gs:// prefix,
@@ -3634,6 +3695,116 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         println!("  report → {}", path.display());
     }
     Ok(())
+}
+
+/// Run `tylertoo stats`: per-zoom tile-weight report over a PMTiles archive
+/// (issue #552). Thin facade over `tylertoo_core::stats::compute_stats`,
+/// which does all the work off `ArchiveIndex` (header + directories only).
+fn run_stats(args: StatsArgs) -> Result<()> {
+    use tylertoo_core::archive_index::ArchiveIndex;
+    use tylertoo_core::stats::compute_stats;
+
+    let archive = ArchiveIndex::open(&args.archive).map_err(|e| {
+        // `ArchiveIndex` reports read failures under the shared PMTiles
+        // error variant ("Failed to write PMTiles: ..."); for a file that
+        // is not an archive at all, say so plainly.
+        let not_pmtiles = std::fs::File::open(&args.archive)
+            .and_then(|mut f| {
+                let mut magic = [0u8; 7];
+                std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic != *b"PMTiles")
+            })
+            .unwrap_or(args.archive.is_file());
+        if not_pmtiles {
+            anyhow::anyhow!(
+                "{} is not a PMTiles v3 archive (missing the PMTiles magic): {e}",
+                args.archive.display()
+            )
+        } else {
+            anyhow::anyhow!("could not open {}: {e}", args.archive.display())
+        }
+    })?;
+    let report = compute_stats(&archive, args.largest)
+        .map_err(|e| anyhow::anyhow!("stats failed for {}: {e}", args.archive.display()))?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize stats report: {e}"))?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    print_stats_table(&report);
+    Ok(())
+}
+
+/// Right-align every column of a table to its widest cell (header included),
+/// two spaces between columns.
+fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    let render_row = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c:>width$}", width = widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let mut lines = vec![render_row(&header_cells)];
+    lines.extend(rows.iter().map(|row| render_row(row)));
+    lines.join("\n")
+}
+
+/// The human-readable form of a [`tylertoo_core::stats::StatsReport`]: the
+/// per-zoom table the issue asked for, followed by the largest tiles (when
+/// any were requested).
+fn print_stats_table(report: &tylertoo_core::stats::StatsReport) {
+    if report.per_zoom.is_empty() {
+        println!("(archive holds no tiles)");
+        return;
+    }
+
+    let rows: Vec<Vec<String>> = report
+        .per_zoom
+        .iter()
+        .map(|z| {
+            vec![
+                z.z.to_string(),
+                format_number(z.tile_count),
+                format_number(z.total_bytes),
+                format_number(z.mean_bytes),
+                format_number(z.p50_bytes),
+                format_number(z.p99_bytes),
+                format_number(z.max_bytes),
+            ]
+        })
+        .collect();
+    println!(
+        "{}",
+        render_table(&["z", "tiles", "total", "mean", "p50", "p99", "max"], &rows)
+    );
+
+    if !report.largest.is_empty() {
+        println!("\nLargest {} tile(s):", report.largest.len());
+        let largest_rows: Vec<Vec<String>> = report
+            .largest
+            .iter()
+            .map(|t| {
+                vec![
+                    t.z.to_string(),
+                    t.x.to_string(),
+                    t.y.to_string(),
+                    format_number(t.bytes),
+                ]
+            })
+            .collect();
+        println!("{}", render_table(&["z", "x", "y", "bytes"], &largest_rows));
+    }
 }
 
 /// Format a number with thousands separators
