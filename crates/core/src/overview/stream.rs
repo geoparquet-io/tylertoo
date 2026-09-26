@@ -18,11 +18,15 @@
 //!   [`OverviewWriter`]. Nothing is retained across batches.
 //!
 //! Peak memory is `O(read batch + winner tables)`: the winner table is 1 byte
-//! per feature; pass 1 additionally holds the `AssignFeature` vector (~48
-//! bytes/feature) and per-candidate ranking keys (16 bytes/feature) while the
-//! assignment runs, all freed before pass 2. Residual `O(N)` state is
-//! therefore ~50–80 bytes per input feature — for 632k features, a few tens of
-//! MB — far below the geometry payload the in-memory path holds.
+//! per feature; pass 1 additionally holds the `AssignFeature` vector (64
+//! bytes/feature, [`super::convert::PASS1_BYTES_PER_ROW`]) from the scan
+//! through the assignment, plus transient per-row vectors during the scan
+//! (ranking-key candidates at 16 bytes/row each, and — when those options are
+//! on — accumulate/ladder values, polygon areas, coalesce line geometries),
+//! all freed before pass 2. Residual `O(N)` state is therefore ≥ 64 bytes per
+//! input feature (typically ~64–100) — for 632k features, a few tens of MB,
+//! far below the geometry payload the in-memory path holds, but tens of GiB
+//! at billion-row scale (#543: preflighted from the footers before pass 1).
 //!
 //! Hilbert order: input order is preserved within each level (the documented
 //! gpio-sorted input contract, spec §4.3), exactly as in the in-memory path —
@@ -1215,6 +1219,30 @@ fn convert_preflight(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<Preflight, ConvertError> {
+    // The UNCACHED probe: `pipeline::available_memory_bytes` must not be
+    // touched before pass 1 — its first call freezes a headroom figure every
+    // later `auto` decision reuses (#485).
+    convert_preflight_with_memory_limit(
+        source,
+        options,
+        super::pipeline::probe_preflight_memory_limit(),
+        super::convert::skip_memory_preflight_from_env(),
+    )
+}
+
+/// [`convert_preflight`], parameterized on the pass-1 memory-floor limit and
+/// the escape-hatch decision (#543 test seam: mirrors
+/// [`build_writer_options_with_ceiling`]'s #509 pattern). Production always
+/// calls it via `convert_preflight` with the real uncached probe; tests pass
+/// a tiny mocked limit to prove the #543 hard error fires from
+/// footer-derived row counts alone — before `stage_input_pass0` or pass 1
+/// ever runs — without needing an actually memory-starved box.
+fn convert_preflight_with_memory_limit(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+    memory_limit: Option<super::pipeline::MemoryLimit>,
+    skip_memory_preflight: bool,
+) -> Result<Preflight, ConvertError> {
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
     // cached across the passes below. For a multi-partition source the
@@ -1275,6 +1303,23 @@ fn convert_preflight(
             "[convert] shard {range}: reading {row_groups_read}/{row_groups_total} input row \
              groups (the groups whose bbox reaches this shard's tile range)"
         );
+    }
+    // #543: preflight the pass-1 feature table's memory floor from footer row
+    // counts alone — no I/O beyond the footers already read above — BEFORE
+    // pass 1 (or `stage_input_pass0` below) does any real work. Skipped for a
+    // `--plan` replay: that path never builds the `Vec<AssignFeature>` table
+    // at all, only re-addresses the saved 1-byte/row winner table, so the
+    // memory floor this checks does not apply to it. With a per-feature
+    // `--bbox`/`--filter` the pruned count is only an upper bound (rows that
+    // fail either never become an `AssignFeature`), so it can only warn.
+    if options.plan.is_none() {
+        let selected_rows = source.selected_row_count(selected_row_groups.as_ref())?;
+        super::convert::preflight_pass1_memory(
+            selected_rows.max(0) as u64,
+            memory_limit,
+            skip_memory_preflight,
+            bbox_units.is_some() || bound_filter.is_some(),
+        )?;
     }
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
@@ -2984,6 +3029,18 @@ fn run_pass1_with_chunk_rows(
     log::debug!("[profile] pass1 chunk_rows={chunk_rows}");
 
     let mut features: Vec<AssignFeature> = Vec::new();
+    // #543 review: pre-size the feature table when its final length is known
+    // from the footers — i.e. no per-feature `--bbox`/`--filter` can drop
+    // rows (only null/unusable geometries, a small overshoot). Growing by
+    // `push` instead costs a transient ~2× the table at the last doubling
+    // (realloc = alloc + copy + free under mimalloc): 128 GiB at 1.58B rows.
+    // `try_reserve_exact` so an absurd size falls back to growth instead of
+    // aborting. Capacity only — output is unchanged.
+    if bbox_units.is_none() && filter.is_none() {
+        if let Ok(rows) = source.selected_row_count(row_groups) {
+            let _ = features.try_reserve_exact(usize::try_from(rows.max(0)).unwrap_or(0));
+        }
+    }
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     let want_areas = accumulator_enabled(options);
     let mut areas: Vec<f32> = Vec::new();
@@ -4083,6 +4140,137 @@ mod tests {
             remaining -= batch_len;
         }
         total
+    }
+
+    /// #543: the pass-1 memory-floor preflight fires from footer-derived row
+    /// counts alone, before pass 1 (or even `stage_input_pass0`) touches a
+    /// single data page — proven with a real fixture file and a mocked limit
+    /// (the #509-style `_with_memory_limit` test seam), the way #509's own
+    /// `build_writer_options_with_ceiling` proved its ceiling preflight.
+    #[test]
+    fn convert_preflight_fails_fast_under_a_tiny_memory_limit() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
+        let values: Vec<f64> = vec![1.0; geoms.len()];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+        // A generous mocked limit fits comfortably.
+        convert_preflight_with_memory_limit(&source, &options, hard_limit(1 << 40), false)
+            .expect("10 rows must fit a 1 TiB mocked limit");
+
+        // A 1-byte mocked hard limit cannot possibly fit 10 rows' feature
+        // table — this must fail from the footer row count alone, never
+        // having opened a data page (the fixture is tiny; if this reached
+        // pass 1 it would simply succeed, silently defeating the test).
+        match convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false) {
+            Err(
+                err @ ConvertError::Pass1MemoryFloorExceeded {
+                    rows: 10,
+                    estimated_bytes: 640,
+                    limit_bytes: 1,
+                },
+            ) => {
+                let msg = err.to_string();
+                for want in [
+                    "10 input row(s)",
+                    "cgroup hard memory limit (memory.max)",
+                    "TYLERTOO_SKIP_MEMORY_PREFLIGHT=1",
+                ] {
+                    assert!(msg.contains(want), "missing {want:?}: {msg}");
+                }
+            }
+            Err(err) => panic!("wrong error: {err}"),
+            Ok(_) => panic!("10 rows must not fit a 1-byte mocked limit"),
+        }
+
+        // The escape hatch downgrades it to a warning.
+        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), true)
+            .expect("the skip hatch must downgrade the hard error");
+
+        // #543 review (S1-2): under a per-feature --bbox the footer count is
+        // only an upper bound, so the same tiny hard limit only warns.
+        let bbox_options = ConvertOptions {
+            bbox: Some([-180.0, -90.0, 180.0, 90.0]),
+            ..options.clone()
+        };
+        convert_preflight_with_memory_limit(&source, &bbox_options, hard_limit(1), false)
+            .expect("a --bbox extract must never hard-error on an upper-bound row count");
+    }
+
+    // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
+    #[allow(clippy::unnecessary_wraps)]
+    fn hard_limit(bytes: u64) -> Option<super::super::pipeline::MemoryLimit> {
+        Some(super::super::pipeline::MemoryLimit {
+            bytes,
+            source: super::super::pipeline::MemoryLimitSource::CgroupMax,
+        })
+    }
+
+    /// #543 review (S1-1): the production preflight must not touch
+    /// `pipeline::available_memory_bytes` — its process-wide cache is meant
+    /// to hold post-pass-1 headroom, and a pre-scan call would freeze a
+    /// near-empty-cgroup figure for every later `auto` decision. Counted
+    /// per thread, so parallel tests warming the cache cannot race this.
+    #[test]
+    fn convert_preflight_does_not_touch_the_available_memory_cache() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
+        let values: Vec<f64> = vec![1.0; geoms.len()];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+        let before = super::super::pipeline::available_memory_bytes_calls_on_this_thread();
+        convert_preflight(&source, &options).expect("10 rows fit any real box");
+        assert_eq!(
+            super::super::pipeline::available_memory_bytes_calls_on_this_thread(),
+            before,
+            "convert_preflight must use the uncached probe"
+        );
+    }
+
+    /// #543: a `--plan` replay never builds the pass-1 feature table (it
+    /// re-addresses the saved 1-byte/row winner table instead — see
+    /// `load_plan_state`), so the memory-floor preflight must not apply to
+    /// it — checked here against an impossibly small mocked limit that would
+    /// otherwise certainly fail.
+    #[test]
+    fn convert_preflight_skips_memory_check_for_plan_replay() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
+        let values: Vec<f64> = vec![1.0; geoms.len()];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            plan: Some(std::path::PathBuf::from("/nonexistent/convert.plan")),
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false)
+            .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }
 
     /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh

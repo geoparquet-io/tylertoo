@@ -240,19 +240,48 @@ pub(super) fn pass1_grid_budget_bytes(profile: MemoryProfile) -> u64 {
 /// wave preflight and its log line), every input is process-global, and a
 /// cached figure also keeps the paired "decide" and "log/assert" calls from
 /// disagreeing when `MemAvailable` drifts between them.
+///
+/// Must NOT be called before pass 1 has run: the first call freezes the
+/// figure, and a pre-scan call would cache a near-empty-cgroup headroom that
+/// inflates every later `auto` decision. Pre-scan checks (the #543 pass-1
+/// memory preflight) use the uncached [`probe_preflight_memory_limit`].
 pub(super) fn available_memory_bytes() -> Option<u64> {
+    #[cfg(test)]
+    AVAILABLE_MEMORY_CALLS.with(|c| c.set(c.get() + 1));
     static CACHED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *CACHED.get_or_init(probe_available_memory_bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: calls to [`available_memory_bytes`] made on this thread.
+    /// Per-thread, so parallel tests that legitimately warm the process-wide
+    /// cache cannot race an assertion that some code path never touched it.
+    static AVAILABLE_MEMORY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: how many times [`available_memory_bytes`] (and so its
+/// process-wide cache) has been touched on the calling thread.
+#[cfg(test)]
+pub(super) fn available_memory_bytes_calls_on_this_thread() -> usize {
+    AVAILABLE_MEMORY_CALLS.with(std::cell::Cell::get)
+}
+
+/// The `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override, when set to a plain number.
+fn auto_mem_limit_override() -> Option<u64> {
+    std::env::var("TYLERTOO_AUTO_MEM_LIMIT_BYTES")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// The uncached probe behind [`available_memory_bytes`]. Split out so the unit
 /// tests — which drive the readers against fixture trees — never depend on
 /// (or poison) the process-wide cache.
 fn probe_available_memory_bytes() -> Option<u64> {
-    if let Ok(v) = std::env::var("TYLERTOO_AUTO_MEM_LIMIT_BYTES") {
-        if let Ok(n) = v.trim().parse::<u64>() {
-            return Some(n);
-        }
+    if let Some(n) = auto_mem_limit_override() {
+        return Some(n);
     }
     let machine = read_proc_mem_available();
     let cgroup = cgroup_memory_limit_bytes();
@@ -288,8 +317,103 @@ fn log_binding_cgroup_limit_once(machine: Option<u64>, cgroup: Option<u64>) {
     });
 }
 
-fn gib(bytes: u64) -> f64 {
+pub(super) fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Where a pre-scan memory figure came from (#543). Only a real hard cgroup
+/// limit — where going over means an OOM kill — may justify failing a run up
+/// front; every other figure is advisory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoryLimitSource {
+    /// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` — a knob to make `auto` conservative,
+    /// not a statement about the box.
+    Override,
+    /// `/proc/meminfo` `MemAvailable`: momentary, and excludes swap.
+    MemAvailable,
+    /// cgroup v2 `memory.max` / v1 `memory.limit_in_bytes`: the OOM-kill limit.
+    CgroupMax,
+    /// cgroup v2 `memory.high`: a throttle ceiling, not an OOM limit.
+    CgroupHigh,
+}
+
+impl MemoryLimitSource {
+    /// Whether exceeding this figure means the kernel kills the process.
+    pub(super) fn is_hard(self) -> bool {
+        matches!(self, Self::CgroupMax)
+    }
+
+    /// How user-facing messages name this figure.
+    pub(super) fn describe(self) -> &'static str {
+        match self {
+            Self::Override => "TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
+            Self::MemAvailable => "available memory (MemAvailable)",
+            Self::CgroupMax => "cgroup hard memory limit (memory.max)",
+            Self::CgroupHigh => "cgroup memory.high throttle limit",
+        }
+    }
+}
+
+/// A pre-scan memory figure and the probe term that supplied it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MemoryLimit {
+    pub(super) bytes: u64,
+    pub(super) source: MemoryLimitSource,
+}
+
+/// Uncached, source-attributed memory probe for the #543 pass-1 preflight.
+///
+/// Same terms as [`available_memory_bytes`] (override, else the minimum of
+/// `MemAvailable`, cgroup `memory.max` headroom and cgroup `memory.high`
+/// headroom), but it (1) never reads or initializes that function's
+/// process-wide cache — it runs before pass 1, and caching a pre-scan figure
+/// would inflate every later `auto` decision (#485) — and (2) reports which
+/// term binds, so the preflight can hard-error only against a real OOM limit.
+/// On a tie the hard limit is reported. `None` when nothing could be probed
+/// (e.g. macOS without the override).
+pub(super) fn probe_preflight_memory_limit() -> Option<MemoryLimit> {
+    if let Some(bytes) = auto_mem_limit_override() {
+        return Some(MemoryLimit {
+            bytes,
+            source: MemoryLimitSource::Override,
+        });
+    }
+    let machine = read_proc_mem_available().map(|bytes| MemoryLimit {
+        bytes,
+        source: MemoryLimitSource::MemAvailable,
+    });
+    let [cg_max, cg_high] = if cfg!(target_os = "linux") {
+        read_cgroup_memory_limits_by_source(std::path::Path::new("/"))
+    } else {
+        [None, None]
+    };
+    binding_memory_limit([machine, cg_max, cg_high])
+}
+
+/// The smallest of the probed figures (a hard limit wins a tie).
+fn binding_memory_limit(candidates: [Option<MemoryLimit>; 3]) -> Option<MemoryLimit> {
+    candidates
+        .into_iter()
+        .flatten()
+        .min_by_key(|l| (l.bytes, !l.source.is_hard()))
+}
+
+/// [`read_cgroup_memory_limit`], split by source: `[hard (v2 memory.max or v1
+/// limit_in_bytes), v2 memory.high]` headrooms. v2 first; v1 only when v2
+/// reports neither.
+fn read_cgroup_memory_limits_by_source(root: &std::path::Path) -> [Option<MemoryLimit>; 2] {
+    let with = |source| move |bytes| MemoryLimit { bytes, source };
+    let v2_max = read_cgroup_v2_headroom(root, &["memory.max"]);
+    let v2_high = read_cgroup_v2_headroom(root, &["memory.high"]);
+    let hard = if v2_max.is_none() && v2_high.is_none() {
+        read_cgroup_v1_limit(root)
+    } else {
+        v2_max
+    };
+    [
+        hard.map(with(MemoryLimitSource::CgroupMax)),
+        v2_high.map(with(MemoryLimitSource::CgroupHigh)),
+    ]
 }
 
 /// At or above this, a cgroup memory limit means "no limit". cgroup v1 writes a
@@ -326,12 +450,13 @@ fn read_cgroup_memory_limit(root: &std::path::Path) -> Option<u64> {
 /// `memory.max`-only probe a no-op there (#485). The level's limit is the
 /// smaller of the two.
 fn read_cgroup_v2_limit(root: &std::path::Path) -> Option<u64> {
+    read_cgroup_v2_headroom(root, &["memory.max", "memory.high"])
+}
+
+/// cgroup v2 headroom under the smallest of `files` along this process's path.
+fn read_cgroup_v2_headroom(root: &std::path::Path, files: &[&str]) -> Option<u64> {
     let rel = proc_self_cgroup_path(root, CgroupSelector::V2).unwrap_or_default();
-    let binding = min_limit_along_path(
-        &root.join("sys/fs/cgroup"),
-        &rel,
-        &["memory.max", "memory.high"],
-    )?;
+    let binding = min_limit_along_path(&root.join("sys/fs/cgroup"), &rel, files)?;
     Some(subtract_unreclaimable_usage(
         binding.bytes,
         &binding.dir,
@@ -2257,6 +2382,84 @@ mod cgroup_tests {
             Some(GIB),
             "the tightest limit along the path must win"
         );
+    }
+
+    /// #543: the preflight probe splits the cgroup figure by source, so the
+    /// hard `memory.max` and the throttle `memory.high` stay distinguishable.
+    #[test]
+    fn preflight_limits_split_v2_max_and_high() {
+        let dir = v2_root("/slurm/job_42");
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/memory.max",
+            "171798691840\n",
+        );
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/slurm/job_42/memory.high",
+            "107374182400\n",
+        );
+        assert_eq!(
+            read_cgroup_memory_limits_by_source(dir.path()),
+            [
+                Some(MemoryLimit {
+                    bytes: 160 * GIB,
+                    source: MemoryLimitSource::CgroupMax,
+                }),
+                Some(MemoryLimit {
+                    bytes: 100 * GIB,
+                    source: MemoryLimitSource::CgroupHigh,
+                }),
+            ]
+        );
+        // The auto probe's combined figure is unchanged: the lower of the two.
+        assert_eq!(read_cgroup_memory_limit(dir.path()), Some(100 * GIB));
+    }
+
+    /// #543: a v1 `memory.limit_in_bytes` is a hard (OOM) limit.
+    #[test]
+    fn preflight_limits_treat_v1_as_hard() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "proc/self/cgroup", "7:memory:/slurm/job_42\n");
+        write_file(
+            dir.path(),
+            "sys/fs/cgroup/memory/slurm/job_42/memory.limit_in_bytes",
+            "171798691840\n",
+        );
+        assert_eq!(
+            read_cgroup_memory_limits_by_source(dir.path()),
+            [
+                Some(MemoryLimit {
+                    bytes: 160 * GIB,
+                    source: MemoryLimitSource::CgroupMax,
+                }),
+                None,
+            ]
+        );
+    }
+
+    /// #543: the binding preflight figure is the smallest, reported with its
+    /// source; a hard limit wins a tie.
+    #[test]
+    fn preflight_binding_limit_is_the_minimum_with_its_source() {
+        let l = |bytes, source| Some(MemoryLimit { bytes, source });
+        assert_eq!(
+            binding_memory_limit([
+                l(50, MemoryLimitSource::MemAvailable),
+                l(80, MemoryLimitSource::CgroupMax),
+                None,
+            ]),
+            l(50, MemoryLimitSource::MemAvailable)
+        );
+        assert_eq!(
+            binding_memory_limit([
+                l(80, MemoryLimitSource::MemAvailable),
+                l(80, MemoryLimitSource::CgroupMax),
+                l(90, MemoryLimitSource::CgroupHigh),
+            ]),
+            l(80, MemoryLimitSource::CgroupMax)
+        );
+        assert_eq!(binding_memory_limit([None, None, None]), None);
     }
 
     #[test]
