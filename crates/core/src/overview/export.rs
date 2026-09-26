@@ -1301,32 +1301,9 @@ fn export_pmtiles_impl(
         &options.feature_order,
     )?;
 
-    // #443: resolve and validate `--feature-id` up front (schema-only checks
-    // -- per-row null/negative/non-integer values are caught during the
-    // scan), and unconditionally withhold the column from the tile
-    // properties/`vector_layers` metadata it would otherwise still publish
-    // under (see `resolve_feature_id_index`'s doc for why this always wins
-    // over the ordinary property selection).
-    if let Some(name) = &options.feature_id {
-        if let FeatureOrder::Column {
-            name: order_name, ..
-        } = &options.feature_order
-        {
-            if order_name == name {
-                return Err(ExportError::FeatureIdConflictsWithFeatureOrder { name: name.clone() });
-            }
-        }
-        let geom_idx = geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?;
-        let idx = resolve_feature_id_index(reader.schema(), geom_idx, &published, name)?;
-        let dt = reader.schema().field(idx).data_type();
-        if !is_integer_scalar(dt) {
-            return Err(ExportError::FeatureIdColumnNotInteger {
-                name: name.clone(),
-                data_type: format!("{dt:?}"),
-            });
-        }
-        published.suppress(reader.schema().field(idx).name());
-    }
+    // #443: resolve and validate `--feature-id` up front, and unconditionally
+    // withhold the column from tile properties/`vector_layers` metadata.
+    apply_feature_id_suppression(reader.schema(), options, &mut published)?;
 
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
@@ -2636,10 +2613,11 @@ type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
 /// [`fanout_batch_members`]' second half: attach each member-producing row's
 /// properties (materialized once per row, shared via `Arc`) and push its
 /// members into their `(level, wave)` store buckets, in band order.
+#[allow(clippy::too_many_arguments)] // one more than `fanout_batch_members` had (#443's `id_col`)
 fn route_fanout_rows(
     batch: &RecordBatch,
     prop_cols: &[(usize, String)],
-    id_col: Option<&(String, Vec<Option<PropertyValue>>)>,
+    id_col: Option<&FeatureIdColumn>,
     plans: &[LevelPlan],
     targets: &[usize],
     mut per_level: Vec<RowMembers>,
@@ -4645,6 +4623,45 @@ fn property_columns(
         .collect()
 }
 
+/// `export_pmtiles_impl`'s `--feature-id` setup (#443), factored out to keep
+/// that function under the line-count lint: reject a `--feature-order` on
+/// the same column (stripping the property would silently break the sort),
+/// resolve the column against the schema, reject a non-integer type, and
+/// unconditionally withhold it from the tile properties / `vector_layers`
+/// metadata it would otherwise still publish under -- see
+/// [`resolve_feature_id_index`]'s doc for why this always wins over the
+/// ordinary property selection. A no-op when `options.feature_id` is `None`.
+/// Per-row null/negative/non-integer values are [`resolve_feature_id_value`]'s
+/// job, once the scan actually reaches them.
+fn apply_feature_id_suppression(
+    schema: &Schema,
+    options: &ExportOptions,
+    published: &mut PublishedNames,
+) -> Result<(), ExportError> {
+    let Some(name) = &options.feature_id else {
+        return Ok(());
+    };
+    if let FeatureOrder::Column {
+        name: order_name, ..
+    } = &options.feature_order
+    {
+        if order_name == name {
+            return Err(ExportError::FeatureIdConflictsWithFeatureOrder { name: name.clone() });
+        }
+    }
+    let geom_idx = geometry_index(schema).ok_or(ExportError::NoGeometryColumn)?;
+    let idx = resolve_feature_id_index(schema, geom_idx, published, name)?;
+    let dt = schema.field(idx).data_type();
+    if !is_integer_scalar(dt) {
+        return Err(ExportError::FeatureIdColumnNotInteger {
+            name: name.clone(),
+            data_type: format!("{dt:?}"),
+        });
+    }
+    published.suppress(schema.field(idx).name());
+    Ok(())
+}
+
 /// Resolve `--feature-id <name>` (#443) against `schema`, matched by its
 /// *published* name -- the same matching `--feature-order` /
 /// `--include-property` / `--exclude-property` use -- independent of any
@@ -4704,6 +4721,11 @@ fn is_integer_scalar(dt: &DataType) -> bool {
     )
 }
 
+/// A `--feature-id` column's name plus its raw per-row values for one batch
+/// (#443): the name is carried alongside for [`resolve_feature_id_value`]'s
+/// error messages.
+type FeatureIdColumn = (String, Vec<Option<PropertyValue>>);
+
 /// The `--feature-id` column's raw per-row values for one batch (#443), or
 /// `None` when `opts.feature_id` is unset. Errors if the named column is
 /// missing or not an integer type; per-row null/negative/non-integer values
@@ -4714,7 +4736,7 @@ fn extract_feature_id_column(
     published: &PublishedNames,
     opts: &ExportOptions,
     batch: &RecordBatch,
-) -> Result<Option<(String, Vec<Option<PropertyValue>>)>, ExportError> {
+) -> Result<Option<FeatureIdColumn>, ExportError> {
     let Some(name) = &opts.feature_id else {
         return Ok(None);
     };

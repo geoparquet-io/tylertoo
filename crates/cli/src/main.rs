@@ -2506,6 +2506,38 @@ fn check_tiles_output(output: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `--feature-order`'s and `--feature-id`'s (#443) columns are read at
+/// export, after `tiles`' own convert step has already applied the property
+/// selection — an excluded column is gone from the intermediate before
+/// export ever sees it, so this is checked here, before any work is done,
+/// rather than after running the whole convert and quietly falling back
+/// (same wording as export's `PropertyRequiredByKnob`).
+fn reject_excluded_knob_columns(
+    options: &tylertoo_core::overview::convert::ConvertOptions,
+    feature_order: &FeatureOrder,
+    feature_id: Option<&String>,
+) -> Result<()> {
+    if let FeatureOrder::Column { name, .. } = feature_order {
+        anyhow::ensure!(
+            options.properties.keeps(name),
+            "property {name:?} is excluded but --feature-order reads it; keep it in the \
+             selection or drop the knob"
+        );
+    }
+    // #443: convert-time-only. This does not apply to export-pmtiles's OWN
+    // --include-property/--exclude-property, which `ExportOptions::feature_id`
+    // always overrides regardless (the column already exists in the
+    // intermediate file either way).
+    if let Some(name) = feature_id {
+        anyhow::ensure!(
+            options.properties.keeps(name),
+            "property {name:?} is excluded but --feature-id reads it; keep it in the \
+             selection or drop the flag"
+        );
+    }
+    Ok(())
+}
+
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
     use tylertoo_core::overview::level::Mode;
@@ -2583,32 +2615,12 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // `ExportOptions`: the empty-shard branch below needs the pivot zoom.
     let shard_range = shard.as_ref().and_then(|job| job.range);
 
-    // #386: the property selection is applied at convert, so an excluded
-    // column is already gone from the intermediate when export would sort
-    // on it — export-pmtiles rejects that pairing outright, and so must the
-    // facade, before any work is done, rather than run the whole convert
-    // and then quietly fall back to input order. Same wording as export's
-    // `PropertyRequiredByKnob`.
-    if let FeatureOrder::Column { name, .. } = &args.feature_order {
-        anyhow::ensure!(
-            options.properties.keeps(name),
-            "property {name:?} is excluded but --feature-order reads it; keep it in the \
-             selection or drop the knob"
-        );
-    }
-    // #443: same reasoning as `--feature-order` above -- `--feature-id`'s
-    // column must physically survive the convert step to reach the export
-    // that moves it to the id. This is convert-time-only: it does not apply
-    // to export-pmtiles's OWN --include-property/--exclude-property, which
-    // `ExportOptions::feature_id` always overrides regardless (the column
-    // already exists in the intermediate file either way).
-    if let Some(name) = &args.feature_id {
-        anyhow::ensure!(
-            options.properties.keeps(name),
-            "property {name:?} is excluded but --feature-id reads it; keep it in the \
-             selection or drop the flag"
-        );
-    }
+    // #386/#443: the property selection is applied at convert, so an excluded
+    // column is already gone from the intermediate before export would sort
+    // or id by it — export-pmtiles rejects that pairing outright, and so must
+    // the facade, before any work is done, rather than run the whole convert
+    // and then quietly fall back.
+    reject_excluded_knob_columns(&options, &args.feature_order, args.feature_id.as_ref())?;
 
     // Intermediate overview file (#314): retained at --keep-overview when
     // given; otherwise a temp file in --spill-dir / $TMPDIR / the output
