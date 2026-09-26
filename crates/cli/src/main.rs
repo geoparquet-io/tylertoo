@@ -520,13 +520,16 @@ struct ExportPmtilesArgs {
     #[arg(long, default_value = "overview")]
     layer_name: String,
 
-    /// Minimum zoom the archive declares, even if the overview file's coarsest
-    /// levels are missing (#380). `overview` omits a level that generalizes to
-    /// nothing, so a file built for z0..z13 can start at z2; without this the
-    /// header then says z2 and a client set up for the requested range never
-    /// asks for the zoomed-out view. The empty zooms hold no tiles (an empty
-    /// tile, in PMTiles terms). Must not be finer than the coarsest level
-    /// present. Default: the coarsest level's zoom
+    /// Minimum zoom the archive declares in its metadata
+    /// (vector_layers[].minzoom), even if the overview file's coarsest levels
+    /// are missing (#380). `overview` omits a level that generalizes to
+    /// nothing, so a file built for z0..z13 can start at z2; this records the
+    /// requested z0 anyway. The PMTiles header's min zoom is not widened: it
+    /// always reports the shallowest zoom that actually holds a tile, as
+    /// `go-pmtiles verify` requires, so renderers that read the header see
+    /// z2 (the empty zooms would render nothing either way). Must not be
+    /// finer than the coarsest level present. Default: the coarsest level's
+    /// zoom
     #[arg(long, value_name = "ZOOM")]
     min_zoom: Option<u8>,
 
@@ -620,8 +623,9 @@ struct ExportPmtilesArgs {
     /// a sharded build, complementing --tile-range's finer half.
     ///
     /// Named a CEILING, not --max-zoom, because it is the opposite of
-    /// --min-zoom here: --min-zoom only widens what the header DECLARES,
-    /// while this one decides which zooms are actually emitted. Distinct from
+    /// --min-zoom here: --min-zoom only widens what the metadata DECLARES
+    /// (vector_layers), while this one decides which zooms are actually
+    /// emitted. Distinct from
     /// building a shallower pyramid too: the overview file still holds every
     /// level (its convert plan is the one the shards consume, and the level
     /// plan is fingerprinted), and this only decides which of them reach the
@@ -2593,9 +2597,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
-        // #380: the archive declares the zoom range that was asked for, even
-        // when the coarsest levels generalized to nothing and were omitted
-        // from the overview. Only a zoom plan has a requested minimum zoom.
+        // #380: the archive's `vector_layers` declares the zoom range that was
+        // asked for, even when the coarsest levels generalized to nothing and
+        // were omitted from the overview (the header stays the actual tiles,
+        // #529/#522). Only a zoom plan has a requested minimum zoom.
         //
         // #498: a data shard owns no zoom coarser than the pivot, so that is
         // what it declares — claiming the coarse job's half would misdescribe
@@ -2644,8 +2649,11 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             convert_report.unprojectable_features,
         )
     );
-    // #380: the header covers the requested range; say which zooms in it
-    // hold nothing rather than let the range above imply they do.
+    // #380: the summary line above covers the requested (declared) range,
+    // which can be wider than the archive's own PMTiles header (#529, #522:
+    // the header always reflects the zooms that actually hold a tile) — say
+    // which zooms in the requested range hold nothing rather than let the
+    // summary imply they do.
     let empty_zooms: Vec<String> = convert_report
         .skipped_empty_levels
         .iter()

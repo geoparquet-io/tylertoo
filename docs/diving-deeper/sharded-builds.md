@@ -388,8 +388,9 @@ monolithic run of the same input with the same options, asserting:
 - identical per-zoom tile counts;
 - **byte-identical tile bodies**, tile by tile.
 
-…and, on the archive rather than the tiles: the same declared zoom range, the
-same bounds, and the same `vector_layers` as the monolithic archive.
+…and, on the archive rather than the tiles: the same header zoom range (the
+zooms that actually hold tiles), the same bounds, and the same `vector_layers`
+(which carries the declared zoom range) as the monolithic archive.
 
 Tile counts alone would not be enough: a seam bug moves geometry between
 neighbouring tiles while keeping every count the same. Byte equality is what
@@ -422,5 +423,6 @@ For a cut you want to choose by hand rather than have balanced for you,
 `export-pmtiles --tile-range LO..HI` takes two tile ids at one zoom directly,
 and `--zoom-ceiling Z` on the same command is the coarse half's complement.
 (It is a *ceiling*, not a `--max-zoom`: unlike `--min-zoom`, which only widens
-what the header declares, this decides which zooms are actually emitted.)
+the range the archive's `vector_layers` declares, this decides which zooms are
+actually emitted.)
 `tiles --shard` is the same mechanism with the bookkeeping done for you.

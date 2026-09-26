@@ -122,8 +122,9 @@ fn convert(
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
         feature_order: parse_feature_order(feature_order)?,
-        // #380: the archive declares the requested range even when the
-        // coarsest levels generalized to nothing.
+        // #380: the archive's `vector_layers` declares the requested range
+        // even when the coarsest levels generalized to nothing (the header
+        // stays the actual tiles, #529/#522).
         min_zoom: Some(min_zoom),
         properties: Default::default(),
         // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
@@ -856,13 +857,15 @@ fn overview(
 ///         lists them, so this is the paint order for any style that does not
 ///         override it. "input" emits source row order; naming a column sorts
 ///         within each tile by that property, ties kept in input order.
-///     min_zoom (int, optional): Minimum zoom the archive declares even when
-///         the overview file's coarsest levels are missing (#380). ``overview``
-///         omits a level that generalizes to nothing, so a file built for
-///         z0..z13 can start at z2; without this the header says z2 and a
-///         client set up for the requested range never asks for the
-///         zoomed-out view. The empty zooms hold no tiles. Must not be finer
-///         than the coarsest level present. Defaults to None (the coarsest
+///     min_zoom (int, optional): Minimum zoom the archive declares in its
+///         metadata (``vector_layers[].minzoom``) even when the overview
+///         file's coarsest levels are missing (#380). ``overview`` omits a
+///         level that generalizes to nothing, so a file built for z0..z13 can
+///         start at z2; this records the requested z0 anyway. The PMTiles
+///         header's min zoom is not widened: it always reports the shallowest
+///         zoom that actually holds a tile, as ``go-pmtiles verify`` requires.
+///         The empty zooms hold no tiles. Must not be finer than the coarsest
+///         level present. Defaults to None (the coarsest
 ///         level's zoom). ``convert()`` passes its own ``min_zoom`` here, so
 ///         pass the same value to match what it writes.
 ///

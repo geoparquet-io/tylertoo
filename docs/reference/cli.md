@@ -515,7 +515,7 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--layer-name <LAYER_NAME>` — MVT layer name written into every tile
 
   Default value: `overview`
-* `--min-zoom <ZOOM>` — Minimum zoom the archive declares, even if the overview file's coarsest levels are missing (#380). `overview` omits a level that generalizes to nothing, so a file built for z0..z13 can start at z2; without this the header then says z2 and a client set up for the requested range never asks for the zoomed-out view. The empty zooms hold no tiles (an empty tile, in PMTiles terms). Must not be finer than the coarsest level present. Default: the coarsest level's zoom
+* `--min-zoom <ZOOM>` — Minimum zoom the archive declares in its metadata (vector_layers[].minzoom), even if the overview file's coarsest levels are missing (#380). `overview` omits a level that generalizes to nothing, so a file built for z0..z13 can start at z2; this records the requested z0 anyway. The PMTiles header's min zoom is not widened: it always reports the shallowest zoom that actually holds a tile, as `go-pmtiles verify` requires, so renderers that read the header see z2 (the empty zooms would render nothing either way). Must not be finer than the coarsest level present. Default: the coarsest level's zoom
 * `--include-property <NAME>` — Keep ONLY these properties in the tiles (repeatable; tippecanoe -y), matched on the names the tiles publish. The overview file is untouched. Naming a property the file does not export is an error; the --feature-order column must stay included
 * `--exclude-property <NAME>` — Drop these properties from the tiles (repeatable; tippecanoe -x). Ignored when --include-property is given, as in tippecanoe
 * `--exclude-all-properties` — Drop every property (tippecanoe -X): geometry-only tiles. Ignored when --include-property is given, as in tippecanoe
@@ -542,7 +542,7 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
    Ranges that partition the pivot zoom partition every deeper zoom, so the resulting archives are disjoint by construction and `tylertoo merge` concatenates them without re-encoding anything. `tiles --shard` derives this automatically from a shard plan; this flag is the manual form, for a cut you want to choose yourself
 * `--zoom-ceiling <ZOOM>` — Emit only the tiles at or below this zoom (#498) — the coarse half of a sharded build, complementing --tile-range's finer half.
 
-   Named a CEILING, not --max-zoom, because it is the opposite of --min-zoom here: --min-zoom only widens what the header DECLARES, while this one decides which zooms are actually emitted. Distinct from building a shallower pyramid too: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive
+   Named a CEILING, not --max-zoom, because it is the opposite of --min-zoom here: --min-zoom only widens what the metadata DECLARES (vector_layers), while this one decides which zooms are actually emitted. Distinct from building a shallower pyramid too: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive
 
 
 

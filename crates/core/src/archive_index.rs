@@ -355,14 +355,19 @@ impl ArchiveIndex {
     /// tiles at all.
     ///
     /// This is the archive's *actual* content, as opposed to
-    /// `header().min_zoom..=header().max_zoom`, which since #380/#390 is only
-    /// a *declaration*: a writer widens it over an empty zoom so a client
-    /// sees the range it was told to expect even where nothing was written
-    /// (`set_declared_min_zoom`/`set_declared_max_zoom`). The pyramid band
-    /// contract (#514) keys off this instead, so a widened header can no
-    /// longer make an empty band look like a legitimate subrange, and an
-    /// honest, narrow header can no longer make a band that fully covers the
-    /// archive's real tiles look like an error.
+    /// `header().min_zoom..=header().max_zoom`. Between #380/#390 and
+    /// #529/#522, `header()`'s own zoom range could also be a *declaration*
+    /// widened over an empty zoom (`set_declared_min_zoom`/
+    /// `set_declared_max_zoom`) so a client saw the range it was told to
+    /// expect even where nothing was written -- but `go-pmtiles verify`
+    /// rejects a header wider than the archive's actual tiles, so tylertoo's
+    /// own writer no longer produces one; a declaration now only reaches
+    /// `vector_layers[].minzoom`/`maxzoom`. An externally produced archive
+    /// can still carry a genuinely mismatched header, though, so the pyramid
+    /// band contract (#514) keys off this method rather than `header()`: a
+    /// widened header can no longer make an empty band look like a
+    /// legitimate subrange, and an honest, narrow header can no longer make a
+    /// band that fully covers the archive's real tiles look like an error.
     ///
     /// Free of any run-length-expansion cost beyond [`Self::tile_id_range`]:
     /// tile ids are Hilbert-curve blocks per zoom, monotonic in zoom, so the
@@ -493,6 +498,35 @@ impl Iterator for TileIter<'_> {
             }
         }
     }
+}
+
+/// Test-only: assert the `go-pmtiles verify` zoom invariants on an archive
+/// (#529, #522). The header's `min_zoom`/`max_zoom` must equal the zooms the
+/// directory actually addresses ([`ArchiveIndex::actual_zoom_range`]; z0..z0
+/// for an archive with no tiles), and `center_zoom` must lie within them.
+#[cfg(test)]
+pub(crate) fn assert_header_zooms_match_tiles(path: &Path) {
+    let idx = ArchiveIndex::open(path).expect("open archive");
+    let h = idx.header();
+    let actual = idx
+        .actual_zoom_range()
+        .expect("actual zoom range")
+        .unwrap_or((0, 0));
+    assert_eq!(
+        (h.min_zoom, h.max_zoom),
+        actual,
+        "{}: header zoom range must equal the zooms that actually hold tiles \
+         (go-pmtiles verify)",
+        path.display()
+    );
+    assert!(
+        h.min_zoom <= h.center_zoom && h.center_zoom <= h.max_zoom,
+        "{}: center_zoom {} outside header z{}..z{}",
+        path.display(),
+        h.center_zoom,
+        h.min_zoom,
+        h.max_zoom
+    );
 }
 
 #[cfg(test)]
