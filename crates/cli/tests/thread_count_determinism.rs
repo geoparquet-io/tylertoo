@@ -425,3 +425,85 @@ fn multi_part_output_is_byte_identical_across_read_worker_counts() {
         }
     }
 }
+
+/// #534, the acceptance oracle for the parallel level assignment: the convert
+/// **plan artifact** must be byte-identical across thread counts.
+///
+/// The plan is the right thing to compare, and the tests above do not compare
+/// it. They compare the exported PMTiles, which is the assignment seen through
+/// simplification, tile encoding and compression — a pipeline that can absorb a
+/// difference (a feature that moved one level in a zoom nobody renders, a
+/// density-budget survivor swapped for an equal-priority twin). The plan is the
+/// assignment itself, serialized: every feature's `min_level`, the level specs,
+/// the cluster and coalesce tables. Nothing in it is lossy, so a single feature
+/// assigned differently by a parallel winner grid or a parallel super-cell
+/// partition changes its bytes.
+///
+/// It is also the artifact the sharded-build architecture (#498) actually
+/// ships: the coarse job computes the one dataset-global assignment with
+/// `--save-plan` and every data shard replays it with `--plan`, so a
+/// thread-count-dependent plan would mean the fleet's shards disagreed about
+/// which feature belongs to which zoom.
+///
+/// Two fixtures, because they exercise different halves of the phase:
+/// `fieldmaps-madagascar-adm4` (17k admin polygons) has a contended polygon
+/// winner grid at coarse levels, and `road-detections` is a line layer, which
+/// runs the line thinning grid and the coalesce tables.
+#[test]
+fn convert_plan_is_byte_identical_across_thread_counts() {
+    for (name, max_zoom) in [
+        ("fieldmaps-madagascar-adm4.parquet", 8u8),
+        ("road-detections.parquet", 12u8),
+    ] {
+        let Some(fixture) = fixture::realdata(name) else {
+            continue;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut baseline: Option<(u32, Vec<u8>)> = None;
+
+        for threads in [1u32, 2, 8] {
+            let out = dir.path().join(format!("plan-t{threads}.pmtiles"));
+            let overview_out = dir.path().join(format!("plan-t{threads}-overview.parquet"));
+            let plan = dir.path().join(format!("t{threads}.plan"));
+            run_tiles(
+                &fixture,
+                &out,
+                &overview_out,
+                threads,
+                false,
+                max_zoom,
+                &["--save-plan", plan.to_str().unwrap()],
+            );
+            let plan_bytes = std::fs::read(&plan).expect("read saved convert plan");
+            assert!(
+                !plan_bytes.is_empty(),
+                "[{name}] --save-plan wrote an empty plan at RAYON_NUM_THREADS={threads}"
+            );
+
+            match &baseline {
+                None => baseline = Some((threads, plan_bytes)),
+                Some((base_threads, base_plan)) => {
+                    assert_eq!(
+                        base_plan.len(),
+                        plan_bytes.len(),
+                        "[{name}] convert plan size differs between \
+                         RAYON_NUM_THREADS={base_threads} ({} bytes) and \
+                         RAYON_NUM_THREADS={threads} ({} bytes) — #534 regression: the parallel \
+                         level assignment is not reproducing the serial one",
+                        base_plan.len(),
+                        plan_bytes.len()
+                    );
+                    assert!(
+                        base_plan == &plan_bytes,
+                        "[{name}] convert plan differs between \
+                         RAYON_NUM_THREADS={base_threads} and RAYON_NUM_THREADS={threads} (same \
+                         {} byte length, different content) — #534 regression: a feature took a \
+                         different level depending on how the winner pass or the density budget \
+                         was split across threads",
+                        plan_bytes.len()
+                    );
+                }
+            }
+        }
+    }
+}

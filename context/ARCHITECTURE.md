@@ -87,6 +87,33 @@ verbatim (spec §2.4).
 1. **Pass 1** streams the input once, keeping only a small per-feature record
    (bbox, kind, ranking key). Level assignment + density budget run over
    those records to produce per-level **winner tables** (~1 byte/feature).
+
+   The assignment is parallel *within* the phase, not only across levels
+   (#534). Running each level's cell-winner grid on its own thread (#264) is
+   the obvious decomposition, but it evaporates at dataset scale: the #306
+   grid RAM budget packs the levels into waves, and a wave of one level has
+   nothing to overlap — which is how a 55.5M-row convert came to spend 107s
+   single-threaded here, more than the whole scan. So a level's grid is
+   **shard-partitioned**: threads classify disjoint feature ranges and bucket
+   each placement by the shard owning its cell, then reduce the shards in
+   parallel, one map per task. No locks, no merge tail, and one entry per
+   occupied cell either way, so the #306 grid estimate still describes the
+   grids. The one new term is the pending placements between shard reduces,
+   which the estimate does not count; it is bounded instead, per wave rather
+   than per level (≈ 2 MiB per pool thread across the whole wave, floor 1 MiB
+   per level, exact-size buffers), because the planner packs many tiny coarse
+   levels into one wave. The wave's winner fold splits by position range, and
+   the density budget's candidate scan and super-cell partition go wide while
+   its admission fold (which threads a running kept count coarse→fine) stays
+   serial. All of it is scheduling: the sharded reduce preserves position
+   order per cell, so every cell resolves its contests exactly as the serial
+   build does, and the budget's sorts are by a strict total order. The unit
+   test `oracle_fixture_reproduces_main` holds a 150k-feature adversarial
+   fixture — above the sharded-build and parallel-sort cutoffs — to golden
+   digests produced by the pre-#534 serial code, at 1/2/7/16 threads and
+   unbounded vs. 1-byte grid budgets; `thread_count_determinism.rs` checks the
+   end-to-end artifact across thread counts, though its fixtures are below the
+   sharded-build size.
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
    reader thread streams batches over a bounded channel while a consumer
