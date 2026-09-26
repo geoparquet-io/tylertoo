@@ -302,6 +302,20 @@ above stand: a reader that ignores the member entirely still produces
 a valid result, merely one that keeps the renamed name. The MUST NOT
 binds only a consumer that chooses to act on the member.
 
+The `zoom_ceiling` member marks a **partial** file (implementation
+note, informative: tylertoo writes one for the coarse job of a sharded
+build, #541). Such a file holds only the levels at or coarser than the
+recorded zoom; its finest level is an ordinary generalized level, so
+§2.4 canonical fidelity does not hold for it even though
+`canonical_level` still reads `L-1` as §3.4 requires. A partial file is
+therefore **not a conforming** `duplicating` file: a validator that
+recognizes the member SHOULD report it as such, and a consumer that
+recognizes it MUST NOT treat the file as a complete pyramid (in
+particular, MUST NOT use its `canonical_level` for §5.3 analysis). A
+reader that does not recognize the member cannot tell; producers
+SHOULD treat partial files as intermediates, not as published
+artifacts.
+
 ```
 Provenance := {
   "engine":       string,      // e.g. "tylertoo 0.6.0"
@@ -347,6 +361,11 @@ Provenance := {
                                // `point_count` / `coalesced_count`
                                // in the modes that append them).
                                // Absent when nothing was renamed.
+  "zoom_ceiling": integer      // OPTIONAL: partial-file marker — the
+                               // level plan reached finer than this
+                               // zoom but only the levels at or
+                               // coarser than it were written;
+                               // absent on every complete file
 }
 
 Ranking := {
@@ -1127,9 +1146,20 @@ Coalescing := {
                                          // ceiling; levels with more
                                          // candidate lines were written
                                          // uncoalesced (counts all 1)
-  "coalesced_count_column":    string    // e.g. "coalesced_count"
+  "coalesced_count_column":    string,   // e.g. "coalesced_count"
+  "merged":                    boolean   // OPTIONAL: whether any chain
+                                         // joined >= 2 segments at any
+                                         // planned non-canonical level
+                                         // (including levels a
+                                         // `zoom_ceiling` did not write)
 }
 ```
+
+`merged` is informative: it lets a consumer decide whether the
+`coalesced_count` column carries information without scanning it, and
+— unlike the column's statistics — it describes the whole conversion,
+so a partial file (§3.5 `zoom_ceiling`) agrees with the complete file
+it is a prefix of. Readers MUST tolerate its absence.
 
 All four parameter members carry the same weight: a writer conforming
 to v0.2.0 that emits the `coalescing` block MUST include
@@ -1182,6 +1212,10 @@ requirements of this spec.
 
 ## 14. Changelog
 
+- **Unreleased (additive, informative)**: `generalization.zoom_ceiling`
+  marks a partial file (§3.5), and `coalescing.merged` records whether
+  coalescing merged anything across the whole level plan (§13.4). Both
+  OPTIONAL; files without them are unchanged.
 - **v0.2.0 (2026-07-03)**: added the point clustering extension (§12:
   `point_count` column, numeric attribute accumulation,
   `generalization.clustering` metadata, duplicating-mode-only rule)

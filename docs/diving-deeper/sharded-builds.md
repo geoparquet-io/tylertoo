@@ -85,15 +85,29 @@ tylertoo tiles fields.parquet coarse.pmtiles \
 This job does two things: it builds the zooms below the pivot (z0–z5 here), and
 it writes `convert.plan` — the artifact every shard then consumes.
 
-**It is a full monolithic convert.** It reads the whole input because the level
-assignment has to, and it runs the *whole* assignment and the *whole* pass 2 —
-`--shard coarse` restricts only which zooms reach the archive, not how much
-work the convert does. Asking for a shallower pyramid here does not help
-either: the shards' convert plan is fingerprinted on the level plan, so a
-coarse job run with a smaller `--max-zoom` produces a plan every shard
-refuses. Making this job genuinely cheap needs a convert-side level ceiling,
-which is
-[issue #541](https://github.com/geoparquet-io/tylertoo/issues/541).
+**It reads the whole input, but it only builds its own levels** (#541). The
+level assignment is dataset-global, so pass 1 and the assignment run over
+every row at every level — that is what makes `convert.plan` a complete
+artifact the shards can consume. Pass 2 then stops at the pivot: the levels at
+and past it are never coalesced, assembled, buffered, spilled or written, and
+the verbatim canonical level — the largest of all, and the one that otherwise
+costs a whole second read of the input — is not built at all.
+
+With `--keep-overview`, the intermediate it keeps is a **partial** overview:
+its footer records the ceiling, `validate` reports it as incomplete, and
+`export-pmtiles` refuses it unless given a `--zoom-ceiling` at or below the
+recorded one. If every feature first appears at or past the pivot, the coarse
+job writes an empty archive and exits 0, like an empty data shard. Under
+`--no-streaming` the coarse job falls back to building every level (same
+tiles, more work).
+
+The plan is **byte-identical** to what an uncapped coarse job writes; the
+ceiling is deliberately outside its fingerprint. That is the invariant the
+fleet rests on, and the parity oracle asserts it directly.
+
+Do **not** try to get the same effect with a shallower `--max-zoom`: the
+convert plan *is* fingerprinted on the level plan, so a coarse job run that
+way produces a plan every shard refuses.
 
 ### 2. The shards (N runs, in parallel)
 
@@ -146,14 +160,34 @@ silently shadow each other.
 
 ## What sharding actually buys you
 
-Being precise about this, because the obvious reading of the recipe above is
-wrong in a way that will cost you a scheduling window.
+Being precise about this, because the cost model is not obvious.
 
-The coarse job costs **about what a monolithic convert costs**. It reads every
-row, runs the full level assignment, and writes the full intermediate
-overview; only the export half is restricted to the zooms below the pivot. So
-for a build whose convert dominates — which is the planet-scale case — the
-fleet's wall clock is still bounded below by one whole convert.
+The coarse job's **floor** is one pass-1 scan plus the level assignment over
+the whole dataset. That cannot be sharded — it is the thing that makes the
+fleet agree with itself (see the next section) — so the fleet's wall clock is
+bounded below by it.
+
+Above that floor, the coarse job still makes **one full-width read of the
+input in pass 2**: every selected row group, every column the output carries,
+decoded — most of it only to be discarded, because the rows that reach a
+coarse level are picked *after* decode. What it saves is everything past the
+read, for the levels at and past the pivot:
+
+- pass 2 generalizes, buffers and writes only the levels below the pivot,
+  which on a thinned pyramid is a small fraction of the rows;
+- the ladder cascade's **fine steps are still computed** — a coarse level's
+  geometry is canonical geometry folded through every finer level's GSD in
+  turn (#218), and skipping those steps would change the coordinates — but
+  only for the rows that reach a coarse level, which after thinning is a small
+  fraction of the input;
+- the canonical level's second read of the input, and the verbatim write of
+  every row with every property, are **gone** — so pass 2 is one read, not
+  two (this is a duplicating-mode saving; `tiles` always converts in
+  duplicating mode).
+
+How much that buys depends on how hard the coarse levels thin. With
+`--no-drop` or a loose density budget they keep most rows, and the coarse job
+costs nearly a full convert.
 
 What you get for that:
 
@@ -164,14 +198,15 @@ What you get for that:
 - **Restartability, which is the bigger prize at this scale.** A monolithic
   run that dies at hour 40 has nothing to show for it. Here a failed shard is
   one array-task re-run, against plan files that are already on disk.
-- **Bounded per-job memory and disk**, so a fleet fits scheduling windows and
-  node limits that one enormous job does not.
+- **Bounded memory and disk for the data shards**, so most of the fleet fits
+  scheduling windows and node limits that one enormous job does not. The
+  coarse job is the exception: its peak is the monolithic pass-1/assign peak
+  whatever `N` is (see the next section).
 
-What you do **not** get yet is a cheap coarse job.
-[#541](https://github.com/geoparquet-io/tylertoo/issues/541) tracks the
-convert-side level ceiling that would make `--shard coarse` stop at the pivot
-instead of building the whole pyramid; until it lands, budget the coarse job
-as a full convert of the input.
+Budget the coarse job as *pass 1 + assign over the whole input, plus one
+full-width read of the input in pass 2 (decoded, mostly discarded), plus
+generalization and writing for the coarse levels only* — cheaper than a full
+convert in time and disk, not in peak memory.
 
 ## Sizing the coarse job's memory
 
@@ -194,7 +229,10 @@ buffered output also need memory, concurrently with (or right after) it.
 **Rule of thumb: budget the coarse job at ≳ (rows × 64 bytes) × 2.5.** For
 the field incident above (1.58B rows, a 94.2 GiB floor), that is ≳235 GiB:
 the job OOM'd on a 192 GiB box — only ~2.04× the floor — 25 minutes in, and
-ran on 360 GiB.
+ran on 360 GiB. That incident predates #541, when the coarse job's pass 2
+still built every level; since #541 its pass 2 builds only the levels below
+the pivot, so its pass-2 buffers are smaller and the ×2.5 multiplier is
+conservative for it. The pass-1 floor itself is unchanged.
 
 **The remedy is a bigger box.** Sharding does not lower this floor: the
 coarse job runs the full pass 1 over the whole input, whatever `N` is. Only a

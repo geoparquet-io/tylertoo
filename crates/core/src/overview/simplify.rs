@@ -55,6 +55,7 @@
 //! explicit, tested identity path rather than an emergent one.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use geo::{
     Area, BoundingRect, Centroid, Geometry, LineString, MultiLineString, MultiPolygon, Point,
@@ -554,8 +555,9 @@ pub(super) fn simplify_step_checked(
 /// An empty chain is the identity (bit-identical clone), matching
 /// [`simplify_for_level`]'s canonical path at zero tolerance.
 ///
-/// Keep step semantics in lock-step with the inline fold in
-/// `overview::stream::process_batch_cascade`; equivalence is enforced by
+/// The step rules live in [`CascadeFold`], which the pipelined engine's
+/// incremental fold (`overview::stream::process_batch_cascade`) drives too;
+/// equivalence is enforced by
 /// `overview::convert::tests::pipelined_matches_serial`.
 pub fn simplify_cascade(
     geom: &Geometry<f64>,
@@ -563,33 +565,117 @@ pub fn simplify_cascade(
     crs: Crs,
     opts: &SimplifyOptions,
 ) -> Simplified {
-    let mut current: Option<Geometry<f64>> = None;
-    let mut alive = true;
-    let mut result = Simplified::Keep(geom.clone());
-    for step in steps_fine_to_coarse {
-        let out = if !alive && step.repr == Representation::Geometry {
-            // Monotone along geometry steps: once dropped, stays dropped.
-            Simplified::Dropped
-        } else {
-            // Alive: cascade the previous step's output. Not alive (Point /
-            // Square step): revive from canonical geometry.
-            let input = if alive {
-                current.as_ref().unwrap_or(geom)
-            } else {
-                geom
-            };
-            simplify_step(input, step.gsd_meters, crs, opts, step.repr)
-        };
-        match &out {
-            Simplified::Keep(g) => {
-                current = Some(g.clone());
-                alive = true;
-            }
-            Simplified::Dropped => alive = false,
-        }
-        result = out;
+    if steps_fine_to_coarse.is_empty() {
+        return Simplified::Keep(geom.clone());
     }
-    result
+    let canonical = Arc::new(geom.clone());
+    let mut fold = CascadeFold::new();
+    let mut last = FoldStep::Dropped;
+    for step in steps_fine_to_coarse {
+        last = fold.step(&canonical, step, crs, opts);
+    }
+    // Release every other handle first, so the common case (the result is a
+    // fresh step output, uniquely owned) unwraps without a copy.
+    drop(fold);
+    drop(canonical);
+    match last {
+        FoldStep::Keep { geom, .. } => {
+            Simplified::Keep(Arc::try_unwrap(geom).unwrap_or_else(|shared| (*shared).clone()))
+        }
+        FoldStep::Dropped => Simplified::Dropped,
+    }
+}
+
+/// The cascade's per-feature state machine (#218), shared by every fold in
+/// the crate (#541 review): [`simplify_cascade`] (the Serial and in-memory
+/// engines), the pipelined engine's incremental fold, and its #541 prefix
+/// over unmaterialized fine levels. Keeping ONE copy of the step rules is
+/// what keeps those paths byte-identical; they used to be three hand-synced
+/// loops.
+///
+/// Rules, per [`step`](Self::step):
+/// - a [`Representation::Geometry`] step after a drop stays dropped (dropping
+///   is monotone along geometry steps);
+/// - otherwise the step folds from the working geometry while alive, or
+///   **revives from canonical** geometry at a `Point` / `Square` step;
+/// - a kept result that the step left value-identical to its input
+///   (`unchanged`, #499) shares the input's allocation instead of the fresh
+///   copy — same value, one fewer geometry resident.
+pub(crate) struct CascadeFold {
+    current: Option<Arc<Geometry<f64>>>,
+    alive: bool,
+}
+
+/// One [`CascadeFold::step`]'s result.
+pub(crate) enum FoldStep {
+    /// Kept. `shared` is `true` when `geom` is the step's input allocation,
+    /// reused because the step changed nothing (#499's profile counter).
+    Keep {
+        /// The level's geometry.
+        geom: Arc<Geometry<f64>>,
+        /// Whether `geom` is shared with the step's input.
+        shared: bool,
+    },
+    /// Not meaningful at this level.
+    Dropped,
+}
+
+impl CascadeFold {
+    /// A fresh fold: alive, working geometry = canonical.
+    pub(crate) fn new() -> Self {
+        Self {
+            current: None,
+            alive: true,
+        }
+    }
+
+    /// Whether the working geometry survived the last step.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive
+    }
+
+    /// Apply one fine→coarse step. `canonical` is both the starting geometry
+    /// and the revival source; it must be the same value on every call.
+    pub(crate) fn step(
+        &mut self,
+        canonical: &Arc<Geometry<f64>>,
+        step: &CascadeStep,
+        crs: Crs,
+        opts: &SimplifyOptions,
+    ) -> FoldStep {
+        if !self.alive && step.repr == Representation::Geometry {
+            // Monotone along geometry steps: once dropped, stays dropped.
+            return FoldStep::Dropped;
+        }
+        // Alive: cascade the previous step's output. Not alive (Point /
+        // Square step): revive from canonical geometry.
+        let base: &Arc<Geometry<f64>> = if self.alive {
+            self.current.as_ref().unwrap_or(canonical)
+        } else {
+            canonical
+        };
+        let (out, unchanged) =
+            simplify_step_checked(base.as_ref(), step.gsd_meters, crs, opts, step.repr);
+        match out {
+            Simplified::Keep(s) => {
+                let geom = if unchanged {
+                    Arc::clone(base)
+                } else {
+                    Arc::new(s)
+                };
+                self.current = Some(Arc::clone(&geom));
+                self.alive = true;
+                FoldStep::Keep {
+                    geom,
+                    shared: unchanged,
+                }
+            }
+            Simplified::Dropped => {
+                self.alive = false;
+                FoldStep::Dropped
+            }
+        }
+    }
 }
 
 // ============================================================================

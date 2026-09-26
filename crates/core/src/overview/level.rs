@@ -236,6 +236,20 @@ pub struct Generalization {
     /// readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renamed_columns: Option<BTreeMap<String, String>>,
+    /// OPTIONAL partial-overview marker (§3.5, additive; #541).
+    ///
+    /// `Some(z)` when the file was written under a convert-side zoom ceiling
+    /// (the coarse job of a sharded build): the level plan reached finer than
+    /// `z`, but only the levels at or coarser than `z` were materialized. The
+    /// file is then a **partial** overview — its finest level is an ordinary
+    /// simplified level, *not* the verbatim canonical level `canonical_level`
+    /// points at, and every level finer than `z` is missing. A consumer MUST
+    /// NOT treat such a file as a complete pyramid: tylertoo's export refuses
+    /// to emit zooms past `z`, and the validator reports the file as not
+    /// conforming (§2.4 cannot hold). Absent on every complete file, which
+    /// keeps their footers byte-identical to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom_ceiling: Option<u8>,
 }
 
 /// How line coalescing was applied for a conversion (Q3, spec §13 draft).
@@ -268,6 +282,19 @@ pub struct CoalescingProvenance {
     /// Name of the merged-segment-count column (this implementation:
     /// `coalesced_count`).
     pub coalesced_count_column: String,
+    /// OPTIONAL: whether coalescing merged anything (§13.4, additive,
+    /// informative; #541 review). `Some(true)` when at least one chain joined
+    /// two or more segments at **any planned** non-canonical level —
+    /// including levels a zoom ceiling ([`Generalization::zoom_ceiling`]) did
+    /// not materialize — and `Some(false)` when every chain was a single
+    /// segment. It is a property of the conversion, not of which levels this
+    /// file happens to hold, so a capped (partial) file and the full run it
+    /// is a prefix of agree on it. The PMTiles export uses it to decide
+    /// whether `coalesced_count` is worth publishing (#379); absent on files
+    /// written before the member existed, where the export falls back to the
+    /// column's row-group statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged: Option<bool>,
 }
 
 /// How point clustering was applied for a conversion (Q4, spec §12 draft).
@@ -989,6 +1016,7 @@ mod tests {
             clustering: None,
             coalescing: None,
             renamed_columns: None,
+            zoom_ceiling: None,
         });
         let json = meta.to_json().unwrap();
         assert!(
@@ -1038,6 +1066,7 @@ mod tests {
             clustering: None,
             coalescing: None,
             renamed_columns: None,
+            zoom_ceiling: None,
         });
         let json = meta.to_json().unwrap();
         // v0.2.0 (§3.5): ranks serialize as a JSON object map, NOT pairs.
@@ -1107,6 +1136,7 @@ mod tests {
             clustering: None,
             coalescing: None,
             renamed_columns: None,
+            zoom_ceiling: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
@@ -1149,8 +1179,10 @@ mod tests {
                 junction_angle: Some(0.0),
                 max_level_rows: Some(2_000_000),
                 coalesced_count_column: "coalesced_count".to_string(),
+                merged: None,
             }),
             renamed_columns: None,
+            zoom_ceiling: None,
         });
         let json = meta.to_json().unwrap();
         // §13.4 (v0.2.0): all five members present when emitted.
@@ -1232,6 +1264,7 @@ mod tests {
             }),
             coalescing: None,
             renamed_columns: None,
+            zoom_ceiling: None,
         });
         let json = meta.to_json().unwrap();
         let parsed = OverviewsMeta::from_json(&json).unwrap();
