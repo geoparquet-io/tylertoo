@@ -218,17 +218,20 @@ pub struct ExportOptions {
     /// Within-tile feature order (#361). Defaults to [`FeatureOrder::Input`],
     /// the order tylertoo has always emitted.
     pub feature_order: FeatureOrder,
-    /// Minimum zoom the archive declares, even when the overview file's
-    /// coarsest levels are missing (#380).
+    /// Minimum zoom the archive declares in its metadata, even when the
+    /// overview file's coarsest levels are missing (#380).
     ///
     /// The converter omits a level that generalizes to nothing (spec §7.3), so
-    /// an overview built for z0..z13 can start at z2. Left `None`, the header
-    /// says z2 and a client configured for the requested range never asks for
-    /// the zoomed-out view. Set to the requested minimum, the header and
-    /// `vector_layers[].minzoom` cover it; the empty zooms simply have no
-    /// tiles, which in PMTiles is an empty tile. Must not be finer than the
-    /// coarsest level present — that would misdescribe real tiles — and is
-    /// rejected if it is. The one-shot `tiles` command passes its
+    /// an overview built for z0..z13 can start at z2. Set to the requested
+    /// minimum, `vector_layers[].minzoom` (and [`ExportReport::min_zoom`])
+    /// cover it; the empty zooms simply have no tiles, which in PMTiles is an
+    /// empty tile. The PMTiles header's own `min_zoom` is NOT widened: it is
+    /// always the shallowest zoom that actually holds a tile (#529, #522), as
+    /// `go-pmtiles verify` requires. Renderers that build TileJSON from the
+    /// header (the pmtiles JS library does) therefore see the narrower range;
+    /// the empty zooms would render nothing either way. Must not be finer
+    /// than the coarsest level present — that would misdescribe real tiles —
+    /// and is rejected if it is. The one-shot `tiles` command passes its
     /// `--min-zoom` here; `export-pmtiles --min-zoom` sets it directly.
     pub min_zoom: Option<u8>,
     /// Which properties the tiles carry (#386): tippecanoe's `-x` / `-y` /
@@ -365,8 +368,8 @@ pub enum ExportError {
 
     #[error(
         "declared min_zoom {declared} is finer than the coarsest level present (zoom \
-         {coarsest}): the header can widen the zoom range over empty zooms, not narrow \
-         it over real tiles (#380)"
+         {coarsest}): the declared zoom range can widen over empty zooms, not narrow \
+         over real tiles (#380)"
     )]
     DeclaredMinZoomTooFine { declared: u8, coarsest: u8 },
 
@@ -1090,8 +1093,8 @@ fn export_pmtiles_impl(
     }
     // #380: the archive may declare a coarser minimum than the file holds.
     let min_zoom = match options.min_zoom {
-        // #371: the declared minimum is a written header field, so it obeys the
-        // same ceiling as everything else. Checked before the #380 comparison
+        // #371: the declared minimum is written into `vector_layers`, so it
+        // obeys the same ceiling as everything else. Checked before the #380 comparison
         // so an out-of-range value is named as such.
         Some(declared) if declared > MAX_ZOOM => {
             return Err(ExportError::DeclaredMinZoomAboveCeiling {
@@ -7438,6 +7441,13 @@ mod tests {
             "header must be the shallowest zoom with an actual tile, not the declared z0"
         );
         assert_eq!(header.max_zoom, 4);
+        crate::archive_index::assert_header_zooms_match_tiles(tout.path());
+
+        // Default options over the same file (whose coarse zooms are empty):
+        // the header must satisfy the same invariant.
+        let tdef = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(tin.path(), tdef.path(), &ExportOptions::default()).unwrap();
+        crate::archive_index::assert_header_zooms_match_tiles(tdef.path());
     }
 
     /// Declaring a minimum finer than the coarsest level would misdescribe

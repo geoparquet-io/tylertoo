@@ -500,6 +500,35 @@ impl Iterator for TileIter<'_> {
     }
 }
 
+/// Test-only: assert the `go-pmtiles verify` zoom invariants on an archive
+/// (#529, #522). The header's `min_zoom`/`max_zoom` must equal the zooms the
+/// directory actually addresses ([`ArchiveIndex::actual_zoom_range`]; z0..z0
+/// for an archive with no tiles), and `center_zoom` must lie within them.
+#[cfg(test)]
+pub(crate) fn assert_header_zooms_match_tiles(path: &Path) {
+    let idx = ArchiveIndex::open(path).expect("open archive");
+    let h = idx.header();
+    let actual = idx
+        .actual_zoom_range()
+        .expect("actual zoom range")
+        .unwrap_or((0, 0));
+    assert_eq!(
+        (h.min_zoom, h.max_zoom),
+        actual,
+        "{}: header zoom range must equal the zooms that actually hold tiles \
+         (go-pmtiles verify)",
+        path.display()
+    );
+    assert!(
+        h.min_zoom <= h.center_zoom && h.center_zoom <= h.max_zoom,
+        "{}: center_zoom {} outside header z{}..z{}",
+        path.display(),
+        h.center_zoom,
+        h.min_zoom,
+        h.max_zoom
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

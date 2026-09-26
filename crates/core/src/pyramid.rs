@@ -32,7 +32,7 @@ use crate::dedup::TileHasher;
 use crate::input::url_scheme;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
-use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType};
+use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
 use crate::tile::TileBounds;
 use crate::Error;
 
@@ -523,19 +523,24 @@ fn warn_implicit_layer_overlaps(bands: &[Band]) {
 /// How a band's declared `min_zoom..=max_zoom` relates to what its archive
 /// actually contains, for a pre-tiled band (#495, reworked for #514).
 ///
-/// Since #380/#390 an archive's header `min_zoom..=max_zoom` is only a
-/// *declaration*: a writer widens it over an empty zoom so a client sees the
-/// range it was told to expect even where nothing was written. Keying this
-/// contract off that field alone produced two opposite bugs for the very
-/// same underlying tiles: a widened header made an effectively-empty band
-/// look like a legitimate subrange (accepted silently, contributing nothing,
-/// while the merged metadata still declared it); an honest, narrow header
-/// made a band that fully covered the archive's real tiles look like an
+/// An archive's *declared* range can be wider than its actual tiles: #380
+/// lets a build declare zooms that generalized to nothing. Between #380/#390
+/// and #529/#522 tylertoo widened the header itself; since then its header
+/// is always the tiles actually written (`go-pmtiles verify` requires it)
+/// and the declaration lives only in `vector_layers[].minzoom`/`maxzoom`,
+/// while an externally produced archive may still widen its header. The
+/// declared range used here is therefore the header's range widened by the
+/// archive's own `vector_layers` ([`declared_zoom_range`]). Keying this
+/// contract off a declaration alone produced two opposite bugs for the very
+/// same underlying tiles: a widened declaration made an effectively-empty
+/// band look like a legitimate subrange (accepted silently, contributing
+/// nothing, while the merged metadata still declared it); an honest, narrow
+/// one made a band that fully covered the archive's real tiles look like an
 /// error. #514 classifies against the archive's *actual* tile range —
 /// [`ArchiveIndex::actual_zoom_range`] — instead, and falls back to the
-/// header's declared range only for the one thing actual content cannot
-/// decide: whether a band that misses every real tile was at least within
-/// what the archive was declared to cover.
+/// declared range only for the one thing actual content cannot decide:
+/// whether a band that misses every real tile was at least within what the
+/// archive was declared to cover.
 ///
 /// * [`Disjoint`](Self::Disjoint) — the band shares no zoom with what the
 ///   archive *declares*, let alone what it actually holds. There is no
@@ -544,16 +549,16 @@ fn warn_implicit_layer_overlaps(bands: &[Band]) {
 ///   which does not make an impossible range possible and so must not
 ///   divert the band to a flag-downgradable classification.
 /// * [`EmptyArchive`](Self::EmptyArchive) — the archive holds no tiles at
-///   all, and the band's range does at least fall within what its header
-///   declares (or that header declares nothing usable: a zero-tile archive
+///   all, and the band's range does at least fall within what it declares
+///   (or it declares nothing usable: a zero-tile tylertoo archive
 ///   finalizes as z0-0 however it was written, so z0-0 here is an absent
 ///   declaration rather than a claim about z0). Treated like
 ///   [`Overshoot`](Self::Overshoot): an error by default, downgradable with
 ///   `--allow-missing-zooms`.
 /// * [`DeclaredButEmpty`](Self::DeclaredButEmpty) — the band shares no zoom
-///   with what the archive actually holds, but does share one with what its
-///   header declares. The band contributes nothing, which is always worth a
-///   warning, but is not a configuration error: the header's own
+///   with what the archive actually holds, but does share one with what it
+///   declares. The band contributes nothing, which is always worth a
+///   warning, but is not a configuration error: the archive's own
 ///   declaration says this span may legitimately be empty (#380's "an empty
 ///   zoom is just an absent tile", applied to a `--band` range instead of a
 ///   whole archive). Never gated behind a flag — there is no real tile to
@@ -583,8 +588,9 @@ enum RangeFit {
     Subrange,
 }
 
-/// Classify `band`'s declared range against an archive's declared header
-/// range (`declared`) and its actual tile range (`actual`, `None` when the
+/// Classify `band`'s declared range against an archive's declared range
+/// (`declared`: header widened by `vector_layers`, see
+/// [`declared_zoom_range`]) and its actual tile range (`actual`, `None` when the
 /// archive holds no tiles). See [`RangeFit`].
 fn band_archive_range_fit(band: &Band, declared: (u8, u8), actual: Option<(u8, u8)>) -> RangeFit {
     let (d_lo, d_hi) = declared;
@@ -598,13 +604,13 @@ fn band_archive_range_fit(band: &Band, declared: (u8, u8), actual: Option<(u8, u
         // Disjointness is settled first here instead.
         //
         // With one exception, and it is why the short-circuit looked right:
-        // a zero-tile archive finalizes as header z0-0 *whatever* range it
-        // was told to declare (the writer widens over empty zooms, but with
-        // no tile to widen from `set_declared_min_zoom` leaves no trace), so
-        // `(0, 0)` alongside no tiles is the absence of a declaration, not a
-        // claim about z0. #514 issue #2 turns on exactly that: a band above
-        // z0 hard-errored as `Disjoint` with a message falsely claiming the
-        // archive declared z0. Any other range did come from somewhere --
+        // a zero-tile tylertoo archive finalizes as z0-0 in both its header
+        // and its `vector_layers` *whatever* range it was told to declare
+        // (`set_declared_min_zoom` only widens from a tile actually written,
+        // and there is none), so `(0, 0)` alongside no tiles is the absence
+        // of a declaration, not a claim about z0. #514 issue #2 turns on
+        // exactly that: a band above z0 hard-errored as `Disjoint` with a
+        // message falsely claiming the archive declared z0. Any other range did come from somewhere --
         // an externally produced archive -- and is a real declaration to be
         // held to.
         return if declared == (0, 0) || overlaps_declared {
@@ -664,7 +670,7 @@ fn dropped_zoom_span(band: &Band, actual_min: u8, actual_max: u8) -> String {
 }
 
 /// Validate one band's declared zoom range against its archive's declared
-/// header range and its actual tile range (#495, reworked for #514), right
+/// range (header widened by `vector_layers`) and its actual tile range (#495, reworked for #514), right
 /// after [`BandArchive::open`] has read both. See [`RangeFit`] for the
 /// five-way contract this enforces.
 ///
@@ -683,15 +689,20 @@ fn check_band_zoom_range(
     archive: &BandArchive,
     allow_missing_zooms: bool,
 ) -> Result<RangeFit, Error> {
-    let header = archive.header();
-    let declared = (header.min_zoom, header.max_zoom);
     let actual = archive.actual_zoom_range()?;
+    // Header widened by the archive's own `vector_layers`: since #529/#522 a
+    // tylertoo archive's header is its actual tiles, so its declaration
+    // (`tiles --min-zoom 0` over tiles at z5-14) lives only in the metadata.
+    // Reading the header alone turned #514's documented `DeclaredButEmpty`
+    // warning into a `Disjoint` hard error for exactly that archive.
+    let declared = archive.declared_zoom_range(actual.is_some());
     let fit = band_archive_range_fit(band, declared, actual);
     match fit {
         RangeFit::Subrange => Ok(fit),
         RangeFit::Disjoint => Err(Error::PMTilesWrite(format!(
-            "band {:?} ({}) declares {} but that archive declares {}, entirely outside \
-             the band's range; there is no zoom this band could write",
+            "band {:?} ({}) declares {} but that archive declares {} (header and \
+             vector_layers), entirely outside the band's range; there is no zoom this band \
+             could write",
             band.layer,
             band.input.display(),
             zoom_span(band.min_zoom, band.max_zoom),
@@ -720,8 +731,8 @@ fn check_band_zoom_range(
         }
         RangeFit::DeclaredButEmpty => {
             log::warn!(
-                "band {:?} declares {} but {} holds no tiles in that span (its header \
-                 declares {}); this band will contribute nothing",
+                "band {:?} declares {} but {} holds no tiles in that span (it declares {} \
+                 in its header/vector_layers); this band will contribute nothing",
                 band.layer,
                 zoom_span(band.min_zoom, band.max_zoom),
                 band.input.display(),
@@ -909,6 +920,81 @@ pub(crate) fn vector_layers_json(layers: Vec<LayerMeta>) -> Value {
     )
 }
 
+/// One `vector_layers` entry's declared `minzoom`/`maxzoom`, validated.
+///
+/// Shared by [`crate::merge`] (its layer union and its report's declared
+/// range) and the pyramid's [`RangeFit`] classifier (an archive's declared
+/// range), so the two read a foreign archive's layer zooms by the same
+/// rules. `fallback` is the archive header's own `(min_zoom, max_zoom)`,
+/// which `Header::from_bytes` has already range-checked.
+///
+/// * A key that is absent or not an unsigned integer falls back to the
+///   header's value for that end.
+/// * A value past [`MAX_TILE_ID_ZOOM`] is not a zoom any PMTiles archive can
+///   address (and `as u8` on it would truncate: a `minzoom` of 256 became 0,
+///   silently widening a merged layer to the whole pyramid); it falls back
+///   to the header's value too, with a warning.
+/// * An inverted result (`minzoom > maxzoom`) cannot describe any zoom, so
+///   the whole entry falls back to the header's range, with a warning,
+///   rather than inverting whatever union it is folded into.
+pub(crate) fn layer_zoom_range(layer: &Value, fallback: (u8, u8), path: &Path) -> (u8, u8) {
+    let id = layer.get("id").and_then(Value::as_str).unwrap_or("?");
+    let zoom = |key: &str, fallback: u8| -> u8 {
+        match layer.get(key).and_then(Value::as_u64) {
+            Some(v) if v <= u64::from(MAX_TILE_ID_ZOOM) => v as u8,
+            Some(v) => {
+                log::warn!(
+                    "{}: vector_layers[{id:?}].{key} = {v} is not a zoom; using the header's \
+                     z{fallback}",
+                    path.display()
+                );
+                fallback
+            }
+            None => fallback,
+        }
+    };
+    let (lo, hi) = (zoom("minzoom", fallback.0), zoom("maxzoom", fallback.1));
+    if lo > hi {
+        log::warn!(
+            "{}: vector_layers[{id:?}] declares minzoom {lo} > maxzoom {hi}; using the \
+             header's {}",
+            path.display(),
+            zoom_span(fallback.0, fallback.1)
+        );
+        return fallback;
+    }
+    (lo, hi)
+}
+
+/// An archive's *declared* zoom range: its header's range widened by every
+/// `vector_layers` entry's (see [`layer_zoom_range`]).
+///
+/// Since #529/#522 tylertoo's own writer stamps the header with the tiles
+/// actually written, so a declaration wider than the real tiles (#380's
+/// `--min-zoom`, #514's `--allow-missing-zooms` band maximum) survives only
+/// in `vector_layers`. An externally produced archive can still widen its
+/// header instead, so both sources count.
+///
+/// With `has_tiles` false, a `(0, 0)` range -- header or layer -- is the
+/// writer's empty-archive sentinel (a zero-tile tylertoo archive finalizes
+/// as z0..z0 in both, whatever it was told to declare), not a claim about
+/// z0, so it is left out of the union; `(0, 0)` comes back only when nothing
+/// else was declared.
+pub(crate) fn declared_zoom_range(
+    header: (u8, u8),
+    has_tiles: bool,
+    layers: impl IntoIterator<Item = (u8, u8)>,
+) -> (u8, u8) {
+    std::iter::once(header)
+        .chain(layers)
+        .filter(|&r| has_tiles || r != (0, 0))
+        .fold(None, |acc: Option<(u8, u8)>, (lo, hi)| match acc {
+            Some((a, b)) => Some((a.min(lo), b.max(hi))),
+            None => Some((lo, hi)),
+        })
+        .unwrap_or((0, 0))
+}
+
 /// One band's archive, indexed and parsed exactly once.
 ///
 /// Only the header, the directories and the metadata are held while that band
@@ -926,6 +1012,9 @@ struct BandArchive {
     /// name(s) actually inside its tiles, as opposed to the label `--band`
     /// gives it. Empty when the metadata has none.
     layer_ids: Vec<String>,
+    /// Every `vector_layers` entry's validated `(minzoom, maxzoom)` (see
+    /// [`layer_zoom_range`]). Empty when the metadata has none.
+    layer_zooms: Vec<(u8, u8)>,
 }
 
 impl BandArchive {
@@ -966,12 +1055,14 @@ impl BandArchive {
         }
 
         let internal = header.internal_compression;
-        let (fields, layer_ids) = parse_layers(index.metadata_raw(), internal, path, label)?;
+        let header_zooms = (header.min_zoom, header.max_zoom);
+        let parsed = parse_layers(index.metadata_raw(), internal, header_zooms, path, label)?;
 
         Ok(BandArchive {
             index,
-            fields,
-            layer_ids,
+            fields: parsed.fields,
+            layer_ids: parsed.ids,
+            layer_zooms: parsed.zooms,
         })
     }
 
@@ -989,6 +1080,18 @@ impl BandArchive {
     /// [`ArchiveIndex::actual_zoom_range`].
     fn actual_zoom_range(&self) -> Result<Option<(u8, u8)>, Error> {
         self.index.actual_zoom_range()
+    }
+
+    /// The archive's declared zoom range: header widened by its own
+    /// `vector_layers` -- see [`declared_zoom_range`]. `has_tiles` is whether
+    /// [`Self::actual_zoom_range`] found any tile.
+    fn declared_zoom_range(&self, has_tiles: bool) -> (u8, u8) {
+        let h = self.header();
+        declared_zoom_range(
+            (h.min_zoom, h.max_zoom),
+            has_tiles,
+            self.layer_zooms.iter().copied(),
+        )
     }
 
     /// Hand every addressed tile to `f` as `(z, x, y, still-compressed bytes)`.
@@ -1036,6 +1139,16 @@ impl BandArchive {
     }
 }
 
+/// What [`parse_layers`] lifts out of a band archive's metadata.
+struct ParsedLayers {
+    /// The matching (or fallback) entry's `fields`, or `{}`.
+    fields: Value,
+    /// Every `vector_layers[*].id`.
+    ids: Vec<String>,
+    /// Every entry's validated `(minzoom, maxzoom)`.
+    zooms: Vec<(u8, u8)>,
+}
+
 /// Lift the `vector_layers` entry whose `id` matches `label` — the band's
 /// `--band LO-HI:PATH:LAYER` name — and every `vector_layers[*].id`, out of a
 /// band archive's JSON metadata.
@@ -1055,12 +1168,17 @@ impl BandArchive {
 /// against `id` instead; `[0]` is kept only as a last-resort fallback, with
 /// a warning naming the mismatch, for the case where nothing matches (e.g. a
 /// hand-built archive whose metadata never declared the label at all).
+///
+/// Also returns every entry's validated `(minzoom, maxzoom)` (see
+/// [`layer_zoom_range`], with `header_zooms` as the fallback), which
+/// [`RangeFit`] folds into the archive's declared range.
 fn parse_layers(
     raw: &[u8],
     internal: Compression,
+    header_zooms: (u8, u8),
     path: &Path,
     label: &str,
-) -> Result<(Value, Vec<String>), Error> {
+) -> Result<ParsedLayers, Error> {
     let plain = compression::decompress_capped(raw, internal, MAX_INTERNAL_BYTES)
         .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))?;
     // Unparseable metadata is not fatal: the band's tiles are still usable,
@@ -1072,7 +1190,11 @@ fn parse_layers(
                 "{}: metadata is not valid JSON ({e}); merged layer will declare no fields",
                 path.display()
             );
-            return Ok((json!({}), Vec::new()));
+            return Ok(ParsedLayers {
+                fields: json!({}),
+                ids: Vec::new(),
+                zooms: Vec::new(),
+            });
         }
     };
     let layers = parsed.get("vector_layers").and_then(Value::as_array);
@@ -1110,7 +1232,15 @@ fn parse_layers(
                 .collect()
         })
         .unwrap_or_default();
-    Ok((fields, ids))
+    let zooms = layers
+        .map(|v| {
+            v.iter()
+                .filter(|l| l.is_object())
+                .map(|l| layer_zoom_range(l, header_zooms, path))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ParsedLayers { fields, ids, zooms })
 }
 
 /// What a pyramid build produced.
@@ -1389,27 +1519,14 @@ pub fn merge_bands_with_options(
     // 300-byte band archive into 164 KiB.
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)
         .map_err(|e| Error::PMTilesWrite(format!("Failed to create streaming writer: {e}")))?;
-    // #380: a band's coarse zooms may hold no tiles (every feature generalized
-    // away there), and the writer would otherwise derive the header's min
-    // zoom from the coarsest tile it sees while `vector_layers[].minzoom`
-    // says what the band declared. Declare the coarsest band; the writer
-    // widens over empty zooms and never narrows over real tiles.
-    if let Some(min_zoom) = bands.iter().map(|b| b.min_zoom).min() {
-        writer.set_declared_min_zoom(min_zoom);
-    }
-    // #514's mirror at the top end: `--allow-missing-zooms` lets a band
-    // declare deeper zooms than its archive actually has (`RangeFit::Overshoot`,
-    // downgraded by the flag), and `LayerMeta` below always uses the band's
-    // own `max_zoom` for `vector_layers[].maxzoom` regardless of what the
-    // archive holds. Without this, the header's `max_zoom` stayed pinned to
-    // the deepest tile actually copied, so a client reading the header (the
-    // pmtiles JS protocol builds TileJSON from it) disagreed with one
-    // building it from `vector_layers`. Declared wins at both ends, same as
-    // the minimum: the writer widens over empty zooms and never narrows over
-    // real tiles.
-    if let Some(max_zoom) = bands.iter().map(|b| b.max_zoom).max() {
-        writer.set_declared_max_zoom(max_zoom);
-    }
+    // No `set_declared_min_zoom`/`set_declared_max_zoom` here: #380's
+    // declared band range (a band's coarse zooms may generalize to nothing;
+    // `--allow-missing-zooms` lets a band declare deeper zooms than its
+    // archive holds) reaches the merged archive through each band's
+    // `LayerMeta` below, which carries the band's own `min_zoom`/`max_zoom`
+    // into `vector_layers` via `finish_merge`'s `set_vector_layers_json` --
+    // which takes precedence over the writer's declared range anyway. The
+    // merged header is always the tiles actually copied (#529, #522).
     let mut layers: Vec<LayerMeta> = Vec::new();
     let mut per_band = Vec::new();
     let mut skipped_total = 0usize;
@@ -2182,9 +2299,10 @@ mod tests {
 
     /// `declared_min_zoom` mimics what a real per-band export does under
     /// #380 -- a band's coarse zooms may hold no tiles at all, yet the
-    /// archive still *declares* the band's full range in its header. Pass
-    /// `None` when the test has no such gap and the header should simply
-    /// reflect the tiles actually written.
+    /// archive still *declares* the band's full range in its
+    /// `vector_layers[].minzoom` (never in its header, which since
+    /// #529/#522 always reflects the tiles actually written). Pass `None`
+    /// when the test has no such gap.
     fn write_band_with_payload(
         path: &Path,
         layer: &str,
@@ -2259,6 +2377,12 @@ mod tests {
         .unwrap();
         let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!((h.min_zoom, h.max_zoom), (3, 3), "single-pass header");
+        crate::archive_index::assert_header_zooms_match_tiles(&out);
+        // The band's declared range still reaches `vector_layers` through
+        // its `LayerMeta` (no `set_declared_*` call needed).
+        let meta: Value = serde_json::from_str(&read_metadata(&out)).unwrap();
+        assert_eq!(meta["vector_layers"][0]["minzoom"], 0, "{meta}");
+        assert_eq!(meta["vector_layers"][0]["maxzoom"], 3, "{meta}");
 
         // Two layers over shared zooms, two-phase path; both only hold a tile
         // at z3, so the merged header is (3, 3) regardless of either band's
@@ -2274,6 +2398,25 @@ mod tests {
         .unwrap();
         let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!((h.min_zoom, h.max_zoom), (3, 3), "two-phase header");
+        crate::archive_index::assert_header_zooms_match_tiles(&out);
+        let meta: Value = serde_json::from_str(&read_metadata(&out)).unwrap();
+        let zooms: Vec<(String, u64, u64)> = meta["vector_layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                (
+                    l["id"].as_str().unwrap().to_string(),
+                    l["minzoom"].as_u64().unwrap(),
+                    l["maxzoom"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            zooms,
+            vec![("2024".into(), 2, 3), ("2025".into(), 1, 3)],
+            "each band's declared range reaches vector_layers"
+        );
     }
 
     /// #385: at a zoom two bands share, a tile both wrote carries both layers
@@ -2569,22 +2712,19 @@ mod tests {
         w.finalize(path).unwrap();
     }
 
-    /// Like [`write_band`], but able to declare a min and/or max zoom beyond
-    /// the tiles actually written -- what a real per-band export does under
-    /// #380 (min) and its #514 mirror (max), and what an externally-produced
-    /// archive might do honestly (both `None`) or with a widened header.
-    /// Writes an archive holding exactly `tiles`, then patches the header's
-    /// min/max zoom bytes (100/101) directly to declare a wider range than
-    /// the tiles actually written.
+    /// Like [`write_band`], but with the header's min/max zoom bytes
+    /// (100/101) patched to declare a wider range than the tiles actually
+    /// written -- what an externally produced archive might do (both `None`
+    /// leaves the header honest).
     ///
-    /// Since #529/#522, `StreamingPmtilesWriter` itself never widens its own
-    /// header past the tiles it wrote -- `go-pmtiles verify` rejects that --
-    /// so `set_declared_min_zoom`/`set_declared_max_zoom` cannot produce a
-    /// widened header any more, only a widened `vector_layers`. `RangeFit`
-    /// (#514) still has to classify a genuinely mismatched header correctly
-    /// though, because an externally produced archive can have one; this
-    /// patches the raw bytes a real external writer could have stamped, the
-    /// same way `empty_archive_with_a_real_declaration_stays_disjoint_under_the_flag`
+    /// Since #529/#522 `StreamingPmtilesWriter` never widens its own header
+    /// past the tiles it wrote (`go-pmtiles verify` rejects that);
+    /// `set_declared_min_zoom`/`set_declared_max_zoom` widen only
+    /// `vector_layers` -- see [`write_band_declared_in_metadata`] for that
+    /// tylertoo-produced shape. `RangeFit` (#514) still has to classify a
+    /// genuinely widened header correctly, so this patches the raw bytes an
+    /// external writer could have stamped, the same way
+    /// `empty_archive_with_a_real_declaration_stays_disjoint_under_the_flag`
     /// does.
     fn write_band_declared_range(
         path: &Path,
@@ -2612,6 +2752,35 @@ mod tests {
             }
             std::fs::write(path, bytes).unwrap();
         }
+    }
+
+    /// Like [`write_band`], but declaring a min and/or max zoom beyond the
+    /// tiles actually written through the real writer API
+    /// (`set_declared_min_zoom`/`set_declared_max_zoom`) -- exactly what a
+    /// tylertoo per-band export produces under #380 (`tiles --min-zoom 0`
+    /// over tiles that start deeper). Since #529/#522 the declaration lands
+    /// only in `vector_layers`; the header stays the tiles written.
+    fn write_band_declared_in_metadata(
+        path: &Path,
+        layer: &str,
+        tiles: &[(u8, u32, u32)],
+        bounds: TileBounds,
+        declared_min_zoom: Option<u8>,
+        declared_max_zoom: Option<u8>,
+    ) {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name(layer);
+        w.set_bounds(&bounds);
+        if let Some(z) = declared_min_zoom {
+            w.set_declared_min_zoom(z);
+        }
+        if let Some(z) = declared_max_zoom {
+            w.set_declared_max_zoom(z);
+        }
+        for (z, x, y) in tiles {
+            w.add_tile(*z, *x, *y, &[0x1a, 0x02, 0x08, 0x01]).unwrap();
+        }
+        w.finalize(path).unwrap();
     }
 
     fn read_metadata(path: &Path) -> String {
@@ -2906,6 +3075,63 @@ mod tests {
         assert!(out.exists(), "a declared-but-empty span is not an error");
     }
 
+    /// #554 review S2-1: the same #514 case, but for an archive tylertoo
+    /// itself produced -- `tiles --min-zoom 0` over tiles at z5-14, used as
+    /// `--band 0-4:a.pmtiles:roads`. Since #529/#522 the writer keeps that
+    /// declaration out of the header (z5-14, the tiles written) and puts it
+    /// only in `vector_layers[].minzoom`. A classifier reading the header
+    /// alone called this `Disjoint` -- a hard error claiming "that archive
+    /// declares z5-14" -- instead of #514's documented `DeclaredButEmpty`
+    /// warning. Built with the real writer API, not a byte patch.
+    #[test]
+    fn band_within_vector_layers_declaration_of_a_tylertoo_archive_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.pmtiles");
+        write_band_declared_in_metadata(
+            &src,
+            "roads",
+            &[(5, 1, 1), (14, 2, 2)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            Some(0),
+            None,
+        );
+        let h = Header::from_bytes(&std::fs::read(&src).unwrap()).unwrap();
+        assert_eq!(
+            (h.min_zoom, h.max_zoom),
+            (5, 14),
+            "the header is honest: the declaration lives only in vector_layers"
+        );
+        crate::archive_index::assert_header_zooms_match_tiles(&src);
+
+        let band = Band::parse(&format!("0-4:{}:roads", src.display())).unwrap();
+        let archive = BandArchive::open(&src, "roads").unwrap();
+        assert_eq!(archive.declared_zoom_range(true), (0, 14));
+        assert_eq!(
+            check_band_zoom_range(&band, &archive, false).unwrap(),
+            RangeFit::DeclaredButEmpty
+        );
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_bands(&[band], &out).unwrap();
+        assert_eq!(report.total_tiles, 0, "this band contributes nothing");
+        assert!(out.exists(), "a declared-but-empty span is not an error");
+
+        // Outside even the vector_layers declaration is still `Disjoint`.
+        let far = dir.path().join("far.pmtiles");
+        write_band_declared_in_metadata(
+            &far,
+            "roads",
+            &[(5, 1, 1), (8, 2, 2)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            Some(3),
+            None,
+        );
+        let band = Band::parse(&format!("0-2:{}:roads", far.display())).unwrap();
+        let archive = BandArchive::open(&far, "roads").unwrap();
+        let err = check_band_zoom_range(&band, &archive, true).unwrap_err();
+        assert!(err.to_string().contains("declares z3-8"), "{err}");
+    }
+
     /// A band that overlaps the archive's actual tiles but does not cover
     /// all of them -- some real, already-tiled zoom would fall outside the
     /// band's range and be dropped -- is an error by default: this is the
@@ -3194,6 +3420,7 @@ mod tests {
             meta["vector_layers"][0]["maxzoom"], 10,
             "vector_layers still advertises the band's declared maximum"
         );
+        crate::archive_index::assert_header_zooms_match_tiles(&out);
     }
 
     /// A band archive with no usable bounds used to vanish from the merged
