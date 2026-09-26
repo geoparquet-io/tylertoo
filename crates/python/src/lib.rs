@@ -248,6 +248,42 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     Ok(dict.into())
 }
 
+/// The Python `accumulate_attributes` mapping as core's per-cluster
+/// aggregation specs, with the two clustering pre-checks the CLI also makes
+/// (core enforces both as well; raising here gives a Python-shaped error
+/// naming the keyword argument rather than the Rust option).
+fn accumulate_specs(
+    accumulate_attributes: Option<BTreeMap<String, String>>,
+    cluster: bool,
+    mode: Mode,
+) -> PyResult<Vec<AccumulateSpec>> {
+    let accumulate_attributes = accumulate_attributes.unwrap_or_default();
+    if !accumulate_attributes.is_empty() && !cluster {
+        return Err(PyErr::new::<PyValueError, _>(
+            "accumulate_attributes requires cluster=True",
+        ));
+    }
+    if cluster && mode == Mode::Partitioning {
+        return Err(PyErr::new::<PyValueError, _>(
+            "cluster=True requires mode=\"duplicating\": a partitioning-mode feature has \
+             one row read across many zoom prefixes, so a per-level point_count cannot \
+             be represented without double counting",
+        ));
+    }
+    accumulate_attributes
+        .into_iter()
+        .map(|(column, op)| {
+            let op = AccumulateOp::parse(&op).ok_or_else(|| {
+                PyErr::new::<PyValueError, _>(format!(
+                    "Invalid accumulate op '{}' for column '{}'. Valid ops: sum, max, min, mean",
+                    op, column
+                ))
+            })?;
+            Ok(AccumulateSpec { column, op })
+        })
+        .collect()
+}
+
 /// Build a multi-resolution GeoParquet overview file (COG-style vector overviews).
 ///
 /// This is the Python equivalent of ``tylertoo overview`` with the full CLI
@@ -668,32 +704,7 @@ fn overview(
         None => Vec::new(),
     };
 
-    // Clustering flags (mirrors the CLI's pre-checks; also enforced in core).
-    let accumulate_attributes = accumulate_attributes.unwrap_or_default();
-    if !accumulate_attributes.is_empty() && !cluster {
-        return Err(PyErr::new::<PyValueError, _>(
-            "accumulate_attributes requires cluster=True",
-        ));
-    }
-    if cluster && mode == Mode::Partitioning {
-        return Err(PyErr::new::<PyValueError, _>(
-            "cluster=True requires mode=\"duplicating\": a partitioning-mode feature has \
-             one row read across many zoom prefixes, so a per-level point_count cannot \
-             be represented without double counting",
-        ));
-    }
-    let accumulate = accumulate_attributes
-        .into_iter()
-        .map(|(column, op)| {
-            let op = AccumulateOp::parse(&op).ok_or_else(|| {
-                PyErr::new::<PyValueError, _>(format!(
-                    "Invalid accumulate op '{}' for column '{}'. Valid ops: sum, max, min, mean",
-                    op, column
-                ))
-            })?;
-            Ok(AccumulateSpec { column, op })
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    let accumulate = accumulate_specs(accumulate_attributes, cluster, mode)?;
 
     // Cluster-conditional default: with cluster=True, absorbed points are
     // summarized (point_count), so the sparser 16.0 grid is the better look.
@@ -757,10 +768,10 @@ fn overview(
         // Python surface yet; follow-up.
         save_plan: None,
         plan: None,
-        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
-        // convert plan they depend on.
+        // Sharded builds (#498/#541): CLI + Rust API only, like their plan.
         shard: None,
         shard_plan_digest: None,
+        zoom_ceiling: None,
     };
 
     // `str` stays the single-input path (files, directories, globs, remote

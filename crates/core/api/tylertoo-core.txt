@@ -1207,6 +1207,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::simplify: tylertoo_core::o
 pub tylertoo_core::overview::convert::ConvertOptions::sort_key: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::convert::ConvertOptions::spill_dir: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::convert::ConvertOptions::streaming: bool
+pub tylertoo_core::overview::convert::ConvertOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::is_verbatim(&self) -> bool
 pub fn tylertoo_core::overview::convert::ConvertOptions::verbatim(self) -> Self

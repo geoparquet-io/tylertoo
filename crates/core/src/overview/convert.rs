@@ -632,6 +632,37 @@ pub struct ConvertOptions {
     /// binding: a plan saved without a shard plan cannot be consumed by a
     /// shard, and vice versa. Default `None`.
     pub shard_plan_digest: Option<String>,
+    /// Materialize only the levels at or coarser than this zoom (#541): the
+    /// **coarse job**'s half of a sharded build, on the convert side.
+    ///
+    /// Pass 1, the level assignment and the artifact written by
+    /// [`save_plan`](Self::save_plan) all stay **full-range** — the assignment
+    /// is dataset-global (the density budget water-fills a super-cell over
+    /// every candidate of a level, the level walk carries a running kept
+    /// count, tie-breaks hash global row indices), so a coarse job that
+    /// assigned only its own zooms would hand its shards a different pyramid.
+    /// What this skips is pass-2 *materialization*: the levels finer than the
+    /// ceiling are never coalesced, assembled, buffered, spilled, encoded or
+    /// written, and the verbatim canonical level — the largest of all, and the
+    /// one the pipelined engine re-reads the whole input for — is not built at
+    /// all. The coarse job's output holds exactly the levels it exports, which
+    /// is exactly what [`ExportOptions::zoom_ceiling`] keeps.
+    ///
+    /// What it does NOT skip: the ladder cascade's *fine* steps. A coarse
+    /// level's geometry is canonical geometry folded through every finer
+    /// level's GSD in turn (#218), so those steps are still computed — just
+    /// for the far smaller set of rows that reach a coarse level, and without
+    /// emitting anything for the levels they pass through.
+    ///
+    /// Deliberately **not fingerprinted** (absent from the convert plan's
+    /// options digest): a capped coarse job and a full run save a
+    /// byte-identical plan, which is the invariant every data shard depends
+    /// on. Streaming pipeline and a [`LevelPlan::ZoomRange`] plan only (a GSD
+    /// ladder has no zoom to compare against). Default `None` — every planned
+    /// level is built.
+    ///
+    /// [`ExportOptions::zoom_ceiling`]: super::export::ExportOptions::zoom_ceiling
+    pub zoom_ceiling: Option<u8>,
 }
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -851,6 +882,7 @@ impl Default for ConvertOptions {
             plan: None,
             shard: None,
             shard_plan_digest: None,
+            zoom_ceiling: None,
         }
     }
 }
@@ -1337,6 +1369,33 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
              and replay its pass-1 + assignment stage); drop --no-streaming"
                 .to_string(),
         ));
+    }
+    // #541: the coarse job's convert-side level ceiling. Checked up front so a
+    // ceiling that would leave nothing to build, or one against a level plan
+    // that has no zooms to compare it with, fails in milliseconds rather than
+    // after pass 1.
+    if let Some(ceiling) = options.zoom_ceiling {
+        if !options.streaming {
+            return Err(ConvertError::InvalidConfig(
+                "a convert-side zoom ceiling requires the streaming pipeline \
+                 (the in-memory reference path builds every planned level); \
+                 drop --no-streaming"
+                    .to_string(),
+            ));
+        }
+        let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
+            return Err(ConvertError::InvalidConfig(
+                "a convert-side zoom ceiling needs a zoom-range level plan: an \
+                 explicit GSD ladder has no zoom to compare the ceiling against"
+                    .to_string(),
+            ));
+        };
+        if ceiling < min_zoom {
+            return Err(ConvertError::InvalidConfig(format!(
+                "zoom ceiling z{ceiling} is coarser than the level plan's minimum \
+                 z{min_zoom}: nothing would be built"
+            )));
+        }
     }
     // #513, in the spirit of the #272 spill-dir block below: both plan paths
     // are touched LONG after the expensive work. `--save-plan` is written
@@ -6236,6 +6295,250 @@ mod tests {
         assert!(validate_file(tout.path()).unwrap().is_valid());
     }
 
+    // ---- convert-side level ceiling (#541) ----------------------------------
+
+    /// Densely sampled, multi-scale-wiggly lines and rings: geometry for which
+    /// cascading is not a no-op.
+    ///
+    /// `synthetic_geometries` is deliberately sparse — every vertex survives
+    /// every tolerance — so a level built by folding through the finer levels
+    /// and one built in a single step from canonical geometry come out
+    /// IDENTICAL there, and a ceiling test over it would pass with the fold
+    /// removed. These carry detail at each rung of the ladder, so RDP removes
+    /// a different vertex subset at every step and the two disagree.
+    fn cascade_sensitive_geometries() -> Vec<Geometry<f64>> {
+        // A smooth curve will not do: RDP at a coarse tolerance picks its
+        // extrema, a fine pre-pass keeps those same extrema, and cascading
+        // lands on the identical vertex subset. Broadband NOISE is what makes
+        // the fold order observable — the fine step removes points the coarse
+        // step would have chosen, so it recurses differently. Deterministic
+        // (a fixed LCG), so the fixture is stable across runs and platforms.
+        fn noise(seed: &mut u64) -> f64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*seed >> 40) as f64 / (1u64 << 24) as f64 - 0.5
+        }
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let wiggle = |seed: &mut u64, x0: f64, y0: f64| -> Vec<(f64, f64)> {
+            (0..400)
+                .map(|k| {
+                    let t = k as f64;
+                    (
+                        x0 + t * 0.0008 + 0.0006 * noise(seed),
+                        y0 + 0.02 * (t * 0.05).sin() + 0.02 * noise(seed),
+                    )
+                })
+                .collect()
+        };
+        let mut geoms = Vec::new();
+        for f in 0..6 {
+            let (x0, y0) = (-60.0 + f as f64 * 20.0, -20.0 + f as f64 * 6.0);
+            geoms.push(Geometry::LineString(LineString::from(wiggle(
+                &mut seed, x0, y0,
+            ))));
+            // A ring of the same crinkly boundary, closed back along a
+            // straight edge — big enough to clear the visibility gate at
+            // every level, so it exercises the polygon fold too.
+            let mut ring = wiggle(&mut seed, x0, y0 + 3.0);
+            let (lx, ly) = *ring.last().unwrap();
+            ring.push((lx, ly - 1.5));
+            ring.push((x0, y0 + 1.5));
+            ring.push(ring[0]);
+            geoms.push(Geometry::Polygon(Polygon::new(
+                LineString::from(ring),
+                vec![],
+            )));
+            // Small crinkly blobs, sized to fall under the visibility gate
+            // partway UP the ladder. Under `CollapseMode::Point` (which the
+            // ceiling test turns on for exactly this reason) the cascade
+            // collapses them at the level where they first go sub-tolerance,
+            // taking the centroid of the geometry SIMPLIFIED to that point;
+            // a fold that skipped the finer steps would take the canonical
+            // centroid instead, and the two are different coordinates.
+            for s in 0..4 {
+                let scale = 0.004 * 2f64.powi(s);
+                let cx = x0 + 0.4 + s as f64 * 0.3;
+                let cy = y0 - 1.0;
+                let blob: Vec<(f64, f64)> = (0..64)
+                    .map(|k| {
+                        let a = k as f64 / 64.0 * std::f64::consts::TAU;
+                        let r = scale * (1.0 + 0.5 * noise(&mut seed));
+                        (cx + r * a.cos(), cy + r * a.sin())
+                    })
+                    .collect();
+                let mut ring = blob;
+                ring.push(ring[0]);
+                geoms.push(Geometry::Polygon(Polygon::new(
+                    LineString::from(ring),
+                    vec![],
+                )));
+            }
+        }
+        geoms
+    }
+
+    /// THE #541 invariant, in one test.
+    ///
+    /// A level-capped convert (the sharded build's coarse job) must produce,
+    /// for every level it *does* build, exactly what the uncapped run built —
+    /// row for row, geometry for geometry — and must save a **byte-identical**
+    /// convert plan, because the data shards consume that plan and nothing
+    /// about them changes.
+    ///
+    /// The geometry half is the delicate one: with cascading on (the
+    /// default), a coarse level's geometry is canonical geometry folded
+    /// through *every* finer level's GSD in turn. Skipping those levels'
+    /// OUTPUT is legal; skipping their fold steps is not, and would show up
+    /// here as coordinates that differ in the last simplification.
+    #[test]
+    fn level_ceiling_matches_the_full_converts_coarse_levels() {
+        let geoms = cascade_sensitive_geometries();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &geoms, false, None);
+
+        let base = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 10,
+            },
+            // The cascade's most order-sensitive path: a polygon that goes
+            // sub-tolerance collapses to the centroid of the geometry AS
+            // SIMPLIFIED at that level, and every coarser step passes the
+            // point through. Fold from canonical geometry instead and the
+            // centroid moves.
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Point,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let full_out = dir.path().join("full.parquet");
+        let full_plan = dir.path().join("full.plan");
+        let full = convert_to_overviews(
+            &input,
+            &full_out,
+            &ConvertOptions {
+                save_plan: Some(full_plan.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        const CEILING: u8 = 5;
+        let capped_out = dir.path().join("capped.parquet");
+        let capped_plan = dir.path().join("capped.plan");
+        let capped = convert_to_overviews(
+            &input,
+            &capped_out,
+            &ConvertOptions {
+                zoom_ceiling: Some(CEILING),
+                save_plan: Some(capped_plan.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        // (1) The plan is the fleet's contract: byte-identical, or every data
+        // shard would refuse (or worse, accept) a different pyramid.
+        assert_eq!(
+            std::fs::read(&full_plan).unwrap(),
+            std::fs::read(&capped_plan).unwrap(),
+            "the capped coarse job must save the plan a full run saves"
+        );
+
+        // (2) The capped run built exactly the levels at or coarser than the
+        // ceiling — and the cap really did bite, or (3) would be vacuous.
+        let want: Vec<&LevelReport> = full
+            .levels
+            .iter()
+            .filter(|l| l.zoom.is_some_and(|z| z <= CEILING))
+            .collect();
+        assert!(
+            !want.is_empty() && want.len() < full.levels.len(),
+            "the fixture must straddle the ceiling: full levels {:?}",
+            full.levels.iter().map(|l| l.zoom).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            capped.levels.iter().map(|l| l.zoom).collect::<Vec<_>>(),
+            want.iter().map(|l| l.zoom).collect::<Vec<_>>(),
+            "the capped run must hold exactly the levels at or coarser than z{CEILING}"
+        );
+
+        // (3) Row for row, geometry for geometry.
+        let full_rdr = OverviewReader::open(&full_out).unwrap();
+        let capped_rdr = OverviewReader::open(&capped_out).unwrap();
+        for level in 0..capped.levels.len() {
+            assert_eq!(
+                read_level_rows(&capped_rdr, level),
+                read_level_rows(&full_rdr, level),
+                "level {level} (z{:?}) differs between the capped and full runs",
+                capped.levels[level].zoom
+            );
+        }
+        assert!(validate_file(&capped_out).unwrap().is_valid());
+
+        // (4) And the two pass-2 engines still agree under the cap. The
+        // Pipelined engine folds the unmaterialized fine steps inline as a
+        // prefix to its incremental cascade; Serial re-derives each level
+        // from the full chain. Same bytes, or one of the two is wrong.
+        let serial_out = dir.path().join("serial.parquet");
+        let serial = convert_to_overviews_strategy(
+            &input,
+            &serial_out,
+            &ConvertOptions {
+                zoom_ceiling: Some(CEILING),
+                ..base
+            },
+            super::super::stream::Pass2Strategy::Serial,
+        )
+        .unwrap();
+        assert_eq!(serial.levels.len(), capped.levels.len());
+        let serial_rdr = OverviewReader::open(&serial_out).unwrap();
+        for level in 0..capped.levels.len() {
+            assert_eq!(
+                read_level_rows(&serial_rdr, level),
+                read_level_rows(&capped_rdr, level),
+                "level {level}: the Serial and Pipelined engines disagree under a ceiling"
+            );
+        }
+    }
+
+    /// The ceiling is a pass-2 knob, and the two ways of asking for something
+    /// it cannot express are refused before any input is opened.
+    #[test]
+    fn level_ceiling_validation() {
+        let too_coarse = validate_options(&ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            zoom_ceiling: Some(3),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            too_coarse.contains("nothing would be built"),
+            "unexpected: {too_coarse}"
+        );
+
+        let gsd_plan = validate_options(&ConvertOptions {
+            levels: LevelPlan::Gsds(vec![1000.0, 500.0]),
+            zoom_ceiling: Some(3),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            gsd_plan.contains("zoom-range level plan"),
+            "unexpected: {gsd_plan}"
+        );
+    }
+
     // ---- zoom-band representation selector (#317 / #279) --------------------
 
     /// Polygon fixtures spanning sizes from "visible at every zoom" down to
@@ -8167,6 +8470,15 @@ mod tests {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 1,
                 max_zoom: 10,
+            },
+            // The cascade's most order-sensitive path: a polygon that goes
+            // sub-tolerance collapses to the centroid of the geometry AS
+            // SIMPLIFIED at that level, and every coarser step passes the
+            // point through. Fold from canonical geometry instead and the
+            // centroid moves.
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Point,
+                ..Default::default()
             },
             ..Default::default()
         };

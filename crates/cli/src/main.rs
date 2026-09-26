@@ -1589,6 +1589,10 @@ impl ConvertTuningArgs {
             // restrict and so no shard to be.
             shard: None,
             shard_plan_digest: None,
+            // Likewise #541's convert-side level ceiling: it exists to make
+            // `tiles --shard coarse` stop at the pivot, and `overview` has
+            // no shard role to derive one from.
+            zoom_ceiling: None,
         };
 
         // Logged because "no features were dropped" is a surprising thing to
@@ -2411,6 +2415,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // this job's slice of it is not. The coarse job writes it into the
         // plan; every shard has to present the same one.
         options.shard_plan_digest = Some(job.cut_digest.clone());
+        // #541: the coarse job builds only the levels it exports. Its pass 1
+        // and level assignment stay full-range, so the plan it saves is
+        // byte-identical to a full run's and every data shard consumes it
+        // unchanged. `resolve_shard_job` has already refused a pivot at or
+        // below --min-zoom, and a GSD ladder has no zoom to cap against.
+        if job.range.is_none() && args.gsd.is_none() {
+            options.zoom_ceiling = Some(job.pivot.saturating_sub(1));
+        }
         log_shard_job(job, args.min_zoom, args.max_zoom);
     }
 

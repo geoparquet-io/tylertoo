@@ -66,6 +66,26 @@ struct Build {
     expect_row_group_pruning: bool,
     /// Which of the plan's row-indexed side tables this build exercises.
     flavor: Flavor,
+    /// #541: run the coarse job with a **convert-side level ceiling**, so it
+    /// materializes only the levels it exports instead of the whole
+    /// monolithic pyramid.
+    ///
+    /// Two things then have to hold, and both are asserted: the capped job's
+    /// tiles are still byte-identical to the monolithic ones (the ladder
+    /// cascade folds canonical geometry through every finer level's GSD, so
+    /// skipping those levels' OUTPUT must not skip their fold STEPS), and the
+    /// convert plan it saves is **byte-identical** to the one a full coarse
+    /// job saves — the data shards consume that plan unchanged, and a ceiling
+    /// that leaked into it would give the whole fleet a different pyramid.
+    coarse_level_ceiling: bool,
+}
+
+/// The same build with #541's convert-side ceiling on the coarse job.
+fn capped(build: Build) -> Build {
+    Build {
+        coarse_level_ceiling: true,
+        ..build
+    }
 }
 
 /// The conversion knob set under test.
@@ -226,6 +246,56 @@ fn build_shard(
     archive
 }
 
+/// #541: run the coarse job with a convert-side level ceiling, and assert
+/// the two things the fleet depends on before handing its overview back.
+///
+/// `full_plan` is the plan the same job saved WITHOUT the ceiling. The capped
+/// job must save that file byte for byte: a data shard verifies the
+/// fingerprint and then reads the plan's row-indexed tables verbatim, so "the
+/// coarse job may build fewer levels" is only true if the artifact does not
+/// move. The second assertion is that the cap actually bit — otherwise the
+/// tile-body parity the caller goes on to check would prove nothing about
+/// #541.
+fn level_capped_coarse_overview(
+    input: &Path,
+    dir: &Path,
+    build: Build,
+    full_plan: &Path,
+) -> PathBuf {
+    let pivot = build.pivot;
+    let capped_overview = dir.join("coarse.parquet");
+    let capped_plan = dir.join("coarse.plan");
+    let report = convert_to_overviews(
+        input,
+        &capped_overview,
+        &ConvertOptions {
+            save_plan: Some(capped_plan.clone()),
+            zoom_ceiling: Some(pivot - 1),
+            ..convert_options(build)
+        },
+    )
+    .expect("level-capped coarse convert");
+    assert_eq!(
+        std::fs::read(full_plan).expect("full plan"),
+        std::fs::read(&capped_plan).expect("capped plan"),
+        "the level-capped coarse job must save the plan a full coarse job saves"
+    );
+    assert!(
+        report
+            .levels
+            .iter()
+            .all(|l| l.zoom.is_some_and(|z| z < pivot)),
+        "the capped coarse job built a level at or past the pivot z{pivot}: {:?}",
+        report.levels.iter().map(|l| l.zoom).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "[oracle] level ceiling z{}: coarse job built {} level(s), plan byte-identical",
+        pivot - 1,
+        report.levels.len()
+    );
+    capped_overview
+}
+
 /// The oracle.
 fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     let Build {
@@ -235,6 +305,7 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
         shards,
         expect_row_group_pruning,
         flavor,
+        coarse_level_ceiling,
     } = build;
     let dir = tempfile::tempdir().expect("tempdir");
     let dir = dir.path();
@@ -269,11 +340,12 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
 
     // --- Step 1: the coarse job. ---------------------------------------
     // It reads the whole input, writes the convert plan every shard consumes,
-    // and exports the zooms below the pivot. Its overview file is also, by
-    // construction, exactly the monolithic one — same input, same options — so
-    // the control export below reuses it rather than converting twice.
+    // and exports the zooms below the pivot. The UNCAPPED coarse job's
+    // overview file is also, by construction, exactly the monolithic one —
+    // same input, same options — so the control export below reuses it rather
+    // than converting twice.
     let convert_plan = dir.join("convert.plan");
-    let overview = dir.join("coarse.parquet");
+    let overview = dir.join("mono.parquet");
     convert_to_overviews(
         input,
         &overview,
@@ -284,9 +356,17 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     )
     .expect("coarse convert");
 
+    // #541: the same job again, this time materializing only the levels it
+    // exports. Everything the fleet depends on has to be unchanged.
+    let coarse_overview = if coarse_level_ceiling {
+        level_capped_coarse_overview(input, dir, build, &convert_plan)
+    } else {
+        overview.clone()
+    };
+
     let coarse = dir.join("coarse.pmtiles");
     export_pmtiles(
-        &overview,
+        &coarse_overview,
         &coarse,
         &ExportOptions {
             zoom_ceiling: Some(pivot - 1),
@@ -686,6 +766,7 @@ fn madagascar(shards: usize) -> Option<(PathBuf, Build)> {
             shards,
             expect_row_group_pruning: false,
             flavor: Flavor::NoCoalesce,
+            coarse_level_ceiling: false,
         },
     ))
 }
@@ -711,6 +792,7 @@ fn grid_build(shards: usize, flavor: Flavor) -> Build {
         shards,
         expect_row_group_pruning: true,
         flavor,
+        coarse_level_ceiling: false,
     }
 }
 
@@ -731,6 +813,37 @@ fn sharded_build_matches_monolithic_with_three_shards() {
         return;
     };
     assert_sharded_build_matches_monolithic(&input, build);
+}
+
+/// #541, N = 2: the coarse job caps pass 2 at the pivot.
+///
+/// Same fleet, same merge, same bar — but the coarse job now builds only the
+/// levels it exports. Madagascar is the right fixture for it: real polygons
+/// whose vertices actually move under the ladder cascade, so a fold that
+/// dropped the unmaterialized fine steps would shift geometry at every coarse
+/// zoom and die on the byte comparison.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_with_two_shards() {
+    let Some((input, build)) = madagascar(2) else {
+        return;
+    };
+    assert_sharded_build_matches_monolithic(&input, capped(build));
+}
+
+/// #541, N = 3: two seams and a level-capped coarse job.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_with_three_shards() {
+    let Some((input, build)) = madagascar(3) else {
+        return;
+    };
+    assert_sharded_build_matches_monolithic(&input, capped(build));
+}
+
+/// #541 where the shards also **prune**: the capped coarse job and the plan
+/// re-addressing have to hold at the same time, under every knob's default.
+#[test]
+fn level_capped_coarse_job_matches_monolithic_when_shards_prune() {
+    assert_sharded_build_matches_monolithic(&grid(), capped(grid_build(3, Flavor::Defaults)));
 }
 
 /// The **pruning** half of the oracle: a world-spanning grid whose 20 row

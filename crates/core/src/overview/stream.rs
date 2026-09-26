@@ -240,6 +240,24 @@ fn partition_emitted_levels(
     (emitted, skipped)
 }
 
+/// How many of `planned` a convert-side zoom ceiling (#541) materializes.
+///
+/// Levels run coarse→fine with strictly ascending zooms, so a ceiling always
+/// keeps a **prefix** — which is what lets pass 2 take `&planned[..kept]` and
+/// leave every index (cluster tables, carriers, cascade chains) alone. `None`
+/// keeps everything; a level with no zoom (an explicit GSD ladder) is kept
+/// too, since nothing proves it is above the ceiling — `validate_options`
+/// refuses that pairing up front, so this is belt-and-braces.
+fn levels_at_or_above_ceiling(planned: &[EmitLevel], ceiling: Option<u8>) -> usize {
+    let Some(ceiling) = ceiling else {
+        return planned.len();
+    };
+    planned
+        .iter()
+        .take_while(|e| e.zoom.is_none_or(|z| z <= ceiling))
+        .count()
+}
+
 /// Build the three writer schemas (identical to the in-memory path):
 /// `source` (base), `cluster` (+ `point_count` when clustering, Q4), and `out`
 /// (+ `coalesced_count` when coalescing, Q3). All three are needed downstream,
@@ -712,7 +730,14 @@ fn run_pass2_levels(
         // Production: buffer levels 0..n-1 from a single read, then stream the
         // finest (verbatim, largest) level last straight into the writer.
         Pass2Strategy::Pipelined => {
-            let buffered_rows: usize = hints[..n - 1].iter().sum();
+            // Streaming the last level separately exists for ONE reason: it is
+            // the verbatim canonical level, far too large to buffer. Under a
+            // convert-side zoom ceiling (#541) the coarse job's finest level
+            // is an ordinary simplified one, so it joins the buffered set and
+            // the whole job costs a single read instead of two.
+            let stream_last = ctxs[n - 1].verbatim;
+            let buffered = if stream_last { n - 1 } else { n };
+            let buffered_rows: usize = hints[..buffered].iter().sum();
             // #305: pass 1's measured average encoded-geometry size per input
             // row sizes the RAM-vs-spill estimate (falls back to calibrated
             // constants on an empty scan). Same decision timing as before —
@@ -725,14 +750,18 @@ fn run_pass2_levels(
                 avg_geom_bytes,
             );
             log::info!(
-                "[convert] pass 2: building {n} overview level(s) from a \
-                     single read (finest level streamed last)"
+                "[convert] pass 2: building {n} overview level(s) from a single read{}",
+                if stream_last {
+                    " (finest level streamed last)"
+                } else {
+                    ""
+                }
             );
-            let (mut stats, engine_timers) = if n > 1 {
+            let (mut stats, engine_timers) = if buffered > 0 {
                 let result = pipeline::run_pass2_buffered(
                     writer,
-                    &ctxs[..n - 1],
-                    &hints[..n - 1],
+                    &ctxs[..buffered],
+                    &hints[..buffered],
                     source,
                     read_tuning,
                     selected_row_groups,
@@ -744,23 +773,26 @@ fn run_pass2_levels(
             } else {
                 (Vec::new(), Pass2Timers::default())
             };
-            let (o, r, v, finest_timers) = write_level_streaming(
-                writer,
-                n - 1,
-                hints[n - 1],
-                source,
-                read_tuning,
-                in_flight_batches,
-                selected_row_groups,
-                &ctxs[n - 1],
-            )?;
-            // #517 S1: the finest level's own stage timers never otherwise
-            // reach `engine_timers` (`run_pass2_buffered` only covers levels
-            // `0..n-1`) — fold them in so `pass2.stage_secs` in the
-            // `TYLERTOO_PROFILE_JSON` dump accounts for every level, matching
-            // `pass2.rows` and `phase_walls.pass2`, which already do.
-            finest_timers.fold_into(&engine_timers);
-            stats.push((o, r, v, 0u64));
+            if stream_last {
+                let (o, r, v, finest_timers) = write_level_streaming(
+                    writer,
+                    n - 1,
+                    hints[n - 1],
+                    source,
+                    read_tuning,
+                    in_flight_batches,
+                    selected_row_groups,
+                    &ctxs[n - 1],
+                )?;
+                // #517 S1: the finest level's own stage timers never otherwise
+                // reach `engine_timers` (`run_pass2_buffered` only covers
+                // levels `0..n-1`) — fold them in so `pass2.stage_secs` in the
+                // `TYLERTOO_PROFILE_JSON` dump accounts for every level,
+                // matching `pass2.rows` and `phase_walls.pass2`, which already
+                // do.
+                finest_timers.fold_into(&engine_timers);
+                stats.push((o, r, v, 0u64));
+            }
             (stats, engine_timers)
         }
     };
@@ -1751,11 +1783,36 @@ pub(crate) fn convert_streaming_strategy(
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.
-    let (emitted, mut skipped) = partition_emitted_levels(&level_specs, &counts);
-    if emitted.is_empty() {
+    let (planned, mut skipped) = partition_emitted_levels(&level_specs, &counts);
+    if planned.is_empty() {
         return Err(ConvertError::NoData);
     }
-    warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
+    warn_plan_skipped_levels(&skipped, num_features, planned[0].gsd, planned[0].zoom);
+
+    // #541: the coarse job of a sharded build materializes only the levels it
+    // exports. Everything above — pass 1, the assignment, and the plan
+    // `--save-plan` has already written — stayed full-range, so a shard
+    // consuming that plan cannot tell the difference. `planned` is kept whole
+    // for the cascade chains below (a coarse level's geometry is folded
+    // through every finer level's GSD, materialized or not); `emitted` is what
+    // gets built and written.
+    let kept = levels_at_or_above_ceiling(&planned, options.zoom_ceiling);
+    if kept == 0 {
+        return Err(ConvertError::NoData);
+    }
+    let emitted = &planned[..kept];
+    if kept < planned.len() {
+        let ceiling = options.zoom_ceiling.expect("a ceiling dropped the levels");
+        log::info!(
+            "[convert] level ceiling z{ceiling}: materializing {kept} of {} planned \
+             overview level(s) — pass 1, the level assignment and any saved plan \
+             stay full-range",
+            planned.len()
+        );
+        // A level above the ceiling was never going to be written, so it is
+        // not an omission the #211 auto-clamp should report.
+        skipped.retain(|s| s.zoom.is_none_or(|z| z <= ceiling));
+    }
 
     let LevelWriter {
         mut writer,
@@ -1769,7 +1826,7 @@ pub(crate) fn convert_streaming_strategy(
         &input_schema,
         geom_idx,
         &geom_field,
-        &emitted,
+        emitted,
         crs,
         ranking_provenance,
         &renames,
@@ -1782,13 +1839,20 @@ pub(crate) fn convert_streaming_strategy(
     log_phase_rss("pre-pass2 (winner tables freed)", &mut peak_rss_mib);
     let t_pass2 = Instant::now();
 
+    // Only the levels that get written need a chain table (#541: under a
+    // ceiling the finer levels never emit a row, so their tables would be
+    // built and thrown away).
     let coalesce_tables =
-        build_pass2_coalesce_tables(coalesce_scratch.as_ref(), &emitted, finest, crs, options);
+        build_pass2_coalesce_tables(coalesce_scratch.as_ref(), emitted, finest, crs, options);
 
     let duplicating = matches!(options.mode, Mode::Duplicating);
-    let cascade_chains = build_cascade_chains(&emitted, finest, duplicating, options);
+    // Built over the WHOLE planned ladder: a coarse level's cascade chain is
+    // the GSD sequence from the finest planned level down to it, and dropping
+    // the unmaterialized steps would change the geometry it folds to.
+    let cascade_chains = build_cascade_chains(&planned, finest, duplicating, options);
+    let cascade_chains = &cascade_chains[..kept];
     let ctxs = build_level_ctxs(
-        &emitted,
+        emitted,
         options,
         &LevelCtxInputs {
             source_schema: &source_schema,
@@ -1801,7 +1865,7 @@ pub(crate) fn convert_streaming_strategy(
             kinds: kinds.as_deref(),
             cluster_tables: cluster_tables.as_ref(),
             coalesce_tables: &coalesce_tables,
-            cascade_chains: &cascade_chains,
+            cascade_chains,
             carriers: &carriers,
             crs,
             finest,
@@ -1838,7 +1902,7 @@ pub(crate) fn convert_streaming_strategy(
     log_validation_skips(validation_skips_before);
 
     let (mut level_reports, level_spill_bytes) =
-        build_level_reports(&emitted, level_stats, &mut skipped);
+        build_level_reports(emitted, level_stats, &mut skipped);
     skipped.sort_by_key(|s| s.planned_level);
     if level_reports.is_empty() {
         // Every emitted level collapsed at write time: no valid overview file
@@ -3761,6 +3825,45 @@ enum SharedStep {
     Dropped,
 }
 
+/// Fold one feature through the cascade steps that no buffered level
+/// materializes (#541), returning the working geometry and liveness the
+/// finest buffered level's own step then starts from.
+///
+/// This is the body of [`super::simplify::simplify_cascade`], step for step —
+/// including "once dropped, stays dropped along geometry steps" and revival
+/// from CANONICAL geometry at a `Point` / `Square` step. It has to be: under
+/// a level ceiling the Serial engine reaches the same level by calling
+/// `simplify_cascade` over the whole chain, and the two must agree byte for
+/// byte (`overview::convert::tests::level_ceiling_matches_the_full_converts_coarse_levels`).
+fn fold_cascade_prefix(
+    canonical: &Arc<Geometry<f64>>,
+    prefix: &[CascadeStep],
+    ctx: &LevelStreamCtx<'_>,
+) -> (Option<Arc<Geometry<f64>>>, bool) {
+    let mut current: Option<Arc<Geometry<f64>>> = None;
+    let mut alive = true;
+    for step in prefix {
+        let out = if !alive && step.repr == Representation::Geometry {
+            Simplified::Dropped
+        } else {
+            let input: &Geometry<f64> = if alive {
+                current.as_deref().unwrap_or(canonical.as_ref())
+            } else {
+                canonical.as_ref()
+            };
+            simplify_step(input, step.gsd_meters, ctx.crs, ctx.simplify, step.repr)
+        };
+        match out {
+            Simplified::Keep(s) => {
+                current = Some(Arc::new(s));
+                alive = true;
+            }
+            Simplified::Dropped => alive = false,
+        }
+    }
+    (current, alive)
+}
+
 /// Pipelined-engine batch processor for cascading simplification (#218).
 ///
 /// Instead of every level independently decoding canonical geometry and
@@ -3787,18 +3890,25 @@ pub(super) fn process_batch_cascade(
         return Ok(Vec::new());
     };
     debug_assert!(ctxs.iter().all(|c| c.duplicating && !c.verbatim));
+    // #541: the chain steps FINER than the finest buffered level — the levels
+    // a level-capped coarse job assigns but never materializes. Empty for an
+    // uncapped run (there the finest buffered level's chain is exactly its own
+    // step), so the fold below is unchanged for every non-sharded build. When
+    // it is non-empty the fold walks it first, from canonical geometry, which
+    // is precisely what `simplify_cascade` does for the same level on the
+    // Serial path — the two must stay in lockstep.
+    let prefix: &[CascadeStep] =
+        &finest.cascade_chain[..finest.cascade_chain.len().saturating_sub(1)];
     // The incremental fold steps ctx-by-ctx; each level's cascade_chain must
-    // be exactly the GSD suffix from the finest buffered level down to it,
-    // or Serial and Pipelined would diverge.
-    debug_assert!(ctxs
-        .iter()
-        .enumerate()
-        .all(|(li, c)| c.cascade_chain.len() == ctxs.len() - li
-            && c.cascade_chain.last()
-                == Some(&CascadeStep {
-                    gsd_meters: c.gsd_m,
-                    repr: c.repr,
-                })));
+    // be exactly the GSD suffix from the finest buffered level down to it
+    // (plus the unmaterialized prefix), or Serial and Pipelined would diverge.
+    debug_assert!(ctxs.iter().enumerate().all(|(li, c)| c.cascade_chain.len()
+        == ctxs.len() - li + prefix.len()
+        && c.cascade_chain.last()
+            == Some(&CascadeStep {
+                gsd_meters: c.gsd_m,
+                repr: c.repr,
+            })));
     // Coalesce-table presence is uniform across buffered levels (tables are
     // built for every non-verbatim level or none); the superset selection
     // below relies on it.
@@ -3885,6 +3995,14 @@ pub(super) fn process_batch_cascade(
             let mut current: Option<Arc<Geometry<f64>>> = None;
             let mut alive = true;
             let (mut shared, mut total) = (0u64, 0u64);
+            // #541: walk the unmaterialized fine steps first, so the finest
+            // buffered ctx folds from the same working geometry a full run
+            // would have handed it. Guarded by the same membership test the
+            // loop's first iteration applies, so a carrier-only row (not a
+            // member anywhere here) pays nothing.
+            if !prefix.is_empty() && ml <= finest.orig_level {
+                (current, alive) = fold_cascade_prefix(g, prefix, finest);
+            }
             for (li, ctx) in ctxs.iter().enumerate().rev() {
                 if ml > ctx.orig_level {
                     break; // duplicating membership is a contiguous fine suffix

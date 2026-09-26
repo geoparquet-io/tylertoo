@@ -326,13 +326,41 @@ Four architectural decisions are load-bearing:
    others. `ConvertOptions::shard` itself is deliberately *not* fingerprinted
    — it is per-job, and every shard of a fleet has a different one.
 
-**The coarse job is a full monolithic convert.** `--shard coarse` restricts
-the EXPORT to zooms below the pivot; the convert reads every row, runs the
-whole assignment and writes the whole intermediate. A shallower `--max-zoom`
-is not a workaround either — the level plan is fingerprinted, so such a plan
-is refused by every shard. Sharding therefore parallelizes the export and the
-shard converts and buys restartability; it does not (yet) make the first job
-cheap. #541 tracks the convert-side level ceiling that would.
+**The coarse job caps pass 2 at the pivot — full assign, partial ladder**
+(#541). `ConvertOptions::zoom_ceiling` (set by the CLI for `--shard coarse`,
+mirroring `ExportOptions::zoom_ceiling`) truncates the level set pass 2
+materializes to the levels the coarse job actually exports. Three things make
+this safe, and each is load-bearing:
+
+1. **Pass 1 and the assignment stay full-range**, and so does the artifact
+   `--save-plan` writes. The assignment is dataset-global (the density budget
+   water-fills a super-cell over every candidate of a level, the level walk
+   carries a running kept count, tie-breaks hash global row indices), so a
+   coarse job that assigned only its own zooms would hand its shards a
+   different pyramid. The ceiling is therefore **excluded from
+   `options_digest`**: a capped coarse job and a full run save a
+   byte-identical plan, asserted directly in `tests/shard_merge_parity.rs`.
+2. **The cascade's fine steps are still computed.** A coarse level's geometry
+   is canonical geometry folded through every finer level's GSD in turn
+   (#218), so the chain is built over the WHOLE planned ladder and only the
+   *materialization* is truncated. In the pipelined engine the steps finer
+   than the deepest buffered level become a `prefix` that
+   `process_batch_cascade` folds first, from canonical geometry — exactly
+   what `simplify_cascade` does for that level on the Serial path. The prefix
+   is empty for an uncapped run, so nothing about a non-sharded build
+   changes. What *is* skipped for free: the cascade superset narrows from
+   "member of the finest non-canonical level" (nearly every row) to "member
+   of the deepest kept level" (a thinned fraction), so far fewer geometries
+   are decoded and folded at all.
+3. **The finest kept level joins the buffered set.** The pipelined engine
+   streams its last level separately only because it is the verbatim
+   canonical one, far too large to buffer. Under a ceiling the deepest level
+   is an ordinary simplified one, so `run_pass2_levels` buffers every level
+   and the whole job costs **one** read instead of two.
+
+What remains un-shardable is the floor: one pass-1 scan plus the assignment
+over the whole dataset. Budget the coarse job as that, plus a pass 2 over the
+coarse levels only.
 
 **An empty data shard succeeds.** The cut must tile the pivot zoom with no
 gap, so a concentrated dataset leaves some ranges owning no rows. Those jobs
