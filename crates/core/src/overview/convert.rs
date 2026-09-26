@@ -659,8 +659,22 @@ pub struct ConvertOptions {
     /// options digest): a capped coarse job and a full run save a
     /// byte-identical plan, which is the invariant every data shard depends
     /// on. Streaming pipeline and a [`LevelPlan::ZoomRange`] plan only (a GSD
-    /// ladder has no zoom to compare against). Default `None` — every planned
+    /// ladder has no zoom to compare against), duplicating mode only, and never
+    /// together with [`shard`](Self::shard). Default `None` — every planned
     /// level is built.
+    ///
+    /// **The output is a partial overview** when the ceiling bites: its finest
+    /// level is an ordinary simplified level, not the verbatim canonical one,
+    /// and every level finer than the ceiling is missing. The footer records
+    /// the ceiling (`generalization.zoom_ceiling`), the validator reports the
+    /// file as non-conforming, and [`export_pmtiles`] refuses it unless its
+    /// own [`ExportOptions::zoom_ceiling`] is at or coarser than the recorded
+    /// one — so a kept intermediate can never pass for a complete pyramid.
+    /// When no feature survives at or coarser than the ceiling the convert
+    /// returns [`ConvertError::NothingAtOrBelowCeiling`] (after any saved plan
+    /// has been written), which the CLI turns into an empty coarse archive.
+    ///
+    /// [`export_pmtiles`]: super::export::export_pmtiles
     ///
     /// [`ExportOptions::zoom_ceiling`]: super::export::ExportOptions::zoom_ceiling
     pub zoom_ceiling: Option<u8>,
@@ -1256,6 +1270,22 @@ pub enum ConvertError {
     /// The input has no features, or every feature was dropped from every level.
     #[error("no output rows produced (empty input or all features dropped)")]
     NoData,
+    /// A [`ConvertOptions::zoom_ceiling`] left nothing to write (#541 review):
+    /// the dataset has features, but none survive at any level at or coarser
+    /// than the ceiling — every such level was auto-clamped away (#211) or
+    /// emptied at write time. Distinct from [`Self::NoData`] because it is a
+    /// legal outcome for the coarse job of a sharded build (small-feature data
+    /// that first appears finer than the pivot), which the CLI turns into a
+    /// valid empty archive exactly as it does for an empty data shard. Any
+    /// `--save-plan` artifact has already been written when this is returned.
+    #[error(
+        "no output rows at or coarser than the zoom ceiling z{ceiling}: every feature first \
+         appears at a finer zoom"
+    )]
+    NothingAtOrBelowCeiling {
+        /// The ceiling that was applied.
+        ceiling: u8,
+    },
     /// The strict cluster accounting / sum invariant (spec §12.1) was
     /// violated while building the per-level cluster tables: a level's
     /// `point_count` values would not partition the source point set (or a
@@ -1312,6 +1342,63 @@ pub enum ConvertError {
         /// feature table must exist in full regardless of `MemoryProfile`).
         limit_bytes: u64,
     },
+}
+
+/// #541: [`ConvertOptions::zoom_ceiling`]'s up-front checks, split out of
+/// [`validate_options`].
+fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
+    // #541: the coarse job's convert-side level ceiling. Checked up front so a
+    // ceiling that would leave nothing to build, or one against a level plan
+    // that has no zooms to compare it with, fails in milliseconds rather than
+    // after pass 1.
+    let Some(ceiling) = options.zoom_ceiling else {
+        return Ok(());
+    };
+    // #541 review: the ceiling is the COARSE job's knob. A data shard owns
+    // only zooms at or finer than the pivot, so a ceiling on top of a
+    // shard range keeps nothing either half would write.
+    if options.shard.is_some() {
+        return Err(ConvertError::InvalidConfig(
+            "a convert-side zoom ceiling cannot be combined with a data shard range: \
+             the shard owns the zooms at and past the pivot, the ceiling keeps only \
+             those coarser than it"
+                .to_string(),
+        ));
+    }
+    // Partitioning writes each feature once, at its coarsest level, so
+    // truncating the ladder would silently drop every feature whose
+    // coarsest level is finer than the ceiling — not a partial pyramid
+    // but a lossy one. The CLI never pairs the two.
+    if matches!(options.mode, Mode::Partitioning) {
+        return Err(ConvertError::InvalidConfig(
+            "a convert-side zoom ceiling requires duplicating mode: in partitioning \
+             mode each feature lives only at its coarsest level, so capping the levels \
+             would drop features rather than levels"
+                .to_string(),
+        ));
+    }
+    if !options.streaming {
+        return Err(ConvertError::InvalidConfig(
+            "a convert-side zoom ceiling requires the streaming pipeline \
+             (the in-memory reference path builds every planned level); \
+             drop --no-streaming"
+                .to_string(),
+        ));
+    }
+    let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
+        return Err(ConvertError::InvalidConfig(
+            "a convert-side zoom ceiling needs a zoom-range level plan: an \
+             explicit GSD ladder has no zoom to compare the ceiling against"
+                .to_string(),
+        ));
+    };
+    if ceiling < min_zoom {
+        return Err(ConvertError::InvalidConfig(format!(
+            "zoom ceiling z{ceiling} is coarser than the level plan's minimum \
+             z{min_zoom}: nothing would be built"
+        )));
+    }
+    Ok(())
 }
 
 /// Convert a GeoParquet file into a multi-resolution overview GeoParquet file.
@@ -1401,33 +1488,7 @@ fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
                 .to_string(),
         ));
     }
-    // #541: the coarse job's convert-side level ceiling. Checked up front so a
-    // ceiling that would leave nothing to build, or one against a level plan
-    // that has no zooms to compare it with, fails in milliseconds rather than
-    // after pass 1.
-    if let Some(ceiling) = options.zoom_ceiling {
-        if !options.streaming {
-            return Err(ConvertError::InvalidConfig(
-                "a convert-side zoom ceiling requires the streaming pipeline \
-                 (the in-memory reference path builds every planned level); \
-                 drop --no-streaming"
-                    .to_string(),
-            ));
-        }
-        let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
-            return Err(ConvertError::InvalidConfig(
-                "a convert-side zoom ceiling needs a zoom-range level plan: an \
-                 explicit GSD ladder has no zoom to compare the ceiling against"
-                    .to_string(),
-            ));
-        };
-        if ceiling < min_zoom {
-            return Err(ConvertError::InvalidConfig(format!(
-                "zoom ceiling z{ceiling} is coarser than the level plan's minimum \
-                 z{min_zoom}: nothing would be built"
-            )));
-        }
-    }
+    validate_zoom_ceiling(options)?;
     // #513, in the spirit of the #272 spill-dir block below: both plan paths
     // are touched LONG after the expensive work. `--save-plan` is written
     // only once pass 1 and the assignment are complete, so an unwritable
@@ -2377,6 +2438,20 @@ struct EmittedLevel {
     coalesce: Option<CoalesceTable>,
 }
 
+/// Record whether any emitted level's chain table joined two or more
+/// segments — the in-memory path's `coalescing.merged` (#379 / #541 review; same rule as the
+/// streaming pipeline, which has no ceiling to account for here).
+fn record_emitted_merged(
+    writer_opts: &mut super::writer::OverviewWriterOptions,
+    emitted: &[EmittedLevel],
+) {
+    let merged = emitted
+        .iter()
+        .filter_map(|e| e.coalesce.as_ref())
+        .any(coalesce_table_merged);
+    record_coalesce_merged(writer_opts.generalization.as_mut(), merged);
+}
+
 /// Build every level's generalized selection, coarse to fine.
 ///
 /// Returns the emitted levels and the planned levels that were omitted because
@@ -2766,17 +2841,17 @@ pub(crate) fn convert_to_overviews_source_strategy(
         .iter()
         .map(|e| LevelSpec::new(e.gsd, e.zoom))
         .collect();
-    let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
     let level_row_counts: Vec<usize> = emitted.iter().map(|e| e.indices.len()).collect();
-    let writer_opts = super::stream::build_writer_options(
+    let mut writer_opts = super::stream::build_writer_options(
         writer_levels,
-        &emitted_gsds,
+        &emitted.iter().map(|e| e.gsd).collect::<Vec<f64>>(),
         &level_row_counts,
         crs,
         ranking_provenance,
         &renames,
         options,
     )?;
+    record_emitted_merged(&mut writer_opts, &emitted);
     // #507: `build_writer_options` may have raised the cap to fit parquet's
     // row-group ceiling. Record it before the options move into the writer.
     let effective_max_row_group_size = (writer_opts.max_row_group_size
@@ -5059,6 +5134,11 @@ pub(super) fn build_generalization(
                 junction_angle: Some(options.coalesce_junction_angle),
                 max_level_rows: Some(options.coalesce_max_level_rows as u64),
                 coalesced_count_column: COALESCED_COUNT_COLUMN.to_string(),
+                // Known only once the chain tables are built, which happens
+                // after the writer (and so this block) exists: pass 2 fills
+                // it in via `record_coalesce_merged` before the footer is
+                // written.
+                merged: None,
             })
         } else {
             None
@@ -5095,6 +5175,22 @@ pub(super) fn build_generalization(
                     .collect(),
             )
         },
+        // #541: set by the streaming pipeline only when a zoom ceiling
+        // actually truncated the level plan (see `Generalization::zoom_ceiling`).
+        zoom_ceiling: None,
+    }
+}
+
+/// Whether any chain table joined two or more segments (#379 / #541 review).
+pub(super) fn coalesce_table_merged(table: &CoalesceTable) -> bool {
+    table.values().any(|&(_, count)| count > 1)
+}
+
+/// Record the #541-review `merged` flag on a generalization block's
+/// coalescing provenance, when that block is present.
+pub(super) fn record_coalesce_merged(generalization: Option<&mut Generalization>, merged: bool) {
+    if let Some(c) = generalization.and_then(|g| g.coalescing.as_mut()) {
+        c.merged = Some(merged);
     }
 }
 
@@ -6868,7 +6964,7 @@ mod tests {
         geoms
     }
 
-    /// THE #541 invariant, in one test.
+    /// THE #541 invariant, as a reusable oracle.
     ///
     /// A level-capped convert (the sharded build's coarse job) must produce,
     /// for every level it *does* build, exactly what the uncapped run built —
@@ -6881,33 +6977,20 @@ mod tests {
     /// through *every* finer level's GSD in turn. Skipping those levels'
     /// OUTPUT is legal; skipping their fold steps is not, and would show up
     /// here as coordinates that differ in the last simplification.
-    #[test]
-    fn level_ceiling_matches_the_full_converts_coarse_levels() {
-        let geoms = cascade_sensitive_geometries();
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        write_input(&input, &geoms, false, None);
+    ///
+    /// Returns the full and capped outputs' reports and paths so a caller can
+    /// assert more about them.
+    fn assert_level_ceiling_parity(
+        dir: &Path,
+        geoms: &[Geometry<f64>],
+        base: &ConvertOptions,
+        ceiling: u8,
+    ) -> (ConvertReport, PathBuf, ConvertReport, PathBuf) {
+        let input = dir.join("in.parquet");
+        write_input(&input, geoms, false, None);
 
-        let base = ConvertOptions {
-            mode: Mode::Duplicating,
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 1,
-                max_zoom: 10,
-            },
-            // The cascade's most order-sensitive path: a polygon that goes
-            // sub-tolerance collapses to the centroid of the geometry AS
-            // SIMPLIFIED at that level, and every coarser step passes the
-            // point through. Fold from canonical geometry instead and the
-            // centroid moves.
-            simplify: SimplifyOptions {
-                collapse: CollapseMode::Point,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let full_out = dir.path().join("full.parquet");
-        let full_plan = dir.path().join("full.plan");
+        let full_out = dir.join("full.parquet");
+        let full_plan = dir.join("full.plan");
         let full = convert_to_overviews(
             &input,
             &full_out,
@@ -6918,14 +7001,13 @@ mod tests {
         )
         .unwrap();
 
-        const CEILING: u8 = 5;
-        let capped_out = dir.path().join("capped.parquet");
-        let capped_plan = dir.path().join("capped.plan");
+        let capped_out = dir.join("capped.parquet");
+        let capped_plan = dir.join("capped.plan");
         let capped = convert_to_overviews(
             &input,
             &capped_out,
             &ConvertOptions {
-                zoom_ceiling: Some(CEILING),
+                zoom_ceiling: Some(ceiling),
                 save_plan: Some(capped_plan.clone()),
                 ..base.clone()
             },
@@ -6945,7 +7027,7 @@ mod tests {
         let want: Vec<&LevelReport> = full
             .levels
             .iter()
-            .filter(|l| l.zoom.is_some_and(|z| z <= CEILING))
+            .filter(|l| l.zoom.is_some_and(|z| z <= ceiling))
             .collect();
         assert!(
             !want.is_empty() && want.len() < full.levels.len(),
@@ -6955,7 +7037,7 @@ mod tests {
         assert_eq!(
             capped.levels.iter().map(|l| l.zoom).collect::<Vec<_>>(),
             want.iter().map(|l| l.zoom).collect::<Vec<_>>(),
-            "the capped run must hold exactly the levels at or coarser than z{CEILING}"
+            "the capped run must hold exactly the levels at or coarser than z{ceiling}"
         );
 
         // (3) Row for row, geometry for geometry.
@@ -6969,19 +7051,47 @@ mod tests {
                 capped.levels[level].zoom
             );
         }
-        assert!(validate_file(&capped_out).unwrap().is_valid());
 
-        // (4) And the two pass-2 engines still agree under the cap. The
+        // (4) The capped file describes itself as partial (#541 review), and
+        // is structurally sound otherwise; the full file carries no marker.
+        assert_eq!(
+            capped_rdr
+                .meta()
+                .generalization
+                .as_ref()
+                .and_then(|g| g.zoom_ceiling),
+            Some(ceiling),
+            "the capped footer must record the ceiling"
+        );
+        assert_eq!(
+            full_rdr
+                .meta()
+                .generalization
+                .as_ref()
+                .and_then(|g| g.zoom_ceiling),
+            None,
+            "a complete file must not carry the partial marker"
+        );
+        let vr = validate_file(&capped_out).unwrap();
+        let failed: Vec<&str> = vr.failures().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            failed,
+            vec!["complete_pyramid"],
+            "a partial overview fails exactly the completeness check: {vr:?}"
+        );
+        assert!(validate_file(&full_out).unwrap().is_valid());
+
+        // (5) And the two pass-2 engines still agree under the cap. The
         // Pipelined engine folds the unmaterialized fine steps inline as a
         // prefix to its incremental cascade; Serial re-derives each level
         // from the full chain. Same bytes, or one of the two is wrong.
-        let serial_out = dir.path().join("serial.parquet");
+        let serial_out = dir.join("serial.parquet");
         let serial = convert_to_overviews_strategy(
             &input,
             &serial_out,
             &ConvertOptions {
-                zoom_ceiling: Some(CEILING),
-                ..base
+                zoom_ceiling: Some(ceiling),
+                ..base.clone()
             },
             super::super::stream::Pass2Strategy::Serial,
         )
@@ -6995,37 +7105,359 @@ mod tests {
                 "level {level}: the Serial and Pipelined engines disagree under a ceiling"
             );
         }
+        (full, full_out, capped, capped_out)
     }
 
-    /// The ceiling is a pass-2 knob, and the two ways of asking for something
-    /// it cannot express are refused before any input is opened.
+    #[test]
+    fn level_ceiling_matches_the_full_converts_coarse_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 10,
+            },
+            // The cascade's most order-sensitive path: a polygon that goes
+            // sub-tolerance collapses to the centroid of the geometry AS
+            // SIMPLIFIED at that level, and every coarser step passes the
+            // point through. Fold from canonical geometry instead and the
+            // centroid moves.
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Point,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_level_ceiling_parity(dir.path(), &cascade_sensitive_geometries(), &base, 5);
+    }
+
+    /// #541 review (S3d): a zoom-band `Point` representation whose band lies
+    /// FINER than the ceiling, so the unmaterialized prefix contains the
+    /// cascade's revive-from-canonical branch: a small polygon drops at the
+    /// finest geometry steps and is revived — from CANONICAL geometry — at
+    /// the band's first `Point` step, all inside the prefix the pipelined
+    /// engine folds before its first buffered level. Serial, Pipelined and
+    /// the full run must agree on every coarse level.
+    #[test]
+    fn level_ceiling_matches_with_a_point_band_past_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        const CEILING: u8 = 5;
+        let base = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 10,
+            },
+            // Drop (the default), not Point: a sub-tolerance polygon must
+            // really DROP at the fine geometry steps for the band to revive
+            // it.
+            // Point bands must run contiguously from the plan's coarsest
+            // level; this one ends at z8, three steps finer than the ceiling.
+            representation: vec![RepresentationBand {
+                min_zoom: 1,
+                max_zoom: 8,
+                repr: Representation::Point,
+            }],
+            ..Default::default()
+        };
+        // Plus isolated ~20 m squares, each alone in its coarse cell: members
+        // at every level, but far below the z9 geometry tolerance — the
+        // "20 m building" the revival rule exists for.
+        let mut geoms = cascade_sensitive_geometries();
+        for k in 0..8 {
+            let (x, y) = (100.0 + k as f64 * 3.0, 40.0 - k as f64 * 2.0);
+            let d = 0.0002;
+            geoms.push(Geometry::Polygon(Polygon::new(
+                LineString::from(vec![(x, y), (x + d, y), (x + d, y + d), (x, y + d), (x, y)]),
+                vec![],
+            )));
+        }
+        let (full, full_out, capped, capped_out) =
+            assert_level_ceiling_parity(dir.path(), &geoms, &base, CEILING);
+
+        // Prove the revival branch actually ran inside the prefix: some
+        // feature is missing from the full run's finest non-canonical level
+        // (dropped by the fold there — it is a member, since duplicating
+        // membership is a fine suffix of any level it reaches) yet present
+        // at a capped coarse level.
+        let ids_at = |path: &Path, level: usize| -> std::collections::BTreeSet<i64> {
+            read_level_rows(&OverviewReader::open(path).unwrap(), level)
+                .into_iter()
+                .map(|r| r.0)
+                .collect()
+        };
+        let finest_simplified = full
+            .levels
+            .iter()
+            .position(|l| l.zoom == Some(9))
+            .expect("the full run holds z9");
+        let dropped_fine = ids_at(&full_out, finest_simplified);
+        let revived: Vec<i64> = (0..capped.levels.len())
+            .flat_map(|l| ids_at(&capped_out, l))
+            .filter(|id| !dropped_fine.contains(id))
+            .collect();
+        assert!(
+            !revived.is_empty(),
+            "the fixture must drop a feature at z9 and revive it at the z8 point step, \
+             or the revive-from-canonical branch never ran inside the prefix"
+        );
+    }
+
+    /// #541 review (S1): whether `coalesced_count` is published must not
+    /// depend on which levels a file holds.
+    ///
+    /// A chain of connected short segments only merges at levels fine enough
+    /// to keep them; with a long isolated line holding the coarse levels
+    /// open, the capped file's own `coalesced_count` never leaves 1 while the
+    /// full file's does. The export used to read that row-group statistic and
+    /// so withheld the column from the capped coarse tiles only — the capped
+    /// and monolithic coarse archives differed. It now reads the converter's
+    /// `coalescing.merged` record, which covers every planned level.
+    #[test]
+    fn level_ceiling_keeps_coalesced_count_publication_in_step() {
+        use crate::overview::export::{export_pmtiles, ExportOptions};
+
+        const CEILING: u8 = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("lines.parquet");
+        // 30 connected ~111 m segments (0.001°), and one long line far away.
+        let mut geoms: Vec<Geometry<f64>> = (0..30)
+            .map(|k| {
+                let x = 10.0 + k as f64 * 0.001;
+                Geometry::LineString(LineString::from(vec![(x, 5.0), (x + 0.001, 5.0)]))
+            })
+            .collect();
+        geoms.push(Geometry::LineString(LineString::from(vec![
+            (-40.0, -10.0),
+            (-20.0, -5.0),
+            (0.0, -12.0),
+        ])));
+        write_input(&input, &geoms, false, None);
+        let base = ConvertOptions {
+            mode: Mode::Duplicating,
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 12,
+            },
+            ..Default::default()
+        };
+        assert!(base.coalesce_lines, "coalescing is on by default");
+
+        let full_out = dir.path().join("full.parquet");
+        convert_to_overviews(&input, &full_out, &base).unwrap();
+        let capped_out = dir.path().join("capped.parquet");
+        convert_to_overviews(
+            &input,
+            &capped_out,
+            &ConvertOptions {
+                zoom_ceiling: Some(CEILING),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        // The premise: the two files' own statistics disagree.
+        let full_rdr = OverviewReader::open(&full_out).unwrap();
+        let capped_rdr = OverviewReader::open(&capped_out).unwrap();
+        assert!(
+            full_rdr.int_column_max("coalesced_count").unwrap() > 1,
+            "the full run must merge the chain somewhere"
+        );
+        assert_eq!(
+            capped_rdr.int_column_max("coalesced_count"),
+            Some(1),
+            "the chain must merge only finer than the ceiling, or this test proves nothing"
+        );
+        // ...while the conversion-level record agrees.
+        let merged = |r: &OverviewReader| {
+            r.meta()
+                .generalization
+                .as_ref()
+                .and_then(|g| g.coalescing.as_ref())
+                .and_then(|c| c.merged)
+        };
+        assert_eq!(merged(&full_rdr), Some(true));
+        assert_eq!(merged(&capped_rdr), Some(true));
+
+        let export = |src: &Path, name: &str| -> Vec<u8> {
+            let out = dir.path().join(name);
+            export_pmtiles(
+                src,
+                &out,
+                &ExportOptions {
+                    zoom_ceiling: Some(CEILING),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            std::fs::read(out).unwrap()
+        };
+        assert_eq!(
+            export(&full_out, "full.pmtiles"),
+            export(&capped_out, "capped.pmtiles"),
+            "the capped and full coarse archives must be byte-identical"
+        );
+    }
+
+    /// #541 review (S2-1): a partial overview refuses to be exported as more
+    /// than it is.
+    #[test]
+    fn a_partial_overview_refuses_zooms_past_its_ceiling() {
+        use crate::overview::export::{export_pmtiles, ExportError, ExportOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &cascade_sensitive_geometries(), false, None);
+        let capped = dir.path().join("capped.parquet");
+        convert_to_overviews(
+            &input,
+            &capped,
+            &ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 1,
+                    max_zoom: 10,
+                },
+                zoom_ceiling: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let out = dir.path().join("out.pmtiles");
+        let export = |ceiling: Option<u8>| {
+            export_pmtiles(
+                &capped,
+                &out,
+                &ExportOptions {
+                    zoom_ceiling: ceiling,
+                    ..Default::default()
+                },
+            )
+        };
+        for bad in [None, Some(6), Some(12)] {
+            let err = export(bad).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ExportError::PartialOverview {
+                        recorded: 5,
+                        requested,
+                    } if requested == bad
+                ),
+                "ceiling {bad:?}: unexpected {err:?}"
+            );
+            assert!(err.to_string().contains("partial"), "{err}");
+        }
+        // What the coarse job does, and anything coarser, still works.
+        export(Some(5)).unwrap();
+        export(Some(3)).unwrap();
+    }
+
+    /// #541 review (S2-2): a ceiling coarser than every level the data
+    /// reaches is the coarse job's legal "nothing here", not a NoData — and
+    /// the saved plan is already on disk when it is returned.
+    #[test]
+    fn a_ceiling_below_every_planned_level_is_a_distinct_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // Tiny polygons: auto-clamped (#211) out of every coarse level.
+        let geoms: Vec<Geometry<f64>> = (0..20)
+            .map(|k| {
+                let (x, y) = (k as f64 * 0.01, 0.0);
+                Geometry::Polygon(Polygon::new(
+                    LineString::from(vec![
+                        (x, y),
+                        (x + 0.0001, y),
+                        (x + 0.0001, y + 0.0001),
+                        (x, y + 0.0001),
+                        (x, y),
+                    ]),
+                    vec![],
+                ))
+            })
+            .collect();
+        write_input(&input, &geoms, false, None);
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 14,
+            },
+            ..Default::default()
+        };
+        let full = convert_to_overviews(&input, dir.path().join("full.parquet"), &base).unwrap();
+        let coarsest = full.levels[0].zoom.unwrap();
+        assert!(coarsest > 2, "fixture must clamp away z0..z2: {coarsest}");
+
+        let plan = dir.path().join("coarse.plan");
+        let err = convert_to_overviews(
+            &input,
+            dir.path().join("capped.parquet"),
+            &ConvertOptions {
+                zoom_ceiling: Some(2),
+                save_plan: Some(plan.clone()),
+                ..base
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConvertError::NothingAtOrBelowCeiling { ceiling: 2 }),
+            "unexpected: {err:?}"
+        );
+        assert!(
+            plan.exists(),
+            "the plan must be saved before the empty outcome"
+        );
+    }
+
+    /// The ceiling is a pass-2 knob, and every way of asking for something it
+    /// cannot express is refused before any input is opened.
     #[test]
     fn level_ceiling_validation() {
-        let too_coarse = validate_options(&ConvertOptions {
+        let refused = |o: ConvertOptions| validate_options(&o).unwrap_err().to_string();
+        let too_coarse = refused(ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 4,
                 max_zoom: 10,
             },
             zoom_ceiling: Some(3),
             ..Default::default()
-        })
-        .unwrap_err()
-        .to_string();
+        });
         assert!(
             too_coarse.contains("nothing would be built"),
             "unexpected: {too_coarse}"
         );
 
-        let gsd_plan = validate_options(&ConvertOptions {
+        let gsd_plan = refused(ConvertOptions {
             levels: LevelPlan::Gsds(vec![1000.0, 500.0]),
             zoom_ceiling: Some(3),
             ..Default::default()
-        })
-        .unwrap_err()
-        .to_string();
+        });
         assert!(
             gsd_plan.contains("zoom-range level plan"),
             "unexpected: {gsd_plan}"
+        );
+
+        // #541 review: a data shard owns the zooms PAST the pivot, so a
+        // ceiling on top of one keeps nothing.
+        let with_shard = refused(ConvertOptions {
+            zoom_ceiling: Some(3),
+            shard: Some(crate::shard::TileRange::parse("1..2").unwrap()),
+            ..Default::default()
+        });
+        assert!(
+            with_shard.contains("data shard range"),
+            "unexpected: {with_shard}"
+        );
+
+        // Partitioning keeps each feature at its coarsest level only, so a
+        // cap would drop features, not levels.
+        let partitioning = refused(ConvertOptions {
+            mode: Mode::Partitioning,
+            zoom_ceiling: Some(3),
+            ..Default::default()
+        });
+        assert!(
+            partitioning.contains("duplicating mode"),
+            "unexpected: {partitioning}"
         );
     }
 

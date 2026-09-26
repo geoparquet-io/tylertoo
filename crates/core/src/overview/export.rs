@@ -440,6 +440,28 @@ pub enum ExportError {
         finest: u8,
     },
 
+    /// The overview file is **partial** (#541 review): it was written under a
+    /// convert-side zoom ceiling (the coarse job of a sharded build), so it
+    /// holds no level finer than `recorded` and its finest level is not the
+    /// canonical one. It can only be exported with a zoom ceiling at or
+    /// coarser than `recorded`.
+    #[error(
+        "the overview file is partial: it was built with a zoom ceiling of z{recorded} (the \
+         coarse job of a sharded build), so it holds no level finer than z{recorded}{}. Export \
+         it with a zoom ceiling of at most z{recorded}, or re-run the convert without the \
+         ceiling for a complete pyramid",
+        match requested {
+            Some(c) => format!(" and cannot be exported up to z{c}"),
+            None => " and cannot be exported as a whole pyramid".to_string(),
+        }
+    )]
+    PartialOverview {
+        /// The ceiling recorded in the file's footer.
+        recorded: u8,
+        /// The export's own ceiling, if any.
+        requested: Option<u8>,
+    },
+
     /// `--min-zoom` is above [`crate::tile::MAX_ZOOM`] (#371).
     #[error("--min-zoom {declared} is above the maximum supported zoom {ceiling} (#371)")]
     DeclaredMinZoomAboveCeiling {
@@ -1003,6 +1025,34 @@ fn plan_levels(
         .collect()
 }
 
+/// #541 review: a partial overview (written under a convert-side zoom
+/// ceiling) holds only the levels at or coarser than that ceiling, and its
+/// finest level is NOT the canonical one. Exporting it as if it were a whole
+/// pyramid would silently ship a truncated archive; only an export that
+/// itself stops at or before the recorded ceiling is what the file was built
+/// for.
+///
+/// Returns the finest zoom the export emits: the file's finest level's zoom,
+/// capped by the export's own ceiling.
+fn emitted_max_zoom(
+    meta: &OverviewsMeta,
+    options: &ExportOptions,
+    finest_level_zoom: u8,
+) -> Result<u8, ExportError> {
+    if let Some(recorded) = meta.generalization.as_ref().and_then(|g| g.zoom_ceiling) {
+        if options.zoom_ceiling.is_none_or(|c| c > recorded) {
+            return Err(ExportError::PartialOverview {
+                recorded,
+                requested: options.zoom_ceiling,
+            });
+        }
+    }
+    Ok(match options.zoom_ceiling {
+        Some(c) => finest_level_zoom.min(c),
+        None => finest_level_zoom,
+    })
+}
+
 /// Full implementation with the #235 test knobs: `force_legacy_pass2` pins the
 /// pre-#235 per-level wave-read pass 2 (the byte-identity oracle the
 /// single-read fan-out is tested against; also the production duplicating
@@ -1058,10 +1108,7 @@ fn export_pmtiles_impl(
         Some(r) => level_zooms[0].max(r.pivot_zoom()),
         None => level_zooms[0],
     };
-    let max_zoom = match options.zoom_ceiling {
-        Some(c) => level_zooms[num_levels - 1].min(c),
-        None => level_zooms[num_levels - 1],
-    };
+    let max_zoom = emitted_max_zoom(&meta, options, level_zooms[num_levels - 1])?;
     if coarsest_zoom > max_zoom {
         return Err(ExportError::RestrictionEmitsNoZoom {
             coarsest: coarsest_zoom,
@@ -3850,17 +3897,28 @@ impl PublishedNames {
     fn from_reader(reader: &OverviewReader) -> Self {
         let meta = reader.meta();
         let mut suppressed = HashSet::new();
-        let counter = meta
+        let coalescing = meta
             .generalization
             .as_ref()
             .and_then(|g| g.coalescing.as_ref())
-            .map(|c| c.coalesced_count_column.as_str())
             // The footer names the column, but only the converter's own
             // counter is eligible: a tampered or foreign footer must not be
             // able to withhold a real data column.
-            .filter(|&c| c == COALESCED_COUNT_COLUMN);
-        if let Some(column) = counter {
-            if reader.int_column_max(column) == Some(1) {
+            .filter(|c| c.coalesced_count_column == COALESCED_COUNT_COLUMN);
+        if let Some(c) = coalescing {
+            let column = c.coalesced_count_column.as_str();
+            // #541 review: prefer the converter's own record of whether any
+            // chain merged, which describes the whole conversion. The
+            // row-group statistic only sees the levels this file holds, so a
+            // zoom-capped coarse job (whose merges all happen finer than the
+            // ceiling) would withhold a column the monolithic build publishes,
+            // and the two builds' coarse tiles would differ. Files written
+            // before the flag existed fall back to the statistic.
+            let never_merged = match c.merged {
+                Some(merged) => !merged,
+                None => reader.int_column_max(column) == Some(1),
+            };
+            if never_merged {
                 log::info!(
                     "[export] not exporting {column:?}: it is 1 on every row \
                      (no lines were merged), so it says nothing about the data; \
@@ -7094,8 +7152,10 @@ mod tests {
                 junction_angle: Some(0.0),
                 max_level_rows: Some(2_000_000),
                 coalesced_count_column: "coalesced_count".to_string(),
+                merged: None,
             }),
             renamed_columns: renames,
+            zoom_ceiling: None,
         }
     }
 

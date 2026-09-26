@@ -454,6 +454,103 @@ fn a_coarse_job_builds_only_the_levels_below_the_pivot() {
     );
 }
 
+/// #541 review (S2-2): a coarse job whose levels below the pivot all come out
+/// empty — every feature first appears at or past the pivot — succeeds with
+/// an empty archive, exactly like an empty data shard, and still writes the
+/// convert plan the shards need.
+///
+/// Before the fix its convert-side ceiling left nothing to build and the job
+/// failed with a misleading "empty input or all features dropped", after
+/// `--save-plan` had already written a perfectly good plan.
+#[test]
+fn a_coarse_job_with_nothing_below_the_pivot_writes_an_empty_archive() {
+    // The road detections are only visible from z5, so a pivot of z3 leaves
+    // the coarse job's z0..z2 with nothing in them.
+    let Some(lines) = fixture::realdata("road-detections.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = dir.path().join("shards.json");
+    let convert_plan = dir.path().join("convert.plan");
+    let coarse = dir.path().join("coarse.pmtiles");
+    let (ok, out) = run(&[
+        "shard-plan",
+        lines.to_str().unwrap(),
+        "--shards",
+        "2",
+        "--pivot",
+        "3",
+        "-o",
+        shard_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}");
+
+    let (ok, out) = run(&[
+        "tiles",
+        lines.to_str().unwrap(),
+        coarse.to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "6",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--save-plan",
+        convert_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "an empty coarse job must succeed: {out}");
+    assert!(out.contains("empty archive"), "{out}");
+    assert!(
+        convert_plan.exists(),
+        "the plan must still be written: {out}"
+    );
+    let idx = tylertoo_core::archive_index::ArchiveIndex::open(&coarse).expect("valid archive");
+    assert_eq!(
+        idx.tiles().count(),
+        0,
+        "the coarse archive must hold no tile"
+    );
+}
+
+/// #541 review (S3b): `--shard coarse --no-streaming` is not an error about
+/// a "convert-side zoom ceiling" the user never asked for. The in-memory
+/// path cannot cap its levels, so the coarse job falls back to building all
+/// of them — same tiles, more work.
+#[test]
+fn a_coarse_job_without_streaming_falls_back_to_the_uncapped_convert() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = dir.path().join("shards.json");
+    let (ok, out) = run(&[
+        "shard-plan",
+        grid().to_str().unwrap(),
+        "--shards",
+        "2",
+        "--pivot",
+        "3",
+        "-o",
+        shard_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}");
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        dir.path().join("coarse.pmtiles").to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "5",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--no-streaming",
+    ]);
+    assert!(ok, "--shard coarse --no-streaming must succeed: {out}");
+    assert!(!out.contains("zoom ceiling"), "{out}");
+}
+
 /// `export-pmtiles --tile-range LO..HI` is the manual form of a shard's
 /// restriction: two tile ids at one zoom, which then own every descendant.
 ///

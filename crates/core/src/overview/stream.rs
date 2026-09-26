@@ -79,13 +79,13 @@ use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_level_chains,
-    count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
-    extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
-    overture_road_ranking, record_level_outcome, resolve_read_workers,
-    resolve_reserved_column_collisions, scan_feature, validate_cluster_schema,
-    validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies, ClassRanking, CoalesceTable,
-    ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport, SkippedLevelReport,
-    KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    coalesce_table_merged, count_vertices, encode_concurrency_for, extract_class_ranks,
+    extract_numeric_values, extract_sort_keys, fill_level_bytes, find_geometry_column,
+    mixed_geometry_field, overture_road_ranking, record_coalesce_merged, record_level_outcome,
+    resolve_read_workers, resolve_reserved_column_collisions, scan_feature,
+    validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies,
+    ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
+    LevelReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
@@ -94,7 +94,7 @@ use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
-    simplify_step_checked, validation_skip_count, CascadeStep, CollapseMode, Representation,
+    validation_skip_count, CascadeFold, CascadeStep, CollapseMode, FoldStep, Representation,
     Simplified, SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
@@ -953,6 +953,132 @@ struct LevelWriter {
     effective_max_row_group_size: Option<usize>,
 }
 
+/// #541: apply a convert-side zoom ceiling to the planned levels. Returns how
+/// many of `planned` are materialized, and the ceiling when it actually
+/// truncated the plan (only then is the output a partial overview). Levels
+/// above the ceiling leave the #211 skipped report, and their pass-1 tables
+/// are released in place.
+fn apply_level_ceiling(
+    planned: &[EmitLevel],
+    ceiling_opt: Option<u8>,
+    skipped: &mut Vec<SkippedLevelReport>,
+    cluster_tables: &mut Option<ClusterTables>,
+    carriers: &mut [Vec<usize>],
+) -> Result<(usize, Option<u8>), ConvertError> {
+    let kept = levels_at_or_above_ceiling(planned, ceiling_opt);
+    // Whether the ceiling actually truncated the plan: only then is the file
+    // a partial overview (and only then may an empty result be the coarse
+    // job's legal "nothing here" rather than a real NoData).
+    let truncated_at =
+        (kept < planned.len()).then(|| ceiling_opt.expect("only a ceiling drops planned levels"));
+    if kept == 0 {
+        // Every planned level is finer than the ceiling (#211 auto-clamp took
+        // the coarse ones). Pass 1, the assignment and any `--save-plan` are
+        // done and valid; there is just nothing for THIS job to write.
+        return Err(ConvertError::NothingAtOrBelowCeiling {
+            ceiling: truncated_at.expect("kept == 0 < planned.len()"),
+        });
+    }
+    if let Some(ceiling) = truncated_at {
+        log::info!(
+            "[convert] level ceiling z{ceiling}: materializing {kept} of {} planned \
+             overview level(s) — pass 1, the level assignment and any saved plan \
+             stay full-range",
+            planned.len()
+        );
+        // A level above the ceiling was never going to be written, so it is
+        // not an omission the #211 auto-clamp should report.
+        skipped.retain(|s| s.zoom.is_none_or(|z| z <= ceiling));
+        // #541 review: the per-level pass-1 tables are indexed by PLANNED
+        // level. The levels finer than the deepest kept one are never
+        // materialized, so their cluster tables and carrier lists would only
+        // sit resident through pass 2. Emptied in place (not truncated) so
+        // every `orig`-indexed lookup stays valid.
+        let deepest = planned[kept - 1].orig as usize;
+        if let Some(tables) = cluster_tables.as_mut() {
+            for t in tables.iter_mut().skip(deepest + 1) {
+                *t = Default::default();
+            }
+        }
+        for c in carriers.iter_mut().skip(deepest + 1) {
+            *c = Vec::new();
+        }
+    }
+    Ok((kept, truncated_at))
+}
+
+/// Footer provenance only pass 2's setup knows, recorded when the writer is
+/// created (#541 review).
+struct FooterFacts {
+    /// Whether any chain at any planned non-canonical level joined two or
+    /// more segments (`CoalescingProvenance::merged`).
+    coalesce_merged: bool,
+    /// The zoom ceiling, when it truncated the level plan
+    /// (`Generalization::zoom_ceiling`).
+    zoom_ceiling: Option<u8>,
+}
+
+/// Whether line coalescing merged anything at ANY planned non-canonical level
+/// (#379 / #541 review) — a property of the conversion, independent of which
+/// levels a zoom ceiling lets this run materialize.
+///
+/// `built` are the chain tables for the materialized levels; when one of them
+/// already merged something, that settles it. Otherwise each unmaterialized
+/// level's table is built (the same `build_level_coalesce_table` a full run
+/// would call), checked and dropped — short-circuiting at the first merge, so
+/// the extra cost is paid only by a capped run over line data that merged
+/// nothing coarse. Without it a capped coarse job and the full run would
+/// disagree on whether `coalesced_count` is published, and the coarse tiles
+/// would differ from the monolithic build's.
+/// The materialized levels' chain tables (`planned[..kept]`; a level above
+/// the ceiling never emits a row, so its table would be built and thrown
+/// away), plus [`coalesce_merged_anywhere`] over the whole plan.
+fn pass2_coalesce(
+    scratch: Option<&CoalesceScratch>,
+    planned: &[EmitLevel],
+    kept: usize,
+    finest: usize,
+    crs: Crs,
+    options: &ConvertOptions,
+) -> (Vec<Option<CoalesceTable>>, bool) {
+    let tables = build_pass2_coalesce_tables(scratch, &planned[..kept], finest, crs, options);
+    let merged = coalesce_merged_anywhere(scratch, &tables, &planned[kept..], finest, crs, options);
+    (tables, merged)
+}
+
+fn coalesce_merged_anywhere(
+    scratch: Option<&CoalesceScratch>,
+    built: &[Option<CoalesceTable>],
+    unmaterialized: &[EmitLevel],
+    finest: usize,
+    crs: Crs,
+    options: &ConvertOptions,
+) -> bool {
+    if built.iter().flatten().any(coalesce_table_merged) {
+        return true;
+    }
+    let Some(scratch) = scratch else {
+        return false;
+    };
+    if unmaterialized.is_empty() || matches!(options.mode, Mode::Partitioning) {
+        return false;
+    }
+    let inputs = scratch.inputs();
+    unmaterialized
+        .par_iter()
+        .filter(|e| e.orig as usize != finest)
+        .any(|e| {
+            coalesce_table_merged(&build_level_coalesce_table(
+                &inputs,
+                e.orig as usize,
+                finest,
+                e.gsd,
+                crs,
+                options,
+            ))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_level_writer(
     output_path: &Path,
@@ -964,6 +1090,7 @@ fn create_level_writer(
     ranking_provenance: RankingProvenance,
     renames: &[(String, String)],
     options: &ConvertOptions,
+    facts: FooterFacts,
 ) -> Result<LevelWriter, ConvertError> {
     // --- Writer setup (identical to the in-memory path). ---------------------
     // Writer schemas: base + point_count when clustering (Q4) + coalesced_count
@@ -978,7 +1105,7 @@ fn create_level_writer(
         .collect();
     let emitted_gsds: Vec<f64> = emitted.iter().map(|e| e.gsd).collect();
     let level_row_counts: Vec<usize> = emitted.iter().map(|e| e.hint).collect();
-    let writer_opts = build_writer_options(
+    let mut writer_opts = build_writer_options(
         writer_levels,
         &emitted_gsds,
         &level_row_counts,
@@ -987,6 +1114,10 @@ fn create_level_writer(
         renames,
         options,
     )?;
+    record_coalesce_merged(writer_opts.generalization.as_mut(), facts.coalesce_merged);
+    if let Some(g) = writer_opts.generalization.as_mut() {
+        g.zoom_ceiling = facts.zoom_ceiling;
+    }
     // #507: `build_writer_options` may have raised the cap to fit parquet's
     // row-group ceiling. Record it before the options move into the writer.
     let effective_max_row_group_size = (writer_opts.max_row_group_size
@@ -1795,12 +1926,12 @@ pub(crate) fn convert_streaming_strategy(
         tables:
             WinnerTables {
                 level_specs,
-                cluster_tables,
+                mut cluster_tables,
                 kinds,
                 coalesce_scratch,
                 min_levels,
                 counts,
-                carriers,
+                mut carriers,
                 finest,
             },
         ranking_provenance,
@@ -1841,23 +1972,25 @@ pub(crate) fn convert_streaming_strategy(
     // for the cascade chains below (a coarse level's geometry is folded
     // through every finer level's GSD, materialized or not); `emitted` is what
     // gets built and written.
-    let kept = levels_at_or_above_ceiling(&planned, options.zoom_ceiling);
-    if kept == 0 {
-        return Err(ConvertError::NoData);
-    }
+    let (kept, truncated_at) = apply_level_ceiling(
+        &planned,
+        options.zoom_ceiling,
+        &mut skipped,
+        &mut cluster_tables,
+        &mut carriers,
+    )?;
     let emitted = &planned[..kept];
-    if kept < planned.len() {
-        let ceiling = options.zoom_ceiling.expect("a ceiling dropped the levels");
-        log::info!(
-            "[convert] level ceiling z{ceiling}: materializing {kept} of {} planned \
-             overview level(s) — pass 1, the level assignment and any saved plan \
-             stay full-range",
-            planned.len()
-        );
-        // A level above the ceiling was never going to be written, so it is
-        // not an omission the #211 auto-clamp should report.
-        skipped.retain(|s| s.zoom.is_none_or(|z| z <= ceiling));
-    }
+
+    // Only the levels that get written need a chain table (#541); built
+    // before the writer because the footer records whether any chain merged.
+    let (coalesce_tables, coalesce_merged) = pass2_coalesce(
+        coalesce_scratch.as_ref(),
+        &planned,
+        kept,
+        finest,
+        crs,
+        options,
+    );
 
     let LevelWriter {
         mut writer,
@@ -1876,6 +2009,10 @@ pub(crate) fn convert_streaming_strategy(
         ranking_provenance,
         &renames,
         options,
+        FooterFacts {
+            coalesce_merged,
+            zoom_ceiling: truncated_at,
+        },
     )?;
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
@@ -1883,12 +2020,6 @@ pub(crate) fn convert_streaming_strategy(
     // the pass-2 output sink builds on (its ceiling is the #294 auto choice).
     log_phase_rss("pre-pass2 (winner tables freed)", &mut peak_rss_mib);
     let t_pass2 = Instant::now();
-
-    // Only the levels that get written need a chain table (#541: under a
-    // ceiling the finer levels never emit a row, so their tables would be
-    // built and thrown away).
-    let coalesce_tables =
-        build_pass2_coalesce_tables(coalesce_scratch.as_ref(), emitted, finest, crs, options);
 
     let duplicating = matches!(options.mode, Mode::Duplicating);
     // Built over the WHOLE planned ladder: a coarse level's cascade chain is
@@ -1951,8 +2082,12 @@ pub(crate) fn convert_streaming_strategy(
     skipped.sort_by_key(|s| s.planned_level);
     if level_reports.is_empty() {
         // Every emitted level collapsed at write time: no valid overview file
-        // can be produced (`levels` MUST be non-empty, §3.3).
-        return Err(ConvertError::NoData);
+        // can be produced (`levels` MUST be non-empty, §3.3). Under a
+        // truncating ceiling that says nothing about the finer levels, so it
+        // is the coarse job's legal empty outcome, not a NoData.
+        return Err(truncated_at.map_or(ConvertError::NoData, |ceiling| {
+            ConvertError::NothingAtOrBelowCeiling { ceiling }
+        }));
     }
 
     // Pass 2's wall STOPS here (#533): the writer finish that follows is its
@@ -3882,45 +4017,6 @@ enum SharedStep {
     Dropped,
 }
 
-/// Fold one feature through the cascade steps that no buffered level
-/// materializes (#541), returning the working geometry and liveness the
-/// finest buffered level's own step then starts from.
-///
-/// This is the body of [`super::simplify::simplify_cascade`], step for step —
-/// including "once dropped, stays dropped along geometry steps" and revival
-/// from CANONICAL geometry at a `Point` / `Square` step. It has to be: under
-/// a level ceiling the Serial engine reaches the same level by calling
-/// `simplify_cascade` over the whole chain, and the two must agree byte for
-/// byte (`overview::convert::tests::level_ceiling_matches_the_full_converts_coarse_levels`).
-fn fold_cascade_prefix(
-    canonical: &Arc<Geometry<f64>>,
-    prefix: &[CascadeStep],
-    ctx: &LevelStreamCtx<'_>,
-) -> (Option<Arc<Geometry<f64>>>, bool) {
-    let mut current: Option<Arc<Geometry<f64>>> = None;
-    let mut alive = true;
-    for step in prefix {
-        let out = if !alive && step.repr == Representation::Geometry {
-            Simplified::Dropped
-        } else {
-            let input: &Geometry<f64> = if alive {
-                current.as_deref().unwrap_or(canonical.as_ref())
-            } else {
-                canonical.as_ref()
-            };
-            simplify_step(input, step.gsd_meters, ctx.crs, ctx.simplify, step.repr)
-        };
-        match out {
-            Simplified::Keep(s) => {
-                current = Some(Arc::new(s));
-                alive = true;
-            }
-            Simplified::Dropped => alive = false,
-        }
-    }
-    (current, alive)
-}
-
 /// Pipelined-engine batch processor for cascading simplification (#218).
 ///
 /// Instead of every level independently decoding canonical geometry and
@@ -4049,64 +4145,42 @@ pub(super) fn process_batch_cascade(
         .map(|(g, &i)| {
             let ml = finest.min_levels[row_offset + i];
             let mut out: Vec<SharedStep> = Vec::with_capacity(ctxs.len());
-            let mut current: Option<Arc<Geometry<f64>>> = None;
-            let mut alive = true;
+            let mut fold = CascadeFold::new();
             let (mut shared, mut total) = (0u64, 0u64);
             // #541: walk the unmaterialized fine steps first, so the finest
             // buffered ctx folds from the same working geometry a full run
-            // would have handed it. Guarded by the same membership test the
-            // loop's first iteration applies, so a carrier-only row (not a
-            // member anywhere here) pays nothing.
+            // would have handed it — the same `CascadeFold` steps
+            // `simplify_cascade` takes over the whole chain on the Serial
+            // path. Guarded by the same membership test the loop's first
+            // iteration applies, so a carrier-only row (not a member anywhere
+            // here) pays nothing.
             if !prefix.is_empty() && ml <= finest.orig_level {
-                (current, alive) = fold_cascade_prefix(g, prefix, finest);
+                for step in prefix {
+                    fold.step(g, step, finest.crs, finest.simplify);
+                }
             }
             for (li, ctx) in ctxs.iter().enumerate().rev() {
                 if ml > ctx.orig_level {
                     break; // duplicating membership is a contiguous fine suffix
                 }
-                if !alive && !has_band_upto[li] {
+                if !fold.is_alive() && !has_band_upto[li] {
                     break; // only geometry ctxs remain: dropped stays dropped
                 }
-                if !alive && ctx.repr == Representation::Geometry {
-                    out.push(SharedStep::Dropped);
-                    continue;
-                }
-                // `base` is the Arc this step folds from: the previous step's
-                // shared geometry when alive, or the canonical geometry `g`
-                // when reviving a dropped fold at a Point / Square band.
-                let base: &Arc<Geometry<f64>> = if alive {
-                    current.as_ref().unwrap_or(g)
-                } else {
-                    g
+                let step = CascadeStep {
+                    gsd_meters: ctx.gsd_m,
+                    repr: ctx.repr,
                 };
-                let (step, unchanged) = simplify_step_checked(
-                    base.as_ref(),
-                    ctx.gsd_m,
-                    ctx.crs,
-                    ctx.simplify,
-                    ctx.repr,
-                );
-                match step {
-                    Simplified::Keep(s) => {
+                match fold.step(g, &step, ctx.crs, ctx.simplify) {
+                    FoldStep::Keep { geom, shared: s } => {
                         total += 1;
-                        // No removal ⇒ the output is value-identical to
-                        // `base` — share its allocation instead of retaining
-                        // the fresh (but structurally identical) `s` that
-                        // simplification just built.
-                        let arc = if unchanged {
+                        // An unchanged step shares its input's allocation
+                        // (#499): a refcount bump, not a retained copy.
+                        if s {
                             shared += 1;
-                            Arc::clone(base)
-                        } else {
-                            Arc::new(s)
-                        };
-                        out.push(SharedStep::Keep(Arc::clone(&arc)));
-                        current = Some(arc);
-                        alive = true;
+                        }
+                        out.push(SharedStep::Keep(geom));
                     }
-                    Simplified::Dropped => {
-                        out.push(SharedStep::Dropped);
-                        alive = false;
-                    }
+                    FoldStep::Dropped => out.push(SharedStep::Dropped),
                 }
             }
             (out, shared, total)
