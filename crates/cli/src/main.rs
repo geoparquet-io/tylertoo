@@ -214,6 +214,8 @@ enum Command {
     ExportPmtiles(ExportPmtilesArgs),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
+    /// Per-zoom tile-weight report for a PMTiles archive (issue #552).
+    Stats(StatsArgs),
     /// Build a multi-band pyramid: several inputs, each owning a zoom range,
     /// one archive (issue #345).
     Pyramid(PyramidArgs),
@@ -1630,6 +1632,30 @@ struct ValidateArgs {
     files_from: Option<PathBuf>,
 }
 
+/// Arguments for `tylertoo stats`.
+///
+/// Per-zoom tile-weight report over an existing PMTiles archive: tile count,
+/// mean, p50, p99 and max STORED (compressed) byte sizes per zoom, plus the
+/// largest individual tiles. Cheap by construction (#552): it walks the
+/// archive's header and directories only (the same `ArchiveIndex` machinery
+/// `merge`/`pyramid` use), reading a directory entry's length for a tile's
+/// stored size -- no tile is ever decompressed, and the archive is never
+/// read whole into memory.
+#[derive(Parser, Debug)]
+struct StatsArgs {
+    /// PMTiles archive to report on.
+    #[arg(value_name = "ARCHIVE")]
+    archive: PathBuf,
+
+    /// How many of the largest tiles (by stored size) to list.
+    #[arg(long, value_name = "N", default_value = "10")]
+    largest: usize,
+
+    /// Print the report as JSON instead of a human-readable table.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `tylertoo tiles` — the one-shot GeoParquet → PMTiles facade.
 ///
 /// This is a thin wrapper that runs `overview` (convert) into a temporary
@@ -1846,6 +1872,7 @@ fn main() -> Result<()> {
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
         Command::Decode(args) => run_decode(args),
+        Command::Stats(args) => run_stats(args),
         Command::Pyramid(args) => run_pyramid(args),
         Command::Merge(args) => run_merge(args),
         Command::ShardPlan(args) => run_shard_plan(args),
@@ -1889,12 +1916,13 @@ where
     // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
     // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
     // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 10] = [
+    const SUBCOMMANDS: [&str; 11] = [
         "tiles",
         "overview",
         "validate",
         "export-pmtiles",
         "decode",
+        "stats",
         "pyramid",
         "merge",
         "shard-plan",
@@ -3579,6 +3607,98 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         println!("  report → {}", path.display());
     }
     Ok(())
+}
+
+/// Run `tylertoo stats`: per-zoom tile-weight report over a PMTiles archive
+/// (issue #552). Thin facade over `tylertoo_core::stats::compute_stats`,
+/// which does all the work off `ArchiveIndex` (header + directories only).
+fn run_stats(args: StatsArgs) -> Result<()> {
+    use tylertoo_core::archive_index::ArchiveIndex;
+    use tylertoo_core::stats::compute_stats;
+
+    let archive = ArchiveIndex::open(&args.archive)
+        .with_context(|| format!("could not open {}", args.archive.display()))?;
+    let report = compute_stats(&archive, args.largest)
+        .map_err(|e| anyhow::anyhow!("stats failed for {}: {e}", args.archive.display()))?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize stats report: {e}"))?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    print_stats_table(&report);
+    Ok(())
+}
+
+/// Right-align every column of a table to its widest cell (header included),
+/// two spaces between columns.
+fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    let render_row = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c:>width$}", width = widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let mut lines = vec![render_row(&header_cells)];
+    lines.extend(rows.iter().map(|row| render_row(row)));
+    lines.join("\n")
+}
+
+/// The human-readable form of a [`tylertoo_core::stats::StatsReport`]: the
+/// per-zoom table the issue asked for, followed by the largest tiles (when
+/// any were requested).
+fn print_stats_table(report: &tylertoo_core::stats::StatsReport) {
+    if report.per_zoom.is_empty() {
+        println!("(archive holds no tiles)");
+        return;
+    }
+
+    let rows: Vec<Vec<String>> = report
+        .per_zoom
+        .iter()
+        .map(|z| {
+            vec![
+                z.zoom.to_string(),
+                format_number(z.tile_count),
+                format_number(z.mean),
+                format_number(z.p50),
+                format_number(z.p99),
+                format_number(z.max),
+            ]
+        })
+        .collect();
+    println!(
+        "{}",
+        render_table(&["z", "tiles", "mean", "p50", "p99", "max"], &rows)
+    );
+
+    if !report.largest.is_empty() {
+        println!("\nLargest {} tile(s):", report.largest.len());
+        let largest_rows: Vec<Vec<String>> = report
+            .largest
+            .iter()
+            .map(|t| {
+                vec![
+                    t.z.to_string(),
+                    t.x.to_string(),
+                    t.y.to_string(),
+                    format_number(t.bytes),
+                ]
+            })
+            .collect();
+        println!("{}", render_table(&["z", "x", "y", "bytes"], &largest_rows));
+    }
 }
 
 /// Format a number with thousands separators

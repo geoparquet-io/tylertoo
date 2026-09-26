@@ -60,6 +60,21 @@ pub fn realdata(name: &str) -> Option<PathBuf> {
     }
 }
 
+/// Locate a golden PMTiles fixture under `tests/fixtures/golden/`.
+///
+/// Unlike [`realdata`], these are committed directly (see `.gitattributes` --
+/// only `tests/fixtures/realdata/*.parquet` is git-lfs), so every clone,
+/// including a fresh one with no LFS fetch, has the real bytes. There is
+/// nothing to skip on: a missing or unusable golden fixture is a repo bug,
+/// not an environment gap, so this panics rather than silently skipping.
+pub fn golden(name: &str) -> PathBuf {
+    let path = workspace_root().join("tests/fixtures/golden").join(name);
+    usability(&path).unwrap_or_else(|why| {
+        panic!("golden fixture {} {why}", path.display());
+    });
+    path
+}
+
 /// The workspace root: the nearest ancestor of this crate that holds the
 /// fixture directory.
 ///

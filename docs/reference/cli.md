@@ -14,6 +14,7 @@ This document contains the help content for the `tylertoo` command-line program.
 * [`tylertoo validate`↴](#tylertoo-validate)
 * [`tylertoo export-pmtiles`↴](#tylertoo-export-pmtiles)
 * [`tylertoo decode`↴](#tylertoo-decode)
+* [`tylertoo stats`↴](#tylertoo-stats)
 * [`tylertoo pyramid`↴](#tylertoo-pyramid)
 * [`tylertoo merge`↴](#tylertoo-merge)
 * [`tylertoo shard-plan`↴](#tylertoo-shard-plan)
@@ -33,6 +34,7 @@ Top-level CLI: a default (bare) tile pipeline plus subcommands.
 * `validate` — Validate a GeoParquet overview file against the spec (§6.2)
 * `export-pmtiles` — Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `decode` — Decode a PMTiles vector-tile archive back to GeoParquet
+* `stats` — Per-zoom tile-weight report for a PMTiles archive (issue #552)
 * `pyramid` — Build a multi-band pyramid: several inputs, each owning a zoom range, one archive (issue #345)
 * `merge` — Concatenate disjoint PMTiles archives into one (issue #498)
 * `shard-plan` — Cut a dataset's tile space into N disjoint shards (issue #498)
@@ -577,6 +579,25 @@ does not reproduce A. See docs/decode.md for details.
 * `--max-zoom <MAX_ZOOM>` — Maximum zoom level to decode
 * `--layer <NAME>` — Only decode features from this MVT layer
 * `--report <PATH>` — Write the JSON decode report to this path
+
+
+
+## `tylertoo stats`
+
+Per-zoom tile-weight report for a PMTiles archive (issue #552)
+
+**Usage:** `tylertoo stats [OPTIONS] <ARCHIVE>`
+
+###### **Arguments:**
+
+* `<ARCHIVE>` — PMTiles archive to report on
+
+###### **Options:**
+
+* `--largest <N>` — How many of the largest tiles (by stored size) to list
+
+  Default value: `10`
+* `--json` — Print the report as JSON instead of a human-readable table
 
 
 
