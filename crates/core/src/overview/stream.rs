@@ -28,6 +28,15 @@
 //! far below the geometry payload the in-memory path holds, but tens of GiB
 //! at billion-row scale (#543: preflighted from the footers before pass 1).
 //!
+//! **Line coalescing is the one exception to "64–100 bytes per feature"**: it
+//! retains each line's full geometry, not a fixed-size record, because
+//! chaining needs the coordinate runs it merges. That buffer is capped by
+//! both limbs of [`ConvertOptions::coalesce_max_level_rows`] (rows AND the
+//! geometry bytes they imply), and the cap is enforced as pass 1 fills —
+//! crossing it frees the buffer on the spot and leaves the rest of the pass
+//! merely counting (#449), rather than paying for a buffer the post-scan
+//! guard discards.
+//!
 //! Hilbert order: input order is preserved within each level (the documented
 //! gpio-sorted input contract, spec §4.3), exactly as in the in-memory path —
 //! no in-memory per-level sort exists in either path.
@@ -74,7 +83,7 @@ use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind};
 use super::cluster::{ClusterEntry, ClusterTables};
-use super::coalesce::CoalesceInput;
+use super::coalesce::{collected_line_bytes, CoalesceInput};
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
@@ -1181,6 +1190,7 @@ fn resolve_winner_tables(
     acc_values: Vec<Vec<Option<f64>>>,
     areas: Vec<f32>,
     coalesce_scratch: Option<CoalesceScratch>,
+    line_tally: (usize, u64),
     num_rows: usize,
     crs: Crs,
     options: &ConvertOptions,
@@ -1278,10 +1288,13 @@ fn resolve_winner_tables(
     // the winner table at coalesced levels; skipped-geometry rows default to
     // Point, which never matches the Line bypass) and the pass-1 line
     // scratch; apply the memory guard.
-    let coalesce_on = coalesce_effective(
-        options,
-        coalesce_scratch.as_ref().map_or(0, |s| s.rows.len()),
-    );
+    // Judged on pass 1's whole-input tally, not on what the scratch happens
+    // to hold: over the ceiling, pass 1 has already released the buffer
+    // (#449) and hands `None` — but the totals are exact either way, so this
+    // reaches the same verdict (and logs the same numbers) as it did when
+    // the whole buffer survived to be measured here.
+    let (tally_lines, tally_bytes) = line_tally;
+    let coalesce_on = coalesce_effective(options, tally_lines, tally_bytes);
     let kinds: Option<Vec<FeatureKind>> = options.coalesce_lines.then(|| {
         let mut k = vec![FeatureKind::Point; num_rows];
         for f in features.iter() {
@@ -1634,6 +1647,7 @@ fn run_pass1_and_assign(
         provenance: ranking_provenance,
         acc_values,
         coalesce: coalesce_scratch,
+        line_tally,
         num_rows,
         skipped_rows,
         geom_bytes,
@@ -1684,6 +1698,7 @@ fn run_pass1_and_assign(
         acc_values,
         areas,
         coalesce_scratch,
+        line_tally,
         num_rows,
         inputs.crs,
         options,
@@ -2900,9 +2915,14 @@ fn scan_road_vocab(col: &dyn Array, found: &mut HashSet<&'static str>) {
 /// residual `O(lines)` allocation: chaining needs a level's candidate line
 /// geometries together, and the candidate set at every non-canonical
 /// duplicating level is ALL lines (chains of sub-visibility fragments must
-/// be reclaimable, so no winner-table pre-filter applies). Bounded by
-/// [`ConvertOptions::coalesce_max_level_rows`]; beyond it coalescing is
-/// skipped and this scratch is never built.
+/// be reclaimable, so no winner-table pre-filter applies).
+///
+/// Bounded by BOTH limbs of [`ConvertOptions::coalesce_max_level_rows`] —
+/// the row count and the geometry bytes it implies
+/// ([`super::convert::coalesce_max_geom_bytes`]) — and, as of #449, bounded
+/// *while filling*: [`LineScratch`] releases the buffer the moment either
+/// limb is crossed, so an over-ceiling input never pays for a scratch the
+/// guard is about to discard.
 pub(super) struct CoalesceScratch {
     /// Source row index per collected line, ascending input order.
     pub(super) rows: Vec<usize>,
@@ -2942,8 +2962,15 @@ struct Pass1Output {
     provenance: RankingProvenance,
     /// Per-accumulate-spec source values (Q4), parallel to `acc_cols`.
     acc_values: Vec<Vec<Option<f64>>>,
-    /// Line geometries + groups for coalescing (Q3); `None` unless enabled.
+    /// Line geometries + groups for coalescing (Q3); `None` unless enabled
+    /// AND inside the #449 memory ceiling.
     coalesce: Option<CoalesceScratch>,
+    /// `(candidate lines, bytes those lines would retain)` over the WHOLE
+    /// input — the two totals [`super::convert::coalesce_effective`] judges,
+    /// counted for every line whether or not `coalesce` kept it, so the
+    /// verdict (and its log line) is the same as a fully-buffering pass's.
+    /// `(0, 0)` when coalescing is off.
+    line_tally: (usize, u64),
     /// Total input rows streamed (INCLUDING skipped-geometry rows): the
     /// domain of every row-indexed table pass 2 addresses.
     num_rows: usize,
@@ -3176,6 +3203,25 @@ struct ChunkLine {
     geom: Geometry<f64>,
 }
 
+/// What pass 1 does with the chunk's line features (#449).
+///
+/// Coalescing's memory guard is evaluated over the WHOLE input's line count
+/// and retained geometry bytes, so those two totals are tallied for every
+/// line whatever happens next — they are two adds over a geometry the scan
+/// has already decoded. Only the geometry *retention* is conditional: once
+/// the running totals cross the ceiling the collected buffer is freed and
+/// the scan drops to [`Tally`](Self::Tally), because the post-hoc guard is
+/// going to discard that buffer anyway.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineCollect {
+    /// Coalescing is off: lines are of no interest at all.
+    Off,
+    /// Count and weigh the lines, but retain no geometry.
+    Tally,
+    /// Count, weigh, and retain the geometry for the coalescing scratch.
+    Collect,
+}
+
 /// Result of scanning one chunk of a batch ([`scan_chunk`]): every index
 /// inside this struct is CHUNK-LOCAL (0-based within the chunk's own row
 /// range). The consumer rebases every index by the chunk's global row/feature
@@ -3192,7 +3238,16 @@ struct ChunkScan {
     /// equals the chunk's row count; merged into the batch-wide `kept_row`
     /// the ladder-blanking step reads.
     kept_row: Vec<bool>,
+    /// Line geometries retained for the coalescing scratch — empty unless
+    /// this chunk was scanned in [`LineCollect::Collect`] mode.
     lines: Vec<ChunkLine>,
+    /// Line features seen in this chunk, retained or not (#449 guard limb 1).
+    line_count: usize,
+    /// Bytes those lines would retain in the scratch (#449 guard limb 2),
+    /// via [`super::coalesce::collected_line_bytes`] — tallied even in
+    /// [`LineCollect::Tally`] mode, so the guard's verdict never depends on
+    /// where collection happened to stop.
+    line_bytes: u64,
     point_count: usize,
     /// Rows skipped for a null, empty, or non-finite geometry (H4) — NOT
     /// including attribute-filtered or bbox-missed rows, matching the
@@ -3238,7 +3293,7 @@ fn scan_chunk(
     diag_row_base: usize,
     filter_mask: Option<&[Option<bool>]>,
     bbox_units: Option<&[f64; 4]>,
-    collect_lines: bool,
+    collect_lines: LineCollect,
     want_areas: bool,
     timers: &Pass1Timers,
 ) -> Result<ChunkScan, ConvertError> {
@@ -3264,7 +3319,12 @@ fn scan_chunk(
     let mut features: Vec<AssignFeature> = Vec::with_capacity(chunk_len);
     let mut areas: Vec<f32> = Vec::with_capacity(if want_areas { chunk_len } else { 0 });
     let mut kept_row = vec![false; geoms_buf.len()];
-    let mut lines: Vec<ChunkLine> = Vec::with_capacity(if collect_lines { chunk_len } else { 0 });
+    let mut lines: Vec<ChunkLine> = Vec::with_capacity(match collect_lines {
+        LineCollect::Collect => chunk_len,
+        LineCollect::Off | LineCollect::Tally => 0,
+    });
+    let mut line_count = 0usize;
+    let mut line_bytes = 0u64;
     let mut point_count = 0usize;
     let mut skipped_rows = 0usize;
 
@@ -3301,12 +3361,16 @@ fn scan_chunk(
         if matches!(kind, FeatureKind::Point) {
             point_count += 1;
         }
-        if collect_lines && matches!(kind, FeatureKind::Line) {
-            lines.push(ChunkLine {
-                local_row: i,
-                local_feat_pos: features.len(),
-                geom: g.clone(),
-            });
+        if collect_lines != LineCollect::Off && matches!(kind, FeatureKind::Line) {
+            line_count += 1;
+            line_bytes += collected_line_bytes(g);
+            if collect_lines == LineCollect::Collect {
+                lines.push(ChunkLine {
+                    local_row: i,
+                    local_feat_pos: features.len(),
+                    geom: g.clone(),
+                });
+            }
         }
         kept_row[i] = true;
         if want_areas {
@@ -3327,6 +3391,8 @@ fn scan_chunk(
         areas,
         kept_row,
         lines,
+        line_count,
+        line_bytes,
         point_count,
         skipped_rows,
     })
@@ -3435,6 +3501,130 @@ fn extract_pass1_batch_keys(
     Ok(())
 }
 
+/// Pass-1 line bookkeeping for coalescing (#449): the collected scratch, the
+/// exact whole-input tally the memory guard is evaluated over, and the
+/// ceiling that stops collection.
+///
+/// The guard used to run only after pass 1 had finished collecting, so an
+/// input over the ceiling paid for the whole buffer and then threw it away —
+/// 11.9 GiB of peak RSS on germany-segments (19.2M lines) for a run that
+/// emits no chains at all. Here the ceiling is enforced *while* collecting:
+/// [`absorb`](Self::absorb) releases the buffer the moment the running
+/// totals cross it and the scan drops to [`LineCollect::Tally`].
+///
+/// The verdict is unchanged and stays exact: `lines`/`bytes` count EVERY
+/// line feature, retained or not, so [`tripped`](Self::tripped) — and the
+/// [`super::convert::coalesce_effective`] call that logs it — see the same
+/// totals a fully-collecting pass would have produced, independent of the
+/// read-batch size, the scan chunking, and the order chunks merge in.
+struct LineScratch {
+    /// What the next batch's chunks should do with their line features.
+    mode: LineCollect,
+    /// Source row index per retained line, ascending input order.
+    rows: Vec<usize>,
+    /// Each retained line's position in the pass's `features` vector.
+    feat_pos: Vec<usize>,
+    /// The retained geometries, parallel to `rows`.
+    geoms: Vec<Geometry<f64>>,
+    /// Line features seen so far, retained or not.
+    lines: usize,
+    /// Bytes those lines would retain (`collected_line_bytes`).
+    bytes: u64,
+    max_rows: usize,
+    max_bytes: u64,
+}
+
+impl LineScratch {
+    fn new(options: &ConvertOptions) -> Self {
+        Self {
+            mode: if options.coalesce_lines {
+                LineCollect::Collect
+            } else {
+                LineCollect::Off
+            },
+            rows: Vec::new(),
+            feat_pos: Vec::new(),
+            geoms: Vec::new(),
+            lines: 0,
+            bytes: 0,
+            max_rows: options.coalesce_max_level_rows,
+            max_bytes: super::convert::coalesce_max_geom_bytes(options),
+        }
+    }
+
+    /// Has the input already exceeded either limb of the memory guard?
+    fn tripped(&self) -> bool {
+        self.mode != LineCollect::Off && (self.lines > self.max_rows || self.bytes > self.max_bytes)
+    }
+
+    /// Merge one chunk's line results, rebasing its chunk-local indices, then
+    /// stop collecting (and free what was collected) if the running totals
+    /// have crossed the ceiling. `chunk_lines` is dropped ungathered once
+    /// collection has stopped.
+    fn absorb(
+        &mut self,
+        chunk_lines: Vec<ChunkLine>,
+        chunk_base: usize,
+        feat_offset: usize,
+        line_count: usize,
+        line_bytes: u64,
+    ) {
+        self.lines += line_count;
+        self.bytes += line_bytes;
+        if self.mode == LineCollect::Collect {
+            for line in chunk_lines {
+                self.rows.push(chunk_base + line.local_row);
+                self.feat_pos.push(feat_offset + line.local_feat_pos);
+                self.geoms.push(line.geom);
+            }
+            if self.tripped() {
+                self.release();
+            }
+        }
+    }
+
+    /// Free the collected buffer and stop collecting — the guard is going to
+    /// skip coalescing, so every retained byte from here on is waste.
+    fn release(&mut self) {
+        self.mode = LineCollect::Tally;
+        self.rows = Vec::new();
+        self.feat_pos = Vec::new();
+        self.geoms = Vec::new();
+        log::debug!(
+            "[convert] coalescing memory guard tripped after {} candidate line(s) / {:.0} MiB \
+             of geometry (ceiling {} line(s) / {:.0} MiB): pass 1 released the line scratch \
+             and is now only counting",
+            self.lines,
+            self.bytes as f64 / (1024.0 * 1024.0),
+            self.max_rows,
+            self.max_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    /// The finished scratch, or `None` when coalescing is off or the guard
+    /// tripped. `sort_keys` are read off the features the lines produced;
+    /// `groups` are the row-indexed interned class values, when class-ranked.
+    fn finish(
+        self,
+        features: &[AssignFeature],
+        all_groups: Option<Vec<u32>>,
+    ) -> Option<CoalesceScratch> {
+        if self.mode != LineCollect::Collect {
+            return None;
+        }
+        Some(CoalesceScratch {
+            sort_keys: self
+                .feat_pos
+                .iter()
+                .map(|&p| features[p].sort_key)
+                .collect(),
+            groups: all_groups.map(|g| self.rows.iter().map(|&r| g[r]).collect()),
+            rows: self.rows,
+            geoms: self.geoms,
+        })
+    }
+}
+
 /// Merge one batch's chunk-local [`scan_chunk`] results into the pass's
 /// running accumulators, IN ASCENDING CHUNK ORDER, rebasing every chunk-local
 /// index (`AssignFeature::index`, a line's row, a line's position in
@@ -3451,9 +3641,7 @@ fn merge_pass1_chunks(
     base: usize,
     features: &mut Vec<AssignFeature>,
     areas: &mut Vec<f32>,
-    line_rows: &mut Vec<usize>,
-    line_feat_pos: &mut Vec<usize>,
-    line_geoms: &mut Vec<Geometry<f64>>,
+    lines: &mut LineScratch,
     point_count: &mut usize,
     skipped_rows: &mut usize,
 ) -> Result<Vec<bool>, ConvertError> {
@@ -3472,11 +3660,13 @@ fn merge_pass1_chunks(
         // needed here — an empty `extend` is a no-op.
         areas.extend(chunk.areas);
         let feat_offset = features.len();
-        for line in chunk.lines {
-            line_rows.push(chunk_base + line.local_row);
-            line_feat_pos.push(feat_offset + line.local_feat_pos);
-            line_geoms.push(line.geom);
-        }
+        lines.absorb(
+            chunk.lines,
+            chunk_base,
+            feat_offset,
+            chunk.line_count,
+            chunk.line_bytes,
+        );
         for mut f in chunk.features {
             f.index += chunk_base;
             features.push(f);
@@ -3589,13 +3779,12 @@ fn run_pass1_with_chunk_rows(
     // Entry-zoom ladder column values (#364), row-indexed.
     let mut ladder_values: Vec<Option<f64>> = Vec::new();
     // Coalescing (Q3): line rows + geometries, and — for an explicit class
-    // ranking — the interned per-row class groups. `line_feat_pos` holds each
+    // ranking — the interned per-row class groups. `feat_pos` holds each
     // line's position in `features` (NOT its row index: skipped-geometry rows
-    // make the two diverge).
-    let collect_lines = options.coalesce_lines;
-    let mut line_rows: Vec<usize> = Vec::new();
-    let mut line_feat_pos: Vec<usize> = Vec::new();
-    let mut line_geoms: Vec<Geometry<f64>> = Vec::new();
+    // make the two diverge). The scratch enforces the #449 memory ceiling as
+    // it fills, so an over-ceiling input never pays for a buffer the guard
+    // will discard.
+    let mut lines = LineScratch::new(options);
     let mut explicit_groups: Vec<u32> = Vec::new();
     let mut explicit_interner = GroupInterner::default();
 
@@ -3651,6 +3840,11 @@ fn run_pass1_with_chunk_rows(
                     off += len;
                 }
 
+                // Sampled once per batch: every chunk of it scans in the same
+                // mode, so the merge below can only over-collect by the lines
+                // of the batch that crosses the ceiling (the reader already
+                // bounds that) before the scratch is released.
+                let collect_lines = lines.mode;
                 let chunk_results: Vec<Result<ChunkScan, ConvertError>> = ranges
                     .par_iter()
                     .map(|&(start, len)| {
@@ -3688,9 +3882,7 @@ fn run_pass1_with_chunk_rows(
                     base,
                     &mut features,
                     &mut areas,
-                    &mut line_rows,
-                    &mut line_feat_pos,
-                    &mut line_geoms,
+                    &mut lines,
                     &mut point_count,
                     &mut skipped_rows,
                 )?;
@@ -3707,7 +3899,10 @@ fn run_pass1_with_chunk_rows(
                     &batch,
                     &proj,
                     &mut plan,
-                    collect_lines,
+                    // Groups are only read off the collected scratch, so they
+                    // stop with it (a ragged tail is never indexed: a released
+                    // scratch yields `None`).
+                    lines.mode == LineCollect::Collect,
                     ladder_col,
                     &kept_row,
                     &mut explicit_keys,
@@ -3730,7 +3925,7 @@ fn run_pass1_with_chunk_rows(
         explicit_keys,
         confidence_keys,
         explicit_groups,
-        collect_lines,
+        lines.mode == LineCollect::Collect,
         features.len(),
         point_count,
     );
@@ -3748,16 +3943,11 @@ fn run_pass1_with_chunk_rows(
     apply_entry_levels(options, &ladder_values, num_rows, &mut features)?;
 
     // Coalescing scratch (Q3): line sort keys + per-line groups. `rows` and
-    // `groups` are row-indexed; sort keys live on the features.
-    let coalesce = collect_lines.then(|| CoalesceScratch {
-        sort_keys: line_feat_pos
-            .iter()
-            .map(|&p| features[p].sort_key)
-            .collect(),
-        groups: all_groups.map(|g| line_rows.iter().map(|&r| g[r]).collect()),
-        rows: line_rows,
-        geoms: line_geoms,
-    });
+    // `groups` are row-indexed; sort keys live on the features. `None` when
+    // coalescing is off OR the #449 ceiling tripped — the tally travels on
+    // in `line_tally`, so the guard still logs the exact totals downstream.
+    let line_tally = (lines.lines, lines.bytes);
+    let coalesce = lines.finish(&features, all_groups);
     Pass1Timers::add(&pass1_timers.assemble, t_assemble);
 
     pass1_timers.log_pass1_summary(t_pass1_fn.elapsed().as_secs_f64(), num_rows);
@@ -3768,6 +3958,7 @@ fn run_pass1_with_chunk_rows(
         provenance,
         acc_values,
         coalesce,
+        line_tally,
         num_rows,
         skipped_rows,
         geom_bytes,
@@ -4847,6 +5038,9 @@ mod tests {
         assert_eq!(a.geom_bytes, b.geom_bytes, "geom_bytes differs");
         assert_eq!(a.provenance, b.provenance, "ranking provenance differs");
         assert_eq!(a.acc_values, b.acc_values, "acc_values differ");
+        // #449: the guard's two totals must not depend on how the scan was
+        // chunked — they decide whether the output is coalesced at all.
+        assert_eq!(a.line_tally, b.line_tally, "coalescing line tally differs");
         assert_features_eq(&a.features, &b.features);
         assert_eq!(a.areas, b.areas, "areas differ");
         match (&a.coalesce, &b.coalesce) {
@@ -4925,6 +5119,240 @@ mod tests {
              chunk_rows=usize::MAX (one per batch): serial={serial_chunks} \
              chunked={chunked_chunks} over {n} rows / {READ_BATCH_SIZE}-row \
              batches"
+        );
+    }
+
+    /// #449: pass 1 must stop collecting line geometries the moment the
+    /// coalescing ceiling is exceeded and hand back NO scratch — the buffer
+    /// it would otherwise carry to the post-hoc
+    /// [`super::convert::coalesce_effective`] check is discarded there
+    /// anyway, so building it is pure peak RSS (11.9 GiB on
+    /// germany-segments, 19.2M lines).
+    #[test]
+    fn pass1_drops_line_scratch_when_row_ceiling_trips() {
+        let geoms = mixed_geometries(3, 9, 2);
+        let opt_geoms: Vec<Option<Geometry<f64>>> = geoms.into_iter().map(Some).collect();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let values: Vec<f64> = (0..opt_geoms.len()).map(|i| i as f64).collect();
+        write_input_with_f64(tin.path(), &opt_geoms, "rank", &values);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 9,
+            },
+            sort_key: Some("rank".to_string()),
+            read_batch_size: 4, // several batches: the trip lands mid-stream
+            ..Default::default()
+        };
+
+        let under = run_pass1_for_test(
+            tin.path(),
+            &ConvertOptions {
+                coalesce_max_level_rows: 9, // exactly the line count: fits
+                ..base.clone()
+            },
+            usize::MAX,
+        );
+        assert_eq!(
+            under.coalesce.as_ref().map(|c| c.geoms.len()),
+            Some(9),
+            "a run inside the ceiling keeps every line geometry"
+        );
+
+        let over = run_pass1_for_test(
+            tin.path(),
+            &ConvertOptions {
+                coalesce_max_level_rows: 8, // one line too many
+                ..base.clone()
+            },
+            usize::MAX,
+        );
+        assert!(
+            over.coalesce.is_none(),
+            "pass 1 must free the line scratch as soon as the ceiling trips, \
+             not hand it to the post-hoc guard: {:?}",
+            over.coalesce.as_ref().map(|c| c.geoms.len())
+        );
+        // The rest of pass 1 is untouched by the trip.
+        assert_features_eq(&under.features, &over.features);
+        assert_eq!(under.num_rows, over.num_rows);
+    }
+
+    /// #449: the ceiling's byte limb — a row count does not bound memory, so
+    /// the guard also trips on the retained geometry bytes
+    /// (`coalesce_max_level_rows × COALESCE_NOMINAL_BYTES_PER_LINE`).
+    #[test]
+    fn pass1_drops_line_scratch_when_byte_ceiling_trips() {
+        // 8 lines of 400 vertices: 8 × (slot + 6400 B) ≈ 51 KiB retained.
+        let opt_geoms: Vec<Option<Geometry<f64>>> = (0..8)
+            .map(|i| {
+                let base = 100.0 + i as f64 * 10.0;
+                let coords: Vec<(f64, f64)> = (0..400)
+                    .map(|k| (base + k as f64 * 0.001, (k % 7) as f64 * 0.001))
+                    .collect();
+                Some(Geometry::LineString(LineString::from(coords)))
+            })
+            .collect();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let values: Vec<f64> = (0..opt_geoms.len()).map(|i| i as f64).collect();
+        write_input_with_f64(tin.path(), &opt_geoms, "rank", &values);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 9,
+            },
+            sort_key: Some("rank".to_string()),
+            read_batch_size: 3,
+            ..Default::default()
+        };
+
+        // Row limb: 1000 rows, so only the byte limb (1000 × 512 = 500 KiB)
+        // can bind — and 8 × ~6.5 KiB does not.
+        let fits = run_pass1_for_test(
+            tin.path(),
+            &ConvertOptions {
+                coalesce_max_level_rows: 1000,
+                ..base.clone()
+            },
+            usize::MAX,
+        );
+        assert_eq!(
+            fits.coalesce.as_ref().map(|c| c.geoms.len()),
+            Some(8),
+            "8 lines are far inside a 1000-row / 500 KiB ceiling"
+        );
+
+        // Same 8 lines, ceiling of 100 rows ⇒ 100 × 512 = 50 KiB of geometry:
+        // the rows fit, the bytes do not.
+        let over = run_pass1_for_test(
+            tin.path(),
+            &ConvertOptions {
+                coalesce_max_level_rows: 100,
+                ..base.clone()
+            },
+            usize::MAX,
+        );
+        assert!(
+            over.coalesce.is_none(),
+            "8 × 400-vertex lines exceed a 50 KiB geometry ceiling even though \
+             8 rows fit a 100-row one"
+        );
+    }
+
+    /// Peak RSS (MiB) reached while `f` runs, sampled from a polling thread
+    /// — the phase-boundary `[rss]` logs cannot see a peak that lives and
+    /// dies inside one phase, which is exactly where the #449 line buffer
+    /// lives.
+    fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, f64) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let (s, p) = (Arc::clone(&stop), Arc::clone(&peak));
+        let sampler = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                if let Some(mib) = current_rss_mib() {
+                    p.fetch_max(mib as u64, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let out = f();
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        (out, peak.load(Ordering::Relaxed) as f64)
+    }
+
+    /// #449 peak-RSS regression, `--ignored` (it writes and scans a ~1.2M-row
+    /// fixture, and RSS sampling is machine-dependent):
+    ///
+    /// ```text
+    /// cargo test -p tylertoo-core --lib --release \
+    ///   overview::stream::tests::pass1_line_buffer_peak -- --ignored --nocapture
+    /// ```
+    ///
+    /// The guard-tripped run must not pay for a buffer it cannot use. The
+    /// tripped run goes FIRST so it cannot borrow a peak from the other
+    /// run's freed arena.
+    #[test]
+    #[ignore = "slow (1.2M-row fixture) + RSS sampling is machine-dependent"]
+    fn pass1_line_buffer_peak_is_released_when_the_ceiling_trips() {
+        const N: usize = 1_200_000;
+        let opt_geoms: Vec<Option<Geometry<f64>>> = (0..N)
+            .map(|i| {
+                let x = (i % 4000) as f64 * 0.001;
+                let y = (i / 4000) as f64 * 0.001;
+                Some(Geometry::LineString(LineString::from(vec![
+                    (x, y),
+                    (x + 0.001, y),
+                ])))
+            })
+            .collect();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let values: Vec<f64> = (0..N).map(|i| (i % 97) as f64).collect();
+        write_input_with_f64(tin.path(), &opt_geoms, "rank", &values);
+        drop(opt_geoms);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 12,
+            },
+            sort_key: Some("rank".to_string()),
+            ..Default::default()
+        };
+
+        let (tripped, tripped_peak) = peak_rss_during(|| {
+            run_pass1_for_test(
+                tin.path(),
+                &ConvertOptions {
+                    coalesce_max_level_rows: 1_000, // trips in the first batch
+                    ..base.clone()
+                },
+                PASS1_CHUNK_ROWS,
+            )
+        });
+        assert!(tripped.coalesce.is_none(), "the ceiling must have tripped");
+        drop(tripped);
+
+        let (kept, kept_peak) = peak_rss_during(|| {
+            run_pass1_for_test(
+                tin.path(),
+                &ConvertOptions {
+                    coalesce_max_level_rows: usize::MAX,
+                    ..base.clone()
+                },
+                PASS1_CHUNK_ROWS,
+            )
+        });
+        assert_eq!(
+            kept.coalesce.as_ref().map(|c| c.geoms.len()),
+            Some(N),
+            "the unguarded run must collect every line"
+        );
+        // What the collected buffer models: one `Geometry` slot + two
+        // coordinates per line (`collected_line_bytes`).
+        let modelled_mib = (N as f64
+            * collected_line_bytes(&Geometry::LineString(LineString::from(vec![
+                (0.0, 0.0),
+                (1.0, 0.0),
+            ]))) as f64)
+            / (1024.0 * 1024.0);
+        let observed_mib = kept_peak - tripped_peak;
+        println!(
+            "[#449] {N} lines: tripped peak {tripped_peak:.0} MiB, collecting peak \
+             {kept_peak:.0} MiB — line buffer observed {observed_mib:.0} MiB, \
+             modelled {modelled_mib:.0} MiB"
+        );
+        // A loose fraction of the model: RSS is allocator- and
+        // machine-dependent, and the collecting run's buffer is partly
+        // served from arena the tripped run also touched.
+        assert!(
+            observed_mib > modelled_mib * 0.4,
+            "a guard-tripped pass 1 still paid for the line buffer: tripped \
+             {tripped_peak:.0} MiB vs collecting {kept_peak:.0} MiB — only \
+             {observed_mib:.0} MiB of the modelled {modelled_mib:.0} MiB was released"
         );
     }
 

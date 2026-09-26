@@ -995,13 +995,42 @@ snap pass (exact matches only).
 Chaining needs a level's candidate line geometries in memory at once, and
 the candidate set at every non-canonical level is **all** lines (dropped
 fragments must be reclaimable, so no winner-table pre-filter applies).
-Datasets with more lines than this ceiling skip coalescing with a warning
-— the file still carries the `coalesced_count` column (all 1) and the
-provenance block, so the overview schema is stable (the tiles then withhold
-the column, as for any all-1 counter). Levels that large are
-near-canonical anyway, where segments are individually visible and
-coalescing matters least. This is the streaming pipeline's one deliberate
-`O(lines)` residual allocation.
+Datasets over this ceiling skip coalescing with a warning — the file still
+carries the `coalesced_count` column (all 1) and the provenance block, so
+the overview schema is stable (the tiles then withhold the column, as for
+any all-1 counter). Levels that large are near-canonical anyway, where
+segments are individually visible and coalescing matters least. This is the
+streaming pipeline's one deliberate `O(lines)` residual allocation.
+
+**The ceiling has two limbs**, because a row count does not bound memory
+(2M two-point road segments retain ~180 MiB; 2M 500-vertex contour lines
+retain ~16 GiB). Coalescing is skipped when **either** is exceeded:
+
+| limb | default | what it counts |
+|------|---------|----------------|
+| candidate lines | `--coalesce-max-level-rows` (2,000,000) | line features in the input |
+| retained geometry | `--coalesce-max-level-rows × 512 B` (1 GiB) | one `Geometry` slot + 16 B per coordinate, per line |
+
+The byte limb scales with the flag, so raising or lowering the ceiling moves
+both. 512 B/line is deliberately generous for line networks (an OSM /
+Overture road segment retains ~150–250 B), so on road data the row limb is
+what binds and the byte limb only catches the long-geometry inputs a row
+count silently mis-sizes.
+
+Both limbs are pure functions of the input, so the verdict — and the output
+— is identical across machines, engines (`streaming` on or off) and
+`--read-batch-size` values. Pass 1 enforces them *while it collects*:
+the moment the running totals cross, it frees what it has buffered and
+falls back to counting (#449). Before that, an over-ceiling input paid for
+the whole buffer and then threw it away — 11.9 GiB of peak RSS on
+germany-segments (19.2M lines) for a run that emits no chains at all.
+
+**What the guard does not bound** is the chain stage itself, on inputs that
+*are* inside the ceiling: `build_chains` copies the level's coordinate runs
+into joinable pieces and indexes every endpoint in a hash map, so a level
+peaks at several times the retained geometry (measured: 1.5M 7-vertex lines,
+168 MiB of coordinates, 1.6 GiB peak RSS — see #449). Budget for roughly
+`8 ×` the retained-geometry figure above, or pass `--no-coalesce-lines`.
 
 ### Interactions
 

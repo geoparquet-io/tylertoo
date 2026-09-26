@@ -1172,10 +1172,14 @@ struct ConvertTuningArgs {
     ///
     /// Chaining holds the level's candidate line geometries in memory at
     /// once (every line is a candidate at every non-canonical level, since
-    /// sub-visibility fragments must be reclaimable). Datasets with more
-    /// lines than this skip coalescing with a warning instead of breaking
-    /// the streaming pipeline's memory bound; near-canonical levels that
-    /// large need coalescing least (segments are individually visible).
+    /// sub-visibility fragments must be reclaimable). Inputs over this
+    /// ceiling skip coalescing with a warning instead of breaking the
+    /// streaming pipeline's memory bound; near-canonical levels that large
+    /// need coalescing least (segments are individually visible).
+    ///
+    /// Two limbs, since a row count does not bound memory: the candidate
+    /// line count, and the geometry those lines retain (this value x 512 B
+    /// — 1 GiB by default). Exceeding either skips coalescing.
     #[arg(
         long,
         value_name = "ROWS",

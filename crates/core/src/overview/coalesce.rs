@@ -99,6 +99,38 @@ pub const DEFAULT_JUNCTION_ANGLE_DEG: f64 = 0.0;
 /// coalescing matters least.
 pub const DEFAULT_COALESCE_MAX_LEVEL_ROWS: usize = 2_000_000;
 
+/// Nominal retained bytes per candidate line, used to read the
+/// [`DEFAULT_COALESCE_MAX_LEVEL_ROWS`] row ceiling as a **memory** ceiling
+/// (#449).
+///
+/// A row count does not bound memory: 2M two-point road segments retain
+/// ~180 MiB of geometry, 2M 500-vertex contour lines retain ~16 GiB. The
+/// guard's whole purpose is the bound, so it trips on whichever comes
+/// first — `coalesce_max_level_rows` lines, or `coalesce_max_level_rows ×`
+/// this many bytes of retained line geometry
+/// ([`collected_line_bytes`]). At the default ceiling that second limb is
+/// 1 GiB, which typical line networks never approach (an OSM/Overture road
+/// segment retains ~150–250 B), so it binds only on the pathological
+/// long-geometry inputs a row count silently mis-sizes.
+pub(crate) const COALESCE_NOMINAL_BYTES_PER_LINE: u64 = 512;
+
+/// Retained footprint of one line geometry held in the pass-1 coalescing
+/// scratch: its `Geometry<f64>` slot in the scratch vector plus the heap
+/// coordinate run behind it (16 B per `Coord<f64>`).
+///
+/// Deliberately a *model*, not a measurement: it must be a pure function of
+/// the geometry so the [`super::convert::coalesce_effective`] verdict is
+/// identical on every platform, allocator and batch size (the streaming and
+/// buffered engines are byte-identical by contract, and both evaluate it).
+/// It undercounts the true resident cost — per-allocation malloc headers, and
+/// the parallel `rows`/`sort_keys`/`groups` side vectors (~40 B per line) —
+/// which the row limb of the ceiling covers.
+pub(crate) fn collected_line_bytes(g: &Geometry<f64>) -> u64 {
+    use geo::coords_iter::CoordsIter;
+    std::mem::size_of::<Geometry<f64>>() as u64
+        + (g.coords_count() as u64) * std::mem::size_of::<geo::Coord<f64>>() as u64
+}
+
 /// One candidate line feature for a level's coalescing pass.
 #[derive(Debug, Clone)]
 pub struct CoalesceInput<'a> {
@@ -1054,6 +1086,38 @@ mod tests {
     #[test]
     fn empty_input_is_noop() {
         assert!(run(&[], 10.0).is_empty());
+    }
+
+    // --- #449 memory accounting --------------------------------------------
+
+    #[test]
+    fn collected_line_bytes_counts_slot_plus_coordinates() {
+        let slot = std::mem::size_of::<Geometry<f64>>() as u64;
+        let two = ls(&[(0.0, 0.0), (1.0, 0.0)]);
+        assert_eq!(collected_line_bytes(&two), slot + 2 * 16);
+        let five = ls(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)]);
+        assert_eq!(collected_line_bytes(&five), slot + 5 * 16);
+        // MultiLineStrings are collected too (they pass through as
+        // singletons), and every part's coordinates are retained.
+        let mls = Geometry::MultiLineString(MultiLineString::new(vec![
+            LineString::from(vec![(0.0, 0.0), (1.0, 0.0)]),
+            LineString::from(vec![(3.0, 0.0), (4.0, 0.0), (5.0, 0.0)]),
+        ]));
+        assert_eq!(collected_line_bytes(&mls), slot + 5 * 16);
+    }
+
+    /// The model must be monotone in coordinate count — the property the
+    /// streaming ceiling relies on to stop collecting at the same line on
+    /// every run.
+    #[test]
+    fn collected_line_bytes_is_monotone_in_vertices() {
+        let mut prev = 0;
+        for n in 2..12 {
+            let coords: Vec<(f64, f64)> = (0..n).map(|i| (i as f64, 0.0)).collect();
+            let bytes = collected_line_bytes(&ls(&coords));
+            assert!(bytes > prev, "{n} vertices: {bytes} !> {prev}");
+            prev = bytes;
+        }
     }
 
     #[test]

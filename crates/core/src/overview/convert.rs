@@ -64,8 +64,9 @@ use super::cluster::{
     POINT_COUNT_COLUMN,
 };
 use super::coalesce::{
-    coalesce_level_lines, CoalesceInput, CoalesceParams, COALESCED_COUNT_COLUMN,
-    DEFAULT_COALESCE_MAX_LEVEL_ROWS, DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
+    coalesce_level_lines, collected_line_bytes, CoalesceInput, CoalesceParams,
+    COALESCED_COUNT_COLUMN, COALESCE_NOMINAL_BYTES_PER_LINE, DEFAULT_COALESCE_MAX_LEVEL_ROWS,
+    DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
 };
 use super::ladder::{build_ladder, entry_levels, EntryZoomSpec};
 use super::level::{
@@ -512,9 +513,16 @@ pub struct ConvertOptions {
     pub coalesce_snap: f64,
     /// Per-level candidate ceiling for coalescing (default
     /// [`DEFAULT_COALESCE_MAX_LEVEL_ROWS`]): chaining holds the level's
-    /// candidate line geometries in memory at once, so levels with more
-    /// candidate lines than this skip coalescing (with a log) instead of
-    /// breaking the streaming pipeline's memory bound.
+    /// candidate line geometries in memory at once, so inputs over this
+    /// ceiling skip coalescing (with a log) instead of breaking the
+    /// streaming pipeline's memory bound.
+    ///
+    /// Two limbs, since a row count does not bound memory (#449): the
+    /// candidate line count, and the geometry those lines retain — this
+    /// value × 512 B of nominal per-line footprint, i.e. 1 GiB at the
+    /// default ceiling. Exceeding either skips coalescing. Both are pure
+    /// functions of the input, so the verdict is identical across engines,
+    /// machines and read-batch sizes.
     pub coalesce_max_level_rows: usize,
     /// Junction continuation threshold for coalescing, in degrees (default
     /// [`DEFAULT_JUNCTION_ANGLE_DEG`] = `0` = OFF, per maintainer render
@@ -2712,11 +2720,8 @@ pub(crate) fn convert_to_overviews_source_strategy(
         resolve_ranking(&input_schema, &full, &geometries, options)?;
 
     // --- Coalescing groups (Q3): interned class values, when class-ranked. ---
-    let num_lines = geometries
-        .iter()
-        .filter(|g| feature_kind(g) == FeatureKind::Line)
-        .count();
-    let coalesce_on = coalesce_effective(options, num_lines);
+    let (num_lines, line_bytes) = coalesce_line_tally(&geometries);
+    let coalesce_on = coalesce_effective(options, num_lines, line_bytes);
     let line_groups: Option<Vec<u32>> = coalesce_on
         .then(|| intern_coalesce_groups(&input_schema, &full, &ranking_provenance))
         .flatten();
@@ -4938,22 +4943,62 @@ pub(super) fn build_level_coalesce_table(
     table
 }
 
+/// Both limbs of the coalescing memory guard (#449) over a decoded geometry
+/// set: `(candidate lines, bytes those lines would retain)`. Counted over
+/// exactly the features the streaming engine collects (`kind == Line`), so
+/// the two engines feed [`coalesce_effective`] the same totals and reach the
+/// same verdict.
+fn coalesce_line_tally(geometries: &[Geometry<f64>]) -> (usize, u64) {
+    geometries
+        .iter()
+        .filter(|g| feature_kind(g) == FeatureKind::Line)
+        .fold((0usize, 0u64), |(n, b), g| {
+            (n + 1, b + collected_line_bytes(g))
+        })
+}
+
+/// The retained-geometry limb of the coalescing memory guard (#449), in
+/// bytes: `coalesce_max_level_rows ×`
+/// [`COALESCE_NOMINAL_BYTES_PER_LINE`]. Saturating, so
+/// `coalesce_max_level_rows: usize::MAX` ("never guard") does not wrap into
+/// a ceiling of zero.
+pub(super) fn coalesce_max_geom_bytes(options: &ConvertOptions) -> u64 {
+    (options.coalesce_max_level_rows as u64).saturating_mul(COALESCE_NOMINAL_BYTES_PER_LINE)
+}
+
 /// Whether coalescing is effectively active for this conversion: enabled,
-/// and the candidate line count fits the per-level memory guard. Logs when
-/// the guard trips (the file still carries the `coalesced_count` column,
-/// all 1, and the coalescing provenance).
-pub(super) fn coalesce_effective(options: &ConvertOptions, num_lines: usize) -> bool {
+/// and the candidate lines fit the memory guard — **both** limbs of it, the
+/// row count and the geometry bytes those rows retain
+/// ([`coalesce_max_geom_bytes`], #449). Logs when the guard trips (the file
+/// still carries the `coalesced_count` column, all 1, and the coalescing
+/// provenance).
+///
+/// Pure in its inputs: both engines evaluate it over the same two totals
+/// (the streaming engine additionally stops *collecting* as soon as the
+/// running totals cross, which is why its totals are still exact — see
+/// [`super::stream`]), so the verdict — and therefore the output — is
+/// identical between them and across read-batch sizes.
+pub(super) fn coalesce_effective(
+    options: &ConvertOptions,
+    num_lines: usize,
+    line_bytes: u64,
+) -> bool {
     if !options.coalesce_lines {
         return false;
     }
-    if num_lines > options.coalesce_max_level_rows {
+    let max_bytes = coalesce_max_geom_bytes(options);
+    if num_lines > options.coalesce_max_level_rows || line_bytes > max_bytes {
         log::warn!(
-            "coalescing skipped: {num_lines} candidate lines exceed \
-             --coalesce-max-level-rows {} (chaining holds a level's line \
+            "coalescing skipped: {num_lines} candidate lines retaining \
+             {:.0} MiB of geometry exceed --coalesce-max-level-rows {} \
+             (≤ {} line(s) and ≤ {:.0} MiB — chaining holds a level's line \
              geometries in memory; near-canonical levels this large need \
              coalescing least). Output keeps the coalesced_count column \
              (all 1).",
-            options.coalesce_max_level_rows
+            line_bytes as f64 / (1024.0 * 1024.0),
+            options.coalesce_max_level_rows,
+            options.coalesce_max_level_rows,
+            max_bytes as f64 / (1024.0 * 1024.0),
         );
         return false;
     }
@@ -10478,6 +10523,76 @@ mod tests {
                 .all(|&c| c == 1));
         }
         assert!(validate_file(tout.path()).unwrap().is_valid());
+    }
+
+    /// #449: the guard's byte limb. A row count does not bound memory, so
+    /// the ceiling also trips on the geometry those rows retain
+    /// (`coalesce_max_level_rows × COALESCE_NOMINAL_BYTES_PER_LINE`).
+    ///
+    /// The streaming engine now enforces the ceiling *while* collecting and
+    /// the buffered engine still measures it after the fact, so the two
+    /// agreeing here is the proof that the early release changed nothing but
+    /// peak RSS.
+    #[test]
+    fn coalesce_guard_trips_on_geometry_bytes_not_just_rows() {
+        // 6 chainable 300-vertex lines: 6 rows, ~29 KiB of retained geometry.
+        let geoms: Vec<Geometry<f64>> = (0..6)
+            .map(|i| {
+                let x0 = i as f64 * 0.01;
+                let coords: Vec<(f64, f64)> = (0..300)
+                    .map(|k| (x0 + k as f64 * (0.01 / 299.0), 0.0))
+                    .collect();
+                Geometry::LineString(LineString::from(coords))
+            })
+            .collect();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            },
+            no_auto_rank: true,
+            coalesce_lines: true,
+            read_batch_size: 2,
+            ..Default::default()
+        };
+
+        // 6 rows fit a 1000-row ceiling and ~29 KiB fits its 500 KiB byte
+        // limb: the fragments chain into one visible artery.
+        let roomy = ConvertOptions {
+            coalesce_max_level_rows: 1000,
+            ..base.clone()
+        };
+        let t_roomy = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(tin.path(), t_roomy.path(), &roomy).unwrap();
+        let r_roomy = OverviewReader::open(t_roomy.path()).unwrap();
+        assert!(
+            read_coalesced_counts(&r_roomy, 0).iter().any(|&c| c > 1),
+            "inside both limbs the chain must form"
+        );
+        assert_streaming_equivalent(tin.path(), &roomy);
+
+        // 6 rows still fit a 40-row ceiling — but ~29 KiB does not fit its
+        // 40 × 512 = 20 KiB byte limb, so coalescing is skipped.
+        let tight = ConvertOptions {
+            coalesce_max_level_rows: 40,
+            ..base.clone()
+        };
+        let t_tight = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(tin.path(), t_tight.path(), &tight).unwrap();
+        let r_tight = OverviewReader::open(t_tight.path()).unwrap();
+        for level in 0..r_tight.num_levels() {
+            assert!(
+                read_coalesced_counts(&r_tight, level)
+                    .iter()
+                    .all(|&c| c == 1),
+                "byte limb must skip chaining at level {level}"
+            );
+        }
+        assert!(validate_file(t_tight.path()).unwrap().is_valid());
+        assert_streaming_equivalent(tin.path(), &tight);
     }
 
     #[test]

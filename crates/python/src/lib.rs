@@ -415,8 +415,10 @@ fn accumulate_specs(
 ///         threshold in degrees; 0 disables (junctions terminate chains).
 ///         Defaults to 0.0.
 ///     coalesce_max_level_rows (int, optional): Per-level candidate-line
-///         ceiling (memory guard); larger levels skip coalescing with a log.
-///         Defaults to 2_000_000.
+///         ceiling (memory guard); inputs over it skip coalescing with a
+///         log. Two limbs: this many candidate lines, and this value x
+///         512 B of retained line geometry (1 GiB by default) — exceeding
+///         either skips coalescing. Defaults to 2_000_000.
 ///     cogp_compat (bool, optional): Emit the optional COGP compatibility
 ///         footer key. Defaults to False.
 ///     row_group_size (int, optional): Maximum output row-group size in rows
