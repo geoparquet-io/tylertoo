@@ -1090,6 +1090,10 @@ pub tylertoo_core::overview::convert::ConvertError::MultiPartitionRequiresStream
 pub tylertoo_core::overview::convert::ConvertError::NoData
 pub tylertoo_core::overview::convert::ConvertError::NoGeometryColumn
 pub tylertoo_core::overview::convert::ConvertError::Parquet(parquet::errors::ParquetError)
+pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded
+pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::estimated_bytes: u64
+pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::limit_bytes: u64
+pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::rows: u64
 pub tylertoo_core::overview::convert::ConvertError::PointCountColumnPresent
 pub tylertoo_core::overview::convert::ConvertError::Properties(tylertoo_core::overview::properties::PropertySelectionError)
 pub tylertoo_core::overview::convert::ConvertError::RankingConflict

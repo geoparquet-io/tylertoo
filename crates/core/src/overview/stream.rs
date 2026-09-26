@@ -1215,6 +1215,21 @@ fn convert_preflight(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<Preflight, ConvertError> {
+    convert_preflight_with_memory_limit(source, options, super::pipeline::available_memory_bytes())
+}
+
+/// [`convert_preflight`], parameterized on the pass-1 memory-floor limit
+/// (#543 test seam: mirrors [`build_writer_options_with_ceiling`]'s #509
+/// pattern). Production always calls it via `convert_preflight` with the
+/// real cgroup-aware probe; tests pass a tiny mocked limit to prove the #543
+/// hard error fires from footer-derived row counts alone — before
+/// `stage_input_pass0` or pass 1 ever runs — without needing an actually
+/// memory-starved box.
+fn convert_preflight_with_memory_limit(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+    memory_limit_bytes: Option<u64>,
+) -> Result<Preflight, ConvertError> {
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
     // cached across the passes below. For a multi-partition source the
@@ -1275,6 +1290,19 @@ fn convert_preflight(
             "[convert] shard {range}: reading {row_groups_read}/{row_groups_total} input row \
              groups (the groups whose bbox reaches this shard's tile range)"
         );
+    }
+    // #543: preflight the pass-1 feature table's memory floor from footer row
+    // counts alone — no I/O beyond the footers already read above — BEFORE
+    // pass 1 (or `stage_input_pass0` below) does any real work. Skipped for a
+    // `--plan` replay: that path never builds the `Vec<AssignFeature>` table
+    // at all, only re-addresses the saved 1-byte/row winner table, so the
+    // memory floor this checks does not apply to it.
+    if options.plan.is_none() {
+        let selected_rows = source.selected_row_count(selected_row_groups.as_ref())?;
+        super::convert::preflight_pass1_memory_with_limit(
+            selected_rows.max(0) as u64,
+            memory_limit_bytes,
+        )?;
     }
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
@@ -4083,6 +4111,79 @@ mod tests {
             remaining -= batch_len;
         }
         total
+    }
+
+    /// #543: the pass-1 memory-floor preflight fires from footer-derived row
+    /// counts alone, before pass 1 (or even `stage_input_pass0`) touches a
+    /// single data page — proven with a real fixture file and a mocked limit
+    /// (the #509-style `_with_memory_limit` test seam), the way #509's own
+    /// `build_writer_options_with_ceiling` proved its ceiling preflight.
+    #[test]
+    fn convert_preflight_fails_fast_under_a_tiny_memory_limit() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
+        let values: Vec<f64> = vec![1.0; geoms.len()];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+        // A generous mocked limit fits comfortably.
+        convert_preflight_with_memory_limit(&source, &options, Some(1 << 40))
+            .expect("10 rows must fit a 1 TiB mocked limit");
+
+        // A 1-byte mocked limit cannot possibly fit 10 rows' feature table —
+        // this must fail from the footer row count alone, never having
+        // opened a data page (the fixture is tiny; if this reached pass 1 it
+        // would simply succeed, silently defeating the test).
+        match convert_preflight_with_memory_limit(&source, &options, Some(1)) {
+            Err(
+                err @ ConvertError::Pass1MemoryFloorExceeded {
+                    rows: 10,
+                    limit_bytes: 1,
+                    ..
+                },
+            ) => {
+                // Exercise the Display impl too (naming the fields matters).
+                let _ = err.to_string();
+            }
+            Err(err) => panic!("wrong error: {err}"),
+            Ok(_) => panic!("10 rows must not fit a 1-byte mocked limit"),
+        }
+    }
+
+    /// #543: a `--plan` replay never builds the pass-1 feature table (it
+    /// re-addresses the saved 1-byte/row winner table instead — see
+    /// `load_plan_state`), so the memory-floor preflight must not apply to
+    /// it — checked here against an impossibly small mocked limit that would
+    /// otherwise certainly fail.
+    #[test]
+    fn convert_preflight_skips_memory_check_for_plan_replay() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
+        let values: Vec<f64> = vec![1.0; geoms.len()];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            plan: Some(std::path::PathBuf::from("/nonexistent/convert.plan")),
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+        convert_preflight_with_memory_limit(&source, &options, Some(1))
+            .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }
 
     /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh

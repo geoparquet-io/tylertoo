@@ -1249,6 +1249,27 @@ pub enum ConvertError {
         /// The safety ceiling checked against.
         ceiling: usize,
     },
+    /// The pass-1 feature table (`Vec<AssignFeature>`, held resident from
+    /// pass 1's scan through the level assignment — see [`super::stream`]'s
+    /// module doc) cannot fit the memory limit at all (#543). Caught from
+    /// footer row counts alone, before pass 1 scans a single row, so this
+    /// fails in seconds instead of after however long the scan ran before an
+    /// OOM kill (the field incident that motivated this check: a 1.58B-row
+    /// coarse job was killed 25 minutes in).
+    #[error("{}", pass1_memory_floor_message(.rows, .estimated_bytes, .limit_bytes))]
+    Pass1MemoryFloorExceeded {
+        /// The footer-known selected row count (row-group pruning already
+        /// applied; `--bbox`/`--filter` may drop a few more at scan time, so
+        /// this is an upper bound, the safe direction for a preflight).
+        rows: u64,
+        /// `rows * `[`PASS1_BYTES_PER_ROW`].
+        estimated_bytes: u64,
+        /// The raw cgroup-aware memory limit/headroom the estimate was
+        /// checked against (NOT [`super::pipeline`]'s fractional `Auto`
+        /// budget — the feature table must exist in full regardless of
+        /// `MemoryProfile`).
+        limit_bytes: u64,
+    },
 }
 
 /// Convert a GeoParquet file into a multi-resolution overview GeoParquet file.
@@ -3610,6 +3631,199 @@ pub(super) fn warn_spill_space(
     }
 }
 
+/// Bytes the pass-1 feature table (`Vec<AssignFeature>`) costs per input row,
+/// resident from pass 1's scan through the level assignment (#543 — see
+/// [`super::stream`]'s module doc for the phase this spans).
+///
+/// Equal to `size_of::<AssignFeature>()`, pinned by the
+/// `pass1_bytes_per_row_matches_struct_size` test below: `index: usize` (8
+/// bytes) + `bbox: [f64; 4]` (32) + `kind: FeatureKind` (1, padded) +
+/// `sort_key: Option<f64>` (16 — `f64` has no spare bit pattern to steal a
+/// niche from, so the discriminant costs a full 8-byte-aligned word, not one
+/// extra byte) + `entry_level: Option<u8>` (padded) round up to a 64-byte,
+/// 8-byte-aligned struct. That is measurably more than a "sum the payload
+/// sizes" guess (~48 bytes — the figure `super::stream`'s module doc used
+/// before this constant existed): the two `Option` fields cost their
+/// alignment padding, not just their payload.
+///
+/// Cross-checked against the #543 field incident directly, with no
+/// additional slack factor needed on top of the struct size: a 1.58B-row
+/// coarse job logged `[rss] pass1 scan: 96836 MiB` right after pass 1 — by
+/// which point the transient per-scan ranking-key vectors
+/// (`extract_pass1_batch_keys`'s `Vec<Option<f64>>`s, 16 bytes/row, live only
+/// until `resolve_ranking_tier` folds them into `AssignFeature::sort_key` and
+/// drops them) have already been merged and freed, leaving just the feature
+/// table resident. `96,836 MiB × 1,048,576 bytes/MiB ÷ 1,580,000,000 rows ≈
+/// 64.3 bytes/row`: within 0.5% of the raw struct size.
+pub(super) const PASS1_BYTES_PER_ROW: u64 = 64;
+
+/// Warn once the pass-1 feature table's estimated size passes this fraction of
+/// the memory limit (#543). It still fits — the hard error is what actually
+/// blocks the run — but little headroom is left for the level-assignment
+/// winner grids (#306) and pass 2's buffered output, both of which run while
+/// the table (or its per-level remainder) is still resident.
+const PASS1_MEMORY_WARN_FRACTION: f64 = 0.85;
+
+/// Escape hatch (#543): downgrades the pass-1 memory-floor hard error to the
+/// warning, for setups where the estimate or the probe is known to be wrong
+/// for this box (an unusual cgroup nesting, or a caller who has already
+/// verified the machine can page/swap through it). Any value other than `"0"`
+/// enables it, matching the doc'd `=1`.
+pub(super) const SKIP_MEMORY_PREFLIGHT_ENV: &str = "TYLERTOO_SKIP_MEMORY_PREFLIGHT";
+
+fn skip_memory_preflight() -> bool {
+    std::env::var(SKIP_MEMORY_PREFLIGHT_ENV).is_ok_and(|v| v != "0")
+}
+
+/// Sizing-guidance doc named in both the warning and the hard error.
+const MEMORY_SIZING_DOC: &str = "docs/diving-deeper/sharded-builds.md";
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// The realistic "this input needs ≳X GiB" total quoted in the warning and
+/// the hard error: [`PASS1_BYTES_PER_ROW`] per row, doubled per
+/// `docs/diving-deeper/sharded-builds.md`'s coarse-job sizing rule to cover
+/// what runs concurrently with (or right after) the resident feature table —
+/// the level-assignment winner grids (#306) and pass 2's buffered output. The
+/// feature table alone is the *floor*, not the whole coarse job's need.
+fn recommended_total_gib(rows: u64) -> f64 {
+    gib(rows.saturating_mul(PASS1_BYTES_PER_ROW).saturating_mul(2))
+}
+
+/// #543 decision (pure, unit-testable without a real memory probe): does the
+/// pass-1 feature table (`rows × `[`PASS1_BYTES_PER_ROW`]) fit under
+/// `limit_bytes`? `limit_bytes = None` (the probe could not determine the
+/// machine's available memory or cgroup limit — no cgroup, no
+/// `/proc/meminfo`, e.g. non-Linux without the override) always fits: a
+/// preflight must never turn "unknown" into a wrong failure.
+#[derive(Debug, PartialEq)]
+enum Pass1MemoryVerdict {
+    Fits,
+    Warn {
+        estimated_bytes: u64,
+        limit_bytes: u64,
+    },
+    Exceeds {
+        estimated_bytes: u64,
+        limit_bytes: u64,
+    },
+}
+
+fn pass1_memory_verdict(rows: u64, limit_bytes: Option<u64>) -> Pass1MemoryVerdict {
+    let Some(limit_bytes) = limit_bytes else {
+        return Pass1MemoryVerdict::Fits;
+    };
+    let estimated_bytes = rows.saturating_mul(PASS1_BYTES_PER_ROW);
+    if estimated_bytes > limit_bytes {
+        Pass1MemoryVerdict::Exceeds {
+            estimated_bytes,
+            limit_bytes,
+        }
+    } else if estimated_bytes as f64 > limit_bytes as f64 * PASS1_MEMORY_WARN_FRACTION {
+        Pass1MemoryVerdict::Warn {
+            estimated_bytes,
+            limit_bytes,
+        }
+    } else {
+        Pass1MemoryVerdict::Fits
+    }
+}
+
+/// The #543 warning body: the estimate still fits, but has passed
+/// [`PASS1_MEMORY_WARN_FRACTION`] of the limit. Pure (unlike
+/// [`pass1_memory_floor_message`] it has no `ConvertError` variant to back
+/// it) so its wording is unit-testable without capturing log output.
+fn pass1_memory_warn_message(rows: u64, estimated_bytes: u64, limit_bytes: u64) -> String {
+    format!(
+        "[convert] the pass-1 feature table for {rows} row(s) is estimated at {:.1} GiB — over \
+         {:.0}% of the {:.1} GiB memory limit. Little headroom is left for the \
+         level-assignment winner grids and pass 2's buffered output, which run while it (or \
+         its per-level remainder) is still resident. This input needs ≳{:.1} GiB; see \
+         {MEMORY_SIZING_DOC} sizing.",
+        gib(estimated_bytes),
+        PASS1_MEMORY_WARN_FRACTION * 100.0,
+        gib(limit_bytes),
+        recommended_total_gib(rows),
+    )
+}
+
+/// The message body of [`ConvertError::Pass1MemoryFloorExceeded`].
+fn pass1_memory_floor_message(rows: &u64, estimated_bytes: &u64, limit_bytes: &u64) -> String {
+    format!(
+        "{rows} input row(s) need an estimated {:.1} GiB for the pass-1 feature table alone \
+         ({PASS1_BYTES_PER_ROW} bytes/row) — over the {:.1} GiB memory limit. This input needs \
+         ≳{:.1} GiB; see {MEMORY_SIZING_DOC} sizing (a sharded build, or a bigger box). Set \
+         {SKIP_MEMORY_PREFLIGHT_ENV}=1 to downgrade this to a warning and attempt the run \
+         anyway.",
+        gib(*estimated_bytes),
+        gib(*limit_bytes),
+        recommended_total_gib(*rows),
+    )
+}
+
+/// #543 preflight: does the pass-1 feature table fit `limit_bytes`? Test seam
+/// over the real probe — mirrors `stream.rs`'s
+/// `build_writer_options_with_ceiling` (#509): production reaches this via
+/// `stream.rs`'s `convert_preflight`, which passes
+/// [`super::pipeline::available_memory_bytes`] (the real cgroup-aware probe);
+/// tests call it directly, or via `convert_preflight_with_memory_limit`, with
+/// a tiny mocked limit to exercise the warn/error paths without needing an
+/// actually memory-starved box, and to prove the error fires from
+/// footer-derived row counts alone (`rows` is the only input), before any
+/// scan I/O.
+pub(super) fn preflight_pass1_memory_with_limit(
+    rows: u64,
+    limit_bytes: Option<u64>,
+) -> Result<(), ConvertError> {
+    preflight_pass1_memory_verdict_action(rows, limit_bytes, skip_memory_preflight())
+}
+
+/// [`preflight_pass1_memory_with_limit`], with the #543 escape hatch's
+/// decision passed in rather than read from the environment — a second test
+/// seam so the skip-hatch's warn-instead-of-error behavior is unit-testable
+/// without mutating (and racing other tests over) process-global environment
+/// state.
+fn preflight_pass1_memory_verdict_action(
+    rows: u64,
+    limit_bytes: Option<u64>,
+    skip_on_exceed: bool,
+) -> Result<(), ConvertError> {
+    match pass1_memory_verdict(rows, limit_bytes) {
+        Pass1MemoryVerdict::Fits => Ok(()),
+        Pass1MemoryVerdict::Warn {
+            estimated_bytes,
+            limit_bytes,
+        } => {
+            log::warn!(
+                "{}",
+                pass1_memory_warn_message(rows, estimated_bytes, limit_bytes)
+            );
+            Ok(())
+        }
+        Pass1MemoryVerdict::Exceeds {
+            estimated_bytes,
+            limit_bytes,
+        } => {
+            if skip_on_exceed {
+                log::warn!(
+                    "[convert] {SKIP_MEMORY_PREFLIGHT_ENV} set: downgrading the pass-1 \
+                     memory-floor error to a warning — {}",
+                    pass1_memory_floor_message(&rows, &estimated_bytes, &limit_bytes),
+                );
+                Ok(())
+            } else {
+                Err(ConvertError::Pass1MemoryFloorExceeded {
+                    rows,
+                    estimated_bytes,
+                    limit_bytes,
+                })
+            }
+        }
+    }
+}
+
 /// Whether a decoded geometry can participate in level assignment: it must
 /// carry at least one coordinate and every coordinate must be finite.
 ///
@@ -5281,6 +5495,162 @@ mod tests {
         assert!(spill_space_check(true, 10 << 30, dir, |_| None).is_none());
         assert!(spill_space_check(true, 0, dir, |_| Some(0)).is_none());
         assert!(spill_space_check(true, 10 << 30, dir, |_| Some(1)).is_some());
+    }
+
+    /// #543: [`PASS1_BYTES_PER_ROW`] must track `AssignFeature`'s actual
+    /// in-memory layout size exactly (no extra slack factor is applied on
+    /// top — see the constant's doc for why none is needed). If this test
+    /// fails, `AssignFeature` grew or shrank and the #543 memory estimate —
+    /// and its doc'd cross-check against the field incident — needs
+    /// recalibrating against the new size.
+    #[test]
+    fn pass1_bytes_per_row_matches_struct_size() {
+        assert_eq!(
+            std::mem::size_of::<AssignFeature>() as u64,
+            PASS1_BYTES_PER_ROW
+        );
+    }
+
+    /// #543: the estimator's three outcomes (fits / warns / hard-errors) and
+    /// their exact boundaries — `> 85%` of the limit warns, `> 100%` (i.e.
+    /// strictly over) errors, exactly at the limit still only warns — plus
+    /// the "unknown limit never fails" fail-soft rule (a preflight must never
+    /// turn "the probe couldn't tell" into a wrong failure).
+    #[test]
+    fn pass1_memory_verdict_thresholds() {
+        assert_eq!(
+            pass1_memory_verdict(1_000, Some(1_000_000)),
+            Pass1MemoryVerdict::Fits
+        );
+        // 13 rows * 64 B/row = 832 B: under 850 B (85% of a 1,000 B limit).
+        assert_eq!(
+            pass1_memory_verdict(13, Some(1_000)),
+            Pass1MemoryVerdict::Fits
+        );
+        // 14 rows * 64 B/row = 896 B: over 850 B but still <= the 1,000 B
+        // limit — warns, does not fail the run.
+        assert_eq!(
+            pass1_memory_verdict(14, Some(1_000)),
+            Pass1MemoryVerdict::Warn {
+                estimated_bytes: 896,
+                limit_bytes: 1_000,
+            }
+        );
+        // Exactly at the limit (16 * 64 = 1,024 == limit): still only warns —
+        // the hard error is reserved for strictly over.
+        assert_eq!(
+            pass1_memory_verdict(16, Some(1_024)),
+            Pass1MemoryVerdict::Warn {
+                estimated_bytes: 1_024,
+                limit_bytes: 1_024,
+            }
+        );
+        // One row more tips the estimate strictly over the limit.
+        assert_eq!(
+            pass1_memory_verdict(17, Some(1_024)),
+            Pass1MemoryVerdict::Exceeds {
+                estimated_bytes: 1_088,
+                limit_bytes: 1_024,
+            }
+        );
+        // The probe could not determine a limit: never fails, at any row count.
+        assert_eq!(
+            pass1_memory_verdict(u64::MAX, None),
+            Pass1MemoryVerdict::Fits
+        );
+    }
+
+    /// #543: the warning names the row count, the estimate, the limit, the
+    /// realistic "needs ≳X GiB" total (doubled per the sharded-builds sizing
+    /// rule), and points at the sizing doc.
+    #[test]
+    fn pass1_memory_warn_message_names_numbers_and_doc() {
+        let rows = 1_580_000_000u64;
+        let estimated = rows * PASS1_BYTES_PER_ROW;
+        let limit = estimated + estimated / 10; // ~10% of headroom left: warns.
+        let msg = pass1_memory_warn_message(rows, estimated, limit);
+        assert!(
+            msg.contains(&rows.to_string()),
+            "names the row count: {msg}"
+        );
+        assert!(
+            msg.contains("docs/diving-deeper/sharded-builds.md"),
+            "points at the sizing doc: {msg}"
+        );
+        assert!(msg.contains("needs ≳"), "states the sizing guidance: {msg}");
+    }
+
+    /// #543: the hard-error message names the row count, the estimate, the
+    /// limit, the sizing guidance, and the escape hatch's exact env var name
+    /// (so a user can copy it verbatim).
+    #[test]
+    fn pass1_memory_floor_message_names_numbers_doc_and_escape_hatch() {
+        let (rows, estimated, limit) = (2_000_000_000u64, 200_000_000_000u64, 100_000_000_000u64);
+        let msg = pass1_memory_floor_message(&rows, &estimated, &limit);
+        assert!(
+            msg.contains(&rows.to_string()),
+            "names the row count: {msg}"
+        );
+        assert!(
+            msg.contains("docs/diving-deeper/sharded-builds.md"),
+            "points at the sizing doc: {msg}"
+        );
+        assert!(
+            msg.contains("TYLERTOO_SKIP_MEMORY_PREFLIGHT=1"),
+            "names the escape hatch verbatim: {msg}"
+        );
+    }
+
+    /// #543: the injectable-limit preflight (the #509-style test seam) fits
+    /// quietly under a generous limit, and — this is the point of the whole
+    /// feature — hard-errors under a tiny mocked one, from row counts alone
+    /// (no `ConvertSource`, no file, no I/O of any kind touches this path).
+    #[test]
+    fn preflight_pass1_memory_with_limit_fits_and_fails() {
+        assert!(preflight_pass1_memory_with_limit(1_000, Some(1 << 30)).is_ok());
+        let err = preflight_pass1_memory_with_limit(1_580_000_000, Some(1_000))
+            .expect_err("a 1,580,000,000-row table cannot fit a 1,000-byte limit");
+        assert!(
+            matches!(
+                err,
+                ConvertError::Pass1MemoryFloorExceeded {
+                    rows: 1_580_000_000,
+                    limit_bytes: 1_000,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// #543: the escape hatch downgrades the hard error to a warning (`Ok`)
+    /// without touching the underlying verdict — tested via the
+    /// skip-decision-as-a-parameter seam, not by mutating the real
+    /// `TYLERTOO_SKIP_MEMORY_PREFLIGHT` environment variable (which would
+    /// race any other test reading process-global env state).
+    #[test]
+    fn preflight_pass1_memory_skip_hatch_downgrades_error_to_ok() {
+        assert!(pass1_memory_verdict(1_580_000_000, Some(1_000)) != Pass1MemoryVerdict::Fits);
+        assert!(preflight_pass1_memory_verdict_action(1_580_000_000, Some(1_000), false).is_err());
+        assert!(preflight_pass1_memory_verdict_action(1_580_000_000, Some(1_000), true).is_ok());
+    }
+
+    /// #543 field-incident cross-check: the constant, applied to the exact
+    /// numbers from the OOM incident that motivated this preflight
+    /// (`[rss] pass1 scan: 96836 MiB` at 1.58B rows), reproduces the measured
+    /// figure to within 1% — the justification for using the raw struct size
+    /// with no additional slack factor.
+    #[test]
+    fn pass1_bytes_per_row_matches_the_field_incident_measurement() {
+        let rows = 1_580_000_000u64;
+        let estimated_gib = gib(rows * PASS1_BYTES_PER_ROW);
+        let measured_gib = 96_836.0 / 1024.0; // 96,836 MiB, converted to GiB.
+        let relative_error = (estimated_gib - measured_gib).abs() / measured_gib;
+        assert!(
+            relative_error < 0.01,
+            "estimate {estimated_gib:.2} GiB vs measured {measured_gib:.2} GiB \
+             (relative error {relative_error:.4})"
+        );
     }
 
     /// #371: `--max-zoom 33` used to be accepted and then spin at 100% CPU
