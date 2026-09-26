@@ -91,6 +91,7 @@ Generate PMTiles vector tiles (the default pipeline)
 
    This restricts the EXPORT only. `--shard` is the form that also prunes the convert's input to the row groups the range can reach, which is what makes a shard cheaper than the whole build rather than merely narrower — prefer it unless you are cutting by hand. The two are mutually exclusive: `--shard` derives its range from the shard plan
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
+* `-f`, `--force` — Overwrite the output if it exists
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
 
    The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.

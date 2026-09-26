@@ -1821,6 +1821,10 @@ struct TilesArgs {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    force: bool,
+
     #[command(flatten)]
     tuning: ConvertTuningArgs,
 }
@@ -2368,6 +2372,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
+
+    if output.exists() && !args.force {
+        anyhow::bail!("{} exists (use --force to overwrite)", output.display());
+    }
 
     // Derive the layer name from the input if not given: file stem for a
     // single file, last path segment for a directory or s3://gs:// prefix,
