@@ -5,10 +5,17 @@
 #                   tracked over time via uploaded reports. NOT a PR gate
 #                   (push/dispatch only) so no permanently-skipped job
 #                   clutters PR check lists.
-#   convert-guard — deterministic structural check that a change hasn't
-#                   altered convert output (per-level feature/vertex counts,
-#                   total rows) on the fixtures-v1 inputs. THIS one gates
-#                   PRs. Timing/RSS are intentionally not gated — far too
+#   convert-guard — the PR gate against a change altering output. TWO checks,
+#                   because one of them was not enough:
+#                     1. ci_guard.py — structural signature of `overview`
+#                        (per-level feature/vertex counts, total rows) on the
+#                        fixtures-v1 inputs.
+#                     2. convert_guard_golden — per-tile digests of a full
+#                        convert -> export build (#558). The structural check
+#                        stops at pass 1 and compares counts, so it green-lit
+#                        the i_overlay 8->9 bump that moved 18 of 588 tiles on
+#                        real data. This one compares the tiles themselves.
+#                   Timing/RSS are intentionally not gated — far too
 #                   noisy on shared runners; see benchmarks/overview/PROFILE.md
 #                   for the tracked timing numbers and ci_guard.py for the
 #                   gated structural signature.
@@ -134,3 +141,14 @@ jobs:
 
       - name: Convert regression guard (structural, deterministic)
         run: python3 benchmarks/overview/ci_guard.py --check
+
+      # #558: the golden tile guard. Its fixture is a plain committed blob, so
+      # this step depends on nothing the steps above fetch — it runs even if
+      # the fixtures-v1 download or its cache is broken. Release profile: the
+      # binary build above already warmed it, and the run is ~0.5 s there
+      # against ~20 s in debug. Verified to produce identical digests under
+      # both profiles.
+      - name: Convert regression guard (golden tiles, #558)
+        run: >-
+          cargo test --locked --release -p tylertoo-core
+          --test convert_guard_golden

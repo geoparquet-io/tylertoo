@@ -14,6 +14,7 @@
 default-filter = """
 not (
     binary(thread_count_determinism)
+  | binary(convert_guard_golden)
   | binary(shard_merge_parity)
   | binary(sharded_builds)
   | test(=header_clustered_flag_matches_the_actual_entry_layout)
