@@ -5,9 +5,10 @@
 #   version-check   version fields stay in sync across the workspace
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
 #                   Cargo.toml [workspace.lints]), cargo-machete, unit tests
-#   Test            full test matrix (ubuntu/macos x stable/beta), minus
-#                   the slow set in .config/nextest.toml
-#   Slow Tests      that slow set, on ubuntu/macos stable
+#   Test            the `quick` nextest tier (ubuntu/macos x stable/beta) —
+#                   see .config/nextest.toml (#457)
+#   Slow Tests      the slow tests `quick` excludes; Test + Slow Tests
+#                   together cover the `full` tier, on ubuntu/macos stable
 #   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
 #   Reference Docs  the committed CLI + Python reference (docs/reference/)
@@ -289,21 +290,23 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run all tests (excluding slow regression tests)
-        # Large polygon regression tests are run manually - see tests/fixtures/realdata/README.md
+      - name: Run all tests (quick tier)
+        # `quick` excludes the slow end-to-end suites (#524) and the manual
+        # large-polygon regression test (see tests/fixtures/realdata/README.md)
+        # — see .config/nextest.toml for the full filter and rationale (#457).
         # nextest runs every test from every binary in parallel.
-        run: >-
-          cargo nextest run --locked --all-features
-          -E 'not test(large_polygon_regression)'
+        run: cargo nextest run --locked --all-features --profile quick
 
       - name: Run doctests
         # nextest does not run doctests.
         run: cargo test --locked --all-features --doc
 
-  # The slow end-to-end tests listed in .config/nextest.toml. They run here,
-  # beside the Test matrix, so no other job waits on them (#524). Stable
-  # only, on both OSes: the set holds the determinism and shard-parity
-  # tests, which guard platform-sensitive behavior.
+  # The slow end-to-end tests excluded from the `quick` nextest profile
+  # (.config/nextest.toml, #457) — together, `quick` (Test job) + this job's
+  # complement equal the `full` profile. They run here, beside the Test
+  # matrix, so no other job waits on them (#524). Stable only, on both OSes:
+  # the set holds the determinism and shard-parity tests, which guard
+  # platform-sensitive behavior.
   slow-tests:
     name: Slow Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
