@@ -428,8 +428,8 @@ fn export_tile_range_restricts_and_rejects_mixed_zooms() {
 }
 
 /// `--zoom-ceiling` is the coarse half's complement, and is named a ceiling
-/// because — unlike `--min-zoom`, which only widens what the header declares
-/// — it decides which zooms are actually emitted.
+/// because — unlike `--min-zoom`, which only widens what `vector_layers`
+/// declares — it decides which zooms are actually emitted.
 #[test]
 fn export_zoom_ceiling_emits_only_the_coarse_half() {
     let dir = tempfile::tempdir().expect("tempdir");

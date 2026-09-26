@@ -1857,11 +1857,17 @@ pub struct StreamingPmtilesWriter {
     /// Max zoom level seen
     max_zoom: u8,
     /// Minimum zoom the archive *declares* even when no tile exists there
-    /// (#380): the header and `vector_layers` cover `min(declared, seen)`.
+    /// (#380). Widens `vector_layers[].minzoom` to `min(declared, seen)` —
+    /// but never the PMTiles header (#529, #522): `go-pmtiles verify`
+    /// requires the header's `min_zoom` to be the shallowest zoom that
+    /// actually holds a tile, so the header always reports the observed
+    /// value regardless of this field.
     declared_min_zoom: Option<u8>,
     /// Maximum zoom the archive *declares* even when no tile exists there —
     /// the mirror of `declared_min_zoom`, used by `tylertoo merge` to union
-    /// the shards' declared ranges rather than the tiles' observed one.
+    /// the shards' declared ranges rather than the tiles' observed one. Like
+    /// `declared_min_zoom`, this reaches `vector_layers[].maxzoom` only,
+    /// never the header.
     declared_max_zoom: Option<u8>,
     /// Geographic bounds
     bounds: TileBounds,
@@ -2229,37 +2235,78 @@ impl StreamingPmtilesWriter {
     }
 
     /// Declare a minimum zoom for the archive regardless of which zooms end
-    /// up holding tiles (#380). The header `min_zoom` and the layer's
-    /// `minzoom` become `min(declared, coarsest tile written)`: an empty zoom
-    /// in a PMTiles archive is just an absent tile, so declaring z0 over a
-    /// pyramid whose coarsest level generalized to nothing is honest, whereas
-    /// letting the header drift to z1 hides the requested range from clients
-    /// that trust it. A declared value finer than a written tile is ignored —
-    /// the header can widen the range, never narrow it over real tiles.
+    /// up holding tiles (#380). The layer's `minzoom` in `vector_layers`
+    /// becomes `min(declared, coarsest tile written)`: an empty zoom in a
+    /// PMTiles archive is just an absent tile, so recording z0 over a
+    /// pyramid whose coarsest level generalized to nothing is honest.
+    ///
+    /// This does NOT widen the PMTiles header's `min_zoom` (#529, #522):
+    /// `go-pmtiles verify` requires the header to equal the shallowest zoom
+    /// that actually holds a tile ("header MinZoom does not match min tile
+    /// z"). The declaration is therefore informational only as far as
+    /// renderers go: the pmtiles JS library builds TileJSON
+    /// `minzoom`/`maxzoom` from the HEADER, and `vector_layers[].minzoom` is
+    /// descriptive metadata it does not use to pick a request range. That is
+    /// acceptable: the declared-but-empty zooms hold no tiles, so they render
+    /// identically either way, and an honest header max lets MapLibre
+    /// overzoom from the deepest real tile. The declared range still matters
+    /// to tylertoo itself (`merge`'s union, the pyramid band check) and to
+    /// anything that inspects `vector_layers`. A declared value finer than a
+    /// written tile is ignored — the declaration can only widen
+    /// `vector_layers`, never narrow it over real tiles.
     pub fn set_declared_min_zoom(&mut self, zoom: u8) {
         self.declared_min_zoom = Some(zoom);
     }
 
     /// Declare a maximum zoom for the archive regardless of which zooms end
     /// up holding tiles — the mirror of [`Self::set_declared_min_zoom`], for
-    /// the same reason at the other end of the range.
+    /// the same reason at the other end of the range. Like the minimum, this
+    /// widens `vector_layers[].maxzoom` only, never the header's `max_zoom`
+    /// (#529, #522).
     ///
-    /// `tylertoo merge` needs it: the merged header's zoom range is the union
-    /// of the shards' *declared* ranges, and a shard covering a sliver of the
-    /// world legitimately has no tile at its own deepest zoom. Deriving the
-    /// merged maximum from the deepest tile actually copied would quietly
-    /// narrow the range every such shard set declares. Like the minimum, a
-    /// declared value can only widen: a declaration coarser than a written
-    /// tile is ignored.
+    /// Informational for renderers in the same way (they read the header);
+    /// see [`Self::set_declared_min_zoom`]. It has no effect when
+    /// [`Self::set_vector_layers_json`] supplies the layers explicitly, as
+    /// `merge` and the pyramid merge do (they carry declared ranges in their
+    /// own `LayerMeta` instead). A declaration coarser than a written tile is
+    /// ignored.
     pub fn set_declared_max_zoom(&mut self, zoom: u8) {
         self.declared_max_zoom = Some(zoom);
     }
 
-    /// The header's minimum zoom: the coarsest tile written, widened by any
-    /// declared minimum. An archive with no tiles is z0..z0 whatever was
+    /// The header's minimum zoom: the coarsest tile actually written, never
+    /// widened by a declared minimum (#529, #522). `go-pmtiles verify`
+    /// rejects a header whose `min_zoom` does not match the shallowest tile
+    /// the directory addresses, so this — unlike [`Self::layer_min_zoom`] —
+    /// ignores `declared_min_zoom` entirely. An archive with no tiles is
+    /// z0..z0.
+    fn actual_min_zoom(&self) -> u8 {
+        if self.entries.is_empty() {
+            0
+        } else {
+            self.min_zoom
+        }
+    }
+
+    /// The header's maximum zoom: the deepest tile actually written, never
+    /// widened by a declared maximum. See [`Self::actual_min_zoom`].
+    fn actual_max_zoom(&self) -> u8 {
+        if self.entries.is_empty() {
+            0
+        } else {
+            self.max_zoom
+        }
+    }
+
+    /// `vector_layers[].minzoom` (and the single-layer metadata fallback's
+    /// minzoom): the coarsest tile written, widened by any declared minimum.
+    /// Unlike [`Self::actual_min_zoom`], this is advertised metadata a
+    /// renderer reads to decide what range to request — not a claim about
+    /// which tiles physically exist in the directory — so #380 lets it be
+    /// wider than the header. An archive with no tiles is z0..z0 whatever was
     /// declared — its max zoom collapses to 0, and a declared minimum above
     /// that would invert the range.
-    fn header_min_zoom(&self) -> u8 {
+    fn layer_min_zoom(&self) -> u8 {
         if self.entries.is_empty() {
             return 0;
         }
@@ -2269,10 +2316,9 @@ impl StreamingPmtilesWriter {
         }
     }
 
-    /// The header's maximum zoom: the deepest tile written, widened by any
-    /// declared maximum. An archive with no tiles is z0..z0, matching
-    /// [`Self::header_min_zoom`].
-    fn header_max_zoom(&self) -> u8 {
+    /// `vector_layers[].maxzoom`: the deepest tile written, widened by any
+    /// declared maximum. See [`Self::layer_min_zoom`].
+    fn layer_max_zoom(&self) -> u8 {
         if self.entries.is_empty() {
             return 0;
         }
@@ -2749,8 +2795,17 @@ impl StreamingPmtilesWriter {
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
-            min_zoom: self.header_min_zoom(),
-            max_zoom: self.header_max_zoom(),
+            // DIVERGENCE FROM TIPPECANOE: header zoom range = actual tiles.
+            // Tippecanoe stamps the requested -Z/-z range in the header even
+            // when the coarse zooms are empty (golden
+            // tests/fixtures/golden/open-buildings.pmtiles: header z0..z10).
+            // We stamp the zooms that actually hold tiles because
+            // `go-pmtiles verify` rejects a wider header (#529, #522); a
+            // declared range (#380) lives only in `vector_layers`. Renderers
+            // building TileJSON from the header see the narrower range --
+            // the empty zooms render identically. See context/ARCHITECTURE.md.
+            min_zoom: self.actual_min_zoom(),
+            max_zoom: self.actual_max_zoom(),
             min_lon: self.bounds.lng_min,
             min_lat: self.bounds.lat_min,
             max_lon: self.bounds.lng_max,
@@ -2758,7 +2813,7 @@ impl StreamingPmtilesWriter {
             center_zoom: if self.entries.is_empty() {
                 0
             } else {
-                (self.header_min_zoom() + self.header_max_zoom()) / 2
+                (self.actual_min_zoom() + self.actual_max_zoom()) / 2
             },
             center_lon: (self.bounds.lng_min + self.bounds.lng_max) / 2.0,
             center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
@@ -2967,8 +3022,8 @@ impl StreamingPmtilesWriter {
 
     /// Build metadata JSON string.
     fn build_metadata_json(&self) -> String {
-        let min_z = self.header_min_zoom();
-        let max_z = self.header_max_zoom();
+        let min_z = self.layer_min_zoom();
+        let max_z = self.layer_max_zoom();
 
         let tilestats_json = self.build_tilestats_json();
         let vector_layers = match &self.vector_layers_json {
@@ -4691,11 +4746,17 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    /// #380: an archive built for z0..z4 whose coarsest levels hold no tiles
-    /// must still say z0 in the header and in `vector_layers`, or a client
-    /// configured for the requested range never asks for the zoomed-out view.
+    /// #529, #522: `go-pmtiles verify` rejects a header whose `min_zoom` is
+    /// declared below the shallowest tile the archive actually holds
+    /// ("header MinZoom does not match min tile z"). #380's declared-minimum
+    /// widening must not reach the header — it still reaches
+    /// `vector_layers[].minzoom`, as informational metadata (renderers such
+    /// as the pmtiles JS library build TileJSON from the header, so they see
+    /// the narrower range; the empty zooms would render nothing anyway),
+    /// while the PMTiles v3 header stays an honest description of what the
+    /// directory addresses.
     #[test]
-    fn streaming_writer_declared_min_zoom_widens_header_and_layer_range() {
+    fn streaming_writer_declared_min_zoom_widens_metadata_but_not_header() {
         use flate2::read::GzDecoder;
         use std::io::Read;
 
@@ -4707,10 +4768,15 @@ mod tests {
         writer.add_tile(2, 1, 1, &[0x1a, 0x00]).unwrap();
         writer.add_tile(4, 5, 5, &[0x1a, 0x01]).unwrap();
         writer.finalize(&path).unwrap();
+        crate::archive_index::assert_header_zooms_match_tiles(&path);
 
         let data = fs::read(&path).unwrap();
         let header = Header::from_bytes(&data[..127]).unwrap();
-        assert_eq!(header.min_zoom, 0, "declared minimum wins over observed z2");
+        assert_eq!(
+            header.min_zoom, 2,
+            "header must be the shallowest zoom that actually holds a tile, \
+             never the declared minimum -- go-pmtiles verify checks this"
+        );
         assert_eq!(header.max_zoom, 4);
 
         let start = header.json_metadata_offset as usize;
@@ -4721,7 +4787,7 @@ mod tests {
             .unwrap();
         assert!(
             json.contains(r#""minzoom":0"#),
-            "vector_layers must advertise the declared minimum: {json}"
+            "vector_layers must still advertise the declared minimum: {json}"
         );
     }
 

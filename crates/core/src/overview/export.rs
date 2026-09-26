@@ -222,17 +222,20 @@ pub struct ExportOptions {
     /// Within-tile feature order (#361). Defaults to [`FeatureOrder::Input`],
     /// the order tylertoo has always emitted.
     pub feature_order: FeatureOrder,
-    /// Minimum zoom the archive declares, even when the overview file's
-    /// coarsest levels are missing (#380).
+    /// Minimum zoom the archive declares in its metadata, even when the
+    /// overview file's coarsest levels are missing (#380).
     ///
     /// The converter omits a level that generalizes to nothing (spec §7.3), so
-    /// an overview built for z0..z13 can start at z2. Left `None`, the header
-    /// says z2 and a client configured for the requested range never asks for
-    /// the zoomed-out view. Set to the requested minimum, the header and
-    /// `vector_layers[].minzoom` cover it; the empty zooms simply have no
-    /// tiles, which in PMTiles is an empty tile. Must not be finer than the
-    /// coarsest level present — that would misdescribe real tiles — and is
-    /// rejected if it is. The one-shot `tiles` command passes its
+    /// an overview built for z0..z13 can start at z2. Set to the requested
+    /// minimum, `vector_layers[].minzoom` (and [`ExportReport::min_zoom`])
+    /// cover it; the empty zooms simply have no tiles, which in PMTiles is an
+    /// empty tile. The PMTiles header's own `min_zoom` is NOT widened: it is
+    /// always the shallowest zoom that actually holds a tile (#529, #522), as
+    /// `go-pmtiles verify` requires. Renderers that build TileJSON from the
+    /// header (the pmtiles JS library does) therefore see the narrower range;
+    /// the empty zooms would render nothing either way. Must not be finer
+    /// than the coarsest level present — that would misdescribe real tiles —
+    /// and is rejected if it is. The one-shot `tiles` command passes its
     /// `--min-zoom` here; `export-pmtiles --min-zoom` sets it directly.
     pub min_zoom: Option<u8>,
     /// Which properties the tiles carry (#386): tippecanoe's `-x` / `-y` /
@@ -319,10 +322,16 @@ pub struct ZoomReport {
 pub struct ExportReport {
     /// Level materialization mode of the source overview file.
     pub mode: String,
-    /// PMTiles header min zoom: the declared minimum zoom (coarsest level's
-    /// zoom unless widened by [`ExportOptions::min_zoom`]).
+    /// The declared minimum zoom (coarsest level's zoom unless widened by
+    /// [`ExportOptions::min_zoom`]) — what the CLI prints as the export's
+    /// zoom range and what `vector_layers[].minzoom` advertises. The PMTiles
+    /// header's own `min_zoom` can differ: it always reflects the shallowest
+    /// zoom that actually holds a tile (#529, #522), which `go-pmtiles
+    /// verify` requires and which is coarser than this value whenever a
+    /// requested level generalized away to nothing (#380).
     pub min_zoom: u8,
-    /// PMTiles header max zoom (finest level's zoom).
+    /// The declared maximum zoom (finest level's zoom). See `min_zoom` above
+    /// for how this relates to the PMTiles header's own `max_zoom`.
     pub max_zoom: u8,
     /// Per-zoom statistics, coarse→fine.
     pub zooms: Vec<ZoomReport>,
@@ -363,8 +372,8 @@ pub enum ExportError {
 
     #[error(
         "declared min_zoom {declared} is finer than the coarsest level present (zoom \
-         {coarsest}): the header can widen the zoom range over empty zooms, not narrow \
-         it over real tiles (#380)"
+         {coarsest}): the declared zoom range can widen over empty zooms, not narrow \
+         over real tiles (#380)"
     )]
     DeclaredMinZoomTooFine { declared: u8, coarsest: u8 },
 
@@ -1078,8 +1087,8 @@ fn export_pmtiles_impl(
     }
     // #380: the archive may declare a coarser minimum than the file holds.
     let min_zoom = match options.min_zoom {
-        // #371: the declared minimum is a written header field, so it obeys the
-        // same ceiling as everything else. Checked before the #380 comparison
+        // #371: the declared minimum is written into `vector_layers`, so it
+        // obeys the same ceiling as everything else. Checked before the #380 comparison
         // so an out-of-range value is named as such.
         Some(declared) if declared > MAX_ZOOM => {
             return Err(ExportError::DeclaredMinZoomAboveCeiling {
@@ -7648,10 +7657,14 @@ mod tests {
     // --- declared minimum zoom (#380) ----------------------------------------
 
     /// The converter omits levels that generalize to nothing (§7.3), so an
-    /// overview built for z0..z4 can start at z2. The archive must still
-    /// declare the range that was asked for.
+    /// overview built for z0..z4 can start at z2. The report still reflects
+    /// the range that was asked for (what the CLI prints and what
+    /// `vector_layers[].minzoom` advertises), but the PMTiles header must
+    /// stay the range the directory actually addresses (z2..z4): #529/#522
+    /// found `go-pmtiles verify` rejecting every archive whose header
+    /// declared a coarser minimum than its shallowest real tile.
     #[test]
-    fn export_declared_min_zoom_is_written_to_header_and_report() {
+    fn export_declared_min_zoom_widens_report_but_header_reflects_actual_tiles() {
         let a = Geometry::Point(Point::new(-120.0, 40.0));
         let b = Geometry::Point(Point::new(120.0, -40.0));
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -7678,8 +7691,18 @@ mod tests {
 
         let data = std::fs::read(tout.path()).unwrap();
         let header = crate::pmtiles_writer::Header::from_bytes(&data[..127]).unwrap();
-        assert_eq!(header.min_zoom, 0);
+        assert_eq!(
+            header.min_zoom, 2,
+            "header must be the shallowest zoom with an actual tile, not the declared z0"
+        );
         assert_eq!(header.max_zoom, 4);
+        crate::archive_index::assert_header_zooms_match_tiles(tout.path());
+
+        // Default options over the same file (whose coarse zooms are empty):
+        // the header must satisfy the same invariant.
+        let tdef = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(tin.path(), tdef.path(), &ExportOptions::default()).unwrap();
+        crate::archive_index::assert_header_zooms_match_tiles(tdef.path());
     }
 
     /// Declaring a minimum finer than the coarsest level would misdescribe

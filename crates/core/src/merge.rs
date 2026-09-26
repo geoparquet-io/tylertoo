@@ -60,7 +60,7 @@ use crate::archive_index::{ArchiveIndex, TileRef};
 use crate::compression::Compression;
 use crate::dedup::TileHasher;
 use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType};
-use crate::pyramid::{vector_layers_json, LayerMeta};
+use crate::pyramid::{declared_zoom_range, layer_zoom_range, vector_layers_json, LayerMeta};
 use crate::tile::TileBounds;
 use crate::{Error, Result};
 
@@ -87,8 +87,15 @@ pub struct MergeReport {
     /// shards must yield the same per-zoom counts as tiling the whole input
     /// in one pass.
     pub per_zoom_tile_counts: BTreeMap<u8, u64>,
-    /// The merged header's zoom range: the union of the inputs' *declared*
-    /// ranges, not of the zooms that happened to hold tiles.
+    /// The union of the tile-holding inputs' *declared* zoom ranges -- each
+    /// input's header range widened by its own `vector_layers`
+    /// minzoom/maxzoom -- not of the zooms that happened to hold tiles. An
+    /// input with no usable `vector_layers` still contributes its header.
+    /// The merged PMTiles header's own zoom range can be narrower: since
+    /// #529/#522 it is always the tiles actually copied, which `go-pmtiles
+    /// verify` requires. The merged `vector_layers` advertises the union of
+    /// the inputs' layer entries, which matches this whenever every input
+    /// carries layer metadata.
     pub min_zoom: u8,
     pub max_zoom: u8,
     /// Distinct tile bodies actually written — `tiles_total` minus whatever
@@ -110,9 +117,11 @@ pub struct MergeReport {
 ///
 /// Tiles are copied still-compressed; nothing is decoded. The output is
 /// clustered by construction (tiles are written in ascending tile-id order),
-/// its bounds are the union of the inputs' usable bounds, its zoom range the
-/// union of their declared ranges, and its `vector_layers` the #492 union of
-/// theirs.
+/// its bounds are the union of the inputs' usable bounds, its `vector_layers`
+/// the #492 union of theirs (whose minzoom/maxzoom is in turn the union of
+/// what the inputs *declare*), and its PMTiles header's own zoom range the
+/// tiles actually copied (#529, #522) -- `go-pmtiles verify` requires that,
+/// even though it can be narrower than the declared range in `vector_layers`.
 ///
 /// Errors if the inputs disagree on tile type or compression, or if any tile
 /// id is claimed twice — by two inputs or by one input's own directory. See
@@ -149,28 +158,20 @@ pub fn merge_shards(
     }
     .map_err(|e| Error::PMTilesWrite(format!("failed to create streaming writer: {e}")))?;
 
-    // The union of what the inputs *declare*, not of the zooms that happen to
-    // hold tiles: a shard covering a sliver of the world legitimately has no
-    // tile at the build's deepest zoom, and deriving the merged maximum from
-    // the deepest tile copied would narrow the range every such shard set
-    // declares.
+    // Computed once and reused: the same "did this input contribute anything"
+    // question decides the zoom union AND which layer declarations are folded
+    // in (see `collect_layers`).
     //
     // An input holding NO tiles is excluded, the same way a bounds-less one
     // is excluded from the bounds union. The writer stamps z0..z0 into an
     // empty archive's header — a sentinel, not a declaration — and folding
     // that in drags the merged minimum to z0, so the output claims zooms the
     // build never produced on the word of a shard that contributed nothing.
-    let mut declared: Vec<(u8, u8)> = Vec::with_capacity(indexes.len());
-    // Computed once and reused: the same "did this input contribute anything"
-    // question decides the zoom union AND which layer declarations are folded
-    // in (see `collect_layers`).
     let mut has_tiles: Vec<bool> = Vec::with_capacity(indexes.len());
     for idx in &indexes {
         let tiles = idx.tile_id_range().map_err(|e| at(idx, e))?.is_some();
         has_tiles.push(tiles);
-        if tiles {
-            declared.push((idx.header().min_zoom, idx.header().max_zoom));
-        } else {
+        if !tiles {
             log::warn!(
                 "{}: holds no tiles; it is excluded from the merged archive's zoom range and \
                  layer declarations (an empty archive's header reads as the writer's z0..z0 \
@@ -179,12 +180,6 @@ pub fn merge_shards(
             );
         }
     }
-    // Every input empty: there is nothing to declare, and the writer's own
-    // empty-archive header (z0..z0) is the honest answer.
-    let min_zoom = declared.iter().map(|&(lo, _)| lo).min().unwrap_or(0);
-    let max_zoom = declared.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
-    writer.set_declared_min_zoom(min_zoom);
-    writer.set_declared_max_zoom(max_zoom);
     // The k-way heap emits ids in ascending order, so the merge is clustered
     // by construction; #506's hook turns that doc claim into a checked
     // contract (debug assertion per add, release warn at finalize).
@@ -223,8 +218,24 @@ pub fn merge_shards(
     // otherwise produce byte-different archives whenever the inputs declare
     // more than one distinct layer between them. (With a single shared layer
     // — the normal shard case — order was already immaterial.)
-    let mut layers = collect_layers(&indexes, &has_tiles);
+    let (mut layers, declared) = collect_layers(&indexes, &has_tiles);
     layers.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // The union of what the inputs *declare*, not of the zooms that happened
+    // to hold tiles: a shard covering a sliver of the world legitimately has
+    // no tile at the build's deepest zoom, and deriving the merged maximum
+    // from the deepest tile actually copied would narrow the range every
+    // such shard set declares. Each input that holds tiles contributes its
+    // header range (since #529/#522 its actual tiles, for a tylertoo
+    // archive) widened by its own `vector_layers` (where a tylertoo
+    // archive's wider declaration now lives) -- so an input with no or
+    // unusable metadata still counts. Every input empty: z0..z0, the
+    // writer's own empty-archive answer.
+    let (min_zoom, max_zoom) = declared.unwrap_or((0, 0));
+    // The merged `vector_layers` carries the inputs' declared layer ranges
+    // through `LayerMeta`; `set_vector_layers_json` takes precedence over the
+    // writer's own declared range, and the merged header is always the tiles
+    // actually copied (#529, #522).
     if let Some(first) = layers.first().map(|l| l.id.clone()) {
         // Only the metadata's `name`; `vector_layers` below is authoritative
         // for what a client actually reads.
@@ -374,78 +385,73 @@ fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Er
 }
 
 /// Every `vector_layers` entry every input declares, in input order (the
-/// caller sorts).
+/// caller sorts), and the union of every tile-holding input's declared zoom
+/// range (header widened by its layers, see [`declared_zoom_range`]); `None`
+/// when no input holds a tile.
 ///
 /// Unparseable or absent metadata is not fatal — the tiles are still
 /// copyable, they just describe no fields — but it is worth a warning, since
 /// a merged archive that declares no layers renders as nothing in most
-/// clients.
+/// clients. Such an input still contributes its header range to the
+/// declared union.
+///
 /// `has_tiles[i]` says whether input `i` contributed any tile; a tile-less
-/// one is skipped for the same reason the zoom union skips it (#498). An
-/// empty shard's metadata carries the writer's z0..z0 sentinel in its layer
-/// entries, and folding that in drags the merged `vector_layers` minzoom to
-/// z0 — the layer then claims zooms the build never produced, on the word of
-/// a job that produced nothing.
-fn collect_layers(indexes: &[ArchiveIndex], has_tiles: &[bool]) -> Vec<LayerMeta> {
+/// one is skipped entirely (#498). An empty shard's header and metadata carry
+/// the writer's z0..z0 sentinel, and folding that in drags the merged minzoom
+/// to z0 — the layer then claims zooms the build never produced, on the word
+/// of a job that produced nothing.
+fn collect_layers(
+    indexes: &[ArchiveIndex],
+    has_tiles: &[bool],
+) -> (Vec<LayerMeta>, Option<(u8, u8)>) {
     let mut layers = Vec::new();
+    let mut declared: Option<(u8, u8)> = None;
     for (i, idx) in indexes.iter().enumerate() {
         if !has_tiles.get(i).copied().unwrap_or(true) {
             continue;
         }
-        let Some(meta) = idx.metadata_json() else {
-            log::warn!(
+        let header = (idx.header().min_zoom, idx.header().max_zoom);
+        let mut input_zooms: Vec<(u8, u8)> = Vec::new();
+        match idx.metadata_json() {
+            None => log::warn!(
                 "{}: metadata is absent or not valid JSON; its layers are not declared in the \
                  merged archive",
                 idx.path().display()
-            );
-            continue;
-        };
-        let Some(arr) = meta.get("vector_layers").and_then(Value::as_array) else {
-            log::warn!(
-                "{}: metadata declares no vector_layers; its layers are not declared in the \
-                 merged archive",
-                idx.path().display()
-            );
-            continue;
-        };
-        for l in arr {
-            let Some(id) = l.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            // `as u8` on a foreign JSON number truncates: a `minzoom` of 256
-            // became 0, silently widening the merged layer to the whole
-            // pyramid. Anything that is not a valid zoom falls back to the
-            // header's own value, which `Header::from_bytes` has already
-            // range-checked.
-            let zoom = |key: &str, fallback: u8| -> u8 {
-                match l.get(key).and_then(Value::as_u64) {
-                    Some(v) => match u8::try_from(v) {
-                        Ok(z) => z,
-                        Err(_) => {
-                            log::warn!(
-                                "{}: vector_layers[{id:?}].{key} = {v} is not a zoom; \
-                                 using the header's z{fallback}",
-                                idx.path().display()
-                            );
-                            fallback
-                        }
-                    },
-                    None => fallback,
+            ),
+            Some(meta) => match meta.get("vector_layers").and_then(Value::as_array) {
+                None => log::warn!(
+                    "{}: metadata declares no vector_layers; its layers are not declared in the \
+                     merged archive",
+                    idx.path().display()
+                ),
+                Some(arr) => {
+                    for l in arr {
+                        let Some(id) = l.get("id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let (minzoom, maxzoom) = layer_zoom_range(l, header, idx.path());
+                        input_zooms.push((minzoom, maxzoom));
+                        layers.push(LayerMeta {
+                            id: id.to_string(),
+                            minzoom,
+                            maxzoom,
+                            fields: l
+                                .get("fields")
+                                .filter(|f| f.is_object())
+                                .cloned()
+                                .unwrap_or_else(|| Value::Object(Default::default())),
+                        });
+                    }
                 }
-            };
-            layers.push(LayerMeta {
-                id: id.to_string(),
-                minzoom: zoom("minzoom", idx.header().min_zoom),
-                maxzoom: zoom("maxzoom", idx.header().max_zoom),
-                fields: l
-                    .get("fields")
-                    .filter(|f| f.is_object())
-                    .cloned()
-                    .unwrap_or_else(|| Value::Object(Default::default())),
-            });
+            },
         }
+        let (lo, hi) = declared_zoom_range(header, true, input_zooms);
+        declared = Some(match declared {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
     }
-    layers
+    (layers, declared)
 }
 
 #[cfg(test)]
@@ -665,53 +671,62 @@ mod tests {
         assert!((h.max_lon - 0.0).abs() < 1e-6, "max_lon {}", h.max_lon);
     }
 
-    /// The merged zoom range is the union of what the inputs DECLARE, not of
-    /// the zooms that happened to hold tiles: a shard covering a sliver of
-    /// the world legitimately has no tile at the build's coarsest or deepest
-    /// zoom, and narrowing the header to what was copied would hide zooms the
-    /// build genuinely produces.
+    /// The merged `vector_layers` (and the report) zoom range is the union of
+    /// what the inputs DECLARE, not of the zooms that happened to hold tiles:
+    /// a shard covering a sliver of the world legitimately has no tile at the
+    /// build's coarsest or deepest zoom, and narrowing the advertised range to
+    /// what was copied would hide zooms the build genuinely produces. The
+    /// merged PMTiles header is different (#529, #522): it is always the
+    /// union of the tiles actually copied, because `go-pmtiles verify`
+    /// rejects a header wider than that.
     #[test]
-    fn merge_shards_header_zoom_range_is_union() {
+    fn merge_shards_vector_layers_zoom_range_is_union_but_header_is_actual() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.pmtiles");
         let b = dir.path().join("b.pmtiles");
         let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
-        // `a` declares z2-z4 but only holds a z4 tile: #380's case, where a
-        // band's coarse zooms generalized away to nothing.
+        // `a` declares z2-z4 in its `vector_layers` but only holds a z4 tile:
+        // #380's case, where a band's coarse zooms generalized away to
+        // nothing. Its own header is honest too: z4-z4, not the declared
+        // z2-z4 (#529, #522).
         let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         w.set_layer_name("l");
         w.set_bounds(&bounds);
         w.set_declared_min_zoom(2);
         w.add_tile(4, 0, 0, &[0x1a, 0x02, 0x08, 0x01]).unwrap();
         w.finalize(&a).unwrap();
-        // `b` declares z5-z9 but only holds z5 and z7 — a shard covering a
-        // sliver of the world, whose deepest zooms are empty out there. The
-        // declaration is patched into the header byte a real export stamps
-        // (byte 101), so this asserts against the FORMAT, not against the
-        // writer API the merge happens to use.
+        assert_eq!((header_of(&a).min_zoom, header_of(&a).max_zoom), (4, 4));
+
+        // `b` holds z5 and z7 — a shard covering a sliver of the world, whose
+        // deepest zooms are empty out there. Its header's max_zoom byte (101)
+        // is hand-patched to simulate an externally produced archive whose
+        // header carries a real declaration beyond its actual tiles. That
+        // declaration counts toward the report's declared union (header
+        // widened by `vector_layers`), but never reaches the merged header,
+        // and -- since b's metadata never declared z9 -- not the merged
+        // `vector_layers` either.
         write_shard(&b, "l", &[(5, 20, 20), (7, 100, 100)], bounds, &[]);
         let mut raw = std::fs::read(&b).unwrap();
         raw[101] = 9;
         std::fs::write(&b, &raw).unwrap();
-
-        assert_eq!((header_of(&a).min_zoom, header_of(&a).max_zoom), (2, 4));
         assert_eq!((header_of(&b).min_zoom, header_of(&b).max_zoom), (5, 9));
 
         let out = dir.path().join("merged.pmtiles");
         let report = merge_shards(&[a.clone(), b.clone()], &out, &MergeOptions::default()).unwrap();
 
-        // z2 comes from a's declaration (its coarsest tile is z4) and z9 from
-        // b's (its deepest tile is z7): the union of what the inputs declare,
-        // not of what they hold.
+        // The merged header is the union of the tiles actually copied — z4
+        // from a, z5 and z7 from b — never widened by either declaration, and
+        // blind to b's hand-patched header byte.
         let h = header_of(&out);
-        assert_eq!((h.min_zoom, h.max_zoom), (2, 9), "{h:?}");
+        assert_eq!((h.min_zoom, h.max_zoom), (4, 7), "{h:?}");
+        crate::archive_index::assert_header_zooms_match_tiles(&out);
+
+        // The report unions each input's declared range: z2 from a's
+        // `vector_layers` (its header is honest z4-z4), z9 from b's widened
+        // header. `vector_layers` unions only the inputs' layer entries: z2
+        // from a, z7 from b's real layer (b's header patch never touched its
+        // metadata).
         assert_eq!((report.min_zoom, report.max_zoom), (2, 9));
-        // `vector_layers` is unioned from the inputs' own layer declarations,
-        // which is a different (and narrower) thing from the header's zoom
-        // range: this fixture patched only b's header byte, so its layer
-        // still declares z5-z7 and the merged layer spans z2-z7. A real
-        // export writes the two consistently; the merge does not invent a
-        // layer range the inputs never declared.
         let layer = metadata_of(&out)["vector_layers"][0].clone();
         assert_eq!(layer["minzoom"], json!(2), "{layer}");
         assert_eq!(layer["maxzoom"], json!(7), "{layer}");
@@ -720,6 +735,104 @@ mod tests {
         assert_eq!(
             report.per_zoom_tile_counts,
             BTreeMap::from([(4u8, 1u64), (5, 1), (7, 1)])
+        );
+    }
+
+    /// A shard whose `vector_layers` is unusable -- here `null`, as a foreign
+    /// or hand-built archive might carry -- over the given tiles.
+    fn write_shard_without_layers(path: &Path, tiles: &[(u8, u32, u32)], layers_json: &str) {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name("l");
+        w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+        w.set_vector_layers_json(layers_json.to_string());
+        for (i, (z, x, y)) in tiles.iter().enumerate() {
+            w.add_tile(*z, *x, *y, &[0x1a, 0x02, 0x08, i as u8])
+                .unwrap();
+        }
+        w.finalize(path).unwrap();
+    }
+
+    /// #554 review S2-2: the report's declared union used to come only from
+    /// `vector_layers`, so inputs with tiles but no usable layer metadata
+    /// were dropped -- every such input gave a z0..z0 report, a mix gave one
+    /// too narrow. Each tile-holding input's header (its actual tiles, for a
+    /// tylertoo archive) now always counts.
+    #[test]
+    fn merge_shards_report_covers_inputs_without_vector_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        write_shard_without_layers(&a, &[(3, 0, 0), (5, 1, 1)], "null");
+        write_shard_without_layers(&b, &[(6, 40, 40), (8, 200, 200)], "null");
+        assert!(metadata_of(&a)["vector_layers"].is_null());
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_shards(&[a.clone(), b.clone()], &out, &MergeOptions::default()).unwrap();
+        assert_eq!(
+            (report.min_zoom, report.max_zoom),
+            (3, 8),
+            "no vector_layers anywhere: the report is the actual tile range"
+        );
+        crate::archive_index::assert_header_zooms_match_tiles(&out);
+
+        // Mixed: `c` declares z1 in vector_layers over a z4 tile; `b` has no
+        // layers but tiles to z8. Both ends must survive.
+        let c = dir.path().join("c.pmtiles");
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name("l");
+        w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+        w.set_declared_min_zoom(1);
+        w.add_tile(4, 0, 0, &[0x1a, 0x02, 0x08, 0x09]).unwrap();
+        w.finalize(&c).unwrap();
+        let out = dir.path().join("mixed.pmtiles");
+        let report = merge_shards(&[c, b], &out, &MergeOptions::default()).unwrap();
+        assert_eq!((report.min_zoom, report.max_zoom), (1, 8));
+        crate::archive_index::assert_header_zooms_match_tiles(&out);
+    }
+
+    /// A foreign layer declaring `minzoom > maxzoom` (or a zoom no archive
+    /// can address) must not invert or blow up the merged range: the entry
+    /// falls back to its archive's header range.
+    #[test]
+    fn merge_shards_inverted_or_invalid_layer_zooms_fall_back_to_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        let b = dir.path().join("b.pmtiles");
+        write_shard_without_layers(
+            &a,
+            &[(5, 1, 1)],
+            r#"[{"id":"l","minzoom":9,"maxzoom":2,"fields":{}}]"#,
+        );
+        write_shard_without_layers(
+            &b,
+            &[(6, 40, 40)],
+            r#"[{"id":"l","minzoom":0,"maxzoom":300,"fields":{}}]"#,
+        );
+
+        let out = dir.path().join("merged.pmtiles");
+        let report = merge_shards(&[a, b], &out, &MergeOptions::default()).unwrap();
+        // a: inverted -> header z5-5. b: maxzoom 300 is not a zoom -> header
+        // z6, minzoom 0 is a real declaration -> z0-6.
+        assert_eq!((report.min_zoom, report.max_zoom), (0, 6), "{report:?}");
+        let layer = metadata_of(&out)["vector_layers"][0].clone();
+        assert_eq!(layer["minzoom"], json!(0), "{layer}");
+        assert_eq!(layer["maxzoom"], json!(6), "{layer}");
+        crate::archive_index::assert_header_zooms_match_tiles(&out);
+
+        // Inverted alone: the report is exactly the header, never inverted.
+        let c = dir.path().join("c.pmtiles");
+        write_shard_without_layers(
+            &c,
+            &[(5, 1, 1), (7, 3, 3)],
+            r#"[{"id":"l","minzoom":9,"maxzoom":2,"fields":{}}]"#,
+        );
+        let out = dir.path().join("inverted.pmtiles");
+        let report = merge_shards(&[c], &out, &MergeOptions::default()).unwrap();
+        assert_eq!((report.min_zoom, report.max_zoom), (5, 7));
+        let layer = metadata_of(&out)["vector_layers"][0].clone();
+        assert_eq!(
+            (layer["minzoom"].clone(), layer["maxzoom"].clone()),
+            (json!(5), json!(7))
         );
     }
 
