@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::covering::extract_row_group_bounds_from_metadata;
@@ -344,13 +345,38 @@ impl OverviewReader {
         level_idx: usize,
         batch_size: usize,
     ) -> Result<ParquetRecordBatchReader, ReaderError> {
+        Ok(self.band_builder(level_idx, batch_size)?.build()?)
+    }
+
+    /// [`Self::read_band_with_batch_size`] projected to the top-level columns
+    /// `roots` (indexes into [`Self::schema`]); batches carry only those
+    /// columns, in schema order, with their field metadata intact.
+    ///
+    /// For consumers that need a narrow slice of every row — the export's
+    /// fan-out bbox scan reads only the geometry — so the property columns are
+    /// neither read nor held in the batches in flight.
+    pub(crate) fn read_band_projected(
+        &self,
+        level_idx: usize,
+        batch_size: usize,
+        roots: &[usize],
+    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+        let builder = self.band_builder(level_idx, batch_size)?;
+        let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
+        Ok(builder.with_projection(mask).build()?)
+    }
+
+    /// A reader builder over `level_idx`'s own row-group band.
+    fn band_builder(
+        &self,
+        level_idx: usize,
+        batch_size: usize,
+    ) -> Result<ParquetRecordBatchReaderBuilder<File>, ReaderError> {
         let (start, end) = self.level_band(level_idx)?;
         let file = File::open(&self.path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        Ok(ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_row_groups((start..=end).collect())
-            .with_batch_size(batch_size)
-            .build()?;
-        Ok(reader)
+            .with_batch_size(batch_size))
     }
 }
 
