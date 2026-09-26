@@ -276,6 +276,92 @@ fn decode_roundtrip_full_archive() {
 }
 
 // ============================================================================
+// `--feature-id` (#443): stable MVT feature ids
+// ============================================================================
+
+/// Full production round trip with `--feature-id id`: the source `id` column
+/// becomes the MVT feature id at every zoom the feature is tiled at, and it
+/// is never *also* published as a decoded property (the fixture's `name` is
+/// untouched, so it doubles as an independent check on which source row a
+/// decoded feature came from).
+#[test]
+fn feature_id_column_is_stable_across_zooms_and_not_duplicated_as_a_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.parquet");
+    let overviews = dir.path().join("fixture-overviews.parquet");
+    let pmtiles = dir.path().join("fixture.pmtiles");
+    let output = dir.path().join("decoded.parquet");
+
+    write_fixture(&input, &fixture_geometries(), None);
+    let convert_opts = ConvertOptions {
+        levels: LevelPlan::ZoomRange {
+            min_zoom: MIN_ZOOM,
+            max_zoom: MAX_ZOOM,
+        },
+        ..Default::default()
+    };
+    convert_to_overviews(&input, &overviews, &convert_opts).unwrap();
+    let export_opts = ExportOptions {
+        feature_id: Some("id".to_string()),
+        ..Default::default()
+    };
+    export_pmtiles(&overviews, &pmtiles, &export_opts).unwrap();
+
+    let report = decode_pmtiles(&pmtiles, &output, &DecodeOptions::default()).unwrap();
+    assert!(report.features_written > 0);
+
+    let file = std::fs::File::open(&output).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = builder.schema().clone();
+    assert!(
+        schema.column_with_name("id").is_none(),
+        "the feature-id column must not also be published as a decoded property"
+    );
+    assert!(
+        schema.column_with_name("name").is_some(),
+        "other properties must still be published"
+    );
+    assert!(schema.column_with_name("mvt_id").is_some());
+
+    let mut zooms_seen: BTreeSet<u8> = BTreeSet::new();
+    let mut rows_checked = 0usize;
+    for batch in builder.build().unwrap() {
+        let batch = batch.unwrap();
+        let s = batch.schema();
+        let zoom = batch
+            .column(s.index_of("zoom").unwrap())
+            .as_primitive::<UInt8Type>()
+            .clone();
+        let mvt_id = batch
+            .column(s.index_of("mvt_id").unwrap())
+            .as_primitive::<UInt64Type>()
+            .clone();
+        let name = batch
+            .column(s.index_of("name").unwrap())
+            .as_string::<i32>()
+            .clone();
+        for i in 0..batch.num_rows() {
+            zooms_seen.insert(zoom.value(i));
+            assert!(!mvt_id.is_null(i), "every feature must carry an id");
+            // The fixture's `name` is `format!("f{id}")` (see `write_fixture`
+            // in this file), so it independently names the expected id.
+            let expected_id: u64 = name.value(i).trim_start_matches('f').parse().unwrap();
+            assert_eq!(
+                mvt_id.value(i),
+                expected_id,
+                "mvt_id must equal the source `id` column value"
+            );
+            rows_checked += 1;
+        }
+    }
+    assert!(rows_checked > 0);
+    assert!(
+        zooms_seen.len() >= 2,
+        "fixture must span multiple zoom levels to prove cross-zoom stability, saw {zooms_seen:?}"
+    );
+}
+
+// ============================================================================
 // Filters
 // ============================================================================
 
