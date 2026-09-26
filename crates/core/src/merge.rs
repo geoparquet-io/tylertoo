@@ -87,8 +87,12 @@ pub struct MergeReport {
     /// shards must yield the same per-zoom counts as tiling the whole input
     /// in one pass.
     pub per_zoom_tile_counts: BTreeMap<u8, u64>,
-    /// The merged header's zoom range: the union of the inputs' *declared*
-    /// ranges, not of the zooms that happened to hold tiles.
+    /// The union of the inputs' *declared* zoom ranges (their `vector_layers`
+    /// minzoom/maxzoom), not of the zooms that happened to hold tiles. This is
+    /// also what the merged archive's own `vector_layers` advertises. The
+    /// merged PMTiles header's own zoom range can be narrower: since #529/#522
+    /// it is always the tiles actually copied, which `go-pmtiles verify`
+    /// requires.
     pub min_zoom: u8,
     pub max_zoom: u8,
     /// Distinct tile bodies actually written — `tiles_total` minus whatever
@@ -110,9 +114,11 @@ pub struct MergeReport {
 ///
 /// Tiles are copied still-compressed; nothing is decoded. The output is
 /// clustered by construction (tiles are written in ascending tile-id order),
-/// its bounds are the union of the inputs' usable bounds, its zoom range the
-/// union of their declared ranges, and its `vector_layers` the #492 union of
-/// theirs.
+/// its bounds are the union of the inputs' usable bounds, its `vector_layers`
+/// the #492 union of theirs (whose minzoom/maxzoom is in turn the union of
+/// what the inputs *declare*), and its PMTiles header's own zoom range the
+/// tiles actually copied (#529, #522) -- `go-pmtiles verify` requires that,
+/// even though it can be narrower than the declared range in `vector_layers`.
 ///
 /// Errors if the inputs disagree on tile type or compression, or if any tile
 /// id is claimed twice — by two inputs or by one input's own directory. See
@@ -149,28 +155,20 @@ pub fn merge_shards(
     }
     .map_err(|e| Error::PMTilesWrite(format!("failed to create streaming writer: {e}")))?;
 
-    // The union of what the inputs *declare*, not of the zooms that happen to
-    // hold tiles: a shard covering a sliver of the world legitimately has no
-    // tile at the build's deepest zoom, and deriving the merged maximum from
-    // the deepest tile copied would narrow the range every such shard set
-    // declares.
+    // Computed once and reused: the same "did this input contribute anything"
+    // question decides the zoom union AND which layer declarations are folded
+    // in (see `collect_layers`).
     //
     // An input holding NO tiles is excluded, the same way a bounds-less one
     // is excluded from the bounds union. The writer stamps z0..z0 into an
     // empty archive's header — a sentinel, not a declaration — and folding
     // that in drags the merged minimum to z0, so the output claims zooms the
     // build never produced on the word of a shard that contributed nothing.
-    let mut declared: Vec<(u8, u8)> = Vec::with_capacity(indexes.len());
-    // Computed once and reused: the same "did this input contribute anything"
-    // question decides the zoom union AND which layer declarations are folded
-    // in (see `collect_layers`).
     let mut has_tiles: Vec<bool> = Vec::with_capacity(indexes.len());
     for idx in &indexes {
         let tiles = idx.tile_id_range().map_err(|e| at(idx, e))?.is_some();
         has_tiles.push(tiles);
-        if tiles {
-            declared.push((idx.header().min_zoom, idx.header().max_zoom));
-        } else {
+        if !tiles {
             log::warn!(
                 "{}: holds no tiles; it is excluded from the merged archive's zoom range and \
                  layer declarations (an empty archive's header reads as the writer's z0..z0 \
@@ -179,12 +177,6 @@ pub fn merge_shards(
             );
         }
     }
-    // Every input empty: there is nothing to declare, and the writer's own
-    // empty-archive header (z0..z0) is the honest answer.
-    let min_zoom = declared.iter().map(|&(lo, _)| lo).min().unwrap_or(0);
-    let max_zoom = declared.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
-    writer.set_declared_min_zoom(min_zoom);
-    writer.set_declared_max_zoom(max_zoom);
     // The k-way heap emits ids in ascending order, so the merge is clustered
     // by construction; #506's hook turns that doc claim into a checked
     // contract (debug assertion per add, release warn at finalize).
@@ -225,7 +217,30 @@ pub fn merge_shards(
     // — the normal shard case — order was already immaterial.)
     let mut layers = collect_layers(&indexes, &has_tiles);
     layers.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // The union of what the inputs' layers *declare*, not of the zooms that
+    // happened to hold tiles: a shard covering a sliver of the world
+    // legitimately has no tile at the build's deepest zoom, and deriving the
+    // merged maximum from the deepest tile actually copied would narrow the
+    // range every such shard set declares.
+    //
+    // Sourced from each input's `vector_layers`, not its header: since
+    // #529/#522 the writer never widens an archive's own header past its
+    // actual tiles, so a shard's declared range survives only in its
+    // metadata. `set_declared_min_zoom`/`set_declared_max_zoom` below widen
+    // the merged `vector_layers` the same way; they never reach the merged
+    // header, which is always the union of the tiles actually copied.
+    let (min_zoom, max_zoom) = if layers.is_empty() {
+        (0, 0)
+    } else {
+        (
+            layers.iter().map(|l| l.minzoom).min().unwrap(),
+            layers.iter().map(|l| l.maxzoom).max().unwrap(),
+        )
+    };
     if let Some(first) = layers.first().map(|l| l.id.clone()) {
+        writer.set_declared_min_zoom(min_zoom);
+        writer.set_declared_max_zoom(max_zoom);
         // Only the metadata's `name`; `vector_layers` below is authoritative
         // for what a client actually reads.
         writer.set_layer_name(&first);
@@ -665,53 +680,60 @@ mod tests {
         assert!((h.max_lon - 0.0).abs() < 1e-6, "max_lon {}", h.max_lon);
     }
 
-    /// The merged zoom range is the union of what the inputs DECLARE, not of
-    /// the zooms that happened to hold tiles: a shard covering a sliver of
-    /// the world legitimately has no tile at the build's coarsest or deepest
-    /// zoom, and narrowing the header to what was copied would hide zooms the
-    /// build genuinely produces.
+    /// The merged `vector_layers` (and the report) zoom range is the union of
+    /// what the inputs DECLARE, not of the zooms that happened to hold tiles:
+    /// a shard covering a sliver of the world legitimately has no tile at the
+    /// build's coarsest or deepest zoom, and narrowing the advertised range to
+    /// what was copied would hide zooms the build genuinely produces. The
+    /// merged PMTiles header is different (#529, #522): it is always the
+    /// union of the tiles actually copied, because `go-pmtiles verify`
+    /// rejects a header wider than that.
     #[test]
-    fn merge_shards_header_zoom_range_is_union() {
+    fn merge_shards_vector_layers_zoom_range_is_union_but_header_is_actual() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.pmtiles");
         let b = dir.path().join("b.pmtiles");
         let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
-        // `a` declares z2-z4 but only holds a z4 tile: #380's case, where a
-        // band's coarse zooms generalized away to nothing.
+        // `a` declares z2-z4 in its `vector_layers` but only holds a z4 tile:
+        // #380's case, where a band's coarse zooms generalized away to
+        // nothing. Its own header is honest too: z4-z4, not the declared
+        // z2-z4 (#529, #522).
         let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         w.set_layer_name("l");
         w.set_bounds(&bounds);
         w.set_declared_min_zoom(2);
         w.add_tile(4, 0, 0, &[0x1a, 0x02, 0x08, 0x01]).unwrap();
         w.finalize(&a).unwrap();
-        // `b` declares z5-z9 but only holds z5 and z7 — a shard covering a
-        // sliver of the world, whose deepest zooms are empty out there. The
-        // declaration is patched into the header byte a real export stamps
-        // (byte 101), so this asserts against the FORMAT, not against the
-        // writer API the merge happens to use.
+        assert_eq!((header_of(&a).min_zoom, header_of(&a).max_zoom), (4, 4));
+
+        // `b` holds z5 and z7 — a shard covering a sliver of the world, whose
+        // deepest zooms are empty out there. Its header's max_zoom byte (101)
+        // is hand-patched to simulate an externally produced archive whose
+        // header carries a real declaration beyond its actual tiles: that
+        // patch must NOT reach the merge's declared-range union, which is
+        // sourced from `vector_layers`, not raw header bytes, precisely
+        // because tylertoo's own writer no longer puts a declaration there.
         write_shard(&b, "l", &[(5, 20, 20), (7, 100, 100)], bounds, &[]);
         let mut raw = std::fs::read(&b).unwrap();
         raw[101] = 9;
         std::fs::write(&b, &raw).unwrap();
-
-        assert_eq!((header_of(&a).min_zoom, header_of(&a).max_zoom), (2, 4));
         assert_eq!((header_of(&b).min_zoom, header_of(&b).max_zoom), (5, 9));
 
         let out = dir.path().join("merged.pmtiles");
         let report = merge_shards(&[a.clone(), b.clone()], &out, &MergeOptions::default()).unwrap();
 
-        // z2 comes from a's declaration (its coarsest tile is z4) and z9 from
-        // b's (its deepest tile is z7): the union of what the inputs declare,
-        // not of what they hold.
+        // The merged header is the union of the tiles actually copied — z4
+        // from a, z5 and z7 from b — never widened by either declaration, and
+        // blind to b's hand-patched header byte.
         let h = header_of(&out);
-        assert_eq!((h.min_zoom, h.max_zoom), (2, 9), "{h:?}");
-        assert_eq!((report.min_zoom, report.max_zoom), (2, 9));
-        // `vector_layers` is unioned from the inputs' own layer declarations,
-        // which is a different (and narrower) thing from the header's zoom
-        // range: this fixture patched only b's header byte, so its layer
-        // still declares z5-z7 and the merged layer spans z2-z7. A real
-        // export writes the two consistently; the merge does not invent a
-        // layer range the inputs never declared.
+        assert_eq!((h.min_zoom, h.max_zoom), (4, 7), "{h:?}");
+
+        // The report and `vector_layers` instead union what the inputs' own
+        // `vector_layers` declare: z2 from a's declaration, z7 from b's real
+        // layer (b's header patch never touched its metadata, so it
+        // contributes nothing here — proof the union no longer reads raw
+        // header bytes).
+        assert_eq!((report.min_zoom, report.max_zoom), (2, 7));
         let layer = metadata_of(&out)["vector_layers"][0].clone();
         assert_eq!(layer["minzoom"], json!(2), "{layer}");
         assert_eq!(layer["maxzoom"], json!(7), "{layer}");

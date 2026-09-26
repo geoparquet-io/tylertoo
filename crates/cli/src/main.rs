@@ -2581,8 +2581,11 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             convert_report.unprojectable_features,
         )
     );
-    // #380: the header covers the requested range; say which zooms in it
-    // hold nothing rather than let the range above imply they do.
+    // #380: the summary line above covers the requested (declared) range,
+    // which can be wider than the archive's own PMTiles header (#529, #522:
+    // the header always reflects the zooms that actually hold a tile) — say
+    // which zooms in the requested range hold nothing rather than let the
+    // summary imply they do.
     let empty_zooms: Vec<String> = convert_report
         .skipped_empty_levels
         .iter()

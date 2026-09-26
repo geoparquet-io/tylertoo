@@ -355,14 +355,19 @@ impl ArchiveIndex {
     /// tiles at all.
     ///
     /// This is the archive's *actual* content, as opposed to
-    /// `header().min_zoom..=header().max_zoom`, which since #380/#390 is only
-    /// a *declaration*: a writer widens it over an empty zoom so a client
-    /// sees the range it was told to expect even where nothing was written
-    /// (`set_declared_min_zoom`/`set_declared_max_zoom`). The pyramid band
-    /// contract (#514) keys off this instead, so a widened header can no
-    /// longer make an empty band look like a legitimate subrange, and an
-    /// honest, narrow header can no longer make a band that fully covers the
-    /// archive's real tiles look like an error.
+    /// `header().min_zoom..=header().max_zoom`. Between #380/#390 and
+    /// #529/#522, `header()`'s own zoom range could also be a *declaration*
+    /// widened over an empty zoom (`set_declared_min_zoom`/
+    /// `set_declared_max_zoom`) so a client saw the range it was told to
+    /// expect even where nothing was written -- but `go-pmtiles verify`
+    /// rejects a header wider than the archive's actual tiles, so tylertoo's
+    /// own writer no longer produces one; a declaration now only reaches
+    /// `vector_layers[].minzoom`/`maxzoom`. An externally produced archive
+    /// can still carry a genuinely mismatched header, though, so the pyramid
+    /// band contract (#514) keys off this method rather than `header()`: a
+    /// widened header can no longer make an empty band look like a
+    /// legitimate subrange, and an honest, narrow header can no longer make a
+    /// band that fully covers the archive's real tiles look like an error.
     ///
     /// Free of any run-length-expansion cost beyond [`Self::tile_id_range`]:
     /// tile ids are Hilbert-curve blocks per zoom, monotonic in zoom, so the

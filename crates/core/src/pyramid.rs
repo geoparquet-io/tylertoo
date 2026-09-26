@@ -2233,11 +2233,13 @@ mod tests {
     }
 
     /// #380 on the pyramid path: a band declared `0-3` whose coarse zooms
-    /// generalized to nothing holds tiles only at z3. The merged header must
-    /// still declare z0, as `vector_layers[].minzoom` already does — on both
-    /// the single-pass and the shared-zoom path.
+    /// generalized to nothing holds tiles only at z3. `vector_layers[].minzoom`
+    /// still declares z0 (checked elsewhere), but the merged PMTiles header
+    /// must stay the zoom that actually holds a tile (#529, #522) — on both
+    /// the single-pass and the shared-zoom path — or `go-pmtiles verify`
+    /// rejects the archive.
     #[test]
-    fn merge_declares_the_bands_min_zoom_even_when_coarse_zooms_are_empty() {
+    fn merge_header_is_actual_tiles_even_when_the_bands_declare_coarser_zooms() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.pmtiles");
         let b = dir.path().join("b.pmtiles");
@@ -2256,9 +2258,11 @@ mod tests {
         )
         .unwrap();
         let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
-        assert_eq!((h.min_zoom, h.max_zoom), (0, 3), "single-pass header");
+        assert_eq!((h.min_zoom, h.max_zoom), (3, 3), "single-pass header");
 
-        // Two layers over shared zooms, two-phase path; the coarser band wins.
+        // Two layers over shared zooms, two-phase path; both only hold a tile
+        // at z3, so the merged header is (3, 3) regardless of either band's
+        // declared range.
         let out = dir.path().join("two.pmtiles");
         merge_bands(
             &[
@@ -2269,7 +2273,7 @@ mod tests {
         )
         .unwrap();
         let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
-        assert_eq!((h.min_zoom, h.max_zoom), (1, 3), "two-phase header");
+        assert_eq!((h.min_zoom, h.max_zoom), (3, 3), "two-phase header");
     }
 
     /// #385: at a zoom two bands share, a tile both wrote carries both layers
@@ -2569,6 +2573,19 @@ mod tests {
     /// the tiles actually written -- what a real per-band export does under
     /// #380 (min) and its #514 mirror (max), and what an externally-produced
     /// archive might do honestly (both `None`) or with a widened header.
+    /// Writes an archive holding exactly `tiles`, then patches the header's
+    /// min/max zoom bytes (100/101) directly to declare a wider range than
+    /// the tiles actually written.
+    ///
+    /// Since #529/#522, `StreamingPmtilesWriter` itself never widens its own
+    /// header past the tiles it wrote -- `go-pmtiles verify` rejects that --
+    /// so `set_declared_min_zoom`/`set_declared_max_zoom` cannot produce a
+    /// widened header any more, only a widened `vector_layers`. `RangeFit`
+    /// (#514) still has to classify a genuinely mismatched header correctly
+    /// though, because an externally produced archive can have one; this
+    /// patches the raw bytes a real external writer could have stamped, the
+    /// same way `empty_archive_with_a_real_declaration_stays_disjoint_under_the_flag`
+    /// does.
     fn write_band_declared_range(
         path: &Path,
         layer: &str,
@@ -2580,16 +2597,21 @@ mod tests {
         let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         w.set_layer_name(layer);
         w.set_bounds(&bounds);
-        if let Some(z) = declared_min_zoom {
-            w.set_declared_min_zoom(z);
-        }
-        if let Some(z) = declared_max_zoom {
-            w.set_declared_max_zoom(z);
-        }
         for (z, x, y) in tiles {
             w.add_tile(*z, *x, *y, &[0x1a, 0x02, 0x08, 0x01]).unwrap();
         }
         w.finalize(path).unwrap();
+
+        if declared_min_zoom.is_some() || declared_max_zoom.is_some() {
+            let mut bytes = std::fs::read(path).unwrap();
+            if let Some(z) = declared_min_zoom {
+                bytes[100] = z;
+            }
+            if let Some(z) = declared_max_zoom {
+                bytes[101] = z;
+            }
+            std::fs::write(path, bytes).unwrap();
+        }
     }
 
     fn read_metadata(path: &Path) -> String {
@@ -3132,15 +3154,15 @@ mod tests {
         assert_eq!(report.total_tiles, 1, "the real z5 tile is written");
     }
 
-    /// #514 issue #3: `--allow-missing-zooms` let a band declare deeper
-    /// zooms than its archive actually has, but the merged header's
-    /// `max_zoom` used to stay pinned to the deepest tile actually copied
-    /// while `vector_layers[].maxzoom` used the band's declared value --
-    /// disagreeing at the top end the way #380 already prevented at the
-    /// bottom. `set_declared_max_zoom` (mirroring #380's
-    /// `set_declared_min_zoom`) fixes it: declared wins at both ends.
+    /// #514 issue #3: `--allow-missing-zooms` lets a band declare deeper
+    /// zooms than its archive actually has. `vector_layers[].maxzoom` uses
+    /// the band's declared value (mirroring #380's minimum), but the merged
+    /// PMTiles header's own `max_zoom` stays pinned to the deepest tile
+    /// actually copied (#529, #522) -- `go-pmtiles verify` rejects a header
+    /// claiming a zoom the directory does not address, so the two are
+    /// expected to disagree here, not to agree.
     #[test]
-    fn merge_declares_the_bands_max_zoom_even_when_deep_zooms_are_missing() {
+    fn merge_vector_layers_declares_the_bands_max_zoom_but_header_is_actual() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("archive.pmtiles");
         // Actual tiles only reach z6; the band declares z3-10.
@@ -3162,14 +3184,15 @@ mod tests {
 
         let h = Header::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!(
-            h.max_zoom, 10,
-            "header must declare the band's max, not the deepest tile"
+            h.max_zoom, 6,
+            "header must be the deepest zoom actually copied (z3 was dropped as \
+             out-of-band, z4-z6 were copied), never the band's declared z10"
         );
 
         let meta: Value = serde_json::from_str(&read_metadata(&out)).unwrap();
         assert_eq!(
             meta["vector_layers"][0]["maxzoom"], 10,
-            "vector_layers must agree with the header"
+            "vector_layers still advertises the band's declared maximum"
         );
     }
 

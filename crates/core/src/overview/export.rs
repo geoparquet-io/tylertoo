@@ -315,10 +315,16 @@ pub struct ZoomReport {
 pub struct ExportReport {
     /// Level materialization mode of the source overview file.
     pub mode: String,
-    /// PMTiles header min zoom: the declared minimum zoom (coarsest level's
-    /// zoom unless widened by [`ExportOptions::min_zoom`]).
+    /// The declared minimum zoom (coarsest level's zoom unless widened by
+    /// [`ExportOptions::min_zoom`]) — what the CLI prints as the export's
+    /// zoom range and what `vector_layers[].minzoom` advertises. The PMTiles
+    /// header's own `min_zoom` can differ: it always reflects the shallowest
+    /// zoom that actually holds a tile (#529, #522), which `go-pmtiles
+    /// verify` requires and which is coarser than this value whenever a
+    /// requested level generalized away to nothing (#380).
     pub min_zoom: u8,
-    /// PMTiles header max zoom (finest level's zoom).
+    /// The declared maximum zoom (finest level's zoom). See `min_zoom` above
+    /// for how this relates to the PMTiles header's own `max_zoom`.
     pub max_zoom: u8,
     /// Per-zoom statistics, coarse→fine.
     pub zooms: Vec<ZoomReport>,
@@ -7393,10 +7399,14 @@ mod tests {
     // --- declared minimum zoom (#380) ----------------------------------------
 
     /// The converter omits levels that generalize to nothing (§7.3), so an
-    /// overview built for z0..z4 can start at z2. The archive must still
-    /// declare the range that was asked for.
+    /// overview built for z0..z4 can start at z2. The report still reflects
+    /// the range that was asked for (what the CLI prints and what
+    /// `vector_layers[].minzoom` advertises), but the PMTiles header must
+    /// stay the range the directory actually addresses (z2..z4): #529/#522
+    /// found `go-pmtiles verify` rejecting every archive whose header
+    /// declared a coarser minimum than its shallowest real tile.
     #[test]
-    fn export_declared_min_zoom_is_written_to_header_and_report() {
+    fn export_declared_min_zoom_widens_report_but_header_reflects_actual_tiles() {
         let a = Geometry::Point(Point::new(-120.0, 40.0));
         let b = Geometry::Point(Point::new(120.0, -40.0));
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -7423,7 +7433,10 @@ mod tests {
 
         let data = std::fs::read(tout.path()).unwrap();
         let header = crate::pmtiles_writer::Header::from_bytes(&data[..127]).unwrap();
-        assert_eq!(header.min_zoom, 0);
+        assert_eq!(
+            header.min_zoom, 2,
+            "header must be the shallowest zoom with an actual tile, not the declared z0"
+        );
         assert_eq!(header.max_zoom, 4);
     }
 
