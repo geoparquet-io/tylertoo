@@ -97,12 +97,23 @@ verbatim (spec §2.4).
    **shard-partitioned**: threads classify disjoint feature ranges and bucket
    each placement by the shard owning its cell, then reduce the shards in
    parallel, one map per task. No locks, no merge tail, and one entry per
-   occupied cell either way, so the #306 estimate is unchanged. The wave's
-   winner fold splits by position range, and the density budget's candidate
-   scan and super-cell partition go wide while its admission fold (which
-   threads a running kept count coarse→fine) stays serial. All of it is
-   scheduling: the assignment, and therefore the `--save-plan` artifact, is
-   byte-identical at any thread count (`thread_count_determinism.rs`).
+   occupied cell either way, so the #306 grid estimate still describes the
+   grids. The one new term is the pending placements between shard reduces,
+   which the estimate does not count; it is bounded instead, per wave rather
+   than per level (≈ 2 MiB per pool thread across the whole wave, floor 1 MiB
+   per level, exact-size buffers), because the planner packs many tiny coarse
+   levels into one wave. The wave's winner fold splits by position range, and
+   the density budget's candidate scan and super-cell partition go wide while
+   its admission fold (which threads a running kept count coarse→fine) stays
+   serial. All of it is scheduling: the sharded reduce preserves position
+   order per cell, so every cell resolves its contests exactly as the serial
+   build does, and the budget's sorts are by a strict total order. The unit
+   test `oracle_fixture_reproduces_main` holds a 150k-feature adversarial
+   fixture — above the sharded-build and parallel-sort cutoffs — to golden
+   digests produced by the pre-#534 serial code, at 1/2/7/16 threads and
+   unbounded vs. 1-byte grid budgets; `thread_count_determinism.rs` checks the
+   end-to-end artifact across thread counts, though its fixtures are below the
+   sharded-build size.
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
    reader thread streams batches over a bounded channel while a consumer

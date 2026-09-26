@@ -49,10 +49,13 @@
 //! concurrency for a capped peak when the budget binds. Grid entries store
 //! only the winner position (priorities are recomputed on contest), roughly
 //! halving per-entry cost. Splitting a level's pass across threads (#534) does
-//! not change that accounting: a cell lives in exactly one shard of the grid,
-//! so a level still holds one entry per occupied cell however many threads
-//! built it. The only addition is one bounded block of pending placements
-//! ([`WINNER_BLOCK_PLACEMENT_BYTES`]), freed between blocks.
+//! not change the grid accounting: a cell lives in exactly one shard of the
+//! grid, so a level still holds one entry per occupied cell however many
+//! threads built it. What it adds is a block of pending placements between
+//! shard reduces, budgeted per WAVE rather than per level
+//! ([`WINNER_BLOCK_BYTES_PER_THREAD`]: ≈ 2 MiB per pool thread across the whole
+//! wave, floor 1 MiB per level) and freed after every reduce. That term is not
+//! in the #306 estimate; it is bounded instead.
 //!
 //! # Parallelism & determinism
 //!
@@ -78,17 +81,25 @@
 //!    `kept_count` coarse→fine and stays strictly serial, as does
 //!    [`water_fill`].
 //!
-//! Results are unaffected because the per-cell winner is the maximum under a
-//! *strict total order* ([`Priority::beats`] — ties are ultimately broken by
-//! the feature `index`), so it never depends on hashmap iteration order, shard
-//! assignment, block or chunk boundaries, or thread scheduling; a feature takes
-//! the *coarsest* level at which it wins regardless of the order levels finish;
-//! and every sort in the budget stage is by a total order too, so its output is
-//! unique. Output is identical across runs, across thread counts and to a fully
-//! serial build (`parallel_winner_chunking_matches_the_serial_grid`,
-//! `parallel_assignment_matches_serial`,
-//! `bounded_waves_match_unbounded_assignment`, and the CLI-level
-//! `thread_count_determinism` end-to-end test).
+//! Results are unaffected. The sharded winner build **preserves position
+//! order** per cell (chunks are collected in order, each chunk's shard group is
+//! in ascending position, and each shard drains the chunks in order — see
+//! [`level_winner_positions`]), so every cell sees the serial build's contests
+//! in the serial build's order and keeps the same winner, even for
+//! priority-identical twins. A feature takes the *coarsest* level at which it
+//! wins regardless of the order levels finish, and every sort in the budget
+//! stage is by a strict total order ([`priority_order`]: [`Priority::beats`]
+//! plus a position tie-break), so its output is unique. Output is identical
+//! across runs, across thread counts and to a fully serial build. The unit
+//! tests pin that at the production thresholds — `oracle_fixture_reproduces_main`
+//! runs a 150k-feature adversarial fixture (dup indices, exact twins,
+//! non-finite keys, ladder levels, `+inf` diagonals) above both the sharded-
+//! build and the parallel-sort cutoffs, under pools of 1/2/7/16 threads and an
+//! unbounded vs. 1-byte grid budget, against a golden digest produced by the
+//! pre-#534 serial code; `parallel_winner_chunking_matches_the_serial_grid`
+//! sweeps chunk/shard/block shapes; `bounded_waves_match_unbounded_assignment`
+//! the wave plans. The CLI-level `thread_count_determinism` test covers the
+//! end-to-end artifact, though its fixtures are below the sharded-build size.
 //!
 //! # DIVERGENCE FROM TIPPECANOE / cogp-rs
 //!
@@ -98,6 +109,7 @@
 //! and is adequate for thinning at overview scales. Revisit if quality gating
 //! (plan V2) shows artifacts.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use rayon::prelude::*;
@@ -363,18 +375,25 @@ impl Priority {
             SortDirection::Desc => k,
             SortDirection::Asc => -k,
         });
-        // A non-finite bbox diagonal is likewise UNRANKABLE (#534: the #428
-        // argument applied to component 2). `scan_feature` rejects non-finite
-        // geometry upstream, so the pipeline never produces one — but
+        // A NaN bbox diagonal is likewise UNRANKABLE (#534: the #428 argument
+        // applied to component 2). `scan_feature` rejects non-finite
+        // coordinates upstream, so the pipeline never produces one — but
         // `assign_levels` is public and takes the bbox verbatim, and a NaN here
-        // would make `beats` answer false in BOTH directions, which is exactly
-        // the property a parallel winner grid may not have: with contests
-        // resolved in an unspecified order, a comparator that cannot decide a
-        // pair has no order-independent maximum. Filing it below every real
-        // diagonal (which is always `>= 0`) keeps `beats` a strict total order
-        // for every possible input.
+        // would make `beats` answer false in BOTH directions. The winner grid
+        // does not care (its contests run in position order, serial or
+        // sharded — see [`level_winner_positions`]), but the density budget's
+        // UNSTABLE sorts do: they need a consistent comparator. Filing NaN below
+        // every real diagonal (which is always `>= 0`) keeps `beats` a strict
+        // total order for every possible input.
+        //
+        // `+inf` is NOT demoted: it is already totally ordered, and it is
+        // reachable from the pipeline — a finite bbox with an extent beyond
+        // ~1.3e154 (a DBL_MAX-style nodata sentinel) overflows `dx * dx`. Such a
+        // feature has the largest diagonal there is and must keep winning its
+        // cell exactly as it did before #534 (and in `coalesce`'s
+        // representative selection, which ranks by this same `Priority`).
         let diag_sq = feat.diag_sq();
-        let diag_sq = if diag_sq.is_finite() { diag_sq } else { -1.0 };
+        let diag_sq = if diag_sq.is_nan() { -1.0 } else { diag_sq };
         Priority {
             sort_rank,
             diag_sq,
@@ -385,15 +404,14 @@ impl Priority {
 
     /// Returns `true` if `self` is strictly better (should win) than `other`.
     ///
-    /// This is a **strict total order** on features with distinct indices, and
-    /// the parallel winner grid (#534) depends on that: the four components are
-    /// compared lexicographically, every one of them is rankable by
-    /// construction (`sort_rank`: `Some` above `None`, finite within `Some` —
-    /// #428; `diag_sq`: finite, negative when unrankable; `hash`, `index`:
-    /// integers), and the last one, `index`, is unique per feature. So for any
-    /// two features with distinct indices exactly one direction is true, the
-    /// maximum of a set is unique, and a cell's winner is the same whatever
-    /// order — thread, shard or block — the contests happen in.
+    /// This is a **strict total order** on features with distinct indices: the
+    /// four components are compared lexicographically, every one of them is
+    /// rankable by construction (`sort_rank`: `Some` above `None`, finite
+    /// within `Some` — #428; `diag_sq`: never NaN, `+inf` on overflow, negative
+    /// when unrankable; `hash`, `index`: integers), and the last one, `index`,
+    /// is unique per feature. So for any two features with distinct indices
+    /// exactly one direction is true — which is what the density budget's
+    /// unstable sorts (via [`priority_order`]) need from their comparator.
     pub(super) fn beats(&self, other: &Priority) -> bool {
         // 1. sort_rank: Some beats None; both Some compares larger-wins.
         match (self.sort_rank, other.sort_rank) {
@@ -500,38 +518,6 @@ fn place_feature(
     ))
 }
 
-/// Does the feature at `challenger` take the cell from the one at `incumbent`?
-///
-/// The [`Priority`] order alone decides it for features with distinct indices
-/// (it is a strict total order there — see [`Priority::beats`]). The position
-/// fallback only fires when two features are priority-identical, which needs a
-/// duplicated `index` (impossible from the pipeline, reachable through the
-/// public API): there the SERIAL build keeps the earlier position, because a
-/// later challenger cannot beat it, so the parallel build — where "later" is
-/// not a thing — has to say so explicitly or the two would disagree.
-///
-/// This is the hottest comparison in the phase (once per placement that lands
-/// on an occupied cell), so the duplicate-`index` case is kept off the fast
-/// path: distinct indices make `beats` total, and then a challenger that does
-/// not beat the incumbent has lost, full stop — no second `beats` call.
-#[inline]
-fn challenger_takes_cell(
-    features: &[AssignFeature],
-    challenger: usize,
-    incumbent: usize,
-    dir: SortDirection,
-) -> bool {
-    let c = Priority::new(&features[challenger], dir);
-    let i = Priority::new(&features[incumbent], dir);
-    if c.beats(&i) {
-        return true;
-    }
-    if features[challenger].index != features[incumbent].index {
-        return false;
-    }
-    !i.beats(&c) && challenger < incumbent
-}
-
 /// Resolve one contest inside a grid map (#306: the grid is the dominant pass-1
 /// allocation, so the entry stores ONLY the winner position — the incumbent's
 /// `Priority` is recomputed on each contest instead of cached. `Priority::new`
@@ -539,6 +525,13 @@ fn challenger_takes_cell(
 /// noise next to the hash-map probe, while dropping the cached 40-byte
 /// `Priority` shrinks each entry from 72 to 32 bytes — ~55% off the grid, the
 /// structure the level count multiplies).
+///
+/// A challenger takes the cell only if it strictly [`Priority::beats`] the
+/// incumbent, so on a priority-identical pair (an exact twin — a duplicated
+/// `index`, reachable only through the public API) the EARLIER position keeps
+/// the cell. That rule is order-dependent, and it is why every build must feed
+/// a cell its contests in ascending position — which both do (see
+/// [`level_winner_positions`]).
 #[inline]
 fn contest_cell(
     grid: &mut HashMap<CellKey, usize>,
@@ -549,7 +542,9 @@ fn contest_cell(
 ) {
     grid.entry(key)
         .and_modify(|slot| {
-            if challenger_takes_cell(features, pos, *slot, dir) {
+            let challenger = Priority::new(&features[pos], dir);
+            let incumbent = Priority::new(&features[*slot], dir);
+            if challenger.beats(&incumbent) {
                 *slot = pos;
             }
         })
@@ -557,9 +552,9 @@ fn contest_cell(
 }
 
 /// Features one rayon task classifies before the shard reduce takes over.
-/// Sized so a task's bucketed output stays in L2 while it is being filled, and
-/// so a level's whole pending block ([`WINNER_BLOCK_PLACEMENT_BYTES`]) stays
-/// small next to the grid it feeds.
+/// Sized so a task's placement buffer (at most `32 Ki × 32 B` = 1 MiB) stays
+/// near L2 while it is being filled, and so a wave's whole pending block
+/// ([`WINNER_BLOCK_BYTES_PER_THREAD`]) stays small next to the grids it feeds.
 const WINNER_CHUNK_FEATURES: usize = 32 * 1024;
 
 /// Grid shards per rayon thread. The reduce is parallel **over shards**, so
@@ -573,14 +568,21 @@ const WINNER_SHARDS_PER_THREAD: usize = 4;
 /// `pending_placement_size_matches_the_documented_budget`).
 const WINNER_BLOCK_PLACEMENT_BYTES: usize = 32;
 
-/// Pending-placement bytes a thread may hold between shard reduces.
+/// Pending-placement bytes per pool thread that a whole WAVE may hold between
+/// shard reduces — the one memory term #534 adds on top of the #306 grid
+/// accounting.
 ///
-/// This is the one memory term #534 adds to the #306 accounting: a level's
-/// transient grows by `threads × this` (24 MiB on a 12-core box), freed between
-/// blocks, and an order of magnitude below the slack already built into
-/// [`GRID_ENTRY_EST_BYTES`]. Big enough that a thread classifies a couple of
-/// chunks per reduce (so the reduce's fixed cost amortises), small enough that
-/// the buffers stay near last-level cache.
+/// It is a per-wave budget, not a per-level one: a wave builds its levels
+/// concurrently, and each level classifies with the whole pool, so if every
+/// level sized its own block from the thread count a wave of `k` levels would
+/// hold `k ×` this (a 13-level coarse wave on 48 threads: ~1.5–2.5 GiB outside
+/// the #306 estimate, precisely on the levels whose tiny grid estimates let
+/// the planner pack them together). [`WinnerBuild::for_pool`] therefore splits
+/// it across the wave's levels, so the wave's pending placements total
+/// ≈ `max(threads × this, levels × 1 MiB)` (≈ 24 MiB on a 12-core box; the
+/// floor is one chunk per level), plus one chunk-sized scratch buffer per
+/// running classify task during its scatter. Buffers are sized exactly (a
+/// counting-sort scatter, no `Vec` doubling slack) and freed after each reduce.
 const WINNER_BLOCK_BYTES_PER_THREAD: usize = 2 * 1024 * 1024;
 
 /// How one level's winner grid is built. A test seam: production always takes
@@ -600,8 +602,11 @@ enum WinnerBuild {
 }
 
 impl WinnerBuild {
-    /// The build for the current rayon pool and feature count.
-    fn for_pool(features: usize) -> Self {
+    /// The build for the current rayon pool and feature count, when
+    /// `concurrent_levels` levels (the wave's size) build at the same time and
+    /// share the wave's pending-placement budget
+    /// ([`WINNER_BLOCK_BYTES_PER_THREAD`]).
+    fn for_pool(features: usize, concurrent_levels: usize) -> Self {
         let threads = rayon::current_num_threads().max(1);
         if threads == 1 || features <= WINNER_CHUNK_FEATURES {
             return WinnerBuild::Serial;
@@ -612,15 +617,21 @@ impl WinnerBuild {
         WinnerBuild::Sharded {
             chunk_features: WINNER_CHUNK_FEATURES,
             shards: (threads * WINNER_SHARDS_PER_THREAD).next_power_of_two(),
-            block_chunks: threads * chunks_per_thread,
+            block_chunks: (threads * chunks_per_thread / concurrent_levels.max(1)).max(1),
         }
     }
 }
 
-/// What one classify task hands the shard reduce: its placements bucketed by
-/// owning shard (index = shard), plus the positions that bypassed the grid
-/// entirely (thinning disabled for their kind — every one of them wins).
-type ChunkPlacements = (Vec<Vec<(CellKey, usize)>>, Vec<usize>);
+/// What one classify task hands the shard reduce: its placements grouped by
+/// owning shard in one exact-size buffer (shard `s` owns
+/// `placements[offsets[s]..offsets[s + 1]]`, each group in ascending position),
+/// plus the positions that bypassed the grid entirely (thinning disabled for
+/// their kind — every one of them wins).
+struct ChunkPlacements {
+    placements: Vec<(CellKey, usize)>,
+    offsets: Vec<usize>,
+    wins: Vec<usize>,
+}
 
 /// Which shard owns a cell. A cheap multiply-xor mix: the shard only has to
 /// spread cells evenly, the map's own hasher still does the real work. Taking
@@ -636,13 +647,61 @@ fn shard_of(key: &CellKey, shard_mask: u64) -> usize {
     ((h >> 13) & shard_mask) as usize
 }
 
+/// Classify one chunk (positions `base..base + chunk.len()`) and group its
+/// placements by owning shard with a counting-sort scatter: one pass collects
+/// the placements (capacity = chunk length, so no growth) and counts per shard,
+/// a prefix sum turns the counts into offsets, and a stable scatter writes one
+/// exact-size buffer. Two allocations per chunk instead of one growing `Vec`
+/// per shard — no doubling slack held through the reduce, and no per-shard
+/// mallocs.
+fn classify_chunk(
+    chunk: &[AssignFeature],
+    base: usize,
+    config: &AssignConfig,
+    gsd_units: f64,
+    repr: Representation,
+    shards: usize,
+    shard_mask: u64,
+) -> ChunkPlacements {
+    let mut raw: Vec<(CellKey, usize)> = Vec::with_capacity(chunk.len());
+    let mut wins: Vec<usize> = Vec::new();
+    let mut offsets = vec![0usize; shards + 1];
+    for (off, feat) in chunk.iter().enumerate() {
+        match place_feature(feat, config, gsd_units, repr) {
+            Placement::Skip => {}
+            Placement::Wins => wins.push(base + off),
+            Placement::Cell(key) => {
+                offsets[shard_of(&key, shard_mask) + 1] += 1;
+                raw.push((key, base + off));
+            }
+        }
+    }
+    for s in 0..shards {
+        offsets[s + 1] += offsets[s];
+    }
+    let mut cursor = offsets.clone();
+    let mut placements: Vec<(CellKey, usize)> = vec![((0, 0, 0), 0); raw.len()];
+    for &(key, pos) in &raw {
+        let slot = &mut cursor[shard_of(&key, shard_mask)];
+        placements[*slot] = (key, pos);
+        *slot += 1;
+    }
+    ChunkPlacements {
+        placements,
+        offsets,
+        wins,
+    }
+}
+
 /// Build one overview level's cell-winner grid and return the winning feature
-/// positions (one per occupied cell).
+/// positions (one per occupied cell), sorted.
 ///
 /// The feature range is split across rayon threads (#534) — this is the
 /// parallelism that survives the #306 memory bound: when the wave planner has
 /// to serialize the levels, cross-level parallelism (#264) is nearly gone and
-/// this pass is what keeps the cores busy.
+/// this pass is what keeps the cores busy. `concurrent_levels` is the size of
+/// the wave this level builds in, which divides the wave's pending-placement
+/// budget (see [`WINNER_BLOCK_BYTES_PER_THREAD`]).
 ///
 /// # Shape
 ///
@@ -650,15 +709,27 @@ fn shard_of(key: &CellKey, shard_mask: u64) -> usize {
 /// `shards` maps, decided by [`shard_of`]. One block at a time:
 ///
 /// 1. *Classify* (parallel over feature chunks): each task runs
-///    [`place_feature`] over its chunk and appends each placement to the
-///    bucket of the shard that owns its cell. Nothing is shared.
+///    [`place_feature`] over its chunk and groups its placements by the shard
+///    that owns each cell ([`classify_chunk`]). Nothing is shared.
 /// 2. *Reduce* (parallel over shards): each task owns one shard's map
-///    exclusively and drains every chunk's bucket for that shard into it.
+///    exclusively and drains every chunk's group for that shard into it.
 ///
 /// No locks and no merge tail: step 2 touches disjoint maps, and the union of
 /// the shard maps holds exactly one entry per occupied cell — the same
-/// footprint the serial single-map build had, which is what lets the #306 wave
-/// planner keep [`estimate_level_grid_bytes`] unchanged.
+/// footprint the serial single-map build had, so the #306 grid estimate
+/// ([`estimate_level_grid_bytes`]) still describes the grids. The pending
+/// placements of step 1 are the only addition, bounded per wave and freed
+/// after every reduce.
+///
+/// # Order preservation — why the result is the serial one
+///
+/// The reduce preserves **position order** per cell: the chunks come back in
+/// order (an indexed `par_chunks().enumerate().collect()`), each chunk's shard
+/// group is in ascending position, a shard drains the chunks in order, and
+/// blocks run one after another. So every cell sees exactly the contests the
+/// serial build would, in exactly the same order, and [`contest_cell`]'s
+/// incumbent-keeps-ties rule resolves them identically — including
+/// priority-identical twins, where the earlier position keeps the cell.
 ///
 /// (The two obvious alternatives are worse. Per-chunk *private* maps merged
 /// afterwards multiply the live entries by the chunk count and pay a serial
@@ -673,13 +744,14 @@ fn level_winner_positions(
     config: &AssignConfig,
     gsd_units: f64,
     repr: Representation,
+    concurrent_levels: usize,
 ) -> Vec<usize> {
     level_winner_positions_in(
         features,
         config,
         gsd_units,
         repr,
-        WinnerBuild::for_pool(features.len()),
+        WinnerBuild::for_pool(features.len(), concurrent_levels),
     )
 }
 
@@ -730,47 +802,43 @@ fn level_winner_positions_in(
             let block_end = (block_start + block_features).min(features.len());
             let block = &features[block_start..block_end];
 
-            // 1. Classify in parallel; bucket each placement by owning shard.
+            // 1. Classify in parallel; group each chunk's placements by shard.
+            //    An indexed collect: `parts` is in chunk (= position) order.
             let parts: Vec<ChunkPlacements> = block
                 .par_chunks(chunk_features)
                 .enumerate()
                 .map(|(ci, chunk)| {
                     let base = block_start + ci * chunk_features;
-                    let mut buckets: Vec<Vec<(CellKey, usize)>> =
-                        (0..shards).map(|_| Vec::new()).collect();
-                    let mut local_wins: Vec<usize> = Vec::new();
-                    for (off, feat) in chunk.iter().enumerate() {
-                        match place_feature(feat, config, gsd_units, repr) {
-                            Placement::Skip => {}
-                            Placement::Wins => local_wins.push(base + off),
-                            Placement::Cell(key) => {
-                                buckets[shard_of(&key, shard_mask)].push((key, base + off));
-                            }
-                        }
-                    }
-                    (buckets, local_wins)
+                    classify_chunk(chunk, base, config, gsd_units, repr, shards, shard_mask)
                 })
                 .collect();
 
-            // 2. Reduce in parallel over shards — disjoint maps, no locks.
+            // 2. Reduce in parallel over shards — disjoint maps, no locks. Each
+            //    shard drains the chunks in order, so its cells see their
+            //    contests in ascending position, exactly as the serial build.
             shard_grids
                 .par_iter_mut()
                 .enumerate()
                 .for_each(|(shard, grid)| {
-                    for (buckets, _) in &parts {
-                        for &(key, pos) in &buckets[shard] {
+                    for part in &parts {
+                        let group = &part.placements[part.offsets[shard]..part.offsets[shard + 1]];
+                        for &(key, pos) in group {
                             contest_cell(grid, key, pos, features, dir);
                         }
                     }
                 });
 
-            for (_, local_wins) in &parts {
-                winners.extend_from_slice(local_wins);
+            for part in &parts {
+                winners.extend_from_slice(&part.wins);
             }
             // `parts` — the block's pending placements — is freed here, before
             // the next block allocates.
             block_start = block_end;
         }
+        // `flat_map` has a lower size hint of 0, so reserve the exact total up
+        // front rather than let `extend` double its way there (and retain up to
+        // 2× through the wave fold).
+        winners.reserve_exact(shard_grids.iter().map(HashMap::len).sum());
         winners.extend(shard_grids.into_iter().flat_map(HashMap::into_values));
     }
 
@@ -789,22 +857,31 @@ fn level_winner_positions_in(
     // holds feature positions (`usize`, `Ord`), one per occupied cell, so this
     // is O(cells log cells), not O(features log features), and cells are
     // bounded by the memory budget in `estimate_level_grid_bytes` above.
-    //
-    // Parallel only when there is enough of it to pay for rayon's split: below
-    // the threshold std's pdqsort beats rayon's quicksort outright, and a serial
-    // build must not be made slower by a change that exists to speed up a
-    // parallel one.
-    if winners.len() >= PAR_SORT_MIN_LEN && rayon::current_num_threads() > 1 {
-        winners.par_sort_unstable();
-    } else {
-        winners.sort_unstable();
-    }
+    sort_unstable_maybe_par(&mut winners, usize::cmp);
     winners
 }
 
 /// Below this length a sort stays sequential: rayon's split and merge cost more
 /// than std's pdqsort saves.
 const PAR_SORT_MIN_LEN: usize = 64 * 1024;
+
+/// Unstable sort by `cmp`, in parallel only when there is enough of it to pay
+/// for rayon's split (at least [`PAR_SORT_MIN_LEN`] elements and more than one
+/// pool thread): below the threshold std's pdqsort beats rayon's quicksort
+/// outright, and a serial build must not be made slower by a change that exists
+/// to speed up a parallel one. Every caller sorts by a strict total order, so
+/// the result is the same either way.
+fn sort_unstable_maybe_par<T, F>(v: &mut [T], cmp: F)
+where
+    T: Send,
+    F: Fn(&T, &T) -> Ordering + Sync,
+{
+    if v.len() >= PAR_SORT_MIN_LEN && rayon::current_num_threads() > 1 {
+        v.par_sort_unstable_by(cmp);
+    } else {
+        v.sort_unstable_by(cmp);
+    }
+}
 
 /// Estimated retained bytes per occupied winner-grid cell (#306).
 ///
@@ -1056,8 +1133,9 @@ pub fn assign_levels_banded(
 /// Tradeoff (documented in #306): when the budget binds, levels in different
 /// waves no longer run concurrently — on a roomy box the plan is a single wave
 /// and #264's parallelism (and wall time) is untouched; on a constrained box
-/// waves shrink toward one-level-per-wave, degrading gracefully to the serial
-/// pre-#264 build rather than an OOM. The wave schedule is pure scheduling:
+/// waves shrink toward one-level-per-wave — each level still built across
+/// every thread (#534), just not overlapped with other levels — rather than an
+/// OOM. The wave schedule is pure scheduling:
 /// the assignment is **identical** for every budget (a feature takes the
 /// coarsest level at which it wins, a fold that is order-independent).
 pub fn assign_levels_bounded(
@@ -1159,12 +1237,19 @@ pub fn assign_levels_bounded(
     }
 
     for wave in waves {
+        let concurrent_levels = wave.len();
         let winners_per_level: Vec<Vec<usize>> = wave
             .clone()
             .into_par_iter()
             .map(|level_idx| {
                 let repr = level_reprs.get(level_idx).copied().unwrap_or_default();
-                level_winner_positions(features, config, gsd_units[level_idx], repr)
+                level_winner_positions(
+                    features,
+                    config,
+                    gsd_units[level_idx],
+                    repr,
+                    concurrent_levels,
+                )
             })
             .collect();
 
@@ -1231,8 +1316,6 @@ pub fn assign_levels_bounded(
 // dropped at a finer level (its `min_level` is the level it was admitted at).
 // This preserves duplicating monotonicity and — because the finest level admits
 // every remaining feature — the canonical level is never thinned (spec §2.4).
-
-use std::cmp::Ordering;
 
 /// Super-cell edge length for spatial-fairness budget allocation, as a multiple
 /// of the level GSD (in coordinate units). A super-cell is the neighborhood over
@@ -1457,11 +1540,7 @@ pub(super) fn select_budget_survivors(
     // priority cut.
     if super_size <= 0.0 || super_size.is_nan() {
         let mut all = cands.to_vec();
-        if all.len() >= PAR_SORT_MIN_LEN && rayon::current_num_threads() > 1 {
-            all.par_sort_unstable_by(|&a, &b| priority_order(prio, a, b));
-        } else {
-            all.sort_unstable_by(|&a, &b| priority_order(prio, a, b));
-        }
+        sort_unstable_maybe_par(&mut all, |&a, &b| priority_order(prio, a, b));
         all.truncate(available);
         return all;
     }
@@ -1490,11 +1569,7 @@ pub(super) fn select_budget_survivors(
     // comparison) then runs only WITHIN a cell. That is `Σ mᵢ log mᵢ` expensive
     // comparisons instead of `M log M`, the same total the hashmap-of-vecs
     // version paid, and the per-cell sorts are themselves parallel.
-    if tagged.len() >= PAR_SORT_MIN_LEN && rayon::current_num_threads() > 1 {
-        tagged.par_sort_unstable();
-    } else {
-        tagged.sort_unstable();
-    }
+    sort_unstable_maybe_par(&mut tagged, Ord::cmp);
 
     // Cells are now contiguous ascending runs.
     let mut pops: Vec<usize> = Vec::new();
@@ -2073,40 +2148,245 @@ mod tests {
         }
     }
 
+    /// SplitMix64 — a self-contained deterministic generator for the oracle
+    /// fixture (no RNG crate, so the fixture is reproducible from this file
+    /// alone on any commit).
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `[0, 1)` from the top 53 bits.
+    fn unit(state: &mut u64) -> f64 {
+        (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Features in [`oracle_fixture`]: above [`WINNER_CHUNK_FEATURES`] (so a
+    /// multi-thread pool takes the sharded winner build) and large enough that
+    /// the fine coarse levels' winner lists and the density budget's candidate
+    /// sets cross [`PAR_SORT_MIN_LEN`] (so the parallel sorts run too).
+    const ORACLE_FEATURES: usize = 150_000;
+
+    /// Distance back to an exact twin's original: more than one
+    /// [`WINNER_CHUNK_FEATURES`] chunk.
+    const TWIN_LAG: usize = 33_331;
+
+    /// The seeded, adversarial fixture behind the main-oracle digests.
+    ///
+    /// ~70% of the features are spread uniformly over a 2000 km square
+    /// (EPSG:3857 meters) — at the fine coarse levels nearly every one owns a
+    /// cell, which is what makes the winner lists long — and ~30% are packed
+    /// into 97 dense clusters, so the coarse levels see heavy contention and
+    /// cell membership straddles chunk/block boundaries. On top of that:
+    /// - sort keys cycle through missing, a small set of tied finite values,
+    ///   NaN, ±inf and ±0.0;
+    /// - every 101st feature reuses its predecessor's `index` (distinct
+    ///   geometry), and every 211th is an EXACT twin of its predecessor (same
+    ///   index, bbox, kind and key — priority-identical) of the feature
+    ///   `TWIN_LAG` positions back, i.e. in a different winner-build chunk, so
+    ///   the "earlier position keeps the cell" rule is exercised across the
+    ///   sharded reduce;
+    /// - every 53rd feature carries a ladder entry level (some beyond the
+    ///   finest level, which clamps);
+    /// - every 997th is a finite-coordinate bbox of extent 2e300 (a DBL_MAX-
+    ///   style nodata sentinel), whose squared diagonal overflows to +inf.
+    fn oracle_fixture() -> Vec<AssignFeature> {
+        let mut rng = 0x5EED_0534_u64;
+        let mut feats: Vec<AssignFeature> = Vec::with_capacity(ORACLE_FEATURES);
+        for i in 0..ORACLE_FEATURES {
+            if i % 211 == 0 && i > 0 {
+                // Far enough back to sit in another winner-build chunk, so
+                // the twins' contest crosses a chunk boundary.
+                let twin = feats[i.checked_sub(TWIN_LAG).unwrap_or(i - 1)];
+                feats.push(twin);
+                continue;
+            }
+            let (x, y) = if splitmix64(&mut rng) % 10 < 3 {
+                let c = (i % 97) as f64;
+                (
+                    c * 20_000.0 + unit(&mut rng) * 3_000.0,
+                    c * 15_000.0 + unit(&mut rng) * 3_000.0,
+                )
+            } else {
+                (unit(&mut rng) * 2.0e6, unit(&mut rng) * 2.0e6)
+            };
+            let span = 5.0 + unit(&mut rng) * 5_000.0;
+            let kind = match splitmix64(&mut rng) % 10 {
+                0..=3 => FeatureKind::Point,
+                4 => FeatureKind::Line,
+                _ => FeatureKind::Polygon,
+            };
+            let bbox = if i % 997 == 0 {
+                [-1.0e300, y, 1.0e300, y + span]
+            } else if kind == FeatureKind::Point {
+                [x, y, x, y]
+            } else {
+                [x, y, x + span, y + span * 0.5]
+            };
+            let sort_key = match i % 9 {
+                0 | 1 => None,
+                2 => Some(f64::NAN),
+                3 => Some(f64::INFINITY),
+                4 => Some(f64::NEG_INFINITY),
+                5 => Some(0.0),
+                6 => Some(-0.0),
+                _ => Some((splitmix64(&mut rng) % 5) as f64),
+            };
+            let entry_level = if i % 53 == 0 {
+                Some((i / 53 % 9) as u8)
+            } else {
+                None
+            };
+            let index = if i % 101 == 0 && i > 0 { i - 1 } else { i };
+            feats.push(AssignFeature {
+                index,
+                bbox,
+                kind,
+                sort_key,
+                entry_level,
+            });
+        }
+        feats
+    }
+
+    /// FNV-1a 64 over a `min_level` sequence (length-prefixed).
+    fn min_level_digest(assignments: &[FeatureAssignment]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |b: u8| {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        };
+        for b in (assignments.len() as u64).to_le_bytes() {
+            eat(b);
+        }
+        for a in assignments {
+            eat(a.min_level);
+        }
+        h
+    }
+
+    /// The oracle levels: z2..z12 (the finest is canonical, so five coarse
+    /// levels run the winner pass), EPSG:3857.
+    fn oracle_gsds() -> Vec<f64> {
+        [2u32, 4, 6, 8, 10, 12].iter().map(|&z| gsd(z)).collect()
+    }
+
+    /// Golden digests of [`oracle_fixture`] under the PRE-#534 serial code.
+    ///
+    /// Produced on `origin/main` @ 044360d (whose `assign.rs` is unchanged
+    /// since this branch's merge-base, b506d94..044360d), by pasting
+    /// `splitmix64` / `unit` / `oracle_fixture` / `min_level_digest` /
+    /// `oracle_gsds` verbatim into that commit's test module and printing
+    /// `min_level_digest` of `assign_levels_bounded(.., grid, &[])` and of
+    /// `apply_density_budget` on top of it (default configs, EPSG:3857), for
+    /// `grid` = `u64::MAX` and `1` (identical there). Being independent of the
+    /// #534 code, they are what `oracle_fixture_reproduces_main` holds the
+    /// parallel build to. Regenerate the same way if the fixture or the
+    /// assignment semantics change on purpose.
+    const ORACLE_CELL_WINNER_DIGEST: u64 = 0xc233_4757_b303_6e6c;
+    const ORACLE_BUDGET_DIGEST: u64 = 0x1a7c_6fb4_d76e_1d39;
+
     /// #534, the end-to-end oracle: the whole assignment phase (cell-winner
-    /// passes + the density-budget fold) must be identical whatever the rayon
-    /// pool size is. Mirrors the CLI-level `thread_count_determinism` test at
-    /// the unit level, where a forced pool makes the comparison cheap.
+    /// passes + the density-budget fold) must reproduce the pre-#534 serial
+    /// output at every pool size and grid budget.
+    ///
+    /// The fixture is sized ABOVE the production cutoffs — so under a
+    /// multi-thread pool the sharded winner build ([`WinnerBuild::for_pool`])
+    /// and the parallel sorts ([`PAR_SORT_MIN_LEN`]) really run; the test
+    /// asserts that — and the 1-byte budget forces one level per wave (the
+    /// largest per-level pending block), the unbounded one a single wave.
     #[test]
-    fn parallel_assignment_matches_serial() {
-        let feats = contended_fixture(20_000);
-        let gsds: Vec<f64> = [2u32, 4, 6, 8, 10, 12].iter().map(|&z| gsd(z)).collect();
+    fn oracle_fixture_reproduces_main() {
+        let feats = oracle_fixture();
+        let gsds = oracle_gsds();
         let cfg = AssignConfig::default();
         let budget = DensityBudgetConfig::default();
 
-        let run = |threads: usize| -> (Vec<FeatureAssignment>, Vec<FeatureAssignment>) {
+        // Production shapes are really exercised at this size.
+        assert!(feats.len() > WINNER_CHUNK_FEATURES);
+        let pool7 = rayon::ThreadPoolBuilder::new()
+            .num_threads(7)
+            .build()
+            .expect("thread pool");
+        pool7.install(|| {
+            assert!(matches!(
+                WinnerBuild::for_pool(feats.len(), 1),
+                WinnerBuild::Sharded { .. }
+            ));
+        });
+        let longest = gsds[..gsds.len() - 1]
+            .iter()
+            .map(|&g| {
+                level_winner_positions_in(
+                    &feats,
+                    &cfg,
+                    gsd_to_coord_units(g, Crs::Epsg3857),
+                    Representation::Geometry,
+                    WinnerBuild::Serial,
+                )
+                .len()
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest >= PAR_SORT_MIN_LEN,
+            "some level's winner list must take the parallel sort ({longest})"
+        );
+
+        for threads in [1usize, 2, 7, 16] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .expect("thread pool");
-            pool.install(|| {
-                let cw = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
-                let budgeted =
-                    apply_density_budget(&cw, &feats, &gsds, &cfg, &budget, Crs::Epsg3857);
-                (cw.assignments, budgeted.assignments)
-            })
-        };
+            for grid in [u64::MAX, 1] {
+                let (cw, budgeted) = pool.install(|| {
+                    let cw = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, grid, &[]);
+                    let b = apply_density_budget(&cw, &feats, &gsds, &cfg, &budget, Crs::Epsg3857);
+                    (cw, b)
+                });
+                assert_eq!(
+                    min_level_digest(&cw.assignments),
+                    ORACLE_CELL_WINNER_DIGEST,
+                    "cell-winner assignment differs from main at {threads} thread(s), \
+                     grid budget {grid}"
+                );
+                assert_eq!(
+                    min_level_digest(&budgeted.assignments),
+                    ORACLE_BUDGET_DIGEST,
+                    "density-budget assignment differs from main at {threads} thread(s), \
+                     grid budget {grid}"
+                );
+            }
+        }
+    }
 
-        let (cw_want, budget_want) = run(1);
-        for threads in [2usize, 3, 5, 8] {
-            let (cw_got, budget_got) = run(threads);
-            assert_eq!(
-                cw_got, cw_want,
-                "cell-winner assignment differs at {threads} thread(s)"
-            );
-            assert_eq!(
-                budget_got, budget_want,
-                "density-budget assignment differs at {threads} thread(s)"
+    /// #564 review: the pending-placement budget is per WAVE. A wave of `k`
+    /// levels splits `threads × chunks-per-thread` chunks between them (floor
+    /// one chunk per level), rather than every level sizing its own block from
+    /// the whole pool.
+    #[test]
+    fn pending_block_budget_is_split_across_a_wave() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("thread pool");
+        let per_thread =
+            WINNER_BLOCK_BYTES_PER_THREAD / (WINNER_CHUNK_FEATURES * WINNER_BLOCK_PLACEMENT_BYTES);
+        let block = |levels: usize| match pool.install(|| WinnerBuild::for_pool(1 << 24, levels)) {
+            WinnerBuild::Sharded { block_chunks, .. } => block_chunks,
+            WinnerBuild::Serial => panic!("expected the sharded build"),
+        };
+        assert_eq!(block(1), 8 * per_thread);
+        assert_eq!(block(4), 8 * per_thread / 4);
+        assert_eq!(block(1_000), 1, "floor: one chunk per level");
+        for levels in 1..=64usize {
+            let total = block(levels) * levels;
+            assert!(
+                total <= (8 * per_thread).max(levels),
+                "{levels} level(s) hold {total} chunks"
             );
         }
     }
@@ -2146,14 +2426,12 @@ mod tests {
         }
     }
 
-    /// #534 / #428: `Priority::beats` must be a strict TOTAL order, because a
-    /// shard-partitioned parallel grid resolves a cell's contests in an
-    /// unspecified order and only a total order has an order-independent
-    /// maximum. A non-finite bbox would otherwise make `beats` answer false in
-    /// both directions (like the #428 NaN sort key), so the diagonal is filed
-    /// the same way: unrankable ranks below every real one.
+    /// #534 / #428: a NaN bbox diagonal (reachable only through the public
+    /// API — the pipeline rejects non-finite coordinates) is filed below every
+    /// real diagonal, so `beats` stays a strict total order for the density
+    /// budget's unstable sorts.
     #[test]
-    fn non_finite_bbox_diagonal_ranks_below_every_finite_one() {
+    fn nan_bbox_diagonal_ranks_below_every_finite_one() {
         let dir = SortDirection::Desc;
         let nan_box = poly(0, 0.0, 0.0, f64::NAN, 10.0);
         let real = poly(1, 0.0, 0.0, 1.0, 1.0);
@@ -2164,9 +2442,38 @@ mod tests {
             !a.beats(&b),
             "an unrankable diagonal must never beat a real one"
         );
+    }
 
-        // Totality: for any two distinct features exactly one direction holds.
-        let feats = [nan_box, real, poly(2, 0.0, 0.0, f64::INFINITY, 1.0)];
+    /// A finite-coordinate bbox whose extent overflows `dx * dx` (a DBL_MAX-
+    /// style nodata sentinel — `scan_feature` lets it through, it only rejects
+    /// non-finite coordinates) has a `+inf` squared diagonal. That is already
+    /// totally ordered, so it must rank ABOVE every finite diagonal, exactly as
+    /// it did before #534 — demoting it would change which feature wins its
+    /// cell (and which chain `coalesce` picks as representative).
+    #[test]
+    fn overflowing_bbox_diagonal_ranks_above_every_finite_one() {
+        let dir = SortDirection::Desc;
+        let huge = poly(0, -1.0e300, 0.0, 1.0e300, 1.0);
+        let big = poly(1, 0.0, 0.0, 1.0e150, 1.0e150);
+        let hp = Priority::new(&huge, dir);
+        assert_eq!(hp.diag_sq, f64::INFINITY, "the fixture must overflow");
+        let bp = Priority::new(&big, dir);
+        assert!(hp.beats(&bp), "+inf diagonal must beat a finite one");
+        assert!(!bp.beats(&hp), "a finite diagonal must not beat +inf");
+
+        // End to end: the sentinel wins the shared coarse cell.
+        let small = poly(2, -5.0, 0.0, 5.0, 1.0);
+        let out = assign_levels(
+            &[small, huge],
+            &[gsd(0), gsd(20)],
+            &AssignConfig::default(),
+            Crs::Epsg3857,
+        );
+        assert_eq!(out.assignments[1].min_level, 0, "the +inf diagonal wins");
+        assert_eq!(out.assignments[0].min_level, 1);
+
+        // Totality across NaN, +inf and finite.
+        let feats = [poly(3, 0.0, 0.0, f64::NAN, 1.0), big, huge];
         for (i, fi) in feats.iter().enumerate() {
             for (j, fj) in feats.iter().enumerate() {
                 if i == j {
