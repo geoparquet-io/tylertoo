@@ -2,7 +2,7 @@
 //!
 //! This module exposes the tylertoo-core functionality to Python via pyo3.
 
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
@@ -163,10 +163,15 @@ fn convert(
 /// Map a [`ConvertError`] to the Python exception type it deserves:
 /// user-input problems (bad options, missing/mistyped columns, invalid level
 /// plans, an input whose coordinates or CRS the tiler cannot work with)
-/// become `ValueError`; everything else (I/O, decode, writer) becomes
+/// become `ValueError`; the #543 pass-1 memory preflight becomes
+/// `MemoryError`; everything else (I/O, decode, writer) becomes
 /// `RuntimeError`.
 fn convert_error_to_py(e: ConvertError) -> PyErr {
     match e {
+        // The box is too small for this input (#543).
+        ConvertError::Pass1MemoryFloorExceeded { .. } => {
+            PyErr::new::<PyMemoryError, _>(format!("{}", e))
+        }
         // The input itself is the problem, not the run (#429).
         ConvertError::AllFeaturesOutOfRange { .. }
         | ConvertError::UnsupportedCrs { .. }

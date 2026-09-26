@@ -24,6 +24,21 @@ The benefit is a peak of O(read batch + winner tables) instead of O(dataset),
 which on a 632k-polygon file is the difference between well under 1 GB and
 several.
 
+**Pass 1 has an O(rows) floor, checked before the scan.** The per-feature
+tables are compact, not free: pass 1 keeps a 64-byte record per input row from
+its scan through the level assignment, plus smaller transient per-row vectors
+during the scan. That is a few tens of MB for a million rows but tens of GiB
+at a billion. Before pass 1 reads a data page, convert estimates `rows × 64 B`
+from the footers and compares it to the memory figure: it warns when the
+realistic whole-job need (about 2.5× that floor) exceeds the figure, and fails
+fast only when the floor alone exceeds a hard cgroup limit (`memory.max`, or
+v1 `memory.limit_in_bytes`). See
+[sizing the coarse job's memory](sharded-builds.md#sizing-the-coarse-jobs-memory)
+for the numbers and the `TYLERTOO_SKIP_MEMORY_PREFLIGHT` escape hatch. The
+check runs in both pipelines (`--no-streaming` too) and is skipped for a
+`--plan` replay. Off Linux there is no `MemAvailable` or cgroup to read, so it
+does nothing unless `TYLERTOO_AUTO_MEM_LIMIT_BYTES` is set.
+
 **The auto profile spills output under memory pressure.** Pass 2 accumulates
 each output level's rows before writing them. The `speed` profile keeps that
 buffer in RAM, `bounded` spills it to temporary Arrow IPC files, and `auto`
@@ -113,6 +128,8 @@ headroom for other work on the box. The warning is the flip side of that
 precedence: a cluster that exported this variable as a workaround for the
 old, node-sized probe is now *disabling* the cgroup awareness that would
 otherwise size the run correctly. Unset it and let the probe read the cgroup.
+The pass-1 memory preflight reads this figure too, but only ever warns against
+it: an override is a sizing knob, not an OOM limit, so it never fails a run.
 
 ### Overlapping read and compute
 

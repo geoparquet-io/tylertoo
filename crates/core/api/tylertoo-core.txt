@@ -1058,7 +1058,7 @@ pub const tylertoo_core::overview::coalesce::DEFAULT_JUNCTION_ANGLE_DEG: f64
 pub const tylertoo_core::overview::coalesce::DEFAULT_SNAP_GSD_FACTOR: f64
 pub fn tylertoo_core::overview::coalesce::coalesce_level_lines(&[tylertoo_core::overview::coalesce::CoalesceInput<'_>], f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::assign::AssignConfig, &tylertoo_core::overview::coalesce::CoalesceParams) -> alloc::vec::Vec<tylertoo_core::overview::coalesce::CoalescedLine>
 pub mod tylertoo_core::overview::convert
-pub enum tylertoo_core::overview::convert::ConvertError
+#[non_exhaustive] pub enum tylertoo_core::overview::convert::ConvertError
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnNotNumeric
