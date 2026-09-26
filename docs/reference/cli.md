@@ -542,7 +542,7 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
    Ranges that partition the pivot zoom partition every deeper zoom, so the resulting archives are disjoint by construction and `tylertoo merge` concatenates them without re-encoding anything. `tiles --shard` derives this automatically from a shard plan; this flag is the manual form, for a cut you want to choose yourself
 * `--zoom-ceiling <ZOOM>` — Emit only the tiles at or below this zoom (#498) — the coarse half of a sharded build, complementing --tile-range's finer half.
 
-   Named a CEILING, not --max-zoom, because it is the opposite of --min-zoom here: --min-zoom only widens what the metadata DECLARES (vector_layers), while this one decides which zooms are actually emitted. Distinct from building a shallower pyramid too: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive
+   Named a CEILING, not --max-zoom, because it is the opposite of --min-zoom here: --min-zoom only widens what the metadata DECLARES (vector_layers), while this one decides which zooms are actually emitted. Distinct from building a shallower pyramid too: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive. A partial overview kept from a `tiles --shard coarse` run holds only the levels up to its own ceiling and can only be exported with this set at or below that ceiling
 
 
 
