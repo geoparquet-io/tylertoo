@@ -1,15 +1,51 @@
-# cargo-nextest configuration.
+# cargo-nextest configuration: quick/full test tiers (#457).
 #
-# The default filter leaves out the slow end-to-end tests: each drives the
-# CLI or the full pipeline over a real-data fixture and takes 20s to 7 min
-# on a CI runner (#524). Together they are ~75% of the suite's test-seconds.
-# The Test matrix and Coverage run the default set. The Slow Tests job in
-# ci.yml runs only this set, once, on ubuntu stable:
+# quick — what a developer runs constantly, and what plain
+#         `cargo nextest run` (no --profile) runs too, since `default`
+#         mirrors it: unit tests plus every integration-test binary except
+#         the handful below that drive the CLI or the full pipeline over
+#         real-data fixtures and take 20s-7min each (#524). Together the
+#         slow set is ~75% of the suite's test-seconds despite being a
+#         small fraction of its tests.
+# full  — quick's tests plus the slow set: everything. Use this before
+#         landing a change to pipeline internals, sharding, or anything
+#         platform-sensitive (determinism, shard-merge parity).
 #
-#   cargo nextest run --ignore-default-filter -E 'not default()'
+#   cargo nextest run                 # == --profile quick
+#   cargo nextest run --profile quick
+#   cargo nextest run --profile full
 #
-# Mark a new slow test by adding it here. Plain `cargo test` ignores this
-# file and runs everything.
+# The filter names the KNOWN-SLOW set explicitly rather than trying to name
+# every fast test: most of the suite is fast by construction (including
+# `overview_hostile`, moved out of `crates/core/src/overview/hostile.rs` in
+# #457 — it runs real conversions but over tiny synthetic fixtures, well
+# under a second for all 51 cases), and a handful of full-pipeline /
+# large-fixture / determinism suites are not. Mark a new slow test or binary
+# by adding it to `[profile.default]`'s `default-filter` exclusion (which
+# `quick` inherits) and to the matching `[[profile.default.overrides]]`
+# filter that gives the slow set its longer timeout. `full` needs no edit:
+# its `default-filter = "all()"` picks the new test up automatically.
+# (nextest has no config-level string interpolation to share one expression.)
+#
+# CI (see ci.yml): the Test matrix and Coverage jobs run `quick`; the
+# "Slow Tests" job runs only the slow set, once, on ubuntu/macos stable, via
+# `--ignore-default-filter -E 'not default()'` — unchanged by this tier
+# split, since `default()` still means the same "quick" set.
+#
+# `test(large_polygon_regression)` also lives in the exclusion: it's a
+# manual, `--release`-only regression test documented in
+# `tests/fixtures/realdata/README.md` against a 1.8GB fixture that isn't
+# tracked in the repo, not a binary that exists in the tree today. Excluding
+# it here (rather than via a one-off `-E` flag in ci.yml) means the day it
+# reappears, `quick`/CI's Test job silently keep skipping it instead of
+# needing a matching CI edit.
+#
+# Plain `cargo test` (not nextest) ignores this file entirely: it runs
+# everything in whatever binary it's pointed at, slow tests included, with
+# no timeout. The slowest end-to-end suites live in `crates/*/tests/`
+# (separate binaries) so `cargo test --lib` stays reasonably fast, though
+# `--lib` still has some real-parquet I/O tests (e.g. `overview::convert`).
+
 [profile.default]
 default-filter = """
 not (
@@ -18,5 +54,44 @@ not (
   | binary(sharded_builds)
   | test(=header_clustered_flag_matches_the_actual_entry_layout)
   | test(=test_real_data_conversion_keeps_the_root_directory_small)
+  | test(large_polygon_regression)
 )
 """
+
+# Hang guard for ordinary (quick-tier) tests: nextest marks a test "slow"
+# (printed, not failed) past 60s, and force-terminates it past 10 minutes.
+# This is not a performance target, just a ceiling so a genuine hang doesn't
+# run forever on a laptop or in CI.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# The slow set gets a much larger ceiling. CI's Slow Tests job runs it under
+# THIS profile (`--ignore-default-filter -E 'not default()'`), so without
+# this override the 10-minute quick-tier guard would apply to tests that
+# legitimately take ~7 minutes on a noisy macOS runner (#561 review:
+# `parallel_pass1_output_is_byte_identical_across_thread_counts` took 408s).
+# Keep this filter in sync with the exclusion in `default-filter` above.
+[[profile.default.overrides]]
+filter = """
+    binary(thread_count_determinism)
+  | binary(shard_merge_parity)
+  | binary(sharded_builds)
+  | test(=header_clustered_flag_matches_the_actual_entry_layout)
+  | test(=test_real_data_conversion_keeps_the_root_directory_small)
+  | test(large_polygon_regression)
+"""
+slow-timeout = { period = "120s", terminate-after = 15 }
+
+[profile.quick]
+# Inherits `default-filter` and `slow-timeout` from [profile.default] above
+# (nextest profiles fall back to `default` for any setting they don't set
+# themselves). Named explicitly so `--profile quick` documents intent at
+# the call site instead of relying on nextest's implicit "no --profile"
+# behavior.
+
+[profile.full]
+# Everything: quick's tests plus the slow set excluded above.
+default-filter = "all()"
+
+# The slow suite's own tests run up to ~7 minutes each (#524); give real
+# hangs a generous but finite ceiling rather than none at all.
+slow-timeout = { period = "120s", terminate-after = 6 }
