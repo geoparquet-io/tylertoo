@@ -258,7 +258,7 @@ level's own auto-narrowed width: `memory_safe_level_wave` (#311) can narrow a
 level's actual wave below this ceiling based on that level's own density: the
 dump doesn't carry that per-level detail yet.
 
-`crates/cli/tests/profile_json_dump.rs::profile_json_written_and_parses`
+`crates/cli/tests/profile_json_dump.rs::profile_json_export_section_parses`
 covers this section: it asserts the `export` object parses, `per_zoom`'s
 length matches `--report`'s `export.zooms` length, the stage-second sum is
 positive, and the sum of `per_zoom[].tiles`/`.features` matches
