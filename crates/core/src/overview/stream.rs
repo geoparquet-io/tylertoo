@@ -205,12 +205,21 @@ fn current_rss_mib() -> Option<f64> {
 /// pass-1 winner tables (O(dataset)) vs the pass-2 output sink (bounded by the
 /// #294 auto profile) — and validate the auto backing choice on real runs.
 fn log_phase_rss(phase: &str, peak_mib: &mut Option<f64>) {
-    if let Some(rss) = current_rss_mib() {
-        if peak_mib.is_none_or(|p| rss > p) {
-            *peak_mib = Some(rss);
-        }
+    if let Some(rss) = sample_rss_peak(peak_mib) {
         log::info!("[rss] {phase}: {rss:.0} MiB");
     }
+}
+
+/// Sample the current RSS and fold it into the running `peak_mib`, silently;
+/// returns the sample. The shared core of [`log_phase_rss`], also used by the
+/// export profile (#535), which samples at its phase boundaries without adding
+/// `[rss]` log lines of its own.
+pub(super) fn sample_rss_peak(peak_mib: &mut Option<f64>) -> Option<f64> {
+    let rss = current_rss_mib()?;
+    if peak_mib.is_none_or(|p| rss > p) {
+        *peak_mib = Some(rss);
+    }
+    Some(rss)
 }
 
 /// Split the resolved level plan into emitted levels (have winners) and skipped
@@ -2071,12 +2080,11 @@ struct ProfileJsonInputs<'a> {
 /// (or the pipeline never reached the dump at all) — a preflight must observe
 /// the filesystem, not change it.
 pub(super) fn preflight_profile_json_path() {
-    let Ok(path) = std::env::var("TYLERTOO_PROFILE_JSON") else {
+    let Some(path) = profile_json_target() else {
         return;
     };
-    if path.trim().is_empty() {
-        return;
-    }
+    // Fix the run id now, near process start, rather than at the first dump.
+    profile_run_id();
     let path = Path::new(&path);
     let probed = if path.exists() {
         // Same mode `write_profile_json` uses, minus `create`: nothing on
@@ -2101,6 +2109,18 @@ pub(super) fn preflight_profile_json_path() {
         })
     };
     if let Err(e) = probed {
+        // #535 review: a `tiles` run preflights twice (convert's
+        // `validate_options`, then `export_pmtiles`), and the banner must not
+        // print twice for the same bad path. Remembered per path, not as a
+        // bare once-per-process flag, so a long-lived host (the Python
+        // bindings) that points the var somewhere else still gets warned.
+        static WARNED: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+        if let Ok(mut warned) = WARNED.lock() {
+            if warned.as_deref() == Some(path) {
+                return;
+            }
+            *warned = Some(path.to_path_buf());
+        }
         let path = path.display();
         log::warn!(
             "[profile] ################################################\n\
@@ -2127,12 +2147,9 @@ pub(super) fn preflight_profile_json_path() {
 /// only logged. Reads exactly one already-computed number per field (no
 /// re-derivation), so this has zero effect on conversion output bytes.
 fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
-    let Ok(path) = std::env::var("TYLERTOO_PROFILE_JSON") else {
+    let Some(path) = profile_json_target() else {
         return;
     };
-    if path.trim().is_empty() {
-        return;
-    }
     let rate = |rows: usize, secs: f64| if secs > 0.0 { rows as f64 / secs } else { 0.0 };
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2151,6 +2168,11 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
     };
     let value = serde_json::json!({
         "timestamp": timestamp,
+        // #535 review: pairs this line with the export line of the same
+        // process (`tiles`), and tells the two shapes apart without sniffing
+        // for `pass1`/`export` keys.
+        "run_id": profile_run_id(),
+        "phase": "convert",
         // Disjoint wall-clock windows of one conversion, in run order, so
         // `pass1 + assign + pass2 + writer_finish <= total` always holds
         // (#533 — before that fix each window ran to the end of the run and
@@ -2203,14 +2225,40 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
         "in_flight": inputs.in_flight_batches,
         "memory_profile": inputs.options.profile,
     });
+    append_profile_line(&path, &value);
+}
+
+/// The `TYLERTOO_PROFILE_JSON` target, or `None` when the var is unset or
+/// blank (profiling off). Shared by both profile writers so they agree on
+/// what "off" means.
+fn profile_json_target() -> Option<String> {
+    std::env::var("TYLERTOO_PROFILE_JSON")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// Append `value` as one JSONL line to `path` — the single write path both
+/// profile writers ([`write_profile_json`], [`write_export_profile_json`])
+/// share. Best-effort: an open/write error is only logged.
+///
+/// The line (with its trailing newline) is serialized up front and written
+/// with ONE `write_all` on an `O_APPEND` file (#535 review). The previous
+/// `writeln!(f, "{value}")` on an unbuffered `File` went through `Display`,
+/// which issues many small `write` syscalls per line — so two processes
+/// appending to the same file (concurrent sweep jobs, or shards) could
+/// interleave fragments of each other's lines. A single append-mode write of
+/// a line this size lands contiguously on local filesystems.
+fn append_profile_line(path: &str, value: &serde_json::Value) {
     use std::io::Write;
+    let mut line = value.to_string();
+    line.push('\n');
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{value}") {
+            if let Err(e) = f.write_all(line.as_bytes()) {
                 log::warn!("[profile] TYLERTOO_PROFILE_JSON write to {path:?} failed: {e}");
             }
         }
@@ -2218,6 +2266,292 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
             log::warn!("[profile] TYLERTOO_PROFILE_JSON open {path:?} failed: {e}");
         }
     }
+}
+
+/// This process's profile run id (#535 review): `"<pid>-<unix nanos>"`,
+/// fixed on first use (in practice at the first preflight, i.e. near process
+/// start). Written into every `TYLERTOO_PROFILE_JSON` line, so a `tiles`
+/// run's convert and export lines share it, and lines from concurrent runs
+/// appending to the same file can be told apart even when their timestamps
+/// interleave.
+pub(super) fn profile_run_id() -> &'static str {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
+/// Add a pre-measured duration to a nanosecond accumulator — the shared
+/// mutator behind every profiling timer set in this module ([`Pass1Timers`],
+/// [`Pass2Timers`], [`ExportTimers`]).
+pub(super) fn add_nanos(cell: &AtomicU64, dur: Duration) {
+    cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Read a nanosecond accumulator as seconds (see [`add_nanos`]).
+fn nanos_secs(cell: &AtomicU64) -> f64 {
+    Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
+}
+
+/// Export-phase [profile] stage counters (#535): nanosecond accumulators,
+/// same atomics-across-threads shape as [`Pass2Timers`], shared by `&` down to
+/// every rayon closure that records time.
+///
+/// Units: every field is CORE-SECONDS — the sum of per-item (or
+/// single-threaded) `Instant` windows across all threads, exactly the
+/// `pass2.stage_secs` convention. Where the work is rayon-parallel, the window
+/// is taken INSIDE the innermost per-item closure (one geometry for `clip`,
+/// one tile for `encode`), never around a whole parallel section, so a
+/// stage's number is the CPU time actually spent in it: it routinely exceeds
+/// a level's wall time under parallelism, and never double-counts through
+/// nested `par_iter`s or work stealing. Work these windows do not cover (the
+/// per-tile member sort before encode, channel waits, rayon scheduling) is
+/// uncounted, not mis-attributed. See `docs/PROFILING.md`.
+#[derive(Default)]
+pub(super) struct ExportTimers {
+    /// Reading overview rows: opening the Parquet reader (footer / page-index
+    /// setup — paid once per band in partitioning mode, once per wave in
+    /// duplicating mode) plus every `ParquetRecordBatchReader::next()` call
+    /// (read + Arrow decode). Charged on the thread doing the read: the
+    /// wave's own thread in [`super::export::process_wave`] (duplicating
+    /// mode), the single-read producer thread in
+    /// [`super::export::fill_member_store`] (partitioning mode, #235). The
+    /// producer's `tx.send` (which can block on the consumer) is excluded.
+    pub(super) band_read: AtomicU64,
+    /// Everything per batch around the clip that is not the clip: the
+    /// geoarrow → `geo::Geometry` decode, the EPSG:3857 → 4326 reprojection
+    /// (timed per geometry inside its `par_iter`), property-column
+    /// extraction, and per-row member materialization + routing into the
+    /// partition buckets / `MemberStore` — in
+    /// [`super::export::collect_wave_members`] and
+    /// [`super::export::fanout_batch_members`]. A `MemberStore` spill flush
+    /// triggered while routing is subtracted out and charged to
+    /// `spill_write` instead.
+    pub(super) decode: AtomicU64,
+    /// [`super::export::feature_tile_members`] (the recursive quadtree clip
+    /// cascade), timed per geometry inside the `par_iter` that drives it.
+    pub(super) clip: AtomicU64,
+    /// Per-tile MVT encode (including the oversized-tile valve) + content
+    /// hash + gzip, timed per tile inside [`super::export::encode_members`]'s
+    /// parallel section. The member sort that precedes it is not counted.
+    pub(super) encode: AtomicU64,
+    /// Partitioning mode only: serializing + writing `MemberStore` spill
+    /// segments (spill backing), during the fill and its final flush.
+    pub(super) spill_write: AtomicU64,
+    /// Partitioning mode only: `MemberStore::take_wave` — reading and
+    /// decoding a wave's spilled segments back (plus the trivial in-RAM
+    /// remainder move; ~0 under RAM backing). Single-threaded, per wave.
+    pub(super) spill_read: AtomicU64,
+    /// `writer.add_tile_precompressed` calls: the serial per-tile write loop
+    /// in [`super::export::export_level`], folded in once per wave.
+    pub(super) spool_write: AtomicU64,
+    /// `writer.checkpoint(...)` calls (throttled salvage snapshots,
+    /// #229/#459). Not the final `writer.finalize(...)` — see
+    /// `phase_walls.finalize`.
+    pub(super) checkpoint: AtomicU64,
+}
+
+/// [`ExportTimers`] snapshotted in seconds for [`write_export_profile_json`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ExportStageSecs {
+    pub(super) band_read: f64,
+    pub(super) decode: f64,
+    pub(super) clip: f64,
+    pub(super) encode: f64,
+    pub(super) spill_write: f64,
+    pub(super) spill_read: f64,
+    pub(super) spool_write: f64,
+    pub(super) checkpoint: f64,
+}
+
+impl ExportTimers {
+    /// Run `f`, charging its duration to `cell`. The per-item form used
+    /// inside rayon closures (one geometry, one tile): an `Instant` pair and a
+    /// relaxed `fetch_add` is noise next to a clip or an MVT encode.
+    pub(super) fn time<T>(cell: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now();
+        let out = f();
+        add_nanos(cell, t.elapsed());
+        out
+    }
+
+    /// Charge the rest of the enclosing scope to `cell` (drop-guard form of
+    /// [`Self::time`], for spans with `?` early returns inside them).
+    pub(super) fn scope(cell: &AtomicU64) -> StageScope<'_> {
+        StageScope {
+            cell,
+            start: Instant::now(),
+        }
+    }
+
+    pub(super) fn stage_secs(&self) -> ExportStageSecs {
+        ExportStageSecs {
+            band_read: nanos_secs(&self.band_read),
+            decode: nanos_secs(&self.decode),
+            clip: nanos_secs(&self.clip),
+            encode: nanos_secs(&self.encode),
+            spill_write: nanos_secs(&self.spill_write),
+            spill_read: nanos_secs(&self.spill_read),
+            spool_write: nanos_secs(&self.spool_write),
+            checkpoint: nanos_secs(&self.checkpoint),
+        }
+    }
+}
+
+/// Drop guard from [`ExportTimers::scope`]: adds the time since it was
+/// created to its cell when it goes out of scope.
+pub(super) struct StageScope<'a> {
+    cell: &'a AtomicU64,
+    start: Instant,
+}
+
+impl Drop for StageScope<'_> {
+    fn drop(&mut self) {
+        add_nanos(self.cell, self.start.elapsed());
+    }
+}
+
+/// Disjoint WALL-clock windows of one export, in run order (#535 review) —
+/// the export analogue of convert's `phase_walls`, so
+/// `scan + fill + levels + finalize <= total`. The remainder of `total` is
+/// the open/validation/writer setup before the scan.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ExportPhaseWalls {
+    /// `scan_all_levels` + the #498 range restriction + `plan_levels`.
+    pub(super) scan: f64,
+    /// The partitioning-mode single-read fill (`fill_member_store`, #235).
+    /// Exactly 0.0 when there is no fill (duplicating mode, or the legacy
+    /// per-wave path): that work then happens per wave inside `levels`.
+    pub(super) fill: f64,
+    /// The per-level loop: every level's wave loop plus the throttled
+    /// checkpoints between levels.
+    pub(super) levels: f64,
+    /// `writer.finalize(...)`.
+    pub(super) finalize: f64,
+}
+
+/// One exported zoom's profile stats (#535): the `export.per_zoom` entries in
+/// `TYLERTOO_PROFILE_JSON`. Deliberately a separate type from
+/// [`super::export::ZoomReport`] (the `--report` JSON's per-zoom type) so this
+/// diagnostics-only knob cannot change the `--report` schema. `tiles` and
+/// `features` come from the same per-level counters `export_level` builds its
+/// `ZoomReport` from.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ExportZoomProfile {
+    pub(super) zoom: u8,
+    /// Wall seconds of this zoom's wave loop in `export_level`, from its
+    /// start to the last tile handed to the writer. EXCLUDES the
+    /// partitioning-mode fill (`phase_walls.fill`, which does the band reads,
+    /// decode and clip for every level up front) and the checkpoint after
+    /// the level; in duplicating mode it includes the per-wave reads/clip.
+    pub(super) wall_secs: f64,
+    pub(super) tiles: usize,
+    pub(super) features: usize,
+    /// Gzip-compressed tile bytes this zoom PRODUCED (`EncodedTile::data`'s
+    /// length summed over every tile handed to the writer), counted BEFORE
+    /// the writer's content-hash dedup — a duplicate tile (e.g. an ocean
+    /// tile) counts here but is stored once, so this can exceed the zoom's
+    /// share of the archive. Not the raw (pre-gzip) MVT size.
+    pub(super) bytes: u64,
+}
+
+/// Inputs to [`write_export_profile_json`] — the export-phase analogue of
+/// [`ProfileJsonInputs`] (#535).
+pub(super) struct ExportProfileJsonInputs<'a> {
+    /// The archive this export wrote.
+    pub(super) output: &'a Path,
+    pub(super) layer_name: &'a str,
+    /// The overview file's materialization mode (`"partitioning"` /
+    /// `"duplicating"`), which decides whether `phase_walls.fill` is used.
+    pub(super) mode: &'a str,
+    pub(super) phase_walls: ExportPhaseWalls,
+    pub(super) total_secs: f64,
+    pub(super) stage_secs: ExportStageSecs,
+    pub(super) per_zoom: &'a [ExportZoomProfile],
+    /// Total wave-loop iterations across every exported level (sum of each
+    /// level's `partitions.len().div_ceil(partition_wave)`).
+    pub(super) waves_total: usize,
+    /// The resolved partition-wave CEILING for this export
+    /// ([`super::export::resolve_and_log_partition_wave`]'s return, `auto` or
+    /// explicit) — a single scalar, not each level's own #311 auto-narrowed
+    /// width.
+    pub(super) partition_wave_width: usize,
+    /// Number of `writer.checkpoint(...)` calls this export made (throttled
+    /// salvage snapshots), not counting the final `finalize`.
+    pub(super) checkpoints: u64,
+    /// Peak of the RSS samples taken at the export's phase boundaries (after
+    /// the scan, the fill, each level, and finalize) — a sampled peak, not a
+    /// true high-water mark. `None` when the platform can't report RSS.
+    pub(super) peak_rss_mib: Option<f64>,
+}
+
+/// Append a SECOND JSON line to `TYLERTOO_PROFILE_JSON`, if set, for the
+/// export phase — the export-side analogue of [`write_profile_json`] (#535).
+/// See `docs/PROFILING.md`'s "Two JSONL lines for one `tiles` run" section
+/// for why this is a second line rather than merged into convert's object;
+/// the two are paired by their shared `run_id`. Same best-effort contract as
+/// [`write_profile_json`]: an unset/blank env var is a no-op, an open/write
+/// error is only logged, and this can never fail (or otherwise affect the
+/// bytes of) an export. Only a SUCCESSFUL export reaches this.
+pub(super) fn write_export_profile_json(inputs: ExportProfileJsonInputs<'_>) {
+    let Some(path) = profile_json_target() else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let per_zoom_json: Vec<serde_json::Value> = inputs
+        .per_zoom
+        .iter()
+        .map(|z| {
+            serde_json::json!({
+                "zoom": z.zoom,
+                "wall_secs": z.wall_secs,
+                "tiles": z.tiles,
+                "features": z.features,
+                "bytes": z.bytes,
+            })
+        })
+        .collect();
+    let (walls, stage) = (inputs.phase_walls, inputs.stage_secs);
+    let value = serde_json::json!({
+        "timestamp": timestamp,
+        "run_id": profile_run_id(),
+        "phase": "export",
+        "output": inputs.output.display().to_string(),
+        "layer": inputs.layer_name,
+        "export": {
+            "mode": inputs.mode,
+            "phase_walls": {
+                "scan": walls.scan,
+                "fill": walls.fill,
+                "levels": walls.levels,
+                "finalize": walls.finalize,
+                "total": inputs.total_secs,
+            },
+            "stage_secs": {
+                "band_read": stage.band_read,
+                "decode": stage.decode,
+                "clip": stage.clip,
+                "encode": stage.encode,
+                "spill_write": stage.spill_write,
+                "spill_read": stage.spill_read,
+                "spool_write": stage.spool_write,
+                "checkpoint": stage.checkpoint,
+            },
+            "per_zoom": per_zoom_json,
+            "waves_total": inputs.waves_total,
+            "partition_wave_width": inputs.partition_wave_width,
+            "checkpoints": inputs.checkpoints,
+            "peak_rss_mib": inputs.peak_rss_mib,
+            "threads": rayon::current_num_threads(),
+        },
+    });
+    append_profile_line(&path, &value);
 }
 
 // ============================================================================
@@ -2474,15 +2808,15 @@ pub(super) struct Pass1StageSecs {
 
 impl Pass1Timers {
     fn add(cell: &AtomicU64, start: Instant) {
-        cell.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        add_nanos(cell, start.elapsed());
     }
     /// Add a pre-measured duration (used by the reader thread for read time,
     /// mirroring [`Pass2Timers::add_dur`]).
     fn add_dur(cell: &AtomicU64, dur: Duration) {
-        cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+        add_nanos(cell, dur);
     }
     fn secs(cell: &AtomicU64) -> f64 {
-        Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
+        nanos_secs(cell)
     }
     fn stage_secs(&self) -> Pass1StageSecs {
         Pass1StageSecs {
@@ -3303,14 +3637,14 @@ pub(super) struct Pass2StageSecs {
 
 impl Pass2Timers {
     fn add(cell: &AtomicU64, start: Instant) {
-        cell.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        add_nanos(cell, start.elapsed());
     }
     /// Add a pre-measured duration (used by the reader thread for read time).
     pub(super) fn add_dur(cell: &AtomicU64, dur: Duration) {
-        cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+        add_nanos(cell, dur);
     }
     fn secs(cell: &AtomicU64) -> f64 {
-        Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
+        nanos_secs(cell)
     }
     pub(super) fn read_cell(&self) -> &AtomicU64 {
         &self.read
