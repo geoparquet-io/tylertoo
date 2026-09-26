@@ -1853,6 +1853,17 @@ const MEMBER_STORE_RAM_BUDGET: usize = 128 * 1024 * 1024;
 /// backpressure knob, mirroring `overview/pipeline.rs`.
 const SINGLE_READ_IN_FLIGHT: usize = 4;
 
+/// Bounded-channel depth between the band reader thread and the clip/route
+/// consumer of one **duplicating**-mode wave ([`process_wave`], #535).
+///
+/// Deliberately shallower than [`SINGLE_READ_IN_FLIGHT`]: this path is the one
+/// that also holds a whole wave's members in RAM, so extra in-flight batches
+/// land on top of the peak the wave-width preflight budgeted. Two is all the
+/// overlap needs — one batch being clipped while the next is read — and it
+/// bounds the extra transient at two `EXPORT_BATCH_SIZE` Arrow batches per
+/// wave, which is noise next to the wave's own member buffer.
+const WAVE_READ_IN_FLIGHT: usize = 2;
+
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
@@ -2585,33 +2596,59 @@ fn scan_all_levels(
         })
         .collect();
 
-    for j in 0..num_levels {
-        // Bands accumulate into finer levels' render sets only in partitioning
-        // mode; duplicating bands are self-contained, so band `j` feeds level
-        // `j` alone.
-        let last = if partitioning { num_levels - 1 } else { j };
-        let band_reader = reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE)?;
-        for batch in band_reader {
-            // Decode + (for 3857) reproject each feature's bbox once per band;
-            // sizing the same bbox into every target level below is bit-identical
-            // to reprojecting it once per level, since reprojection is a pure fn.
-            let bboxes = decode_batch_bboxes(&batch?, crs)?;
-            for k in j..=last {
-                let scan = &mut scans[k];
-                scan.feature_count += bboxes.len();
-                let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zooms[k], opts);
-                if let Some(b) = batch_bounds {
-                    match &mut scan.bounds {
-                        Some(acc) => acc.expand(&b),
-                        None => scan.bounds = Some(b),
+    // PERF (#535): same read/compute overlap as [`process_wave`] — the Parquet
+    // read is inherently single-threaded while the decode + sizing fans out
+    // over the Rayon pool, so reading and sizing alternately on one thread left
+    // the pool parked for the whole read. The scan was 3.9 of the 16 s export
+    // wall on a 3.07 M-feature z0–13 run. Every band goes down one channel in
+    // band order (as [`fill_member_store`] does), so the consumer folds batches
+    // in exactly the order the serial loop did and the `LevelScan`s come out
+    // identical — not merely equivalent under the commutativity argument in
+    // this function's docs.
+    let scans_ref = &mut scans;
+    let zooms_ref = &zooms;
+    scoped_pipe(
+        SINGLE_READ_IN_FLIGHT,
+        |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
+            for j in 0..num_levels {
+                let band_reader = reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE)?;
+                for batch in band_reader {
+                    if tx.send((j, batch?)).is_err() {
+                        return Ok(()); // consumer dropped the receiver
                     }
                 }
-                for (key, v) in batch_counts {
-                    *scan.tile_counts.entry(key).or_insert(0) += v;
+            }
+            Ok(())
+        },
+        |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
+            for (j, batch) in rx.iter() {
+                // Bands accumulate into finer levels' render sets only in
+                // partitioning mode; duplicating bands are self-contained, so
+                // band `j` feeds level `j` alone.
+                let last = if partitioning { num_levels - 1 } else { j };
+                // Decode + (for 3857) reproject each feature's bbox once per
+                // band; sizing the same bbox into every target level below is
+                // bit-identical to reprojecting it once per level, since
+                // reprojection is a pure fn.
+                let bboxes = decode_batch_bboxes(&batch, crs)?;
+                for k in j..=last {
+                    let scan = &mut scans_ref[k];
+                    scan.feature_count += bboxes.len();
+                    let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zooms_ref[k], opts);
+                    if let Some(b) = batch_bounds {
+                        match &mut scan.bounds {
+                            Some(acc) => acc.expand(&b),
+                            None => scan.bounds = Some(b),
+                        }
+                    }
+                    for (key, v) in batch_counts {
+                        *scan.tile_counts.entry(key).or_insert(0) += v;
+                    }
                 }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(scans)
 }
 
@@ -2839,17 +2876,50 @@ fn process_wave(
     // per wave on this path) plus each `next()` (read + Arrow decode);
     // `collect_wave_members` charges its own `decode`/`clip`.
     let timers = ctx.timers;
-    let mut batch_reader = ExportTimers::time(&timers.band_read, || {
-        ctx.reader
-            .read_level_with_batch_size(ctx.level_idx, bbox, EXPORT_BATCH_SIZE)
-    })?;
 
     let t_collect = Instant::now();
     let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     let mut seq = 0u64;
-    while let Some(batch) = ExportTimers::time(&timers.band_read, || batch_reader.next()) {
-        collect_wave_members(ctx, wave, &batch?, &mut seq, &mut buckets)?;
-    }
+    // PERF (#535): the read runs on its own thread, one batch ahead of the
+    // clip, instead of alternating with it on this one. The read is
+    // single-threaded by nature (one Parquet reader, sequential row groups)
+    // while the clip fans out over the whole Rayon pool, so a read-then-clip
+    // loop left 11 of 12 cores parked for the whole read: `band_read` was
+    // 5.3 of the 17 s `levels` wall on a 3.07 M-feature z0–13 export, all of
+    // it on the critical path. The partitioning path (#235's
+    // [`fill_member_store`]) is already shaped this way; this brings the
+    // duplicating path in line, without touching wave widths, partitions or
+    // the work either side does.
+    //
+    // Output is unchanged: one producer over a FIFO channel delivers batches
+    // in read order, so `seq` — the band-order counter the within-tile
+    // ordering derives from — advances exactly as it did serially, and the
+    // consumer does the same work in the same order.
+    let buckets_ref = &mut buckets;
+    let seq_ref = &mut seq;
+    scoped_pipe(
+        WAVE_READ_IN_FLIGHT,
+        |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
+            let mut batch_reader = ExportTimers::time(&timers.band_read, || {
+                ctx.reader
+                    .read_level_with_batch_size(ctx.level_idx, bbox, EXPORT_BATCH_SIZE)
+            })?;
+            loop {
+                let next = ExportTimers::time(&timers.band_read, || batch_reader.next());
+                let Some(batch) = next else { break };
+                if tx.send(batch?).is_err() {
+                    return Ok(()); // consumer dropped the receiver (error path)
+                }
+            }
+            Ok(())
+        },
+        |rx: Receiver<RecordBatch>| -> Result<(), ExportError> {
+            for batch in rx.iter() {
+                collect_wave_members(ctx, wave, &batch, seq_ref, buckets_ref)?;
+            }
+            Ok(())
+        },
+    )?;
     let collect_secs = t_collect.elapsed().as_secs_f64();
     let n_members: usize = buckets.iter().map(Vec::len).sum();
 
