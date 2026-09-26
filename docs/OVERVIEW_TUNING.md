@@ -210,7 +210,7 @@ WARN omitting 1 empty level(s) [0] … none of the 3399 input feature(s)
 `--verbatim` turns the whole ladder off, so every level reproduces the input:
 
 ```
-$ tylertoo tiles cells.parquet out.pmtiles --min-zoom 0 --max-zoom 5 --verbatim
+$ tylertoo tiles cells.parquet out.pmtiles --min-zoom 0 --max-zoom 5 --verbatim -f
   z0  (level 0): 3399 features
   z1  (level 1): 3399 features
   z2  (level 2): 3399 features
@@ -516,12 +516,12 @@ two-archive merge:
 
 ```bash
 # Dots zoomed out, full polygons zoomed in, in ONE PMTiles:
-tylertoo tiles buildings.parquet buildings.pmtiles \
+tylertoo tiles buildings.parquet buildings.pmtiles -f \
   --min-zoom 0 --max-zoom 14 \
   --representation "0-7:point,8-14:geom"
 
 # Tippecanoe-style placeholder squares at coarse zooms instead:
-tylertoo tiles buildings.parquet buildings.pmtiles \
+tylertoo tiles buildings.parquet buildings.pmtiles -f \
   --min-zoom 0 --max-zoom 14 \
   --representation "0-7:square"
 ```
@@ -631,6 +631,16 @@ At the mid zooms, a dense square carpet can exceed `--max-tile-size`; the
 valve then sheds squares for that tile, as it would any feature. Raise
 the cap or accept the thinner carpet.
 
+To see how close each zoom runs to the cap, `tylertoo stats` reports the
+per-zoom tile count, total, mean, p50, p99 and max **stored** (compressed)
+tile size, plus the largest tiles by z/x/y, from the archive's directory
+alone (no tile is read):
+
+```bash
+tylertoo stats buildings.pmtiles --largest 5     # human table
+tylertoo stats buildings.pmtiles --json          # same numbers, machine-readable
+```
+
 Opt-in for now: the drop default is unchanged pending the #259-fixture
 sweep (#279 tracks the default decision). Recorded in the footer
 provenance as `generalization.collapse: "square"` (`--collapse` records
@@ -664,7 +674,7 @@ tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 6 \
 
 # ...or place the rungs by hand. Rungs must fall inside the zoom range, and
 # each names a value the column actually carries.
-tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 8 \
+tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 8 -f \
   --entry-zoom "density:5000=0,1000=3,200=6"
 ```
 
@@ -1095,10 +1105,10 @@ If your style depends on paint order, pin it rather than inheriting it:
 tylertoo tiles in.parquet out.pmtiles --feature-order input
 
 # Sort within each tile by a property: high `level` painted last (on top)
-tylertoo tiles in.parquet out.pmtiles --feature-order level
+tylertoo tiles in.parquet out.pmtiles --feature-order level -f
 
 # ...or first (underneath)
-tylertoo tiles in.parquet out.pmtiles --feature-order level:desc
+tylertoo tiles in.parquet out.pmtiles --feature-order level:desc -f
 ```
 
 Accepted on both `tiles` and `export-pmtiles`.
@@ -1432,7 +1442,7 @@ eight columns nobody asked for). The geometry column is always kept.
 
 ```bash
 # Tiles carry only confidence and metrics:area
-tylertoo tiles fields.parquet fields.pmtiles --max-zoom 13 \
+tylertoo tiles fields.parquet fields.pmtiles --max-zoom 13 -f \
   --include-property confidence --include-property metrics:area
 
 # Everything except the id and the timestamp
@@ -1746,9 +1756,8 @@ path, it must itself be writable, since it is about to be clobbered. `--plan`
 must be a readable convert plan (magic bytes checked, with a future format
 version named as such) — same fail-fast contract as `--spill-dir`.
 An existing plan at `--save-plan PATH` is **overwritten**, with a log line;
-that matches how `overview` and `tiles` treat their own outputs (only
-`pyramid`, which merges several archives, gates overwrites behind
-`-f/--force`).
+that matches how `overview` treats its output. `tiles`, `pyramid`, `merge` and
+`shard-plan` instead refuse an existing output unless given `-f/--force`.
 Not yet exposed in the Python bindings.
 
 ---

@@ -56,6 +56,7 @@ pub mod pmtiles_writer;
 pub mod pyramid;
 pub mod quality;
 pub mod shard;
+pub mod stats;
 pub mod sutherland_hodgman;
 pub mod tile;
 pub mod wkb;

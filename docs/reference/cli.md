@@ -14,6 +14,7 @@ This document contains the help content for the `tylertoo` command-line program.
 * [`tylertoo validate`↴](#tylertoo-validate)
 * [`tylertoo export-pmtiles`↴](#tylertoo-export-pmtiles)
 * [`tylertoo decode`↴](#tylertoo-decode)
+* [`tylertoo stats`↴](#tylertoo-stats)
 * [`tylertoo pyramid`↴](#tylertoo-pyramid)
 * [`tylertoo merge`↴](#tylertoo-merge)
 * [`tylertoo shard-plan`↴](#tylertoo-shard-plan)
@@ -33,6 +34,7 @@ Top-level CLI: a default (bare) tile pipeline plus subcommands.
 * `validate` — Validate a GeoParquet overview file against the spec (§6.2)
 * `export-pmtiles` — Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `decode` — Decode a PMTiles vector-tile archive back to GeoParquet
+* `stats` — Per-zoom tile-weight report for a PMTiles archive (issue #552)
 * `pyramid` — Build a multi-band pyramid: several inputs, each owning a zoom range, one archive (issue #345)
 * `merge` — Concatenate disjoint PMTiles archives into one (issue #498)
 * `shard-plan` — Cut a dataset's tile space into N disjoint shards (issue #498)
@@ -91,6 +93,7 @@ Generate PMTiles vector tiles (the default pipeline)
 
    This restricts the EXPORT only. `--shard` is the form that also prunes the convert's input to the row groups the range can reach, which is what makes a shard cheaper than the whole build rather than merely narrower — prefer it unless you are cutting by hand. The two are mutually exclusive: `--shard` derives its range from the shard plan
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
+* `-f`, `--force` — Overwrite the output if it exists
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
 
    The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.
@@ -576,6 +579,31 @@ does not reproduce A. See docs/decode.md for details.
 * `--max-zoom <MAX_ZOOM>` — Maximum zoom level to decode
 * `--layer <NAME>` — Only decode features from this MVT layer
 * `--report <PATH>` — Write the JSON decode report to this path
+
+
+
+## `tylertoo stats`
+
+Per-zoom tile-weight report for a PMTiles archive (issue #552).
+
+For each zoom: tile count, total, mean, p50, p99 and max tile size, plus the largest individual tiles (`--largest N`). Sizes are STORED (compressed) bytes per addressed tile, read from the directory entries alone -- no tile is decompressed or even read. Run-length members and deduplicated tiles each count at the full length of their shared body, so `tiles x mean` (the `total` column) is the bytes a client would fetch and can exceed the archive's size on disk.
+
+Percentiles are nearest-rank: pN is the smallest size such that at least ceil(N/100 x tiles) of the zoom's tiles are no larger. Largest tiles are ordered by size descending, ties by ascending PMTiles tile id (lower zoom first, then Hilbert order).
+
+Memory and time are proportional to the archive's directory entries, not its tile count: runs are aggregated with their multiplicity, never expanded.
+
+**Usage:** `tylertoo stats [OPTIONS] <ARCHIVE>`
+
+###### **Arguments:**
+
+* `<ARCHIVE>` — PMTiles archive to report on
+
+###### **Options:**
+
+* `--largest <N>` — How many of the largest tiles (by stored size) to list
+
+  Default value: `10`
+* `--json` — Print the report as JSON instead of a human-readable table
 
 
 

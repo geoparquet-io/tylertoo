@@ -60,6 +60,21 @@ pub fn realdata(name: &str) -> Option<PathBuf> {
     }
 }
 
+/// Locate a golden PMTiles fixture under `tests/fixtures/golden/`.
+///
+/// Unlike [`realdata`], these are committed directly (see `.gitattributes` --
+/// only `tests/fixtures/realdata/*.parquet` is git-lfs), so every clone,
+/// including a fresh one with no LFS fetch, has the real bytes. There is
+/// nothing to skip on: a missing or unusable golden fixture is a repo bug,
+/// not an environment gap, so this panics rather than silently skipping.
+pub fn golden(name: &str) -> PathBuf {
+    let path = workspace_root().join("tests/fixtures/golden").join(name);
+    usability(&path).unwrap_or_else(|why| {
+        panic!("golden fixture {} {why}", path.display());
+    });
+    path
+}
+
 /// The workspace root: the nearest ancestor of this crate that holds the
 /// fixture directory.
 ///
@@ -99,8 +114,15 @@ fn classify(bytes: &[u8], path: &Path) -> Result<(), String> {
             bytes.len()
         ));
     }
-    // Only parquet has a magic worth asserting; other fixtures (raw WKB) are
-    // accepted on readability alone.
+    // Parquet and PMTiles have a magic worth asserting; other fixtures (raw
+    // WKB) are accepted on readability alone.
+    let is_pmtiles = path.extension().is_some_and(|e| e == "pmtiles");
+    if is_pmtiles && !bytes.starts_with(b"PMTiles") {
+        return Err(format!(
+            "is not a PMTiles archive (missing the PMTiles magic, {} bytes).",
+            bytes.len()
+        ));
+    }
     let is_parquet = path.extension().is_some_and(|e| e == "parquet");
     if is_parquet && !(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1")) {
         return Err(format!(
@@ -144,6 +166,17 @@ mod fixture_guard_tests {
         assert!(err.contains("PAR1"), "{err}");
         let err = classify(b"", Path::new("x.parquet")).unwrap_err();
         assert!(err.contains("PAR1"), "{err}");
+    }
+
+    #[test]
+    fn pmtiles_fixtures_need_the_pmtiles_magic() {
+        let mut buf = b"PMTiles\x03".to_vec();
+        buf.extend_from_slice(&[0u8; 16]);
+        assert!(classify(&buf, Path::new("x.pmtiles")).is_ok());
+        let err = classify(b"garbage", Path::new("x.pmtiles")).unwrap_err();
+        assert!(err.contains("PMTiles magic"), "{err}");
+        let err = classify(b"", Path::new("x.pmtiles")).unwrap_err();
+        assert!(err.contains("PMTiles magic"), "{err}");
     }
 
     #[test]
