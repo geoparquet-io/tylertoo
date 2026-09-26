@@ -186,6 +186,65 @@ What you get for that:
 Budget the coarse job as *pass 1 + assign over the whole input, plus a pass 2
 over the coarse levels* — not as a full convert.
 
+## Sizing the coarse job's memory
+
+The coarse job's irreducible cost is the **pass-1 feature table**: one
+`AssignFeature` per input row, held resident from pass 1's scan through the
+level assignment. It costs **64 bytes/row** — measured from the struct's
+actual layout (`size_of::<AssignFeature>()`; two of its fields are `Option`s,
+so alignment padding costs more than the payload alone would suggest) and
+cross-checked against a field incident: a 1.58B-row coarse job logged
+`[rss] pass1 scan: 96836 MiB` right after the pass-1 scan —
+`96,836 MiB ÷ 1.58B rows ≈ 64.3 bytes/row` — and was OOM-killed later, during
+the winner-grid wave build. 64 bytes/row is a floor, not the scan's whole
+peak: smaller per-row vectors (ranking keys, and depending on options
+accumulate values, polygon areas, line geometries) coexist with it during
+the scan.
+
+That feature table is only part of what the coarse job holds at once — the
+level-assignment winner grids (per-level, budgeted separately) and pass 2's
+buffered output also need memory, concurrently with (or right after) it.
+**Rule of thumb: budget the coarse job at ≳ (rows × 64 bytes) × 2.5.** For
+the field incident above (1.58B rows, a 94.2 GiB floor), that is ≳235 GiB:
+the job OOM'd on a 192 GiB box — only ~2.04× the floor — 25 minutes in, and
+ran on 360 GiB.
+
+**The remedy is a bigger box.** Sharding does not lower this floor: the
+coarse job runs the full pass 1 over the whole input, whatever `N` is. Only a
+`--plan` replay skips pass 1 (it re-reads the saved 1-byte/row winner table
+instead), and that plan must first be cut — once — on a machine big enough
+for the full pass 1.
+
+tylertoo checks this automatically and cheaply: before pass 1 reads a single
+row, it estimates `selected rows × 64 bytes` from the input's footers (no
+data pages read) and compares it to the process's memory figure — the same
+container-aware probe `auto` uses, but read fresh and attributed to its
+source:
+
+- **Warning** when the realistic need (floor × 2.5) exceeds the figure,
+  naming the numbers, the figure's source (`MemAvailable`, cgroup
+  `memory.max` or `memory.high`, or the `TYLERTOO_AUTO_MEM_LIMIT_BYTES`
+  override) and this sizing rule. The incident above would have warned.
+- **Hard error** only when the floor alone exceeds a **hard** cgroup limit
+  (`memory.max`, or v1 `memory.limit_in_bytes`) — the kernel would kill the
+  job anyway, so it fails in seconds instead of after the scan.
+  `MemAvailable` (momentary, excludes swap), `memory.high` (a throttle, not
+  a kill) and the override are advisory and only ever warn.
+- With `--bbox` or `--filter` the footer count is an unpruned upper bound
+  (rows that miss either never enter the table), so the check only warns.
+
+If the estimate is wrong for your setup (an unusual cgroup nesting, or a box
+you already know can page through it), set
+`TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` (also `true`, `yes` or `on`) to downgrade
+the hard error to the warning and proceed anyway. Off Linux there is no
+cgroup or `MemAvailable` to read, so the check does nothing unless the
+override is set. A `--plan` replay skips it.
+
+This check does not (yet) make the coarse job's floor any smaller —
+[#543](https://github.com/geoparquet-io/tylertoo/issues/543) tracks shrinking
+it (a narrower struct-of-arrays layout, or spilling the table between scan
+and assign) — it only fails fast instead of after a long scan.
+
 ## Why a shard must consume the convert plan
 
 `--shard I/N` **without `--plan` is a hard error**, and that is not a
