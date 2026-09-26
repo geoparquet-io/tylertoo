@@ -187,7 +187,8 @@ Both paths are preflighted in `validate_options` (#513), alongside the #272
 *and*, when the target file already exists, that file itself must open for
 writing. `--save-plan` is written only *after* pass 1 and the assignment, so
 a bad target used to cost the whole scan. An existing plan is overwritten
-with a log line, matching how `overview`/`tiles` treat their own outputs; the
+with a log line, matching how `overview` treats its output (`tiles` refuses
+an existing archive unless given `-f/--force`); the
 preflight only ever observes, so it never truncates the plan it probes. The
 magic's last byte is the format version and is matched separately from the
 `TTPLAN\0` prefix, so a plan from a future tylertoo reports its version

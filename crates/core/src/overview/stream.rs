@@ -2514,11 +2514,13 @@ pub(super) struct ExportTimers {
     /// Reading overview rows: opening the Parquet reader (footer / page-index
     /// setup — paid once per band in partitioning mode, once per wave in
     /// duplicating mode) plus every `ParquetRecordBatchReader::next()` call
-    /// (read + Arrow decode). Charged on the thread doing the read: the
-    /// wave's own thread in [`super::export::process_wave`] (duplicating
-    /// mode), the single-read producer thread in
-    /// [`super::export::fill_member_store`] (partitioning mode, #235). The
-    /// producer's `tx.send` (which can block on the consumer) is excluded.
+    /// (read + Arrow decode). Charged in both modes on a producer thread that
+    /// reads ahead of, and concurrently with, the decode/clip consumer: each
+    /// wave's producer in [`super::export::process_wave`] (duplicating mode,
+    /// #535) and the single-read producer in
+    /// [`super::export::fill_member_store`] (partitioning mode, #235) — so it
+    /// overlaps `decode`/`clip` in wall time. The producer's `tx.send` (which
+    /// can block on the consumer) is excluded.
     pub(super) band_read: AtomicU64,
     /// Everything per batch around the clip that is not the clip: the
     /// geoarrow → `geo::Geometry` decode, the EPSG:3857 → 4326 reprojection

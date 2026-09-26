@@ -62,6 +62,9 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 - Spec validation (`tylertoo validate`)
 - PMTiles → GeoParquet decoding (`tylertoo decode`) — tippecanoe-decode
   semantics, any PMTiles v3 MVT archive
+- Per-zoom tile-weight report (`tylertoo stats`) — tile count, mean, p50,
+  p99 and max stored tile size per zoom plus the largest tiles, read from
+  the archive's directory alone
 
 ## Install
 
@@ -81,7 +84,8 @@ Silicon) and Windows x86_64 are attached to every
 tylertoo input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 
 # Keep the reusable multi-resolution overview file too — one run, both artifacts
-tylertoo input.parquet output.pmtiles --max-zoom 14 \
+# (an existing output is refused unless you pass -f/--force)
+tylertoo input.parquet output.pmtiles --max-zoom 14 --force \
   --keep-overview overviews.parquet
 ```
 

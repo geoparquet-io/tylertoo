@@ -142,6 +142,62 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
     (x.round() as i32, y.round() as i32)
 }
 
+/// One tile's lon/lat → tile-unit transform, with the parts that depend only
+/// on the tile precomputed.
+///
+/// PERF (#535): the transform needs three Mercator Y fractions —
+/// `bounds.lat_max`, `bounds.lat_min` and the coordinate's own latitude — and
+/// each one is a `tan` plus an `asinh`. The first two are constant for the
+/// whole tile, but the per-coordinate entry point recomputed them on **every**
+/// vertex, so two thirds of the transcendental work was redundant: profiling a
+/// 3.07 M-feature z0–13 export put `tan`/`log1p`/`hypot` under
+/// [`mercator_y_fraction`] at ~6 % of all active CPU. Building this once per
+/// tile and reusing it across every ring of every feature leaves one `tan` +
+/// `asinh` per coordinate.
+///
+/// The stored spans are the same subtractions the per-coordinate form did, and
+/// the ratios are still `(v - lo) / span` divisions (not
+/// multiply-by-reciprocal), so every projected coordinate is **bit-identical**
+/// to the pre-#535 value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TileProjector {
+    lng_min: f64,
+    lng_span: f64,
+    merc_top: f64,
+    merc_span: f64,
+    extent_f: f64,
+}
+
+impl TileProjector {
+    #[inline]
+    pub(crate) fn new(bounds: &TileBounds, extent: u32) -> Self {
+        let merc_top = mercator_y_fraction(bounds.lat_max);
+        let merc_bottom = mercator_y_fraction(bounds.lat_min);
+        Self {
+            lng_min: bounds.lng_min,
+            lng_span: bounds.lng_max - bounds.lng_min,
+            merc_top,
+            merc_span: merc_bottom - merc_top,
+            extent_f: extent as f64,
+        }
+    }
+
+    /// Unrounded tile-unit position of a lon/lat coordinate.
+    #[inline]
+    pub(crate) fn project(&self, lng: f64, lat: f64) -> (f64, f64) {
+        let x_ratio = (lng - self.lng_min) / self.lng_span;
+        let y_ratio = (mercator_y_fraction(lat) - self.merc_top) / self.merc_span;
+        (x_ratio * self.extent_f, y_ratio * self.extent_f)
+    }
+
+    /// [`Self::project`] snapped to integer tile units.
+    #[inline]
+    pub(crate) fn round(&self, lng: f64, lat: f64) -> (i32, i32) {
+        let (x, y) = self.project(lng, lat);
+        (x.round() as i32, y.round() as i32)
+    }
+}
+
 /// Web Mercator Y fraction of a latitude: 0.0 at the top of the Mercator
 /// world (+85.0511°), 0.5 at the equator, 1.0 at the bottom (−85.0511°).
 ///
@@ -171,17 +227,7 @@ pub(crate) fn geo_to_tile_coords_unrounded(
     bounds: &TileBounds,
     extent: u32,
 ) -> (f64, f64) {
-    let extent_f = extent as f64;
-
-    // X: linear in longitude.
-    let x_ratio = (lng - bounds.lng_min) / (bounds.lng_max - bounds.lng_min);
-
-    // Y: linear in Mercator fraction, top-down (tile Y increases downward).
-    let merc_top = mercator_y_fraction(bounds.lat_max);
-    let merc_bottom = mercator_y_fraction(bounds.lat_min);
-    let y_ratio = (mercator_y_fraction(lat) - merc_top) / (merc_bottom - merc_top);
-
-    (x_ratio * extent_f, y_ratio * extent_f)
+    TileProjector::new(bounds, extent).project(lng, lat)
 }
 
 // ============================================================================
@@ -204,6 +250,8 @@ pub fn encode_multi_point(points: &MultiPoint, bounds: &TileBounds, extent: u32)
     if points.0.is_empty() {
         return vec![];
     }
+    // One projector for the whole geometry (#535): see [`TileProjector`].
+    let proj = TileProjector::new(bounds, extent);
 
     let mut geometry = Vec::with_capacity(1 + points.0.len() * 2);
     let mut cursor_x = 0i32;
@@ -213,7 +261,7 @@ pub fn encode_multi_point(points: &MultiPoint, bounds: &TileBounds, extent: u32)
     geometry.push(command_encode(CMD_MOVE_TO, points.0.len() as u32));
 
     for point in &points.0 {
-        let (x, y) = geo_to_tile_coords(point.x(), point.y(), bounds, extent);
+        let (x, y) = proj.round(point.x(), point.y());
         let dx = x - cursor_x;
         let dy = y - cursor_y;
         geometry.push(zigzag_encode(dx));
@@ -230,37 +278,37 @@ pub fn encode_linestring(line: &LineString, bounds: &TileBounds, extent: u32) ->
     if line.0.len() < 2 {
         return vec![];
     }
-
+    let proj = TileProjector::new(bounds, extent);
     let mut geometry = Vec::with_capacity(3 + (line.0.len() - 1) * 2);
-    let mut cursor_x = 0i32;
-    let mut cursor_y = 0i32;
+    append_linestring(line, &proj, &mut (0i32, 0i32), &mut geometry);
+    geometry
+}
 
+/// Append one line's MoveTo/LineTo run to `geometry`, advancing `cursor`.
+fn append_linestring(
+    line: &LineString,
+    proj: &TileProjector,
+    cursor: &mut (i32, i32),
+    geometry: &mut Vec<u32>,
+) {
     // First point: MoveTo
     let first = &line.0[0];
-    let (x, y) = geo_to_tile_coords(first.x, first.y, bounds, extent);
-    let dx = x - cursor_x;
-    let dy = y - cursor_y;
+    let (x, y) = proj.round(first.x, first.y);
     geometry.push(command_encode(CMD_MOVE_TO, 1));
-    geometry.push(zigzag_encode(dx));
-    geometry.push(zigzag_encode(dy));
-    cursor_x = x;
-    cursor_y = y;
+    geometry.push(zigzag_encode(x - cursor.0));
+    geometry.push(zigzag_encode(y - cursor.1));
+    *cursor = (x, y);
 
     // Remaining points: LineTo
     if line.0.len() > 1 {
         geometry.push(command_encode(CMD_LINE_TO, (line.0.len() - 1) as u32));
         for coord in line.0.iter().skip(1) {
-            let (x, y) = geo_to_tile_coords(coord.x, coord.y, bounds, extent);
-            let dx = x - cursor_x;
-            let dy = y - cursor_y;
-            geometry.push(zigzag_encode(dx));
-            geometry.push(zigzag_encode(dy));
-            cursor_x = x;
-            cursor_y = y;
+            let (x, y) = proj.round(coord.x, coord.y);
+            geometry.push(zigzag_encode(x - cursor.0));
+            geometry.push(zigzag_encode(y - cursor.1));
+            *cursor = (x, y);
         }
     }
-
-    geometry
 }
 
 /// Encode a MultiLineString geometry to MVT geometry commands.
@@ -269,39 +317,15 @@ pub fn encode_multi_linestring(
     bounds: &TileBounds,
     extent: u32,
 ) -> Vec<u32> {
+    let proj = TileProjector::new(bounds, extent);
     let mut geometry = Vec::new();
-    let mut cursor_x = 0i32;
-    let mut cursor_y = 0i32;
+    let mut cursor = (0i32, 0i32);
 
     for line in &lines.0 {
         if line.0.len() < 2 {
             continue;
         }
-
-        // First point: MoveTo
-        let first = &line.0[0];
-        let (x, y) = geo_to_tile_coords(first.x, first.y, bounds, extent);
-        let dx = x - cursor_x;
-        let dy = y - cursor_y;
-        geometry.push(command_encode(CMD_MOVE_TO, 1));
-        geometry.push(zigzag_encode(dx));
-        geometry.push(zigzag_encode(dy));
-        cursor_x = x;
-        cursor_y = y;
-
-        // Remaining points: LineTo
-        if line.0.len() > 1 {
-            geometry.push(command_encode(CMD_LINE_TO, (line.0.len() - 1) as u32));
-            for coord in line.0.iter().skip(1) {
-                let (x, y) = geo_to_tile_coords(coord.x, coord.y, bounds, extent);
-                let dx = x - cursor_x;
-                let dy = y - cursor_y;
-                geometry.push(zigzag_encode(dx));
-                geometry.push(zigzag_encode(dy));
-                cursor_x = x;
-                cursor_y = y;
-            }
-        }
+        append_linestring(line, &proj, &mut cursor, &mut geometry);
     }
 
     geometry
@@ -320,10 +344,10 @@ type TileEdge = ((i32, i32), (i32, i32));
 /// Snap a ring to tile units, dropping consecutive duplicates and closing it.
 /// Returns `None` when fewer than three distinct vertices remain — the ring
 /// has no area at this zoom and would only encode as a degenerate polygon.
-fn quantize_ring(ring: &LineString, bounds: &TileBounds, extent: u32) -> Option<TileRing> {
+fn quantize_ring(ring: &LineString, proj: &TileProjector) -> Option<TileRing> {
     let mut out: TileRing = Vec::with_capacity(ring.0.len());
     for c in &ring.0 {
-        let p = geo_to_tile_coords(c.x, c.y, bounds, extent);
+        let p = proj.round(c.x, c.y);
         if out.last() != Some(&p) {
             out.push(p);
         }
@@ -438,32 +462,81 @@ fn node_ring(ring: TileRing) -> TileRing {
     if n > NODE_MAX_EDGES {
         return ring;
     }
+    let inserts = if n <= NODE_SWEEP_MIN_EDGES {
+        node_inserts_all_pairs(&ring, n)
+    } else {
+        node_inserts_sweep(&ring, n)
+    };
+    apply_node_inserts(ring, inserts)
+}
+
+/// Every vertex against every edge — `O(n²)` [`node_insert`] calls, all in
+/// registers and without allocating beyond the result.
+///
+/// The whole of [`node_ring`] until #535, and still the cheapest thing to do
+/// for a short ring. It is also the oracle [`node_inserts_sweep`] is tested
+/// against, which is why it stays here rather than being inlined.
+fn node_inserts_all_pairs(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
     // (edge index, position along the edge, vertex) for every insertion.
     let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
-    for (k, &v) in ring[..n].iter().enumerate() {
+    for k in 0..n {
         for i in 0..n {
-            // Edges that end or start at v contain it trivially.
-            if i == k || (i + 1) % n == k {
-                continue;
-            }
-            let (a, b) = (ring[i], ring[i + 1]);
-            let bx = edge_box(a, b);
-            if v.0 < bx.0 || v.0 > bx.2 || v.1 < bx.1 || v.1 > bx.3 || v == a || v == b {
-                continue;
-            }
-            let cross = (i64::from(b.0) - i64::from(a.0)) * (i64::from(v.1) - i64::from(a.1))
-                - (i64::from(b.1) - i64::from(a.1)) * (i64::from(v.0) - i64::from(a.0));
-            if cross == 0 {
-                let along = (i64::from(v.0) - i64::from(a.0)).abs()
-                    + (i64::from(v.1) - i64::from(a.1)).abs();
-                inserts.push((i, along, v));
+            if let Some(ins) = node_insert(ring, n, k, i) {
+                inserts.push(ins);
             }
         }
     }
+    inserts
+}
+
+/// [`node_inserts_all_pairs`] by x-sorted sweep (#535).
+///
+/// The all-pairs scan is `O(n²)`, and on a 3.07 M-feature z0–13 export it was
+/// the single hottest thing in the whole encode stage (32 core-seconds, 15e9
+/// inner iterations) — the coalesced overview polygons carry exterior rings of
+/// thousands of edges, and those few rings dominate the `n²` sum.
+///
+/// An insertion needs the vertex inside the edge's bounding box, so a vertex
+/// can only match edges whose x-span covers it. Sorting the vertices by x once
+/// makes each edge's candidate vertices a contiguous slice, cutting the scan to
+/// `O(n log n + Σ candidates)`.
+///
+/// The result is the same **multiset** as the all-pairs scan: the per-pair test
+/// is the same [`node_insert`] and every box-overlapping pair is still visited,
+/// so only the order of discovery differs — which [`apply_node_inserts`]'s sort
+/// normalizes.
+fn node_inserts_sweep(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
+    let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_unstable_by_key(|&k| ring[k as usize].0);
+    let xs: Vec<i32> = order.iter().map(|&k| ring[k as usize].0).collect();
+    for i in 0..n {
+        let bx = edge_box(ring[i], ring[i + 1]);
+        let lo = xs.partition_point(|&x| x < bx.0);
+        let hi = xs.partition_point(|&x| x <= bx.2);
+        for &k in &order[lo..hi] {
+            if let Some(ins) = node_insert(ring, n, k as usize, i) {
+                inserts.push(ins);
+            }
+        }
+    }
+    inserts
+}
+
+/// Splice [`node_insert`] results into `ring`: each `(edge index, position
+/// along the edge, vertex)` lands inside the edge it was found on, in order
+/// along that edge, with a vertex already present not repeated.
+///
+/// The sort is what makes the enumeration order in [`node_ring`] irrelevant:
+/// the tuples carry their own position, and equal tuples (the same vertex
+/// value found from two ring positions) are indistinguishable, so any
+/// discovery order splices to the same ring.
+fn apply_node_inserts(ring: TileRing, mut inserts: Vec<(usize, i64, (i32, i32))>) -> TileRing {
     if inserts.is_empty() {
         return ring;
     }
     inserts.sort_unstable();
+    let n = ring.len() - 1;
     let mut out: TileRing = Vec::with_capacity(ring.len() + inserts.len());
     let mut next = 0;
     for (i, &v0) in ring[..n].iter().enumerate() {
@@ -479,6 +552,43 @@ fn node_ring(ring: TileRing) -> TileRing {
     let first = out[0];
     out.push(first);
     out
+}
+
+/// Ring sizes at or below this keep [`node_ring`]'s all-pairs scan: `n²`
+/// register-only tests beat an x-sort plus two heap allocations until the ring
+/// is a few dozen edges long.
+const NODE_SWEEP_MIN_EDGES: usize = 32;
+
+/// [`node_ring`]'s per-pair test: the insertion of vertex `ring[k]` into edge
+/// `i`, if the vertex lies exactly on that edge's interior.
+///
+/// `None` when the edge is one of the two meeting at the vertex (which contain
+/// it trivially), when the vertex is outside the edge's bounding box or is one
+/// of its endpoints, or when it is not exactly collinear with it.
+#[inline]
+fn node_insert(
+    ring: &[(i32, i32)],
+    n: usize,
+    k: usize,
+    i: usize,
+) -> Option<(usize, i64, (i32, i32))> {
+    // Edges that end or start at v contain it trivially.
+    if i == k || (i + 1) % n == k {
+        return None;
+    }
+    let v = ring[k];
+    let (a, b) = (ring[i], ring[i + 1]);
+    let bx = edge_box(a, b);
+    if v.0 < bx.0 || v.0 > bx.2 || v.1 < bx.1 || v.1 > bx.3 || v == a || v == b {
+        return None;
+    }
+    let cross = (i64::from(b.0) - i64::from(a.0)) * (i64::from(v.1) - i64::from(a.1))
+        - (i64::from(b.1) - i64::from(a.1)) * (i64::from(v.0) - i64::from(a.0));
+    if cross != 0 {
+        return None;
+    }
+    let along = (i64::from(v.0) - i64::from(a.0)).abs() + (i64::from(v.1) - i64::from(a.1)).abs();
+    Some((i, along, v))
 }
 
 /// Exact integer test: do closed segments `a` and `b` share any point
@@ -756,11 +866,24 @@ fn regroup_pinched(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
         let Some(first) = by_box.next() else {
             continue;
         };
-        let containing = std::iter::once(first)
-            .chain(by_box)
-            .filter(|&i| point_in_ring(hole[0], &polys[i][0]))
-            .min_by_key(|&i| areas[i]);
-        polys[containing.unwrap_or(first)].push(hole);
+        // PERF (#535): with a single box-containing exterior the answer is
+        // `first` whichever way the point-in-ring test goes — it either
+        // survives the filter as the only candidate, or the filter empties and
+        // `unwrap_or(first)` lands on it anyway — so the O(ring) crossing
+        // count is pure waste. That is the overwhelmingly common shape (one
+        // exterior, its own holes): the test was 5 % of all active CPU on a
+        // 3.07 M-feature export, ~3.5 M calls, essentially all of them
+        // single-candidate.
+        let target = match by_box.next() {
+            None => first,
+            Some(second) => [first, second]
+                .into_iter()
+                .chain(by_box)
+                .filter(|&i| point_in_ring(hole[0], &polys[i][0]))
+                .min_by_key(|&i| areas[i])
+                .unwrap_or(first),
+        };
+        polys[target].push(hole);
     }
     polys
 }
@@ -957,8 +1080,8 @@ fn resolve_part_overlaps(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
 
 /// Quantize every ring of `polygon`, clean the result, and return the
 /// polygons to emit (exterior first in each).
-fn quantized_polygons(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<Vec<TileRing>> {
-    let Some(exterior) = quantize_ring(polygon.exterior(), bounds, extent) else {
+fn quantized_polygons(polygon: &Polygon, proj: &TileProjector) -> Vec<Vec<TileRing>> {
+    let Some(exterior) = quantize_ring(polygon.exterior(), proj) else {
         return Vec::new();
     };
     let mut rings = vec![exterior];
@@ -966,7 +1089,7 @@ fn quantized_polygons(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
         polygon
             .interiors()
             .iter()
-            .filter_map(|r| quantize_ring(r, bounds, extent)),
+            .filter_map(|r| quantize_ring(r, proj)),
     );
     clean_tile_polygon(rings)
 }
@@ -1028,7 +1151,8 @@ fn encode_tile_polygons(polys: &[Vec<TileRing>]) -> Vec<u32> {
 pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
     // Quantize first, clean in tile space (#383), then orient on the stored
     // integer coordinates — the sign the spec is defined on.
-    encode_tile_polygons(&quantized_polygons(polygon, bounds, extent))
+    let proj = TileProjector::new(bounds, extent);
+    encode_tile_polygons(&quantized_polygons(polygon, &proj))
 }
 
 /// Encode a MultiPolygon geometry to MVT geometry commands.
@@ -1038,10 +1162,11 @@ pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
 /// - Exterior rings: clockwise in tile coordinates
 /// - Interior rings: counter-clockwise in tile coordinates
 pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+    let proj = TileProjector::new(bounds, extent);
     let polys: Vec<Vec<TileRing>> = polygons
         .0
         .iter()
-        .flat_map(|p| quantized_polygons(p, bounds, extent))
+        .flat_map(|p| quantized_polygons(p, &proj))
         .collect();
     encode_tile_polygons(&resolve_part_overlaps(polys))
 }
@@ -1111,6 +1236,57 @@ impl PropertyValue {
     }
 }
 
+/// Deduplication key for a non-string [`PropertyValue`]: the variant plus the
+/// value's exact bits.
+///
+/// PERF (#461/#535): the layer's value table used to be keyed on
+/// `format!("{value:?}")`, which allocated and formatted a `String` for every
+/// property of every feature of every tile — float properties went through
+/// `grisu` shortest-roundtrip formatting each time. This keys on the bits
+/// instead: no allocation, no formatting, same dedup.
+///
+/// It reproduces the `Debug`-string equivalence exactly. Distinct variants can
+/// never collide (their `Debug` output carried the variant name, this carries
+/// the discriminant); integers and bools are injective either way; and for
+/// floats, `Debug` prints the shortest string that round-trips, so two
+/// distinct bit patterns always printed differently — with one exception, NaN,
+/// whose every payload printed `NaN` and therefore deduplicated together. NaN
+/// is canonicalized to a single bit pattern here to keep that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ScalarKey {
+    Float(u32),
+    Double(u64),
+    Int(i64),
+    UInt(u64),
+    Bool(bool),
+}
+
+impl ScalarKey {
+    /// The key for a non-string value. [`PropertyValue::String`] never
+    /// reaches here: [`LayerBuilder`] indexes strings by the string itself.
+    #[inline]
+    fn of(value: &PropertyValue) -> Self {
+        match value {
+            PropertyValue::String(_) => {
+                unreachable!("string values are indexed by LayerBuilder::string_index")
+            }
+            PropertyValue::Float(f) => Self::Float(if f.is_nan() {
+                f32::NAN.to_bits()
+            } else {
+                f.to_bits()
+            }),
+            PropertyValue::Double(d) => Self::Double(if d.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                d.to_bits()
+            }),
+            PropertyValue::Int(i) => Self::Int(*i),
+            PropertyValue::UInt(u) => Self::UInt(*u),
+            PropertyValue::Bool(b) => Self::Bool(*b),
+        }
+    }
+}
+
 /// Builder for encoding features into an MVT layer.
 pub struct LayerBuilder {
     name: String,
@@ -1119,7 +1295,11 @@ pub struct LayerBuilder {
     keys: Vec<String>,
     key_index: HashMap<String, u32>,
     values: Vec<Value>,
-    value_index: HashMap<String, u32>, // Serialize value for deduplication lookup
+    /// Dedup index for string values, keyed on the string itself so a repeat
+    /// lookup borrows instead of allocating.
+    string_index: HashMap<String, u32>,
+    /// Dedup index for every other value ([`ScalarKey`]).
+    scalar_index: HashMap<ScalarKey, u32>,
 }
 
 impl LayerBuilder {
@@ -1132,7 +1312,8 @@ impl LayerBuilder {
             keys: Vec::new(),
             key_index: HashMap::new(),
             values: Vec::new(),
-            value_index: HashMap::new(),
+            string_index: HashMap::new(),
+            scalar_index: HashMap::new(),
         }
     }
 
@@ -1155,18 +1336,40 @@ impl LayerBuilder {
     }
 
     /// Get or insert a value, returning its index.
+    ///
+    /// Both indexes address the one shared `values` table, so first-encounter
+    /// order — and hence every emitted value index — is exactly what the
+    /// single `format!`-keyed map produced.
     fn get_or_insert_value(&mut self, value: &PropertyValue) -> u32 {
-        // Create a string key for deduplication
-        let value_key = format!("{:?}", value);
-
-        if let Some(&idx) = self.value_index.get(&value_key) {
-            idx
-        } else {
-            let idx = self.values.len() as u32;
-            self.values.push(value.to_mvt_value());
-            self.value_index.insert(value_key, idx);
-            idx
+        match value {
+            PropertyValue::String(s) => match self.string_index.get(s.as_str()) {
+                Some(&idx) => idx,
+                None => {
+                    let idx = self.push_value(value);
+                    self.string_index.insert(s.clone(), idx);
+                    idx
+                }
+            },
+            _ => {
+                let key = ScalarKey::of(value);
+                match self.scalar_index.get(&key) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = self.push_value(value);
+                        self.scalar_index.insert(key, idx);
+                        idx
+                    }
+                }
+            }
         }
+    }
+
+    /// Append `value` to the layer's value table and return its index.
+    #[inline]
+    fn push_value(&mut self, value: &PropertyValue) -> u32 {
+        let idx = self.values.len() as u32;
+        self.values.push(value.to_mvt_value());
+        idx
     }
 
     /// Add a feature to the layer.
@@ -2541,6 +2744,179 @@ mod tests {
         r
     }
 
+    /// The bit-keyed value dedup must assign exactly the indexes the pre-#535
+    /// `format!("{value:?}")` key did, for every value shape that could
+    /// plausibly alias: the two float widths carrying the same number, signed
+    /// vs unsigned integers at the same magnitude, `0.0` against `-0.0`,
+    /// several NaN payloads (which the `Debug` key deduplicated together, all
+    /// printing `NaN`), infinities, and repeats in mixed order.
+    #[test]
+    fn value_dedup_indexes_match_the_debug_string_key() {
+        let mut nan_payload = f64::NAN.to_bits();
+        nan_payload ^= 0x0000_0000_00ff_ff00; // a different, still-NaN payload
+        let values = vec![
+            PropertyValue::Int(1),
+            PropertyValue::UInt(1),
+            PropertyValue::Bool(true),
+            PropertyValue::Float(1.0),
+            PropertyValue::Double(1.0),
+            PropertyValue::String("1".into()),
+            PropertyValue::String("1.0".into()),
+            PropertyValue::Int(1),
+            PropertyValue::Double(0.0),
+            PropertyValue::Double(-0.0),
+            PropertyValue::Double(f64::NAN),
+            PropertyValue::Double(f64::from_bits(nan_payload)),
+            PropertyValue::Float(f32::NAN),
+            PropertyValue::Double(f64::INFINITY),
+            PropertyValue::Double(f64::NEG_INFINITY),
+            PropertyValue::String(String::new()),
+            PropertyValue::UInt(1),
+            PropertyValue::Double(-0.0),
+            PropertyValue::Int(-1),
+            PropertyValue::Double(1.5),
+            PropertyValue::Float(1.5),
+            PropertyValue::String("1".into()),
+        ];
+        assert!(
+            f64::from_bits(nan_payload).is_nan() && nan_payload != f64::NAN.to_bits(),
+            "fixture must be a second, distinct NaN encoding"
+        );
+
+        // Reference: the pre-#535 single `format!`-keyed map.
+        let mut reference_index: HashMap<String, u32> = HashMap::new();
+        let mut reference_next = 0u32;
+        let expected: Vec<u32> = values
+            .iter()
+            .map(|v| {
+                *reference_index.entry(format!("{v:?}")).or_insert_with(|| {
+                    let i = reference_next;
+                    reference_next += 1;
+                    i
+                })
+            })
+            .collect();
+
+        let mut layer = LayerBuilder::new("l");
+        let got: Vec<u32> = values
+            .iter()
+            .map(|v| layer.get_or_insert_value(v))
+            .collect();
+        assert_eq!(got, expected, "value indexes diverged from the Debug key");
+        assert_eq!(
+            layer.values.len(),
+            reference_next as usize,
+            "value table length diverged"
+        );
+    }
+
+    /// The x-sorted sweep must find exactly the insertions the all-pairs scan
+    /// found, and node the ring to exactly the same vertices — on rings big
+    /// enough to take the sweep branch in production and on rings small enough
+    /// to take the direct one, including the T-touch-heavy ones a tiny
+    /// coordinate grid manufactures.
+    ///
+    /// Both enumerations are run explicitly, so the check does not depend on
+    /// which branch [`node_ring`] happens to pick at a given size.
+    #[test]
+    fn node_ring_sweep_matches_all_pairs_reference() {
+        let mut seed = 0x0d0d_1234_5678_u64;
+        let mut touched = 0usize;
+        let mut swept = 0usize;
+        for case in 0..784 {
+            // Alternate a tiny grid (frequent exact collinearity → T-touches)
+            // with a wider one, and walk EVERY ring size 3..=100 (eight rings
+            // each), both sides of the sweep threshold.
+            let grid = if case % 2 == 0 { 8 } else { 40 } as u32;
+            let n = 3 + (case / 2) % 98;
+            let mut pts: Vec<(i32, i32)> = Vec::new();
+            let mut guard = 0;
+            while pts.len() < n && guard < 4000 {
+                guard += 1;
+                let p = (
+                    (lcg(&mut seed) % grid) as i32,
+                    (lcg(&mut seed) % grid) as i32,
+                );
+                if pts.last() != Some(&p) {
+                    pts.push(p);
+                }
+            }
+            if pts.len() < 3 || pts.first() == pts.last() {
+                continue;
+            }
+            let ring = closed(&pts);
+            let n = ring.len() - 1;
+
+            // The insertion multisets must agree (sorted, because the sweep
+            // discovers them edge-major and the scan vertex-major).
+            let mut all_pairs = node_inserts_all_pairs(&ring, n);
+            let mut sweep = node_inserts_sweep(&ring, n);
+            all_pairs.sort_unstable();
+            sweep.sort_unstable();
+            assert_eq!(sweep, all_pairs, "insertions diverged, ring={ring:?}");
+
+            // ...and so must the noded rings, including via the branch
+            // `node_ring` actually takes at this size.
+            let expected = apply_node_inserts(ring.clone(), all_pairs);
+            if expected.len() != ring.len() {
+                touched += 1;
+                swept += usize::from(n > NODE_SWEEP_MIN_EDGES);
+            }
+            assert_eq!(node_ring(ring.clone()), expected, "ring={ring:?}");
+        }
+        assert!(
+            touched > 20 && swept > 10,
+            "too few noded rings to be meaningful: {touched} ({swept} past the sweep threshold)"
+        );
+    }
+
+    /// The tile projector is a hoisted-constant refactor of the
+    /// per-coordinate transform, so every projected coordinate must come out
+    /// BIT-identical (not merely close) to the pre-#535 formula.
+    #[test]
+    fn tile_projector_is_bit_identical_to_per_coordinate_transform() {
+        let reference = |lng: f64, lat: f64, b: &TileBounds, extent: u32| -> (f64, f64) {
+            let extent_f = extent as f64;
+            let x_ratio = (lng - b.lng_min) / (b.lng_max - b.lng_min);
+            let merc_top = mercator_y_fraction(b.lat_max);
+            let merc_bottom = mercator_y_fraction(b.lat_min);
+            let y_ratio = (mercator_y_fraction(lat) - merc_top) / (merc_bottom - merc_top);
+            (x_ratio * extent_f, y_ratio * extent_f)
+        };
+        for &(z, x, y) in &[
+            (0u8, 0u32, 0u32),
+            (1, 1, 0),
+            (5, 17, 9),
+            (10, 511, 700),
+            (13, 4013, 4700),
+            (14, 0, 16383),
+        ] {
+            let b = crate::tile::TileCoord::new(x, y, z).bounds();
+            let proj = TileProjector::new(&b, DEFAULT_EXTENT);
+            for i in 0..=20 {
+                let f = i as f64 / 20.0;
+                // Inside the tile, and outside it on both axes (the buffer
+                // carries coordinates beyond the tile edge).
+                for spread in [0.0f64, 0.15, -0.15] {
+                    let lng = b.lng_min + (b.lng_max - b.lng_min) * (f + spread);
+                    let lat = b.lat_min + (b.lat_max - b.lat_min) * (f + spread);
+                    let want = reference(lng, lat, &b, DEFAULT_EXTENT);
+                    let got = proj.project(lng, lat);
+                    assert_eq!(
+                        got.0.to_bits(),
+                        want.0.to_bits(),
+                        "x at z{z}/{x}/{y} lng={lng}"
+                    );
+                    assert_eq!(
+                        got.1.to_bits(),
+                        want.1.to_bits(),
+                        "y at z{z}/{x}/{y} lat={lat}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A collinear vertex at ring[0] (RDP never tests the ring's first
     /// vertex, so snapping leaves these behind constantly) is not a fold:
     /// the ring must read as simple whichever vertex it starts at.
@@ -2744,6 +3120,36 @@ mod tests {
             let g = tile_rings_to_polygon(&p);
             assert!(g.is_valid(), "{flat:?}");
         }
+    }
+
+    /// The single-candidate short-circuit (#535) must not change where a hole
+    /// lands, including in the case that makes it sound risky: exactly one
+    /// exterior box contains the hole's box, but the hole's first vertex is
+    /// NOT inside that exterior's ring. The containment filter then empties
+    /// and the pre-#535 code fell back to that same exterior via
+    /// `unwrap_or(first)`, so skipping the test has to agree.
+    #[test]
+    fn hole_with_one_box_candidate_attaches_without_the_containment_test() {
+        // A C: the hole's box sits in the notch, inside the C's bbox but
+        // outside its fill, and the hole's first vertex is in the notch too.
+        let ext = closed(&[
+            (0, 0),
+            (100, 0),
+            (100, 20),
+            (20, 20),
+            (20, 80),
+            (100, 80),
+            (100, 100),
+            (0, 100),
+        ]);
+        let hole = closed(&[(40, 40), (60, 40), (60, 60), (40, 60)]);
+        assert!(
+            !point_in_ring(hole[0], &ext),
+            "fixture must have the hole vertex OUTSIDE the exterior's fill"
+        );
+        let polys = regroup_pinched(vec![ext.clone(), hole.clone()]);
+        assert_eq!(polys.len(), 1, "{polys:?}");
+        assert_eq!(polys[0], vec![ext, hole], "hole must still attach to it");
     }
 
     /// Point-in-ring: inside, outside, on an edge and on a vertex.

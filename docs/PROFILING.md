@@ -241,10 +241,14 @@ tile), never around a whole parallel section:
 - `band_read`: reading overview rows. It covers opening the Parquet
   reader (footer/page-index setup, once per band in partitioning mode and
   once per wave in duplicating mode) plus every
-  `ParquetRecordBatchReader::next()` call (read + Arrow decode). It is
-  charged on the reading thread: the wave's own thread in `process_wave`
-  (duplicating), or the fill's producer thread in `fill_member_store`
-  (partitioning). The producer's blocking `tx.send` is excluded.
+  `ParquetRecordBatchReader::next()` call (read + Arrow decode). In both
+  modes it is charged on a dedicated producer thread that reads ahead of
+  the decode/clip consumer: the fill's producer in `fill_member_store`
+  (partitioning), or each wave's producer in `process_wave` (duplicating,
+  #535). The producer's blocking `tx.send` is excluded. The level scan's
+  own read (`scan_all_levels`, geometry column only) also runs on a
+  producer thread but is not timed by any stage; it lands in
+  `phase_walls.scan`.
 - `decode`: everything per batch around the clip that is not the clip. That
   means the geoarrow → `geo::Geometry` decode, the EPSG:3857 → 4326
   reprojection (timed per geometry), property extraction, and per-row member
@@ -277,14 +281,18 @@ tile), never around a whole parallel section:
 > waits, rayon scheduling) is uncounted rather than mis-attributed, so the
 > stages are not expected to sum to any `phase_walls` entry.
 >
-> **Where stages overlap in wall time:** in the partitioning-mode fill, the
-> producer thread's `band_read` runs concurrently with the consumer's
-> `decode`/`clip`. The consumer's time parked in `rx.iter()` waiting for the
-> next batch is uncounted. So in that mode `band_read + decode + clip` can
-> exceed `phase_walls.fill` even before parallelism is counted, and a small
-> `band_read` next to a large `fill` means the fill was CPU-bound, not
-> I/O-bound. In duplicating mode, each wave's read and its decode/clip run
-> one after the other, not concurrently.
+> **Where stages overlap in wall time:** in both modes the producer
+> thread's `band_read` runs concurrently with the consumer's
+> `decode`/`clip` — in the partitioning-mode fill, and in every
+> duplicating-mode wave (#535). The consumer's time parked in `rx.iter()`
+> waiting for the next batch is uncounted. So `band_read + decode + clip`
+> can exceed `phase_walls.fill` (partitioning) or the `per_zoom[].wall_secs`
+> / `phase_walls.levels` it ran in (duplicating) even before parallelism is
+> counted, and a small `band_read` next to a large `fill` or level wall
+> means the work was CPU-bound, not I/O-bound. The level scan overlaps its
+> read the same way. The per-wave `[profile]` debug log's `collect=` value
+> is the wave's read + decode + clip wall, so it includes the consumer's
+> wait on the producer.
 
 `export.per_zoom[].wall_secs` is the wall time of that zoom's wave loop in
 `export_level`. It **excludes the partitioning-mode fill** (which does the
