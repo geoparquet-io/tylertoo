@@ -10,8 +10,13 @@
 //! ```text
 //! cargo bench --package tylertoo-core --bench assign_scaling
 //! ASSIGN_BENCH_ROWS=20000000 ASSIGN_BENCH_THREADS=1,4,8,12 \
+//!     ASSIGN_BENCH_REPEATS=5 \
 //!     cargo bench --package tylertoo-core --bench assign_scaling
 //! ```
+//!
+//! Knobs: `ASSIGN_BENCH_ROWS`, `ASSIGN_BENCH_THREADS` (comma-separated pool
+//! sizes), `ASSIGN_BENCH_REPEATS` (best-of, default 3) and
+//! `ASSIGN_BENCH_GRID_MIB` (the #306 grid budget; `0` = unbounded).
 //!
 //! Not a criterion benchmark: the interesting quantity is a wall-clock curve
 //! against thread count on one large input, not a distribution over many small
@@ -148,35 +153,54 @@ fn main() {
         "threads", "assign_s", "budget_s", "total_s", "speedup"
     );
 
-    let mut baseline: Option<f64> = None;
+    // Repeats are reported by their MINIMUM, not their mean. Contention from
+    // anything else on the box can only ever ADD wall time to a run, so under
+    // a shared machine the minimum is the estimator that converges on the
+    // uncontended figure while the mean wanders with the neighbours. Repeats
+    // are interleaved across thread counts (outer loop) so a slow patch hits
+    // every point on the curve rather than whichever one it landed on.
+    let repeats = env_usize("ASSIGN_BENCH_REPEATS", 3).max(1);
+    let mut best: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::INFINITY); threads.len()];
     let mut expected: Option<Vec<u8>> = None;
-    for &t in &threads {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(t)
-            .build()
-            .expect("rayon pool");
-        let (assign_s, budget_s, levels) = pool.install(|| {
-            let ta = Instant::now();
-            let cw = assign_levels_bounded(&feats, &gsds, &config, Crs::Epsg3857, grid_budget, &[]);
-            let assign_s = ta.elapsed().as_secs_f64();
-            let tb = Instant::now();
-            let out = apply_density_budget(&cw, &feats, &gsds, &config, &density, Crs::Epsg3857);
-            let budget_s = tb.elapsed().as_secs_f64();
-            let levels: Vec<u8> = out.assignments.iter().map(|a| a.min_level).collect();
-            (assign_s, budget_s, levels)
-        });
-        let total = assign_s + budget_s;
-        let speedup = baseline.map_or(1.0, |b: f64| b / total);
-        baseline.get_or_insert(total);
-        println!("{t:>8}  {assign_s:>10.2}  {budget_s:>10.2}  {total:>10.2}  {speedup:>7.2}x");
-        match &expected {
-            None => expected = Some(levels),
-            Some(want) => assert!(
-                *want == levels,
-                "assignment differs at {t} thread(s) — the parallel build must be \
-                 byte-identical to the serial one"
-            ),
+    for _ in 0..repeats {
+        for (slot, &t) in best.iter_mut().zip(&threads) {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(t)
+                .build()
+                .expect("rayon pool");
+            let (assign_s, budget_s, levels) = pool.install(|| {
+                let ta = Instant::now();
+                let cw =
+                    assign_levels_bounded(&feats, &gsds, &config, Crs::Epsg3857, grid_budget, &[]);
+                let assign_s = ta.elapsed().as_secs_f64();
+                let tb = Instant::now();
+                let out =
+                    apply_density_budget(&cw, &feats, &gsds, &config, &density, Crs::Epsg3857);
+                let budget_s = tb.elapsed().as_secs_f64();
+                let levels: Vec<u8> = out.assignments.iter().map(|a| a.min_level).collect();
+                (assign_s, budget_s, levels)
+            });
+            if assign_s + budget_s < slot.0 + slot.1 {
+                *slot = (assign_s, budget_s);
+            }
+            match &expected {
+                None => expected = Some(levels),
+                Some(want) => assert!(
+                    *want == levels,
+                    "assignment differs at {t} thread(s) — the parallel build must be \
+                     identical to the serial one"
+                ),
+            }
         }
     }
-    println!("\nassignment identical across every pool size.");
+
+    let baseline = best[0].0 + best[0].1;
+    for (&(assign_s, budget_s), &t) in best.iter().zip(&threads) {
+        let total = assign_s + budget_s;
+        let speedup = baseline / total;
+        println!("{t:>8}  {assign_s:>10.2}  {budget_s:>10.2}  {total:>10.2}  {speedup:>7.2}x");
+    }
+    println!(
+        "\nbest of {repeats} repeat(s); assignment identical across every pool size and repeat."
+    );
 }

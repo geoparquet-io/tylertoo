@@ -509,6 +509,11 @@ fn place_feature(
 /// public API): there the SERIAL build keeps the earlier position, because a
 /// later challenger cannot beat it, so the parallel build — where "later" is
 /// not a thing — has to say so explicitly or the two would disagree.
+///
+/// This is the hottest comparison in the phase (once per placement that lands
+/// on an occupied cell), so the duplicate-`index` case is kept off the fast
+/// path: distinct indices make `beats` total, and then a challenger that does
+/// not beat the incumbent has lost, full stop — no second `beats` call.
 #[inline]
 fn challenger_takes_cell(
     features: &[AssignFeature],
@@ -518,7 +523,13 @@ fn challenger_takes_cell(
 ) -> bool {
     let c = Priority::new(&features[challenger], dir);
     let i = Priority::new(&features[incumbent], dir);
-    c.beats(&i) || (!i.beats(&c) && challenger < incumbent)
+    if c.beats(&i) {
+        return true;
+    }
+    if features[challenger].index != features[incumbent].index {
+        return false;
+    }
+    !i.beats(&c) && challenger < incumbent
 }
 
 /// Resolve one contest inside a grid map (#306: the grid is the dominant pass-1
@@ -778,9 +789,22 @@ fn level_winner_positions_in(
     // holds feature positions (`usize`, `Ord`), one per occupied cell, so this
     // is O(cells log cells), not O(features log features), and cells are
     // bounded by the memory budget in `estimate_level_grid_bytes` above.
-    winners.par_sort_unstable();
+    //
+    // Parallel only when there is enough of it to pay for rayon's split: below
+    // the threshold std's pdqsort beats rayon's quicksort outright, and a serial
+    // build must not be made slower by a change that exists to speed up a
+    // parallel one.
+    if winners.len() >= PAR_SORT_MIN_LEN && rayon::current_num_threads() > 1 {
+        winners.par_sort_unstable();
+    } else {
+        winners.sort_unstable();
+    }
     winners
 }
+
+/// Below this length a sort stays sequential: rayon's split and merge cost more
+/// than std's pdqsort saves.
+const PAR_SORT_MIN_LEN: usize = 64 * 1024;
 
 /// Estimated retained bytes per occupied winner-grid cell (#306).
 ///
@@ -1433,19 +1457,20 @@ pub(super) fn select_budget_survivors(
     // priority cut.
     if super_size <= 0.0 || super_size.is_nan() {
         let mut all = cands.to_vec();
-        all.par_sort_unstable_by(|&a, &b| priority_order(prio, a, b));
+        if all.len() >= PAR_SORT_MIN_LEN && rayon::current_num_threads() > 1 {
+            all.par_sort_unstable_by(|&a, &b| priority_order(prio, a, b));
+        } else {
+            all.sort_unstable_by(|&a, &b| priority_order(prio, a, b));
+        }
         all.truncate(available);
         return all;
     }
 
     // Super-cell partition by SORT rather than by hashmap-of-vecs (#534):
-    // tagging is an element-wise map and the sort is a parallel sort, so this
-    // whole stage — the O(dataset) half of the density budget — goes wide, where
-    // the hashmap it replaces was serial and could not be split across threads
-    // without either a lock per candidate or a merge tail. The comparator is a
-    // strict total order on `(cell, Priority, position)`, so the sorted order —
-    // and therefore everything downstream — is unique: sorting in parallel
-    // cannot change it.
+    // tagging is an element-wise map and both sorts below are parallel sorts, so
+    // this whole stage — the O(dataset) half of the density budget — goes wide,
+    // where the hashmap it replaces was serial and could not be split across
+    // threads without either a lock per candidate or a merge tail.
     let mut tagged: Vec<((i64, i64), usize)> = cands
         .par_iter()
         .map(|&i| {
@@ -1459,22 +1484,44 @@ pub(super) fn select_budget_survivors(
             )
         })
         .collect();
-    tagged.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| priority_order(prio, a.1, b.1)));
+    // Two sorts, not one combined `(cell, Priority)` sort. The cheap one groups
+    // the cells — a derived `Ord` on `((i64, i64), usize)`, no indirection — and
+    // the expensive one (`priority_order`, two random probes into `prio` per
+    // comparison) then runs only WITHIN a cell. That is `Σ mᵢ log mᵢ` expensive
+    // comparisons instead of `M log M`, the same total the hashmap-of-vecs
+    // version paid, and the per-cell sorts are themselves parallel.
+    if tagged.len() >= PAR_SORT_MIN_LEN && rayon::current_num_threads() > 1 {
+        tagged.par_sort_unstable();
+    } else {
+        tagged.sort_unstable();
+    }
 
-    // Cells are now contiguous ascending runs, each internally best-first — the
-    // same (sorted key, then priority) order the hashmap version produced, so
-    // `chosen` comes out feature-for-feature identical.
+    // Cells are now contiguous ascending runs.
+    let mut pops: Vec<usize> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
     for (i, entry) in tagged.iter().enumerate() {
         if i == 0 || tagged[i - 1].0 != entry.0 {
             starts.push(i);
+            pops.push(0);
         }
+        *pops.last_mut().expect("a run was started") += 1;
     }
-    let pops: Vec<usize> = starts
-        .iter()
-        .enumerate()
-        .map(|(c, &s)| starts.get(c + 1).copied().unwrap_or(tagged.len()) - s)
-        .collect();
+
+    // Sort each run best-first. The runs are disjoint subslices, so each is
+    // owned outright by the task that sorts it. `priority_order` is a strict
+    // total order, so each run's order — and therefore `chosen` — is unique:
+    // sorting in parallel cannot change it, and it matches what the
+    // hashmap-of-vecs version produced feature for feature.
+    let mut runs: Vec<&mut [((i64, i64), usize)]> = Vec::with_capacity(starts.len());
+    let mut rest = tagged.as_mut_slice();
+    for &pop in &pops {
+        let (run, tail) = rest.split_at_mut(pop);
+        runs.push(run);
+        rest = tail;
+    }
+    runs.par_iter_mut()
+        .for_each(|run| run.sort_unstable_by(|a, b| priority_order(prio, a.1, b.1)));
+    drop(runs);
 
     let alpha = 1.0 / gamma.max(1.0);
     let allocs = water_fill(&pops, available, alpha);
