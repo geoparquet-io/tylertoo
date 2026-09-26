@@ -343,3 +343,40 @@ fn tiles_refuses_existing_output_without_force_and_overwrites_with_it() {
     let bytes = std::fs::read(&output).expect("read output pmtiles");
     assert_eq!(&bytes[..PMTILES_MAGIC.len()], PMTILES_MAGIC);
 }
+
+/// An existing *directory* at the output path is refused up front, even with
+/// `-f`: the final rename can never replace it, so the run must not spend a
+/// whole convert + export before failing (#557 review).
+#[test]
+fn tiles_refuses_a_directory_output_even_with_force() {
+    let Some(fixture) = fixture::realdata("road-detections.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.pmtiles");
+    std::fs::create_dir(&output).expect("create directory at output path");
+
+    let run = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--max-zoom",
+            "3",
+            "-f",
+        ])
+        .output()
+        .expect("run tylertoo tiles -f");
+    assert!(
+        !run.status.success(),
+        "tiles must refuse a directory output"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("is a directory"), "got: {stderr}");
+    assert!(
+        !stderr.contains("Generating") && !stderr.contains("Converting"),
+        "should bail before any work, got: {stderr}"
+    );
+    assert!(output.is_dir(), "the directory must be left alone");
+}

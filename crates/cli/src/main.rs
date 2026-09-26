@@ -215,6 +215,23 @@ enum Command {
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
     /// Per-zoom tile-weight report for a PMTiles archive (issue #552).
+    ///
+    /// For each zoom: tile count, total, mean, p50, p99 and max tile size, plus
+    /// the largest individual tiles (`--largest N`). Sizes are STORED
+    /// (compressed) bytes per addressed tile, read from the directory entries
+    /// alone -- no tile is decompressed or even read. Run-length members and
+    /// deduplicated tiles each count at the full length of their shared body,
+    /// so `tiles x mean` (the `total` column) is the bytes a client would
+    /// fetch and can exceed the archive's size on disk.
+    ///
+    /// Percentiles are nearest-rank: pN is the smallest size such that at
+    /// least ceil(N/100 x tiles) of the zoom's tiles are no larger. Largest
+    /// tiles are ordered by size descending, ties by ascending PMTiles tile
+    /// id (lower zoom first, then Hilbert order).
+    ///
+    /// Memory and time are proportional to the archive's directory entries,
+    /// not its tile count: runs are aggregated with their multiplicity, never
+    /// expanded.
     Stats(StatsArgs),
     /// Build a multi-band pyramid: several inputs, each owning a zoom range,
     /// one archive (issue #345).
@@ -1638,15 +1655,9 @@ struct ValidateArgs {
     files_from: Option<PathBuf>,
 }
 
-/// Arguments for `tylertoo stats`.
-///
-/// Per-zoom tile-weight report over an existing PMTiles archive: tile count,
-/// mean, p50, p99 and max STORED (compressed) byte sizes per zoom, plus the
-/// largest individual tiles. Cheap by construction (#552): it walks the
-/// archive's header and directories only (the same `ArchiveIndex` machinery
-/// `merge`/`pyramid` use), reading a directory entry's length for a tile's
-/// stored size -- no tile is ever decompressed, and the archive is never
-/// read whole into memory.
+/// Arguments for `tylertoo stats` (see the `Command::Stats` docs for the
+/// report's semantics). Walks the archive's header and directory entries only
+/// (the same `ArchiveIndex` machinery `merge`/`pyramid` use).
 #[derive(Parser, Debug)]
 struct StatsArgs {
     /// PMTiles archive to report on.
@@ -2432,6 +2443,22 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
     })
 }
 
+/// `tiles` output gate (#551): an existing file is refused unless `force`.
+/// A directory can never be replaced by the final rename, `--force` or not,
+/// so it is refused up front instead of after a whole convert + export.
+fn check_tiles_output(output: &Path, force: bool) -> Result<()> {
+    if output.is_dir() {
+        anyhow::bail!(
+            "{} is a directory; the output must be a PMTiles file path",
+            output.display()
+        );
+    }
+    if output.exists() && !force {
+        anyhow::bail!("{} exists (use --force to overwrite)", output.display());
+    }
+    Ok(())
+}
+
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
     use tylertoo_core::overview::level::Mode;
@@ -2440,9 +2467,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
 
-    if output.exists() && !args.force {
-        anyhow::bail!("{} exists (use --force to overwrite)", output.display());
-    }
+    check_tiles_output(&output, args.force)?;
 
     // Derive the layer name from the input if not given: file stem for a
     // single file, last path segment for a directory or s3://gs:// prefix,
@@ -3679,8 +3704,25 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     use tylertoo_core::archive_index::ArchiveIndex;
     use tylertoo_core::stats::compute_stats;
 
-    let archive = ArchiveIndex::open(&args.archive)
-        .with_context(|| format!("could not open {}", args.archive.display()))?;
+    let archive = ArchiveIndex::open(&args.archive).map_err(|e| {
+        // `ArchiveIndex` reports read failures under the shared PMTiles
+        // error variant ("Failed to write PMTiles: ..."); for a file that
+        // is not an archive at all, say so plainly.
+        let not_pmtiles = std::fs::File::open(&args.archive)
+            .and_then(|mut f| {
+                let mut magic = [0u8; 7];
+                std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic != *b"PMTiles")
+            })
+            .unwrap_or(args.archive.is_file());
+        if not_pmtiles {
+            anyhow::anyhow!(
+                "{} is not a PMTiles v3 archive (missing the PMTiles magic): {e}",
+                args.archive.display()
+            )
+        } else {
+            anyhow::anyhow!("could not open {}: {e}", args.archive.display())
+        }
+    })?;
     let report = compute_stats(&archive, args.largest)
         .map_err(|e| anyhow::anyhow!("stats failed for {}: {e}", args.archive.display()))?;
 
@@ -3732,18 +3774,19 @@ fn print_stats_table(report: &tylertoo_core::stats::StatsReport) {
         .iter()
         .map(|z| {
             vec![
-                z.zoom.to_string(),
+                z.z.to_string(),
                 format_number(z.tile_count),
-                format_number(z.mean),
-                format_number(z.p50),
-                format_number(z.p99),
-                format_number(z.max),
+                format_number(z.total_bytes),
+                format_number(z.mean_bytes),
+                format_number(z.p50_bytes),
+                format_number(z.p99_bytes),
+                format_number(z.max_bytes),
             ]
         })
         .collect();
     println!(
         "{}",
-        render_table(&["z", "tiles", "mean", "p50", "p99", "max"], &rows)
+        render_table(&["z", "tiles", "total", "mean", "p50", "p99", "max"], &rows)
     );
 
     if !report.largest.is_empty() {

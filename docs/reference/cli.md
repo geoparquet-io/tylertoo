@@ -584,7 +584,13 @@ does not reproduce A. See docs/decode.md for details.
 
 ## `tylertoo stats`
 
-Per-zoom tile-weight report for a PMTiles archive (issue #552)
+Per-zoom tile-weight report for a PMTiles archive (issue #552).
+
+For each zoom: tile count, total, mean, p50, p99 and max tile size, plus the largest individual tiles (`--largest N`). Sizes are STORED (compressed) bytes per addressed tile, read from the directory entries alone -- no tile is decompressed or even read. Run-length members and deduplicated tiles each count at the full length of their shared body, so `tiles x mean` (the `total` column) is the bytes a client would fetch and can exceed the archive's size on disk.
+
+Percentiles are nearest-rank: pN is the smallest size such that at least ceil(N/100 x tiles) of the zoom's tiles are no larger. Largest tiles are ordered by size descending, ties by ascending PMTiles tile id (lower zoom first, then Hilbert order).
+
+Memory and time are proportional to the archive's directory entries, not its tile count: runs are aggregated with their multiplicity, never expanded.
 
 **Usage:** `tylertoo stats [OPTIONS] <ARCHIVE>`
 

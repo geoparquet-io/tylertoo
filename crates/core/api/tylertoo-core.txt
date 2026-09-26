@@ -2976,7 +2976,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::shard::TileRange
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::shard::TileRange
 pub fn tylertoo_core::shard::resolve_range(&std::path::Path, tylertoo_core::shard::ShardRole, core::option::Option<&tylertoo_core::input_set::ConvertSource>) -> core::result::Result<(tylertoo_core::shard::ShardPlan, core::option::Option<tylertoo_core::shard::TileRange>), tylertoo_core::shard::ShardError>
 pub mod tylertoo_core::stats
-pub struct tylertoo_core::stats::LargestTile
+#[non_exhaustive] pub struct tylertoo_core::stats::LargestTile
 pub tylertoo_core::stats::LargestTile::bytes: u64
 pub tylertoo_core::stats::LargestTile::x: u32
 pub tylertoo_core::stats::LargestTile::y: u32
@@ -2999,7 +2999,7 @@ impl core::marker::Unpin for tylertoo_core::stats::LargestTile
 impl core::marker::UnsafeUnpin for tylertoo_core::stats::LargestTile
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::stats::LargestTile
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::stats::LargestTile
-pub struct tylertoo_core::stats::StatsReport
+#[non_exhaustive] pub struct tylertoo_core::stats::StatsReport
 pub tylertoo_core::stats::StatsReport::largest: alloc::vec::Vec<tylertoo_core::stats::LargestTile>
 pub tylertoo_core::stats::StatsReport::per_zoom: alloc::vec::Vec<tylertoo_core::stats::ZoomStats>
 impl core::clone::Clone for tylertoo_core::stats::StatsReport
@@ -3021,13 +3021,14 @@ impl core::marker::Unpin for tylertoo_core::stats::StatsReport
 impl core::marker::UnsafeUnpin for tylertoo_core::stats::StatsReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::stats::StatsReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::stats::StatsReport
-pub struct tylertoo_core::stats::ZoomStats
-pub tylertoo_core::stats::ZoomStats::max: u64
-pub tylertoo_core::stats::ZoomStats::mean: u64
-pub tylertoo_core::stats::ZoomStats::p50: u64
-pub tylertoo_core::stats::ZoomStats::p99: u64
+#[non_exhaustive] pub struct tylertoo_core::stats::ZoomStats
+pub tylertoo_core::stats::ZoomStats::max_bytes: u64
+pub tylertoo_core::stats::ZoomStats::mean_bytes: u64
+pub tylertoo_core::stats::ZoomStats::p50_bytes: u64
+pub tylertoo_core::stats::ZoomStats::p99_bytes: u64
 pub tylertoo_core::stats::ZoomStats::tile_count: u64
-pub tylertoo_core::stats::ZoomStats::zoom: u8
+pub tylertoo_core::stats::ZoomStats::total_bytes: u64
+pub tylertoo_core::stats::ZoomStats::z: u8
 impl core::clone::Clone for tylertoo_core::stats::ZoomStats
 pub fn tylertoo_core::stats::ZoomStats::clone(&self) -> tylertoo_core::stats::ZoomStats
 impl core::cmp::Eq for tylertoo_core::stats::ZoomStats
