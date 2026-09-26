@@ -104,6 +104,30 @@ harness = false
 name = "bbox_containment"
 harness = false
 
+[[bench]]
+name = "pass1_decode"
+harness = false
+
+[[bench]]
+name = "assign"
+harness = false
+
+[[bench]]
+name = "simplify_cascade"
+harness = false
+
+[[bench]]
+name = "mvt_encode"
+harness = false
+
+[[bench]]
+name = "tile_compress_dedup"
+harness = false
+
+[[bench]]
+name = "assign_scaling"
+harness = false
+
 [lints]
 workspace = true
 

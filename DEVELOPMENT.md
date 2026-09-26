@@ -132,14 +132,93 @@ new test up automatically.
 
 ### Benchmarks
 
+Criterion coverage of the measured hot paths lives in `crates/core/benches/`,
+all using in-repo `tests/fixtures/realdata/` fixtures (run
+`git submodule update --init` and the fixtures download step above first):
+
+| Bench | Covers |
+|-------|--------|
+| `pass1_decode` | Arrow columnar decode: `from_arrow_array` + `extract_geometries_from_array` (the pass-1 scan's per-chunk decode) |
+| `assign` | `assign_levels_bounded` + `apply_density_budget` at a fixed, CI-sized feature count (the thread-*scaling* curve at dataset scale is `assign_scaling.rs`, a separate manual harness — see its own doc comment) |
+| `simplify_cascade` | `simplify_cascade` over real polygons through a 10-level fine→coarse chain with a zoom-band `Point` tail (#218, #317) |
+| `mvt_encode` | `encode_polygon` (the #383/#461 quantize → noding-sweep → clean → orient path) and `LayerBuilder::add_feature`/`build` (the #559 alloc-free value-dedup path) |
+| `clipping` | Sutherland-Hodgman vs `i_overlay`, plus an `export_clip_mix` group matching the point/line/polygon distribution `overview::export` actually clips per tile |
+| `bbox_containment` | Bbox containment fast-path checks |
+| `tile_compress_dedup` | Per-tile gzip compression and the XXH3 tile-content dedup cache |
+
+Run one:
+
 ```bash
 cargo bench --package tylertoo-core --bench clipping
-cargo bench --package tylertoo-core --bench bbox_containment
+cargo bench --package tylertoo-core --bench mvt_encode
 open target/criterion/report/index.html
 ```
 
+Run all of them (same set CI's `bench` job runs):
+
+```bash
+for b in clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup; do
+  cargo bench --package tylertoo-core --bench "$b"
+done
+```
+
+`assign_scaling` (`cargo bench --package tylertoo-core --bench assign_scaling`)
+is a separate, non-criterion wall-clock harness for the thread-count scaling
+curve at dataset scale (#534) — too large and too variance-sensitive for
+criterion's repeated-sampling model. It isn't part of the regression gate
+below.
+
 The corpus-scale benchmarks (storage/access/conversion) are scripted in
 `benchmarks/overview/`; profiling is documented in `docs/PROFILING.md`.
+
+#### Criterion regression gate (#448)
+
+CI's `bench` job saves a named criterion baseline (`--save-baseline main`)
+on every push to `main` and uploads it as the `criterion-baseline-main`
+artifact. A separate `criterion-regression` job — **not** run on every PR,
+since shared-runner timing noise makes a per-PR gate a false-positive
+machine (this is the #393 lesson the issue is named for: an 18% encode
+regression sailed through the old bench.yml, which only uploaded reports
+with no comparison at all) — downloads that baseline and compares against
+it. It runs:
+
+- on a weekly schedule (Monday 06:00 UTC), to catch drift even when no PR
+  opts in;
+- on `workflow_dispatch`;
+- on a PR once the **`benchmark` label** is applied (add the label to ask
+  for a regression check on a perf-sensitive change).
+
+It warns at a >=10% regression and fails at >=25%, per-bench, via
+`scripts/criterion_gate.py`, which diffs `mean.point_estimate` between the
+downloaded `main` baseline and the just-run `new` snapshot in
+`target/criterion/`.
+
+To run the same check locally against your own saved baseline:
+
+```bash
+# 1. On a known-good commit (e.g. main), save the baseline once:
+git checkout main
+for b in clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup; do
+  cargo bench --package tylertoo-core --bench "$b" -- --save-baseline main
+done
+
+# 2. On your branch, compare against it:
+git checkout your-branch
+for b in clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup; do
+  cargo bench --package tylertoo-core --bench "$b" -- --baseline main
+done
+
+# 3. Gate:
+python3 scripts/criterion_gate.py --check --baseline main --warn 10 --fail 25
+```
+
+`critcmp` (`cargo install critcmp`) gives a nicer side-by-side table over the
+same `target/criterion/` data if you want a human-readable diff instead of
+(or alongside) the gate's plain-text one:
+
+```bash
+critcmp main new
+```
 
 ## CI Gates — and How to Run Them Locally
 

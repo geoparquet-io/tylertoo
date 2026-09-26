@@ -1,17 +1,32 @@
 # Benchmarks + convert-regression guard.
 #
-# Two jobs:
-#   bench         — criterion micro-benches (clipping, bbox_containment),
-#                   tracked over time via uploaded reports. NOT a PR gate
-#                   (push/dispatch only) so no permanently-skipped job
-#                   clutters PR check lists.
-#   convert-guard — deterministic structural check that a change hasn't
-#                   altered convert output (per-level feature/vertex counts,
-#                   total rows) on the fixtures-v1 inputs. THIS one gates
-#                   PRs. Timing/RSS are intentionally not gated — far too
-#                   noisy on shared runners; see benchmarks/overview/PROFILE.md
-#                   for the tracked timing numbers and ci_guard.py for the
-#                   gated structural signature.
+# Three jobs:
+#   bench                — criterion micro-benches over the hot paths
+#                          (pass-1 decode, assign, simplify cascade, mvt
+#                          encode + value dedup, clip, tile gzip+dedup).
+#                          NOT a PR gate (push/dispatch only) so no
+#                          permanently-skipped job clutters PR check lists.
+#                          On push to `main` it also saves a named criterion
+#                          baseline ("main") and uploads it as an artifact —
+#                          the input `criterion-regression` compares against.
+#   criterion-regression — #448's numeric regression gate. Runs the same
+#                          benches against the last `main` baseline and fails
+#                          on a gross (>25%) regression, warns at >10%. Does
+#                          NOT run on every PR — shared runners are too noisy
+#                          for a per-PR timing gate (the #393 lesson this
+#                          issue is named for). It runs on a weekly schedule,
+#                          on manual dispatch, and on a PR only once the
+#                          "benchmark" label is applied. See
+#                          DEVELOPMENT.md's "Criterion regression gate"
+#                          section for the local workflow.
+#   convert-guard        — deterministic structural check that a change
+#                          hasn't altered convert output (per-level
+#                          feature/vertex counts, total rows) on the
+#                          fixtures-v1 inputs. THIS one gates PRs. Timing/RSS
+#                          are intentionally not gated here — far too noisy
+#                          on shared runners; see benchmarks/overview/PROFILE.md
+#                          for the tracked timing numbers and ci_guard.py for
+#                          the gated structural signature.
 #
 # The old tiling/streaming pipeline benches were deleted with the legacy
 # pipeline (#177/#189); this runs the surviving bench targets in
@@ -23,6 +38,11 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # Weekly, Monday 06:00 UTC — catches drift even when no PR carries the
+    # "benchmark" label that week.
+    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -30,12 +50,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every criterion target this repo defines, in one place so `bench` and
+  # `criterion-regression` can't drift apart.
+  CRITERION_BENCHES: "clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup"
 
 jobs:
   bench:
     name: Benchmark
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'schedule'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,14 +100,110 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          cargo bench --all-features --bench clipping
-          cargo bench --all-features --bench bbox_containment
+          # On main, save a named "main" baseline every push — the artifact
+          # criterion-regression compares PRs/schedule runs against. Off
+          # main (manual dispatch from a branch), just run plain so a stray
+          # dispatch never mislabels a baseline.
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            EXTRA="-- --save-baseline main"
+          else
+            EXTRA=""
+          fi
+          for bench in $CRITERION_BENCHES; do
+            cargo bench --all-features --bench "$bench" $EXTRA
+          done
         timeout-minutes: 20
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: criterion-reports
+          path: target/criterion/
+
+      - name: Upload main baseline
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: criterion-baseline-main
+          path: target/criterion/
+          retention-days: 90
+
+  criterion-regression:
+    name: Criterion regression gate
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'benchmark'))
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Fetch the last main criterion baseline
+        run: |
+          mkdir -p target/criterion
+          run_id=$(gh run list --repo "${{ github.repository }}" --workflow=Benchmarks \
+            --branch main --status success --json databaseId,event \
+            -q '[.[] | select(.event=="push")][0].databaseId')
+          if [ -z "$run_id" ]; then
+            echo "::error::no successful 'Benchmarks' run on main has a criterion-baseline-main artifact yet"
+            exit 1
+          fi
+          gh run download "$run_id" --repo "${{ github.repository }}" \
+            -n criterion-baseline-main -D target/criterion
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run benchmarks against the main baseline
+        run: |
+          for bench in $CRITERION_BENCHES; do
+            cargo bench --all-features --bench "$bench" -- --baseline main
+          done
+        timeout-minutes: 20
+
+      - name: Check for regressions
+        run: python3 scripts/criterion_gate.py --check --baseline main --warn 10 --fail 25
+
+      - name: Upload comparison report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: criterion-regression-report
           path: target/criterion/
 
   convert-guard:
