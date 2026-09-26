@@ -129,6 +129,10 @@ use super::pipe::scoped_pipe;
 use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
 use super::properties::PropertySelection;
 use super::reader::{OverviewReader, ReaderError};
+use super::stream::{
+    add_nanos, preflight_profile_json_path, sample_rss_peak, write_export_profile_json,
+    ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers, ExportZoomProfile,
+};
 use super::writer::LEVEL_COLUMN;
 
 /// Default MVT tile extent (matches [`crate::mvt::DEFAULT_EXTENT`]).
@@ -1016,6 +1020,10 @@ fn export_pmtiles_impl(
     force_legacy_pass2: bool,
     backing_override: Option<SinkBacking>,
 ) -> Result<ExportReport, ExportError> {
+    // #535 step 1 / #517 S2: probe `TYLERTOO_PROFILE_JSON` writability loudly,
+    // for the standalone `export-pmtiles` path (which never runs convert's
+    // own preflight); redundant but harmless in the `tiles` path.
+    preflight_profile_json_path();
     let start = Instant::now();
     let input_path = input_path.as_ref();
 
@@ -1035,21 +1043,7 @@ fn export_pmtiles_impl(
     // level's zoom here and require strict ascent before any scan runs; see
     // [`ExportError::LevelZoomsNotAscending`] for what a collision used to do
     // silently (pre-#506) and what it does now if left unrejected.
-    let level_zooms: Vec<u8> = (0..num_levels)
-        .map(|level_idx| zoom_for_level(&meta, level_idx))
-        .collect::<Result<_, _>>()?;
-    for i in 1..level_zooms.len() {
-        if level_zooms[i] <= level_zooms[i - 1] {
-            return Err(ExportError::LevelZoomsNotAscending {
-                previous_level: i - 1,
-                previous_zoom: level_zooms[i - 1],
-                previous_gsd: meta.levels[i - 1].gsd,
-                level: i,
-                zoom: level_zooms[i],
-                gsd: meta.levels[i].gsd,
-            });
-        }
-    }
+    let level_zooms = resolve_level_zooms(&meta, num_levels)?;
     // #498: the zooms this export will actually emit, which is what #380's
     // declared-minimum rules must be measured against. A data shard starts at
     // the pivot however coarse the overview file is (the coarser levels belong
@@ -1212,12 +1206,10 @@ fn export_pmtiles_impl(
         writer.set_bounds(b);
     }
 
-    // Throttle for incremental checkpoints (#229): a fast export finishes before
-    // the first interval elapses and never checkpoints, letting `finalize` do
-    // all the work.
-    let mut last_checkpoint = Instant::now();
-
     let mut zooms: Vec<ZoomReport> = Vec::with_capacity(num_levels);
+    // #535 step 1: stage timers + per-zoom profile -> a second
+    // `TYLERTOO_PROFILE_JSON` line at the end ([`emit_export_profile_json`]).
+    let mut progress = ExportProgress::new(num_levels);
 
     // Plan every level's partitions and wave width up front. The partitioning
     // single-read fill (#235) routes members by (level, partition, wave), so
@@ -1233,6 +1225,7 @@ fn export_pmtiles_impl(
         mean_member_bytes,
         available_ram,
     )?;
+    progress.end_scan(t_scan);
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
     // is the accumulating row-group prefix (§5.1), so the legacy per-level
@@ -1260,20 +1253,25 @@ fn export_pmtiles_impl(
             );
             b
         });
-        Some(fill_member_store(
+        let t_fill = Instant::now();
+        let store = fill_member_store(
             &reader,
             &FanoutCtx {
                 crs,
                 plans: &plans,
                 opts: options,
                 published: &published,
+                timers: &progress.profile.timers,
             },
             backing,
-        )?)
+        )?;
+        progress.end_fill(t_fill);
+        Some(store)
     } else {
         None
     };
 
+    let t_levels = Instant::now();
     for (level_idx, plan) in plans.iter().enumerate() {
         zooms.push(export_level(
             &mut writer,
@@ -1289,31 +1287,31 @@ fn export_pmtiles_impl(
                 options,
                 start,
             },
+            &mut progress,
         )?);
 
         // Salvageable output (#229): snapshot a valid archive capped at this
         // zoom so an interrupted run keeps its finished zooms. Throttled, and
         // skipped on the last level since `finalize` immediately follows and
         // produces the complete archive.
-        if level_idx + 1 < num_levels && last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
-            let t_ckpt = Instant::now();
-            writer.checkpoint(output_path.as_ref())?;
-            last_checkpoint = Instant::now();
-            log::info!(
-                "[export] checkpoint written: zooms {}..={} salvageable at {} ({:.2}s)",
+        if level_idx + 1 < num_levels
+            && progress.checkpoint_throttle.elapsed() >= CHECKPOINT_INTERVAL
+        {
+            checkpoint_level(
+                &mut writer,
+                output_path.as_ref(),
                 coarsest_zoom,
                 plan.zoom,
-                writer
-                    .salvage_path()
-                    .unwrap_or(output_path.as_ref())
-                    .display(),
-                t_ckpt.elapsed().as_secs_f64(),
-            );
+                &mut progress,
+            )?;
         }
     }
 
+    progress.profile.walls.levels = t_levels.elapsed().as_secs_f64();
+
     let t_finalize = Instant::now();
     writer.finalize(output_path.as_ref())?;
+    progress.end_finalize(t_finalize);
     log::info!(
         "[export] finalize complete: {:.2}s (total {:.0}s)",
         t_finalize.elapsed().as_secs_f64(),
@@ -1324,8 +1322,17 @@ fn export_pmtiles_impl(
     let total_tile_features = zooms.iter().map(|z| z.tile_feature_count).sum();
     let oversized_tiles = zooms.iter().map(|z| z.oversized_tiles).sum();
 
+    let mode = format!("{:?}", reader.mode()).to_lowercase();
+    progress.profile.emit(&ExportProfileTarget {
+        output: output_path.as_ref(),
+        layer_name: &options.layer_name,
+        mode: &mode,
+        partition_wave_width: ceiling_wave,
+        start,
+    });
+
     Ok(ExportReport {
-        mode: format!("{:?}", reader.mode()).to_lowercase(),
+        mode,
         min_zoom,
         max_zoom,
         zooms,
@@ -1334,6 +1341,148 @@ fn export_pmtiles_impl(
         oversized_tiles,
         duration_secs: start.elapsed().as_secs_f64(),
     })
+}
+
+/// Every level's zoom, in level order, required to strictly ascend (#371 /
+/// #506 follow-up — see the call site in `export_pmtiles_impl`). Pulled out
+/// of it to keep that function under clippy's function-length ceiling.
+fn resolve_level_zooms(meta: &OverviewsMeta, num_levels: usize) -> Result<Vec<u8>, ExportError> {
+    let level_zooms: Vec<u8> = (0..num_levels)
+        .map(|level_idx| zoom_for_level(meta, level_idx))
+        .collect::<Result<_, _>>()?;
+    for i in 1..level_zooms.len() {
+        if level_zooms[i] <= level_zooms[i - 1] {
+            return Err(ExportError::LevelZoomsNotAscending {
+                previous_level: i - 1,
+                previous_zoom: level_zooms[i - 1],
+                previous_gsd: meta.levels[i - 1].gsd,
+                level: i,
+                zoom: level_zooms[i],
+                gsd: meta.levels[i].gsd,
+            });
+        }
+    }
+    Ok(level_zooms)
+}
+
+/// Snapshot a salvageable archive after a level (#229/#459's throttled
+/// checkpoint), logging the same line `export_pmtiles_impl`'s inline version
+/// used to. Pulled out of `export_pmtiles_impl` to keep it under clippy's
+/// function-length ceiling. Resets the checkpoint throttle clock, and records
+/// the checkpoint's duration and count in the profile.
+fn checkpoint_level(
+    writer: &mut StreamingPmtilesWriter,
+    output_path: &Path,
+    coarsest_zoom: u8,
+    zoom: u8,
+    progress: &mut ExportProgress,
+) -> Result<(), ExportError> {
+    let t_ckpt = Instant::now();
+    writer.checkpoint(output_path)?;
+    let dur = t_ckpt.elapsed();
+    progress.checkpoint_throttle = Instant::now();
+    add_nanos(&progress.profile.timers.checkpoint, dur);
+    progress.profile.checkpoints += 1;
+    log::info!(
+        "[export] checkpoint written: zooms {coarsest_zoom}..={zoom} salvageable at {} ({:.2}s)",
+        writer.salvage_path().unwrap_or(output_path).display(),
+        dur.as_secs_f64(),
+    );
+    Ok(())
+}
+
+/// Export-wide mutable state threaded through the per-level loop as one
+/// `&mut` (keeps `export_pmtiles_impl` under clippy's function-length
+/// ceiling). Two owners, kept apart on purpose:
+///
+/// - `checkpoint_throttle` is BEHAVIOR: the #229 incremental-checkpoint
+///   throttle clock, which decides when a salvage snapshot is written.
+/// - `profile` is diagnostics only (#535): nothing in it is ever read by
+///   anything that affects the archive.
+struct ExportProgress {
+    /// When the last checkpoint was written (or the export started): a
+    /// checkpoint is due once [`CHECKPOINT_INTERVAL`] has elapsed since. A
+    /// fast export finishes before the first interval elapses and never
+    /// checkpoints, letting `finalize` do all the work.
+    checkpoint_throttle: Instant,
+    profile: ExportProfile,
+}
+
+impl ExportProgress {
+    fn new(num_levels: usize) -> Self {
+        Self {
+            checkpoint_throttle: Instant::now(),
+            profile: ExportProfile {
+                timers: ExportTimers::default(),
+                walls: ExportPhaseWalls::default(),
+                per_zoom: Vec::with_capacity(num_levels),
+                waves_total: 0,
+                checkpoints: 0,
+                peak_rss_mib: None,
+            },
+        }
+    }
+
+    /// Close the scan (+ plan) phase wall and sample RSS.
+    fn end_scan(&mut self, t_scan: Instant) {
+        self.profile.walls.scan = t_scan.elapsed().as_secs_f64();
+        sample_rss_peak(&mut self.profile.peak_rss_mib);
+    }
+
+    /// Close the partitioning-mode fill phase wall and sample RSS.
+    fn end_fill(&mut self, t_fill: Instant) {
+        self.profile.walls.fill = t_fill.elapsed().as_secs_f64();
+        sample_rss_peak(&mut self.profile.peak_rss_mib);
+    }
+
+    /// Close the finalize phase wall and sample RSS.
+    fn end_finalize(&mut self, t_finalize: Instant) {
+        self.profile.walls.finalize = t_finalize.elapsed().as_secs_f64();
+        sample_rss_peak(&mut self.profile.peak_rss_mib);
+    }
+}
+
+/// The export's `TYLERTOO_PROFILE_JSON` accumulators (#535): stage timers,
+/// phase walls, and the per-zoom split. Diagnostics only.
+struct ExportProfile {
+    timers: ExportTimers,
+    walls: ExportPhaseWalls,
+    per_zoom: Vec<ExportZoomProfile>,
+    waves_total: usize,
+    checkpoints: u64,
+    peak_rss_mib: Option<f64>,
+}
+
+/// The per-export facts [`ExportProfile::emit`] writes alongside the
+/// accumulators.
+struct ExportProfileTarget<'a> {
+    output: &'a Path,
+    layer_name: &'a str,
+    mode: &'a str,
+    partition_wave_width: usize,
+    /// Start of the whole export: `phase_walls.total` is elapsed from here.
+    start: Instant,
+}
+
+impl ExportProfile {
+    /// Write the export's `TYLERTOO_PROFILE_JSON` line (a no-op when the var
+    /// is unset). See [`write_export_profile_json`] for why this is a SECOND
+    /// JSONL line rather than merged into convert's object.
+    fn emit(&self, target: &ExportProfileTarget<'_>) {
+        write_export_profile_json(ExportProfileJsonInputs {
+            output: target.output,
+            layer_name: target.layer_name,
+            mode: target.mode,
+            phase_walls: self.walls,
+            total_secs: target.start.elapsed().as_secs_f64(),
+            stage_secs: self.timers.stage_secs(),
+            per_zoom: &self.per_zoom,
+            waves_total: self.waves_total,
+            partition_wave_width: target.partition_wave_width,
+            checkpoints: self.checkpoints,
+            peak_rss_mib: self.peak_rss_mib,
+        });
+    }
 }
 
 /// Everything one level's pass-2 render reads besides the writer and the
@@ -1364,6 +1513,7 @@ fn export_level(
     writer: &mut StreamingPmtilesWriter,
     mut store: Option<&mut MemberStore>,
     level: &ExportLevelCtx<'_>,
+    progress: &mut ExportProgress,
 ) -> Result<ZoomReport, ExportError> {
     let ExportLevelCtx {
         reader,
@@ -1379,6 +1529,7 @@ fn export_level(
     let zoom = plan.zoom;
     let partitions = &plan.partitions;
     let partition_wave = plan.wave;
+    let timers = &progress.profile.timers;
 
     let t_tiles = Instant::now();
     let ctx = LevelCtx {
@@ -1388,11 +1539,13 @@ fn export_level(
         zoom,
         opts: options,
         published,
+        timers,
     };
     let mut tile_count = 0usize;
     let mut tile_feature_count = 0usize;
     let mut oversized = 0usize;
     let mut write_secs = 0f64;
+    let mut bytes_written = 0u64;
     let total_waves = partitions.len().div_ceil(partition_wave);
     // Within-level progress (#229): a long finest level is where runs get
     // stuck, so emit a throttled wave counter. If it advances the level is
@@ -1400,13 +1553,14 @@ fn export_level(
     let mut last_wave_log = Instant::now();
     for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
         let results: Vec<Vec<EncodedTile>> = match store.as_deref_mut() {
-            Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options)?,
+            Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options, timers)?,
             None => process_wave(&ctx, wave)?,
         };
         let t_write = Instant::now();
         for tiles in &results {
             for t in tiles {
                 tile_feature_count += t.feature_count;
+                bytes_written += t.data.len() as u64;
                 if t.oversized {
                     oversized += 1;
                 }
@@ -1422,7 +1576,12 @@ fn export_level(
             }
             tile_count += tiles.len();
         }
-        write_secs += t_write.elapsed().as_secs_f64();
+        let write_dur = t_write.elapsed();
+        write_secs += write_dur.as_secs_f64();
+        // #535: `spool_write` is exactly this per-wave window — the serial
+        // per-tile `writer.add_tile_precompressed` calls above, same span
+        // `write_secs` already measures for the `[profile]` log below.
+        add_nanos(&timers.spool_write, write_dur);
 
         if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
             log::info!(
@@ -1454,6 +1613,16 @@ fn export_level(
         t_tiles.elapsed().as_secs_f64() - write_secs,
     );
 
+    let profile = &mut progress.profile;
+    profile.per_zoom.push(ExportZoomProfile {
+        zoom,
+        wall_secs: t_tiles.elapsed().as_secs_f64(),
+        tiles: tile_count,
+        features: tile_feature_count,
+        bytes: bytes_written,
+    });
+    profile.waves_total += total_waves;
+    sample_rss_peak(&mut profile.peak_rss_mib);
     Ok(ZoomReport {
         zoom,
         level: level_idx,
@@ -1555,6 +1724,8 @@ struct LevelCtx<'a> {
     /// MVT key per schema column (#359); identity unless the file records a
     /// reserved-column rename whose source name is free again.
     published: &'a PublishedNames,
+    /// Profiling stage timers (#535); diagnostics only.
+    timers: &'a ExportTimers,
 }
 
 /// The per-export constants the single-read fan-out reads for every batch:
@@ -1568,6 +1739,8 @@ struct FanoutCtx<'a> {
     plans: &'a [LevelPlan],
     opts: &'a ExportOptions,
     published: &'a PublishedNames,
+    /// Profiling stage timers (#535); diagnostics only.
+    timers: &'a ExportTimers,
 }
 
 /// One level's precomputed pass-2 plan: its Web Mercator zoom, its planned
@@ -1952,6 +2125,10 @@ struct MemberStore {
     buffered_bytes: usize,
     /// Present under spill backing only.
     spill: Option<MemberSpill>,
+    /// Profiling only (#535): cumulative time spent in [`Self::flush_bucket`]
+    /// (serialize + write of spill segments). Read by the fill to charge it
+    /// to `spill_write` rather than to the routing that triggered it.
+    flush_time: Duration,
 }
 
 impl MemberStore {
@@ -1988,6 +2165,7 @@ impl MemberStore {
             bucket_bytes,
             buffered_bytes: 0,
             spill,
+            flush_time: Duration::ZERO,
         })
     }
 
@@ -2032,6 +2210,7 @@ impl MemberStore {
         if members.is_empty() {
             return Ok(());
         }
+        let t_flush = Instant::now();
         let spill = self
             .spill
             .as_mut()
@@ -2044,6 +2223,7 @@ impl MemberStore {
         spill.writer.write_all(&buf)?;
         spill.segments[level][wave].push((spill.offset, buf.len() as u64));
         spill.offset += buf.len() as u64;
+        self.flush_time += t_flush.elapsed();
         Ok(())
     }
 
@@ -2059,11 +2239,13 @@ impl MemberStore {
                     self.flush_bucket(li, wi)?;
                 }
             }
+            let t_flush = Instant::now();
             self.spill
                 .as_mut()
                 .expect("spill checked above")
                 .writer
                 .flush()?;
+            self.flush_time += t_flush.elapsed();
         }
         Ok(())
     }
@@ -2108,6 +2290,7 @@ fn fill_member_store(
     ctx: &FanoutCtx<'_>,
     backing: SinkBacking,
 ) -> Result<MemberStore, ExportError> {
+    let timers = ctx.timers;
     let plans = ctx.plans;
     let num_levels = plans.len();
     let mut store = MemberStore::new(plans, backing)?;
@@ -2119,8 +2302,16 @@ fn fill_member_store(
         SINGLE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for band in 0..num_levels {
-                let band_reader = reader.read_band_with_batch_size(band, EXPORT_BATCH_SIZE)?;
-                for batch in band_reader {
+                // #535: `band_read` is this producer thread's own time — the
+                // reader open plus each Parquet read + Arrow decode, excluding
+                // the `tx.send` below (a bounded-channel send that can block
+                // on the consumer, which must not be charged to reading).
+                let mut band_reader = ExportTimers::time(&timers.band_read, || {
+                    reader.read_band_with_batch_size(band, EXPORT_BATCH_SIZE)
+                })?;
+                loop {
+                    let next = ExportTimers::time(&timers.band_read, || band_reader.next());
+                    let Some(batch) = next else { break };
                     if tx.send((band, batch?)).is_err() {
                         return Ok(()); // consumer dropped the receiver (error path)
                     }
@@ -2140,6 +2331,9 @@ fn fill_member_store(
         },
     )?;
     store.finish_fill()?;
+    // Every spill flush (during routing and the final one) → `spill_write`;
+    // `fanout_batch_members` already kept its share out of `decode`.
+    add_nanos(&timers.spill_write, store.flush_time);
     log::info!(
         "[export] pass2 fill (#235): {seq} row(s) read once and fanned across \
          {num_levels} level(s) in {:.2}s",
@@ -2165,18 +2359,11 @@ fn fanout_batch_members(
         plans,
         opts,
         published,
+        timers,
     } = *ctx;
     let schema = batch.schema();
     let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
-    let geom_field = schema.field(geom_idx).clone();
-    let garr: Arc<dyn GeoArrowArray> =
-        from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
-    if matches!(crs, Crs::Epsg3857) {
-        geoms = geoms.par_iter().map(reproject_3857_to_4326).collect();
-    }
+    let geoms = decode_batch_geometries(batch, &schema, geom_idx, crs, timers)?;
 
     // Band `j` belongs to every level `k >= j`'s render set (partitioning
     // prefix). A level with no planned partitions sized no tiles, so no
@@ -2187,18 +2374,49 @@ fn fanout_batch_members(
         .collect();
     // `[target][row]` -> the row's `(key, clipped geometry)` members at that
     // target level.
-    type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
-    let mut per_level: Vec<RowMembers> = targets
+    let per_level: Vec<RowMembers> = targets
         .iter()
         .map(|&k| {
             geoms
                 .par_iter()
-                .map(|g| feature_tile_members(g, plans[k].zoom, opts, 0, u64::MAX))
+                .map(|g| {
+                    ExportTimers::time(&timers.clip, || {
+                        feature_tile_members(g, plans[k].zoom, opts, 0, u64::MAX)
+                    })
+                })
                 .collect()
         })
         .collect();
     drop(geoms);
 
+    // #535: the rest (property extraction + routing into the store) is
+    // `decode`, minus any spill flush a `store.push` triggers, which the fill
+    // charges to `spill_write` instead.
+    let t_route = Instant::now();
+    let flushed_before = store.flush_time;
+    let prop_cols = property_columns(&schema, geom_idx, published);
+    let routed = route_fanout_rows(batch, &prop_cols, plans, &targets, per_level, seq, store);
+    let flushed = store.flush_time.saturating_sub(flushed_before);
+    add_nanos(&timers.decode, t_route.elapsed().saturating_sub(flushed));
+    routed
+}
+
+/// Per row of a batch, the row's `(key, clipped geometry)` members at one
+/// target level.
+type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
+
+/// [`fanout_batch_members`]' second half: attach each member-producing row's
+/// properties (materialized once per row, shared via `Arc`) and push its
+/// members into their `(level, wave)` store buckets, in band order.
+fn route_fanout_rows(
+    batch: &RecordBatch,
+    prop_cols: &[(usize, String)],
+    plans: &[LevelPlan],
+    targets: &[usize],
+    mut per_level: Vec<RowMembers>,
+    seq: &mut u64,
+    store: &mut MemberStore,
+) -> Result<(), ExportError> {
     if per_level.iter().all(|rows| rows.iter().all(Vec::is_empty)) {
         *seq += batch.num_rows() as u64;
         return Ok(());
@@ -2207,10 +2425,9 @@ fn fanout_batch_members(
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members at any level, shared across the
     // row's members via `Arc` (as the legacy path does per wave).
-    let prop_cols = property_columns(&schema, geom_idx, published);
     let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
         Vec::with_capacity(prop_cols.len());
-    for &(idx, ref name) in &prop_cols {
+    for &(idx, ref name) in prop_cols {
         extracted.push((name.clone(), extract_property_column(batch.column(idx))));
     }
     for row in 0..batch.num_rows() {
@@ -2260,15 +2477,16 @@ fn encode_wave_from_store(
     wave: &[Partition],
     zoom: u8,
     opts: &ExportOptions,
+    timers: &ExportTimers,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
-    let members = store.take_wave(level_idx, wave_idx)?;
+    let members = ExportTimers::time(&timers.spill_read, || store.take_wave(level_idx, wave_idx))?;
     let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     for m in members {
         buckets[route_partition(wave, m.key)].push(m);
     }
     buckets
         .into_par_iter()
-        .map(|members| encode_members(members, zoom, opts))
+        .map(|members| encode_members(members, zoom, opts, timers))
         .collect::<Result<_, _>>()
 }
 
@@ -2561,16 +2779,20 @@ fn process_wave(
         }
         Crs::Epsg3857 => None,
     };
-    let batch_reader =
+    // #535: `band_read` is the reader open (footer/page-index setup, paid
+    // per wave on this path) plus each `next()` (read + Arrow decode);
+    // `collect_wave_members` charges its own `decode`/`clip`.
+    let timers = ctx.timers;
+    let mut batch_reader = ExportTimers::time(&timers.band_read, || {
         ctx.reader
-            .read_level_with_batch_size(ctx.level_idx, bbox, EXPORT_BATCH_SIZE)?;
+            .read_level_with_batch_size(ctx.level_idx, bbox, EXPORT_BATCH_SIZE)
+    })?;
 
     let t_collect = Instant::now();
     let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     let mut seq = 0u64;
-    for batch in batch_reader {
-        let batch = batch?;
-        collect_wave_members(ctx, wave, &batch, &mut seq, &mut buckets)?;
+    while let Some(batch) = ExportTimers::time(&timers.band_read, || batch_reader.next()) {
+        collect_wave_members(ctx, wave, &batch?, &mut seq, &mut buckets)?;
     }
     let collect_secs = t_collect.elapsed().as_secs_f64();
     let n_members: usize = buckets.iter().map(Vec::len).sum();
@@ -2578,7 +2800,7 @@ fn process_wave(
     let t_encode = Instant::now();
     let tiles: Vec<Vec<EncodedTile>> = buckets
         .into_par_iter()
-        .map(|members| encode_members(members, ctx.zoom, ctx.opts))
+        .map(|members| encode_members(members, ctx.zoom, ctx.opts, timers))
         .collect::<Result<_, _>>()?;
     let n_tiles: usize = tiles.iter().map(Vec::len).sum();
     log::debug!(
@@ -2610,6 +2832,35 @@ fn route_partition(wave: &[Partition], key: u64) -> usize {
     idx
 }
 
+/// Decode a batch's geometry column to `geo::Geometry` (geoarrow, no WKB
+/// round trip), reprojecting EPSG:3857 input to lon/lat — shared by both
+/// pass-2 paths. #535: charged to `decode`, the serial decode as one window
+/// and the reprojection per geometry inside its `par_iter` (core-seconds).
+fn decode_batch_geometries(
+    batch: &RecordBatch,
+    schema: &Schema,
+    geom_idx: usize,
+    crs: Crs,
+    timers: &ExportTimers,
+) -> Result<Vec<Geometry<f64>>, ExportError> {
+    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
+    ExportTimers::time(&timers.decode, || -> Result<(), ExportError> {
+        let geom_field = schema.field(geom_idx).clone();
+        let garr: Arc<dyn GeoArrowArray> =
+            from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
+                .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+        extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
+        Ok(())
+    })?;
+    if matches!(crs, Crs::Epsg3857) {
+        geoms = geoms
+            .par_iter()
+            .map(|g| ExportTimers::time(&timers.decode, || reproject_3857_to_4326(g)))
+            .collect();
+    }
+    Ok(geoms)
+}
+
 /// Decode one record batch and append its members to the wave's per-partition
 /// buckets: clip every feature (in parallel) into its intersecting tiles across
 /// the wave's whole key range, route each member to its owning partition, then
@@ -2626,25 +2877,25 @@ fn collect_wave_members(
     debug_assert_eq!(buckets.len(), wave.len());
     let key_lo = wave[0].key_lo;
     let key_hi = wave[wave.len() - 1].key_hi;
+    let timers = ctx.timers;
 
     let schema = batch.schema();
     let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
-    let geom_field = schema.field(geom_idx).clone();
-    let garr: Arc<dyn GeoArrowArray> =
-        from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
-    if matches!(ctx.crs, Crs::Epsg3857) {
-        geoms = geoms.par_iter().map(reproject_3857_to_4326).collect();
-    }
+    let geoms = decode_batch_geometries(batch, &schema, geom_idx, ctx.crs, timers)?;
 
-    // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key range.
+    // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
+    // range. #535: `clip` is timed per geometry inside the closure.
     let row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
         .par_iter()
-        .map(|g| feature_tile_members(g, ctx.zoom, ctx.opts, key_lo, key_hi))
+        .map(|g| {
+            ExportTimers::time(&timers.clip, || {
+                feature_tile_members(g, ctx.zoom, ctx.opts, key_lo, key_hi)
+            })
+        })
         .collect();
     drop(geoms);
+    // #535: the rest of this batch (property extraction + routing) is `decode`.
+    let _decode = ExportTimers::scope(&timers.decode);
 
     if row_members.iter().all(|v| v.is_empty()) {
         *seq += row_members.len() as u64;
@@ -3458,6 +3709,7 @@ fn encode_members(
     mut members: Vec<Member>,
     zoom: u8,
     opts: &ExportOptions,
+    timers: &ExportTimers,
 ) -> Result<Vec<EncodedTile>, ExportError> {
     sort_members_for_encode(&mut members, &opts.feature_order);
 
@@ -3469,9 +3721,11 @@ fn encode_members(
     // writer loop only dedups and appends bytes (issue #227). Compression must
     // match the writer's `tile_compression` (Gzip) so `add_tile_precompressed`
     // stays byte-identical to the old serial `add_tile_with_count` path.
+    // #535: `encode` is timed per tile, inside this closure (core-seconds).
     groups
         .into_par_iter()
         .filter_map(|g| {
+            let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
             let (data, count, oversized) = encode_tile(g, &tb, opts);
@@ -3637,7 +3891,8 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
     // compression into the parallel encode section). This helper exists to
     // exercise MVT *encoding*, so decompress each tile back to raw MVT bytes;
     // the assertions in the tests below operate on the uncompressed payload.
-    let mut tiles = encode_members(members, zoom, opts).expect("in-memory gzip is infallible");
+    let mut tiles = encode_members(members, zoom, opts, &ExportTimers::default())
+        .expect("in-memory gzip is infallible");
     for t in &mut tiles {
         t.data = crate::compression::decompress_capped(
             &t.data,
