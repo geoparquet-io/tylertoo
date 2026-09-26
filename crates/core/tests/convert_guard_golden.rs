@@ -5,8 +5,11 @@
 //!
 //! The Convert regression guard (`benchmarks/overview/ci_guard.py`, the
 //! `Convert regression guard` job in `.github/workflows/bench.yml`) green-lit
-//! the `i_overlay` 8.1.2 → 9.0.0 / `i_float` 4 → 5 bump in 5c123fa, which
-//! changed real tile output: on a Brazil coarse build, 18 of 588 tiles moved
+//! the `i_overlay` 8.1.2 → 9.0.0 / `i_float` 4 → 5 bump in 5c123fa — our own
+//! direct dependency, the engine behind the `clip_geometry` boundary-bridge
+//! fallback and the #383 quantization repair, not the `i_overlay` 4.5.2 that
+//! `geo` vendors for `BooleanOps`. It changed real tile output: on a Brazil
+//! coarse build, 18 of 588 tiles moved
 //! (±1-MVT-unit coordinate shifts in clipped boundaries across z5–z8, and one
 //! small polygon flipping across its collapse threshold).
 //!
@@ -312,8 +315,8 @@ fn guarded_build_matches_the_committed_tile_golden() {
         "TILE OUTPUT CHANGED — {} of {} guarded tiles differ from the golden.\n\
          \n\
          If this arrived with a dependency bump (geo, geo-types, i_overlay, \
-         i_float, earcutr), that bump changed rendered geometry: it is not an \
-         auto-merge, it needs a maintainer decision (#558).\n\
+         i_float, i_shape, earcut), that bump changed rendered geometry: it is \
+         not an auto-merge, it needs a maintainer decision (#558).\n\
          If the change is intended, regenerate and commit the diff with it:\n  \
          {UPDATE_ENV}=1 cargo test -p tylertoo-core --test convert_guard_golden\n\
          \n{}{}",

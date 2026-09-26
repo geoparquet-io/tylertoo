@@ -322,7 +322,7 @@ wait for a human. A weekly security job (cargo-audit + cargo-deny +
 pip-audit) opens/updates a pinned `security-audit` issue on failure.
 
 **Geometry-engine bumps are the exception** (#558): `geo`, `geo-types`,
-`i_overlay`, `i_float` and `earcutr` can change rendered tile geometry
+`i_overlay`, `i_float`, `i_shape` and `earcut` can change rendered tile geometry
 at any semver level, so green CI alone is not consent to merge one.
 The golden tile guard enforces this mechanically — it fails on any
 output change — so such a bump reaches a human as a red check rather

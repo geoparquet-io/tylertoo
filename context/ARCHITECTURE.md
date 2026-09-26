@@ -444,8 +444,12 @@ tiles while keeping every count the same.
 ratified this as the intended behavior.**
 
 `5c123fa` (merged as #539) bumped `i_overlay` 8.1.2 → 9.0.0 (pulling `i_float`
-4 → 5) — the boolean-ops engine under `geo`'s clipping, and so under the
-i_overlay fallback in `clip_geometry` and the #383 quantization repair. A
+4 → 5). That is **our own direct dependency**, not `geo`'s: `geo` 0.33 vendors
+`i_overlay` 4.5.2 for its `BooleanOps`, and both versions coexist in
+`Cargo.lock`. Ours is the engine behind `ioverlay_clip.rs` — the boundary-bridge
+fallback in `clip_geometry` (`clip.rs`, reached on every non-simple ring and,
+with `--no-simple-clip-fastpath`, on all of them) and the #383 post-quantization
+polygon repair in `export.rs`. So the bump moved the clipper directly. A
 three-way A/B on the Brazil 2025 coarse job (27.98M rows, 588 tiles, identical
 shard plan and options) measured:
 
@@ -471,13 +475,16 @@ regenerated from whatever they decide.
 
 ### Policy: geometry-engine bumps are not green-CI merges
 
-A bump to `geo`, `geo-types`, `i_overlay`, `i_float` or `earcutr` can change
-rendered geometry at **any** semver level — i_overlay is reached through
-`geo`'s trait impls, so its version is a *behavioral* input to every tile we
-write, not a build detail. Such a bump must not be merged on green CI alone,
-nor auto-merged. `dependabot-automerge.yml` already leaves majors for a human;
-that is not the safeguard, because a patch release of the same crate would be
-auto-merged and can move coordinates just as easily.
+A bump to `geo`, `geo-types`, `i_overlay`, `i_float`, `i_shape` or `earcut` can
+change rendered geometry at **any** semver level. These are *behavioral* inputs
+to every tile we write, not build details, and there are two routes in: our
+direct `i_overlay` (the clip fallback and the #383 repair) and the copy `geo`
+vendors for its own `BooleanOps`/triangulation — so a `geo` bump can move
+clipping without `i_overlay` appearing in the diff at all. Such a bump must not
+be merged on green CI alone, nor auto-merged. `dependabot-automerge.yml`
+already leaves majors for a human; that is not the safeguard, because a patch
+release of the same crate would be auto-merged and can move coordinates just as
+easily.
 
 The mechanical enforcement is the golden tile guard
 (`crates/core/tests/convert_guard_golden.rs`, run by the `Convert regression
