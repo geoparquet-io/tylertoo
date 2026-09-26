@@ -487,24 +487,31 @@ release of the same crate would be auto-merged and can move coordinates just as
 easily.
 
 The mechanical enforcement is the golden tile guard
-(`crates/core/tests/convert_guard_golden.rs`, run by the `Convert regression
-guard` job): it pins per-tile digests of a full `convert` → `export` build over
-real clipper-stressing geometry, and **fails on any output change**, so a bump
+(`crates/core/tests/convert_guard_golden.rs`): it pins per-tile digests of a
+full `convert` → `export` build over real clipper-stressing geometry, and **fails on any output change**, so a bump
 that moves a coordinate cannot be green. A golden diff is therefore the signal
 to stop and decide, and a PR that carries one must say in its body why the
-output moved.
+output moved. Discrimination is verified, not assumed: rolling `i_overlay` back
+to 8.1.2 fails it on 4 of 384 guarded tiles (`8/96/138`, `8/97/134`, in both
+cases) — a thin margin, recorded with the recipe in
+`tests/fixtures/guard/README.md`.
 
-Why the pre-existing guard did not do this, since the same job name gated #539:
+What makes it a gate is where it runs. It is in the slow set in
+`.config/nextest.toml`, so it runs in `Slow Tests (ubuntu-latest)` and
+`Slow Tests (macos-latest)` (`ci.yml`) — both **required** checks in `main`'s
+branch protection (verified). The `Convert regression guard` job in
+`bench.yml` is *not* a required check, so it does not gate merges and the
+golden does not run there. If the golden ever leaves the nextest slow set, or
+Slow Tests stops being required, the guard silently stops gating.
+
+Why the pre-existing guard did not do this, though it ran (green) on #539:
 `benchmarks/overview/ci_guard.py` runs `tylertoo overview` and compares
 per-level feature/vertex counts. Clipping happens in export, which that guard
 never runs, and counts are blind to coordinates that move without appearing or
-disappearing — the exact shape of an overlay-engine change. Both guards now run
-in that job; neither replaces the other (the structural one is cheap, covers
-three geometry classes, and catches pass-1 regressions the golden's single
-fixture does not).
-
-For this to gate auto-merge, `Convert regression guard` has to be a **required**
-check in `main`'s branch protection. Worth verifying rather than assuming.
+disappearing — the exact shape of an overlay-engine change. The two guards run
+in different places (structural in `bench.yml`, golden in Slow Tests); neither
+replaces the other (the structural one is cheap, covers three geometry classes,
+and catches pass-1 regressions the golden's single fixture does not).
 
 ## Decision Record: MVT Winding Fix + PMTiles Decode (#112, 2026-07-04)
 

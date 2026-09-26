@@ -11,6 +11,9 @@
 # Mark a new slow test by adding it here. Plain `cargo test` ignores this
 # file and runs everything.
 [profile.default]
+# convert_guard_golden (#558 golden tile guard) MUST stay in this slow set:
+# the required Slow Tests checks are the only place it gates merges. Move
+# it out and the guard silently stops gating.
 default-filter = """
 not (
     binary(thread_count_determinism)

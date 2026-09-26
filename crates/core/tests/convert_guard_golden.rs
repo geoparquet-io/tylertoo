@@ -3,8 +3,8 @@
 //!
 //! # Why this exists
 //!
-//! The Convert regression guard (`benchmarks/overview/ci_guard.py`, the
-//! `Convert regression guard` job in `.github/workflows/bench.yml`) green-lit
+//! The structural convert guard (`benchmarks/overview/ci_guard.py`, run by
+//! the `Convert regression guard` job in `.github/workflows/bench.yml`) green-lit
 //! the `i_overlay` 8.1.2 → 9.0.0 / `i_float` 4 → 5 bump in 5c123fa — our own
 //! direct dependency, the engine behind the `clip_geometry` boundary-bridge
 //! fallback and the #383 quantization repair, not the `i_overlay` 4.5.2 that
@@ -39,10 +39,24 @@
 //! tile bytes under i_overlay 8 vs 9 on a full z0–z13 run.
 //!
 //! The windows are kept **whole** — every feature whose bbox intersects one is
-//! present, none are sampled — because the discrimination cannot be re-verified
-//! locally (the lockfile pins i_overlay 9 now), and dropping neighbours of a
-//! divergent polygon is exactly how you would lose it. See
+//! present, none are sampled — because dropping neighbours of a divergent
+//! polygon is exactly how you would lose it. See
 //! `tests/fixtures/guard/README.md` for the extraction query.
+//!
+//! **Discrimination is verified, and the margin is thin.** Rolling our direct
+//! dependency back (`i_overlay = "=8.1.2"` in `crates/core/Cargo.toml`, then
+//! `cargo update -p i_overlay@9.0.0 --precise 8.1.2`, which also moves
+//! `i_float` 5 → 4.1.0 and `i_shape` 5 → 4.0.0 and compiles unchanged) makes
+//! this test fail with 4 of 384 guarded tiles differing: `8/96/138` and
+//! `8/97/134`, in *both* cases. So only two z8 tiles discriminate that bump,
+//! and the `ioverlay` case caught nothing `defaults` did not (the Brazil A/B
+//! moved 18 tiles across z5–z8). Widening the fixture around more divergent
+//! sites would harden it; the source extract is not in the repo, so that is
+//! optional future work.
+//!
+//! The build requests z0–z13, but this fixture emits **no tiles at z0–z2**
+//! (the golden starts at `3/3/4`), so a change confined to z0–z2 is invisible
+//! to this guard.
 //!
 //! # The two cases
 //!
@@ -66,8 +80,9 @@
 //! TYLERTOO_UPDATE_GOLDEN=1 cargo test -p tylertoo-core --test convert_guard_golden
 //! ```
 //!
-//! It rewrites `tests/fixtures/guard/br-clip-divergence.golden.txt` in place and
-//! fails the run, so the regeneration can never be mistaken for a pass. Commit
+//! Only the exact value `1` regenerates. It rewrites
+//! `tests/fixtures/guard/br-clip-divergence.golden.txt` in place and fails the
+//! run, so the regeneration can never be mistaken for a pass. Commit
 //! the diff **with the change that caused it** and say in the PR body why the
 //! output moved — a golden diff arriving on its own, or with a dependency bump
 //! and no explanation, is the thing this guard exists to stop.
@@ -101,6 +116,7 @@ const GOLDEN: &str = "br-clip-divergence.golden.txt";
 const LAYER: &str = "guard";
 
 /// Zoom depth of the guarded build: the same z0–z13 the #558 A/B ran at.
+/// (z0–z2 produce no tiles for this fixture; the golden starts at z3.)
 ///
 /// It is not just about covering the zooms that diverged there (z5–z8). A
 /// clipper is only exercised where a tile edge cuts a feature, and the three
@@ -259,7 +275,9 @@ fn guarded_build_matches_the_committed_tile_golden() {
     let current = render(&lines);
     let path = golden_path();
 
-    if std::env::var_os(UPDATE_ENV).is_some() {
+    // Only the exact value `1` regenerates: `=0` or `=false` must not
+    // silently rewrite the golden.
+    if std::env::var(UPDATE_ENV).as_deref() == Ok("1") {
         std::fs::write(&path, &current).expect("write golden");
         // Fail loudly: regenerating is not passing. The next unswitched run
         // is what proves the new golden is stable.

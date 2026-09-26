@@ -40,11 +40,32 @@ on the three locations where that A/B actually diverged:
 | -44.2621, -14.2955 |
 | -50.8011, -14.534 |
 
-Whole windows, not a sample. The discrimination cannot be re-verified locally —
-`Cargo.lock` pins i_overlay 9 now, and reverting the lock to 8 would not
-reproduce the original build — so the only way to preserve it is to keep the
-divergent geometry *and its neighbours* intact. Thinning inside a window would
-change which polygon wins a cell and could drop the very feature that moved.
+Whole windows, not a sample: thinning inside a window would change which
+polygon wins a cell and could drop the very feature that moved.
+
+### Discrimination (verified)
+
+Re-verify by rolling our direct dependency back and running the guard:
+
+```bash
+# crates/core/Cargo.toml: i_overlay = "=8.1.2"
+cargo update -p i_overlay@9.0.0 --precise 8.1.2   # also i_float 5 -> 4.1.0, i_shape 5 -> 4.0.0
+cargo test --release -p tylertoo-core --test convert_guard_golden
+```
+
+It compiles unchanged and fails with **4 of 384 guarded tiles differing**:
+`8/96/138` and `8/97/134`, in both the `defaults` and `ioverlay` cases.
+
+The margin is thin, stated plainly: only two z8 tiles discriminate this bump
+(the full Brazil A/B moved 18 tiles across z5–z8), and the `ioverlay` case
+caught the same tiles as `defaults` here. Widening the fixture around more of
+the A/B's divergent sites would harden it; the source extract is not in the
+repo, so that is optional future work.
+
+### Zoom coverage
+
+The build requests z0–z13, but this fixture emits **no tiles at z0–z2** — the
+golden starts at `3/3/4`. A change confined to z0–z2 is invisible to this guard.
 
 ### Extraction
 
@@ -85,5 +106,5 @@ Regenerate only when an output change is intended:
 TYLERTOO_UPDATE_GOLDEN=1 cargo test -p tylertoo-core --test convert_guard_golden
 ```
 
-It rewrites the file and then fails, so a regeneration can never be mistaken for
+Only the exact value `1` regenerates. It rewrites the file and then fails, so a regeneration can never be mistaken for
 a pass. Commit the diff **with the change that caused it**.

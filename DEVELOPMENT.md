@@ -155,11 +155,13 @@ cargo semver-checks check-release \
   --package tylertoo-core \
   --baseline-rev origin/main
 
-# Convert regression guard — two checks, both gating.
+# Convert regression guards (#558)
 # 1. structural signature of `overview` over fixtures-v1
+#    (bench.yml Convert regression guard; not a required check)
 cargo build --release --package tylertoo
 python3 benchmarks/overview/ci_guard.py --check
-# 2. golden tile digests of a full convert -> export build (#558)
+# 2. golden tile digests of a full convert -> export build
+#    (nextest slow set -> required Slow Tests checks in ci.yml)
 cargo test --release -p tylertoo-core \
   --test convert_guard_golden
 
@@ -325,7 +327,7 @@ pip-audit) opens/updates a pinned `security-audit` issue on failure.
 `i_overlay`, `i_float`, `i_shape` and `earcut` can change rendered tile geometry
 at any semver level, so green CI alone is not consent to merge one.
 The golden tile guard enforces this mechanically — it fails on any
-output change — so such a bump reaches a human as a red check rather
+output change and runs in the required `Slow Tests` checks — so such a bump reaches a human as a red check rather
 than as a merge. See `context/ARCHITECTURE.md`, "Decision Record:
 Geometry-Engine Dependency Bumps (#558)".
 
