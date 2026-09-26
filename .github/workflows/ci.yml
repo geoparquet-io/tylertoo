@@ -5,13 +5,15 @@
 #   version-check   version fields stay in sync across the workspace
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
 #                   Cargo.toml [workspace.lints]), cargo-machete, unit tests
-#   Test            full test matrix (ubuntu/macos x stable/beta)
+#   Test            full test matrix (ubuntu/macos x stable/beta), minus
+#                   the slow set in .config/nextest.toml
+#   Slow Tests      that slow set, on ubuntu/macos stable
 #   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
 #   Reference Docs  the committed CLI + Python reference (docs/reference/)
 #                   still match regeneration from source (clap help strings +
 #                   pyo3 docstrings); fails on drift
-#   Coverage        cargo-tarpaulin -> codecov
+#   Coverage        cargo-llvm-cov -> lcov -> codecov (informational)
 #   Profiling       dhat-heap feature keeps compiling
 #   Security Audit  cargo-audit + cargo-deny (advisories/licenses/bans/sources)
 #   CI Lint         zizmor (GitHub Actions security linter) on this repo's
@@ -168,7 +170,8 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-build-target-
 
       - name: Install protoc
         run: |
@@ -269,7 +272,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -281,9 +284,98 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-nextest
+
       - name: Run all tests (excluding slow regression tests)
         # Large polygon regression tests are run manually - see tests/fixtures/realdata/README.md
-        run: cargo test --locked --all-features -- --skip large_polygon_regression
+        # nextest runs every test from every binary in parallel.
+        run: >-
+          cargo nextest run --locked --all-features
+          -E 'not test(large_polygon_regression)'
+
+      - name: Run doctests
+        # nextest does not run doctests.
+        run: cargo test --locked --all-features --doc
+
+  # The slow end-to-end tests listed in .config/nextest.toml. They run here,
+  # beside the Test matrix, so no other job waits on them (#524). Stable
+  # only, on both OSes: the set holds the determinism and shard-parity
+  # tests, which guard platform-sensitive behavior.
+  slow-tests:
+    name: Slow Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        # Same key as the Test (<os>, stable) lane: same build, so this job
+        # starts from a warm target/ and compiles almost nothing.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ runner.os }}-stable-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-stable-cargo-build-target-
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-nextest
+
+      - name: Run slow tests
+        run: >-
+          cargo nextest run --locked --all-features
+          --ignore-default-filter -E 'not default()'
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.
@@ -468,29 +560,57 @@ jobs:
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        # Own key: llvm-cov builds into target/llvm-cov-target with
+        # instrumentation flags, so the Test job's cache does not help.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ runner.os }}-llvm-cov-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-llvm-cov-target-
 
       - name: Install protoc
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Install tarpaulin
-        # Prebuilt binary via install-action; `cargo install cargo-tarpaulin`
-        # was several minutes of compile time on every run.
+      - name: Install cargo-llvm-cov and cargo-nextest
+        # Prebuilt binaries via install-action; compiling them from source
+        # costs minutes on every run.
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
-          tool: cargo-tarpaulin
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Generate coverage
-        # --timeout 300: tarpaulin's 60s default per-test timeout is too tight
-        # for the thread-count determinism e2e (multiple instrumented CLI
-        # subprocess runs over the 17k-row madagascar fixture, #460).
-        run: cargo tarpaulin --out xml --all-features --workspace --exclude tylertoo-python --timeout 300
+        # Source-based instrumentation (#524). tarpaulin ran the suite under
+        # ptrace and needed --timeout 300 for the #460 determinism e2e; it
+        # was the CI long pole at ~11 min. llvm-cov also counts the CLI
+        # subprocesses those e2e tests spawn, which tarpaulin could not.
+        # nextest runs every test from every binary in parallel; cargo test
+        # runs the test binaries one after another.
+        run: >-
+          cargo llvm-cov nextest --all-features --workspace
+          --exclude tylertoo-python
+          --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          files: ./cobertura.xml
+          files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false  # Don't fail if token not configured
 
