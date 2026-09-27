@@ -1,0 +1,43 @@
+# cargo-mutants configuration — read by the weekly mutation-tests.yml job
+# and by a local `cargo mutants --package tylertoo-core` (#419).
+#
+# Keys: `cargo mutants --emit-schema=config`, or
+# https://github.com/sourcefrog/cargo-mutants/blob/main/src/config.rs.
+# The file is parsed with deny_unknown_fields: a typo fails every run.
+
+# Run each mutant's tests through nextest instead of `cargo test`, so the
+# quick/full tiers in .config/nextest.toml apply. Plain `cargo nextest run`
+# is the `quick` profile, which drops the slow end-to-end binaries
+# (convert_guard_golden, shard_merge_parity, thread_count_determinism,
+# sharded_builds, ...: 20s-7min each, ~75% of the suite's test-seconds,
+# #524). Running those once per mutant would turn a weekly sweep into a
+# multi-day one, and they gate merges elsewhere (the required Slow Tests
+# checks in ci.yml). Marking a new test slow in nextest.toml removes it
+# from mutation runs automatically; nothing to keep in sync here.
+# `cargo test` has no way to exclude an integration-test binary, which is
+# why this is a tool switch rather than an argument list.
+test_tool = "nextest"
+
+# Make the tier explicit at the call site (nextest would pick `quick`
+# anyway: it mirrors `default`, and `--profile` is a nextest arg here).
+additional_cargo_test_args = ["--profile", "quick"]
+
+# Timeouts. cargo-mutants kills a mutant's test run at
+# max(minimum_test_timeout, timeout_multiplier x baseline test time) and
+# reports it as `timeout`, which counts as caught-ish noise, not signal.
+# The core quick tier still runs real-parquet I/O (e.g. overview::convert,
+# leaf_directory_integration) and nextest runs every binary in parallel, so
+# baseline time is noisy on a 2-vCPU runner; the defaults (5x, 20s floor)
+# flagged genuine slowdowns fine but a 20s floor is too tight for a mutant
+# that lands in a hot loop the property tests then grind through. 3x the
+# baseline with a 120s floor keeps a runaway mutant bounded (nextest's own
+# slow-timeout in nextest.toml, 60s x 10 periods, is the ceiling per test)
+# without killing legitimate ones.
+timeout_multiplier = 3.0
+minimum_test_timeout = 120.0
+
+# Skip mutating calls that only change allocation strategy (`with_capacity`
+# -> `new`) or logging: they never change observable behaviour, so a
+# "missed" report for them is noise.
+skip_calls_defaults = true
+skip_calls = ["debug!", "trace!", "info!", "warn!", "error!"]
