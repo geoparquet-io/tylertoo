@@ -648,6 +648,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::mvt::TileBuilder
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::mvt::TileBuilder
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::mvt::TileBuilder
 pub const tylertoo_core::mvt::DEFAULT_EXTENT: u32
+pub const tylertoo_core::mvt::TILE_COORD_CLAMP: i32
 pub fn tylertoo_core::mvt::command_decode(u32) -> (u32, u32)
 pub fn tylertoo_core::mvt::command_encode(u32, u32) -> u32
 pub fn tylertoo_core::mvt::encode_geometry(&geo_types::geometry::Geometry, &tylertoo_core::tile::TileBounds, u32) -> (alloc::vec::Vec<u32>, tylertoo_core::vector_tile::tile::GeomType)
