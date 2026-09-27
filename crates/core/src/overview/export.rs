@@ -135,6 +135,12 @@ use super::stream::{
 };
 use super::writer::LEVEL_COLUMN;
 
+mod feature_id;
+use feature_id::{
+    feature_id_values, resolve_feature_id, validate_feature_id_column, ResolvedFeatureId,
+};
+pub use feature_id::{FeatureIdColumnProblem, InvalidFeatureIdReason};
+
 /// Default MVT tile extent (matches [`crate::mvt::DEFAULT_EXTENT`]).
 const DEFAULT_EXTENT: u32 = 4096;
 
@@ -287,21 +293,27 @@ pub struct ExportOptions {
     /// any suppression already recorded for that column: an explicit
     /// `--feature-id` always wins over the #379 auto-suppression heuristic
     /// and over a `--include-property` / `--exclude-property` naming the same
-    /// column (see [`resolve_feature_id_index`]).
+    /// column.
     ///
-    /// The named column must be an integer type (`Int8`..`Int64` or
-    /// `UInt8`..`UInt64`) and every value a non-null, non-negative integer --
-    /// MVT's feature id is `uint64`. A violation is a hard export error naming
-    /// the column and (for a per-row violation) the offending row's file scan
-    /// order, rather than silently reinterpreting or dropping it; see
-    /// [`resolve_feature_id_value`] for exactly what is checked and the
-    /// DIVERGENCE FROM TIPPECANOE note on why this is stricter than
-    /// `--use-attribute-for-id`.
+    /// The named column must be an integer type (`Int8`..`Int64`,
+    /// `UInt8`..`UInt64`) or an unscaled decimal (`DECIMAL(p,0)`), and every
+    /// value in every row of the overview file a non-null integer in
+    /// `0..=u64::MAX` -- MVT's feature id is `uint64`. The whole column is
+    /// checked up front, before any tile is written; a violation is an
+    /// [`ExportError::FeatureIdColumn`] or [`ExportError::InvalidFeatureId`]
+    /// (naming the overview-file row and level), never a silent
+    /// reinterpretation. String and float columns are rejected (a divergence
+    /// from tippecanoe, which parses them): cast them to an integer first.
     ///
     /// The column is moved to the feature id, never *also* published as a
     /// regular tile property (tippecanoe's behaviour) -- it is stripped from
     /// `vector_layers` and from every tile's tags regardless of the property
     /// selection in force.
+    ///
+    /// Aggregated features: a cluster carries its representative's id, a
+    /// coalesced line chain its highest-priority member's, and a #384
+    /// tiny-polygon carrier its own. Uniqueness across source rows is not
+    /// checked.
     ///
     /// Default `None`: every feature keeps the tile-local member index it has
     /// always had (unique only within a single tile/zoom pair -- see
@@ -376,7 +388,11 @@ pub struct ExportReport {
 }
 
 /// Errors from [`export_pmtiles`].
+///
+/// `#[non_exhaustive]`: new failure modes are added without a breaking
+/// change; match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExportError {
     /// Opening or reading the overview file failed.
     #[error("overview reader error: {0}")]
@@ -563,70 +579,39 @@ pub enum ExportError {
     )]
     PropertyRequiredByKnob { name: String, knob: String },
 
-    /// `--feature-id <name>` (#443) names no property this export could read.
-    #[error(
-        "feature-id column {name:?} is not a property of this export (available: {available})"
-    )]
-    FeatureIdColumnNotFound { name: String, available: String },
-
-    /// `--feature-id`'s column is not an integer type (#443): MVT feature ids
-    /// are `uint64`, so a string, float, boolean, temporal or decimal column
-    /// cannot represent one.
-    #[error(
-        "feature-id column {name:?} has type {data_type} -- MVT feature ids must come from an \
-         integer column (Int8/16/32/64 or UInt8/16/32/64)"
-    )]
-    FeatureIdColumnNotInteger { name: String, data_type: String },
-
-    /// A `--feature-id` row was null (#443). MVT feature ids are non-optional
-    /// `uint64`s, so a missing value cannot be encoded; this is a hard error
-    /// rather than a silent per-feature fallback to the tile-local index.
-    #[error(
-        "feature-id column {column:?} is null at row {row} (file scan order): every feature \
-         needs an id when --feature-id is set"
-    )]
-    FeatureIdNull { column: String, row: u64 },
-
-    /// A `--feature-id` row was negative (#443). See
-    /// [`resolve_feature_id_value`] for why this is an error rather than
-    /// tippecanoe's silent two's-complement reinterpretation.
-    #[error(
-        "feature-id column {column:?} is negative ({value}) at row {row} (file scan order): \
-         MVT feature ids are unsigned 64-bit integers"
-    )]
-    FeatureIdNegative {
+    /// `--feature-id` (#443) names a column that cannot supply MVT feature
+    /// ids at all: absent, not an integer type, also the `--feature-order`
+    /// column, or aggregated by `--accumulate-attribute`. Raised before any
+    /// row is read.
+    #[error("--feature-id column {column:?} {reason}")]
+    FeatureIdColumn {
+        /// The `--feature-id` column, as the caller named it.
         column: String,
-        row: u64,
-        value: i64,
+        /// What is wrong with it.
+        reason: FeatureIdColumnProblem,
     },
 
-    /// A `--feature-id` row held a non-integer property value (string, float,
-    /// bool, ...). Reachable from the `Feature`-based test-support path
-    /// (no Arrow schema to gate on); on the production Arrow path this is
-    /// defensive, since [`ExportError::FeatureIdColumnNotInteger`] already
-    /// gates the whole column.
+    /// A row of the overview file holds no valid `--feature-id` value
+    /// (#443): null, negative, or beyond `u64`. Every row of the file -- all
+    /// levels -- is checked up front, before any tile is written, so this
+    /// arrives in seconds rather than after the coarser levels export.
     #[error(
-        "feature-id column {column:?} is not an integer ({value}) at row {row} (file scan \
-         order): MVT feature ids must be non-negative integers"
+        "--feature-id column {column:?} {reason} at row {row} of the overview file (level \
+         {level}, z{zoom}; the overview file's own row order, not the source file's): every \
+         exported feature needs a non-negative integer id"
     )]
-    FeatureIdNotInteger {
+    InvalidFeatureId {
+        /// The `--feature-id` column, as the caller named it.
         column: String,
+        /// The overview level whose row group holds the row.
+        level: usize,
+        /// That level's Web Mercator zoom.
+        zoom: u8,
+        /// 0-based row index in the overview file.
         row: u64,
-        value: String,
+        /// What is wrong with the value.
+        reason: InvalidFeatureIdReason,
     },
-
-    /// `--feature-id` and `--feature-order` name the same column (#443).
-    /// `--feature-id` strips the column from the tile's properties (it is
-    /// never also published), which is exactly what `--feature-order`
-    /// [`FeatureOrder::Column`] needs to read to sort by it -- combining them
-    /// on the same column is therefore rejected rather than silently
-    /// producing input-order tiles.
-    #[error(
-        "--feature-id and --feature-order both name {name:?}: --feature-id removes the column \
-         from the tile properties --feature-order needs to sort by, so the two cannot share a \
-         column"
-    )]
-    FeatureIdConflictsWithFeatureOrder { name: String },
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -1270,6 +1255,8 @@ fn export_pmtiles_impl(
     let mean_member_bytes = reader.finest_level_mean_row_bytes();
     let available_ram = available_memory_bytes();
 
+    let (published, feature_id) = resolve_export_columns(&reader, options, &level_zooms)?;
+
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
     // #459: the tail-directory layout. Tile bytes append straight into
@@ -1290,21 +1277,6 @@ fn export_pmtiles_impl(
     writer.set_expect_clustered(true);
     writer.set_layer_name(&options.layer_name);
     writer.set_declared_min_zoom(min_zoom);
-    // #359: which name each column is published under. Derived once from the
-    // file's own rename provenance so a standalone `export-pmtiles` on an
-    // overview written by an earlier run restores names just as `tiles` does.
-    // #386: then the caller's include/exclude, matched on the published names.
-    let mut published = PublishedNames::from_reader(&reader).with_selection(
-        reader.schema(),
-        geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?,
-        &options.properties,
-        &options.feature_order,
-    )?;
-
-    // #443: resolve and validate `--feature-id` up front, and unconditionally
-    // withhold the column from tile properties/`vector_layers` metadata.
-    apply_feature_id_suppression(reader.schema(), options, &mut published)?;
-
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
     // compare equal and the stable sort leaves input order. A typo therefore
@@ -1416,6 +1388,7 @@ fn export_pmtiles_impl(
                 plans: &plans,
                 opts: options,
                 published: &published,
+                feature_id: feature_id.as_ref(),
                 timers: &progress.profile.timers,
             },
             backing,
@@ -1439,6 +1412,7 @@ fn export_pmtiles_impl(
                 num_levels,
                 crs,
                 published: &published,
+                feature_id: feature_id.as_ref(),
                 options,
                 start,
             },
@@ -1640,6 +1614,42 @@ impl ExportProfile {
     }
 }
 
+/// Which columns the tiles carry, under which names, and the `--feature-id`
+/// column -- all settled before the output is created.
+///
+/// #359: the published names are derived from the file's own rename
+/// provenance, so a standalone `export-pmtiles` on an overview written by an
+/// earlier run restores names just as `tiles` does; #386: then the caller's
+/// include/exclude, matched on the published names. #443: `--feature-id` is
+/// resolved (withholding its column from the tile properties and
+/// `vector_layers`) and every row of the file checked, so a bad id fails in
+/// seconds with its true overview-file row, not after the coarser levels
+/// export.
+fn resolve_export_columns(
+    reader: &OverviewReader,
+    options: &ExportOptions,
+    level_zooms: &[u8],
+) -> Result<(PublishedNames, Option<ResolvedFeatureId>), ExportError> {
+    let geom_idx = geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?;
+    let mut published = PublishedNames::from_reader(reader).with_selection(
+        reader.schema(),
+        geom_idx,
+        &options.properties,
+        &options.feature_order,
+    )?;
+    let feature_id = resolve_feature_id(
+        reader.schema(),
+        geom_idx,
+        reader.meta(),
+        options,
+        &mut published,
+    )?;
+    if let Some(fid) = &feature_id {
+        validate_feature_id_column(reader, fid, level_zooms)?;
+    }
+    Ok((published, feature_id))
+}
+
 /// Everything one level's pass-2 render reads besides the writer and the
 /// member store.
 struct ExportLevelCtx<'a> {
@@ -1652,6 +1662,8 @@ struct ExportLevelCtx<'a> {
     num_levels: usize,
     crs: Crs,
     published: &'a PublishedNames,
+    /// The resolved `--feature-id` column (#443), if any.
+    feature_id: Option<&'a ResolvedFeatureId>,
     options: &'a ExportOptions,
     /// Start of the whole export, for the elapsed-time progress lines.
     start: Instant,
@@ -1678,6 +1690,7 @@ fn export_level(
         num_levels,
         crs,
         published,
+        feature_id,
         options,
         start,
     } = *level;
@@ -1694,6 +1707,7 @@ fn export_level(
         zoom,
         opts: options,
         published,
+        feature_id,
         timers,
     };
     let mut tile_count = 0usize;
@@ -1845,8 +1859,9 @@ struct Member {
     geom: Geometry<f64>,
     props: Arc<Vec<(String, PropertyValue)>>,
     /// `Some` on every member when [`ExportOptions::feature_id`] is set
-    /// (validated at extraction time, #443); `None` when it is not, in which
-    /// case [`build_mvt`] falls back to the tile-local member index.
+    /// (every row of the file validated up front, #443); `None` when it is
+    /// not, in which case [`build_mvt`] falls back to the tile-local member
+    /// index.
     id: Option<u64>,
 }
 
@@ -1885,6 +1900,8 @@ struct LevelCtx<'a> {
     /// MVT key per schema column (#359); identity unless the file records a
     /// reserved-column rename whose source name is free again.
     published: &'a PublishedNames,
+    /// The resolved `--feature-id` column (#443), if any.
+    feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
 }
@@ -1900,6 +1917,8 @@ struct FanoutCtx<'a> {
     plans: &'a [LevelPlan],
     opts: &'a ExportOptions,
     published: &'a PublishedNames,
+    /// The resolved `--feature-id` column (#443), if any.
+    feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
 }
@@ -2554,6 +2573,7 @@ fn fanout_batch_members(
         plans,
         opts,
         published,
+        feature_id,
         timers,
     } = *ctx;
     let schema = batch.schema();
@@ -2589,18 +2609,8 @@ fn fanout_batch_members(
     // charges to `spill_write` instead.
     let t_route = Instant::now();
     let flushed_before = store.flush_time;
-    let prop_cols = property_columns(&schema, geom_idx, published);
-    let id_col = extract_feature_id_column(&schema, geom_idx, published, opts, batch)?;
-    let routed = route_fanout_rows(
-        batch,
-        &prop_cols,
-        id_col.as_ref(),
-        plans,
-        &targets,
-        per_level,
-        seq,
-        store,
-    );
+    let cols = AttrColumns::new(&schema, geom_idx, published, feature_id);
+    let routed = route_fanout_rows(batch, &cols, plans, &targets, per_level, seq, store);
     let flushed = store.flush_time.saturating_sub(flushed_before);
     add_nanos(&timers.decode, t_route.elapsed().saturating_sub(flushed));
     routed
@@ -2610,14 +2620,15 @@ fn fanout_batch_members(
 /// target level.
 type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
 
+/// A feature's MVT properties, shared across its tile members.
+type SharedProps = Arc<Vec<(String, PropertyValue)>>;
+
 /// [`fanout_batch_members`]' second half: attach each member-producing row's
 /// properties (materialized once per row, shared via `Arc`) and push its
 /// members into their `(level, wave)` store buckets, in band order.
-#[allow(clippy::too_many_arguments)] // one more than `fanout_batch_members` had (#443's `id_col`)
 fn route_fanout_rows(
     batch: &RecordBatch,
-    prop_cols: &[(usize, String)],
-    id_col: Option<&FeatureIdColumn>,
+    cols: &AttrColumns<'_>,
     plans: &[LevelPlan],
     targets: &[usize],
     mut per_level: Vec<RowMembers>,
@@ -2632,29 +2643,13 @@ fn route_fanout_rows(
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members at any level, shared across the
     // row's members via `Arc` (as the legacy path does per wave).
-    let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
-        Vec::with_capacity(prop_cols.len());
-    for &(idx, ref name) in prop_cols {
-        extracted.push((name.clone(), extract_property_column(batch.column(idx))));
-    }
+    let attrs = cols.extract(batch);
     for row in 0..batch.num_rows() {
         if per_level.iter().all(|rows| rows[row].is_empty()) {
             *seq += 1;
             continue;
         }
-        // #443: resolved once per row (band-order `*seq` names the row in
-        // the error, matching every member the row produces).
-        let id = match id_col {
-            None => None,
-            Some((name, col)) => Some(resolve_feature_id_value(col[row].as_ref(), name, *seq)?),
-        };
-        let mut props = Vec::with_capacity(extracted.len());
-        for (name, col) in &extracted {
-            if let Some(v) = &col[row] {
-                props.push((name.clone(), v.clone()));
-            }
-        }
-        let props = Arc::new(props);
+        let (props, id) = attrs.row(row)?;
         for (ti, &k) in targets.iter().enumerate() {
             let items = std::mem::take(&mut per_level[ti][row]);
             let plan = &plans[k];
@@ -3190,30 +3185,13 @@ fn collect_wave_members(
 
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members.
-    let prop_cols = property_columns(&schema, geom_idx, ctx.published);
-    let id_col = extract_feature_id_column(&schema, geom_idx, ctx.published, ctx.opts, batch)?;
-    let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
-        Vec::with_capacity(prop_cols.len());
-    for &(idx, ref name) in &prop_cols {
-        extracted.push((name.clone(), extract_property_column(batch.column(idx))));
-    }
+    let attrs = AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id).extract(batch);
     for (row, items) in row_members.into_iter().enumerate() {
         if items.is_empty() {
             *seq += 1;
             continue;
         }
-        // #443: see `route_fanout_rows`'s identical resolution.
-        let id = match &id_col {
-            None => None,
-            Some((name, col)) => Some(resolve_feature_id_value(col[row].as_ref(), name, *seq)?),
-        };
-        let mut props = Vec::with_capacity(extracted.len());
-        for (name, col) in &extracted {
-            if let Some(v) = &col[row] {
-                props.push((name.clone(), v.clone()));
-            }
-        }
-        let props = Arc::new(props);
+        let (props, id) = attrs.row(row)?;
         for (key, geom) in items {
             buckets[route_partition(wave, key)].push(Member {
                 key,
@@ -4173,7 +4151,7 @@ fn build_mvt<'a>(
 /// #443: resolves `opts.feature_id` directly against `f.props` (there is no
 /// Arrow schema on this path), stripping the named property out of the
 /// member's tags exactly as the production Arrow path does -- so this
-/// exercises the same "moved, not copied" contract with the same error type.
+/// exercises the same "moved, not copied" contract with the same error types.
 #[cfg(test)]
 fn encode_level_tiles(
     features: &[Feature],
@@ -4185,9 +4163,10 @@ fn encode_level_tiles(
         let seq = fi as u64;
         let id = match &opts.feature_id {
             None => None,
-            Some(name) => Some(resolve_feature_id_value(
+            Some(name) => Some(feature_id::feature_id_from_property(
                 find_property_value(&f.props, name),
                 name,
+                zoom,
                 seq,
             )?),
         };
@@ -4223,10 +4202,8 @@ fn encode_level_tiles(
     Ok(tiles)
 }
 
-/// Find a named property's value in an unindexed `(name, value)` list —
-/// shared by the [`encode_level_tiles`] test-support path and
-/// [`resolve_feature_id_value`] callers that only have `Feature.props`, not
-/// an Arrow column, to look in.
+/// Find a named property's value in an unindexed `(name, value)` list, for
+/// the [`encode_level_tiles`] test-support path (no Arrow column to read).
 #[cfg(test)]
 fn find_property_value<'a>(
     props: &'a [(String, PropertyValue)],
@@ -4623,172 +4600,74 @@ fn property_columns(
         .collect()
 }
 
-/// `export_pmtiles_impl`'s `--feature-id` setup (#443), factored out to keep
-/// that function under the line-count lint: reject a `--feature-order` on
-/// the same column (stripping the property would silently break the sort),
-/// resolve the column against the schema, reject a non-integer type, and
-/// unconditionally withhold it from the tile properties / `vector_layers`
-/// metadata it would otherwise still publish under -- see
-/// [`resolve_feature_id_index`]'s doc for why this always wins over the
-/// ordinary property selection. A no-op when `options.feature_id` is `None`.
-/// Per-row null/negative/non-integer values are [`resolve_feature_id_value`]'s
-/// job, once the scan actually reaches them.
-fn apply_feature_id_suppression(
-    schema: &Schema,
-    options: &ExportOptions,
-    published: &mut PublishedNames,
-) -> Result<(), ExportError> {
-    let Some(name) = &options.feature_id else {
-        return Ok(());
-    };
-    if let FeatureOrder::Column {
-        name: order_name, ..
-    } = &options.feature_order
-    {
-        if order_name == name {
-            return Err(ExportError::FeatureIdConflictsWithFeatureOrder { name: name.clone() });
+/// The columns pass 2 attaches to each member: the exportable properties
+/// ([`property_columns`]) and the resolved `--feature-id` column (#443).
+struct AttrColumns<'a> {
+    props: Vec<(usize, String)>,
+    feature_id: Option<&'a ResolvedFeatureId>,
+}
+
+impl<'a> AttrColumns<'a> {
+    fn new(
+        schema: &Schema,
+        geom_idx: usize,
+        published: &PublishedNames,
+        feature_id: Option<&'a ResolvedFeatureId>,
+    ) -> Self {
+        Self {
+            props: property_columns(schema, geom_idx, published),
+            feature_id,
         }
     }
-    let geom_idx = geometry_index(schema).ok_or(ExportError::NoGeometryColumn)?;
-    let idx = resolve_feature_id_index(schema, geom_idx, published, name)?;
-    let dt = schema.field(idx).data_type();
-    if !is_integer_scalar(dt) {
-        return Err(ExportError::FeatureIdColumnNotInteger {
-            name: name.clone(),
-            data_type: format!("{dt:?}"),
-        });
+
+    /// Extract every column of one batch once, for per-row materialization.
+    fn extract(&self, batch: &RecordBatch) -> BatchAttributes<'a> {
+        BatchAttributes {
+            props: self
+                .props
+                .iter()
+                .map(|&(idx, ref name)| (name.clone(), extract_property_column(batch.column(idx))))
+                .collect(),
+            ids: self.feature_id.map(|fid| {
+                let ids = feature_id_values(batch.column(fid.idx))
+                    .map(|v| v.into_iter().map(Result::ok).collect())
+                    .unwrap_or_default();
+                (fid, ids)
+            }),
+        }
     }
-    published.suppress(schema.field(idx).name());
-    Ok(())
 }
 
-/// Resolve `--feature-id <name>` (#443) against `schema`, matched by its
-/// *published* name -- the same matching `--feature-order` /
-/// `--include-property` / `--exclude-property` use -- independent of any
-/// suppression already recorded on `published`.
-///
-/// That independence is deliberate: an explicit `--feature-id` always wins
-/// over the #379 auto-suppression heuristic and over an
-/// `--include-property` / `--exclude-property` naming the same column,
-/// mirroring tippecanoe's `--use-attribute-for-id`, which extracts the named
-/// attribute before its own `-x`/`-y`/`-X` filter is even consulted
-/// (`serial.cpp`'s `attribute_for_id` block runs first and `continue`s past
-/// the filter for that key). So naming the id column in `--include-property`
-/// or `--exclude-property` is a harmless no-op, never an error -- it is
-/// removed from the property set either way (the caller unconditionally
-/// [`PublishedNames::suppress`]es it after this resolves).
-fn resolve_feature_id_index(
-    schema: &Schema,
-    geom_idx: usize,
-    published: &PublishedNames,
-    name: &str,
-) -> Result<usize, ExportError> {
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .find(|&(i, f)| {
-            i != geom_idx
-                && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
-                && published.publish(f.name()) == name
-        })
-        .map(|(i, _)| i)
-        .ok_or_else(|| ExportError::FeatureIdColumnNotFound {
-            name: name.to_string(),
-            available: property_columns(schema, geom_idx, published)
-                .into_iter()
-                .map(|(_, n)| format!("{n:?}"))
-                .collect::<Vec<_>>()
-                .join(", "),
-        })
+/// One batch's extracted [`AttrColumns`].
+struct BatchAttributes<'a> {
+    props: Vec<(String, Vec<Option<PropertyValue>>)>,
+    /// The `--feature-id` column and its per-row ids (`None` = invalid).
+    ids: Option<(&'a ResolvedFeatureId, Vec<Option<u64>>)>,
 }
 
-/// The eight Arrow integer types a `--feature-id` column may have (#443).
-/// MVT's feature id is `uint64`, but a signed column is allowed too --
-/// [`resolve_feature_id_value`] rejects a negative value from one -- since
-/// GeoParquet integer ids are usually signed.
-fn is_integer_scalar(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-    )
-}
-
-/// A `--feature-id` column's name plus its raw per-row values for one batch
-/// (#443): the name is carried alongside for [`resolve_feature_id_value`]'s
-/// error messages.
-type FeatureIdColumn = (String, Vec<Option<PropertyValue>>);
-
-/// The `--feature-id` column's raw per-row values for one batch (#443), or
-/// `None` when `opts.feature_id` is unset. Errors if the named column is
-/// missing or not an integer type; per-row null/negative/non-integer values
-/// are [`resolve_feature_id_value`]'s job, once the row is actually needed.
-fn extract_feature_id_column(
-    schema: &Schema,
-    geom_idx: usize,
-    published: &PublishedNames,
-    opts: &ExportOptions,
-    batch: &RecordBatch,
-) -> Result<Option<FeatureIdColumn>, ExportError> {
-    let Some(name) = &opts.feature_id else {
-        return Ok(None);
-    };
-    let idx = resolve_feature_id_index(schema, geom_idx, published, name)?;
-    let dt = schema.field(idx).data_type();
-    if !is_integer_scalar(dt) {
-        return Err(ExportError::FeatureIdColumnNotInteger {
-            name: name.clone(),
-            data_type: format!("{dt:?}"),
-        });
-    }
-    Ok(Some((
-        name.clone(),
-        extract_property_column(batch.column(idx)),
-    )))
-}
-
-/// Convert one `--feature-id` row's raw property value into the MVT `u64`
-/// feature id, or a descriptive error naming the column and the row's file
-/// scan order (#443).
-///
-/// DIVERGENCE FROM TIPPECANOE: `--use-attribute-for-id` only *warns* on a
-/// non-numeric or fractional id attribute and, for a numeric string, feeds it
-/// through `strtoull`, which for a leading `-` computes the value's
-/// two's-complement unsigned reinterpretation and accepts it whenever
-/// printing that value back out reproduces the input string (`serial.cpp`'s
-/// `attribute_for_id` block) -- so `"-5"` quietly becomes id
-/// `18446744073709551611` with no error at all. Issue #443 asks for hard
-/// errors on null/negative/non-integer ids instead of reproducing that
-/// silent reinterpretation.
-fn resolve_feature_id_value(
-    value: Option<&PropertyValue>,
-    column: &str,
-    row: u64,
-) -> Result<u64, ExportError> {
-    match value {
-        None => Err(ExportError::FeatureIdNull {
-            column: column.to_string(),
-            row,
-        }),
-        Some(PropertyValue::UInt(u)) => Ok(*u),
-        Some(PropertyValue::Int(i)) if *i >= 0 => Ok(*i as u64),
-        Some(PropertyValue::Int(i)) => Err(ExportError::FeatureIdNegative {
-            column: column.to_string(),
-            row,
-            value: *i,
-        }),
-        Some(other) => Err(ExportError::FeatureIdNotInteger {
-            column: column.to_string(),
-            row,
-            value: format!("{other:?}"),
-        }),
+impl BatchAttributes<'_> {
+    /// Row `row`'s properties (shared across its members via `Arc`) and its
+    /// `--feature-id`, if one is set.
+    fn row(&self, row: usize) -> Result<(SharedProps, Option<u64>), ExportError> {
+        let id = match &self.ids {
+            None => None,
+            // `validate_feature_id_column` already vouched for every row of
+            // the file, so this only fires if the file changed underneath
+            // the export.
+            Some((fid, ids)) => Some(ids.get(row).copied().flatten().ok_or_else(|| {
+                ExportError::Arrow(arrow_schema::ArrowError::InvalidArgumentError(format!(
+                    "--feature-id column {:?} holds an invalid value that the up-front check \
+                     did not see; was the overview file modified during the export?",
+                    fid.name
+                )))
+            })?),
+        };
+        let props = self
+            .props
+            .iter()
+            .filter_map(|(name, col)| col[row].as_ref().map(|v| (name.clone(), v.clone())))
+            .collect();
+        Ok((Arc::new(props), id))
     }
 }
 
@@ -8790,107 +8669,8 @@ mod tests {
     // ========================================================================
     // `--feature-id` (#443): stable MVT feature ids
     // ========================================================================
-
-    /// Happy path: a non-negative int/uint value becomes its own `u64` id.
-    #[test]
-    fn feature_id_value_accepts_uint_and_nonneg_int() {
-        assert_eq!(
-            resolve_feature_id_value(Some(&PropertyValue::UInt(42)), "id", 0).unwrap(),
-            42
-        );
-        assert_eq!(
-            resolve_feature_id_value(Some(&PropertyValue::Int(42)), "id", 0).unwrap(),
-            42
-        );
-        assert_eq!(
-            resolve_feature_id_value(Some(&PropertyValue::Int(0)), "id", 0).unwrap(),
-            0
-        );
-    }
-
-    /// A null value is a hard error naming the column and the row.
-    #[test]
-    fn feature_id_value_rejects_null() {
-        let err = resolve_feature_id_value(None, "id", 7).unwrap_err();
-        match err {
-            ExportError::FeatureIdNull { column, row } => {
-                assert_eq!(column, "id");
-                assert_eq!(row, 7);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    /// A negative value is a hard error -- DIVERGENCE FROM TIPPECANOE, which
-    /// silently reinterprets it as a huge unsigned id instead of rejecting it
-    /// (see `resolve_feature_id_value`'s doc comment).
-    #[test]
-    fn feature_id_value_rejects_negative() {
-        let err = resolve_feature_id_value(Some(&PropertyValue::Int(-5)), "id", 3).unwrap_err();
-        match err {
-            ExportError::FeatureIdNegative { column, row, value } => {
-                assert_eq!(column, "id");
-                assert_eq!(row, 3);
-                assert_eq!(value, -5);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    /// A non-integer value (string, float, bool) is a hard error.
-    #[test]
-    fn feature_id_value_rejects_non_integer() {
-        for bad in [
-            PropertyValue::String("abc".to_string()),
-            PropertyValue::Double(1.5),
-            PropertyValue::Float(1.5),
-            PropertyValue::Bool(true),
-        ] {
-            let err = resolve_feature_id_value(Some(&bad), "id", 1).unwrap_err();
-            assert!(
-                matches!(err, ExportError::FeatureIdNotInteger { .. }),
-                "unexpected {err:?} for {bad:?}"
-            );
-        }
-    }
-
-    /// `--feature-id` matches by *published* name and ignores any
-    /// suppression already recorded: naming the id column in
-    /// `--include-property` / `--exclude-property` (which end up as
-    /// suppression either way) must not hide it from `--feature-id`.
-    #[test]
-    fn feature_id_index_resolves_independent_of_suppression() {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-            geometry_field(),
-        ]);
-        let mut published = PublishedNames::identity();
-        published.suppress("id");
-        let idx = resolve_feature_id_index(&schema, 2, &published, "id").unwrap();
-        assert_eq!(idx, 0);
-    }
-
-    /// Naming a column that is not in the schema is a clear error listing
-    /// what is available.
-    #[test]
-    fn feature_id_index_errors_naming_available_columns() {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-            geometry_field(),
-        ]);
-        let published = PublishedNames::identity();
-        let err = resolve_feature_id_index(&schema, 2, &published, "nope").unwrap_err();
-        match err {
-            ExportError::FeatureIdColumnNotFound { name, available } => {
-                assert_eq!(name, "nope");
-                assert!(available.contains("\"id\""));
-                assert!(available.contains("\"name\""));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
+    // Value conversion and column resolution are unit-tested in
+    // `export/feature_id.rs`; these exercise the whole export.
 
     /// The encode path: a feature's `--feature-id` value becomes the MVT
     /// feature id at every zoom it is encoded at, and the id column is never
@@ -8950,110 +8730,87 @@ mod tests {
         }
     }
 
-    /// A null/negative/non-integer `--feature-id` value fails the export
-    /// rather than falling back to the tile-local index.
-    #[test]
-    fn feature_id_error_path_names_the_column_and_row() {
-        let feats = vec![Feature {
-            geom: Geometry::Point(Point::new(-120.0, 40.0)),
-            props: vec![("id".to_string(), PropertyValue::Int(-1))],
-        }];
-        let opts = ExportOptions {
-            feature_id: Some("id".to_string()),
-            ..Default::default()
-        };
-        let err = encode_level_tiles(&feats, 4, &opts).err().unwrap();
-        match err {
-            ExportError::FeatureIdNegative { column, row, value } => {
-                assert_eq!(column, "id");
-                assert_eq!(row, 0);
-                assert_eq!(value, -1);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+    fn two_point_fixture(path: &Path) {
+        write_fixture(
+            path,
+            &[(
+                vec![1, 2],
+                vec![
+                    Geometry::Point(Point::new(-120.0, 40.0)),
+                    Geometry::Point(Point::new(120.0, -40.0)),
+                ],
+            )],
+        );
     }
 
-    /// End-to-end through `export_pmtiles`: an id column also named in
-    /// `--feature-order` is rejected up front rather than silently breaking
-    /// the sort.
+    fn export_with_feature_id(
+        input: &Path,
+        opts: ExportOptions,
+    ) -> Result<ExportReport, ExportError> {
+        let out = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(input, out.path(), &opts)
+    }
+
+    /// An id column also named in `--feature-order` is rejected up front
+    /// rather than silently breaking the sort.
     #[test]
     fn feature_id_conflicts_with_feature_order_on_the_same_column() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_fixture(
+        two_point_fixture(tmp.path());
+        let err = export_with_feature_id(
             tmp.path(),
-            &[(
-                vec![1, 2],
-                vec![
-                    Geometry::Point(Point::new(-120.0, 40.0)),
-                    Geometry::Point(Point::new(120.0, -40.0)),
-                ],
-            )],
-        );
-        let out = tempfile::NamedTempFile::new().unwrap();
-        let opts = ExportOptions {
-            feature_id: Some("id".to_string()),
-            feature_order: FeatureOrder::Column {
-                name: "id".to_string(),
-                descending: false,
+            ExportOptions {
+                feature_id: Some("id".to_string()),
+                feature_order: FeatureOrder::Column {
+                    name: "id".to_string(),
+                    descending: false,
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        };
-        let err = export_pmtiles(tmp.path(), out.path(), &opts).unwrap_err();
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
-            ExportError::FeatureIdConflictsWithFeatureOrder { name } if name == "id"
+            ExportError::FeatureIdColumn {
+                column,
+                reason: FeatureIdColumnProblem::ConflictsWithFeatureOrder,
+            } if column == "id"
         ));
     }
 
-    /// `--feature-id` naming a column absent from the overview file's schema
-    /// is a clear error, not a silent fallback.
+    /// An unknown column and a non-integer column (the fixture's string
+    /// `name`) are clear errors, not a silent fallback.
     #[test]
-    fn feature_id_unknown_column_is_rejected() {
+    fn feature_id_unknown_or_non_integer_column_is_rejected() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_fixture(
-            tmp.path(),
-            &[(
-                vec![1, 2],
-                vec![
-                    Geometry::Point(Point::new(-120.0, 40.0)),
-                    Geometry::Point(Point::new(120.0, -40.0)),
-                ],
-            )],
-        );
-        let out = tempfile::NamedTempFile::new().unwrap();
-        let opts = ExportOptions {
-            feature_id: Some("nope".to_string()),
+        two_point_fixture(tmp.path());
+        let with = |name: &str| ExportOptions {
+            feature_id: Some(name.to_string()),
             ..Default::default()
         };
-        let err = export_pmtiles(tmp.path(), out.path(), &opts).unwrap_err();
-        assert!(matches!(err, ExportError::FeatureIdColumnNotFound { name, .. } if name == "nope"));
-    }
-
-    /// `--feature-id` naming a non-integer column (the fixture's `name`, a
-    /// string) is rejected at export setup, before any row is scanned.
-    #[test]
-    fn feature_id_non_integer_column_is_rejected() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_fixture(
-            tmp.path(),
-            &[(
-                vec![1, 2],
-                vec![
-                    Geometry::Point(Point::new(-120.0, 40.0)),
-                    Geometry::Point(Point::new(120.0, -40.0)),
-                ],
-            )],
+        let err = export_with_feature_id(tmp.path(), with("nope")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExportError::FeatureIdColumn {
+                    column,
+                    reason: FeatureIdColumnProblem::NotFound { available },
+                } if column == "nope" && available == "\"id\", \"name\""
+            ),
+            "{err:?}"
         );
-        let out = tempfile::NamedTempFile::new().unwrap();
-        let opts = ExportOptions {
-            feature_id: Some("name".to_string()),
-            ..Default::default()
-        };
-        let err = export_pmtiles(tmp.path(), out.path(), &opts).unwrap_err();
-        assert!(matches!(
-            err,
-            ExportError::FeatureIdColumnNotInteger { name, .. } if name == "name"
-        ));
+        let err = export_with_feature_id(tmp.path(), with("name")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExportError::FeatureIdColumn {
+                    column,
+                    reason: FeatureIdColumnProblem::NotInteger { .. },
+                } if column == "name"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("gpio or DuckDB"), "{err}");
     }
 
     /// `--feature-id` naming a column also listed in `--exclude-property`
@@ -9062,26 +8819,178 @@ mod tests {
     #[test]
     fn feature_id_column_named_in_exclude_property_still_works() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_fixture(
+        two_point_fixture(tmp.path());
+        let report = export_with_feature_id(
             tmp.path(),
-            &[(
-                vec![1, 2],
-                vec![
-                    Geometry::Point(Point::new(-120.0, 40.0)),
-                    Geometry::Point(Point::new(120.0, -40.0)),
-                ],
-            )],
-        );
-        let out = tempfile::NamedTempFile::new().unwrap();
-        let opts = ExportOptions {
-            feature_id: Some("id".to_string()),
-            properties: PropertySelection {
-                exclude: vec!["id".to_string()],
+            ExportOptions {
+                feature_id: Some("id".to_string()),
+                properties: PropertySelection {
+                    exclude: vec!["id".to_string()],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
+        )
+        .unwrap();
+        assert!(report.total_tiles > 0);
+    }
+
+    /// Write an overview whose `id` column is nullable Int64, one batch per
+    /// level, in `mode`, with two-row row groups (so several row groups per
+    /// level, some of which the statistics short-circuit can skip).
+    fn write_nullable_id_fixture(path: &Path, mode: Mode, levels: &[Vec<Option<i64>>]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, false),
+            geometry_field(),
+        ]));
+        let specs: Vec<LevelSpec> = (0..levels.len())
+            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
+            .collect();
+        let mut opts = OverviewWriterOptions::new(mode, specs);
+        opts.max_row_group_size = 2;
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        let mut n = 0usize;
+        for (k, ids) in levels.iter().enumerate() {
+            let geoms: Vec<Geometry<f64>> = (0..ids.len())
+                .map(|i| {
+                    let t = (n + i) as f64;
+                    Geometry::Point(Point::new(-150.0 + t * 7.0, -60.0 + t * 5.0))
+                })
+                .collect();
+            n += ids.len();
+            let names: Vec<String> = (0..ids.len()).map(|i| format!("f{k}_{i}")).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(build_geometry_array(&geoms).to_array_ref()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(k, Some(ids.len()), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+    }
+
+    /// S2-2: a bad id anywhere in the file -- here in the FINEST level --
+    /// fails the export before the output is created, naming the true
+    /// overview-file row and its level, in both modes and on both pass-2
+    /// engines (the partitioning single-read fan-out and the legacy per-wave
+    /// read).
+    #[test]
+    fn feature_id_bad_value_fails_up_front_with_the_overview_row_and_level() {
+        let good = |base: i64, n: i64| (base..base + n).map(Some).collect::<Vec<_>>();
+        let cases: [(Option<i64>, InvalidFeatureIdReason); 2] = [
+            (None, InvalidFeatureIdReason::Null),
+            (
+                Some(-9),
+                InvalidFeatureIdReason::Negative {
+                    value: "-9".to_string(),
+                },
+            ),
+        ];
+        for mode in [Mode::Duplicating, Mode::Partitioning] {
+            for (bad, reason) in cases.clone() {
+                // Level 0: 3 rows, level 1: 4 rows, level 2: 5 rows with the
+                // bad value at index 3 => overview-file row 3 + 4 + 3 = 10.
+                let mut finest = good(100, 5);
+                finest[3] = bad;
+                let levels = vec![good(0, 3), good(10, 4), finest];
+                let dir = tempfile::tempdir().unwrap();
+                let input = dir.path().join("ov.parquet");
+                write_nullable_id_fixture(&input, mode, &levels);
+                let opts = ExportOptions {
+                    feature_id: Some("id".to_string()),
+                    ..Default::default()
+                };
+                for legacy in [false, true] {
+                    let out = dir.path().join(format!("out-{legacy}.pmtiles"));
+                    let err = export_pmtiles_impl(
+                        &input,
+                        &out,
+                        &opts,
+                        DEFAULT_PARTITION_TARGET,
+                        legacy,
+                        None,
+                    )
+                    .unwrap_err();
+                    match &err {
+                        ExportError::InvalidFeatureId {
+                            column,
+                            level,
+                            zoom,
+                            row,
+                            reason: got,
+                        } => {
+                            assert_eq!(column, "id");
+                            assert_eq!((*level, *zoom, *row), (2, 6, 10), "{mode:?}: {err}");
+                            assert_eq!(got, &reason);
+                        }
+                        other => panic!("{mode:?}: unexpected {other:?}"),
+                    }
+                    assert!(err.to_string().contains("row 10 of the overview file"));
+                    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name().into_string().unwrap())
+                        .filter(|n| n.starts_with("out-"))
+                        .collect();
+                    assert!(
+                        leftovers.is_empty(),
+                        "{mode:?}: nothing may be written before the check fails: {leftovers:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same fixture with only valid ids exports, and the ids survive the
+    /// partitioning single-read fan-out under both member-store backings
+    /// (the spill codec carries them) byte-identically to the legacy path.
+    #[test]
+    fn feature_id_partitioning_single_read_matches_legacy_under_both_backings() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        partitioning_equivalence_fixture(tin.path());
+        let opts = ExportOptions {
+            feature_id: Some("id".to_string()),
+            partition_wave: 2,
             ..Default::default()
         };
-        let report = export_pmtiles(tmp.path(), out.path(), &opts).unwrap();
-        assert!(report.total_tiles > 0);
+        let t_legacy = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles_impl(tin.path(), t_legacy.path(), &opts, 1, true, None).unwrap();
+        let legacy_bytes = std::fs::read(t_legacy.path()).unwrap();
+        let t_plain = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles_impl(
+            tin.path(),
+            t_plain.path(),
+            &ExportOptions {
+                feature_id: None,
+                ..opts.clone()
+            },
+            1,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read(t_plain.path()).unwrap(),
+            legacy_bytes,
+            "--feature-id must change the tiles (ids + the id tag moved out)"
+        );
+        for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+            let t_new = tempfile::NamedTempFile::new().unwrap();
+            export_pmtiles_impl(tin.path(), t_new.path(), &opts, 1, false, Some(backing)).unwrap();
+            assert_eq!(
+                std::fs::read(t_new.path()).unwrap(),
+                legacy_bytes,
+                "single-read ({backing:?}) diverges from legacy with --feature-id"
+            );
+        }
     }
 }

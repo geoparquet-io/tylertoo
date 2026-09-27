@@ -629,16 +629,22 @@ struct ExportPmtilesArgs {
     /// Matched against the property name as the tile publishes it -- the
     /// same naming `--feature-order` / `--include-property` /
     /// `--exclude-property` use -- and it always wins over those flags
-    /// naming the same column (harmless no-op, never an error). The column
-    /// must be an integer type and every value a non-null, non-negative
-    /// integer (MVT feature ids are `uint64`); a violation fails the export
-    /// naming the column and the offending row. The column is moved to the
-    /// id, never also published as a regular property (tippecanoe's
-    /// behaviour) -- repeat it under two names in the source data if both
-    /// are wanted.
+    /// naming the same column (harmless no-op, never an error).
     ///
-    /// Unset (the default) keeps the pre-#443 tile-local member index --
-    /// unique only within a single tile/zoom pair.
+    /// The column must be an integer type (or DECIMAL(p,0)) and every row of
+    /// the overview file must hold a non-null value in 0..=u64::MAX (MVT
+    /// feature ids are `uint64`). The whole column is checked before any
+    /// tile is written; a violation fails naming the column, the overview
+    /// file's row (not the source file's) and its level. String and float
+    /// ids are rejected, unlike tippecanoe: cast them to an integer first
+    /// (e.g. with gpio or DuckDB). The column is moved to the id, never also
+    /// published as a regular property (tippecanoe's behaviour) -- repeat it
+    /// under two names in the source data if both are wanted.
+    ///
+    /// Clusters carry their representative's id, coalesced lines their
+    /// highest-priority member's; duplicate ids are not checked. Unset (the
+    /// default) keeps the tile-local member index -- unique only within a
+    /// single tile/zoom pair.
     #[arg(long, value_name = "COLUMN")]
     feature_id: Option<String>,
 
@@ -1816,15 +1822,20 @@ struct TilesArgs {
     /// `--exclude-property` naming this column is instead a harmless no-op,
     /// since the id is always moved out of the properties regardless.
     ///
-    /// The column must be an integer type and every value a non-null,
-    /// non-negative integer (MVT feature ids are `uint64`); a violation fails
-    /// the export naming the column and the offending row. The column is
-    /// moved to the id, never also published as a regular property
-    /// (tippecanoe's behaviour) -- repeat it under two names in the source
-    /// data if both are wanted.
+    /// The column must be an integer type (or DECIMAL(p,0)) and every row of
+    /// the overview file must hold a non-null value in 0..=u64::MAX (MVT
+    /// feature ids are `uint64`). The whole column is checked before any
+    /// tile is written; a violation fails naming the column, the overview
+    /// file's row (not the source file's) and its level. String and float
+    /// ids are rejected, unlike tippecanoe: cast them to an integer first
+    /// (e.g. with gpio or DuckDB). The column is moved to the id, never also
+    /// published as a regular property (tippecanoe's behaviour) -- repeat it
+    /// under two names in the source data if both are wanted.
     ///
-    /// Unset (the default) keeps the pre-#443 tile-local member index --
-    /// unique only within a single tile/zoom pair.
+    /// It cannot also be an --accumulate-attribute column. Clusters carry
+    /// their representative's id, coalesced lines their highest-priority
+    /// member's; duplicate ids are not checked. Unset (the default) keeps the
+    /// tile-local member index -- unique only within a single tile/zoom pair.
     #[arg(long, value_name = "COLUMN")]
     feature_id: Option<String>,
 
@@ -2534,6 +2545,17 @@ fn reject_excluded_knob_columns(
             "property {name:?} is excluded but --feature-id reads it; keep it in the \
              selection or drop the flag"
         );
+        // A clustered point's accumulated value is a sum/min/max/mean of
+        // several ids -- the id of no feature. Export rejects it from the
+        // file's clustering provenance too; checking here saves the convert.
+        if let Some(spec) = options.accumulate.iter().find(|a| a.column == *name) {
+            anyhow::bail!(
+                "--feature-id column {name:?} is also --accumulate-attribute {name}:{}; a \
+                 cluster's aggregated value identifies no single feature, so accumulate a \
+                 different column",
+                spec.op.as_str()
+            );
+        }
     }
     Ok(())
 }
@@ -4135,10 +4157,12 @@ mod tests {
         assert!(Cli::try_parse_from(argv).is_err());
     }
 
-    /// #443: the flag has to actually reach `ExportOptions` on both
-    /// `tiles` and `export-pmtiles`, not just parse.
+    /// #443: the flag parses on both `tiles` and `export-pmtiles` (both
+    /// copy it verbatim into `ExportOptions::feature_id`; the end-to-end
+    /// behaviour is covered in `tests/tiles_facade.rs` and core's export
+    /// tests).
     #[test]
-    fn feature_id_flag_reaches_both_commands() {
+    fn feature_id_flag_parses_on_both_commands() {
         assert_eq!(parse_tiles(&[]).feature_id, None);
         assert_eq!(parse_export(&[]).feature_id, None);
 

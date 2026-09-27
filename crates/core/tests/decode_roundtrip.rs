@@ -32,6 +32,7 @@ use tylertoo_core::batch_processor::extract_geometries_from_array;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_core::overview::level::Mode;
 
 const MIN_ZOOM: u8 = 4;
 const MAX_ZOOM: u8 = 14;
@@ -286,6 +287,18 @@ fn decode_roundtrip_full_archive() {
 /// decoded feature came from).
 #[test]
 fn feature_id_column_is_stable_across_zooms_and_not_duplicated_as_a_property() {
+    assert_feature_id_roundtrip(Mode::Duplicating);
+}
+
+/// The same round trip in partitioning mode, whose export takes the
+/// single-read fan-out pass 2 (#235) -- members buffered in the member store
+/// between the read and the encode -- rather than the per-wave read.
+#[test]
+fn feature_id_roundtrip_partitioning_single_read() {
+    assert_feature_id_roundtrip(Mode::Partitioning);
+}
+
+fn assert_feature_id_roundtrip(mode: Mode) {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("fixture.parquet");
     let overviews = dir.path().join("fixture-overviews.parquet");
@@ -298,6 +311,7 @@ fn feature_id_column_is_stable_across_zooms_and_not_duplicated_as_a_property() {
             min_zoom: MIN_ZOOM,
             max_zoom: MAX_ZOOM,
         },
+        mode,
         ..Default::default()
     };
     convert_to_overviews(&input, &overviews, &convert_opts).unwrap();
@@ -357,7 +371,8 @@ fn feature_id_column_is_stable_across_zooms_and_not_duplicated_as_a_property() {
     assert!(rows_checked > 0);
     assert!(
         zooms_seen.len() >= 2,
-        "fixture must span multiple zoom levels to prove cross-zoom stability, saw {zooms_seen:?}"
+        "{mode:?}: fixture must span multiple zoom levels to prove cross-zoom stability, saw \
+         {zooms_seen:?}"
     );
 }
 

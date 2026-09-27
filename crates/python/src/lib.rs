@@ -875,14 +875,19 @@ fn overview(
 ///         MVT feature ``id`` on every tile the feature appears in, at every
 ///         zoom (#443; tippecanoe's ``--use-attribute-for-id``), so MapLibre
 ///         ``setFeatureState`` (hover, selection, joins) keys correctly
-///         across tile and zoom boundaries. Matched against the property
-///         name as the tile publishes it. The column must be an integer
-///         type and every value a non-null, non-negative integer (MVT
-///         feature ids are ``uint64``); a violation raises ``RuntimeError``
-///         naming the column and the offending row. The column is moved to
-///         the id, never also published as a regular property. Defaults to
-///         None, which keeps the pre-#443 tile-local member index (unique
-///         only within a single tile/zoom pair).
+///         across tile and zoom boundaries without ``promoteId``. Matched against
+///         the property name as the tile publishes it. The column must be an
+///         integer type (or ``DECIMAL(p,0)``) and every row of the overview
+///         file a non-null value in ``0..=2**64-1``; the whole column is
+///         checked before any tile is written, and a violation raises
+///         ``RuntimeError`` naming the column and the overview file's row
+///         and level. String and float ids are rejected (unlike tippecanoe):
+///         cast them to an integer first. The column is moved to the id,
+///         never also published as a regular property. Clusters carry their
+///         representative's id and coalesced lines their highest-priority
+///         member's; duplicate ids are not checked. Defaults to None, which
+///         keeps the tile-local member index (unique only within a single
+///         tile/zoom pair). Not available on ``convert()``.
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"

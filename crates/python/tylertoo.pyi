@@ -78,5 +78,6 @@ def export_pmtiles(
     partition_wave: int = 0,
     feature_order: str = "input",
     min_zoom: int | None = None,
+    feature_id: str | None = None,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
