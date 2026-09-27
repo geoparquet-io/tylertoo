@@ -128,15 +128,23 @@ Sundays, or `gh workflow run mutation-tests.yml`) runs `cargo mutants` on
 `tylertoo-core` under the `quick` tier too: `.cargo/mutants.toml` sets
 `test_tool = "nextest"`, so marking a test slow in `nextest.toml` also
 drops it from every mutant's test run. The ~8200 mutants are split over
-a `--shard k/n` matrix (`SHARD_COUNT` in the workflow) so each shard
-fits GitHub's 6-hour job limit; a `report` job sums the shards'
-`outcomes.json` into one score. The job is advisory — missed mutants and
-timeouts show up as the mutation score in the job summary, not as a red
-run — but a run that could not measure everything (a baseline failure,
-which needs the `geometry-test-data` submodule and the realdata
-fixtures, or a shard hitting its time limit) opens or updates a pinned
-`mutation-tests` issue. To reproduce locally, with the submodule and
-fixtures in place:
+a `--shard k/n` matrix (`SHARD_COUNT` in the workflow, sized from
+measured shard durations so each shard finishes well inside its
+350-minute limit); a `report` job sums the shards' `outcomes.json` into
+one score. Each shard runs cargo-mutants inside a cgroup with a memory
+cap (`MUTANTS_MEMORY_MAX`): a mutant that turns a loop's advance into a
+no-op allocates without bound and would otherwise take the whole runner
+VM down (#602), whereas under the cap the kernel kills just that test
+process and the mutant counts as caught. The job is advisory — missed
+mutants and timeouts show up as the mutation score in the job summary,
+not as a red run — but a run that could not measure everything (a
+baseline failure, which needs the `geometry-test-data` submodule and
+the realdata fixtures, a lost runner, or a shard hitting its time
+limit) opens or updates a pinned `mutation-tests` issue that lists each
+shard's outcome (failed, timed out, or cancelled early by hand). To
+verify a workflow fix without a full sweep, dispatch a subset of
+shards: `gh workflow run mutation-tests.yml -f shard_list=0,1`. To
+reproduce locally, with the submodule and fixtures in place:
 
 ```bash
 cargo install cargo-mutants cargo-nextest --locked
