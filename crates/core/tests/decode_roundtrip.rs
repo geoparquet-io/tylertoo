@@ -3,8 +3,10 @@
 //! Round-trips through the real production pipeline: fixture GeoParquet →
 //! `convert_to_overviews` → `export_pmtiles` → `decode_pmtiles` → read the
 //! output GeoParquet and verify coordinates, provenance columns, properties
-//! and filters. Plus a golden comparison against `tippecanoe-decode` when
-//! that binary is available (skipped gracefully otherwise).
+//! and filters. Plus a golden comparison against `tippecanoe-decode`, which
+//! skips (with the remedy printed) when that binary is absent from a working
+//! copy and FAILS on CI, where the pinned tippecanoe is installed by the
+//! workflow (#420).
 //!
 //! Run with:
 //!   cargo test --package tylertoo-core --test decode_roundtrip -- --nocapture
@@ -566,13 +568,28 @@ fn collect_positions(value: &serde_json::Value, out: &mut Vec<(f64, f64)>) {
 
 #[test]
 fn decode_golden_against_tippecanoe_decode() {
-    // Skip gracefully when the reference binary is unavailable.
+    // Skip on a working copy without the reference binary, but not on CI:
+    // the same rule `tests/support/fixture.rs` applies to the real-data
+    // fixtures (#369). A skip that CI treats as `ok` is coverage that is
+    // gone — this test never ran in CI for as long as it skipped silently
+    // (#420). The CI workflows put the pinned tippecanoe build
+    // (`benchmarks/e2e/setup_tippecanoe.sh`) on PATH before running the
+    // test suite, so on CI an absent `tippecanoe-decode` means that step
+    // or its cache is broken.
     if Command::new("tippecanoe-decode")
         .arg("--version")
         .output()
         .is_err()
     {
-        eprintln!("tippecanoe-decode not available, skipping golden comparison");
+        let remedy = "tippecanoe-decode not on PATH.\n  Build the pinned \
+             tippecanoe and put it on PATH with:\n    \
+             benchmarks/e2e/setup_tippecanoe.sh\n    \
+             eval \"$(benchmarks/e2e/setup_tippecanoe.sh --print-path)\"";
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must not skip the tippecanoe-decode golden comparison: {remedy}"
+        );
+        eprintln!("Skipping: {remedy}");
         return;
     }
 
