@@ -1654,6 +1654,16 @@ it. An explicit `--include-property coalesced_count` on export wins over the
 1-everywhere withholding (#379): the column is in the file, and naming it is
 not a typo.
 
+**Column types** (#434): struct, list and map columns are exported as JSON
+strings (tippecanoe's convention for nested attributes), so
+`--include-property names` on an Overture file keeps the whole `names`
+struct as one string property. A column with no MVT encoding at all (a
+binary column) is dropped with one warning per column, listed in the export
+report's `skipped_property_columns`, and rejected by name if
+`--include-property` asks for it; `--exclude-property` naming it silences
+the warning. The full type table is in
+[preparing input](diving-deeper/preparing-input.md#design-decisions).
+
 ---
 
 ## Performance profiles: `--profile`, `--in-flight-batches`, `--read-workers`

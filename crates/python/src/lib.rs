@@ -1010,7 +1010,8 @@ fn overview(
 ///     "tile_count", "tile_feature_count", "oversized_tiles",
 ///     "encode_dropped_features", "encode_quantized_features"), "total_tiles",
 ///     "total_tile_features", "oversized_tiles", "encode_dropped_features",
-///     "encode_quantized_features", "duration_secs".
+///     "encode_quantized_features", "skipped_property_columns",
+///     "duration_secs".
 ///     ``encode_dropped_features`` counts tile members with nothing to encode
 ///     (empty geometries, empty GeometryCollections); non-zero means content
 ///     was lost after clipping, and a warning names the total.
@@ -1018,6 +1019,12 @@ fn overview(
 ///     collapsed at the tile extent (zero-area polygon rings, lines of fewer
 ///     than two points, typically clip slivers at a buffered tile edge);
 ///     expected on ordinary data and never a warning.
+///     ``skipped_property_columns`` is a list of dicts with "name" and
+///     "data_type": the property columns the export dropped because their
+///     Arrow type has no MVT encoding, such as a binary column; each is also
+///     warned about once. Struct, list and map columns are not dropped: they
+///     reach the tiles as JSON strings, the tippecanoe convention for nested
+///     attributes.
 ///
 /// Raises:
 ///     RuntimeError: The export failed (not an overview file, unsupported
@@ -1094,6 +1101,14 @@ fn export_pmtiles(
     dict.set_item("total_tiles", report.total_tiles)?;
     dict.set_item("total_tile_features", report.total_tile_features)?;
     dict.set_item("oversized_tiles", report.oversized_tiles)?;
+    let skipped = PyList::empty(py);
+    for col in &report.skipped_property_columns {
+        let d = PyDict::new(py);
+        d.set_item("name", &col.name)?;
+        d.set_item("data_type", &col.data_type)?;
+        skipped.append(d)?;
+    }
+    dict.set_item("skipped_property_columns", skipped)?;
     dict.set_item("encode_dropped_features", report.encode_dropped_features)?;
     dict.set_item(
         "encode_quantized_features",

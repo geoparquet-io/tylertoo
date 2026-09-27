@@ -5,6 +5,9 @@ plumbing (one happy-path test per knob group), error propagation, and
 output-file validity via the validate() checklist.
 """
 
+import gzip
+import json
+import struct
 import tempfile
 from pathlib import Path
 
@@ -723,3 +726,54 @@ class TestFeatureOrder:
             out = Path(tmpdir) / "out.pmtiles"
             tylertoo.convert(str(BUILDINGS), str(out), max_zoom=1, feature_order=spec)
             assert out.stat().st_size > 0
+
+
+OVERTURE_NAMES = FIXTURES_DIR / "properties" / "overture-names.parquet"
+
+needs_overture_names = pytest.mark.skipif(
+    not OVERTURE_NAMES.exists(), reason="overture-names.parquet fixture not available"
+)
+
+
+def _archive_metadata(path):
+    """The PMTiles v3 JSON metadata block (offset/length at header bytes 24..40)."""
+    buf = Path(path).read_bytes()
+    off, length = struct.unpack_from("<QQ", buf, 24)
+    return json.loads(gzip.decompress(buf[off : off + length]))
+
+
+class TestNestedProperties:
+    """#434: an Overture-shaped input (`names` struct, `sources` list, a
+    binary column) keeps its nested columns as JSON strings and reports the
+    binary column it had to drop.
+    """
+
+    @needs_overture_names
+    def test_names_struct_survives_as_a_json_string_and_binary_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ovr = Path(tmpdir) / "overview.parquet"
+            pm = Path(tmpdir) / "out.pmtiles"
+            tylertoo.overview(str(OVERTURE_NAMES), str(ovr), max_zoom=8)
+            report = tylertoo.export_pmtiles(str(ovr), str(pm))
+
+            assert report["skipped_property_columns"] == [
+                {"name": "raw", "data_type": "Binary"}
+            ]
+
+            fields = {}
+            for layer in _archive_metadata(pm)["vector_layers"]:
+                fields.update(layer["fields"])
+            assert fields["names"] == "String"
+            assert fields["sources"] == "String"
+            assert fields["id"] == "Number"
+            assert "raw" not in fields
+            assert "bbox" not in fields
+
+    @needs_buildings
+    def test_a_scalar_only_export_reports_no_skipped_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ovr = Path(tmpdir) / "overview.parquet"
+            pm = Path(tmpdir) / "out.pmtiles"
+            tylertoo.overview(str(BUILDINGS), str(ovr), min_zoom=11, max_zoom=12)
+            report = tylertoo.export_pmtiles(str(ovr), str(pm))
+            assert report["skipped_property_columns"] == []
