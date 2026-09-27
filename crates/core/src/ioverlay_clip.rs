@@ -1,4 +1,9 @@
-//! i_overlay-based polygon clipping for robust tile boundary clipping.
+//! i_overlay-based polygon and line clipping for robust tile boundary clipping.
+//!
+//! This is the ONE boolean-ops engine tylertoo clips with (#435): the polygon
+//! fallback, the line clipper and the #383 polygon repair all run on the
+//! crate's direct `i_overlay` dependency. `geo` 0.33 vendors its own, older
+//! `i_overlay` for `BooleanOps`; nothing here or in `clip.rs` calls it.
 //!
 //! This module provides clipping functions using i_overlay's boolean operations
 //! for robust polygon clipping. Unlike wagyu which operates in integer coordinates,
@@ -31,10 +36,12 @@
 //! the overhead of coordinate conversion that wagyu requires.
 
 use crate::tile::TileBounds;
-use geo::{BoundingRect, Coord, Geometry, LineString, MultiPolygon, Polygon};
+use geo::{BoundingRect, Coord, Geometry, LineString, MultiLineString, MultiPolygon, Polygon};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::clip::FloatClip;
 use i_overlay::float::overlay::FloatOverlay;
+use i_overlay::string::clip::ClipRule;
 
 // ============================================================================
 // Type Aliases
@@ -220,8 +227,8 @@ pub fn clip_polygon_ioverlay(poly: &Polygon<f64>, bounds: &TileBounds) -> Option
 
     // Perform intersection using EvenOdd fill rule
     // EvenOdd correctly handles self-intersecting polygons
-    // Note: geo 0.32 pins i_overlay to 4.0.x which lacks OverlayOptions::ogc(),
-    // but Default options with EvenOdd fill rule achieve the same valid output.
+    // Default options with the EvenOdd fill rule give valid (OGC-style) output;
+    // `OverlayOptions::ogc()` is not needed for a rectangle clip.
     let mut overlay = FloatOverlay::with_subj_and_clip_custom(
         &[subj],
         &[clip],
@@ -263,8 +270,8 @@ pub fn clip_multipolygon_ioverlay(
     let clip = bounds_to_clip_box(bounds);
 
     // Perform intersection using default options
-    // Note: geo 0.32 pins i_overlay to 4.0.x which lacks OverlayOptions::ogc(),
-    // but Default options with EvenOdd fill rule achieve the same valid output.
+    // Default options with the EvenOdd fill rule give valid (OGC-style) output;
+    // `OverlayOptions::ogc()` is not needed for a rectangle clip.
     let mut overlay = FloatOverlay::with_subj_and_clip_custom(
         &subj_shapes,
         &[clip],
@@ -274,6 +281,59 @@ pub fn clip_multipolygon_ioverlay(
     let result: IOverlayShapes = overlay.overlay(OverlayRule::Intersect, FillRule::EvenOdd);
 
     ioverlay_to_geometry(result)
+}
+
+/// Clip a MultiLineString to tile bounds using i_overlay's string clipping
+/// (#435).
+///
+/// This is the line counterpart of [`clip_polygon_ioverlay`], and the drop-in
+/// replacement for `geo::BooleanOps::clip(&mls, false)`: the same operation
+/// (`FillRule::EvenOdd`, boundary included, not inverted, open clip contour)
+/// on our direct `i_overlay` instead of the 4.x copy `geo` 0.33 vendors, so
+/// lines and polygons are clipped by ONE engine. Each input line is one
+/// subject path; the bounds rectangle is the clip contour.
+///
+/// Output parts are whatever the engine emits: pieces of the input lines
+/// that lie inside or on the bounds, in the engine's own order, with
+/// zero-length pieces and consecutive duplicate vertices dropped. A part
+/// can be split at an interior vertex where the engine nodes it (see the
+/// pinned cases in `tests/line_clip_pinned.rs`). An empty result means
+/// nothing of the input lies within the bounds.
+pub fn clip_multilinestring_ioverlay(
+    mls: &MultiLineString<f64>,
+    bounds: &TileBounds,
+) -> MultiLineString<f64> {
+    if mls.0.is_empty() {
+        return MultiLineString::new(Vec::new());
+    }
+
+    let subject: Vec<IOverlayContour> = mls
+        .0
+        .iter()
+        .map(|ls| ls.0.iter().map(|c| [c.x, c.y]).collect())
+        .collect();
+
+    // Open contour: i_overlay closes it implicitly, as geo's
+    // `ring_to_shape_path` does when it strips a ring's closing vertex.
+    let clip: IOverlayContour = vec![
+        [bounds.lng_min, bounds.lat_min],
+        [bounds.lng_max, bounds.lat_min],
+        [bounds.lng_max, bounds.lat_max],
+        [bounds.lng_min, bounds.lat_max],
+    ];
+
+    let clip_rule = ClipRule {
+        invert: false,
+        boundary_included: true,
+    };
+    let paths = subject.clip_by(&clip, FillRule::EvenOdd, clip_rule);
+
+    MultiLineString::new(
+        paths
+            .into_iter()
+            .map(|path| LineString::new(path.into_iter().map(|[x, y]| Coord { x, y }).collect()))
+            .collect(),
+    )
 }
 
 /// Union several polygons (whose exteriors all wind the same way and whose
@@ -531,5 +591,86 @@ mod tests {
             }
             _ => panic!("Expected MultiPolygon"),
         }
+    }
+
+    // ========== Line clipping (#435) ==========
+
+    fn line_parts(m: &MultiLineString<f64>) -> Vec<Vec<(f64, f64)>> {
+        m.0.iter()
+            .map(|l| l.0.iter().map(|c| (c.x, c.y)).collect())
+            .collect()
+    }
+
+    fn lines(parts: &[&[(f64, f64)]]) -> MultiLineString<f64> {
+        MultiLineString::new(parts.iter().map(|p| LineString::from(p.to_vec())).collect())
+    }
+
+    #[test]
+    fn test_clip_lines_crossing_is_trimmed() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(&lines(&[&[(-5.0, 5.0), (15.0, 5.0)]]), &bounds);
+        assert_eq!(line_parts(&out), vec![vec![(0.0, 5.0), (10.0, 5.0)]]);
+    }
+
+    #[test]
+    fn test_clip_lines_outside_is_empty() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(&lines(&[&[(20.0, 20.0), (30.0, 30.0)]]), &bounds);
+        assert!(out.0.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn test_clip_lines_collinear_with_edge_is_kept() {
+        // boundary_included: a run along the bottom edge survives.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(&lines(&[&[(-5.0, 0.0), (15.0, 0.0)]]), &bounds);
+        assert_eq!(line_parts(&out), vec![vec![(0.0, 0.0), (10.0, 0.0)]]);
+    }
+
+    #[test]
+    fn test_clip_lines_corner_graze_is_dropped() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(&lines(&[&[(-5.0, 5.0), (5.0, -5.0)]]), &bounds);
+        assert!(out.0.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn test_clip_lines_re_entering_matches_pinned_baseline() {
+        // Same case as `line_clip_pinned::line_exiting_and_re_entering_is_split_at_the_bounds`:
+        // the geo/i_overlay-4 baseline broke the re-entering run at (7,5).
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(
+            &lines(&[&[
+                (-5.0, 5.0),
+                (3.0, 5.0),
+                (3.0, 15.0),
+                (7.0, 15.0),
+                (7.0, 5.0),
+                (15.0, 5.0),
+            ]]),
+            &bounds,
+        );
+        assert_eq!(
+            line_parts(&out),
+            vec![
+                vec![(0.0, 5.0), (3.0, 5.0), (3.0, 10.0)],
+                vec![(7.0, 10.0), (7.0, 5.0)],
+                vec![(7.0, 5.0), (10.0, 5.0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_clip_lines_zero_length_is_dropped() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(&lines(&[&[(5.0, 5.0), (5.0, 5.0)]]), &bounds);
+        assert!(out.0.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn test_clip_lines_empty_input_is_empty() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(&MultiLineString::new(vec![]), &bounds);
+        assert!(out.0.is_empty());
     }
 }

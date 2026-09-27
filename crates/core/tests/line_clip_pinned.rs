@@ -18,7 +18,16 @@
 //!    an xxh3 over every output coordinate's bits.
 //!
 //! If a change to the line clipper moves any of these, the PR must say why
-//! (see `context/ARCHITECTURE.md`, "Line clipping engine").
+//! (see `context/ARCHITECTURE.md`, "One boolean-ops engine").
+//!
+//! Re-pin history:
+//! - #435 (the switch itself): every hand-built case stayed coordinate-
+//!   identical. The two sweep digests moved — same kept/part/vertex counts,
+//!   but ~half the vertices differ by exactly one unit of i_overlay's
+//!   float→integer grid (2^-34..2^-36 degrees, max 2.3e-10), four to five
+//!   orders of magnitude under an MVT unit at z14. The digests below are the
+//!   i_overlay-9 values; the pre-switch ones were
+//!   z12 0xbb55_0c07_303c_8bbe and z14 0xd28a_ce50_39c3_0db2.
 //!
 //! Run with:
 //!   cargo test --package tylertoo-core --test line_clip_pinned -- --nocapture
@@ -393,7 +402,7 @@ fn road_detections_z12_sweep_is_pinned() {
             kept: 1031,
             parts: 1141,
             vertices: 5679,
-            digest: 0xbb55_0c07_303c_8bbe,
+            digest: 0xf12c_06cb_932b_1dfc,
         }
     );
 }
@@ -406,7 +415,7 @@ fn road_detections_z14_sweep_is_pinned() {
             kept: 1120,
             parts: 1239,
             vertices: 5957,
-            digest: 0xd28a_ce50_39c3_0db2,
+            digest: 0x82be_2b5a_25d7_a6ad,
         }
     );
 }
