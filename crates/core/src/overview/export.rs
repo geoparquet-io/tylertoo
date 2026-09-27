@@ -4656,15 +4656,13 @@ impl PublishedNames {
                     // #434: a column that IS in the file but has no MVT
                     // encoding gets its own message; "unknown" would send
                     // the caller looking for a typo that is not there.
-                    if let Some(f) = schema
-                        .fields()
-                        .iter()
-                        .enumerate()
-                        .filter(|&(i, f)| {
-                            i != geom_idx && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
-                        })
-                        .map(|(_, f)| f)
-                        .find(|f| self.publish(f.name()) == name && !self.is_suppressed(f.name()))
+                    // Scanned over the same candidates `property_columns`
+                    // draws from, so the bbox covering struct (index
+                    // metadata, never a property) falls through to
+                    // "unknown" rather than being called an unencodable
+                    // struct.
+                    if let Some((_, f)) = candidate_columns(schema, geom_idx, &self)
+                        .find(|(_, f)| self.publish(f.name()) == name)
                     {
                         return Err(ExportError::UnsupportedProperty {
                             name: name.clone(),
@@ -4927,6 +4925,16 @@ fn is_supported_scalar(dt: &DataType) -> bool {
 /// [`extract_property_column`]'s own scalar rules; a leaf type without one
 /// (binary, an unrenderable timezone) renders as JSON `null` rather than
 /// dropping the whole column.
+/// Whether a (possibly dictionary-encoded) type renders as a JSON string,
+/// i.e. can key a JSON object.
+fn is_string_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::Dictionary(_, value) => is_string_type(value),
+        _ => false,
+    }
+}
+
 fn is_json_encoded(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -5267,12 +5275,15 @@ enum JsonNode {
         array: arrow_array::ArrayRef,
         values: Box<JsonNode>,
     },
-    /// A map: `offsets[i]..offsets[i + 1]` of `(key, value)` pairs. String
-    /// keys make a JSON object; any other key type makes an array of
-    /// two-element arrays, since JSON object keys can only be strings.
+    /// A map: `offsets[i]..offsets[i + 1]` of `(key, value)` pairs. A
+    /// string key TYPE makes a JSON object; any other key type makes an
+    /// array of two-element arrays, since JSON object keys can only be
+    /// strings. Decided once per column from the type (`string_keys`), so
+    /// every row and every batch agree on the shape.
     Map {
         offsets: Vec<usize>,
         array: arrow_array::ArrayRef,
+        string_keys: bool,
         keys: Box<JsonNode>,
         values: Box<JsonNode>,
     },
@@ -5321,10 +5332,23 @@ impl JsonNode {
                 JsonNode::Map {
                     offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
                     array: arrow_array::make_array(col.to_data()),
+                    // Decided once from the key TYPE, not from the values:
+                    // every row of the batch (and every batch of the column)
+                    // then takes the same shape, and a key type with no
+                    // rendering (binary) cannot masquerade as strings.
+                    string_keys: is_string_type(a.keys().data_type()),
                     keys: Box::new(JsonNode::resolve(a.keys().as_ref())),
                     values: Box::new(JsonNode::resolve(a.values().as_ref())),
                 }
             }
+            // Unwrapped HERE, not through the leaf's own dictionary arm: a
+            // dictionary over a struct or list must resolve into a nested
+            // node, or its values would be JSON-stringified as a column of
+            // their own and then embedded as string literals (double-encoded).
+            DataType::Dictionary(_, value) => match arrow_cast::cast(col, value) {
+                Ok(flat) => JsonNode::resolve(flat.as_ref()),
+                Err(_) => JsonNode::Leaf(vec![None; col.len()]),
+            },
             _ => JsonNode::Leaf(extract_property_column(col)),
         }
     }
@@ -5378,19 +5402,25 @@ impl JsonNode {
             }
             JsonNode::Map {
                 offsets,
+                string_keys,
                 keys,
                 values,
                 ..
             } => {
-                let string_keys = matches!(keys.as_ref(), JsonNode::Leaf(v)
-                    if v.iter().flatten().all(|k| matches!(k, PropertyValue::String(_))));
+                let string_keys = *string_keys;
                 out.push(if string_keys { b'{' } else { b'[' });
                 for (k, j) in (offsets[i]..offsets[i + 1]).enumerate() {
                     if k > 0 {
                         out.push(b',');
                     }
                     if string_keys {
-                        keys.write(out, j);
+                        // Arrow forbids null map keys; if one ever arrives,
+                        // a quoted "null" keeps the object valid JSON.
+                        if keys.is_null(j) {
+                            write_json_str(out, "null");
+                        } else {
+                            keys.write(out, j);
+                        }
                         out.push(b':');
                         values.write(out, j);
                     } else {
@@ -7708,6 +7738,96 @@ mod tests {
             }
             other => panic!("expected UnsupportedProperty, got {other:?}"),
         }
+
+        // The file's bbox covering struct is index metadata, not a
+        // property: asking for it is "unknown", never "an unencodable
+        // struct" -- structs ARE encodable, and that message would lie.
+        let opts = ExportOptions {
+            properties: PropertySelection {
+                include: Some(vec!["bbox".to_string()]),
+                ..Default::default()
+            },
+            ..ExportOptions::default()
+        };
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
+        assert!(
+            matches!(&err, ExportError::UnknownProperty { name, .. } if name == "bbox"),
+            "the covering must be unknown as a property, got {err:?}"
+        );
+    }
+
+    /// #434 review: the map shape is decided from the key TYPE. A binary
+    /// key has no rendering, so it must not be mistaken for a string key
+    /// (`{null:"x"}` is not JSON); it renders as pairs with `null` keys,
+    /// and the output parses.
+    #[test]
+    fn binary_keyed_map_renders_as_pairs_and_stays_valid_json() {
+        use arrow_array::builder::{BinaryBuilder, MapBuilder, StringBuilder};
+
+        let mut m = MapBuilder::new(None, BinaryBuilder::new(), StringBuilder::new());
+        m.keys().append_value(b"k1");
+        m.values().append_value("x");
+        m.keys().append_value(b"k2");
+        m.values().append_value("y");
+        m.append(true).unwrap();
+        m.append(true).unwrap(); // empty map
+        let m = m.finish();
+        let got = extract_property_column(&m);
+        let rendered: Vec<&str> = got
+            .iter()
+            .map(|v| match v {
+                Some(PropertyValue::String(s)) => s.as_str(),
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(rendered, vec![r#"[[null,"x"],[null,"y"]]"#, "[]"]);
+        for s in &rendered {
+            serde_json::from_str::<serde_json::Value>(s).expect("valid JSON");
+        }
+        // The empty row alone must take the same (array) shape: the choice
+        // does not depend on which keys a batch happens to hold.
+        let empty_only = m.slice(1, 1);
+        assert_eq!(
+            extract_property_column(&empty_only)[0],
+            Some(PropertyValue::String("[]".to_string()))
+        );
+    }
+
+    /// #434 review: a dictionary-encoded struct nested in a list must
+    /// resolve into a nested node, not be stringified as its own column and
+    /// embedded as a string literal (double-encoded).
+    #[test]
+    fn dictionary_encoded_struct_inside_a_list_is_not_double_encoded() {
+        use arrow_array::types::Int8Type;
+        use arrow_array::{DictionaryArray, Int32Array, Int8Array, ListArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+
+        let values = StructArray::from(vec![(
+            Arc::new(Field::new("n", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        )]);
+        let dict = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(1), Some(0), None]),
+            Arc::new(values),
+        )
+        .unwrap();
+        let item = Arc::new(Field::new("item", dict.data_type().clone(), true));
+        let list = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([3, 0]),
+            Arc::new(dict),
+            None,
+        );
+        let got = extract_property_column(&list);
+        assert_eq!(
+            got[0],
+            Some(PropertyValue::String(
+                r#"[{"n":20},{"n":10},null]"#.to_string()
+            )),
+            "nested struct values must be JSON values, not string literals"
+        );
+        assert_eq!(got[1], Some(PropertyValue::String("[]".to_string())));
     }
 
     /// #434: the JSON rendering, value by value. Nulls inside a struct are
