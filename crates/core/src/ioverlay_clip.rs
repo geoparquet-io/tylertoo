@@ -283,6 +283,12 @@ pub fn clip_multipolygon_ioverlay(
     ioverlay_to_geometry(result)
 }
 
+/// Largest coordinate magnitude handed to i_overlay's float adapter. i_float 5
+/// documents 2^500 (about 3.3e150) as the f64 limit of
+/// `FloatPointAdapter::new` and panics beyond it; the margin keeps the
+/// extent's centre/radius arithmetic finite too.
+const IOVERLAY_MAX_ABS_COORD: f64 = 1e150;
+
 /// Clip a MultiLineString to tile bounds using i_overlay's string clipping
 /// (#435).
 ///
@@ -299,11 +305,23 @@ pub fn clip_multipolygon_ioverlay(
 /// can be split at an interior vertex where the engine nodes it (see the
 /// pinned cases in `tests/line_clip_pinned.rs`). An empty result means
 /// nothing of the input lies within the bounds.
-pub fn clip_multilinestring_ioverlay(
+pub(crate) fn clip_multilinestring_ioverlay(
     mls: &MultiLineString<f64>,
     bounds: &TileBounds,
 ) -> MultiLineString<f64> {
-    if mls.0.is_empty() {
+    // i_float 5's adapter panics ("Invalid adapter bounds") when the
+    // combined extent is non-finite or a coordinate magnitude exceeds 2^500
+    // (its documented f64 limit). The geo path returned nothing for such
+    // input; keep that contract. `bounds` are lon/lat, so only the subject
+    // can trip it.
+    let representable = |v: f64| v.is_finite() && v.abs() < IOVERLAY_MAX_ABS_COORD;
+    if mls.0.is_empty()
+        || !mls
+            .0
+            .iter()
+            .flat_map(|ls| ls.0.iter())
+            .all(|c| representable(c.x) && representable(c.y))
+    {
         return MultiLineString::new(Vec::new());
     }
 
@@ -672,5 +690,46 @@ mod tests {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         let out = clip_multilinestring_ioverlay(&MultiLineString::new(vec![]), &bounds);
         assert!(out.0.is_empty());
+    }
+
+    #[test]
+    fn test_clip_lines_non_finite_coordinate_yields_empty() {
+        // i_float 5's adapter panics ("Invalid adapter bounds") on a
+        // non-finite extent; the geo path returned nothing. Keep returning
+        // nothing.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let out = clip_multilinestring_ioverlay(
+                &lines(&[&[(5.0, 5.0), (bad, 5.0)], &[(2.0, 2.0), (8.0, 8.0)]]),
+                &bounds,
+            );
+            assert!(out.0.is_empty(), "{bad}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn test_clip_lines_astronomical_coordinate_yields_empty() {
+        // Finite but beyond the adapter's 2^500 limit: same panic, same
+        // guard.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for bad in [1e300, -1e300, f64::MAX] {
+            let out = clip_multilinestring_ioverlay(&lines(&[&[(5.0, 5.0), (5.0, bad)]]), &bounds);
+            assert!(out.0.is_empty(), "{bad}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn test_clip_lines_far_but_sane_coordinate_still_clips() {
+        // Well inside the guard: the engine must still run, not be
+        // short-circuited.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let out = clip_multilinestring_ioverlay(&lines(&[&[(-1e6, 5.0), (1e6, 5.0)]]), &bounds);
+        assert_eq!(line_parts(&out), vec![vec![(0.0, 5.0), (10.0, 5.0)]]);
+    }
+
+    #[test]
+    fn ioverlay_max_abs_coord_is_under_the_adapter_limit() {
+        assert!(IOVERLAY_MAX_ABS_COORD < 2f64.powi(500));
+        assert!(IOVERLAY_MAX_ABS_COORD > 2f64.powi(498));
     }
 }

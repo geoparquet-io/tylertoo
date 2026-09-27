@@ -394,28 +394,50 @@ fn sweep(zoom: u8) -> Sweep {
     s
 }
 
+/// Counts are pinned on every platform. The coordinate digest is pinned on
+/// Linux only: tile bounds come from `sinh().atan()` (libm), which differs
+/// by an ulp between platforms, and that ulp reaches the clipped boundary
+/// intersections (macOS: z14 digest 0x1d03_35aa_b999_f979 with identical
+/// counts). A grid-rounded digest was rejected: a 1-ulp shift straddles a
+/// rounding boundary often enough over ~12k coordinates to flake.
+fn assert_sweep(got: Sweep, want: Sweep) {
+    assert_eq!(
+        (got.kept, got.parts, got.vertices),
+        (want.kept, want.parts, want.vertices),
+        "counts: got {got:?}, want {want:?}"
+    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            got.digest, want.digest,
+            "digest: got {got:?}, want {want:?}"
+        );
+    } else {
+        eprintln!("digest not pinned on this platform: {got:?}");
+    }
+}
+
 #[test]
 fn road_detections_z12_sweep_is_pinned() {
-    assert_eq!(
+    assert_sweep(
         sweep(12),
         Sweep {
             kept: 1031,
             parts: 1141,
             vertices: 5679,
             digest: 0xf12c_06cb_932b_1dfc,
-        }
+        },
     );
 }
 
 #[test]
 fn road_detections_z14_sweep_is_pinned() {
-    assert_eq!(
+    assert_sweep(
         sweep(14),
         Sweep {
             kept: 1120,
             parts: 1239,
             vertices: 5957,
             digest: 0x82be_2b5a_25d7_a6ad,
-        }
+        },
     );
 }

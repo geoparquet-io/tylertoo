@@ -576,7 +576,23 @@ path was already snapping every line vertex to that grid; the new one lands
 on the adjacent cell. That is four to five orders of magnitude below one MVT
 unit at z14 (≈5.4e-6 °), so a quantized tile coordinate can only move on an
 exact rounding tie. An end-to-end A/B (main vs this branch, `tiles` over `road-detections.parquet`, z0–z14, 78 tiles) produced byte-identical archives. The sweep digests in `line_clip_pinned.rs` were
-re-pinned to the new engine for this reason; the counts did not change.
+re-pinned to the new engine for this reason; the counts did not change. The
+counts are pinned on every platform; the bit-exact digest only on Linux,
+because tile bounds come from `sinh().atan()` and libm differs by an ulp
+across platforms, which reaches the clipped intersections (macOS produced a
+different z14 digest with identical counts). A grid-rounded digest was
+rejected: over ~12k coordinates a 1-ulp shift straddles a rounding boundary
+often enough to flake.
+
+**Input guard:** i_float 5's adapter panics ("Invalid adapter bounds") when
+the subject's extent is non-finite or a coordinate magnitude exceeds its
+documented f64 limit of 2^500, where the `geo` path returned an empty
+result. `clip_multilinestring_ioverlay` checks every coordinate (finite and
+below `IOVERLAY_MAX_ABS_COORD` = 1e150) and returns empty before calling the
+engine, so a NaN/inf/1e300 vertex still yields "nothing to clip" rather than
+a panic. The polygon entry points (`clip_polygon_ioverlay` and friends) are
+not changed by #435 and carry no such guard; whether they need one is a
+separate question.
 
 **Residual duplicate:** `i_overlay` 4.5.2 stays in `Cargo.lock` because `geo`
 0.33.1 (the latest release at the time of writing) depends on it
