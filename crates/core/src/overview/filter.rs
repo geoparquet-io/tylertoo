@@ -230,7 +230,11 @@ impl FilterExpr {
 /// Parse a filter expression source string into a [`FilterExpr`].
 pub fn parse_filter(src: &str) -> Result<FilterExpr, FilterError> {
     let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     let expr = p.parse_or()?;
     if p.pos != p.tokens.len() {
         return Err(FilterError::Parse(format!(
@@ -429,12 +433,38 @@ fn tokenize(src: &str) -> Result<Vec<Token>, FilterError> {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Deepest `(` / `NOT` nesting `parse_filter` accepts.
+///
+/// The parser is recursive descent, one stack frame per level, and the
+/// source is user input: the `filter_expr` fuzz target (#424) overflowed the
+/// stack with a few hundred thousand `(`. Hand-written filters nest a
+/// handful deep; 100 leaves that a long way behind while keeping the stack
+/// bounded on every platform's default thread size.
+const MAX_NESTING_DEPTH: usize = 100;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current `(` / `NOT` nesting, checked against [`MAX_NESTING_DEPTH`].
+    depth: usize,
 }
 
 impl Parser {
+    /// Enter one nesting level, or fail once past [`MAX_NESTING_DEPTH`].
+    fn descend(&mut self) -> Result<(), FilterError> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(FilterError::Parse(format!(
+                "expression nests deeper than {MAX_NESTING_DEPTH} levels of '(' / NOT"
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn ascend(&mut self) {
+        self.depth -= 1;
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -486,10 +516,15 @@ impl Parser {
 
     fn parse_unary(&mut self) -> Result<FilterExpr, FilterError> {
         if self.eat(&Token::Not) {
-            return Ok(FilterExpr::Not(Box::new(self.parse_unary()?)));
+            self.descend()?;
+            let inner = self.parse_unary()?;
+            self.ascend();
+            return Ok(FilterExpr::Not(Box::new(inner)));
         }
         if self.eat(&Token::LParen) {
+            self.descend()?;
             let e = self.parse_or()?;
+            self.ascend();
             self.expect(Token::RParen, "')'")?;
             return Ok(e);
         }
@@ -1482,6 +1517,43 @@ mod tests {
         };
         assert!(matches!(*al, FilterExpr::Compare { .. }));
         assert!(matches!(*ar, FilterExpr::Not(_)));
+    }
+
+    /// Found by the `filter_expr` fuzz target (#424): the parser recursed
+    /// once per `(` and once per `NOT`, so a 200k-deep expression overflowed
+    /// the stack instead of coming back as a parse error. Nesting is now
+    /// capped at [`MAX_NESTING_DEPTH`]; anything a person would write stays
+    /// far below it.
+    #[test]
+    fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
+        let deep_parens = format!("{}a = 1{}", "(".repeat(200_000), ")".repeat(200_000));
+        let err = parse_filter(&deep_parens).unwrap_err();
+        assert!(
+            matches!(&err, FilterError::Parse(m) if m.contains("nest")),
+            "expected a nesting error, got {err}"
+        );
+
+        let deep_not = format!("{}a = 1", "NOT ".repeat(200_000));
+        let err = parse_filter(&deep_not).unwrap_err();
+        assert!(
+            matches!(&err, FilterError::Parse(m) if m.contains("nest")),
+            "expected a nesting error, got {err}"
+        );
+
+        // The cap is well above anything hand-written: exactly at the limit
+        // still parses, one past it does not.
+        let at_limit = format!(
+            "{}a = 1{}",
+            "(".repeat(MAX_NESTING_DEPTH),
+            ")".repeat(MAX_NESTING_DEPTH)
+        );
+        assert!(parse_filter(&at_limit).is_ok());
+        let past_limit = format!(
+            "{}a = 1{}",
+            "(".repeat(MAX_NESTING_DEPTH + 1),
+            ")".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        assert!(parse_filter(&past_limit).is_err());
     }
 
     #[test]

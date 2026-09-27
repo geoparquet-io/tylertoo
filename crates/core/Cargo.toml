@@ -15,6 +15,11 @@ categories.workspace = true
 [features]
 default = []
 dhat-heap = ["dhat"]
+# Fuzz hooks (#424): `#[doc(hidden)]` entry points that let the standalone
+# `fuzz/` crate reach parsers which are private on purpose (the MVT tile
+# decode inside `decode`, `pyramid::BandArchive`). Never enabled by default,
+# never part of the public API baseline; only `fuzz/Cargo.toml` turns it on.
+fuzzing = []
 # Remote input support: read GeoParquet directly from s3://, https://,
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.

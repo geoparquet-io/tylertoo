@@ -1,0 +1,217 @@
+# Nightly Fuzz — cargo-fuzz (libFuzzer) on the untrusted-bytes parsers.
+#
+# Purpose: the parsers in tylertoo-core that consume third-party bytes (a
+# PMTiles header and directory, an MVT tile body, a whole `--band` archive,
+# the footer JSON, WKB, the `--filter` grammar) get five minutes of libFuzzer
+# each, every night, seeded from fuzz/corpus/<target>/ (#424). #397's class
+# of bug — an archive-controlled count sizing an allocation — is what this
+# finds in minutes.
+#
+# The fuzz crate is a standalone workspace (fuzz/Cargo.toml), so nothing
+# here touches the per-PR build. One matrix job per target keeps a crash in
+# one parser from hiding the others' results; the `notify` job then opens or
+# updates a single pinned `fuzz` issue when any target failed, following the
+# mutation-tests.yml pattern.
+#
+# A crash uploads fuzz/artifacts/<target>/ (the reproducer input) as a job
+# artifact. Minimize it with `cargo +nightly fuzz tmin <target> <artifact>`
+# and turn it into a deterministic regression test in core — see
+# fuzz/README.md.
+
+name: Nightly Fuzz
+
+on:
+  schedule:
+    # Every day at 3 AM UTC (an hour after the Sunday mutation run starts).
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 'Seconds of fuzzing per target'
+        required: false
+        default: '300'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # cargo-fuzz needs nightly (-Z sanitizer). Pinned to the same nightly the
+  # public-api gate in ci.yml uses, so there is one nightly to bump.
+  NIGHTLY: nightly-2026-09-15
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - pmtiles_header
+          - pmtiles_directory
+          - mvt_decode
+          - band_archive
+          - filter_expr
+          - footer_json
+          - wkb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml') }}
+
+      - name: Cache fuzz build
+        # The fuzz crate has its own target dir (it is its own workspace) and
+        # its build is the expensive part: core with sanitizer
+        # instrumentation. Keyed on the nightly and the core sources, so a
+        # core change rebuilds and a corpus-only change does not.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/target
+          key: ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/core/**', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-fuzz
+
+      - name: Fuzz ${{ matrix.target }}
+        id: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          MAX_TOTAL_TIME: ${{ inputs.max_total_time || '300' }}
+        # The corpus dir is the committed seeds plus whatever this run
+        # discovers; it is not persisted between runs (a seed worth keeping
+        # is committed by hand). -timeout bounds one input, so a single slow
+        # case is a reported timeout rather than a job that never ends.
+        run: |
+          cargo "+$NIGHTLY" fuzz run "$TARGET" -- \
+            -max_total_time="$MAX_TOTAL_TIME" \
+            -timeout=60 \
+            -rss_limit_mb=2048
+        working-directory: fuzz
+
+      - name: Upload crash artifacts
+        if: failure() && steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/**
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+          OUTCOME: ${{ steps.fuzz.outcome }}
+        run: |
+          {
+            echo "## Fuzz \`$TARGET\`: $OUTCOME"
+            n=$(ls "fuzz/artifacts/$TARGET" 2>/dev/null | wc -l)
+            if [ "$n" -gt 0 ]; then
+              echo ""
+              echo "Crash inputs (in the \`fuzz-artifacts-$TARGET\` artifact):"
+              echo '```'
+              ls "fuzz/artifacts/$TARGET"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: Open or update the fuzz issue
+    runs-on: ubuntu-latest
+    needs: fuzz
+    if: always() && needs.fuzz.result == 'failure'
+    permissions:
+      contents: read
+      issues: write
+      # `gh run view --json jobs` lists this run's jobs to name the failures.
+      actions: read
+    steps:
+      - name: Open or update the fuzz issue
+        # Ported from mutation-tests.yml. Any failing target — a crash, a
+        # timeout, an OOM, or a build failure — gets one pinned `fuzz` issue
+        # that is updated, not duplicated, on every failing run.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Make sure the label exists (no-op if it already does).
+          gh label create fuzz \
+            --description "Automated nightly fuzz run failures" \
+            --color B60205 2>/dev/null || true
+
+          # Name the targets that failed so the issue is actionable without
+          # opening the run.
+          FAILED=$(gh run view "$GITHUB_RUN_ID" --json jobs \
+            --jq '[.jobs[] | select(.conclusion == "failure" and (.name | startswith("Fuzz "))) | .name | ltrimstr("Fuzz ")] | join(", ")')
+
+          TITLE="Nightly fuzz run is failing"
+          BODY="The scheduled cargo-fuzz run found a failing target.
+
+          Failing targets: ${FAILED:-(see the run)}
+
+          Run: $RUN_URL
+
+          Each failing job uploads its \`fuzz/artifacts/<target>/\` directory as
+          the \`fuzz-artifacts-<target>\` artifact: that is the reproducer input.
+          To reproduce and minimize:
+
+          \`\`\`
+          cd fuzz
+          cargo +nightly fuzz run <target> path/to/crash-input
+          cargo +nightly fuzz tmin <target> path/to/crash-input
+          \`\`\`
+
+          then add the minimized input as a deterministic regression test in
+          core (fuzz/README.md has the flow).
+
+          ---
+          _This issue is managed by .github/workflows/fuzz.yml. It is updated
+          (not duplicated) on every failing nightly run; close it once a run
+          completes green._"
+
+          EXISTING=$(gh issue list --label fuzz --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING"
+            gh issue edit "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL (targets: ${FAILED:-see the run})"
+          else
+            echo "Opening new issue"
+            NEW_URL=$(gh issue create --title "$TITLE" --label fuzz --body "$BODY")
+            # Pin it so it stays visible (best effort; needs no extra scope).
+            NUM=${NEW_URL##*/}
+            ISSUE_ID=$(gh api "repos/$GH_REPO/issues/$NUM" --jq .node_id)
+            # shellcheck disable=SC2016  # $id is a GraphQL variable, not shell
+            gh api graphql -f query='
+              mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { number } } }' \
+              -f id="$ISSUE_ID" || true
+          fi

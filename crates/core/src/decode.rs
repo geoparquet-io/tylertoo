@@ -612,6 +612,40 @@ fn decode_tile_features(
     Ok(out)
 }
 
+/// Fuzz hook (#424): decode one *uncompressed* MVT tile at `(z, x, y)`
+/// exactly as [`decode_pmtiles`] would, and return
+/// `(features decoded, features whose geometry decoded to something)`.
+///
+/// This is the tile-bytes surface of the decoder — protobuf parse, command
+/// stream, ring assembly, tag lookup — reached with the archive framing
+/// (directory walk, decompression) stripped away so libFuzzer spends its
+/// budget on the parser rather than on gzip. Decompression is fuzzed on its
+/// own through the `band_archive` target. Only the `fuzz/` crate calls this;
+/// the `fuzzing` feature is never on in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_tile(
+    z: u8,
+    x: u32,
+    y: u32,
+    plain: &[u8],
+) -> Result<(usize, usize), DecodeError> {
+    let header = Header {
+        tile_compression: crate::compression::Compression::None,
+        ..Header::default()
+    };
+    let tile = TileRef {
+        z,
+        x,
+        y,
+        start: 0,
+        len: plain.len(),
+    };
+    let decoded = decode_tile_features(plain, &header, &tile, &DecodeOptions::default())?;
+    let with_geometry = decoded.iter().filter(|(_, f)| f.geometry.is_some()).count();
+    Ok((decoded.len(), with_geometry))
+}
+
 // ============================================================================
 // MVT geometry command stream -> parts -> geo::Geometry
 // ============================================================================
