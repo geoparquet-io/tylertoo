@@ -508,6 +508,15 @@ tables via `format_duckdb_knobs.py`; recipe in
 > Moldova row below is the old in-memory pipeline. Current numbers
 > (convert ~55 s / ~320 MB peak RSS on the same file) and the change
 > history are in [`PROFILE.md`](./PROFILE.md).
+>
+> **For a head-to-head against tippecanoe, use
+> [`benchmarks/e2e/`](../e2e/README.md) instead** (#447). The table below
+> compares `tylertoo overview` (which writes an overview *GeoParquet*)
+> against tippecanoe (which writes a *tileset*) — different artifacts, so
+> the ratio was never meaningful, and tippecanoe's version was whatever
+> happened to be on `$PATH`. The e2e harness pins tippecanoe by tag and
+> SHA, compares PMTiles to PMTiles, and reports the input-conversion share
+> separately.
 
 `tylertoo overview` (duplicating, default knobs, z0..14, reads GeoParquet
 natively) vs the golden tippecanoe workflow `gpio convert geojson <src> |
