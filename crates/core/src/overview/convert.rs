@@ -5402,11 +5402,33 @@ pub(super) fn build_level_coalesce_table(
     crs: Crs,
     options: &ConvertOptions,
 ) -> CoalesceTable {
+    build_level_coalesce_table_and_hint(inputs, level, finest, gsd_m, crs, options).0
+}
+
+/// [`build_level_coalesce_table`] plus the level's PRE-simplification chain
+/// count — the streaming engine's `level_row_hint` for the level.
+///
+/// The two used to come from two separate runs of the whole chain stage: the
+/// hint from a count-only pass in `resolve_winner_tables` (which needs it
+/// before it can plan the levels at all), the table from a second pass in
+/// `build_pass2_coalesce_tables`. On a 1.5M-line fixture the counting pass
+/// alone was 53 s of a 79 s run (#570). Returning both from one run keeps the
+/// hint bit-for-bit what the count-only pass produced — `chains.len()`,
+/// counted BEFORE the simplify drops the table applies.
+pub(super) fn build_level_coalesce_table_and_hint(
+    inputs: &[CoalesceInput<'_>],
+    level: usize,
+    finest: usize,
+    gsd_m: f64,
+    crs: Crs,
+    options: &ConvertOptions,
+) -> (CoalesceTable, usize) {
     use rayon::prelude::*;
 
     let t_chains = Instant::now();
     let chains = coalesce_level_chains(inputs, level, finest, gsd_m, crs, options);
     let chain_secs = t_chains.elapsed().as_secs_f64();
+    let hint = chains.len();
     let t_simplify = Instant::now();
     // Only for the log line below, so not worth an O(vertices) walk otherwise.
     let longest = log::log_enabled!(log::Level::Debug)
@@ -5440,7 +5462,7 @@ pub(super) fn build_level_coalesce_table(
         table.len(),
         t_simplify.elapsed().as_secs_f64(),
     );
-    table
+    (table, hint)
 }
 
 /// Both limbs of the coalescing memory guard (#449) over a decoded geometry
