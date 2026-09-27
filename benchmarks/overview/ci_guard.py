@@ -65,7 +65,16 @@ ARCHIVE_BYTES_KEY = "archive_bytes"
 
 
 def run(args: list[str], capture: bool = False) -> str:
-    proc = subprocess.run([str(BIN), *args], check=True, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            [str(BIN), *args], check=True, capture_output=True, text=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"tylertoo {' '.join(args)} failed (exit {e.returncode})", file=sys.stderr
+        )
+        print(e.stderr, file=sys.stderr)
+        raise
     return proc.stdout if capture else ""
 
 
@@ -102,10 +111,12 @@ def export_signature(archive: Path, export_report: dict, td: Path) -> dict:
     zooms = []
     for zr in export_report["zooms"]:
         z = zr["zoom"]
-        if dir_tiles.get(z) != zr["tile_count"]:
+        # `stats` omits zooms with no tiles; the export report keeps a
+        # ZoomReport for a level that generalized away entirely.
+        if dir_tiles.get(z, 0) != zr["tile_count"]:
             raise SystemExit(
                 f"{archive.name}: z{z} export report says {zr['tile_count']} tiles, "
-                f"directory holds {dir_tiles.get(z)}"
+                f"directory holds {dir_tiles.get(z, 0)}"
             )
         zooms.append(
             {
@@ -181,11 +192,11 @@ def compare(label: str, base: dict, cur: dict, tolerance: float) -> list[str]:
     if b_bytes is None:
         drift.append(f"[{label}] baseline has no {ARCHIVE_BYTES_KEY}; run --update")
     else:
-        rel = abs(c_bytes - b_bytes) / b_bytes
-        if rel > tolerance:
+        delta = (c_bytes - b_bytes) / b_bytes
+        if abs(delta) > tolerance:
             drift.append(
                 f"[{label}] archive size {b_bytes} -> {c_bytes} bytes "
-                f"({rel:+.2%} vs tolerance {tolerance:.0%})"
+                f"({delta:+.2%} vs tolerance +-{tolerance:.0%})"
             )
     return drift
 

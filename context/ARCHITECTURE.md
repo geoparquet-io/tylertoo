@@ -471,6 +471,7 @@ therefore its band, in the same PR, with the new measurement in the comment.
 | Tile-size control (export) | Single non-iterative drop pass (`--tile-size-limit`) | Iterative threshold retry loop | Overview levels are already budgeted; the valve is a backstop, not the mechanism |
 | Polygon clipping (export) | Sutherland–Hodgman f64 + i_overlay fallback | Sutherland–Hodgman integer tile coords | Same algorithm family, different coordinate space (below) |
 | Tile buffer axis (export, #341) | `--tile-buffer` is converted to degrees from the tile's LONGITUDE width (`tile_width x buffer_px / 256`) and that one value is applied to both axes | `--buffer` is tile pixels on both axes | Exact on x; on y the effective buffer is `buffer_px x sec(lat)` pixels, because a Mercator tile's latitude span shrinks as `cos(lat)` while its longitude span does not — 8 px at the equator, ~16 px at 60 deg, ~92 px at 85 deg. Bounded: the over-draw stays under one tile height below ~88.2 deg, outside the Mercator domain, and it errs towards carrying MORE geometry across the seam. A per-axis buffer has to be threaded through `bbox_within_buffered` and `clip_geometry_simple` as well, which moves tile bytes again, so it is deferred. Antimeridian seam continuity is separately out of scope: membership widening is clamped to the lon/lat domain and a feature at lng 179.99 does not reach tile x=0 |
+| Tile buffer cap and extent validation (export, #433) | `--tile-buffer` is capped at `MAX_TILE_BUFFER_PX` = 256 (one full tile width) and `extent` must be positive (non-power-of-two warns), both checked by `ExportOptions::validate` before any I/O; `decode` refuses a layer declaring `extent: 0` | `--buffer` has no documented upper bound; the extent is set as a power of two through `-d`/`-D`/`-m` detail bits, so zero is unreachable there | A buffer past one tile width has no output that is not reachable below it, and since the buffer is what makes a feature belong to more than one tile, an unbounded one is an `O(features × tiles)` blow-up (`--tile-buffer 100000` ≈ 390 tile widths). `extent = 0` quantizes everything to the origin and writes a layer every consumer divides by. The sharded read-pruning margin (two pivot tiles = 512 px, #498) is wider than the cap, and a `const` assertion in `shard.rs` keeps it so; `ExportError::TileBufferTooWideForShard` is retained for API compatibility but no longer raised |
 | Untileable input (#429) | Pass 1 tallies, in ONE traversal of the feature bboxes, the #188 antimeridian suspects plus two losses: features outside the declared CRS's coordinate range (`bbox_out_of_crs_range`) and features with valid lon/lat wholly outside the Web Mercator tiling domain (latitude beyond ±85.05°, `bbox_unprojectable`). Both land on `ConvertReport` (`out_of_range_features`, `unprojectable_features`), each warns once, and when together they account for **≥99%** of the input the convert FAILS with `ConvertError::AllFeaturesOutOfRange` instead of writing an empty archive | No CRS gate: GeoJSON is lon/lat by contract, so out-of-range coordinates are clamped or dropped at projection time and a wrong-CRS input yields an empty tileset with exit 0 | The counts are taken at the END OF PASS 1 rather than at the end of convert: pass 1 already holds every feature bbox, so failing there costs no second pass and leaves no half-written overview behind. The gate is a share, not exactly 100%, because a million-row wrong-CRS file with a dozen `POINT(0 0)` placeholder rows would otherwise sail through. The two losses are counted (and worded) separately because their fixes differ: a reprojection for the first, nothing at all for the second — Mercator does not reach the poles. The projected-CRS diagnosis and its `gpio convert reproject` hint are gated on coordinate MAGNITUDE (any offending coordinate above 1000 in absolute value), so one stray 0–360°-convention longitude gets neutral wording rather than an accusation about the whole file |
 | Polygon cleanup after tile quantization (export, #383) | Exact integer checks first (every ring simple, no two rings crossing/overlapping — plane sweeps); only a polygon that fails them is repaired: rings noded and split at pinch vertices, pieces regrouped by their own original sense, then an even-odd overlay (bounded rounds) for what still fails; multipolygon parts that actually interact (exteriors meeting, or one part's vertex inside another's fill) are unioned under NonZero, the rest pass through untouched | wagyu positive-fill union on every polygon after snapping (`tile.cpp`), unconditionally | The common case — a clean polygon — is a check, not an overlay, and its vertices come out exactly as snapped (no re-noding or ring rotation). Bowtie lobes: the pinch path keeps the pieces that share the ring's original sense (the larger lobe's, when the net area is zero) and drops the reversed ones — the same lobe wagyu's positive fill keeps; a ring that still crosses after pinch-splitting goes to the even-odd overlay, which keeps both lobes
 | PMTiles header zoom range (export, #529/#522/#554) | Header `min_zoom`/`max_zoom` = the zooms that actually hold tiles; a wider requested range (`--min-zoom 0` over levels that generalized to nothing, a pyramid band's declared range, a shard set's union) lives only in `vector_layers[].minzoom`/`maxzoom` | Stamps the requested `-Z`/`-z` range in the header even when the coarse zooms are empty (golden `tests/fixtures/golden/open-buildings.pmtiles`: header z0..z10) | `go-pmtiles verify` rejects a header wider than the directory ("header MinZoom does not match min tile z"). Renderers that build TileJSON from the header (the pmtiles JS `getTileJson`) therefore see the narrower range; `vector_layers` zooms are informational to them. Acceptable: the empty zooms render identically (nothing either way), and an honest `maxzoom` lets MapLibre overzoom from the deepest real tile instead of requesting empty ones. `merge` and the pyramid band check read the declared range as header ∪ `vector_layers` so tylertoo's own archives keep round-tripping |
@@ -487,12 +488,14 @@ ratified this as the intended behavior.**
 `5c123fa` (merged as #539) bumped `i_overlay` 8.1.2 → 9.0.0 (pulling `i_float`
 4 → 5). That is **our own direct dependency**, not `geo`'s: `geo` 0.33 vendors
 `i_overlay` 4.5.2 for its `BooleanOps`, and both versions coexist in
-`Cargo.lock`. Ours is the engine behind `ioverlay_clip.rs` — the boundary-bridge
-fallback in `clip_geometry` (`clip.rs`, reached on every non-simple ring and,
-with `--no-simple-clip-fastpath`, on all of them) and the #383 post-quantization
-polygon repair in `export.rs`. So the bump moved the clipper directly. A
-three-way A/B on the Brazil 2025 coarse job (27.98M rows, 588 tiles, identical
-shard plan and options) measured:
+`Cargo.lock` (since #435 nothing of ours calls the vendored one — see "One
+boolean-ops engine" below). Ours is the engine behind `ioverlay_clip.rs` — the
+boundary-bridge fallback in `clip_geometry` (`clip.rs`, reached on every
+non-simple ring and, with `--no-simple-clip-fastpath`, on all of them), the
+line clipper (#435), and the #383 post-quantization polygon repair in
+`export.rs`. So the bump moved the clipper directly. A three-way A/B on the
+Brazil 2025 coarse job (27.98M rows, 588 tiles, identical shard plan and
+options) measured:
 
 | comparison | differing tiles |
 |---|---|
@@ -553,6 +556,74 @@ disappearing — the exact shape of an overlay-engine change. The two guards run
 in different places (structural in `bench.yml`, golden in Slow Tests); neither
 replaces the other (the structural one is cheap, covers three geometry classes,
 and catches pass-1 regressions the golden's single fixture does not).
+
+### One boolean-ops engine: line clipping moved to the direct i_overlay (#435)
+
+Until #435 the two clippers ran on two engines. Polygons went through
+`ioverlay_clip.rs` on our direct `i_overlay` (9.0); lines went through
+`geo::BooleanOps::clip` in `clip.rs`, which is `geo` 0.33's vendored
+`i_overlay` 4.5.2 — four major versions of robustness fixes apart, so a line
+and a polygon sharing a tile edge could in principle be cut by engines that
+disagree about where that edge is (the inconsistency class #205 is about),
+plus duplicate compile and binary weight for `i_overlay`/`i_float`/`i_shape`/
+`i_tree`. `clip.rs` now calls `ioverlay_clip::clip_multilinestring_ioverlay`,
+the same operation on the direct engine (`FloatClip::clip_by`,
+`FillRule::EvenOdd`, `ClipRule { invert: false, boundary_included: true }`,
+open clip contour — exactly what `geo`'s `clip_with_fill_rule` did). No code
+of ours references `BooleanOps` any more.
+
+**Behaviour:** pinned before the switch in `crates/core/tests/line_clip_pinned.rs`
+through the public `clip::clip_geometry` — 17 hand-built cases with literal
+coordinates (double crossings, corner grazes, edge-collinear runs, boundary
+vertices, degenerate segments, bbox-overlap-only) and a digest sweep over the
+`road-detections` fixture at z12 and z14. Every hand-built case is
+coordinate-identical on the new engine, including the old engine's quirks (a
+re-entering run broken at an interior vertex, parts emitted out of input
+order, consecutive duplicates collapsed, zero-length lines dropped). The
+real-data sweep is structurally identical (same kept/part/vertex counts) but
+not bit-identical: about half the vertices differ by **exactly one unit of
+i_overlay's float→integer grid** (2⁻³⁴ ° at the z12 tile scale, 2⁻³⁵–2⁻³⁶ ° at
+z14; max 2.3e-10 °), in y only, at interior vertices as well as boundary
+intersections. Neither engine returns the input vertex bit-exactly — the old
+path was already snapping every line vertex to that grid; the new one lands
+on the adjacent cell. That is four to five orders of magnitude below one MVT
+unit at z14 (≈5.4e-6 °), so a quantized tile coordinate can only move on an
+exact rounding tie. An end-to-end A/B (main vs this branch, `tiles` over `road-detections.parquet`, z0–z14, 78 tiles) produced byte-identical archives. The sweep digests in `line_clip_pinned.rs` were
+re-pinned to the new engine for this reason; the counts did not change. The
+counts are pinned on every platform; the bit-exact digest only on Linux,
+because tile bounds come from `sinh().atan()` and libm differs by an ulp
+across platforms, which reaches the clipped intersections (macOS produced a
+different z14 digest with identical counts). A grid-rounded digest was
+rejected: over ~12k coordinates a 1-ulp shift straddles a rounding boundary
+often enough to flake.
+
+**Input guard:** i_float 5's adapter panics ("Invalid adapter bounds") when
+the subject's extent is non-finite or a coordinate magnitude exceeds its
+documented f64 limit of 2^500, where the `geo` path returned an empty
+result. `clip_multilinestring_ioverlay` checks every coordinate (finite and
+below `IOVERLAY_MAX_ABS_COORD` = 1e150) and returns empty before calling the
+engine, so a NaN/inf/1e300 vertex still yields "nothing to clip" rather than
+a panic. The polygon entry points (`clip_polygon_ioverlay` and friends) are
+not changed by #435 and carry no such guard; whether they need one is a
+separate question.
+
+**Residual duplicate:** `i_overlay` 4.5.2 stays in `Cargo.lock` because `geo`
+0.33.1 (the latest release at the time of writing) depends on it
+(`i_overlay = "4.5.1, < 4.6.0"`) for its own `BooleanOps` and triangulation.
+It leaves the lockfile only when a `geo` release depends on `i_overlay` 9 and
+we take that bump — which, per the policy above, is a golden-guarded decision,
+not a green-CI merge. Nothing of ours calls the vendored copy now, so that
+future bump cannot move line or polygon clipping through `geo`; it could still
+move `earcut`/triangulation and the `Simplify`/`Area` family, which is why the
+policy stays.
+
+**Compression duplicates (same PR):** `brotli` and `zstd` were pinned at 9 and
+0.14 while `parquet` 59 needs 8 and 0.13, so both were compiled twice.
+`compression.rs` uses only the stable surface (`Decompressor::new`,
+`CompressorWriter::with_params`, `BrotliEncoderParams.quality`, `encode_all`,
+`stream::read::Decoder`), which is identical across those majors, so core now
+requires `brotli = "8"` and `zstd = "0.13"` and follows `parquet`'s versions.
+When `parquet` moves, move these with it.
 
 ## Decision Record: MVT Winding Fix + PMTiles Decode (#112, 2026-07-04)
 
