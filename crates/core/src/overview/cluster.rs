@@ -49,7 +49,7 @@
 
 use std::collections::HashMap;
 
-use super::assign::{AssignConfig, AssignFeature, FeatureKind, Priority};
+use super::assign::{AssignConfig, AssignFeature, FeatureKind, Priority, SortDirection};
 use super::level::Crs;
 
 /// Name of the mandatory cluster-size column written when clustering is
@@ -208,10 +208,13 @@ pub fn build_cluster_tables(
         return tables;
     }
 
-    let prio: Vec<Priority> = features
-        .iter()
-        .map(|f| Priority::new(f, config.sort_direction))
-        .collect();
+    // Priorities are DERIVED where a comparison needs one, not tabulated
+    // (#565). `Priority` is 32 B, so a `Vec<Priority>` here was another
+    // dataset-wide table alongside the pass-1 feature table — and it bought
+    // almost nothing: the two comparisons below run once per *present* point
+    // per level (the cell-winner fold) and once per orphan-cell ring candidate,
+    // not inside an O(n log n) sort, so recomputing is in the noise.
+    let prio = |pos: usize| Priority::new(&features[pos], config.sort_direction);
 
     // Thinning off (`--verbatim`, or `--point-thinning 0`) makes every cell
     // guard below fail, so no cluster table is built and every `point_count`
@@ -251,7 +254,7 @@ pub fn build_cluster_tables(
             present
                 .entry(key)
                 .and_modify(|best| {
-                    if prio[pos].beats(&prio[*best]) {
+                    if prio(pos).beats(&prio(*best)) {
                         *best = pos;
                     }
                 })
@@ -289,7 +292,7 @@ pub fn build_cluster_tables(
             orphan_keys.sort_unstable();
             let mut resolved: HashMap<(i64, i64), usize> = HashMap::new();
             for key in orphan_keys {
-                let w = nearest_present(key, &present, features, &prio, cell_size);
+                let w = nearest_present(key, &present, features, config.sort_direction, cell_size);
                 resolved.insert(key, w);
             }
             for (i, &pos) in point_pos.iter().enumerate() {
@@ -401,7 +404,7 @@ fn nearest_present(
     cell_key: (i64, i64),
     present: &HashMap<(i64, i64), usize>,
     features: &[AssignFeature],
-    prio: &[Priority],
+    dir: SortDirection,
     cell_size: f64,
 ) -> usize {
     let center = (
@@ -419,7 +422,7 @@ fn nearest_present(
         if da != db {
             da < db
         } else {
-            prio[a].beats(&prio[b])
+            Priority::new(&features[a], dir).beats(&Priority::new(&features[b], dir))
         }
     };
 

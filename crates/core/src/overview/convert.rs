@@ -4016,6 +4016,14 @@ pub(super) const PASS1_BYTES_PER_ROW: u64 = 64;
 /// 2's buffered output. Calibrated on the #543 incident: 1.58B rows (a
 /// 94.2 GiB floor) OOM'd at 192 GiB — ≈2.04× the floor — and ran at 360 GiB,
 /// so the factor must sit above 2.04. Crossing it warns; it never fails a run.
+///
+/// **Left at 2.5 by #565, deliberately.** That ticket removed 40 B/feature from
+/// the density budget's peak (the `Vec<Priority>` it used to hold live across
+/// the whole admission fold — 0.63× this floor on its own), so the true
+/// multiple on the incident job is now *lower* than when 2.5 was calibrated and
+/// the factor is strictly more conservative than before. Lowering it would mean
+/// re-deriving it against a fresh billion-row run, which is the only evidence
+/// that would justify moving a number this one warns on.
 const PASS1_RECOMMENDED_FACTOR: f64 = 2.5;
 
 /// Escape hatch (#543): downgrades the pass-1 memory-floor hard error to a

@@ -373,13 +373,19 @@ pub fn coalesce_level_lines(
                 .enumerate()
                 .map(|(pos, (_, f))| AssignFeature { index: pos, ..*f })
                 .collect();
-            let prio: Vec<Priority> = feats
-                .iter()
-                .map(|f| Priority::new(f, config.sort_direction))
-                .collect();
+            // No priority table: `select_budget_survivors` derives each
+            // candidate's from `feats[pos]` (#565). `feats` is built with
+            // `index: pos` precisely so the derived priority — hash and index
+            // tie-break included — is the one the removed table held.
             let cands: Vec<usize> = (0..survivors.len()).collect();
             let mut chosen = super::assign::select_budget_survivors(
-                &cands, max_chains, &feats, &prio, gsd_m, crs, gamma,
+                &cands,
+                max_chains,
+                &feats,
+                config.sort_direction,
+                gsd_m,
+                crs,
+                gamma,
             );
             chosen.sort_unstable();
             let mut keep = vec![false; survivors.len()];
