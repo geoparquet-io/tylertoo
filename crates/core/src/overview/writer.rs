@@ -1254,7 +1254,7 @@ fn geometry_columns(schema: &Schema) -> Vec<String> {
 /// recognise (and drop) a pre-existing covering column that would collide with
 /// the encoder's generated one (§4.4), without touching unrelated struct
 /// attributes that merely share the covering's *name*.
-fn is_bbox_covering_struct(field: &Field) -> bool {
+pub(crate) fn is_bbox_covering_struct(field: &Field) -> bool {
     match field.data_type() {
         DataType::Struct(children) => {
             if children.len() != 4 {
@@ -1270,7 +1270,7 @@ fn is_bbox_covering_struct(field: &Field) -> bool {
 
 /// Covering column name the encoder will produce for a geometry column, per its
 /// default rule (`bbox` for `geometry`/`geography`, else `{name}_bbox`).
-fn covering_name_for(column_name: &str) -> String {
+pub(crate) fn covering_name_for(column_name: &str) -> String {
     if column_name == "geometry" || column_name == "geography" {
         "bbox".to_string()
     } else {

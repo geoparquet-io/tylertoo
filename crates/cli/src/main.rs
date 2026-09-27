@@ -3113,6 +3113,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             convert_report.unprojectable_features,
         )
     );
+    print_skipped_property_columns(&export_report.skipped_property_columns);
     // #380: the summary line above covers the requested (declared) range,
     // which can be wider than the archive's own PMTiles header (#529, #522:
     // the header always reflects the zooms that actually hold a tile) — say
@@ -3675,6 +3676,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         report.oversized_tiles,
         report.duration_secs
     );
+    print_skipped_property_columns(&report.skipped_property_columns);
 
     if let Some(path) = &args.report {
         let json = serde_json::to_string_pretty(&report)
@@ -3684,6 +3686,27 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         println!("  report → {}", path.display());
     }
     Ok(())
+}
+
+/// #434: the export already warned once per column through the log; the
+/// summary repeats the loss in one line so it is not missed when the log is
+/// quiet or scrolled away. Nothing is printed when nothing was dropped.
+fn print_skipped_property_columns(
+    skipped: &[tylertoo_core::overview::export::SkippedPropertyColumn],
+) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!(
+        "  {} property column{} not exported (no MVT encoding for the type): {}",
+        skipped.len(),
+        if skipped.len() == 1 { "" } else { "s" },
+        skipped
+            .iter()
+            .map(|c| format!("{:?} ({})", c.name, c.data_type))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 /// If `spec` is the `LO-HI=INPUT=LAYER` escape form and `layer` is exactly

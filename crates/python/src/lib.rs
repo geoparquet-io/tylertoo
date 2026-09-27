@@ -996,7 +996,12 @@ fn overview(
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
 ///     (list of dicts with "zoom", "level", "level_feature_count",
 ///     "tile_count", "tile_feature_count", "oversized_tiles"), "total_tiles",
-///     "total_tile_features", "oversized_tiles", "duration_secs".
+///     "total_tile_features", "oversized_tiles", "skipped_property_columns"
+///     (list of dicts with "name" and "data_type": the property columns the
+///     export dropped because their Arrow type has no MVT encoding, such as
+///     a binary column; each is also warned about once. Struct, list and map
+///     columns are not dropped: they reach the tiles as JSON strings, the
+///     tippecanoe convention for nested attributes), "duration_secs".
 ///
 /// Raises:
 ///     RuntimeError: The export failed (not an overview file, unsupported
@@ -1069,6 +1074,14 @@ fn export_pmtiles(
     dict.set_item("total_tiles", report.total_tiles)?;
     dict.set_item("total_tile_features", report.total_tile_features)?;
     dict.set_item("oversized_tiles", report.oversized_tiles)?;
+    let skipped = PyList::empty(py);
+    for col in &report.skipped_property_columns {
+        let d = PyDict::new(py);
+        d.set_item("name", &col.name)?;
+        d.set_item("data_type", &col.data_type)?;
+        skipped.append(d)?;
+    }
+    dict.set_item("skipped_property_columns", skipped)?;
     dict.set_item("duration_secs", report.duration_secs)?;
     Ok(dict.into())
 }

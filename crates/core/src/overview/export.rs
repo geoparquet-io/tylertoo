@@ -444,8 +444,25 @@ pub struct ExportReport {
     pub total_tile_features: usize,
     /// Total tiles that hit the oversized safety valve.
     pub oversized_tiles: usize,
+    /// Property columns of the overview file that the export could not
+    /// encode and therefore dropped (#434): binary columns and any other
+    /// Arrow type with neither an MVT scalar nor a JSON rendering. Each is
+    /// warned about once, at resolution, and listed here so the loss is in
+    /// the `--report` as well as the log. Struct/list/map columns are NOT
+    /// here: they reach the tiles as JSON strings.
+    pub skipped_property_columns: Vec<SkippedPropertyColumn>,
     /// Wall-clock export duration in seconds.
     pub duration_secs: f64,
+}
+
+/// A property column the export dropped because its Arrow type has no MVT
+/// encoding (#434). See [`ExportReport::skipped_property_columns`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedPropertyColumn {
+    /// The column's name as the tile would have published it.
+    pub name: String,
+    /// The Arrow type, rendered with `Debug` (`Binary`, `LargeBinary`, ...).
+    pub data_type: String,
 }
 
 /// Errors from [`export_pmtiles`].
@@ -667,6 +684,19 @@ pub enum ExportError {
          (exportable: {available})"
     )]
     UnknownProperty { name: String, available: String },
+
+    /// `--include-property` names a column the file has but the export
+    /// cannot encode (#434): a binary column, or another Arrow type with
+    /// neither an MVT scalar nor a JSON rendering. Distinguished from
+    /// [`Self::UnknownProperty`] so the caller learns the column is there
+    /// and what to do about it, instead of hunting for a typo.
+    #[error(
+        "included property {name:?} is a {data_type} column, which the export cannot \
+         encode as an MVT value (supported: strings, numbers, booleans, dates and \
+         timestamps, decimals, and struct/list/map columns as JSON strings); cast or \
+         encode it as text first, e.g. with gpio or DuckDB"
+    )]
+    UnsupportedProperty { name: String, data_type: String },
 
     #[error(
         "property {name:?} is excluded but {knob} reads it; keep it in the selection or \
@@ -1347,7 +1377,11 @@ fn export_pmtiles_impl(
     let mean_member_bytes = reader.finest_level_mean_row_bytes();
     let available_ram = available_memory_bytes();
 
-    let (published, feature_id) = resolve_export_columns(&reader, options, &level_zooms)?;
+    let ResolvedColumns {
+        published,
+        feature_id,
+        skipped: skipped_property_columns,
+    } = resolve_export_columns(&reader, options, &level_zooms)?;
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
@@ -1560,6 +1594,7 @@ fn export_pmtiles_impl(
         total_tiles,
         total_tile_features,
         oversized_tiles,
+        skipped_property_columns,
         duration_secs: start.elapsed().as_secs_f64(),
     })
 }
@@ -1721,7 +1756,7 @@ fn resolve_export_columns(
     reader: &OverviewReader,
     options: &ExportOptions,
     level_zooms: &[u8],
-) -> Result<(PublishedNames, Option<ResolvedFeatureId>), ExportError> {
+) -> Result<ResolvedColumns, ExportError> {
     let geom_idx = geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?;
     let mut published = PublishedNames::from_reader(reader).with_selection(
         reader.schema(),
@@ -1729,6 +1764,20 @@ fn resolve_export_columns(
         &options.properties,
         &options.feature_order,
     )?;
+    // #434: said once per column, here, where the schema is resolved once
+    // per export -- never from the per-batch extraction, which would repeat
+    // it for every row group of every level.
+    let skipped = skipped_property_columns(reader.schema(), geom_idx, &published);
+    for col in &skipped {
+        log::warn!(
+            "[export] not exporting property {:?}: its type {} has no MVT encoding \
+             (strings, numbers, booleans, temporals and decimals are encoded directly; \
+             struct/list/map columns as JSON strings); cast or encode it as text first, \
+             e.g. with gpio or DuckDB",
+            col.name,
+            col.data_type
+        );
+    }
     let feature_id = resolve_feature_id(
         reader.schema(),
         geom_idx,
@@ -1739,7 +1788,19 @@ fn resolve_export_columns(
     if let Some(fid) = &feature_id {
         validate_feature_id_column(reader, fid, level_zooms)?;
     }
-    Ok((published, feature_id))
+    Ok(ResolvedColumns {
+        published,
+        feature_id,
+        skipped,
+    })
+}
+
+/// What [`resolve_export_columns`] settled once per export.
+struct ResolvedColumns {
+    published: PublishedNames,
+    feature_id: Option<ResolvedFeatureId>,
+    /// The columns warned about and left out (#434), for the report.
+    skipped: Vec<SkippedPropertyColumn>,
 }
 
 /// Everything one level's pass-2 render reads besides the writer and the
@@ -4592,6 +4653,24 @@ impl PublishedNames {
         if let Some(include) = &selection.include {
             for name in include {
                 if !published.contains(&name.as_str()) {
+                    // #434: a column that IS in the file but has no MVT
+                    // encoding gets its own message; "unknown" would send
+                    // the caller looking for a typo that is not there.
+                    if let Some(f) = schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, f)| {
+                            i != geom_idx && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+                        })
+                        .map(|(_, f)| f)
+                        .find(|f| self.publish(f.name()) == name && !self.is_suppressed(f.name()))
+                    {
+                        return Err(ExportError::UnsupportedProperty {
+                            name: name.clone(),
+                            data_type: format!("{:?}", f.data_type()),
+                        });
+                    }
                     return Err(ExportError::UnknownProperty {
                         name: name.clone(),
                         available: published
@@ -4603,8 +4682,14 @@ impl PublishedNames {
                 }
             }
         }
+        // Every column the selection can address, exportable or not (#434):
+        // excluding a binary column the export would otherwise drop with a
+        // warning is a real choice, not a no-op, and silences that warning.
+        let candidates: Vec<(usize, String)> = candidate_columns(schema, geom_idx, &self)
+            .map(|(i, f)| (i, self.publish(f.name()).to_string()))
+            .collect();
         for name in &selection.exclude {
-            if !published.contains(&name.as_str()) {
+            if !candidates.iter().any(|(_, n)| n == name) {
                 log::warn!(
                     "[export] excluded property {name:?} is not exported by this file anyway"
                 );
@@ -4619,10 +4704,12 @@ impl PublishedNames {
             }
         }
         let mut dropped = 0usize;
-        for (idx, name) in &exportable {
+        for (idx, name) in &candidates {
             if !selection.keeps(name) {
                 self.suppressed.insert(schema.field(*idx).name().clone());
-                dropped += 1;
+                if exportable.iter().any(|(i, _)| i == idx) {
+                    dropped += 1;
+                }
             }
         }
         let kept: Vec<&str> = published
@@ -4669,27 +4756,67 @@ impl PublishedNames {
 }
 
 /// The `(index, published name)` of every exportable property column:
-/// everything that is not the geometry column, not the `level` column, and
-/// whose type is a supported MVT scalar (struct/list covering columns are
-/// skipped). The index addresses the real schema column; the name is what the
+/// everything that is not the geometry column, not the `level` column, not
+/// the geometry's bbox covering struct, and whose type the export can encode
+/// ([`is_exportable`]: MVT scalars directly, struct/list/map columns as JSON
+/// strings). The index addresses the real schema column; the name is what the
 /// tile advertises, which differs when a rename is restored ([`PublishedNames`]).
 fn property_columns(
     schema: &Schema,
     geom_idx: usize,
     published: &PublishedNames,
 ) -> Vec<(usize, String)> {
+    candidate_columns(schema, geom_idx, published)
+        .filter(|&(_, f)| is_exportable(f.data_type()))
+        .map(|(i, f)| (i, published.publish(f.name()).to_string()))
+        .collect()
+}
+
+/// The property columns the export drops because their type has no MVT
+/// encoding (#434), in schema order. Everything [`property_columns`] would
+/// consider and [`is_exportable`] rejects; a column the selection already
+/// withheld is not "dropped", it was asked for, so it is not listed.
+fn skipped_property_columns(
+    schema: &Schema,
+    geom_idx: usize,
+    published: &PublishedNames,
+) -> Vec<SkippedPropertyColumn> {
+    candidate_columns(schema, geom_idx, published)
+        .filter(|&(_, f)| !is_exportable(f.data_type()))
+        .map(|(_, f)| SkippedPropertyColumn {
+            name: published.publish(f.name()).to_string(),
+            data_type: format!("{:?}", f.data_type()),
+        })
+        .collect()
+}
+
+/// Every schema column that is a property candidate: not the geometry, not
+/// the `level` column, not the geometry's own bbox covering (the writer's
+/// `{xmin, ymin, xmax, ymax}` struct under the covering name, which is index
+/// metadata and not user data -- so it is neither exported nor warned about),
+/// and not withheld by the selection.
+fn candidate_columns<'a>(
+    schema: &'a Schema,
+    geom_idx: usize,
+    published: &'a PublishedNames,
+) -> impl Iterator<Item = (usize, &'a arrow_schema::Field)> + 'a {
+    let covering = schema
+        .fields()
+        .get(geom_idx)
+        .map(|g| super::writer::covering_name_for(g.name()));
     schema
         .fields()
         .iter()
         .enumerate()
-        .filter(|&(i, f)| {
+        .filter(move |&(i, f)| {
+            let is_covering = covering.as_deref() == Some(f.name().as_str())
+                && super::writer::is_bbox_covering_struct(f);
             i != geom_idx
                 && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
                 && !published.is_suppressed(f.name())
-                && is_supported_scalar(f.data_type())
+                && !is_covering
         })
-        .map(|(i, f)| (i, published.publish(f.name()).to_string()))
-        .collect()
+        .map(|(i, f)| (i, f.as_ref()))
 }
 
 /// The columns pass 2 attaches to each member: the exportable properties
@@ -4791,6 +4918,55 @@ fn is_supported_scalar(dt: &DataType) -> bool {
         || matches!(dt, DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
 }
 
+/// Arrow types that reach the tile as a JSON string (#434): struct, list,
+/// large list, fixed-size list and map columns. tippecanoe does the same for
+/// nested GeoJSON attributes -- `stringify_value` in `read_json.cpp` turns
+/// any object or array into an `mvt_string` holding its `json_stringify`
+/// text -- and it is what the Overture `names` struct and `sources` list
+/// need to survive the export at all. The nested leaves are rendered by
+/// [`extract_property_column`]'s own scalar rules; a leaf type without one
+/// (binary, an unrenderable timezone) renders as JSON `null` rather than
+/// dropping the whole column.
+fn is_json_encoded(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Struct(_)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _)
+    )
+}
+
+/// Whether a column of this type is exported as a property: an MVT scalar
+/// ([`is_supported_scalar`]), a JSON-encoded nested type
+/// ([`is_json_encoded`]), or a dictionary over either (unwrapped on
+/// extraction). [`property_columns`], [`field_metadata`] and
+/// [`extract_property_column`] all gate on this one predicate, so a column
+/// advertised in `vector_layers.fields` is always one the tiles can fill.
+fn is_exportable(dt: &DataType) -> bool {
+    match dt {
+        DataType::Dictionary(_, value) => is_exportable(value),
+        dt => is_supported_scalar(dt) || is_json_encoded(dt),
+    }
+}
+
+/// The `vector_layers.fields` type name for an exportable column, or `None`
+/// for one the export drops.
+fn field_type_name(dt: &DataType) -> Option<&'static str> {
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 => Some("String"),
+        DataType::Boolean => Some("Boolean"),
+        DataType::Dictionary(_, value) => field_type_name(value),
+        // Temporal values reach the tile as ISO 8601 text and nested values
+        // as JSON text, so the field must be advertised as what a client
+        // will actually read.
+        dt if is_temporal_scalar(dt) || is_json_encoded(dt) => Some("String"),
+        dt if is_supported_scalar(dt) => Some("Number"),
+        _ => None,
+    }
+}
+
 /// Arrow types rendered as ISO 8601 strings rather than numbers.
 ///
 /// Rendering is delegated to `arrow_cast`'s own formatter, so the text matches
@@ -4850,26 +5026,12 @@ fn field_metadata(
     published: &PublishedNames,
 ) -> HashMap<String, String> {
     let geom_idx = geom_idx.unwrap_or(usize::MAX);
-    let mut out = HashMap::new();
-    for (i, f) in schema.fields().iter().enumerate() {
-        if i == geom_idx
-            || f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
-            || published.is_suppressed(f.name())
-        {
-            continue;
-        }
-        let ty = match f.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => "String",
-            DataType::Boolean => "Boolean",
-            // Temporal values reach the tile as ISO 8601 text, so the field
-            // must be advertised as what a client will actually read.
-            dt if is_temporal_scalar(dt) => "String",
-            dt if is_supported_scalar(dt) => "Number",
-            _ => continue,
-        };
-        out.insert(published.publish(f.name()).to_string(), ty.to_string());
-    }
-    out
+    candidate_columns(schema, geom_idx, published)
+        .filter_map(|(_, f)| {
+            field_type_name(f.data_type())
+                .map(|ty| (published.publish(f.name()).to_string(), ty.to_string()))
+        })
+        .collect()
 }
 
 /// Extract one Arrow column into per-row optional [`PropertyValue`]s. Null cells
@@ -5035,8 +5197,233 @@ fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Option<PropertyV
             };
             out
         }
+        // A dictionary is an encoding, not a type: unwrap it to its value
+        // type (one `arrow_cast` pass over the batch, cheap) and extract that.
+        // `is_exportable` admits a dictionary only over an exportable value
+        // type, so the cast cannot land on the fallthrough below.
+        DataType::Dictionary(_, value) => match arrow_cast::cast(col, value) {
+            Ok(flat) => extract_property_column(flat.as_ref()),
+            Err(e) => {
+                log::warn!(
+                    "cannot unwrap {:?} column, dropping it: {e}",
+                    col.data_type()
+                );
+                vec![None; n]
+            }
+        },
+        // #434: nested columns as JSON strings, the tippecanoe convention
+        // (see `is_json_encoded`). One string per non-null row; a null row
+        // stays null (no property), as for every scalar column.
+        dt if is_json_encoded(dt) => json_property_column(col),
         _ => vec![None; n],
     }
+}
+
+// ============================================================================
+// Nested properties as JSON (#434)
+// ============================================================================
+
+/// Render every row of a struct/list/map column as a JSON string.
+///
+/// The column is first resolved into a [`JsonNode`] tree -- one node per
+/// nested Arrow array, with every scalar leaf extracted ONCE for the whole
+/// batch through [`extract_property_column`] -- and then each row is written
+/// straight into one reusable byte buffer. So the per-row cost is the write
+/// itself: no intermediate `serde_json::Value` tree, no per-value
+/// formatter, and exactly one `String` allocation per non-null row.
+fn json_property_column(col: &dyn Array) -> Vec<Option<PropertyValue>> {
+    let node = JsonNode::resolve(col);
+    let mut buf = Vec::with_capacity(64);
+    (0..col.len())
+        .map(|i| {
+            if col.is_null(i) {
+                return None;
+            }
+            buf.clear();
+            node.write(&mut buf, i);
+            // Only `serde_json` and ASCII punctuation ever wrote into `buf`,
+            // so it is valid UTF-8; the checked conversion is belt and braces.
+            String::from_utf8(buf.clone())
+                .ok()
+                .map(PropertyValue::String)
+        })
+        .collect()
+}
+
+/// One nested Arrow array, ready to be written row by row as JSON.
+enum JsonNode {
+    /// A scalar leaf, already extracted for the whole array. An unsupported
+    /// leaf type extracts to all-`None`, which renders as `null` per value.
+    Leaf(Vec<Option<PropertyValue>>),
+    /// A struct: its field names and one node per child, indexed by the
+    /// same row.
+    Struct {
+        array: arrow_array::StructArray,
+        fields: Vec<(String, JsonNode)>,
+    },
+    /// A variable-length list: `offsets[i]..offsets[i + 1]` of `values`.
+    List {
+        offsets: Vec<usize>,
+        array: arrow_array::ArrayRef,
+        values: Box<JsonNode>,
+    },
+    /// A map: `offsets[i]..offsets[i + 1]` of `(key, value)` pairs. String
+    /// keys make a JSON object; any other key type makes an array of
+    /// two-element arrays, since JSON object keys can only be strings.
+    Map {
+        offsets: Vec<usize>,
+        array: arrow_array::ArrayRef,
+        keys: Box<JsonNode>,
+        values: Box<JsonNode>,
+    },
+}
+
+impl JsonNode {
+    fn resolve(col: &dyn Array) -> Self {
+        match col.data_type() {
+            DataType::Struct(_) => {
+                let array = col.as_struct().clone();
+                let fields = array
+                    .fields()
+                    .iter()
+                    .zip(array.columns())
+                    .map(|(f, child)| (f.name().clone(), JsonNode::resolve(child.as_ref())))
+                    .collect();
+                JsonNode::Struct { array, fields }
+            }
+            DataType::List(_) => {
+                let a = col.as_list::<i32>();
+                JsonNode::List {
+                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    array: arrow_array::make_array(col.to_data()),
+                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                }
+            }
+            DataType::LargeList(_) => {
+                let a = col.as_list::<i64>();
+                JsonNode::List {
+                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    array: arrow_array::make_array(col.to_data()),
+                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                }
+            }
+            DataType::FixedSizeList(_, _) => {
+                let a = col.as_fixed_size_list();
+                let width = usize::try_from(a.value_length()).unwrap_or(0);
+                JsonNode::List {
+                    offsets: (0..=a.len()).map(|i| i * width).collect(),
+                    array: arrow_array::make_array(col.to_data()),
+                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                }
+            }
+            DataType::Map(_, _) => {
+                let a = col.as_map();
+                JsonNode::Map {
+                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    array: arrow_array::make_array(col.to_data()),
+                    keys: Box::new(JsonNode::resolve(a.keys().as_ref())),
+                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                }
+            }
+            _ => JsonNode::Leaf(extract_property_column(col)),
+        }
+    }
+
+    /// Whether row `i` of this node is null (renders as `null`).
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            JsonNode::Leaf(values) => values.get(i).is_none_or(Option::is_none),
+            JsonNode::Struct { array, .. } => array.is_null(i),
+            JsonNode::List { array, .. } | JsonNode::Map { array, .. } => array.is_null(i),
+        }
+    }
+
+    /// Write row `i` as JSON. `serde_json` does every string escape and
+    /// number rendering (a non-finite float becomes `null`, as serde_json
+    /// renders it everywhere); only the punctuation is written by hand.
+    fn write(&self, out: &mut Vec<u8>, i: usize) {
+        if self.is_null(i) {
+            out.extend_from_slice(b"null");
+            return;
+        }
+        match self {
+            JsonNode::Leaf(values) => {
+                // `is_null` above already returned for a `None`.
+                let value = values[i].as_ref().expect("checked non-null");
+                write_json_scalar(out, value);
+            }
+            JsonNode::Struct { fields, .. } => {
+                out.push(b'{');
+                for (k, (name, child)) in fields.iter().enumerate() {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    write_json_str(out, name);
+                    out.push(b':');
+                    child.write(out, i);
+                }
+                out.push(b'}');
+            }
+            JsonNode::List {
+                offsets, values, ..
+            } => {
+                out.push(b'[');
+                for (k, j) in (offsets[i]..offsets[i + 1]).enumerate() {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    values.write(out, j);
+                }
+                out.push(b']');
+            }
+            JsonNode::Map {
+                offsets,
+                keys,
+                values,
+                ..
+            } => {
+                let string_keys = matches!(keys.as_ref(), JsonNode::Leaf(v)
+                    if v.iter().flatten().all(|k| matches!(k, PropertyValue::String(_))));
+                out.push(if string_keys { b'{' } else { b'[' });
+                for (k, j) in (offsets[i]..offsets[i + 1]).enumerate() {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    if string_keys {
+                        keys.write(out, j);
+                        out.push(b':');
+                        values.write(out, j);
+                    } else {
+                        out.push(b'[');
+                        keys.write(out, j);
+                        out.push(b',');
+                        values.write(out, j);
+                        out.push(b']');
+                    }
+                }
+                out.push(if string_keys { b'}' } else { b']' });
+            }
+        }
+    }
+}
+
+/// Write one scalar as JSON.
+fn write_json_scalar(out: &mut Vec<u8>, value: &PropertyValue) {
+    // `serde_json::to_writer` into a `Vec` cannot fail: the writer is
+    // infallible and every variant here is serializable.
+    let _ = match value {
+        PropertyValue::String(s) => serde_json::to_writer(&mut *out, s),
+        PropertyValue::Bool(b) => serde_json::to_writer(&mut *out, b),
+        PropertyValue::Int(v) => serde_json::to_writer(&mut *out, v),
+        PropertyValue::UInt(v) => serde_json::to_writer(&mut *out, v),
+        PropertyValue::Float(v) => serde_json::to_writer(&mut *out, v),
+        PropertyValue::Double(v) => serde_json::to_writer(&mut *out, v),
+    };
+}
+
+/// Write one string as a JSON string literal.
+fn write_json_str(out: &mut Vec<u8>, s: &str) {
+    let _ = serde_json::to_writer(&mut *out, s);
 }
 
 // ============================================================================
@@ -6978,6 +7365,470 @@ mod tests {
         assert_eq!(meta.get("d").map(String::as_str), Some("String"));
         assert_eq!(meta.get("ts").map(String::as_str), Some("String"));
         assert_eq!(meta.get("dec").map(String::as_str), Some("Number"));
+    }
+
+    // --- #434: nested columns as JSON strings, unsupported ones warned ------
+
+    /// The Overture shape: `names` is a struct holding a string and a
+    /// string-keyed map, `sources` a list of strings, plus a binary column
+    /// the export cannot encode. `n` rows per level, two levels, one row per
+    /// row group so the once-per-export accounting is exercised across many
+    /// row groups. Row `null_row` (when given) has null `names` and
+    /// `sources`.
+    fn write_overture_fixture(path: &Path, n: usize, null_row: Option<usize>, binary: &str) {
+        use arrow_array::builder::{ListBuilder, MapBuilder, StringBuilder};
+        use arrow_array::{BinaryArray, StructArray};
+
+        let primary = StringArray::from(
+            (0..n)
+                .map(|i| (Some(i) != null_row).then(|| format!("Place {i}")))
+                .collect::<Vec<_>>(),
+        );
+        let mut common = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for i in 0..n {
+            if Some(i) == null_row {
+                common.append(false).unwrap();
+                continue;
+            }
+            common.keys().append_value("fr");
+            common.values().append_value(format!("Lieu {i}"));
+            common.keys().append_value("de");
+            common.values().append_value(format!("Ort {i}"));
+            common.append(true).unwrap();
+        }
+        let common = common.finish();
+        let names_nulls = null_row.map(|r| {
+            arrow_array::BooleanArray::from((0..n).map(|i| i != r).collect::<Vec<_>>())
+                .values()
+                .clone()
+                .into()
+        });
+        let names = StructArray::new(
+            vec![
+                Arc::new(Field::new("primary", DataType::Utf8, true)),
+                Arc::new(Field::new("common", common.data_type().clone(), true)),
+            ]
+            .into(),
+            vec![Arc::new(primary) as ArrayRef, Arc::new(common) as ArrayRef],
+            names_nulls,
+        );
+        let mut sources = ListBuilder::new(StringBuilder::new());
+        for i in 0..n {
+            if Some(i) == null_row {
+                sources.append_null();
+                continue;
+            }
+            sources.values().append_value("osm");
+            sources.values().append_value("meta");
+            sources.append(true);
+        }
+        let sources = sources.finish();
+        let raw = BinaryArray::from_iter_values((0..n).map(|i| format!("blob{i}").into_bytes()));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("names", names.data_type().clone(), true),
+            Field::new("sources", sources.data_type().clone(), true),
+            Field::new(binary, DataType::Binary, false),
+            geometry_field(),
+        ]));
+        let specs = vec![
+            LevelSpec::new(gsd(2), Some(2)),
+            LevelSpec::new(gsd(4), Some(4)),
+        ];
+        let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
+        opts.max_row_group_size = 1;
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        for level in 0..2 {
+            let geoms: Vec<Geometry<f64>> = (0..n)
+                .map(|i| Geometry::Point(Point::new(-120.0 + i as f64 * 0.01, 40.0)))
+                .collect();
+            let rb = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                    Arc::new(names.clone()),
+                    Arc::new(sources.clone()),
+                    Arc::new(raw.clone()),
+                    Arc::new(build_geometry_array(&geoms).to_array_ref()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(level, Some(n), std::iter::once(rb))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+    }
+
+    /// The archive's `vector_layers[].fields` (name -> type) over every layer.
+    fn archive_fields(path: &Path) -> HashMap<String, String> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::fs::File::open(path)
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        // PMTiles v3 header: the JSON metadata offset/length live at bytes 24..40.
+        let off = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
+        let json = compression::decompress_capped(
+            &buf[off..off + len],
+            Compression::Gzip,
+            compression::MAX_INTERNAL_BYTES,
+        )
+        .expect("archive metadata is gzip");
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        v["vector_layers"]
+            .as_array()
+            .expect("vector_layers")
+            .iter()
+            .flat_map(|l| {
+                l["fields"].as_object().into_iter().flat_map(|o| {
+                    o.iter()
+                        .map(|(k, t)| (k.clone(), t.as_str().unwrap().to_string()))
+                })
+            })
+            .collect()
+    }
+
+    /// The decoded parquet's property column names (everything `decode`
+    /// adds and the geometry left out).
+    fn decoded_property_names(pmtiles: &Path) -> Vec<String> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let decoded = tempfile::NamedTempFile::new().unwrap();
+        crate::decode::decode_pmtiles(
+            pmtiles,
+            decoded.path(),
+            &crate::decode::DecodeOptions::default(),
+        )
+        .unwrap();
+        let file = std::fs::File::open(decoded.path()).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "zoom" | "layer" | "mvt_id" | "geometry" | "bbox"
+                )
+            })
+            .collect()
+    }
+
+    /// #434, end to end on the Overture shape: the struct and the list reach
+    /// the tiles as JSON strings and are advertised as `String`; the binary
+    /// column is dropped, counted in the report, and never advertised; the
+    /// file's own bbox covering struct is neither exported nor counted.
+    #[test]
+    fn overture_shaped_nested_columns_export_as_json_strings() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_overture_fixture(tin.path(), 3, Some(2), "raw");
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let report = export_pmtiles(tin.path(), tout.path(), &ExportOptions::default()).unwrap();
+
+        assert_eq!(
+            report.skipped_property_columns,
+            vec![SkippedPropertyColumn {
+                name: "raw".to_string(),
+                data_type: "Binary".to_string(),
+            }],
+            "the binary column is the one and only skipped column; the bbox \
+             covering must not be counted"
+        );
+
+        let fields = archive_fields(tout.path());
+        assert_eq!(fields.get("names").map(String::as_str), Some("String"));
+        assert_eq!(fields.get("sources").map(String::as_str), Some("String"));
+        assert_eq!(fields.get("id").map(String::as_str), Some("Number"));
+        assert!(
+            !fields.contains_key("raw"),
+            "binary must not be advertised: {fields:?}"
+        );
+        assert!(
+            !fields.contains_key("bbox"),
+            "the covering is not a property: {fields:?}"
+        );
+
+        let mut names = decoded_property_names(tout.path());
+        names.sort();
+        assert_eq!(names, vec!["id", "names", "sources"]);
+
+        // The tile values themselves: one JSON string per non-null row.
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        let feats = read_level_features(&reader, 0, Crs::Epsg4326).unwrap();
+        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default()).unwrap();
+        let strings: Vec<String> = tiles
+            .iter()
+            .flat_map(|t| decode_tile(&t.data).layers)
+            .flat_map(|l| l.values)
+            .filter_map(|v| v.string_value)
+            .collect();
+        for want in [
+            r#"{"primary":"Place 0","common":{"fr":"Lieu 0","de":"Ort 0"}}"#,
+            r#"{"primary":"Place 1","common":{"fr":"Lieu 1","de":"Ort 1"}}"#,
+            r#"["osm","meta"]"#,
+        ] {
+            assert!(
+                strings.iter().any(|s| s == want),
+                "{want} missing from the tile strings: {strings:?}"
+            );
+        }
+        assert!(
+            !strings.iter().any(|s| s.contains("Place 2") || s == "null"),
+            "a null struct row must carry no property at all: {strings:?}"
+        );
+        // Each feature's tag count: `id` + `names` + `sources` for rows 0
+        // and 1, `id` alone for the null row.
+        let tag_counts: Vec<usize> = tiles
+            .iter()
+            .flat_map(|t| decode_tile(&t.data).layers)
+            .flat_map(|l| l.features)
+            .map(|f| f.tags.len() / 2)
+            .collect();
+        let mut sorted = tag_counts.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 3, 3], "tags per feature: {tag_counts:?}");
+    }
+
+    /// #434: the warning is said once per skipped column per export -- not
+    /// once per row group, level or tile -- and the report lists it once.
+    #[test]
+    fn skipped_column_is_warned_and_reported_once_per_export() {
+        use std::sync::Mutex;
+
+        struct CountingLogger;
+        static HITS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        impl log::Log for CountingLogger {
+            fn enabled(&self, m: &log::Metadata) -> bool {
+                m.level() <= log::Level::Warn
+            }
+            fn log(&self, record: &log::Record) {
+                if record.level() == log::Level::Warn {
+                    HITS.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        // Another test in this binary may have installed a logger first;
+        // then only the report half of this test is checkable.
+        let logging = log::set_logger(&CountingLogger).is_ok();
+        log::set_max_level(log::LevelFilter::Warn);
+
+        // 6 rows x 2 levels at one row per row group: 12 row groups, and
+        // every level's export re-extracts the columns per batch.
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_overture_fixture(tin.path(), 6, None, "raw_once_434");
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let report = export_pmtiles(tin.path(), tout.path(), &ExportOptions::default()).unwrap();
+        assert_eq!(report.skipped_property_columns.len(), 1);
+        assert_eq!(report.skipped_property_columns[0].name, "raw_once_434");
+        assert!(report.total_tiles >= 2, "both levels exported");
+
+        if logging {
+            // The logger is process-global, so sibling tests' warnings land
+            // here too: count only this fixture's uniquely named column.
+            let hits = HITS.lock().unwrap();
+            let raw_warnings = hits
+                .iter()
+                .filter(|m| m.contains("not exporting property \"raw_once_434\""))
+                .count();
+            assert_eq!(
+                raw_warnings, 1,
+                "one warning per skipped column per export; warnings were {hits:?}"
+            );
+            assert!(
+                hits.iter()
+                    .filter(|m| m.contains("not exporting property"))
+                    .all(|m| !m.contains("bbox")),
+                "the covering struct must not be warned about: {hits:?}"
+            );
+        }
+    }
+
+    /// #434: `--include-property` addresses a JSON-encoded column like any
+    /// other, and naming a column the export cannot encode says so instead
+    /// of calling it unknown.
+    #[test]
+    fn property_selection_covers_json_encoded_columns() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_overture_fixture(tin.path(), 2, None, "raw");
+
+        let opts = ExportOptions {
+            properties: PropertySelection {
+                include: Some(vec!["names".to_string()]),
+                ..Default::default()
+            },
+            ..ExportOptions::default()
+        };
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(tin.path(), tout.path(), &opts).expect("include names exports");
+        assert_eq!(decoded_property_names(tout.path()), vec!["names"]);
+        let fields = archive_fields(tout.path());
+        assert_eq!(fields.len(), 1, "{fields:?}");
+        assert_eq!(fields.get("names").map(String::as_str), Some("String"));
+
+        let opts = ExportOptions {
+            properties: PropertySelection {
+                exclude: vec!["names".to_string(), "raw".to_string()],
+                ..Default::default()
+            },
+            ..ExportOptions::default()
+        };
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let report = export_pmtiles(tin.path(), tout.path(), &opts).expect("exclude exports");
+        let mut names = decoded_property_names(tout.path());
+        names.sort();
+        assert_eq!(names, vec!["id", "sources"]);
+        assert!(
+            report.skipped_property_columns.is_empty(),
+            "an excluded binary column was asked for, not dropped: {:?}",
+            report.skipped_property_columns
+        );
+
+        let opts = ExportOptions {
+            properties: PropertySelection {
+                include: Some(vec!["raw".to_string()]),
+                ..Default::default()
+            },
+            ..ExportOptions::default()
+        };
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
+        match err {
+            ExportError::UnsupportedProperty { name, data_type } => {
+                assert_eq!(name, "raw");
+                assert_eq!(data_type, "Binary");
+            }
+            other => panic!("expected UnsupportedProperty, got {other:?}"),
+        }
+    }
+
+    /// #434: the JSON rendering, value by value. Nulls inside a struct are
+    /// `null` members (the struct is still a value), a non-finite float is
+    /// `null`, a non-string map key makes an array of pairs, fixed-size and
+    /// large lists render like lists, nested lists nest, and a
+    /// dictionary-encoded column is unwrapped to its value type.
+    #[test]
+    fn json_property_rendering_covers_every_nested_kind() {
+        use arrow_array::builder::{
+            FixedSizeListBuilder, Int32Builder, LargeListBuilder, ListBuilder, MapBuilder,
+            StringBuilder,
+        };
+        use arrow_array::types::Int8Type;
+        use arrow_array::{DictionaryArray, Float64Array, Int32Array, StructArray};
+
+        // struct { n: Int32?, x: Float64?, tags: List<Int32>? }
+        let n = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let x = Float64Array::from(vec![Some(1.5), Some(f64::NAN), Some(-0.25)]);
+        let mut tags = ListBuilder::new(Int32Builder::new());
+        tags.values().append_value(7);
+        tags.values().append_value(8);
+        tags.append(true);
+        tags.append_null();
+        tags.append(true); // empty list
+        let tags = tags.finish();
+        let st = StructArray::from(vec![
+            (
+                Arc::new(Field::new("n", DataType::Int32, true)),
+                Arc::new(n) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("x", DataType::Float64, true)),
+                Arc::new(x) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("tags", tags.data_type().clone(), true)),
+                Arc::new(tags) as ArrayRef,
+            ),
+        ]);
+        let got = extract_property_column(&st);
+        let strings: Vec<Option<&str>> = got
+            .iter()
+            .map(|v| match v {
+                Some(PropertyValue::String(s)) => Some(s.as_str()),
+                None => None,
+                other => panic!("nested column must render as a string: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                Some(r#"{"n":1,"x":1.5,"tags":[7,8]}"#),
+                Some(r#"{"n":null,"x":null,"tags":null}"#),
+                Some(r#"{"n":3,"x":-0.25,"tags":[]}"#),
+            ]
+        );
+        assert_eq!(
+            field_type_name(st.data_type()),
+            Some("String"),
+            "a struct is advertised as a string"
+        );
+
+        // Map<Int32, Utf8>: keys are not strings, so pairs, not an object.
+        let mut m = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        m.keys().append_value(1);
+        m.values().append_value("one");
+        m.keys().append_value(2);
+        m.values().append_null();
+        m.append(true).unwrap();
+        let m = m.finish();
+        assert_eq!(
+            extract_property_column(&m)[0],
+            Some(PropertyValue::String(r#"[[1,"one"],[2,null]]"#.to_string()))
+        );
+
+        // FixedSizeList<Int32, 2> and LargeList<Utf8>, with a quote to escape.
+        let mut fsl = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        fsl.values().append_value(1);
+        fsl.values().append_value(2);
+        fsl.append(true);
+        let fsl = fsl.finish();
+        assert_eq!(
+            extract_property_column(&fsl)[0],
+            Some(PropertyValue::String("[1,2]".to_string()))
+        );
+        let mut ll = LargeListBuilder::new(StringBuilder::new());
+        ll.values().append_value("say \"hi\"");
+        ll.append(true);
+        let ll = ll.finish();
+        assert_eq!(
+            extract_property_column(&ll)[0],
+            Some(PropertyValue::String(r#"["say \"hi\""]"#.to_string()))
+        );
+
+        // Dictionary<Int8, Utf8> unwraps to plain strings, not JSON.
+        let dict: DictionaryArray<Int8Type> =
+            vec![Some("a"), None, Some("b")].into_iter().collect();
+        assert_eq!(
+            extract_property_column(&dict),
+            vec![
+                Some(PropertyValue::String("a".to_string())),
+                None,
+                Some(PropertyValue::String("b".to_string())),
+            ]
+        );
+        assert_eq!(field_type_name(dict.data_type()), Some("String"));
+        assert!(is_exportable(dict.data_type()));
+
+        // Binary has no encoding at all: not exportable, not advertised.
+        assert!(!is_exportable(&DataType::Binary));
+        assert!(!is_exportable(&DataType::LargeBinary));
+        assert_eq!(field_type_name(&DataType::Binary), None);
+        assert_eq!(
+            field_type_name(&DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Binary)
+            )),
+            None,
+            "a dictionary over an unsupported value type is unsupported"
+        );
     }
 
     #[test]
