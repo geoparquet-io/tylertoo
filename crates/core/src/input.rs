@@ -477,6 +477,7 @@ pub(crate) mod remote {
         ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
     };
     use parquet::errors::ParquetError;
+    use parquet::file::metadata::ParquetMetaData;
     use url::Url;
 
     use super::{FetchStats, InputError, InputReader};
@@ -772,17 +773,11 @@ pub(crate) mod remote {
             &self,
         ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
             let reader = InputReader::Remote(self.reader());
-            let metadata = match self.metadata.get() {
-                Some(md) => md.clone(),
-                None => {
-                    let md = ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new())?;
-                    // A concurrent open may have won the race; either copy
-                    // is equivalent.
-                    let _ = self.metadata.set(md.clone());
-                    md
-                }
-            };
+            let metadata = self.load_footer()?;
             // Column-chunk byte ranges (sorted) for readahead clamping.
+            // `load_footer` has already rejected any chunk whose range
+            // overflows or runs past the object (#430), so the add cannot
+            // wrap; saturate anyway rather than trust a cached footer.
             self.shared.chunk_ranges.get_or_init(|| {
                 let mut ranges: Vec<Range<u64>> = metadata
                     .metadata()
@@ -791,7 +786,7 @@ pub(crate) mod remote {
                     .flat_map(|rg| {
                         rg.columns().iter().map(|col| {
                             let (start, len) = col.byte_range();
-                            start..start + len
+                            start..start.saturating_add(len)
                         })
                     })
                     .collect();
@@ -860,8 +855,51 @@ pub(crate) mod remote {
             }
             let reader = InputReader::Remote(self.reader());
             let md = ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new())?;
+            self.validate_chunk_ranges(md.metadata())?;
+            // A concurrent open may have won the race; either copy is
+            // equivalent.
             let _ = self.metadata.set(md.clone());
             Ok(md)
+        }
+
+        /// #430: reject a footer whose column chunk byte ranges overflow or
+        /// run past the object before anything is built on it. Every later
+        /// `start + len` over these ranges (chunk map, staging spans, page
+        /// slices) would otherwise wrap in release or panic in debug on a
+        /// hostile parquet.
+        fn validate_chunk_ranges(&self, metadata: &ParquetMetaData) -> Result<(), InputError> {
+            for (rg_idx, rg) in metadata.row_groups().iter().enumerate() {
+                for (col_idx, col) in rg.columns().iter().enumerate() {
+                    // parquet's `byte_range()` asserts on a negative offset
+                    // or length, and the thrift decoder does not reject
+                    // them, so check the raw fields first.
+                    let raw_start = col
+                        .dictionary_page_offset()
+                        .unwrap_or_else(|| col.data_page_offset());
+                    let raw_len = col.compressed_size();
+                    if raw_start < 0 || raw_len < 0 {
+                        return Err(ParquetError::EOF(format!(
+                            "column chunk (row group {rg_idx}, column {col_idx}) has a \
+                             negative offset or length ({raw_start}, {raw_len}) for {}",
+                            self.location
+                        ))
+                        .into());
+                    }
+                    let (start, len) = col.byte_range();
+                    let end = start.checked_add(len).filter(|end| *end <= self.size);
+                    if end.is_none() || usize::try_from(len).is_err() {
+                        return Err(ParquetError::EOF(format!(
+                            "column chunk (row group {rg_idx}, column {col_idx}) range \
+                             {start}..{} beyond object size {} for {}",
+                            start as u128 + len as u128,
+                            self.size,
+                            self.location
+                        ))
+                        .into());
+                    }
+                }
+            }
+            Ok(())
         }
 
         /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
@@ -899,25 +937,38 @@ pub(crate) mod remote {
                 Some(sel) => sel.to_vec(),
                 None => (0..row_groups.len()).collect(),
             };
-            let plan: Vec<StagedRowGroup> = indices
-                .into_iter()
-                .filter_map(|i| row_groups.get(i))
-                .filter_map(|rg| {
-                    let mut start = u64::MAX;
-                    let mut end = 0u64;
-                    let mut chunks = Vec::with_capacity(rg.columns().len());
-                    for col in rg.columns() {
-                        let (s, len) = col.byte_range();
-                        start = start.min(s);
-                        end = end.max(s + len);
-                        chunks.push((s, len as usize));
-                    }
-                    (end > start).then_some(StagedRowGroup {
+            let mut plan: Vec<StagedRowGroup> = Vec::with_capacity(indices.len());
+            for rg in indices.into_iter().filter_map(|i| row_groups.get(i)) {
+                let mut start = u64::MAX;
+                let mut end = 0u64;
+                let mut chunks = Vec::with_capacity(rg.columns().len());
+                for col in rg.columns() {
+                    let (s, len) = col.byte_range();
+                    // Checked (#430): `load_footer` validated these, but a
+                    // wrapped span here would fetch the wrong bytes.
+                    let chunk_end = s
+                        .checked_add(len)
+                        .filter(|e| *e <= self.size)
+                        .zip(usize::try_from(len).ok())
+                        .ok_or_else(|| {
+                            ParquetError::EOF(format!(
+                                "column chunk range {s}..{} beyond object size {} for {}",
+                                s as u128 + len as u128,
+                                self.size,
+                                self.location
+                            ))
+                        })?;
+                    start = start.min(s);
+                    end = end.max(chunk_end.0);
+                    chunks.push((s, chunk_end.1));
+                }
+                if end > start {
+                    plan.push(StagedRowGroup {
                         span: start..end,
                         chunks,
-                    })
-                })
-                .collect();
+                    });
+                }
+            }
             if plan.is_empty() {
                 return Ok(());
             }
@@ -974,9 +1025,15 @@ pub(crate) mod remote {
                     let base = rg.span.start;
                     let mut spill = spill.lock().expect("spill lock");
                     for (chunk_start, len) in rg.chunks {
-                        let off = (chunk_start - base) as usize;
-                        if off + len <= bytes.len() {
-                            spill.put(chunk_start, &bytes.slice(off..off + len));
+                        // Checked (#430): a wrapped `off + len` would pass the
+                        // bound and panic inside `slice`.
+                        let slice = chunk_start
+                            .checked_sub(base)
+                            .and_then(|off| usize::try_from(off).ok())
+                            .and_then(|off| off.checked_add(len).map(|end| off..end))
+                            .filter(|r| r.end <= bytes.len());
+                        if let Some(r) = slice {
+                            spill.put(chunk_start, &bytes.slice(r));
                         }
                     }
                 }
@@ -1410,6 +1467,12 @@ pub(crate) mod remote {
             }
             // L3: network. Fetch once, then spill the bytes for later passes.
             let data = self.fetch(chunk.clone())?;
+            // #430: a store that returns fewer bytes than the chunk declares
+            // (truncated download) is an error here, before anything is
+            // cached or sliced from it.
+            if data.len() as u64 != chunk.end - chunk.start {
+                return Err(self.short_chunk_error(chunk, data.len()));
+            }
             self.spill
                 .lock()
                 .expect("spill lock")
@@ -1465,10 +1528,27 @@ pub(crate) mod remote {
             // (footer tail, metadata) is fetched exactly.
             if let Some(chunk) = self.chunk_containing(start, end) {
                 let data = self.chunk_data(&chunk)?;
-                let offset = (start - chunk.start) as usize;
-                return Ok(data.slice(offset..offset + length));
+                // Checked (#430): the store may have returned fewer bytes
+                // than the chunk declares (truncated download); slicing
+                // past `data.len()` would panic.
+                let slice = usize::try_from(start - chunk.start)
+                    .ok()
+                    .and_then(|off| off.checked_add(length).map(|e| off..e))
+                    .filter(|r| r.end <= data.len())
+                    .ok_or_else(|| self.short_chunk_error(&chunk, data.len()))?;
+                return Ok(data.slice(slice));
             }
             self.fetch(start..end)
+        }
+
+        /// The error for a column chunk the store returned short (#430).
+        fn short_chunk_error(&self, chunk: &Range<u64>, got: usize) -> ParquetError {
+            ParquetError::EOF(format!(
+                "column chunk {chunk:?} of {} returned {got} bytes, expected {} \
+                 (truncated download?)",
+                self.location,
+                chunk.end - chunk.start
+            ))
         }
 
         /// Chunked sequential reader for
@@ -1507,7 +1587,14 @@ pub(crate) mod remote {
                         .reader
                         .chunk_data(&chunk)
                         .map_err(std::io::Error::other)?;
-                    let offset = (self.pos - chunk.start) as usize;
+                    // Checked (#430): a short chunk must not slice past
+                    // the bytes the store actually returned.
+                    let offset = usize::try_from(self.pos - chunk.start)
+                        .ok()
+                        .filter(|off| *off <= data.len())
+                        .ok_or_else(|| {
+                            std::io::Error::other(self.reader.short_chunk_error(&chunk, data.len()))
+                        })?;
                     self.buf = data.slice(offset..);
                     self.buf_offset = 0;
                     self.pos = chunk.end;
@@ -1821,7 +1908,11 @@ mod tests {
     mod remote_tests {
         use super::super::*;
 
+        use super::super::remote::RemoteSource;
         use super::super::test_memory_source as memory_source;
+        use object_store::path::Path as ObjectPath;
+        use object_store::{ObjectMeta, ObjectStore};
+        use std::sync::Arc;
 
         /// Minimal single-column parquet bytes for reader plumbing tests.
         fn tiny_parquet() -> Vec<u8> {
@@ -2217,6 +2308,297 @@ mod tests {
             let reader = r.reader();
             let size = reader.object_size();
             assert!(reader.get_bytes_range(size - 1, 2).is_err());
+        }
+
+        /// Rewrite `bytes`' footer so every column chunk declares
+        /// `total_compressed_size = len` (#430 hostile-footer fixture): the
+        /// data pages are kept verbatim, only the thrift footer is replaced.
+        fn with_hostile_chunk_len(bytes: &[u8], len: i64) -> Vec<u8> {
+            with_hostile_chunks(bytes, |b| b.set_total_compressed_size(len))
+        }
+
+        /// Rewrite `bytes`' footer so every column chunk declares
+        /// `data_page_offset = offset` (and no dictionary page).
+        fn with_hostile_chunk_offset(bytes: &[u8], offset: i64) -> Vec<u8> {
+            with_hostile_chunks(bytes, |b| {
+                b.set_dictionary_page_offset(None)
+                    .set_data_page_offset(offset)
+            })
+        }
+
+        /// Apply `mutate` to every column chunk's metadata builder and
+        /// re-serialize the footer behind the original data pages.
+        fn with_hostile_chunks(
+            bytes: &[u8],
+            mutate: impl Fn(
+                parquet::file::metadata::ColumnChunkMetaDataBuilder,
+            ) -> parquet::file::metadata::ColumnChunkMetaDataBuilder,
+        ) -> Vec<u8> {
+            use parquet::file::metadata::{ParquetMetaDataReader, ParquetMetaDataWriter};
+
+            let md = ParquetMetaDataReader::new()
+                .parse_and_finish(&Bytes::from(bytes.to_vec()))
+                .unwrap();
+            let row_groups: Vec<_> = md
+                .row_groups()
+                .iter()
+                .map(|rg| {
+                    let cols: Vec<_> = rg
+                        .columns()
+                        .iter()
+                        .map(|c| mutate(c.clone().into_builder()).build().unwrap())
+                        .collect();
+                    rg.clone()
+                        .into_builder()
+                        .set_column_metadata(cols)
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            let md = md.into_builder().set_row_groups(row_groups).build();
+            let footer_len =
+                u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                    as usize;
+            let data_end = bytes.len() - 8 - footer_len;
+            let mut out = bytes[..data_end].to_vec();
+            ParquetMetaDataWriter::new(&mut out, &md).finish().unwrap();
+            out
+        }
+
+        /// #430: a footer whose column chunk range runs past EOF must be a
+        /// typed error from open / staging, never a panic (debug overflow)
+        /// or a wrapped range (release).
+        #[test]
+        fn hostile_footer_chunk_past_eof_is_error_not_panic() {
+            let good = tiny_parquet();
+            // -1: parquet's `byte_range()` asserts on a negative length, so
+            // the check must reject it before calling that.
+            for len in [good.len() as i64 * 4, i64::MAX, -1] {
+                let bytes = with_hostile_chunk_len(&good, len);
+                let source = memory_source(bytes, "hostile.parquet");
+                let err = match source.open() {
+                    Ok(builder) => match builder.build() {
+                        Ok(reader) => reader
+                            .map(|b| b.map(|_| ()))
+                            .collect::<Result<Vec<()>, _>>()
+                            .err()
+                            .map(InputError::from)
+                            .expect("hostile chunk range must not read cleanly"),
+                        Err(e) => InputError::from(e),
+                    },
+                    Err(e) => e,
+                };
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("beyond object size") || msg.contains("EOF"),
+                    "len={len}: expected an EOF-style error, got: {msg}"
+                );
+                assert!(
+                    source.stage_row_groups(None).is_err(),
+                    "len={len}: staging must reject the hostile range"
+                );
+            }
+        }
+
+        /// #430: a negative `data_page_offset` must be a typed error, not
+        /// parquet's `byte_range()` assertion panic.
+        #[test]
+        fn hostile_footer_negative_page_offset_is_error_not_panic() {
+            let bytes = with_hostile_chunk_offset(&tiny_parquet(), -1);
+            let source = memory_source(bytes, "hostile.parquet");
+            let err = source.open().expect_err("negative offset must not open");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("negative") && msg.contains("EOF"),
+                "expected a negative-offset EOF error, got: {msg}"
+            );
+            assert!(source.stage_row_groups(None).is_err());
+        }
+
+        /// Object store double that returns `drop` fewer bytes than
+        /// requested for any range inside the data region (a truncated
+        /// download); footer reads are served intact so the reader gets
+        /// as far as slicing column chunks.
+        #[derive(Debug)]
+        struct TruncatingStore {
+            inner: object_store::memory::InMemory,
+            data_end: u64,
+            drop: usize,
+        }
+
+        impl std::fmt::Display for TruncatingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "TruncatingStore({})", self.inner)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for TruncatingStore {
+            async fn put_opts(
+                &self,
+                location: &ObjectPath,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjectPath,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+
+            async fn get_opts(
+                &self,
+                location: &ObjectPath,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                use futures_util::StreamExt;
+                let result = self.inner.get_opts(location, options).await?;
+                if result.range.start >= self.data_end {
+                    return Ok(result);
+                }
+                let meta = result.meta.clone();
+                let attributes = result.attributes.clone();
+                let full = result.range.clone();
+                let bytes = result.bytes().await?;
+                let keep = bytes.len().saturating_sub(self.drop);
+                let short = bytes.slice(..keep);
+                Ok(object_store::GetResult {
+                    payload: object_store::GetResultPayload::Stream(
+                        futures_util::stream::once(futures_util::future::ready(Ok(short))).boxed(),
+                    ),
+                    meta,
+                    range: full.start..full.start + keep as u64,
+                    attributes,
+                    extensions: Default::default(),
+                })
+            }
+
+            fn delete_stream(
+                &self,
+                locations: futures_util::stream::BoxStream<
+                    'static,
+                    object_store::Result<ObjectPath>,
+                >,
+            ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectPath>>
+            {
+                self.inner.delete_stream(locations)
+            }
+
+            fn list(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&ObjectPath>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy_opts(
+                &self,
+                from: &ObjectPath,
+                to: &ObjectPath,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+
+        fn truncating_source(bytes: Vec<u8>, drop: usize) -> InputSource {
+            use object_store::ObjectStoreExt;
+
+            let footer_len =
+                u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                    as u64;
+            let data_end = bytes.len() as u64 - 8 - footer_len;
+            let inner = object_store::memory::InMemory::new();
+            let location = ObjectPath::from("short.parquet");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(inner.put(&location, bytes.into())).unwrap();
+            let store: Arc<dyn ObjectStore> = Arc::new(TruncatingStore {
+                inner,
+                data_end,
+                drop,
+            });
+            InputSource::Remote(
+                RemoteSource::from_store(store, location, "memory://short.parquet".into()).unwrap(),
+            )
+        }
+
+        /// #430: a store that returns fewer bytes than requested for a
+        /// column chunk (truncated download) must surface as a read error,
+        /// not a `Bytes::slice` panic.
+        #[test]
+        fn truncated_chunk_read_is_error_not_panic() {
+            let source = truncating_source(tiny_parquet(), 3);
+            let outcome = source.open().and_then(|b| {
+                b.build()
+                    .map_err(InputError::from)?
+                    .map(|batch| batch.map(|_| ()))
+                    .collect::<Result<Vec<()>, _>>()
+                    .map_err(InputError::from)
+            });
+            assert!(outcome.is_err(), "short read must be an error");
+        }
+
+        /// #430 sequential path: `get_read` inside a truncated chunk must
+        /// also fail cleanly.
+        #[test]
+        fn truncated_chunk_sequential_read_is_error_not_panic() {
+            use parquet::file::reader::ChunkReader;
+            use std::io::Read;
+
+            let bytes = tiny_parquet();
+            let source = truncating_source(bytes, 3);
+            // Populate the chunk map, then read past what the store returns.
+            let builder = source.open().unwrap();
+            let (start, len) = builder.metadata().row_group(0).column(0).byte_range();
+            let chunk = start..start + len;
+            let InputSource::Remote(ref r) = source else {
+                unreachable!()
+            };
+            let reader = InputReader::Remote(r.reader());
+            let mut out = Vec::new();
+            let res = reader
+                .get_read(chunk.end - 1)
+                .and_then(|mut rd| rd.read_to_end(&mut out).map_err(ParquetError::from));
+            assert!(
+                res.is_err(),
+                "sequential read past a short chunk must error"
+            );
+        }
+
+        /// #430: a page read whose declared range exceeds the bytes the
+        /// store returned must be an EOF error, not a slice panic.
+        #[test]
+        fn truncated_chunk_get_bytes_is_eof_error() {
+            let source = truncating_source(tiny_parquet(), 3);
+            let builder = source.open().unwrap();
+            let (start, len) = builder.metadata().row_group(0).column(0).byte_range();
+            let InputSource::Remote(ref r) = source else {
+                unreachable!()
+            };
+            let reader = r.reader();
+            let err = reader
+                .get_bytes_range(start, len as usize)
+                .expect_err("short chunk must not be served");
+            assert!(
+                matches!(err, ParquetError::EOF(_)),
+                "expected EOF, got {err:?}"
+            );
         }
     }
 }

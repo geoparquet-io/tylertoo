@@ -1,0 +1,1 @@
+(pop > 1000 AND area <= 2.5) OR class IN ("city", "town")

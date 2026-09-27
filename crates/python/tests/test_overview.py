@@ -206,6 +206,18 @@ class TestExportPmtilesApi:
         with pytest.raises(RuntimeError):
             tylertoo.export_pmtiles("/nonexistent.parquet", "/tmp/out.pmtiles")
 
+    def test_export_pmtiles_rejects_missing_spill_dir(self):
+        """#427: spill_dir is validated before any work, naming the flag."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "no-such-dir"
+            pattern = r"spill-dir .* not an existing directory"
+            with pytest.raises(RuntimeError, match=pattern):
+                tylertoo.export_pmtiles(
+                    "/nonexistent.parquet",
+                    str(Path(tmpdir) / "out.pmtiles"),
+                    spill_dir=missing,
+                )
+
 
 class TestValidateApi:
     def test_validate_exists(self):
@@ -278,6 +290,36 @@ class TestOverviewIntegration:
             assert len(report["levels"]) == 4
             assert report["levels"][0]["zoom"] == 11
             assert report["levels"][-1]["zoom"] == 14
+
+    def test_overview_max_zoom_auto(self):
+        """#444: max_zoom="auto" estimates a zoom from the input instead of
+        taking a literal, and the resulting plan still resolves and writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, report = self._overview(tmpdir, min_zoom=0, max_zoom="auto")
+            # open-buildings (~30m buildings ~23m apart) pins to z14, the
+            # same value the core characterization test asserts.
+            assert report["levels"][-1]["zoom"] == 14
+
+    def test_overview_max_zoom_auto_min_zoom_above_ceiling_raises(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="min-zoom 17"),
+        ):
+            self._overview(tmpdir, min_zoom=17, max_zoom="auto")
+
+    def test_overview_max_zoom_out_of_range_int_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="between 0 and 255"),
+        ):
+            self._overview(tmpdir, max_zoom=300)
+
+    def test_overview_max_zoom_garbled_string_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="auto"),
+        ):
+            self._overview(tmpdir, max_zoom="not-a-zoom")
 
     def test_overview_explicit_gsds(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -564,6 +606,18 @@ class TestExportPmtilesIntegration:
                 assert z["zoom"] == z["level"] + report["min_zoom"]
                 assert z["tile_count"] > 0
 
+    def test_export_spill_dir_is_accepted(self):
+        """#427: an existing spill_dir is accepted (and left clean)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ovr = self._make_overview(tmpdir)
+            pm = Path(tmpdir) / "out.pmtiles"
+            spill = Path(tmpdir) / "spill"
+            spill.mkdir()
+            report = tylertoo.export_pmtiles(str(ovr), str(pm), spill_dir=spill)
+            assert pm.exists()
+            assert report["total_tiles"] > 0
+            assert list(spill.iterdir()) == [], "spill files must be removed"
+
     def test_export_knobs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ovr = self._make_overview(tmpdir)
@@ -578,6 +632,24 @@ class TestExportPmtilesIntegration:
             )
             assert pm.exists()
             assert report["total_tiles"] > 0
+
+    @pytest.mark.parametrize(
+        ("kwargs", "needle"),
+        [
+            ({"extent": 0}, "extent 0"),
+            ({"tile_buffer": 257}, "--tile-buffer 257"),
+            ({"tile_buffer": 100_000}, "--tile-buffer 100000"),
+        ],
+    )
+    def test_export_rejects_bad_extent_and_tile_buffer(self, kwargs, needle):
+        """#433: ``extent=0`` and a ``tile_buffer`` past the 256px cap are
+        refused before any tile is written, naming the value."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ovr = self._make_overview(tmpdir)
+            pm = Path(tmpdir) / "out.pmtiles"
+            with pytest.raises(Exception, match=needle):
+                tylertoo.export_pmtiles(str(ovr), str(pm), **kwargs)
+            assert not pm.exists() or pm.stat().st_size == 0
 
     def test_export_feature_id(self):
         """#443: ``feature_id=`` reaches the export: an integer column works,

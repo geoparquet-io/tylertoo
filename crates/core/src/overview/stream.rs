@@ -94,7 +94,8 @@ use super::convert::{
     resolve_read_workers, resolve_reserved_column_collisions, scan_feature,
     validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies,
     ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
-    LevelReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    LevelReport, PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES,
+    ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
@@ -790,6 +791,7 @@ fn run_pass2_levels(
                     in_flight_batches,
                     backing,
                     out_schema,
+                    options.spill_dir.as_deref(),
                 )?;
                 (result.levels, result.timers)
             } else {
@@ -1629,6 +1631,140 @@ struct PlanState {
     /// resolution, the density budget, carriers and cluster tables. Zero on
     /// the `--plan` path, where the artifact stands in for it.
     assign_wall: Duration,
+    /// `(points, lines, polygons)` across the scan — the per-kind tally the
+    /// plan artifact carries. Counted only when a plan is written or loaded
+    /// (it is one extra O(N) pass over the pass-1 features), `(0, 0, 0)`
+    /// otherwise; the plan-only report (#560) is its only reader.
+    kind_counts: (usize, usize, usize),
+}
+
+/// The front half of a streaming convert: the preflight, and pass 1 + the
+/// level assignment (or the `--plan` artifact that replaces them).
+struct FrontHalf {
+    preflight: Preflight,
+    plan: PlanState,
+}
+
+/// Run everything that precedes pass 2, in the order a convert runs it.
+///
+/// Factored out so the full convert and the plan-only run (#560) share ONE
+/// code path up to the point where `--save-plan` has written its artifact.
+/// That sharing is the #560 invariant's implementation: there is no separate
+/// plan-writing path that could drift from the one the fleet's full coarse job
+/// takes, so the artifact cannot differ.
+fn run_front_half(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+    peak_rss_mib: &mut Option<f64>,
+) -> Result<FrontHalf, ConvertError> {
+    // A numeric sort key and a categorical class ranking would both drive
+    // `AssignFeature::sort_key` (Q1); refused before the input is opened.
+    if options.sort_key.is_some() && options.class_ranking.is_some() {
+        return Err(ConvertError::RankingConflict);
+    }
+    let preflight = convert_preflight(source, options)?;
+    // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
+    // profile-derived knobs): what pass 1, the assignment and the plan's
+    // fingerprint all see.
+    let options = &preflight.options;
+    let plan = resolve_plan_state(
+        &Pass1Inputs {
+            source,
+            input_schema: &preflight.input_schema,
+            geom_idx: preflight.geom_idx,
+            acc_cols: &preflight.acc_cols,
+            selected_row_groups: preflight.selected_row_groups.as_ref(),
+            bbox_units: preflight.bbox_units.as_ref(),
+            bound_filter: preflight.bound_filter.as_ref(),
+            crs: preflight.crs,
+        },
+        options,
+        peak_rss_mib,
+    )?;
+    Ok(FrontHalf { preflight, plan })
+}
+
+/// `--plan-only` (#560): run the front half, which writes the `--save-plan`
+/// artifact, and stop — no pass 2, no output file, no writer.
+///
+/// The caller ([`super::convert::write_convert_plan_sources`]) has already
+/// normalized and validated the options and checked that `save_plan` is set.
+pub(crate) fn write_plan_streaming(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+) -> Result<PlanReport, ConvertError> {
+    let start = Instant::now();
+    let mut peak_rss_mib: Option<f64> = None;
+    let FrontHalf { preflight, plan } = run_front_half(source, options, &mut peak_rss_mib)?;
+    let options = &preflight.options;
+    let path = options
+        .save_plan
+        .clone()
+        .expect("checked by write_convert_plan_sources");
+
+    // Exactly the partition the full convert makes at this point, so the
+    // report names the same levels a full run would write and the same #211
+    // auto-clamp warning fires.
+    let (planned, skipped) =
+        partition_emitted_levels(&plan.tables.level_specs, &plan.tables.counts);
+    if planned.is_empty() {
+        // Same gate, same point in the run: a plan whose every level is empty
+        // describes a build that would produce no tiles at all, and a fleet
+        // must not be launched against it. The artifact was written the moment
+        // the assignment finished; a full run keeps it next to its failure,
+        // but here the plan is the ONLY output, and a zero-level plan left
+        // behind by a failing run is a trap for whoever launches the fleet
+        // from the directory. Removed, best-effort — the NoData is the error
+        // worth reporting either way.
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "could not remove the empty convert plan {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        return Err(ConvertError::NoData);
+    }
+    warn_plan_skipped_levels(&skipped, plan.num_features, planned[0].gsd, planned[0].zoom);
+    log_phase_rss("plan-only (assignment complete)", &mut peak_rss_mib);
+    log::info!(
+        "[rss] plan-only peak: {}",
+        peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
+    );
+
+    // Propagated rather than defaulted: the plan was written moments ago, so
+    // failing to stat it means something is wrong with the one output this
+    // run produces.
+    let plan_bytes = std::fs::metadata(&path)?.len();
+    let (points, lines, polygons) = plan.kind_counts;
+    Ok(PlanReport {
+        plan_bytes,
+        path,
+        input_rows: plan.num_rows,
+        input_features: plan.num_features,
+        points,
+        lines,
+        polygons,
+        levels: planned
+            .iter()
+            .map(|l| PlanLevelReport {
+                planned_level: l.orig as usize,
+                gsd: l.gsd,
+                zoom: l.zoom,
+                feature_count: l.hint,
+            })
+            .collect(),
+        skipped_empty_levels: skipped,
+        ranking: plan.ranking_provenance,
+        entry_zoom: options.entry_zoom.as_ref().map(|s| format!("{s:?}")),
+        row_groups_total: preflight.row_groups_total,
+        row_groups_read: preflight.row_groups_read,
+        pass1_secs: plan.pass1_wall.as_secs_f64(),
+        assign_secs: plan.assign_wall.as_secs_f64(),
+        duration_secs: start.elapsed().as_secs_f64(),
+        remote_fetch: super::convert::log_remote_fetch(source),
+    })
 }
 
 /// Run pass 1 + the level assignment, or load the artifact that stands in for
@@ -1781,6 +1917,7 @@ fn run_pass1_and_assign(
         pass1_stage_secs,
         pass1_wall,
         assign_wall,
+        kind_counts: kind_counts.unwrap_or_default(),
     })
 }
 
@@ -1943,6 +2080,7 @@ fn load_plan_state(
         // The load stands in for the scan; the assignment did not run at all.
         pass1_wall: t_pass1.elapsed(),
         assign_wall: Duration::ZERO,
+        kind_counts: (totals.n_points, totals.n_lines, totals.n_polygons),
     })
 }
 
@@ -1958,10 +2096,9 @@ pub(crate) fn convert_streaming_strategy(
     // and which phase produced it.
     let mut peak_rss_mib: Option<f64> = None;
 
-    if options.sort_key.is_some() && options.class_ranking.is_some() {
-        return Err(ConvertError::RankingConflict);
-    }
-
+    // --- Preflight, then pass 1 + assignment (or the saved plan that ---------
+    // --- replaces them). Shared verbatim with `--plan-only` (#560). ----------
+    let FrontHalf { preflight, plan } = run_front_half(source, options, &mut peak_rss_mib)?;
     let Preflight {
         options: resolved_options,
         input_schema,
@@ -1970,15 +2107,15 @@ pub(crate) fn convert_streaming_strategy(
         geom_idx,
         geom_field,
         acc_cols,
-        bbox_units,
-        bound_filter,
+        // Pass-1 inputs only: pass 2 reads the assignment's `min_levels`,
+        // where a row the bbox or the filter dropped is already UNASSIGNED.
+        bbox_units: _,
+        bound_filter: _,
         selected_row_groups,
         row_groups_total,
         row_groups_read,
-    } = convert_preflight(source, options)?;
+    } = preflight;
     let options = &resolved_options;
-
-    // --- Pass 1 + assignment, or the saved plan that replaces them. ----------
     let PlanState {
         tables:
             WinnerTables {
@@ -1999,20 +2136,8 @@ pub(crate) fn convert_streaming_strategy(
         pass1_stage_secs,
         pass1_wall,
         assign_wall,
-    } = resolve_plan_state(
-        &Pass1Inputs {
-            source,
-            input_schema: &input_schema,
-            geom_idx,
-            acc_cols: &acc_cols,
-            selected_row_groups: selected_row_groups.as_ref(),
-            bbox_units: bbox_units.as_ref(),
-            bound_filter: bound_filter.as_ref(),
-            crs,
-        },
-        options,
-        &mut peak_rss_mib,
-    )?;
+        kind_counts: _,
+    } = plan;
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.
@@ -5976,5 +6101,632 @@ mod tests {
                 ceiling: 1
             }
         ));
+    }
+
+    // ========================================================================
+    // #422: direct tests for the default engine's concurrency, pruning, and
+    // fault-path machinery.
+    // ========================================================================
+
+    use super::super::convert::{
+        IN_FLIGHT_BATCHES_AUTO, IN_FLIGHT_BATCHES_MAX, IN_FLIGHT_BATCHES_MIN,
+    };
+    use super::super::level::MemoryProfile;
+    use super::super::testutil::{write_multi_rg_attr_input, write_multi_rg_input, AttrRow};
+    use super::super::writer::{EncodeFaults, WriterError};
+
+    /// Guard against the failure mode under test being an *indefinite hang*:
+    /// run `f` on a helper thread and fail the test if it does not finish.
+    /// Mirrors `pipe.rs`'s `within()`; the budget is larger here because the
+    /// closures write real parquet through the real reader.
+    fn within<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 'static) -> R {
+        use crossbeam_channel::RecvTimeoutError;
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<R>(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(f());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("{what}: deadlocked (no result within 60s)")
+            }
+            // The helper thread unwound before sending: its own panic message
+            // is on stderr and is the real failure.
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("{what}: the guarded closure panicked (see above)")
+            }
+        }
+    }
+
+    /// `resolve_and_log_in_flight_batches` is the one place both passes take
+    /// their channel depth from (#264 / #460). The table pins its contract:
+    /// `IN_FLIGHT_BATCHES_AUTO` sizes from the detected core count clamped to
+    /// `[MIN, MAX]`, every explicit value passes through verbatim (below the
+    /// floor, at either clamp, and above the ceiling — the caller opted into
+    /// the memory cost), and the `phase` label is logging only.
+    #[test]
+    fn resolve_and_log_in_flight_batches_table() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(IN_FLIGHT_BATCHES_MIN);
+        let auto_expected = cores.clamp(IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX);
+        let cases: [(&str, usize, usize); 7] = [
+            (
+                "auto sizes from the core count",
+                IN_FLIGHT_BATCHES_AUTO,
+                auto_expected,
+            ),
+            ("explicit 1 (no read-ahead)", 1, 1),
+            (
+                "explicit below the auto floor",
+                IN_FLIGHT_BATCHES_MIN - 1,
+                IN_FLIGHT_BATCHES_MIN - 1,
+            ),
+            (
+                "explicit at the auto floor",
+                IN_FLIGHT_BATCHES_MIN,
+                IN_FLIGHT_BATCHES_MIN,
+            ),
+            (
+                "explicit between the clamps",
+                IN_FLIGHT_BATCHES_MIN + 3,
+                IN_FLIGHT_BATCHES_MIN + 3,
+            ),
+            (
+                "explicit at the auto ceiling",
+                IN_FLIGHT_BATCHES_MAX,
+                IN_FLIGHT_BATCHES_MAX,
+            ),
+            (
+                "explicit above the auto ceiling",
+                IN_FLIGHT_BATCHES_MAX + 100,
+                IN_FLIGHT_BATCHES_MAX + 100,
+            ),
+        ];
+        for phase in ["pass 1", "pass 2"] {
+            for (name, requested, expected) in cases {
+                assert_eq!(
+                    resolve_and_log_in_flight_batches(phase, requested),
+                    expected,
+                    "{phase}: {name} (requested {requested})"
+                );
+            }
+        }
+        // The auto depth is never outside the clamps, whatever the box, and
+        // tracks the core count exactly when that count lies inside them.
+        let auto = resolve_and_log_in_flight_batches("pass 1", IN_FLIGHT_BATCHES_AUTO);
+        assert!(
+            (IN_FLIGHT_BATCHES_MIN..=IN_FLIGHT_BATCHES_MAX).contains(&auto),
+            "auto depth {auto} outside [{IN_FLIGHT_BATCHES_MIN}, {IN_FLIGHT_BATCHES_MAX}]"
+        );
+        if (IN_FLIGHT_BATCHES_MIN..=IN_FLIGHT_BATCHES_MAX).contains(&cores) {
+            assert_eq!(
+                auto, cores,
+                "auto must follow the core count inside the clamps"
+            );
+        }
+        // Auto and an explicit request for the same depth resolve identically:
+        // the sentinel adds nothing a caller could not have asked for.
+        assert_eq!(
+            resolve_and_log_in_flight_batches("pass 2", auto),
+            auto,
+            "an explicit request for the auto depth must resolve to itself"
+        );
+    }
+
+    /// The auto clamp itself, over core counts a single box cannot produce:
+    /// a small box is lifted to the floor (a few cores stay fed, #213), a big
+    /// one is held at the ceiling (the single-threaded writer caps the
+    /// speedup, so more in flight only grows the resident batch set), and in
+    /// between the depth IS the core count. Explicit requests ignore the core
+    /// count entirely. Driven through the core-count seam, since the real
+    /// count on the box running this is one fixed point of the table.
+    #[test]
+    fn auto_in_flight_batches_clamp_to_the_core_count_range() {
+        use super::super::convert::resolve_in_flight_batches_with_cores as resolve;
+        let cases: [(&str, usize, usize); 7] = [
+            ("single core lifts to the floor", 1, IN_FLIGHT_BATCHES_MIN),
+            (
+                "just below the floor lifts to it",
+                IN_FLIGHT_BATCHES_MIN - 1,
+                IN_FLIGHT_BATCHES_MIN,
+            ),
+            ("at the floor", IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MIN),
+            (
+                "inside the range is the core count",
+                IN_FLIGHT_BATCHES_MIN + 2,
+                IN_FLIGHT_BATCHES_MIN + 2,
+            ),
+            (
+                "at the ceiling",
+                IN_FLIGHT_BATCHES_MAX,
+                IN_FLIGHT_BATCHES_MAX,
+            ),
+            (
+                "just above the ceiling holds at it",
+                IN_FLIGHT_BATCHES_MAX + 1,
+                IN_FLIGHT_BATCHES_MAX,
+            ),
+            (
+                "a huge box holds at the ceiling",
+                1024,
+                IN_FLIGHT_BATCHES_MAX,
+            ),
+        ];
+        for (name, cores, expected) in cases {
+            assert_eq!(
+                resolve(IN_FLIGHT_BATCHES_AUTO, cores),
+                expected,
+                "auto on {cores} core(s): {name}"
+            );
+            // An explicit request never consults the core count.
+            for explicit in [1, IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX + 100] {
+                assert_eq!(
+                    resolve(explicit, cores),
+                    explicit,
+                    "explicit {explicit} on {cores} core(s) must pass through"
+                );
+            }
+        }
+        // The seam and the production entry point agree on this box.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(IN_FLIGHT_BATCHES_MIN);
+        assert_eq!(
+            resolve(IN_FLIGHT_BATCHES_AUTO, cores),
+            resolve_and_log_in_flight_batches("pass 1", IN_FLIGHT_BATCHES_AUTO)
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Fault-injected writer: the pass-2 producer→writer channel.
+    // ------------------------------------------------------------------------
+
+    fn point_geoms(n: usize) -> Vec<Option<Geometry<f64>>> {
+        (0..n)
+            .map(|i| {
+                Some(Geometry::Point(Point::new(
+                    (i % 179) as f64 * 0.5 - 40.0,
+                    (i % 83) as f64 * 0.5 - 20.0,
+                )))
+            })
+            .collect()
+    }
+
+    /// Stream one verbatim level through [`write_level_streaming`] into a
+    /// writer whose detached encode task is armed to fail (#426's seam), with
+    /// a channel depth of 1 and far more read batches than the writer gets
+    /// through before it errors — so the producer is blocked in `send` when
+    /// the consumer fails, the #362 deadlock shape. Returns the error message
+    /// `write_level_streaming` surfaced.
+    fn stream_level_into_faulty_writer(faults: EncodeFaults) -> String {
+        const ROWS: usize = 400;
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &point_geoms(ROWS), true, None);
+        let tout = tempfile::NamedTempFile::new().unwrap();
+
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let options = ConvertOptions {
+            mode: Mode::Duplicating,
+            // Plain columns only: no cluster / coalesce columns to append, so
+            // the level context below is the minimal one.
+            cluster: false,
+            coalesce_lines: false,
+            ..ConvertOptions::default()
+        };
+        // As the production driver does before any schema index is derived
+        // (#386): narrow the source to the selected property columns, which
+        // drops the input's own bbox covering from the read.
+        super::super::convert::apply_property_selection(&source, &options).unwrap();
+        let input_schema = source.schema().unwrap();
+        let geom_idx = find_geometry_column(&input_schema).expect("fixture has a geometry column");
+        let geom_name = input_schema.field(geom_idx).name().clone();
+        let crs = Crs::Epsg4326;
+        let (source_schema, cluster_schema, out_schema) =
+            build_level_schemas(&input_schema, geom_idx, &geom_name, crs, &options);
+
+        // Tiny row groups + concurrency 2: the first row-group encode is
+        // submitted after 4 rows and drained (surfacing the injected panic)
+        // when the third is submitted — a dozen rows into a 400-row level.
+        let mut writer_opts = build_writer_options(
+            vec![LevelSpec::new(10.0, Some(10))],
+            &[10.0],
+            &[ROWS],
+            crs,
+            ranking_provenance(),
+            &[],
+            &options,
+        )
+        .unwrap();
+        writer_opts.max_row_group_size = 4;
+        writer_opts.encode_concurrency = 2;
+        let mut writer = OverviewWriter::create(tout.path(), &out_schema, writer_opts).unwrap();
+        writer.set_encode_faults(faults);
+
+        // Every row is a member of the single (verbatim, canonical) level.
+        let min_levels = vec![0u8; ROWS];
+        let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
+            .filter(|&c| c != geom_idx)
+            .collect();
+        let ctx = LevelStreamCtx {
+            source_schema: &source_schema,
+            cluster_schema: &cluster_schema,
+            out_schema: &out_schema,
+            non_geom_cols: &non_geom_cols,
+            geom_idx,
+            min_levels: &min_levels,
+            orig_level: 0,
+            duplicating: true,
+            verbatim: true,
+            gsd_m: 10.0,
+            repr: Representation::Geometry,
+            crs,
+            simplify: &options.simplify,
+            cluster_enabled: false,
+            cluster_table: None,
+            acc_cols: &[],
+            coalesce_enabled: false,
+            kinds: None,
+            coalesce_table: None,
+            cascade_chain: &[],
+            carriers: &[],
+        };
+        let tuning = ReadTuning {
+            batch_size: 8, // 50 read batches for the producer to push
+            workers: 1,
+            avg_geom_bytes: None,
+            profile: MemoryProfile::Speed,
+        };
+        match write_level_streaming(&mut writer, 0, ROWS, &source, tuning, 1, None, &ctx) {
+            // The row-group stage reports its caught panic as a parquet
+            // error, the WKB stage as a geoparquet-encoder one; both are the
+            // writer's own typed error, which is the contract here.
+            Err(ConvertError::Writer(
+                e @ (WriterError::Parquet(_) | WriterError::GeoParquet(_)),
+            )) => e.to_string(),
+            Err(other) => panic!("expected the writer's typed error, got: {other}"),
+            Ok((outcome, rows, _, _)) => {
+                panic!("a failing writer must not report success ({outcome:?}, {rows} rows)")
+            }
+        }
+    }
+
+    /// The finest-level stream (`write_level_streaming`): when the writer —
+    /// the channel's consumer — fails mid-level, the error must come back
+    /// typed (`ConvertError::Writer`) and promptly. The producer is blocked
+    /// in `tx.send` at that moment; it must observe the hang-up
+    /// (`ReadFlow::Stop`, not an error of its own that would mask the
+    /// writer's) and the scoped join must complete. Both encode stages are
+    /// covered, since each is its own detached task with its own drain.
+    #[test]
+    fn writer_failure_mid_level_surfaces_typed_error_without_deadlock() {
+        for (stage, faults, expect) in [
+            (
+                "row-group encode",
+                EncodeFaults {
+                    row_group: true,
+                    wkb: false,
+                },
+                "injected row-group encode panic",
+            ),
+            (
+                "WKB encode",
+                EncodeFaults {
+                    row_group: false,
+                    wkb: true,
+                },
+                "injected WKB encode panic",
+            ),
+        ] {
+            let msg = within(
+                "writer_failure_mid_level_surfaces_typed_error_without_deadlock",
+                move || stream_level_into_faulty_writer(faults),
+            );
+            assert!(
+                msg.contains(expect),
+                "{stage}: the writer's own failure must be what surfaces, got: {msg}"
+            );
+        }
+    }
+
+    /// The same guarantee end to end through the production driver
+    /// (`convert_streaming_strategy`, pipelined engine): a sink that rejects
+    /// every write (`/dev/full`, ENOSPC) fails the conversion with the
+    /// writer's typed error instead of hanging a producer on a full channel
+    /// or reporting a truncated file as success. Linux only: no other CI
+    /// platform has an always-full device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipelined_convert_surfaces_a_sink_write_failure_without_deadlock() {
+        let sink = Path::new("/dev/full");
+        if !sink.exists() {
+            eprintln!("Skipping: {} is not present on this box", sink.display());
+            return;
+        }
+        let msg = within(
+            "pipelined_convert_surfaces_a_sink_write_failure_without_deadlock",
+            move || {
+                let tin = tempfile::NamedTempFile::new().unwrap();
+                write_input(tin.path(), &point_geoms(3000), true, None);
+                let options = ConvertOptions {
+                    mode: Mode::Duplicating,
+                    levels: LevelPlan::ZoomRange {
+                        min_zoom: 2,
+                        max_zoom: 8,
+                    },
+                    read_batch_size: 64,
+                    in_flight_batches: 1,
+                    ..ConvertOptions::default()
+                };
+                match super::super::convert::convert_to_overviews_strategy(
+                    tin.path(),
+                    sink,
+                    &options,
+                    Pass2Strategy::Pipelined,
+                ) {
+                    Err(e @ ConvertError::Writer(_)) => e.to_string(),
+                    Err(other) => panic!("expected the writer's typed error, got: {other}"),
+                    Ok(report) => panic!(
+                        "a conversion into /dev/full must not succeed ({} level(s) reported)",
+                        report.levels.len()
+                    ),
+                }
+            },
+        );
+        assert!(
+            msg.contains("No space left on device"),
+            "the sink's ENOSPC must be what surfaces, got: {msg}"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Row-group pruning: pruned groups are never read.
+    // ------------------------------------------------------------------------
+
+    /// Read everything `read_in_order` delivers for `selection` — the exact
+    /// call both passes make — and return the `id` values in delivery order
+    /// plus the number of batches delivered. The fixtures hold one row per
+    /// row group with `id` = row-group index, so the ids ARE the row groups
+    /// the reader touched.
+    fn ids_read_in_order(
+        source: &ConvertSource,
+        selection: Option<&RowGroupSelection>,
+        workers: usize,
+    ) -> (Vec<i64>, usize) {
+        use arrow_array::cast::AsArray;
+        let mut ids: Vec<i64> = Vec::new();
+        let mut batches = 0usize;
+        read_in_order(
+            source,
+            selection,
+            ReadTuning {
+                batch_size: 1,
+                workers,
+                avg_geom_bytes: None,
+                profile: MemoryProfile::Speed,
+            },
+            |batch, offset, _| {
+                batches += 1;
+                assert_eq!(
+                    offset,
+                    ids.len(),
+                    "row offsets must be contiguous over the delivered rows"
+                );
+                let col = batch
+                    .column(batch.schema().index_of("id").unwrap())
+                    .as_primitive::<arrow_array::types::Int64Type>();
+                ids.extend(col.iter().flatten());
+                Ok(ReadFlow::Continue)
+            },
+        )
+        .unwrap();
+        (ids, batches)
+    }
+
+    /// Pruned row groups are pruned all the way down: what
+    /// `select_row_groups_streaming` drops by footer statistics (bbox
+    /// covering, #102) never reaches `read_in_order`, in either reader
+    /// shape. The counting reader sees exactly the selected groups' rows —
+    /// one per group here — and nothing from a pruned one.
+    #[test]
+    fn pruned_row_groups_are_never_read() {
+        // Four row groups: (0,0), (10,10), (20,20), (30,30); id = group.
+        let coords = [(0.0, 0.0), (10.0, 10.0), (20.0, 20.0), (30.0, 30.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let crs = Crs::Epsg4326;
+
+        // No pruning active: no selection, and the reader delivers every group.
+        assert!(
+            select_row_groups_streaming(&source, None, None, None, crs)
+                .unwrap()
+                .is_none(),
+            "no bbox, filter, or shard means no selection at all"
+        );
+        for workers in [1, 4] {
+            let (ids, batches) = ids_read_in_order(&source, None, workers);
+            assert_eq!(ids, vec![0, 1, 2, 3], "workers={workers}: unpruned read");
+            assert_eq!(batches, 4, "workers={workers}");
+        }
+
+        // bbox around (10,10): only row group 1 can intersect it.
+        let bbox = [9.0, 9.0, 11.0, 11.0];
+        let sel = select_row_groups_streaming(&source, Some(&bbox), None, None, crs)
+            .unwrap()
+            .expect("a bbox always yields a selection");
+        assert_eq!(
+            sel.parts(),
+            &[vec![1usize]],
+            "bbox pruning by covering stats"
+        );
+        assert_eq!(sel.total_selected(), 1);
+        for workers in [1, 4] {
+            let (ids, batches) = ids_read_in_order(&source, Some(&sel), workers);
+            assert_eq!(ids, vec![1], "workers={workers}: a pruned group was read");
+            assert_eq!(batches, 1, "workers={workers}");
+        }
+
+        // bbox that misses every group: an empty selection reads nothing —
+        // no batch is even delivered.
+        let nowhere = [100.0, 100.0, 101.0, 101.0];
+        let sel = select_row_groups_streaming(&source, Some(&nowhere), None, None, crs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.total_selected(), 0);
+        let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
+        assert!(
+            ids.is_empty(),
+            "an empty selection must read no rows: {ids:?}"
+        );
+        assert_eq!(batches, 0);
+    }
+
+    /// The attribute-filter pushdown (#315) and its intersection with the
+    /// bbox pruning: the combined selection is what the reader honours, and
+    /// the two prunings compose by intersection rather than either winning.
+    #[test]
+    fn filter_and_bbox_pruning_compose_and_pruned_groups_are_never_read() {
+        use super::super::filter::{parse_filter, BoundFilter};
+
+        // Rows: (0,0)/0.1, (10,10)/0.9, (20,20)/0.85, (30,30)/null; id = group.
+        let rows: Vec<AttrRow> = vec![
+            ((0.0, 0.0), Some(0.1), Some("soy")),
+            ((10.0, 10.0), Some(0.9), Some("corn")),
+            ((20.0, 20.0), Some(0.85), Some("soy")),
+            ((30.0, 30.0), None, Some("rice")),
+        ];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_attr_input(tin.path(), &rows);
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let schema = source.schema().unwrap();
+        let crs = Crs::Epsg4326;
+        let expr = parse_filter("confidence > 0.8").unwrap();
+        let filter = BoundFilter::bind(&expr, &schema, &[]).unwrap();
+
+        // Filter alone: group 0 (0.1) and group 3 (all null) are provably
+        // non-matching by their column statistics.
+        let sel = select_row_groups_streaming(&source, None, Some(&filter), None, crs)
+            .unwrap()
+            .expect("a filter always yields a selection");
+        assert_eq!(sel.parts(), &[vec![1usize, 2]], "statistics pushdown");
+        let (ids, _) = ids_read_in_order(&source, Some(&sel), 1);
+        assert_eq!(ids, vec![1, 2], "a filter-pruned group was read");
+
+        // bbox ∩ filter: the bbox keeps group 2 only, the filter keeps 1 and
+        // 2 — their intersection is group 2.
+        let bbox = [19.0, 19.0, 21.0, 21.0];
+        let sel = select_row_groups_streaming(&source, Some(&bbox), Some(&filter), None, crs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.parts(), &[vec![2usize]], "bbox ∩ filter");
+        let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
+        assert_eq!(ids, vec![2]);
+        assert_eq!(batches, 1);
+
+        // Disjoint prunings: the bbox keeps group 0, which the filter
+        // rejects — nothing survives and nothing is read.
+        let bbox = [-1.0, -1.0, 1.0, 1.0];
+        let sel = select_row_groups_streaming(&source, Some(&bbox), Some(&filter), None, crs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.total_selected(), 0, "{:?}", sel.parts());
+        let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
+        assert!(ids.is_empty(), "{ids:?}");
+        assert_eq!(batches, 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // #407 regression: the accumulator's placeholder threshold.
+    // ------------------------------------------------------------------------
+
+    /// Ten 400 m fields (160,000 m² each) in one accumulation patch, all
+    /// non-members of level 0 — the `accumulate::tests` shape, driven through
+    /// the streaming path's own carrier resolution (`streaming_carriers`) so
+    /// the options → threshold wiring is what is under test.
+    fn ten_dropped_fields() -> (Vec<AssignFeature>, Vec<u8>, Vec<f32>) {
+        let feats: Vec<AssignFeature> = (0..10)
+            .map(|i| AssignFeature {
+                index: i,
+                bbox: [10.0 + i as f64 * 5.0, 10.0, 410.0 + i as f64 * 5.0, 410.0],
+                kind: FeatureKind::Polygon,
+                sort_key: None,
+                entry_level: None,
+            })
+            .collect();
+        (feats, vec![1u8; 10], vec![160_000.0f32; 10])
+    }
+
+    /// Carriers for a two-level plan (1000 m accumulating, 10 m canonical)
+    /// under `--collapse-square` with the given simplify factor.
+    fn carriers_for_factor(factor: f64) -> Vec<Vec<usize>> {
+        let (feats, min_levels, areas) = ten_dropped_fields();
+        let options = ConvertOptions {
+            mode: Mode::Duplicating,
+            simplify: SimplifyOptions {
+                factor,
+                collapse: CollapseMode::Square,
+                ..SimplifyOptions::default()
+            },
+            ..ConvertOptions::default()
+        };
+        streaming_carriers(
+            &options,
+            &feats,
+            &min_levels,
+            areas,
+            &[1000.0, 10.0],
+            &[Representation::Geometry, Representation::Geometry],
+            Crs::Epsg3857,
+        )
+    }
+
+    /// Control for the two #407 cases below: at a 1 × GSD factor
+    /// (T = 1e6 m²) the ten fields' 1.6e6 m² make exactly one carrier — the
+    /// 7th field crosses the threshold — so the harness is live and any "no
+    /// carriers" result below is the guard, not a dead accumulator.
+    #[test]
+    fn streaming_carriers_emit_one_placeholder_per_threshold() {
+        let carriers = carriers_for_factor(1.0);
+        assert_eq!(carriers[0], vec![6]);
+        assert!(
+            carriers[1].is_empty(),
+            "the canonical level never accumulates"
+        );
+    }
+
+    /// #407, the zero case: `--simplify-factor 0` makes the placeholder
+    /// threshold `(0 × gsd)² = 0`. The accumulator must skip the level (its
+    /// `threshold <= 0` guard) rather than let every dropped polygon cross a
+    /// zero threshold and come back as a zero-size carrier square.
+    #[test]
+    fn streaming_carriers_skip_a_zero_simplify_factor() {
+        let carriers = carriers_for_factor(0.0);
+        assert!(
+            carriers[0].is_empty(),
+            "factor 0 must accumulate nothing, got carriers {:?}",
+            carriers[0]
+        );
+    }
+
+    /// #407, the tiny-factor case: a factor small enough that the placeholder
+    /// square would quantize below one tile unit (here 1e-6 ⇒ a 1 mm side,
+    /// T = 1e-6 m²) must not turn every dropped polygon into a carrier — the
+    /// MVT cleaner drops the resulting rings as degenerate, so the level
+    /// would carry every feature and show none of it.
+    ///
+    /// Fails today: the guard only catches `threshold <= 0`, so each 160,000
+    /// m² field crosses the 1e-6 m² threshold on its own and all ten become
+    /// carriers. Ignored until #407 lands its "skip when the side would
+    /// quantize below one tile unit" guard; un-ignore it there.
+    #[test]
+    #[ignore = "#407: a sub-unit placeholder threshold still makes every dropped polygon a carrier"]
+    fn streaming_carriers_skip_a_sub_unit_simplify_factor() {
+        let carriers = carriers_for_factor(1e-6);
+        assert!(
+            carriers[0].len() < 10,
+            "a sub-unit threshold turned every dropped polygon into a carrier: {:?}",
+            carriers[0]
+        );
     }
 }
