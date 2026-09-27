@@ -317,6 +317,17 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
     )?;
     dict.set_item("out_of_range_features", report.out_of_range_features)?;
     dict.set_item("unprojectable_features", report.unprojectable_features)?;
+    // #553: the first few out-of-range features, by row and coordinate.
+    let exemplars = PyList::empty(py);
+    for e in &report.out_of_range_exemplars {
+        let d = PyDict::new(py);
+        d.set_item("part", e.part)?;
+        d.set_item("row", e.row)?;
+        d.set_item("axis", e.axis)?;
+        d.set_item("value", e.value)?;
+        exemplars.append(d)?;
+    }
+    dict.set_item("out_of_range_exemplars", exemplars)?;
     dict.set_item("duration_secs", report.duration_secs)?;
     // Remote-input fetch counters (#210); None for local inputs.
     match &report.remote_fetch {
@@ -575,6 +586,9 @@ fn accumulate_specs(
 ///     the declared CRS's coordinate range — dropped or clipped),
 ///     "unprojectable_features" (features with valid lon/lat outside the Web
 ///     Mercator tiling domain, |lat| > 85.05° — these cannot be tiled),
+///     "out_of_range_exemplars" (the first few out-of-range features, as
+///     dicts with "part" (None for a single file), "row" (the row in that
+///     file), "axis" ("lon"/"lat", or "x"/"y" for EPSG:3857), and "value"),
 ///     "duration_secs", and "remote_fetch" (None for local inputs; for remote
 ///     URLs a dict with "requests", "bytes_fetched", "object_size").
 ///
