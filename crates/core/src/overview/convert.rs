@@ -1034,6 +1034,7 @@ pub(super) fn record_level_outcome(
 /// assignment's view, which is exactly what a shard consuming the plan will
 /// act on.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct PlanLevelReport {
     /// Index in the PLANNED (requested) level range, 0 = coarsest. Planned
     /// levels with no winners are omitted (#211 auto-clamp) and listed in
@@ -1052,6 +1053,7 @@ pub struct PlanLevelReport {
 /// #560): what the saved plan says, for an operator to sanity-check before
 /// committing a fleet's shard hours to it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct PlanReport {
     /// Where the plan was written ([`ConvertOptions::save_plan`]).
     pub path: PathBuf,
@@ -1063,8 +1065,12 @@ pub struct PlanReport {
     /// Features that survived the scan (a usable geometry, and inside
     /// `--bbox` / `--filter` when given).
     pub input_features: usize,
-    /// `(points, lines, polygons)` across the scan.
-    pub kinds: (usize, usize, usize),
+    /// Point features across the scan.
+    pub points: usize,
+    /// Line features across the scan.
+    pub lines: usize,
+    /// Polygon features across the scan.
+    pub polygons: usize,
     /// The levels the assignment populated, coarse → fine.
     pub levels: Vec<PlanLevelReport>,
     /// Planned levels with no winners at all, omitted from the pyramid (#211
@@ -1993,6 +1999,15 @@ pub fn write_convert_plan_sources(
         }
         None => options,
     };
+    // #517's rule, applied to the other run that writes no dump: the profile
+    // covers pass 2 and the export, neither of which a plan-only run reaches.
+    // Said up front rather than exiting 0 with an empty (or untouched) file.
+    if std::env::var_os("TYLERTOO_PROFILE_JSON").is_some_and(|v| !v.is_empty()) {
+        log::warn!(
+            "[profile] TYLERTOO_PROFILE_JSON is set but the profile dump only \
+             covers a full convert; a plan-only run writes no dump"
+        );
+    }
     // `--save-plan` already requires the streaming pipeline (validated above),
     // which is where the separable pass-1 + assignment stage lives.
     super::stream::write_plan_streaming(source, options)
@@ -7836,7 +7851,7 @@ mod tests {
         assert!(report.levels.iter().all(|l| l.feature_count > 0));
         assert_eq!(report.input_features, 12);
         assert_eq!(report.input_rows, 12);
-        assert_eq!(report.kinds, (0, 0, 12));
+        assert_eq!((report.points, report.lines, report.polygons), (0, 0, 12));
         assert_eq!(report.ranking.mode, "size-fallback");
         assert_eq!(report.entry_zoom, None);
         assert_eq!(report.row_groups_read, report.row_groups_total);
@@ -7906,8 +7921,40 @@ mod tests {
             "unexpected: {in_memory}"
         );
 
-        // Nothing above opened the input, let alone wrote a plan.
+        // Every refusal above is a config check, so none of them left a plan
+        // behind.
         assert!(!plan.exists(), "a refused plan-only run wrote a plan");
+    }
+
+    /// An input with nothing to tile fails the plan-only run with NoData, as
+    /// it fails a full run — and, the plan being the only output, does not
+    /// leave a zero-level plan on disk for a fleet to be launched against.
+    #[test]
+    fn plan_only_no_data_leaves_no_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &polygon_fixture(), false, None);
+        let plan = dir.path().join("p.plan");
+
+        let err = write_convert_plan(
+            &input,
+            &ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                // Nowhere near the fixture: nothing survives the scan.
+                bbox: Some([170.0, 75.0, 179.0, 84.0]),
+                save_plan: Some(plan.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::NoData), "got {err:?}");
+        assert!(
+            !plan.exists(),
+            "a NoData plan-only run left its plan behind"
+        );
     }
 
     // ---- zoom-band representation selector (#317 / #279) --------------------

@@ -103,9 +103,11 @@ Generate PMTiles vector tiles (the default pipeline)
 
    Requires --save-plan, which is then this run's only output.
 
-   For the fleet whose coarse tiles are DISCARDED: an aggregate-into- fields handover build, where cell aggregates from outside tylertoo own the coarse zooms and real geometry owns the fine ones, merged with `tylertoo merge`. The coarse job still has to run — the level assignment is dataset-global, so no data shard can recompute it — but only for its plan, and export is the majority of that job's wall.
+   For the fleet whose coarse tiles are DISCARDED: an aggregate-into-fields handover build, where cell aggregates from outside tylertoo own the coarse zooms and real geometry owns the fine ones, merged with `tylertoo merge`. The coarse job still has to run — the level assignment is dataset-global, so no data shard can recompute it — but only for its plan, so it skips pass 2 and the export.
 
-   Pass the same flags the fleet's shards will use, plus this one: the plan is fingerprinted, so a plan-only run is byte-identical to the plan a full (or `--shard coarse`) run writes with the same options, and nothing else about the fleet changes. With `--shard coarse --shard-plan`, the cut digest is recorded in the plan as usual.
+   For a fleet, pass `--shard coarse --shard-plan` as well: the data shards (`--shard I/N`) refuse a plan that does not record their shard plan's cut. Without them the plan is for an unsharded `tiles --plan` / `overview --plan` replay only. The pivot may equal --min-zoom here (the handover shape: the external archive owns every zoom below it), since a plan-only coarse job builds no zoom of its own.
+
+   Pass the same convert flags the fleet's shards will use, plus this one (export-only flags are refused): the plan is fingerprinted, so a plan-only run is byte-identical to the plan a full (or `--shard coarse`) run writes with the same options, and nothing else about the fleet changes.
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
 * `-f`, `--force` — Overwrite the output if it exists
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).

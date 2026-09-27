@@ -1935,22 +1935,33 @@ struct TilesArgs {
     ///
     /// Requires --save-plan, which is then this run's only output.
     ///
-    /// For the fleet whose coarse tiles are DISCARDED: an aggregate-into-
-    /// fields handover build, where cell aggregates from outside tylertoo own
-    /// the coarse zooms and real geometry owns the fine ones, merged with
-    /// `tylertoo merge`. The coarse job still has to run — the level
-    /// assignment is dataset-global, so no data shard can recompute it — but
-    /// only for its plan, and export is the majority of that job's wall.
+    /// For the fleet whose coarse tiles are DISCARDED: an
+    /// aggregate-into-fields handover build, where cell aggregates from
+    /// outside tylertoo own the coarse zooms and real geometry owns the fine
+    /// ones, merged with `tylertoo merge`. The coarse job still has to run —
+    /// the level assignment is dataset-global, so no data shard can recompute
+    /// it — but only for its plan, so it skips pass 2 and the export.
     ///
-    /// Pass the same flags the fleet's shards will use, plus this one: the
-    /// plan is fingerprinted, so a plan-only run is byte-identical to the
-    /// plan a full (or `--shard coarse`) run writes with the same options,
-    /// and nothing else about the fleet changes. With `--shard coarse
-    /// --shard-plan`, the cut digest is recorded in the plan as usual.
+    /// For a fleet, pass `--shard coarse --shard-plan` as well: the data
+    /// shards (`--shard I/N`) refuse a plan that does not record their shard
+    /// plan's cut. Without them the plan is for an unsharded `tiles --plan` /
+    /// `overview --plan` replay only. The pivot may equal --min-zoom here
+    /// (the handover shape: the external archive owns every zoom below it),
+    /// since a plan-only coarse job builds no zoom of its own.
+    ///
+    /// Pass the same convert flags the fleet's shards will use, plus this one
+    /// (export-only flags are refused): the plan is fingerprinted, so a
+    /// plan-only run is byte-identical to the plan a full (or `--shard
+    /// coarse`) run writes with the same options, and nothing else about the
+    /// fleet changes.
     #[arg(
         long,
         requires = "save_plan",
-        conflicts_with_all = ["keep_overview", "report", "tile_range", "force", "layer_name", "max_tile_size"],
+        conflicts_with_all = [
+            "keep_overview", "report", "tile_range", "force", "layer_name",
+            "max_tile_size", "tile_buffer", "feature_order", "partition_wave",
+            "no_simple_clip_fastpath", "feature_id",
+        ],
         help_heading = "Sharded builds"
     )]
     plan_only: bool,
@@ -2469,6 +2480,7 @@ fn resolve_shard_job(
     shard_plan: Option<&Path>,
     min_zoom: u8,
     max_zoom: u8,
+    plan_only: bool,
 ) -> Result<Option<ShardJob>> {
     use tylertoo_core::shard::ShardRole;
 
@@ -2502,7 +2514,13 @@ fn resolve_shard_job(
     // the requested minimum leaves it nothing, and without this the whole
     // convert runs — potentially for hours — before the export refuses an
     // empty zoom restriction.
-    if matches!(role, ShardRole::Coarse) {
+    //
+    // #560: not under --plan-only, which builds no zoom at all — the coarse
+    // job there is only the plan's writer. A pivot AT --min-zoom is exactly
+    // the handover shape (an external archive owns every zoom below the
+    // pivot, and the fleet runs --min-zoom = pivot), so refusing it would
+    // refuse the one build plan-only exists for.
+    if matches!(role, ShardRole::Coarse) && !plan_only {
         anyhow::ensure!(
             plan.pivot_zoom > min_zoom,
             "--shard coarse with --shard-plan {} has no zoom to build: the coarse job owns \
@@ -2635,6 +2653,7 @@ fn tiles_convert_options(
         args.shard_plan.as_deref(),
         args.min_zoom,
         args.max_zoom,
+        args.plan_only,
     )?;
     if let Some(job) = &shard {
         options.shard = job.range;
@@ -2659,7 +2678,18 @@ fn tiles_convert_options(
         if !args.plan_only && job.range.is_none() && args.gsd.is_none() && options.streaming {
             options.zoom_ceiling = Some(job.pivot.saturating_sub(1));
         }
-        log_shard_job(job, args.min_zoom, args.max_zoom);
+        if args.plan_only {
+            // The coarse job's usual line names the zooms it builds; this one
+            // builds none (and its pivot may sit at --min-zoom, #560).
+            log::info!(
+                "[tiles] shard job {}: plan only — writes the convert plan for pivot z{}, \
+                 builds no zoom",
+                job.role,
+                job.pivot
+            );
+        } else {
+            log_shard_job(job, args.min_zoom, args.max_zoom);
+        }
     }
     Ok((options, shard))
 }
@@ -2696,7 +2726,8 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
             "--plan-only cannot be combined with a data shard (--shard I/N): the shard reads \
              only the row groups its range reaches, so the plan it wrote would cover that \
              subset and be useless to the rest of the fleet. The plan comes from the job that \
-             reads everything — `--shard coarse --plan-only`, or no --shard at all"
+             reads everything: `--shard coarse --shard-plan <the fleet's shard plan> \
+             --plan-only`"
         );
     }
     let save_plan = args
@@ -2713,7 +2744,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
             write_convert_plan_sources(&source, &options)
         }
     }
-    .map_err(|e| anyhow::anyhow!("writing the convert plan failed: {e}"))?;
+    .context("writing the convert plan failed")?;
 
     println!("✓ Wrote the convert plan (no tiles: --plan-only)");
     println!("  input:  {}", spec.display());
@@ -2726,9 +2757,9 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
         "  rows:   {} input row(s) → {} feature(s) ({} point, {} line, {} polygon)",
         format_number(report.input_rows as u64),
         format_number(report.input_features as u64),
-        format_number(report.kinds.0 as u64),
-        format_number(report.kinds.1 as u64),
-        format_number(report.kinds.2 as u64),
+        format_number(report.points as u64),
+        format_number(report.lines as u64),
+        format_number(report.polygons as u64),
     );
     println!(
         "  levels: {} planned level(s) populated{}",
@@ -2779,10 +2810,23 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
         report.pass1_secs,
         report.assign_secs,
     );
-    println!(
-        "  next:   give this plan to every data shard with --plan {}",
-        save_plan.display()
-    );
+    if shard.is_some() {
+        println!(
+            "  next:   give this plan to every data shard with --plan {}",
+            save_plan.display()
+        );
+    } else {
+        // No cut digest in the fingerprint, so a data shard (which presents
+        // its shard plan's) refuses this plan — say so here rather than at
+        // the first shard of the fleet.
+        println!(
+            "  next:   replay this plan in an unsharded run (`tiles --plan {0}` or \
+             `overview --plan {0}`). It records no shard plan, so a fleet's data shards \
+             refuse it: for a fleet, re-run with --shard coarse --shard-plan <the fleet's \
+             shard plan>",
+            save_plan.display()
+        );
+    }
     Ok(())
 }
 

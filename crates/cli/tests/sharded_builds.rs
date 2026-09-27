@@ -1196,6 +1196,12 @@ fn plan_only_misuse_is_refused() {
         vec!["--tile-range", "21..40"],
         vec!["--layer-name", "x"],
         vec!["--force"],
+        vec!["--max-tile-size", "1M"],
+        vec!["--tile-buffer", "4"],
+        vec!["--feature-order", "input"],
+        vec!["--partition-wave", "4"],
+        vec!["--no-simple-clip-fastpath"],
+        vec!["--feature-id", "id"],
     ] {
         let mut argv = vec![
             "tiles",
@@ -1215,4 +1221,113 @@ fn plan_only_misuse_is_refused() {
 
     // Nothing above got as far as writing a plan.
     assert!(!plan.exists(), "a refused --plan-only run wrote a plan");
+}
+
+/// The handover shape #560 exists for: an external archive owns every zoom
+/// below the pivot, so the fleet runs `--min-zoom` = pivot. A FULL coarse job
+/// has nothing to build there and is refused
+/// (`a_coarse_job_with_no_zoom_to_build_fails_before_converting`), but a
+/// plan-only coarse job builds no zoom anyway — it must run, and its plan
+/// must be the one the data shards of that fleet accept.
+#[test]
+fn plan_only_at_the_pivot_writes_a_plan_the_fleet_accepts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = cut_plan(dir.path(), "2", "3");
+    let plan = dir.path().join("convert.plan");
+    let zooms = ["--min-zoom", "3", "--max-zoom", "5"];
+    let grid_s = grid().to_str().unwrap().to_string();
+    let plan_s = plan.to_str().unwrap().to_string();
+    let shard_plan_s = shard_plan.to_str().unwrap().to_string();
+
+    let mut argv = vec!["tiles", grid_s.as_str()];
+    argv.extend(zooms);
+    argv.extend([
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        &shard_plan_s,
+        "--save-plan",
+        &plan_s,
+        "--plan-only",
+    ]);
+    let (ok, out) = run(&argv);
+    assert!(
+        ok,
+        "--plan-only with the pivot at --min-zoom must run: {out}"
+    );
+    assert!(plan.exists(), "{out}");
+    assert!(
+        out.contains("give this plan to every data shard"),
+        "a sharded plan-only run points at the data shards: {out}"
+    );
+
+    for i in ["0/2", "1/2"] {
+        let shard_out = dir.path().join(format!("shard-{}.pmtiles", &i[..1]));
+        let shard_out_s = shard_out.to_str().unwrap().to_string();
+        let mut argv = vec!["tiles", grid_s.as_str(), shard_out_s.as_str()];
+        argv.extend(zooms);
+        argv.extend([
+            "--shard",
+            i,
+            "--shard-plan",
+            &shard_plan_s,
+            "--plan",
+            &plan_s,
+        ]);
+        let (ok, out) = run(&argv);
+        assert!(ok, "data shard {i} must accept the plan: {out}");
+        assert!(shard_out.exists(), "{out}");
+    }
+}
+
+/// A plan-only run WITHOUT `--shard coarse --shard-plan` records no cut, so
+/// no data shard can use it. The run says so instead of pointing the operator
+/// at the fleet, and a data shard handed the plan anyway refuses it.
+#[test]
+fn an_unsharded_plan_only_plan_is_not_for_a_fleet() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = cut_plan(dir.path(), "2", "3");
+    let plan = dir.path().join("convert.plan");
+    let grid_s = grid().to_str().unwrap().to_string();
+
+    let (ok, out) = run(&[
+        "tiles",
+        &grid_s,
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "5",
+        "--save-plan",
+        plan.to_str().unwrap(),
+        "--plan-only",
+    ]);
+    assert!(ok, "an unsharded --plan-only run must succeed: {out}");
+    assert!(
+        !out.contains("give this plan to every data shard"),
+        "an unsharded plan must not be pointed at the fleet: {out}"
+    );
+    assert!(
+        out.contains("unsharded") && out.contains("--shard coarse --shard-plan"),
+        "the run must say what the plan is for, and how to get a fleet's: {out}"
+    );
+
+    let shard_out = dir.path().join("shard-0.pmtiles");
+    let (ok, out) = run(&[
+        "tiles",
+        &grid_s,
+        shard_out.to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "5",
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(!ok, "a data shard must refuse a plan with no cut: {out}");
+    assert!(out.contains("saved WITHOUT a shard plan"), "{out}");
+    assert!(!shard_out.exists(), "{out}");
 }

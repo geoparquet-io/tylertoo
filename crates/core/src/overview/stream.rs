@@ -1681,9 +1681,20 @@ pub(crate) fn write_plan_streaming(
     if planned.is_empty() {
         // Same gate, same point in the run: a plan whose every level is empty
         // describes a build that would produce no tiles at all, and a fleet
-        // must not be launched against it. The artifact is on disk (it was
-        // written the moment the assignment finished) exactly as it is when a
-        // full run fails here.
+        // must not be launched against it. The artifact was written the moment
+        // the assignment finished; a full run keeps it next to its failure,
+        // but here the plan is the ONLY output, and a zero-level plan left
+        // behind by a failing run is a trap for whoever launches the fleet
+        // from the directory. Removed, best-effort — the NoData is the error
+        // worth reporting either way.
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "could not remove the empty convert plan {}: {e}",
+                    path.display()
+                );
+            }
+        }
         return Err(ConvertError::NoData);
     }
     warn_plan_skipped_levels(&skipped, plan.num_features, planned[0].gsd, planned[0].zoom);
@@ -1693,12 +1704,19 @@ pub(crate) fn write_plan_streaming(
         peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
     );
 
+    // Propagated rather than defaulted: the plan was written moments ago, so
+    // failing to stat it means something is wrong with the one output this
+    // run produces.
+    let plan_bytes = std::fs::metadata(&path)?.len();
+    let (points, lines, polygons) = plan.kind_counts;
     Ok(PlanReport {
-        plan_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        plan_bytes,
         path,
         input_rows: plan.num_rows,
         input_features: plan.num_features,
-        kinds: plan.kind_counts,
+        points,
+        lines,
+        polygons,
         levels: planned
             .iter()
             .map(|l| PlanLevelReport {
