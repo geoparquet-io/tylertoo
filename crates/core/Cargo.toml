@@ -15,6 +15,11 @@ categories.workspace = true
 [features]
 default = []
 dhat-heap = ["dhat"]
+# Fuzz hooks (#424): `#[doc(hidden)]` entry points that let the standalone
+# `fuzz/` crate reach parsers which are private on purpose (the MVT tile
+# decode inside `decode`, `pyramid::BandArchive`). Never enabled by default,
+# never part of the public API baseline; only `fuzz/Cargo.toml` turns it on.
+fuzzing = []
 # Remote input support: read GeoParquet directly from s3://, https://,
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.
@@ -51,8 +56,9 @@ thiserror = { workspace = true }
 log = { workspace = true }
 memory-stats = { workspace = true }
 flate2 = "1"
-brotli = "9"
-zstd = "0.14"
+# brotli and zstd follow parquet's majors (8 / 0.13) so each compiles once (#435).
+brotli = "8"
+zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde = { workspace = true }
 serde_json = "1"
@@ -131,6 +137,10 @@ harness = false
 
 [[bench]]
 name = "assign_scaling"
+harness = false
+
+[[bench]]
+name = "hostile_geometry"
 harness = false
 
 [lints]

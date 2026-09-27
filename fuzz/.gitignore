@@ -1,5 +1,9 @@
 target/
-corpus/
+# Seeds are committed as corpus/<target>/seed-*; everything libFuzzer adds
+# to corpus/<target>/ during a run (sha1-named) stays untracked.
+corpus/*/*
+!corpus/*/seed-*
 artifacts/
 coverage/
 Cargo.lock
+fuzz-*.log

@@ -58,7 +58,7 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--min-zoom <MIN_ZOOM>` — Minimum (coarsest) Web Mercator zoom level
 
   Default value: `0`
-* `--max-zoom <MAX_ZOOM>` — Maximum (finest) Web Mercator zoom level
+* `--max-zoom <MAX_ZOOM>` — Maximum (finest) Web Mercator zoom level, or `auto` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing (honoring --bbox/--filter, never above z16). The chosen zoom and its evidence are logged; an input with nothing to measure is an error. Ignored with --gsd
 
   Default value: `14`
 * `--gsd <GSDS>` — Explicit comma-separated GSD list (meters, strictly decreasing). Overrides --min-zoom/--max-zoom when set — the same semantics as `tylertoo overview --gsd`, so the absolute-GSD ladder is reachable in one step
@@ -66,7 +66,7 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--layer-name <LAYER_NAME>` — Layer name for the output tiles (default: derived from input filename)
 * `--max-tile-size <SIZE>` — Maximum tile size (e.g., "500K", "1M", or raw bytes). When a tile exceeds this limit, the export sheds features in a single non-iterative pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --tile-size-limit for parity with `export-pmtiles`. With --verbatim and no explicit value, the cap is disabled: a valve that sheds features to fit a byte budget is not verbatim either
 * `--no-simple-clip-fastpath` — Disable the simple-clip fast path (issue #239), forcing the i_overlay boundary-bridge fallback on every polygon clip. The fast path is on by default (render-equivalent on simple rings); pass this only when you need byte-stable tile output, since the fast path rotates simple rings to a different start vertex
-* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels, carried across tile seams so features don't clip at boundaries
+* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels, carried across tile seams so features don't clip at boundaries. At most 256 (one full tile width); wider is refused, since past that a tile duplicates geometry from tiles it does not border and every feature belongs to O(buffer²) tiles (#433)
 
   Default value: `8`
 * `--partition-wave <N|auto>` — Partitions processed per band read during the export phase (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
@@ -318,13 +318,14 @@ Build a multi-resolution overview GeoParquet file
 * `--min-zoom <MIN_ZOOM>` — Minimum (coarsest) Web Mercator zoom for the level range
 
   Default value: `0`
-* `--max-zoom <MAX_ZOOM>` — Maximum (finest / canonical) Web Mercator zoom for the level range
+* `--max-zoom <MAX_ZOOM>` — Maximum (finest / canonical) Web Mercator zoom for the level range, or `auto` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing (honoring --bbox/--filter, never above z16). The chosen zoom and its evidence are logged; an input with nothing to measure is an error. Ignored with --gsd
 
   Default value: `6`
 * `--gsd <GSDS>` — Explicit comma-separated GSD list (meters, strictly decreasing). Overrides --min-zoom/--max-zoom when set
 * `--bbox <XMIN,YMIN,XMAX,YMAX>` — Regional extract: only convert features whose bbox intersects this bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). Row groups whose GeoParquet 1.1 covering statistics don't intersect are skipped at the parquet footer level (no data pages read); inputs without covering stats degrade gracefully (all row groups read, exact per-feature filter still applies)
 * `--cogp-compat` — Emit the optional COGP compatibility footer key (partitioning mode)
 * `--report <PATH>` — Write the JSON conversion report to this path
+* `-f`, `--force` — Overwrite the output if it exists
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
 
    The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.
@@ -542,13 +543,15 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--include-property <NAME>` — Keep ONLY these properties in the tiles (repeatable; tippecanoe -y), matched on the names the tiles publish. The overview file is untouched. Naming a property the file does not export is an error; the --feature-order column must stay included
 * `--exclude-property <NAME>` — Drop these properties from the tiles (repeatable; tippecanoe -x). Ignored when --include-property is given, as in tippecanoe
 * `--exclude-all-properties` — Drop every property (tippecanoe -X): geometry-only tiles. Ignored when --include-property is given, as in tippecanoe
-* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels (feature seam continuity)
+* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels (feature seam continuity). At most 256 (one full tile width); wider is refused, since past that a tile duplicates geometry from tiles it does not border and every feature belongs to O(buffer²) tiles (#433)
 
   Default value: `8`
 * `--tile-size-limit <SIZE>` — Per-tile MVT size cap (e.g., "500K", "1M", or raw bytes). When a tile exceeds it, a single non-iterative drop pass sheds features for that tile only (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --max-tile-size for parity with the `tiles` command
 
   Default value: `500K`
-* `--report <PATH>` — Write the JSON export report to this path
+* `--report <PATH>` — Write the JSON export report to this path.
+
+   Besides per-zoom tile and feature counts and the oversized-tile tally, the report carries two encode tallies (total and per zoom, #431). `encode_dropped_features`: tile members with nothing to encode -- empty geometries or empty GeometryCollections; non-zero means content was lost after clipping, a warning names the total and the summary line repeats it. `encode_quantized_features`: tile members whose geometry collapsed at the tile extent -- zero-area polygon rings, lines of fewer than two points, typically clip slivers at a buffered tile edge; expected on ordinary data and never a warning.
 * `--no-simple-clip-fastpath` — Disable the simple-clip fast path (issue #239), forcing the i_overlay boundary-bridge fallback on every polygon clip. The fast path is on by default (render-equivalent on simple rings); pass this only when you need byte-stable tile output, since the fast path rotates simple rings to a different start vertex
 * `--partition-wave <N|auto>` — Partitions processed per band read during export (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
 
@@ -573,6 +576,8 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--zoom-ceiling <ZOOM>` — Emit only the tiles at or below this zoom (#498) — the coarse half of a sharded build, complementing --tile-range's finer half.
 
    Named a CEILING, not --max-zoom, because it is the opposite of --min-zoom here: --min-zoom only widens what the metadata DECLARES (vector_layers), while this one decides which zooms are actually emitted. Distinct from building a shallower pyramid too: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive. A partial overview kept from a `tiles --shard coarse` run holds only the levels up to its own ceiling and can only be exported with this set at or below that ceiling
+* `--spill-dir <PATH>` — Directory for the export's member spill file (#427): the on-disk backing the partitioning single-read pass 2 falls back to when the buffered members would not fit the memory budget. Same knob as `overview`/`tiles --spill-dir`. Defaults to the process temp directory ($TMPDIR), which on many Slurm and Kubernetes nodes is a RAM-backed /tmp; point this at real disk there. The directory must exist. The archive itself is never spilled here: it is assembled in place at OUTPUT.partial beside the output
+* `-f`, `--force` — Overwrite the output if it exists
 
 
 
@@ -606,6 +611,7 @@ does not reproduce A. See docs/decode.md for details.
 * `--max-zoom <MAX_ZOOM>` — Maximum zoom level to decode
 * `--layer <NAME>` — Only decode features from this MVT layer
 * `--report <PATH>` — Write the JSON decode report to this path
+* `-f`, `--force` — Overwrite the output if it exists
 
 
 
@@ -659,6 +665,13 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 
    Off by default: a band's premise is that its input is already the right resolution for the zooms it owns, so thinning and simplifying it would re-introduce exactly what banding avoids. Pass this when a band is raw features spanning several zooms and you do want the ladder inside it.
 * `--max-tile-size <SIZE>` — Per-tile MVT size cap for bands tiled here (e.g. "500K"). Unset means no cap, matching the verbatim default: a valve that sheds features to fit a byte budget would drop cells the band exists to draw
+* `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order for bands tiled here (#374): `input` (default) or a property name, optionally `:asc` / `:desc`.
+
+   Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361): MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a banded aggregate or nested choropleth usually wants — with ties kept in input order so output stays deterministic.
+
+   Applies to every GeoParquet band alike, like `--generalize` and `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps the order it was tiled with. Each band's export reads the column independently: a GeoParquet band that does not have it is exported in input order with a warning naming the band's layer, not an error.
+
+  Default value: `input`
 * `--work-dir <DIR>` — Directory for the per-band intermediates (removed on the way out). Defaults to the system temp directory
 * `--allow-missing-zooms` — Allow a pre-tiled band's declared zoom range to overshoot what its archive actually holds.
 

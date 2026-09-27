@@ -452,12 +452,14 @@ the layer declarations alike. `shard-plan` warns at cut time when it produces
 such ranges, which is the signal that a smaller `--shards` would balance the
 fleet better.
 
-**`--tile-buffer` is capped at 512 tile pixels.** A shard prunes its input to
-the row groups within two pivot tiles of its range; a wider buffer could pull
-geometry into one of its tiles from a row group it never read, so the tile
-would come out missing geometry the monolithic run has. 512 is two full tile
-widths, against a default of 8 — anything past it is refused rather than
-silently wrong.
+**`--tile-buffer` stays within the read-pruning margin.** A shard prunes its
+input to the row groups within two pivot tiles (512 tile pixels) of its range;
+a wider buffer could pull geometry into one of its tiles from a row group it
+never read, so the tile would come out missing geometry the monolithic run has.
+Every export, sharded or not, caps `--tile-buffer` at 256 tile pixels — one
+full tile width, against a default of 8 (#433) — which sits inside that margin,
+so a sharded build needs no cap of its own; the two bounds are tied by a
+compile-time check in the source.
 
 The Python bindings do not expose sharding yet, the same as the convert plan it
 depends on.

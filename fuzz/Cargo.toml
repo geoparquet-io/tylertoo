@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-tylertoo-core = { path = "../crates/core" }
+tylertoo-core = { path = "../crates/core", features = ["fuzzing"] }
 
 [[bin]]
 name = "footer_json"
@@ -21,6 +21,41 @@ bench = false
 [[bin]]
 name = "wkb"
 path = "fuzz_targets/wkb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pmtiles_header"
+path = "fuzz_targets/pmtiles_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pmtiles_directory"
+path = "fuzz_targets/pmtiles_directory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mvt_decode"
+path = "fuzz_targets/mvt_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "band_archive"
+path = "fuzz_targets/band_archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_expr"
+path = "fuzz_targets/filter_expr.rs"
 test = false
 doc = false
 bench = false

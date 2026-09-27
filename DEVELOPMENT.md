@@ -123,6 +123,51 @@ CI mirrors the tiers: the Test matrix (ubuntu/macos × stable/beta) runs
 `quick`; the Slow Tests job runs exactly the set `quick` excludes, on
 ubuntu and macOS stable. Together they cover `full`.
 
+The weekly mutation-testing job (`.github/workflows/mutation-tests.yml`,
+Sundays, or `gh workflow run mutation-tests.yml`) runs `cargo mutants` on
+`tylertoo-core` under the `quick` tier too: `.cargo/mutants.toml` sets
+`test_tool = "nextest"`, so marking a test slow in `nextest.toml` also
+drops it from every mutant's test run. The ~8200 mutants are split over
+a `--shard k/n` matrix (`SHARD_COUNT` in the workflow) so each shard
+fits GitHub's 6-hour job limit; a `report` job sums the shards'
+`outcomes.json` into one score. The job is advisory — missed mutants and
+timeouts show up as the mutation score in the job summary, not as a red
+run — but a run that could not measure everything (a baseline failure,
+which needs the `geometry-test-data` submodule and the realdata
+fixtures, or a shard hitting its time limit) opens or updates a pinned
+`mutation-tests` issue. To reproduce locally, with the submodule and
+fixtures in place:
+
+```bash
+cargo install cargo-mutants cargo-nextest --locked
+cargo mutants --package tylertoo-core --list   # what would be mutated
+cargo mutants --package tylertoo-core \
+  -F 'simplify'                                # one module, minutes
+cargo mutants --package tylertoo-core          # the full sweep, hours
+```
+
+The nightly fuzz job (`.github/workflows/fuzz.yml`, 3 AM UTC, or
+`gh workflow run fuzz.yml`) runs every `cargo-fuzz` target in `fuzz/`
+for 300 s each, one matrix job per target, seeded from
+`fuzz/corpus/<target>/seed-*`. The targets cover the parsers that read
+third-party bytes: the PMTiles header and directory, an MVT tile body, a
+whole `--band` archive, the footer JSON, WKB, and the `--filter` grammar.
+A crash uploads the reproducer as the `fuzz-artifacts-<target>` artifact
+and opens or updates a pinned `fuzz` issue. `fuzz/README.md` has the
+target table, how to run one locally, and how to minimize a crash into
+a regression test. The fuzz crate is its own workspace and never affects
+the per-PR build; two of its targets reach private code through
+`#[doc(hidden)]` hooks behind core's `fuzzing` feature, which nothing
+else enables.
+
+```bash
+cargo install cargo-fuzz --locked
+cd fuzz
+cargo +nightly fuzz list
+cargo +nightly fuzz run pmtiles_directory -- \
+  -max_total_time=60
+```
+
 When a new test takes more than ~20s, add it to the slow set in
 `.config/nextest.toml`: the `default-filter` exclusion in
 `[profile.default]` (which `quick` inherits) and the matching
@@ -279,9 +324,11 @@ cargo semver-checks check-release \
   --package tylertoo-core \
   --baseline-rev origin/main
 
-# Convert regression guards (#558)
-# 1. structural signature of `overview` over fixtures-v1
-#    (bench.yml Convert regression guard; not a required check)
+# Convert regression guards (#558, #425)
+# 1. structural signature of `overview` -> `export-pmtiles`
+#    over fixtures-v1: per-level counts, per-zoom tile and
+#    feature counts (written + `decode`d back), archive
+#    bytes +-2% (e2e.yml Archive e2e; see "Archive e2e" below)
 cargo build --release --package tylertoo
 python3 benchmarks/overview/ci_guard.py --check
 # 2. golden tile digests of a full convert -> export build
@@ -357,6 +404,89 @@ uv run pip-audit -r /tmp/requirements.txt --disable-pip
 If you change a `#[pyo3(signature = ...)]` in
 `crates/python/src/lib.rs`, update `crates/python/tylertoo.pyi` —
 stubtest will fail otherwise.
+
+### Archive e2e (independent readers, #421 / #425)
+
+`.github/workflows/e2e.yml` builds the release binary, runs the
+convert+export guard above over the fixtures-v1 inputs, and then opens
+every archive it produced with readers that share no code with our
+PMTiles writer: go-pmtiles `pmtiles verify` (structure: header,
+directories, clustering, zoom bounds) and a uv script that walks the
+archive with the Python `pmtiles` reader and decodes sampled tiles at
+every zoom with `mapbox-vector-tile`. Locally:
+
+```bash
+cargo build --release --package tylertoo
+
+# 1. guard, keeping the archives for the reader checks
+python3 benchmarks/overview/ci_guard.py --check \
+  --keep-archives /tmp/e2e-archives
+
+# 2. go-pmtiles at the pinned release, sha256-checked,
+#    installed into .tools/ (gitignored)
+scripts/setup_go_pmtiles.sh
+eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+for f in /tmp/e2e-archives/*.pmtiles; do
+  "$PMTILES_BIN" verify "$f"
+done
+
+# 3. pmtiles + mapbox-vector-tile (PEP 723 inline deps,
+#    resolved by uv); the layer is the archive's stem
+for f in /tmp/e2e-archives/*.pmtiles; do
+  uv run scripts/verify_archive.py "$f" \
+    --layer "$(basename "$f" .pmtiles)" --per-zoom 5
+done
+```
+
+After an intended output change, regenerate the baseline with
+`python3 benchmarks/overview/ci_guard.py --update` (release build) and
+commit `benchmarks/overview/ci_baseline.json`. Archive bytes are compared
+with a 2% tolerance (`--tolerance`); everything else exactly. Only our
+own archives go through `pmtiles verify` — the tippecanoe-made
+`tests/fixtures/golden/*.pmtiles` are inputs, not outputs.
+
+### tippecanoe parity gate (#420)
+
+`.github/workflows/tippecanoe-compare.yml` (every PR, push to main,
+weekly) tiles the fixtures-v1 inputs with tylertoo and with tippecanoe
+2.79.0 built from source at a pinned tag + commit, decodes both
+archives with independent readers, and gates the per-zoom tile,
+feature, distinct-id, vertex and byte ratios against
+`benchmarks/e2e/tippecanoe_tolerances.toml`. The table lands in the
+job summary; a scheduled failure opens an issue labelled
+`tippecanoe-parity`. Method and flag mapping:
+`benchmarks/e2e/README.md`, "Parity gate". Locally:
+
+```bash
+cargo build --release --package tylertoo
+
+# pinned tippecanoe, built into .tools/ (gitignored);
+# needs a C++ toolchain, sqlite3 and zlib headers
+benchmarks/e2e/setup_tippecanoe.sh
+
+# the gate: all three fixtures, ~75 s on a 16-core
+# laptop; exit 1 on a breach with the cell named
+uv run benchmarks/e2e/compare_tippecanoe.py
+
+# one fixture, keep the archives and the JSON record
+uv run benchmarks/e2e/compare_tippecanoe.py \
+  --only open-buildings --work /tmp/cmp --keep \
+  --json /tmp/cmp/parity.json
+```
+
+The bands are a ratchet like the convert guard baseline: when a
+change moves a ratio on purpose, edit the band in the same PR and put
+the new measured value in its comment. The Test and Coverage jobs
+build the same pinned tippecanoe so that
+`decode_golden_against_tippecanoe_decode` (decode_roundtrip.rs) runs;
+on CI a missing `tippecanoe-decode` fails that test instead of
+skipping it. To run it locally:
+
+```bash
+eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+cargo test -p tylertoo-core --test decode_roundtrip \
+  decode_golden -- --nocapture
+```
 
 ### Workflows
 

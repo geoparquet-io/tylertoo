@@ -6,7 +6,9 @@
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
 #                   Cargo.toml [workspace.lints]), cargo-machete, unit tests
 #   Test            the `quick` nextest tier (ubuntu/macos x stable/beta) —
-#                   see .config/nextest.toml (#457)
+#                   see .config/nextest.toml (#457); installs the pinned
+#                   tippecanoe so the tippecanoe-decode golden test runs
+#                   rather than skips (#420)
 #   Slow Tests      the slow tests `quick` excludes; Test + Slow Tests
 #                   together cover the `full` tier, on ubuntu/macos stable
 #   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
@@ -21,8 +23,9 @@
 #                   own workflows
 #
 # Benchmarks run in bench.yml (push to main / manual); mutation testing runs
-# in mutation-tests.yml (weekly). Neither appears here, so no job in this
-# workflow is ever skipped on a PR.
+# in mutation-tests.yml (weekly); the tippecanoe parity gate (#420) runs in
+# tippecanoe-compare.yml (PRs, push to main, weekly). None appears here, so
+# no job in this workflow is ever skipped on a PR.
 #
 # TOOLCHAIN POLICY: floating `stable` for all gates, with a `beta` lane in the
 # Test matrix as the early-warning system for upcoming rustc/clippy breakage
@@ -289,6 +292,29 @@ jobs:
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: cargo-nextest
+
+      # The tippecanoe-decode golden comparison in decode_roundtrip.rs is a
+      # hard failure on CI when the binary is missing (#420; it skipped
+      # silently before, so it had never run here). Pinned tag + commit SHA,
+      # built into .tools/ and cached on the setup script's hash - the same
+      # build tippecanoe-compare.yml gates against.
+      - name: Install tippecanoe build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libsqlite3-dev zlib1g-dev
+
+      - name: Cache tippecanoe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools/tippecanoe-*
+            .tools/src-*
+          key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build tippecanoe (pinned tag + SHA) and put it on PATH
+        run: |
+          benchmarks/e2e/setup_tippecanoe.sh
+          eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+          dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
 
       - name: Run all tests (quick tier)
         # `quick` excludes the slow end-to-end suites (#524) and the manual
@@ -597,6 +623,29 @@ jobs:
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: cargo-llvm-cov,cargo-nextest
+
+      # The tippecanoe-decode golden comparison in decode_roundtrip.rs is a
+      # hard failure on CI when the binary is missing (#420; it skipped
+      # silently before, so it had never run here). Pinned tag + commit SHA,
+      # built into .tools/ and cached on the setup script's hash - the same
+      # build tippecanoe-compare.yml gates against.
+      - name: Install tippecanoe build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libsqlite3-dev zlib1g-dev
+
+      - name: Cache tippecanoe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools/tippecanoe-*
+            .tools/src-*
+          key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build tippecanoe (pinned tag + SHA) and put it on PATH
+        run: |
+          benchmarks/e2e/setup_tippecanoe.sh
+          eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+          dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
 
       - name: Generate coverage
         # Source-based instrumentation (#524). tarpaulin ran the suite under

@@ -1,0 +1,23 @@
+[package]
+name = "hostile-wagyu"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "wagyu-rs runner for the #205 hostile-geometry evaluation (out of the workspace: see README.md)"
+license = "Apache-2.0"
+
+# Deliberately NOT a workspace member (root Cargo.toml `exclude`s it): wagyu-rs
+# 0.2.1 declares a dead `geo = "0.32"` dependency (its sources only use
+# geo-types), and geo 0.32 pins i_overlay `>=4.0, <4.1` while tylertoo's geo
+# 0.33 pins i_overlay `>=4.5.1, <4.6`. Two semver-compatible i_overlay 4.x
+# requirements cannot coexist in one graph, so wagyu-rs cannot be a dependency
+# of tylertoo-core at all — not even optional (cargo resolves optional
+# dependencies whether or not their feature is on). Upstream fix requested:
+# nlebovits/wagyu-rs (drop `geo` from [dependencies]).
+[workspace]
+
+[dependencies]
+wagyu-rs = "0.2.1"
+geo-types = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
