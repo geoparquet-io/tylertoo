@@ -6,7 +6,7 @@ Production data samples for testing tylertoo tiling performance.
 
 | File | Features | Size | Source | Use Case |
 |------|----------|------|--------|----------|
-| `open-buildings.parquet` | 1,000 | 143KB | Google Open Buildings | Quick tests, golden comparisons |
+| `open-buildings.parquet` | 1,000 | 143KB | VIDA Google-Microsoft-OSM Open Buildings (Andorra) | Quick tests, golden comparisons |
 | `fieldmaps-madagascar-adm4.parquet` | 17,465 | 28MB | [FieldMaps](https://fieldmaps.io) | **Parallelization benchmarks** |
 | `fieldmaps-boundaries.parquet` | 3 | 2.2MB | FieldMaps | Large polygon tests |
 | `road-detections.parquet` | ~1,000 | 90KB | Road detection ML | LineString tests |
@@ -14,8 +14,10 @@ Production data samples for testing tylertoo tiling performance.
 ## Attribution
 
 - **FieldMaps data** courtesy of Maxym Malynowsky ([fieldmaps.io](https://fieldmaps.io)) — edge-matched humanitarian admin boundaries
-- **Google Open Buildings** — CC BY 4.0
-- **Road detections** — derived from ML model outputs
+- **Open buildings**: Andorra subset of [VIDA's Google-Microsoft-OSM Open Buildings](https://source.coop/vida/google-microsoft-osm-open-buildings), ODbL 1.0 (Microsoft and OpenStreetMap footprints)
+- **Road detections**: derived from ML model outputs
+
+The repository-root `NOTICE` file lists the verified licenses.
 
 ## Getting Fixtures
 
