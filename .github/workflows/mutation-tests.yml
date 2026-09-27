@@ -2,7 +2,17 @@
 #
 # Purpose: mutation testing is far too slow for the PR path, so it runs on a
 # weekly schedule (plus manual dispatch) and publishes its report as an
-# artifact + job summary. It is advisory, not a PR gate.
+# artifact + job summary. It is advisory, not a PR gate: missed mutants and
+# timeouts are reported in the summary, not turned into a red run.
+#
+# The run IS red when cargo-mutants could not measure anything (the
+# unmutated baseline failed, a usage error, an internal error), and a red
+# run opens or updates a pinned `mutation-tests` issue so it has an owner.
+# Every scheduled run from 2026-08 to 2026-09 failed this way in silence
+# (#419): the checkout lacked `submodules: recursive`, so the
+# tests/fixtures/geometry-test-data submodule was empty in the scratch copy
+# cargo-mutants builds, and invalid_geometry_clipping panicked in the
+# baseline. Configuration lives in .cargo/mutants.toml.
 
 name: Weekly Mutation Tests
 
@@ -23,9 +33,15 @@ jobs:
   mutations:
     name: Mutation Testing
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # geometry-test-data is a submodule; without it the baseline
+          # test run panics and no mutants get tested (#419).
+          submodules: recursive
           persist-credentials: false
 
       - name: Cache test fixtures
@@ -64,15 +80,51 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install cargo-mutants
+      - name: Install cargo-mutants and cargo-nextest
+        # nextest: .cargo/mutants.toml sets test_tool = "nextest" so the
+        # quick tier from .config/nextest.toml applies to every mutant.
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
-          tool: cargo-mutants
+          tool: cargo-mutants,cargo-nextest
+
+      - name: Sanity-check the scratch copy sees the fixtures
+        # Fail fast (seconds, not the ~3 min baseline) with a clear message
+        # if the checkout regresses again. The assertion mirrors what the
+        # baseline needs: the submodule's examples and the downloaded
+        # realdata parquet files.
+        run: |
+          test -d tests/fixtures/geometry-test-data/examples \
+            || { echo "::error::geometry-test-data submodule is empty — checkout needs submodules: recursive"; exit 1; }
+          test -f tests/fixtures/realdata/fieldmaps-boundaries.parquet \
+            || { echo "::error::realdata fixtures missing — gh release download failed"; exit 1; }
+          cargo mutants --package tylertoo-core --list --no-shuffle > mutants.list
+          echo "$(wc -l < mutants.list) mutants queued"
 
       - name: Run mutation tests on core
+        id: mutants
         # NB: package name is tylertoo-core (the old gpq2tiles-core spelling
         # made every scheduled run fail at startup).
-        run: cargo mutants --package tylertoo-core --output mutants.out
+        #
+        # Exit codes (https://mutants.rs/exit-codes.html): 0 all caught,
+        # 2 some missed, 3 some timed out — those three are a completed
+        # measurement and this job is advisory, so they pass. 4 = the
+        # unmutated baseline failed (nothing tested), 1 = usage error,
+        # 70 = internal error: those fail the job and open the issue below.
+        #
+        # `--output DIR` creates mutants.out *inside* DIR: the old
+        # `--output mutants.out` nested it at mutants.out/mutants.out, which
+        # is why the summary step never found a report even on green runs.
+        run: |
+          set +e
+          cargo mutants --package tylertoo-core --output .
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0|2|3) echo "cargo mutants finished (exit $code)"; exit 0 ;;
+            4) echo "::error::cargo mutants: unmutated baseline failed, no mutants tested"; exit 1 ;;
+            *) echo "::error::cargo mutants failed with exit $code"; exit 1 ;;
+          esac
 
       - name: Upload mutation report
         if: always()
@@ -82,12 +134,127 @@ jobs:
           path: mutants.out/
 
       - name: Post summary
+        id: summary
         if: always()
+        env:
+          EXIT_CODE: ${{ steps.mutants.outputs.exit_code }}
         run: |
-          echo "## Mutation Testing Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f mutants.out/outcomes.txt ]; then
-            cat mutants.out/outcomes.txt >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Mutation Testing Results"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ! -f mutants.out/outcomes.json ]; then
+            {
+              echo "No mutation results found (cargo mutants exit code: ${EXIT_CODE:-unknown})."
+              echo "The run did not get as far as writing outcomes.json; see the job log."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "score=n/a" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # outcomes.json: top-level counts from cargo-mutants' LabOutcome.
+          # Score = caught / (caught + missed + timeout): unviable mutants
+          # (did not compile) are not a test-suite failure and are left out,
+          # matching how cargo-mutants itself reports.
+          read -r total caught missed timeout unviable < <(jq -r \
+            '[.total_mutants, .caught, .missed, .timeout, .unviable] | @sh' \
+            mutants.out/outcomes.json | tr -d "'")
+          tested=$((caught + missed + timeout))
+          if [ "$tested" -gt 0 ]; then
+            score=$(awk -v c="$caught" -v t="$tested" 'BEGIN { printf "%.1f", 100 * c / t }')
           else
-            echo "No mutation results found" >> "$GITHUB_STEP_SUMMARY"
+            score="n/a"
+          fi
+          echo "score=$score" >> "$GITHUB_OUTPUT"
+          echo "missed=$missed" >> "$GITHUB_OUTPUT"
+          echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "**Mutation score: ${score}%** (${caught} caught / ${tested} tested)"
+            echo ""
+            echo "| Outcome | Count |"
+            echo "|---|---|"
+            echo "| Total mutants | ${total} |"
+            echo "| Caught | ${caught} |"
+            echo "| Missed | ${missed} |"
+            echo "| Timeout | ${timeout} |"
+            echo "| Unviable (did not compile) | ${unviable} |"
+            echo ""
+            echo "cargo mutants exit code: ${EXIT_CODE:-unknown}"
+            echo ""
+            for kind in missed timeout; do
+              if [ -s "mutants.out/${kind}.txt" ]; then
+                n=$(wc -l < "mutants.out/${kind}.txt")
+                echo "<details><summary>${kind} (${n})</summary>"
+                echo ""
+                echo '```'
+                head -n 200 "mutants.out/${kind}.txt"
+                [ "$n" -gt 200 ] && echo "... ($((n - 200)) more in the mutation-report artifact)"
+                echo '```'
+                echo "</details>"
+                echo ""
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the mutation-tests issue
+        # Ported from security.yml. Fires only when the run produced no
+        # measurement (baseline / usage / internal failure), never for a low
+        # score: that is the summary's job.
+        if: failure() && steps.mutants.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXIT_CODE: ${{ steps.mutants.outputs.exit_code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Make sure the label exists (no-op if it already does).
+          gh label create mutation-tests \
+            --description "Automated weekly mutation-test run failures" \
+            --color B60205 2>/dev/null || true
+
+          # The baseline log names the failing test; surface its tail so the
+          # issue is actionable without opening the artifact.
+          BASELINE_TAIL=""
+          if [ -f mutants.out/log/baseline.log ]; then
+            BASELINE_TAIL=$(sed 's/\x1b\[[0-9;]*m//g' mutants.out/log/baseline.log \
+              | grep -E "panicked at|FAIL|error(\[|:)" | tail -n 30)
+          fi
+
+          TITLE="Weekly mutation tests are failing"
+          BODY="The scheduled cargo-mutants run did not complete: it exited with
+          code ${EXIT_CODE:-unknown} (4 = unmutated baseline failed, so no
+          mutants were tested; see https://mutants.rs/exit-codes.html).
+
+          Run: $RUN_URL
+
+          Baseline log excerpt:
+          \`\`\`
+          ${BASELINE_TAIL:-(no baseline log; the run failed before cargo-mutants wrote one)}
+          \`\`\`
+
+          ---
+          _This issue is managed by .github/workflows/mutation-tests.yml. It is
+          updated (not duplicated) on every failing weekly run; close it once a
+          run completes. A low mutation score does not open this issue; the job
+          summary reports the score._"
+
+          EXISTING=$(gh issue list --label mutation-tests --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING"
+            gh issue edit "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL"
+          else
+            echo "Opening new issue"
+            NEW_URL=$(gh issue create --title "$TITLE" --label mutation-tests --body "$BODY")
+            # Pin it so it stays visible (best effort; needs no extra scope).
+            NUM=${NEW_URL##*/}
+            ISSUE_ID=$(gh api "repos/$GH_REPO/issues/$NUM" --jq .node_id)
+            # shellcheck disable=SC2016  # $id is a GraphQL variable, not shell
+            gh api graphql -f query='
+              mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { number } } }' \
+              -f id="$ISSUE_ID" || true
           fi

@@ -123,6 +123,25 @@ CI mirrors the tiers: the Test matrix (ubuntu/macos × stable/beta) runs
 `quick`; the Slow Tests job runs exactly the set `quick` excludes, on
 ubuntu and macOS stable. Together they cover `full`.
 
+The weekly mutation-testing job (`.github/workflows/mutation-tests.yml`,
+Sundays, or `gh workflow run mutation-tests.yml`) runs `cargo mutants` on
+`tylertoo-core` under the `quick` tier too: `.cargo/mutants.toml` sets
+`test_tool = "nextest"`, so marking a test slow in `nextest.toml` also
+drops it from every mutant's test run. The job is advisory — missed
+mutants and timeouts show up as the mutation score in the job summary,
+not as a red run — but a run that could not measure anything (the
+unmutated baseline fails, which needs the `geometry-test-data` submodule
+and the realdata fixtures) opens or updates a pinned `mutation-tests`
+issue. To reproduce locally, with the submodule and fixtures in place:
+
+```bash
+cargo install cargo-mutants cargo-nextest --locked
+cargo mutants --package tylertoo-core --list   # what would be mutated
+cargo mutants --package tylertoo-core \
+  -F 'simplify'                                # one module, minutes
+cargo mutants --package tylertoo-core          # the full sweep, hours
+```
+
 When a new test takes more than ~20s, add it to the slow set in
 `.config/nextest.toml`: the `default-filter` exclusion in
 `[profile.default]` (which `quick` inherits) and the matching
