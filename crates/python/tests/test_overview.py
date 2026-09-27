@@ -57,6 +57,7 @@ class TestOutOfRangeExemplars:
                 {"part": None, "row": 7, "axis": "lon", "value": 190.25}
             ]
 
+
 needs_streaming_small = pytest.mark.skipif(
     not STREAMING_SMALL.exists(),
     reason="multi-rowgroup-small.parquet fixture not available",
