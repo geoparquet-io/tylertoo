@@ -495,6 +495,10 @@ struct DecodeArgs {
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    force: bool,
+
     /// Not supported here (single-file subcommand); accepted so the error
     /// can point at `overview`/`tiles` instead of clap's generic message.
     #[arg(long, value_name = "PATH", hide = true)]
@@ -708,6 +712,21 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "ZOOM")]
     zoom_ceiling: Option<u8>,
 
+    /// Directory for the export's member spill file (#427): the on-disk
+    /// backing the partitioning single-read pass 2 falls back to when the
+    /// buffered members would not fit the memory budget. Same knob as
+    /// `overview`/`tiles --spill-dir`. Defaults to the process temp
+    /// directory ($TMPDIR), which on many Slurm and Kubernetes nodes is a
+    /// RAM-backed /tmp; point this at real disk there. The directory must
+    /// exist. The archive itself is never spilled here: it is assembled in
+    /// place at OUTPUT.partial beside the output.
+    #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
+    spill_dir: Option<PathBuf>,
+
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    force: bool,
+
     /// Not supported here (single-file subcommand); accepted so the error
     /// can point at `overview`/`tiles` instead of clap's generic message.
     #[arg(long, value_name = "PATH", hide = true)]
@@ -776,6 +795,10 @@ struct OverviewArgs {
     /// Write the JSON conversion report to this path.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
+
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    force: bool,
 
     #[command(flatten)]
     tuning: ConvertTuningArgs,
@@ -2612,10 +2635,12 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
     })
 }
 
-/// `tiles` output gate (#551): an existing file is refused unless `force`.
-/// A directory can never be replaced by the final rename, `--force` or not,
-/// so it is refused up front instead of after a whole convert + export.
-fn check_tiles_output(output: &Path, force: bool) -> Result<()> {
+/// Output gate for every subcommand that writes a file (#551 for `tiles`,
+/// #427 for `overview`, `export-pmtiles` and `decode`): an existing file is
+/// refused unless `force`. A directory can never be replaced by the final
+/// rename, `--force` or not, so it is refused up front instead of after a
+/// whole convert + export.
+fn check_output_path(output: &Path, force: bool) -> Result<()> {
     if output.is_dir() {
         anyhow::bail!(
             "{} is a directory; the output must be a PMTiles file path",
@@ -2624,6 +2649,19 @@ fn check_tiles_output(output: &Path, force: bool) -> Result<()> {
     }
     if output.exists() && !force {
         anyhow::bail!("{} exists (use --force to overwrite)", output.display());
+    }
+    Ok(())
+}
+
+/// `--spill-dir` preflight (#427), shared wording with the convert side
+/// (`ConvertOptions` validation) so the two subcommands fail the same way.
+/// Core checks it again inside `export_pmtiles`; this runs first so a bad
+/// directory is reported before the input is even looked at.
+fn check_spill_dir(spill_dir: Option<&Path>) -> Result<()> {
+    if let Some(dir) = spill_dir {
+        if !dir.is_dir() {
+            anyhow::bail!("spill-dir {} is not an existing directory", dir.display());
+        }
     }
     Ok(())
 }
@@ -2933,7 +2971,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         args.files_from.clone(),
     )?;
 
-    check_tiles_output(&output, args.force)?;
+    check_output_path(&output, args.force)?;
 
     // Derive the layer name from the input if not given: file stem for a
     // single file, last path segment for a directory or s3://gs:// prefix,
@@ -3093,6 +3131,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         zoom_ceiling: shard
             .and_then(|job| job.range.is_none().then(|| job.pivot.saturating_sub(1))),
         feature_id: args.feature_id.clone(),
+        // #427: one scratch knob — the export's member spill goes where the
+        // convert's spill (and the intermediate overview) go.
+        spill_dir: args.tuning.spill_dir.clone(),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -3301,6 +3342,11 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
+
+    // #427: refuse an existing output (without --force) before any work. The
+    // overview itself is written to a sibling and renamed over OUTPUT at the
+    // end, so an interrupted run leaves a previous file intact either way.
+    check_output_path(&output, args.force)?;
 
     let mode = match args.mode.as_str() {
         "duplicating" => Mode::Duplicating,
@@ -3624,6 +3670,10 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // #427: refuse an existing output (without --force) and a bad --spill-dir
+    // before the input is even looked at.
+    check_output_path(&args.output, args.force)?;
+    check_spill_dir(args.spill_dir.as_deref())?;
     reject_files_from(args.files_from.as_ref(), "export-pmtiles")?;
     require_single_local_file(&args.input, "export-pmtiles")?;
 
@@ -3649,6 +3699,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
             .transpose()?,
         zoom_ceiling: args.zoom_ceiling,
         feature_id: args.feature_id.clone(),
+        spill_dir: args.spill_dir.clone(),
     };
 
     println!(
@@ -4076,6 +4127,8 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // #427: refuse an existing output (without --force) before any work.
+    check_output_path(&args.output, args.force)?;
     reject_files_from(args.files_from.as_ref(), "decode")?;
     require_single_local_file(&args.input, "decode")?;
 

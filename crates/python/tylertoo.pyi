@@ -79,5 +79,6 @@ def export_pmtiles(
     feature_order: str = "input",
     min_zoom: int | None = None,
     feature_id: str | None = None,
+    spill_dir: str | Path | None = None,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...

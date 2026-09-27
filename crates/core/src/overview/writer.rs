@@ -350,6 +350,13 @@ pub struct OverviewWriter<W: Write + Send> {
     /// `write_level`/`finish` calls, so both refuse immediately once this is
     /// set.
     failed: bool,
+    /// Set by [`OverviewWriter::create`] (#427): the file is being written
+    /// to a sibling of the destination, and `finish` publishes it there by
+    /// rename once the footer is down. `None` for an arbitrary sink
+    /// ([`Self::try_new`]), where the caller owns the destination. Dropping
+    /// an unfinished writer removes the sibling and leaves whatever was at
+    /// the destination untouched.
+    pending_output: Option<crate::atomic_output::PendingOutput>,
     /// Test-only fault injection for the detached encode tasks (#426).
     #[cfg(test)]
     encode_faults: EncodeFaults,
@@ -411,13 +418,23 @@ struct RgAssembly {
 
 impl OverviewWriter<File> {
     /// Create an overview writer that writes to `path`.
+    ///
+    /// The destination is not touched until [`Self::finish`] succeeds
+    /// (#427): the file is built in a uniquely-named sibling
+    /// (`<name>.<random>.partial`, in `path`'s directory) and renamed over
+    /// `path` once its footer is written. A run that fails or is dropped
+    /// before then removes the sibling; a run killed outright leaves it, but
+    /// the previous `path` is intact either way. The sibling must therefore
+    /// be creatable in `path`'s directory, which must already exist.
     pub fn create<P: AsRef<Path>>(
         path: P,
         source_schema: &Schema,
         options: OverviewWriterOptions,
     ) -> Result<Self, WriterError> {
-        let file = File::create(path)?;
-        Self::try_new(file, source_schema, options)
+        let (file, pending) = crate::atomic_output::create(path.as_ref())?;
+        let mut writer = Self::try_new(file, source_schema, options)?;
+        writer.pending_output = Some(pending);
+        Ok(writer)
     }
 }
 
@@ -518,6 +535,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             written_spec_indices: Vec::new(),
             next_level_idx: 0,
             failed: false,
+            pending_output: None,
             #[cfg(test)]
             encode_faults: EncodeFaults::default(),
         })
@@ -933,6 +951,11 @@ impl<W: Write + Send> OverviewWriter<W> {
         }
 
         self.writer.close()?;
+        // #427: the footer is down and the handle closed — publish the
+        // sibling over the destination. Only now does the destination change.
+        if let Some(pending) = self.pending_output.take() {
+            pending.publish()?;
+        }
         Ok(meta)
     }
 
@@ -3166,5 +3189,97 @@ mod tests {
                 );
             },
         );
+    }
+
+    // ---- #427: the destination is untouched until `finish` publishes. ----
+
+    fn dir_listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// An `overview` run killed or failed part-way must leave the previous
+    /// file at the destination byte-for-byte intact (#427): `create` opens a
+    /// sibling, not the destination, and a writer that never reaches
+    /// `finish` (here: it errors out with incomplete levels) removes it.
+    #[test]
+    fn interrupted_create_leaves_previous_output_intact() {
+        let schema = Arc::new(source_schema());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("overview.parquet");
+        std::fs::write(&out, b"previous good overview").unwrap();
+
+        let mut writer = OverviewWriter::create(&out, &schema, duplicating_options()).unwrap();
+        let _ = writer
+            .write_level(0, None, std::iter::once(source_batch(&schema, &[0, 3])))
+            .unwrap();
+        // Rows have been appended to *something*, but not to the destination.
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"previous good overview",
+            "destination truncated while the overview was in flight"
+        );
+        assert_eq!(
+            dir_listing(dir.path()).len(),
+            2,
+            "sibling beside the output"
+        );
+
+        let err = writer.finish().unwrap_err();
+        assert!(matches!(err, WriterError::IncompleteLevels { .. }));
+
+        assert_eq!(std::fs::read(&out).unwrap(), b"previous good overview");
+        assert_eq!(
+            dir_listing(dir.path()),
+            vec!["overview.parquet".to_string()],
+            "the failed writer's sibling must be removed"
+        );
+    }
+
+    /// A successful `finish` publishes over the previous file and leaves no
+    /// sibling behind.
+    #[test]
+    fn finish_publishes_over_previous_output_without_litter() {
+        let schema = Arc::new(source_schema());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("overview.parquet");
+        std::fs::write(&out, b"previous good overview").unwrap();
+
+        let mut writer = OverviewWriter::create(&out, &schema, duplicating_options()).unwrap();
+        for level in 0..3 {
+            let _ = writer
+                .write_level(level, None, std::iter::once(source_batch(&schema, &[0, 3])))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..4], b"PAR1", "destination holds the new parquet");
+        assert_eq!(
+            dir_listing(dir.path()),
+            vec!["overview.parquet".to_string()]
+        );
+    }
+
+    /// A dropped writer (the "Ctrl-C reached the drop glue" case, or a caller
+    /// that bailed on an earlier error) also cleans up its sibling.
+    #[test]
+    fn dropped_writer_removes_its_sibling() {
+        let schema = Arc::new(source_schema());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("overview.parquet");
+        let writer = OverviewWriter::create(&out, &schema, duplicating_options()).unwrap();
+        assert_eq!(dir_listing(dir.path()).len(), 1);
+        drop(writer);
+        assert!(
+            dir_listing(dir.path()).is_empty(),
+            "{:?}",
+            dir_listing(dir.path())
+        );
+        assert!(!out.exists());
     }
 }

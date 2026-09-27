@@ -1506,6 +1506,7 @@ pub tylertoo_core::overview::export::ExportError::Reader(tylertoo_core::overview
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::finest: u8
+pub tylertoo_core::overview::export::ExportError::SpillDirNotDirectory(std::path::PathBuf)
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
@@ -1617,6 +1618,7 @@ pub tylertoo_core::overview::export::ExportOptions::min_zoom: core::option::Opti
 pub tylertoo_core::overview::export::ExportOptions::partition_wave: usize
 pub tylertoo_core::overview::export::ExportOptions::properties: tylertoo_core::overview::properties::PropertySelection
 pub tylertoo_core::overview::export::ExportOptions::simple_clip_fastpath: bool
+pub tylertoo_core::overview::export::ExportOptions::spill_dir: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::export::ExportOptions::tile_buffer: u32
 pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>

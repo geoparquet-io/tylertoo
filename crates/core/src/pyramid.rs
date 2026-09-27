@@ -1453,6 +1453,13 @@ pub fn build_pyramid(
             // set on `opts.export` would apply to every band alike, and be
             // rejected by any band whose range starts finer (#380).
             min_zoom: Some(band.min_zoom),
+            // #427: the band's export spill goes where its intermediates go,
+            // unless the caller placed it explicitly.
+            spill_dir: opts
+                .export
+                .spill_dir
+                .clone()
+                .or_else(|| opts.work_dir.clone()),
             ..opts.export.clone()
         };
         export_pmtiles(overview.path(), archive.path(), &export).map_err(|e| {
