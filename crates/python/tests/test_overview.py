@@ -279,6 +279,26 @@ class TestOverviewIntegration:
             assert report["levels"][0]["zoom"] == 11
             assert report["levels"][-1]["zoom"] == 14
 
+    def test_overview_max_zoom_auto(self):
+        """#444: max_zoom="auto" estimates a zoom from the input instead of
+        taking a literal, and the resulting plan still resolves and writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, report = self._overview(tmpdir, min_zoom=0, max_zoom="auto")
+            assert len(report["levels"]) >= 1
+            chosen = report["levels"][-1]["zoom"]
+            assert chosen is not None
+            # open-buildings is small dense polygons; the estimate should
+            # land well above the coarse admin-boundary end of the range and
+            # at or below the documented auto ceiling (16).
+            assert 6 <= chosen <= 16
+
+    def test_overview_max_zoom_garbled_string_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="auto"),
+        ):
+            self._overview(tmpdir, max_zoom="not-a-zoom")
+
     def test_overview_explicit_gsds(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _, report = self._overview(tmpdir, gsds=[8.0, 2.0], polygon_visibility=0.0)

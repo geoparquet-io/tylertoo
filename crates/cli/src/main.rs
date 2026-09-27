@@ -693,9 +693,12 @@ struct OverviewArgs {
     #[arg(long, default_value = "0")]
     min_zoom: u8,
 
-    /// Maximum (finest / canonical) Web Mercator zoom for the level range.
+    /// Maximum (finest / canonical) Web Mercator zoom for the level range, or
+    /// `auto` (#444, tippecanoe `-zg` parity) to estimate it from the input's
+    /// feature spacing/extent. See `tylertoo_core::overview::auto_zoom` for
+    /// the heuristic; the chosen zoom and its evidence are logged.
     #[arg(long, default_value = "6")]
-    max_zoom: u8,
+    max_zoom: MaxZoomArg,
 
     /// Explicit comma-separated GSD list (meters, strictly decreasing).
     /// Overrides --min-zoom/--max-zoom when set.
@@ -1716,9 +1719,12 @@ struct TilesArgs {
     #[arg(long, default_value = "0")]
     min_zoom: u8,
 
-    /// Maximum (finest) Web Mercator zoom level.
+    /// Maximum (finest) Web Mercator zoom level, or `auto` (#444, tippecanoe
+    /// `-zg` parity) to estimate it from the input's feature spacing/extent.
+    /// See `tylertoo_core::overview::auto_zoom` for the heuristic; the chosen
+    /// zoom and its evidence are logged.
     #[arg(long, default_value = "14")]
-    max_zoom: u8,
+    max_zoom: MaxZoomArg,
 
     /// Explicit comma-separated GSD list (meters, strictly decreasing).
     /// Overrides --min-zoom/--max-zoom when set — the same semantics as
@@ -2203,6 +2209,54 @@ fn convert_produced_nothing(e: &tylertoo_core::overview::convert::ConvertError) 
     )
 }
 
+/// `--max-zoom N` or `--max-zoom auto` (#444, tippecanoe `-zg` parity).
+///
+/// Parsed here and resolved to a concrete `u8` by [`resolve_max_zoom`] before
+/// anything else sees it (the level plan, `--shard` resolution, the
+/// human-readable summary), so every existing consumer of a numeric
+/// `max_zoom: u8` — including `core`'s `LevelPlan` and `check_zoom_ceiling`,
+/// which validate before any I/O happens — is completely unchanged: the
+/// numeric path is byte-identical to before this flag existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaxZoomArg {
+    /// An explicit zoom, exactly as before.
+    Fixed(u8),
+    /// Estimate the zoom from the input (see
+    /// `tylertoo_core::overview::auto_zoom`).
+    Auto,
+}
+
+impl std::str::FromStr for MaxZoomArg {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("auto") {
+            return Ok(MaxZoomArg::Auto);
+        }
+        s.parse::<u8>()
+            .map(MaxZoomArg::Fixed)
+            .map_err(|_| format!("invalid --max-zoom {s:?}: expected a number 0-30, or \"auto\""))
+    }
+}
+
+/// Resolve `--max-zoom auto` to a concrete zoom (#444): builds a dedicated
+/// [`ConvertSource`](tylertoo_core::input_set::ConvertSource) for `spec` (the
+/// real conversion resolves its own source separately, so this read never
+/// competes with or mutates it), reads a bounded, deterministic sample of the
+/// input's geometry column, and logs the chosen zoom with the evidence that
+/// drove it. A `Fixed` value is returned verbatim with no I/O at all.
+fn resolve_max_zoom(arg: MaxZoomArg, spec: &InputSpec, min_zoom: u8) -> Result<u8> {
+    use tylertoo_core::overview::auto_zoom::{estimate_max_zoom, AUTO_MAX_ZOOM_CEILING};
+
+    match arg {
+        MaxZoomArg::Fixed(z) => Ok(z),
+        MaxZoomArg::Auto => {
+            let source = resolve_convert_source(spec)?;
+            let evidence = estimate_max_zoom(&source, min_zoom, AUTO_MAX_ZOOM_CEILING)?;
+            Ok(evidence.chosen_zoom)
+        }
+    }
+}
+
 /// Resolve the level plan shared by `overview` and `tiles`: an explicit
 /// `--gsd` list (comma-separated meters, strictly decreasing) overrides the
 /// `--min-zoom`/`--max-zoom` range. Kept in one place so the two commands
@@ -2489,10 +2543,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
+    // #444: resolved once, up front — every consumer below (the level plan,
+    // `--shard` resolution, logging) sees a plain zoom exactly as before.
+    let max_zoom = resolve_max_zoom(args.max_zoom, &spec, args.min_zoom)?;
+
     // Overviews for PMTiles are always duplicating (partitioning can't be
     // exported to per-tile MVT). Every other convert knob comes from the
     // shared tuning set, so `tiles` matches the two-step overview → export.
-    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
+    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, max_zoom)?;
     let mut options = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
@@ -2506,7 +2564,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         args.shard.as_deref(),
         args.shard_plan.as_deref(),
         args.min_zoom,
-        args.max_zoom,
+        max_zoom,
     )?;
     // A data shard's range prunes the convert's reads as well as the export;
     // a hand-written `--tile-range` restricts the export only (the two flags
@@ -2536,7 +2594,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         if job.range.is_none() && args.gsd.is_none() && options.streaming {
             options.zoom_ceiling = Some(job.pivot.saturating_sub(1));
         }
-        log_shard_job(job, args.min_zoom, args.max_zoom);
+        log_shard_job(job, args.min_zoom, max_zoom);
     }
 
     // The data shard's own range, kept past `tile_range`'s move into
@@ -2616,7 +2674,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         Err(e) if shard_range.is_some() && convert_produced_nothing(&e) => {
             let job = shard.as_ref().expect("a range implies a shard job");
             let range = shard_range.expect("checked by the guard");
-            return write_empty_shard(&output, &layer_name, job, range, args.max_zoom, &e);
+            return write_empty_shard(&output, &layer_name, job, range, max_zoom, &e);
         }
         // #541 review: the coarse job's counterpart. Its convert stops at the
         // pivot, and when every feature first appears finer than that (#211
@@ -2903,7 +2961,8 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
     };
 
-    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
+    let max_zoom = resolve_max_zoom(args.max_zoom, &spec, args.min_zoom)?;
+    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, max_zoom)?;
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
@@ -4798,6 +4857,30 @@ mod tests {
     // --- #316: tuning parity between `tiles` and the two-step chain ----------
 
     #[test]
+    fn max_zoom_arg_parses_numbers_and_auto_case_insensitively() {
+        assert_eq!("6".parse::<MaxZoomArg>().unwrap(), MaxZoomArg::Fixed(6));
+        assert_eq!("0".parse::<MaxZoomArg>().unwrap(), MaxZoomArg::Fixed(0));
+        assert_eq!("auto".parse::<MaxZoomArg>().unwrap(), MaxZoomArg::Auto);
+        assert_eq!("AUTO".parse::<MaxZoomArg>().unwrap(), MaxZoomArg::Auto);
+        assert_eq!("Auto".parse::<MaxZoomArg>().unwrap(), MaxZoomArg::Auto);
+        let err = "banana".parse::<MaxZoomArg>().unwrap_err();
+        assert!(err.contains("--max-zoom") && err.contains("auto"), "{err}");
+    }
+
+    /// #444: a `Fixed` `--max-zoom` must resolve to the exact same number
+    /// with **zero I/O** — `resolve_max_zoom` never even looks at `spec`
+    /// in that branch, which this proves by pointing it at an input that
+    /// does not exist. This is the numeric-path-is-byte-identical guarantee:
+    /// the CLI hands core the same `u8` it always did.
+    #[test]
+    fn resolve_max_zoom_fixed_is_pure_and_does_not_touch_the_input() {
+        let spec = InputSpec::Path(PathBuf::from("/nonexistent/definitely-not-a-file.parquet"));
+        for z in [0u8, 6, 14, 30] {
+            assert_eq!(resolve_max_zoom(MaxZoomArg::Fixed(z), &spec, 0).unwrap(), z);
+        }
+    }
+
+    #[test]
     fn resolve_level_plan_gsd_overrides_zoom_range() {
         use tylertoo_core::overview::convert::LevelPlan;
 
@@ -4820,13 +4903,22 @@ mod tests {
         assert!(err.to_string().contains("--gsd"), "names the flag: {err}");
     }
 
+    /// Unwrap a test-parsed `--max-zoom` to its fixed `u8`, panicking on
+    /// `auto` — every call site here is exercising the numeric path.
+    fn fixed_zoom(z: MaxZoomArg) -> u8 {
+        match z {
+            MaxZoomArg::Fixed(n) => n,
+            MaxZoomArg::Auto => panic!("expected a fixed --max-zoom in this test"),
+        }
+    }
+
     #[test]
     fn tiles_gsd_and_report_flags_thread_through() {
         use tylertoo_core::overview::convert::LevelPlan;
 
         // --gsd on `tiles` reaches the same absolute-GSD ladder as `overview`.
         let a = parse_tiles(&["--gsd", "800,400,200"]);
-        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, fixed_zoom(a.max_zoom)).unwrap() {
             LevelPlan::Gsds(gsds) => assert_eq!(gsds, vec![800.0, 400.0, 200.0]),
             other => panic!("expected Gsds, got {other:?}"),
         }
@@ -4851,14 +4943,18 @@ mod tests {
         use tylertoo_core::overview::convert::LevelPlan;
 
         let a = parse_tiles(&["--min-zoom", "30", "--max-zoom", "33"]);
-        assert_eq!(a.max_zoom, 33, "the CLI must not silently clamp");
-        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+        assert_eq!(
+            fixed_zoom(a.max_zoom),
+            33,
+            "the CLI must not silently clamp"
+        );
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, fixed_zoom(a.max_zoom)).unwrap() {
             LevelPlan::ZoomRange { max_zoom, .. } => assert_eq!(max_zoom, 33),
             other => panic!("expected ZoomRange, got {other:?}"),
         }
 
         let a = parse_tiles(&["--gsd", "0.000005"]);
-        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, fixed_zoom(a.max_zoom)).unwrap() {
             LevelPlan::Gsds(gsds) => assert_eq!(gsds, vec![0.000_005]),
             other => panic!("expected Gsds, got {other:?}"),
         }

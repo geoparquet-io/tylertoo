@@ -152,6 +152,50 @@ class TestConvertIntegration:
 
             assert output.exists()
 
+    def test_convert_max_zoom_auto(self):
+        """#444: max_zoom="auto" estimates the zoom instead of a literal."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            tylertoo.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom="auto",
+            )
+
+            assert output.exists()
+            assert output.read_bytes()[: len(PMTILES_MAGIC)] == PMTILES_MAGIC
+
+    def test_convert_max_zoom_auto_is_case_insensitive(self):
+        """ "AUTO" / "Auto" are accepted the same as "auto"."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for spelling in ("AUTO", "Auto"):
+                output = Path(tmpdir) / f"output-{spelling}.pmtiles"
+                tylertoo.convert(
+                    input=str(input_file),
+                    output=str(output),
+                    max_zoom=spelling,
+                )
+                assert output.exists()
+
+    def test_convert_max_zoom_garbled_string_raises_value_error(self):
+        """A non-"auto" string is a ValueError, not a silent misparse."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+            with pytest.raises(ValueError, match="auto"):
+                tylertoo.convert(
+                    input=str(input_file),
+                    output=str(output),
+                    max_zoom="not-a-zoom",
+                )
+
     def test_convert_with_layer_name_override(self):
         """Test conversion with a custom layer name."""
         input_file = REALDATA_DIR / "open-buildings.parquet"

@@ -62,6 +62,17 @@ gsd(z) = 40075016.69 / gsd_base / 2^z          (meters, spec §5.2)
 | `--gsd G1,G2,…` | — | meters, strictly decreasing | explicit per-level GSDs; **overrides** the zoom range and `--gsd-base` |
 | `--min-zoom` / `--max-zoom` | `0` / `6` | Web Mercator zoom | coarsest / finest (canonical) level (max **30**) |
 
+**`--max-zoom auto` (#444, tippecanoe `-zg` parity).** Instead of a number,
+estimate the finest zoom from the input's own feature spacing/extent: a
+bounded sample of feature bboxes is read (project just the geometry column),
+and the finest zoom is picked where a standard tile pixel resolves about half
+the smaller of "typical feature size" and "typical spacing to a nearby
+feature" — clamped to `[--min-zoom, 16]`. The chosen zoom and the
+measurements behind it are logged at `info`, so it can be second-guessed;
+treat it as a starting point, the same way tippecanoe users treat `-zg`. See
+`overview::auto_zoom` and `context/ARCHITECTURE.md`'s divergence table for the
+formula and why it reads real feature bboxes rather than footer stats alone.
+
 **Zoom ceiling: 30 — an addressability limit, not a recommendation.** Every
 zoom tylertoo writes must fit the tile arithmetic: tile coordinates are 32-bit
 (so z31 is the hard limit) and the PMTiles Hilbert tile id needs `4^z` of

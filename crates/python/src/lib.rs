@@ -31,6 +31,64 @@ fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
+/// `max_zoom` as either an `int` (the zoom, verbatim) or the string
+/// `"auto"` (#444, tippecanoe `-zg` parity — estimate it from the input).
+/// `#[derive(FromPyObject)]` tries each tuple variant in order, so an `int`
+/// argument (including the existing `max_zoom=14`/`max_zoom=6` defaults)
+/// matches `Fixed` exactly as a plain `u8` parameter always did; anything
+/// else falls through to `Str` for [`MaxZoomInput::validate`] to check.
+#[derive(Debug, Clone, FromPyObject)]
+enum MaxZoomInput {
+    /// An explicit zoom, exactly as before.
+    Fixed(u8),
+    /// Anything that wasn't an `int` — validated to be `"auto"` (any case)
+    /// by [`MaxZoomInput::validate`].
+    Str(String),
+}
+
+/// A [`MaxZoomInput`] validated to be either a concrete zoom or `"auto"`.
+#[derive(Debug, Clone, Copy)]
+enum MaxZoomChoice {
+    /// An explicit zoom, exactly as before.
+    Fixed(u8),
+    /// Estimate the zoom from the input (see
+    /// `tylertoo_core::overview::auto_zoom`).
+    Auto,
+}
+
+impl MaxZoomInput {
+    fn validate(self) -> PyResult<MaxZoomChoice> {
+        match self {
+            MaxZoomInput::Fixed(n) => Ok(MaxZoomChoice::Fixed(n)),
+            MaxZoomInput::Str(s) if s.eq_ignore_ascii_case("auto") => Ok(MaxZoomChoice::Auto),
+            MaxZoomInput::Str(s) => Err(PyValueError::new_err(format!(
+                "max_zoom string must be \"auto\", got {s:?}"
+            ))),
+        }
+    }
+}
+
+/// Resolve a `max_zoom` kwarg (#444) to a concrete zoom. `Fixed` returns
+/// its value verbatim with **no I/O at all** — `open_source` (building a
+/// [`ConvertSource`] just for the estimate, never the one the real
+/// conversion reads) is only ever called for `Auto`.
+fn resolve_max_zoom_py(
+    z: MaxZoomInput,
+    min_zoom: u8,
+    open_source: impl FnOnce() -> PyResult<ConvertSource>,
+) -> PyResult<u8> {
+    use tylertoo_core::overview::auto_zoom::{estimate_max_zoom, AUTO_MAX_ZOOM_CEILING};
+    match z.validate()? {
+        MaxZoomChoice::Fixed(n) => Ok(n),
+        MaxZoomChoice::Auto => {
+            let source = open_source()?;
+            let evidence = estimate_max_zoom(&source, min_zoom, AUTO_MAX_ZOOM_CEILING)
+                .map_err(convert_error_to_py)?;
+            Ok(evidence.chosen_zoom)
+        }
+    }
+}
+
 /// Convert GeoParquet to PMTiles in one shot (overview facade).
 ///
 /// .. deprecated::
@@ -53,7 +111,11 @@ fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
 ///         byte-range requests.
 ///     output (str): Path to output PMTiles file.
 ///     min_zoom (int, optional): Minimum (coarsest) zoom level. Defaults to 0.
-///     max_zoom (int, optional): Maximum (finest) zoom level. Defaults to 14.
+///     max_zoom (int or "auto", optional): Maximum (finest) zoom level.
+///         Defaults to 14. Pass ``"auto"`` (#444, tippecanoe ``-zg`` parity)
+///         to estimate it from the input's feature spacing/extent instead of
+///         choosing a number; the chosen zoom and the evidence behind it are
+///         logged.
 ///     layer_name (str, optional): Override the MVT layer name (defaults to
 ///         the input filename stem).
 ///     tile_size_limit (int, optional): Per-tile MVT size cap in bytes. A tile
@@ -85,14 +147,14 @@ fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=MaxZoomInput::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
     py: Python<'_>,
     input: &str,
     output: &str,
     min_zoom: u8,
-    max_zoom: u8,
+    max_zoom: MaxZoomInput,
     layer_name: Option<String>,
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
@@ -106,6 +168,12 @@ fn convert(
     // last literal segment for a glob (core owns the rules).
     let layer_name =
         layer_name.unwrap_or_else(|| tylertoo_core::input_set::derive_layer_name(input));
+
+    // #444: resolved once, up front -- everything below sees a plain zoom,
+    // exactly as before this flag existed.
+    let max_zoom = resolve_max_zoom_py(max_zoom, min_zoom, || {
+        ConvertSource::resolve_path(&input_path).map_err(|e| convert_error_to_py(e.into()))
+    })?;
 
     let options = ConvertOptions {
         levels: LevelPlan::ZoomRange { min_zoom, max_zoom },
@@ -316,8 +384,11 @@ fn accumulate_specs(
 ///         Defaults to "duplicating".
 ///     min_zoom (int, optional): Coarsest Web Mercator zoom of the level
 ///         range. Defaults to 0.
-///     max_zoom (int, optional): Finest (canonical) Web Mercator zoom of the
-///         level range. Defaults to 6.
+///     max_zoom (int or "auto", optional): Finest (canonical) Web Mercator
+///         zoom of the level range. Defaults to 6. Pass ``"auto"`` (#444,
+///         tippecanoe ``-zg`` parity) to estimate it from the input's
+///         feature spacing/extent; the chosen zoom and its evidence are
+///         logged.
 ///     gsds (list[float], optional): Explicit per-level GSD list in meters,
 ///         strictly decreasing coarse-to-fine. Overrides min_zoom/max_zoom.
 ///     gsd_base (float, optional): GSD tile-band base for the zoom-to-GSD
@@ -515,7 +586,7 @@ fn accumulate_specs(
     *,
     mode="duplicating",
     min_zoom=0,
-    max_zoom=6,
+    max_zoom=MaxZoomInput::Fixed(6),
     gsds=None,
     gsd_base=1024.0,
     sort_key=None,
@@ -564,7 +635,7 @@ fn overview(
     output: &str,
     mode: &str,
     min_zoom: u8,
-    max_zoom: u8,
+    max_zoom: MaxZoomInput,
     gsds: Option<Vec<f64>>,
     gsd_base: f64,
     sort_key: Option<String>,
@@ -639,6 +710,24 @@ fn overview(
             )))
         }
     };
+
+    // #444: resolved once, up front -- everything below sees a plain zoom,
+    // exactly as before this flag existed. `input` is a str path/URL or a
+    // list[str] of parts (the same shapes the real conversion accepts
+    // below); a dedicated `ConvertSource` is opened just for this estimate
+    // (see `tylertoo_core::overview::auto_zoom` for why it never reuses the
+    // one the real conversion opens).
+    let max_zoom = resolve_max_zoom_py(max_zoom, min_zoom, || {
+        if let Ok(s) = input.extract::<String>() {
+            ConvertSource::resolve(&s).map_err(|e| convert_error_to_py(e.into()))
+        } else if let Ok(list) = input.extract::<Vec<String>>() {
+            ConvertSource::from_input_list(&list).map_err(|e| convert_error_to_py(e.into()))
+        } else {
+            Err(PyErr::new::<PyTypeError, _>(
+                "input must be a str path/URL or a list[str] of paths/URLs",
+            ))
+        }
+    })?;
 
     // Explicit GSD list overrides the zoom range (like the CLI's --gsd).
     let levels = match gsds {
