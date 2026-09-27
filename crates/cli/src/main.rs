@@ -1358,8 +1358,10 @@ struct ConvertTuningArgs {
     /// LARGER batches amortize per-batch overhead (slightly faster) at the
     /// cost of proportionally more peak memory; SMALLER batches bound memory
     /// tighter. The default (8192) keeps per-batch transients in the tens of
-    /// MB even for vertex-heavy polygon data. Capped at 1048576 rows. No
-    /// effect with --no-streaming.
+    /// MB even for vertex-heavy polygon data. Capped at 1048576 rows, and
+    /// lowered automatically (with a warning) when the input's rows are so
+    /// large that a batch of this many would pass the ~2 GiB arrow can
+    /// decode per byte-array column. No effect with --no-streaming.
     #[arg(
         long,
         value_name = "ROWS",
@@ -3216,9 +3218,12 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             export_report.min_zoom,
             export_report.max_zoom,
             convert_report.duration_secs + export_report.duration_secs,
-            convert_report.out_of_range_features,
-            convert_report.unprojectable_features,
-            export_report.encode_dropped_features,
+            &SummaryLosses {
+                out_of_range: convert_report.out_of_range_features,
+                out_of_range_exemplars: &convert_report.out_of_range_exemplars,
+                unprojectable: convert_report.unprojectable_features,
+                encode_dropped: export_report.encode_dropped_features,
+            },
         )
     );
     print_skipped_property_columns(&export_report.skipped_property_columns);
@@ -3293,6 +3298,19 @@ fn row_group_autoscale_note(
     })
 }
 
+/// The feature losses the `tiles` summary line reports (#429, #431, #553).
+#[derive(Clone, Copy, Default)]
+struct SummaryLosses<'a> {
+    /// Features outside the declared CRS range.
+    out_of_range: usize,
+    /// The first few of those, by row and coordinate (#553).
+    out_of_range_exemplars: &'a [tylertoo_core::overview::convert::OutOfRangeExemplar],
+    /// Valid lon/lat outside the Web Mercator tiling domain.
+    unprojectable: usize,
+    /// Tile features dropped at MVT encode (#431).
+    encode_dropped: usize,
+}
+
 /// The tile-count line of the `tiles` summary (#429).
 ///
 /// Normally a bare count. When features were lost it says so on the same line
@@ -3304,21 +3322,37 @@ fn row_group_autoscale_note(
 /// A ≥99% loss never reaches here (the conversion fails outright), so this
 /// covers the partial case and the "some other filter also emptied the
 /// archive" one.
+///
+/// `out_of_range_exemplars` names the first few offending rows and
+/// coordinates (#553): root-causing a real case (a5 grid cells with
+/// vertices up to 0.6° past ±180°) used to require a separate DuckDB query
+/// against the input, when the bare count gave no lead to follow.
 fn tiles_summary_line(
     total_tiles: usize,
     min_zoom: u8,
     max_zoom: u8,
     secs: f64,
-    out_of_range: usize,
-    unprojectable: usize,
-    encode_dropped: usize,
+    losses: &SummaryLosses<'_>,
 ) -> String {
+    let SummaryLosses {
+        out_of_range,
+        out_of_range_exemplars,
+        unprojectable,
+        encode_dropped,
+    } = *losses;
     let zooms = format!("z{min_zoom}..z{max_zoom}");
     let tiles = format_number(total_tiles as u64);
     let mut losses: Vec<String> = Vec::new();
     if out_of_range > 0 {
+        let exemplar =
+            tylertoo_core::overview::convert::out_of_range_exemplar_note(out_of_range_exemplars);
+        let exemplar = if exemplar.is_empty() {
+            String::new()
+        } else {
+            format!(";{exemplar}")
+        };
         losses.push(format!(
-            "{} feature(s) dropped (outside the declared CRS range)",
+            "{} feature(s) dropped (outside the declared CRS range{exemplar})",
             format_number(out_of_range as u64)
         ));
     }
@@ -5706,10 +5740,27 @@ mod tests {
     /// unqualified success.
     #[test]
     fn tiles_summary_line_names_out_of_range_losses() {
-        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0, 0);
+        let clean = tiles_summary_line(
+            1234,
+            0,
+            14,
+            1.5,
+            &SummaryLosses {
+                ..SummaryLosses::default()
+            },
+        );
         assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
 
-        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0, 0);
+        let empty = tiles_summary_line(
+            0,
+            0,
+            14,
+            0.05,
+            &SummaryLosses {
+                out_of_range: 3,
+                ..SummaryLosses::default()
+            },
+        );
         assert!(
             empty.starts_with(
                 "0 tiles \u{2014} 3 feature(s) dropped (outside the declared CRS range)"
@@ -5717,7 +5768,16 @@ mod tests {
             "a wrong-CRS run must not read as a clean success: {empty}"
         );
 
-        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0, 0);
+        let partial = tiles_summary_line(
+            10,
+            0,
+            14,
+            0.2,
+            &SummaryLosses {
+                out_of_range: 1,
+                ..SummaryLosses::default()
+            },
+        );
         assert!(
             partial.contains("10 tiles across z0..z14")
                 && partial.contains("1 feature(s) dropped (outside the declared CRS range)"),
@@ -5725,7 +5785,16 @@ mod tests {
         );
 
         // The Mercator-domain loss is named separately: nothing to reproject.
-        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7, 0);
+        let polar = tiles_summary_line(
+            0,
+            0,
+            14,
+            0.05,
+            &SummaryLosses {
+                unprojectable: 7,
+                ..SummaryLosses::default()
+            },
+        );
         assert!(
             polar.contains(
                 "7 feature(s) dropped (|lat| > 85.05\u{b0}, outside the Web Mercator \
@@ -5735,7 +5804,17 @@ mod tests {
         );
 
         // Both at once, both named.
-        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3, 0);
+        let both = tiles_summary_line(
+            5,
+            0,
+            14,
+            0.1,
+            &SummaryLosses {
+                out_of_range: 2,
+                unprojectable: 3,
+                ..SummaryLosses::default()
+            },
+        );
         assert!(
             both.contains("2 feature(s) dropped (outside the declared CRS range)")
                 && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
@@ -5743,7 +5822,16 @@ mod tests {
         );
 
         // #431: encode-time drops are a post-clip loss and are named as such.
-        let encode = tiles_summary_line(5, 0, 14, 0.1, 0, 0, 4);
+        let encode = tiles_summary_line(
+            5,
+            0,
+            14,
+            0.1,
+            &SummaryLosses {
+                encode_dropped: 4,
+                ..SummaryLosses::default()
+            },
+        );
         assert!(
             encode.contains("5 tiles across z0..z14")
                 && encode.contains(
@@ -5765,6 +5853,47 @@ mod tests {
                 && note.contains("lines of fewer than two points")
                 && !note.contains("dropped"),
             "{note}"
+        );
+    }
+
+    /// #553: a bare count sent a real investigation to a separate DuckDB
+    /// query against the input to find the offending rows. The summary line
+    /// must name them itself.
+    #[test]
+    fn tiles_summary_line_names_out_of_range_exemplars() {
+        use tylertoo_core::overview::convert::OutOfRangeExemplar;
+
+        let exemplars = vec![
+            OutOfRangeExemplar {
+                part: None,
+                row: 1041,
+                axis: "lon",
+                value: 180.548,
+            },
+            OutOfRangeExemplar {
+                part: None,
+                row: 2210,
+                axis: "lon",
+                value: 180.101,
+            },
+        ];
+        let msg = tiles_summary_line(
+            0,
+            0,
+            14,
+            0.05,
+            &SummaryLosses {
+                out_of_range: 19,
+                out_of_range_exemplars: &exemplars,
+                ..SummaryLosses::default()
+            },
+        );
+        assert!(
+            msg.contains(
+                "19 feature(s) dropped (outside the declared CRS range; e.g. lon \
+                          180.548 (row 1041), lon 180.101 (row 2210))"
+            ),
+            "the summary must name the offending coordinates and rows, not just a count: {msg}"
         );
     }
 
