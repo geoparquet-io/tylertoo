@@ -147,17 +147,19 @@ cargo mutants --package tylertoo-core          # the full sweep, hours
 ```
 
 Every PR also gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
-job "Mutation score (diff-scoped)"): `cargo mutants --in-diff` on
-`git diff origin/main...HEAD`, so only mutants inside the lines the PR
-changes are generated and tested, under the same `.cargo/mutants.toml`.
-A typical PR is a few dozen mutants and ten to twenty minutes, most of
-it the cold baseline build. It is advisory: the score and the missed
-mutants (`file:line`) go to the job summary, and a same-repo PR with
-missed mutants gets one sticky comment that is updated in place on every
-push; it never turns the check red, and a PR that touches no Rust under
-`crates/` skips it in seconds. The local twin, which also includes
-uncommitted changes and exits 1 on a missed mutant so it can gate a
-commit by choice:
+job "Mutation score (diff-scoped)"): `cargo mutants --package
+tylertoo-core --in-diff` on `git diff origin/main...HEAD`, so only
+mutants inside the core lines the PR changes are generated and tested,
+under the same `.cargo/mutants.toml`. A typical PR is a few dozen
+mutants and ten to twenty minutes, most of it the cold baseline build.
+It is advisory: the score and the missed mutants (`file:line`) go to the
+job summary, and a same-repo PR with missed mutants gets one sticky
+comment that is updated in place on every push; it never turns the
+check red, a PR that touches no Rust under `crates/core/` skips it in
+seconds, and a change whose lines hold no mutation site (tests only)
+reports "no mutants in this diff". The local twin, which also includes
+uncommitted changes (untracked `.rs` files are marked intent-to-add) and
+exits 1 on a missed mutant so it can gate a commit by choice:
 
 ```bash
 scripts/mutants-diff.sh                  # vs origin/main
