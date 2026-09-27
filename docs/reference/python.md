@@ -26,7 +26,7 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 * `output` (`str`) — Output overview GeoParquet file.
 * `mode` (`str`) — Level materialization mode, "duplicating" (each level is a self-contained rendering) or "partitioning" (each feature appears once at its coarsest level; prefix reads). Defaults to "duplicating".
 * `min_zoom` (`int`) — Coarsest Web Mercator zoom of the level range. Defaults to 0.
-* `max_zoom` (`int`) — Finest (canonical) Web Mercator zoom of the level range. Defaults to 6.
+* `max_zoom` (`int or "auto"`) — Finest (canonical) Web Mercator zoom of the level range. Defaults to 6. Pass `"auto"` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing, honoring `bbox` and `filter`, never above 16; ignored with `gsds`. The chosen zoom is the finest `zoom` in the returned report's `levels` (the evidence is logged through Rust's logger, which is not forwarded to Python `logging`). Raises ValueError when the input has nothing to measure or min_zoom is above 16.
 * `gsds` (`list[float]`) — Explicit per-level GSD list in meters, strictly decreasing coarse-to-fine. Overrides min_zoom/max_zoom.
 * `gsd_base` (`float`) — GSD tile-band base for the zoom-to-GSD mapping: gsd(z) = 40075016.69 / base / 2^z. Larger = finer (denser) levels, smaller = coarser. No effect with explicit gsds. Defaults to 1024.0.
 * `sort_key` (`str`) — Numeric column used as the cell-winner priority key (higher wins by default; see sort_direction). Mutually exclusive with class_rank_column.
@@ -176,7 +176,7 @@ The legacy keyword arguments `drop_density`, `compression`, `include`, `exclude`
 * `input` (`str`) — Path to input GeoParquet file (EPSG:4326 or EPSG:3857), or a remote URL (`s3://`, `https://`, `gs://`) read via byte-range requests.
 * `output` (`str`) — Path to output PMTiles file.
 * `min_zoom` (`int`) — Minimum (coarsest) zoom level. Defaults to 0.
-* `max_zoom` (`int`) — Maximum (finest) zoom level. Defaults to 14.
+* `max_zoom` (`int or "auto"`) — Maximum (finest) zoom level. Defaults to 14. Pass `"auto"` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing, never above 16. The chosen zoom is the archive's max zoom (the evidence is logged through Rust's logger, which is not forwarded to Python `logging`). Raises ValueError when the input has nothing to measure or min_zoom is above 16.
 * `layer_name` (`str`) — Override the MVT layer name (defaults to the input filename stem).
 * `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
 * `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.

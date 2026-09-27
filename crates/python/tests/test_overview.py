@@ -284,13 +284,23 @@ class TestOverviewIntegration:
         taking a literal, and the resulting plan still resolves and writes."""
         with tempfile.TemporaryDirectory() as tmpdir:
             _, report = self._overview(tmpdir, min_zoom=0, max_zoom="auto")
-            assert len(report["levels"]) >= 1
-            chosen = report["levels"][-1]["zoom"]
-            assert chosen is not None
-            # open-buildings is small dense polygons; the estimate should
-            # land well above the coarse admin-boundary end of the range and
-            # at or below the documented auto ceiling (16).
-            assert 6 <= chosen <= 16
+            # open-buildings (~30m buildings ~23m apart) pins to z14, the
+            # same value the core characterization test asserts.
+            assert report["levels"][-1]["zoom"] == 14
+
+    def test_overview_max_zoom_auto_min_zoom_above_ceiling_raises(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="min-zoom 17"),
+        ):
+            self._overview(tmpdir, min_zoom=17, max_zoom="auto")
+
+    def test_overview_max_zoom_out_of_range_int_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="between 0 and 255"),
+        ):
+            self._overview(tmpdir, max_zoom=300)
 
     def test_overview_max_zoom_garbled_string_raises_value_error(self):
         with (

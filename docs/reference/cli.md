@@ -58,7 +58,7 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--min-zoom <MIN_ZOOM>` — Minimum (coarsest) Web Mercator zoom level
 
   Default value: `0`
-* `--max-zoom <MAX_ZOOM>` — Maximum (finest) Web Mercator zoom level
+* `--max-zoom <MAX_ZOOM>` — Maximum (finest) Web Mercator zoom level, or `auto` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing (honoring --bbox/--filter, never above z16). The chosen zoom and its evidence are logged; an input with nothing to measure is an error. Ignored with --gsd
 
   Default value: `14`
 * `--gsd <GSDS>` — Explicit comma-separated GSD list (meters, strictly decreasing). Overrides --min-zoom/--max-zoom when set — the same semantics as `tylertoo overview --gsd`, so the absolute-GSD ladder is reachable in one step
@@ -309,7 +309,7 @@ Build a multi-resolution overview GeoParquet file
 * `--min-zoom <MIN_ZOOM>` — Minimum (coarsest) Web Mercator zoom for the level range
 
   Default value: `0`
-* `--max-zoom <MAX_ZOOM>` — Maximum (finest / canonical) Web Mercator zoom for the level range
+* `--max-zoom <MAX_ZOOM>` — Maximum (finest / canonical) Web Mercator zoom for the level range, or `auto` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing (honoring --bbox/--filter, never above z16). The chosen zoom and its evidence are logged; an input with nothing to measure is an error. Ignored with --gsd
 
   Default value: `6`
 * `--gsd <GSDS>` — Explicit comma-separated GSD list (meters, strictly decreasing). Overrides --min-zoom/--max-zoom when set

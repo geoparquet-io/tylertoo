@@ -166,8 +166,12 @@ class TestConvertIntegration:
                 max_zoom="auto",
             )
 
-            assert output.exists()
-            assert output.read_bytes()[: len(PMTILES_MAGIC)] == PMTILES_MAGIC
+            data = output.read_bytes()
+            assert data[: len(PMTILES_MAGIC)] == PMTILES_MAGIC
+            # PMTiles v3 header byte 101 is the archive's max zoom; the
+            # open-buildings estimate pins to z14 (see the core
+            # characterization test).
+            assert data[101] == 14
 
     def test_convert_max_zoom_auto_is_case_insensitive(self):
         """ "AUTO" / "Auto" are accepted the same as "auto"."""
@@ -179,7 +183,7 @@ class TestConvertIntegration:
                 tylertoo.convert(
                     input=str(input_file),
                     output=str(output),
-                    max_zoom=spelling,
+                    max_zoom=spelling,  # type: ignore[arg-type]
                 )
                 assert output.exists()
 
@@ -193,7 +197,7 @@ class TestConvertIntegration:
                 tylertoo.convert(
                     input=str(input_file),
                     output=str(output),
-                    max_zoom="not-a-zoom",
+                    max_zoom="not-a-zoom",  # type: ignore[arg-type]
                 )
 
     def test_convert_with_layer_name_override(self):
