@@ -425,9 +425,11 @@ fn quantize_ring(ring: &LineString, proj: &TileProjector) -> Option<TileRing> {
 ///
 /// Each term is at most 2^49 (see [`TILE_COORD_CLAMP`]); the sum is
 /// accumulated in `i128` so that no ring length can overflow it, then
-/// saturated into `i64` — which only matters for a ring of more than 2^14
-/// vertices all near the clamp, and even then keeps the sign and the
-/// ordering the callers use.
+/// saturated into `±i64::MAX` — which only matters for a ring of more than
+/// 2^14 vertices all near the clamp, and even then keeps the sign and the
+/// ordering the callers use. The negative bound is `-i64::MAX`, not
+/// `i64::MIN`, because [`regroup_pinched`] takes `.abs()` of the result and
+/// `i64::MIN.abs()` overflows.
 fn ring_area2(ring: &[(i32, i32)]) -> i64 {
     let sum: i128 = ring
         .windows(2)
@@ -437,7 +439,7 @@ fn ring_area2(ring: &[(i32, i32)]) -> i64 {
             )
         })
         .sum();
-    sum.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    sum.clamp(-i128::from(i64::MAX), i128::from(i64::MAX)) as i64
 }
 
 fn tile_rings_to_polygon(rings: &[TileRing]) -> Polygon<f64> {
@@ -3452,6 +3454,42 @@ mod tests {
         let cmds = encode_multi_polygon(&MultiPolygon::new(vec![a, b]), &tiny_bounds(), 4096);
         assert!(!cmds.is_empty());
         assert_clamped(&cmds);
+    }
+
+    /// A ring winding `turns` times around the clamp box, one way or the
+    /// other. Each corner edge contributes 2^49 to the shoelace sum, so
+    /// past 2^12 turns the true sum leaves `i64`.
+    fn winding_box_ring(turns: usize, clockwise: bool) -> TileRing {
+        let c = TILE_COORD_CLAMP;
+        let mut corners = [(c, c), (-c, c), (-c, -c), (c, -c)];
+        if clockwise {
+            corners.reverse();
+        }
+        let mut ring: TileRing = corners.iter().copied().cycle().take(4 * turns).collect();
+        ring.push(ring[0]);
+        ring
+    }
+
+    /// A shoelace sum past ±2^63 saturates, and the saturated value must be
+    /// safe for the `.abs()` the regrouping code applies: `i64::MIN.abs()`
+    /// panics, so the negative bound is `-i64::MAX`.
+    #[test]
+    fn ring_area2_saturates_symmetrically() {
+        let neg = winding_box_ring(4097, true);
+        let pos = winding_box_ring(4097, false);
+        let (a, b) = (ring_area2(&neg), ring_area2(&pos));
+        assert!(a < 0 && b > 0, "sign preserved: {a} {b}");
+        assert_eq!(a.abs(), i64::MAX);
+        assert_eq!(b.abs(), i64::MAX);
+        // Ordering against a ring that does not saturate.
+        let small = winding_box_ring(2, false);
+        assert!(ring_area2(&small) < b);
+        assert!(ring_area2(&small).abs() < a.abs());
+        // Below the threshold (4096 turns is exactly 2^63) the sum is exact.
+        assert_eq!(
+            ring_area2(&winding_box_ring(4095, false)),
+            4095 * 4 * (1i64 << 49)
+        );
     }
 
     /// The snap itself: finite values clamp to ±[`TILE_COORD_CLAMP`], the
