@@ -72,3 +72,6 @@ corpus/V2_REVIEW.md
 
 # mkdocs build output
 site/
+
+# pinned go-pmtiles binary (scripts/setup_go_pmtiles.sh)
+.tools/

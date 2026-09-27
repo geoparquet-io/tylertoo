@@ -753,7 +753,11 @@ fn cluster_sum_by_level(
             }
             let entry = &mut per_level[level as usize];
             entry.0 += 1;
-            entry.1 += counts.value(i);
+            // Checked (#430): a hostile point_count column must not wrap the
+            // sum (release) or panic (debug).
+            entry.1 = entry.1.checked_add(counts.value(i)).ok_or_else(|| {
+                format!("level {level}: sum(point_count) overflows i64 (hostile point_count)")
+            })?;
         }
     }
     Ok(Some(per_level))
@@ -807,11 +811,14 @@ fn check_level_footer_consistency(
 pub fn level_for_rg(meta: &OverviewsMeta, rg: usize) -> Option<usize> {
     let mut start = 0usize;
     for (k, level) in meta.levels.iter().enumerate() {
-        let end = level.row_group_end as usize;
+        // Checked (#430): a negative `row_group_end` is not a row-group
+        // index (an `as usize` cast would map -1 to usize::MAX and claim
+        // every row group); a band ending at usize::MAX has no successor.
+        let end = usize::try_from(level.row_group_end).ok()?;
         if rg >= start && rg <= end {
             return Some(k);
         }
-        start = end + 1;
+        start = end.checked_add(1)?;
     }
     None
 }
@@ -1508,6 +1515,63 @@ mod tests {
         assert_eq!(level_for_rg(&meta, 6), Some(2));
         assert_eq!(level_for_rg(&meta, 14), Some(2));
         assert_eq!(level_for_rg(&meta, 15), None);
+    }
+
+    /// #430: hostile `row_group_end` values (negative, or `i64::MAX` so the
+    /// next band's start would overflow) must not panic or misreport a band;
+    /// a level whose end cannot be a row-group index covers nothing.
+    #[test]
+    fn level_for_rg_hostile_row_group_end_does_not_panic() {
+        let level = |end: i64| Level {
+            row_group_end: end,
+            gsd: 1000.0,
+            zoom: None,
+        };
+        let meta = |levels: Vec<Level>| OverviewsMeta {
+            version: "0.1.0".to_string(),
+            mode: Some(Mode::Duplicating),
+            canonical_level: Some(0),
+            levels,
+            generalization: None,
+        };
+        // Negative end: not a row-group index, covers no row group.
+        let negative = meta(vec![level(-1), level(3)]);
+        assert_eq!(level_for_rg(&negative, 0), None);
+        assert_eq!(level_for_rg(&negative, 3), None);
+        // i64::MAX end: the band is open-ended; the (impossible) next band
+        // start must not overflow.
+        let huge = meta(vec![level(1), level(i64::MAX), level(5)]);
+        assert_eq!(level_for_rg(&huge, 0), Some(0));
+        assert_eq!(level_for_rg(&huge, 2), Some(1));
+        assert_eq!(level_for_rg(&huge, i64::MAX as usize), Some(1));
+        // Beyond every representable end: no band, no wrap.
+        assert_eq!(level_for_rg(&huge, usize::MAX), None);
+    }
+
+    /// #430: a hostile `point_count` column whose per-level sum overflows
+    /// i64 must be reported as a check failure, never a panic (debug) or a
+    /// wrapped, silently wrong sum (release).
+    #[test]
+    fn clustering_sum_overflow_is_reported_not_panic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Level 0 has two point rows (ids 0 and 2) whose counts overflow.
+        write_cluster_fixture(
+            tmp.path(),
+            &[vec![0, 2], vec![0, 1, 2]],
+            Some(&[vec![i64::MAX, i64::MAX], vec![1, 1, 1]]),
+        );
+        let report = validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
+        assert_eq!(report.check_passed("cluster_sum_invariant"), Some(false));
+        let msg = report
+            .failures()
+            .find(|f| f.name == "cluster_sum_invariant")
+            .map(|f| f.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("overflow"),
+            "expected overflow report, got: {msg}"
+        );
     }
 
     #[test]
