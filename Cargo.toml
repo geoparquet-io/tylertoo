@@ -151,7 +151,7 @@ inherits = "release"
 # "mutants"`; nextest gets it as `--cargo-profile=mutants`). Every mutant
 # recompiles tylertoo-core and relinks its test binaries, so this profile
 # is tuned for that loop, not for debugging:
-# - no debuginfo: the 23 core test binaries were 4.6 GB of link output
+# - no debuginfo: the core test binaries were 4.6 GB of link output
 #   under `test`, 1.1 GB here, and nobody attaches a debugger to a mutant.
 # - workspace crates stay at opt-level 0 (inherited from `test`, with
 #   overflow-checks and debug-assertions on, which is where many mutants
@@ -169,5 +169,10 @@ strip = "debuginfo"
 incremental = true
 codegen-units = 256
 
+# codegen-units is NOT inherited here on purpose: 256 units is right for
+# the per-mutant incremental rebuild of the workspace, but the
+# dependencies are built once and run thousands of times, so they get
+# release-style cross-function inlining.
 [profile.mutants.package."*"]
 opt-level = 3
+codegen-units = 16

@@ -7,7 +7,7 @@
 # mutated package for every mutant, but nextest's `default-filter` only
 # decides which tests *run*. The slow-tier binaries (shard_merge_parity,
 # convert_guard_golden, ...) and the all-#[ignore] ones (debug_antarctica,
-# huge_polygon_clip) were linked ~8200 times a sweep for nothing. Passing
+# huge_polygon_clip) were linked ~8400 times a sweep for nothing. Passing
 # `--lib --test <name>...` to cargo restricts the build to binaries that
 # have at least one test the mutation run would execute.
 #
@@ -34,9 +34,14 @@ cargo nextest --version > /dev/null 2>&1 \
   || { echo "error: cargo-nextest is required (cargo install cargo-nextest --locked)" >&2; exit 2; }
 
 # One line per integration-test binary with a runnable test, sorted.
+# Default features on purpose: that is what cargo-mutants builds, and a
+# feature-gated test binary must be listed only if the mutation run would
+# have it. Compiler output goes to a file and is shown if the list fails.
+errlog=$(mktemp)
+trap 'rm -f "$errlog"' EXIT
 binaries=$(
   cargo nextest list --package tylertoo-core --profile mutants \
-      --message-format json 2> /dev/null \
+      --locked --message-format json 2> "$errlog" \
     | jq -r '
         .["rust-suites"][]
         | select(.kind == "test")
@@ -46,7 +51,7 @@ binaries=$(
                  | length > 0)
         | .["binary-name"]' \
     | sort
-)
+) || { cat "$errlog" >&2; echo "error: cargo nextest list failed" >&2; exit 2; }
 
 fragment=$(
   echo 'additional_cargo_args = ['

@@ -194,9 +194,13 @@ scripts/mutants-diff.sh                  # vs origin/main
 scripts/mutants-diff.sh main -- -j 2     # other base; extra cargo-mutants args
 ```
 
-The first run pays a clean build of the dependencies at `opt-level = 3`
-(a couple of minutes); every mutant after that is an incremental
-rebuild. cargo-mutants has no per-mutant test selection (it does not
+cargo-mutants copies the tree into a scratch directory without `target/`,
+so every invocation above starts with a clean build of the dependencies
+at `opt-level = 3` (a few minutes on a laptop). For a short local run
+add `--in-place`: cargo-mutants then mutates the working tree itself,
+reuses its `target/`, and restores each file when it is done (do not
+edit the tree while it runs). Every mutant after the first is an
+incremental rebuild either way. cargo-mutants has no per-mutant test selection (it does not
 tell the test command which file it mutated), and narrowing tests to the
 mutated module by hand loses catches: in a 30-mutant sample, 11 of 28
 catches came first from a test in *another* module or an integration

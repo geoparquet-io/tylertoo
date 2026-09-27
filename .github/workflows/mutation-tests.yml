@@ -260,6 +260,27 @@ jobs:
           echo 0 | sudo tee "$MUTANTS_CGROUP/memory.swap.max" > /dev/null
           echo "cgroup $MUTANTS_CGROUP: memory.max=$(cat "$MUTANTS_CGROUP/memory.max") swap.max=$(cat "$MUTANTS_CGROUP/memory.swap.max")"
 
+      - name: Point tests at a job-owned TMPDIR and sweep it in the background
+        # The `mutants` nextest profile terminates in-flight tests the
+        # moment one fails; a killed test never runs Drop, so its
+        # tempfile::tempdir() stays on disk. Every test writes under this
+        # directory, and a background loop that outlives the step deletes
+        # anything older than ten minutes (no test run lasts that long:
+        # cargo-mutants kills a mutant's tests well before), or a
+        # 350-minute shard fills the runner's disk.
+        run: |
+          sweep="$RUNNER_TEMP/mutants-tmp"
+          mkdir -p "$sweep"
+          echo "TMPDIR=$sweep" >> "$GITHUB_ENV"
+          (
+            while true; do
+              find "$sweep" -mindepth 1 -maxdepth 1 -mmin +10 \
+                -exec rm -rf {} + 2>/dev/null
+              sleep 300
+            done
+          ) >/dev/null 2>&1 &
+          disown
+
       - name: Run mutation tests on core
         id: mutants
         # NB: package name is tylertoo-core (the old gpq2tiles-core spelling

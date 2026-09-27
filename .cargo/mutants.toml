@@ -31,11 +31,13 @@ profile = "mutants"
 # cargo *builds* per mutant, not just what nextest runs: the lib test
 # binary plus the integration binaries that have at least one test the
 # `mutants` nextest profile would execute. Without this, cargo links all
-# 23 test binaries of the crate for every mutant, including the five slow-
-# tier ones nextest's default-filter then skips (convert_guard_golden,
-# shard_merge_parity, sharded_builds, stream_profile_parity,
-# thread_count_determinism) and the two whose tests are all #[ignore]
-# (debug_antarctica, huge_polygon_clip).
+# 17 test binaries of the crate (lib + 16 integration) for every mutant,
+# including the three slow-tier ones nextest's default-filter then skips
+# (convert_guard_golden, shard_merge_parity, stream_profile_parity) and
+# the two whose tests are all #[ignore] (debug_antarctica,
+# huge_polygon_clip). The cli crate's slow binaries (sharded_builds,
+# thread_count_determinism) are never built here: `--package
+# tylertoo-core` already excludes them.
 #
 # Derived, not hand-picked: `scripts/mutants-test-binaries.sh` prints this
 # array from `cargo nextest list --profile mutants`, and `--check` fails
