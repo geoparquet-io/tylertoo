@@ -298,7 +298,13 @@ the job OOM'd on a 192 GiB box — only ~2.04× the floor — 25 minutes in, and
 ran on 360 GiB. That incident predates #541, when the coarse job's pass 2
 still built every level; since #541 its pass 2 builds only the levels below
 the pivot, so its pass-2 buffers are smaller and the ×2.5 multiplier is
-conservative for it. The pass-1 floor itself is unchanged.
+conservative for it. #565 made it more conservative still: the density budget
+used to hold a 40 bytes/feature priority table live across the whole level
+assignment (0.63× the floor on its own — ~59 GiB of that incident's peak) and
+now derives each priority where the comparison needs it, holding none. The
+multiplier is unchanged because it is calibrated on a measured OOM, and
+re-deriving it needs a fresh billion-row run, not an argument. The pass-1
+floor itself is unchanged either way.
 
 **The remedy is a bigger box.** Sharding does not lower this floor: the
 coarse job runs the full pass 1 over the whole input, whatever `N` is. Only a
