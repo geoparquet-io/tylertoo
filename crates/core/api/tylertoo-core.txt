@@ -624,6 +624,8 @@ pub struct tylertoo_core::mvt::LayerBuilder
 impl tylertoo_core::mvt::LayerBuilder
 pub fn tylertoo_core::mvt::LayerBuilder::add_feature(&mut self, core::option::Option<u64>, &geo_types::geometry::Geometry, &[(alloc::string::String, tylertoo_core::mvt::PropertyValue)], &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::mvt::LayerBuilder::build(self) -> tylertoo_core::vector_tile::tile::Layer
+pub fn tylertoo_core::mvt::LayerBuilder::dropped_features(&self) -> usize
+pub fn tylertoo_core::mvt::LayerBuilder::feature_count(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::new(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn tylertoo_core::mvt::LayerBuilder::with_extent(self, u32) -> Self
 impl core::marker::Freeze for tylertoo_core::mvt::LayerBuilder
@@ -658,6 +660,7 @@ pub fn tylertoo_core::mvt::encode_multi_point(&geo_types::geometry::multi_point:
 pub fn tylertoo_core::mvt::encode_multi_polygon(&geo_types::geometry::multi_polygon::MultiPolygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_point(&geo_types::geometry::point::Point, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_polygon(&geo_types::geometry::polygon::Polygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
+pub fn tylertoo_core::mvt::flatten_geometry_collection(&geo_types::geometry::geometry_collection::GeometryCollection<f64>) -> alloc::vec::Vec<geo_types::geometry::Geometry>
 pub fn tylertoo_core::mvt::geo_to_tile_coords(f64, f64, &tylertoo_core::tile::TileBounds, u32) -> (i32, i32)
 pub fn tylertoo_core::mvt::orient_multi_polygon_for_mvt(&geo_types::geometry::multi_polygon::MultiPolygon) -> geo_types::geometry::multi_polygon::MultiPolygon
 pub fn tylertoo_core::mvt::orient_polygon_for_mvt(&geo_types::geometry::polygon::Polygon) -> geo_types::geometry::polygon::Polygon
@@ -1637,6 +1640,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportOptions
 pub struct tylertoo_core::overview::export::ExportReport
 pub tylertoo_core::overview::export::ExportReport::duration_secs: f64
+pub tylertoo_core::overview::export::ExportReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ExportReport::max_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::min_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::mode: alloc::string::String
@@ -1661,6 +1665,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ExportReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ExportReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportReport
 pub struct tylertoo_core::overview::export::ZoomReport
+pub tylertoo_core::overview::export::ZoomReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ZoomReport::level: usize
 pub tylertoo_core::overview::export::ZoomReport::level_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::oversized_tiles: usize

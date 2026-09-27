@@ -548,7 +548,9 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--tile-size-limit <SIZE>` — Per-tile MVT size cap (e.g., "500K", "1M", or raw bytes). When a tile exceeds it, a single non-iterative drop pass sheds features for that tile only (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --max-tile-size for parity with the `tiles` command
 
   Default value: `500K`
-* `--report <PATH>` — Write the JSON export report to this path
+* `--report <PATH>` — Write the JSON export report to this path.
+
+   Besides per-zoom tile and feature counts and the oversized-tile tally, the report carries `encode_dropped_features` (total and per zoom): tile members that produced no MVT feature at encode -- empty geometries or GeometryCollections, or polygons that quantize to zero area at the tile extent (#431). Non-zero means content was lost after clipping; a warning names the total and the summary line repeats it.
 * `--no-simple-clip-fastpath` — Disable the simple-clip fast path (issue #239), forcing the i_overlay boundary-bridge fallback on every polygon clip. The fast path is on by default (render-equivalent on simple rings); pass this only when you need byte-stable tile output, since the fast path rotates simple rings to a different start vertex
 * `--partition-wave <N|auto>` — Partitions processed per band read during export (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
 

@@ -114,7 +114,7 @@ Python equivalent of `tylertoo export-pmtiles`: each overview level becomes one 
 
 ###### **Returns:**
 
-`dict` — Export report with keys "mode", "min_zoom", "max_zoom", "zooms" (list of dicts with "zoom", "level", "level_feature_count", "tile_count", "tile_feature_count", "oversized_tiles"), "total_tiles", "total_tile_features", "oversized_tiles", "duration_secs".
+`dict` — Export report with keys "mode", "min_zoom", "max_zoom", "zooms" (list of dicts with "zoom", "level", "level_feature_count", "tile_count", "tile_feature_count", "oversized_tiles", "encode_dropped_features"), "total_tiles", "total_tile_features", "oversized_tiles", "encode_dropped_features", "duration_secs". `encode_dropped_features` counts tile members that produced no MVT feature at encode (empty geometries, empty GeometryCollections, polygons that quantize to zero area at the tile extent); non-zero means content was lost after clipping, and a warning names the total.
 
 ###### **Raises:**
 

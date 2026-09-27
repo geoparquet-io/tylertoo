@@ -993,8 +993,13 @@ fn overview(
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
 ///     (list of dicts with "zoom", "level", "level_feature_count",
-///     "tile_count", "tile_feature_count", "oversized_tiles"), "total_tiles",
-///     "total_tile_features", "oversized_tiles", "duration_secs".
+///     "tile_count", "tile_feature_count", "oversized_tiles",
+///     "encode_dropped_features"), "total_tiles", "total_tile_features",
+///     "oversized_tiles", "encode_dropped_features", "duration_secs".
+///     ``encode_dropped_features`` counts tile members that produced no MVT
+///     feature at encode (empty geometries, empty GeometryCollections,
+///     polygons that quantize to zero area at the tile extent); non-zero
+///     means content was lost after clipping, and a warning names the total.
 ///
 /// Raises:
 ///     RuntimeError: The export failed (not an overview file, unsupported
@@ -1061,12 +1066,14 @@ fn export_pmtiles(
         d.set_item("tile_count", z.tile_count)?;
         d.set_item("tile_feature_count", z.tile_feature_count)?;
         d.set_item("oversized_tiles", z.oversized_tiles)?;
+        d.set_item("encode_dropped_features", z.encode_dropped_features)?;
         zooms.append(d)?;
     }
     dict.set_item("zooms", zooms)?;
     dict.set_item("total_tiles", report.total_tiles)?;
     dict.set_item("total_tile_features", report.total_tile_features)?;
     dict.set_item("oversized_tiles", report.oversized_tiles)?;
+    dict.set_item("encode_dropped_features", report.encode_dropped_features)?;
     dict.set_item("duration_secs", report.duration_secs)?;
     Ok(dict.into())
 }
