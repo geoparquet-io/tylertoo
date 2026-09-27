@@ -1,10 +1,5 @@
 //! Scaling harness for the level-assignment phase (#534).
 //!
-//! Carried into #448's bench inventory verbatim from #564 (open at the time
-//! of writing), which introduces it against the parallelized assign path —
-//! it depends only on `overview::assign` APIs already on `main`, so it
-//! compiles and runs unchanged here. No functional edits.
-//!
 //! Times the two stages `resolve_winner_tables` runs — the per-level
 //! cell-winner passes ([`assign_levels_bounded`]) and the density budget
 //! ([`apply_density_budget`]) — over a synthetic, spatially clustered feature
