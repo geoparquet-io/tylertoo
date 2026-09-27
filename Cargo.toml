@@ -5,6 +5,10 @@ members = [
     "crates/cli",
     "crates/python",
 ]
+# The #205 wagyu-rs evaluation runner has its own dependency graph: wagyu-rs
+# 0.2.1's dead `geo = "0.32"` dependency cannot resolve beside our geo 0.33
+# (both pin a different i_overlay 4.x). See corpus/hostile_wagyu/Cargo.toml.
+exclude = ["corpus/hostile_wagyu"]
 
 [workspace.package]
 version = "0.11.0"
