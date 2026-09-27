@@ -64,7 +64,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -215,10 +215,12 @@ fn current_rss_mib() -> Option<f64> {
 /// These `[rss] <phase>` lines pinpoint which phase dominates peak memory —
 /// pass-1 winner tables (O(dataset)) vs the pass-2 output sink (bounded by the
 /// #294 auto profile) — and validate the auto backing choice on real runs.
-fn log_phase_rss(phase: &str, peak_mib: &mut Option<f64>) {
-    if let Some(rss) = sample_rss_peak(peak_mib) {
-        log::info!("[rss] {phase}: {rss:.0} MiB");
-    }
+///
+/// Returns the sample, so a caller can also hand it to the #571 sampler.
+fn log_phase_rss(phase: &str, peak_mib: &mut Option<f64>) -> Option<f64> {
+    let rss = sample_rss_peak(peak_mib)?;
+    log::info!("[rss] {phase}: {rss:.0} MiB");
+    Some(rss)
 }
 
 /// Sample the current RSS and fold it into the running `peak_mib`, silently;
@@ -259,11 +261,20 @@ const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// generalized with phase attribution so the profiling path can use it too,
 /// not just that one test.
 ///
+/// Besides the background ticks, the sampler also records a sample at every
+/// [`Self::mark_phase`] (credited to the phase that is ending), at
+/// [`Self::finish`], and every boundary sample its owner hands it through
+/// [`Self::record`]. So every phase the run entered has an entry however
+/// short it was, and `true_peak_mib` is never below the boundary-sampled
+/// `peak_rss_mib` reported next to it.
+///
 /// Spawned only when profiling is on ([`Self::start_if`]): `None` means no
 /// thread, no channel, no allocation beyond the `bool` check — zero cost when
 /// `TYLERTOO_PROFILE_JSON` is unset, per #571.
 pub(super) struct RssSampler {
-    stop: Arc<AtomicBool>,
+    /// Dropping this sender wakes the thread out of its interval wait at
+    /// once, so stopping never waits out a full [`RSS_SAMPLE_INTERVAL`].
+    stop: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<JoinHandle<()>>,
     state: Arc<Mutex<RssSamplerState>>,
     interval: Duration,
@@ -275,10 +286,28 @@ struct RssSamplerState {
     current_phase: String,
     /// The absolute peak RSS seen by ANY sample, regardless of phase.
     true_peak_mib: f64,
-    /// Per-phase peak, in first-seen (execution) order — a run has a handful
-    /// of phases, so a linear scan per sample is simpler than a `HashMap`
-    /// and keeps the profile JSON's phase order matching what happened.
+    /// Per-phase peak, in first-seen (execution) order. A run has a handful
+    /// of phases, so a linear scan per sample is simpler than a `HashMap`.
+    /// (The JSON object built from it is key-sorted by `serde_json`.)
     phase_peaks_mib: Vec<(String, f64)>,
+}
+
+impl RssSamplerState {
+    /// Fold one RSS sample into the true peak and the current phase's max.
+    fn record(&mut self, mib: f64) {
+        if mib > self.true_peak_mib {
+            self.true_peak_mib = mib;
+        }
+        let current = &self.current_phase;
+        match self.phase_peaks_mib.iter_mut().find(|(p, _)| p == current) {
+            Some((_, peak)) => {
+                if mib > *peak {
+                    *peak = mib;
+                }
+            }
+            None => self.phase_peaks_mib.push((current.clone(), mib)),
+        }
+    }
 }
 
 /// What [`RssSampler::finish`] reports: the whole-run true peak plus the max
@@ -310,47 +339,54 @@ impl RssSampler {
     }
 
     fn start(initial_phase: &str, interval: Duration) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
+        use std::sync::mpsc::RecvTimeoutError;
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
         let state = Arc::new(Mutex::new(RssSamplerState {
             current_phase: initial_phase.to_string(),
             true_peak_mib: 0.0,
             phase_peaks_mib: Vec::new(),
         }));
-        let (stop_bg, state_bg) = (Arc::clone(&stop), Arc::clone(&state));
-        let handle = std::thread::spawn(move || {
-            while !stop_bg.load(Ordering::Relaxed) {
-                if let Some(mib) = current_rss_mib() {
-                    if let Ok(mut s) = state_bg.lock() {
-                        if mib > s.true_peak_mib {
-                            s.true_peak_mib = mib;
-                        }
-                        let phase = s.current_phase.clone();
-                        match s.phase_peaks_mib.iter_mut().find(|(p, _)| *p == phase) {
-                            Some((_, peak)) => {
-                                if mib > *peak {
-                                    *peak = mib;
-                                }
-                            }
-                            None => s.phase_peaks_mib.push((phase, mib)),
-                        }
-                    }
+        let state_bg = Arc::clone(&state);
+        let handle = std::thread::spawn(move || loop {
+            if let Some(mib) = current_rss_mib() {
+                if let Ok(mut s) = state_bg.lock() {
+                    s.record(mib);
                 }
-                std::thread::sleep(interval);
+            }
+            // A timeout is the next tick; a message or a dropped sender
+            // (`stop_thread`, or `Drop` on an early return) is the stop.
+            match stop_rx.recv_timeout(interval) {
+                Err(RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             }
         });
         Self {
-            stop,
+            stop: Some(stop),
             handle: Some(handle),
             state,
             interval,
         }
     }
 
-    /// Attribute every sample taken from now on to `phase`, until the next
-    /// call. Cheap (one mutex lock + a possible short-string clone); called
-    /// only at phase boundaries, never per-row.
-    pub(super) fn mark_phase(&self, phase: &str) {
+    /// Fold a sample taken elsewhere (a boundary sample) into the current
+    /// phase and the true peak.
+    pub(super) fn record(&self, mib: f64) {
         if let Ok(mut s) = self.state.lock() {
+            s.record(mib);
+        }
+    }
+
+    /// Close the current phase with one sample credited to it, then
+    /// attribute every sample from now on to `phase`, until the next call.
+    /// The closing sample is what gives a phase shorter than the poll
+    /// interval an entry at all. Cheap (one RSS read, one mutex lock, a
+    /// short-string clone); called only at phase boundaries, never per-row.
+    pub(super) fn mark_phase(&self, phase: &str) {
+        let mib = current_rss_mib();
+        if let Ok(mut s) = self.state.lock() {
+            if let Some(mib) = mib {
+                s.record(mib);
+            }
             if s.current_phase != phase {
                 s.current_phase = phase.to_string();
             }
@@ -358,15 +394,19 @@ impl RssSampler {
     }
 
     fn stop_thread(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        drop(self.stop.take());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 
-    /// Stop the sampler thread and return its findings.
+    /// Stop the sampler thread, take one closing sample for the current
+    /// phase, and return the findings.
     pub(super) fn finish(mut self) -> RssSamplerReport {
         self.stop_thread();
+        if let Some(mib) = current_rss_mib() {
+            self.record(mib);
+        }
         let state = self
             .state
             .lock()
@@ -407,6 +447,15 @@ impl RssTracker {
         }
     }
 
+    /// Test seam: a tracker around an explicit (e.g. long-interval) sampler.
+    #[cfg(test)]
+    fn with_sampler(sampler: Option<RssSampler>) -> Self {
+        Self {
+            boundary_peak_mib: None,
+            sampler,
+        }
+    }
+
     /// Enter `phase`: everything the background sampler observes from now on
     /// is attributed to it, until the next call. A no-op when profiling is
     /// off (the sampler never started).
@@ -417,8 +466,14 @@ impl RssTracker {
     }
 
     /// The pre-existing #295 boundary sample + `[rss] <phase>` log line.
+    ///
+    /// The sample also goes to the background sampler, credited to the
+    /// current phase, so `true_peak_mib` is never below `peak_rss_mib`.
     pub(super) fn log_phase(&mut self, phase: &str) {
-        log_phase_rss(phase, &mut self.boundary_peak_mib);
+        let sample = log_phase_rss(phase, &mut self.boundary_peak_mib);
+        if let (Some(sampler), Some(mib)) = (&self.sampler, sample) {
+            sampler.record(mib);
+        }
     }
 
     /// [`Self::log_phase`] for `ended` immediately followed by
@@ -1871,7 +1926,7 @@ pub(crate) fn write_plan_streaming(
     let start = Instant::now();
     // Boundary sampling only: a plan-only run writes no profile JSON dump,
     // so the #571 background sampler would have no reader.
-    let mut rss = RssTracker::new(false, "pass1 scan");
+    let mut rss = RssTracker::new(false, "preflight");
     let FrontHalf { preflight, plan } = run_front_half(source, options, &mut rss)?;
     let options = &preflight.options;
     let path = options
@@ -1963,13 +2018,18 @@ fn resolve_plan_state(
         .then(|| Fingerprint::capture(inputs.source, inputs.selected_row_groups, options, flag))
         .transpose()?;
     match &options.plan {
-        Some(path) => load_plan_state(
-            path,
-            fingerprint.expect("captured for --plan"),
-            options,
-            inputs.source,
-            inputs.selected_row_groups,
-        ),
+        Some(path) => {
+            // #571: a `--plan` run has no pass 1 and no assignment; the
+            // sampler credits this stretch to the load instead.
+            rss.enter_phase("plan load");
+            load_plan_state(
+                path,
+                fingerprint.expect("captured for --plan"),
+                options,
+                inputs.source,
+                inputs.selected_row_groups,
+            )
+        }
         None => run_pass1_and_assign(inputs, options, fingerprint, rss),
     }
 }
@@ -1982,6 +2042,7 @@ fn run_pass1_and_assign(
     fingerprint: Option<Fingerprint>,
     rss: &mut RssTracker,
 ) -> Result<PlanState, ConvertError> {
+    rss.enter_phase("pass1 scan"); // #571: the preflight ends here
     let t_pass1 = Instant::now();
     let Pass1Output {
         mut features,
@@ -2307,7 +2368,9 @@ pub(crate) fn convert_streaming_strategy(
     let start = Instant::now();
     // #295/#571 peak-RSS tracking: boundary samples + a continuous
     // background sampler when profiling is on (see `RssTracker`/`RssSampler`).
-    let mut rss = RssTracker::new(profile_json_target().is_some(), "pass1 scan");
+    // The sampler starts in "preflight"; `run_pass1_and_assign` (or the
+    // `--plan` load in `resolve_plan_state`) enters the next phase.
+    let mut rss = RssTracker::new(profile_json_target().is_some(), "preflight");
 
     // --- Preflight, then pass 1 + assignment (or the saved plan that ---------
     // --- replaces them). Shared verbatim with `--plan-only` (#560). ----------
@@ -2823,7 +2886,8 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
 
 /// Build the `rss_sampler` object shared by both `TYLERTOO_PROFILE_JSON`
 /// dumps (#571): the continuous background sampler's TRUE peak RSS and its
-/// per-phase maxima, in execution order — see `docs/PROFILING.md` for the
+/// per-phase maxima (a JSON object, so key-sorted: `serde_json` is built
+/// without `preserve_order`) — see `docs/PROFILING.md` for the
 /// exact contrast with the boundary-sampled `peak_rss_mib` next to it. `null`
 /// only when the sampler never ran (profiling off), which in practice never
 /// happens here since the whole dump is a no-op then.
@@ -5936,6 +6000,107 @@ mod tests {
             tracker.finish_sampler().is_none(),
             "profiling off must produce no sampler report"
         );
+    }
+
+    /// #571 review: stopping the sampler must not wait out a full poll
+    /// interval. `finish` (and `Drop`, on an early `?` return) joins the
+    /// thread; a thread parked in a plain `sleep(interval)` held every
+    /// profiled convert and export up to 250 ms past its last phase, time
+    /// that also leaked into the run's own `duration_secs`.
+    #[test]
+    fn rss_sampler_stops_without_waiting_out_the_interval() {
+        let long = Duration::from_secs(30);
+        let sampler = RssSampler::start_if_with_interval(true, "a", long)
+            .expect("profiling_on=true always starts a sampler");
+        std::thread::sleep(Duration::from_millis(20));
+        let t = Instant::now();
+        let _ = sampler.finish();
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "finish took {:?}: it waited out the {long:?} poll interval",
+            t.elapsed()
+        );
+
+        let sampler = RssSampler::start_if_with_interval(true, "a", long)
+            .expect("profiling_on=true always starts a sampler");
+        std::thread::sleep(Duration::from_millis(20));
+        let t = Instant::now();
+        drop(sampler);
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "drop took {:?}: it waited out the {long:?} poll interval",
+            t.elapsed()
+        );
+    }
+
+    /// #571 review: every phase the run entered must appear in
+    /// `phase_peaks_mib`, even one shorter than the poll interval. Before
+    /// the fix a phase got an entry only if a background tick happened to
+    /// land inside it, so a sub-interval phase (every phase of a small run,
+    /// or a quick `writer.finish`) silently vanished from the dump.
+    #[test]
+    fn rss_sampler_reports_every_entered_phase_even_when_shorter_than_the_interval() {
+        let sampler = RssSampler::start_if_with_interval(true, "a", Duration::from_secs(30))
+            .expect("profiling_on=true always starts a sampler");
+        sampler.mark_phase("b");
+        sampler.mark_phase("c");
+        let report = sampler.finish();
+        if current_rss_mib().is_none() {
+            return; // platform cannot report RSS: nothing is sampled at all
+        }
+        let phases: Vec<&str> = report
+            .phase_peaks_mib
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert_eq!(phases, ["a", "b", "c"]);
+        let max = report
+            .phase_peaks_mib
+            .iter()
+            .map(|&(_, m)| m)
+            .fold(0.0, f64::max);
+        assert_eq!(
+            report.true_peak_mib, max,
+            "the true peak is the max over every phase's samples"
+        );
+    }
+
+    /// #571 review: the continuous sampler's `true_peak_mib` must never
+    /// sit below the boundary-sampled `peak_rss_mib` it is reported next to.
+    /// Before the fix the two sample sets were disjoint: a boundary sample
+    /// taken between two background ticks (any run shorter than the
+    /// interval, or a spike the boundary happened to land on) could exceed
+    /// the "true" peak, and `docs/PROFILING.md` had to tell readers the two
+    /// numbers were not comparable.
+    #[test]
+    fn rss_tracker_true_peak_is_never_below_the_boundary_peak() {
+        let sampler = RssSampler::start_if_with_interval(true, "a", Duration::from_secs(30))
+            .expect("profiling_on=true always starts a sampler");
+        // Let the spawn-time tick land first, so the allocation below
+        // happens strictly between background samples.
+        std::thread::sleep(Duration::from_millis(50));
+        let mut tracker = RssTracker::with_sampler(Some(sampler));
+
+        const ALLOC_MIB: usize = 200;
+        let mut buf = vec![0u8; ALLOC_MIB * 1024 * 1024];
+        for chunk in buf.chunks_mut(4096) {
+            chunk[0] = 1;
+        }
+        tracker.log_phase("a"); // boundary sample sees the buffer
+        drop(buf);
+
+        let boundary = tracker.boundary_peak_mib;
+        let report = tracker
+            .finish_sampler()
+            .expect("a started sampler always reports");
+        if let Some(boundary) = boundary {
+            assert!(
+                report.true_peak_mib >= boundary,
+                "true_peak_mib ({:.0} MiB) fell below the boundary peak \
+                 ({boundary:.0} MiB)",
+                report.true_peak_mib
+            );
+        }
     }
 
     /// #571: the background sampler must observe a peak that lives and dies

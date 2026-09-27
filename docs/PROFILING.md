@@ -111,10 +111,11 @@ not "the run was not profiled".
                                     // if RSS sampling is unavailable
   "rss_sampler": {                  // #571: the CONTINUOUS background sampler
     "interval_ms": 250,             // poll interval
-    "true_peak_mib": 32.1,          // true high-water mark across the WHOLE run
+    "true_peak_mib": 32.1,          // max over EVERY sample of the whole run
     "phase_peaks_mib": {            // max RSS observed while each phase was
-      "pass1 scan": 32.1,           // current — execution order, one entry
-      "assignment+budget (winner tables)": 30.4, // per phase actually visited
+      "preflight": 12.0,            // current, one entry per phase the run
+      "pass1 scan": 32.1,           // entered (key order is not meaningful)
+      "assignment+budget (winner tables)": 30.4,
       "pre-pass2 (winner tables freed)": 28.9,
       "pass2 (output sink)": 29.9,
       "writer.finish": 29.28
@@ -137,32 +138,29 @@ and released it again 74s later, all inside "pass1 scan" — `peak_rss_mib`
 true peak.
 
 `rss_sampler` fixes this with a background thread that polls RSS every
-`interval_ms` (250ms in production; a test-only seam uses a shorter interval)
-whenever profiling is on, and is not spawned at all otherwise — zero cost off
-the profiling path. It reports two numbers boundary sampling cannot produce:
+`interval_ms` (250ms) whenever profiling is on, and is not spawned at all
+otherwise. Besides its own ticks it also records one sample at every phase
+change (credited to the phase that is ending), one when it stops, and every
+boundary sample behind `peak_rss_mib`. It reports:
 
-- `true_peak_mib`: the max of every sample the background sampler took,
-  across the whole run.
-- `phase_peaks_mib`: the max RSS observed while each named phase was current,
-  keyed by the same phase names `peak_rss_mib`'s underlying `[rss] <phase>`
-  log lines use, in the order the run actually visited them (a level ceiling
-  or `--plan` run can visit fewer phases than the schema example above).
+- `true_peak_mib`: the max of every sample above, across the whole run. It
+  is never below `peak_rss_mib`, and exceeds it when a peak lived and died
+  between two boundaries: the gap #571 exists to surface.
+- `phase_peaks_mib`: the max RSS observed while each named phase was
+  current, one entry for every phase the run entered, however short. The
+  phases are `preflight` (options, schema and input checks), then
+  `pass1 scan` and `assignment+budget (winner tables)`, or `plan load` in
+  their place on a `--plan` run, then `pre-pass2 (winner tables freed)`,
+  `pass2 (output sink)` and `writer.finish`. The object's key order carries
+  no meaning; read the order from this list.
 
-On any run that runs long enough for the sampler to catch a peak the
-boundary samples missed, `true_peak_mib > peak_rss_mib` — that gap is exactly
-what #571 exists to surface. **On a run shorter than `interval_ms`** (a tiny
-fixture, a smoke test), the two samplers are not directly comparable:
-`peak_rss_mib` is guaranteed to have sampled at each of the five exact phase
-ends, while the background sampler may have taken zero or one sample total
-and can easily miss a peak the boundary samples caught — so
-`true_peak_mib < peak_rss_mib` on such a run is expected, not a bug. Treat
-`rss_sampler.true_peak_mib` as the more trustworthy number for sizing
-line-heavy or long-running jobs (#543's preflight guidance and the
-memory-envelope docs), not as a value with a fixed ordering against
-`peak_rss_mib` on every run. `peak_rss_mib` remains for backward
-compatibility with existing consumers of this field. `rss_sampler` is `null`
-only when profiling was off, which cannot happen for a line this dump
-actually wrote (the whole dump is a no-op then).
+A spike shorter than `interval_ms` that falls between two samples is still
+missed, so `true_peak_mib` is a lower bound on the real high-water mark,
+tighter than `peak_rss_mib`. Use it for sizing line-heavy or long-running
+jobs (#543's preflight guidance and the memory-envelope docs).
+`peak_rss_mib` stays for existing consumers of the field. `rss_sampler` is
+`null` only when profiling was off, which cannot happen for a line this
+dump actually wrote (the whole dump is a no-op then).
 
 The four `phase_walls` phases are **disjoint** windows of one conversion, so
 `pass1 + assign + pass2 + writer_finish <= total` always holds; the
@@ -273,10 +271,10 @@ missing export line after a failed run is expected, not a profiling bug.
     "peak_rss_mib": 812.4,         // BOUNDARY-sampled peak (see below); null if unavailable
     "rss_sampler": {                // #571: the CONTINUOUS background sampler
       "interval_ms": 250,
-      "true_peak_mib": 940.7,      // true high-water mark across the WHOLE export
+      "true_peak_mib": 940.7,      // max over EVERY sample of the export
       "phase_peaks_mib": {         // max RSS while each phase was current
         "scan": 210.5,
-        "fill": 940.7,             // 0 entries here in duplicating mode (no fill)
+        "fill": 940.7,             // absent in duplicating mode (no fill)
         "levels": 880.2,
         "finalize": 815.0
       }
@@ -371,17 +369,13 @@ boundaries (after the scan, the fill, each level, and finalize). It is a
 sampled peak, not a true high-water mark, and is `null` where the platform
 cannot report RSS.
 
-`export.rss_sampler` (#571) is the continuous background sampler's report —
+`export.rss_sampler` (#571) is the continuous background sampler's report,
 the export-side counterpart of convert's `rss_sampler` (see that section
-above for the full explanation of why it exists, how it differs from
-`peak_rss_mib`, and why the two are not directly comparable on a run shorter
-than `interval_ms`). It runs a background thread from the level scan through
-`finalize`, polling every `interval_ms`, and reports `true_peak_mib` (the max
-of every sample taken) plus `phase_peaks_mib` keyed by `scan` / `fill` /
-`levels` / `finalize` — the same names as `export.phase_walls`. In
-duplicating mode `fill` never runs, so it gets at most a fleeting sample (or
-none) between `scan` and `levels`, mirroring `phase_walls.fill` being exactly
-`0.0` there. Spawned only when profiling is
+above for how it differs from `peak_rss_mib`). Its thread runs from the start
+of the level scan through `finalize`, and it reports `true_peak_mib` plus
+`phase_peaks_mib` keyed by `scan` / `fill` / `levels` / `finalize`, the same
+names as `export.phase_walls`. In duplicating mode the fill never runs, so
+`phase_peaks_mib` has no `fill` key. It is spawned only when profiling is
 on; `null` otherwise (which cannot happen for a line this dump actually
 wrote).
 
