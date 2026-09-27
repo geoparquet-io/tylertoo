@@ -1282,6 +1282,127 @@ fn level_within_ceiling(zoom: Option<u8>, ceiling: Option<u8>) -> bool {
     }
 }
 
+/// Per planned level, the rows the coalesced lines contribute (the level's
+/// surviving chain count; every collected line at the canonical level), plus
+/// the chain tables pass 2 will consume when `prebuild` is set (#570).
+///
+/// `prebuild` is off for `--plan-only` (#560), which stops after the plan is
+/// written: it runs the chain stage for the counts alone, so it neither
+/// simplifies every chain nor holds every level's table while the plan's WKB
+/// copy of the line scratch is encoded. The counts are identical either way:
+/// both come from [`super::convert::coalesce_level_chains`], taken before
+/// simplification.
+///
+/// The levels run in parallel waves of at most [`chain_stage_wave`] levels,
+/// sized against the profile's pass-1 memory budget: every level runs the
+/// chain stage over the WHOLE line scratch, so its transient is a multiple
+/// of the scratch, and all levels at once (15 on a z0–z14 ladder) is that
+/// multiple times the level count. Pass 1 now runs every planned level, even
+/// ones that end up empty and that pass 2 never used to build, so without a
+/// bound a run whose coarse levels are empty peaks higher than it did when
+/// only pass 2 built tables (#579 review).
+fn coalesce_level_counts(
+    scratch: &CoalesceScratch,
+    level_specs: &[(f64, Option<u8>)],
+    finest: usize,
+    crs: Crs,
+    options: &ConvertOptions,
+    prebuild: bool,
+) -> (Vec<usize>, Option<CoalesceBuild>) {
+    let line_bytes: u64 = scratch.geoms.iter().map(collected_line_bytes).sum();
+    let budget = super::pipeline::pass1_grid_budget_bytes(options.profile);
+    let wave = chain_stage_wave(level_specs.len(), line_bytes, budget);
+    coalesce_level_counts_in_waves(scratch, level_specs, finest, crs, options, prebuild, wave)
+}
+
+/// Modelled transient of one level's chain stage, as a multiple of the
+/// line scratch's modelled bytes ([`collected_line_bytes`]): the joinable
+/// pieces and sorted endpoint incidences, the merged chain runs, and the
+/// simplified table. Measured on 1.5M 7-vertex lines (240 MiB modelled):
+/// ≈310 MiB per concurrently running level, about 1.3×; 2 leaves headroom
+/// for longer merged strokes.
+const CHAIN_STAGE_TRANSIENT_FACTOR: u64 = 2;
+
+/// How many levels' chain stages [`coalesce_level_counts`] runs at once:
+/// `budget` over one level's modelled transient, clamped to `1..=levels`.
+/// No line bytes (or an unbounded `speed` budget) means no bound.
+fn chain_stage_wave(levels: usize, line_bytes: u64, budget: u64) -> usize {
+    let levels = levels.max(1);
+    let per_level = line_bytes.saturating_mul(CHAIN_STAGE_TRANSIENT_FACTOR);
+    if per_level == 0 {
+        return levels;
+    }
+    usize::try_from(budget / per_level)
+        .unwrap_or(usize::MAX)
+        .clamp(1, levels)
+}
+
+/// [`coalesce_level_counts`] with an explicit wave size. The result does not
+/// depend on `wave`: each level's run is independent of every other's, and
+/// results are collected in level order.
+fn coalesce_level_counts_in_waves(
+    scratch: &CoalesceScratch,
+    level_specs: &[(f64, Option<u8>)],
+    finest: usize,
+    crs: Crs,
+    options: &ConvertOptions,
+    prebuild: bool,
+    wave: usize,
+) -> (Vec<usize>, Option<CoalesceBuild>) {
+    let num_levels = level_specs.len();
+    let inputs = scratch.inputs();
+    let wave = wave.max(1);
+    log::info!(
+        "[convert] {} coalesce chains for {num_levels} level(s) ({} candidate line(s), \
+         {wave} level(s) at a time)",
+        if prebuild {
+            "building the tables of"
+        } else {
+            "counting"
+        },
+        inputs.len()
+    );
+    // One run per level, `wave` levels at a time. With `prebuild` it produces
+    // BOTH the count the level plan needs and the table pass 2 needs.
+    let levels: Vec<usize> = (0..num_levels).collect();
+    let mut per_level: Vec<(usize, Option<CoalesceTable>, bool)> = Vec::with_capacity(num_levels);
+    for chunk in levels.chunks(wave) {
+        per_level.par_extend(chunk.par_iter().map(|&level| {
+            if level == finest {
+                // The canonical level is verbatim: every collected line is its
+                // own row, and there is no chain table.
+                return (scratch.rows.len(), None, false);
+            }
+            let gsd = level_specs[level].0;
+            if !prebuild {
+                let chains = super::convert::coalesce_level_chains(
+                    &inputs, level, finest, gsd, crs, options,
+                );
+                return (chains.len(), None, false);
+            }
+            let (table, hint) = super::convert::build_level_coalesce_table_and_hint(
+                &inputs, level, finest, gsd, crs, options,
+            );
+            let merged = coalesce_table_merged(&table);
+            let keep = level_within_ceiling(level_specs[level].1, options.zoom_ceiling);
+            (hint, keep.then_some(table), merged)
+        }));
+    }
+    let mut counts = Vec::with_capacity(num_levels);
+    let mut tables = Vec::with_capacity(num_levels);
+    let mut merged_anywhere = false;
+    for (hint, table, merged) in per_level {
+        counts.push(hint);
+        tables.push(table);
+        merged_anywhere |= merged;
+    }
+    let build = prebuild.then_some(CoalesceBuild {
+        tables,
+        merged: merged_anywhere,
+    });
+    (counts, build)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_winner_tables(
     features: &mut Vec<AssignFeature>,
@@ -1292,6 +1413,7 @@ fn resolve_winner_tables(
     num_rows: usize,
     crs: Crs,
     options: &ConvertOptions,
+    prebuild_chain_tables: bool,
     peak_rss_mib: &mut Option<f64>,
 ) -> Result<WinnerTables, ConvertError> {
     // --- Winner tables (assignment + Q2 density budget). ---------------------
@@ -1419,9 +1541,8 @@ fn resolve_winner_tables(
     // row-group sizing hint and for empty-level omission). With coalescing,
     // line rows leave the winner table at non-canonical levels: their count
     // is the level's surviving chain count instead (computed by running the
-    // chain stage per level — cheap relative to decode; the tables are
-    // rebuilt, with simplification, per level in pass 2 rather than held for
-    // every level at once).
+    // chain stage per level, which also builds the simplified tables pass 2
+    // consumes, #570; see `coalesce_level_counts`).
     let mut hist = vec![0usize; num_levels];
     for (f, &ml) in features.iter().zip(&feat_min_levels) {
         if coalesce_scratch.is_some() && f.kind == FeatureKind::Line {
@@ -1447,51 +1568,22 @@ fn resolve_winner_tables(
     for (count, level_carriers) in counts.iter_mut().zip(&carriers) {
         *count += level_carriers.len();
     }
-    let coalesce_build = coalesce_scratch.as_ref().map(|scratch| {
+    let mut coalesce_build = None;
+    if let Some(scratch) = &coalesce_scratch {
         // Duplicating only (partitioning + coalescing is rejected upstream).
-        let inputs = scratch.inputs();
-        log::info!(
-            "[convert] building coalesce chain tables for {num_levels} level(s) \
-             ({} candidate line(s))",
-            inputs.len()
+        let (chain_counts, build) = coalesce_level_counts(
+            scratch,
+            &level_specs,
+            finest,
+            crs,
+            options,
+            prebuild_chain_tables,
         );
-        // One run per level, in parallel, producing BOTH the count this
-        // function needs and the table pass 2 needs (#570).
-        let per_level: Vec<(usize, Option<CoalesceTable>, bool)> = (0..num_levels)
-            .into_par_iter()
-            .map(|level| {
-                if level == finest {
-                    // The canonical level is verbatim: every collected line is
-                    // its own row, and there is no chain table.
-                    return (scratch.rows.len(), None, false);
-                }
-                let (table, hint) = super::convert::build_level_coalesce_table_and_hint(
-                    &inputs,
-                    level,
-                    finest,
-                    level_gsds[level],
-                    crs,
-                    options,
-                );
-                let merged = coalesce_table_merged(&table);
-                let keep = level_within_ceiling(level_specs[level].1, options.zoom_ceiling);
-                (hint, keep.then_some(table), merged)
-            })
-            .collect();
-        let mut tables = Vec::with_capacity(num_levels);
-        let mut merged_anywhere = false;
-        for (level, (hint, table, merged)) in per_level.into_iter().enumerate() {
-            counts[level] += hint;
-            tables.push(table);
-            merged_anywhere |= merged;
+        for (count, chains) in counts.iter_mut().zip(chain_counts) {
+            *count += chains;
         }
-        CoalesceBuild {
-            tables,
-            merged: merged_anywhere,
-        }
-    });
-    if coalesce_build.is_some() {
-        log_phase_rss("coalesce chain tables", peak_rss_mib);
+        coalesce_build = build;
+        log_phase_rss("coalesce chain stage", peak_rss_mib);
     }
 
     Ok(WinnerTables {
@@ -1702,6 +1794,9 @@ struct Pass1Inputs<'a> {
     bbox_units: Option<&'a [f64; 4]>,
     bound_filter: Option<&'a super::filter::BoundFilter>,
     crs: Crs,
+    /// Keep the coalesce chain tables the level counts are built from, for
+    /// pass 2 (#570). Off for `--plan-only`, which has no pass 2.
+    prebuild_chain_tables: bool,
 }
 
 /// Everything the rest of the driver consumes from pass 1 and the level
@@ -1753,9 +1848,14 @@ struct FrontHalf {
 /// That sharing is the #560 invariant's implementation: there is no separate
 /// plan-writing path that could drift from the one the fleet's full coarse job
 /// takes, so the artifact cannot differ.
+///
+/// `prebuild_chain_tables` is the one difference, and it never reaches the
+/// artifact: a full convert keeps the coalesce chain tables pass 1 built for
+/// pass 2 (#570); `--plan-only` has no pass 2, so it only counts the chains.
 fn run_front_half(
     source: &ConvertSource,
     options: &ConvertOptions,
+    prebuild_chain_tables: bool,
     peak_rss_mib: &mut Option<f64>,
 ) -> Result<FrontHalf, ConvertError> {
     // A numeric sort key and a categorical class ranking would both drive
@@ -1778,6 +1878,7 @@ fn run_front_half(
             bbox_units: preflight.bbox_units.as_ref(),
             bound_filter: preflight.bound_filter.as_ref(),
             crs: preflight.crs,
+            prebuild_chain_tables,
         },
         options,
         peak_rss_mib,
@@ -1796,7 +1897,7 @@ pub(crate) fn write_plan_streaming(
 ) -> Result<PlanReport, ConvertError> {
     let start = Instant::now();
     let mut peak_rss_mib: Option<f64> = None;
-    let FrontHalf { preflight, plan } = run_front_half(source, options, &mut peak_rss_mib)?;
+    let FrontHalf { preflight, plan } = run_front_half(source, options, false, &mut peak_rss_mib)?;
     let options = &preflight.options;
     let path = options
         .save_plan
@@ -1967,6 +2068,7 @@ fn run_pass1_and_assign(
         num_rows,
         inputs.crs,
         options,
+        inputs.prebuild_chain_tables,
         peak_rss_mib,
     )?;
     // Stops before `--save-plan` serialization, which is I/O for an opt-in
@@ -2194,7 +2296,7 @@ pub(crate) fn convert_streaming_strategy(
 
     // --- Preflight, then pass 1 + assignment (or the saved plan that ---------
     // --- replaces them). Shared verbatim with `--plan-only` (#560). ----------
-    let FrontHalf { preflight, plan } = run_front_half(source, options, &mut peak_rss_mib)?;
+    let FrontHalf { preflight, plan } = run_front_half(source, options, true, &mut peak_rss_mib)?;
     let Preflight {
         options: resolved_options,
         input_schema,
@@ -6723,6 +6825,113 @@ mod tests {
                 hint: 10,
             })
             .collect()
+    }
+
+    /// A scratch of `chains` separate 10-segment polylines, so every
+    /// non-canonical level has chains to count and to merge.
+    fn chained_scratch(chains: usize) -> CoalesceScratch {
+        let mut geoms = Vec::new();
+        for c in 0..chains {
+            let y = c as f64 * 0.5;
+            for k in 0..10 {
+                let x0 = -20.0 + k as f64 * 0.01;
+                geoms.push(Geometry::LineString(LineString::from(vec![
+                    (x0, y),
+                    (x0 + 0.005, y + 0.001),
+                    (x0 + 0.01, y),
+                ])));
+            }
+        }
+        CoalesceScratch {
+            rows: (0..geoms.len()).collect(),
+            sort_keys: vec![None; geoms.len()],
+            groups: None,
+            geoms,
+        }
+    }
+
+    /// `--plan-only` never reaches pass 2, so it must count the chains
+    /// without building (and holding) every level's simplified chain table,
+    /// and the counts must be exactly the ones a full run plans with.
+    #[test]
+    fn plan_only_counts_chains_without_building_tables() {
+        let scratch = chained_scratch(40);
+        let level_specs: Vec<(f64, Option<u8>)> = (0..6u8)
+            .map(|z| (20_000.0 / f64::from(1u32 << z), Some(z + 4)))
+            .collect();
+        let finest = level_specs.len() - 1;
+        let options = ConvertOptions::default();
+        let (full_counts, full_build) = coalesce_level_counts(
+            &scratch,
+            &level_specs,
+            finest,
+            Crs::Epsg4326,
+            &options,
+            true,
+        );
+        let (plan_counts, plan_build) = coalesce_level_counts(
+            &scratch,
+            &level_specs,
+            finest,
+            Crs::Epsg4326,
+            &options,
+            false,
+        );
+        assert_eq!(plan_counts, full_counts, "plan-only plans the same levels");
+        assert!(
+            plan_build.is_none(),
+            "plan-only must not build chain tables"
+        );
+        let full_build = full_build.expect("a full run keeps its tables for pass 2");
+        assert_eq!(full_build.tables.len(), level_specs.len());
+        assert!(full_build.tables[finest].is_none());
+        assert!(full_build.merged, "10-segment polylines merge");
+        assert_eq!(full_counts[finest], scratch.rows.len());
+    }
+
+    /// How many levels' chain stages may run at once: the memory budget over
+    /// one level's modelled transient, never below one, never above the plan.
+    #[test]
+    fn chain_stage_wave_is_bounded_by_the_budget() {
+        let per_level = 100 * CHAIN_STAGE_TRANSIENT_FACTOR;
+        assert_eq!(chain_stage_wave(7, 100, u64::MAX), 7, "unbounded: all");
+        assert_eq!(chain_stage_wave(7, 100, per_level * 3), 3);
+        assert_eq!(chain_stage_wave(7, 100, per_level * 3 + 1), 3);
+        assert_eq!(chain_stage_wave(7, 100, 1), 1, "never below one level");
+        assert_eq!(chain_stage_wave(7, 0, 1), 7, "no line bytes: no bound");
+        assert_eq!(chain_stage_wave(0, 100, u64::MAX), 1);
+    }
+
+    /// Running the levels in bounded waves changes the peak, never the result:
+    /// counts, tables and the merged verdict match the all-at-once build.
+    #[test]
+    fn chain_stage_waves_do_not_change_the_result() {
+        let scratch = chained_scratch(40);
+        let level_specs: Vec<(f64, Option<u8>)> = (0..6u8)
+            .map(|z| (20_000.0 / f64::from(1u32 << z), Some(z + 4)))
+            .collect();
+        let finest = level_specs.len() - 1;
+        let options = ConvertOptions::default();
+        let run = |wave: usize| {
+            coalesce_level_counts_in_waves(
+                &scratch,
+                &level_specs,
+                finest,
+                Crs::Epsg4326,
+                &options,
+                true,
+                wave,
+            )
+        };
+        let (all_counts, all_build) = run(level_specs.len());
+        let all_build = all_build.unwrap();
+        for wave in [1, 2, 4] {
+            let (counts, build) = run(wave);
+            let build = build.unwrap();
+            assert_eq!(counts, all_counts, "wave {wave}");
+            assert_eq!(build.merged, all_build.merged, "wave {wave}");
+            assert_eq!(build.tables, all_build.tables, "wave {wave}");
+        }
     }
 
     /// Pass 2 takes pass 1's prebuilt tables verbatim, level by level, and

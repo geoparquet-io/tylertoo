@@ -1074,21 +1074,34 @@ footprint **4890 → 1157 MiB** (−76 %, byte-identical output); the real
 input's post-fix peak is an extrapolation, not a measurement.
 
 **What the guard does not bound** is the chain stage itself, on inputs that
-*are* inside the ceiling: `build_chains` copies every line's coordinate run
-into a joinable piece and indexes every endpoint in a hash map, per level,
-and runs twice per level (#570). Measured whole-run peaks for 1.5M 7-vertex
-lines (240 MiB of modelled retained geometry), macOS peak memory footprint:
+*are* inside the ceiling. Every overview level runs it over the whole line
+scratch, and pass 1 runs it for every planned level (a level's row count is
+its chain count, which the level plan needs before pass 2). Since #570 an
+unmerged line borrows its coordinates instead of copying them, endpoints are
+grouped by a sort instead of a hash map of vectors, and pass 2 reuses the
+tables pass 1 built instead of running the stage a second time.
 
-| fixture | peak, coalescing on | peak, `--no-coalesce-lines` | ratio to modelled retained |
+The levels run in parallel, in waves sized against the `--profile` memory
+budget (60 % of available RAM under `auto`/`bounded`, unbounded under
+`speed`): at most `budget / (2 × modelled line bytes)` levels at once, and
+never fewer than one. A tighter budget costs wall time, never output.
+Measured on Linux (`/usr/bin/time -v` max RSS), 1.5M 7-vertex lines in
+chains of ten (240 MiB modelled):
+
+| run | before #570 | #570, unbounded budget | #570, budget capped |
 |---|---|---|---|
-| #569 benchmark (1.5M × 7 vertices) | 3825 MiB | — | ≈16× |
-| end-to-end chains, z0–z14 (1.5M × 7 vertices, 2000-segment strokes) | 6923 MiB | 329 MiB | ≈29× (≈27× as a delta) |
+| `tiles`, z0–z14 | 5340 MiB, 80 s | 4667 MiB, 19 s | 3525 MiB, 19 s (8 GB RAM, 9 levels per wave) |
+| `overview` defaults (6 of 7 levels empty) | 1227 MiB, 24 s | 2386 MiB, 2.4 s | 1373 MiB, 5.6 s (2.5 GB RAM, 2 levels per wave) |
+| `tiles --plan-only` | 1437 MiB, 50 s | 4973 MiB, 4.6 s | 1845 MiB, 9.6 s (2.5 GB RAM, 2 levels per wave) |
 
-So budget **≈30× the modelled retained geometry on top of the run's
-`--no-coalesce-lines` peak** for an in-ceiling line input — at the default
-ceiling's ≈1 GB that is tens of GiB — or pass `--no-coalesce-lines`.
-Shrinking this amplification is tracked in
-[#570](https://github.com/geoparquet-io/tylertoo/issues/570).
+The same input with `--no-coalesce-lines` peaks at 935 MiB (`tiles`,
+z0–z14). With RAM to spare, the parallel levels trade memory for time: a
+run whose coarse levels come out empty can peak higher than before #570,
+because pass 2 used to build only the levels that had rows, while pass 1
+cannot know which levels are empty until it has run them. Under memory
+pressure the budget caps the waves. To force the lowest peak, set
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` low (one level per wave), or pass
+`--no-coalesce-lines`.
 
 ### Interactions
 

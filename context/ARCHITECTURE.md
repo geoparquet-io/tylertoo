@@ -139,7 +139,13 @@ verbatim (spec §2.4).
    dropped rather than carried; pass 2 rebuilds any level whose table is
    missing, so the ceiling predicate is a caching decision, never a
    correctness one. The `--plan` path skips pass 1 entirely and pass 2 builds
-   the tables itself, as before.
+   the tables itself, as before. `--plan-only` has no pass 2, so it counts
+   the chains without simplifying or keeping them; the counts, and so the
+   plan artifact, are the same. The levels run in parallel waves sized
+   against the profile's pass-1 memory budget (`chain_stage_wave`), since
+   each level's chain stage spans the whole line scratch and pass 1 runs
+   levels that turn out empty, which pass 2 used to skip. Wave size changes
+   the peak and the wall time, never the result.
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
    reader thread streams batches over a bounded channel while a consumer
