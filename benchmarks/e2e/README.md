@@ -14,8 +14,14 @@ No CI wiring lives here — benchmarking in CI is [#448](https://github.com/geop
 ./benchmarks/e2e/setup_tippecanoe.sh        # builds the pinned tippecanoe
 cargo build --release -p tylertoo
 python3 benchmarks/e2e/run_e2e.py --repeat 3 --geojson --quality-matched
-python3 benchmarks/e2e/format_results.py    # print RESULTS.md's tables
+python3 benchmarks/e2e/format_results.py benchmarks/e2e/results-<stamp>.json
 ```
+
+A run writes `results-<UTC timestamp>.json` (gitignored), so an ad-hoc run
+never overwrites the committed record. `format_results.py` with no argument
+prints the committed `results.json`. Replacing the committed record is a
+deliberate act: pass `--out benchmarks/e2e/results.json`, then regenerate
+RESULTS.md's tables from it.
 
 `run_e2e.py` is standard library only. The optional visual-parity renderer
 needs plotting packages and runs under `uv`:
@@ -42,17 +48,21 @@ The harness makes all four measurements and prints all four:
 | **C** | tippecanoe tile-only: `fgb → pmtiles` | is the *tiler* faster, given a free head start |
 
 **A′ exists because A is not an output-parity comparison.** tylertoo's density
-budget thins features at coarse and mid zooms. tippecanoe drops nothing but
-points, so on a contiguous polygon coverage it emits every feature at every
-zoom. On the madagascar fixture that is 865 of 17,465 admin polygons at z8
-against tippecanoe's 17,465 — a visibly different map, not a subtler one, and
-quoting A against it would be quoting a number for less work.
+budget thins features hard at coarse and mid zooms. tippecanoe's rate-based
+dropping applies only to points at defaults; its tiny-polygon reduction
+(disabled by `-pt`) still removes small polygons at low zooms, but on a
+contiguous polygon coverage it keeps far more of them and reaches every
+feature by a mid zoom. On the madagascar fixture tylertoo's default has 865 of
+17,465 admin polygons at z8 while tippecanoe reaches all 17,465 by z8 — a
+visibly different map, not a subtler one, and quoting A against it would be
+quoting a number for less work.
 
 A′ runs `--verbatim --simplify-factor 1.0`, which switches the whole
 thinning/visibility ladder off while keeping simplification (verbatim alone
-would drop that too, and tippecanoe does simplify). It lands within a handful
-of tiles of tippecanoe's per-zoom counts, which is how we know the comparison
-is like-for-like. **A′ vs C is the number to quote to a skeptic.**
+would drop that too, and tippecanoe does simplify). It reaches near-parity,
+not identical output: on madagascar, tile counts within 2 of tippecanoe's per
+zoom, distinct features within 0.4% at z8 and ~5% at z4, with 10 tiles hitting
+tylertoo's size valve. **A′ vs C is the number to quote to a skeptic.**
 
 **A vs B is the product comparison.** Reading GeoParquet natively is the
 product's thesis, not a benchmarking trick: a user who starts from GeoParquet
@@ -71,8 +81,13 @@ the subtraction themselves.
 `setup_tippecanoe.sh` clones **felt/tippecanoe at tag `2.79.0`**, verifies the
 commit is `68ab8dcc229f95b8b25877697d5e8d66783af503`, builds it into
 `.tools/`, and writes `tippecanoe.lock.json`. `run_e2e.py` refuses to run
-against a binary whose `--version` does not match the lockfile (override with
-`TIPPECANOE_ALLOW_MISMATCH=1`, and then say so in the write-up).
+against a binary whose `--version` is not `tippecanoe v2.79.0` — the expected
+string is hard-coded in the harness, so the check holds with or without a
+lockfile (override with `TIPPECANOE_ALLOW_MISMATCH=1`, which is recorded in
+the results; say so in the write-up). The build tag and SHA are recorded only
+when the binary is the one the lockfile names; any other binary is recorded
+with `sha: null`. Re-pinning to another tag requires both `TIPPECANOE_TAG` and
+`TIPPECANOE_SHA`; the script refuses a tag without its expected commit.
 
 The **pin itself** lives in `setup_tippecanoe.sh` (`TIPPECANOE_TAG` /
 `TIPPECANOE_SHA`); the lockfile is a machine-local artifact naming a built
@@ -101,7 +116,7 @@ harness passes exactly this and records the full argv of both tools in
 | zoom range | `--min-zoom 0 --max-zoom 14` | `-Z 0 -z 14` | **matched** |
 | layer name | `--layer-name <id>` | `-l <id>` | **matched** |
 | tile buffer | `--tile-buffer 8` | `-b 8` (tippecanoe default is 5) | **matched**, by moving tippecanoe to tylertoo's value |
-| per-tile byte cap | `--max-tile-size 500K` | `--maximum-tile-bytes 500000` | **matched** (same number is also tippecanoe's default) |
+| per-tile byte cap | `--max-tile-size 500000` (tylertoo's own default `500K` is 512,000 bytes) | `--maximum-tile-bytes 500000` (tippecanoe's default) | **matched**, by passing tippecanoe's 500,000 explicitly to both |
 | oversize-tile valve | single non-iterative drop pass (always on) | `--drop-fraction-as-needed` | **approximated** — see asymmetries |
 | drop rate | `--drop-rate 1.65` | *not passed* (tippecanoe default 2.5) | **not matched on purpose** — see asymmetries |
 | gamma | `--drop-gamma 1.5` | *not passed* (tippecanoe default 0) | **not matched on purpose** |
@@ -126,7 +141,7 @@ These are real and are not tuned away in either direction.
 
 | # | asymmetry | which way it cuts |
 |---|---|---|
-| 0 | **Defaults do not produce the same map.** tylertoo's density budget thins features at coarse and mid zooms; tippecanoe drops only points. For a contiguous polygon coverage tylertoo's default output has visible holes where tippecanoe's is complete. | **favours tylertoo heavily in A.** This is why A′ exists; quote A′ vs C for output parity. |
+| 0 | **Defaults do not produce the same map.** tylertoo's density budget thins features hard at coarse and mid zooms; tippecanoe's rate-based dropping applies only to points at defaults, and its tiny-polygon reduction removes only small polygons at low zooms (it reaches all 17,465 madagascar polygons by z8). For a contiguous polygon coverage tylertoo's default output has visible holes where tippecanoe's is complete. | **favours tylertoo heavily in A.** This is why A′ exists; quote A′ vs C for output parity. |
 | 1 | **Input format.** tippecanoe cannot read GeoParquet; a conversion step is unavoidable. | favours tylertoo in A-vs-B. Neutralised in A-vs-C. |
 | 2 | **Generalization model.** tylertoo generalizes in world space, once per level, into a reusable overview file; tippecanoe generalizes in tile space, per tile, at encode time. They are not the same algorithm producing the same tiles faster — they are different algorithms with comparable *output intent*. Even in A′ the simplification is metres-of-GSD vs tile units, so vertex counts differ. | unquantifiable; this is why the visual-parity renderer exists |
 | 3 | **Oversize-tile valve.** tylertoo does one non-iterative drop pass; `--drop-fraction-as-needed` re-encodes the tile in a loop until it fits. | favours tylertoo on time, tippecanoe on tile-fill quality |
@@ -136,6 +151,7 @@ These are real and are not tuned away in either direction.
 | 7 | **Converter start-up.** `gpio` is a Python CLI (~0.3 s interpreter start-up); `ogr2ogr` is a C binary. On a 1,000-feature fixture the start-up *is* the conversion time. The harness times **both** converters and the e2e number uses the **faster**. A converter that fails on a dataset is recorded and skipped, not fatal — `gpio convert flatgeobuf` currently fails on the madagascar fixture (`NULL geometry not supported with spatial index`, although the parquet has no null, empty or invalid geometry), so `ogr2ogr` supplied that input. | neutralised |
 | 8 | **Thread counts.** Both tools use all cores; neither is pinned. tylertoo's export wave width is `auto` (memory-preflighted). Numbers are machine-specific, which is why `results.json` records CPU, core count and RAM. | neutral, but not portable |
 | 9 | **Warm cache.** A discarded warm-up run precedes the timed repeats for every stage, on both sides. No cold-cache numbers are published — macOS cannot drop caches without root. | neutral |
+| 10 | **Fixed run order.** Every dataset runs tylertoo first (defaults, then quality-matched), then the converters, then tippecanoe; runs are not interleaved. On a laptop, thermal state drifts across a run, so the later, longer tippecanoe stages may run on a hotter (throttled) or cooler machine than tylertoo's. | unknown direction; machine-dependent |
 
 ## Metrics
 
@@ -192,8 +208,8 @@ dataset. That is the path for cluster-scale runs.
 | file | what it is |
 |---|---|
 | `setup_tippecanoe.sh` | clones + verifies + builds the pinned tippecanoe; writes `tippecanoe.lock.json` |
-| `run_e2e.py` | the harness (stdlib only); writes `results.json` and a markdown table |
-| `format_results.py` | prints RESULTS.md's tables from `results.json`, so no number is retyped |
+| `run_e2e.py` | the harness (stdlib only); writes `results-<UTC timestamp>.json` (or `--out`) and a markdown table |
+| `format_results.py` | prints RESULTS.md's tables from a results file (default `results.json`), so no number is retyped |
 | `render_parity.py` | side-by-side PNG renders of two archives at chosen zooms, with distinct-feature counts |
 | `results.json` | the recorded run behind RESULTS.md (machine, argv, every repeat) |
 | `RESULTS.md` | measured numbers, machine, caveats |
@@ -208,6 +224,7 @@ dataset. That is the path for cluster-scale runs.
 | `--geojson` | adds the ldGeoJSON + `-P` leg, evidence for "fgb is tippecanoe's best input" |
 | `--repeat N` | timed runs per measurement (median); default 3 |
 | `--dataset ID=PATH` | register your own GeoParquet; cluster-scale path |
-| `--tippecanoe-extra="…"` | probe a single tippecanoe flag's cost, recorded in `results.json` (use `=`, or argparse eats a leading `-`) |
+| `--tippecanoe-extra="…"` | probe a single tippecanoe flag's cost, recorded in the results file (use `=`, or argparse eats a leading `-`) |
 | `--work DIR --keep` | keep intermediates and archives, e.g. to feed `render_parity.py` |
-| `--tippecanoe PATH` | use a different tippecanoe (version must match the lockfile) |
+| `--tippecanoe PATH` | use a different tippecanoe (its `--version` must still be `tippecanoe v2.79.0`; recorded with `sha: null`) |
+| `--out FILE` | results file; default `results-<UTC timestamp>.json`. Name `results.json` only to replace the committed record |

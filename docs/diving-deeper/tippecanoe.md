@@ -60,10 +60,13 @@ measured numbers are in `benchmarks/e2e/RESULTS.md`.
 Two things a skeptical reader should know before reading any ratio.
 
 **At defaults the two tools do not draw the same map.** tylertoo's density
-budget thins features at coarse and mid zooms. tippecanoe drops only points,
-so on a contiguous polygon coverage it emits every feature at every zoom. On a
-17,465-polygon admin-boundary dataset, tylertoo's default z8 tile set carries
-865 of those polygons and tippecanoe's carries all 17,465. If your layer is a
+budget thins features hard at coarse and mid zooms. tippecanoe's rate-based
+dropping applies only to points at defaults; its tiny-polygon reduction still
+removes small polygons at low zooms, but on a contiguous polygon coverage it
+keeps far more and reaches every feature by a mid zoom. On a 17,465-polygon
+admin-boundary dataset, tylertoo's default z8 tile set carries 865 of those
+polygons and tippecanoe's reaches all 17,465 by z8 (at z4 the counts are 254
+and 6,102). If your layer is a
 coverage rather than a sample — admin boundaries, parcels, a choropleth — that
 is the behaviour to change (`--verbatim`, or raise `--gsd-base` and lower the
 thinning factors; see [Tuning what appears at each zoom](tuning-zoom.md)), and
@@ -77,19 +80,23 @@ pushdown and remote byte-range reads possible at all, but the tiling engine
 is carrying the ratio.
 
 With those stated, on that dataset (Apple M3 Pro, 12 cores, z0–z14, median of
-3 warm runs):
+3 warm runs; measured at tylertoo 0.11.0 @ `044360d`, which includes the #559
+export speed-up and predates #564's parallel level assignment):
 
 | comparison | tylertoo | tippecanoe 2.79.0 | ratio |
 |---|---|---|---|
-| Same features at every zoom (`--verbatim --simplify-factor 1.0`) vs tippecanoe reading FlatGeobuf | 2.67 s | 20.05 s | **≈7.5×** |
-| Each tool at its own defaults, end to end from GeoParquet | 1.61 s | 20.24 s | **≈10–12×** |
+| Near-parity output (`--verbatim --simplify-factor 1.0`) vs tippecanoe reading FlatGeobuf | 2.67 s | 20.05 s | **≈7.5×** |
+| Each tool at its own defaults, end to end from GeoParquet | 1.61 s | 20.24 s | **≈12.5×** |
 | Output archive, quality-matched | 118 MB | 151 MB | 0.78× |
-| Peak RSS, quality-matched run | 760 MB | 413 MB | 1.8× (tylertoo heavier) |
+| Peak RSS, quality-matched run | 835 MB | 413 MB | 2.0× (tylertoo heavier) |
 
-The quality-matched row lands within two tiles of tippecanoe's count at every
-zoom, which is how we know it is like-for-like. The defaults row is a range
-because two runs an hour apart on the same idle laptop differed by 20%. The
-memory row is a loss, not a win, and `--partition-wave` is the knob.
+The quality-matched run is near-parity, not identical output: its tile count
+is within 2 of tippecanoe's at every zoom, its distinct features are within
+0.4% of tippecanoe's at z8 and about 5% at z4, and 10 of its tiles hit
+tylertoo's per-tile size valve. Each figure is one run of three warm repeats
+on a laptop, so treat single-digit ratios as approximate; the per-repeat
+spread is in `benchmarks/e2e/RESULTS.md`. The memory row is a loss, not a
+win, and `--partition-wave` is the knob.
 
 The corpus is three in-repo fixtures, the largest 28 MB; nothing here says how
 either tool behaves at planet scale, on points, or on cold cache.

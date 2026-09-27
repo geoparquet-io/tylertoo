@@ -53,7 +53,8 @@ the vector-tile tool this project measures itself against — tylertoo runs alon
 The head-to-head is measured, not asserted: `benchmarks/e2e/` pins tippecanoe
 2.79.0 by commit and reports wall time, peak RSS, archive size and per-zoom
 tile parity, with the asymmetries that cannot be closed listed rather than
-buried
+buried. The published numbers were measured at tylertoo 0.11.0 @ `044360d`
+(includes #559's export speed-up; predates #564's parallel level assignment)
 ([results](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md),
 [method](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/README.md),
 [how the two tools line up](https://geoparquet-io.github.io/tylertoo/diving-deeper/tippecanoe/)).

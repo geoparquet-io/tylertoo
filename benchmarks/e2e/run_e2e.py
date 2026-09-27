@@ -28,11 +28,14 @@ pre-converted FlatGeobuf for free and asks whether the tiler itself is faster.
 Report both or report neither.
 
 A' vs C is the comparison to quote to a skeptic. tylertoo's density budget
-thins features at coarse and mid zooms; tippecanoe drops only points, so on a
-contiguous polygon coverage it emits every feature at every zoom. Measuring A
-against C on such a dataset compares against less work. A' turns the ladder
-off (keeping simplification) and lands within a couple of tiles of
-tippecanoe's per-zoom counts.
+thins features hard at coarse and mid zooms. tippecanoe's rate-based dropping
+applies only to points at defaults; it still removes small polygons at low
+zooms (tiny-polygon reduction, which -pt disables), but on a contiguous
+polygon coverage it keeps far more of them and reaches every feature by a
+mid zoom (all 17,465 of madagascar-adm4 by z8, against tylertoo's 865).
+Measuring A against C on such a dataset compares against less work. A' turns
+the ladder off (keeping simplification) and reaches near-parity: tile counts
+within 2 per zoom, features within 0.4% at z8 and ~5% at z4.
 
 The conversion step (B − C) is printed on its own so a reader can see exactly
 how much of the e2e gap is input format. A line-delimited GeoJSON variant is
@@ -42,8 +45,10 @@ real GeoParquet→tippecanoe pipelines actually run.
 
 FAIRNESS RULES THIS SCRIPT FOLLOWS
 ----------------------------------
-* tippecanoe is pinned (see setup_tippecanoe.sh) and its version + git SHA go
-  into every result file. Never "whatever is on PATH".
+* tippecanoe is pinned (see setup_tippecanoe.sh). Its `--version` must equal
+  EXPECTED_TIPPECANOE_VERSION on every run, and goes into every result file
+  with the build tag + SHA when the binary is the one setup_tippecanoe.sh
+  built (null otherwise). Never "whatever is on PATH".
 * Both tools get the same zoom range, the same layer name, the same tile
   buffer and the same per-tile byte cap. The exact argv of both is recorded.
 * A discarded warm-up run precedes the timed repeats, so every measurement is
@@ -57,6 +62,8 @@ USAGE
     ./setup_tippecanoe.sh
     cargo build --release -p tylertoo
     python3 run_e2e.py --repeat 3 --geojson --quality-matched   # the full run
+        # -> results-<UTC timestamp>.json (gitignored); pass --out results.json
+        #    only when deliberately replacing the committed record
     python3 run_e2e.py --only madagascar-adm4 --repeat 5
     python3 run_e2e.py --dataset big=/data/planet-buildings.parquet \
                        --only big --max-zoom 12         # cluster-scale run
@@ -122,8 +129,11 @@ DATASETS = {
 # Settings parity
 #
 # These are tylertoo's `tiles` defaults, mapped onto the nearest tippecanoe
-# flag. Where a default already matches (the 500 KB per-tile cap) nothing is
-# passed on either side. Where tylertoo's default differs from tippecanoe's
+# flag, and passed EXPLICITLY on both sides so neither tool's default decides.
+# The per-tile cap looks matched but is not: tylertoo's default `500K` is
+# 500 * 1024 = 512,000 bytes, tippecanoe's default --maximum-tile-bytes is
+# 500,000, so the harness passes 500000 to both. Where tylertoo's default
+# differs from tippecanoe's
 # (buffer 8 vs 5) the tippecanoe side is moved to tylertoo's value rather than
 # the reverse, because the buffer changes output *size*, and letting
 # tippecanoe write smaller tiles from a smaller buffer would flatter tylertoo
@@ -145,7 +155,15 @@ DATASETS = {
 DEFAULT_MIN_ZOOM = 0
 DEFAULT_MAX_ZOOM = 14
 TILE_BUFFER = 8            # tylertoo default; tippecanoe default is 5
-MAX_TILE_BYTES = 500_000   # tylertoo --max-tile-size 500K == tippecanoe default
+# tippecanoe's default cap. NOT tylertoo's default (its `500K` is 512,000
+# bytes), so the harness passes 500000 to both tools explicitly.
+MAX_TILE_BYTES = 500_000
+
+# The pinned baseline, exactly as `tippecanoe --version` prints it. Enforced on
+# every run, whether or not the gitignored, machine-local tippecanoe.lock.json
+# exists: a missing lockfile must never mean "any binary will do". Keep in
+# step with TIPPECANOE_TAG in setup_tippecanoe.sh.
+EXPECTED_TIPPECANOE_VERSION = "tippecanoe v2.79.0"
 
 
 # --------------------------------------------------------------------------
@@ -296,19 +314,22 @@ def geojsonseq_argv(src: Path, dst: Path) -> list[str] | None:
 # Flags for the QUALITY-MATCHED tylertoo run (see --quality-matched).
 #
 # At defaults the two tools do not emit the same map. tylertoo's density budget
-# thins features at coarse and mid zooms; tippecanoe drops nothing but points,
-# so for a contiguous polygon coverage (admin boundaries, parcels) tippecanoe
-# emits every feature at every zoom and tylertoo emits a sample. On the
-# madagascar fixture that is 865 of 17,465 polygons at z8 — a visibly
-# different map, and comparing wall time against it would be comparing
-# against less work.
+# thins features hard at coarse and mid zooms. tippecanoe's rate-based
+# dropping applies only to points at defaults; its tiny-polygon reduction
+# (disabled by -pt) still removes small polygons at low zooms, but for a
+# contiguous polygon coverage (admin boundaries, parcels) it keeps most of
+# them and reaches every feature by a mid zoom, while tylertoo emits a sample.
+# On the madagascar fixture tippecanoe has all 17,465 polygons by z8 and
+# tylertoo's default has 865 — a visibly different map, and comparing wall
+# time against it would be comparing against less work.
 #
 # `--verbatim` switches the whole thinning/visibility ladder off, and
 # `--simplify-factor` is then set back explicitly (verbatim would otherwise
 # disable simplification too, and tippecanoe does simplify). `--max-tile-size`
-# likewise has to be restated because verbatim disables the cap. The result
-# emits every feature at every zoom, which is what tippecanoe does here, and
-# lands within a handful of tiles of tippecanoe's per-zoom counts.
+# likewise has to be restated because verbatim disables the cap (so the size
+# valve still fires: 10 madagascar tiles hit it). The result is near-parity
+# with tippecanoe, not identity: tile counts within 2 per zoom, features
+# within 0.4% at z8 and ~5% at z4.
 QUALITY_MATCHED_FLAGS = ["--verbatim", "--simplify-factor", "1.0"]
 
 
@@ -382,30 +403,39 @@ def main() -> int:
     ap.add_argument("--tylertoo", default=os.environ.get(
         "TYLERTOO", str(REPO / "target" / "release" / "tylertoo")))
     ap.add_argument("--tippecanoe", default=os.environ.get("TIPPECANOE"),
-                    help="default: the binary named in tippecanoe.lock.json")
+                    help="default: the binary named in tippecanoe.lock.json. "
+                         "Its --version must be "
+                         f"{EXPECTED_TIPPECANOE_VERSION!r} either way")
     ap.add_argument("--tippecanoe-extra", default="",
                     help="extra tippecanoe flags, space-separated, appended to "
-                         "the parity set and recorded in results.json "
+                         "the parity set and recorded in the results file "
                          "(e.g. --tippecanoe-extra=-pf). Pass it with '=' or "
                          "argparse will swallow the leading dash. For probing "
                          "how much a single flag costs — publish the parity "
                          "set, not a variant, unless you say which")
     ap.add_argument("--quality-matched", action="store_true",
                     help="also run tylertoo with the thinning ladder off "
-                         f"({' '.join(QUALITY_MATCHED_FLAGS)}) so it emits "
-                         "every feature at every zoom, as tippecanoe does "
-                         "for polygons/lines. This is the comparison to quote "
-                         "when output parity matters more than defaults")
+                         f"({' '.join(QUALITY_MATCHED_FLAGS)}) so its per-zoom "
+                         "output is near tippecanoe's for polygons/lines. "
+                         "This is the comparison to quote when output parity "
+                         "matters more than defaults")
     ap.add_argument("--geojson", action="store_true",
                     help="also measure the ldGeoJSON + -P tippecanoe path")
     ap.add_argument("--work", default=None,
                     help="working directory for intermediates (default: a temp dir)")
     ap.add_argument("--keep", action="store_true",
                     help="keep intermediates and output archives")
-    ap.add_argument("--out", default=str(HERE / "results.json"))
+    ap.add_argument("--out", default=None,
+                    help="results file (default: results-<UTC timestamp>.json "
+                         "next to this script, gitignored). The committed "
+                         "record results.json is only ever written when named "
+                         "here explicitly")
     ap.add_argument("--markdown", default=None,
                     help="also write a markdown table here")
     args = ap.parse_args()
+    if args.out is None:
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        args.out = str(HERE / f"results-{stamp}.json")
 
     # --- resolve binaries -------------------------------------------------
     tylertoo = args.tylertoo
@@ -423,12 +453,21 @@ def main() -> int:
     tip_version = subprocess.check_output([tippecanoe, "--version"],
                                           stderr=subprocess.STDOUT,
                                           text=True).strip().splitlines()[0]
-    pinned = lock.get("version_string")
-    if pinned and tip_version != pinned and not os.environ.get("TIPPECANOE_ALLOW_MISMATCH"):
+    mismatch_allowed = bool(os.environ.get("TIPPECANOE_ALLOW_MISMATCH"))
+    if tip_version != EXPECTED_TIPPECANOE_VERSION and not mismatch_allowed:
         return fail(f"tippecanoe version mismatch: got {tip_version!r}, "
-                    f"pinned {pinned!r}\n"
-                    "  set TIPPECANOE_ALLOW_MISMATCH=1 to override (and say so "
-                    "in the results)")
+                    f"pinned {EXPECTED_TIPPECANOE_VERSION!r}\n"
+                    "  set TIPPECANOE_ALLOW_MISMATCH=1 to override (recorded "
+                    "in the results; say so in the write-up)")
+
+    # The lockfile's tag + SHA describe the binary setup_tippecanoe.sh built.
+    # They are only true of THIS run if this run is using that binary; for any
+    # other binary (brew, --tippecanoe PATH) the build commit is unknown and
+    # is recorded as null rather than borrowed.
+    lock_bin = lock.get("binary")
+    is_lock_binary = bool(lock_bin) and Path(lock_bin).resolve() == Path(tippecanoe).resolve()
+    tip_tag = lock.get("tag") if is_lock_binary else None
+    tip_sha = lock.get("sha") if is_lock_binary else None
 
     tyler_version = subprocess.check_output([tylertoo, "--version"],
                                             text=True).strip()
@@ -451,209 +490,215 @@ def main() -> int:
     workdir = Path(args.work) if args.work else Path(tempfile.mkdtemp(prefix="tt-e2e-"))
     workdir.mkdir(parents=True, exist_ok=True)
 
-    results = {
-        "schema_version": 1,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "machine": machine_info(),
-        "tylertoo": {"binary": tylertoo, "version": tyler_version,
-                     "git_sha": git_sha()},
-        "tippecanoe": {"binary": tippecanoe, "version": tip_version,
-                       "tag": lock.get("tag"), "sha": lock.get("sha")},
-        "settings": {
-            "min_zoom": args.min_zoom, "max_zoom": args.max_zoom,
-            "tile_buffer": TILE_BUFFER, "max_tile_bytes": MAX_TILE_BYTES,
-            "repeat": args.repeat, "warm_cache": True,
-            "tippecanoe_extra": tip_extra,
-        },
-        "datasets": {},
-    }
-
-    for did, ds in datasets.items():
-        src = Path(ds["path"])
-        if not src.exists():
-            print(f"skip {did}: {src} not found "
-                  f"(fetch: gh release download fixtures-v1 "
-                  f"--dir tests/fixtures/realdata/)", file=sys.stderr)
-            continue
-        print(f"\n=== {did} ===", flush=True)
-        entry = {
-            "input": str(src),
-            "input_bytes": src.stat().st_size,
-            "note": ds.get("note"),
-            "layer": ds["layer"],
+    # The work dir is removed on every exit path (success, a failed stage,
+    # Ctrl-C) unless the caller asked to keep it or supplied it.
+    try:
+        results = {
+            "schema_version": 1,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "machine": machine_info(),
+            "tylertoo": {"binary": tylertoo, "version": tyler_version,
+                         "git_sha": git_sha()},
+            "tippecanoe": {"binary": tippecanoe, "version": tip_version,
+                           "expected_version": EXPECTED_TIPPECANOE_VERSION,
+                           "version_mismatch_allowed": (
+                               tip_version != EXPECTED_TIPPECANOE_VERSION),
+                           "tag": tip_tag, "sha": tip_sha},
+            "settings": {
+                "min_zoom": args.min_zoom, "max_zoom": args.max_zoom,
+                "tile_buffer": TILE_BUFFER, "max_tile_bytes": MAX_TILE_BYTES,
+                "repeat": args.repeat, "warm_cache": True,
+                "tippecanoe_extra": tip_extra,
+            },
+            "datasets": {},
         }
 
-        # --- A. tylertoo: parquet -> pmtiles -----------------------------
-        tt_out = workdir / f"{did}.tylertoo.pmtiles"
-        tt_report = workdir / f"{did}.tylertoo.report.json"
-        print("  tylertoo tiles (parquet -> pmtiles) ...", flush=True)
-        entry["tylertoo"] = repeat(
-            tylertoo_argv(tylertoo, src, tt_out, ds["layer"],
-                          args.min_zoom, args.max_zoom, tt_report),
-            args.repeat)
-        entry["tylertoo"]["output_bytes"] = tt_out.stat().st_size
-        entry["tylertoo"]["per_zoom"] = per_zoom_counts(tylertoo, tt_out)
-        if tt_report.exists():
-            entry["tylertoo"]["phases"] = phase_split(tt_report)
-
-        # --- A'. tylertoo with the thinning ladder off (output parity) ----
-        if args.quality_matched:
-            qm_out = workdir / f"{did}.tylertoo-qm.pmtiles"
-            qm_report = workdir / f"{did}.tylertoo-qm.report.json"
-            print("  tylertoo tiles, quality-matched "
-                  f"({' '.join(QUALITY_MATCHED_FLAGS)}) ...", flush=True)
-            entry["tylertoo_quality_matched"] = repeat(
-                tylertoo_argv(tylertoo, src, qm_out, ds["layer"],
-                              args.min_zoom, args.max_zoom, qm_report,
-                              QUALITY_MATCHED_FLAGS),
-                args.repeat)
-            entry["tylertoo_quality_matched"]["output_bytes"] = \
-                qm_out.stat().st_size
-            entry["tylertoo_quality_matched"]["per_zoom"] = \
-                per_zoom_counts(tylertoo, qm_out)
-            if qm_report.exists():
-                entry["tylertoo_quality_matched"]["phases"] = \
-                    phase_split(qm_report)
-
-        # --- input conversion: parquet -> fgb ----------------------------
-        converters = fgb_converters(src, workdir, did)
-        if not converters:
-            return fail("neither ogr2ogr nor gpio found; cannot build "
-                        "tippecanoe's input. Install GDAL or gpio.")
-        entry["convert_fgb_candidates"] = {}
-        for tool, (argv, dst) in converters.items():
-            print(f"  {tool}: parquet -> fgb ...", flush=True)
-            try:
-                m = repeat(argv, args.repeat, unlink_first=dst)
-            except CommandFailed as exc:
-                # A converter that cannot handle this dataset is a fact about
-                # the dataset, recorded rather than fatal — as long as one
-                # converter works, tippecanoe still gets its input.
-                print(f"    {tool} failed (recorded, not fatal): "
-                      f"{first_error_line(exc.tail)}", file=sys.stderr)
-                entry["convert_fgb_candidates"][tool] = {
-                    "tool": tool, "failed": True, "argv": argv,
-                    "stderr_tail": exc.tail[-600:]}
+        for did, ds in datasets.items():
+            src = Path(ds["path"])
+            if not src.exists():
+                print(f"skip {did}: {src} not found "
+                      f"(fetch: gh release download fixtures-v1 "
+                      f"--dir tests/fixtures/realdata/)", file=sys.stderr)
                 continue
-            m["output_bytes"] = dst.stat().st_size
-            m["tool"] = tool
-            m["path"] = str(dst)
-            entry["convert_fgb_candidates"][tool] = m
-        ok = [m for m in entry["convert_fgb_candidates"].values()
-              if not m.get("failed")]
-        if not ok:
-            return fail(f"no parquet->fgb converter succeeded for {did}; "
-                        f"see {args.out} for the recorded errors")
-        best = min(ok, key=lambda m: m["wall_median_s"])
-        entry["convert_fgb"] = best
-        fgb = Path(best["path"])
+            print(f"\n=== {did} ===", flush=True)
+            entry = {
+                "input": str(src),
+                "input_bytes": src.stat().st_size,
+                "note": ds.get("note"),
+                "layer": ds["layer"],
+            }
 
-        # --- C. tippecanoe: fgb -> pmtiles -------------------------------
-        tp_out = workdir / f"{did}.tippecanoe-fgb.pmtiles"
-        print("  tippecanoe (fgb -> pmtiles) ...", flush=True)
-        entry["tippecanoe_fgb"] = repeat(
-            tippecanoe_argv(tippecanoe, fgb, tp_out, ds["layer"],
-                            args.min_zoom, args.max_zoom, False, tip_extra),
-            args.repeat)
-        entry["tippecanoe_fgb"]["output_bytes"] = tp_out.stat().st_size
-        entry["tippecanoe_fgb"]["per_zoom"] = per_zoom_counts(tylertoo, tp_out)
+            # --- A. tylertoo: parquet -> pmtiles -----------------------------
+            tt_out = workdir / f"{did}.tylertoo.pmtiles"
+            tt_report = workdir / f"{did}.tylertoo.report.json"
+            print("  tylertoo tiles (parquet -> pmtiles) ...", flush=True)
+            entry["tylertoo"] = repeat(
+                tylertoo_argv(tylertoo, src, tt_out, ds["layer"],
+                              args.min_zoom, args.max_zoom, tt_report),
+                args.repeat)
+            entry["tylertoo"]["output_bytes"] = tt_out.stat().st_size
+            entry["tylertoo"]["per_zoom"] = per_zoom_counts(tylertoo, tt_out)
+            if tt_report.exists():
+                entry["tylertoo"]["phases"] = phase_split(tt_report)
 
-        # --- B. the honest e2e = conversion + tiling ---------------------
-        entry["tippecanoe_e2e"] = {
-            "wall_median_s": (entry["convert_fgb"]["wall_median_s"]
-                              + entry["tippecanoe_fgb"]["wall_median_s"]),
-            "peak_rss_bytes": max_opt(entry["convert_fgb"]["peak_rss_bytes"],
-                                      entry["tippecanoe_fgb"]["peak_rss_bytes"]),
-            "converter": entry["convert_fgb"]["tool"],
-            "note": "parquet->fgb (fastest available converter) then "
-                    "fgb->pmtiles, run as two processes; peak RSS is the "
-                    "larger of the two stages, not their sum",
-        }
+            # --- A'. tylertoo with the thinning ladder off (output parity) ----
+            if args.quality_matched:
+                qm_out = workdir / f"{did}.tylertoo-qm.pmtiles"
+                qm_report = workdir / f"{did}.tylertoo-qm.report.json"
+                print("  tylertoo tiles, quality-matched "
+                      f"({' '.join(QUALITY_MATCHED_FLAGS)}) ...", flush=True)
+                entry["tylertoo_quality_matched"] = repeat(
+                    tylertoo_argv(tylertoo, src, qm_out, ds["layer"],
+                                  args.min_zoom, args.max_zoom, qm_report,
+                                  QUALITY_MATCHED_FLAGS),
+                    args.repeat)
+                entry["tylertoo_quality_matched"]["output_bytes"] = \
+                    qm_out.stat().st_size
+                entry["tylertoo_quality_matched"]["per_zoom"] = \
+                    per_zoom_counts(tylertoo, qm_out)
+                if qm_report.exists():
+                    entry["tylertoo_quality_matched"]["phases"] = \
+                        phase_split(qm_report)
 
-        # --- optional: ldGeoJSON + -P ------------------------------------
-        if args.geojson:
-            gj = workdir / f"{did}.geojsonseq"
-            gconv = geojsonseq_argv(src, gj)
-            if gconv is None:
-                print("  (skipping ldGeoJSON: ogr2ogr not found)", file=sys.stderr)
-            else:
+            # --- input conversion: parquet -> fgb ----------------------------
+            converters = fgb_converters(src, workdir, did)
+            if not converters:
+                return fail("neither ogr2ogr nor gpio found; cannot build "
+                            "tippecanoe's input. Install GDAL or gpio.")
+            entry["convert_fgb_candidates"] = {}
+            for tool, (argv, dst) in converters.items():
+                print(f"  {tool}: parquet -> fgb ...", flush=True)
                 try:
-                    print("  ogr2ogr: parquet -> ldGeoJSON ...", flush=True)
-                    entry["convert_geojsonseq"] = repeat(gconv, args.repeat,
-                                                         unlink_first=gj)
-                    entry["convert_geojsonseq"]["output_bytes"] = gj.stat().st_size
-                    gj_out = workdir / f"{did}.tippecanoe-geojson.pmtiles"
-                    print("  tippecanoe -P (ldGeoJSON -> pmtiles) ...", flush=True)
-                    entry["tippecanoe_geojsonseq"] = repeat(
-                        tippecanoe_argv(tippecanoe, gj, gj_out, ds["layer"],
-                                        args.min_zoom, args.max_zoom, True, tip_extra),
-                        args.repeat)
-                    entry["tippecanoe_geojsonseq"]["output_bytes"] = \
-                        gj_out.stat().st_size
-                    entry["tippecanoe_geojsonseq"]["per_zoom"] = \
-                        per_zoom_counts(tylertoo, gj_out)
+                    m = repeat(argv, args.repeat, unlink_first=dst)
                 except CommandFailed as exc:
-                    # The ldGeoJSON leg is supporting evidence, not the
-                    # headline; losing it must not lose the whole run.
-                    print(f"    ldGeoJSON leg failed (recorded): {exc}",
-                          file=sys.stderr)
-                    entry["geojsonseq_error"] = exc.tail[-600:]
-                    entry.pop("convert_geojsonseq", None)
-                    entry.pop("tippecanoe_geojsonseq", None)
+                    # A converter that cannot handle this dataset is a fact about
+                    # the dataset, recorded rather than fatal — as long as one
+                    # converter works, tippecanoe still gets its input.
+                    print(f"    {tool} failed (recorded, not fatal): "
+                          f"{first_error_line(exc.tail)}", file=sys.stderr)
+                    entry["convert_fgb_candidates"][tool] = {
+                        "tool": tool, "failed": True, "argv": argv,
+                        "stderr_tail": exc.tail[-600:]}
+                    continue
+                m["output_bytes"] = dst.stat().st_size
+                m["tool"] = tool
+                m["path"] = str(dst)
+                entry["convert_fgb_candidates"][tool] = m
+            ok = [m for m in entry["convert_fgb_candidates"].values()
+                  if not m.get("failed")]
+            if not ok:
+                return fail(f"no parquet->fgb converter succeeded for {did}; "
+                            "see the converter errors printed above")
+            best = min(ok, key=lambda m: m["wall_median_s"])
+            entry["convert_fgb"] = best
+            fgb = Path(best["path"])
 
-        # --- ratios (computed here so nobody recomputes them by hand) ----
-        a = entry["tylertoo"]["wall_median_s"]
-        entry["ratios"] = {
-            "e2e_speedup": entry["tippecanoe_e2e"]["wall_median_s"] / a,
-            "tiles_only_speedup": entry["tippecanoe_fgb"]["wall_median_s"] / a,
-            "input_conversion_share_of_tippecanoe_e2e":
-                entry["convert_fgb"]["wall_median_s"]
-                / entry["tippecanoe_e2e"]["wall_median_s"],
-            "archive_size_ratio_tylertoo_over_tippecanoe":
-                entry["tylertoo"]["output_bytes"]
-                / entry["tippecanoe_fgb"]["output_bytes"],
-        }
-        qm = entry.get("tylertoo_quality_matched")
-        if qm:
-            q = qm["wall_median_s"]
-            entry["ratios"].update({
-                "e2e_speedup_quality_matched":
-                    entry["tippecanoe_e2e"]["wall_median_s"] / q,
-                "tiles_only_speedup_quality_matched":
-                    entry["tippecanoe_fgb"]["wall_median_s"] / q,
-                "archive_size_ratio_quality_matched":
-                    qm["output_bytes"] / entry["tippecanoe_fgb"]["output_bytes"],
-            })
-        results["datasets"][did] = entry
-        line = (f"  e2e {entry['ratios']['e2e_speedup']:.2f}x | "
-                f"tiles-only {entry['ratios']['tiles_only_speedup']:.2f}x")
-        if qm:
-            line += (f" | quality-matched tiles-only "
-                     f"{entry['ratios']['tiles_only_speedup_quality_matched']:.2f}x")
-        print(line, flush=True)
+            # --- C. tippecanoe: fgb -> pmtiles -------------------------------
+            tp_out = workdir / f"{did}.tippecanoe-fgb.pmtiles"
+            print("  tippecanoe (fgb -> pmtiles) ...", flush=True)
+            entry["tippecanoe_fgb"] = repeat(
+                tippecanoe_argv(tippecanoe, fgb, tp_out, ds["layer"],
+                                args.min_zoom, args.max_zoom, False, tip_extra),
+                args.repeat)
+            entry["tippecanoe_fgb"]["output_bytes"] = tp_out.stat().st_size
+            entry["tippecanoe_fgb"]["per_zoom"] = per_zoom_counts(tylertoo, tp_out)
 
-    # Paths in the record are provenance, not addresses: rewrite the repo
-    # root and the (temporary) work directory to placeholders so a committed
-    # results.json is readable by someone who is not on this machine and does
-    # not leak whatever directory the run happened to live in.
-    blob = json.dumps(results, indent=2, default=str)
-    for prefix, token in ((str(workdir), "<work>"), (str(REPO), "<repo>")):
-        blob = blob.replace(prefix, token)
-    Path(args.out).write_text(blob + "\n")
-    print(f"\nwrote {args.out}")
+            # --- B. the honest e2e = conversion + tiling ---------------------
+            entry["tippecanoe_e2e"] = {
+                "wall_median_s": (entry["convert_fgb"]["wall_median_s"]
+                                  + entry["tippecanoe_fgb"]["wall_median_s"]),
+                "peak_rss_bytes": max_opt(entry["convert_fgb"]["peak_rss_bytes"],
+                                          entry["tippecanoe_fgb"]["peak_rss_bytes"]),
+                "converter": entry["convert_fgb"]["tool"],
+                "note": "parquet->fgb (fastest available converter) then "
+                        "fgb->pmtiles, run as two processes; peak RSS is the "
+                        "larger of the two stages, not their sum",
+            }
 
-    table = markdown_table(results)
-    if args.markdown:
-        Path(args.markdown).write_text(table)
-        print(f"wrote {args.markdown}")
-    print()
-    print(table)
+            # --- optional: ldGeoJSON + -P ------------------------------------
+            if args.geojson:
+                gj = workdir / f"{did}.geojsonseq"
+                gconv = geojsonseq_argv(src, gj)
+                if gconv is None:
+                    print("  (skipping ldGeoJSON: ogr2ogr not found)", file=sys.stderr)
+                else:
+                    try:
+                        print("  ogr2ogr: parquet -> ldGeoJSON ...", flush=True)
+                        entry["convert_geojsonseq"] = repeat(gconv, args.repeat,
+                                                             unlink_first=gj)
+                        entry["convert_geojsonseq"]["output_bytes"] = gj.stat().st_size
+                        gj_out = workdir / f"{did}.tippecanoe-geojson.pmtiles"
+                        print("  tippecanoe -P (ldGeoJSON -> pmtiles) ...", flush=True)
+                        entry["tippecanoe_geojsonseq"] = repeat(
+                            tippecanoe_argv(tippecanoe, gj, gj_out, ds["layer"],
+                                            args.min_zoom, args.max_zoom, True, tip_extra),
+                            args.repeat)
+                        entry["tippecanoe_geojsonseq"]["output_bytes"] = \
+                            gj_out.stat().st_size
+                        entry["tippecanoe_geojsonseq"]["per_zoom"] = \
+                            per_zoom_counts(tylertoo, gj_out)
+                    except CommandFailed as exc:
+                        # The ldGeoJSON leg is supporting evidence, not the
+                        # headline; losing it must not lose the whole run.
+                        print(f"    ldGeoJSON leg failed (recorded): {exc}",
+                              file=sys.stderr)
+                        entry["geojsonseq_error"] = exc.tail[-600:]
+                        entry.pop("convert_geojsonseq", None)
+                        entry.pop("tippecanoe_geojsonseq", None)
 
-    if not args.keep and not args.work:
-        shutil.rmtree(workdir, ignore_errors=True)
-    else:
-        print(f"intermediates kept in {workdir}")
-    return 0
+            # --- ratios (computed here so nobody recomputes them by hand) ----
+            a = entry["tylertoo"]["wall_median_s"]
+            entry["ratios"] = {
+                "e2e_speedup": entry["tippecanoe_e2e"]["wall_median_s"] / a,
+                "tiles_only_speedup": entry["tippecanoe_fgb"]["wall_median_s"] / a,
+                "input_conversion_share_of_tippecanoe_e2e":
+                    entry["convert_fgb"]["wall_median_s"]
+                    / entry["tippecanoe_e2e"]["wall_median_s"],
+                "archive_size_ratio_tylertoo_over_tippecanoe":
+                    entry["tylertoo"]["output_bytes"]
+                    / entry["tippecanoe_fgb"]["output_bytes"],
+            }
+            qm = entry.get("tylertoo_quality_matched")
+            if qm:
+                q = qm["wall_median_s"]
+                entry["ratios"].update({
+                    "e2e_speedup_quality_matched":
+                        entry["tippecanoe_e2e"]["wall_median_s"] / q,
+                    "tiles_only_speedup_quality_matched":
+                        entry["tippecanoe_fgb"]["wall_median_s"] / q,
+                    "archive_size_ratio_quality_matched":
+                        qm["output_bytes"] / entry["tippecanoe_fgb"]["output_bytes"],
+                })
+            results["datasets"][did] = entry
+            line = (f"  e2e {entry['ratios']['e2e_speedup']:.2f}x | "
+                    f"tiles-only {entry['ratios']['tiles_only_speedup']:.2f}x")
+            if qm:
+                line += (f" | quality-matched tiles-only "
+                         f"{entry['ratios']['tiles_only_speedup_quality_matched']:.2f}x")
+            print(line, flush=True)
+
+        # Paths in the record are provenance, not addresses: rewrite the repo
+        # root and the (temporary) work directory to placeholders so a committed
+        # results.json is readable by someone who is not on this machine and does
+        # not leak whatever directory the run happened to live in.
+        blob = json.dumps(results, indent=2, default=str)
+        for prefix, token in ((str(workdir), "<work>"), (str(REPO), "<repo>")):
+            blob = blob.replace(prefix, token)
+        Path(args.out).write_text(blob + "\n")
+        print(f"\nwrote {args.out}")
+
+        table = markdown_table(results)
+        if args.markdown:
+            Path(args.markdown).write_text(table)
+            print(f"wrote {args.markdown}")
+        print()
+        print(table)
+        return 0
+    finally:
+        if not args.keep and not args.work:
+            shutil.rmtree(workdir, ignore_errors=True)
+        else:
+            print(f"intermediates kept in {workdir}")
 
 
 # --------------------------------------------------------------------------

@@ -6,7 +6,8 @@ Kept separate from run_e2e.py so the numbers in RESULTS.md are regenerated
 from the recorded run rather than retyped. Retyped benchmark numbers drift,
 and a drifted number is indistinguishable from a dishonest one.
 
-    python3 format_results.py results.json            # print all tables
+    python3 format_results.py                         # the committed results.json
+    python3 format_results.py results-<stamp>.json    # an ad-hoc run
     python3 format_results.py results.json --section headline
 """
 
@@ -148,13 +149,17 @@ def provenance(r) -> str:
         f"- **Machine** — {m.get('cpu')}, {m.get('cpu_count')} cores, "
         f"{m.get('ram_gb')} GB RAM, {m.get('platform')}",
         f"- **tylertoo** — {t['version']} @ `{t['git_sha']}` (release build)",
-        f"- **tippecanoe** — {p['version']}, tag `{p['tag']}`, "
-        f"commit `{p['sha']}`, built from source by `setup_tippecanoe.sh`",
+        (f"- **tippecanoe** — {p['version']}, tag `{p['tag']}`, "
+         f"commit `{p['sha']}`, built from source by `setup_tippecanoe.sh`"
+         if p.get("sha") else
+         f"- **tippecanoe** — {p['version']}, not the `setup_tippecanoe.sh` "
+         f"build (commit unknown)"),
         f"- **Settings** — z{s_['min_zoom']}–z{s_['max_zoom']}, tile buffer "
         f"{s_['tile_buffer']}, per-tile cap {s_['max_tile_bytes']:,} bytes",
         f"- **Method** — median of {s_['repeat']} timed runs after one "
         f"discarded warm-up; warm page cache; no other load on the machine",
-        f"- **Recorded** — {r['generated_at']} → `results.json`",
+        f"- **Recorded** — {r['generated_at']} → "
+        f"`{r.get('_source_file', 'results.json')}`",
     ])
 
 
@@ -176,6 +181,7 @@ def main() -> int:
     ap.add_argument("--dataset", default=None, help="for --section per-zoom")
     args = ap.parse_args()
     r = json.loads(args.results.read_text())
+    r["_source_file"] = args.results.name
 
     if args.section == "per-zoom":
         did = args.dataset or next(iter(r["datasets"]))

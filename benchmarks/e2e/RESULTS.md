@@ -8,7 +8,15 @@ Every timing, memory, size and tile-count table below is printed by
 no number is retyped. The two exceptions are labelled where they appear: the
 per-zoom *feature* counts in §2 come from `render_parity.py` (PMTiles decoding,
 which `tylertoo stats` does not do), and the variance table in §7 is derived
-from the `wall_all_s` arrays in the same `results.json`.
+from the `wall_all_s` arrays in the same `results.json`. Figures from an
+earlier run that is **not** in `results.json` appear only in §4 and §7, and
+are labelled there as such.
+
+Regenerate the tables from the committed record with
+`python3 format_results.py` (defaults to `results.json`). A fresh
+`run_e2e.py` run writes `results-<UTC timestamp>.json` and never touches the
+committed file; to replace the record, run with `--out results.json`, then
+re-run `format_results.py results.json` and paste its output here.
 
 Issue: [#447](https://github.com/geoparquet-io/tylertoo/issues/447).
 
@@ -21,23 +29,28 @@ Issue: [#447](https://github.com/geoparquet-io/tylertoo/issues/447).
 - **Method** — median of 3 timed runs after one discarded warm-up; warm page cache; no other load on the machine
 - **Recorded** — 2026-09-26T20:41:10Z → `results.json`
 
+`044360d` includes #559 (export speed-up) and predates #564 (parallel level
+assignment); later tylertoo builds are not reflected here.
+
 A laptop is not a cluster. These numbers are a floor for reproducibility, not
 a claim about server-class hardware; `--dataset ID=PATH` runs the identical
 harness on a bigger file when someone has one.
 
 ## What to quote
 
-> On a 17,465-feature MultiPolygon admin dataset, at output parity, tylertoo
-> produced the same z0–z14 PMTiles archive **≈7.5× faster** than tippecanoe
-> 2.79.0 reading FlatGeobuf (2.67 s vs 20.05 s), in an archive 22% smaller,
-> at roughly 1.8× tippecanoe's peak RSS. Counting the GeoParquet→FlatGeobuf
-> conversion a tippecanoe user has to run, and with tylertoo at its own
-> defaults (which emit a thinned map — see below), the end-to-end figure is
-> **≈10–12×**.
+> On a 17,465-feature MultiPolygon admin dataset, at near-parity output
+> (tile counts within 2 per zoom; features within 0.4% at z8 and ~5% at z4;
+> 10 tiles hit tylertoo's size valve), tylertoo built a z0–z14 PMTiles
+> archive **≈7.5× faster** than tippecanoe 2.79.0 reading FlatGeobuf
+> (2.67 s vs 20.05 s), in an archive 22% smaller, at roughly 2× tippecanoe's
+> peak RSS (835 MB vs 413 MB). Counting the GeoParquet→FlatGeobuf conversion
+> a tippecanoe user has to run, and with tylertoo at its own defaults (which
+> emit a thinned map — see below), the end-to-end figure in this run is
+> **≈12.5×**.
 
-The range on the defaults figure is not hedging: two runs of this harness on
-this machine an hour apart gave 10.4× and 12.5× for the same dataset and
-flags. Quote the band, not the better end. §7 has the variance data.
+That is one recorded run of three warm repeats on a laptop. Treat the ratios
+as approximate, not as two-significant-figure facts; §7 has the per-repeat
+spread.
 
 ## 1. Headline (both tools at their own defaults)
 
@@ -57,10 +70,12 @@ test (Polygon, LineString) and nothing more. Do not average these rows.
 ## 2. Output parity — the number to quote to a skeptic
 
 At defaults the two tools do not draw the same map. tylertoo's density budget
-thins features at coarse and mid zooms; tippecanoe drops only points, so on a
-contiguous polygon coverage it emits every feature at every zoom. Measured
-with `render_parity.py` (distinct feature ids per zoom, so cross-tile
-duplication does not inflate either side):
+thins features hard at coarse and mid zooms. tippecanoe's rate-based dropping
+applies only to points at defaults; its tiny-polygon reduction (disabled by
+`-pt`) still removes small polygons at low zooms — 6,102 of 17,465 survive at
+z4 — but it reaches every feature by z8. Measured with `render_parity.py`
+(distinct feature ids per zoom, so cross-tile duplication does not inflate
+either side):
 
 | zoom | tylertoo, defaults | tylertoo, quality-matched | tippecanoe |
 |---|---|---|---|
@@ -78,8 +93,11 @@ choropleth. A speed ratio against that is a ratio against less work.
 
 So the harness also runs tylertoo with the thinning ladder switched off
 (`--verbatim --simplify-factor 1.0`, which keeps simplification because
-tippecanoe simplifies too). That lands within 1–2 tiles of tippecanoe's count
-at every zoom and within 0.3% of its feature count at z8:
+tippecanoe simplifies too). That reaches near-parity, not identical output:
+within 2 tiles of tippecanoe's count at every zoom, within 0.4% of its
+feature count at z8 (17,406 vs 17,465) and about 5% at z4 (5,786 vs 6,102),
+and 10 of its tiles hit tylertoo's per-tile size valve (`oversized_tiles` in
+`results.json`):
 
 | dataset | tylertoo default | tylertoo quality-matched | tippecanoe tile-only | tile-only speedup, matched | tylertoo tiles (default → matched) | tippecanoe tiles | archive, matched | archive ratio |
 |---|---|---|---|---|---|---|---|---|
@@ -114,7 +132,7 @@ smaller archive and is the remaining, unclosable simplification asymmetry.
 | dataset | parquet in | fgb out | conversion (fastest tool) | tool | conversion share of tippecanoe e2e | ldGeoJSON out | ldGeoJSON convert | tippecanoe -P on ldGeoJSON |
 |---|---|---|---|---|---|---|---|---|
 | `madagascar-adm4` | 27.1 MB | 43.2 MB | 0.19 s | `ogr2ogr` | 1% | 75.0 MB | 2.07 s | 23.59 s |
-| `open-buildings` | 0.1 MB | 0.3 MB | 0.06 s | `ogr2ogr` | 22% | 0.4 MB | 0.06 s | 0.21 s |
+| `open-buildings` | 0.1 MB | 0.3 MB | 0.06 s | `ogr2ogr` | 22% | 0.4 MB | 0.07 s | 0.21 s |
 | `road-detections` | 0.1 MB | 0.2 MB | 0.06 s | `ogr2ogr` | 23% | 0.3 MB | 0.07 s | 0.21 s |
 
 **The input-format advantage is small on this dataset, and saying so matters.**
@@ -129,7 +147,7 @@ which is mostly `ogr2ogr` start-up, not conversion work.
 The ldGeoJSON leg is evidence for the claim that FlatGeobuf is tippecanoe's
 best input here: text is 75 MB against 43 MB of FlatGeobuf, and even with
 `-P` (parallel parse) tippecanoe is slower reading it (23.59 s vs 20.05 s)
-on top of a 10× more expensive conversion (2.07 s vs 0.19 s). Benchmarking
+on top of an 11× more expensive conversion (2.07 s vs 0.19 s). Benchmarking
 tippecanoe from GeoJSON would have flattered tylertoo, so the headline does
 not.
 
@@ -150,12 +168,16 @@ recommendation change.
 | `open-buildings` | 28 MB | 139 MB | 54 MB | 0.1 MB | 0.2 MB | 0.61× |
 | `road-detections` | 32 MB | 141 MB | 53 MB | 0.1 MB | 0.2 MB | 0.57× |
 
-**tylertoo loses the memory column on the only dataset that matters** — 760 MB
-against tippecanoe's 413 MB on `madagascar-adm4`, 1.8×. tylertoo's export
+This table is the defaults run. **tylertoo loses the memory column on the
+only dataset that matters** — 760 MB against tippecanoe's 413 MB on
+`madagascar-adm4` at defaults (1.8×), and 835 MB against 413 MB for the
+quality-matched run (2.0×; `tylertoo_quality_matched.peak_rss_bytes` in
+`results.json`), which is the run the parity claim uses. tylertoo's export
 concurrency is `--partition-wave auto`, which sizes itself against available
-RAM, so this figure moves with machine state (an earlier run of the same
-harness, same machine, without `--quality-matched`, recorded 457 MB). Pin it
-with an explicit `--partition-wave N` before drawing conclusions. On the tiny
+RAM, so this figure moves with machine state (from an earlier, uncommitted
+run of the same harness on the same machine, not in `results.json`: 457 MB
+at defaults). Pin it with an explicit `--partition-wave N` before drawing
+conclusions. On the tiny
 fixtures tylertoo wins the column, 28 MB to 139 MB, because tippecanoe
 allocates its working set up front.
 
@@ -199,8 +221,9 @@ corpus rather than overstated.
 | z14 | 113,993 | 113,991 | 93.19 MB | 110.20 MB |
 | **total** | **146,924** | **153,047** | | |
 
-Read the byte columns, not just the tile columns: at z1–z8 tylertoo's stored
-bytes are 10–25× smaller than tippecanoe's for nearly the same tile count.
+Read the byte columns, not just the tile columns: at z2–z8 tylertoo's stored
+bytes are 14–25× smaller than tippecanoe's (z1: ~87×) for nearly the same
+tile count.
 That is the thinning of §2 showing up as size. At z14, where tylertoo emits
 every feature, the two agree to two tiles and tylertoo's bytes are 15%
 smaller — the simplification difference alone.
@@ -250,20 +273,22 @@ tile. tippecanoe writes one.
 
 Within a single run (3 timed repeats after a warm-up), on `madagascar-adm4`:
 
-| measurement | median | min | max | spread |
+| measurement | median | min | max | spread, (max − min) / min |
 |---|---|---|---|---|
 | tylertoo, defaults | 1.61 s | 1.60 s | 1.80 s | 13% |
-| tylertoo, quality-matched | 2.67 s | 2.56 s | 3.41 s | 33% |
+| tylertoo, quality-matched | 2.67 s | 2.56 s | 3.40 s | 33% |
 | tippecanoe, fgb in | 20.05 s | 19.70 s | 22.81 s | 16% |
 | tippecanoe -P, ldGeoJSON in | 23.59 s | 22.41 s | 31.73 s | 42% |
 | ogr2ogr parquet→fgb | 0.19 s | 0.17 s | 0.19 s | 8% |
 
-Between two full runs an hour apart on the same idle laptop, tylertoo's
-`madagascar-adm4` median moved 2.34 s → 1.61 s and the defaults ratio moved
-10.4× → 12.5× (tippecanoe moved 23.93 s → 20.05 s over the same pair).
-**A single-digit ratio measured on a laptop carries roughly ±20%.** That is
-why "What to quote" above gives a band, and why no row here should be quoted
-to two significant figures.
+Between runs, from an earlier, uncommitted run that is **not** in
+`results.json` (so these figures cannot be regenerated from this record):
+an hour before the recorded run, on the same idle laptop, tylertoo's
+`madagascar-adm4` median was 2.34 s against the recorded 1.61 s, tippecanoe's
+was 23.93 s against 20.05 s, and the defaults ratio was 10.4× against 12.5×.
+Take that as a warning rather than a measurement: **a single-digit ratio
+measured on a laptop can move by roughly 20% between runs**, which is why no
+row here should be quoted to two significant figures.
 
 ## 8. What this does not measure
 
