@@ -146,6 +146,24 @@ cargo mutants --package tylertoo-core \
 cargo mutants --package tylertoo-core          # the full sweep, hours
 ```
 
+Every PR also gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
+job "Mutation score (diff-scoped)"): `cargo mutants --in-diff` on
+`git diff origin/main...HEAD`, so only mutants inside the lines the PR
+changes are generated and tested, under the same `.cargo/mutants.toml`.
+A typical PR is a few dozen mutants and ten to twenty minutes, most of
+it the cold baseline build. It is advisory: the score and the missed
+mutants (`file:line`) go to the job summary, and a same-repo PR with
+missed mutants gets one sticky comment that is updated in place on every
+push; it never turns the check red, and a PR that touches no Rust under
+`crates/` skips it in seconds. The local twin, which also includes
+uncommitted changes and exits 1 on a missed mutant so it can gate a
+commit by choice:
+
+```bash
+scripts/mutants-diff.sh                  # vs origin/main
+scripts/mutants-diff.sh main -- -j 2     # other base; extra cargo-mutants args
+```
+
 The nightly fuzz job (`.github/workflows/fuzz.yml`, 3 AM UTC, or
 `gh workflow run fuzz.yml`) runs every `cargo-fuzz` target in `fuzz/`
 for 300 s each, one matrix job per target, seeded from
