@@ -63,8 +63,8 @@
 //! admitted/admitted-at pair per feature plus the per-level candidate list and
 //! its super-cell tags. What it does NOT hold any more is a priority table
 //! (#565). A `Vec<Priority>` parallel to the feature slice was 40 B/feature live
-//! for the whole fold — the single largest allocation here, 2.2 GiB on a 55M-row
-//! job and ~63 GiB at the 1.58B-row global scale, stacked on the 64 B/row pass-1
+//! for the whole fold — the single largest allocation here, 2.1 GiB on a 55M-row
+//! job and ~59 GiB at the 1.58B-row global scale, stacked on the 64 B/row pass-1
 //! feature table (`convert::PASS1_BYTES_PER_ROW`) that is still live throughout.
 //! Every field of a [`Priority`] is a pure function of the `AssignFeature` the
 //! comparator already has to read, so [`priority_order`] derives both sides per
@@ -389,8 +389,8 @@ const MISSING_SORT_RANK: f64 = f64::NEG_INFINITY;
 /// two multiplies, a hash mix and a couple of compares — so callers that need a
 /// priority for a *comparison* derive it on the spot rather than materializing a
 /// table parallel to the feature slice. `apply_density_budget` used to build exactly
-/// that table: 40 B/feature live for the whole admission fold, 2.2 GiB on a
-/// 55M-row job and ~63 GiB at the 1.58B-row global scale, on top of the
+/// that table: 40 B/feature live for the whole admission fold, 2.1 GiB on a
+/// 55M-row job and ~59 GiB at the 1.58B-row global scale, on top of the
 /// 64 B/row pass-1 feature-table floor the #543 preflight already warns about.
 ///
 /// Four words, down from five: the `Option<f64>` sort rank became an `f64` with
@@ -1471,7 +1471,7 @@ pub fn apply_density_budget(
     // from `features[pos]` inside `priority_order`, where the comparison needs
     // it. A `Vec<Priority>` over the whole dataset — which is what this used to
     // build, in one parallel pass, and hold live across the entire admission
-    // fold — was 40 B/feature: 2.2 GiB on a 55M-row job and ~63 GiB at the
+    // fold — was 40 B/feature: 2.1 GiB on a 55M-row job and ~59 GiB at the
     // 1.58B-row global scale, stacked on the 64 B/row pass-1 feature table
     // (`convert::PASS1_BYTES_PER_ROW`) that is still live at this point and on
     // the cell-winner assignment being budgeted. It was the largest single

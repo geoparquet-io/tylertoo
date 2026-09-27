@@ -131,7 +131,7 @@ verbatim (spec §2.4).
    The density budget holds **no priority table** (#565). It used to build a
    `Vec<Priority>` parallel to the feature slice and keep it live across the
    whole coarse→fine admission fold: 40 B/feature, the largest single
-   allocation in the phase, 2.2 GiB on that 55.5M-row job and ~63 GiB at the
+   allocation in the phase, 2.1 GiB on that 55.5M-row job and ~59 GiB at the
    1.58B-row global scale — all of it on top of the 64 B/row pass-1 feature
    table (#543's `PASS1_BYTES_PER_ROW`), which is still live throughout.
    Every component of a priority (direction-applied sort rank, squared bbox
