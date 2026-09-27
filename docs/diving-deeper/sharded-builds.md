@@ -77,7 +77,7 @@ fleet size.
 
 ```bash
 tylertoo tiles fields.parquet coarse.pmtiles \
-    --min-zoom 0 --max-zoom 14 \
+    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
     --shard coarse --shard-plan shards.json \
     --save-plan convert.plan
 ```
@@ -109,11 +109,77 @@ Do **not** try to get the same effect with a shallower `--max-zoom`: the
 convert plan *is* fingerprinted on the level plan, so a coarse job run that
 way produces a plan every shard refuses.
 
+#### When the coarse tiles are thrown away: `--plan-only`
+
+Sometimes the coarse job's *tiles* are not wanted at all. In an
+**aggregate-into-fields handover build**, an archive produced outside tylertoo
+(cell aggregates with their own per-cell metrics) owns z0–z8, real polygons own
+z9–z13, and `tylertoo merge` joins them: the coarse job's zooms are replaced
+wholesale. It still has to run, because the level assignment is dataset-global
+and only it reads every row — but only for the plan.
+
+`--plan-only` is that run, with no export at all. For the handover above, the
+fleet's zoom range starts where the external archive stops, so the shard plan
+is cut at that zoom too (`shard-plan … --pivot 9`), and every job — this one
+and each shard — passes the same `--min-zoom 9 --max-zoom 13`:
+
+```bash
+tylertoo tiles fields.parquet \
+    --min-zoom 9 --max-zoom 13 --no-coalesce-lines \
+    --shard coarse --shard-plan shards.json \
+    --save-plan convert.plan \
+    --plan-only
+```
+
+The same convert flags the fleet's shards will use, plus this one (export-only
+flags are refused), and **no OUTPUT positional** — there is no archive, no
+intermediate overview, and nothing else left on disk. A full coarse job with
+its pivot at `--min-zoom` is refused (it would have no zoom to build); a
+plan-only one builds no zoom anyway, so that shape is exactly what it accepts.
+Pass 1 and the level assignment run exactly as before, so the plan is once
+again **byte-identical** to the one a full or level-capped coarse job writes
+(the parity oracle builds its whole fleet from a `--plan-only` plan and
+compares the merged archive to a monolithic run, tile body by tile body).
+
+**For a fleet, `--shard coarse --shard-plan` is required.** The coarse job
+records the shard plan's cut in the plan, and every data shard checks it: a
+plan-only run without them writes a plan for an unsharded `tiles --plan` /
+`overview --plan` replay, which every data shard refuses. The run says which
+kind of plan it wrote.
+
+What it saves is the coarse job's pass 2 and export. How much of the job
+that is depends on the build: the ~72% of wall measured when #560 was filed
+was a share of a *one-shot* run
+([#550](https://github.com/geoparquet-io/tylertoo/issues/550)), taken before
+#541 capped the coarse job's pass 2 at the pivot, so on a current coarse job
+the saving is smaller — measure your own before planning around it.
+
+**It does not lower the memory floor.** The peak is pass 1 plus the
+assignment, which is the same peak the full coarse job hits before its pass 2
+starts: the [#549 preflight](#sizing-the-coarse-jobs-memory) still runs, and the ×2.5 rule of thumb
+still applies (conservatively — it includes pass-2 buffers a plan-only run
+never allocates, but the pass-1 floor is the same, and sizing a plan-only
+box below it will fail the same way).
+
+It requires `--save-plan` (the plan is its only output) and refuses what it
+cannot honor: an OUTPUT path, `--shard I/N` (a data shard's plan would cover
+only that shard's rows), and the export-side knobs `--report`,
+`--keep-overview`, `--tile-range`, `--layer-name`, `--max-tile-size`,
+`--tile-buffer`, `--feature-order`, `--feature-id`, `--partition-wave`,
+`--no-simple-clip-fastpath` and `--force`. The run prints what the plan
+contains — level counts, per-kind feature tallies, how the cell-winner ranking
+resolved, the entry-zoom ladder — so the plan can be sanity-checked before any
+shard hours are committed; `--verbose` adds the per-level breakdown. If nothing
+survives the scan, the run fails and leaves no plan behind.
+
+Skip it when you want the coarse tiles: a `--shard coarse` run produces them
+*and* the plan in one pass, and #541 already makes its pass 2 cheap.
+
 ### 2. The shards (N runs, in parallel)
 
 ```bash
 tylertoo tiles fields.parquet shard-$i.pmtiles \
-    --min-zoom 0 --max-zoom 14 \
+    --min-zoom 0 --max-zoom 14 --no-coalesce-lines \
     --shard $i/16 --shard-plan shards.json \
     --plan convert.plan
 ```
@@ -380,12 +446,14 @@ the layer declarations alike. `shard-plan` warns at cut time when it produces
 such ranges, which is the signal that a smaller `--shards` would balance the
 fleet better.
 
-**`--tile-buffer` is capped at 512 tile pixels.** A shard prunes its input to
-the row groups within two pivot tiles of its range; a wider buffer could pull
-geometry into one of its tiles from a row group it never read, so the tile
-would come out missing geometry the monolithic run has. 512 is two full tile
-widths, against a default of 8 — anything past it is refused rather than
-silently wrong.
+**`--tile-buffer` stays within the read-pruning margin.** A shard prunes its
+input to the row groups within two pivot tiles (512 tile pixels) of its range;
+a wider buffer could pull geometry into one of its tiles from a row group it
+never read, so the tile would come out missing geometry the monolithic run has.
+Every export, sharded or not, caps `--tile-buffer` at 256 tile pixels — one
+full tile width, against a default of 8 (#433) — which sits inside that margin,
+so a sharded build needs no cap of its own; the two bounds are tied by a
+compile-time check in the source.
 
 The Python bindings do not expose sharding yet, the same as the convert plan it
 depends on.

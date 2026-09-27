@@ -230,7 +230,11 @@ impl FilterExpr {
 /// Parse a filter expression source string into a [`FilterExpr`].
 pub fn parse_filter(src: &str) -> Result<FilterExpr, FilterError> {
     let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     let expr = p.parse_or()?;
     if p.pos != p.tokens.len() {
         return Err(FilterError::Parse(format!(
@@ -429,12 +433,43 @@ fn tokenize(src: &str) -> Result<Vec<Token>, FilterError> {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Deepest expression tree `parse_filter` builds: every `(`, `NOT`, `AND`
+/// and `OR` counts one level.
+///
+/// The parser is recursive descent, and the tree it builds is walked
+/// recursively by `Drop`, `column_names` and `eval_expr`, one stack frame per
+/// level; the source is user input. The `filter_expr` fuzz target (#424)
+/// overflowed the stack with a few hundred thousand `(`, and review found
+/// the same with `a = 1 OR a = 1 OR ...`, since a chain becomes a left-deep
+/// tree one level per operator. Hand-written filters stay a handful deep
+/// either way; 100 leaves that a long way behind while keeping the stack
+/// bounded on every platform's default thread size.
+const MAX_NESTING_DEPTH: usize = 100;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Depth of the tree under construction, checked against
+    /// [`MAX_NESTING_DEPTH`].
+    depth: usize,
 }
 
 impl Parser {
+    /// Enter one nesting level, or fail once past [`MAX_NESTING_DEPTH`].
+    fn descend(&mut self) -> Result<(), FilterError> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(FilterError::Parse(format!(
+                "expression nests deeper than {MAX_NESTING_DEPTH} levels of '(' / NOT / AND / OR"
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn ascend(&mut self) {
+        self.depth -= 1;
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -468,28 +503,46 @@ impl Parser {
 
     fn parse_or(&mut self) -> Result<FilterExpr, FilterError> {
         let mut left = self.parse_and()?;
+        // Each operator adds one level to the left-deep chain the tree
+        // becomes, and Drop / column_names / eval_expr recurse once per
+        // level, so a chain spends the nesting budget operator by operator
+        // (the fuzz target's 300k-`OR` overflow) and hands it back once the
+        // chain ends.
+        let mut levels = 0;
         while self.eat(&Token::Or) {
+            self.descend()?;
+            levels += 1;
             let right = self.parse_and()?;
             left = FilterExpr::Or(Box::new(left), Box::new(right));
         }
+        self.depth -= levels;
         Ok(left)
     }
 
     fn parse_and(&mut self) -> Result<FilterExpr, FilterError> {
         let mut left = self.parse_unary()?;
+        let mut levels = 0;
         while self.eat(&Token::And) {
+            self.descend()?;
+            levels += 1;
             let right = self.parse_unary()?;
             left = FilterExpr::And(Box::new(left), Box::new(right));
         }
+        self.depth -= levels;
         Ok(left)
     }
 
     fn parse_unary(&mut self) -> Result<FilterExpr, FilterError> {
         if self.eat(&Token::Not) {
-            return Ok(FilterExpr::Not(Box::new(self.parse_unary()?)));
+            self.descend()?;
+            let inner = self.parse_unary()?;
+            self.ascend();
+            return Ok(FilterExpr::Not(Box::new(inner)));
         }
         if self.eat(&Token::LParen) {
+            self.descend()?;
             let e = self.parse_or()?;
+            self.ascend();
             self.expect(Token::RParen, "')'")?;
             return Ok(e);
         }
@@ -1482,6 +1535,79 @@ mod tests {
         };
         assert!(matches!(*al, FilterExpr::Compare { .. }));
         assert!(matches!(*ar, FilterExpr::Not(_)));
+    }
+
+    /// Found by the `filter_expr` fuzz target (#424): the parser recursed
+    /// once per `(` and once per `NOT`, so a 200k-deep expression overflowed
+    /// the stack instead of coming back as a parse error. Nesting is now
+    /// capped at [`MAX_NESTING_DEPTH`]; anything a person would write stays
+    /// far below it.
+    #[test]
+    fn deep_nesting_is_a_parse_error_not_a_stack_overflow() {
+        let deep_parens = format!("{}a = 1{}", "(".repeat(200_000), ")".repeat(200_000));
+        let err = parse_filter(&deep_parens).unwrap_err();
+        assert!(
+            matches!(&err, FilterError::Parse(m) if m.contains("nest")),
+            "expected a nesting error, got {err}"
+        );
+
+        let deep_not = format!("{}a = 1", "NOT ".repeat(200_000));
+        let err = parse_filter(&deep_not).unwrap_err();
+        assert!(
+            matches!(&err, FilterError::Parse(m) if m.contains("nest")),
+            "expected a nesting error, got {err}"
+        );
+
+        // The cap is well above anything hand-written: exactly at the limit
+        // still parses, one past it does not.
+        let at_limit = format!(
+            "{}a = 1{}",
+            "(".repeat(MAX_NESTING_DEPTH),
+            ")".repeat(MAX_NESTING_DEPTH)
+        );
+        assert!(parse_filter(&at_limit).is_ok());
+        let past_limit = format!(
+            "{}a = 1{}",
+            "(".repeat(MAX_NESTING_DEPTH + 1),
+            ")".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        assert!(parse_filter(&past_limit).is_err());
+    }
+
+    /// Review follow-up to the cap above (#424): `a OR a OR ...` builds a
+    /// left-deep `Or(Box(Or(...)))` chain one level per operator, and
+    /// `Drop`, `column_names` and `eval_expr` each recurse once per level, so
+    /// 300k operators overflowed the stack even though nothing nested in
+    /// `(` / `NOT`. Every `AND` / `OR` now counts toward the same
+    /// [`MAX_NESTING_DEPTH`], which bounds the tree's depth outright.
+    #[test]
+    fn long_operator_chains_are_a_parse_error_not_a_stack_overflow() {
+        for op in ["OR", "AND"] {
+            let chain = vec!["a = 1"; 300_000].join(&format!(" {op} "));
+            let err = parse_filter(&chain).unwrap_err();
+            assert!(
+                matches!(&err, FilterError::Parse(m) if m.contains("nest")),
+                "{op}: expected a nesting error, got {err}"
+            );
+
+            // Chains up to the cap still parse and walk: N operators is N
+            // levels, so MAX_NESTING_DEPTH operators is the deepest allowed.
+            let at_limit = vec!["a = 1"; MAX_NESTING_DEPTH + 1].join(&format!(" {op} "));
+            let expr = parse_filter(&at_limit).unwrap_or_else(|e| panic!("{op} at limit: {e}"));
+            assert_eq!(expr.column_names(), vec!["a".to_string()]);
+            let past_limit = vec!["a = 1"; MAX_NESTING_DEPTH + 2].join(&format!(" {op} "));
+            assert!(parse_filter(&past_limit).is_err(), "{op} past limit");
+        }
+
+        // Mixed chains and parentheses share the one budget: the depth of the
+        // built tree, not any one construct, is what is bounded.
+        let mixed = format!(
+            "{}{}{}",
+            "(".repeat(MAX_NESTING_DEPTH / 2),
+            vec!["a = 1"; MAX_NESTING_DEPTH / 2 + 2].join(" OR "),
+            ")".repeat(MAX_NESTING_DEPTH / 2)
+        );
+        assert!(parse_filter(&mixed).is_err(), "mixed past limit");
     }
 
     #[test]

@@ -1453,6 +1453,13 @@ pub fn build_pyramid(
             // set on `opts.export` would apply to every band alike, and be
             // rejected by any band whose range starts finer (#380).
             min_zoom: Some(band.min_zoom),
+            // #427: the band's export spill goes where its intermediates go,
+            // unless the caller placed it explicitly.
+            spill_dir: opts
+                .export
+                .spill_dir
+                .clone()
+                .or_else(|| opts.work_dir.clone()),
             ..opts.export.clone()
         };
         export_pmtiles(overview.path(), archive.path(), &export).map_err(|e| {
@@ -1839,6 +1846,36 @@ fn finish_merge(
         skipped: tally.skipped_total,
         bands_without_bounds: tally.bands_without_bounds,
     })
+}
+
+/// Fuzz hook (#424): treat `bytes` as a whole PMTiles archive and put it
+/// through everything `merge_bands` does to a `--band` input short of
+/// writing output: [`BandArchive::open`] (header, directory walk, metadata
+/// layer parse), the zoom-range and bounds queries, and a full
+/// [`BandArchive::for_each_tile`] pass reading every addressed tile body.
+///
+/// Returns the number of tiles handed out. The archive goes through a temp
+/// file because the reader is `pread`-based by design (#498). Only the
+/// `fuzz/` crate calls this; the `fuzzing` feature is never on in a normal
+/// build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, Error> {
+    use std::io::Write as _;
+    let mut file = NamedTempFile::new().map_err(Error::Io)?;
+    file.write_all(bytes).map_err(Error::Io)?;
+    file.flush().map_err(Error::Io)?;
+
+    let band = BandArchive::open(file.path(), "")?;
+    let _ = band.bounds();
+    let actual = band.actual_zoom_range()?;
+    let _ = band.declared_zoom_range(actual.is_some());
+    let mut tiles = 0u64;
+    band.for_each_tile(|_z, _x, _y, _data| {
+        tiles += 1;
+        Ok(())
+    })?;
+    Ok(tiles)
 }
 
 #[cfg(test)]

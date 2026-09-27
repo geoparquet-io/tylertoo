@@ -44,6 +44,7 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::Schema;
 use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
+use std::path::Path;
 use tempfile::NamedTempFile;
 
 use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
@@ -1553,10 +1554,14 @@ enum LevelSink {
 }
 
 impl LevelSink {
-    fn new(backing: SinkBacking, out_schema: &Schema) -> Result<Self, ConvertError> {
+    fn new(
+        backing: SinkBacking,
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+    ) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
-            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema)?),
+            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema, spill_dir)?),
         })
     }
 
@@ -1578,6 +1583,22 @@ impl LevelSink {
 /// so it carries no advice, only the broken invariant.
 fn internal(what: &str) -> ConvertError {
     ConvertError::Io(std::io::Error::other(format!("internal: {what}")))
+}
+
+/// A pass-2 spill file under `spill_dir`, or the process temp dir when none
+/// is given (#427). Named so a leftover from a killed run is recognizable.
+pub(super) fn spill_temp_file(spill_dir: Option<&Path>) -> std::io::Result<NamedTempFile> {
+    let dir = spill_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    tempfile::Builder::new()
+        .prefix("tylertoo-spill-")
+        .suffix(".arrow")
+        .tempfile_in(&dir)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot create a spill file in {}: {e}", dir.display()),
+            )
+        })
 }
 
 /// Batches a level's spill-writer thread may hold ahead of the consumer.
@@ -1624,8 +1645,10 @@ struct SpillWriterDone {
 }
 
 impl SpillState {
-    fn new(out_schema: &Schema) -> Result<Self, ConvertError> {
-        let temp = NamedTempFile::new()?;
+    /// `spill_dir` is where the spill file goes (#427: `--spill-dir`, the one
+    /// scratch knob); `None` is the process temp dir, as before.
+    fn new(out_schema: &Schema, spill_dir: Option<&Path>) -> Result<Self, ConvertError> {
+        let temp = spill_temp_file(spill_dir)?;
         let write_handle = temp.reopen()?;
         // Constructed on the caller's thread so a broken spill directory or an
         // unwritable temp file fails the conversion here, with the caller's
@@ -1778,6 +1801,7 @@ pub(super) fn run_pass2_buffered(
     in_flight: usize,
     backing: SinkBacking,
     out_schema: &Schema,
+    spill_dir: Option<&Path>,
 ) -> Result<Pass2EngineResult, ConvertError> {
     let num_levels = ctxs.len();
     debug_assert_eq!(num_levels, hints.len());
@@ -1787,7 +1811,7 @@ pub(super) fn run_pass2_buffered(
 
     let mut sinks: Vec<LevelSink> = Vec::with_capacity(num_levels);
     for _ in 0..num_levels {
-        sinks.push(LevelSink::new(backing, out_schema)?);
+        sinks.push(LevelSink::new(backing, out_schema, spill_dir)?);
     }
     let mut rows = vec![0usize; num_levels];
     let mut verts = vec![0usize; num_levels];
@@ -1997,7 +2021,7 @@ mod spill_tests {
     #[test]
     fn spill_writer_preserves_push_order() {
         let s = schema("id");
-        let mut sink = SpillState::new(&s).unwrap();
+        let mut sink = SpillState::new(&s, None).unwrap();
         // Comfortably more than SPILL_QUEUE_DEPTH, so the consumer really does
         // block on a full queue and the two threads interleave.
         let pushed: Vec<Vec<i64>> = (0..64i64).map(|i| vec![i * 10, i * 10 + 1]).collect();
@@ -2091,6 +2115,43 @@ mod spill_tests {
         );
     }
 
+    /// #427: the pass-2 spill file lives under `spill_dir` when one is given
+    /// (the one scratch knob for everything tylertoo puts on disk), and is
+    /// removed with the sink.
+    #[test]
+    fn spill_file_lives_under_spill_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = schema("id");
+        let mut sink = SpillState::new(&s, Some(dir.path())).unwrap();
+        sink.push(batch(&s, vec![1, 2, 3])).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "one spill file under the spill dir: {entries:?}"
+        );
+        let (mut reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 3);
+        drop(reader);
+        drop(temp);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "spill file removed"
+        );
+    }
+
+    /// A missing spill dir fails the sink up front (the caller's error
+    /// handling), never inside the writer thread.
+    #[test]
+    fn missing_spill_dir_fails_at_construction() {
+        let s = schema("id");
+        let err = SpillState::new(&s, Some(std::path::Path::new("/nonexistent/tylertoo-427")))
+            .err()
+            .expect("a missing spill dir must fail");
+        assert!(matches!(err, ConvertError::Io(_)), "{err}");
+    }
+
     /// A sink abandoned without `into_reader` (an error path, or an unwind)
     /// must still join its writer rather than leaving a thread parked on a
     /// receiver that never disconnects. The test body is the assertion: a
@@ -2098,7 +2159,7 @@ mod spill_tests {
     #[test]
     fn dropping_a_sink_joins_its_writer() {
         let s = schema("id");
-        let mut sink = SpillState::new(&s).unwrap();
+        let mut sink = SpillState::new(&s, None).unwrap();
         for i in 0..8i64 {
             sink.push(batch(&s, vec![i])).unwrap();
         }

@@ -12,9 +12,10 @@
 //! Overview simplification runs RDP **directly on the source-CRS geometry**
 //! with a world-space tolerance derived from the level's GSD (ground sample
 //! distance, meters). This module therefore *extracts and adapts* the
-//! algorithms from `crate::simplify` (the RDP call itself — `geo`'s
-//! [`geo::Simplify`] — plus the ring-validity/degenerate guards) but couples
-//! to none of its tile-space entry points.
+//! algorithms from `crate::simplify` (the RDP call itself — originally
+//! `geo`'s [`geo::Simplify`], now the output-identical iterative
+//! `rdp_coords`, #575 — plus the ring-validity/degenerate guards) but
+//! couples to none of its tile-space entry points.
 //!
 //! # Tolerance model
 //!
@@ -682,7 +683,8 @@ impl CascadeFold {
 // Internal helpers (world-space, tile-free).
 //
 // These adapt the algorithms from `crate::simplify` — the RDP call itself
-// (`geo`'s `Simplify`), the ring-closure/degenerate guards, and the multi
+// (`rdp_coords`, output-identical to `geo`'s `Simplify` but iterative,
+// #575), the ring-closure/degenerate guards, and the multi
 // dispatch — but run directly on source-CRS coordinates with a world-space
 // tolerance instead of transforming into tile-local pixel space.
 // ============================================================================
@@ -737,6 +739,18 @@ const RDP_MIN_RING: usize = 4;
 ///
 /// A differential test (`rdp_matches_geo_*`) pins all of this against
 /// `geo::Simplify` over random and adversarial shapes.
+//
+// DIVERGENCE FROM TIPPECANOE: tippecanoe's `douglas_peucker` (clip.cpp) is
+// itself iterative (an explicit `std::stack`), so running on the heap
+// matches it. Its split rules differ, and this keeps `geo`'s because it must
+// reproduce the pre-#575 output byte for byte. Tippecanoe measures distance
+// on integer tile coordinates rounded to 1/16 (`distance_from_line`), breaks
+// distance ties toward the lexicographically smallest vertex, scanning from
+// the smaller endpoint so the result does not depend on winding, and keeps a
+// minimum through its `retain` count rather than `geo`'s `INITIAL_MIN` floor.
+// We keep the last maximum in index order and the `INITIAL_MIN` floor. Both
+// use a strict `> epsilon` split test. Recorded in context/ARCHITECTURE.md
+// (Known Divergences, Simplification row).
 fn rdp_coords(
     coords: &[geo::Coord<f64>],
     epsilon: f64,
@@ -946,7 +960,7 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
 ///
 /// - Below the visibility gate ⇒ collapse (drop, or representative point when
 ///   `collapse` is set).
-/// - Rings are simplified via `geo::Simplify` (which keeps each ring at
+/// - Rings are simplified via [`rdp_polygon`] (geo-identical RDP, which keeps each ring at
 ///   `>= 4` points, matching `MIN_POLYGON_RING_POINTS`); interior rings that
 ///   fall below the gate are dropped.
 /// - If the exterior collapses (too few points or sub-tolerance area) ⇒
@@ -2521,6 +2535,19 @@ mod rdp_tests {
     #[test]
     #[ignore] // measurement, not an assertion (#575)
     fn probe_rdp_scaling() {
+        // `geo`'s recursive side needs one frame per retained vertex, so at
+        // n = 12,000 it overflows the default 2 MiB test thread (release
+        // build included) and aborts the probe. Give the whole measurement a
+        // stack large enough for the reference to finish.
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(probe_rdp_scaling_body)
+            .expect("spawn")
+            .join()
+            .expect("probe");
+    }
+
+    fn probe_rdp_scaling_body() {
         let amp = 0.0002_f64;
         let step = 0.0004_f64;
         for n in [1500usize, 3000, 6000, 12000] {
@@ -2539,6 +2566,242 @@ mod rdp_tests {
                     ours.0.len()
                 );
             }
+        }
+    }
+
+    // ---- hostile differential harness (adversarial review of #578) --------
+
+    /// Bitwise identity of two coordinate lists (`==` on `f64` is false for
+    /// NaN, which would hide or fake a divergence on NaN inputs).
+    fn same_bits(a: &[Coord<f64>], b: &[Coord<f64>]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(p, q)| p.x.to_bits() == q.x.to_bits() && p.y.to_bits() == q.y.to_bits())
+    }
+
+    /// Run `f` and capture a panic as `None`. `geo` and [`rdp_coords`] both
+    /// carry the same `debug_assert` on an all-NaN interior (no distance is
+    /// `>= 0.0`), so in a debug build "both panic" is agreement too.
+    fn outcome<F: FnOnce() -> Vec<Coord<f64>>>(f: F) -> Option<Vec<Coord<f64>>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+    }
+
+    /// Differential check of both floors: the open-line floor against
+    /// `LineString::simplify`, the ring floor against `Polygon::simplify`
+    /// (whose exterior is the same coordinates, closed by `Polygon::new` on
+    /// both sides).
+    fn assert_matches_geo(coords: &[Coord<f64>], tol: f64) -> Result<(), String> {
+        let ls = LineString::new(coords.to_vec());
+        let ours = outcome(|| rdp_linestring(&ls, tol).0);
+        let geo_out = outcome(|| ls.simplify(tol).0);
+        match (&ours, &geo_out) {
+            (Some(a), Some(b)) if same_bits(a, b) => {}
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "line floor diverged at tol {tol} on {coords:?}: ours {ours:?}, geo {geo_out:?}"
+                ))
+            }
+        }
+        let poly = Polygon::new(ls.clone(), vec![]);
+        let ours = outcome(|| rdp_polygon(&poly, tol).exterior().0.clone());
+        let geo_out = outcome(|| poly.simplify(tol).exterior().0.clone());
+        match (&ours, &geo_out) {
+            (Some(a), Some(b)) if same_bits(a, b) => Ok(()),
+            (None, None) => Ok(()),
+            _ => Err(format!(
+                "ring floor diverged at tol {tol} on {coords:?}: ours {ours:?}, geo {geo_out:?}"
+            )),
+        }
+    }
+
+    fn hostile_tol() -> impl proptest::strategy::Strategy<Value = f64> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => 0.0f64..4.0,
+            2 => (0u8..9).prop_map(|k| f64::from(k) * 0.5),
+            1 => Just(0.0),
+            1 => Just(-1.0),
+            1 => Just(f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(f64::MIN_POSITIVE),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+        /// Small integer grids: dense with exact distance ties, coincident
+        /// and duplicate-consecutive vertices, collinear runs and closed
+        /// rings — where a changed tie-break or floor order would show.
+        #[test]
+        fn rdp_matches_geo_on_integer_grids(
+            pts in proptest::collection::vec((-3i8..=3, -3i8..=3), 0..40),
+            dup_every in 0usize..4,
+            close in proptest::bool::ANY,
+            tol in hostile_tol(),
+        ) {
+            let mut coords: Vec<Coord<f64>> = Vec::new();
+            for (i, (x, y)) in pts.iter().enumerate() {
+                let c = Coord { x: f64::from(*x), y: f64::from(*y) };
+                coords.push(c);
+                if dup_every > 0 && i % dup_every == 0 {
+                    coords.push(c);
+                }
+            }
+            if close {
+                if let Some(first) = coords.first().copied() {
+                    coords.push(first);
+                }
+            }
+            if let Err(e) = assert_matches_geo(&coords, tol) {
+                return Err(proptest::test_runner::TestCaseError::fail(e));
+            }
+        }
+
+        /// Arbitrary finite and non-finite coordinates: NaN and ±inf
+        /// vertices and endpoints, huge magnitudes, signed zeros.
+        #[test]
+        fn rdp_matches_geo_on_non_finite_coords(
+            pts in proptest::collection::vec(
+                (
+                    proptest::prop_oneof![
+                        6 => -1.0e6f64..1.0e6,
+                        1 => proptest::prelude::Just(f64::NAN),
+                        1 => proptest::prelude::Just(f64::INFINITY),
+                        1 => proptest::prelude::Just(f64::NEG_INFINITY),
+                        1 => proptest::prelude::Just(-0.0f64),
+                        1 => proptest::prelude::Just(f64::MAX),
+                    ],
+                    -1.0e6f64..1.0e6,
+                ),
+                0..24,
+            ),
+            tol in hostile_tol(),
+        ) {
+            let coords: Vec<Coord<f64>> =
+                pts.iter().map(|&(x, y)| Coord { x, y }).collect();
+            if let Err(e) = assert_matches_geo(&coords, tol) {
+                return Err(proptest::test_runner::TestCaseError::fail(e));
+            }
+        }
+    }
+
+    /// Deterministic edge shapes the property tests may not land on.
+    #[test]
+    fn rdp_matches_geo_on_edge_shapes() {
+        let c = |x: f64, y: f64| Coord { x, y };
+        let shapes: Vec<Vec<Coord<f64>>> = vec![
+            vec![],
+            vec![c(0.0, 0.0)],
+            vec![c(0.0, 0.0), c(0.0, 0.0)],
+            vec![c(0.0, 0.0), c(1.0, 1.0), c(0.0, 0.0)],
+            vec![c(0.0, 0.0), c(1.0, 0.0), c(2.0, 0.0)],
+            // Every interior vertex exactly equidistant: the last-maximum
+            // tie-break decides the split.
+            vec![
+                c(0.0, 0.0),
+                c(1.0, 1.0),
+                c(2.0, 1.0),
+                c(3.0, 1.0),
+                c(4.0, 0.0),
+            ],
+            // Closed square, and a closed ring degenerate to one point.
+            vec![
+                c(0.0, 0.0),
+                c(1.0, 0.0),
+                c(1.0, 1.0),
+                c(0.0, 1.0),
+                c(0.0, 0.0),
+            ],
+            vec![c(5.0, 5.0); 6],
+            // NaN endpoint (every chord distance is NaN) and NaN interior.
+            vec![c(f64::NAN, 0.0), c(1.0, 1.0), c(2.0, 0.0)],
+            vec![c(0.0, 0.0), c(f64::NAN, f64::NAN), c(2.0, 0.0), c(3.0, 5.0)],
+            vec![c(0.0, 0.0), c(f64::INFINITY, 1.0), c(2.0, 0.0), c(3.0, 1.0)],
+        ];
+        for s in &shapes {
+            for &tol in &[-1.0, 0.0, 0.5, 1.0, 1.5, f64::NAN, f64::INFINITY] {
+                assert_matches_geo(s, tol).unwrap();
+            }
+        }
+    }
+
+    /// Million-vertex strokes, compared against `geo` on a 1 GiB stack (so
+    /// the reference itself survives its recursion). Shapes whose split
+    /// tree is tractable at this size: a random walk (shallow splits), a
+    /// zigzag at a tolerance above its amplitude (one scan culls it all),
+    /// and a jittered straight line (culled everywhere but the floor).
+    #[test]
+    fn rdp_matches_geo_on_million_vertex_strokes() {
+        let big = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(|| {
+                let n = 1_000_000;
+                let walk = noisy_line(n, 7, 3.0);
+                let zig = zigzag(n, 0.0002, 0.0004);
+                let flat = noisy_line(n, 99, 1e-9);
+                for (ls, tol) in [(&walk, 2.0), (&walk, 50.0), (&zig, 0.00021), (&flat, 1e-3)] {
+                    let ours = rdp_linestring(ls, tol);
+                    let theirs = ls.simplify(tol);
+                    assert!(
+                        same_bits(&ours.0, &theirs.0),
+                        "diverged on an n={} stroke at tol {tol}",
+                        ls.0.len()
+                    );
+                }
+            })
+            .expect("spawn");
+        big.join().expect("no divergence");
+    }
+
+    /// #575 end to end: the production entry point (not just the RDP
+    /// kernel) must simplify a stroke that is too deep for recursion on a
+    /// small stack, so reverting either call site to `geo::Simplify` fails
+    /// here. Covers the line path and the polygon-ring path.
+    #[test]
+    fn simplify_for_level_handles_deep_strokes_on_a_small_stack() {
+        let amp = 0.0002_f64;
+        let ls = zigzag(SMALL_STACK_ZIGZAG, amp, 0.0004);
+        let mut ring = ls.0.clone();
+        // Close the zigzag into a thin ring: down, back, and home.
+        let last_x = ring.last().unwrap().x;
+        ring.push(Coord { x: last_x, y: -1.0 });
+        ring.push(Coord { x: 0.0, y: -1.0 });
+        ring.push(ring[0]);
+        let line = Geometry::LineString(ls);
+        let poly = Geometry::Polygon(Polygon::new(LineString::new(ring), vec![]));
+        let opts = SimplifyOptions {
+            cascade: false,
+            ..SimplifyOptions::default()
+        };
+        // 3857 meters verbatim: tolerance = factor * gsd, just under `amp`.
+        let gsd = amp * 0.99;
+        let handle = std::thread::Builder::new()
+            .stack_size(SMALL_STACK_BYTES)
+            .spawn(move || {
+                let l = simplify_for_level(&line, gsd, Crs::Epsg3857, &opts);
+                let p = simplify_for_level(&poly, gsd, Crs::Epsg3857, &opts);
+                (l, p)
+            })
+            .expect("spawn");
+        let (line_out, poly_out) = handle.join().expect("no stack overflow, no panic");
+        match line_out {
+            Simplified::Keep(Geometry::LineString(out)) => assert!(
+                out.0.len() * 10 >= SMALL_STACK_ZIGZAG * 9,
+                "expected almost every vertex retained, kept {}",
+                out.0.len()
+            ),
+            other => panic!("line should survive as a LineString, got {other:?}"),
+        }
+        match poly_out {
+            Simplified::Keep(Geometry::Polygon(p)) => assert!(
+                p.exterior().0.len() * 10 >= SMALL_STACK_ZIGZAG * 9,
+                "expected almost every ring vertex retained, kept {}",
+                p.exterior().0.len()
+            ),
+            other => panic!("ring should survive as a Polygon, got {other:?}"),
         }
     }
 }

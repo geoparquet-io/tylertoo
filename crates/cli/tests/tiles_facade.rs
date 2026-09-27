@@ -62,6 +62,106 @@ fn tiles_facade_produces_valid_pmtiles() {
     );
 }
 
+/// #444: `--max-zoom auto` estimates the finest zoom from the input's
+/// feature extents/spacing instead of taking a literal number, builds the
+/// archive to exactly that zoom, and logs the evidence that drove the pick.
+#[test]
+fn tiles_facade_accepts_max_zoom_auto() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("auto.pmtiles");
+
+    let result = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "auto",
+        ])
+        .output()
+        .expect("run tylertoo tiles --max-zoom auto");
+    assert!(
+        result.status.success(),
+        "tiles --max-zoom auto exited with {}: {}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let bytes = std::fs::read(&output).expect("read output pmtiles");
+    assert_eq!(&bytes[..PMTILES_MAGIC.len()], PMTILES_MAGIC);
+
+    // PMTiles v3 header: byte 101 is the archive's max zoom. open-buildings
+    // (~30m buildings, ~23m apart) pins to z14 (see the core
+    // `real_fixtures_choose_pinned_zooms` characterization).
+    assert_eq!(bytes[101], 14, "auto-chosen max zoom in the archive header");
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("--max-zoom auto: chose z14"),
+        "expected the auto-zoom evidence to be logged, got: {stderr}"
+    );
+}
+
+/// #444 review: a `--min-zoom` above auto's z16 ceiling is a clean error
+/// before any input is read, not a `clamp` panic.
+#[test]
+fn tiles_facade_max_zoom_auto_rejects_min_zoom_above_ceiling() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("auto.pmtiles");
+    let result = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            fixture.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--min-zoom",
+            "17",
+            "--max-zoom",
+            "auto",
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("--min-zoom 17") && !stderr.contains("panicked"),
+        "expected a clean min-zoom error, got: {stderr}"
+    );
+}
+
+/// An out-of-range or garbled `--max-zoom` value that isn't `auto` still
+/// fails clap parsing immediately, before any input is touched.
+#[test]
+fn tiles_facade_rejects_garbled_max_zoom() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.pmtiles");
+
+    let result = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            "/nonexistent/input.parquet",
+            output.to_str().unwrap(),
+            "--max-zoom",
+            "not-a-number",
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("--max-zoom") && stderr.contains("auto"),
+        "error should mention --max-zoom and the auto option, got: {stderr}"
+    );
+}
+
 #[test]
 fn bare_invocation_rewrites_to_tiles() {
     let Some(fixture) = fixture::realdata("road-detections.parquet") else {
