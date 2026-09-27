@@ -446,6 +446,18 @@ tiles while keeping every count the same.
 
 ## Known Divergences from Tippecanoe (overview pipeline)
 
+Every divergence below has a measured footprint: `.github/workflows/tippecanoe-compare.yml`
+runs `benchmarks/e2e/compare_tippecanoe.py` (#420) on every PR and weekly,
+tiling the fixtures-v1 inputs with tylertoo (quality-matched: `--verbatim
+--simplify-factor 1.0`) and pinned tippecanoe 2.79.0 under matched flags, and
+gating the per-zoom tile / feature / distinct-id / vertex / byte ratios
+against the bands in `benchmarks/e2e/tippecanoe_tolerances.toml`. The bands
+are a ratchet: each carries the measured ratio and names the divergence that
+explains it (sub-pixel handling, simplification units, the y-axis buffer,
+empty coarse tiles). Closing a divergence in this table moves a ratio and
+therefore its band, in the same PR, with the new measurement in the comment.
+`corpus/METRICS.md` §2 defines what is compared.
+
 | Area | Our approach | Tippecanoe | Notes |
 |------|--------------|------------|-------|
 | Generalization space | World-space, per **level**, stored in the file | Tile-space, per tile, at encode time | The core format difference: levels are reusable, exact, SQL-queryable |

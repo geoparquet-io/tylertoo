@@ -400,6 +400,49 @@ with a 2% tolerance (`--tolerance`); everything else exactly. Only our
 own archives go through `pmtiles verify` — the tippecanoe-made
 `tests/fixtures/golden/*.pmtiles` are inputs, not outputs.
 
+### tippecanoe parity gate (#420)
+
+`.github/workflows/tippecanoe-compare.yml` (every PR, push to main,
+weekly) tiles the fixtures-v1 inputs with tylertoo and with tippecanoe
+2.79.0 built from source at a pinned tag + commit, decodes both
+archives with independent readers, and gates the per-zoom tile,
+feature, distinct-id, vertex and byte ratios against
+`benchmarks/e2e/tippecanoe_tolerances.toml`. The table lands in the
+job summary; a scheduled failure opens an issue labelled
+`tippecanoe-parity`. Method and flag mapping:
+`benchmarks/e2e/README.md`, "Parity gate". Locally:
+
+```bash
+cargo build --release --package tylertoo
+
+# pinned tippecanoe, built into .tools/ (gitignored);
+# needs a C++ toolchain, sqlite3 and zlib headers
+benchmarks/e2e/setup_tippecanoe.sh
+
+# the gate: all three fixtures, ~75 s on a 16-core
+# laptop; exit 1 on a breach with the cell named
+uv run benchmarks/e2e/compare_tippecanoe.py
+
+# one fixture, keep the archives and the JSON record
+uv run benchmarks/e2e/compare_tippecanoe.py \
+  --only open-buildings --work /tmp/cmp --keep \
+  --json /tmp/cmp/parity.json
+```
+
+The bands are a ratchet like the convert guard baseline: when a
+change moves a ratio on purpose, edit the band in the same PR and put
+the new measured value in its comment. The Test and Coverage jobs
+build the same pinned tippecanoe so that
+`decode_golden_against_tippecanoe_decode` (decode_roundtrip.rs) runs;
+on CI a missing `tippecanoe-decode` fails that test instead of
+skipping it. To run it locally:
+
+```bash
+eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+cargo test -p tylertoo-core --test decode_roundtrip \
+  decode_golden -- --nocapture
+```
+
 ### Workflows
 
 ```bash
