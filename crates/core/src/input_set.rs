@@ -866,7 +866,7 @@ impl ConvertSource {
     /// The widest byte-array column chunk among the `selected` row groups of
     /// every part (`None` selection = all), footer statistics only (#563).
     /// See [`BYTE_ARRAY_BATCH_LIMIT`].
-    pub fn widest_byte_array_column(
+    pub(crate) fn widest_byte_array_column(
         &self,
         selected: Option<&RowGroupSelection>,
     ) -> Result<Option<WidestByteArrayColumn>, InputError> {
