@@ -418,6 +418,17 @@ pub struct ZoomReport {
     pub tile_feature_count: usize,
     /// Number of tiles at this zoom that hit the oversized safety valve.
     pub oversized_tiles: usize,
+    /// Tile members at this zoom that had nothing to encode (#431): empty
+    /// geometries and empty `GeometryCollection`s. Counted per (feature,
+    /// tile) pair, like `tile_feature_count`. Non-zero means content was lost
+    /// after clipping; a warning names the total at the end of the export.
+    pub encode_dropped_features: usize,
+    /// Tile members at this zoom whose geometry had coordinates but collapsed
+    /// at the tile extent and so produced no MVT feature (#431): polygon rings
+    /// of zero area, lines of fewer than two points — typically a clip sliver
+    /// at a buffered tile edge. Expected on ordinary data; informational, and
+    /// never a warning.
+    pub encode_quantized_features: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -444,6 +455,12 @@ pub struct ExportReport {
     pub total_tile_features: usize,
     /// Total tiles that hit the oversized safety valve.
     pub oversized_tiles: usize,
+    /// Total tile members with nothing to encode, across all zooms — see
+    /// [`ZoomReport::encode_dropped_features`] (#431).
+    pub encode_dropped_features: usize,
+    /// Total tile members that collapsed at the tile extent, across all
+    /// zooms — see [`ZoomReport::encode_quantized_features`] (#431).
+    pub encode_quantized_features: usize,
     /// Wall-clock export duration in seconds.
     pub duration_secs: f64,
 }
@@ -730,7 +747,15 @@ struct EncodedTile {
     data: Vec<u8>,
     hash: u64,
     raw_len: usize,
+    /// MVT features in the tile. `0` means every member encoded to nothing
+    /// (#431): the carrier exists only to deliver `encode_dropped` and is not
+    /// written to the archive.
     feature_count: usize,
+    /// Members with nothing to encode (#431); see [`TileMvt::unencodable`].
+    encode_dropped: usize,
+    /// Members that collapsed at the tile extent (#431); see
+    /// [`TileMvt::quantized`].
+    encode_quantized: usize,
     oversized: bool,
 }
 
@@ -1542,6 +1567,8 @@ fn export_pmtiles_impl(
     let total_tiles = zooms.iter().map(|z| z.tile_count).sum();
     let total_tile_features = zooms.iter().map(|z| z.tile_feature_count).sum();
     let oversized_tiles = zooms.iter().map(|z| z.oversized_tiles).sum();
+    let encode_dropped_features = warn_encode_drops(&zooms);
+    let encode_quantized_features = zooms.iter().map(|z| z.encode_quantized_features).sum();
 
     let mode = format!("{:?}", reader.mode()).to_lowercase();
     progress.profile.emit(&ExportProfileTarget {
@@ -1560,8 +1587,30 @@ fn export_pmtiles_impl(
         total_tiles,
         total_tile_features,
         oversized_tiles,
+        encode_dropped_features,
+        encode_quantized_features,
         duration_secs: start.elapsed().as_secs_f64(),
     })
+}
+
+/// Sum the per-zoom unencodable drops and, when there are any, say so once
+/// (#431).
+///
+/// Only members with nothing to encode count here: the expected collapses at
+/// the tile extent (`encode_quantized_features`) never warn, or every polygon
+/// export would. One aggregate `log::warn!` (the #429 out-of-range pattern)
+/// so the CLI's `env_logger` shows it and the summary never reads as an
+/// unqualified success. Returns the total for the report.
+fn warn_encode_drops(zooms: &[ZoomReport]) -> usize {
+    let total: usize = zooms.iter().map(|z| z.encode_dropped_features).sum();
+    if total > 0 {
+        log::warn!(
+            "{total} tile feature(s) had nothing to encode and were dropped at MVT encode \
+             (empty geometries or empty GeometryCollections); see \
+             `encode_dropped_features` in the report"
+        );
+    }
+    total
 }
 
 /// Every level's zoom, in level order, required to strictly ascend (#371 /
@@ -1805,6 +1854,8 @@ fn export_level(
     let mut tile_count = 0usize;
     let mut tile_feature_count = 0usize;
     let mut oversized = 0usize;
+    let mut encode_dropped = 0usize;
+    let mut encode_quantized = 0usize;
     let mut write_secs = 0f64;
     let mut bytes_written = 0u64;
     let total_waves = partitions.len().div_ceil(partition_wave);
@@ -1820,6 +1871,12 @@ fn export_level(
         let t_write = Instant::now();
         for tiles in &results {
             for t in tiles {
+                encode_dropped += t.encode_dropped;
+                encode_quantized += t.encode_quantized;
+                if t.feature_count == 0 {
+                    // #431: an all-dropped tile is a tally carrier, not a tile.
+                    continue;
+                }
                 tile_feature_count += t.feature_count;
                 bytes_written += t.data.len() as u64;
                 if t.oversized {
@@ -1834,8 +1891,8 @@ fn export_level(
                     t.raw_len,
                     t.feature_count,
                 )?;
+                tile_count += 1;
             }
-            tile_count += tiles.len();
         }
         let write_dur = t_write.elapsed();
         write_secs += write_dur.as_secs_f64();
@@ -1891,6 +1948,8 @@ fn export_level(
         tile_count,
         tile_feature_count,
         oversized_tiles: oversized,
+        encode_dropped_features: encode_dropped,
+        encode_quantized_features: encode_quantized,
     })
 }
 
@@ -4091,13 +4150,26 @@ fn encode_members(
             let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
-            let (data, count, oversized) = encode_tile(g, &tb, opts);
-            if count == 0 {
-                return None;
+            let mvt = encode_tile(g, &tb, opts);
+            if mvt.features == 0 {
+                // Every member encoded to nothing (#431). There is no tile
+                // to write, but the drops must still reach the report, so
+                // hand back an empty carrier the writer loop skips.
+                return Some(Ok(EncodedTile {
+                    x,
+                    y,
+                    data: Vec::new(),
+                    hash: 0,
+                    raw_len: 0,
+                    feature_count: 0,
+                    encode_dropped: mvt.unencodable,
+                    encode_quantized: mvt.quantized,
+                    oversized: mvt.oversized,
+                }));
             }
-            let hash = TileHasher::hash(&data);
-            let raw_len = data.len();
-            let compressed = match compression::compress(&data, Compression::Gzip) {
+            let hash = TileHasher::hash(&mvt.data);
+            let raw_len = mvt.data.len();
+            let compressed = match compression::compress(&mvt.data, Compression::Gzip) {
                 Ok(c) => c,
                 Err(e) => return Some(Err(ExportError::from(e))),
             };
@@ -4107,8 +4179,10 @@ fn encode_members(
                 data: compressed,
                 hash,
                 raw_len,
-                feature_count: count,
-                oversized,
+                feature_count: mvt.features,
+                encode_dropped: mvt.unencodable,
+                encode_quantized: mvt.quantized,
+                oversized: mvt.oversized,
             }))
         })
         .collect()
@@ -4125,38 +4199,51 @@ fn bbox_within_buffered(bbox: &TileBounds, tb: &TileBounds, buffer: f64) -> bool
         && bbox.lat_max <= tb.lat_max + buffer
 }
 
+/// One tile's MVT bytes plus the encode tallies the report needs.
+struct TileMvt {
+    /// Raw (uncompressed) MVT bytes.
+    data: Vec<u8>,
+    /// MVT features actually written to the layer. A `GeometryCollection`
+    /// member contributes one per geometry kind it holds (#431).
+    features: usize,
+    /// Members with nothing to encode — empty geometries or empty
+    /// collections (#431). Content loss; gates the export warning.
+    unencodable: usize,
+    /// Members with coordinates that collapsed at the tile extent — polygon
+    /// rings of zero area, lines of fewer than two points (clip slivers at a
+    /// buffered edge). Expected; informational only.
+    quantized: usize,
+    /// Whether the oversized valve fired.
+    oversized: bool,
+}
+
 /// Encode a single tile's members to MVT bytes, applying the oversized valve.
-/// Returns `(bytes, features_encoded, oversized)`.
-fn encode_tile(
-    members: &[Member],
-    tb: &TileBounds,
-    opts: &ExportOptions,
-) -> (Vec<u8>, usize, bool) {
-    let data = build_mvt(members.iter(), tb, opts);
+fn encode_tile(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
+    let full = build_mvt(members.iter(), tb, opts);
 
     match opts.tile_size_limit {
         // `limit > 0` so `Some(0)` is a no-op off switch (the CLI/Python `0`
         // disable value never reaches here as `Some`, but guard the core API too).
-        Some(limit) if limit > 0 && data.len() > limit && members.len() > 1 => {
+        Some(limit) if limit > 0 && full.data.len() > limit && members.len() > 1 => {
             // Single, non-iterative drop pass. Keep a proportional count and let
             // `select_kept_members` decide *which* features survive.
-            let keep_frac = limit as f64 / data.len() as f64;
+            let keep_frac = limit as f64 / full.data.len() as f64;
             let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
             let kept = shed_to_fit(members, keep, opts);
             let keep = kept.len();
-            let data = build_mvt(kept, tb, opts);
+            let shed = build_mvt(kept, tb, opts);
             log::warn!(
                 "oversized tile ({} bytes > {limit} limit): dropped {} of {} features (one pass)",
-                data.len(),
+                shed.data.len(),
                 members.len() - keep,
                 members.len()
             );
-            (data, keep, true)
+            TileMvt {
+                oversized: true,
+                ..shed
+            }
         }
-        _ => {
-            let count = members.len();
-            (data, count, false)
-        }
+        _ => full,
     }
 }
 
@@ -4219,7 +4306,7 @@ fn build_mvt<'a>(
     members: impl IntoIterator<Item = &'a Member>,
     tb: &TileBounds,
     opts: &ExportOptions,
-) -> Vec<u8> {
+) -> TileMvt {
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
     for (i, m) in members.into_iter().enumerate() {
         // #443: a resolved `--feature-id` always wins; the no-flag default
@@ -4227,9 +4314,18 @@ fn build_mvt<'a>(
         let id = m.id.unwrap_or(i as u64);
         layer.add_feature(Some(id), &m.geom, &m.props, tb);
     }
+    let features = layer.feature_count();
+    let unencodable = layer.dropped_features();
+    let quantized = layer.quantized_features();
     let mut tb_builder = TileBuilder::new();
     tb_builder.add_layer(layer.build());
-    tb_builder.build().encode_to_vec()
+    TileMvt {
+        data: tb_builder.build().encode_to_vec(),
+        features,
+        unencodable,
+        quantized,
+        oversized: false,
+    }
 }
 
 // ============================================================================
@@ -4283,6 +4379,8 @@ fn encode_level_tiles(
     // the assertions in the tests below operate on the uncompressed payload.
     let mut tiles = encode_members(members, zoom, opts, &ExportTimers::default())
         .expect("in-memory gzip is infallible");
+    // #431: all-dropped carriers hold no tile bytes; the writer skips them too.
+    tiles.retain(|t| t.feature_count > 0);
     for t in &mut tiles {
         t.data = crate::compression::decompress_capped(
             &t.data,
@@ -5882,7 +5980,7 @@ mod tests {
             props: Arc::new(Vec::new()),
             id: None,
         };
-        build_mvt(std::iter::once(&m), &tb, opts)
+        build_mvt(std::iter::once(&m), &tb, opts).data
     }
 
     /// The recursive cascade must emit the same tile-key set as the direct
@@ -7099,7 +7197,7 @@ mod tests {
             props: Arc::new(vec![]),
             id: None,
         };
-        let expected = build_mvt([&member], &tc.bounds(), &opts);
+        let expected = build_mvt([&member], &tc.bounds(), &opts).data;
         assert_eq!(
             tiles[0].data, expected,
             "contained feature must bypass the clip (geometry emitted as-is)"
@@ -7643,9 +7741,11 @@ mod tests {
             tile_size_limit: Some(0),
             ..Default::default()
         };
-        let (_data, count, oversized) = encode_tile(&members, &tb, &opts);
-        assert!(!oversized, "Some(0) must disable the cap");
-        assert_eq!(count, members.len());
+        let mvt = encode_tile(&members, &tb, &opts);
+        assert!(!mvt.oversized, "Some(0) must disable the cap");
+        assert_eq!(mvt.features, members.len());
+        assert_eq!(mvt.unencodable, 0);
+        assert_eq!(mvt.quantized, 0);
     }
 
     // --- #235: partitioning single-read fan-out pass 2 -----------------------

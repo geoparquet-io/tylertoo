@@ -33,7 +33,7 @@ then export it to a PMTiles archive — mirroring the CLI and Python surfaces.
 | `ConvertReport` | `overview::convert` | Per-level feature/vertex/byte counts and remote-fetch stats. |
 | `export_pmtiles` | `overview::export` | Export an overview file to a PMTiles archive. |
 | `ExportOptions` | `overview::export` | Layer name, tile buffer/extent, per-tile size cap, wave scheduling. |
-| `ExportReport` | `overview::export` | Per-zoom tile counts and oversized-tile tallies. |
+| `ExportReport` | `overview::export` | Per-zoom tile counts, oversized-tile tallies, and the MVT-encode tallies (`encode_dropped_features`: nothing to encode, warned; `encode_quantized_features`: collapsed at the tile extent, expected; #431). |
 | `StreamingPmtilesWriter` | crate root | Lower-level streaming PMTiles v3 writer, if you drive tiling yourself. |
 | `validate_wgs84`, `extract_crs`, `CrsInfo` | `quality` | CRS checks used by the input contract. |
 

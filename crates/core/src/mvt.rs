@@ -15,6 +15,7 @@ use crate::tile::TileBounds;
 use crate::vector_tile::tile::{Feature, GeomType, Layer, Value};
 use crate::vector_tile::Tile;
 use geo::orient::{Direction, Orient};
+use geo::CoordsIter;
 use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use std::collections::HashMap;
 
@@ -1256,7 +1257,14 @@ pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent
     encode_tile_polygons(&resolve_part_overlaps(polys))
 }
 
-/// Encode any geo::Geometry to MVT geometry commands and return the geometry type.
+/// Encode a single-type geo::Geometry to MVT geometry commands and return the
+/// geometry type.
+///
+/// `Line`, `Rect` and `Triangle` encode as the line / polygon they are. A
+/// `GeometryCollection` is **not** a single MVT type and returns
+/// `(vec![], GeomType::Unknown)`: split it first with
+/// [`flatten_geometry_collection`], which is what [`LayerBuilder::add_feature`]
+/// does (#431).
 pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Vec<u32>, GeomType) {
     match geom {
         Geometry::Point(p) => (encode_point(p, bounds, extent), GeomType::Point),
@@ -1268,9 +1276,72 @@ pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Ve
         ),
         Geometry::Polygon(p) => (encode_polygon(p, bounds, extent), GeomType::Polygon),
         Geometry::MultiPolygon(mp) => (encode_multi_polygon(mp, bounds, extent), GeomType::Polygon),
-        // For geometry collections, we'd need to handle each part separately
-        // For now, return empty geometry with unknown type
-        _ => (vec![], GeomType::Unknown),
+        Geometry::Line(l) => (
+            encode_linestring(&LineString::from(*l), bounds, extent),
+            GeomType::Linestring,
+        ),
+        Geometry::Rect(r) => (
+            encode_polygon(&r.to_polygon(), bounds, extent),
+            GeomType::Polygon,
+        ),
+        Geometry::Triangle(t) => (
+            encode_polygon(&t.to_polygon(), bounds, extent),
+            GeomType::Polygon,
+        ),
+        Geometry::GeometryCollection(_) => (vec![], GeomType::Unknown),
+    }
+}
+
+/// Flatten a `GeometryCollection` (recursively) into at most three
+/// single-type geometries, in draw order: every polygonal part as one
+/// `MultiPolygon`, every linear part as one `MultiLineString`, every point
+/// part as one `MultiPoint`. Kinds with no parts are absent, so an empty
+/// collection (or a nest of empty collections) yields an empty vector.
+///
+/// MVT features are single-type (spec §4.3.4), so a collection cannot be one
+/// feature. Tippecanoe splits a GeoJSON `GeometryCollection` at read time
+/// into one feature **per member** with the same id and properties
+/// (`read_json.cpp`, `serialize_geojson_feature`). We group by kind instead
+/// so the collection contributes at most three features per tile and its
+/// `--feature-id` is shared by as few features as possible; the rendered
+/// content is the same. See `context/ARCHITECTURE.md` (#431).
+pub fn flatten_geometry_collection(gc: &geo::GeometryCollection<f64>) -> Vec<Geometry> {
+    let mut polygons: Vec<Polygon> = Vec::new();
+    let mut lines: Vec<LineString> = Vec::new();
+    let mut points: Vec<Point> = Vec::new();
+    collect_gc_parts(gc, &mut polygons, &mut lines, &mut points);
+    let mut out = Vec::with_capacity(3);
+    if !polygons.is_empty() {
+        out.push(Geometry::MultiPolygon(MultiPolygon::new(polygons)));
+    }
+    if !lines.is_empty() {
+        out.push(Geometry::MultiLineString(MultiLineString::new(lines)));
+    }
+    if !points.is_empty() {
+        out.push(Geometry::MultiPoint(MultiPoint::new(points)));
+    }
+    out
+}
+
+fn collect_gc_parts(
+    gc: &geo::GeometryCollection<f64>,
+    polygons: &mut Vec<Polygon>,
+    lines: &mut Vec<LineString>,
+    points: &mut Vec<Point>,
+) {
+    for part in &gc.0 {
+        match part {
+            Geometry::Point(p) => points.push(*p),
+            Geometry::MultiPoint(mp) => points.extend(mp.0.iter().copied()),
+            Geometry::LineString(ls) => lines.push(ls.clone()),
+            Geometry::MultiLineString(mls) => lines.extend(mls.0.iter().cloned()),
+            Geometry::Line(l) => lines.push(LineString::from(*l)),
+            Geometry::Polygon(p) => polygons.push(p.clone()),
+            Geometry::MultiPolygon(mp) => polygons.extend(mp.0.iter().cloned()),
+            Geometry::Rect(r) => polygons.push(r.to_polygon()),
+            Geometry::Triangle(t) => polygons.push(t.to_polygon()),
+            Geometry::GeometryCollection(inner) => collect_gc_parts(inner, polygons, lines, points),
+        }
     }
 }
 
@@ -1385,6 +1456,12 @@ pub struct LayerBuilder {
     string_index: HashMap<String, u32>,
     /// Dedup index for every other value ([`ScalarKey`]).
     scalar_index: HashMap<ScalarKey, u32>,
+    /// Input features that produced no MVT feature and had no coordinates to
+    /// begin with (see [`Self::dropped_features`]).
+    unencodable: usize,
+    /// Input features with coordinates that produced no MVT feature because
+    /// they collapse at the tile extent (see [`Self::quantized_features`]).
+    quantized: usize,
 }
 
 impl LayerBuilder {
@@ -1399,6 +1476,8 @@ impl LayerBuilder {
             values: Vec::new(),
             string_index: HashMap::new(),
             scalar_index: HashMap::new(),
+            unencodable: 0,
+            quantized: 0,
         }
     }
 
@@ -1406,6 +1485,32 @@ impl LayerBuilder {
     pub fn with_extent(mut self, extent: u32) -> Self {
         self.extent = extent;
         self
+    }
+
+    /// Number of MVT features added so far. A `GeometryCollection` counts
+    /// once per single-type part it split into (up to three).
+    pub fn feature_count(&self) -> usize {
+        self.features.len()
+    }
+
+    /// Number of [`Self::add_feature`] calls that produced **no** MVT feature
+    /// because the input had nothing to encode (#431): an empty geometry, an
+    /// empty `GeometryCollection` (or one holding only empty parts). This is
+    /// content loss the caller should report; nothing in the layer records
+    /// it. Expected collapses at the tile extent are counted separately in
+    /// [`Self::quantized_features`].
+    pub fn dropped_features(&self) -> usize {
+        self.unencodable
+    }
+
+    /// Number of [`Self::add_feature`] calls whose input **had** coordinates
+    /// but produced no MVT feature because it cannot be represented at this
+    /// tile's extent: a polygon whose rings collapse to zero area, a line
+    /// with fewer than two points (a clip sliver at a buffered tile edge is
+    /// the routine case). Expected on ordinary data; informational, not a
+    /// warning.
+    pub fn quantized_features(&self) -> usize {
+        self.quantized
     }
 
     /// Get or insert a key, returning its index.
@@ -1459,6 +1564,13 @@ impl LayerBuilder {
 
     /// Add a feature to the layer.
     ///
+    /// A `GeometryCollection` is split with [`flatten_geometry_collection`]
+    /// into one MVT feature per geometry kind present (polygons, lines,
+    /// points — in that draw order), each carrying the same `id` and
+    /// `properties` (#431). A call that yields no feature at all is tallied
+    /// in [`Self::dropped_features`] when the input had no coordinates, or in
+    /// [`Self::quantized_features`] when it collapsed at the tile extent.
+    ///
     /// # Arguments
     /// * `id` - Optional feature ID
     /// * `geometry` - The geometry to encode
@@ -1471,16 +1583,58 @@ impl LayerBuilder {
         properties: &[(String, PropertyValue)],
         bounds: &TileBounds,
     ) {
-        let (geom_commands, geom_type) = encode_geometry(geometry, bounds, self.extent);
-
-        // Skip empty geometries: unsupported types, and polygons that
-        // quantize to nothing at this zoom (MVT 2.1 §4.2 requires a
-        // geometry).
-        if geom_commands.is_empty() {
-            return;
+        let emitted = match geometry {
+            Geometry::GeometryCollection(gc) => {
+                let mut tags: Option<Vec<u32>> = None;
+                let mut any = false;
+                for part in flatten_geometry_collection(gc) {
+                    let (commands, geom_type) = encode_geometry(&part, bounds, self.extent);
+                    if commands.is_empty() {
+                        continue;
+                    }
+                    // Intern the tags once, on the first part that survives.
+                    let tags = tags.get_or_insert_with(|| self.encode_tags(properties));
+                    self.features.push(Feature {
+                        id,
+                        tags: tags.clone(),
+                        r#type: Some(geom_type as i32),
+                        geometry: commands,
+                    });
+                    any = true;
+                }
+                any
+            }
+            _ => {
+                let (commands, geom_type) = encode_geometry(geometry, bounds, self.extent);
+                // Skip empty geometries: polygons that quantize to nothing at
+                // this zoom (MVT 2.1 §4.2 requires a geometry).
+                if commands.is_empty() {
+                    false
+                } else {
+                    let tags = self.encode_tags(properties);
+                    self.features.push(Feature {
+                        id,
+                        tags,
+                        r#type: Some(geom_type as i32),
+                        geometry: commands,
+                    });
+                    true
+                }
+            }
+        };
+        if !emitted {
+            // A geometry with no coordinates at all had nothing to encode;
+            // one with coordinates collapsed at this extent.
+            if geometry.coords_count() == 0 {
+                self.unencodable += 1;
+            } else {
+                self.quantized += 1;
+            }
         }
+    }
 
-        // Encode tags as [key_idx, value_idx, key_idx, value_idx, ...]
+    /// Encode tags as `[key_idx, value_idx, key_idx, value_idx, ...]`.
+    fn encode_tags(&mut self, properties: &[(String, PropertyValue)]) -> Vec<u32> {
         let mut tags = Vec::with_capacity(properties.len() * 2);
         for (key, value) in properties {
             let key_idx = self.get_or_insert_key(key);
@@ -1488,15 +1642,7 @@ impl LayerBuilder {
             tags.push(key_idx);
             tags.push(value_idx);
         }
-
-        let feature = Feature {
-            id,
-            tags,
-            r#type: Some(geom_type as i32),
-            geometry: geom_commands,
-        };
-
-        self.features.push(feature);
+        tags
     }
 
     /// Build the MVT Layer.
@@ -3517,5 +3663,190 @@ mod tests {
         let (x, y) = geo_to_tile_coords(1e12, 0.5, &test_bounds(), 4096);
         assert_eq!(x, c);
         assert!(y.abs() <= c);
+    }
+
+    // ------------------------------------------------------------------------
+    // GeometryCollection splitting (#431)
+    // ------------------------------------------------------------------------
+
+    fn gc_props() -> Vec<(String, PropertyValue)> {
+        vec![
+            ("name".to_string(), PropertyValue::String("gc".to_string())),
+            ("value".to_string(), PropertyValue::Int(7)),
+        ]
+    }
+
+    /// A GeometryCollection holding one part of each kind becomes one MVT
+    /// feature per kind, every one carrying the collection's id and tags.
+    #[test]
+    fn geometry_collection_encodes_one_feature_per_type() {
+        let bounds = test_bounds();
+        let gc = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
+            Geometry::Point(point!(x: 0.2, y: 0.2)),
+            Geometry::LineString(line_string![(x: 0.1, y: 0.1), (x: 0.9, y: 0.9)]),
+            Geometry::Polygon(polygon![
+                (x: 0.3, y: 0.3),
+                (x: 0.7, y: 0.3),
+                (x: 0.7, y: 0.7),
+                (x: 0.3, y: 0.7),
+                (x: 0.3, y: 0.3),
+            ]),
+        ]));
+        let mut builder = LayerBuilder::new("gc");
+        builder.add_feature(Some(42), &gc, &gc_props(), &bounds);
+        assert_eq!(builder.feature_count(), 3, "one feature per geometry kind");
+        assert_eq!(builder.dropped_features(), 0);
+
+        let layer = builder.build();
+        assert_eq!(layer.features.len(), 3);
+        let mut types: Vec<i32> = layer.features.iter().map(|f| f.r#type.unwrap()).collect();
+        types.sort_unstable();
+        assert_eq!(
+            types,
+            vec![
+                GeomType::Point as i32,
+                GeomType::Linestring as i32,
+                GeomType::Polygon as i32
+            ]
+        );
+        for f in &layer.features {
+            assert_eq!(f.id, Some(42), "every part keeps the collection's id");
+            assert_eq!(f.tags, layer.features[0].tags, "every part keeps the tags");
+            assert!(!f.geometry.is_empty());
+        }
+        // Tags are interned once: two keys, two values, not 3x that.
+        assert_eq!(layer.keys.len(), 2);
+        assert_eq!(layer.values.len(), 2);
+    }
+
+    /// Nested collections flatten, and same-kind parts across the nesting
+    /// merge into ONE multi-geometry feature (MVT features are single-type).
+    #[test]
+    fn nested_geometry_collections_flatten_and_merge_by_type() {
+        let bounds = test_bounds();
+        let inner = geo::GeometryCollection::from(vec![
+            Geometry::Point(point!(x: 0.2, y: 0.2)),
+            Geometry::Point(point!(x: 0.8, y: 0.8)),
+        ]);
+        let gc = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
+            Geometry::GeometryCollection(inner),
+            Geometry::MultiPoint(MultiPoint::from(vec![point!(x: 0.5, y: 0.5)])),
+            Geometry::LineString(line_string![(x: 0.1, y: 0.1), (x: 0.9, y: 0.9)]),
+        ]));
+        let mut builder = LayerBuilder::new("gc");
+        builder.add_feature(Some(3), &gc, &gc_props(), &bounds);
+        assert_eq!(builder.dropped_features(), 0);
+        let layer = builder.build();
+        assert_eq!(
+            layer.features.len(),
+            2,
+            "points merge into one MultiPoint feature"
+        );
+        let points = layer
+            .features
+            .iter()
+            .find(|f| f.r#type == Some(GeomType::Point as i32))
+            .expect("a point feature");
+        // MoveTo with count 3: (3 << 3) | 1.
+        assert_eq!(points.geometry[0], (3 << 3) | CMD_MOVE_TO);
+        assert!(layer
+            .features
+            .iter()
+            .any(|f| f.r#type == Some(GeomType::Linestring as i32)));
+    }
+
+    /// An empty collection yields no feature, and the drop is counted rather
+    /// than silent.
+    #[test]
+    fn empty_geometry_collection_is_dropped_and_counted() {
+        let bounds = test_bounds();
+        let gc =
+            Geometry::GeometryCollection(geo::GeometryCollection::from(Vec::<Geometry>::new()));
+        let mut builder = LayerBuilder::new("gc");
+        builder.add_feature(Some(1), &gc, &gc_props(), &bounds);
+        // A collection of empty collections is just as empty.
+        let nested = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
+            Geometry::GeometryCollection(geo::GeometryCollection::from(Vec::<Geometry>::new())),
+        ]));
+        builder.add_feature(Some(2), &nested, &gc_props(), &bounds);
+        // A plain point still encodes, so the counter is per input feature.
+        builder.add_feature(
+            Some(3),
+            &Geometry::Point(point!(x: 0.5, y: 0.5)),
+            &gc_props(),
+            &bounds,
+        );
+        assert_eq!(builder.feature_count(), 1);
+        assert_eq!(builder.dropped_features(), 2);
+        assert_eq!(
+            builder.quantized_features(),
+            0,
+            "an empty geometry is unencodable, not quantized away"
+        );
+        assert_eq!(builder.build().features.len(), 1);
+    }
+
+    /// Geometry that HAS coordinates but cannot be represented at the tile
+    /// extent — a one-point line, a sub-pixel polygon — is an expected,
+    /// quantized-away drop, kept apart from the unencodable tally so a
+    /// routine polygon export never warns (#431 review).
+    #[test]
+    fn quantized_away_geometry_is_counted_separately_from_unencodable() {
+        let bounds = test_bounds();
+        let mut builder = LayerBuilder::new("q");
+        // One point is not a line: encode_linestring returns nothing.
+        let stub = Geometry::LineString(LineString::from(vec![(0.5, 0.5)]));
+        builder.add_feature(Some(1), &stub, &gc_props(), &bounds);
+        // A polygon far below one tile unit collapses to zero area.
+        let eps = 1e-9;
+        let sliver = Geometry::Polygon(polygon![
+            (x: 0.5, y: 0.5),
+            (x: 0.5 + eps, y: 0.5),
+            (x: 0.5 + eps, y: 0.5 + eps),
+            (x: 0.5, y: 0.5),
+        ]);
+        builder.add_feature(Some(2), &sliver, &gc_props(), &bounds);
+        // A collection whose only parts quantize away is quantized, not empty.
+        let gc = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
+            stub.clone(),
+            sliver.clone(),
+        ]));
+        builder.add_feature(Some(3), &gc, &gc_props(), &bounds);
+        // Truly empty input stays on the unencodable side.
+        let empty = Geometry::LineString(LineString::from(Vec::<(f64, f64)>::new()));
+        builder.add_feature(Some(4), &empty, &gc_props(), &bounds);
+
+        assert_eq!(builder.feature_count(), 0);
+        assert_eq!(builder.quantized_features(), 3);
+        assert_eq!(builder.dropped_features(), 1);
+    }
+
+    /// The remaining `geo::Geometry` variants — `Line`, `Rect`, `Triangle` —
+    /// are encoded as the line / polygon they are instead of vanishing.
+    #[test]
+    fn line_rect_triangle_encode_as_their_kind() {
+        let bounds = test_bounds();
+        let line = Geometry::Line(geo::Line::new((0.1, 0.1), (0.9, 0.9)));
+        let rect = Geometry::Rect(geo::Rect::new((0.2, 0.2), (0.8, 0.8)));
+        let tri = Geometry::Triangle(geo::Triangle::new(
+            (0.1, 0.1).into(),
+            (0.9, 0.1).into(),
+            (0.5, 0.9).into(),
+        ));
+        assert_eq!(
+            encode_geometry(&line, &bounds, 4096).1,
+            GeomType::Linestring
+        );
+        assert_eq!(encode_geometry(&rect, &bounds, 4096).1, GeomType::Polygon);
+        assert_eq!(encode_geometry(&tri, &bounds, 4096).1, GeomType::Polygon);
+        for g in [&line, &rect, &tri] {
+            assert!(!encode_geometry(g, &bounds, 4096).0.is_empty());
+        }
+        // Inside a collection they group with their kind.
+        let gc = geo::GeometryCollection::from(vec![line, rect, tri]);
+        let parts = flatten_geometry_collection(&gc);
+        assert_eq!(parts.len(), 2, "one MultiPolygon + one MultiLineString");
+        assert!(matches!(parts[0], Geometry::MultiPolygon(ref mp) if mp.0.len() == 2));
+        assert!(matches!(parts[1], Geometry::MultiLineString(ref mls) if mls.0.len() == 1));
     }
 }

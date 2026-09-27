@@ -627,6 +627,16 @@ struct ExportPmtilesArgs {
     tile_size_limit: usize,
 
     /// Write the JSON export report to this path.
+    ///
+    /// Besides per-zoom tile and feature counts and the oversized-tile tally,
+    /// the report carries two encode tallies (total and per zoom, #431).
+    /// `encode_dropped_features`: tile members with nothing to encode -- empty
+    /// geometries or empty GeometryCollections; non-zero means content was
+    /// lost after clipping, a warning names the total and the summary line
+    /// repeats it. `encode_quantized_features`: tile members whose geometry
+    /// collapsed at the tile extent -- zero-area polygon rings, lines of
+    /// fewer than two points, typically clip slivers at a buffered tile edge;
+    /// expected on ordinary data and never a warning.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
@@ -3151,8 +3161,12 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             convert_report.duration_secs + export_report.duration_secs,
             convert_report.out_of_range_features,
             convert_report.unprojectable_features,
+            export_report.encode_dropped_features,
         )
     );
+    if let Some(note) = encode_quantized_note(export_report.encode_quantized_features) {
+        println!("  {note}");
+    }
     // #380: the summary line above covers the requested (declared) range,
     // which can be wider than the archive's own PMTiles header (#529, #522:
     // the header always reflects the zooms that actually hold a tile) — say
@@ -3239,6 +3253,7 @@ fn tiles_summary_line(
     secs: f64,
     out_of_range: usize,
     unprojectable: usize,
+    encode_dropped: usize,
 ) -> String {
     let zooms = format!("z{min_zoom}..z{max_zoom}");
     let tiles = format_number(total_tiles as u64);
@@ -3255,6 +3270,16 @@ fn tiles_summary_line(
             format_number(unprojectable as u64)
         ));
     }
+    if encode_dropped > 0 {
+        // #431: post-clip losses at MVT encode; the core's aggregate warning
+        // names the causes. Expected extent collapses are NOT a loss and go
+        // through `encode_quantized_note` instead.
+        losses.push(format!(
+            "{} tile feature(s) dropped at MVT encode (empty geometry or empty \
+             GeometryCollection)",
+            format_number(encode_dropped as u64)
+        ));
+    }
     if losses.is_empty() {
         return format!("{tiles} tiles across {zooms} in {secs:.2}s");
     }
@@ -3264,6 +3289,22 @@ fn tiles_summary_line(
     } else {
         format!("{tiles} tiles across {zooms} in {secs:.2}s — {dropped}")
     }
+}
+
+/// The informational note for members that collapsed at the tile extent
+/// (#431), if any. Deliberately NOT part of the summary line: a clip sliver
+/// that quantizes to zero area at a buffered tile edge is routine on any
+/// polygon export and is not content loss.
+fn encode_quantized_note(encode_quantized: usize) -> Option<String> {
+    (encode_quantized > 0).then(|| {
+        format!(
+            "note: {} tile feature(s) collapsed at the tile extent and were not encoded \
+             (zero-area polygon rings or lines of fewer than two points, typically clip \
+             slivers at a buffered tile edge) \u{2014} expected, see \
+             `encode_quantized_features` in the report",
+            format_number(encode_quantized as u64)
+        )
+    })
 }
 
 /// The pyramid build's skipped-tile line, if any (#514 S3).
@@ -3696,7 +3737,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     );
     for z in &report.zooms {
         println!(
-            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}",
+            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}{}{}",
             z.zoom,
             z.level,
             z.tile_count,
@@ -3705,16 +3746,39 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
                 format!(", {} oversized", z.oversized_tiles)
             } else {
                 String::new()
+            },
+            if z.encode_dropped_features > 0 {
+                format!(", {} unencodable", z.encode_dropped_features)
+            } else {
+                String::new()
+            },
+            if z.encode_quantized_features > 0 {
+                format!(", {} collapsed at extent", z.encode_quantized_features)
+            } else {
+                String::new()
             }
         );
     }
     println!(
-        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s",
+        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s{}",
         report.total_tiles,
         report.total_tile_features,
         report.oversized_tiles,
-        report.duration_secs
+        report.duration_secs,
+        if report.encode_dropped_features > 0 {
+            // #431: never let the summary read as an unqualified success.
+            format!(
+                " \u{2014} {} tile feature(s) dropped at MVT encode (empty geometry or \
+                 empty GeometryCollection); see the warning above",
+                report.encode_dropped_features
+            )
+        } else {
+            String::new()
+        }
     );
+    if let Some(note) = encode_quantized_note(report.encode_quantized_features) {
+        println!("  {note}");
+    }
 
     if let Some(path) = &args.report {
         let json = serde_json::to_string_pretty(&report)
@@ -5550,10 +5614,10 @@ mod tests {
     /// unqualified success.
     #[test]
     fn tiles_summary_line_names_out_of_range_losses() {
-        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0);
+        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0, 0);
         assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
 
-        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0);
+        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0, 0);
         assert!(
             empty.starts_with(
                 "0 tiles \u{2014} 3 feature(s) dropped (outside the declared CRS range)"
@@ -5561,7 +5625,7 @@ mod tests {
             "a wrong-CRS run must not read as a clean success: {empty}"
         );
 
-        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0);
+        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0, 0);
         assert!(
             partial.contains("10 tiles across z0..z14")
                 && partial.contains("1 feature(s) dropped (outside the declared CRS range)"),
@@ -5569,7 +5633,7 @@ mod tests {
         );
 
         // The Mercator-domain loss is named separately: nothing to reproject.
-        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7);
+        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7, 0);
         assert!(
             polar.contains(
                 "7 feature(s) dropped (|lat| > 85.05\u{b0}, outside the Web Mercator \
@@ -5579,11 +5643,36 @@ mod tests {
         );
 
         // Both at once, both named.
-        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3);
+        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3, 0);
         assert!(
             both.contains("2 feature(s) dropped (outside the declared CRS range)")
                 && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
             "{both}"
+        );
+
+        // #431: encode-time drops are a post-clip loss and are named as such.
+        let encode = tiles_summary_line(5, 0, 14, 0.1, 0, 0, 4);
+        assert!(
+            encode.contains("5 tiles across z0..z14")
+                && encode.contains(
+                    "4 tile feature(s) dropped at MVT encode (empty geometry or empty \
+                     GeometryCollection)"
+                ),
+            "{encode}"
+        );
+    }
+
+    /// #431 review: extent collapses are expected and never qualify the
+    /// success line; they get their own note, naming what they are.
+    #[test]
+    fn encode_quantized_note_is_separate_and_silent_at_zero() {
+        assert_eq!(encode_quantized_note(0), None);
+        let note = encode_quantized_note(2).unwrap();
+        assert!(
+            note.contains("2 tile feature(s) collapsed at the tile extent")
+                && note.contains("lines of fewer than two points")
+                && !note.contains("dropped"),
+            "{note}"
         );
     }
 
