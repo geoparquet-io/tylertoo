@@ -340,6 +340,62 @@ fn check_convert_line(
         "the TYLERTOO_PROFILE_JSON preflight must leave no probe file behind, \
          found: {strays:?}"
     );
+
+    check_rss_sampler(value, value, &CONVERT_PHASES);
+}
+
+/// Every phase a plain (no `--plan`) convert enters, as `rss_sampler`
+/// reports them (#571).
+const CONVERT_PHASES: [&str; 6] = [
+    "preflight",
+    "pass1 scan",
+    "assignment+budget (winner tables)",
+    "pre-pass2 (winner tables freed)",
+    "pass2 (output sink)",
+    "writer.finish",
+];
+
+/// #571: the `rss_sampler` object inside `holder` (the convert line itself,
+/// or its `export` object). Every phase the run entered has an entry however
+/// short it was, `true_peak_mib` is the max over them, and it is never below
+/// the boundary-sampled `peak_rss_mib` it sits next to.
+fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phases: &[&str]) {
+    let sampler = &holder["rss_sampler"];
+    assert_eq!(
+        sampler["interval_ms"], 250,
+        "rss_sampler.interval_ms must be the production cadence: {line}"
+    );
+    let Some(boundary) = holder["peak_rss_mib"].as_f64() else {
+        // The platform cannot report RSS: nothing was sampled at all.
+        return;
+    };
+    let peaks = sampler["phase_peaks_mib"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rss_sampler.phase_peaks_mib must be an object: {line}"));
+    let mut got: Vec<&str> = peaks.keys().map(String::as_str).collect();
+    let mut want = phases.to_vec();
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "rss_sampler.phase_peaks_mib must name exactly the phases the run entered: {line}"
+    );
+    let true_peak = sampler["true_peak_mib"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("rss_sampler.true_peak_mib must be a number: {line}"));
+    let max_phase = peaks
+        .values()
+        .map(|v| v.as_f64().expect("phase peak must be a number"))
+        .fold(0.0, f64::max);
+    assert_eq!(
+        true_peak, max_phase,
+        "rss_sampler.true_peak_mib must be the max over phase_peaks_mib: {line}"
+    );
+    assert!(
+        true_peak >= boundary,
+        "rss_sampler.true_peak_mib ({true_peak}) must not be below the \
+         boundary-sampled peak_rss_mib ({boundary}): {line}"
+    );
 }
 
 /// #535: the export profile line of [`profile_json_written_and_parses`]'s
@@ -467,6 +523,8 @@ fn check_export_line(report: &serde_json::Value, export_value: &serde_json::Valu
             || export["peak_rss_mib"].as_f64().is_some_and(|m| m > 0.0),
         "export.peak_rss_mib must be a positive number or null: {export_value}"
     );
+    // Duplicating mode runs no fill, so the sampler has no `fill` entry.
+    check_rss_sampler(export_value, export, &["scan", "levels", "finalize"]);
 }
 
 /// `export.phase_walls` are disjoint wall windows of the export, so they
@@ -595,6 +653,69 @@ fn profile_json_export_line_partitioning_mode() {
     assert!(
         export["per_zoom"].as_array().is_some_and(|z| z.len() > 1),
         "this test needs a multi-level export: {export_value}"
+    );
+    check_rss_sampler(
+        export_value,
+        export,
+        &["scan", "fill", "levels", "finalize"],
+    );
+    check_rss_sampler(converts[0], converts[0], &CONVERT_PHASES);
+}
+
+/// #571 review: a `--plan` convert runs no pass 1 and no assignment; the
+/// sampler must credit that stretch to the plan load, not report a
+/// `pass1 scan` phase that never ran.
+#[test]
+fn profile_json_rss_sampler_names_the_plan_load_phase() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plan = dir.path().join("convert.plan");
+    let profile_json = dir.path().join("profile.jsonl");
+    let base = [
+        fixture.to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "6",
+    ];
+    for (name, flag) in [("a.parquet", "--save-plan"), ("b.parquet", "--plan")] {
+        let out = dir.path().join(name);
+        let mut args = vec!["overview", base[0], out.to_str().unwrap()];
+        args.extend_from_slice(&base[1..]);
+        args.extend_from_slice(&[flag, plan.to_str().unwrap()]);
+        let output = Command::new(tylertoo_bin())
+            .args(&args)
+            .env("TYLERTOO_PROFILE_JSON", &profile_json)
+            .output()
+            .expect("run tylertoo overview");
+        assert!(
+            output.status.success(),
+            "overview {flag} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let contents = std::fs::read_to_string(&profile_json).expect("read TYLERTOO_PROFILE_JSON");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every profile line must be valid JSON"))
+        .collect();
+    assert_eq!(lines.len(), 2, "two overview runs, two lines: {contents}");
+    check_rss_sampler(&lines[0], &lines[0], &CONVERT_PHASES);
+    check_rss_sampler(
+        &lines[1],
+        &lines[1],
+        &[
+            "preflight",
+            "plan load",
+            "pre-pass2 (winner tables freed)",
+            "pass2 (output sink)",
+            "writer.finish",
+        ],
     );
 }
 

@@ -130,8 +130,9 @@ use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
 use super::properties::PropertySelection;
 use super::reader::{OverviewReader, ReaderError};
 use super::stream::{
-    add_nanos, preflight_profile_json_path, sample_rss_peak, write_export_profile_json,
-    ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers, ExportZoomProfile,
+    add_nanos, preflight_profile_json_path, profile_json_target, sample_rss_peak,
+    write_export_profile_json, ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers,
+    ExportZoomProfile, RssSampler, RssSamplerReport,
 };
 use super::writer::LEVEL_COLUMN;
 
@@ -1476,6 +1477,11 @@ fn export_pmtiles_impl(
     // features to the tile-size accumulators of every level whose prefix
     // includes it. O(#tiles) memory per level; the per-level `LevelScan`s are
     // byte-identical to independent per-level scans.
+    // #571: the continuous RSS sampler starts HERE, with the scan it is
+    // meant to watch, iff profiling is on (no thread otherwise). It is handed
+    // to `ExportProgress` below; an early `?` return drops it, which stops
+    // the thread.
+    let rss_sampler = RssSampler::start_if(profile_json_target().is_some(), "scan");
     let t_scan = Instant::now();
     let mut scans = scan_all_levels(&reader, crs, &meta, options)?;
     log::info!(
@@ -1512,7 +1518,9 @@ fn export_pmtiles_impl(
     let mut zooms: Vec<ZoomReport> = Vec::with_capacity(num_levels);
     // #535 step 1: stage timers + per-zoom profile -> a second
     // `TYLERTOO_PROFILE_JSON` line at the end ([`emit_export_profile_json`]).
-    let mut progress = ExportProgress::new(num_levels);
+    // #571: `ExportProgress` also owns the continuous RSS sampler started
+    // before the scan (`None` when profiling is off).
+    let mut progress = ExportProgress::new(num_levels, rss_sampler);
 
     // Plan every level's partitions and wave width up front. The partitioning
     // single-read fill (#235) routes members by (level, partition, wave), so
@@ -1542,20 +1550,12 @@ fn export_pmtiles_impl(
     // path is kept there (and as the tests' byte-identity oracle).
     let single_read = matches!(reader.mode(), Mode::Partitioning) && !force_legacy_pass2;
     let mut store = if single_read {
-        let buffered_rows: usize = scans.iter().map(|s| s.feature_count).sum();
         let backing = backing_override.unwrap_or_else(|| {
-            let b = auto_backing(
-                Mode::Partitioning,
-                buffered_rows,
-                available_ram,
-                mean_member_bytes,
-            );
-            log::info!(
-                "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \
-                 member row(s) across {num_levels} level(s) → {b:?}"
-            );
-            b
+            auto_fill_backing(&scans, num_levels, available_ram, mean_member_bytes)
         });
+        // #571: entered only when the fill runs, so a duplicating-mode export
+        // (no fill) has no `fill` entry in `phase_peaks_mib`.
+        progress.enter_phase("fill");
         let t_fill = Instant::now();
         let store = fill_member_store(
             &reader,
@@ -1574,6 +1574,10 @@ fn export_pmtiles_impl(
     } else {
         None
     };
+    // #571: the per-level wave loop — the analogous phase to convert's
+    // pass-2 output sink, and where a single dense level's clip/encode
+    // buffers can peak between the (rare) checkpoint boundaries.
+    progress.enter_phase("levels");
 
     let t_levels = Instant::now();
     for (level_idx, plan) in plans.iter().enumerate() {
@@ -1613,6 +1617,7 @@ fn export_pmtiles_impl(
     }
 
     progress.profile.walls.levels = t_levels.elapsed().as_secs_f64();
+    progress.enter_phase("finalize");
 
     let t_finalize = Instant::now();
     writer.finalize(output_path.as_ref())?;
@@ -1622,6 +1627,9 @@ fn export_pmtiles_impl(
         t_finalize.elapsed().as_secs_f64(),
         start.elapsed().as_secs_f64(),
     );
+    // #571: stop the sampler (a no-op if profiling was off) and fold its
+    // findings into the profile `emit` is about to write.
+    progress.finish_rss_sampler();
 
     let total_tiles = zooms.iter().map(|z| z.tile_count).sum();
     let total_tile_features = zooms.iter().map(|z| z.tile_feature_count).sum();
@@ -1721,6 +1729,30 @@ fn checkpoint_level(
     Ok(())
 }
 
+/// The #235 single-read fill's member-store backing when the caller did not
+/// force one: the auto RAM-vs-spill choice over every level's buffered
+/// members, logged. Pulled out of [`export_pmtiles_impl`] to keep it under
+/// clippy's function-length ceiling.
+fn auto_fill_backing(
+    scans: &[LevelScan],
+    num_levels: usize,
+    available_ram: Option<u64>,
+    mean_member_bytes: Option<u64>,
+) -> SinkBacking {
+    let buffered_rows: usize = scans.iter().map(|s| s.feature_count).sum();
+    let b = auto_backing(
+        Mode::Partitioning,
+        buffered_rows,
+        available_ram,
+        mean_member_bytes,
+    );
+    log::info!(
+        "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \
+         member row(s) across {num_levels} level(s) → {b:?}"
+    );
+    b
+}
+
 /// Export-wide mutable state threaded through the per-level loop as one
 /// `&mut` (keeps `export_pmtiles_impl` under clippy's function-length
 /// ceiling). Two owners, kept apart on purpose:
@@ -1736,10 +1768,16 @@ struct ExportProgress {
     /// checkpoints, letting `finalize` do all the work.
     checkpoint_throttle: Instant,
     profile: ExportProfile,
+    /// #571: the continuous background sampler, running only when
+    /// `TYLERTOO_PROFILE_JSON` is set — catches an intra-phase peak (e.g. the
+    /// partitioning-mode fill, or a single dense level's wave loop) that the
+    /// `end_*` boundary samples below cannot see, the same gap #571 fixed on
+    /// the convert side. `None`, no thread, when profiling is off.
+    rss_sampler: Option<RssSampler>,
 }
 
 impl ExportProgress {
-    fn new(num_levels: usize) -> Self {
+    fn new(num_levels: usize, rss_sampler: Option<RssSampler>) -> Self {
         Self {
             checkpoint_throttle: Instant::now(),
             profile: ExportProfile {
@@ -1749,26 +1787,52 @@ impl ExportProgress {
                 waves_total: 0,
                 checkpoints: 0,
                 peak_rss_mib: None,
+                rss_sampler_report: None,
             },
+            rss_sampler,
+        }
+    }
+
+    /// Attribute every sample the background sampler takes from now on to
+    /// `phase`, until the next call. A no-op when profiling is off.
+    fn enter_phase(&self, phase: &str) {
+        if let Some(sampler) = &self.rss_sampler {
+            sampler.mark_phase(phase);
+        }
+    }
+
+    /// Take a boundary RSS sample into `peak_rss_mib`, and hand it to the
+    /// #571 sampler too (credited to the current phase), so the sampler's
+    /// `true_peak_mib` is never below the boundary peak beside it.
+    fn sample_boundary_rss(&mut self) {
+        let sample = sample_rss_peak(&mut self.profile.peak_rss_mib);
+        if let (Some(sampler), Some(mib)) = (&self.rss_sampler, sample) {
+            sampler.record(mib);
         }
     }
 
     /// Close the scan (+ plan) phase wall and sample RSS.
     fn end_scan(&mut self, t_scan: Instant) {
         self.profile.walls.scan = t_scan.elapsed().as_secs_f64();
-        sample_rss_peak(&mut self.profile.peak_rss_mib);
+        self.sample_boundary_rss();
     }
 
     /// Close the partitioning-mode fill phase wall and sample RSS.
     fn end_fill(&mut self, t_fill: Instant) {
         self.profile.walls.fill = t_fill.elapsed().as_secs_f64();
-        sample_rss_peak(&mut self.profile.peak_rss_mib);
+        self.sample_boundary_rss();
     }
 
     /// Close the finalize phase wall and sample RSS.
     fn end_finalize(&mut self, t_finalize: Instant) {
         self.profile.walls.finalize = t_finalize.elapsed().as_secs_f64();
-        sample_rss_peak(&mut self.profile.peak_rss_mib);
+        self.sample_boundary_rss();
+    }
+
+    /// Stop the sampler (a no-op if profiling was off) and fold its report
+    /// into the profile that `emit` writes.
+    fn finish_rss_sampler(&mut self) {
+        self.profile.rss_sampler_report = self.rss_sampler.take().map(RssSampler::finish);
     }
 }
 
@@ -1781,6 +1845,10 @@ struct ExportProfile {
     waves_total: usize,
     checkpoints: u64,
     peak_rss_mib: Option<f64>,
+    /// #571: the continuous sampler's findings, filled by
+    /// [`ExportProgress::finish_rss_sampler`] just before `emit`. `None` only
+    /// when profiling was off.
+    rss_sampler_report: Option<RssSamplerReport>,
 }
 
 /// The per-export facts [`ExportProfile::emit`] writes alongside the
@@ -1811,6 +1879,7 @@ impl ExportProfile {
             partition_wave_width: target.partition_wave_width,
             checkpoints: self.checkpoints,
             peak_rss_mib: self.peak_rss_mib,
+            rss_sampler_report: &self.rss_sampler_report,
         });
     }
 }
@@ -2026,7 +2095,7 @@ fn export_level(
         bytes: bytes_written,
     });
     profile.waves_total += total_waves;
-    sample_rss_peak(&mut profile.peak_rss_mib);
+    progress.sample_boundary_rss();
     Ok(ZoomReport {
         zoom,
         level: level_idx,
