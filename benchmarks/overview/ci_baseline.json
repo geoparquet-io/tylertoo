@@ -78,10 +78,10 @@
       "total_vertices": 3046875
     },
     "export": {
-      "archive_bytes": 104558642,
+      "archive_bytes": 104558542,
       "decoded_features_total": 353002,
-      "total_tile_features": 353062,
-      "total_tiles": 146924,
+      "total_tile_features": 353002,
+      "total_tiles": 146922,
       "zooms": [
         {
           "decoded_features": 40,
@@ -98,7 +98,7 @@
         {
           "decoded_features": 426,
           "tile_count": 2,
-          "tile_feature_count": 427,
+          "tile_feature_count": 426,
           "zoom": 3
         },
         {
@@ -116,7 +116,7 @@
         {
           "decoded_features": 405,
           "tile_count": 6,
-          "tile_feature_count": 406,
+          "tile_feature_count": 405,
           "zoom": 6
         },
         {
@@ -128,43 +128,43 @@
         {
           "decoded_features": 1199,
           "tile_count": 42,
-          "tile_feature_count": 1200,
+          "tile_feature_count": 1199,
           "zoom": 8
         },
         {
           "decoded_features": 2209,
           "tile_count": 138,
-          "tile_feature_count": 2211,
+          "tile_feature_count": 2209,
           "zoom": 9
         },
         {
           "decoded_features": 4143,
           "tile_count": 487,
-          "tile_feature_count": 4145,
+          "tile_feature_count": 4143,
           "zoom": 10
         },
         {
           "decoded_features": 8541,
           "tile_count": 1705,
-          "tile_feature_count": 8543,
+          "tile_feature_count": 8541,
           "zoom": 11
         },
         {
           "decoded_features": 22758,
-          "tile_count": 6037,
-          "tile_feature_count": 22767,
+          "tile_count": 6036,
+          "tile_feature_count": 22758,
           "zoom": 12
         },
         {
           "decoded_features": 69191,
-          "tile_count": 24489,
-          "tile_feature_count": 69206,
+          "tile_count": 24488,
+          "tile_feature_count": 69191,
           "zoom": 13
         },
         {
           "decoded_features": 242394,
           "tile_count": 113993,
-          "tile_feature_count": 242421,
+          "tile_feature_count": 242394,
           "zoom": 14
         }
       ]
@@ -338,7 +338,7 @@
     "export": {
       "archive_bytes": 111072,
       "decoded_features_total": 2338,
-      "total_tile_features": 2339,
+      "total_tile_features": 2338,
       "total_tiles": 82,
       "zooms": [
         {
@@ -374,7 +374,7 @@
         {
           "decoded_features": 1128,
           "tile_count": 52,
-          "tile_feature_count": 1129,
+          "tile_feature_count": 1128,
           "zoom": 14
         }
       ]
