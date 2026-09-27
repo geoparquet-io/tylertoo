@@ -6151,13 +6151,19 @@ mod tests {
                 "before-allocation sample ({before:.0} MiB) should sit well \
                  below the sampler's phase-a peak ({phase_a_peak:.0} MiB)"
             );
-            assert!(
-                after < phase_a_peak - 50.0,
-                "after-free sample ({after:.0} MiB) should sit well below \
-                 the sampler's phase-a peak ({phase_a_peak:.0} MiB) — \
-                 boundary sampling alone would have missed the whole \
-                 allocation"
-            );
+            // Whether the freed pages leave RSS at once is the allocator's
+            // call, not the sampler's: glibc returns a 200 MiB block with
+            // munmap, but macOS's allocator keeps it resident (CI saw the
+            // after-free sample still at the peak). Asserted only on Linux.
+            if cfg!(target_os = "linux") {
+                assert!(
+                    after < phase_a_peak - 50.0,
+                    "after-free sample ({after:.0} MiB) should sit well below \
+                     the sampler's phase-a peak ({phase_a_peak:.0} MiB) — \
+                     boundary sampling alone would have missed the whole \
+                     allocation"
+                );
+            }
         }
         assert!(
             report.true_peak_mib >= phase_a_peak,
