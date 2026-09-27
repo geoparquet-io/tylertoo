@@ -91,6 +91,12 @@ mod tests {
     /// returns `None` (never an error, never a false positive).
     #[test]
     fn missing_path_is_undetectable() {
+        // Exercises the diff-scoped mutation job's "no mutants in this
+        // diff" path: a test-only change plans zero mutants.
+        assert_eq!(
+            is_ram_backed(Path::new("/nonexistent/tylertoo-fs-probe-605")),
+            None
+        );
         assert_eq!(
             is_ram_backed(Path::new("/nonexistent/tylertoo-fs-probe-273")),
             None,

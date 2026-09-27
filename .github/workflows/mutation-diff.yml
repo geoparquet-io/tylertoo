@@ -1,0 +1,437 @@
+# Mutation Diff — cargo-mutants on the lines a PR changes.
+#
+# Purpose: the weekly sweep (mutation-tests.yml, ~8200 mutants, ~120 CPU-
+# hours) is far too slow for the PR path, so mutation testing never saw a
+# change before it merged. This job gives every PR a diff-scoped run:
+# `cargo mutants --in-diff` generates mutants only inside the hunks of
+# `git diff origin/<base>...HEAD`, so a typical PR tests a few dozen mutants
+# in ten to twenty minutes instead of thousands in days. It reads the same
+# .cargo/mutants.toml as the weekly job (nextest, `quick` tier, timeouts),
+# so the two measurements agree; scripts/mutants-diff.sh is the local twin.
+#
+# Advisory, never red: the mutants step has continue-on-error, the job's
+# own timeout is on that step (a huge diff runs out of time without failing
+# the job), and the result is a job summary (score, per-outcome counts, the
+# missed mutants as file:line) plus, when mutants are missed on a same-repo
+# PR, one sticky PR comment that is updated in place on every run. A missed
+# mutant is a hint about test strength, not a defect in the change, and
+# equivalent mutants exist, so a gate here would train people to ignore it.
+# Only the `comment` job holds `pull-requests: write`; it never checks out
+# code.
+#
+# No memory cap: mutation-tests.yml (#602/#604) runs its shards in a cgroup
+# because a runaway mutant (a loop that no longer advances) can fill the
+# runner's RAM and take the VM down. A diff-scoped run is small enough
+# that a lost job costs minutes, not hours, and it is advisory, so the
+# cgroup dance is not worth its sudo and self-test here; port it from the
+# weekly job if a lost runner ever becomes a habit.
+#
+# PRs that change no Rust under crates/core/ (docs, workflows, CLI, Python)
+# skip the toolchain setup entirely and write a one-line summary; only
+# tylertoo-core is mutated, as in the weekly job.
+
+name: Mutation Diff
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the PR supersedes the previous run: the old result would
+# describe lines that no longer exist.
+concurrency:
+  group: mutation-diff-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  mutants:
+    name: Mutation score (diff-scoped)
+    runs-on: ubuntu-latest
+    # Ceiling for the whole job; the mutants step below carries its own,
+    # shorter one so a slow run ends as an advisory partial result rather
+    # than a cancelled job.
+    timeout-minutes: 60
+    outputs:
+      rust_changed: ${{ steps.diff.outputs.rust_changed }}
+      planned: ${{ steps.plan.outputs.planned }}
+      measured: ${{ steps.summary.outputs.measured }}
+      missed: ${{ steps.summary.outputs.missed }}
+      comment: ${{ steps.summary.outputs.comment }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the merge-base with the base branch exists for
+          # the three-dot diff below; the submodule so the baseline's
+          # geometry tests pass in cargo-mutants' scratch copy (#419).
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Diff against the base branch
+        id: diff
+        env:
+          # Empty on workflow_dispatch: measure the dispatched ref against main.
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        # On pull_request the checkout is the merge commit of the PR onto
+        # its base, so `origin/<base>...HEAD` is exactly the PR's change
+        # as it would land. Only tylertoo-core is mutated (as in the weekly
+        # job: the pyo3 cdylib's wrappers have no Rust tests and would all
+        # show as missed), so only Rust under crates/core/ can yield
+        # mutants and anything else is a clean skip. A deletion-only diff
+        # has no `+++ b/` lines but is still a diff.
+        run: |
+          git diff "origin/$BASE_REF...HEAD" -- ':(glob)crates/core/**/*.rs' > pr.diff
+          if [ -s pr.diff ]; then
+            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Rust files changed vs origin/$BASE_REF:"
+            grep '^+++ b/' pr.diff | sed 's|^+++ b/|  |' || echo "  (deletions only)"
+          else
+            echo "rust_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No Rust source under crates/core/ changed vs origin/$BASE_REF; skipping."
+            {
+              echo "## Mutation Diff"
+              echo ""
+              echo "Skipped: this PR changes no Rust source under \`crates/core/\`, so there is nothing to mutate."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Cache test fixtures
+        if: steps.diff.outputs.rust_changed == 'true'
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.diff.outputs.rust_changed == 'true' && steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        if: steps.diff.outputs.rust_changed == 'true'
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        if: steps.diff.outputs.rust_changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      # The `quick` tier the baseline runs includes decode_roundtrip's
+      # tippecanoe-decode golden test, a hard failure under CI when the
+      # binary is missing (#420): same pinned build as the Test job in
+      # ci.yml and the weekly mutation job.
+      - name: Install tippecanoe build deps
+        if: steps.diff.outputs.rust_changed == 'true'
+        run: sudo apt-get install -y libsqlite3-dev zlib1g-dev
+
+      - name: Cache tippecanoe
+        if: steps.diff.outputs.rust_changed == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools/tippecanoe-*
+            .tools/src-*
+          key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build tippecanoe (pinned tag + SHA) and put it on PATH
+        if: steps.diff.outputs.rust_changed == 'true'
+        run: |
+          benchmarks/e2e/setup_tippecanoe.sh
+          eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+          dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry
+        if: steps.diff.outputs.rust_changed == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        if: steps.diff.outputs.rust_changed == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-mutants and cargo-nextest
+        if: steps.diff.outputs.rust_changed == 'true'
+        # cargo-mutants is pinned to the release the weekly job currently
+        # resolves (its install-action line floats), so the two runs
+        # agree on the mutation catalogue; bump both together. nextest:
+        # .cargo/mutants.toml sets test_tool = "nextest" so the quick tier
+        # from .config/nextest.toml applies to every mutant.
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-mutants@27.1.0,cargo-nextest
+
+      - name: Sanity-check the scratch copy sees the fixtures
+        id: plan
+        if: steps.diff.outputs.rust_changed == 'true'
+        # Fail fast (seconds, not the multi-minute baseline) with a clear
+        # message if the checkout regresses (#419), and list what will run.
+        # A diff that touches Rust but no mutation site (tests only, a
+        # cfg(test) module, comments) plans zero mutants; cargo-mutants
+        # would then exit 0 without a report, so the later steps read
+        # `planned` instead of treating that as a failure.
+        run: |
+          test -d tests/fixtures/geometry-test-data/examples \
+            || { echo "::error::geometry-test-data submodule is empty — checkout needs submodules: recursive"; exit 1; }
+          test -f tests/fixtures/realdata/fieldmaps-boundaries.parquet \
+            || { echo "::error::realdata fixtures missing — gh release download failed"; exit 1; }
+          cargo mutants --package tylertoo-core --in-diff pr.diff --list > mutants.list
+          planned=$(wc -l < mutants.list)
+          echo "planned=$planned" >> "$GITHUB_OUTPUT"
+          echo "$planned mutants in the diff:"
+          cat mutants.list
+
+      - name: Run cargo-mutants on the diff
+        id: mutants
+        if: steps.diff.outputs.rust_changed == 'true' && steps.plan.outputs.planned != '0'
+        # Advisory: a missed mutant (exit 2) or a timeout (exit 3) is a
+        # completed measurement and passes; a failed baseline (4: the
+        # PR's own tests fail, which CI's Test job reports properly) or an
+        # internal error fails this step only, and the job goes on to
+        # report what it has. The step timeout (not the job's) bounds a
+        # huge diff the same way: cargo-mutants writes outcomes.json after
+        # every mutant, so the summary shows the partial result.
+        # Exit codes: https://mutants.rs/exit-codes.html
+        #
+        # `--output DIR` creates mutants.out *inside* DIR.
+        continue-on-error: true
+        timeout-minutes: 45
+        run: |
+          start=$(date +%s)
+          set +e
+          cargo mutants --package tylertoo-core --in-diff pr.diff --output . -j 2
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "elapsed=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0|2|3) echo "cargo mutants finished (exit $code)"; exit 0 ;;
+            4) echo "::warning::cargo mutants: unmutated baseline failed, no mutants tested"; exit 1 ;;
+            *) echo "::warning::cargo mutants failed with exit $code"; exit 1 ;;
+          esac
+
+      - name: Post summary
+        id: summary
+        # `measured` tells the comment job whether there is a result to
+        # report at all: a cancelled run, a failed baseline or missing
+        # fixtures leave outcomes.json absent or partial, and rewriting the
+        # sticky comment to "all caught" from that would be a lie.
+        if: (!cancelled()) && steps.diff.outputs.rust_changed == 'true'
+        env:
+          PLANNED: ${{ steps.plan.outputs.planned }}
+          EXIT_CODE: ${{ steps.mutants.outputs.exit_code }}
+          ELAPSED: ${{ steps.mutants.outputs.elapsed }}
+          STEP_OUTCOME: ${{ steps.mutants.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          {
+            echo "## Mutation Diff"
+            echo ""
+            echo "cargo-mutants on the lines this change touches (\`git diff origin/$BASE_REF...HEAD\`, Rust under \`crates/core/\`). Advisory: never a red check."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${PLANNED:-}" = "0" ]; then
+            echo "No mutants in this diff: the changed Rust lines hold no mutation site (tests, cfg(test) modules, comments)." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "measured=true"
+              echo "missed=0"
+              echo "comment="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ ! -f mutants.out/outcomes.json ]; then
+            {
+              echo "Inconclusive: cargo-mutants wrote no outcomes.json (planned ${PLANNED:-n/a} mutants; step outcome: ${STEP_OUTCOME}, exit ${EXIT_CODE:-n/a})."
+              echo "A failed baseline means this branch's own tests fail; see the step log and the mutation-diff-report artifact."
+            } >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "measured=false"
+              echo "missed=0"
+              echo "comment="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # outcomes.json top-level counts (cargo-mutants' LabOutcome).
+          # Score = caught / (caught + missed + timeout): unviable mutants
+          # (did not compile) are not a test-suite failure, matching how
+          # cargo-mutants itself reports.
+          read -r total caught missed timeout unviable < <(jq -r \
+            '[.total_mutants, .caught, .missed, .timeout, .unviable] | @tsv' \
+            mutants.out/outcomes.json)
+          tested=$((caught + missed + timeout))
+          if [ "$tested" -gt 0 ]; then
+            score=$(awk -v c="$caught" -v t="$tested" 'BEGIN { printf "%.1f", 100 * c / t }')
+          else
+            score="n/a"
+          fi
+          echo "missed=$missed" >> "$GITHUB_OUTPUT"
+
+          # outcomes.json counts only mutants that ran (total_mutants grows
+          # per tested mutant), so "partial" is measured against the plan
+          # from `--list`. A complete run is a measurement even when some
+          # mutants were missed or timed out (exit 2/3); a step that timed
+          # out or errored mid-way is reported but not treated as one.
+          partial=""
+          done_count=$((tested + unviable))
+          if [ "$done_count" -lt "${PLANNED:-$done_count}" ]; then
+            partial=" (partial: the step ended with outcome ${STEP_OUTCOME} after ${done_count}/${PLANNED} planned mutants)"
+            echo "measured=false" >> "$GITHUB_OUTPUT"
+          elif [ "$STEP_OUTCOME" = "success" ]; then
+            echo "measured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "measured=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$ELAPSED" ]; then
+            took=" in $((ELAPSED / 60))m$((ELAPSED % 60))s"
+          else
+            took=""
+          fi
+
+          # Same body for the summary and the sticky comment, minus the header.
+          {
+            echo "**Mutation score: ${score}%** (${caught} caught / ${tested} tested${took})${partial}"
+            echo ""
+            echo "| Outcome | Count |"
+            echo "|---|---|"
+            echo "| Planned (in diff) | ${PLANNED:-n/a} |"
+            echo "| Tested | ${total} |"
+            echo "| Caught | ${caught} |"
+            echo "| Missed | ${missed} |"
+            echo "| Timeout | ${timeout} |"
+            echo "| Unviable (did not compile) | ${unviable} |"
+            echo ""
+            for kind in missed timeout; do
+              list=mutants.out/${kind}.txt
+              if [ -s "$list" ]; then
+                n=$(wc -l < "$list")
+                echo "<details open><summary>${kind} (${n})</summary>"
+                echo ""
+                echo '```'
+                head -n 100 "$list"
+                [ "$n" -gt 100 ] && echo "... ($((n - 100)) more in the mutation-diff-report artifact)"
+                echo '```'
+                echo "</details>"
+                echo ""
+              fi
+            done
+          } > body.md
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+
+          # The sticky comment gets a title, the run link and the how-to.
+          {
+            echo "### Mutation Diff: ${missed} missed mutant(s) in this change"
+            echo ""
+            cat body.md
+            echo "A missed mutant is a code change no test in the \`quick\` tier detects; it is a hint about test strength, not a failure. Some are equivalent mutants and can be ignored. Reproduce locally with \`scripts/mutants-diff.sh\`. [Run](${RUN_URL}) · updated in place on every push."
+          } > comment.md
+          {
+            echo "comment<<MUTATION_DIFF_EOF_$GITHUB_RUN_ID"
+            cat comment.md
+            echo "MUTATION_DIFF_EOF_$GITHUB_RUN_ID"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload report
+        if: (!cancelled()) && steps.diff.outputs.rust_changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mutation-diff-report
+          path: |
+            mutants.out/
+            pr.diff
+            mutants.list
+          if-no-files-found: warn
+
+  comment:
+    name: Sticky PR comment
+    needs: mutants
+    # Same-repo PRs only: a fork's GITHUB_TOKEN is read-only, so posting
+    # would fail there anyway (the job summary still has the result).
+    # `!cancelled()` rather than `always()`: a run superseded by a newer
+    # push must not touch the comment.
+    if: >-
+      (!cancelled()) && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Create or update the sticky comment
+        # One comment per PR, found by its HTML marker and edited in place.
+        # Created only when a mutant is missed; once it exists, a later
+        # clean run (all caught, no mutants in the diff, or no Rust left
+        # in the diff) rewrites it instead of leaving a stale list. An
+        # inconclusive run (failed baseline, missing fixtures, step timed
+        # out) leaves the comment alone. Never a second comment.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUST_CHANGED: ${{ needs.mutants.outputs.rust_changed }}
+          PLANNED: ${{ needs.mutants.outputs.planned }}
+          MEASURED: ${{ needs.mutants.outputs.measured }}
+          MISSED: ${{ needs.mutants.outputs.missed }}
+          COMMENT: ${{ needs.mutants.outputs.comment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RUST_CHANGED" = "true" ] && [ "$MEASURED" != "true" ]; then
+            echo "Run was inconclusive (measured=${MEASURED:-unset}); leaving any existing comment alone."
+            exit 0
+          fi
+
+          marker='<!-- mutation-diff-sticky-comment -->'
+          existing=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)
+
+          if [ "${MISSED:-0}" -gt 0 ] && [ -n "$COMMENT" ]; then
+            body="$marker
+          $COMMENT"
+          elif [ -z "$existing" ]; then
+            echo "No missed mutants and no earlier comment: nothing to post."
+            exit 0
+          elif [ "$RUST_CHANGED" = "true" ] && [ "$PLANNED" = "0" ]; then
+            body="$marker
+          ### Mutation Diff: no mutants in this diff
+
+          The latest push changes Rust under \`crates/core/\`, but the changed lines hold no mutation site (tests, cfg(test) modules, comments). [Run](${RUN_URL})"
+          elif [ "$RUST_CHANGED" = "true" ]; then
+            body="$marker
+          ### Mutation Diff: all mutants in this change are caught
+
+          The latest push leaves no missed mutant in the diff-scoped run. [Run](${RUN_URL})"
+          else
+            body="$marker
+          ### Mutation Diff: nothing to mutate
+
+          The latest push changes no Rust source under \`crates/core/\`, so the diff-scoped run was skipped. [Run](${RUN_URL})"
+          fi
+
+          if [ -n "$existing" ]; then
+            echo "Updating comment $existing"
+            gh api -X PATCH "repos/$GH_REPO/issues/comments/$existing" -f body="$body" --silent
+          else
+            echo "Creating comment on #$PR_NUMBER"
+            gh api -X POST "repos/$GH_REPO/issues/$PR_NUMBER/comments" -f body="$body" --silent
+          fi

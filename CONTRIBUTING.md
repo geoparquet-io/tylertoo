@@ -39,6 +39,11 @@ Python setup, and how to run every CI gate locally.
    and (for Python changes) the ruff/mypy/stubtest/vulture/xenon/pytest
    suite via `uv run`. The full list with commands:
    [DEVELOPMENT.md → CI Gates](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
+   One check is advisory rather than required: the diff-scoped mutation
+   run (`Mutation Diff`) lists the mutants in your change that no test
+   catches, in its job summary and in a sticky PR comment. Treat it as a
+   hint for a missing test, not a failure; `scripts/mutants-diff.sh`
+   reproduces it locally.
 3. Submit the PR using the [PR template](https://github.com/geoparquet-io/tylertoo/blob/main/.github/PULL_REQUEST_TEMPLATE.md);
    never bypass the pre-commit hooks (`--no-verify` is forbidden).
 
