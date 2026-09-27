@@ -236,6 +236,24 @@ logged at debug level). Either way the validity check is capped at 2048
 vertices on oversized candidates (#242) to avoid an O(V²) stall, and the
 canonical level is always verbatim.
 
+**DIVERGENCE FROM `geo`: RDP runs iteratively, not recursively** (#575).
+`rdp_coords` in `overview/simplify.rs` replaces `geo::Simplify` with an
+explicit-stack RDP. RDP's split depth is O(n), not O(log n): when the farthest
+vertex sits next to a subproblem's end, every split peels off one vertex. Line
+coalescing (Q3) makes long chains routine — a road row merged into one
+12,001-vertex zigzag stroke overflowed a rayon worker's stack outright
+(`fatal runtime error: stack overflow`). The iterative version keeps the depth
+on the heap, and drops geo's per-frame `Vec` (allocated and copied at every
+level: O(n²) of memcpy on top of the O(n²) distance scans). Output is
+bit-identical by construction — it reuses geo's own point-to-segment
+`Euclidean.distance`, the same last-maximum tie-break, the same strict
+`> epsilon` split test, and the same `INITIAL_MIN` floor threaded through
+depth-first leaf order — and `rdp_matches_geo_on_{lines,polygons}` pins that
+against `geo::Simplify`. What it does NOT change is RDP's **O(n²) worst-case
+time**: on the pathological zigzag the distance scans remain quadratic (an
+exact O(n log n) RDP needs the Hershberger–Snoeyink path hull, which belongs
+upstream in `geo`).
+
 ### Export (`export-pmtiles`, `overview/export.rs`)
 
 Batch PMTiles export **from** an overview file. The overview file already
@@ -503,7 +521,7 @@ therefore its band, in the same PR, with the new measurement in the comment.
 | Area | Our approach | Tippecanoe | Notes |
 |------|--------------|------------|-------|
 | Generalization space | World-space, per **level**, stored in the file | Tile-space, per tile, at encode time | The core format difference: levels are reusable, exact, SQL-queryable |
-| Simplification | RDP, tolerance = factor × level GSD, **cascading** by default (#218) with boolean-overlay validity repair (vertex-capped, #242) | `douglas_peucker` in tile pixel space | Canonical level always verbatim; `--no-cascade` reverts to per-level eps-halving |
+| Simplification | RDP, tolerance = factor × level GSD, **cascading** by default (#218) with boolean-overlay validity repair (vertex-capped, #242) | `douglas_peucker` in tile pixel space | Canonical level always verbatim; `--no-cascade` reverts to per-level eps-halving. The RDP kernel (`rdp_coords`, #575) is iterative like tippecanoe's, but keeps `geo`'s split rules: float distances (tippecanoe: integer tile coordinates rounded to 1/16), last-maximum tie-break in index order (tippecanoe: lexicographically smallest vertex, winding-independent), and the `INITIAL_MIN` floor of 2 per line / 4 per ring (tippecanoe: its `retain` count). Both split on a strict `> epsilon` |
 | Density drop rate | `--drop-rate 1.65`, budget anchored on full canonical count `N` | `-r`/`--drop-rate` 2.5, anchored on per-tile basezoom count | Same geometric ladder; different anchor ⇒ different numeric default (see `corpus/SWEEPS.md`) |
 | Spatial fairness | `--drop-gamma` per super-cell allocation ∝ population^(1/γ) | gamma dot-dropping in dense areas | Same idea, applied per super-cell so per-level totals are unchanged |
 | Sub-pixel polygons at coarse zooms | Hard-dropped by default; opt-in dispositions: `--collapse` → representative Point (spec Q4), `--collapse-square` → area-dithered ~1×GSD placeholder square (#279) | Tiny-polygon reduction ON by default: accumulates dropped area serially per tile, emits placeholder squares | Type-preserving drop default keeps renderers unsurprised and is unchanged pending the #259-fixture sweep (#279 tracks the default decision). Two mechanisms share `T = tol²` (#384): an **accumulator** over every polygon a level does not carry (gate, thinning, budget), per 32×GSD patch rather than per tile since levels have no tile scope, run once on the pass-1 feature table in input order so all three engines read one carrier set (`overview/accumulate.rs`); and a **per-feature dither** (deterministic hash of the anchor coordinates, keep probability `area/tol²`) for members that collapse at write time. Disjoint sets, byte-identical across engines and thread counts. tippecanoe only accumulates rings with area ≤ `tiny_polygon_size²` and keeps larger rings as geometry; we clamp each polygon's contribution to one placeholder instead of skipping large ones (a non-member was already dropped by the gate/thinning here), so a polygon contributes at most one placeholder of area and a patch keeps < 1 `T` unemitted. tippecanoe places the placeholder at the ring's first vertex with side `tiny_polygon_size` (default 2 px); ours sits at the representative point with side `factor × GSD`. Ladder-placed features (#364) are never accumulated. Accumulator is duplicating-mode only (and `point` bands never accumulate); in partitioning mode neither mechanism runs. Old per-tile-pipeline accumulator design: #85, removed with #177; structural fix: #246 |

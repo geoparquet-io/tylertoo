@@ -5172,16 +5172,44 @@ pub(super) fn build_level_coalesce_table(
     crs: Crs,
     options: &ConvertOptions,
 ) -> CoalesceTable {
+    use rayon::prelude::*;
+
+    let t_chains = Instant::now();
     let chains = coalesce_level_chains(inputs, level, finest, gsd_m, crs, options);
-    let mut table = CoalesceTable::with_capacity(chains.len());
-    for chain in chains {
-        match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify) {
-            Simplified::Keep(g) => {
-                table.insert(chain.rep, (g, chain.count));
-            }
-            Simplified::Dropped => {}
-        }
-    }
+    let chain_secs = t_chains.elapsed().as_secs_f64();
+    let t_simplify = Instant::now();
+    // Only for the log line below, so not worth an O(vertices) walk otherwise.
+    let longest = log::log_enabled!(log::Level::Debug)
+        .then(|| chains.iter().map(|c| count_vertices(&c.geom)).max())
+        .flatten()
+        .unwrap_or(0);
+    // Simplification is the expensive half (RDP is O(vertices²) worst case,
+    // #575) and each chain is independent, so it runs chain-parallel. The
+    // levels above this are already `par_iter`'d, but on line data only the
+    // two or three levels whose tolerance sits just under the geometry's own
+    // detail are slow — without this, those few levels each ran one core while
+    // the rest of the machine idled. Chain reps are distinct, so the table is
+    // a set of unique keys either way (`CoalesceTable` is a `HashMap`: no
+    // consumer depends on its order — they sort the keys or look up by one).
+    let table: CoalesceTable = chains
+        .into_par_iter()
+        .filter_map(
+            |chain| match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify) {
+                Simplified::Keep(g) => Some((chain.rep, (g, chain.count))),
+                Simplified::Dropped => None,
+            },
+        )
+        .collect();
+    // Per-level chain-stage split. Simplification of a coalesced stroke is
+    // RDP, whose worst case is O(vertices²) (#575), so "how long was the
+    // longest chain" is the first thing to look at when this stage stalls.
+    log::debug!(
+        "[profile] coalesce level {level}: {} line(s) -> {} kept chain(s), longest chain \
+         {longest} vertices; chain {chain_secs:.2}s + simplify {:.2}s",
+        inputs.len(),
+        table.len(),
+        t_simplify.elapsed().as_secs_f64(),
+    );
     table
 }
 
