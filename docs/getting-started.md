@@ -115,7 +115,8 @@ workflow keeps it as a first-class artifact.
 
 The `--max-zoom` flag defaults to 6, enough for a continental overview but too
 coarse for street-level detail. A web map that zooms to individual features
-needs it raised.
+needs it raised. If you are unsure how far, `--max-zoom auto` estimates it from
+the sizes and spacing of your features and logs the zoom it chose.
 
 ```bash
 tylertoo overview \

@@ -26,7 +26,7 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 * `output` (`str`) — Output overview GeoParquet file.
 * `mode` (`str`) — Level materialization mode, "duplicating" (each level is a self-contained rendering) or "partitioning" (each feature appears once at its coarsest level; prefix reads). Defaults to "duplicating".
 * `min_zoom` (`int`) — Coarsest Web Mercator zoom of the level range. Defaults to 0.
-* `max_zoom` (`int`) — Finest (canonical) Web Mercator zoom of the level range. Defaults to 6.
+* `max_zoom` (`int or "auto"`) — Finest (canonical) Web Mercator zoom of the level range. Defaults to 6. Pass `"auto"` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing, honoring `bbox` and `filter`, never above 16; ignored with `gsds`. The chosen zoom is the finest `zoom` in the returned report's `levels` (the evidence is logged through Rust's logger, which is not forwarded to Python `logging`). Raises ValueError when the input has nothing to measure or min_zoom is above 16.
 * `gsds` (`list[float]`) — Explicit per-level GSD list in meters, strictly decreasing coarse-to-fine. Overrides min_zoom/max_zoom.
 * `gsd_base` (`float`) — GSD tile-band base for the zoom-to-GSD mapping: gsd(z) = 40075016.69 / base / 2^z. Larger = finer (denser) levels, smaller = coarser. No effect with explicit gsds. Defaults to 1024.0.
 * `sort_key` (`str`) — Numeric column used as the cell-winner priority key (higher wins by default; see sort_direction). Mutually exclusive with class_rank_column.
@@ -91,7 +91,7 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 ## `export_pmtiles`
 
 ```python
-export_pmtiles(input, output, *, layer_name='overview', tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=True, partition_wave=0, feature_order='input', min_zoom=None, feature_id=None)
+export_pmtiles(input, output, *, layer_name='overview', tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=True, partition_wave=0, feature_order='input', min_zoom=None, feature_id=None, spill_dir=None)
 ```
 
 Export an overview GeoParquet file to a PMTiles archive.
@@ -103,18 +103,19 @@ Python equivalent of `tylertoo export-pmtiles`: each overview level becomes one 
 * `input` (`str`) — Input overview GeoParquet file (produced by `overview()`).
 * `output` (`str`) — Output PMTiles archive.
 * `layer_name` (`str`) — MVT layer name written into every tile and the archive metadata. Defaults to "overview".
-* `tile_buffer` (`int`) — Per-tile edge buffer in tile pixels (feature seam continuity). Defaults to 8.
-* `extent` (`int`) — MVT tile extent (tile-local resolution). Defaults to 4096.
+* `tile_buffer` (`int`) — Per-tile edge buffer in tile pixels (feature seam continuity). Defaults to 8; at most 256 (one full tile width), wider raises.
+* `extent` (`int`) — MVT tile extent (tile-local resolution). Defaults to 4096. Must be positive (0 raises); a value that is not a power of two is accepted with a warning.
 * `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single non-iterative drop pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
 * `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.
 * `partition_wave` (`int`) — Partitions processed per band read during export (the export concurrency knob). Defaults to 0, which auto-sizes via a memory-budget preflight: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with the TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive integer to override. Wider waves keep more cores busy at proportionally more peak memory. Output is byte-identical for every value (the wave is a scheduling concern).
 * `feature_order` (`str`) — Within-tile feature order (#361): "input" (default) or a property name, optionally suffixed ":asc" / ":desc". Renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. "input" emits source row order; naming a column sorts within each tile by that property, ties kept in input order.
 * `min_zoom` (`int`) — Minimum zoom the archive declares in its metadata (`vector_layers[].minzoom`) even when the overview file's coarsest levels are missing (#380). `overview` omits a level that generalizes to nothing, so a file built for z0..z13 can start at z2; this records the requested z0 anyway. The PMTiles header's min zoom is not widened: it always reports the shallowest zoom that actually holds a tile, as `go-pmtiles verify` requires. The empty zooms hold no tiles. Must not be finer than the coarsest level present. Defaults to None (the coarsest level's zoom). `convert()` passes its own `min_zoom` here, so pass the same value to match what it writes.
 * `feature_id` (`str`) — Carry a property column through as the MVT feature `id` on every tile the feature appears in, at every zoom (#443; tippecanoe's `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover, selection, joins) keys correctly across tile and zoom boundaries without `promoteId`. Matched against the property name as the tile publishes it. The column must be an integer type (or `DECIMAL(p,0)`) and every row of the overview file a non-null value in `0..=2**64-1`; the whole column is checked before any tile is written, and a violation raises `RuntimeError` naming the column and the overview file's row and level. String and float ids are rejected (unlike tippecanoe): cast them to an integer first. The column is moved to the id, never also published as a regular property. Clusters carry their representative's id and coalesced lines their highest-priority member's; duplicate ids are not checked. Defaults to None, which keeps the tile-local member index (unique only within a single tile/zoom pair). Not available on `convert()`.
+* `spill_dir` (`str or os.PathLike`) — Directory for the export's member spill file (#427): the on-disk backing the partitioning single-read pass 2 falls back to when the buffered members would not fit the memory budget. The same knob as `overview()`'s `spill_dir`. Defaults to None (the process temp directory, `$TMPDIR` -- often a RAM-backed `/tmp` on cluster nodes; point it at real disk there). The directory must exist; a missing one raises `RuntimeError` before any work is done. The archive itself is never spilled here: it is assembled in place at `<output>.partial` beside the output.
 
 ###### **Returns:**
 
-`dict` — Export report with keys "mode", "min_zoom", "max_zoom", "zooms" (list of dicts with "zoom", "level", "level_feature_count", "tile_count", "tile_feature_count", "oversized_tiles"), "total_tiles", "total_tile_features", "oversized_tiles", "duration_secs".
+`dict` — Export report with keys "mode", "min_zoom", "max_zoom", "zooms" (list of dicts with "zoom", "level", "level_feature_count", "tile_count", "tile_feature_count", "oversized_tiles", "encode_dropped_features", "encode_quantized_features"), "total_tiles", "total_tile_features", "oversized_tiles", "encode_dropped_features", "encode_quantized_features", "duration_secs". `encode_dropped_features` counts tile members with nothing to encode (empty geometries, empty GeometryCollections); non-zero means content was lost after clipping, and a warning names the total. `encode_quantized_features` counts tile members whose geometry collapsed at the tile extent (zero-area polygon rings, lines of fewer than two points, typically clip slivers at a buffered tile edge); expected on ordinary data and never a warning.
 
 ###### **Raises:**
 
@@ -176,7 +177,7 @@ The legacy keyword arguments `drop_density`, `compression`, `include`, `exclude`
 * `input` (`str`) — Path to input GeoParquet file (EPSG:4326 or EPSG:3857), or a remote URL (`s3://`, `https://`, `gs://`) read via byte-range requests.
 * `output` (`str`) — Path to output PMTiles file.
 * `min_zoom` (`int`) — Minimum (coarsest) zoom level. Defaults to 0.
-* `max_zoom` (`int`) — Maximum (finest) zoom level. Defaults to 14.
+* `max_zoom` (`int or "auto"`) — Maximum (finest) zoom level. Defaults to 14. Pass `"auto"` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing, never above 16. The chosen zoom is the archive's max zoom (the evidence is logged through Rust's logger, which is not forwarded to Python `logging`). Raises ValueError when the input has nothing to measure or min_zoom is above 16.
 * `layer_name` (`str`) — Override the MVT layer name (defaults to the input filename stem).
 * `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
 * `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.

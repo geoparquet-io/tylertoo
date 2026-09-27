@@ -1,0 +1,161 @@
+# Archive e2e: the convert+export regression guard and independent-reader
+# validation of the archives it produces (#421, #425).
+#
+# One job, because every step needs the same thing — a release binary run
+# over the fixtures-v1 inputs — and a second job would rebuild it:
+#
+#   1. benchmarks/overview/ci_guard.py --check --keep-archives
+#      `overview` -> `export-pmtiles` -> `stats` / `decode` per fixture; the
+#      structural signature (per-level feature/vertex counts, per-zoom tile
+#      counts, written and decoded feature totals, archive bytes +-2%) is
+#      compared exactly against the committed ci_baseline.json. This is the
+#      guard that used to live in bench.yml and stopped at pass 1 (#425).
+#   2. go-pmtiles `pmtiles verify` on every archive from step 1: the
+#      reference PMTiles v3 structural validator, a static binary at a
+#      pinned release with the download's sha256 checked
+#      (scripts/setup_go_pmtiles.sh).
+#   3. scripts/verify_archive.py on every archive: the Python `pmtiles`
+#      reader walks header/metadata/directories, and `mapbox-vector-tile`
+#      decodes sampled tiles at every zoom (layer name, geometry validity,
+#      non-zero features). Neither reader shares a line of code with our
+#      writer — the point of #421.
+#
+# Our own tests only ever read our archives with our own code; the writer
+# is self-implemented (the pmtiles crate is read-only). A self-consistent-
+# but-wrong header/directory/framing passes the Rust suite and fails here.
+#
+# Only OUR archives go through `pmtiles verify`: the tippecanoe-made
+# tests/fixtures/golden/*.pmtiles are inputs to golden comparisons, not
+# outputs, and are not this job's concern.
+#
+# Intended as a PR-gating check. Required checks are branch-protection
+# contexts, so "Archive e2e (independent readers)" has to be added there
+# (repo settings) — this file cannot do that.
+
+name: Archive e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  GO_PMTILES_VERSION: "1.31.2"
+
+jobs:
+  archive-e2e:
+    name: Archive e2e (independent readers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-guard-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --package tylertoo
+
+      # Step 1: the structural guard, keeping the archives for steps 2-3.
+      - name: Convert + export regression guard (structural, deterministic)
+        run: |
+          python3 benchmarks/overview/ci_guard.py --check \
+            --keep-archives e2e-archives
+
+      # Step 2: go-pmtiles verify. The binary is cached per version and
+      # platform; the setup script re-checks the version string on a cache
+      # hit and the tarball's sha256 on a download.
+      - name: Cache go-pmtiles
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/go-pmtiles-${{ env.GO_PMTILES_VERSION }}
+          key: go-pmtiles-${{ env.GO_PMTILES_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install go-pmtiles (pinned, checksummed)
+        run: scripts/setup_go_pmtiles.sh
+
+      - name: pmtiles verify (go-pmtiles) on every produced archive
+        run: |
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          status=0
+          for f in e2e-archives/*.pmtiles; do
+            echo "::group::pmtiles verify $f"
+            if "$PMTILES_BIN" verify "$f"; then
+              echo "OK   $f"
+            else
+              echo "FAIL $f"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+      # Step 3: the Python readers. uv resolves the script's PEP 723 inline
+      # dependencies (pinned pmtiles + mapbox-vector-tile).
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: scripts/verify_archive.py
+
+      - name: Decode sampled tiles with pmtiles + mapbox-vector-tile
+        run: |
+          status=0
+          for f in e2e-archives/*.pmtiles; do
+            layer="$(basename "$f" .pmtiles)"
+            uv run scripts/verify_archive.py "$f" --layer "$layer" \
+              --per-zoom 5 || status=1
+          done
+          exit "$status"
+
+      # Failure-only: the admin fixture's z0-14 archive is ~100 MB.
+      - name: Upload produced archives
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-archives
+          path: e2e-archives/
+          retention-days: 7
+          if-no-files-found: ignore

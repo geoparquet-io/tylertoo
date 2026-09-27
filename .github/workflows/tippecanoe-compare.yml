@@ -1,0 +1,207 @@
+# tippecanoe parity gate (#420): tylertoo vs the pinned tippecanoe on the
+# fixtures-v1 inputs, per zoom, tolerance-gated.
+#
+# CLAUDE.md's "all algorithms MUST match tippecanoe" was enforced by nothing
+# until this job: the one tippecanoe-decode golden test skipped silently
+# when the binary was absent (it was always absent on CI), and the manual
+# corpus/goldens.sh comparison ran on a maintainer's laptop. This job:
+#
+#   1. builds the release binary and, from source at a pinned tag + commit
+#      SHA (benchmarks/e2e/setup_tippecanoe.sh, cached in .tools/ on the
+#      script's hash, so a re-pin invalidates the cache), tippecanoe 2.79.0;
+#   2. runs benchmarks/e2e/compare_tippecanoe.py: both tools tile every
+#      fixture with matched flags (the README.md "Settings parity" set;
+#      tylertoo in its quality-matched configuration, which is the run
+#      meant to match tippecanoe), both archives are decoded with the
+#      Python pmtiles + mapbox-vector-tile readers, and per zoom the
+#      tile count, feature instances, distinct feature ids, vertex count
+#      and stored bytes are compared as tylertoo/tippecanoe ratios against
+#      the bands in benchmarks/e2e/tippecanoe_tolerances.toml (a comment
+#      per band says what was measured and why);
+#   3. writes the table to the job summary, keeps the JSON record as an
+#      artifact, and on a scheduled/manual failure opens (or updates) an
+#      issue labelled `tippecanoe-parity` so a drift has an owner.
+#
+# Runs on every PR and on push to main (the push is what makes the
+# tippecanoe and cargo caches available to PR runs — caches made on a PR
+# branch are private to it), weekly against main so an upstream-independent
+# drift (a runner image change, a dependency bump that moved the geometry
+# engine) is caught between PRs, and on demand. The whole job is well
+# under 15 minutes with warm caches (the compare itself is ~2 minutes on a
+# 4-core runner); making it a REQUIRED check is a branch-protection
+# setting ("tippecanoe parity"), which this file cannot set.
+#
+# When a PR moves a ratio on purpose (a closed divergence, a new default),
+# it updates the band in tippecanoe_tolerances.toml in the same PR with the
+# new measurement in the comment - the same ratchet rule as the convert
+# guard baseline and the golden tile digests.
+
+name: tippecanoe parity
+
+on:
+  push:
+    branches: [main]
+  # Every PR, whatever its base: a stacked PR changes what lands on main
+  # just as much as one opened against it, and the gate is cheap enough.
+  pull_request:
+  schedule:
+    # Every Monday at 07:00 UTC (an hour after the security audit).
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parity-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compare:
+    name: tippecanoe parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc and tippecanoe build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libsqlite3-dev zlib1g-dev
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-guard-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --package tylertoo
+
+      # The pinned tippecanoe, built from source into .tools/. The cache key
+      # is the setup script's hash: the tag and the commit SHA live in that
+      # script, so a re-pin is a new cache entry, and a hit still re-checks
+      # the checkout's HEAD against the pinned SHA.
+      - name: Cache tippecanoe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools/tippecanoe-*
+            .tools/src-*
+          key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build tippecanoe (pinned tag + SHA)
+        run: benchmarks/e2e/setup_tippecanoe.sh
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: benchmarks/e2e/compare_tippecanoe.py
+
+      - name: Compare tylertoo vs tippecanoe (tolerance-gated)
+        id: compare
+        # continue-on-error so the record is uploaded and the issue opened
+        # before the job is failed at the end.
+        continue-on-error: true
+        run: |
+          uv run benchmarks/e2e/compare_tippecanoe.py \
+            --json parity.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the parity record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tippecanoe-parity
+          path: parity.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Open or update the parity issue
+        # Scheduled and manual runs only: a PR run's failure is the PR's
+        # red check, and an issue per red PR would be noise.
+        if: steps.compare.outcome == 'failure' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # Make sure the label exists (no-op if it already does).
+          gh label create tippecanoe-parity \
+            --description "Automated tylertoo vs tippecanoe parity gate failures" \
+            --color B60205 2>/dev/null || true
+
+          if [ -f parity.json ]; then
+            BREACHES=$(python3 -c '
+          import json
+          d = json.load(open("parity.json"))
+          print("\n".join(f"- {b}" for b in d["breaches"]) or "- (no breach list: the run failed before comparing)")
+          ')
+          else
+            BREACHES="- the run failed before producing a record (tippecanoe missing or at the wrong version, a fixture missing, or a tool crashed); see the log"
+          fi
+
+          TITLE="tippecanoe parity gate is failing"
+          BODY="The ${EVENT} tylertoo vs tippecanoe comparison (#420) is outside its tolerance bands.
+
+          Run: $RUN_URL (the full per-zoom table is in the job summary; the JSON record is the \`tippecanoe-parity\` artifact)
+
+          Breaches:
+          $BREACHES
+
+          ---
+          _This issue is managed by .github/workflows/tippecanoe-compare.yml. It is
+          updated (not duplicated) on every failing scheduled run; close it once
+          the ratio is back in band or the band in
+          benchmarks/e2e/tippecanoe_tolerances.toml has been moved on purpose,
+          with the new measurement in its comment._"
+
+          EXISTING=$(gh issue list --label tippecanoe-parity --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING"
+            gh issue edit "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL"
+          else
+            echo "Opening new issue"
+            gh issue create --title "$TITLE" --label tippecanoe-parity --body "$BODY"
+          fi
+
+      - name: Fail the job on a breach
+        if: steps.compare.outcome != 'success'
+        run: |
+          echo "::error::tylertoo vs tippecanoe parity is outside tolerance (see the job summary)"
+          exit 1

@@ -722,10 +722,25 @@ pub const IN_FLIGHT_BATCHES_MAX: usize = 16;
 /// `pipelined_in_flight_matches_reference` equivalence test).
 pub fn resolve_in_flight_batches(requested: usize) -> usize {
     if requested == IN_FLIGHT_BATCHES_AUTO {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(IN_FLIGHT_BATCHES_MIN)
-            .clamp(IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX)
+        resolve_in_flight_batches_with_cores(
+            requested,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(IN_FLIGHT_BATCHES_MIN),
+        )
+    } else {
+        requested
+    }
+}
+
+/// [`resolve_in_flight_batches`], parameterized on the detected core count
+/// (#422 test seam): the auto clamp is only observable on a box whose core
+/// count lies outside `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`, so a
+/// test that reads the real count cannot pin it. Production always calls it
+/// via `resolve_in_flight_batches` with the real count.
+pub(super) fn resolve_in_flight_batches_with_cores(requested: usize, cores: usize) -> usize {
+    if requested == IN_FLIGHT_BATCHES_AUTO {
+        cores.clamp(IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX)
     } else {
         requested
     }
@@ -1025,6 +1040,85 @@ pub(super) fn record_level_outcome(
     }
 }
 
+/// One planned level of a plan-only run (#560): what the level assignment
+/// decided, before pass 2 has had a chance to collapse anything.
+///
+/// The counts are WINNER counts — the rows pass 2 would feed to the level —
+/// not written rows, because a plan-only run never runs pass 2. A level whose
+/// geometry all collapses at write time still appears here; it is the
+/// assignment's view, which is exactly what a shard consuming the plan will
+/// act on.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct PlanLevelReport {
+    /// Index in the PLANNED (requested) level range, 0 = coarsest. Planned
+    /// levels with no winners are omitted (#211 auto-clamp) and listed in
+    /// [`PlanReport::skipped_empty_levels`], so this can skip values.
+    pub planned_level: usize,
+    /// Ground sample distance in meters.
+    pub gsd: f64,
+    /// Web Mercator zoom, if the level plan supplied one.
+    pub zoom: Option<u8>,
+    /// Features the assignment placed at this level (cumulative across
+    /// coarser levels in duplicating mode, matching the level's membership).
+    pub feature_count: usize,
+}
+
+/// Result of a plan-only run ([`write_convert_plan`], `tiles --plan-only`,
+/// #560): what the saved plan says, for an operator to sanity-check before
+/// committing a fleet's shard hours to it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct PlanReport {
+    /// Where the plan was written ([`ConvertOptions::save_plan`]).
+    pub path: PathBuf,
+    /// Size of the written plan artifact in bytes.
+    pub plan_bytes: u64,
+    /// Total input rows streamed, INCLUDING rows skipped for an unusable
+    /// geometry — the domain of every row-indexed table in the plan.
+    pub input_rows: usize,
+    /// Features that survived the scan (a usable geometry, and inside
+    /// `--bbox` / `--filter` when given).
+    pub input_features: usize,
+    /// Point features across the scan.
+    pub points: usize,
+    /// Line features across the scan.
+    pub lines: usize,
+    /// Polygon features across the scan.
+    pub polygons: usize,
+    /// The levels the assignment populated, coarse → fine.
+    pub levels: Vec<PlanLevelReport>,
+    /// Planned levels with no winners at all, omitted from the pyramid (#211
+    /// auto-clamp). The most common shape is a coarse prefix.
+    pub skipped_empty_levels: Vec<SkippedLevelReport>,
+    /// How the cell-winner ranking was resolved (§3.5): explicit sort key,
+    /// class ranking, an auto-detected well-known schema, or the size
+    /// fallback. The one assignment input an operator most often gets by
+    /// accident.
+    pub ranking: RankingProvenance,
+    /// The entry-zoom ladder spec the run was given (`--magnitude-ladder` and
+    /// friends), rendered — the same canonical `Debug` form the plan's own
+    /// options fingerprint records. `None` when no ladder was asked for.
+    ///
+    /// The ladder's *derived* rungs are baked into the plan's `min_levels`
+    /// rather than stored verbatim (see the `plan_state` module docs), so this
+    /// is the request, not the resolved rungs.
+    pub entry_zoom: Option<String>,
+    /// Row groups in the input, and how many were read (`--bbox` / `--filter`
+    /// pruning).
+    pub row_groups_total: usize,
+    /// Input row groups actually read.
+    pub row_groups_read: usize,
+    /// Wall seconds of the pass-1 scan alone.
+    pub pass1_secs: f64,
+    /// Wall seconds of the level assignment.
+    pub assign_secs: f64,
+    /// Wall seconds of the whole plan-only run.
+    pub duration_secs: f64,
+    /// Remote-input fetch counters (#210), `None` for local inputs.
+    pub remote_fetch: Option<crate::input::FetchStats>,
+}
+
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConvertReport {
@@ -1281,6 +1375,34 @@ pub enum ConvertError {
     /// The input has no features, or every feature was dropped from every level.
     #[error("no output rows produced (empty input or all features dropped)")]
     NoData,
+    /// `--max-zoom auto` (#444) with a `--min-zoom` above the auto ceiling
+    /// ([`super::auto_zoom::AUTO_MAX_ZOOM_CEILING`]): no zoom satisfies both.
+    #[error(
+        "--max-zoom auto cannot honor --min-zoom {min_zoom}: auto never picks a zoom \
+         above z{ceiling}. Lower --min-zoom, or pass an explicit --max-zoom"
+    )]
+    AutoZoomMinAboveCeiling {
+        /// The requested minimum zoom.
+        min_zoom: u8,
+        /// The auto ceiling it exceeds.
+        ceiling: u8,
+    },
+    /// `--max-zoom auto` (#444) found nothing to measure: fewer than two
+    /// distinct feature locations and no feature with a measurable extent.
+    /// tippecanoe's `-zg` refuses the same way ("Can't guess maxzoom (-zg)
+    /// without at least two distinct feature locations").
+    #[error(
+        "can't guess --max-zoom auto: the {sampled} sampled features (of {rows} rows read) \
+         have fewer than two distinct locations and no measurable extent. Pass an \
+         explicit --max-zoom"
+    )]
+    AutoZoomNoSignal {
+        /// Input rows the estimate read (after `--bbox`/`--filter` row-group
+        /// pruning).
+        rows: u64,
+        /// Features that survived sampling and the per-feature filters.
+        sampled: usize,
+    },
     /// A [`ConvertOptions::zoom_ceiling`] left nothing to write (#541 review):
     /// the dataset has features, but none survive at any level at or coarser
     /// than the ceiling — every such level was auto-clamped away (#211) or
@@ -1422,7 +1544,7 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
 /// degenerates the assignment grid — every cell-winner pass would skip every
 /// feature — so nonsensical values are rejected up front with a clear error
 /// instead of producing an "everything at the canonical level" file.
-fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
+pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     let positive = |name: &str, v: f64| {
         if !v.is_finite() || v <= 0.0 {
             return Err(ConvertError::InvalidConfig(format!(
@@ -1845,6 +1967,95 @@ pub(super) fn level_representations(
         .collect()
 }
 
+/// Write the convert plan artifact ([`ConvertOptions::save_plan`]) and stop —
+/// pass 1 and the level assignment run in full, pass 2 and the output file are
+/// skipped entirely (#560).
+///
+/// # Why this exists
+///
+/// The coarse job of a sharded fleet does two jobs: it exports the zooms
+/// coarser than the pivot, and it writes the plan every data shard consumes
+/// (the assignment is dataset-global — see the `plan_state` module docs — so
+/// no shard can recompute it). In an *aggregate-into-fields handover* build,
+/// where an externally produced archive owns the coarse zooms and tylertoo
+/// owns the fine ones, the coarse job's TILES ARE DISCARDED: it runs purely as
+/// a plan writer. This is that run, without the export nobody reads.
+///
+/// # The invariant
+///
+/// The artifact is **byte-identical** to the one a full (or `zoom_ceiling`-
+/// capped, #541) run of the same options over the same input writes. Pass 1
+/// and the assignment are reached through the same code path
+/// (`stream::run_front_half`), and nothing about "only the plan is wanted"
+/// enters the plan's options fingerprint. The oracle asserts it with
+/// `fs::read(a) == fs::read(b)`, in this module and in `shard_merge_parity`.
+///
+/// # Requirements
+///
+/// [`ConvertOptions::save_plan`] must be set — it is the only output — and
+/// [`ConvertOptions::zoom_ceiling`] must not be, since there is no pass 2 to
+/// cap. Everything `--save-plan` already refuses is refused here too: a
+/// [`ConvertOptions::plan`] to replay, a data-shard
+/// [`ConvertOptions::shard`] range (whose plan would cover only that shard's
+/// rows), and `streaming: false`.
+pub fn write_convert_plan(
+    input_path: impl AsRef<Path>,
+    options: &ConvertOptions,
+) -> Result<PlanReport, ConvertError> {
+    let source = ConvertSource::resolve_path(input_path.as_ref())?;
+    write_convert_plan_sources(&source, options)
+}
+
+/// [`write_convert_plan`] over an already-resolved [`ConvertSource`] — the
+/// entry point for a `--files-from` manifest, an explicit input list, or a
+/// custom object store, exactly as [`convert_to_overviews_sources`] is.
+pub fn write_convert_plan_sources(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+) -> Result<PlanReport, ConvertError> {
+    // The plan IS the output: without a target there is nothing for this run
+    // to produce, and silently doing the whole scan for nothing is the one
+    // outcome worth refusing outright.
+    if options.save_plan.is_none() {
+        return Err(ConvertError::InvalidConfig(
+            "writing a convert plan requires --save-plan PATH: a plan-only run \
+             produces no archive and no overview, so the plan is its only output"
+                .to_string(),
+        ));
+    }
+    // #541's ceiling truncates what PASS 2 materializes, and pass 2 does not
+    // run here. Refused rather than ignored: an operator who caps a plan-only
+    // run has misunderstood which half they skipped.
+    if options.zoom_ceiling.is_some() {
+        return Err(ConvertError::InvalidConfig(
+            "a convert-side zoom ceiling has no meaning for a plan-only run: the \
+             ceiling bounds the levels pass 2 materializes, and a plan-only run \
+             materializes none. Drop it — the plan is full-range either way"
+                .to_string(),
+        ));
+    }
+    let inert_options: ConvertOptions;
+    let options: &ConvertOptions = match normalize_convert_options(source, options)? {
+        Some(adjusted) => {
+            inert_options = adjusted;
+            &inert_options
+        }
+        None => options,
+    };
+    // #517's rule, applied to the other run that writes no dump: the profile
+    // covers pass 2 and the export, neither of which a plan-only run reaches.
+    // Said up front rather than exiting 0 with an empty (or untouched) file.
+    if std::env::var_os("TYLERTOO_PROFILE_JSON").is_some_and(|v| !v.is_empty()) {
+        log::warn!(
+            "[profile] TYLERTOO_PROFILE_JSON is set but the profile dump only \
+             covers a full convert; a plan-only run writes no dump"
+        );
+    }
+    // `--save-plan` already requires the streaming pipeline (validated above),
+    // which is where the separable pass-1 + assignment stage lives.
+    super::stream::write_plan_streaming(source, options)
+}
+
 pub fn convert_to_overviews(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -2176,7 +2387,7 @@ fn knob_columns(options: &ConvertOptions) -> Vec<(String, String)> {
 /// would otherwise silently produce a file narrowed to the earlier call's
 /// columns. One rule: a `ConvertSource` is single-use once a selection has
 /// been applied.
-fn apply_property_selection(
+pub(super) fn apply_property_selection(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<(), ConvertError> {
@@ -2633,15 +2844,19 @@ fn build_emitted_levels(
     (emitted, skipped)
 }
 
-/// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
-/// Runs the full option normalization (validation, cluster/accumulate checks,
-/// the partitioning-coalesce-inert rewrite) before dispatching.
-pub(crate) fn convert_to_overviews_source_strategy(
+/// The option normalization every conversion entry point runs before any
+/// input is read: knob sanity, the property projection, the spill directory,
+/// the mode-combination checks, and the ladder/mode rewrites.
+///
+/// Returns `Some(adjusted)` when a rewrite applied, `None` to use the options
+/// as given. Shared by [`convert_to_overviews_source_strategy`] and
+/// [`write_convert_plan_sources`] (#560) so a plan-only run reaches pass 1
+/// through exactly the options a full run would — which is what makes the
+/// plan artifact byte-identical.
+fn normalize_convert_options(
     source: &ConvertSource,
-    output_path: &Path,
     options: &ConvertOptions,
-    strategy: super::stream::Pass2Strategy,
-) -> Result<ConvertReport, ConvertError> {
+) -> Result<Option<ConvertOptions>, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
     // #386: narrow the source to the requested property columns before any
@@ -2658,8 +2873,20 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // is on by default, so partitioning conversions silently proceed
     // without it (no column, no provenance); the CLI rejects an EXPLICIT
     // request instead.
+    Ok(adjusted_for_ladder_and_mode(options))
+}
+
+/// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
+/// Runs the full option normalization (validation, cluster/accumulate checks,
+/// the partitioning-coalesce-inert rewrite) before dispatching.
+pub(crate) fn convert_to_overviews_source_strategy(
+    source: &ConvertSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+    strategy: super::stream::Pass2Strategy,
+) -> Result<ConvertReport, ConvertError> {
     let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match adjusted_for_ladder_and_mode(options) {
+    let options: &ConvertOptions = match normalize_convert_options(source, options)? {
         Some(adjusted) => {
             inert_options = adjusted;
             &inert_options
@@ -7168,6 +7395,43 @@ mod tests {
             "the capped coarse job must save the plan a full run saves"
         );
 
+        // (1b) #560: and so must a PLAN-ONLY run, which skips pass 2
+        // altogether. Same three legs, same bytes: neither the level ceiling
+        // nor "don't materialize anything" may reach the artifact the data
+        // shards consume.
+        let only_plan = dir.join("plan-only.plan");
+        let only = write_convert_plan(
+            &input,
+            &ConvertOptions {
+                save_plan: Some(only_plan.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&full_plan).unwrap(),
+            std::fs::read(&only_plan).unwrap(),
+            "a plan-only run must save the plan a full run saves"
+        );
+        // The report describes the assignment, so every level the full run
+        // WROTE must be in it (a planned level can still be dropped later, at
+        // write time, when all its geometry collapses — pass 2's business,
+        // which a plan-only run never reaches).
+        assert_eq!(only.input_features, full.input_features);
+        assert_eq!(only.path, only_plan);
+        assert_eq!(
+            only.plan_bytes,
+            std::fs::metadata(&only_plan).unwrap().len()
+        );
+        let only_zooms: Vec<Option<u8>> = only.levels.iter().map(|l| l.zoom).collect();
+        for l in &full.levels {
+            assert!(
+                only_zooms.contains(&l.zoom),
+                "plan-only report is missing z{:?} that the full run wrote: {only_zooms:?}",
+                l.zoom
+            );
+        }
+
         // (2) The capped run built exactly the levels at or coarser than the
         // ceiling — and the cap really did bite, or (3) would be vacuous.
         let want: Vec<&LevelReport> = full
@@ -7402,13 +7666,31 @@ mod tests {
         )
         .unwrap();
 
-        // The premise: the two files' own statistics disagree.
+        // The premise: the two files' own statistics disagree. The full file
+        // spans more than one count, which the statistic fold refuses (#399),
+        // so its max is read from the data.
         let full_rdr = OverviewReader::open(&full_out).unwrap();
         let capped_rdr = OverviewReader::open(&capped_out).unwrap();
-        assert!(
-            full_rdr.int_column_max("coalesced_count").unwrap() > 1,
-            "the full run must merge the chain somewhere"
-        );
+        let full_max = (0..full_rdr.num_levels())
+            .flat_map(|k| full_rdr.read_level(k, None).unwrap())
+            .map(|batch| {
+                use arrow_array::cast::AsArray;
+                use arrow_array::types::Int32Type;
+                let batch = batch.unwrap();
+                let idx = batch.schema().index_of("coalesced_count").unwrap();
+                batch
+                    .column(idx)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(1)
+            })
+            .max()
+            .unwrap();
+        assert!(full_max > 1, "the full run must merge the chain somewhere");
+        assert_eq!(full_rdr.int_column_max("coalesced_count"), None);
         assert_eq!(
             capped_rdr.int_column_max("coalesced_count"),
             Some(1),
@@ -7604,6 +7886,163 @@ mod tests {
         assert!(
             partitioning.contains("duplicating mode"),
             "unexpected: {partitioning}"
+        );
+    }
+
+    // ---- --plan-only (#560) -------------------------------------------------
+
+    /// A plan-only run's ONLY side effect is the plan. No overview, no
+    /// temp file, no checkpoint, nothing half-written — the handover build
+    /// that motivated #560 runs this job and then throws the whole working
+    /// directory away except this one artifact.
+    #[test]
+    fn plan_only_writes_nothing_but_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &polygon_fixture(), false, None);
+
+        let workdir = dir.path().join("work");
+        std::fs::create_dir(&workdir).unwrap();
+        let plan = workdir.join("convert.plan");
+        let report = write_convert_plan(
+            &input,
+            &ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 8,
+                },
+                save_plan: Some(plan.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let left: Vec<String> = std::fs::read_dir(&workdir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["convert.plan".to_string()],
+            "a plan-only run left more than the plan behind"
+        );
+        assert!(report.plan_bytes > 0);
+        assert_eq!(report.path, plan);
+
+        // The report is the sanity check an operator gets instead of an
+        // archive: level counts, the input tallies, and how the ranking that
+        // drove the whole assignment was resolved.
+        assert!(!report.levels.is_empty());
+        assert!(report
+            .levels
+            .windows(2)
+            .all(|w| w[0].planned_level < w[1].planned_level));
+        assert!(report.levels.iter().all(|l| l.feature_count > 0));
+        assert_eq!(report.input_features, 12);
+        assert_eq!(report.input_rows, 12);
+        assert_eq!((report.points, report.lines, report.polygons), (0, 0, 12));
+        assert_eq!(report.ranking.mode, "size-fallback");
+        assert_eq!(report.entry_zoom, None);
+        assert_eq!(report.row_groups_read, report.row_groups_total);
+        // Pass 1 and the assignment ran; pass 2 did not, and the run is the
+        // two of them plus the plan write.
+        assert!(report.duration_secs >= report.pass1_secs);
+    }
+
+    /// Every way of asking for a plan-only run that cannot produce one is
+    /// refused up front, with the flag named.
+    #[test]
+    fn plan_only_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &polygon_fixture(), false, None);
+        let plan = dir.path().join("p.plan");
+        let refused = |o: ConvertOptions| write_convert_plan(&input, &o).unwrap_err().to_string();
+
+        // The plan is the only output: no target, no run.
+        let no_target = refused(ConvertOptions::default());
+        assert!(no_target.contains("--save-plan"), "unexpected: {no_target}");
+
+        // #541's ceiling bounds what pass 2 materializes, and pass 2 does not
+        // run — ignoring it silently would hide a misunderstanding.
+        let ceiling = refused(ConvertOptions {
+            save_plan: Some(plan.clone()),
+            zoom_ceiling: Some(4),
+            ..Default::default()
+        });
+        assert!(
+            ceiling.contains("no meaning for a plan-only run"),
+            "unexpected: {ceiling}"
+        );
+
+        // Replaying a plan and writing one are opposite ends of a run.
+        let replay = refused(ConvertOptions {
+            save_plan: Some(plan.clone()),
+            plan: Some(plan.clone()),
+            ..Default::default()
+        });
+        assert!(
+            replay.contains("mutually exclusive"),
+            "unexpected: {replay}"
+        );
+
+        // A data shard reads a subset, so the plan it would write is useless
+        // to the rest of the fleet — the same refusal `--save-plan` already
+        // carries, reached through the plan-only entry point.
+        let data_shard = refused(ConvertOptions {
+            save_plan: Some(plan.clone()),
+            shard: Some(crate::shard::TileRange::parse("1..2").unwrap()),
+            ..Default::default()
+        });
+        assert!(
+            data_shard.contains("--shard and --save-plan are mutually exclusive"),
+            "unexpected: {data_shard}"
+        );
+
+        // The separable pass-1 + assignment stage is the streaming pipeline's.
+        let in_memory = refused(ConvertOptions {
+            save_plan: Some(plan.clone()),
+            streaming: false,
+            ..Default::default()
+        });
+        assert!(
+            in_memory.contains("streaming pipeline"),
+            "unexpected: {in_memory}"
+        );
+
+        // Every refusal above is a config check, so none of them left a plan
+        // behind.
+        assert!(!plan.exists(), "a refused plan-only run wrote a plan");
+    }
+
+    /// An input with nothing to tile fails the plan-only run with NoData, as
+    /// it fails a full run — and, the plan being the only output, does not
+    /// leave a zero-level plan on disk for a fleet to be launched against.
+    #[test]
+    fn plan_only_no_data_leaves_no_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &polygon_fixture(), false, None);
+        let plan = dir.path().join("p.plan");
+
+        let err = write_convert_plan(
+            &input,
+            &ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 6,
+                },
+                // Nowhere near the fixture: nothing survives the scan.
+                bbox: Some([170.0, 75.0, 179.0, 84.0]),
+                save_plan: Some(plan.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::NoData), "got {err:?}");
+        assert!(
+            !plan.exists(),
+            "a NoData plan-only run left its plan behind"
         );
     }
 
@@ -10861,65 +11300,8 @@ mod tests {
     // Bbox row-group filtering tests (#102)
     // ========================================================================
 
-    /// Write a multi-row-group GeoParquet file with covering column stats so
-    /// row-group pruning can actually bite. Each row group contains one point
-    /// at `(x, y)` with id = row-group index.
-    fn write_multi_rg_input(path: &Path, coords: &[(f64, f64)], with_covering: bool) {
-        write_multi_rg_input_with_crs(path, coords, with_covering, None)
-    }
-
-    /// [`write_multi_rg_input`] with an explicit geometry CRS (#518: the
-    /// EPSG:3857 probe needs a file that declares Pseudo-Mercator PROJJSON).
-    fn write_multi_rg_input_with_crs(
-        path: &Path,
-        coords: &[(f64, f64)],
-        with_covering: bool,
-        crs_metadata: Option<geoarrow::datatypes::Metadata>,
-    ) {
-        use parquet::file::properties::WriterProperties;
-
-        let geoms: Vec<Geometry<f64>> = coords
-            .iter()
-            .map(|&(x, y)| Geometry::Point(Point::new(x, y)))
-            .collect();
-        let n = geoms.len();
-        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-        let geom_arr = match crs_metadata {
-            Some(md) => {
-                let typ = GeometryType::new(Arc::new(md));
-                let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-                b.extend_from_iter(geoms.iter().map(Some));
-                b.finish()
-            }
-            None => build_geometry_array(&geoms),
-        };
-        let geom_field = geom_arr.data_type().to_field("geometry", true);
-        let fields = vec![
-            Arc::new(Field::new("id", DataType::Int64, false)),
-            Arc::new(geom_field),
-        ];
-        let columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), geom_arr.to_array_ref()];
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-
-        let gpq_options = GeoParquetWriterOptionsBuilder::default()
-            .set_encoding(GeoParquetWriterEncoding::WKB)
-            .set_generate_covering(with_covering)
-            .build();
-        let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
-        let target_schema = encoder.target_schema();
-        // Row-group size = 1 to force n row groups.
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(1))
-            .build();
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
-        let mut encoder = encoder;
-        let encoded = encoder.encode_record_batch(&batch).unwrap();
-        writer.write(&encoded).unwrap();
-        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
-        writer.close().unwrap();
-    }
+    /// Fixture writers shared with `overview::stream`'s tests (#422).
+    use super::super::testutil::{write_multi_rg_input, write_multi_rg_input_with_crs};
 
     /// Read all ids from all levels of an overview file.
     fn read_all_ids(reader: &OverviewReader) -> Vec<i64> {
@@ -11085,60 +11467,8 @@ mod tests {
     // Attribute filter tests (#315)
     // ========================================================================
 
-    /// One fixture row: `((x, y), confidence, crop)`.
-    type AttrRow = ((f64, f64), Option<f64>, Option<&'static str>);
-
-    /// Multi-row-group input with attribute columns: one row per row group at
-    /// `(x, y)` with `id` = row-group index, plus a nullable `confidence`
-    /// Float64 and a nullable `crop` Utf8 column. One row per row group makes
-    /// per-row-group column statistics exact, so pushdown pruning can bite.
-    fn write_multi_rg_attr_input(path: &Path, rows: &[AttrRow]) {
-        use parquet::file::properties::WriterProperties;
-
-        let geoms: Vec<Geometry<f64>> = rows
-            .iter()
-            .map(|&((x, y), _, _)| Geometry::Point(Point::new(x, y)))
-            .collect();
-        let n = geoms.len();
-        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-        let confidence =
-            arrow_array::Float64Array::from(rows.iter().map(|(_, c, _)| *c).collect::<Vec<_>>());
-        let crop =
-            arrow_array::StringArray::from(rows.iter().map(|(_, _, s)| *s).collect::<Vec<_>>());
-        let geom_arr = build_geometry_array(&geoms);
-        let geom_field = geom_arr.data_type().to_field("geometry", true);
-        let fields = vec![
-            Arc::new(Field::new("id", DataType::Int64, false)),
-            Arc::new(Field::new("confidence", DataType::Float64, true)),
-            Arc::new(Field::new("crop", DataType::Utf8, true)),
-            Arc::new(geom_field),
-        ];
-        let columns: Vec<Arc<dyn Array>> = vec![
-            Arc::new(id),
-            Arc::new(confidence),
-            Arc::new(crop),
-            geom_arr.to_array_ref(),
-        ];
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-
-        let gpq_options = GeoParquetWriterOptionsBuilder::default()
-            .set_encoding(GeoParquetWriterEncoding::WKB)
-            .set_generate_covering(true)
-            .build();
-        let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
-        let target_schema = encoder.target_schema();
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(1))
-            .build();
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
-        let mut encoder = encoder;
-        let encoded = encoder.encode_record_batch(&batch).unwrap();
-        writer.write(&encoded).unwrap();
-        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
-        writer.close().unwrap();
-    }
+    /// Fixture writer shared with `overview::stream`'s tests (#422).
+    use super::super::testutil::{write_multi_rg_attr_input, AttrRow};
 
     /// Rows: (0,0)/0.1/soy, (10,10)/0.9/corn, (20,20)/0.85/soy, (30,30)/null/rice.
     fn attr_rows() -> Vec<AttrRow> {

@@ -78,63 +78,49 @@ pub fn extract_geometries_opt_from_array(
     array: &dyn GeoArrowArray,
     output: &mut Vec<Option<Geometry<f64>>>,
 ) -> Result<()> {
+    visit_geoarrow_array(array, ExtractGeometries { output })
+}
+
+/// A computation over one typed GeoArrow accessor, run by
+/// [`visit_geoarrow_array`] after it has resolved the array's concrete type.
+///
+/// The dispatch over [`GeoArrowType`] lives in exactly one place; a caller
+/// that wants something other than a full `geo::Geometry` conversion (e.g.
+/// the `--max-zoom auto` estimator, which reads a bbox for a sample of rows
+/// through `geo_traits` without converting anything) implements this trait
+/// instead of re-matching every geometry type.
+pub(crate) trait GeoArrowVisitor {
+    /// What the visit produces.
+    type Output;
+
+    /// Run over the typed accessor.
+    fn visit<'a, A>(self, accessor: &'a A) -> Result<Self::Output>
+    where
+        A: GeoArrowArrayAccessor<'a>,
+        A::Item: ToGeoGeometry<f64>;
+}
+
+/// Resolve `array`'s concrete GeoArrow type and hand its typed accessor to
+/// `visitor`. Unsupported types are a [`Error::GeoParquetRead`].
+pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
+    array: &dyn GeoArrowArray,
+    visitor: V,
+) -> Result<V::Output> {
     match array.data_type() {
-        GeoArrowType::Point(_) => {
-            let arr = array.as_point();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::LineString(_) => {
-            let arr = array.as_line_string();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::Polygon(_) => {
-            let arr = array.as_polygon();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::MultiPoint(_) => {
-            let arr = array.as_multi_point();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::MultiLineString(_) => {
-            let arr = array.as_multi_line_string();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::MultiPolygon(_) => {
-            let arr = array.as_multi_polygon();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::Geometry(_) => {
-            let arr = array.as_geometry();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::GeometryCollection(_) => {
-            let arr = array.as_geometry_collection();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::Wkb(_) => {
-            let arr = array.as_wkb::<i32>();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::LargeWkb(_) => {
-            let arr = array.as_wkb::<i64>();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::WkbView(_) => {
-            let arr = array.as_wkb_view();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::Wkt(_) => {
-            let arr = array.as_wkt::<i32>();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::LargeWkt(_) => {
-            let arr = array.as_wkt::<i64>();
-            extract_typed_array(arr, output)
-        }
-        GeoArrowType::WktView(_) => {
-            let arr = array.as_wkt_view();
-            extract_typed_array(arr, output)
-        }
+        GeoArrowType::Point(_) => visitor.visit(array.as_point()),
+        GeoArrowType::LineString(_) => visitor.visit(array.as_line_string()),
+        GeoArrowType::Polygon(_) => visitor.visit(array.as_polygon()),
+        GeoArrowType::MultiPoint(_) => visitor.visit(array.as_multi_point()),
+        GeoArrowType::MultiLineString(_) => visitor.visit(array.as_multi_line_string()),
+        GeoArrowType::MultiPolygon(_) => visitor.visit(array.as_multi_polygon()),
+        GeoArrowType::Geometry(_) => visitor.visit(array.as_geometry()),
+        GeoArrowType::GeometryCollection(_) => visitor.visit(array.as_geometry_collection()),
+        GeoArrowType::Wkb(_) => visitor.visit(array.as_wkb::<i32>()),
+        GeoArrowType::LargeWkb(_) => visitor.visit(array.as_wkb::<i64>()),
+        GeoArrowType::WkbView(_) => visitor.visit(array.as_wkb_view()),
+        GeoArrowType::Wkt(_) => visitor.visit(array.as_wkt::<i32>()),
+        GeoArrowType::LargeWkt(_) => visitor.visit(array.as_wkt::<i64>()),
+        GeoArrowType::WktView(_) => visitor.visit(array.as_wkt_view()),
         _ => Err(Error::GeoParquetRead(format!(
             "Unsupported geometry type: {:?}",
             array.data_type()
@@ -142,28 +128,33 @@ pub fn extract_geometries_opt_from_array(
     }
 }
 
-/// Extract geometries from a typed GeoArrow array into a row-aligned Vec of
-/// `Option`s (one entry per slot; see [`extract_geometries_opt_from_array`]).
-fn extract_typed_array<'a, A>(
-    accessor: &'a A,
-    output: &mut Vec<Option<Geometry<f64>>>,
-) -> Result<()>
-where
-    A: GeoArrowArrayAccessor<'a>,
-    A::Item: ToGeoGeometry<f64>,
-{
-    for (i, item) in accessor.iter().enumerate() {
-        match item {
-            Some(geom_result) => {
-                let geom_trait = geom_result.map_err(|e| {
-                    Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
-                })?;
-                output.push(geom_trait.try_to_geometry());
+/// [`extract_geometries_opt_from_array`]'s visitor: one row-aligned
+/// `Option<Geometry>` per slot.
+struct ExtractGeometries<'o> {
+    output: &'o mut Vec<Option<Geometry<f64>>>,
+}
+
+impl GeoArrowVisitor for ExtractGeometries<'_> {
+    type Output = ();
+
+    fn visit<'a, A>(self, accessor: &'a A) -> Result<()>
+    where
+        A: GeoArrowArrayAccessor<'a>,
+        A::Item: ToGeoGeometry<f64>,
+    {
+        for (i, item) in accessor.iter().enumerate() {
+            match item {
+                Some(geom_result) => {
+                    let geom_trait = geom_result.map_err(|e| {
+                        Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
+                    })?;
+                    self.output.push(geom_trait.try_to_geometry());
+                }
+                None => self.output.push(None),
             }
-            None => output.push(None),
         }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]

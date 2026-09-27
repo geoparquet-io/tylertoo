@@ -480,6 +480,39 @@ fn convert_plan_is_byte_identical_across_thread_counts() {
                 "[{name}] --save-plan wrote an empty plan at RAYON_NUM_THREADS={threads}"
             );
 
+            // #560: the same plan, from the run that skips the export. It must
+            // match the full run's at every thread count — the artifact is the
+            // fleet's contract, and neither the thread count nor the presence
+            // of a pass 2 may show up in it.
+            let only = dir.path().join(format!("t{threads}-plan-only.plan"));
+            let status = Command::new(tylertoo_bin())
+                .args([
+                    "tiles",
+                    fixture.to_str().unwrap(),
+                    "--min-zoom",
+                    "0",
+                    "--max-zoom",
+                    &max_zoom.to_string(),
+                    "--save-plan",
+                    only.to_str().unwrap(),
+                    "--plan-only",
+                ])
+                .env("RAYON_NUM_THREADS", threads.to_string())
+                .output()
+                .unwrap_or_else(|e| panic!("run tylertoo tiles --plan-only: {e}"));
+            assert!(
+                status.status.success(),
+                "[{name}] --plan-only exited with {}: {}",
+                status.status,
+                String::from_utf8_lossy(&status.stderr)
+            );
+            assert!(
+                std::fs::read(&only).expect("read plan-only plan") == plan_bytes,
+                "[{name}] --plan-only wrote a different plan than the full run at \
+                 RAYON_NUM_THREADS={threads} — #560 regression: skipping pass 2 must not \
+                 change the artifact every data shard consumes"
+            );
+
             match &baseline {
                 None => baseline = Some((threads, plan_bytes)),
                 Some((base_threads, base_plan)) => {

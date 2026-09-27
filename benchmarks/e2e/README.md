@@ -6,15 +6,21 @@ numbers live in [RESULTS.md](RESULTS.md); this file is the method, including
 every place the comparison is not apples to apples.
 
 Issue: [#447](https://github.com/geoparquet-io/tylertoo/issues/447).
-No CI wiring lives here — benchmarking in CI is [#448](https://github.com/geoparquet-io/tylertoo/issues/448)'s lane.
+Benchmarking in CI is [#448](https://github.com/geoparquet-io/tylertoo/issues/448)'s lane.
+The **output-parity gate** built on this harness's flag set —
+`compare_tippecanoe.py` + `tippecanoe_tolerances.toml`, run by
+`.github/workflows/tippecanoe-compare.yml` — is [#420](https://github.com/geoparquet-io/tylertoo/issues/420);
+see "Parity gate" below.
 
 ## Quick start
 
 ```bash
-./benchmarks/e2e/setup_tippecanoe.sh        # builds the pinned tippecanoe
+./benchmarks/e2e/setup_tippecanoe.sh        # builds the pinned tippecanoe into <repo>/.tools
 cargo build --release -p tylertoo
 python3 benchmarks/e2e/run_e2e.py --repeat 3 --geojson --quality-matched
 python3 benchmarks/e2e/format_results.py benchmarks/e2e/results-<stamp>.json
+
+uv run benchmarks/e2e/compare_tippecanoe.py   # the parity gate (#420); exit 1 on a breach
 ```
 
 A run writes `results-<UTC timestamp>.json` (gitignored), so an ad-hoc run
@@ -79,8 +85,9 @@ the subtraction themselves.
 ## The baseline is pinned
 
 `setup_tippecanoe.sh` clones **felt/tippecanoe at tag `2.79.0`**, verifies the
-commit is `68ab8dcc229f95b8b25877697d5e8d66783af503`, builds it into
-`.tools/`, and writes `tippecanoe.lock.json`. `run_e2e.py` refuses to run
+commit is `68ab8dcc229f95b8b25877697d5e8d66783af503`, builds it into the
+repo-root `.tools/` (next to go-pmtiles; `TIPPECANOE_TOOLS_DIR` overrides,
+`--print-path` emits the `PATH` export), and writes `tippecanoe.lock.json`. `run_e2e.py` refuses to run
 against a binary whose `--version` is not `tippecanoe v2.79.0` — the expected
 string is hard-coded in the harness, so the check holds with or without a
 lockfile (override with `TIPPECANOE_ALLOW_MISMATCH=1`, which is recorded in
@@ -153,6 +160,47 @@ These are real and are not tuned away in either direction.
 | 9 | **Warm cache.** A discarded warm-up run precedes the timed repeats for every stage, on both sides. No cold-cache numbers are published — macOS cannot drop caches without root. | neutral |
 | 10 | **Fixed run order.** Every dataset runs tylertoo first (defaults, then quality-matched), then the converters, then tippecanoe; runs are not interleaved. On a laptop, thermal state drifts across a run, so the later, longer tippecanoe stages may run on a hotter (throttled) or cooler machine than tylertoo's. | unknown direction; machine-dependent |
 
+## Parity gate (#420)
+
+`compare_tippecanoe.py` is the CI-facing sibling of `run_e2e.py`: same
+datasets, same flag mapping (imported from `run_e2e.py`, so they cannot
+drift), no timing. It tiles every fixture with tylertoo — the
+quality-matched run (`--verbatim --simplify-factor 1.0`) is gated, the
+defaults run is printed for #387 — and with the pinned tippecanoe, decodes
+both archives with the Python `pmtiles` + `mapbox-vector-tile` readers, and
+compares per zoom: tiles, MVT feature instances, distinct feature ids (where
+a dataset has a unique integer column, carried through as the MVT id on
+both sides), vertices, stored bytes, and the per-shared-tile feature-count
+median. Each ratio (tylertoo / tippecanoe) is checked against a band in
+`tippecanoe_tolerances.toml`, which has a comment per band saying what was
+measured and which divergence explains it. Exit 1 names the cell.
+
+Two things differ from `run_e2e.py` on purpose:
+
+- **tippecanoe's input is line-delimited GeoJSON written by the script
+  itself** (pyarrow + shapely), not FlatGeobuf from ogr2ogr/gpio. Ubuntu's
+  GDAL has no Parquet driver and gpio fails on the madagascar fixture, but
+  the real reason is determinism: ogr2ogr's FlatGeobuf writer builds a
+  spatial index and **reorders features along a Hilbert curve**, and
+  tippecanoe's tiny-polygon accumulator is order-dependent, so the
+  ogr2ogr-fed baseline carries roughly half the coarse-zoom placeholder
+  features of the row-order one (z2 madagascar: 5,441 vs 10,383 feature
+  instances). The gate's converter preserves row order and passes no `-P`,
+  which would reorder too. This is also why the gate's numbers are not the
+  RESULTS.md numbers.
+- **`--feature-id fid` / `--use-attribute-for-id=fid -aI`** on
+  madagascar-adm4, so distinct ids can be counted (METRICS.md §2's dedup).
+
+```bash
+uv run benchmarks/e2e/compare_tippecanoe.py                # all fixtures
+uv run benchmarks/e2e/compare_tippecanoe.py --only open-buildings --json out.json
+uv run benchmarks/e2e/compare_tippecanoe.py --work /tmp/cmp --keep   # keep archives
+```
+
+When a change moves a ratio on purpose, update the band in
+`tippecanoe_tolerances.toml` in the same PR and put the new measurement in
+its comment.
+
 ## Metrics
 
 Recorded per dataset, per stage, in `results.json`:
@@ -211,10 +259,12 @@ dataset. That is the path for cluster-scale runs.
 | `run_e2e.py` | the harness (stdlib only); writes `results-<UTC timestamp>.json` (or `--out`) and a markdown table |
 | `format_results.py` | prints RESULTS.md's tables from a results file (default `results.json`), so no number is retyped |
 | `render_parity.py` | side-by-side PNG renders of two archives at chosen zooms, with distinct-feature counts |
+| `compare_tippecanoe.py` | the parity gate (#420): tiles both tools, decodes both archives, per-zoom ratios vs `tippecanoe_tolerances.toml`; exit 1 on a breach |
+| `tippecanoe_tolerances.toml` | the gate's bands, one comment per band with the measured ratio and the divergence behind it |
 | `results.json` | the recorded run behind RESULTS.md (machine, argv, every repeat) |
 | `RESULTS.md` | measured numbers, machine, caveats |
 | `tippecanoe.lock.json` | local resolution of the pin (gitignored; written by setup) |
-| `.tools/` | built tippecanoe (gitignored) |
+| `<repo>/.tools/` | built tippecanoe, next to go-pmtiles (gitignored) |
 
 ## Useful flags
 
