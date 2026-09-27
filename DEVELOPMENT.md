@@ -146,6 +146,28 @@ cargo mutants --package tylertoo-core \
 cargo mutants --package tylertoo-core          # the full sweep, hours
 ```
 
+The nightly fuzz job (`.github/workflows/fuzz.yml`, 3 AM UTC, or
+`gh workflow run fuzz.yml`) runs every `cargo-fuzz` target in `fuzz/`
+for 300 s each, one matrix job per target, seeded from
+`fuzz/corpus/<target>/seed-*`. The targets cover the parsers that read
+third-party bytes: the PMTiles header and directory, an MVT tile body, a
+whole `--band` archive, the footer JSON, WKB, and the `--filter` grammar.
+A crash uploads the reproducer as the `fuzz-artifacts-<target>` artifact
+and opens or updates a pinned `fuzz` issue. `fuzz/README.md` has the
+target table, how to run one locally, and how to minimize a crash into
+a regression test. The fuzz crate is its own workspace and never affects
+the per-PR build; two of its targets reach private code through
+`#[doc(hidden)]` hooks behind core's `fuzzing` feature, which nothing
+else enables.
+
+```bash
+cargo install cargo-fuzz --locked
+cd fuzz
+cargo +nightly fuzz list
+cargo +nightly fuzz run pmtiles_directory -- \
+  -max_total_time=60
+```
+
 When a new test takes more than ~20s, add it to the slow set in
 `.config/nextest.toml`: the `default-filter` exclusion in
 `[profile.default]` (which `quick` inherits) and the matching
