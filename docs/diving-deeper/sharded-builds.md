@@ -265,6 +265,20 @@ the hard error to the warning and proceed anyway. Off Linux there is no
 cgroup or `MemAvailable` to read, so the check does nothing unless the
 override is set. A `--plan` replay skips it.
 
+**Line coalescing is not in the estimate.** With coalescing on (the default
+for `convert`/`tiles`; a sharded fleet must run with `--no-coalesce-lines`,
+see [v1 restrictions](#v1-restrictions), but the preflight applies to every
+convert), a line input inside the coalescing ceiling also holds its line
+geometry through pass 1 — up to `--coalesce-max-level-rows × 512 B`
+modelled, ≈1 GB (≈1.2 GiB resident) at the defaults — and the chain stage
+then peaks at a large multiple of that: measured whole-run peaks of 16–29×
+the modelled line geometry
+([Overview tuning](../OVERVIEW_TUNING.md), `--coalesce-max-level-rows`,
+[#570](https://github.com/geoparquet-io/tylertoo/issues/570)). Add that on
+top of the rule of thumb above for line-heavy inputs, or pass
+`--no-coalesce-lines`. Over the ceiling, coalescing is skipped and pass 1
+frees the buffer as soon as it crosses, so it adds nothing.
+
 This check does not (yet) make the coarse job's floor any smaller —
 [#543](https://github.com/geoparquet-io/tylertoo/issues/543) tracks shrinking
 it (a narrower struct-of-arrays layout, or spilling the table between scan
