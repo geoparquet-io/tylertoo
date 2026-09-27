@@ -475,12 +475,14 @@ ratified this as the intended behavior.**
 `5c123fa` (merged as #539) bumped `i_overlay` 8.1.2 → 9.0.0 (pulling `i_float`
 4 → 5). That is **our own direct dependency**, not `geo`'s: `geo` 0.33 vendors
 `i_overlay` 4.5.2 for its `BooleanOps`, and both versions coexist in
-`Cargo.lock`. Ours is the engine behind `ioverlay_clip.rs` — the boundary-bridge
-fallback in `clip_geometry` (`clip.rs`, reached on every non-simple ring and,
-with `--no-simple-clip-fastpath`, on all of them) and the #383 post-quantization
-polygon repair in `export.rs`. So the bump moved the clipper directly. A
-three-way A/B on the Brazil 2025 coarse job (27.98M rows, 588 tiles, identical
-shard plan and options) measured:
+`Cargo.lock` (since #435 nothing of ours calls the vendored one — see "One
+boolean-ops engine" below). Ours is the engine behind `ioverlay_clip.rs` — the
+boundary-bridge fallback in `clip_geometry` (`clip.rs`, reached on every
+non-simple ring and, with `--no-simple-clip-fastpath`, on all of them), the
+line clipper (#435), and the #383 post-quantization polygon repair in
+`export.rs`. So the bump moved the clipper directly. A three-way A/B on the
+Brazil 2025 coarse job (27.98M rows, 588 tiles, identical shard plan and
+options) measured:
 
 | comparison | differing tiles |
 |---|---|
@@ -541,6 +543,74 @@ disappearing — the exact shape of an overlay-engine change. The two guards run
 in different places (structural in `bench.yml`, golden in Slow Tests); neither
 replaces the other (the structural one is cheap, covers three geometry classes,
 and catches pass-1 regressions the golden's single fixture does not).
+
+### One boolean-ops engine: line clipping moved to the direct i_overlay (#435)
+
+Until #435 the two clippers ran on two engines. Polygons went through
+`ioverlay_clip.rs` on our direct `i_overlay` (9.0); lines went through
+`geo::BooleanOps::clip` in `clip.rs`, which is `geo` 0.33's vendored
+`i_overlay` 4.5.2 — four major versions of robustness fixes apart, so a line
+and a polygon sharing a tile edge could in principle be cut by engines that
+disagree about where that edge is (the inconsistency class #205 is about),
+plus duplicate compile and binary weight for `i_overlay`/`i_float`/`i_shape`/
+`i_tree`. `clip.rs` now calls `ioverlay_clip::clip_multilinestring_ioverlay`,
+the same operation on the direct engine (`FloatClip::clip_by`,
+`FillRule::EvenOdd`, `ClipRule { invert: false, boundary_included: true }`,
+open clip contour — exactly what `geo`'s `clip_with_fill_rule` did). No code
+of ours references `BooleanOps` any more.
+
+**Behaviour:** pinned before the switch in `crates/core/tests/line_clip_pinned.rs`
+through the public `clip::clip_geometry` — 17 hand-built cases with literal
+coordinates (double crossings, corner grazes, edge-collinear runs, boundary
+vertices, degenerate segments, bbox-overlap-only) and a digest sweep over the
+`road-detections` fixture at z12 and z14. Every hand-built case is
+coordinate-identical on the new engine, including the old engine's quirks (a
+re-entering run broken at an interior vertex, parts emitted out of input
+order, consecutive duplicates collapsed, zero-length lines dropped). The
+real-data sweep is structurally identical (same kept/part/vertex counts) but
+not bit-identical: about half the vertices differ by **exactly one unit of
+i_overlay's float→integer grid** (2⁻³⁴ ° at the z12 tile scale, 2⁻³⁵–2⁻³⁶ ° at
+z14; max 2.3e-10 °), in y only, at interior vertices as well as boundary
+intersections. Neither engine returns the input vertex bit-exactly — the old
+path was already snapping every line vertex to that grid; the new one lands
+on the adjacent cell. That is four to five orders of magnitude below one MVT
+unit at z14 (≈5.4e-6 °), so a quantized tile coordinate can only move on an
+exact rounding tie. An end-to-end A/B (main vs this branch, `tiles` over `road-detections.parquet`, z0–z14, 78 tiles) produced byte-identical archives. The sweep digests in `line_clip_pinned.rs` were
+re-pinned to the new engine for this reason; the counts did not change. The
+counts are pinned on every platform; the bit-exact digest only on Linux,
+because tile bounds come from `sinh().atan()` and libm differs by an ulp
+across platforms, which reaches the clipped intersections (macOS produced a
+different z14 digest with identical counts). A grid-rounded digest was
+rejected: over ~12k coordinates a 1-ulp shift straddles a rounding boundary
+often enough to flake.
+
+**Input guard:** i_float 5's adapter panics ("Invalid adapter bounds") when
+the subject's extent is non-finite or a coordinate magnitude exceeds its
+documented f64 limit of 2^500, where the `geo` path returned an empty
+result. `clip_multilinestring_ioverlay` checks every coordinate (finite and
+below `IOVERLAY_MAX_ABS_COORD` = 1e150) and returns empty before calling the
+engine, so a NaN/inf/1e300 vertex still yields "nothing to clip" rather than
+a panic. The polygon entry points (`clip_polygon_ioverlay` and friends) are
+not changed by #435 and carry no such guard; whether they need one is a
+separate question.
+
+**Residual duplicate:** `i_overlay` 4.5.2 stays in `Cargo.lock` because `geo`
+0.33.1 (the latest release at the time of writing) depends on it
+(`i_overlay = "4.5.1, < 4.6.0"`) for its own `BooleanOps` and triangulation.
+It leaves the lockfile only when a `geo` release depends on `i_overlay` 9 and
+we take that bump — which, per the policy above, is a golden-guarded decision,
+not a green-CI merge. Nothing of ours calls the vendored copy now, so that
+future bump cannot move line or polygon clipping through `geo`; it could still
+move `earcut`/triangulation and the `Simplify`/`Area` family, which is why the
+policy stays.
+
+**Compression duplicates (same PR):** `brotli` and `zstd` were pinned at 9 and
+0.14 while `parquet` 59 needs 8 and 0.13, so both were compiled twice.
+`compression.rs` uses only the stable surface (`Decompressor::new`,
+`CompressorWriter::with_params`, `BrotliEncoderParams.quality`, `encode_all`,
+`stream::read::Decoder`), which is identical across those majors, so core now
+requires `brotli = "8"` and `zstd = "0.13"` and follows `parquet`'s versions.
+When `parquet` moves, move these with it.
 
 ## Decision Record: MVT Winding Fix + PMTiles Decode (#112, 2026-07-04)
 
