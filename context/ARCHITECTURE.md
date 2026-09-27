@@ -87,6 +87,33 @@ verbatim (spec §2.4).
 1. **Pass 1** streams the input once, keeping only a small per-feature record
    (bbox, kind, ranking key). Level assignment + density budget run over
    those records to produce per-level **winner tables** (~1 byte/feature).
+
+   The assignment is parallel *within* the phase, not only across levels
+   (#534). Running each level's cell-winner grid on its own thread (#264) is
+   the obvious decomposition, but it evaporates at dataset scale: the #306
+   grid RAM budget packs the levels into waves, and a wave of one level has
+   nothing to overlap — which is how a 55.5M-row convert came to spend 107s
+   single-threaded here, more than the whole scan. So a level's grid is
+   **shard-partitioned**: threads classify disjoint feature ranges and bucket
+   each placement by the shard owning its cell, then reduce the shards in
+   parallel, one map per task. No locks, no merge tail, and one entry per
+   occupied cell either way, so the #306 grid estimate still describes the
+   grids. The one new term is the pending placements between shard reduces,
+   which the estimate does not count; it is bounded instead, per wave rather
+   than per level (≈ 2 MiB per pool thread across the whole wave, floor 1 MiB
+   per level, exact-size buffers), because the planner packs many tiny coarse
+   levels into one wave. The wave's winner fold splits by position range, and
+   the density budget's candidate scan and super-cell partition go wide while
+   its admission fold (which threads a running kept count coarse→fine) stays
+   serial. All of it is scheduling: the sharded reduce preserves position
+   order per cell, so every cell resolves its contests exactly as the serial
+   build does, and the budget's sorts are by a strict total order. The unit
+   test `oracle_fixture_reproduces_main` holds a 150k-feature adversarial
+   fixture — above the sharded-build and parallel-sort cutoffs — to golden
+   digests produced by the pre-#534 serial code, at 1/2/7/16 threads and
+   unbounded vs. 1-byte grid budgets; `thread_count_determinism.rs` checks the
+   end-to-end artifact across thread counts, though its fixtures are below the
+   sharded-build size.
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
    reader thread streams batches over a bounded channel while a consumer
@@ -435,6 +462,83 @@ tiles while keeping every count the same.
 | Untileable input (#429) | Pass 1 tallies, in ONE traversal of the feature bboxes, the #188 antimeridian suspects plus two losses: features outside the declared CRS's coordinate range (`bbox_out_of_crs_range`) and features with valid lon/lat wholly outside the Web Mercator tiling domain (latitude beyond ±85.05°, `bbox_unprojectable`). Both land on `ConvertReport` (`out_of_range_features`, `unprojectable_features`), each warns once, and when together they account for **≥99%** of the input the convert FAILS with `ConvertError::AllFeaturesOutOfRange` instead of writing an empty archive | No CRS gate: GeoJSON is lon/lat by contract, so out-of-range coordinates are clamped or dropped at projection time and a wrong-CRS input yields an empty tileset with exit 0 | The counts are taken at the END OF PASS 1 rather than at the end of convert: pass 1 already holds every feature bbox, so failing there costs no second pass and leaves no half-written overview behind. The gate is a share, not exactly 100%, because a million-row wrong-CRS file with a dozen `POINT(0 0)` placeholder rows would otherwise sail through. The two losses are counted (and worded) separately because their fixes differ: a reprojection for the first, nothing at all for the second — Mercator does not reach the poles. The projected-CRS diagnosis and its `gpio convert reproject` hint are gated on coordinate MAGNITUDE (any offending coordinate above 1000 in absolute value), so one stray 0–360°-convention longitude gets neutral wording rather than an accusation about the whole file |
 | Polygon cleanup after tile quantization (export, #383) | Exact integer checks first (every ring simple, no two rings crossing/overlapping — plane sweeps); only a polygon that fails them is repaired: rings noded and split at pinch vertices, pieces regrouped by their own original sense, then an even-odd overlay (bounded rounds) for what still fails; multipolygon parts that actually interact (exteriors meeting, or one part's vertex inside another's fill) are unioned under NonZero, the rest pass through untouched | wagyu positive-fill union on every polygon after snapping (`tile.cpp`), unconditionally | The common case — a clean polygon — is a check, not an overlay, and its vertices come out exactly as snapped (no re-noding or ring rotation). Bowtie lobes: the pinch path keeps the pieces that share the ring's original sense (the larger lobe's, when the net area is zero) and drops the reversed ones — the same lobe wagyu's positive fill keeps; a ring that still crosses after pinch-splitting goes to the even-odd overlay, which keeps both lobes
 | PMTiles header zoom range (export, #529/#522/#554) | Header `min_zoom`/`max_zoom` = the zooms that actually hold tiles; a wider requested range (`--min-zoom 0` over levels that generalized to nothing, a pyramid band's declared range, a shard set's union) lives only in `vector_layers[].minzoom`/`maxzoom` | Stamps the requested `-Z`/`-z` range in the header even when the coarse zooms are empty (golden `tests/fixtures/golden/open-buildings.pmtiles`: header z0..z10) | `go-pmtiles verify` rejects a header wider than the directory ("header MinZoom does not match min tile z"). Renderers that build TileJSON from the header (the pmtiles JS `getTileJson`) therefore see the narrower range; `vector_layers` zooms are informational to them. Acceptable: the empty zooms render identically (nothing either way), and an honest `maxzoom` lets MapLibre overzoom from the deepest real tile instead of requesting empty ones. `merge` and the pyramid band check read the declared range as header ∪ `vector_layers` so tylertoo's own archives keep round-tripping |
+
+## Decision Record: Geometry-Engine Dependency Bumps (#558, 2026-09-26)
+
+### i_overlay 9.0 changed clipping output — main's baseline moved at 5c123fa
+
+**Recorded as fact, and flagged for maintainer sign-off: nobody has yet
+ratified this as the intended behavior.**
+
+`5c123fa` (merged as #539) bumped `i_overlay` 8.1.2 → 9.0.0 (pulling `i_float`
+4 → 5). That is **our own direct dependency**, not `geo`'s: `geo` 0.33 vendors
+`i_overlay` 4.5.2 for its `BooleanOps`, and both versions coexist in
+`Cargo.lock`. Ours is the engine behind `ioverlay_clip.rs` — the boundary-bridge
+fallback in `clip_geometry` (`clip.rs`, reached on every non-simple ring and,
+with `--no-simple-clip-fastpath`, on all of them) and the #383 post-quantization
+polygon repair in `export.rs`. So the bump moved the clipper directly. A
+three-way A/B on the Brazil 2025 coarse job (27.98M rows, 588 tiles, identical
+shard plan and options) measured:
+
+| comparison | differing tiles |
+|---|---|
+| `main@6b9c3ff` vs `main@b64daf8` (the #539 merge) | **18** |
+| `main@b64daf8` vs `main` after #542/#549/#550/#554 | **0** |
+
+The 18 tiles carry ±1-MVT-unit coordinate shifts in clipped boundaries across
+z5–z8, correspondingly different areas, and one small polygon flipping across
+its collapse threshold (tilestats −1 of 2.5M). Everything merged after the bump
+is byte-clean.
+
+The new behavior is **main's baseline as of 5c123fa** — that is a statement
+about what the tree does, not an endorsement. The case for accepting it is that
+i_overlay 9 is a correctness-oriented major release and the delta is ~3 features
+in 1.7M at z8; the case against has not been made, because the change was never
+noticed at merge time. The golden committed in
+`tests/fixtures/guard/br-clip-divergence.golden.txt` encodes the post-bump
+output, so accepting it is now also the default outcome of doing nothing.
+A maintainer deciding otherwise should say so on #558 and the golden should be
+regenerated from whatever they decide.
+
+### Policy: geometry-engine bumps are not green-CI merges
+
+A bump to `geo`, `geo-types`, `i_overlay`, `i_float`, `i_shape` or `earcut` can
+change rendered geometry at **any** semver level. These are *behavioral* inputs
+to every tile we write, not build details, and there are two routes in: our
+direct `i_overlay` (the clip fallback and the #383 repair) and the copy `geo`
+vendors for its own `BooleanOps`/triangulation — so a `geo` bump can move
+clipping without `i_overlay` appearing in the diff at all. Such a bump must not
+be merged on green CI alone, nor auto-merged. `dependabot-automerge.yml`
+already leaves majors for a human; that is not the safeguard, because a patch
+release of the same crate would be auto-merged and can move coordinates just as
+easily.
+
+The mechanical enforcement is the golden tile guard
+(`crates/core/tests/convert_guard_golden.rs`): it pins per-tile digests of a
+full `convert` → `export` build over real clipper-stressing geometry, and **fails on any output change**, so a bump
+that moves a coordinate cannot be green. A golden diff is therefore the signal
+to stop and decide, and a PR that carries one must say in its body why the
+output moved. Discrimination is verified, not assumed: rolling `i_overlay` back
+to 8.1.2 fails it on 4 of 384 guarded tiles (`8/96/138`, `8/97/134`, in both
+cases) — a thin margin, recorded with the recipe in
+`tests/fixtures/guard/README.md`.
+
+What makes it a gate is where it runs. It is in the slow set in
+`.config/nextest.toml`, so it runs in `Slow Tests (ubuntu-latest)` and
+`Slow Tests (macos-latest)` (`ci.yml`) — both **required** checks in `main`'s
+branch protection (verified). The `Convert regression guard` job in
+`bench.yml` is *not* a required check, so it does not gate merges and the
+golden does not run there. If the golden ever leaves the nextest slow set, or
+Slow Tests stops being required, the guard silently stops gating.
+
+Why the pre-existing guard did not do this, though it ran (green) on #539:
+`benchmarks/overview/ci_guard.py` runs `tylertoo overview` and compares
+per-level feature/vertex counts. Clipping happens in export, which that guard
+never runs, and counts are blind to coordinates that move without appearing or
+disappearing — the exact shape of an overlay-engine change. The two guards run
+in different places (structural in `bench.yml`, golden in Slow Tests); neither
+replaces the other (the structural one is cheap, covers three geometry classes,
+and catches pass-1 regressions the golden's single fixture does not).
 
 ## Decision Record: MVT Winding Fix + PMTiles Decode (#112, 2026-07-04)
 

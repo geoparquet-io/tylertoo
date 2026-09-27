@@ -193,6 +193,16 @@ cargo semver-checks check-release \
   --package tylertoo-core \
   --baseline-rev origin/main
 
+# Convert regression guards (#558)
+# 1. structural signature of `overview` over fixtures-v1
+#    (bench.yml Convert regression guard; not a required check)
+cargo build --release --package tylertoo
+python3 benchmarks/overview/ci_guard.py --check
+# 2. golden tile digests of a full convert -> export build
+#    (nextest slow set -> required Slow Tests checks in ci.yml)
+cargo test --release -p tylertoo-core \
+  --test convert_guard_golden
+
 # Profiling feature still compiles
 cargo build --features dhat-heap
 
@@ -219,6 +229,20 @@ similarity-rs has no baseline file and no per-pair suppression. A new
 finding at or above 0.95 has to be refactored away. When the API
 gate fires on an intended change, regenerate the baseline in the
 same PR — see `crates/core/api/README.md`.
+
+The golden tile guard is the same kind of gate: when a change moves
+tile output **on purpose**, regenerate its golden in the same PR and
+say in the PR body why the output moved.
+
+```bash
+TYLERTOO_UPDATE_GOLDEN=1 cargo test -p tylertoo-core \
+  --test convert_guard_golden
+```
+
+It rewrites `tests/fixtures/guard/br-clip-divergence.golden.txt` and
+then fails, so regenerating can never be mistaken for passing.
+A golden diff on a **dependency bump** is not a regeneration cue — see
+`context/ARCHITECTURE.md`, "Geometry-Engine Dependency Bumps (#558)".
 
 ### Python (`crates/python`)
 
@@ -336,6 +360,14 @@ Dependabot (weekly) covers cargo, pip (uv lockfile), and GitHub
 Actions; patch/minor updates auto-merge once all gates pass, majors
 wait for a human. A weekly security job (cargo-audit + cargo-deny +
 pip-audit) opens/updates a pinned `security-audit` issue on failure.
+
+**Geometry-engine bumps are the exception** (#558): `geo`, `geo-types`,
+`i_overlay`, `i_float`, `i_shape` and `earcut` can change rendered tile geometry
+at any semver level, so green CI alone is not consent to merge one.
+The golden tile guard enforces this mechanically — it fails on any
+output change and runs in the required `Slow Tests` checks — so such a bump reaches a human as a red check rather
+than as a merge. See `context/ARCHITECTURE.md`, "Decision Record:
+Geometry-Engine Dependency Bumps (#558)".
 
 ## Resources
 

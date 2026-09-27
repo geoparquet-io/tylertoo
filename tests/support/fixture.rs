@@ -75,6 +75,30 @@ pub fn golden(name: &str) -> PathBuf {
     path
 }
 
+/// Locate a **guard** fixture (`tests/fixtures/guard/`).
+///
+/// Committed as a plain git blob for the same reason [`golden`] is — only
+/// `tests/fixtures/realdata/*.parquet` is routed through git-lfs — so a plain
+/// `actions/checkout` already holds the file and no release download, cache or
+/// submodule can be the reason it is missing. That matters more here than
+/// anywhere: the golden guard's whole job is to fail on an output change, and
+/// a fixture that can be absent turns it into a test that can quietly not run
+/// (#369's failure mode, #558's consequence).
+///
+/// So this one never skips and never returns `None`: it panics, everywhere,
+/// and names the remedy.
+pub fn guard(name: &str) -> PathBuf {
+    let path = workspace_root().join("tests/fixtures/guard").join(name);
+    if let Err(why) = usability(&path) {
+        panic!(
+            "guard fixture {} {why}\n  It is committed as a plain git blob; \
+             restore it with:\n    git checkout -- tests/fixtures/guard/",
+            path.display(),
+        );
+    }
+    path
+}
+
 /// The workspace root: the nearest ancestor of this crate that holds the
 /// fixture directory.
 ///
