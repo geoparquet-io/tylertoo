@@ -870,6 +870,21 @@ pub(crate) mod remote {
         fn validate_chunk_ranges(&self, metadata: &ParquetMetaData) -> Result<(), InputError> {
             for (rg_idx, rg) in metadata.row_groups().iter().enumerate() {
                 for (col_idx, col) in rg.columns().iter().enumerate() {
+                    // parquet's `byte_range()` asserts on a negative offset
+                    // or length, and the thrift decoder does not reject
+                    // them, so check the raw fields first.
+                    let raw_start = col
+                        .dictionary_page_offset()
+                        .unwrap_or_else(|| col.data_page_offset());
+                    let raw_len = col.compressed_size();
+                    if raw_start < 0 || raw_len < 0 {
+                        return Err(ParquetError::EOF(format!(
+                            "column chunk (row group {rg_idx}, column {col_idx}) has a \
+                             negative offset or length ({raw_start}, {raw_len}) for {}",
+                            self.location
+                        ))
+                        .into());
+                    }
                     let (start, len) = col.byte_range();
                     let end = start.checked_add(len).filter(|end| *end <= self.size);
                     if end.is_none() || usize::try_from(len).is_err() {
@@ -2299,6 +2314,26 @@ mod tests {
         /// `total_compressed_size = len` (#430 hostile-footer fixture): the
         /// data pages are kept verbatim, only the thrift footer is replaced.
         fn with_hostile_chunk_len(bytes: &[u8], len: i64) -> Vec<u8> {
+            with_hostile_chunks(bytes, |b| b.set_total_compressed_size(len))
+        }
+
+        /// Rewrite `bytes`' footer so every column chunk declares
+        /// `data_page_offset = offset` (and no dictionary page).
+        fn with_hostile_chunk_offset(bytes: &[u8], offset: i64) -> Vec<u8> {
+            with_hostile_chunks(bytes, |b| {
+                b.set_dictionary_page_offset(None)
+                    .set_data_page_offset(offset)
+            })
+        }
+
+        /// Apply `mutate` to every column chunk's metadata builder and
+        /// re-serialize the footer behind the original data pages.
+        fn with_hostile_chunks(
+            bytes: &[u8],
+            mutate: impl Fn(
+                parquet::file::metadata::ColumnChunkMetaDataBuilder,
+            ) -> parquet::file::metadata::ColumnChunkMetaDataBuilder,
+        ) -> Vec<u8> {
             use parquet::file::metadata::{ParquetMetaDataReader, ParquetMetaDataWriter};
 
             let md = ParquetMetaDataReader::new()
@@ -2311,13 +2346,7 @@ mod tests {
                     let cols: Vec<_> = rg
                         .columns()
                         .iter()
-                        .map(|c| {
-                            c.clone()
-                                .into_builder()
-                                .set_total_compressed_size(len)
-                                .build()
-                                .unwrap()
-                        })
+                        .map(|c| mutate(c.clone().into_builder()).build().unwrap())
                         .collect();
                     rg.clone()
                         .into_builder()
@@ -2342,7 +2371,9 @@ mod tests {
         #[test]
         fn hostile_footer_chunk_past_eof_is_error_not_panic() {
             let good = tiny_parquet();
-            for len in [good.len() as i64 * 4, i64::MAX] {
+            // -1: parquet's `byte_range()` asserts on a negative length, so
+            // the check must reject it before calling that.
+            for len in [good.len() as i64 * 4, i64::MAX, -1] {
                 let bytes = with_hostile_chunk_len(&good, len);
                 let source = memory_source(bytes, "hostile.parquet");
                 let err = match source.open() {
@@ -2367,6 +2398,21 @@ mod tests {
                     "len={len}: staging must reject the hostile range"
                 );
             }
+        }
+
+        /// #430: a negative `data_page_offset` must be a typed error, not
+        /// parquet's `byte_range()` assertion panic.
+        #[test]
+        fn hostile_footer_negative_page_offset_is_error_not_panic() {
+            let bytes = with_hostile_chunk_offset(&tiny_parquet(), -1);
+            let source = memory_source(bytes, "hostile.parquet");
+            let err = source.open().expect_err("negative offset must not open");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("negative") && msg.contains("EOF"),
+                "expected a negative-offset EOF error, got: {msg}"
+            );
+            assert!(source.stage_row_groups(None).is_err());
         }
 
         /// Object store double that returns `drop` fewer bytes than
