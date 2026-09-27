@@ -52,6 +52,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
+      # cargo-mutants runs the `quick` nextest tier for its baseline, which
+      # includes decode_roundtrip's tippecanoe-decode golden test; that test
+      # is a hard failure under CI when the binary is missing (#420), so the
+      # baseline needs the same pinned tippecanoe the Test job builds, or
+      # every weekly run fails before testing a single mutant.
+      - name: Install tippecanoe build deps
+        run: sudo apt-get install -y libsqlite3-dev zlib1g-dev
+
+      - name: Cache tippecanoe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools/tippecanoe-*
+            .tools/src-*
+          key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build tippecanoe (pinned tag + SHA) and put it on PATH
+        run: |
+          benchmarks/e2e/setup_tippecanoe.sh
+          eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+          dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
+
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
