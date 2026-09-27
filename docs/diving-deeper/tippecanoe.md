@@ -47,6 +47,61 @@ back into features, and in both the result is the tiled representation —
 simplified, clipped, and duplicated across tiles — never the original source.
 tylertoo's decoder follows tippecanoe-decode's model deliberately.
 
+## The measured comparison
+
+"Faster than tippecanoe" needs a number, a version and a caveat list, so
+there is a harness: `benchmarks/e2e/` pins **tippecanoe 2.79.0** by tag and
+commit, builds it from source, converts the same GeoParquet to tippecanoe's
+best input format, and holds zoom range, layer name, tile buffer and per-tile
+byte cap equal on both sides. Full method, the flag-by-flag parity mapping and
+the asymmetries that flags cannot close are in `benchmarks/e2e/README.md`;
+measured numbers are in `benchmarks/e2e/RESULTS.md`.
+
+Two things a skeptical reader should know before reading any ratio.
+
+**At defaults the two tools do not draw the same map.** tylertoo's density
+budget thins features hard at coarse and mid zooms. tippecanoe's rate-based
+dropping applies only to points at defaults; its tiny-polygon reduction still
+removes small polygons at low zooms, but on a contiguous polygon coverage it
+keeps far more and reaches every feature by a mid zoom. On a 17,465-polygon
+admin-boundary dataset, tylertoo's default z8 tile set carries 865 of those
+polygons and tippecanoe's reaches all 17,465 by z8 (at z4 the counts are 254
+and 6,102). If your layer is a
+coverage rather than a sample — admin boundaries, parcels, a choropleth — that
+is the behaviour to change (`--verbatim`, or raise `--gsd-base` and lower the
+thinning factors; see [Tuning what appears at each zoom](tuning-zoom.md)), and
+it is the configuration any honest speed comparison has to use.
+
+**The GeoParquet read is not where most of the speed comes from.** On that
+same dataset the GeoParquet→FlatGeobuf conversion a tippecanoe user must run
+is about 1% of tippecanoe's end-to-end wall. The native columnar read saves a
+43 MB intermediate file and is what makes `--bbox`/`--filter` row-group
+pushdown and remote byte-range reads possible at all, but the tiling engine
+is carrying the ratio.
+
+With those stated, on that dataset (Apple M3 Pro, 12 cores, z0–z14, median of
+3 warm runs; measured at tylertoo 0.11.0 @ `044360d`, which includes the #559
+export speed-up and predates #564's parallel level assignment):
+
+| comparison | tylertoo | tippecanoe 2.79.0 | ratio |
+|---|---|---|---|
+| Near-parity output (`--verbatim --simplify-factor 1.0`) vs tippecanoe reading FlatGeobuf | 2.67 s | 20.05 s | **≈7.5×** |
+| Each tool at its own defaults, end to end from GeoParquet | 1.61 s | 20.24 s | **≈12.5×** |
+| Output archive, quality-matched | 118 MB | 151 MB | 0.78× |
+| Peak RSS, quality-matched run | 835 MB | 413 MB | 2.0× (tylertoo heavier) |
+
+The quality-matched run is near-parity, not identical output: its tile count
+is within 2 of tippecanoe's at every zoom, its distinct features are within
+0.4% of tippecanoe's at z8 and about 5% at z4, and 10 of its tiles hit
+tylertoo's per-tile size valve. Each figure is one run of three warm repeats
+on a laptop, so treat single-digit ratios as approximate; the per-repeat
+spread is in `benchmarks/e2e/RESULTS.md`. The memory row is a loss, not a
+win, and `--partition-wave` is the knob.
+
+The corpus is three in-repo fixtures, the largest 28 MB; nothing here says how
+either tool behaves at planet scale, on points, or on cold cache.
+`benchmarks/e2e/RESULTS.md` lists what is untested.
+
 ## API walkthrough
 
 ### Mapping tippecanoe concepts to tylertoo

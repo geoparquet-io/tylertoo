@@ -211,7 +211,9 @@ Generate PMTiles vector tiles (the default pipeline)
   Default value: `1.0`
 * `--coalesce-max-level-rows <ROWS>` — Per-level candidate-line ceiling for line coalescing (memory guard).
 
-   Chaining holds the level's candidate line geometries in memory at once (every line is a candidate at every non-canonical level, since sub-visibility fragments must be reclaimable). Datasets with more lines than this skip coalescing with a warning instead of breaking the streaming pipeline's memory bound; near-canonical levels that large need coalescing least (segments are individually visible).
+   Chaining holds the level's candidate line geometries in memory at once (every line is a candidate at every non-canonical level, since sub-visibility fragments must be reclaimable). Inputs over this ceiling skip coalescing with a warning instead of breaking the streaming pipeline's memory bound; near-canonical levels that large need coalescing least (segments are individually visible).
+
+   Two limbs, since a row count does not bound memory: the candidate line count, and the geometry those lines retain (this value x 512 B of modelled geometry — ~1 GB by default, ~1.2 GiB resident). Exceeding either skips coalescing. The byte limb binds first on lines averaging over ~28 vertices (unsplit rivers, boundaries, contours); raise this value to coalesce them, at a proportional memory cost.
 
   Default value: `2000000`
 * `--row-group-size <ROW_GROUP_SIZE>` — Maximum output row-group size in rows.
@@ -424,7 +426,9 @@ Build a multi-resolution overview GeoParquet file
   Default value: `1.0`
 * `--coalesce-max-level-rows <ROWS>` — Per-level candidate-line ceiling for line coalescing (memory guard).
 
-   Chaining holds the level's candidate line geometries in memory at once (every line is a candidate at every non-canonical level, since sub-visibility fragments must be reclaimable). Datasets with more lines than this skip coalescing with a warning instead of breaking the streaming pipeline's memory bound; near-canonical levels that large need coalescing least (segments are individually visible).
+   Chaining holds the level's candidate line geometries in memory at once (every line is a candidate at every non-canonical level, since sub-visibility fragments must be reclaimable). Inputs over this ceiling skip coalescing with a warning instead of breaking the streaming pipeline's memory bound; near-canonical levels that large need coalescing least (segments are individually visible).
+
+   Two limbs, since a row count does not bound memory: the candidate line count, and the geometry those lines retain (this value x 512 B of modelled geometry — ~1 GB by default, ~1.2 GiB resident). Exceeding either skips coalescing. The byte limb binds first on lines averaging over ~28 vertices (unsplit rivers, boundaries, contours); raise this value to coalesce them, at a proportional memory cost.
 
   Default value: `2000000`
 * `--row-group-size <ROW_GROUP_SIZE>` — Maximum output row-group size in rows.
