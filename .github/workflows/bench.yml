@@ -1,10 +1,14 @@
 # Benchmarks + convert-regression guard.
 #
 # Two jobs:
-#   bench         — criterion micro-benches (clipping, bbox_containment),
-#                   tracked over time via uploaded reports. NOT a PR gate
-#                   (push/dispatch only) so no permanently-skipped job
-#                   clutters PR check lists.
+#   bench         — criterion micro-benches over the hot paths (pass-1
+#                   decode, assign, simplify cascade, mvt encode + value
+#                   dedup, clip, bbox containment, tile gzip+dedup; the list
+#                   lives in scripts/criterion_compare.sh), tracked over time
+#                   via uploaded reports. NOT a PR gate (push/dispatch only)
+#                   so no permanently-skipped job clutters PR check lists.
+#                   The numeric regression gate (#448) is a separate,
+#                   opt-in workflow: bench-regression.yml.
 #   convert-guard — deterministic structural check that a change hasn't
 #                   altered convert output (per-level feature/vertex counts,
 #                   total rows) on the fixtures-v1 inputs. Runs on PRs but is
@@ -41,7 +45,7 @@ jobs:
     name: Benchmark
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,9 +86,10 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          cargo bench --all-features --bench clipping
-          cargo bench --all-features --bench bbox_containment
-        timeout-minutes: 20
+          for bench in $(scripts/criterion_compare.sh --list); do
+            cargo bench --all-features --bench "$bench"
+          done
+        timeout-minutes: 30
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
