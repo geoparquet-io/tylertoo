@@ -550,6 +550,27 @@ impl<'a> core::marker::Unpin for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> core::marker::UnsafeUnpin for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::SourceStream<'a>
+pub struct tylertoo_core::input_set::WidestByteArrayColumn
+pub tylertoo_core::input_set::WidestByteArrayColumn::avg_row_bytes: u64
+pub tylertoo_core::input_set::WidestByteArrayColumn::column: alloc::string::String
+pub tylertoo_core::input_set::WidestByteArrayColumn::part: usize
+pub tylertoo_core::input_set::WidestByteArrayColumn::row_group: usize
+impl core::clone::Clone for tylertoo_core::input_set::WidestByteArrayColumn
+pub fn tylertoo_core::input_set::WidestByteArrayColumn::clone(&self) -> tylertoo_core::input_set::WidestByteArrayColumn
+impl core::cmp::Eq for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::cmp::PartialEq for tylertoo_core::input_set::WidestByteArrayColumn
+pub fn tylertoo_core::input_set::WidestByteArrayColumn::eq(&self, &tylertoo_core::input_set::WidestByteArrayColumn) -> bool
+impl core::fmt::Debug for tylertoo_core::input_set::WidestByteArrayColumn
+pub fn tylertoo_core::input_set::WidestByteArrayColumn::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::marker::Freeze for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::marker::Send for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::marker::Sync for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::marker::Unpin for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::marker::UnsafeUnpin for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::WidestByteArrayColumn
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::WidestByteArrayColumn
+pub const tylertoo_core::input_set::BYTE_ARRAY_BATCH_LIMIT: u64
 pub fn tylertoo_core::input_set::derive_layer_name(&str) -> alloc::string::String
 pub mod tylertoo_core::ioverlay_clip
 pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
@@ -1140,6 +1161,9 @@ pub tylertoo_core::overview::convert::ConvertError::AutoZoomMinAboveCeiling::min
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::rows: u64
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::sampled: usize
+pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge
+pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge::limit_bytes: u64
+pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge::widest: tylertoo_core::input_set::WidestByteArrayColumn
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnNotString
@@ -1305,6 +1329,7 @@ pub tylertoo_core::overview::convert::ConvertReport::effective_max_row_group_siz
 pub tylertoo_core::overview::convert::ConvertReport::input_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::levels: alloc::vec::Vec<tylertoo_core::overview::convert::LevelReport>
 pub tylertoo_core::overview::convert::ConvertReport::mode: tylertoo_core::overview::level::Mode
+pub tylertoo_core::overview::convert::ConvertReport::out_of_range_exemplars: alloc::vec::Vec<tylertoo_core::overview::convert::OutOfRangeExemplar>
 pub tylertoo_core::overview::convert::ConvertReport::out_of_range_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::remote_fetch: core::option::Option<tylertoo_core::input::FetchStats>
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_read: usize
@@ -1354,6 +1379,28 @@ impl core::marker::Unpin for tylertoo_core::overview::convert::LevelReport
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::convert::LevelReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::convert::LevelReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::LevelReport
+pub struct tylertoo_core::overview::convert::OutOfRangeExemplar
+pub tylertoo_core::overview::convert::OutOfRangeExemplar::axis: &'static str
+pub tylertoo_core::overview::convert::OutOfRangeExemplar::part: core::option::Option<usize>
+pub tylertoo_core::overview::convert::OutOfRangeExemplar::row: usize
+pub tylertoo_core::overview::convert::OutOfRangeExemplar::value: f64
+impl core::clone::Clone for tylertoo_core::overview::convert::OutOfRangeExemplar
+pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::clone(&self) -> tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::cmp::PartialEq for tylertoo_core::overview::convert::OutOfRangeExemplar
+pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::eq(&self, &tylertoo_core::overview::convert::OutOfRangeExemplar) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::convert::OutOfRangeExemplar
+pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::OutOfRangeExemplar
+pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::marker::Send for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::marker::Sync for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::marker::Unpin for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::convert::OutOfRangeExemplar
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::OutOfRangeExemplar
 #[non_exhaustive] pub struct tylertoo_core::overview::convert::PlanLevelReport
 pub tylertoo_core::overview::convert::PlanLevelReport::feature_count: usize
 pub tylertoo_core::overview::convert::PlanLevelReport::gsd: f64
@@ -1458,6 +1505,7 @@ pub const tylertoo_core::overview::convert::READ_WORKERS_MAX: usize
 pub fn tylertoo_core::overview::convert::convert_to_overviews(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_source(&tylertoo_core::input::InputSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_sources(&tylertoo_core::input_set::ConvertSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
+pub fn tylertoo_core::overview::convert::out_of_range_exemplar_note(&[tylertoo_core::overview::convert::OutOfRangeExemplar]) -> alloc::string::String
 pub fn tylertoo_core::overview::convert::overture_road_ranking(alloc::string::String) -> tylertoo_core::overview::convert::ClassRanking
 pub fn tylertoo_core::overview::convert::parse_representation_spec(&str) -> core::result::Result<alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>, alloc::string::String>
 pub fn tylertoo_core::overview::convert::read_workers_ceiling() -> usize

@@ -449,6 +449,23 @@ fn multi_part_output_is_byte_identical_across_read_worker_counts() {
 /// `fieldmaps-madagascar-adm4` (17k admin polygons) has a contended polygon
 /// winner grid at coarse levels, and `road-detections` is a line layer, which
 /// runs the line thinning grid and the coalesce tables.
+///
+/// Each runs twice: at the default density budget, and at `--drop-rate 6`, which
+/// makes the budget bind harder and at more levels (#565). The density budget
+/// is the half of the phase #565 rewrote, from a materialized priority table to
+/// priorities derived per comparison, and it only runs its super-cell partition
+/// and priority sorts at a level where it **binds**; at a level under budget,
+/// `apply_density_budget` admits every candidate and never compares two of them.
+///
+/// So the test checks that the budget binds, and it cannot check that by
+/// comparing plan bytes: the plan's fingerprint records the `density` option,
+/// so two runs that differ only in `--drop-rate` always write different bytes,
+/// even when both assign every feature identically. Instead it reads the
+/// per-level feature counts out of each plan ([`plan_level_counts`]) and
+/// requires every arm's counts to differ from an unbudgeted
+/// (`--no-density-drop`) run's, and the two arms' counts to differ from each
+/// other. If a fixture or default change stops the budget binding, this fails
+/// rather than passing with the budget code never run.
 #[test]
 fn convert_plan_is_byte_identical_across_thread_counts() {
     for (name, max_zoom) in [
@@ -459,84 +476,166 @@ fn convert_plan_is_byte_identical_across_thread_counts() {
             continue;
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut baseline: Option<(u32, Vec<u8>)> = None;
+        let mut per_arm: Vec<Vec<u8>> = Vec::new();
 
-        for threads in [1u32, 2, 8] {
-            let out = dir.path().join(format!("plan-t{threads}.pmtiles"));
-            let overview_out = dir.path().join(format!("plan-t{threads}-overview.parquet"));
-            let plan = dir.path().join(format!("t{threads}.plan"));
-            run_tiles(
-                &fixture,
-                &out,
-                &overview_out,
-                threads,
-                false,
-                max_zoom,
-                &["--save-plan", plan.to_str().unwrap()],
-            );
-            let plan_bytes = std::fs::read(&plan).expect("read saved convert plan");
-            assert!(
-                !plan_bytes.is_empty(),
-                "[{name}] --save-plan wrote an empty plan at RAYON_NUM_THREADS={threads}"
-            );
+        for (arm, extra) in [("default", &[][..]), ("bound", &["--drop-rate", "6"][..])] {
+            let mut baseline: Option<(u32, Vec<u8>)> = None;
 
-            // #560: the same plan, from the run that skips the export. It must
-            // match the full run's at every thread count — the artifact is the
-            // fleet's contract, and neither the thread count nor the presence
-            // of a pass 2 may show up in it.
-            let only = dir.path().join(format!("t{threads}-plan-only.plan"));
-            let status = Command::new(tylertoo_bin())
-                .args([
+            for threads in [1u32, 2, 8] {
+                let tag = format!("{arm}-t{threads}");
+                let out = dir.path().join(format!("plan-{tag}.pmtiles"));
+                let overview_out = dir.path().join(format!("plan-{tag}-overview.parquet"));
+                let plan = dir.path().join(format!("{tag}.plan"));
+                let mut args: Vec<&str> = vec!["--save-plan", plan.to_str().unwrap()];
+                args.extend_from_slice(extra);
+                run_tiles(
+                    &fixture,
+                    &out,
+                    &overview_out,
+                    threads,
+                    false,
+                    max_zoom,
+                    &args,
+                );
+                let plan_bytes = std::fs::read(&plan).expect("read saved convert plan");
+                assert!(
+                    !plan_bytes.is_empty(),
+                    "[{name}/{arm}] --save-plan wrote an empty plan at \
+                     RAYON_NUM_THREADS={threads}"
+                );
+
+                // #560: the same plan, from the run that skips the export. It
+                // must match the full run's at every thread count — the artifact
+                // is the fleet's contract, and neither the thread count nor the
+                // presence of a pass 2 may show up in it.
+                let only = dir.path().join(format!("{tag}-plan-only.plan"));
+                let max_zoom_arg = max_zoom.to_string();
+                let mut only_args: Vec<&str> = vec![
                     "tiles",
                     fixture.to_str().unwrap(),
                     "--min-zoom",
                     "0",
                     "--max-zoom",
-                    &max_zoom.to_string(),
+                    &max_zoom_arg,
                     "--save-plan",
                     only.to_str().unwrap(),
                     "--plan-only",
-                ])
-                .env("RAYON_NUM_THREADS", threads.to_string())
-                .output()
-                .unwrap_or_else(|e| panic!("run tylertoo tiles --plan-only: {e}"));
-            assert!(
-                status.status.success(),
-                "[{name}] --plan-only exited with {}: {}",
-                status.status,
-                String::from_utf8_lossy(&status.stderr)
-            );
-            assert!(
-                std::fs::read(&only).expect("read plan-only plan") == plan_bytes,
-                "[{name}] --plan-only wrote a different plan than the full run at \
-                 RAYON_NUM_THREADS={threads} — #560 regression: skipping pass 2 must not \
-                 change the artifact every data shard consumes"
-            );
+                ];
+                only_args.extend_from_slice(extra);
+                let status = Command::new(tylertoo_bin())
+                    .args(&only_args)
+                    .env("RAYON_NUM_THREADS", threads.to_string())
+                    .output()
+                    .unwrap_or_else(|e| panic!("run tylertoo tiles --plan-only: {e}"));
+                assert!(
+                    status.status.success(),
+                    "[{name}/{arm}] --plan-only exited with {}: {}",
+                    status.status,
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                assert!(
+                    std::fs::read(&only).expect("read plan-only plan") == plan_bytes,
+                    "[{name}/{arm}] --plan-only wrote a different plan than the full run at \
+                     RAYON_NUM_THREADS={threads} — #560 regression: skipping pass 2 must not \
+                     change the artifact every data shard consumes"
+                );
 
-            match &baseline {
-                None => baseline = Some((threads, plan_bytes)),
-                Some((base_threads, base_plan)) => {
-                    assert_eq!(
-                        base_plan.len(),
-                        plan_bytes.len(),
-                        "[{name}] convert plan size differs between \
-                         RAYON_NUM_THREADS={base_threads} ({} bytes) and \
-                         RAYON_NUM_THREADS={threads} ({} bytes) — #534 regression: the parallel \
-                         level assignment is not reproducing the serial one",
-                        base_plan.len(),
-                        plan_bytes.len()
-                    );
-                    assert!(
-                        base_plan == &plan_bytes,
-                        "[{name}] convert plan differs between \
-                         RAYON_NUM_THREADS={base_threads} and RAYON_NUM_THREADS={threads} (same \
-                         {} byte length, different content) — #534 regression: a feature took a \
-                         different level depending on how the winner pass or the density budget \
-                         was split across threads",
-                        plan_bytes.len()
-                    );
+                match &baseline {
+                    None => baseline = Some((threads, plan_bytes)),
+                    Some((base_threads, base_plan)) => {
+                        assert_eq!(
+                            base_plan.len(),
+                            plan_bytes.len(),
+                            "[{name}/{arm}] convert plan size differs between \
+                             RAYON_NUM_THREADS={base_threads} ({} bytes) and \
+                             RAYON_NUM_THREADS={threads} ({} bytes) — #534 regression: the \
+                             parallel level assignment is not reproducing the serial one",
+                            base_plan.len(),
+                            plan_bytes.len()
+                        );
+                        assert!(
+                            base_plan == &plan_bytes,
+                            "[{name}/{arm}] convert plan differs between \
+                             RAYON_NUM_THREADS={base_threads} and RAYON_NUM_THREADS={threads} \
+                             (same {} byte length, different content) — #534 regression: a \
+                             feature took a different level depending on how the winner pass or \
+                             the density budget was split across threads",
+                            plan_bytes.len()
+                        );
+                    }
                 }
             }
+            per_arm.push(baseline.expect("each arm runs at least one thread count").1);
         }
+
+        // The budget must actually bind in both arms (see the doc comment for
+        // why plan bytes cannot answer this).
+        let unbudgeted = dir.path().join("unbudgeted.plan");
+        let max_zoom_arg = max_zoom.to_string();
+        let status = Command::new(tylertoo_bin())
+            .args([
+                "tiles",
+                fixture.to_str().unwrap(),
+                "--min-zoom",
+                "0",
+                "--max-zoom",
+                &max_zoom_arg,
+                "--save-plan",
+                unbudgeted.to_str().unwrap(),
+                "--plan-only",
+                "--no-density-drop",
+            ])
+            .env("RAYON_NUM_THREADS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("run tylertoo tiles --no-density-drop: {e}"));
+        assert!(
+            status.status.success(),
+            "[{name}] --no-density-drop --plan-only exited with {}: {}",
+            status.status,
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let unbudgeted_counts =
+            plan_level_counts(&std::fs::read(&unbudgeted).expect("read unbudgeted plan"));
+        let arm_counts: Vec<Vec<usize>> = per_arm.iter().map(|p| plan_level_counts(p)).collect();
+        for (arm, counts) in ["default", "bound"].iter().zip(&arm_counts) {
+            assert_ne!(
+                counts, &unbudgeted_counts,
+                "[{name}/{arm}] the density budget did not bind at any level (per-level counts \
+                 equal the --no-density-drop run's), so this arm never runs the super-cell \
+                 partition or its priority sorts (#565) — raise the drop rate or pick a denser \
+                 fixture"
+            );
+        }
+        assert_ne!(
+            arm_counts[0], arm_counts[1],
+            "[{name}] --drop-rate 6 assigned the same per-level counts as the default, so the \
+             `bound` arm adds no coverage (#565)"
+        );
     }
+}
+
+/// The per-level feature counts recorded in a saved convert plan.
+///
+/// The plan stores its scalars as JSON in the Arrow IPC schema metadata
+/// (`plan_state::PlanMeta`), uncompressed, so the `"counts":[...]` array can be
+/// read straight out of the bytes without an Arrow reader in this crate. The
+/// IPC file repeats the schema in its footer; the first occurrence is used.
+fn plan_level_counts(plan: &[u8]) -> Vec<usize> {
+    const KEY: &[u8] = b"\"counts\":[";
+    let start = plan
+        .windows(KEY.len())
+        .position(|w| w == KEY)
+        .expect("plan has no \"counts\" array in its metadata")
+        + KEY.len();
+    let len = plan[start..]
+        .iter()
+        .position(|&b| b == b']')
+        .expect("unterminated \"counts\" array");
+    let text = std::str::from_utf8(&plan[start..start + len]).expect("counts are ASCII");
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split(',')
+        .map(|c| c.parse().expect("count is an integer"))
+        .collect()
 }

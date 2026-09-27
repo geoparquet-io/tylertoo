@@ -146,6 +146,43 @@ verbatim (spec §2.4).
    each level's chain stage spans the whole line scratch and pass 1 runs
    levels that turn out empty, which pass 2 used to skip. Wave size changes
    the peak and the wall time, never the result.
+
+   The density budget holds **no priority table** (#565). It used to build a
+   `Vec<Priority>` parallel to the feature slice and keep it live across the
+   whole coarse→fine admission fold: 40 B/feature, the largest single
+   allocation in the phase, 2.1 GiB on that 55.5M-row job and ~59 GiB at the
+   1.58B-row global scale — all of it on top of the 64 B/row pass-1 feature
+   table (#543's `PASS1_BYTES_PER_ROW`), which is still live throughout.
+   Every component of a priority (direction-applied sort rank, squared bbox
+   diagonal, hash of the row index, the index) is a pure function of the
+   `AssignFeature` the comparator must read anyway, so both sides are derived
+   per comparison instead — a table probe traded for a few arithmetic ops on a
+   cache line already being fetched, not for an extra memory reference.
+   `Priority` itself went 40 → 32 bytes in the same change, by replacing the
+   `Option<f64>` sort rank with an `f64` whose `-inf` means "missing": lossless
+   (a rank is admitted only through `is_finite`, and negating a finite value
+   for the `Asc` direction keeps it finite, so no real rank can reach the
+   sentinel) and *the* correct sentinel, since a missing key has to rank below
+   every present one and `-inf` does that with no special case. The hash
+   component stays a stored field even though it is a pure function of the
+   index beside it: dropping it for a 24-byte struct and mixing on a tie
+   measured *slower* (+22% against +16% on the budget phase at one thread),
+   because the mix does not depend on the compares ahead of it and issues
+   alongside them, while making it conditional puts a three-multiply
+   dependency chain behind two branches. On the `assign_scaling` harness (8M
+   rows, 14 levels, 1 GiB grid budget) the budget's transient fell
+   72.1 → 32.1 B/feature for 7–16% more wall in that phase (2–5% of the whole
+   assignment), and the phase's peak is now dominated by the per-level
+   candidate list and its super-cell tags, which are freed between levels.
+   Process peak RSS over the phase fell 2125 → 1811 MiB at 8M rows. The
+   comparator's semantics are unchanged, which
+   is what `oracle_fixture_reproduces_main` above and
+   `deriving_priority_per_comparison_orders_as_the_materialized_table_did`
+   (exhaustive over ordered pairs, both sort directions, on a fixture of
+   NaN/±inf/duplicate keys, `0.0` vs `-0.0`, zero and overflowing diagonals,
+   duplicate indices and exact twins) hold it to. In particular `-0.0` and
+   `+0.0` must keep **tying** — an IEEE total order would separate them and
+   silently change which feature wins a cell.
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
    reader thread streams batches over a bounded channel while a consumer

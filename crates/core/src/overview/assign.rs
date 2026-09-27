@@ -57,6 +57,24 @@
 //! wave, floor 1 MiB per level) and freed after every reduce. That term is not
 //! in the #306 estimate; it is bounded instead.
 //!
+//! The **density budget** ([`apply_density_budget`]) is the other half of the
+//! phase's footprint, and it is `O(features)` by nature: it decides every
+//! feature's final level in one coarse→fine fold, so it holds an
+//! admitted/admitted-at pair per feature plus the per-level candidate list and
+//! its super-cell tags. What it does NOT hold any more is a priority table
+//! (#565). A `Vec<Priority>` parallel to the feature slice was 40 B/feature live
+//! for the whole fold — the single largest allocation here, 2.1 GiB on a 55M-row
+//! job and ~59 GiB at the 1.58B-row global scale, stacked on the 64 B/row pass-1
+//! feature table (`convert::PASS1_BYTES_PER_ROW`) that is still live throughout.
+//! Every field of a [`Priority`] is a pure function of the `AssignFeature` the
+//! comparator already has to read, so [`priority_order`] derives both sides per
+//! comparison instead. Measured on the `assign_scaling` harness (8M rows, 14
+//! levels, 1 GiB grid budget), the budget's transient fell from 72.1 to 32.1
+//! B/feature — the phase's peak is now dominated by the per-level candidate list
+//! and its super-cell tags, both already allocated and freed per level. The
+//! trade is comparison cost: the budget phase is 7–16% slower (more at one
+//! thread, less at twelve) for removing ~5/8 of its footprint.
+//!
 //! # Parallelism & determinism
 //!
 //! Four decompositions, all of them **scheduling only** — every one produces
@@ -345,15 +363,56 @@ fn stable_hash(index: usize) -> u64 {
 /// (which have different cell sizes) never share a bucket.
 type CellKey = (u8, i64, i64);
 
+/// The [`Priority::sort_rank`] value that means "this feature has no sort key".
+///
+/// A sentinel rather than an `Option` (#565): it takes [`Priority`] from 40 to
+/// 32 bytes and makes the comparator's first component a branchless float
+/// compare instead of a two-way `match` on a discriminant.
+///
+/// It is **lossless** — no real rank can collide with it. `Priority::new`
+/// admits a key only through `f64::is_finite`, and negating a finite value
+/// (the `Asc` direction) yields a finite value, so every real `sort_rank` is
+/// finite and `-inf` is unambiguous. It is also the *correct* sentinel value
+/// rather than merely a free one: a missing key must rank below every present
+/// one (#428), and `-inf < x` for every finite `x`, so the "larger wins"
+/// comparison that ranks two present keys ranks a missing one at the bottom
+/// with no special case at all.
+const MISSING_SORT_RANK: f64 = f64::NEG_INFINITY;
+
 /// Priority of a feature within a cell. Higher is better. Compared
-/// lexicographically to yield a strict total order (see [`Priority::cmp`]).
+/// lexicographically to yield a strict total order (see [`Priority::beats`]).
 /// `pub(super)` so the clustering stage (`super::cluster`) can rank present
 /// features with the exact order the cell-winner stage used.
+///
+/// **Cheap to derive and NOT worth storing per feature** (#565). Every field is
+/// a pure function of `(AssignFeature, SortDirection)` — four float subtractions,
+/// two multiplies, a hash mix and a couple of compares — so callers that need a
+/// priority for a *comparison* derive it on the spot rather than materializing a
+/// table parallel to the feature slice. `apply_density_budget` used to build exactly
+/// that table: 40 B/feature live for the whole admission fold, 2.1 GiB on a
+/// 55M-row job and ~59 GiB at the 1.58B-row global scale, on top of the
+/// 64 B/row pass-1 feature-table floor the #543 preflight already warns about.
+///
+/// Four words, down from five: the `Option<f64>` sort rank became an `f64` with
+/// an `-inf` sentinel ([`MISSING_SORT_RANK`]).
+///
+/// `hash` **stays a field** even though it is [`stable_hash`] of the next one,
+/// which means the struct stores a function of its own contents. Dropping it and
+/// mixing inside [`Priority::beats`] on a component-1-and-2 tie was tried and is
+/// measurably slower — 24 B/+22% against 32 B/+16% on the budget at one thread,
+/// `assign_scaling` at 8M rows, best of 9 interleaved rounds — because the mix
+/// does not depend on the two compares ahead of it and so issues alongside them,
+/// whereas making it conditional puts a three-multiply dependency chain behind
+/// two branches. Since nothing materializes a `Priority` per feature any more,
+/// the 8 bytes buy nothing to pay for that.
+///
+/// So: derive per comparison, and keep the derivation branch-free.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Priority {
-    /// Encoded sort key: `Some` sorts above `None`; direction already applied
-    /// so that "larger `sort_bits` wins".
-    sort_rank: Option<f64>,
+    /// Encoded sort key, direction already applied so that "larger wins".
+    /// [`MISSING_SORT_RANK`] (`-inf`) means the feature has no key; every real
+    /// value is finite.
+    sort_rank: f64,
     diag_sq: f64,
     hash: u64,
     /// Smaller index wins ties; stored negated-in-comparison.
@@ -371,10 +430,14 @@ impl Priority {
         // strict weak order, so the cell incumbent would keep the cell
         // whatever the keys say and `sort_by` would be entitled to panic.
         // Apply direction so a plain "larger wins" comparison is correct.
-        let sort_rank = feat.sort_key.filter(|k| k.is_finite()).map(|k| match dir {
-            SortDirection::Desc => k,
-            SortDirection::Asc => -k,
-        });
+        let sort_rank = feat
+            .sort_key
+            .filter(|k| k.is_finite())
+            .map(|k| match dir {
+                SortDirection::Desc => k,
+                SortDirection::Asc => -k,
+            })
+            .unwrap_or(MISSING_SORT_RANK);
         // A NaN bbox diagonal is likewise UNRANKABLE (#534: the #428 argument
         // applied to component 2). `scan_feature` rejects non-finite
         // coordinates upstream, so the pipeline never produces one — but
@@ -406,29 +469,32 @@ impl Priority {
     ///
     /// This is a **strict total order** on features with distinct indices: the
     /// four components are compared lexicographically, every one of them is
-    /// rankable by construction (`sort_rank`: `Some` above `None`, finite
-    /// within `Some` — #428; `diag_sq`: never NaN, `+inf` on overflow, negative
-    /// when unrankable; `hash`, `index`: integers), and the last one, `index`,
-    /// is unique per feature. So for any two features with distinct indices
-    /// exactly one direction is true — which is what the density budget's
-    /// unstable sorts (via [`priority_order`]) need from their comparator.
+    /// rankable by construction (`sort_rank`: never NaN, finite when present
+    /// and [`MISSING_SORT_RANK`] when not — #428; `diag_sq`: never NaN, `+inf`
+    /// on overflow, negative when unrankable; `hash`, `index`: integers), and
+    /// the last one, `index`, is unique per feature. So for any two features
+    /// with distinct indices exactly one direction is true — which is what the
+    /// density budget's unstable sorts (via [`priority_order`]) need from their
+    /// comparator.
     pub(super) fn beats(&self, other: &Priority) -> bool {
-        // 1. sort_rank: Some beats None; both Some compares larger-wins.
-        match (self.sort_rank, other.sort_rank) {
-            (Some(a), Some(b)) => {
-                if a != b {
-                    return a > b;
-                }
-            }
-            (Some(_), None) => return true,
-            (None, Some(_)) => return false,
-            (None, None) => {}
+        // 1. sort_rank: larger wins, and a missing key is `-inf`, which is
+        //    smaller than every present (finite) one. #565 replaced a
+        //    `match` on two `Option`s with this; the four cases it enumerated
+        //    are all reproduced, because `-inf != finite` and `-inf < finite`:
+        //    present-vs-present unchanged, present-vs-missing `true`,
+        //    missing-vs-present `false`, missing-vs-missing falls through.
+        //    (`!=` also keeps `-0.0` and `+0.0` a TIE, which is what the
+        //    `Option` form did and what the `Asc` direction can produce from
+        //    keys of `0.0` and `-0.0`.)
+        if self.sort_rank != other.sort_rank {
+            return self.sort_rank > other.sort_rank;
         }
         // 2. larger bbox diagonal wins.
         if self.diag_sq != other.diag_sq {
             return self.diag_sq > other.diag_sq;
         }
-        // 3. larger stable hash wins.
+        // 3. larger stable hash wins. Eager, not computed here on a tie — see
+        //    the note on `Priority` for the measurement that settled that.
         if self.hash != other.hash {
             return self.hash > other.hash;
         }
@@ -1392,8 +1458,8 @@ pub fn apply_density_budget(
     let n = features.len();
     let finest = num_levels - 1;
 
-    // The coarsest level cell-winner permits each feature to appear at.
-    // Element-wise maps over the whole dataset, so they go wide (#534); the
+    // The coarsest level cell-winner permits each feature to appear at. An
+    // element-wise map over the whole dataset, so it goes wide (#534); the
     // ADMISSION FOLD below stays strictly serial.
     let cw_min: Vec<u8> = assignment
         .assignments
@@ -1401,11 +1467,17 @@ pub fn apply_density_budget(
         .map(|a| a.min_level)
         .collect();
 
-    // Q1 priority per feature — identical ordering to the cell-winner stage.
-    let prio: Vec<Priority> = features
-        .par_iter()
-        .map(|f| Priority::new(f, config.sort_direction))
-        .collect();
+    // NO priority table here (#565). The Q1 priority of a candidate is derived
+    // from `features[pos]` inside `priority_order`, where the comparison needs
+    // it. A `Vec<Priority>` over the whole dataset — which is what this used to
+    // build, in one parallel pass, and hold live across the entire admission
+    // fold — was 40 B/feature: 2.1 GiB on a 55M-row job and ~59 GiB at the
+    // 1.58B-row global scale, stacked on the 64 B/row pass-1 feature table
+    // (`convert::PASS1_BYTES_PER_ROW`) that is still live at this point and on
+    // the cell-winner assignment being budgeted. It was the largest single
+    // allocation in the phase, and every byte of it was recomputable from a
+    // feature the comparator already has to read.
+    let dir = config.sort_direction;
 
     let keep_frac = 1.0 / budget.drop_rate;
     let total = n as f64;
@@ -1471,7 +1543,7 @@ pub fn apply_density_budget(
             &cands,
             available,
             features,
-            &prio,
+            dir,
             level_gsds[level],
             crs,
             budget.gamma,
@@ -1496,7 +1568,18 @@ pub fn apply_density_budget(
     }
 }
 
-/// Order two candidates best-first by Q1 [`Priority`] (a strict total order).
+/// Order two candidates, identified by their position in `features`, best-first
+/// by Q1 [`Priority`] (a strict total order).
+///
+/// The two priorities are **derived here, per comparison**, not looked up in a
+/// precomputed table (#565). `Priority::new` is a handful of arithmetic ops on
+/// one `AssignFeature`, and the table it replaces was 40 B live per feature for
+/// the whole of `apply_density_budget` — the largest single allocation in the
+/// phase and the one that made the assignment's true peak roughly 2.2× the
+/// feature table on a 55M-row job. The comparator already had to touch
+/// `features[a]` and `features[b]`'s cache lines to reach a table indexed the
+/// same way, so this trades a table probe for the arithmetic, not for an extra
+/// memory reference.
 ///
 /// The position fallback is what makes this a *consistent* comparator rather
 /// than one that answers `Greater` in both directions: two features can only tie
@@ -1506,12 +1589,15 @@ pub fn apply_density_budget(
 /// position also makes the sort's output independent of how the input was
 /// chunked, which the parallel sorts below need (#534).
 #[inline]
-fn priority_order(prio: &[Priority], a: usize, b: usize) -> Ordering {
+fn priority_order(features: &[AssignFeature], dir: SortDirection, a: usize, b: usize) -> Ordering {
     if a == b {
-        Ordering::Equal
-    } else if prio[a].beats(&prio[b]) {
+        return Ordering::Equal;
+    }
+    let pa = Priority::new(&features[a], dir);
+    let pb = Priority::new(&features[b], dir);
+    if pa.beats(&pb) {
         Ordering::Less
-    } else if prio[b].beats(&prio[a]) {
+    } else if pb.beats(&pa) {
         Ordering::Greater
     } else {
         a.cmp(&b)
@@ -1524,11 +1610,17 @@ fn priority_order(prio: &[Priority], a: usize, b: usize) -> Ordering {
 /// key order; ties broken by [`Priority`]'s index tiebreak).
 /// `pub(super)` so the coalescing stage (`super::coalesce`) can apply the
 /// same per-level budget + spatial fairness to merged chains.
+///
+/// `cands` holds *positions* in `features`, and each candidate's priority is
+/// derived from `features[pos]` and `dir` as it is needed (#565) — there is no
+/// priority table. Taking `dir` rather than a `&[Priority]` also makes the
+/// old "the table must be parallel to `features` and built with the same
+/// direction" precondition unrepresentable.
 pub(super) fn select_budget_survivors(
     cands: &[usize],
     available: usize,
     features: &[AssignFeature],
-    prio: &[Priority],
+    dir: SortDirection,
     gsd_m: f64,
     crs: Crs,
     gamma: f64,
@@ -1540,7 +1632,7 @@ pub(super) fn select_budget_survivors(
     // priority cut.
     if super_size <= 0.0 || super_size.is_nan() {
         let mut all = cands.to_vec();
-        sort_unstable_maybe_par(&mut all, |&a, &b| priority_order(prio, a, b));
+        sort_unstable_maybe_par(&mut all, |&a, &b| priority_order(features, dir, a, b));
         all.truncate(available);
         return all;
     }
@@ -1595,7 +1687,7 @@ pub(super) fn select_budget_survivors(
         rest = tail;
     }
     runs.par_iter_mut()
-        .for_each(|run| run.sort_unstable_by(|a, b| priority_order(prio, a.1, b.1)));
+        .for_each(|run| run.sort_unstable_by(|a, b| priority_order(features, dir, a.1, b.1)));
     drop(runs);
 
     let alpha = 1.0 / gamma.max(1.0);
@@ -2496,13 +2588,10 @@ mod tests {
     #[test]
     fn priority_order_breaks_exact_ties_deterministically() {
         let twins = [poly(5, 0.0, 0.0, 10.0, 10.0), poly(5, 0.0, 0.0, 10.0, 10.0)];
-        let prio: Vec<Priority> = twins
-            .iter()
-            .map(|f| Priority::new(f, SortDirection::Desc))
-            .collect();
-        assert_eq!(priority_order(&prio, 0, 1), Ordering::Less);
-        assert_eq!(priority_order(&prio, 1, 0), Ordering::Greater);
-        assert_eq!(priority_order(&prio, 0, 0), Ordering::Equal);
+        let dir = SortDirection::Desc;
+        assert_eq!(priority_order(&twins, dir, 0, 1), Ordering::Less);
+        assert_eq!(priority_order(&twins, dir, 1, 0), Ordering::Greater);
+        assert_eq!(priority_order(&twins, dir, 0, 0), Ordering::Equal);
     }
 
     #[test]
@@ -2925,11 +3014,7 @@ mod tests {
 
         // A global priority cut (top 320 across everything) keeps far fewer A.
         let mut order: Vec<usize> = (0..n).collect();
-        let prio: Vec<Priority> = feats
-            .iter()
-            .map(|f| Priority::new(f, SortDirection::Desc))
-            .collect();
-        order.sort_by(|&a, &b| priority_order(&prio, a, b));
+        order.sort_by(|&a, &b| priority_order(&feats, SortDirection::Desc, a, b));
         let global_a = order.iter().take(320).filter(|&&i| i < a_n).count();
 
         assert_eq!(a_kept, a_n, "fairness keeps the entire sparse cluster");
@@ -2985,6 +3070,364 @@ mod tests {
         assert_eq!(
             cw.assignments, out.assignments,
             "disabled budget must be an identity"
+        );
+    }
+
+    // ---- #565: Priority is derived, not stored ------------------------------
+
+    /// [`Priority`] is on the hot path of every density-budget sort and used to
+    /// be materialized once per feature for the whole phase. It is no longer
+    /// stored anywhere dataset-wide, but it is still copied around per
+    /// comparison, and the `Option<f64>` → [`MISSING_SORT_RANK`] change that
+    /// took it from 40 bytes to 32 is easy to undo by accident (re-adding an
+    /// `Option<_>` field, or widening one). Pin the layout so that costs a
+    /// failing test and a decision rather than nothing.
+    #[test]
+    fn priority_stays_four_machine_words() {
+        assert_eq!(
+            std::mem::size_of::<Priority>(),
+            32,
+            "Priority changed size: sort_rank/diag_sq/hash/index, no padding, \
+             no Option"
+        );
+    }
+
+    /// #565: [`MISSING_SORT_RANK`] is a sentinel inside the `sort_rank` value
+    /// space, so the thing to prove is that **no real key can reach it** and
+    /// that it still ranks where `None` ranked.
+    ///
+    /// The reachable ways to produce a non-present key are all covered: absent,
+    /// NaN, `+inf` and `-inf` (`Priority::new` files every non-finite key as
+    /// missing, #428), in both sort directions — `Asc` negates, which is the one
+    /// operation that could manufacture `-inf` out of a *present* key, and
+    /// cannot, because it only ever sees finite input.
+    #[test]
+    fn missing_sort_key_sentinel_is_unreachable_from_a_real_key() {
+        for dir in [SortDirection::Desc, SortDirection::Asc] {
+            for missing in [
+                None,
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+            ] {
+                let mut f = poly(0, 0.0, 0.0, 10.0, 10.0);
+                f.sort_key = missing;
+                assert_eq!(
+                    Priority::new(&f, dir).sort_rank,
+                    MISSING_SORT_RANK,
+                    "{missing:?} must file as missing under {dir:?}"
+                );
+            }
+            // Extremes of the finite range: the values closest to the sentinel.
+            for key in [f64::MIN, f64::MAX, f64::MIN_POSITIVE, 0.0, -0.0] {
+                let mut present = poly(1, 0.0, 0.0, 10.0, 10.0);
+                present.sort_key = Some(key);
+                let p = Priority::new(&present, dir);
+                assert_ne!(
+                    p.sort_rank, MISSING_SORT_RANK,
+                    "the finite key {key:e} collided with the missing sentinel under {dir:?}"
+                );
+                assert!(
+                    p.sort_rank.is_finite(),
+                    "a finite key must stay finite under {dir:?}: {key:e}"
+                );
+
+                // And it must out-rank a missing key, in both directions.
+                let mut absent = poly(1, 0.0, 0.0, 10.0, 10.0);
+                absent.sort_key = None;
+                let a = Priority::new(&absent, dir);
+                assert!(p.beats(&a), "a present key must beat a missing one");
+                assert!(!a.beats(&p), "a missing key must not beat a present one");
+            }
+        }
+    }
+
+    /// #565: `-0.0` and `+0.0` sort keys must **tie** on component 1.
+    ///
+    /// The `Option<f64>` form compared with `!=` / `>`, under which `-0.0 == 0.0`
+    /// — so two features whose keys differ only in the sign of zero fell through
+    /// to the bbox diagonal, and the diagonal (or the hash) decided which won
+    /// their cell. The `f64` sentinel form must keep exactly that. The trap is
+    /// that an IEEE *total* order — `f64::total_cmp`, or the bit pattern of an
+    /// `f64` reinterpreted as an integer, either of which is a natural thing to
+    /// reach for when packing this field smaller — puts `-0.0` strictly below
+    /// `+0.0`. That is not a tie-break refinement: it makes the *smaller* bbox
+    /// win a cell the larger one used to win, which changes the output.
+    ///
+    /// Both directions matter, because `Asc` negates: keys of `0.0` and `-0.0`
+    /// arrive as `-0.0` and `0.0`, i.e. the pair swaps sides and must still tie.
+    #[test]
+    fn signed_zero_sort_keys_tie_on_component_one() {
+        for dir in [SortDirection::Desc, SortDirection::Asc] {
+            let mut pos_zero = poly(0, 0.0, 0.0, 10.0, 10.0);
+            pos_zero.sort_key = Some(0.0);
+            // A visibly SMALLER diagonal, so a component-1 separation would show
+            // up as the small feature winning.
+            let mut neg_zero = poly(1, 0.0, 0.0, 1.0, 1.0);
+            neg_zero.sort_key = Some(-0.0);
+
+            let p = Priority::new(&pos_zero, dir);
+            let n = Priority::new(&neg_zero, dir);
+            assert!(
+                p.sort_rank == n.sort_rank,
+                "signed zeros must compare equal on component 1 under {dir:?}"
+            );
+            assert!(
+                p.beats(&n),
+                "the tie must fall through to the larger diagonal under {dir:?}"
+            );
+            assert!(!n.beats(&p), "and not the other way under {dir:?}");
+        }
+    }
+
+    /// The comparator the removed priority table fed, written out verbatim, for
+    /// the two equivalence tests below.
+    fn table_order(prio: &[Priority], a: usize, b: usize) -> Ordering {
+        if a == b {
+            Ordering::Equal
+        } else if prio[a].beats(&prio[b]) {
+            Ordering::Less
+        } else if prio[b].beats(&prio[a]) {
+            Ordering::Greater
+        } else {
+            a.cmp(&b)
+        }
+    }
+
+    /// #565 acceptance, unit scale: deriving each candidate's [`Priority`]
+    /// inside the comparator must order **exactly** as the materialized
+    /// `Vec<Priority>` table it replaces did.
+    ///
+    /// This is the crux of the change. `select_budget_survivors` still keeps
+    /// each super-cell's top `alloc` members in comparator order, so if the
+    /// comparator's total order is unchanged then every survivor set is
+    /// unchanged, and with it every feature's `min_level` and the `--save-plan`
+    /// bytes. (`oracle_fixture_reproduces_main` checks that consequence
+    /// end-to-end against a digest taken from the pre-parallel serial code; this
+    /// checks the cause, exhaustively, and localizes a failure to the
+    /// comparator.)
+    ///
+    /// Exhaustive over ordered pairs, both sort directions, on a fixture built
+    /// to make every component of `beats` decide *and* tie: present/absent/NaN/
+    /// ±inf keys, duplicate keys, `0.0` vs `-0.0` (which `Asc` negation turns
+    /// into `-0.0` vs `0.0` — a pair the comparator must keep TIED, since an
+    /// IEEE total order would separate them and silently change which feature
+    /// wins its cell), zero diagonals, equal diagonals from different extents,
+    /// overflowing `+inf` diagonals, NaN diagonals, duplicate indices and an
+    /// exact twin.
+    #[test]
+    fn deriving_priority_per_comparison_orders_as_the_materialized_table_did() {
+        let keys = [
+            None,
+            Some(0.0),
+            Some(-0.0),
+            Some(1.0),
+            Some(1.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::MAX),
+        ];
+        // (xmax, ymax): a zero diagonal, two equal diagonals from different
+        // extents, an overflowing one, and a NaN one.
+        let extents = [
+            (0.0, 0.0),
+            (3.0, 4.0),
+            (4.0, 3.0),
+            (1.0e300, 1.0e300),
+            (f64::NAN, 1.0),
+        ];
+        let mut feats: Vec<AssignFeature> = Vec::new();
+        for (ki, &key) in keys.iter().enumerate() {
+            for &(dx, dy) in &extents {
+                for kind in [FeatureKind::Point, FeatureKind::Line, FeatureKind::Polygon] {
+                    feats.push(AssignFeature {
+                        // Deliberately NOT unique: a duplicated index is the one
+                        // input that can tie every component, which is what the
+                        // position fallback exists for.
+                        index: ki % 3,
+                        bbox: [0.0, 0.0, dx, dy],
+                        kind,
+                        sort_key: key,
+                        entry_level: None,
+                    });
+                }
+            }
+        }
+        // An exact twin of the first entry, same index and all.
+        feats.push(feats[0]);
+
+        for dir in [SortDirection::Desc, SortDirection::Asc] {
+            let prio: Vec<Priority> = feats.iter().map(|f| Priority::new(f, dir)).collect();
+            let mut decided = 0usize;
+            let mut tied_to_position = 0usize;
+            for a in 0..feats.len() {
+                for b in 0..feats.len() {
+                    assert_eq!(
+                        priority_order(&feats, dir, a, b),
+                        table_order(&prio, a, b),
+                        "derived order disagrees with the table at ({a}, {b}) under {dir:?}"
+                    );
+                    if a != b {
+                        if prio[a].beats(&prio[b]) || prio[b].beats(&prio[a]) {
+                            decided += 1;
+                        } else {
+                            tied_to_position += 1;
+                        }
+                    }
+                }
+            }
+            // The fixture must reach both arms, or the agreement above covers
+            // only one of them.
+            assert!(
+                decided > 0 && tied_to_position > 0,
+                "fixture is degenerate under {dir:?}: decided={decided} tied={tied_to_position}"
+            );
+
+            // Same permutation out of a full unstable sort, not just pairwise
+            // agreement: pdqsort's behaviour depends on the comparator as a
+            // whole, not on individual pairs.
+            let mut lazy_sorted: Vec<usize> = (0..feats.len()).collect();
+            let mut table_sorted = lazy_sorted.clone();
+            lazy_sorted.sort_unstable_by(|&a, &b| priority_order(&feats, dir, a, b));
+            table_sorted.sort_unstable_by(|&a, &b| table_order(&prio, a, b));
+            assert_eq!(
+                lazy_sorted, table_sorted,
+                "sorted order differs under {dir:?}"
+            );
+        }
+    }
+
+    /// #565 acceptance, phase scale: with the density budget BINDING over many
+    /// super-cells, [`select_budget_survivors`] must choose exactly the features
+    /// it chose when it was handed a materialized priority table.
+    ///
+    /// The reference is computed independently of the production path: a
+    /// `BTreeMap` grouping (not the sort-based partition), a serial per-cell
+    /// sort (not the parallel per-run one), and the table comparator (not the
+    /// derived one). Only [`water_fill`] is shared, which #565 does not touch.
+    ///
+    /// The per-cell sorts in the production path go through `runs.par_iter_mut`,
+    /// which is unconditional, so at this size they really do run in parallel in
+    /// the default pool. The super-cell *grouping* sort stays sequential here
+    /// (it is below [`PAR_SORT_MIN_LEN`]) — deliberately, because the fixture
+    /// needed to clear that would triple the test's debug-build wall time to
+    /// cover a sort whose comparator #565 does not touch, and which
+    /// `oracle_fixture_reproduces_main` already exercises above the cutoff.
+    ///
+    /// The `assert_ne!` is load-bearing: if the fixture stops making the budget
+    /// bind, `apply_density_budget` returns its input untouched, the rewritten
+    /// code never runs, and the rest of the test would pass vacuously.
+    #[test]
+    fn a_binding_density_budget_keeps_the_table_order_survivors() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // ~400 hot spots on a coarse lattice with a sub-super-cell jitter, so
+        // super-cell populations are very uneven and `water_fill` both caps and
+        // fractionally allocates.
+        let feats: Vec<AssignFeature> = (0..40_000)
+            .map(|i| {
+                let spot = next() % 400;
+                let cx = (spot % 20) as f64 * 40_000.0 + (next() % 9_000) as f64;
+                let cy = (spot / 20) as f64 * 40_000.0 + (next() % 9_000) as f64;
+                let kind = match next() % 10 {
+                    0..=4 => FeatureKind::Point,
+                    5..=7 => FeatureKind::Line,
+                    _ => FeatureKind::Polygon,
+                };
+                // Points get a zero diagonal, so component 2 ties constantly and
+                // the hash is what actually ranks them.
+                let size = if kind == FeatureKind::Point {
+                    0.0
+                } else {
+                    10.0_f64.powf(1.0 + (next() % 4000) as f64 / 1000.0)
+                };
+                let sort_key = match next() % 4 {
+                    0 => None,
+                    _ => Some((next() % 512) as f64),
+                };
+                AssignFeature {
+                    index: i,
+                    bbox: [cx, cy, cx + size, cy + size],
+                    kind,
+                    sort_key,
+                    entry_level: None,
+                }
+            })
+            .collect();
+        let gsds: Vec<f64> = (3u32..=12).map(gsd).collect();
+        let config = AssignConfig::default();
+        let cw = assign_levels(&feats, &gsds, &config, Crs::Epsg3857);
+        let out = apply_density_budget(
+            &cw,
+            &feats,
+            &gsds,
+            &config,
+            &DensityBudgetConfig::default(),
+            Crs::Epsg3857,
+        );
+        assert_ne!(
+            cw.assignments, out.assignments,
+            "fixture no longer exercises a binding density budget"
+        );
+
+        // Replay the level with the most candidates (the second-finest, which
+        // every feature the cell-winner pass admits anywhere reaches) both ways.
+        let level = gsds.len() - 2;
+        let cands: Vec<usize> = (0..feats.len())
+            .filter(|&i| (cw.assignments[i].min_level as usize) <= level)
+            .collect();
+        assert!(
+            cands.len() > 20_000,
+            "the replay must be big enough to be a real test ({})",
+            cands.len()
+        );
+        let available = cands.len() / 3;
+        let gamma = DensityBudgetConfig::default().gamma;
+        let derived = select_budget_survivors(
+            &cands,
+            available,
+            &feats,
+            config.sort_direction,
+            gsds[level],
+            Crs::Epsg3857,
+            gamma,
+        );
+
+        let prio: Vec<Priority> = feats
+            .iter()
+            .map(|f| Priority::new(f, config.sort_direction))
+            .collect();
+        let super_size = gsd_to_coord_units(gsds[level], Crs::Epsg3857) * SUPERCELL_GSD_FACTOR;
+        let mut cells: std::collections::BTreeMap<(i64, i64), Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for &i in &cands {
+            let (cx, cy) = feats[i].center();
+            cells
+                .entry((
+                    (cx / super_size).floor() as i64,
+                    (cy / super_size).floor() as i64,
+                ))
+                .or_default()
+                .push(i);
+        }
+        assert!(cells.len() > 1, "the replay must span several super-cells");
+        let pops: Vec<usize> = cells.values().map(Vec::len).collect();
+        let allocs = water_fill(&pops, available, 1.0 / gamma.max(1.0));
+        let mut expected: Vec<usize> = Vec::new();
+        for ((_, members), alloc) in cells.iter_mut().zip(allocs) {
+            members.sort_unstable_by(|&a, &b| table_order(&prio, a, b));
+            expected.extend(members.iter().take(alloc.min(members.len())).copied());
+        }
+        assert_eq!(
+            derived, expected,
+            "the derived-priority survivors differ from the table-order ones"
         );
     }
 

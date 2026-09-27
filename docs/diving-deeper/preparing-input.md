@@ -31,7 +31,19 @@ to reproject and those features simply cannot be tiled. Both counts appear in
 the run summary and in the conversion report
 (`out_of_range_features`, `unprojectable_features`), and when the two together
 account for 99% or more of the input, the conversion fails instead of writing an
-empty archive.
+empty archive. The out-of-range count also names its first few features, by row
+and offending coordinate (`lon 180.548 (row 1041)`; the report's
+`out_of_range_exemplars`), so a dateline cell or a stray projected point can be
+looked up directly. The row is the row in the input file, counting any row
+groups `--bbox` or `--filter` skipped; a directory or glob input also names the
+part.
+
+**Very large geometries shrink the read batch.** Arrow decodes a WKB column into
+an array whose offsets top out at about 2 GiB per batch. When the input's rows
+are large enough that a default 8192-row batch would pass that (rows averaging
+over about 128 KB), the converter reads fewer rows per batch and logs a warning
+saying so; the output is unchanged. Only geometries averaging over 2 GiB each
+cannot be read at all, and the conversion then fails naming its row group.
 
 **Streaming memory depends on row-group size.** The converter reads one row
 group at a time, so peak memory tracks the largest row group in the file, not

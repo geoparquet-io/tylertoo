@@ -45,6 +45,21 @@ class TestRemoteInput:
 
 
 STREAMING_SMALL = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
+DATELINE = FIXTURES_DIR / "streaming" / "out-of-range-dateline.parquet"
+
+
+class TestOutOfRangeExemplars:
+    """#553: the report names where out-of-range features are, not only how many."""
+
+    def test_report_names_the_row_and_coordinate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "o.parquet"
+            report = tylertoo.overview(str(DATELINE), str(out), max_zoom=4)
+            assert report["out_of_range_features"] == 1
+            assert report["out_of_range_exemplars"] == [
+                {"part": None, "row": 7, "axis": "lon", "value": 190.25}
+            ]
+
 
 needs_streaming_small = pytest.mark.skipif(
     not STREAMING_SMALL.exists(),

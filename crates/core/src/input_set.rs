@@ -140,6 +140,183 @@ pub struct MultiSource {
 #[derive(Debug, Clone)]
 pub struct RowGroupSelection(Vec<Vec<usize>>);
 
+/// arrow-rs decodes a parquet `BYTE_ARRAY` column (WKB geometry, strings)
+/// into a `BinaryArray`/`StringArray` whose offsets are `i32`, so one decoded
+/// record batch holds at most this many bytes of any one such column (#563).
+/// Past it the read fails with the opaque `Parquet error: index overflow
+/// decoding byte array`.
+///
+/// The ceiling applies per BATCH, not per row group: a batch may be a slice
+/// of one row group or straddle several. A row group larger than this reads
+/// fine in batches of fewer rows, and row groups each well under it overflow
+/// when one batch spans enough of them.
+pub const BYTE_ARRAY_BATCH_LIMIT: u64 = i32::MAX as u64;
+
+/// The byte-array column chunk with the most bytes per row among some row
+/// groups (#563): the one that decides how many rows one batch can hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidestByteArrayColumn {
+    /// Index into the source's parts (0 for a single file).
+    pub part: usize,
+    /// The row group's local index within its part.
+    pub row_group: usize,
+    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
+    pub column: String,
+    /// Decoded bytes per row, averaged over the row group, rounded up.
+    pub avg_row_bytes: u64,
+}
+
+/// The widest byte-array column chunk of `meta`'s row groups `row_groups`
+/// (`None` = all), or `None` when there is no non-empty byte-array chunk.
+///
+/// Footer-only. The per-chunk size is the larger of the chunk's
+/// `total_uncompressed_size` and, when the writer recorded it, its
+/// `unencoded_byte_array_data_bytes` size statistic: a dictionary-encoded
+/// chunk's uncompressed size counts each distinct value once, while the
+/// decoded array holds a copy per row.
+pub(crate) fn widest_byte_array_column(
+    meta: &ParquetMetaData,
+    row_groups: Option<&[usize]>,
+    part: usize,
+) -> Option<WidestByteArrayColumn> {
+    let groups = meta.row_groups();
+    let all: Vec<usize>;
+    let picked: &[usize] = match row_groups {
+        Some(p) => p,
+        None => {
+            all = (0..groups.len()).collect();
+            &all
+        }
+    };
+    let mut widest: Option<WidestByteArrayColumn> = None;
+    for &gi in picked {
+        let Some(rg) = groups.get(gi) else {
+            continue;
+        };
+        let rows = rg.num_rows().max(0) as u64;
+        if rows == 0 {
+            continue;
+        }
+        for col in rg.columns() {
+            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
+                continue;
+            }
+            let bytes = col
+                .uncompressed_size()
+                .max(col.unencoded_byte_array_data_bytes().unwrap_or(0))
+                .max(0) as u64;
+            let avg_row_bytes = bytes.div_ceil(rows);
+            if widest
+                .as_ref()
+                .is_none_or(|w| avg_row_bytes > w.avg_row_bytes)
+            {
+                widest = Some(WidestByteArrayColumn {
+                    part,
+                    row_group: gi,
+                    column: col.column_path().string(),
+                    avg_row_bytes,
+                });
+            }
+        }
+    }
+    widest
+}
+
+/// Rows per batch that keep an average batch of the widest byte-array column
+/// at or under half of `limit` (#563), never below 1. The half is headroom
+/// for rows larger than their row group's average.
+pub(crate) fn byte_array_batch_rows(avg_row_bytes: u64, limit: u64) -> usize {
+    let budget = limit / 2;
+    usize::try_from(budget / avg_row_bytes.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// `requested` rows per batch, lowered when `widest` needs fewer to stay
+/// under [`BYTE_ARRAY_BATCH_LIMIT`].
+pub(crate) fn capped_batch_rows(requested: usize, widest: Option<&WidestByteArrayColumn>) -> usize {
+    match widest {
+        Some(w) => requested.min(byte_array_batch_rows(
+            w.avg_row_bytes,
+            BYTE_ARRAY_BATCH_LIMIT,
+        )),
+        None => requested,
+    }
+    .max(1)
+}
+
+/// Maps a row's position in a [`ConvertSource`]'s read stream back to the
+/// part and the row within that part's file (#553).
+///
+/// The streaming scan numbers features by their position in the stream it
+/// actually reads: the selected row groups of every part, concatenated in
+/// read order. That is the right key for the winner tables, and the wrong
+/// thing to show a person: once `--bbox`/`--filter`/`--shard` prunes a row
+/// group, or the input has more than one part, stream position 1041 is not
+/// row 1041 of any file. This rebuilds the file row from footer row counts
+/// alone, in the same part-then-selected-row-group order
+/// [`ConvertSource::open_stream`] reads.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamRowLocator {
+    /// One entry per selected, non-empty row group, in read order:
+    /// `(first stream row, part, first file row within the part)`.
+    starts: Vec<(u64, usize, u64)>,
+    /// Rows in the whole stream: one past the last stream row.
+    total: u64,
+}
+
+impl StreamRowLocator {
+    /// Build from per-part, per-row-group row counts
+    /// ([`ConvertSource::part_row_group_row_counts`]) and the selection the
+    /// stream reads (`None` = every row group of every part).
+    pub(crate) fn new(row_counts: &[Vec<i64>], selected: Option<&RowGroupSelection>) -> Self {
+        let mut starts = Vec::new();
+        let mut stream_row = 0u64;
+        for (part, counts) in row_counts.iter().enumerate() {
+            // A row group's first file row: the sum of every earlier group's
+            // rows, whether selected or not.
+            let mut first_rows = Vec::with_capacity(counts.len());
+            let mut acc = 0u64;
+            for &n in counts {
+                first_rows.push(acc);
+                acc += n.max(0) as u64;
+            }
+            let picked: Vec<usize> = match selected.and_then(|s| s.parts().get(part)) {
+                Some(p) => p.clone(),
+                None => (0..counts.len()).collect(),
+            };
+            for g in picked {
+                let (Some(&n), Some(&first)) = (counts.get(g), first_rows.get(g)) else {
+                    continue;
+                };
+                let n = n.max(0) as u64;
+                if n == 0 {
+                    continue;
+                }
+                starts.push((stream_row, part, first));
+                stream_row += n;
+            }
+        }
+        Self {
+            starts,
+            total: stream_row,
+        }
+    }
+
+    /// `(part, row within the part's file)` for stream position
+    /// `stream_row`, or `None` past the end of the stream.
+    pub(crate) fn locate(&self, stream_row: usize) -> Option<(usize, usize)> {
+        let r = stream_row as u64;
+        if r >= self.total {
+            return None;
+        }
+        // The last group starting at or before `r` holds it.
+        let i = self.starts.partition_point(|&(start, _, _)| start <= r);
+        let &(start, part, first) = self.starts.get(i.checked_sub(1)?)?;
+        Some((part, (first + (r - start)) as usize))
+    }
+}
+
 impl RowGroupSelection {
     /// Build from per-part local row-group index lists.
     pub fn from_parts(parts: Vec<Vec<usize>>) -> Self {
@@ -618,6 +795,18 @@ impl ConvertSource {
             .collect())
     }
 
+    /// A [`StreamRowLocator`] for the stream this source reads under
+    /// `selected` (#553): footer row counts only, no data page read.
+    pub(crate) fn stream_row_locator(
+        &self,
+        selected: Option<&RowGroupSelection>,
+    ) -> Result<StreamRowLocator, InputError> {
+        Ok(StreamRowLocator::new(
+            &self.part_row_group_row_counts()?,
+            selected,
+        ))
+    }
+
     /// Per-part bbox row-group selection (#102): applies the single-file
     /// covering-statistics pruning to each part independently.
     /// `bbox_units` is `[xmin, ymin, xmax, ymax]` in the file CRS units.
@@ -672,6 +861,24 @@ impl ConvertSource {
                 )
             })
             .sum())
+    }
+
+    /// The widest byte-array column chunk among the `selected` row groups of
+    /// every part (`None` selection = all), footer statistics only (#563).
+    /// See [`BYTE_ARRAY_BATCH_LIMIT`].
+    pub(crate) fn widest_byte_array_column(
+        &self,
+        selected: Option<&RowGroupSelection>,
+    ) -> Result<Option<WidestByteArrayColumn>, InputError> {
+        let metas = self.metas()?;
+        Ok(metas
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, m)| {
+                let picked = selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice);
+                widest_byte_array_column(&m.parquet, picked, pi)
+            })
+            .max_by_key(|w| w.avg_row_bytes))
     }
 
     /// Fetch counters summed over remote parts (`None` when no part is
@@ -742,12 +949,16 @@ impl ConvertSource {
             .iter()
             .map(|m| m.reader.clone())
             .collect::<Vec<_>>();
+        // #563: never ask arrow for a batch whose byte-array column could
+        // pass its i32 offset ceiling. Output does not depend on the batch
+        // size; only the opaque overflow error does.
+        let widest = self.widest_byte_array_column(plan.row_groups)?;
         Ok(SourceStream {
             parts,
             metas,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
-            batch_size: plan.batch_size.max(1),
+            batch_size: capped_batch_rows(plan.batch_size.max(1), widest.as_ref()),
             part_idx: 0,
             current: None,
             done: false,
@@ -2431,5 +2642,136 @@ b.parquet
         assert_eq!(derive_layer_name(""), "layer");
         assert_eq!(derive_layer_name("s3://"), "layer");
         assert_eq!(derive_layer_name("/"), "layer");
+    }
+
+    // --- #553: stream position -> file row ---------------------------------
+
+    /// Without a selection, a single part's stream row IS its file row, and
+    /// a second part's rows restart at 0.
+    #[test]
+    fn stream_row_locator_maps_parts_without_a_selection() {
+        let counts = vec![vec![3, 2], vec![4]];
+        let loc = StreamRowLocator::new(&counts, None);
+        assert_eq!(loc.locate(0), Some((0, 0)));
+        assert_eq!(loc.locate(4), Some((0, 4)));
+        assert_eq!(loc.locate(5), Some((1, 0)));
+        assert_eq!(loc.locate(8), Some((1, 3)));
+        assert_eq!(loc.locate(9), None, "past the end of the stream");
+    }
+
+    /// A pruned row group shifts every later stream position; the locator
+    /// adds the pruned group's rows back, and skips empty row groups and
+    /// empty part selections the way the reader does.
+    #[test]
+    fn stream_row_locator_restores_rows_of_pruned_row_groups() {
+        // Part 0: groups of 3, 0, 2, 4 rows; groups 0 and 1 pruned.
+        // Part 1: groups of 5, 5; nothing selected.
+        // Part 2: groups of 2, 2; group 1 selected.
+        let counts = vec![vec![3, 0, 2, 4], vec![5, 5], vec![2, 2]];
+        let sel = RowGroupSelection::from_parts(vec![vec![1, 2, 3], vec![], vec![1]]);
+        let loc = StreamRowLocator::new(&counts, Some(&sel));
+        // Stream rows 0..2 are part 0's group 2 (file rows 3..5).
+        assert_eq!(loc.locate(0), Some((0, 3)));
+        assert_eq!(loc.locate(1), Some((0, 4)));
+        // Stream rows 2..6 are part 0's group 3 (file rows 5..9).
+        assert_eq!(loc.locate(2), Some((0, 5)));
+        assert_eq!(loc.locate(5), Some((0, 8)));
+        // Stream rows 6..8 are part 2's group 1 (file rows 2..4).
+        assert_eq!(loc.locate(6), Some((2, 2)));
+        assert_eq!(loc.locate(7), Some((2, 3)));
+        assert_eq!(loc.locate(8), None);
+    }
+
+    // --- #563: byte-array batch ceiling -------------------------------------
+
+    /// A fixture with one `geometry` (Binary) column of `blob_sizes` zero
+    /// blobs, `max_row_group_size` rows per row group.
+    fn write_geometry_fixture_with_grouping(
+        path: &Path,
+        blob_sizes: &[usize],
+        max_row_group_size: Option<usize>,
+    ) {
+        use arrow_array::BinaryArray;
+
+        let blobs: Vec<Vec<u8>> = blob_sizes.iter().map(|&n| vec![0u8; n]).collect();
+        let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        write_parquet(
+            path,
+            vec![Field::new("geometry", DataType::Binary, false)],
+            vec![Arc::new(BinaryArray::from_vec(refs))],
+            max_row_group_size,
+        );
+    }
+
+    /// The widest column is found per row group, respecting the selection,
+    /// and averaged over the group's rows.
+    #[test]
+    fn widest_byte_array_column_names_the_row_group_and_respects_the_selection() {
+        let dir = tmpdir();
+        let f = dir.path().join("geo.parquet");
+        // Row group 0: two 16-byte rows. Row group 1: two 4096-byte rows.
+        write_geometry_fixture_with_grouping(&f, &[16, 16, 4096, 4096], Some(2));
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+
+        let w = src.widest_byte_array_column(None).unwrap().unwrap();
+        assert_eq!((w.part, w.row_group, w.column.as_str()), (0, 1, "geometry"));
+        assert!(
+            w.avg_row_bytes >= 4096 && w.avg_row_bytes < 4096 + 64,
+            "average bytes per row, not the chunk total: {w:?}"
+        );
+
+        let only_small = RowGroupSelection::from_parts(vec![vec![0]]);
+        let w = src
+            .widest_byte_array_column(Some(&only_small))
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.row_group, 0);
+        assert!(w.avg_row_bytes < 64, "{w:?}");
+    }
+
+    /// The batch cap keeps an average batch at half the ceiling, never
+    /// drops below one row, and leaves a narrow input's batch alone.
+    #[test]
+    fn byte_array_batch_rows_budgets_half_the_ceiling() {
+        assert_eq!(byte_array_batch_rows(100, 1000), 5);
+        assert_eq!(byte_array_batch_rows(10_000, 1000), 1);
+        assert_eq!(byte_array_batch_rows(0, 1000), 500);
+        // 128 KiB rows against the real ceiling: 8191 rows (1 GiB - 1 byte).
+        assert_eq!(
+            byte_array_batch_rows(128 * 1024, BYTE_ARRAY_BATCH_LIMIT),
+            8191
+        );
+        assert_eq!(capped_batch_rows(8192, None), 8192);
+        let wide = WidestByteArrayColumn {
+            part: 0,
+            row_group: 0,
+            column: "geometry".into(),
+            avg_row_bytes: 300_000,
+        };
+        assert_eq!(capped_batch_rows(8192, Some(&wide)), 3579);
+        assert_eq!(capped_batch_rows(100, Some(&wide)), 100);
+    }
+
+    /// #563's real failure, end to end: one row group of 9000 rows x 300 KB
+    /// (2.5 GiB of geometry). At 8192 rows per batch arrow overflows its i32
+    /// offsets; the capped stream reads every row. Ignored by default
+    /// (writes a multi-GiB fixture); run with `--ignored`.
+    #[test]
+    #[ignore = "writes a >2GiB parquet fixture; run explicitly with --ignored"]
+    fn open_stream_reads_a_real_oversized_row_group() {
+        let dir = tmpdir();
+        let f = dir.path().join("huge.parquet");
+        write_geometry_fixture_with_grouping(&f, &vec![300_000; 9000], None);
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let rows: usize = src
+            .open_stream(&ReadPlan {
+                batch_size: 8192,
+                projection: None,
+                row_groups: None,
+            })
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 9000);
     }
 }
