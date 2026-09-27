@@ -157,9 +157,11 @@ impl OverviewReader {
     /// The largest value of integer column `name` across the whole file, read
     /// from row-group statistics alone (no data pages).
     ///
-    /// `None` when the column is absent, is not a *signed* INT32/INT64, or
-    /// any non-empty row group lacks a max statistic or holds a null — the
-    /// caller then knows nothing and must treat the column as carrying
+    /// `Some(v)` means the column holds `v` on every row: the fold requires
+    /// the file-wide min and max statistics to agree. `None` when the column
+    /// is absent, is not a *signed* INT32/INT64, spans more than one value,
+    /// or any non-empty row group lacks a min/max statistic or holds a null
+    /// — the caller then knows nothing and must treat the column as carrying
     /// information. Used to recognise provenance counters that never left 1
     /// (#379).
     ///
@@ -207,7 +209,7 @@ impl OverviewReader {
         // holds none.
         let nullable = column.max_def_level() > 0;
 
-        let mut max: Option<i64> = None;
+        let mut range: Option<(i64, i64)> = None;
         for rg in 0..self.metadata.num_row_groups() {
             let rgm = self.metadata.row_group(rg);
             if rgm.num_rows() == 0 {
@@ -217,14 +219,20 @@ impl OverviewReader {
             if nullable && stats.null_count_opt() != Some(0) {
                 return None;
             }
-            let rg_max = match stats {
-                Statistics::Int32(s) => i64::from(*s.max_opt()?),
-                Statistics::Int64(s) => *s.max_opt()?,
+            let (rg_min, rg_max) = match stats {
+                Statistics::Int32(s) => (i64::from(*s.min_opt()?), i64::from(*s.max_opt()?)),
+                Statistics::Int64(s) => (*s.min_opt()?, *s.max_opt()?),
                 _ => return None,
             };
-            max = Some(max.map_or(rg_max, |m| m.max(rg_max)));
+            range = Some(range.map_or((rg_min, rg_max), |(lo, hi)| {
+                (lo.min(rg_min), hi.max(rg_max))
+            }));
         }
-        max
+        // The caller reads `Some(v)` as "v on every row", so a column that
+        // spans more than one value is refused, not folded: `{0, 1}` has max
+        // 1 but says something about each row.
+        let (min, max) = range?;
+        (min == max).then_some(max)
     }
 
     /// The Arrow schema of the file (including the `level` column).
@@ -826,8 +834,9 @@ mod tests {
         writer.finish().unwrap()
     }
 
-    /// The signed INT32 NOT NULL column the converter writes: the statistic
-    /// is exact and the fold is what the caller relies on.
+    /// The signed INT32 NOT NULL column the converter writes, holding one
+    /// value throughout: the statistic is exact and the fold is what the
+    /// caller relies on.
     #[test]
     fn int_column_max_reads_signed_not_null_column() {
         use arrow_array::Int32Array;
@@ -835,11 +844,34 @@ mod tests {
         write_int_column_fixture(
             tmp.path(),
             Field::new("n", DataType::Int32, false),
-            Arc::new(Int32Array::from(vec![1, 3, 1])),
+            Arc::new(Int32Array::from(vec![3, 3, 3])),
         );
         let reader = OverviewReader::open(tmp.path()).unwrap();
         assert_eq!(reader.int_column_max("n"), Some(3));
         assert_eq!(reader.int_column_max("absent"), None);
+    }
+
+    /// The caller reads `Some(1)` as "1 on every row", so a column whose
+    /// values are not all the same must not fold at all: `{0, 1}` and
+    /// `{-3, 1}` both have max 1 while carrying information (#399 review).
+    /// The min is in the same chunk statistics, so the check is free.
+    #[test]
+    fn int_column_max_refuses_column_whose_min_differs_from_max() {
+        use arrow_array::Int32Array;
+        for values in [vec![0, 1], vec![-3, 1], vec![1, 3, 1]] {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            write_int_column_fixture(
+                tmp.path(),
+                Field::new("n", DataType::Int32, false),
+                Arc::new(Int32Array::from(values.clone())),
+            );
+            let reader = OverviewReader::open(tmp.path()).unwrap();
+            assert_eq!(
+                reader.int_column_max("n"),
+                None,
+                "{values:?} is not one value on every row"
+            );
+        }
     }
 
     /// A `UInt32` column over INT32 physical: a value >= 2^31 is a negative
@@ -921,7 +953,7 @@ mod tests {
         write_int_column_fixture(
             tmp.path(),
             Field::new("n", DataType::Int32, true),
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(1)])),
+            Arc::new(Int32Array::from(vec![Some(2), Some(2), Some(2)])),
         );
         let reader = OverviewReader::open(tmp.path()).unwrap();
         assert_eq!(reader.int_column_max("n"), Some(2));
