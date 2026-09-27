@@ -121,11 +121,12 @@ fn out_of_range_warning_diagnoses_a_projected_crs_only_when_the_values_are_big()
     use super::convert::out_of_range_warning;
     use super::level::Crs;
 
-    assert!(out_of_range_warning(0, 10, Crs::Epsg4326, 0.0).is_none());
-    assert!(out_of_range_warning(3, 0, Crs::Epsg4326, 0.0).is_none());
+    assert!(out_of_range_warning(0, 10, Crs::Epsg4326, 0.0, &[]).is_none());
+    assert!(out_of_range_warning(3, 0, Crs::Epsg4326, 0.0, &[]).is_none());
 
     // Meter-scale values: the file is almost certainly in another CRS.
-    let msg = out_of_range_warning(1, 4, Crs::Epsg4326, 6_883_000.0).expect("a warning is due");
+    let msg =
+        out_of_range_warning(1, 4, Crs::Epsg4326, 6_883_000.0, &[]).expect("a warning is due");
     assert!(msg.contains("1 of 4 feature(s) (25.0%)"), "{msg}");
     assert!(
         msg.contains("OGC:CRS84 / EPSG:4326 coordinate range"),
@@ -139,7 +140,8 @@ fn out_of_range_warning_diagnoses_a_projected_crs_only_when_the_values_are_big()
 
     // One stray Pacific point at lng 180.001 (0–360° convention data) is not
     // evidence of a projected CRS, and must not be diagnosed as one (S2-2).
-    let stray = out_of_range_warning(1, 1_000, Crs::Epsg4326, 180.001).expect("a warning is due");
+    let stray =
+        out_of_range_warning(1, 1_000, Crs::Epsg4326, 180.001, &[]).expect("a warning is due");
     assert!(stray.contains("1 of 1000 feature(s) (0.1%)"), "{stray}");
     assert!(
         stray.contains("reach beyond the OGC:CRS84 / EPSG:4326 coordinate range")
@@ -153,7 +155,8 @@ fn out_of_range_warning_diagnoses_a_projected_crs_only_when_the_values_are_big()
 
     // A file that already declares EPSG:3857 gets 3857-shaped wording, never
     // a message that contradicts its own metadata (S2-3).
-    let m3857 = out_of_range_warning(2, 2, Crs::Epsg3857, 30_000_000.0).expect("a warning is due");
+    let m3857 =
+        out_of_range_warning(2, 2, Crs::Epsg3857, 30_000_000.0, &[]).expect("a warning is due");
     assert!(
         m3857.contains("EPSG:3857 coordinate range (±20037508.34 m)")
             && m3857.contains("metadata says EPSG:3857")

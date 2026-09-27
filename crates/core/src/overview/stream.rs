@@ -1933,6 +1933,11 @@ fn load_plan_state(
             // Only feeds the all-lost diagnosis, which already fired (or did
             // not) on the run that produced the plan.
             max_abs_out_of_range: 0.0,
+            // #553: the plan artifact carries only the totals (`PlanTotals`),
+            // not per-feature exemplars — a replayed run reports the counts
+            // honestly but without the "e.g. lon ... (row ...)" detail the
+            // original scan had.
+            out_of_range_exemplars: Vec::new(),
         },
         pass1_stage_secs: Pass1StageSecs::default(),
         // The load stands in for the scan; the assignment did not run at all.
@@ -2188,23 +2193,61 @@ pub(crate) fn convert_streaming_strategy(
         in_flight_batches,
     });
 
-    Ok(ConvertReport {
-        mode: options.mode,
-        levels: level_reports,
-        skipped_empty_levels: skipped,
-        input_features: num_features,
+    Ok(build_streaming_report(ConvertReportInputs {
+        options,
+        source,
+        level_reports,
+        skipped,
+        num_features,
         total_rows,
         total_vertices,
         total_compressed_bytes,
         row_groups_total,
         row_groups_read,
-        antimeridian_suspect_features: tallies.antimeridian_suspect,
-        out_of_range_features: tallies.out_of_range,
-        unprojectable_features: tallies.unprojectable,
-        duration_secs: start.elapsed().as_secs_f64(),
-        remote_fetch: super::convert::log_remote_fetch(source),
+        tallies,
+        start,
         effective_max_row_group_size,
-    })
+    }))
+}
+
+/// [`convert_streaming_strategy`]'s locals the final [`ConvertReport`]
+/// assembly needs, grouped for the same reason as [`ProfileJsonContext`]:
+/// keeps the caller under clippy's function-length ceiling.
+struct ConvertReportInputs<'a> {
+    options: &'a ConvertOptions,
+    source: &'a ConvertSource,
+    level_reports: Vec<LevelReport>,
+    skipped: Vec<SkippedLevelReport>,
+    num_features: usize,
+    total_rows: usize,
+    total_vertices: usize,
+    total_compressed_bytes: i64,
+    row_groups_total: usize,
+    row_groups_read: usize,
+    tallies: BboxTallies,
+    start: Instant,
+    effective_max_row_group_size: Option<usize>,
+}
+
+fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
+    ConvertReport {
+        mode: inputs.options.mode,
+        levels: inputs.level_reports,
+        skipped_empty_levels: inputs.skipped,
+        input_features: inputs.num_features,
+        total_rows: inputs.total_rows,
+        total_vertices: inputs.total_vertices,
+        total_compressed_bytes: inputs.total_compressed_bytes,
+        row_groups_total: inputs.row_groups_total,
+        row_groups_read: inputs.row_groups_read,
+        antimeridian_suspect_features: inputs.tallies.antimeridian_suspect,
+        out_of_range_features: inputs.tallies.out_of_range,
+        unprojectable_features: inputs.tallies.unprojectable,
+        out_of_range_exemplars: inputs.tallies.out_of_range_exemplars,
+        duration_secs: inputs.start.elapsed().as_secs_f64(),
+        remote_fetch: super::convert::log_remote_fetch(inputs.source),
+        effective_max_row_group_size: inputs.effective_max_row_group_size,
+    }
 }
 
 /// [`convert_streaming_strategy`]'s locals the `TYLERTOO_PROFILE_JSON` dump

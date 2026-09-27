@@ -2810,6 +2810,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             convert_report.duration_secs + export_report.duration_secs,
             convert_report.out_of_range_features,
             convert_report.unprojectable_features,
+            &convert_report.out_of_range_exemplars,
         )
     );
     // #380: the summary line above covers the requested (declared) range,
@@ -2891,6 +2892,11 @@ fn row_group_autoscale_note(
 /// A ≥99% loss never reaches here (the conversion fails outright), so this
 /// covers the partial case and the "some other filter also emptied the
 /// archive" one.
+///
+/// `out_of_range_exemplars` names the first few offending rows and
+/// coordinates (#553): root-causing a real case (a5 grid cells with
+/// vertices up to 0.6° past ±180°) used to require a separate DuckDB query
+/// against the input, when the bare count gave no lead to follow.
 fn tiles_summary_line(
     total_tiles: usize,
     min_zoom: u8,
@@ -2898,13 +2904,21 @@ fn tiles_summary_line(
     secs: f64,
     out_of_range: usize,
     unprojectable: usize,
+    out_of_range_exemplars: &[tylertoo_core::overview::convert::OutOfRangeExemplar],
 ) -> String {
     let zooms = format!("z{min_zoom}..z{max_zoom}");
     let tiles = format_number(total_tiles as u64);
     let mut losses: Vec<String> = Vec::new();
     if out_of_range > 0 {
+        let exemplar =
+            tylertoo_core::overview::convert::out_of_range_exemplar_note(out_of_range_exemplars);
+        let exemplar = if exemplar.is_empty() {
+            String::new()
+        } else {
+            format!(";{exemplar}")
+        };
         losses.push(format!(
-            "{} feature(s) dropped (outside the declared CRS range)",
+            "{} feature(s) dropped (outside the declared CRS range{exemplar})",
             format_number(out_of_range as u64)
         ));
     }
@@ -5051,10 +5065,10 @@ mod tests {
     /// unqualified success.
     #[test]
     fn tiles_summary_line_names_out_of_range_losses() {
-        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0);
+        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0, &[]);
         assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
 
-        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0);
+        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0, &[]);
         assert!(
             empty.starts_with(
                 "0 tiles \u{2014} 3 feature(s) dropped (outside the declared CRS range)"
@@ -5062,7 +5076,7 @@ mod tests {
             "a wrong-CRS run must not read as a clean success: {empty}"
         );
 
-        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0);
+        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0, &[]);
         assert!(
             partial.contains("10 tiles across z0..z14")
                 && partial.contains("1 feature(s) dropped (outside the declared CRS range)"),
@@ -5070,7 +5084,7 @@ mod tests {
         );
 
         // The Mercator-domain loss is named separately: nothing to reproject.
-        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7);
+        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7, &[]);
         assert!(
             polar.contains(
                 "7 feature(s) dropped (|lat| > 85.05\u{b0}, outside the Web Mercator \
@@ -5080,11 +5094,40 @@ mod tests {
         );
 
         // Both at once, both named.
-        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3);
+        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3, &[]);
         assert!(
             both.contains("2 feature(s) dropped (outside the declared CRS range)")
                 && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
             "{both}"
+        );
+    }
+
+    /// #553: a bare count sent a real investigation to a separate DuckDB
+    /// query against the input to find the offending rows. The summary line
+    /// must name them itself.
+    #[test]
+    fn tiles_summary_line_names_out_of_range_exemplars() {
+        use tylertoo_core::overview::convert::OutOfRangeExemplar;
+
+        let exemplars = vec![
+            OutOfRangeExemplar {
+                row: 1041,
+                axis: "lon",
+                value: 180.548,
+            },
+            OutOfRangeExemplar {
+                row: 2210,
+                axis: "lon",
+                value: 180.101,
+            },
+        ];
+        let msg = tiles_summary_line(0, 0, 14, 0.05, 19, 0, &exemplars);
+        assert!(
+            msg.contains(
+                "19 feature(s) dropped (outside the declared CRS range; e.g. lon \
+                          180.548 (row 1041), lon 180.101 (row 2210))"
+            ),
+            "the summary must name the offending coordinates and rows, not just a count: {msg}"
         );
     }
 

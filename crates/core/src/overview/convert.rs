@@ -1079,6 +1079,11 @@ pub struct ConvertReport {
     /// [`ConvertError::AllFeaturesOutOfRange`] rather than writing an empty
     /// archive (#429).
     pub unprojectable_features: usize,
+    /// The first few [`out_of_range_features`](Self::out_of_range_features)'
+    /// rows and offending coordinates (#553), or empty when nothing was out
+    /// of range, or when the run replayed a `--plan` artifact (whose saved
+    /// totals do not carry exemplars).
+    pub out_of_range_exemplars: Vec<OutOfRangeExemplar>,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
     /// Remote-input fetch counters (#210): range requests issued and bytes
@@ -2980,6 +2985,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         antimeridian_suspect_features: tallies.antimeridian_suspect,
         out_of_range_features: tallies.out_of_range,
         unprojectable_features: tallies.unprojectable,
+        out_of_range_exemplars: tallies.out_of_range_exemplars,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
         effective_max_row_group_size,
@@ -3535,6 +3541,72 @@ fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
     )
 }
 
+/// One #429 out-of-range feature's row and offending coordinate (#553): the
+/// exemplar a summary points investigators at instead of a bare count.
+/// Root-causing a real dateline case (a5 grid cells 0.6° past ±180°) used to
+/// require a separate DuckDB query against the input; this is what lets the
+/// message name the answer up front.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct OutOfRangeExemplar {
+    /// The feature's row position in the source file
+    /// ([`AssignFeature::index`]).
+    pub row: usize,
+    /// Which coordinate tripped the range check: `"lon"`/`"lat"` for
+    /// EPSG:4326, `"x"`/`"y"` for EPSG:3857.
+    pub axis: &'static str,
+    /// The offending coordinate's value.
+    pub value: f64,
+}
+
+/// At most this many out-of-range exemplars are kept (#553): enough to show
+/// a pattern (e.g. "every offender near +180°") without holding a growing
+/// `Vec` for a run where millions of features are out of range.
+pub(super) const OUT_OF_RANGE_EXEMPLAR_CAP: usize = 3;
+
+/// Which of a bbox's four coordinates trips [`bbox_out_of_crs_range`] worst,
+/// and its value (#553). Picks the largest excess so a feature that is only
+/// slightly over one edge but wildly over another reports the edge that
+/// actually explains the loss.
+///
+/// Only called on a bbox [`bbox_out_of_crs_range`] already confirmed is out
+/// of range, so a candidate is always found; the fallback exists only to
+/// keep the function total.
+fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
+    let r = crs_coordinate_range(crs);
+    let (lon, lat) = match crs {
+        Crs::Epsg4326 => ("lon", "lat"),
+        Crs::Epsg3857 => ("x", "y"),
+    };
+    let candidates = [
+        (lon, bbox[0], (-r.max_x) - bbox[0]),
+        (lon, bbox[2], bbox[2] - r.max_x),
+        (lat, bbox[1], (-r.max_y) - bbox[1]),
+        (lat, bbox[3], bbox[3] - r.max_y),
+    ];
+    candidates
+        .into_iter()
+        .filter(|&(_, _, excess)| excess > 0.0)
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(axis, value, _)| (axis, value))
+        .unwrap_or((lon, bbox[0]))
+}
+
+/// The "e.g. lon 180.548 (row 1041), lon 180.101 (row 2210)" suffix naming
+/// the first few out-of-range exemplars (#553), or `""` when there are none.
+/// Shared by the aggregate `log::warn!` ([`out_of_range_warning`]) and the
+/// CLI's `tiles` summary line, so both name where the loss came from instead
+/// of only how much was lost.
+pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
+    if exemplars.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = exemplars
+        .iter()
+        .map(|e| format!("{} {:.3} (row {})", e.axis, e.value, e.row))
+        .collect();
+    format!(" e.g. {}", parts.join(", "))
+}
+
 /// #429 decision + message (pure, so it is unit-testable without capturing
 /// logs). The one aggregate warning for `count` of `total` out-of-range
 /// features, or `None` to stay quiet.
@@ -3542,12 +3614,14 @@ fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
 /// `max_abs` is the largest `|coordinate|` among the offenders: the
 /// projected-CRS diagnosis (and its `gpio` hint) is gated on it, so one
 /// Pacific point at lng 180.001 gets neutral wording rather than being told
-/// its whole file is in the wrong CRS (review S2-2).
+/// its whole file is in the wrong CRS (review S2-2). `exemplars` names the
+/// first few offending rows and coordinates (#553).
 pub(super) fn out_of_range_warning(
     count: usize,
     total: usize,
     crs: Crs,
     max_abs: f64,
+    exemplars: &[OutOfRangeExemplar],
 ) -> Option<String> {
     if count == 0 || total == 0 {
         return None;
@@ -3556,9 +3630,10 @@ pub(super) fn out_of_range_warning(
     let (label, text) = (range.label, range.text);
     let pct = count as f64 / total as f64 * 100.0;
     let advice = reprojection_advice(crs, max_abs);
+    let exemplar = out_of_range_exemplar_note(exemplars);
     Some(format!(
         "{count} of {total} feature(s) ({pct:.1}%) reach beyond the {label} coordinate \
-         range ({text}) and were dropped or clipped.{advice}"
+         range ({text}) and were dropped or clipped.{exemplar}{advice}"
     ))
 }
 
@@ -3584,7 +3659,7 @@ pub(super) const ALL_LOST_PERCENT: usize = 99;
 
 /// One-pass pass-1 bbox tallies: #188 antimeridian suspects plus the #429
 /// losses. Fused into a single traversal of the feature list (review S3b).
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub(super) struct BboxTallies {
     /// Features whose bbox spans more than 180° of longitude (#188).
     pub antimeridian_suspect: usize,
@@ -3596,6 +3671,9 @@ pub(super) struct BboxTallies {
     /// Largest `|coordinate|` among the out-of-range features, for the
     /// magnitude-gated diagnosis.
     pub max_abs_out_of_range: f64,
+    /// The first [`OUT_OF_RANGE_EXEMPLAR_CAP`] out-of-range features' rows
+    /// and offending coordinates (#553).
+    pub out_of_range_exemplars: Vec<OutOfRangeExemplar>,
 }
 
 impl BboxTallies {
@@ -3680,13 +3758,27 @@ pub(super) fn tally_feature_bboxes(
         if bbox_out_of_crs_range(&f.bbox, crs) {
             t.out_of_range += 1;
             t.max_abs_out_of_range = t.max_abs_out_of_range.max(bbox_max_abs(&f.bbox));
+            if t.out_of_range_exemplars.len() < OUT_OF_RANGE_EXEMPLAR_CAP {
+                let (axis, value) = out_of_range_coordinate(&f.bbox, crs);
+                t.out_of_range_exemplars.push(OutOfRangeExemplar {
+                    row: f.index,
+                    axis,
+                    value,
+                });
+            }
         } else if bbox_unprojectable(&f.bbox, crs) {
             t.unprojectable += 1;
         }
     }
     let total = features.len();
     warn_antimeridian_suspects(t.antimeridian_suspect);
-    if let Some(msg) = out_of_range_warning(t.out_of_range, total, crs, t.max_abs_out_of_range) {
+    if let Some(msg) = out_of_range_warning(
+        t.out_of_range,
+        total,
+        crs,
+        t.max_abs_out_of_range,
+        &t.out_of_range_exemplars,
+    ) {
         log::warn!("{msg}");
     }
     if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
@@ -5683,6 +5775,103 @@ mod tests {
         // Integers cannot be non-finite: unchanged.
         let col = Int64Array::from(vec![Some(-1i64), None, Some(7)]);
         assert_eq!(extract_sort_keys(&col), vec![Some(-1.0), None, Some(7.0)]);
+    }
+
+    // --- #553: name WHERE an out-of-range drop came from -------------------
+
+    fn point_feature(index: usize, x: f64, y: f64) -> AssignFeature {
+        AssignFeature {
+            index,
+            bbox: [x, y, x, y],
+            kind: FeatureKind::Point,
+            sort_key: None,
+            entry_level: None,
+        }
+    }
+
+    /// The offending coordinate is the one that actually exceeds the CRS's
+    /// range, and for a feature over more than one edge, the one exceeded by
+    /// the largest margin.
+    #[test]
+    fn out_of_range_coordinate_names_the_worst_edge() {
+        // A dateline a5 cell: only longitude is out of range (#553's real case).
+        assert_eq!(
+            out_of_range_coordinate(&[179.0, 10.0, 180.548, 20.0], Crs::Epsg4326),
+            ("lon", 180.548)
+        );
+        // Latitude out of range instead.
+        assert_eq!(
+            out_of_range_coordinate(&[-10.0, -95.0, 10.0, -80.0], Crs::Epsg4326),
+            ("lat", -95.0)
+        );
+        // Both edges violated: the larger excess wins (200 - 180 = 20 vs.
+        // 95 - 90 = 5).
+        assert_eq!(
+            out_of_range_coordinate(&[-10.0, -95.0, 200.0, 10.0], Crs::Epsg4326),
+            ("lon", 200.0)
+        );
+        // EPSG:3857 uses x/y, not lon/lat.
+        let over = WEBMERC_HALF_M + 1000.0;
+        assert_eq!(
+            out_of_range_coordinate(&[0.0, 0.0, over, 0.0], Crs::Epsg3857),
+            ("x", over)
+        );
+    }
+
+    /// `tally_feature_bboxes` collects the first [`OUT_OF_RANGE_EXEMPLAR_CAP`]
+    /// out-of-range rows and their offending coordinate — and stops there,
+    /// so a run with millions of offenders does not grow an unbounded `Vec`.
+    #[test]
+    fn tally_feature_bboxes_caps_exemplars_and_names_rows() {
+        let mut features = vec![point_feature(0, 10.0, 10.0)]; // in range
+                                                               // Five out-of-range dateline features at rows 1, 2, 3, 4, 5.
+        for row in 1..=5usize {
+            features.push(point_feature(row, 180.0 + row as f64 * 0.1, 10.0));
+        }
+        let tallies = tally_feature_bboxes(&features, Crs::Epsg4326).expect("not all lost");
+        assert_eq!(tallies.out_of_range, 5);
+        assert_eq!(
+            tallies.out_of_range_exemplars.len(),
+            OUT_OF_RANGE_EXEMPLAR_CAP,
+            "capped even though 5 features are out of range"
+        );
+        let rows: Vec<usize> = tallies
+            .out_of_range_exemplars
+            .iter()
+            .map(|e| e.row)
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3]);
+        assert_eq!(tallies.out_of_range_exemplars[0].axis, "lon");
+    }
+
+    /// The exemplar note is what turns a bare count into something naming
+    /// WHERE the loss came from (#553's ask), and is empty when there is
+    /// nothing to name.
+    #[test]
+    fn out_of_range_exemplar_note_names_rows_and_coordinates() {
+        assert_eq!(out_of_range_exemplar_note(&[]), "");
+
+        let exemplars = vec![
+            OutOfRangeExemplar {
+                row: 1041,
+                axis: "lon",
+                value: 180.548,
+            },
+            OutOfRangeExemplar {
+                row: 2210,
+                axis: "lon",
+                value: 180.101,
+            },
+        ];
+        let note = out_of_range_exemplar_note(&exemplars);
+        assert!(note.contains("lon 180.548 (row 1041)"), "{note}");
+        assert!(note.contains("lon 180.101 (row 2210)"), "{note}");
+
+        // The full aggregate warning includes it too.
+        let msg =
+            out_of_range_warning(19, 1000, Crs::Epsg4326, 180.548, &exemplars).expect("warns");
+        assert!(msg.contains("19 of 1000"), "{msg}");
+        assert!(msg.contains("lon 180.548 (row 1041)"), "{msg}");
     }
 
     /// The filter path reads the same columns but must NOT lose ±inf: it is a
