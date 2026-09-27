@@ -659,6 +659,13 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 
    Off by default: a band's premise is that its input is already the right resolution for the zooms it owns, so thinning and simplifying it would re-introduce exactly what banding avoids. Pass this when a band is raw features spanning several zooms and you do want the ladder inside it.
 * `--max-tile-size <SIZE>` — Per-tile MVT size cap for bands tiled here (e.g. "500K"). Unset means no cap, matching the verbatim default: a valve that sheds features to fit a byte budget would drop cells the band exists to draw
+* `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order for bands tiled here (#374): `input` (default) or a property name, optionally `:asc` / `:desc`.
+
+   Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361): MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a banded aggregate or nested choropleth usually wants — with ties kept in input order so output stays deterministic.
+
+   Applies to every GeoParquet band alike, like `--generalize` and `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps the order it was tiled with. The column must exist in every GeoParquet band, since each band's export reads it.
+
+  Default value: `input`
 * `--work-dir <DIR>` — Directory for the per-band intermediates (removed on the way out). Defaults to the system temp directory
 * `--allow-missing-zooms` — Allow a pre-tiled band's declared zoom range to overshoot what its archive actually holds.
 

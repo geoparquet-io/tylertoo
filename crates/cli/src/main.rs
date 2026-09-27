@@ -345,6 +345,25 @@ pub struct PyramidArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
     pub max_tile_size: Option<usize>,
 
+    /// Within-tile feature order for bands tiled here (#374): `input`
+    /// (default) or a property name, optionally `:asc` / `:desc`.
+    ///
+    /// Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361):
+    /// MVT does not define draw order, but renderers paint features in the
+    /// order the tile lists them, so this is the paint order for any style
+    /// that does not override it. `input` emits source row order. Naming a
+    /// column sorts within each tile by that property — `--feature-order
+    /// level` puts high `level` on top, which is what a banded aggregate or
+    /// nested choropleth usually wants — with ties kept in input order so
+    /// output stays deterministic.
+    ///
+    /// Applies to every GeoParquet band alike, like `--generalize` and
+    /// `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps
+    /// the order it was tiled with. The column must exist in every
+    /// GeoParquet band, since each band's export reads it.
+    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
+    pub feature_order: FeatureOrder,
+
     /// Directory for the per-band intermediates (removed on the way out).
     /// Defaults to the system temp directory.
     #[arg(long, value_name = "DIR")]
@@ -3703,9 +3722,7 @@ fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
-    use tylertoo_core::overview::convert::ConvertOptions;
-    use tylertoo_core::overview::export::ExportOptions;
-    use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band, PyramidOptions};
+    use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -3763,20 +3780,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         }
     }
 
-    let convert = if args.generalize {
-        ConvertOptions::default()
-    } else {
-        ConvertOptions::default().verbatim()
-    };
-    let opts = PyramidOptions {
-        convert,
-        export: ExportOptions {
-            tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
-            ..ExportOptions::default()
-        },
-        work_dir: args.work_dir.clone(),
-        allow_missing_zooms: args.allow_missing_zooms,
-    };
+    let opts = pyramid_options(&args);
 
     let report = build_pyramid(&bands, &args.output, &opts)
         .map_err(|e| anyhow::anyhow!("pyramid build failed: {e}"))?;
@@ -3801,6 +3805,34 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         format_number(report.total_tiles as u64)
     );
     Ok(())
+}
+
+/// The `pyramid` flags that apply to every GeoParquet band alike, as the
+/// library options `build_pyramid` substitutes each band's own layer name
+/// and zoom range into. Kept separate from `run_pyramid` so a test can
+/// check a flag actually reaches `PyramidOptions` (#374: `--feature-order`
+/// was documented for `tiles` and `export-pmtiles` but `pyramid` built its
+/// export options from `ExportOptions::default()`).
+fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions {
+    use tylertoo_core::overview::convert::ConvertOptions;
+    use tylertoo_core::overview::export::ExportOptions;
+    use tylertoo_core::pyramid::PyramidOptions;
+
+    let convert = if args.generalize {
+        ConvertOptions::default()
+    } else {
+        ConvertOptions::default().verbatim()
+    };
+    PyramidOptions {
+        convert,
+        export: ExportOptions {
+            tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
+            feature_order: args.feature_order.clone(),
+            ..ExportOptions::default()
+        },
+        work_dir: args.work_dir.clone(),
+        allow_missing_zooms: args.allow_missing_zooms,
+    }
 }
 
 /// A path's identity for "is this the same file?", resolved as far as the
@@ -4432,6 +4464,69 @@ mod tests {
             Command::ExportPmtiles(a) => a,
             other => panic!("expected export-pmtiles subcommand, got {other:?}"),
         }
+    }
+
+    fn parse_pyramid(flags: &[&str]) -> PyramidArgs {
+        let mut argv = vec![
+            "tylertoo",
+            "pyramid",
+            "out.pmtiles",
+            "--band",
+            "0-5:coarse.parquet",
+        ];
+        argv.extend_from_slice(flags);
+        match Cli::try_parse_from(argv)
+            .expect("pyramid args should parse")
+            .command
+        {
+            Command::Pyramid(a) => a,
+            other => panic!("expected pyramid subcommand, got {other:?}"),
+        }
+    }
+
+    /// #374: `pyramid` takes the same `--feature-order` as `tiles` and
+    /// `export-pmtiles`, once for the whole pyramid, and it has to reach
+    /// `PyramidOptions::export` — the library already honours it per band,
+    /// the CLI just never set it, so `ExportOptions::default()` always won.
+    #[test]
+    fn feature_order_flag_reaches_pyramid() {
+        let column = |name: &str, descending| FeatureOrder::Column {
+            name: name.to_string(),
+            descending,
+        };
+
+        assert_eq!(parse_pyramid(&[]).feature_order, FeatureOrder::Input);
+        assert_eq!(
+            pyramid_options(&parse_pyramid(&[])).export.feature_order,
+            FeatureOrder::Input
+        );
+
+        assert_eq!(
+            parse_pyramid(&["--feature-order", "level:desc"]).feature_order,
+            column("level", true)
+        );
+        let opts = pyramid_options(&parse_pyramid(&["--feature-order", "level:desc"]));
+        assert_eq!(opts.export.feature_order, column("level", true));
+        // The rest of the export options are untouched by the new knob.
+        assert_eq!(opts.export.tile_size_limit, None);
+        assert_eq!(
+            pyramid_options(&parse_pyramid(&["--feature-order", "level"]))
+                .export
+                .feature_order,
+            column("level", false)
+        );
+
+        // Same parser as the other two commands: a bad direction is rejected
+        // at parse time.
+        let mut argv = vec![
+            "tylertoo",
+            "pyramid",
+            "out.pmtiles",
+            "--band",
+            "0-5:a.parquet",
+        ];
+        argv.extend_from_slice(&["--feature-order", "level:dsc"]);
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 
     /// #361: the flag has to actually reach `ExportOptions` on both commands.
