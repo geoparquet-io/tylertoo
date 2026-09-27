@@ -4575,6 +4575,11 @@ struct PublishedNames {
     restored: HashMap<String, String>,
     /// Schema field names that are not exported at all (#379).
     suppressed: HashSet<String>,
+    /// The bbox covering column the file's `geo` metadata declares for the
+    /// geometry column, when it declares one. A covering is never a
+    /// property (see [`is_covering_column`]); this is the declared spelling,
+    /// alongside the default names and the shape rule.
+    covering: Option<String>,
 }
 
 impl PublishedNames {
@@ -4637,6 +4642,7 @@ impl PublishedNames {
         Self {
             restored,
             suppressed,
+            covering: None,
         }
     }
 
@@ -4694,7 +4700,20 @@ impl PublishedNames {
                 suppressed.insert(column.to_string());
             }
         }
-        Self::from_meta(meta, reader.schema(), suppressed)
+        let mut names = Self::from_meta(meta, reader.schema(), suppressed);
+        // The covering the `geo` metadata declares for the geometry column,
+        // as its top-level struct name (the spec paths are `["bbox","xmin"]`
+        // and so on). A parse failure or an absent declaration leaves the
+        // default-name and shape rules to recognise it.
+        names.covering = geometry_index(reader.schema()).and_then(|gi| {
+            let geom = reader.schema().field(gi).name().as_str();
+            let json = reader.geo_metadata_json()?;
+            crate::covering::parse_covering_metadata(json, Some(geom))
+                .ok()
+                .flatten()
+                .and_then(|spec| spec.xmin_path.first().cloned())
+        });
+        names
     }
 
     /// Apply a caller's property selection (#386) on top of the file-derived
@@ -4887,32 +4906,63 @@ fn skipped_property_columns(
 }
 
 /// Every schema column that is a property candidate: not the geometry, not
-/// the `level` column, not the geometry's own bbox covering (the writer's
-/// `{xmin, ymin, xmax, ymax}` struct under the covering name, which is index
-/// metadata and not user data -- so it is neither exported nor warned about),
-/// and not withheld by the selection.
+/// the `level` column, not a bbox covering struct ([`is_covering_column`]:
+/// index metadata, not user data -- so it is neither exported nor warned
+/// about), and not withheld by the selection.
 fn candidate_columns<'a>(
     schema: &'a Schema,
     geom_idx: usize,
     published: &'a PublishedNames,
 ) -> impl Iterator<Item = (usize, &'a arrow_schema::Field)> + 'a {
-    let covering = schema
-        .fields()
-        .get(geom_idx)
-        .map(|g| super::writer::covering_name_for(g.name()));
+    let geom = schema.fields().get(geom_idx).map(|g| g.name().as_str());
     schema
         .fields()
         .iter()
         .enumerate()
         .filter(move |&(i, f)| {
-            let is_covering = covering.as_deref() == Some(f.name().as_str())
-                && super::writer::is_bbox_covering_struct(f);
             i != geom_idx
                 && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
                 && !published.is_suppressed(f.name())
-                && !is_covering
+                && !is_covering_column(f, geom, published.covering.as_deref())
         })
         .map(|(i, f)| (i, f.as_ref()))
+}
+
+/// Whether `field` is the geometry's bbox covering rather than a property.
+///
+/// A covering is a `{xmin, ymin, xmax, ymax}` struct
+/// ([`super::writer::is_bbox_covering_struct`]) that ALSO satisfies any of:
+/// its name is the one the file's `geo` metadata declares (`declared`); its
+/// name is a default spelling (`covering_name_for(geom)`, `<geom>_bbox`,
+/// `bbox`); or its four children are floats. The last rule is what catches
+/// a file with no `geo` metadata whose covering was named `geometry_bbox`
+/// (the madagascar fixture): before it, that struct was JSON-encoded into
+/// every feature as a ~60-byte unique string, which the tippecanoe parity
+/// gate flagged as +12% bytes at every zoom. A four-float struct of exactly
+/// that shape is never a real property.
+fn is_covering_column(
+    field: &arrow_schema::Field,
+    geom: Option<&str>,
+    declared: Option<&str>,
+) -> bool {
+    if !super::writer::is_bbox_covering_struct(field) {
+        return false;
+    }
+    let name = field.name().as_str();
+    if declared == Some(name) || name == "bbox" {
+        return true;
+    }
+    if let Some(geom) = geom {
+        if name == super::writer::covering_name_for(geom) || name == format!("{geom}_bbox") {
+            return true;
+        }
+    }
+    match field.data_type() {
+        DataType::Struct(children) => children
+            .iter()
+            .all(|c| matches!(c.data_type(), DataType::Float32 | DataType::Float64)),
+        _ => false,
+    }
 }
 
 /// The columns pass 2 attaches to each member: the exportable properties
@@ -7303,6 +7353,98 @@ mod tests {
     /// The selected-columns predicate and the extraction arms must agree: a
     /// column advertised in `vector_layers.fields` has to be fillable. A named
     /// timezone is not renderable without a tz database, so it must be neither
+    /// #434 follow-up (tippecanoe parity gate): a bbox covering struct is
+    /// index metadata whatever it is called. A file with no `geo` metadata
+    /// and a covering named `geometry_bbox` (the madagascar fixture) must
+    /// not have that struct JSON-encoded into every feature, advertised, or
+    /// warned about -- and asking for it by name is "unknown", not
+    /// "unsupported".
+    #[test]
+    fn covering_struct_is_recognised_by_shape_whatever_its_name() {
+        use arrow_schema::Fields;
+
+        let bbox_of = |dt: DataType| {
+            DataType::Struct(Fields::from(vec![
+                Field::new("xmin", dt.clone(), true),
+                Field::new("ymin", dt.clone(), true),
+                Field::new("xmax", dt.clone(), true),
+                Field::new("ymax", dt, true),
+            ]))
+        };
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            // Covering under a non-default name, float children: shape rule.
+            Field::new("geometry_bbox", bbox_of(DataType::Float32), true),
+            // Covering under a default name with non-float children: name rule.
+            Field::new("bbox", bbox_of(DataType::Int32), true),
+            // Same shape but not a covering: a real property, JSON-encoded.
+            Field::new(
+                "extent",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("w", DataType::Float64, true),
+                    Field::new("h", DataType::Float64, true),
+                ])),
+                true,
+            ),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let published = PublishedNames::identity();
+        let geom_idx = 4;
+
+        let names: Vec<String> = property_columns(&schema, geom_idx, &published)
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "extent"],
+            "coverings must not be properties"
+        );
+        assert!(
+            skipped_property_columns(&schema, geom_idx, &published).is_empty(),
+            "coverings must not be warned about either"
+        );
+        let fields = field_metadata(&schema, Some(geom_idx), &published);
+        assert!(!fields.contains_key("geometry_bbox"), "{fields:?}");
+        assert!(!fields.contains_key("bbox"), "{fields:?}");
+        assert_eq!(fields.get("extent").map(String::as_str), Some("String"));
+
+        for name in ["geometry_bbox", "bbox"] {
+            let err = PublishedNames::identity()
+                .with_selection(
+                    &schema,
+                    geom_idx,
+                    &PropertySelection {
+                        include: Some(vec![name.to_string()]),
+                        ..Default::default()
+                    },
+                    &FeatureOrder::Input,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, ExportError::UnknownProperty { name: n, .. } if n == name),
+                "{name}: expected UnknownProperty, got {err:?}"
+            );
+        }
+
+        // The declared covering name (from `geo` metadata) is honoured even
+        // for a struct that matches neither the default names nor the
+        // float-children rule.
+        let schema = Schema::new(vec![
+            Field::new("my_cover", bbox_of(DataType::Int32), true),
+            Field::new("geometry", DataType::Binary, false),
+        ]);
+        let declared = PublishedNames {
+            covering: Some("my_cover".to_string()),
+            ..PublishedNames::identity()
+        };
+        assert!(property_columns(&schema, 1, &declared).is_empty());
+        assert!(
+            !property_columns(&schema, 1, &PublishedNames::identity()).is_empty(),
+            "without the declaration an int-children struct under a custom name is a property"
+        );
+    }
+
     /// selected nor advertised -- dropping it is honest, promising it is not.
     #[test]
     fn unrenderable_timezone_is_neither_selected_nor_advertised() {

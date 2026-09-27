@@ -2396,6 +2396,7 @@ impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::reader::
 pub struct tylertoo_core::overview::reader::OverviewReader
 impl tylertoo_core::overview::reader::OverviewReader
 pub fn tylertoo_core::overview::reader::OverviewReader::finest_level_mean_row_bytes(&self) -> core::option::Option<u64>
+pub fn tylertoo_core::overview::reader::OverviewReader::geo_metadata_json(&self) -> core::option::Option<&str>
 pub fn tylertoo_core::overview::reader::OverviewReader::int_column_max(&self, &str) -> core::option::Option<i64>
 pub fn tylertoo_core::overview::reader::OverviewReader::level_for_gsd(&self, f64) -> usize
 pub fn tylertoo_core::overview::reader::OverviewReader::level_for_zoom(&self, u8) -> usize
