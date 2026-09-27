@@ -1550,19 +1550,8 @@ fn export_pmtiles_impl(
     // path is kept there (and as the tests' byte-identity oracle).
     let single_read = matches!(reader.mode(), Mode::Partitioning) && !force_legacy_pass2;
     let mut store = if single_read {
-        let buffered_rows: usize = scans.iter().map(|s| s.feature_count).sum();
         let backing = backing_override.unwrap_or_else(|| {
-            let b = auto_backing(
-                Mode::Partitioning,
-                buffered_rows,
-                available_ram,
-                mean_member_bytes,
-            );
-            log::info!(
-                "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \
-                 member row(s) across {num_levels} level(s) → {b:?}"
-            );
-            b
+            auto_fill_backing(&scans, num_levels, available_ram, mean_member_bytes)
         });
         // #571: entered only when the fill runs, so a duplicating-mode export
         // (no fill) has no `fill` entry in `phase_peaks_mib`.
@@ -1738,6 +1727,30 @@ fn checkpoint_level(
         dur.as_secs_f64(),
     );
     Ok(())
+}
+
+/// The #235 single-read fill's member-store backing when the caller did not
+/// force one: the auto RAM-vs-spill choice over every level's buffered
+/// members, logged. Pulled out of [`export_pmtiles_impl`] to keep it under
+/// clippy's function-length ceiling.
+fn auto_fill_backing(
+    scans: &[LevelScan],
+    num_levels: usize,
+    available_ram: Option<u64>,
+    mean_member_bytes: Option<u64>,
+) -> SinkBacking {
+    let buffered_rows: usize = scans.iter().map(|s| s.feature_count).sum();
+    let b = auto_backing(
+        Mode::Partitioning,
+        buffered_rows,
+        available_ram,
+        mean_member_bytes,
+    );
+    log::info!(
+        "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \
+         member row(s) across {num_levels} level(s) → {b:?}"
+    );
+    b
 }
 
 /// Export-wide mutable state threaded through the per-level loop as one
