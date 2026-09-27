@@ -7638,13 +7638,31 @@ mod tests {
         )
         .unwrap();
 
-        // The premise: the two files' own statistics disagree.
+        // The premise: the two files' own statistics disagree. The full file
+        // spans more than one count, which the statistic fold refuses (#399),
+        // so its max is read from the data.
         let full_rdr = OverviewReader::open(&full_out).unwrap();
         let capped_rdr = OverviewReader::open(&capped_out).unwrap();
-        assert!(
-            full_rdr.int_column_max("coalesced_count").unwrap() > 1,
-            "the full run must merge the chain somewhere"
-        );
+        let full_max = (0..full_rdr.num_levels())
+            .flat_map(|k| full_rdr.read_level(k, None).unwrap())
+            .map(|batch| {
+                use arrow_array::cast::AsArray;
+                use arrow_array::types::Int32Type;
+                let batch = batch.unwrap();
+                let idx = batch.schema().index_of("coalesced_count").unwrap();
+                batch
+                    .column(idx)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(1)
+            })
+            .max()
+            .unwrap();
+        assert!(full_max > 1, "the full run must merge the chain somewhere");
+        assert_eq!(full_rdr.int_column_max("coalesced_count"), None);
         assert_eq!(
             capped_rdr.int_column_max("coalesced_count"),
             Some(1),

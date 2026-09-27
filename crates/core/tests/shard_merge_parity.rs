@@ -1074,18 +1074,41 @@ fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
     let coarse_overview = level_capped_coarse_overview(&input, dir, build, &full_plan);
 
     // The premise: the two files' own counters disagree, so a publish
-    // decision read from them would too.
-    let max = |p: &Path| {
-        OverviewReader::open(p)
-            .expect("open overview")
-            .int_column_max("coalesced_count")
+    // decision read from them would too. The monolithic file spans more
+    // than one count, which the statistic fold refuses (#399), so its max
+    // is read from the data.
+    let data_max = |p: &Path| -> i32 {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        let reader = OverviewReader::open(p).expect("open overview");
+        (0..reader.num_levels())
+            .flat_map(|k| reader.read_level(k, None).expect("read level"))
+            .map(|batch| {
+                let batch = batch.expect("batch");
+                let idx = batch
+                    .schema()
+                    .index_of("coalesced_count")
+                    .expect("counter column");
+                batch
+                    .column(idx)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(1)
+            })
+            .max()
+            .expect("at least one batch")
     };
     assert!(
-        max(&mono_overview).is_some_and(|m| m > 1),
+        data_max(&mono_overview) > 1,
         "the chains must merge somewhere in the monolithic build"
     );
     assert_eq!(
-        max(&coarse_overview),
+        OverviewReader::open(&coarse_overview)
+            .expect("open overview")
+            .int_column_max("coalesced_count"),
         Some(1),
         "the chains must merge only past the pivot, or this oracle proves nothing"
     );

@@ -7914,6 +7914,30 @@ mod tests {
         user_column: Option<&str>,
     ) {
         use arrow_array::Int32Array;
+        write_typed_counter_fixture(
+            path,
+            generalization,
+            Field::new(counter, DataType::Int32, false),
+            &counts
+                .iter()
+                .map(|c| Arc::new(Int32Array::from(c.clone())) as ArrayRef)
+                .collect::<Vec<_>>(),
+            user_column,
+        );
+    }
+
+    /// [`write_counter_fixture`] with the counter column's Arrow field and
+    /// per-level arrays supplied by the caller, for columns the converter
+    /// never writes itself (a pyarrow-style unsigned or nullable counter,
+    /// #399).
+    fn write_typed_counter_fixture(
+        path: &Path,
+        generalization: Generalization,
+        counter: Field,
+        counts: &[ArrayRef],
+        user_column: Option<&str>,
+    ) {
+        use arrow_array::Int32Array;
 
         let a = Geometry::Point(Point::new(-120.0, 40.0));
         let b = Geometry::Point(Point::new(120.0, -40.0));
@@ -7922,7 +7946,7 @@ mod tests {
             fields.push(Field::new(name, DataType::Int32, false));
         }
         fields.push(geometry_field());
-        fields.push(Field::new(counter, DataType::Int32, false));
+        fields.push(counter);
         let schema = Arc::new(Schema::new(fields));
         let specs: Vec<LevelSpec> = (0..counts.len())
             .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
@@ -7942,7 +7966,7 @@ mod tests {
                 columns.push(Arc::new(Int32Array::from(vec![7; n])));
             }
             columns.push(Arc::new(build_geometry_array(&geoms).to_array_ref()));
-            columns.push(Arc::new(Int32Array::from(level_counts.clone())));
+            columns.push(level_counts.clone());
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
             assert_eq!(
                 writer
@@ -8179,6 +8203,60 @@ mod tests {
             names.contains(&"id".to_string()),
             "id was withheld: {names:?}"
         );
+    }
+
+    /// #399: a foreign writer's nullable `coalesced_count` holding `{1, null}`
+    /// has max 1 but is not 1 everywhere — the null/1 distinction is data the
+    /// tiles would lose. The counter must stay exported.
+    #[test]
+    fn nullable_coalesced_count_with_nulls_is_not_withheld() {
+        use arrow_array::Int32Array;
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_typed_counter_fixture(
+            tin.path(),
+            coalescing_generalization(None),
+            Field::new("coalesced_count", DataType::Int32, true),
+            &[
+                Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(1), Some(1)])) as ArrayRef,
+            ],
+            None,
+        );
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        assert_eq!(
+            reader.int_column_max("coalesced_count"),
+            None,
+            "a row group with a null must not fold to a max"
+        );
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["coalesced_count", "id"]);
+    }
+
+    /// #399: a foreign writer's `UInt32` `coalesced_count` is compared as
+    /// signed by a naive statistics fold, so a row group whose real max is
+    /// 2^31 would fold *below* one whose max is 1 and the counter would be
+    /// withheld although it plainly carries information. It must stay
+    /// exported.
+    #[test]
+    fn unsigned_coalesced_count_is_not_withheld() {
+        use arrow_array::UInt32Array;
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_typed_counter_fixture(
+            tin.path(),
+            coalescing_generalization(None),
+            Field::new("coalesced_count", DataType::UInt32, false),
+            &[
+                Arc::new(UInt32Array::from(vec![1u32, 1 << 31])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![1u32, 1])) as ArrayRef,
+            ],
+            None,
+        );
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        assert_eq!(reader.int_column_max("coalesced_count"), None);
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["coalesced_count", "id"]);
     }
 
     // --- declared minimum zoom (#380) ----------------------------------------
