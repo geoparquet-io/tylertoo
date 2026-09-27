@@ -1239,6 +1239,66 @@ one stable sort per tile over features already in memory.
 
 ---
 
+## Stable feature ids: `--feature-id`
+
+Every MVT feature carries an `id`. **Without `--feature-id` that id is
+tile-local**: it is the feature's position within one tile at one zoom, so the
+same building gets a different id in the neighbouring tile and at the next
+zoom. That is enough for an `id` to exist, and not enough for anything that
+keys on it.
+
+`--feature-id COLUMN` writes the column's value as the feature id instead, on
+every tile and zoom the feature appears in (tippecanoe's
+`--use-attribute-for-id`):
+
+```bash
+tylertoo tiles buildings.parquet buildings.pmtiles --feature-id building_id
+tylertoo export-pmtiles overview.parquet out.pmtiles --feature-id building_id
+```
+
+With a stable id, MapLibre's feature state works across tile and zoom
+boundaries without `promoteId`: `map.setFeatureState({ source, sourceLayer, id },
+{ hover: true })` highlights the same feature wherever it is drawn, and a join
+of external data keyed on the id stays attached as the map pans and zooms.
+(`promoteId` still works on any property, `--feature-id` or not; the flag
+lets clients that read the MVT id directly skip it.)
+
+Rules:
+
+- **Integer columns only**: `Int8`..`Int64`, `UInt8`..`UInt64`, or an unscaled
+  `DECIMAL(p,0)`. MVT ids are unsigned 64-bit integers. Tippecanoe also parses
+  numeric strings and integral floats; tylertoo rejects them. A string id —
+  Overture's GERS ids, for example — has no lossless integer form. Cast or hash
+  it to an integer column before tiling (with `gpio` or DuckDB, e.g.
+  `hash(id)::UBIGINT`), and keep the original string as a property if clients
+  need it.
+- **Every row must hold a value in `0..=2^64-1`.** A null, a negative, or an
+  out-of-range decimal fails the export. Unlike tippecanoe, tylertoo does not
+  turn `-5` into `18446744073709551611`. The whole column of the overview file
+  (every level) is checked **before any tile is written**, so the error arrives
+  in seconds. It names the overview file's row and level, not the source row:
+  the convert reorders rows into levels.
+- **The column is moved, not copied.** It becomes the id and is dropped from
+  the tile properties and `vector_layers`, whatever `--include-property` /
+  `--exclude-property` say at export. To keep it as a property as well, carry
+  it under a second name in the source. On `tiles`, the convert step must keep
+  the column, so `--exclude-property` naming it is an error there.
+- **It cannot be the `--feature-order` column** (that sort reads the tile
+  properties the id was moved out of) or an `--accumulate-attribute` column,
+  whose clustered value is a sum or mean of several ids.
+- **Aggregated features keep one member's id.** A cluster (`--cluster`) carries
+  its representative point's id. A coalesced line chain carries its
+  highest-priority member's id. A tiny-polygon placeholder carries its own
+  polygon's id. Ids are not checked for uniqueness; a column with duplicate
+  values gives features that share an id, and feature state then applies to
+  all of them.
+
+`pyramid` does not take `--feature-id` yet, and neither does the Python
+`convert()` one-shot. Use `overview()` + `export_pmtiles(..., feature_id=...)`
+instead.
+
+---
+
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
 These do not change *which* features or vertices survive — geometry and

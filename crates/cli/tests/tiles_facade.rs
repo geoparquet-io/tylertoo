@@ -353,6 +353,77 @@ fn tiles_rejects_feature_order_on_an_excluded_property() {
     );
 }
 
+/// #443: same reasoning as `tiles_rejects_feature_order_on_an_excluded_property`
+/// above, for `--feature-id`: the column must physically survive the convert
+/// step's property selection to reach the export that moves it to the MVT
+/// feature id, so `tiles --exclude-property X --feature-id X` is rejected up
+/// front rather than silently falling back to the tile-local index.
+#[test]
+fn tiles_rejects_feature_id_on_an_excluded_property() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.parquet");
+    std::fs::write(&input, b"not really parquet").unwrap();
+    let out = dir.path().join("out.pmtiles");
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--exclude-property",
+            "id",
+            "--feature-id",
+            "id",
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(
+        !output.status.success(),
+        "--feature-id on an excluded property must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "property \"id\" is excluded but --feature-id reads it; keep it in the \
+             selection or drop the flag"
+        ),
+        "error should name the flag and column, got: {stderr}"
+    );
+    assert!(!out.exists(), "no output must be written");
+}
+
+/// #443 (S3a): an `--accumulate-attribute` on the `--feature-id` column
+/// would give each cluster a summed/averaged id -- the id of no feature --
+/// so the facade rejects the pairing before running the convert.
+#[test]
+fn tiles_rejects_feature_id_on_an_accumulated_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.parquet");
+    std::fs::write(&input, b"not really parquet").unwrap();
+    let out = dir.path().join("out.pmtiles");
+
+    let output = Command::new(tylertoo_bin())
+        .args([
+            "tiles",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--cluster",
+            "--accumulate-attribute",
+            "id:sum",
+            "--feature-id",
+            "id",
+        ])
+        .output()
+        .expect("run tylertoo tiles");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--feature-id column \"id\" is also --accumulate-attribute id:sum"),
+        "error should name both flags, got: {stderr}"
+    );
+    assert!(!out.exists(), "no output must be written");
+}
+
 /// #551: `tiles` refuses to clobber an existing output unless `-f/--force`
 /// is given, matching `pyramid`/`merge`/`shard-plan`.
 #[test]

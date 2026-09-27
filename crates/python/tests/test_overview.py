@@ -599,6 +599,19 @@ class TestExportPmtilesIntegration:
             assert pm.exists()
             assert report["total_tiles"] > 0
 
+    def test_export_feature_id(self):
+        """#443: ``feature_id=`` reaches the export: an integer column works,
+        an unknown or non-integer one is rejected before any tile."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ovr = self._make_overview(tmpdir)
+            pm = Path(tmpdir) / "out.pmtiles"
+            report = tylertoo.export_pmtiles(str(ovr), str(pm), feature_id="s2_id")
+            assert report["total_tiles"] > 0
+            with pytest.raises(RuntimeError, match='--feature-id column "nope"'):
+                tylertoo.export_pmtiles(str(ovr), str(pm), feature_id="nope")
+            with pytest.raises(RuntimeError, match="cast a string or float id"):
+                tylertoo.export_pmtiles(str(ovr), str(pm), feature_id="bf_source")
+
     def test_export_rejects_non_overview_input(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             pm = Path(tmpdir) / "out.pmtiles"

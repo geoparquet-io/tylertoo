@@ -135,6 +135,12 @@ use super::stream::{
 };
 use super::writer::LEVEL_COLUMN;
 
+mod feature_id;
+use feature_id::{
+    feature_id_values, resolve_feature_id, validate_feature_id_column, ResolvedFeatureId,
+};
+pub use feature_id::{FeatureIdColumnProblem, InvalidFeatureIdReason};
+
 /// Default MVT tile extent (matches [`crate::mvt::DEFAULT_EXTENT`]).
 const DEFAULT_EXTENT: u32 = 4096;
 
@@ -279,6 +285,41 @@ pub struct ExportOptions {
     ///
     /// Default `None` (no ceiling).
     pub zoom_ceiling: Option<u8>,
+    /// Carry a property column through as the MVT feature `id` on every tile
+    /// the feature appears in, at every zoom (#443; tippecanoe's
+    /// `--use-attribute-for-id`). Matched against the property name as the
+    /// tile would publish it -- the same naming `--feature-order` /
+    /// `--include-property` / `--exclude-property` use -- and independent of
+    /// any suppression already recorded for that column: an explicit
+    /// `--feature-id` always wins over the #379 auto-suppression heuristic
+    /// and over a `--include-property` / `--exclude-property` naming the same
+    /// column.
+    ///
+    /// The named column must be an integer type (`Int8`..`Int64`,
+    /// `UInt8`..`UInt64`) or an unscaled decimal (`DECIMAL(p,0)`), and every
+    /// value in every row of the overview file a non-null integer in
+    /// `0..=u64::MAX` -- MVT's feature id is `uint64`. The whole column is
+    /// checked up front, before any tile is written; a violation is an
+    /// [`ExportError::FeatureIdColumn`] or [`ExportError::InvalidFeatureId`]
+    /// (naming the overview-file row and level), never a silent
+    /// reinterpretation. String and float columns are rejected (a divergence
+    /// from tippecanoe, which parses them): cast them to an integer first.
+    ///
+    /// The column is moved to the feature id, never *also* published as a
+    /// regular tile property (tippecanoe's behaviour) -- it is stripped from
+    /// `vector_layers` and from every tile's tags regardless of the property
+    /// selection in force.
+    ///
+    /// Aggregated features: a cluster carries its representative's id, a
+    /// coalesced line chain its highest-priority member's, and a #384
+    /// tiny-polygon carrier its own. Uniqueness across source rows is not
+    /// checked.
+    ///
+    /// Default `None`: every feature keeps the tile-local member index it has
+    /// always had (unique only within a single tile/zoom pair -- see
+    /// [`build_mvt`]). Whether that no-flag default should instead omit the
+    /// id entirely is an open question (#443) this option does not decide.
+    pub feature_id: Option<String>,
 }
 
 impl Default for ExportOptions {
@@ -295,6 +336,7 @@ impl Default for ExportOptions {
             properties: PropertySelection::default(),
             tile_range: None,
             zoom_ceiling: None,
+            feature_id: None,
         }
     }
 }
@@ -346,7 +388,11 @@ pub struct ExportReport {
 }
 
 /// Errors from [`export_pmtiles`].
+///
+/// `#[non_exhaustive]`: new failure modes are added without a breaking
+/// change; match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExportError {
     /// Opening or reading the overview file failed.
     #[error("overview reader error: {0}")]
@@ -532,6 +578,40 @@ pub enum ExportError {
          drop the knob"
     )]
     PropertyRequiredByKnob { name: String, knob: String },
+
+    /// `--feature-id` (#443) names a column that cannot supply MVT feature
+    /// ids at all: absent, not an integer type, also the `--feature-order`
+    /// column, or aggregated by `--accumulate-attribute`. Raised before any
+    /// row is read.
+    #[error("--feature-id column {column:?} {reason}")]
+    FeatureIdColumn {
+        /// The `--feature-id` column, as the caller named it.
+        column: String,
+        /// What is wrong with it.
+        reason: FeatureIdColumnProblem,
+    },
+
+    /// A row of the overview file holds no valid `--feature-id` value
+    /// (#443): null, negative, or beyond `u64`. Every row of the file -- all
+    /// levels -- is checked up front, before any tile is written, so this
+    /// arrives in seconds rather than after the coarser levels export.
+    #[error(
+        "--feature-id column {column:?} {reason} at row {row} of the overview file (level \
+         {level}, z{zoom}; the overview file's own row order, not the source file's): every \
+         exported feature needs a non-negative integer id"
+    )]
+    InvalidFeatureId {
+        /// The `--feature-id` column, as the caller named it.
+        column: String,
+        /// The overview level whose row group holds the row.
+        level: usize,
+        /// That level's Web Mercator zoom.
+        zoom: u8,
+        /// 0-based row index in the overview file.
+        row: u64,
+        /// What is wrong with the value.
+        reason: InvalidFeatureIdReason,
+    },
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -1175,6 +1255,8 @@ fn export_pmtiles_impl(
     let mean_member_bytes = reader.finest_level_mean_row_bytes();
     let available_ram = available_memory_bytes();
 
+    let (published, feature_id) = resolve_export_columns(&reader, options, &level_zooms)?;
+
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
     // #459: the tail-directory layout. Tile bytes append straight into
@@ -1195,17 +1277,6 @@ fn export_pmtiles_impl(
     writer.set_expect_clustered(true);
     writer.set_layer_name(&options.layer_name);
     writer.set_declared_min_zoom(min_zoom);
-    // #359: which name each column is published under. Derived once from the
-    // file's own rename provenance so a standalone `export-pmtiles` on an
-    // overview written by an earlier run restores names just as `tiles` does.
-    // #386: then the caller's include/exclude, matched on the published names.
-    let published = PublishedNames::from_reader(&reader).with_selection(
-        reader.schema(),
-        geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?,
-        &options.properties,
-        &options.feature_order,
-    )?;
-
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
     // compare equal and the stable sort leaves input order. A typo therefore
@@ -1317,6 +1388,7 @@ fn export_pmtiles_impl(
                 plans: &plans,
                 opts: options,
                 published: &published,
+                feature_id: feature_id.as_ref(),
                 timers: &progress.profile.timers,
             },
             backing,
@@ -1340,6 +1412,7 @@ fn export_pmtiles_impl(
                 num_levels,
                 crs,
                 published: &published,
+                feature_id: feature_id.as_ref(),
                 options,
                 start,
             },
@@ -1541,6 +1614,42 @@ impl ExportProfile {
     }
 }
 
+/// Which columns the tiles carry, under which names, and the `--feature-id`
+/// column -- all settled before the output is created.
+///
+/// #359: the published names are derived from the file's own rename
+/// provenance, so a standalone `export-pmtiles` on an overview written by an
+/// earlier run restores names just as `tiles` does; #386: then the caller's
+/// include/exclude, matched on the published names. #443: `--feature-id` is
+/// resolved (withholding its column from the tile properties and
+/// `vector_layers`) and every row of the file checked, so a bad id fails in
+/// seconds with its true overview-file row, not after the coarser levels
+/// export.
+fn resolve_export_columns(
+    reader: &OverviewReader,
+    options: &ExportOptions,
+    level_zooms: &[u8],
+) -> Result<(PublishedNames, Option<ResolvedFeatureId>), ExportError> {
+    let geom_idx = geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?;
+    let mut published = PublishedNames::from_reader(reader).with_selection(
+        reader.schema(),
+        geom_idx,
+        &options.properties,
+        &options.feature_order,
+    )?;
+    let feature_id = resolve_feature_id(
+        reader.schema(),
+        geom_idx,
+        reader.meta(),
+        options,
+        &mut published,
+    )?;
+    if let Some(fid) = &feature_id {
+        validate_feature_id_column(reader, fid, level_zooms)?;
+    }
+    Ok((published, feature_id))
+}
+
 /// Everything one level's pass-2 render reads besides the writer and the
 /// member store.
 struct ExportLevelCtx<'a> {
@@ -1553,6 +1662,8 @@ struct ExportLevelCtx<'a> {
     num_levels: usize,
     crs: Crs,
     published: &'a PublishedNames,
+    /// The resolved `--feature-id` column (#443), if any.
+    feature_id: Option<&'a ResolvedFeatureId>,
     options: &'a ExportOptions,
     /// Start of the whole export, for the elapsed-time progress lines.
     start: Instant,
@@ -1579,6 +1690,7 @@ fn export_level(
         num_levels,
         crs,
         published,
+        feature_id,
         options,
         start,
     } = *level;
@@ -1595,6 +1707,7 @@ fn export_level(
         zoom,
         opts: options,
         published,
+        feature_id,
         timers,
     };
     let mut tile_count = 0usize;
@@ -1736,13 +1849,20 @@ fn key_to_xy(key: u64, zoom: u8) -> (u32, u32) {
 
 /// One tile member: a feature's clipped geometry destined for the tile with
 /// key `key`, the feature's band-order sequence number (stable within-tile
-/// ordering), and the feature's MVT properties (shared across the feature's
-/// tile copies).
+/// ordering), the feature's MVT properties (shared across the feature's tile
+/// copies), and its resolved `--feature-id` (#443), if any -- also shared
+/// across every tile/zoom copy of the feature, which is what makes the id
+/// stable across tile and zoom boundaries.
 struct Member {
     key: u64,
     seq: u64,
     geom: Geometry<f64>,
     props: Arc<Vec<(String, PropertyValue)>>,
+    /// `Some` on every member when [`ExportOptions::feature_id`] is set
+    /// (every row of the file validated up front, #443); `None` when it is
+    /// not, in which case [`build_mvt`] falls back to the tile-local member
+    /// index.
+    id: Option<u64>,
 }
 
 /// One level's result from the scan pass ([`scan_all_levels`]).
@@ -1780,6 +1900,8 @@ struct LevelCtx<'a> {
     /// MVT key per schema column (#359); identity unless the file records a
     /// reserved-column rename whose source name is free again.
     published: &'a PublishedNames,
+    /// The resolved `--feature-id` column (#443), if any.
+    feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
 }
@@ -1795,6 +1917,8 @@ struct FanoutCtx<'a> {
     plans: &'a [LevelPlan],
     opts: &'a ExportOptions,
     published: &'a PublishedNames,
+    /// The resolved `--feature-id` column (#443), if any.
+    feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
 }
@@ -1968,11 +2092,19 @@ fn encode_geometry(buf: &mut Vec<u8>, g: &Geometry<f64>) {
     }
 }
 
-/// Serialize one member: key, seq, properties, geometry. Property floats spill
-/// as bit patterns for the same exactness guarantee as coordinates.
+/// Serialize one member: key, seq, feature id, properties, geometry.
+/// Property floats spill as bit patterns for the same exactness guarantee as
+/// coordinates.
 fn encode_member(buf: &mut Vec<u8>, m: &Member) {
     put_u64(buf, m.key);
     put_u64(buf, m.seq);
+    match m.id {
+        Some(id) => {
+            buf.push(1);
+            put_u64(buf, id);
+        }
+        None => buf.push(0),
+    }
     put_u32(buf, m.props.len() as u32);
     for (name, v) in m.props.iter() {
         put_u32(buf, name.len() as u32);
@@ -2136,6 +2268,11 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
 fn decode_member(cur: &mut SpillCursor<'_>) -> Result<Member, ExportError> {
     let key = cur.u64()?;
     let seq = cur.u64()?;
+    let id = match cur.u8()? {
+        0 => None,
+        1 => Some(cur.u64()?),
+        _ => return Err(spill_corrupt()),
+    };
     let n_props = cur.u32()? as usize;
     let mut props = Vec::with_capacity(n_props);
     for _ in 0..n_props {
@@ -2157,6 +2294,7 @@ fn decode_member(cur: &mut SpillCursor<'_>) -> Result<Member, ExportError> {
         seq,
         geom,
         props: Arc::new(props),
+        id,
     })
 }
 
@@ -2435,6 +2573,7 @@ fn fanout_batch_members(
         plans,
         opts,
         published,
+        feature_id,
         timers,
     } = *ctx;
     let schema = batch.schema();
@@ -2470,8 +2609,8 @@ fn fanout_batch_members(
     // charges to `spill_write` instead.
     let t_route = Instant::now();
     let flushed_before = store.flush_time;
-    let prop_cols = property_columns(&schema, geom_idx, published);
-    let routed = route_fanout_rows(batch, &prop_cols, plans, &targets, per_level, seq, store);
+    let cols = AttrColumns::new(&schema, geom_idx, published, feature_id);
+    let routed = route_fanout_rows(batch, &cols, plans, &targets, per_level, seq, store);
     let flushed = store.flush_time.saturating_sub(flushed_before);
     add_nanos(&timers.decode, t_route.elapsed().saturating_sub(flushed));
     routed
@@ -2481,12 +2620,15 @@ fn fanout_batch_members(
 /// target level.
 type RowMembers = Vec<Vec<(u64, Geometry<f64>)>>;
 
+/// A feature's MVT properties, shared across its tile members.
+type SharedProps = Arc<Vec<(String, PropertyValue)>>;
+
 /// [`fanout_batch_members`]' second half: attach each member-producing row's
 /// properties (materialized once per row, shared via `Arc`) and push its
 /// members into their `(level, wave)` store buckets, in band order.
 fn route_fanout_rows(
     batch: &RecordBatch,
-    prop_cols: &[(usize, String)],
+    cols: &AttrColumns<'_>,
     plans: &[LevelPlan],
     targets: &[usize],
     mut per_level: Vec<RowMembers>,
@@ -2501,23 +2643,13 @@ fn route_fanout_rows(
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members at any level, shared across the
     // row's members via `Arc` (as the legacy path does per wave).
-    let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
-        Vec::with_capacity(prop_cols.len());
-    for &(idx, ref name) in prop_cols {
-        extracted.push((name.clone(), extract_property_column(batch.column(idx))));
-    }
+    let attrs = cols.extract(batch);
     for row in 0..batch.num_rows() {
         if per_level.iter().all(|rows| rows[row].is_empty()) {
             *seq += 1;
             continue;
         }
-        let mut props = Vec::with_capacity(extracted.len());
-        for (name, col) in &extracted {
-            if let Some(v) = &col[row] {
-                props.push((name.clone(), v.clone()));
-            }
-        }
-        let props = Arc::new(props);
+        let (props, id) = attrs.row(row)?;
         for (ti, &k) in targets.iter().enumerate() {
             let items = std::mem::take(&mut per_level[ti][row]);
             let plan = &plans[k];
@@ -2532,6 +2664,7 @@ fn route_fanout_rows(
                         seq: *seq,
                         geom,
                         props: Arc::clone(&props),
+                        id,
                     },
                 )?;
             }
@@ -3052,30 +3185,20 @@ fn collect_wave_members(
 
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members.
-    let prop_cols = property_columns(&schema, geom_idx, ctx.published);
-    let mut extracted: Vec<(String, Vec<Option<PropertyValue>>)> =
-        Vec::with_capacity(prop_cols.len());
-    for &(idx, ref name) in &prop_cols {
-        extracted.push((name.clone(), extract_property_column(batch.column(idx))));
-    }
+    let attrs = AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id).extract(batch);
     for (row, items) in row_members.into_iter().enumerate() {
         if items.is_empty() {
             *seq += 1;
             continue;
         }
-        let mut props = Vec::with_capacity(extracted.len());
-        for (name, col) in &extracted {
-            if let Some(v) = &col[row] {
-                props.push((name.clone(), v.clone()));
-            }
-        }
-        let props = Arc::new(props);
+        let (props, id) = attrs.row(row)?;
         for (key, geom) in items {
             buckets[route_partition(wave, key)].push(Member {
                 key,
                 seq: *seq,
                 geom,
                 props: Arc::clone(&props),
+                id,
             });
         }
         *seq += 1;
@@ -4007,7 +4130,10 @@ fn build_mvt<'a>(
 ) -> Vec<u8> {
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
     for (i, m) in members.into_iter().enumerate() {
-        layer.add_feature(Some(i as u64), &m.geom, &m.props, tb);
+        // #443: a resolved `--feature-id` always wins; the no-flag default
+        // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
+        let id = m.id.unwrap_or(i as u64);
+        layer.add_feature(Some(id), &m.geom, &m.props, tb);
     }
     let mut tb_builder = TileBuilder::new();
     tb_builder.add_layer(layer.build());
@@ -4021,17 +4147,41 @@ fn build_mvt<'a>(
 /// Test-support: the pre-partitioning in-memory reference path — build every
 /// member for a fully materialized feature slice at `zoom` (unbounded key
 /// range) and encode via the production member machinery.
+///
+/// #443: resolves `opts.feature_id` directly against `f.props` (there is no
+/// Arrow schema on this path), stripping the named property out of the
+/// member's tags exactly as the production Arrow path does -- so this
+/// exercises the same "moved, not copied" contract with the same error types.
 #[cfg(test)]
-fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> Vec<EncodedTile> {
+fn encode_level_tiles(
+    features: &[Feature],
+    zoom: u8,
+    opts: &ExportOptions,
+) -> Result<Vec<EncodedTile>, ExportError> {
     let mut members = Vec::new();
     for (fi, f) in features.iter().enumerate() {
-        let props = Arc::new(f.props.clone());
+        let seq = fi as u64;
+        let id = match &opts.feature_id {
+            None => None,
+            Some(name) => Some(feature_id::feature_id_from_property(
+                find_property_value(&f.props, name),
+                name,
+                zoom,
+                seq,
+            )?),
+        };
+        let props: Vec<(String, PropertyValue)> = match &opts.feature_id {
+            Some(name) => f.props.iter().filter(|(n, _)| n != name).cloned().collect(),
+            None => f.props.clone(),
+        };
+        let props = Arc::new(props);
         for (key, geom) in feature_tile_members(&f.geom, zoom, opts, 0, u64::MAX) {
             members.push(Member {
                 key,
-                seq: fi as u64,
+                seq,
                 geom,
                 props: Arc::clone(&props),
+                id,
             });
         }
     }
@@ -4049,7 +4199,17 @@ fn encode_level_tiles(features: &[Feature], zoom: u8, opts: &ExportOptions) -> V
         )
         .expect("gzip roundtrip of just-compressed tile");
     }
-    tiles
+    Ok(tiles)
+}
+
+/// Find a named property's value in an unindexed `(name, value)` list, for
+/// the [`encode_level_tiles`] test-support path (no Arrow column to read).
+#[cfg(test)]
+fn find_property_value<'a>(
+    props: &'a [(String, PropertyValue)],
+    name: &str,
+) -> Option<&'a PropertyValue> {
+    props.iter().find(|(n, _)| n == name).map(|(_, v)| v)
 }
 
 /// Test-support: read every feature (geometry + carried properties) of a level
@@ -4399,6 +4559,15 @@ impl PublishedNames {
         self.suppressed.contains(schema_name)
     }
 
+    /// Withhold a schema column from the tiles entirely (#443: a
+    /// `--feature-id` column is moved to the feature id and must never also
+    /// publish as a regular property, so this is applied unconditionally
+    /// after resolving it -- regardless of what the ordinary property
+    /// selection already decided for that column).
+    fn suppress(&mut self, schema_name: &str) {
+        self.suppressed.insert(schema_name.to_string());
+    }
+
     /// The MVT key for a schema field name.
     fn publish<'a>(&'a self, schema_name: &'a str) -> &'a str {
         self.restored
@@ -4429,6 +4598,77 @@ fn property_columns(
         })
         .map(|(i, f)| (i, published.publish(f.name()).to_string()))
         .collect()
+}
+
+/// The columns pass 2 attaches to each member: the exportable properties
+/// ([`property_columns`]) and the resolved `--feature-id` column (#443).
+struct AttrColumns<'a> {
+    props: Vec<(usize, String)>,
+    feature_id: Option<&'a ResolvedFeatureId>,
+}
+
+impl<'a> AttrColumns<'a> {
+    fn new(
+        schema: &Schema,
+        geom_idx: usize,
+        published: &PublishedNames,
+        feature_id: Option<&'a ResolvedFeatureId>,
+    ) -> Self {
+        Self {
+            props: property_columns(schema, geom_idx, published),
+            feature_id,
+        }
+    }
+
+    /// Extract every column of one batch once, for per-row materialization.
+    fn extract(&self, batch: &RecordBatch) -> BatchAttributes<'a> {
+        BatchAttributes {
+            props: self
+                .props
+                .iter()
+                .map(|&(idx, ref name)| (name.clone(), extract_property_column(batch.column(idx))))
+                .collect(),
+            ids: self.feature_id.map(|fid| {
+                let ids = feature_id_values(batch.column(fid.idx))
+                    .map(|v| v.into_iter().map(Result::ok).collect())
+                    .unwrap_or_default();
+                (fid, ids)
+            }),
+        }
+    }
+}
+
+/// One batch's extracted [`AttrColumns`].
+struct BatchAttributes<'a> {
+    props: Vec<(String, Vec<Option<PropertyValue>>)>,
+    /// The `--feature-id` column and its per-row ids (`None` = invalid).
+    ids: Option<(&'a ResolvedFeatureId, Vec<Option<u64>>)>,
+}
+
+impl BatchAttributes<'_> {
+    /// Row `row`'s properties (shared across its members via `Arc`) and its
+    /// `--feature-id`, if one is set.
+    fn row(&self, row: usize) -> Result<(SharedProps, Option<u64>), ExportError> {
+        let id = match &self.ids {
+            None => None,
+            // `validate_feature_id_column` already vouched for every row of
+            // the file, so this only fires if the file changed underneath
+            // the export.
+            Some((fid, ids)) => Some(ids.get(row).copied().flatten().ok_or_else(|| {
+                ExportError::Arrow(arrow_schema::ArrowError::InvalidArgumentError(format!(
+                    "--feature-id column {:?} holds an invalid value that the up-front check \
+                     did not see; was the overview file modified during the export?",
+                    fid.name
+                )))
+            })?),
+        };
+        let props = self
+            .props
+            .iter()
+            .filter_map(|(name, col)| col[row].as_ref().map(|v| (name.clone(), v.clone())))
+            .collect();
+        Ok((Arc::new(props), id))
+    }
 }
 
 /// MVT-encodable Arrow scalar types.
@@ -5548,6 +5788,7 @@ mod tests {
             seq: 0,
             geom: geom.clone(),
             props: Arc::new(Vec::new()),
+            id: None,
         };
         build_mvt(std::iter::once(&m), &tb, opts)
     }
@@ -6603,7 +6844,7 @@ mod tests {
 
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let feats = read_level_features(&reader, 0, Crs::Epsg4326).unwrap();
-        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default());
+        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default()).unwrap();
         assert_eq!(tiles.len(), 1);
 
         let decoded = decode_tile(&tiles[0].data);
@@ -6666,7 +6907,7 @@ mod tests {
         assert_eq!(feats.len(), 2);
 
         // Level 0 -> zoom 2. Two far-apart points => two distinct tiles.
-        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default());
+        let tiles = encode_level_tiles(&feats, 2, &ExportOptions::default()).unwrap();
         assert_eq!(tiles.len(), 2, "two far-apart points => two tiles");
         for t in &tiles {
             assert_eq!(t.feature_count, 1);
@@ -6711,7 +6952,7 @@ mod tests {
 
         let opts = ExportOptions::default();
         // Level 1 -> zoom 4.
-        let tiles = encode_level_tiles(&feats, 4, &opts);
+        let tiles = encode_level_tiles(&feats, 4, &opts).unwrap();
         assert!(tiles.len() >= 2, "wide line must span multiple tiles");
         let extent = opts.extent as i32;
         let slack = extent * opts.tile_buffer as i32 / 256 + 4;
@@ -6754,7 +6995,7 @@ mod tests {
             props: vec![],
         }];
         let opts = ExportOptions::default();
-        let tiles = encode_level_tiles(&feats, 4, &opts);
+        let tiles = encode_level_tiles(&feats, 4, &opts).unwrap();
         assert_eq!(tiles.len(), 1, "fully-contained feature => exactly 1 tile");
         assert_eq!(tiles[0].feature_count, 1);
 
@@ -6764,6 +7005,7 @@ mod tests {
             seq: 0,
             geom: poly.clone(),
             props: Arc::new(vec![]),
+            id: None,
         };
         let expected = build_mvt([&member], &tc.bounds(), &opts);
         assert_eq!(
@@ -6782,7 +7024,7 @@ mod tests {
             props: vec![],
         }];
         let opts = ExportOptions::default();
-        let tiles = encode_level_tiles(&feats, 4, &opts);
+        let tiles = encode_level_tiles(&feats, 4, &opts).unwrap();
         assert!(tiles.len() >= 2, "seam-crossing line must span tiles");
         let extent = opts.extent as i32;
         // The buffer is in TILE PIXELS; in MVT units that is
@@ -6827,7 +7069,7 @@ mod tests {
             tile_size_limit: None,
             ..Default::default()
         };
-        let none = encode_level_tiles(&feats, 6, &no_limit);
+        let none = encode_level_tiles(&feats, 6, &no_limit).unwrap();
         assert!(none.iter().all(|t| !t.oversized));
         let full_count: usize = none.iter().map(|t| t.feature_count).sum();
 
@@ -6836,7 +7078,7 @@ mod tests {
             tile_size_limit: Some(64),
             ..Default::default()
         };
-        let limited = encode_level_tiles(&feats, 6, &opts);
+        let limited = encode_level_tiles(&feats, 6, &opts).unwrap();
         assert!(
             limited.iter().any(|t| t.oversized),
             "tiny --tile-size-limit must trip the valve"
@@ -6866,6 +7108,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(x, y)),
             props: Arc::new(Vec::new()),
+            id: None,
         }
     }
 
@@ -6879,6 +7122,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)),
             props: Arc::new(vec![("level".to_string(), PropertyValue::Double(level))]),
+            id: None,
         }
     }
 
@@ -7034,6 +7278,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(0.0, 0.0)),
             props: Arc::new(vec![("level".to_string(), PropertyValue::Double(level))]),
+            id: None,
         };
         // Tile 1's low value must not migrate ahead of tile 0's high value.
         let mut members = vec![mk(1, 0, 0.1), mk(0, 1, 0.9), mk(0, 2, 0.2)];
@@ -7063,6 +7308,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(0.0, 0.0)),
             props: Arc::new(vec![("n".to_string(), v)]),
+            id: None,
         };
         let members = vec![
             mk(0, PropertyValue::Int(10)),
@@ -7140,6 +7386,7 @@ mod tests {
                     seq: n as u64,
                     geom: Geometry::LineString(LineString::from(coords)),
                     props: Arc::new(Vec::new()),
+                    id: None,
                 }
             })
             .collect();
@@ -7246,6 +7493,7 @@ mod tests {
                     seq: i,
                     geom: Geometry::LineString(coords.into_iter().collect()),
                     props: Arc::new(vec![("level".to_string(), PropertyValue::Double(i as f64))]),
+                    id: None,
                 }
             })
             .collect();
@@ -7376,11 +7624,16 @@ mod tests {
             ("b".to_string(), PropertyValue::Bool(true)),
         ];
         for (i, g) in geoms.into_iter().enumerate() {
+            // #443: every other member carries a `--feature-id` value, so the
+            // roundtrip covers both `Some` and `None` through the spill wire
+            // format.
+            let id = (i % 2 == 0).then_some(u64::MAX - 7 - i as u64);
             let m = Member {
                 key: tile_key(7, 11, 5) + i as u64,
                 seq: u64::MAX - i as u64,
                 geom: g,
                 props: Arc::new(props.clone()),
+                id,
             };
             let mut buf = Vec::new();
             encode_member(&mut buf, &m);
@@ -7389,6 +7642,10 @@ mod tests {
             assert!(cur.is_empty(), "trailing bytes after decode (geometry {i})");
             assert_eq!(back.key, m.key);
             assert_eq!(back.seq, m.seq);
+            assert_eq!(
+                back.id, m.id,
+                "feature id must survive the spill (geometry {i})"
+            );
             assert_eq!(*back.props, *m.props);
             let mut buf2 = Vec::new();
             encode_member(&mut buf2, &back);
@@ -7413,6 +7670,7 @@ mod tests {
             seq,
             geom: Geometry::Point(Point::new(seq as f64, -1.0)),
             props: Arc::new(vec![("id".to_string(), PropertyValue::Int(seq as i64))]),
+            id: None,
         };
         store.push(0, 0, mk(0, 0)).unwrap();
         store.push(0, 1, mk(1, 1)).unwrap();
@@ -8406,5 +8664,333 @@ mod tests {
             detect_crs(utm.path()),
             Err(ExportError::UnsupportedCrs { .. })
         ));
+    }
+
+    // ========================================================================
+    // `--feature-id` (#443): stable MVT feature ids
+    // ========================================================================
+    // Value conversion and column resolution are unit-tested in
+    // `export/feature_id.rs`; these exercise the whole export.
+
+    /// The encode path: a feature's `--feature-id` value becomes the MVT
+    /// feature id at every zoom it is encoded at, and the id column is never
+    /// also published as a regular tag.
+    #[test]
+    fn feature_id_reaches_the_decoded_tile_at_every_zoom_and_is_not_duplicated() {
+        let feats = vec![
+            Feature {
+                geom: Geometry::Point(Point::new(-120.0, 40.0)),
+                props: vec![
+                    ("id".to_string(), PropertyValue::Int(4242)),
+                    ("name".to_string(), PropertyValue::String("a".to_string())),
+                ],
+            },
+            Feature {
+                geom: Geometry::Point(Point::new(120.0, -40.0)),
+                props: vec![
+                    ("id".to_string(), PropertyValue::UInt(7)),
+                    ("name".to_string(), PropertyValue::String("b".to_string())),
+                ],
+            },
+        ];
+        let opts = ExportOptions {
+            feature_id: Some("id".to_string()),
+            ..Default::default()
+        };
+        for zoom in [2u8, 4u8] {
+            let tiles = encode_level_tiles(&feats, zoom, &opts).unwrap();
+            let mut seen_ids: Vec<u64> = Vec::new();
+            for t in &tiles {
+                let decoded = decode_tile(&t.data);
+                let keys = &decoded.layers[0].keys;
+                for f in &decoded.layers[0].features {
+                    seen_ids.push(f.id.expect("feature-id column must produce an MVT id"));
+                    let tag_names: Vec<&str> = f
+                        .tags
+                        .iter()
+                        .step_by(2)
+                        .map(|&k| keys[k as usize].as_str())
+                        .collect();
+                    assert!(
+                        !tag_names.contains(&"id"),
+                        "the feature-id column must not also be a tile property at z{zoom}"
+                    );
+                    assert!(
+                        tag_names.contains(&"name"),
+                        "other properties must still be published at z{zoom}"
+                    );
+                }
+            }
+            seen_ids.sort_unstable();
+            assert_eq!(
+                seen_ids,
+                vec![7, 4242],
+                "both feature ids present at z{zoom}"
+            );
+        }
+    }
+
+    fn two_point_fixture(path: &Path) {
+        write_fixture(
+            path,
+            &[(
+                vec![1, 2],
+                vec![
+                    Geometry::Point(Point::new(-120.0, 40.0)),
+                    Geometry::Point(Point::new(120.0, -40.0)),
+                ],
+            )],
+        );
+    }
+
+    fn export_with_feature_id(
+        input: &Path,
+        opts: ExportOptions,
+    ) -> Result<ExportReport, ExportError> {
+        let out = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(input, out.path(), &opts)
+    }
+
+    /// An id column also named in `--feature-order` is rejected up front
+    /// rather than silently breaking the sort.
+    #[test]
+    fn feature_id_conflicts_with_feature_order_on_the_same_column() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        two_point_fixture(tmp.path());
+        let err = export_with_feature_id(
+            tmp.path(),
+            ExportOptions {
+                feature_id: Some("id".to_string()),
+                feature_order: FeatureOrder::Column {
+                    name: "id".to_string(),
+                    descending: false,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ExportError::FeatureIdColumn {
+                column,
+                reason: FeatureIdColumnProblem::ConflictsWithFeatureOrder,
+            } if column == "id"
+        ));
+    }
+
+    /// An unknown column and a non-integer column (the fixture's string
+    /// `name`) are clear errors, not a silent fallback.
+    #[test]
+    fn feature_id_unknown_or_non_integer_column_is_rejected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        two_point_fixture(tmp.path());
+        let with = |name: &str| ExportOptions {
+            feature_id: Some(name.to_string()),
+            ..Default::default()
+        };
+        let err = export_with_feature_id(tmp.path(), with("nope")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExportError::FeatureIdColumn {
+                    column,
+                    reason: FeatureIdColumnProblem::NotFound { available },
+                } if column == "nope" && available == "\"id\", \"name\""
+            ),
+            "{err:?}"
+        );
+        let err = export_with_feature_id(tmp.path(), with("name")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExportError::FeatureIdColumn {
+                    column,
+                    reason: FeatureIdColumnProblem::NotInteger { .. },
+                } if column == "name"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("gpio or DuckDB"), "{err}");
+    }
+
+    /// `--feature-id` naming a column also listed in `--exclude-property`
+    /// still works: tippecanoe extracts the id attribute before its own
+    /// filter runs, so this must be a harmless no-op, not an error.
+    #[test]
+    fn feature_id_column_named_in_exclude_property_still_works() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        two_point_fixture(tmp.path());
+        let report = export_with_feature_id(
+            tmp.path(),
+            ExportOptions {
+                feature_id: Some("id".to_string()),
+                properties: PropertySelection {
+                    exclude: vec!["id".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(report.total_tiles > 0);
+    }
+
+    /// Write an overview whose `id` column is nullable Int64, one batch per
+    /// level, in `mode`, with two-row row groups (so several row groups per
+    /// level, some of which the statistics short-circuit can skip).
+    fn write_nullable_id_fixture(path: &Path, mode: Mode, levels: &[Vec<Option<i64>>]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, false),
+            geometry_field(),
+        ]));
+        let specs: Vec<LevelSpec> = (0..levels.len())
+            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
+            .collect();
+        let mut opts = OverviewWriterOptions::new(mode, specs);
+        opts.max_row_group_size = 2;
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        let mut n = 0usize;
+        for (k, ids) in levels.iter().enumerate() {
+            let geoms: Vec<Geometry<f64>> = (0..ids.len())
+                .map(|i| {
+                    let t = (n + i) as f64;
+                    Geometry::Point(Point::new(-150.0 + t * 7.0, -60.0 + t * 5.0))
+                })
+                .collect();
+            n += ids.len();
+            let names: Vec<String> = (0..ids.len()).map(|i| format!("f{k}_{i}")).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(build_geometry_array(&geoms).to_array_ref()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(k, Some(ids.len()), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap();
+    }
+
+    /// S2-2: a bad id anywhere in the file -- here in the FINEST level --
+    /// fails the export before the output is created, naming the true
+    /// overview-file row and its level, in both modes and on both pass-2
+    /// engines (the partitioning single-read fan-out and the legacy per-wave
+    /// read).
+    #[test]
+    fn feature_id_bad_value_fails_up_front_with_the_overview_row_and_level() {
+        let good = |base: i64, n: i64| (base..base + n).map(Some).collect::<Vec<_>>();
+        let cases: [(Option<i64>, InvalidFeatureIdReason); 2] = [
+            (None, InvalidFeatureIdReason::Null),
+            (
+                Some(-9),
+                InvalidFeatureIdReason::Negative {
+                    value: "-9".to_string(),
+                },
+            ),
+        ];
+        for mode in [Mode::Duplicating, Mode::Partitioning] {
+            for (bad, reason) in cases.clone() {
+                // Level 0: 3 rows, level 1: 4 rows, level 2: 5 rows with the
+                // bad value at index 3 => overview-file row 3 + 4 + 3 = 10.
+                let mut finest = good(100, 5);
+                finest[3] = bad;
+                let levels = vec![good(0, 3), good(10, 4), finest];
+                let dir = tempfile::tempdir().unwrap();
+                let input = dir.path().join("ov.parquet");
+                write_nullable_id_fixture(&input, mode, &levels);
+                let opts = ExportOptions {
+                    feature_id: Some("id".to_string()),
+                    ..Default::default()
+                };
+                for legacy in [false, true] {
+                    let out = dir.path().join(format!("out-{legacy}.pmtiles"));
+                    let err = export_pmtiles_impl(
+                        &input,
+                        &out,
+                        &opts,
+                        DEFAULT_PARTITION_TARGET,
+                        legacy,
+                        None,
+                    )
+                    .unwrap_err();
+                    match &err {
+                        ExportError::InvalidFeatureId {
+                            column,
+                            level,
+                            zoom,
+                            row,
+                            reason: got,
+                        } => {
+                            assert_eq!(column, "id");
+                            assert_eq!((*level, *zoom, *row), (2, 6, 10), "{mode:?}: {err}");
+                            assert_eq!(got, &reason);
+                        }
+                        other => panic!("{mode:?}: unexpected {other:?}"),
+                    }
+                    assert!(err.to_string().contains("row 10 of the overview file"));
+                    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name().into_string().unwrap())
+                        .filter(|n| n.starts_with("out-"))
+                        .collect();
+                    assert!(
+                        leftovers.is_empty(),
+                        "{mode:?}: nothing may be written before the check fails: {leftovers:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same fixture with only valid ids exports, and the ids survive the
+    /// partitioning single-read fan-out under both member-store backings
+    /// (the spill codec carries them) byte-identically to the legacy path.
+    #[test]
+    fn feature_id_partitioning_single_read_matches_legacy_under_both_backings() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        partitioning_equivalence_fixture(tin.path());
+        let opts = ExportOptions {
+            feature_id: Some("id".to_string()),
+            partition_wave: 2,
+            ..Default::default()
+        };
+        let t_legacy = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles_impl(tin.path(), t_legacy.path(), &opts, 1, true, None).unwrap();
+        let legacy_bytes = std::fs::read(t_legacy.path()).unwrap();
+        let t_plain = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles_impl(
+            tin.path(),
+            t_plain.path(),
+            &ExportOptions {
+                feature_id: None,
+                ..opts.clone()
+            },
+            1,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read(t_plain.path()).unwrap(),
+            legacy_bytes,
+            "--feature-id must change the tiles (ids + the id tag moved out)"
+        );
+        for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+            let t_new = tempfile::NamedTempFile::new().unwrap();
+            export_pmtiles_impl(tin.path(), t_new.path(), &opts, 1, false, Some(backing)).unwrap();
+            assert_eq!(
+                std::fs::read(t_new.path()).unwrap(),
+                legacy_bytes,
+                "single-read ({backing:?}) diverges from legacy with --feature-id"
+            );
+        }
     }
 }

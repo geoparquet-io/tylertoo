@@ -124,6 +124,7 @@ stored, reusable level.
 | tiny-polygon reduction | `--collapse-square` | Area accumulator per 32×GSD patch of the level (tile-less), plus a per-feature dither for write-time collapses |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |
+| `--use-attribute-for-id` | `--feature-id` | Integer or `DECIMAL(p,0)` columns only (string and float ids are rejected, not parsed); null or negative values are errors, not warnings. Without it, ids are tile-local. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids---feature-id) |
 
 ### What only tylertoo does
 
