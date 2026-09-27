@@ -5,10 +5,13 @@
 //
 // Run with: cargo bench --package tylertoo-core -- clipping
 
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use geo::{Coord, LineString, Polygon};
+use geo::{Coord, Geometry, LineString, Point, Polygon};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -180,7 +183,7 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
     let poly = match load_antarctica_polygon() {
         Some(p) => p,
         None => {
-            eprintln!("Warning: Antarctica fixture not found, skipping benchmark");
+            fixtures::missing("clipping", "antarctica-polygon.wkb");
             return;
         }
     };
@@ -212,6 +215,65 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
     group.finish();
 }
 
+/// A mixed batch of points, lines and polygons at varied sizes, matching
+/// the feature-type distribution `overview::export` actually feeds
+/// `clip_geometry` per tile (#448 "export clip mix"): mostly small
+/// point/line features with a handful of larger polygons.
+fn build_export_mix(n: usize) -> Vec<Geometry<f64>> {
+    let bounds = TileBounds::new(-67.5, -66.51, -56.25, -61.61);
+    let center = (
+        (bounds.lng_min + bounds.lng_max) / 2.0,
+        (bounds.lat_min + bounds.lat_max) / 2.0,
+    );
+    (0..n)
+        .map(|i| match i % 10 {
+            0..=5 => Geometry::Point(Point::new(
+                center.0 + (i as f64 % 7.0) - 3.5,
+                center.1 + (i as f64 % 5.0) - 2.5,
+            )),
+            6..=8 => {
+                let dx = (i as f64 % 4.0) - 2.0;
+                Geometry::LineString(LineString::new(vec![
+                    Coord {
+                        x: center.0 + dx,
+                        y: center.1,
+                    },
+                    Coord {
+                        x: center.0 + dx + 0.5,
+                        y: center.1 + 0.5,
+                    },
+                    Coord {
+                        x: center.0 + dx + 1.0,
+                        y: center.1 - 0.3,
+                    },
+                ]))
+            }
+            _ => Geometry::Polygon(generate_circle_polygon(50, center, 5.0 + (i as f64 % 3.0))),
+        })
+        .collect()
+}
+
+/// Benchmark `clip_geometry` over a realistic mixed feature batch (#448).
+fn bench_export_clip_mix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("export_clip_mix");
+    let bounds = TileBounds::new(-67.5, -66.51, -56.25, -61.61);
+    let buffer = 0.0;
+
+    for n in [200usize, 2_000].iter() {
+        let batch = build_export_mix(*n);
+        group.throughput(Throughput::Elements(*n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &batch, |b, batch| {
+            b.iter(|| {
+                for geom in batch {
+                    black_box(clip_geometry(black_box(geom), black_box(&bounds), buffer));
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sutherland_hodgman,
@@ -219,5 +281,6 @@ criterion_group!(
     bench_wide_polygon,
     bench_clip_geometry,
     bench_antarctica_polygon,
+    bench_export_clip_mix,
 );
 criterion_main!(benches);

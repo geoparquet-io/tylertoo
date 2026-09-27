@@ -132,6 +132,9 @@ fn convert(
         // and `export-pmtiles --tile-range`.
         tile_range: None,
         zoom_ceiling: None,
+        // #443: not exposed on this deprecated one-shot facade; use
+        // `overview()` + `export_pmtiles(..., feature_id=...)` instead.
+        feature_id: None,
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -873,6 +876,23 @@ fn overview(
 ///         level present. Defaults to None (the coarsest
 ///         level's zoom). ``convert()`` passes its own ``min_zoom`` here, so
 ///         pass the same value to match what it writes.
+///     feature_id (str, optional): Carry a property column through as the
+///         MVT feature ``id`` on every tile the feature appears in, at every
+///         zoom (#443; tippecanoe's ``--use-attribute-for-id``), so MapLibre
+///         ``setFeatureState`` (hover, selection, joins) keys correctly
+///         across tile and zoom boundaries without ``promoteId``. Matched against
+///         the property name as the tile publishes it. The column must be an
+///         integer type (or ``DECIMAL(p,0)``) and every row of the overview
+///         file a non-null value in ``0..=2**64-1``; the whole column is
+///         checked before any tile is written, and a violation raises
+///         ``RuntimeError`` naming the column and the overview file's row
+///         and level. String and float ids are rejected (unlike tippecanoe):
+///         cast them to an integer first. The column is moved to the id,
+///         never also published as a regular property. Clusters carry their
+///         representative's id and coalesced lines their highest-priority
+///         member's; duplicate ids are not checked. Defaults to None, which
+///         keeps the tile-local member index (unique only within a single
+///         tile/zoom pair). Not available on ``convert()``.
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
@@ -890,7 +910,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, feature_id=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -904,6 +924,7 @@ fn export_pmtiles(
     partition_wave: usize,
     feature_order: &str,
     min_zoom: Option<u8>,
+    feature_id: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
@@ -922,6 +943,7 @@ fn export_pmtiles(
         // and `export-pmtiles --tile-range`.
         tile_range: None,
         zoom_ceiling: None,
+        feature_id,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

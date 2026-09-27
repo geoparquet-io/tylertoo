@@ -1341,7 +1341,7 @@ pub fn tylertoo_core::overview::convert::read_workers_ceiling() -> usize
 pub fn tylertoo_core::overview::convert::resolve_in_flight_batches(usize) -> usize
 pub fn tylertoo_core::overview::convert::resolve_read_workers(usize) -> usize
 pub mod tylertoo_core::overview::export
-pub enum tylertoo_core::overview::export::ExportError
+#[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling
@@ -1350,6 +1350,15 @@ pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::d
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declared: u8
+pub tylertoo_core::overview::export::ExportError::FeatureIdColumn
+pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::column: alloc::string::String
+pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::reason: tylertoo_core::overview::export::FeatureIdColumnProblem
+pub tylertoo_core::overview::export::ExportError::InvalidFeatureId
+pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::column: alloc::string::String
+pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::level: usize
+pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::reason: tylertoo_core::overview::export::InvalidFeatureIdReason
+pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::row: u64
+pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::zoom: u8
 pub tylertoo_core::overview::export::ExportError::Io(core::io::error::Error)
 pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive
 pub tylertoo_core::overview::export::ExportError::LevelGsdNotFinitePositive::gsd: f64
@@ -1406,6 +1415,31 @@ impl core::marker::Unpin for tylertoo_core::overview::export::ExportError
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ExportError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ExportError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportError
+#[non_exhaustive] pub enum tylertoo_core::overview::export::FeatureIdColumnProblem
+pub tylertoo_core::overview::export::FeatureIdColumnProblem::Accumulated
+pub tylertoo_core::overview::export::FeatureIdColumnProblem::Accumulated::op: alloc::string::String
+pub tylertoo_core::overview::export::FeatureIdColumnProblem::ConflictsWithFeatureOrder
+pub tylertoo_core::overview::export::FeatureIdColumnProblem::NotFound
+pub tylertoo_core::overview::export::FeatureIdColumnProblem::NotFound::available: alloc::string::String
+pub tylertoo_core::overview::export::FeatureIdColumnProblem::NotInteger
+pub tylertoo_core::overview::export::FeatureIdColumnProblem::NotInteger::data_type: alloc::string::String
+impl core::clone::Clone for tylertoo_core::overview::export::FeatureIdColumnProblem
+pub fn tylertoo_core::overview::export::FeatureIdColumnProblem::clone(&self) -> tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::cmp::Eq for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::cmp::PartialEq for tylertoo_core::overview::export::FeatureIdColumnProblem
+pub fn tylertoo_core::overview::export::FeatureIdColumnProblem::eq(&self, &tylertoo_core::overview::export::FeatureIdColumnProblem) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::export::FeatureIdColumnProblem
+pub fn tylertoo_core::overview::export::FeatureIdColumnProblem::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::export::FeatureIdColumnProblem
+pub fn tylertoo_core::overview::export::FeatureIdColumnProblem::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::marker::Freeze for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::marker::Send for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::marker::Sync for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::marker::Unpin for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::FeatureIdColumnProblem
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::FeatureIdColumnProblem
 pub enum tylertoo_core::overview::export::FeatureOrder
 pub tylertoo_core::overview::export::FeatureOrder::Column
 pub tylertoo_core::overview::export::FeatureOrder::Column::descending: bool
@@ -1431,8 +1465,32 @@ impl core::marker::Unpin for tylertoo_core::overview::export::FeatureOrder
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::FeatureOrder
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::FeatureOrder
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::FeatureOrder
+#[non_exhaustive] pub enum tylertoo_core::overview::export::InvalidFeatureIdReason
+pub tylertoo_core::overview::export::InvalidFeatureIdReason::Negative
+pub tylertoo_core::overview::export::InvalidFeatureIdReason::Negative::value: alloc::string::String
+pub tylertoo_core::overview::export::InvalidFeatureIdReason::Null
+pub tylertoo_core::overview::export::InvalidFeatureIdReason::TooLarge
+pub tylertoo_core::overview::export::InvalidFeatureIdReason::TooLarge::value: alloc::string::String
+impl core::clone::Clone for tylertoo_core::overview::export::InvalidFeatureIdReason
+pub fn tylertoo_core::overview::export::InvalidFeatureIdReason::clone(&self) -> tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::cmp::Eq for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::cmp::PartialEq for tylertoo_core::overview::export::InvalidFeatureIdReason
+pub fn tylertoo_core::overview::export::InvalidFeatureIdReason::eq(&self, &tylertoo_core::overview::export::InvalidFeatureIdReason) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::export::InvalidFeatureIdReason
+pub fn tylertoo_core::overview::export::InvalidFeatureIdReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::export::InvalidFeatureIdReason
+pub fn tylertoo_core::overview::export::InvalidFeatureIdReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::marker::Freeze for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::marker::Send for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::marker::Sync for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::marker::Unpin for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::InvalidFeatureIdReason
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::InvalidFeatureIdReason
 pub struct tylertoo_core::overview::export::ExportOptions
 pub tylertoo_core::overview::export::ExportOptions::extent: u32
+pub tylertoo_core::overview::export::ExportOptions::feature_id: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::export::ExportOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
 pub tylertoo_core::overview::export::ExportOptions::layer_name: alloc::string::String
 pub tylertoo_core::overview::export::ExportOptions::min_zoom: core::option::Option<u8>

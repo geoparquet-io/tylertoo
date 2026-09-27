@@ -77,6 +77,13 @@ Generate PMTiles vector tiles (the default pipeline)
    MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a nested choropleth usually wants — with ties kept in input order so output stays deterministic.
 
   Default value: `input`
+* `--feature-id <COLUMN>` — Carry a property column through as the MVT feature `id` on every tile the feature appears in, at every zoom (#443; tippecanoe's `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover, selection, joins) keys correctly across tile and zoom boundaries.
+
+   Matched against the property name as the tile publishes it -- the same naming `--feature-order` / `--include-property` / `--exclude-property` use. The column must survive the convert step's own property selection to reach the export that reads it (naming a column `--exclude-property` already dropped is an error, same as `--feature-order`); an export-time `--include-property` / `--exclude-property` naming this column is instead a harmless no-op, since the id is always moved out of the properties regardless.
+
+   The column must be an integer type (or DECIMAL(p,0)) and every row of the overview file must hold a non-null value in 0..=u64::MAX (MVT feature ids are `uint64`). The whole column is checked before any tile is written; a violation fails naming the column, the overview file's row (not the source file's) and its level. String and float ids are rejected, unlike tippecanoe: cast them to an integer first (e.g. with gpio or DuckDB). The column is moved to the id, never also published as a regular property (tippecanoe's behaviour) -- repeat it under two names in the source data if both are wanted.
+
+   It cannot also be an --accumulate-attribute column. Clusters carry their representative's id, coalesced lines their highest-priority member's; duplicate ids are not checked. Unset (the default) keeps the tile-local member index -- unique only within a single tile/zoom pair.
 * `--report <PATH>` — Write a JSON report to this path: a combined object with a `convert` section (the overview build, matching `overview --report`) and an `export` section (the PMTiles export, matching `export-pmtiles --report`), so the one-step run captures both halves the two-step chain would
 * `--keep-overview <PATH>` — Write the intermediate overview GeoParquet to PATH and RETAIN it, instead of a temp file removed after the export — one run then yields both artifacts: the reusable multi-resolution overview (queryable, re-exportable, see `tylertoo overview`) and the PMTiles. The PMTiles output is identical either way. Without this flag the intermediate is written to --spill-dir if given, else $TMPDIR if set, else the output directory, and deleted once the export finishes (see the note on the materialized intermediate under --spill-dir)
 * `--shard <I/N|coarse>` — Build one job of a sharded fleet (#498): `I/N` for data shard I of N, or `coarse` for the job that owns the zooms coarser than the pivot.
@@ -549,6 +556,13 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
    MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a nested choropleth usually wants — with ties kept in input order so output stays deterministic.
 
   Default value: `input`
+* `--feature-id <COLUMN>` — Carry a property column through as the MVT feature `id` on every tile the feature appears in, at every zoom (#443; tippecanoe's `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover, selection, joins) keys correctly across tile and zoom boundaries.
+
+   Matched against the property name as the tile publishes it -- the same naming `--feature-order` / `--include-property` / `--exclude-property` use -- and it always wins over those flags naming the same column (harmless no-op, never an error).
+
+   The column must be an integer type (or DECIMAL(p,0)) and every row of the overview file must hold a non-null value in 0..=u64::MAX (MVT feature ids are `uint64`). The whole column is checked before any tile is written; a violation fails naming the column, the overview file's row (not the source file's) and its level. String and float ids are rejected, unlike tippecanoe: cast them to an integer first (e.g. with gpio or DuckDB). The column is moved to the id, never also published as a regular property (tippecanoe's behaviour) -- repeat it under two names in the source data if both are wanted.
+
+   Clusters carry their representative's id, coalesced lines their highest-priority member's; duplicate ids are not checked. Unset (the default) keeps the tile-local member index -- unique only within a single tile/zoom pair.
 * `--tile-range <LO..HI>` — Emit only the tiles in this PMTiles tile-id range (#498): `LO..HI`, two tile ids AT THE SAME ZOOM.
 
    That zoom is the pivot. The range then owns every descendant of those tiles at every deeper zoom — a subtree's ids are contiguous on the Hilbert curve, so the restriction is an exact interval test at each zoom, not a bounding approximation. Tiles COARSER than the pivot are outside the range and are not emitted.

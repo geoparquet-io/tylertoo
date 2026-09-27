@@ -132,14 +132,100 @@ new test up automatically.
 
 ### Benchmarks
 
+Criterion coverage of the measured hot paths lives in `crates/core/benches/`.
+The real-data benches read `tests/fixtures/realdata/` (fetch it with the
+`gh release download fixtures-v1 ...` step above). Locally, a bench whose
+fixture is missing prints a message and skips; with
+`TYLERTOO_BENCH_REQUIRE_FIXTURES=1` (set in CI's regression gate) it panics
+instead, so a gated run can't silently compare nothing.
+
+| Bench | Covers |
+|-------|--------|
+| `pass1_decode` | Arrow columnar decode: `from_arrow_array` + `extract_geometries_from_array` (the pass-1 scan's per-chunk decode) |
+| `assign` | `assign_levels_bounded` + `apply_density_budget` at a fixed, CI-sized feature count (the thread-*scaling* curve at dataset scale is `assign_scaling.rs`, a separate manual harness — see its own doc comment) |
+| `simplify_cascade` | `simplify_cascade` over real polygons through a 10-level fine→coarse chain with a zoom-band `Point` tail (#218, #317) |
+| `mvt_encode` | `encode_polygon` (the #383/#461 quantize → noding-sweep → clean → orient path, on rings under the 4096-edge noding cap; `antarctica_316k_over_cap` times the over-cap early-out) and `LayerBuilder::add_feature`/`build` (the #559 alloc-free value-dedup path) |
+| `clipping` | Sutherland-Hodgman vs `i_overlay`, plus an `export_clip_mix` group matching the point/line/polygon distribution `overview::export` actually clips per tile |
+| `bbox_containment` | Bbox containment fast-path checks |
+| `tile_compress_dedup` | Per-tile gzip compression and the XXH3 tile-content dedup cache |
+
+Run one:
+
 ```bash
 cargo bench --package tylertoo-core --bench clipping
-cargo bench --package tylertoo-core --bench bbox_containment
+cargo bench --package tylertoo-core --bench mvt_encode
 open target/criterion/report/index.html
 ```
 
+The gated set is defined once, in `scripts/criterion_compare.sh`
+(`scripts/criterion_compare.sh --list` prints it). Run all of them (what CI's
+`bench` job runs):
+
+```bash
+for b in $(scripts/criterion_compare.sh --list); do
+  cargo bench --package tylertoo-core --bench "$b"
+done
+```
+
+`assign_scaling` (`cargo bench --package tylertoo-core --bench assign_scaling`)
+is a separate, non-criterion wall-clock harness for the thread-count scaling
+curve at dataset scale (#534) — too large and too variance-sensitive for
+criterion's repeated-sampling model. It isn't part of the regression gate
+below.
+
 The corpus-scale benchmarks (storage/access/conversion) are scripted in
 `benchmarks/overview/`; profiling is documented in `docs/PROFILING.md`.
+
+#### Criterion regression gate (#448)
+
+`.github/workflows/bench-regression.yml` runs the benches twice on one
+runner, base revision first and head second, and gates the difference. A
+baseline saved by an earlier run on another VM would mostly measure the VM;
+two runs on the same machine minutes apart are the comparison shared runners
+can support. (The #393 lesson the issue is named for: an 18% encode
+regression sailed through the old bench.yml, which only uploaded reports.)
+
+It is **not** run on every PR. It runs:
+
+- on a PR carrying the **`benchmark` label** (adding the label starts it;
+  later pushes re-run it while the label stays). Base = the merge-base with
+  the PR's base branch;
+- on `workflow_dispatch`, with an optional `base` input. Without it, a run on
+  `main` compares against the latest `v*` release tag, and a run on any other
+  branch against its merge-base with `origin/main`.
+
+There is no schedule: main against itself on a timer only measures noise.
+
+`scripts/criterion_compare.sh <base-rev>` does the two runs. It checks the
+base out into a temporary git worktree, runs the benches there with
+`--save-baseline base`, deletes every `new/` and `change/` directory, then
+runs the current checkout with `--baseline-lenient base`. `--baseline-lenient`
+matters: plain `--baseline` aborts the whole run on a bench that has no base
+result yet. Output goes to `target/criterion-compare/` (`CRITERION_HOME`),
+wiped at the start, so your normal `target/criterion/` history isn't touched
+and can't leak in.
+
+`scripts/criterion_gate.py` then reads criterion's own `change/estimates.json`
+for each bench (the relative change of the mean with its 95% bootstrap
+confidence interval):
+
+- **fail** when the CI *lower bound* of the change is >= +25%, meaning the
+  regression is at least that large even at the optimistic end of the
+  interval, so noise alone is an unlikely cause;
+- **warn** when the point estimate is >= +10%;
+- a bench with no base result (new in this change) is reported as
+  "new (no baseline)" and not gated; a bench with a base result but no head
+  result is reported as "not run at head";
+- **fail** when nothing at all was comparable: a comparison that compared
+  nothing is a broken run, not a pass.
+
+To run the same check locally:
+
+```bash
+scripts/criterion_compare.sh origin/main      # or any base revision
+uv run python scripts/criterion_gate.py --check \
+  --criterion-dir target/criterion-compare --baseline base --warn 10 --fail 25
+```
 
 ## CI Gates — and How to Run Them Locally
 
