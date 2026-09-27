@@ -1478,6 +1478,8 @@ pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declar
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::reason: tylertoo_core::overview::export::FeatureIdColumnProblem
+pub tylertoo_core::overview::export::ExportError::InvalidExtent
+pub tylertoo_core::overview::export::ExportError::InvalidExtent::extent: u32
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::level: usize
@@ -1511,6 +1513,9 @@ pub tylertoo_core::overview::export::ExportError::Reader(tylertoo_core::overview
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::finest: u8
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWide
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::buffer: u32
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::max: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
@@ -1626,6 +1631,8 @@ pub tylertoo_core::overview::export::ExportOptions::tile_buffer: u32
 pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::export::ExportOptions::zoom_ceiling: core::option::Option<u8>
+impl tylertoo_core::overview::export::ExportOptions
+pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
 impl core::clone::Clone for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::clone(&self) -> tylertoo_core::overview::export::ExportOptions
 impl core::default::Default for tylertoo_core::overview::export::ExportOptions
@@ -1692,6 +1699,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ZoomReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ZoomReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ZoomReport
 pub const tylertoo_core::overview::export::DEFAULT_TILE_SIZE_LIMIT: usize
+pub const tylertoo_core::overview::export::MAX_TILE_BUFFER_PX: u32
 pub const tylertoo_core::overview::export::PARTITION_WAVE_AUTO: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_FALLBACK_MAX: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize

@@ -103,8 +103,8 @@ Python equivalent of `tylertoo export-pmtiles`: each overview level becomes one 
 * `input` (`str`) — Input overview GeoParquet file (produced by `overview()`).
 * `output` (`str`) — Output PMTiles archive.
 * `layer_name` (`str`) — MVT layer name written into every tile and the archive metadata. Defaults to "overview".
-* `tile_buffer` (`int`) — Per-tile edge buffer in tile pixels (feature seam continuity). Defaults to 8.
-* `extent` (`int`) — MVT tile extent (tile-local resolution). Defaults to 4096.
+* `tile_buffer` (`int`) — Per-tile edge buffer in tile pixels (feature seam continuity). Defaults to 8; at most 256 (one full tile width), wider raises.
+* `extent` (`int`) — MVT tile extent (tile-local resolution). Defaults to 4096. Must be positive (0 raises); a value that is not a power of two is accepted with a warning.
 * `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single non-iterative drop pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
 * `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.
 * `partition_wave` (`int`) — Partitions processed per band read during export (the export concurrency knob). Defaults to 0, which auto-sizes via a memory-budget preflight: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with the TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive integer to override. Wider waves keep more cores busy at proportionally more peak memory. Output is byte-identical for every value (the wave is a scheduling concern).

@@ -124,6 +124,21 @@ zero_sized_map_values = "warn"
 lto = true
 codegen-units = 1
 strip = true
+# Integer overflow is a bug, not a wrap (#432): a tile compiler that silently
+# wraps writes wrong bytes, and the known bug class is "panics in debug,
+# silently wrong in release". Hot loops are float-dominated, so the cost is
+# low single-digit percent (measured on lines-portland-medium; see PR #432's
+# body). Untrusted-input boundaries still use checked_*/typed errors: a panic
+# there is a DoS, not a fix.
+overflow-checks = true
+
+# ...but only for workspace crates. `package."*"` matches non-workspace
+# (dependency) crates only, so this leaves them at Cargo's release default:
+# a third-party crate with a latent wrap that is benign for it would
+# otherwise become a hard abort of the binary and a PanicException in the
+# Python wheel, and we cannot fix or test those sites.
+[profile.release.package."*"]
+overflow-checks = false
 
 [profile.bench]
 inherits = "release"

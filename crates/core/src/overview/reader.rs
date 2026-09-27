@@ -157,30 +157,82 @@ impl OverviewReader {
     /// The largest value of integer column `name` across the whole file, read
     /// from row-group statistics alone (no data pages).
     ///
-    /// `None` when the column is absent, is not INT32/INT64, or any row group
-    /// lacks a max statistic — the caller then knows nothing and must treat
-    /// the column as carrying information. Used to recognise provenance
-    /// counters that never left 1 (#379).
+    /// `Some(v)` means the column holds `v` on every row: the fold requires
+    /// the file-wide min and max statistics to agree. `None` when the column
+    /// is absent, is not a *signed* INT32/INT64, spans more than one value,
+    /// or any non-empty row group lacks a min/max statistic or holds a null
+    /// — the caller then knows nothing and must treat the column as carrying
+    /// information. Used to recognise provenance counters that never left 1
+    /// (#379).
+    ///
+    /// The refusals exist for files the converter did not write (#399); its
+    /// own counters are signed INT32 NOT NULL with chunk statistics, so they
+    /// always fold:
+    ///
+    /// - An unsigned logical type (`UInt32` over INT32, `UInt64` over INT64)
+    ///   stores values ≥ 2^31 / 2^63 as negative physical ints, so a signed
+    ///   fold would put a row group whose real max is huge *below* one whose
+    ///   max is 1 and the caller would withhold a column that is plainly not
+    ///   1 everywhere. Reinterpreting the bits is not enough either: whether
+    ///   a writer computed the chunk min/max with unsigned ordering is a
+    ///   per-writer choice (`ColumnOrder`), and a heuristic whose only cost
+    ///   on `None` is "export the column" has no business trusting it.
+    /// - A row group with `null_count > 0` (or, for an OPTIONAL column, no
+    ///   recorded null count) may hold `{1, null}`: its max is 1, but the
+    ///   null/1 distinction is information the tiles would lose.
     pub fn int_column_max(&self, name: &str) -> Option<i64> {
+        use parquet::basic::{ConvertedType, IntType, LogicalType};
         use parquet::file::statistics::Statistics;
 
         let descr = self.metadata.file_metadata().schema_descr();
         let col_idx =
             (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name)?;
-        let mut max: Option<i64> = None;
+        let column = descr.column(col_idx);
+        let unsigned = matches!(
+            column.logical_type_ref(),
+            Some(LogicalType::Integer(IntType {
+                is_signed: false,
+                ..
+            }))
+        ) || matches!(
+            column.converted_type(),
+            ConvertedType::UINT_8
+                | ConvertedType::UINT_16
+                | ConvertedType::UINT_32
+                | ConvertedType::UINT_64
+        );
+        if unsigned {
+            return None;
+        }
+        // A definition level above zero means the leaf, or an ancestor, is
+        // OPTIONAL: the column can hold nulls, so each chunk must prove it
+        // holds none.
+        let nullable = column.max_def_level() > 0;
+
+        let mut range: Option<(i64, i64)> = None;
         for rg in 0..self.metadata.num_row_groups() {
             let rgm = self.metadata.row_group(rg);
             if rgm.num_rows() == 0 {
                 continue;
             }
-            let rg_max = match rgm.column(col_idx).statistics()? {
-                Statistics::Int32(s) => i64::from(*s.max_opt()?),
-                Statistics::Int64(s) => *s.max_opt()?,
+            let stats = rgm.column(col_idx).statistics()?;
+            if nullable && stats.null_count_opt() != Some(0) {
+                return None;
+            }
+            let (rg_min, rg_max) = match stats {
+                Statistics::Int32(s) => (i64::from(*s.min_opt()?), i64::from(*s.max_opt()?)),
+                Statistics::Int64(s) => (*s.min_opt()?, *s.max_opt()?),
                 _ => return None,
             };
-            max = Some(max.map_or(rg_max, |m| m.max(rg_max)));
+            range = Some(range.map_or((rg_min, rg_max), |(lo, hi)| {
+                (lo.min(rg_min), hi.max(rg_max))
+            }));
         }
-        max
+        // The caller reads `Some(v)` as "v on every row", so a column that
+        // spans more than one value is refused, not folded: `{0, 1}` has max
+        // 1 but says something about each row.
+        let (min, max) = range?;
+        (min == max).then_some(max)
     }
 
     /// The Arrow schema of the file (including the `level` column).
@@ -411,7 +463,7 @@ mod tests {
     use crate::overview::writer::{
         LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions,
     };
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use geo::{Geometry, LineString, Point, Polygon};
     use geoarrow::array::GeometryBuilder;
@@ -740,5 +792,220 @@ mod tests {
         // And reading returns only ids 100,101.
         let ids = read_ids(reader.read_level(1, Some(bbox)).unwrap());
         assert_eq!(ids, vec![100, 101]);
+    }
+
+    // --- int_column_max on foreign-written columns (#399) -------------------
+
+    /// One-level overview fixture whose schema is `id`, `geometry`, then the
+    /// given `field`, with `values` as that column's array. Written through
+    /// the converter's own writer so the footer is valid; the column's Arrow
+    /// type is whatever the caller passes (a pyarrow-style `UInt32`, a
+    /// nullable `Int32`, ...), which the converter itself never emits.
+    fn write_int_column_fixture(
+        path: &std::path::Path,
+        field: Field,
+        values: ArrayRef,
+    ) -> OverviewsMeta {
+        let n = values.len();
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geometry_field(),
+            field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(build_geometry_array(&ids).to_array_ref()),
+                values,
+            ],
+        )
+        .unwrap();
+        let opts =
+            OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        assert_eq!(
+            writer
+                .write_level(0, Some(n), std::iter::once(batch))
+                .unwrap(),
+            LevelWriteOutcome::Written
+        );
+        writer.finish().unwrap()
+    }
+
+    /// The signed INT32 NOT NULL column the converter writes, holding one
+    /// value throughout: the statistic is exact and the fold is what the
+    /// caller relies on.
+    #[test]
+    fn int_column_max_reads_signed_not_null_column() {
+        use arrow_array::Int32Array;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_int_column_fixture(
+            tmp.path(),
+            Field::new("n", DataType::Int32, false),
+            Arc::new(Int32Array::from(vec![3, 3, 3])),
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert_eq!(reader.int_column_max("n"), Some(3));
+        assert_eq!(reader.int_column_max("absent"), None);
+    }
+
+    /// The caller reads `Some(1)` as "1 on every row", so a column whose
+    /// values are not all the same must not fold at all: `{0, 1}` and
+    /// `{-3, 1}` both have max 1 while carrying information (#399 review).
+    /// The min is in the same chunk statistics, so the check is free.
+    #[test]
+    fn int_column_max_refuses_column_whose_min_differs_from_max() {
+        use arrow_array::Int32Array;
+        for values in [vec![0, 1], vec![-3, 1], vec![1, 3, 1]] {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            write_int_column_fixture(
+                tmp.path(),
+                Field::new("n", DataType::Int32, false),
+                Arc::new(Int32Array::from(values.clone())),
+            );
+            let reader = OverviewReader::open(tmp.path()).unwrap();
+            assert_eq!(
+                reader.int_column_max("n"),
+                None,
+                "{values:?} is not one value on every row"
+            );
+        }
+    }
+
+    /// A `UInt32` column over INT32 physical: a value >= 2^31 is a negative
+    /// i32 when read as signed, so a naive fold would report a max *below*
+    /// the real one (here: 1) and the caller would withhold a column that is
+    /// plainly not 1 everywhere. Unsigned logical types are refused outright:
+    /// whether the stored min/max were even computed with unsigned ordering
+    /// depends on the writer, so the heuristic must not trust them.
+    #[test]
+    fn int_column_max_refuses_unsigned_int32_column() {
+        use arrow_array::UInt32Array;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_int_column_fixture(
+            tmp.path(),
+            Field::new("n", DataType::UInt32, false),
+            Arc::new(UInt32Array::from(vec![1u32, 1 << 31, 1])),
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert_eq!(
+            reader.int_column_max("n"),
+            None,
+            "an unsigned column must not be folded as signed"
+        );
+    }
+
+    /// `UInt64` over INT64 physical: the same sign hazard, and a max that
+    /// does not even fit `i64`.
+    #[test]
+    fn int_column_max_refuses_unsigned_int64_column() {
+        use arrow_array::UInt64Array;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_int_column_fixture(
+            tmp.path(),
+            Field::new("n", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(vec![1u64, u64::MAX, 1])),
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert_eq!(reader.int_column_max("n"), None);
+    }
+
+    /// Even an unsigned column whose values all fit the signed range is
+    /// refused: the caller needs "provably 1 everywhere", and the type alone
+    /// says the statistic's ordering is writer-dependent.
+    #[test]
+    fn int_column_max_refuses_unsigned_column_even_when_small() {
+        use arrow_array::UInt32Array;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_int_column_fixture(
+            tmp.path(),
+            Field::new("n", DataType::UInt32, false),
+            Arc::new(UInt32Array::from(vec![1u32, 1, 1])),
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert_eq!(reader.int_column_max("n"), None);
+    }
+
+    /// A nullable column holding `{1, null}` has max 1, but it is not 1
+    /// everywhere: the null/1 distinction is information the caller would
+    /// lose. Any row group with `null_count > 0` makes the answer `None`.
+    #[test]
+    fn int_column_max_refuses_column_with_nulls() {
+        use arrow_array::Int32Array;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_int_column_fixture(
+            tmp.path(),
+            Field::new("n", DataType::Int32, true),
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(1)])),
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert_eq!(reader.int_column_max("n"), None);
+    }
+
+    /// A column declared nullable but with no nulls written is fine: the
+    /// statistic records `null_count = 0`, so the max is exact.
+    #[test]
+    fn int_column_max_accepts_nullable_column_without_nulls() {
+        use arrow_array::Int32Array;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_int_column_fixture(
+            tmp.path(),
+            Field::new("n", DataType::Int32, true),
+            Arc::new(Int32Array::from(vec![Some(2), Some(2), Some(2)])),
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert_eq!(reader.int_column_max("n"), Some(2));
+    }
+
+    /// A foreign writer that recorded no column statistics: there is no max
+    /// to fold, so the answer is `None` (the caller then treats the column as
+    /// carrying information).
+    #[test]
+    fn int_column_max_is_none_without_statistics() {
+        use arrow_array::Int32Array;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+        // Borrow a valid one-level footer from the converter's own writer...
+        let donor = tempfile::NamedTempFile::new().unwrap();
+        let meta = write_int_column_fixture(
+            donor.path(),
+            Field::new("n", DataType::Int32, false),
+            Arc::new(Int32Array::from(vec![1, 1])),
+        );
+        // ...and put it on a plain parquet file written with stats disabled,
+        // one row group, matching the footer's single `row_group_end = 0`.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 1]))])
+                .unwrap();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::None)
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                OVERVIEWS_KEY.to_string(),
+                meta.to_json().unwrap(),
+            )]))
+            .build();
+        {
+            let file = File::create(tmp.path()).unwrap();
+            let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        assert!(
+            reader
+                .metadata
+                .row_group(0)
+                .column(0)
+                .statistics()
+                .is_none(),
+            "fixture must carry no statistics"
+        );
+        assert_eq!(reader.int_column_max("n"), None);
     }
 }

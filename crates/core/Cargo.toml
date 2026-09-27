@@ -51,8 +51,9 @@ thiserror = { workspace = true }
 log = { workspace = true }
 memory-stats = { workspace = true }
 flate2 = "1"
-brotli = "9"
-zstd = "0.14"
+# brotli and zstd follow parquet's majors (8 / 0.13) so each compiles once (#435).
+brotli = "8"
+zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde = { workspace = true }
 serde_json = "1"
