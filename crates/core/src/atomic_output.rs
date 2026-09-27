@@ -41,8 +41,25 @@ pub(crate) struct PendingOutput {
 /// the [`PendingOutput`] renames it over `target` on `publish`.
 ///
 /// A relative `target` with no directory component (`out.parquet`) is
-/// created in the current directory, like `File::create` would.
+/// created in the current directory, like `File::create` would. A `target`
+/// that is an existing symlink is written *through*: the sibling is created
+/// beside the link's resolved destination (same filesystem as the rename)
+/// and published over that destination, so the link survives and points at
+/// the new data, as it would have with `File::create`.
 pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
+    let resolved;
+    let target = match std::fs::symlink_metadata(target) {
+        Ok(m) if m.file_type().is_symlink() => {
+            resolved = std::fs::canonicalize(target).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot resolve the symlink {}: {e}", target.display()),
+                )
+            })?;
+            resolved.as_path()
+        }
+        _ => target,
+    };
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -57,19 +74,27 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
         })?
         .to_string_lossy()
         .into_owned();
-    let temp = tempfile::Builder::new()
-        .prefix(&format!("{name}."))
-        .suffix(".partial")
-        .tempfile_in(dir)
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "cannot create the temporary output beside {}: {e}",
-                    target.display()
-                ),
-            )
-        })?;
+    let prefix = format!("{name}.");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".partial");
+    // `tempfile` creates 0600 by default and `persist` is a plain rename, so
+    // the published output would stay owner-only — unreadable from a shared
+    // directory or a web-served folder, unlike the PMTiles beside it. Ask for
+    // 0666 so the process umask applies exactly as it does to `File::create`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let temp = builder.tempfile_in(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot create the temporary output beside {}: {e}",
+                target.display()
+            ),
+        )
+    })?;
     let (file, temp) = temp.into_parts();
     Ok((
         file,
@@ -198,19 +223,72 @@ mod tests {
         );
     }
 
+    /// The published file must carry the same mode `File::create` would
+    /// have given it (0666 & !umask), not `tempfile`'s owner-only default:
+    /// a shared directory must not end up with an unreadable `.parquet`
+    /// next to a readable `.pmtiles`.
     #[cfg(unix)]
     #[test]
-    fn sibling_is_private_to_the_owner() {
+    fn published_file_has_file_create_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        // Control: what `File::create` yields under the current umask.
+        let control = dir.path().join("control");
+        File::create(&control).unwrap();
+        let expected = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+
         let target = dir.path().join("out.parquet");
         let (_f, pending) = create(&target).unwrap();
-        let mode = std::fs::metadata(pending.temp_path())
+        let sibling_mode = std::fs::metadata(pending.temp_path())
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "sibling mode {mode:o}");
+        assert_eq!(sibling_mode, expected, "sibling mode {sibling_mode:o}");
+        pending.publish().unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, expected,
+            "published mode {mode:o}, expected {expected:o}"
+        );
+    }
+
+    /// A symlinked destination is written through, like `File::create`
+    /// would: the link survives and its target holds the new data, with no
+    /// sibling left beside either.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_destination_is_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real = real_dir.join("data.parquet");
+        std::fs::write(&real, b"old").unwrap();
+        let link = dir.path().join("link.parquet");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let (mut file, pending) = create(&link).unwrap();
+        assert_eq!(
+            pending.temp_path().parent().unwrap(),
+            std::fs::canonicalize(&real_dir).unwrap(),
+            "sibling goes beside the resolved target"
+        );
+        file.write_all(b"new").unwrap();
+        drop(file);
+        pending.publish().unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), real);
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        assert_eq!(std::fs::read(&link).unwrap(), b"new");
+        assert_eq!(listing(&real_dir), vec!["data.parquet".to_string()]);
+        assert_eq!(
+            listing(dir.path()),
+            vec!["link.parquet".to_string(), "real".to_string()]
+        );
     }
 
     #[test]

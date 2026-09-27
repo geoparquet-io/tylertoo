@@ -2640,10 +2640,10 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
 /// refused unless `force`. A directory can never be replaced by the final
 /// rename, `--force` or not, so it is refused up front instead of after a
 /// whole convert + export.
-fn check_output_path(output: &Path, force: bool) -> Result<()> {
+fn check_output_path(output: &Path, kind: OutputKind, force: bool) -> Result<()> {
     if output.is_dir() {
         anyhow::bail!(
-            "{} is a directory; the output must be a PMTiles file path",
+            "{} is a directory; the output must be a {kind} file path",
             output.display()
         );
     }
@@ -2651,6 +2651,22 @@ fn check_output_path(output: &Path, force: bool) -> Result<()> {
         anyhow::bail!("{} exists (use --force to overwrite)", output.display());
     }
     Ok(())
+}
+
+/// What a subcommand's output is, for [`check_output_path`]'s message.
+#[derive(Clone, Copy, Debug)]
+enum OutputKind {
+    Pmtiles,
+    GeoParquet,
+}
+
+impl std::fmt::Display for OutputKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OutputKind::Pmtiles => "PMTiles",
+            OutputKind::GeoParquet => "GeoParquet",
+        })
+    }
 }
 
 /// `--spill-dir` preflight (#427), shared wording with the convert side
@@ -2971,7 +2987,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         args.files_from.clone(),
     )?;
 
-    check_output_path(&output, args.force)?;
+    check_output_path(&output, OutputKind::Pmtiles, args.force)?;
 
     // Derive the layer name from the input if not given: file stem for a
     // single file, last path segment for a directory or s3://gs:// prefix,
@@ -3346,7 +3362,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     // #427: refuse an existing output (without --force) before any work. The
     // overview itself is written to a sibling and renamed over OUTPUT at the
     // end, so an interrupted run leaves a previous file intact either way.
-    check_output_path(&output, args.force)?;
+    check_output_path(&output, OutputKind::GeoParquet, args.force)?;
 
     let mode = match args.mode.as_str() {
         "duplicating" => Mode::Duplicating,
@@ -3672,7 +3688,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
 
     // #427: refuse an existing output (without --force) and a bad --spill-dir
     // before the input is even looked at.
-    check_output_path(&args.output, args.force)?;
+    check_output_path(&args.output, OutputKind::Pmtiles, args.force)?;
     check_spill_dir(args.spill_dir.as_deref())?;
     reject_files_from(args.files_from.as_ref(), "export-pmtiles")?;
     require_single_local_file(&args.input, "export-pmtiles")?;
@@ -4128,7 +4144,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // #427: refuse an existing output (without --force) before any work.
-    check_output_path(&args.output, args.force)?;
+    check_output_path(&args.output, OutputKind::GeoParquet, args.force)?;
     reject_files_from(args.files_from.as_ref(), "decode")?;
     require_single_local_file(&args.input, "decode")?;
 

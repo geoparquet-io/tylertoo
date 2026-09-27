@@ -83,11 +83,11 @@ fn tiles_refuses_existing_output_without_force() {
 /// `--force` or not, so it is refused up front for every writer.
 #[test]
 fn directory_output_is_refused_even_with_force() {
-    for (sub, name) in [
-        ("export-pmtiles", "out.pmtiles"),
-        ("decode", "out.parquet"),
-        ("overview", "out.parquet"),
-        ("tiles", "out.pmtiles"),
+    for (sub, name, kind) in [
+        ("export-pmtiles", "out.pmtiles", "PMTiles"),
+        ("decode", "out.parquet", "GeoParquet"),
+        ("overview", "out.parquet", "GeoParquet"),
+        ("tiles", "out.pmtiles", "PMTiles"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join(name);
@@ -101,8 +101,10 @@ fn directory_output_is_refused_even_with_force() {
         ]);
         assert!(!ok, "{sub}: a directory output must be refused");
         assert!(
-            stderr.contains("is a directory"),
-            "{sub}: error must say why, got:\n{stderr}"
+            stderr.contains(&format!(
+                "is a directory; the output must be a {kind} file path"
+            )),
+            "{sub}: error must say why and name the output kind, got:\n{stderr}"
         );
     }
 }
