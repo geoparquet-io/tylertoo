@@ -33,9 +33,13 @@ use tylertoo_core::overview::export::FeatureOrder;
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
 /// Parse human-readable memory size (e.g., "8G", "16G", "512M") to bytes.
+///
+/// The suffix multiplication is checked (#432): `99999999999999999G` used to
+/// wrap in release builds and be accepted as a small byte count. A value
+/// that does not fit `usize` is a parse error like any other malformed size.
 fn parse_memory_size(s: &str) -> Result<usize, String> {
     let s = s.trim().to_uppercase();
-    let (num_str, multiplier) = if s.ends_with("G") || s.ends_with("GB") {
+    let (num_str, multiplier): (&str, usize) = if s.ends_with("G") || s.ends_with("GB") {
         (
             s.trim_end_matches("GB").trim_end_matches("G"),
             1024 * 1024 * 1024,
@@ -52,11 +56,14 @@ fn parse_memory_size(s: &str) -> Result<usize, String> {
     num_str
         .trim()
         .parse::<usize>()
-        .map(|n| n * multiplier)
-        .map_err(|_| {
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .ok_or_else(|| {
             format!(
-                "Invalid memory size: '{}'. Use format like '8G', '16G', '512M'",
-                s
+                "Invalid memory size: '{}'. Use format like '8G', '16G', '512M' \
+                 (the value must fit in {} bytes)",
+                s,
+                usize::MAX
             )
         })
 }
@@ -4481,6 +4488,28 @@ mod tests {
         // A plain integer is raw bytes — keeps pre-reconciliation invocations working.
         assert_eq!(parse_size_bytes("500000").unwrap(), 500_000);
         assert!(parse_size_bytes("banana").is_err());
+    }
+
+    /// #432: a size whose suffix multiplication overflows `usize` must be a
+    /// parse error, not a wrapped (silently small) byte count. Before the
+    /// fix `99999999999999999G` wrapped in release builds and was accepted.
+    #[test]
+    fn parse_size_bytes_rejects_overflow() {
+        for s in [
+            "99999999999999999G",
+            "99999999999999999999K",
+            "18446744073709551615M",
+        ] {
+            let err = parse_size_bytes(s).expect_err(s);
+            assert!(err.contains("Invalid size"), "{s}: {err}");
+            let err = parse_memory_size(s).expect_err(s);
+            assert!(err.contains("Invalid memory size"), "{s}: {err}");
+        }
+        // The largest representable value still parses.
+        assert_eq!(
+            parse_memory_size(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
     }
 
     #[test]
