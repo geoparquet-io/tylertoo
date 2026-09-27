@@ -9,8 +9,8 @@
 # one `--shard k/n` slice each, and `report` merges the per-shard
 # outcomes.json files into one score. `report` also opens or updates a
 # pinned `mutation-tests` issue whenever the matrix did not fully succeed:
-# a failed baseline, a usage or internal error, or a shard that hit its
-# time limit (which GitHub reports as cancelled, not failed).
+# a failed baseline, a usage or internal error, a lost runner, or a shard
+# that hit its time limit (which GitHub reports as cancelled, not failed).
 #
 # Why shards: the core crate yields ~8200 mutants and each one costs a
 # build plus a `quick`-tier nextest run (~50s locally, more on a runner),
@@ -23,6 +23,18 @@
 # tests/fixtures/geometry-test-data was empty in the scratch copy
 # cargo-mutants builds and invalid_geometry_clipping panicked in the
 # baseline. Configuration lives in .cargo/mutants.toml.
+#
+# History (#602): the first sharded run lost 7 of 32 shards to "The runner
+# has received a shutdown signal" after 1-3.5 h of correct progress. The
+# baseline had passed in every one; the mutants in flight at each death
+# were loop-advance mutations (`off += len` -> `off *= len` in
+# stream.rs::run_pass1_with_chunk_rows, `i += 2` -> `i -= 2` in
+# filter.rs::tokenize) that push into a Vec forever. Such a mutant fills
+# the runner's 16 GB in seconds, far inside the 120 s+ mutant timeout, and
+# the VM dies with the job. The `mutations` job now runs cargo-mutants
+# inside a cgroup with a memory cap so the kernel kills the runaway test
+# process instead (nextest reports the SIGKILL as a failure, so the mutant
+# counts as caught) and the shard carries on.
 
 name: Weekly Mutation Tests
 
@@ -30,7 +42,17 @@ on:
   schedule:
     # Run every Sunday at 2 AM UTC
     - cron: '0 2 * * 0'
-  workflow_dispatch:  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      shard_list:
+        description: >-
+          Comma-separated 0-based shard indices to run, e.g. "0,1,7"; empty
+          runs all SHARD_COUNT shards. The split stays k/SHARD_COUNT, so a
+          subset measures only those slices: use it to verify a workflow fix
+          in one shard's time instead of a full sweep.
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -38,12 +60,31 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Number of matrix shards. Sizing: ~8200 mutants / 32 = ~260 per shard;
-  # at ~60s per mutant with two in flight (-j 2 on a 4-vCPU runner) that
-  # is ~2.2h, under the 350-minute job limit below with headroom for a
-  # slow runner. Every shard must use the same value or the split is
-  # meaningless (https://mutants.rs/shards.html).
-  SHARD_COUNT: 32
+  # Number of matrix shards. Sizing, from the run behind #602 (32 shards,
+  # -j 2 on a 4-vCPU runner): the shards that completed took 2.5-3.7 h
+  # for ~257 mutants each, i.e. 128 minutes of headroom under the
+  # 350-minute limit below at the slow end, which a slow runner day could
+  # eat. At 40 shards each slice is ~205 mutants, so the same slow end is
+  # ~3.0 h (~170 minutes of headroom, 1.5x runner slowdown still fits).
+  # Runner usage barely moves: the per-shard setup (toolchain, tippecanoe,
+  # baseline, ~10 min) is the only duplicated cost, and with the 20-job
+  # concurrency cap the sweep runs in two waves either way (32 = 20 + 12,
+  # 40 = 20 + 20), so the wall clock does not grow. Every shard must use
+  # the same value or the split is meaningless
+  # (https://mutants.rs/shards.html).
+  SHARD_COUNT: 40
+  # Per-shard job time limit in minutes. GitHub's ceiling is 360; a little
+  # under so the cutoff is a documented choice, not a surprise. `plan`
+  # exports it so `mutations` (timeout-minutes) and `report` (to tell a
+  # timeout from a manual cancellation) read one number.
+  SHARD_TIMEOUT_MINUTES: 350
+  # cgroup memory cap for the whole cargo-mutants process tree (builds and
+  # tests). The 4-vCPU ubuntu runner has 16 GB; the cap leaves ~3 GB for
+  # the runner agent and the OS so a runaway mutant is OOM-killed inside
+  # the cgroup instead of taking the VM down (#602). Two rustc builds plus
+  # two `quick` nextest runs fit in a few GB, so the cap only bites on a
+  # genuinely unbounded allocation.
+  MUTANTS_MEMORY_MAX: 13G
 
 jobs:
   plan:
@@ -51,28 +92,48 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       shards: ${{ steps.shards.outputs.shards }}
+      timeout_minutes: ${{ steps.shards.outputs.timeout_minutes }}
     steps:
       - name: Enumerate shard indices
         id: shards
-        # cargo-mutants shard indices are 0-based: 0..n-1.
+        env:
+          SHARD_LIST: ${{ inputs.shard_list }}
+        # cargo-mutants shard indices are 0-based: 0..n-1. A dispatch may
+        # name a subset; anything that is not an index below SHARD_COUNT
+        # is rejected here rather than by a cryptic cargo-mutants error
+        # 40 times over.
         run: |
-          shards=$(seq 0 $((SHARD_COUNT - 1)) | jq -cs .)
+          if [ -z "$SHARD_LIST" ]; then
+            shards=$(seq 0 $((SHARD_COUNT - 1)) | jq -cs .)
+          else
+            bad=$(tr ', ' '\n' <<< "$SHARD_LIST" | grep . | grep -Ev '^[0-9]+$' || true)
+            if [ -n "$bad" ]; then
+              echo "::error::shard_list must be comma-separated integers; got: $bad"
+              exit 1
+            fi
+            shards=$(tr ', ' '\n' <<< "$SHARD_LIST" | grep . | sort -un | jq -cs .)
+            if ! jq -e --argjson n "$SHARD_COUNT" \
+                 'length > 0 and all(. < $n)' <<< "$shards" > /dev/null; then
+              echo "::error::shard_list must name shards in 0..$((SHARD_COUNT - 1)); got: $SHARD_LIST"
+              exit 1
+            fi
+          fi
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
-          echo "shards: $shards"
+          echo "timeout_minutes=$SHARD_TIMEOUT_MINUTES" >> "$GITHUB_OUTPUT"
+          echo "shards: $shards (of $SHARD_COUNT), time limit ${SHARD_TIMEOUT_MINUTES} min"
 
   mutations:
     name: Mutation Testing (shard ${{ matrix.shard }})
     needs: plan
     runs-on: ubuntu-latest
-    # GitHub's ceiling is 360 minutes; set it explicitly and a little
-    # under so the cutoff is a documented choice, not a surprise.
-    timeout-minutes: 350
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout_minutes) }}
     strategy:
       fail-fast: false  # one bad shard must not cancel the rest
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     env:
       SHARD: ${{ matrix.shard }}
+      MUTANTS_CGROUP: /sys/fs/cgroup/mutants
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -160,6 +221,45 @@ jobs:
             --sharding round-robin --shard "$SHARD/$SHARD_COUNT" > mutants.list
           echo "$(wc -l < mutants.list) mutants queued for shard $SHARD/$SHARD_COUNT"
 
+      - name: Create the memory-capped cgroup and prove the cap bites
+        # A mutant that turns a loop's advance into a no-op allocates
+        # without bound and fills the 16 GB VM in seconds, killing the
+        # runner with the job (#602: 7 of 32 shards). cargo-mutants and
+        # nextest have no memory limit of their own, and a per-process
+        # RLIMIT_AS would also throttle rustc, so the whole process tree
+        # goes into a cgroup v2 leaf with memory.max set (swap off so the
+        # kernel OOM-kills instead of thrashing). Steps do not share a
+        # shell, so the mutants step joins the cgroup itself; this step
+        # creates it and runs a 1 GiB allocation under a 512 MiB throwaway
+        # cap, which must die with SIGKILL (exit 137). If the runner image
+        # ever loses cgroup v2 or the memory controller, this fails loudly
+        # instead of letting the OOMs quietly come back.
+        run: |
+          root=/sys/fs/cgroup
+          grep -qw memory "$root/cgroup.controllers" \
+            || { echo "::error::cgroup v2 memory controller not available on this runner"; exit 1; }
+          echo +memory | sudo tee "$root/cgroup.subtree_control" > /dev/null
+
+          probe="$MUTANTS_CGROUP-selftest"
+          sudo mkdir -p "$probe"
+          echo 512M | sudo tee "$probe/memory.max" > /dev/null
+          echo 0 | sudo tee "$probe/memory.swap.max" > /dev/null
+          set +e
+          ( me=$BASHPID  # captured before the pipeline forks
+            echo "$me" | sudo tee "$probe/cgroup.procs" > /dev/null
+            exec python3 -c 'b = b"x" * (1024 ** 3); print("still alive with", len(b), "bytes")' )
+          rc=$?
+          set -e
+          sudo rmdir "$probe" || true
+          [ "$rc" -eq 137 ] \
+            || { echo "::error::memory cap self-test: a 1 GiB allocation under a 512 MiB cap was not killed (exit $rc)"; exit 1; }
+          echo "memory cap self-test passed: runaway allocation was OOM-killed (exit $rc)"
+
+          sudo mkdir -p "$MUTANTS_CGROUP"
+          echo "$MUTANTS_MEMORY_MAX" | sudo tee "$MUTANTS_CGROUP/memory.max" > /dev/null
+          echo 0 | sudo tee "$MUTANTS_CGROUP/memory.swap.max" > /dev/null
+          echo "cgroup $MUTANTS_CGROUP: memory.max=$(cat "$MUTANTS_CGROUP/memory.max") swap.max=$(cat "$MUTANTS_CGROUP/memory.swap.max")"
+
       - name: Run mutation tests on core
         id: mutants
         # NB: package name is tylertoo-core (the old gpq2tiles-core spelling
@@ -181,12 +281,18 @@ jobs:
         # `--output mutants.out` nested it at mutants.out/mutants.out, which
         # is why the summary step never found a report even on green runs.
         run: |
+          # Join the capped cgroup (children inherit it) — see the step above.
+          echo $$ | sudo tee "$MUTANTS_CGROUP/cgroup.procs" > /dev/null
+          echo "running in cgroup $(cut -d: -f3 /proc/self/cgroup) (memory.max=$(cat "$MUTANTS_CGROUP/memory.max"))"
+
           set +e
           cargo mutants --package tylertoo-core --output . -j 2 \
             --sharding round-robin --shard "$SHARD/$SHARD_COUNT"
           code=$?
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "cgroup peak memory: $(cat "$MUTANTS_CGROUP/memory.peak" 2>/dev/null || echo n/a) bytes," \
+            "OOM kills: $(grep -E '^oom_kill ' "$MUTANTS_CGROUP/memory.events" | cut -d' ' -f2)"
           case "$code" in
             0|2|3) echo "cargo mutants finished (exit $code)"; exit 0 ;;
             4) echo "::error::cargo mutants: unmutated baseline failed, no mutants tested"; exit 1 ;;
@@ -211,7 +317,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read  # per-shard job conclusions and timings
       issues: write
+    env:
+      SHARDS_JSON: ${{ needs.plan.outputs.shards }}
+      SHARD_TIMEOUT_MINUTES: ${{ needs.plan.outputs.timeout_minutes }}
     steps:
       - name: Download shard reports
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -222,26 +332,105 @@ jobs:
         # no artifact; the summary below counts those explicitly.
         continue-on-error: true
 
+      - name: Classify each shard's outcome
+        id: shards
+        # GitHub folds every non-success into `needs.mutations.result`, so
+        # the per-shard job records are the only way to tell apart a shard
+        # that failed on its own, one that hit the time limit (reported as
+        # cancelled), and one cancelled early (the run was cancelled by
+        # hand, or the runner was lost). A cancelled shard whose elapsed
+        # time is within 5 minutes of the limit is a timeout; anything
+        # shorter was cancelled before it could time out.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | select(.name | startswith("Mutation Testing (shard "))
+                  | [(.name | capture("shard (?<k>[0-9]+)") | .k), (.conclusion // "unknown"),
+                     .started_at, .completed_at] | @tsv' > jobs.tsv
+          ok=""; failed=""; timed_out=""; cancelled_early=""; other=""
+          while IFS=$'\t' read -r k conclusion started completed; do
+            mins=$(( ($(date -d "${completed:-now}" +%s) - $(date -d "${started:-now}" +%s)) / 60 ))
+            case "$conclusion" in
+              success) ok="$ok $k" ;;
+              failure) failed="$failed $k(${mins}m)" ;;
+              cancelled)
+                if [ "$mins" -ge $((SHARD_TIMEOUT_MINUTES - 5)) ]; then
+                  timed_out="$timed_out $k(${mins}m)"
+                else
+                  cancelled_early="$cancelled_early $k(${mins}m)"
+                fi ;;
+              *) other="$other $k($conclusion)" ;;
+            esac
+          done < jobs.tsv
+          {
+            echo "ok=${ok# }"
+            echo "failed=${failed# }"
+            echo "timed_out=${timed_out# }"
+            echo "cancelled_early=${cancelled_early# }"
+            echo "other=${other# }"
+          } | tee -a "$GITHUB_OUTPUT"
+
       - name: Post summary
         id: summary
         env:
           MATRIX_RESULT: ${{ needs.mutations.result }}
+          FAILED: ${{ steps.shards.outputs.failed }}
+          TIMED_OUT: ${{ steps.shards.outputs.timed_out }}
+          CANCELLED_EARLY: ${{ steps.shards.outputs.cancelled_early }}
+          OTHER: ${{ steps.shards.outputs.other }}
         run: |
+          n_shards=$(jq 'length' <<< "$SHARDS_JSON")
+          if [ "$n_shards" -eq "$SHARD_COUNT" ]; then
+            which_shards="all ${SHARD_COUNT} shards"
+          else
+            which_shards="${n_shards} of ${SHARD_COUNT} shards: $(jq -r 'join(",")' <<< "$SHARDS_JSON")"
+          fi
+          echo "which_shards=$which_shards" >> "$GITHUB_OUTPUT"
           {
             echo "## Mutation Testing Results"
             echo ""
-            echo "Matrix result: **${MATRIX_RESULT}** (${SHARD_COUNT} shards)"
+            echo "Matrix result: **${MATRIX_RESULT}** (${which_shards})"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Every shard's report is at shards/mutation-report-shard-N/outcomes.json.
           reports=$(find shards -name outcomes.json 2>/dev/null | sort -V)
           n_reports=$(printf '%s\n' "$reports" | grep -c . || true)
+          # Shards that neither timed out nor were cancelled early yet have
+          # no outcomes.json: they died before writing one (baseline
+          # failure, cargo-mutants error, or a lost runner). Cancelled
+          # shards are listed under their own headings, not here.
           missing=""
-          for ((k = 0; k < SHARD_COUNT; k++)); do
-            [ -f "shards/mutation-report-shard-$k/outcomes.json" ] || missing="$missing $k"
+          for k in $(jq -r '.[]' <<< "$SHARDS_JSON"); do
+            [ -f "shards/mutation-report-shard-$k/outcomes.json" ] && continue
+            case " $TIMED_OUT $CANCELLED_EARLY " in
+              *" $k("*) continue ;;
+            esac
+            missing="$missing $k"
           done
           echo "shards_without_report=${missing# }" >> "$GITHUB_OUTPUT"
+
+          {
+            if [ -n "$FAILED" ]; then
+              echo "- Failed shards (baseline failed, cargo-mutants error, or the runner died): ${FAILED}"
+            fi
+            if [ -n "$TIMED_OUT" ]; then
+              echo "- Shards cancelled at the ${SHARD_TIMEOUT_MINUTES}-minute time limit (mutants unmeasured; raise SHARD_COUNT): ${TIMED_OUT}"
+            fi
+            if [ -n "$CANCELLED_EARLY" ]; then
+              echo "- Shards cancelled before the time limit (the run was cancelled, or the runner was lost): ${CANCELLED_EARLY}"
+            fi
+            if [ -n "$OTHER" ]; then
+              echo "- Shards with another outcome: ${OTHER}"
+            fi
+            if [ -n "$missing" ]; then
+              echo "- Shards without a report (not cancelled, yet wrote no outcomes.json):${missing}"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$n_reports" -eq 0 ]; then
             {
@@ -267,16 +456,15 @@ jobs:
           else
             score="n/a"
           fi
-          echo "score=$score" >> "$GITHUB_OUTPUT"
-          echo "missed=$missed" >> "$GITHUB_OUTPUT"
-          echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
+          {
+            echo "score=$score"
+            echo "reported=${n_reports}/${n_shards}"
+            echo "missed=$missed"
+            echo "timeout=$timeout"
+          } >> "$GITHUB_OUTPUT"
 
           {
-            echo "**Mutation score: ${score}%** (${caught} caught / ${tested} tested, ${n_reports}/${SHARD_COUNT} shards reported)"
-            if [ -n "$missing" ]; then
-              echo ""
-              echo "Shards without a report (cancelled or failed before the baseline):${missing}"
-            fi
+            echo "**Mutation score: ${score}%** (${caught} caught / ${tested} tested, ${n_reports}/${n_shards} shards reported)"
             echo ""
             echo "| Outcome | Count |"
             echo "|---|---|"
@@ -306,16 +494,23 @@ jobs:
       - name: Open or update the mutation-tests issue
         # Ported from security.yml. Fires whenever the matrix did not
         # succeed: `needs.mutations.result` is `failure` for a failed
-        # baseline / usage / internal error, `cancelled` when a shard hit
-        # timeout-minutes or the run was cancelled, `skipped` when `plan`
-        # failed. It never fires for a low score: that is the summary's job.
+        # baseline / usage / internal error / lost runner, `cancelled` when
+        # a shard hit its time limit or the run was cancelled, `skipped`
+        # when `plan` failed. It never fires for a low score: that is the
+        # summary's job.
         if: needs.mutations.result != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           MATRIX_RESULT: ${{ needs.mutations.result }}
+          WHICH_SHARDS: ${{ steps.summary.outputs.which_shards }}
           SCORE: ${{ steps.summary.outputs.score }}
+          REPORTED: ${{ steps.summary.outputs.reported }}
           MISSING_SHARDS: ${{ steps.summary.outputs.shards_without_report }}
+          FAILED: ${{ steps.shards.outputs.failed }}
+          TIMED_OUT: ${{ steps.shards.outputs.timed_out }}
+          CANCELLED_EARLY: ${{ steps.shards.outputs.cancelled_early }}
+          OTHER: ${{ steps.shards.outputs.other }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Make sure the label exists (no-op if it already does).
@@ -339,28 +534,41 @@ jobs:
           done
 
           TITLE="Weekly mutation tests are failing"
-          BODY="The scheduled cargo-mutants run did not complete: the shard
-          matrix ended with result \`${MATRIX_RESULT}\` (\`failure\` = a shard's
-          unmutated baseline failed or cargo-mutants errored, so nothing was
-          tested there; \`cancelled\` = a shard hit its ${SHARD_COUNT}-shard time
-          limit, so its mutants are unmeasured; see
+          BODY="The cargo-mutants run did not complete: the shard matrix ended
+          with result \`${MATRIX_RESULT}\` (\`failure\` = a shard's unmutated
+          baseline failed, cargo-mutants errored, or the runner died, so nothing
+          more was tested there; \`cancelled\` = a shard hit the
+          ${SHARD_TIMEOUT_MINUTES}-minute shard time limit, or the run was
+          cancelled by hand, so its mutants are unmeasured; see
           https://mutants.rs/exit-codes.html).
 
           Run: $RUN_URL
-          Score from the shards that did report: ${SCORE:-n/a}%
-          Shards without a report: ${MISSING_SHARDS:-none}
+          Shards run: ${WHICH_SHARDS:-unknown}
+          Score from the shards that did report: ${SCORE:-n/a}% (${REPORTED:-0} shards reported)
+
+          Per-shard outcome (index, then minutes elapsed in parentheses):
+          - failed on their own (baseline failed, cargo-mutants error, or the runner died): ${FAILED:-none}
+          - cancelled at the ${SHARD_TIMEOUT_MINUTES}-minute time limit, so raise SHARD_COUNT: ${TIMED_OUT:-none}
+          - cancelled before the time limit (the run was cancelled, or the runner was lost): ${CANCELLED_EARLY:-none}
+          - other outcome: ${OTHER:-none}
+          - without a report although not cancelled (died before writing outcomes.json): ${MISSING_SHARDS:-none}
 
           Baseline log excerpt:
           \`\`\`
-          ${BASELINE_TAIL:-(no baseline log in any shard shows a failure: a cancelled shard timed out after its baseline passed)}
+          ${BASELINE_TAIL:-(no baseline log in any shard shows a failure: every reporting shard got past its baseline)}
           \`\`\`
 
           ---
           _This issue is managed by .github/workflows/mutation-tests.yml. It is
-          updated (not duplicated) on every failing weekly run; close it once a
-          run completes. A low mutation score does not open this issue; the job
-          summary reports the score. If shards time out, raise SHARD_COUNT in
-          the workflow._"
+          updated (not duplicated) on every failing run; close it once a run
+          completes. A low mutation score does not open this issue; the job
+          summary reports the score. A shard that failed with \"The runner has
+          received a shutdown signal\" in its log and nothing else was a lost
+          runner (a runaway allocation escaping the memory cap, or GitHub
+          reclaiming the VM); a shard cancelled early was cancelled by hand or
+          lost its runner and is not a defect by itself. If shards time out,
+          raise SHARD_COUNT in the workflow. To verify a fix without a full
+          sweep: gh workflow run mutation-tests.yml -f shard_list=0,1._"
 
           EXISTING=$(gh issue list --label mutation-tests --state open \
             --json number --jq '.[0].number // empty')
@@ -368,7 +576,7 @@ jobs:
           if [ -n "$EXISTING" ]; then
             echo "Updating existing issue #$EXISTING"
             gh issue edit "$EXISTING" --body "$BODY"
-            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL (matrix result: ${MATRIX_RESULT})"
+            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL (matrix result: ${MATRIX_RESULT}; ${WHICH_SHARDS:-unknown shards})"
           else
             echo "Opening new issue"
             NEW_URL=$(gh issue create --title "$TITLE" --label mutation-tests --body "$BODY")
