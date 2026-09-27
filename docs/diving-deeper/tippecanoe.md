@@ -146,11 +146,44 @@ point CSV, plus GeoJSON on standard input. tylertoo reads GeoParquet in
 `EPSG:4326` or `EPSG:3857` and nothing else, on the expectation that `gpio`
 converts other formats first.
 
-**Ships tileset tooling.** `tile-join` merges tilesets and joins CSV attributes
-onto existing features, and `-e` writes a directory of tiles. tylertoo has no
-equivalent to these; it writes one PMTiles archive or the overview file.
-(`-zg`, which guesses a maximum zoom, has a counterpart in `--max-zoom auto`.) (`-L`, one layer per input
-file, is covered by `pyramid` bands that share a zoom range.)
+**Joins attributes onto finished tiles.** `tile-join` joins CSV columns onto
+the features of an existing tileset by a key column. tylertoo leaves this out on
+purpose. The join belongs in parquet space, before tiling, where the new
+attributes become ordinary columns that `--filter`, `--include-property`, and
+`--feature-id` can use, and where a change to the table means one join and one
+tiling run rather than a join over every tile. Run the join in DuckDB, then let
+`gpio` restore the Hilbert order and row-group layout the join discards:
+
+```bash
+duckdb -c "LOAD spatial; COPY (
+  SELECT p.*, c.population
+  FROM 'parcels.parquet' p
+  JOIN 'census.csv' c USING (geoid)
+) TO 'joined.parquet' (FORMAT parquet)"
+gpio sort hilbert joined.parquet parcels-joined.parquet \
+  --row-group-size-mb 128
+```
+
+The other half of `tile-join`, merging tilesets, has counterparts:
+`tylertoo merge` for archives with disjoint tile ids, and `pyramid` bands that
+share a zoom range for one layer per input.
+
+**Writes MBTiles or a tile directory.** tippecanoe writes MBTiles or PMTiles,
+and `-e` writes a directory of tiles. tylertoo writes one PMTiles archive, or
+the overview file, and nothing else. For MBTiles or a directory, convert the
+finished archive with `pmtiles-convert` from the Python
+[`pmtiles`](https://pypi.org/project/pmtiles/) package, which picks the output
+format from the output path:
+
+```bash
+uvx --from pmtiles pmtiles-convert tiles.pmtiles tiles.mbtiles
+uvx --from pmtiles pmtiles-convert tiles.pmtiles tiles/
+```
+
+The directory holds `{z}/{x}/{y}.mvt` files with the tile bytes as stored in
+the archive, which tylertoo gzip-compresses, plus a `metadata.json`. The
+`pmtiles convert` command in go-pmtiles goes the other way, MBTiles to PMTiles,
+so it does not serve this purpose.
 
 ### Decoding tiles back
 

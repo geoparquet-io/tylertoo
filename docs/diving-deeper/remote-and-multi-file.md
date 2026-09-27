@@ -85,3 +85,22 @@ manifest before the single positional output.
 **Directory or glob input.** A partition set given as a positional path, for the
 common case where the partitions sit together on disk and their listing order is
 acceptable as the row order.
+
+**Hive partition keys stay in the path.** A directory input is walked
+recursively, and an `s3://` or `gs://` prefix lists every key below it, so a
+Hive or Spark layout such as `year=2024/region=north/part-00000.parquet` reads
+every part file. Names starting with `.` or `_` (`_SUCCESS`, `.crc`,
+`_temporary/`) are skipped. tylertoo does not turn the `key=value` path segments
+into columns: the rows carry only the columns stored inside the files, so
+`--filter`, `--include-property`, and the tile properties cannot see `year` or
+`region` unless the files hold them too. Hive writers usually drop partition
+columns from the files. When you need them, write them back in DuckDB, which
+reads the path segments as columns, and re-sort with `gpio`:
+
+```bash
+duckdb -c "LOAD spatial; COPY (
+  SELECT * FROM read_parquet('dataset/**/*.parquet',
+                             hive_partitioning = true)
+) TO 'flat.parquet' (FORMAT parquet)"
+gpio sort hilbert flat.parquet dataset.parquet --row-group-size-mb 128
+```
