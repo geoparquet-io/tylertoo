@@ -104,6 +104,10 @@ harness = false
 name = "bbox_containment"
 harness = false
 
+[[bench]]
+name = "assign_scaling"
+harness = false
+
 [lints]
 workspace = true
 
