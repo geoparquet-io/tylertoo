@@ -627,6 +627,7 @@ pub fn tylertoo_core::mvt::LayerBuilder::build(self) -> tylertoo_core::vector_ti
 pub fn tylertoo_core::mvt::LayerBuilder::dropped_features(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::feature_count(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn tylertoo_core::mvt::LayerBuilder::quantized_features(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::with_extent(self, u32) -> Self
 impl core::marker::Freeze for tylertoo_core::mvt::LayerBuilder
 impl core::marker::Send for tylertoo_core::mvt::LayerBuilder
@@ -1641,6 +1642,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::E
 pub struct tylertoo_core::overview::export::ExportReport
 pub tylertoo_core::overview::export::ExportReport::duration_secs: f64
 pub tylertoo_core::overview::export::ExportReport::encode_dropped_features: usize
+pub tylertoo_core::overview::export::ExportReport::encode_quantized_features: usize
 pub tylertoo_core::overview::export::ExportReport::max_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::min_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::mode: alloc::string::String
@@ -1666,6 +1668,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportReport
 pub struct tylertoo_core::overview::export::ZoomReport
 pub tylertoo_core::overview::export::ZoomReport::encode_dropped_features: usize
+pub tylertoo_core::overview::export::ZoomReport::encode_quantized_features: usize
 pub tylertoo_core::overview::export::ZoomReport::level: usize
 pub tylertoo_core::overview::export::ZoomReport::level_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::oversized_tiles: usize

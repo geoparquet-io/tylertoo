@@ -15,6 +15,7 @@ use crate::tile::TileBounds;
 use crate::vector_tile::tile::{Feature, GeomType, Layer, Value};
 use crate::vector_tile::Tile;
 use geo::orient::{Direction, Orient};
+use geo::CoordsIter;
 use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use std::collections::HashMap;
 
@@ -1453,8 +1454,12 @@ pub struct LayerBuilder {
     string_index: HashMap<String, u32>,
     /// Dedup index for every other value ([`ScalarKey`]).
     scalar_index: HashMap<ScalarKey, u32>,
-    /// Input features that produced no MVT feature (see [`Self::dropped_features`]).
-    dropped: usize,
+    /// Input features that produced no MVT feature and had no coordinates to
+    /// begin with (see [`Self::dropped_features`]).
+    unencodable: usize,
+    /// Input features with coordinates that produced no MVT feature because
+    /// they collapse at the tile extent (see [`Self::quantized_features`]).
+    quantized: usize,
 }
 
 impl LayerBuilder {
@@ -1469,7 +1474,8 @@ impl LayerBuilder {
             values: Vec::new(),
             string_index: HashMap::new(),
             scalar_index: HashMap::new(),
-            dropped: 0,
+            unencodable: 0,
+            quantized: 0,
         }
     }
 
@@ -1486,11 +1492,23 @@ impl LayerBuilder {
     }
 
     /// Number of [`Self::add_feature`] calls that produced **no** MVT feature
-    /// (#431): empty geometries and empty collections, and polygons that
-    /// quantize to zero area at this tile's extent. Nothing in the layer
-    /// records these, so the caller must read this counter to report them.
+    /// because the input had nothing to encode (#431): an empty geometry, an
+    /// empty `GeometryCollection` (or one holding only empty parts). This is
+    /// content loss the caller should report; nothing in the layer records
+    /// it. Expected collapses at the tile extent are counted separately in
+    /// [`Self::quantized_features`].
     pub fn dropped_features(&self) -> usize {
-        self.dropped
+        self.unencodable
+    }
+
+    /// Number of [`Self::add_feature`] calls whose input **had** coordinates
+    /// but produced no MVT feature because it cannot be represented at this
+    /// tile's extent: a polygon whose rings collapse to zero area, a line
+    /// with fewer than two points (a clip sliver at a buffered tile edge is
+    /// the routine case). Expected on ordinary data; informational, not a
+    /// warning.
+    pub fn quantized_features(&self) -> usize {
+        self.quantized
     }
 
     /// Get or insert a key, returning its index.
@@ -1547,8 +1565,9 @@ impl LayerBuilder {
     /// A `GeometryCollection` is split with [`flatten_geometry_collection`]
     /// into one MVT feature per geometry kind present (polygons, lines,
     /// points — in that draw order), each carrying the same `id` and
-    /// `properties` (#431). Any call that yields no feature at all is tallied
-    /// in [`Self::dropped_features`].
+    /// `properties` (#431). A call that yields no feature at all is tallied
+    /// in [`Self::dropped_features`] when the input had no coordinates, or in
+    /// [`Self::quantized_features`] when it collapsed at the tile extent.
     ///
     /// # Arguments
     /// * `id` - Optional feature ID
@@ -1602,7 +1621,13 @@ impl LayerBuilder {
             }
         };
         if !emitted {
-            self.dropped += 1;
+            // A geometry with no coordinates at all had nothing to encode;
+            // one with coordinates collapsed at this extent.
+            if geometry.coords_count() == 0 {
+                self.unencodable += 1;
+            } else {
+                self.quantized += 1;
+            }
         }
     }
 
@@ -3715,7 +3740,47 @@ mod tests {
         );
         assert_eq!(builder.feature_count(), 1);
         assert_eq!(builder.dropped_features(), 2);
+        assert_eq!(
+            builder.quantized_features(),
+            0,
+            "an empty geometry is unencodable, not quantized away"
+        );
         assert_eq!(builder.build().features.len(), 1);
+    }
+
+    /// Geometry that HAS coordinates but cannot be represented at the tile
+    /// extent — a one-point line, a sub-pixel polygon — is an expected,
+    /// quantized-away drop, kept apart from the unencodable tally so a
+    /// routine polygon export never warns (#431 review).
+    #[test]
+    fn quantized_away_geometry_is_counted_separately_from_unencodable() {
+        let bounds = test_bounds();
+        let mut builder = LayerBuilder::new("q");
+        // One point is not a line: encode_linestring returns nothing.
+        let stub = Geometry::LineString(LineString::from(vec![(0.5, 0.5)]));
+        builder.add_feature(Some(1), &stub, &gc_props(), &bounds);
+        // A polygon far below one tile unit collapses to zero area.
+        let eps = 1e-9;
+        let sliver = Geometry::Polygon(polygon![
+            (x: 0.5, y: 0.5),
+            (x: 0.5 + eps, y: 0.5),
+            (x: 0.5 + eps, y: 0.5 + eps),
+            (x: 0.5, y: 0.5),
+        ]);
+        builder.add_feature(Some(2), &sliver, &gc_props(), &bounds);
+        // A collection whose only parts quantize away is quantized, not empty.
+        let gc = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
+            stub.clone(),
+            sliver.clone(),
+        ]));
+        builder.add_feature(Some(3), &gc, &gc_props(), &bounds);
+        // Truly empty input stays on the unencodable side.
+        let empty = Geometry::LineString(LineString::from(Vec::<(f64, f64)>::new()));
+        builder.add_feature(Some(4), &empty, &gc_props(), &bounds);
+
+        assert_eq!(builder.feature_count(), 0);
+        assert_eq!(builder.quantized_features(), 3);
+        assert_eq!(builder.dropped_features(), 1);
     }
 
     /// The remaining `geo::Geometry` variants — `Line`, `Rect`, `Triangle` —

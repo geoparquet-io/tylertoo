@@ -509,6 +509,42 @@ fn geometry_collection_parts_reach_the_tiles() {
     }
 }
 
+/// #431 review: a routine polygon export must not warn. Buildings clipped to
+/// sub-pixel slivers at a buffered tile edge legitimately quantize to zero
+/// area; those land in `encode_quantized_features`, never in
+/// `encode_dropped_features` (the gate for the warning and for the qualified
+/// CLI summary).
+#[test]
+fn ordinary_polygon_export_reports_no_unencodable_drops() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/realdata/open-buildings.parquet");
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
+    let tov = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let copts = ConvertOptions {
+        levels: LevelPlan::ZoomRange {
+            min_zoom: 8,
+            max_zoom: 14,
+        },
+        ..Default::default()
+    };
+    convert_to_overviews(&fixture, tov.path(), &copts).unwrap();
+    let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default()).unwrap();
+    assert!(report.total_tile_features > 0);
+    assert_eq!(
+        report.encode_dropped_features, 0,
+        "no building is empty or unsupported, so nothing is unencodable: {report:?}"
+    );
+    assert!(report.zooms.iter().all(|z| z.encode_dropped_features == 0));
+    // The quantized tally is where any edge slivers go; it is informational.
+    let quantized: usize = report
+        .zooms
+        .iter()
+        .map(|z| z.encode_quantized_features)
+        .sum();
+    assert_eq!(quantized, report.encode_quantized_features);
+}
+
 /// `(zoom, id, geometry)` for every row of a `decode_pmtiles` output.
 fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
     use arrow_array::cast::AsArray;
