@@ -68,8 +68,11 @@ fn bench_gzip(c: &mut Criterion) {
     for feature_count in [50usize, 500, 2_000] {
         let bytes = build_tile_bytes(feature_count);
         group.throughput(Throughput::Bytes(bytes.len() as u64));
+        // Keyed on the feature count, not `bytes.len()`: an encoder change
+        // that shifts the payload size must not rename the bench (and orphan
+        // its baseline).
         group.bench_with_input(
-            BenchmarkId::from_parameter(bytes.len()),
+            BenchmarkId::from_parameter(format!("{feature_count}_features")),
             &bytes,
             |b, bytes| {
                 b.iter(|| black_box(compress(black_box(bytes), Compression::Gzip).unwrap()));

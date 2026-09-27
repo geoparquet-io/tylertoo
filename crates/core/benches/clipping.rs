@@ -5,6 +5,9 @@
 //
 // Run with: cargo bench --package tylertoo-core -- clipping
 
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -180,7 +183,7 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
     let poly = match load_antarctica_polygon() {
         Some(p) => p,
         None => {
-            eprintln!("Warning: Antarctica fixture not found, skipping benchmark");
+            fixtures::missing("clipping", "antarctica-polygon.wkb");
             return;
         }
     };

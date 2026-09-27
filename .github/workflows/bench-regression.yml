@@ -1,0 +1,151 @@
+# Criterion regression gate (#448) — opt-in, same-runner base-vs-head.
+#
+# One job on one runner: build and run the criterion benches at the base
+# revision (`--save-baseline base`), then at the head revision
+# (`--baseline-lenient base`), then gate with scripts/criterion_gate.py.
+# Comparing two runs from the same machine minutes apart is the only timing
+# comparison shared runners support honestly; a baseline carried over from an
+# earlier run on a different VM is mostly measuring the VM (#393).
+#
+# Base revision:
+#   pull_request        merge-base of the PR head and its base branch.
+#   workflow_dispatch   the `base` input if given; otherwise, on main, the
+#                       latest v* release tag before HEAD ("what changed since
+#                       the last release"); on any other branch, its merge-base
+#                       with origin/main.
+#
+# Triggers: NOT every PR. Only PRs carrying the `benchmark` label (applying the
+# label starts it; later pushes re-run it while the label stays) and manual
+# dispatch. There is no schedule: main-vs-main on a timer compares a revision
+# against itself and only measures noise. Kept in its own workflow so label
+# events don't re-run bench.yml's convert-guard.
+#
+# Gate: fail if the 95% CI lower bound of a bench's mean change is >= +25%;
+# warn if the point estimate is >= +10%. See DEVELOPMENT.md, "Criterion
+# regression gate".
+
+name: Bench regression
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base revision to compare against (default: see workflow header)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-regression-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  criterion-regression:
+    name: Criterion regression gate
+    runs-on: ubuntu-latest
+    # On a PR: only with the `benchmark` label, and on a `labeled` event only
+    # when that label is the one just added.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'benchmark') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'benchmark'))
+    timeout-minutes: 90
+    env:
+      TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion-compare
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve base revision
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          INPUT_BASE: ${{ inputs.base }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base=$(git merge-base "$PR_BASE_SHA" HEAD)
+          elif [ -n "$INPUT_BASE" ]; then
+            base=$(git rev-parse --verify "${INPUT_BASE}^{commit}")
+          elif [ "$REF_NAME" = "main" ]; then
+            tag=$(git describe --tags --abbrev=0 --match 'v*' HEAD^)
+            base=$(git rev-parse --verify "${tag}^{commit}")
+          else
+            base=$(git merge-base origin/main HEAD)
+          fi
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then
+            echo "::error::base revision $base is HEAD itself; nothing to compare"
+            exit 1
+          fi
+          echo "Comparing base $base -> head $(git rev-parse HEAD)"
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      # Own key: this job builds two revisions into one target dir, so it must
+      # not share (or overwrite) bench.yml's cache entry. Criterion output goes
+      # to CRITERION_HOME, which criterion_compare.sh wipes before running, so
+      # a restored target/ can't leak old results into the comparison.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-regression-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run benches at base, then head
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          rm -rf target/criterion target/criterion-compare
+          scripts/criterion_compare.sh "$BASE_SHA"
+        timeout-minutes: 75
+
+      - name: Check for regressions
+        run: >-
+          python3 scripts/criterion_gate.py --check
+          --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 25
+
+      - name: Upload comparison report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: criterion-regression-report
+          path: target/criterion-compare/

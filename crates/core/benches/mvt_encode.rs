@@ -2,9 +2,10 @@
 //! path, and the alloc-free value-dedup path #559 introduced.
 //!
 //! Two groups:
-//! - `encode_polygon`: [`encode_polygon`] on real/synthetic rings, which
-//!   quantizes to tile-integer space, runs the [`NODE_MAX_EDGES`]-gated
-//!   noding sweep, cleans pinches, and orients the result (#383/#461).
+//! - `encode_polygon`: [`encode_polygon`] on synthetic rings under the
+//!   `NODE_MAX_EDGES` cap (quantize to tile-integer space, noding sweep,
+//!   pinch cleanup, orientation; #383/#461), plus the unclipped Antarctica
+//!   ring, which is over the cap and so times the noding early-out.
 //! - `layer_value_dedup`: [`LayerBuilder::add_feature`] +
 //!   [`LayerBuilder::build`] over a feature set whose properties repeat
 //!   heavily across features (the common case: a handful of distinct
@@ -12,6 +13,9 @@
 //!   the shape the #559 alloc-free `ScalarKey`/string dedup targets.
 //!
 //! Run with: cargo bench --package tylertoo-core --bench mvt_encode
+
+#[path = "support/fixtures.rs"]
+mod fixtures;
 
 use std::fs::File;
 use std::hint::black_box;
@@ -24,8 +28,9 @@ use geo::{Coord, Geometry, LineString, Point, Polygon};
 use tylertoo_core::mvt::{encode_polygon, LayerBuilder, PropertyValue};
 use tylertoo_core::tile::TileBounds;
 
-/// Path to the Antarctica polygon fixture (316k coords, exercises the
-/// noding sweep's `NODE_MAX_EDGES` cap boundary).
+/// Path to the Antarctica polygon fixture (316k coords). Encoded unclipped,
+/// its quantized ring stays far above `NODE_MAX_EDGES` (4096), so it times
+/// the quantize/clean path with noding's over-cap early-out, not the sweep.
 const ANTARCTICA_FIXTURE: &str = "../../tests/fixtures/realdata/antarctica-polygon.wkb";
 
 fn load_antarctica_polygon() -> Option<Polygon<f64>> {
@@ -81,19 +86,24 @@ fn bench_encode_polygon(c: &mut Criterion) {
     if let Some(poly) = load_antarctica_polygon() {
         let verts = poly.exterior().0.len() as u64;
         group.throughput(Throughput::Elements(verts));
-        group.bench_function("antarctica_316k", |b| {
+        // Named for what it measures: the over-cap early-out in `node_ring`
+        // (the noding sweep itself is covered by the synthetic sizes above).
+        group.bench_function("antarctica_316k_over_cap", |b| {
             b.iter(|| black_box(encode_polygon(black_box(&poly), black_box(&bounds), 4096)));
         });
     } else {
-        eprintln!("mvt_encode: Antarctica fixture not found, skipping antarctica_316k");
+        fixtures::missing("mvt_encode", "antarctica-polygon.wkb");
     }
 
     group.finish();
 }
 
+/// One feature's property list, as `LayerBuilder::add_feature` takes it.
+type Props = Vec<(String, PropertyValue)>;
+
 /// A small pool of realistic repeated tag values (the common OSM/admin-data
 /// shape: a handful of distinct strings/numbers shared by many features).
-fn synthetic_properties(feature_idx: usize) -> Vec<(String, PropertyValue)> {
+fn synthetic_properties(feature_idx: usize) -> Props {
     const HIGHWAYS: &[&str] = &["residential", "primary", "secondary", "service", "track"];
     const SURFACES: &[&str] = &["paved", "unpaved", "gravel"];
     vec![
@@ -128,17 +138,24 @@ fn bench_value_dedup(c: &mut Criterion) {
     let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
 
     for n in [1_000usize, 10_000] {
+        // Geometries and property vectors are built once, outside the timed
+        // loop, so the bench times `add_feature` + `build` (the dedup path)
+        // rather than String/Vec construction.
+        let features: Vec<(Geometry<f64>, Props)> = (0..n)
+            .map(|i| {
+                let geom = Geometry::Point(Point::new(
+                    (i % 100) as f64 / 100.0 - 0.5,
+                    (i / 100) as f64 / 100.0 - 0.5,
+                ));
+                (geom, synthetic_properties(i))
+            })
+            .collect();
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &features, |b, features| {
             b.iter(|| {
                 let mut builder = LayerBuilder::new("bench").with_extent(4096);
-                for i in 0..n {
-                    let geom = Geometry::Point(Point::new(
-                        (i % 100) as f64 / 100.0 - 0.5,
-                        (i / 100) as f64 / 100.0 - 0.5,
-                    ));
-                    let props = synthetic_properties(i);
-                    builder.add_feature(Some(i as u64), &geom, &props, &bounds);
+                for (i, (geom, props)) in features.iter().enumerate() {
+                    builder.add_feature(Some(i as u64), geom, props, &bounds);
                 }
                 black_box(builder.build())
             });

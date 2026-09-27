@@ -11,6 +11,9 @@
 //!
 //! Run with: cargo bench --package tylertoo-core --bench pass1_decode
 
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::fs::File;
 use std::hint::black_box;
 use std::path::Path;
@@ -24,13 +27,12 @@ use std::time::Duration;
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 
 /// Real-world fixtures under `tests/fixtures/realdata/` (#448 note: reuse
-/// in-repo fixtures rather than synthesizing new ones). Feature counts are
-/// approximate (see the fixtures' own README) and only used for throughput
-/// labeling.
-const FIXTURES: &[(&str, &str, u64)] = &[
-    ("open-buildings", "open-buildings.parquet", 1_000),
-    ("road-detections", "road-detections.parquet", 1_000),
-    ("fieldmaps-boundaries", "fieldmaps-boundaries.parquet", 3),
+/// in-repo fixtures rather than synthesizing new ones). Throughput is the
+/// actual row count of the loaded batches, not a hardcoded guess.
+const FIXTURES: &[(&str, &str)] = &[
+    ("open-buildings", "open-buildings.parquet"),
+    ("road-detections", "road-detections.parquet"),
+    ("fieldmaps-boundaries", "fieldmaps-boundaries.parquet"),
 ];
 
 fn fixture_path(name: &str) -> String {
@@ -74,14 +76,15 @@ fn bench_pass1_decode(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(4));
     group.sample_size(30);
 
-    for (label, file, approx_features) in FIXTURES {
+    for (label, file) in FIXTURES {
         let path = fixture_path(file);
         let Some((_, gfield, gidx, batches)) = load_batches(Path::new(&path)) else {
-            eprintln!("pass1_decode: fixture {path} not found, skipping {label}");
+            fixtures::missing("pass1_decode", &path);
             continue;
         };
 
-        group.throughput(Throughput::Elements(*approx_features));
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        group.throughput(Throughput::Elements(rows as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(label),
             &(gfield, gidx, batches),

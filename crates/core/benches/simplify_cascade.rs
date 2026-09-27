@@ -8,6 +8,9 @@
 //!
 //! Run with: cargo bench --package tylertoo-core --bench simplify_cascade
 
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::fs::File;
 use std::hint::black_box;
 use std::io::Read;
@@ -99,7 +102,7 @@ fn bench_simplify_cascade(c: &mut Criterion) {
 
     for (label, geom) in fixtures {
         let Some(geom) = geom else {
-            eprintln!("simplify_cascade: fixture for {label} not found, skipping");
+            fixtures::missing("simplify_cascade", label);
             continue;
         };
         let verts = geo::coords_iter::CoordsIter::coords_count(&geom) as u64;
