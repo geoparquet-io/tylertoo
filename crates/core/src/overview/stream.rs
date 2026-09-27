@@ -64,8 +64,9 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -229,6 +230,208 @@ pub(super) fn sample_rss_peak(peak_mib: &mut Option<f64>) -> Option<f64> {
         *peak_mib = Some(rss);
     }
     Some(rss)
+}
+
+/// How often the background RSS sampler (#571) polls process RSS while
+/// profiling is on. An internal constant, not a tunable — this is our own
+/// diagnostics cadence, not tiling behavior with a tippecanoe/planetiler
+/// reference to match.
+const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Continuous background RSS sampler (#571).
+///
+/// The `[rss] <phase>` boundary logs above ([`log_phase_rss`]) only ever
+/// sample AT phase boundaries. A peak that lives and dies entirely inside one
+/// phase is invisible to them — on a 1.5M-line fixture, the pass-1
+/// line-coalescing buffer (#449) reached 3.8 GiB and released it again 74s
+/// later, all inside the "pass1 scan" phase, and `[rss] convert peak`
+/// reported a number ~3 GiB below the true peak. This sampler polls RSS on
+/// its own thread every [`RSS_SAMPLE_INTERVAL`] and keeps two numbers
+/// boundary sampling cannot produce:
+///
+/// - the TRUE peak RSS across the whole run ([`RssSamplerReport::true_peak_mib`]);
+/// - the max RSS observed while each named phase was current
+///   ([`RssSamplerReport::phase_peaks_mib`], attributed via [`Self::mark_phase`]).
+///
+/// This promotes the polling loop `peak_rss_during` (in `tests` below, #449)
+/// used to verify the pass-1 line-buffer memory model to 1% — same approach,
+/// generalized with phase attribution so the profiling path can use it too,
+/// not just that one test.
+///
+/// Spawned only when profiling is on ([`Self::start_if`]): `None` means no
+/// thread, no channel, no allocation beyond the `bool` check — zero cost when
+/// `TYLERTOO_PROFILE_JSON` is unset, per #571.
+pub(super) struct RssSampler {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    state: Arc<Mutex<RssSamplerState>>,
+    interval: Duration,
+}
+
+struct RssSamplerState {
+    /// The phase every sample is attributed to until the next
+    /// [`RssSampler::mark_phase`] call.
+    current_phase: String,
+    /// The absolute peak RSS seen by ANY sample, regardless of phase.
+    true_peak_mib: f64,
+    /// Per-phase peak, in first-seen (execution) order — a run has a handful
+    /// of phases, so a linear scan per sample is simpler than a `HashMap`
+    /// and keeps the profile JSON's phase order matching what happened.
+    phase_peaks_mib: Vec<(String, f64)>,
+}
+
+/// What [`RssSampler::finish`] reports: the whole-run true peak plus the max
+/// RSS seen during each phase, in execution order.
+pub(super) struct RssSamplerReport {
+    pub(super) interval_ms: u64,
+    pub(super) true_peak_mib: f64,
+    pub(super) phase_peaks_mib: Vec<(String, f64)>,
+}
+
+impl RssSampler {
+    /// Start the sampler iff `profiling_on`; otherwise spawn nothing. Samples
+    /// taken before the first [`Self::mark_phase`] call are attributed to
+    /// `initial_phase`.
+    pub(super) fn start_if(profiling_on: bool, initial_phase: &str) -> Option<Self> {
+        profiling_on.then(|| Self::start(initial_phase, RSS_SAMPLE_INTERVAL))
+    }
+
+    /// Test seam: like [`Self::start_if`] but with an explicit poll interval,
+    /// so tests observe a deliberate allocation without waiting out the
+    /// production 250 ms cadence.
+    #[cfg(test)]
+    fn start_if_with_interval(
+        profiling_on: bool,
+        initial_phase: &str,
+        interval: Duration,
+    ) -> Option<Self> {
+        profiling_on.then(|| Self::start(initial_phase, interval))
+    }
+
+    fn start(initial_phase: &str, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(RssSamplerState {
+            current_phase: initial_phase.to_string(),
+            true_peak_mib: 0.0,
+            phase_peaks_mib: Vec::new(),
+        }));
+        let (stop_bg, state_bg) = (Arc::clone(&stop), Arc::clone(&state));
+        let handle = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Relaxed) {
+                if let Some(mib) = current_rss_mib() {
+                    if let Ok(mut s) = state_bg.lock() {
+                        if mib > s.true_peak_mib {
+                            s.true_peak_mib = mib;
+                        }
+                        let phase = s.current_phase.clone();
+                        match s.phase_peaks_mib.iter_mut().find(|(p, _)| *p == phase) {
+                            Some((_, peak)) => {
+                                if mib > *peak {
+                                    *peak = mib;
+                                }
+                            }
+                            None => s.phase_peaks_mib.push((phase, mib)),
+                        }
+                    }
+                }
+                std::thread::sleep(interval);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+            state,
+            interval,
+        }
+    }
+
+    /// Attribute every sample taken from now on to `phase`, until the next
+    /// call. Cheap (one mutex lock + a possible short-string clone); called
+    /// only at phase boundaries, never per-row.
+    pub(super) fn mark_phase(&self, phase: &str) {
+        if let Ok(mut s) = self.state.lock() {
+            if s.current_phase != phase {
+                s.current_phase = phase.to_string();
+            }
+        }
+    }
+
+    fn stop_thread(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// Stop the sampler thread and return its findings.
+    pub(super) fn finish(mut self) -> RssSamplerReport {
+        self.stop_thread();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RssSamplerReport {
+            interval_ms: self.interval.as_millis() as u64,
+            true_peak_mib: state.true_peak_mib,
+            phase_peaks_mib: state.phase_peaks_mib.clone(),
+        }
+    }
+}
+
+impl Drop for RssSampler {
+    fn drop(&mut self) {
+        // Best-effort: normal shutdown goes through `finish`, but an early
+        // return (`?`) before that must still stop the thread rather than
+        // leak it running forever.
+        self.stop_thread();
+    }
+}
+
+/// Convert's RSS tracking: the pre-existing #295 boundary peak plus the #571
+/// continuous sampler, threaded through pass 1 / assignment the same way the
+/// bare `peak_rss_mib: &mut Option<f64>` always was — promoting the sampler
+/// cost no new plumbing beyond widening this one type.
+pub(super) struct RssTracker {
+    /// `[rss] <phase>` boundary peak (#295), unchanged semantics: feeds
+    /// `peak_rss_mib` in the profile JSON exactly as before.
+    pub(super) boundary_peak_mib: Option<f64>,
+    sampler: Option<RssSampler>,
+}
+
+impl RssTracker {
+    pub(super) fn new(profiling_on: bool, initial_phase: &str) -> Self {
+        Self {
+            boundary_peak_mib: None,
+            sampler: RssSampler::start_if(profiling_on, initial_phase),
+        }
+    }
+
+    /// Enter `phase`: everything the background sampler observes from now on
+    /// is attributed to it, until the next call. A no-op when profiling is
+    /// off (the sampler never started).
+    pub(super) fn enter_phase(&self, phase: &str) {
+        if let Some(sampler) = &self.sampler {
+            sampler.mark_phase(phase);
+        }
+    }
+
+    /// The pre-existing #295 boundary sample + `[rss] <phase>` log line.
+    pub(super) fn log_phase(&mut self, phase: &str) {
+        log_phase_rss(phase, &mut self.boundary_peak_mib);
+    }
+
+    /// [`Self::log_phase`] for `ended` immediately followed by
+    /// [`Self::enter_phase`] for `next` — the common "one phase's boundary IS
+    /// the next phase's start" shape every convert transition uses.
+    pub(super) fn log_phase_then_enter(&mut self, ended: &str, next: &str) {
+        self.log_phase(ended);
+        self.enter_phase(next);
+    }
+
+    /// Stop the sampler (a no-op if profiling was off) and take its report.
+    pub(super) fn finish_sampler(&mut self) -> Option<RssSamplerReport> {
+        self.sampler.take().map(RssSampler::finish)
+    }
 }
 
 /// Split the resolved level plan into emitted levels (have winners) and skipped
@@ -1194,7 +1397,7 @@ fn resolve_winner_tables(
     num_rows: usize,
     crs: Crs,
     options: &ConvertOptions,
-    peak_rss_mib: &mut Option<f64>,
+    rss: &mut RssTracker,
 ) -> Result<WinnerTables, ConvertError> {
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
@@ -1241,7 +1444,7 @@ fn resolve_winner_tables(
     );
     // Pass-1 winner tables (bboxes/kinds/sort-keys for every feature across all
     // levels) are the O(dataset) peak candidate flagged in #295.
-    log_phase_rss("assignment+budget (winner tables)", peak_rss_mib);
+    rss.log_phase("assignment+budget (winner tables)");
 
     // The feature-parallel winner table (coarsest level per FEATURE, in
     // `features` order) feeds the cluster stage and the per-level counts.
@@ -1608,7 +1811,7 @@ struct PlanState {
 fn resolve_plan_state(
     inputs: &Pass1Inputs<'_>,
     options: &ConvertOptions,
-    peak_rss_mib: &mut Option<f64>,
+    rss: &mut RssTracker,
 ) -> Result<PlanState, ConvertError> {
     // Captured before either branch: the load path compares the saved
     // fingerprint against it, the save path stores it.
@@ -1628,7 +1831,7 @@ fn resolve_plan_state(
             inputs.source,
             inputs.selected_row_groups,
         ),
-        None => run_pass1_and_assign(inputs, options, fingerprint, peak_rss_mib),
+        None => run_pass1_and_assign(inputs, options, fingerprint, rss),
     }
 }
 
@@ -1638,7 +1841,7 @@ fn run_pass1_and_assign(
     inputs: &Pass1Inputs<'_>,
     options: &ConvertOptions,
     fingerprint: Option<Fingerprint>,
-    peak_rss_mib: &mut Option<f64>,
+    rss: &mut RssTracker,
 ) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
     let Pass1Output {
@@ -1690,7 +1893,12 @@ fn run_pass1_and_assign(
         "[profile] pass1 stream+scan: {:.2}s",
         pass1_wall.as_secs_f64()
     );
-    log_phase_rss("pass1 scan", peak_rss_mib);
+    rss.log_phase("pass1 scan");
+    // Everything from here to the next boundary belongs to the level
+    // assignment (#571): this is what lets the background sampler catch a
+    // peak that would otherwise straddle the "pass1 scan" / "assignment"
+    // boundary uncredited to either.
+    rss.enter_phase("assignment+budget (winner tables)");
 
     let t_assign = Instant::now();
     let tables = resolve_winner_tables(
@@ -1702,7 +1910,7 @@ fn run_pass1_and_assign(
         num_rows,
         inputs.crs,
         options,
-        peak_rss_mib,
+        rss,
     )?;
     // Stops before `--save-plan` serialization, which is I/O for an opt-in
     // artifact rather than part of the assignment itself.
@@ -1913,6 +2121,42 @@ fn load_plan_state(
     })
 }
 
+/// Log the continuous sampler's true peak against the boundary-sampled one
+/// (#571), but only when the gap is worth a line — i.e. when boundary
+/// sampling actually missed something. Pulled out of
+/// [`convert_streaming_strategy`] purely to stay under clippy's
+/// function-length ceiling; it has no effect on the profile JSON (that
+/// happens later, in [`emit_profile_json`]).
+fn log_rss_true_peak_if_notable(boundary_peak_mib: Option<f64>, report: &Option<RssSamplerReport>) {
+    let Some(report) = report else {
+        return;
+    };
+    if boundary_peak_mib.is_none_or(|boundary| report.true_peak_mib > boundary + 1.0) {
+        log::info!(
+            "[rss] convert true peak (continuous sampling): {:.0} MiB (boundary-sampled peak \
+             was {})",
+            report.true_peak_mib,
+            boundary_peak_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
+        );
+    }
+}
+
+/// The end of convert's RSS tracking (#295/#571): log `[rss] convert peak`,
+/// stop the background sampler (a no-op if profiling was off), log the
+/// true-peak comparison when it's notable, and return both for the profile
+/// JSON. Pulled out of [`convert_streaming_strategy`] for clippy's
+/// function-length ceiling; called once, right after the last `log_phase`.
+fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerReport>) {
+    let peak_rss_mib = rss.boundary_peak_mib;
+    log::info!(
+        "[rss] convert peak: {}",
+        peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
+    );
+    let rss_sampler_report = rss.finish_sampler();
+    log_rss_true_peak_if_notable(peak_rss_mib, &rss_sampler_report);
+    (peak_rss_mib, rss_sampler_report)
+}
+
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -1920,10 +2164,9 @@ pub(crate) fn convert_streaming_strategy(
     strategy: Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
     let start = Instant::now();
-    // #295: peak-RSS-by-phase instrumentation. Each phase boundary logs process
-    // RSS; the max is reported at the end so a single run shows both the peak
-    // and which phase produced it.
-    let mut peak_rss_mib: Option<f64> = None;
+    // #295/#571 peak-RSS tracking: boundary samples + a continuous
+    // background sampler when profiling is on (see `RssTracker`/`RssSampler`).
+    let mut rss = RssTracker::new(profile_json_target().is_some(), "pass1 scan");
 
     if options.sort_key.is_some() && options.class_ranking.is_some() {
         return Err(ConvertError::RankingConflict);
@@ -1978,8 +2221,9 @@ pub(crate) fn convert_streaming_strategy(
             crs,
         },
         options,
-        &mut peak_rss_mib,
+        &mut rss,
     )?;
+    rss.enter_phase("pre-pass2 (winner tables freed)"); // #571
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.
@@ -2042,7 +2286,7 @@ pub(crate) fn convert_streaming_strategy(
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
     // Pass-1 O(N) scratch has been freed by here; this marks the memory floor
     // the pass-2 output sink builds on (its ceiling is the #294 auto choice).
-    log_phase_rss("pre-pass2 (winner tables freed)", &mut peak_rss_mib);
+    rss.log_phase_then_enter("pre-pass2 (winner tables freed)", "pass2 (output sink)");
     let t_pass2 = Instant::now();
 
     let duplicating = matches!(options.mode, Mode::Duplicating);
@@ -2119,7 +2363,7 @@ pub(crate) fn convert_streaming_strategy(
     // sums) belongs to neither.
     let pass2_wall = t_pass2.elapsed();
     log::debug!("[profile] pass2 total: {:.2}s", pass2_wall.as_secs_f64());
-    log_phase_rss("pass2 (output sink)", &mut peak_rss_mib);
+    rss.log_phase_then_enter("pass2 (output sink)", "writer.finish");
 
     let t_finish = Instant::now();
     let meta = writer.finish()?;
@@ -2128,11 +2372,8 @@ pub(crate) fn convert_streaming_strategy(
         "[profile] writer.finish: {:.2}s",
         writer_finish_wall.as_secs_f64()
     );
-    log_phase_rss("writer.finish", &mut peak_rss_mib);
-    log::info!(
-        "[rss] convert peak: {}",
-        peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
-    );
+    rss.log_phase("writer.finish");
+    let (peak_rss_mib, rss_sampler_report) = finish_convert_rss(rss);
     fill_level_bytes(output_path, &meta, &mut level_reports)?;
 
     let total_rows: usize = level_reports.iter().map(|l| l.feature_count).sum();
@@ -2157,6 +2398,7 @@ pub(crate) fn convert_streaming_strategy(
         level_reports: &level_reports,
         level_spill_bytes: &level_spill_bytes,
         peak_rss_mib,
+        rss_sampler_report,
         in_flight_batches,
     });
 
@@ -2201,6 +2443,9 @@ struct ProfileJsonContext<'a> {
     level_reports: &'a [LevelReport],
     level_spill_bytes: &'a [u64],
     peak_rss_mib: Option<f64>,
+    /// The #571 continuous sampler's findings, `None` only when profiling
+    /// was off (in which case this whole dump is never written anyway).
+    rss_sampler_report: Option<RssSamplerReport>,
     in_flight_batches: usize,
 }
 
@@ -2228,6 +2473,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
             .map(|(l, &spill_bytes)| (l.feature_count, spill_bytes))
             .collect(),
         peak_rss_mib: ctx.peak_rss_mib,
+        rss_sampler_report: ctx.rss_sampler_report,
         in_flight_batches: ctx.in_flight_batches,
     });
 }
@@ -2269,6 +2515,10 @@ struct ProfileJsonInputs<'a> {
     /// buffered in RAM or streamed directly (the finest level).
     levels: Vec<(usize, u64)>,
     peak_rss_mib: Option<f64>,
+    /// #571: the continuous sampler's true peak + per-phase maxima, feeding
+    /// the dump's `rss_sampler` object. `None` only when profiling was off
+    /// (moot: this whole dump is a no-op then).
+    rss_sampler_report: Option<RssSamplerReport>,
     in_flight_batches: usize,
 }
 
@@ -2435,6 +2685,7 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
         },
         "levels": levels_json,
         "peak_rss_mib": inputs.peak_rss_mib,
+        "rss_sampler": rss_sampler_json(&inputs.rss_sampler_report),
         "threads": rayon::current_num_threads(),
         "in_flight": inputs.in_flight_batches,
         "memory_profile": inputs.options.profile,
@@ -2442,10 +2693,35 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
     append_profile_line(&path, &value);
 }
 
+/// Build the `rss_sampler` object shared by both `TYLERTOO_PROFILE_JSON`
+/// dumps (#571): the continuous background sampler's TRUE peak RSS and its
+/// per-phase maxima, in execution order — see `docs/PROFILING.md` for the
+/// exact contrast with the boundary-sampled `peak_rss_mib` next to it. `null`
+/// only when the sampler never ran (profiling off), which in practice never
+/// happens here since the whole dump is a no-op then.
+fn rss_sampler_json(report: &Option<RssSamplerReport>) -> serde_json::Value {
+    match report {
+        Some(r) => {
+            let phase_peaks_mib: serde_json::Map<String, serde_json::Value> = r
+                .phase_peaks_mib
+                .iter()
+                .map(|(phase, mib)| (phase.clone(), serde_json::json!(mib)))
+                .collect();
+            serde_json::json!({
+                "interval_ms": r.interval_ms,
+                "true_peak_mib": r.true_peak_mib,
+                "phase_peaks_mib": phase_peaks_mib,
+            })
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
 /// The `TYLERTOO_PROFILE_JSON` target, or `None` when the var is unset or
 /// blank (profiling off). Shared by both profile writers so they agree on
-/// what "off" means.
-fn profile_json_target() -> Option<String> {
+/// what "off" means, and by `export.rs` (#571) to decide whether to start its
+/// own [`RssSampler`].
+pub(super) fn profile_json_target() -> Option<String> {
     std::env::var("TYLERTOO_PROFILE_JSON")
         .ok()
         .filter(|p| !p.trim().is_empty())
@@ -2702,6 +2978,9 @@ pub(super) struct ExportProfileJsonInputs<'a> {
     /// the scan, the fill, each level, and finalize) — a sampled peak, not a
     /// true high-water mark. `None` when the platform can't report RSS.
     pub(super) peak_rss_mib: Option<f64>,
+    /// #571: the continuous sampler's true peak + per-phase maxima, feeding
+    /// `export.rss_sampler`. `None` only when profiling was off.
+    pub(super) rss_sampler_report: &'a Option<RssSamplerReport>,
 }
 
 /// Append a SECOND JSON line to `TYLERTOO_PROFILE_JSON`, if set, for the
@@ -2764,6 +3043,7 @@ pub(super) fn write_export_profile_json(inputs: ExportProfileJsonInputs<'_>) {
             "partition_wave_width": inputs.partition_wave_width,
             "checkpoints": inputs.checkpoints,
             "peak_rss_mib": inputs.peak_rss_mib,
+            "rss_sampler": rss_sampler_json(inputs.rss_sampler_report),
             "threads": rayon::current_num_threads(),
         },
     });
@@ -5390,23 +5670,19 @@ mod tests {
     /// — the phase-boundary `[rss]` logs cannot see a peak that lives and
     /// dies inside one phase, which is exactly where the #449 line buffer
     /// lives.
+    ///
+    /// #571: this is now a thin wrapper over the production [`RssSampler`]
+    /// (a 2 ms interval, same as this helper used before promotion) rather
+    /// than its own bespoke polling loop — the sampler that verified the
+    /// pass-1 memory model to 1% below is the one now driving the profile
+    /// dump, not a parallel reimplementation of it.
     fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, f64) {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        let stop = Arc::new(AtomicBool::new(false));
-        let peak = Arc::new(AtomicU64::new(0));
-        let (s, p) = (Arc::clone(&stop), Arc::clone(&peak));
-        let sampler = std::thread::spawn(move || {
-            while !s.load(Ordering::Relaxed) {
-                if let Some(mib) = current_rss_mib() {
-                    p.fetch_max(mib as u64, Ordering::Relaxed);
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        });
+        let sampler =
+            RssSampler::start_if_with_interval(true, "peak_rss_during", Duration::from_millis(2))
+                .expect("profiling_on=true always starts a sampler");
         let out = f();
-        stop.store(true, Ordering::Relaxed);
-        sampler.join().unwrap();
-        (out, peak.load(Ordering::Relaxed) as f64)
+        let report = sampler.finish();
+        (out, report.true_peak_mib)
     }
 
     /// #449 peak-RSS regression, `--ignored` (it writes and scans a ~1.2M-row
@@ -5507,6 +5783,92 @@ mod tests {
             "a guard-tripped pass 1 still paid for the line buffer: tripped \
              {tripped_peak:.0} MiB vs collecting {kept_peak:.0} MiB — only \
              {observed_mib:.0} MiB of the modelled {modelled_mib:.0} MiB was released"
+        );
+    }
+
+    /// #571: `RssSampler::start_if(false, ...)` must spawn nothing — the
+    /// profiling-off path costs zero threads, zero channels, zero polling.
+    /// Deliberately drives the `bool` directly rather than the
+    /// `TYLERTOO_PROFILE_JSON` env var: mutating process-global env state
+    /// from a `#[test]` racing other tests in the same binary would be
+    /// flaky, and the production call site
+    /// (`profile_json_target().is_some()`) is a one-line, untestable-by-unit
+    /// translation of the env var into exactly this `bool`.
+    #[test]
+    fn rss_sampler_not_spawned_when_profiling_is_off() {
+        assert!(
+            RssSampler::start_if(false, "pass1 scan").is_none(),
+            "profiling off must start no sampler thread at all"
+        );
+        // Same contract on the convert-side wrapper: no sampler inside means
+        // `enter_phase` and `finish_sampler` are no-ops, not panics.
+        let mut tracker = RssTracker::new(false, "pass1 scan");
+        tracker.enter_phase("assignment+budget (winner tables)"); // must not panic
+        assert!(
+            tracker.finish_sampler().is_none(),
+            "profiling off must produce no sampler report"
+        );
+    }
+
+    /// #571: the background sampler must observe a peak that lives and dies
+    /// entirely BETWEEN two phase boundaries — exactly the gap that made
+    /// `[rss] convert peak` under-report the #449 coalescing peak by ~3 GiB
+    /// on a real run. Uses a short poll interval (the test seam) so a
+    /// deliberate ~200 MiB allocation, held only briefly, is reliably
+    /// sampled without waiting out the production 250 ms cadence.
+    #[test]
+    fn rss_sampler_catches_a_peak_that_lives_and_dies_inside_one_phase() {
+        let sampler = RssSampler::start_if_with_interval(true, "phase-a", Duration::from_millis(5))
+            .expect("profiling_on=true always starts a sampler");
+
+        // What a BOUNDARY sample taken right before the allocation would see.
+        let before_mib = current_rss_mib();
+
+        // A single large allocation, touched (not just zeroed-and-lazily-
+        // mapped) so it is real committed RSS, held just long enough for
+        // several 5ms samples to land, then dropped before the phase ends —
+        // i.e. it never crosses a boundary sample on either side.
+        const ALLOC_MIB: usize = 200;
+        let mut buf = vec![0u8; ALLOC_MIB * 1024 * 1024];
+        for chunk in buf.chunks_mut(4096) {
+            chunk[0] = 1;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        drop(buf);
+        std::thread::sleep(Duration::from_millis(20)); // let RSS settle back down
+
+        // What a BOUNDARY sample taken right after would see — the buffer is
+        // already freed.
+        let after_mib = current_rss_mib();
+
+        sampler.mark_phase("phase-b");
+        let report = sampler.finish();
+        let phase_a_peak = report
+            .phase_peaks_mib
+            .iter()
+            .find(|(p, _)| p == "phase-a")
+            .map(|&(_, mib)| mib)
+            .expect("phase-a must have at least one sample");
+
+        if let (Some(before), Some(after)) = (before_mib, after_mib) {
+            // The two "boundary" samples bracket the allocation but never see
+            // it — this is the exact defect #571 fixes.
+            assert!(
+                before < phase_a_peak - 50.0,
+                "before-allocation sample ({before:.0} MiB) should sit well \
+                 below the sampler's phase-a peak ({phase_a_peak:.0} MiB)"
+            );
+            assert!(
+                after < phase_a_peak - 50.0,
+                "after-free sample ({after:.0} MiB) should sit well below \
+                 the sampler's phase-a peak ({phase_a_peak:.0} MiB) — \
+                 boundary sampling alone would have missed the whole \
+                 allocation"
+            );
+        }
+        assert!(
+            report.true_peak_mib >= phase_a_peak,
+            "the whole-run true peak must be at least the one phase's peak"
         );
     }
 

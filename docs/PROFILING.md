@@ -107,12 +107,62 @@ not "the run was not profiled".
   "levels": [                       // per WRITTEN level, writer order
     { "rows": 1000, "spill_bytes": 0 }
   ],
-  "peak_rss_mib": 29.28,            // null if RSS sampling is unavailable
+  "peak_rss_mib": 29.28,            // BOUNDARY-sampled peak (see below); null
+                                    // if RSS sampling is unavailable
+  "rss_sampler": {                  // #571: the CONTINUOUS background sampler
+    "interval_ms": 250,             // poll interval
+    "true_peak_mib": 32.1,          // true high-water mark across the WHOLE run
+    "phase_peaks_mib": {            // max RSS observed while each phase was
+      "pass1 scan": 32.1,           // current — execution order, one entry
+      "assignment+budget (winner tables)": 30.4, // per phase actually visited
+      "pre-pass2 (winner tables freed)": 28.9,
+      "pass2 (output sink)": 29.9,
+      "writer.finish": 29.28
+    }
+  },
   "threads": 12,                    // rayon::current_num_threads()
   "in_flight": 12,                  // read batches in flight (pass 2)
   "memory_profile": "auto"          // the resolved MemoryProfile
 }
 ```
+
+### `peak_rss_mib` vs `rss_sampler` (#571)
+
+`peak_rss_mib` only ever samples RSS **at the five phase boundaries** above
+(`log_phase_rss`, unchanged since #295): the max of those five snapshots. A
+peak that lives and dies entirely **inside** one phase is invisible to it. On
+a 1.5M-line fixture the pass-1 line-coalescing buffer (#449) reached 3.8 GiB
+and released it again 74s later, all inside "pass1 scan" — `peak_rss_mib`
+(and the `[rss] convert peak` log line) reported a number ~3 GiB below the
+true peak.
+
+`rss_sampler` fixes this with a background thread that polls RSS every
+`interval_ms` (250ms in production; a test-only seam uses a shorter interval)
+whenever profiling is on, and is not spawned at all otherwise — zero cost off
+the profiling path. It reports two numbers boundary sampling cannot produce:
+
+- `true_peak_mib`: the max of every sample the background sampler took,
+  across the whole run.
+- `phase_peaks_mib`: the max RSS observed while each named phase was current,
+  keyed by the same phase names `peak_rss_mib`'s underlying `[rss] <phase>`
+  log lines use, in the order the run actually visited them (a level ceiling
+  or `--plan` run can visit fewer phases than the schema example above).
+
+On any run that runs long enough for the sampler to catch a peak the
+boundary samples missed, `true_peak_mib > peak_rss_mib` — that gap is exactly
+what #571 exists to surface. **On a run shorter than `interval_ms`** (a tiny
+fixture, a smoke test), the two samplers are not directly comparable:
+`peak_rss_mib` is guaranteed to have sampled at each of the five exact phase
+ends, while the background sampler may have taken zero or one sample total
+and can easily miss a peak the boundary samples caught — so
+`true_peak_mib < peak_rss_mib` on such a run is expected, not a bug. Treat
+`rss_sampler.true_peak_mib` as the more trustworthy number for sizing
+line-heavy or long-running jobs (#543's preflight guidance and the
+memory-envelope docs), not as a value with a fixed ordering against
+`peak_rss_mib` on every run. `peak_rss_mib` remains for backward
+compatibility with existing consumers of this field. `rss_sampler` is `null`
+only when profiling was off, which cannot happen for a line this dump
+actually wrote (the whole dump is a no-op then).
 
 The four `phase_walls` phases are **disjoint** windows of one conversion, so
 `pass1 + assign + pass2 + writer_finish <= total` always holds; the
@@ -220,7 +270,17 @@ missing export line after a failed run is expected, not a profiling bug.
     "waves_total": 10,             // sum of every level's wave-loop iterations
     "partition_wave_width": 12,    // the resolved partition-wave CEILING
     "checkpoints": 0,              // writer.checkpoint() calls, NOT finalize
-    "peak_rss_mib": 812.4,         // sampled peak (see below); null if unavailable
+    "peak_rss_mib": 812.4,         // BOUNDARY-sampled peak (see below); null if unavailable
+    "rss_sampler": {                // #571: the CONTINUOUS background sampler
+      "interval_ms": 250,
+      "true_peak_mib": 940.7,      // true high-water mark across the WHOLE export
+      "phase_peaks_mib": {         // max RSS while each phase was current
+        "scan": 210.5,
+        "fill": 940.7,             // 0 entries here in duplicating mode (no fill)
+        "levels": 880.2,
+        "finalize": 815.0
+      }
+    },
     "threads": 12                  // rayon::current_num_threads()
   }
 }
@@ -310,6 +370,20 @@ can exceed the archive's size. It is not the raw pre-gzip MVT size.
 boundaries (after the scan, the fill, each level, and finalize). It is a
 sampled peak, not a true high-water mark, and is `null` where the platform
 cannot report RSS.
+
+`export.rss_sampler` (#571) is the continuous background sampler's report —
+the export-side counterpart of convert's `rss_sampler` (see that section
+above for the full explanation of why it exists, how it differs from
+`peak_rss_mib`, and why the two are not directly comparable on a run shorter
+than `interval_ms`). It runs a background thread from the level scan through
+`finalize`, polling every `interval_ms`, and reports `true_peak_mib` (the max
+of every sample taken) plus `phase_peaks_mib` keyed by `scan` / `fill` /
+`levels` / `finalize` — the same names as `export.phase_walls`. In
+duplicating mode `fill` never runs, so it gets at most a fleeting sample (or
+none) between `scan` and `levels`, mirroring `phase_walls.fill` being exactly
+`0.0` there. Spawned only when profiling is
+on; `null` otherwise (which cannot happen for a line this dump actually
+wrote).
 
 `export.partition_wave_width` is the resolved partition-wave **ceiling**
 (`resolve_and_log_partition_wave`'s return, `auto` or an explicit

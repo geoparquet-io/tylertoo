@@ -130,8 +130,9 @@ use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
 use super::properties::PropertySelection;
 use super::reader::{OverviewReader, ReaderError};
 use super::stream::{
-    add_nanos, preflight_profile_json_path, sample_rss_peak, write_export_profile_json,
-    ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers, ExportZoomProfile,
+    add_nanos, preflight_profile_json_path, profile_json_target, sample_rss_peak,
+    write_export_profile_json, ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers,
+    ExportZoomProfile, RssSampler, RssSamplerReport,
 };
 use super::writer::LEVEL_COLUMN;
 
@@ -1336,7 +1337,9 @@ fn export_pmtiles_impl(
     let mut zooms: Vec<ZoomReport> = Vec::with_capacity(num_levels);
     // #535 step 1: stage timers + per-zoom profile -> a second
     // `TYLERTOO_PROFILE_JSON` line at the end ([`emit_export_profile_json`]).
-    let mut progress = ExportProgress::new(num_levels);
+    // #571: `ExportProgress` also starts the continuous RSS sampler here, iff
+    // profiling is on — zero cost (no thread) otherwise.
+    let mut progress = ExportProgress::new(num_levels, profile_json_target().is_some());
 
     // Plan every level's partitions and wave width up front. The partitioning
     // single-read fill (#235) routes members by (level, partition, wave), so
@@ -1353,6 +1356,10 @@ fn export_pmtiles_impl(
         available_ram,
     )?;
     progress.end_scan(t_scan);
+    // #571: attribute samples from here on to "fill" — overwritten below by
+    // "levels" the moment the (possible) fill resolves, so a duplicating-mode
+    // export (no fill at all) never lingers on this label.
+    progress.enter_phase("fill");
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
     // is the accumulating row-group prefix (§5.1), so the legacy per-level
@@ -1398,6 +1405,10 @@ fn export_pmtiles_impl(
     } else {
         None
     };
+    // #571: the per-level wave loop — the analogous phase to convert's
+    // pass-2 output sink, and where a single dense level's clip/encode
+    // buffers can peak between the (rare) checkpoint boundaries.
+    progress.enter_phase("levels");
 
     let t_levels = Instant::now();
     for (level_idx, plan) in plans.iter().enumerate() {
@@ -1437,6 +1448,7 @@ fn export_pmtiles_impl(
     }
 
     progress.profile.walls.levels = t_levels.elapsed().as_secs_f64();
+    progress.enter_phase("finalize");
 
     let t_finalize = Instant::now();
     writer.finalize(output_path.as_ref())?;
@@ -1446,6 +1458,9 @@ fn export_pmtiles_impl(
         t_finalize.elapsed().as_secs_f64(),
         start.elapsed().as_secs_f64(),
     );
+    // #571: stop the sampler (a no-op if profiling was off) and fold its
+    // findings into the profile `emit` is about to write.
+    progress.finish_rss_sampler();
 
     let total_tiles = zooms.iter().map(|z| z.tile_count).sum();
     let total_tile_features = zooms.iter().map(|z| z.tile_feature_count).sum();
@@ -1535,10 +1550,16 @@ struct ExportProgress {
     /// checkpoints, letting `finalize` do all the work.
     checkpoint_throttle: Instant,
     profile: ExportProfile,
+    /// #571: the continuous background sampler, running only when
+    /// `TYLERTOO_PROFILE_JSON` is set — catches an intra-phase peak (e.g. the
+    /// partitioning-mode fill, or a single dense level's wave loop) that the
+    /// `end_*` boundary samples below cannot see, the same gap #571 fixed on
+    /// the convert side. `None`, no thread, when profiling is off.
+    rss_sampler: Option<RssSampler>,
 }
 
 impl ExportProgress {
-    fn new(num_levels: usize) -> Self {
+    fn new(num_levels: usize, profiling_on: bool) -> Self {
         Self {
             checkpoint_throttle: Instant::now(),
             profile: ExportProfile {
@@ -1548,7 +1569,17 @@ impl ExportProgress {
                 waves_total: 0,
                 checkpoints: 0,
                 peak_rss_mib: None,
+                rss_sampler_report: None,
             },
+            rss_sampler: RssSampler::start_if(profiling_on, "scan"),
+        }
+    }
+
+    /// Attribute every sample the background sampler takes from now on to
+    /// `phase`, until the next call. A no-op when profiling is off.
+    fn enter_phase(&self, phase: &str) {
+        if let Some(sampler) = &self.rss_sampler {
+            sampler.mark_phase(phase);
         }
     }
 
@@ -1569,6 +1600,12 @@ impl ExportProgress {
         self.profile.walls.finalize = t_finalize.elapsed().as_secs_f64();
         sample_rss_peak(&mut self.profile.peak_rss_mib);
     }
+
+    /// Stop the sampler (a no-op if profiling was off) and fold its report
+    /// into the profile that `emit` writes.
+    fn finish_rss_sampler(&mut self) {
+        self.profile.rss_sampler_report = self.rss_sampler.take().map(RssSampler::finish);
+    }
 }
 
 /// The export's `TYLERTOO_PROFILE_JSON` accumulators (#535): stage timers,
@@ -1580,6 +1617,10 @@ struct ExportProfile {
     waves_total: usize,
     checkpoints: u64,
     peak_rss_mib: Option<f64>,
+    /// #571: the continuous sampler's findings, filled by
+    /// [`ExportProgress::finish_rss_sampler`] just before `emit`. `None` only
+    /// when profiling was off.
+    rss_sampler_report: Option<RssSamplerReport>,
 }
 
 /// The per-export facts [`ExportProfile::emit`] writes alongside the
@@ -1610,6 +1651,7 @@ impl ExportProfile {
             partition_wave_width: target.partition_wave_width,
             checkpoints: self.checkpoints,
             peak_rss_mib: self.peak_rss_mib,
+            rss_sampler_report: &self.rss_sampler_report,
         });
     }
 }
