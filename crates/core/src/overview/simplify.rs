@@ -58,8 +58,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use geo::{
-    Area, BoundingRect, Centroid, Geometry, LineString, MultiLineString, MultiPolygon, Point,
-    Polygon, Rect, Simplify, Validation,
+    Area, BoundingRect, Centroid, Distance, Geometry, LineString, MultiLineString, MultiPolygon,
+    Point, Polygon, Rect, Validation,
 };
 
 pub use super::level::{Crs, METERS_PER_DEGREE};
@@ -693,6 +693,134 @@ fn rect_diag(r: Rect<f64>) -> f64 {
     r.width().hypot(r.height())
 }
 
+/// Minimum retained vertices RDP will not cull below, for an open LineString
+/// (`geo`'s `LINE_STRING_INITIAL_MIN`).
+const RDP_MIN_LINE: usize = 2;
+
+/// Minimum retained vertices RDP will not cull below, for a Polygon ring
+/// (`geo`'s `POLYGON_INITIAL_MIN`).
+const RDP_MIN_RING: usize = 4;
+
+/// Ramer–Douglas–Peucker, with the recursion on the heap (#575).
+///
+/// # Why this is not `geo::Simplify`
+///
+/// `geo`'s `compute_rdp` recurses, and RDP's split depth is **O(n)** in the
+/// worst case, not O(log n): when the farthest vertex is always next to a
+/// subproblem's end, every frame peels off one vertex. A regular zigzag whose
+/// amplitude is just above the epsilon does exactly that — coalescing a road
+/// row into one 12,000-vertex stroke and simplifying it blew a rayon worker's
+/// stack (`fatal runtime error: stack overflow`, #575). Coalescing makes long
+/// chains routine, so the depth has to come off the stack. The explicit stack
+/// grows on the heap and is bounded by the same O(n), which is now fine.
+///
+/// It also removes geo's per-frame `Vec<RdpIndex<T>>` (allocated, popped and
+/// `extend_from_slice`d at every level, i.e. O(n²) *copying* on top of the
+/// O(n²) distance scans in the pathological case): this keeps one `keep` mask
+/// and writes the survivors out once.
+///
+/// # Output identity
+///
+/// Bit-for-bit `geo`'s result, deliberately:
+///
+/// - the farthest-vertex scan runs over the same half-open interior range and
+///   keeps the LAST maximum (`>=`), seeded at distance `0.0`;
+/// - distances come from **`geo`'s own** point-to-segment
+///   `Euclidean.distance`, so no comparison can land differently through a
+///   re-derived formula;
+/// - the `> epsilon` split test is strict, as there;
+/// - `initial_min` reproduces geo's `INITIAL_MIN` floor, including that it is
+///   threaded through a single running length in depth-first, left-to-right
+///   leaf order — hence `stack.push(right)` before `stack.push(left)` below,
+///   which makes the pop order a pre-order DFS and visits leaves left to
+///   right, exactly as the recursion did.
+///
+/// A differential test (`rdp_matches_geo_*`) pins all of this against
+/// `geo::Simplify` over random and adversarial shapes.
+fn rdp_coords(
+    coords: &[geo::Coord<f64>],
+    epsilon: f64,
+    initial_min: usize,
+) -> Vec<geo::Coord<f64>> {
+    // `geo` returns the input untouched for a non-positive epsilon, and its
+    // base cases (0, 1 or 2 coordinates) retain everything.
+    if epsilon <= 0.0 || coords.len() < 3 {
+        return coords.to_vec();
+    }
+
+    let mut keep = vec![true; coords.len()];
+    let mut retained = coords.len();
+    let mut stack: Vec<(usize, usize)> = vec![(0, coords.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 {
+            continue; // nothing between the endpoints: geo's 2-element base case
+        }
+        let chord = geo::Line::new(coords[a], coords[b]);
+        // Seeded exactly as geo's fold: index `a` ("local 0"), distance 0.
+        let mut farthest = a;
+        let mut farthest_dist = 0.0_f64;
+        // `take(b).skip(a + 1)`: geo's own interior range, ascending.
+        for (i, c) in coords.iter().enumerate().take(b).skip(a + 1) {
+            let d = geo::Euclidean.distance(*c, &chord);
+            if d >= farthest_dist {
+                farthest = i;
+                farthest_dist = d;
+            }
+        }
+        debug_assert_ne!(farthest, a, "an interior vertex is always the farthest");
+        if farthest_dist > epsilon {
+            // Right first so the left subproblem pops (and culls) first.
+            stack.push((farthest, b));
+            stack.push((a, farthest));
+            continue;
+        }
+        // Cull the interior — unless that would take the whole geometry below
+        // the floor, in which case geo keeps this subproblem's input as-is.
+        let culled = b - a - 1;
+        if retained - culled < initial_min {
+            continue;
+        }
+        retained -= culled;
+        for k in &mut keep[(a + 1)..b] {
+            *k = false;
+        }
+    }
+    debug_assert_eq!(
+        keep.iter().filter(|k| **k).count(),
+        retained,
+        "the keep mask and geo's running retained length must agree"
+    );
+
+    let mut out = Vec::with_capacity(retained);
+    out.extend(
+        coords
+            .iter()
+            .zip(&keep)
+            .filter(|(_, &k)| k)
+            .map(|(c, _)| *c),
+    );
+    out
+}
+
+/// [`rdp_coords`] over a LineString — the drop-in for `geo`'s
+/// `LineString::simplify`.
+#[inline]
+fn rdp_linestring(ls: &LineString<f64>, epsilon: f64) -> LineString<f64> {
+    LineString::new(rdp_coords(&ls.0, epsilon, RDP_MIN_LINE))
+}
+
+/// [`rdp_coords`] over every ring — the drop-in for `geo`'s
+/// `Polygon::simplify` (which uses the ring floor, not the line one).
+fn rdp_polygon(poly: &Polygon<f64>, epsilon: f64) -> Polygon<f64> {
+    Polygon::new(
+        LineString::new(rdp_coords(&poly.exterior().0, epsilon, RDP_MIN_RING)),
+        poly.interiors()
+            .iter()
+            .map(|r| LineString::new(rdp_coords(&r.0, epsilon, RDP_MIN_RING)))
+            .collect(),
+    )
+}
+
 /// Bounding-box diagonal of a LineString (`0.0` if empty / a single point).
 #[inline]
 fn linestring_diag(ls: &LineString<f64>) -> f64 {
@@ -727,7 +855,7 @@ fn simplify_linestring_checked(ls: &LineString<f64>, tol: f64) -> Option<(LineSt
     if diag < tol {
         return None;
     }
-    let simplified = ls.simplify(tol);
+    let simplified = rdp_linestring(ls, tol);
     if simplified.0.len() < MIN_LINESTRING_POINTS || linestring_diag(&simplified) <= 0.0 {
         return None;
     }
@@ -887,7 +1015,7 @@ fn simplify_polygon_impl_checked(
     let mut eps = tol;
     let mut invalid_candidate: Option<Polygon<f64>> = None;
     for _ in 0..attempts {
-        let simplified = poly.simplify(eps);
+        let simplified = rdp_polygon(poly, eps);
 
         // Drop interior rings that collapsed below the gate.
         let interiors: Vec<LineString<f64>> = simplified
@@ -1109,7 +1237,7 @@ fn collapse_polygon(poly: &Polygon<f64>, mode: CollapseMode, tol: f64) -> Simpli
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo::{Coord, MultiPoint};
+    use geo::{Coord, MultiPoint, Simplify};
 
     // ---- helpers -----------------------------------------------------------
 
@@ -2177,5 +2305,240 @@ mod tests {
             "a point passed through a coarser Point step is untouched"
         );
         assert_eq!(second, Simplified::Keep(point_geom));
+    }
+}
+
+#[cfg(test)]
+mod rdp_tests {
+    use super::*;
+    use geo::{Coord, Simplify};
+    use std::time::Instant;
+
+    /// The #575 shape: a regular zigzag of amplitude `amp`, the worst case for
+    /// RDP's split depth (the farthest vertex is always next to an end, so
+    /// every split peels off one vertex — O(n) deep, O(n²) work).
+    fn zigzag(n: usize, amp: f64, step: f64) -> LineString<f64> {
+        LineString::new(
+            (0..n)
+                .map(|i| Coord {
+                    x: i as f64 * step,
+                    y: if i % 2 == 1 { amp } else { 0.0 },
+                })
+                .collect(),
+        )
+    }
+
+    /// Deterministic pseudo-random walk (no dev-dependency on a RNG).
+    fn noisy_line(n: usize, seed: u64, scale: f64) -> LineString<f64> {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        let mut x = 0.0;
+        let mut y = 0.0;
+        LineString::new(
+            (0..n)
+                .map(|_| {
+                    x += 1.0 + next() * 0.5;
+                    y += next() * scale;
+                    Coord { x, y }
+                })
+                .collect(),
+        )
+    }
+
+    /// The contract [`rdp_coords`] rests on: identical output to `geo`'s
+    /// recursive RDP, over shapes that exercise culling, the `INITIAL_MIN`
+    /// floor, and the pathological split depth.
+    #[test]
+    fn rdp_matches_geo_on_lines() {
+        let mut cases: Vec<LineString<f64>> = vec![
+            LineString::new(vec![]),
+            LineString::new(vec![Coord { x: 0.0, y: 0.0 }]),
+            LineString::new(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 0.0 }]),
+            // Collinear: everything between the ends is culled.
+            LineString::new(
+                (0..9)
+                    .map(|i| Coord {
+                        x: i as f64,
+                        y: 0.0,
+                    })
+                    .collect(),
+            ),
+            // All coincident (the floor is what keeps two of them).
+            LineString::new((0..7).map(|_| Coord { x: 3.0, y: 4.0 }).collect()),
+            // geo's own doc example.
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 5.0, y: 4.0 },
+                Coord { x: 11.0, y: 5.5 },
+                Coord { x: 17.3, y: 3.2 },
+                Coord { x: 27.8, y: 0.1 },
+            ]),
+        ];
+        for n in [3usize, 5, 17, 101, 1001] {
+            cases.push(zigzag(n, 0.0002, 0.0004));
+            cases.push(zigzag(n, 1.0, 1.0));
+        }
+        for seed in [1u64, 42, 12345] {
+            for n in [4usize, 33, 257, 2049] {
+                cases.push(noisy_line(n, seed, 3.0));
+            }
+        }
+
+        for (c, ls) in cases.iter().enumerate() {
+            for &tol in &[
+                -1.0, 0.0, 1e-9, 0.00001, 0.0001, 0.00019, 0.0002, 0.00021, 0.5, 1.0, 2.0, 1e6,
+            ] {
+                assert_eq!(
+                    rdp_linestring(ls, tol),
+                    ls.simplify(tol),
+                    "case {c} (n={}) diverged from geo at tol {tol}",
+                    ls.0.len()
+                );
+            }
+        }
+    }
+
+    /// Same contract for rings, which carry geo's higher `INITIAL_MIN` floor
+    /// (4, not 2) — the floor is threaded through one running length in
+    /// depth-first leaf order, so this is the case an iterative rewrite is
+    /// most likely to get wrong.
+    #[test]
+    fn rdp_matches_geo_on_polygons() {
+        let ring = |coords: Vec<Coord<f64>>| LineString::new(coords);
+        let mut cases: Vec<Polygon<f64>> = vec![
+            Polygon::new(
+                ring(vec![
+                    Coord { x: 0.0, y: 0.0 },
+                    Coord { x: 10.0, y: 0.0 },
+                    Coord { x: 10.0, y: 10.0 },
+                    Coord { x: 0.0, y: 10.0 },
+                    Coord { x: 0.0, y: 0.0 },
+                ]),
+                vec![],
+            ),
+            // A near-collinear ring: culling it would go under the floor.
+            Polygon::new(
+                ring(
+                    (0..12)
+                        .map(|i| Coord {
+                            x: (i % 6) as f64,
+                            y: 0.0,
+                        })
+                        .collect(),
+                ),
+                vec![],
+            ),
+        ];
+        // A wobbly circle with a wobbly hole.
+        for n in [8usize, 64, 512] {
+            let circle = |r: f64, wob: f64| {
+                ring(
+                    (0..=n)
+                        .map(|i| {
+                            let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                            let rr = r + if i % 2 == 0 { wob } else { -wob };
+                            Coord {
+                                x: rr * t.cos(),
+                                y: rr * t.sin(),
+                            }
+                        })
+                        .collect(),
+                )
+            };
+            cases.push(Polygon::new(circle(10.0, 0.05), vec![circle(3.0, 0.02)]));
+        }
+
+        for (c, poly) in cases.iter().enumerate() {
+            for &tol in &[0.0, 1e-9, 0.01, 0.04, 0.05, 0.06, 0.5, 2.0, 100.0] {
+                assert_eq!(
+                    rdp_polygon(poly, tol),
+                    poly.simplify(tol),
+                    "polygon case {c} diverged from geo at tol {tol}"
+                );
+            }
+        }
+    }
+
+    /// Stack budget for the #575 regression test, and the zigzag length run
+    /// inside it. `geo`'s recursive RDP needs one frame per retained vertex,
+    /// so this shape overflows it; the iterative one needs a constant frame
+    /// and a heap `Vec`. Kept small on purpose: the shape is RDP's O(n²)
+    /// worst case, so a CI-fast length matters more than a dramatic one (the
+    /// real crash was a 12,001-vertex stroke on a rayon worker).
+    const SMALL_STACK_BYTES: usize = 128 * 1024;
+    const SMALL_STACK_ZIGZAG: usize = 4_001;
+
+    /// #575: a coalesced stroke long enough to overflow a worker stack under
+    /// the recursive RDP must simplify fine on a SMALL stack.
+    ///
+    /// A stack overflow aborts the process rather than panicking, so a
+    /// regression here fails as a crashed test binary, not an assertion.
+    #[test]
+    fn long_zigzag_simplifies_on_a_small_stack() {
+        let amp = 0.0002_f64;
+        let ls = zigzag(SMALL_STACK_ZIGZAG, amp, 0.0004);
+        let handle = std::thread::Builder::new()
+            .stack_size(SMALL_STACK_BYTES)
+            .spawn(move || {
+                // Just below the amplitude: every vertex survives, which is
+                // the deepest split tree the shape can produce.
+                let out = rdp_linestring(&ls, amp * 0.99);
+                (out.0.len(), ls.0.len())
+            })
+            .expect("spawn");
+        let (kept, total) = handle.join().expect("no stack overflow, no panic");
+        // Just under the amplitude, nearly every vertex is above the epsilon
+        // and survives — i.e. the split tree really did go ~`total` deep,
+        // which is what the recursive version could not do here.
+        assert!(
+            kept * 10 >= total * 9,
+            "expected almost every vertex retained, kept {kept} of {total}"
+        );
+    }
+
+    /// The same run through `geo`'s recursive RDP — proof that
+    /// [`long_zigzag_simplifies_on_a_small_stack`] is a real regression test
+    /// and not a tautology. `#[ignore]`d because it ABORTS the test process
+    /// (that is the bug); run it deliberately:
+    /// `cargo test --lib geo_rdp_overflows -- --ignored`.
+    #[test]
+    #[ignore]
+    fn geo_rdp_overflows_the_same_small_stack() {
+        let amp = 0.0002_f64;
+        let ls = zigzag(SMALL_STACK_ZIGZAG, amp, 0.0004);
+        let handle = std::thread::Builder::new()
+            .stack_size(SMALL_STACK_BYTES)
+            .spawn(move || ls.simplify(amp * 0.99).0.len())
+            .expect("spawn");
+        println!("geo kept {} — no overflow", handle.join().unwrap());
+    }
+
+    #[test]
+    #[ignore] // measurement, not an assertion (#575)
+    fn probe_rdp_scaling() {
+        let amp = 0.0002_f64;
+        let step = 0.0004_f64;
+        for n in [1500usize, 3000, 6000, 12000] {
+            let ls = zigzag(n, amp, step);
+            for f in [0.5, 0.99, 1.01, 2.0] {
+                let tol = amp * f;
+                let t = Instant::now();
+                let ours = rdp_linestring(&ls, tol);
+                let ms_ours = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                let theirs = ls.simplify(tol);
+                let ms_geo = t.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(ours, theirs);
+                println!(
+                    "n={n} tol=amp*{f} kept={} iterative {ms_ours:.2} ms vs geo {ms_geo:.2} ms",
+                    ours.0.len()
+                );
+            }
+        }
     }
 }

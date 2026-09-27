@@ -222,6 +222,24 @@ logged at debug level). Either way the validity check is capped at 2048
 vertices on oversized candidates (#242) to avoid an O(V²) stall, and the
 canonical level is always verbatim.
 
+**DIVERGENCE FROM `geo`: RDP runs iteratively, not recursively** (#575).
+`rdp_coords` in `overview/simplify.rs` replaces `geo::Simplify` with an
+explicit-stack RDP. RDP's split depth is O(n), not O(log n): when the farthest
+vertex sits next to a subproblem's end, every split peels off one vertex. Line
+coalescing (Q3) makes long chains routine — a road row merged into one
+12,001-vertex zigzag stroke overflowed a rayon worker's stack outright
+(`fatal runtime error: stack overflow`). The iterative version keeps the depth
+on the heap, and drops geo's per-frame `Vec` (allocated and copied at every
+level: O(n²) of memcpy on top of the O(n²) distance scans). Output is
+bit-identical by construction — it reuses geo's own point-to-segment
+`Euclidean.distance`, the same last-maximum tie-break, the same strict
+`> epsilon` split test, and the same `INITIAL_MIN` floor threaded through
+depth-first leaf order — and `rdp_matches_geo_on_{lines,polygons}` pins that
+against `geo::Simplify`. What it does NOT change is RDP's **O(n²) worst-case
+time**: on the pathological zigzag the distance scans remain quadratic (an
+exact O(n log n) RDP needs the Hershberger–Snoeyink path hull, which belongs
+upstream in `geo`).
+
 ### Export (`export-pmtiles`, `overview/export.rs`)
 
 Batch PMTiles export **from** an overview file. The overview file already
