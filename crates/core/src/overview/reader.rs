@@ -118,6 +118,18 @@ impl OverviewReader {
         &self.meta
     }
 
+    /// The raw GeoParquet `geo` footer JSON, if the file carries one (an
+    /// overview written by tylertoo always does; a foreign file may not).
+    pub fn geo_metadata_json(&self) -> Option<&str> {
+        self.metadata
+            .file_metadata()
+            .key_value_metadata()?
+            .iter()
+            .find(|kv| kv.key.eq_ignore_ascii_case("geo"))?
+            .value
+            .as_deref()
+    }
+
     /// The total number of Parquet row groups in the file.
     pub fn num_row_groups(&self) -> usize {
         self.metadata.num_row_groups()
