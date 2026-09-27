@@ -722,10 +722,25 @@ pub const IN_FLIGHT_BATCHES_MAX: usize = 16;
 /// `pipelined_in_flight_matches_reference` equivalence test).
 pub fn resolve_in_flight_batches(requested: usize) -> usize {
     if requested == IN_FLIGHT_BATCHES_AUTO {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(IN_FLIGHT_BATCHES_MIN)
-            .clamp(IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX)
+        resolve_in_flight_batches_with_cores(
+            requested,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(IN_FLIGHT_BATCHES_MIN),
+        )
+    } else {
+        requested
+    }
+}
+
+/// [`resolve_in_flight_batches`], parameterized on the detected core count
+/// (#422 test seam): the auto clamp is only observable on a box whose core
+/// count lies outside `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`, so a
+/// test that reads the real count cannot pin it. Production always calls it
+/// via `resolve_in_flight_batches` with the real count.
+pub(super) fn resolve_in_flight_batches_with_cores(requested: usize, cores: usize) -> usize {
+    if requested == IN_FLIGHT_BATCHES_AUTO {
+        cores.clamp(IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX)
     } else {
         requested
     }
@@ -2372,7 +2387,7 @@ fn knob_columns(options: &ConvertOptions) -> Vec<(String, String)> {
 /// would otherwise silently produce a file narrowed to the earlier call's
 /// columns. One rule: a `ConvertSource` is single-use once a selection has
 /// been applied.
-fn apply_property_selection(
+pub(super) fn apply_property_selection(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<(), ConvertError> {
@@ -11239,65 +11254,8 @@ mod tests {
     // Bbox row-group filtering tests (#102)
     // ========================================================================
 
-    /// Write a multi-row-group GeoParquet file with covering column stats so
-    /// row-group pruning can actually bite. Each row group contains one point
-    /// at `(x, y)` with id = row-group index.
-    fn write_multi_rg_input(path: &Path, coords: &[(f64, f64)], with_covering: bool) {
-        write_multi_rg_input_with_crs(path, coords, with_covering, None)
-    }
-
-    /// [`write_multi_rg_input`] with an explicit geometry CRS (#518: the
-    /// EPSG:3857 probe needs a file that declares Pseudo-Mercator PROJJSON).
-    fn write_multi_rg_input_with_crs(
-        path: &Path,
-        coords: &[(f64, f64)],
-        with_covering: bool,
-        crs_metadata: Option<geoarrow::datatypes::Metadata>,
-    ) {
-        use parquet::file::properties::WriterProperties;
-
-        let geoms: Vec<Geometry<f64>> = coords
-            .iter()
-            .map(|&(x, y)| Geometry::Point(Point::new(x, y)))
-            .collect();
-        let n = geoms.len();
-        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-        let geom_arr = match crs_metadata {
-            Some(md) => {
-                let typ = GeometryType::new(Arc::new(md));
-                let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-                b.extend_from_iter(geoms.iter().map(Some));
-                b.finish()
-            }
-            None => build_geometry_array(&geoms),
-        };
-        let geom_field = geom_arr.data_type().to_field("geometry", true);
-        let fields = vec![
-            Arc::new(Field::new("id", DataType::Int64, false)),
-            Arc::new(geom_field),
-        ];
-        let columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), geom_arr.to_array_ref()];
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-
-        let gpq_options = GeoParquetWriterOptionsBuilder::default()
-            .set_encoding(GeoParquetWriterEncoding::WKB)
-            .set_generate_covering(with_covering)
-            .build();
-        let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
-        let target_schema = encoder.target_schema();
-        // Row-group size = 1 to force n row groups.
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(1))
-            .build();
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
-        let mut encoder = encoder;
-        let encoded = encoder.encode_record_batch(&batch).unwrap();
-        writer.write(&encoded).unwrap();
-        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
-        writer.close().unwrap();
-    }
+    /// Fixture writers shared with `overview::stream`'s tests (#422).
+    use super::super::testutil::{write_multi_rg_input, write_multi_rg_input_with_crs};
 
     /// Read all ids from all levels of an overview file.
     fn read_all_ids(reader: &OverviewReader) -> Vec<i64> {
@@ -11463,60 +11421,8 @@ mod tests {
     // Attribute filter tests (#315)
     // ========================================================================
 
-    /// One fixture row: `((x, y), confidence, crop)`.
-    type AttrRow = ((f64, f64), Option<f64>, Option<&'static str>);
-
-    /// Multi-row-group input with attribute columns: one row per row group at
-    /// `(x, y)` with `id` = row-group index, plus a nullable `confidence`
-    /// Float64 and a nullable `crop` Utf8 column. One row per row group makes
-    /// per-row-group column statistics exact, so pushdown pruning can bite.
-    fn write_multi_rg_attr_input(path: &Path, rows: &[AttrRow]) {
-        use parquet::file::properties::WriterProperties;
-
-        let geoms: Vec<Geometry<f64>> = rows
-            .iter()
-            .map(|&((x, y), _, _)| Geometry::Point(Point::new(x, y)))
-            .collect();
-        let n = geoms.len();
-        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-        let confidence =
-            arrow_array::Float64Array::from(rows.iter().map(|(_, c, _)| *c).collect::<Vec<_>>());
-        let crop =
-            arrow_array::StringArray::from(rows.iter().map(|(_, _, s)| *s).collect::<Vec<_>>());
-        let geom_arr = build_geometry_array(&geoms);
-        let geom_field = geom_arr.data_type().to_field("geometry", true);
-        let fields = vec![
-            Arc::new(Field::new("id", DataType::Int64, false)),
-            Arc::new(Field::new("confidence", DataType::Float64, true)),
-            Arc::new(Field::new("crop", DataType::Utf8, true)),
-            Arc::new(geom_field),
-        ];
-        let columns: Vec<Arc<dyn Array>> = vec![
-            Arc::new(id),
-            Arc::new(confidence),
-            Arc::new(crop),
-            geom_arr.to_array_ref(),
-        ];
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-
-        let gpq_options = GeoParquetWriterOptionsBuilder::default()
-            .set_encoding(GeoParquetWriterEncoding::WKB)
-            .set_generate_covering(true)
-            .build();
-        let encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
-        let target_schema = encoder.target_schema();
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(1))
-            .build();
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
-        let mut encoder = encoder;
-        let encoded = encoder.encode_record_batch(&batch).unwrap();
-        writer.write(&encoded).unwrap();
-        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
-        writer.close().unwrap();
-    }
+    /// Fixture writer shared with `overview::stream`'s tests (#422).
+    use super::super::testutil::{write_multi_rg_attr_input, AttrRow};
 
     /// Rows: (0,0)/0.1/soy, (10,10)/0.9/corn, (20,20)/0.85/soy, (30,30)/null/rice.
     fn attr_rows() -> Vec<AttrRow> {
