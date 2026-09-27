@@ -47,7 +47,7 @@ use geoarrow_array::GeoArrowArray;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::input::InputSource;
-use crate::input_set::ConvertSource;
+use crate::input_set::{ConvertSource, RowGroupSelection};
 use serde::Serialize;
 
 use crate::batch_processor::extract_geometries_opt_from_array;
@@ -2216,7 +2216,7 @@ fn decode_and_filter_geometries(
     geom_field: &Field,
     bbox_units: Option<&[f64; 4]>,
     filter_mask: Option<&[Option<bool>]>,
-) -> Result<(RecordBatch, Vec<Geometry<f64>>), ConvertError> {
+) -> Result<DecodedInput, ConvertError> {
     let geom_array: Arc<dyn GeoArrowArray> =
         from_arrow_array(full.column(geom_idx).as_ref(), geom_field)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
@@ -2247,7 +2247,11 @@ fn decode_and_filter_geometries(
         .collect();
     let dropped = keep.iter().filter(|k| !**k).count();
     if dropped == 0 {
-        return Ok((full, geom_opts.into_iter().flatten().collect()));
+        return Ok(DecodedInput {
+            full,
+            geometries: geom_opts.into_iter().flatten().collect(),
+            kept_rows: None,
+        });
     }
     if geom_skipped > 0 {
         log::warn!(
@@ -2258,13 +2262,33 @@ fn decode_and_filter_geometries(
     }
     let mask = arrow_array::BooleanArray::from(keep.clone());
     let filtered = arrow_select::filter::filter_record_batch(&full, &mask)?;
+    let kept_rows = keep
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| k.then_some(i))
+        .collect();
     let geoms = geom_opts
         .into_iter()
         .zip(&keep)
         .filter(|(_, k)| **k)
         .map(|(g, _)| g.expect("kept rows are Some"))
         .collect();
-    Ok((filtered, geoms))
+    Ok(DecodedInput {
+        full: filtered,
+        geometries: geoms,
+        kept_rows: Some(kept_rows),
+    })
+}
+
+/// [`decode_and_filter_geometries`]'s result: the kept rows and their
+/// decoded geometries, row-aligned.
+struct DecodedInput {
+    full: RecordBatch,
+    geometries: Vec<Geometry<f64>>,
+    /// Each kept row's position in the batch that was read, or `None` when
+    /// every row was kept (the identity). Lets a diagnostic name the input
+    /// row a feature came from (#553).
+    kept_rows: Option<Vec<usize>>,
 }
 
 /// Adjustments both pipelines make before converting, or `None` to use the
@@ -2601,6 +2625,8 @@ struct LoadedInput {
     full: RecordBatch,
     /// Decoded geometries, row-aligned with `full`.
     geometries: Vec<Geometry<f64>>,
+    /// Maps a `full` row back to its file row (#553).
+    rows: InMemoryRows,
     row_groups_total: usize,
     row_groups_read: usize,
 }
@@ -2657,6 +2683,7 @@ fn load_input_table(
         bbox_units.as_ref(),
         bound_filter.as_ref(),
     );
+    let read_selection = combined_sel.clone();
     let (builder, row_groups_read) = match combined_sel {
         Some(sel) => {
             let n = sel.len();
@@ -2685,12 +2712,21 @@ fn load_input_table(
     // the #288 rename is order-preserving so indices line up).
     let filter_mask: Option<Vec<Option<bool>>> =
         bound_filter.as_ref().map(|f| f.eval_mask(&full, &|i| i));
-    let (full, geometries) = decode_and_filter_geometries(
+    let DecodedInput {
+        full,
+        geometries,
+        kept_rows,
+    } = decode_and_filter_geometries(
         full,
         geom_idx,
         &geom_field,
         bbox_units.as_ref(),
         filter_mask.as_deref(),
+    )?;
+    let row_locator = source.stream_row_locator(
+        read_selection
+            .map(|sel| RowGroupSelection::from_parts(vec![sel]))
+            .as_ref(),
     )?;
 
     // Apply the reserved-column renames (#288) to the in-memory table. Columns
@@ -2712,9 +2748,33 @@ fn load_input_table(
         acc_cols,
         full,
         geometries,
+        rows: InMemoryRows {
+            kept_rows,
+            row_locator,
+        },
         row_groups_total,
         row_groups_read,
     })
+}
+
+/// Maps a row of the in-memory path's filtered table back to its row in the
+/// input file (#553), for diagnostics that name a row.
+struct InMemoryRows {
+    /// Each filtered row's position in the batch that was read, or `None`
+    /// when no row was dropped.
+    kept_rows: Option<Vec<usize>>,
+    /// Maps a read-batch position back to its file row.
+    row_locator: crate::input_set::StreamRowLocator,
+}
+
+impl InMemoryRows {
+    /// `(part, file row)` for filtered-table row `i`; a single file names no
+    /// part.
+    fn locate(&self, i: usize) -> (Option<usize>, usize) {
+        let stream_row = self.kept_rows.as_ref().map_or(i, |k| k[i]);
+        let row = self.row_locator.locate(stream_row).map_or(i, |(_, r)| r);
+        (None, row)
+    }
 }
 
 struct EmittedLevel {
@@ -3008,6 +3068,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         acc_cols,
         full,
         geometries,
+        rows,
         row_groups_total,
         row_groups_read,
     } = load_input_table(source, source_single, options)?;
@@ -3052,7 +3113,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // antimeridian suspects, and the #429 losses (outside the CRS range, or
     // outside the Web Mercator tiling domain). Warns once per kind and
     // refuses to "succeed" into an empty archive when ~everything is lost.
-    let tallies = tally_feature_bboxes(&features, crs)?;
+    let tallies = tally_feature_bboxes(&features, crs, &|i| rows.locate(i))?;
 
     // #306: cap the transient winner-grid memory at the profile-derived RAM
     // budget (`speed` stays unbounded). Pure scheduling — output-identical.
@@ -3775,8 +3836,12 @@ fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
 /// message name the answer up front.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct OutOfRangeExemplar {
-    /// The feature's row position in the source file
-    /// ([`AssignFeature::index`]).
+    /// Index of the input part (file) holding the feature, in the source's
+    /// read order; `None` when the input is a single file.
+    pub part: Option<usize>,
+    /// The feature's row within that file: its position in the whole file,
+    /// counting row groups `--bbox`/`--filter`/`--shard` pruned, so it can
+    /// be looked up directly (DuckDB's `file_row_number`, for example).
     pub row: usize,
     /// Which coordinate tripped the range check: `"lon"`/`"lat"` for
     /// EPSG:4326, `"x"`/`"y"` for EPSG:3857.
@@ -3829,9 +3894,32 @@ pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
     }
     let parts: Vec<String> = exemplars
         .iter()
-        .map(|e| format!("{} {:.3} (row {})", e.axis, e.value, e.row))
+        .map(|e| {
+            let value = exemplar_value_text(e.axis, e.value);
+            match e.part {
+                None => format!("{} {value} (row {})", e.axis, e.row),
+                Some(p) => format!("{} {value} (part {p}, row {})", e.axis, e.row),
+            }
+        })
         .collect();
     format!(" e.g. {}", parts.join(", "))
+}
+
+/// An exemplar's coordinate as text: three decimals, unless rounding to
+/// three decimals would land it back on the range edge (180.0000001 as
+/// "180.000"), in which case the shortest exact form, which always shows
+/// the excess.
+fn exemplar_value_text(axis: &str, value: f64) -> String {
+    let limit = match axis {
+        "lon" => 180.0,
+        "lat" => 90.0,
+        _ => WEBMERC_HALF_M,
+    };
+    let short = format!("{value:.3}");
+    match short.parse::<f64>() {
+        Ok(rounded) if rounded.abs() > limit => short,
+        _ => format!("{value}"),
+    }
 }
 
 /// #429 decision + message (pure, so it is unit-testable without capturing
@@ -3973,9 +4061,14 @@ pub(super) fn all_lost_error(t: &BboxTallies, total: usize, crs: Crs) -> Option<
 /// than "at the end of convert". Pass 1 already knows the answer, and failing
 /// here costs no second pass and leaves no half-written overview behind (see
 /// `context/ARCHITECTURE.md`).
+///
+/// `locate` turns a feature's [`AssignFeature::index`] (its position in the
+/// pruned read stream) into the `(part, file row)` an exemplar names (#553);
+/// it is called at most [`OUT_OF_RANGE_EXEMPLAR_CAP`] times.
 pub(super) fn tally_feature_bboxes(
     features: &[AssignFeature],
     crs: Crs,
+    locate: &dyn Fn(usize) -> (Option<usize>, usize),
 ) -> Result<BboxTallies, ConvertError> {
     let mut t = BboxTallies::default();
     for f in features {
@@ -3987,8 +4080,10 @@ pub(super) fn tally_feature_bboxes(
             t.max_abs_out_of_range = t.max_abs_out_of_range.max(bbox_max_abs(&f.bbox));
             if t.out_of_range_exemplars.len() < OUT_OF_RANGE_EXEMPLAR_CAP {
                 let (axis, value) = out_of_range_coordinate(&f.bbox, crs);
+                let (part, row) = locate(f.index);
                 t.out_of_range_exemplars.push(OutOfRangeExemplar {
-                    row: f.index,
+                    part,
+                    row,
                     axis,
                     value,
                 });
@@ -6055,7 +6150,8 @@ mod tests {
         for row in 1..=5usize {
             features.push(point_feature(row, 180.0 + row as f64 * 0.1, 10.0));
         }
-        let tallies = tally_feature_bboxes(&features, Crs::Epsg4326).expect("not all lost");
+        let tallies =
+            tally_feature_bboxes(&features, Crs::Epsg4326, &|i| (None, i)).expect("not all lost");
         assert_eq!(tallies.out_of_range, 5);
         assert_eq!(
             tallies.out_of_range_exemplars.len(),
@@ -6080,11 +6176,13 @@ mod tests {
 
         let exemplars = vec![
             OutOfRangeExemplar {
+                part: None,
                 row: 1041,
                 axis: "lon",
                 value: 180.548,
             },
             OutOfRangeExemplar {
+                part: None,
                 row: 2210,
                 axis: "lon",
                 value: 180.101,
@@ -6099,6 +6197,43 @@ mod tests {
             out_of_range_warning(19, 1000, Crs::Epsg4326, 180.548, &exemplars).expect("warns");
         assert!(msg.contains("19 of 1000"), "{msg}");
         assert!(msg.contains("lon 180.548 (row 1041)"), "{msg}");
+    }
+
+    /// #553 review: an exemplar just past the edge (float noise from a
+    /// reprojection, a dateline vertex at 180.0000001) must not print as
+    /// "lon 180.000", a value that reads as in range. Three decimals when
+    /// they still show the excess, full precision when they do not.
+    #[test]
+    fn out_of_range_exemplar_note_never_rounds_back_into_range() {
+        let ex = |axis: &'static str, value: f64| OutOfRangeExemplar {
+            part: None,
+            row: 7,
+            axis,
+            value,
+        };
+        assert_eq!(
+            out_of_range_exemplar_note(&[ex("lon", 180.000_000_1)]),
+            " e.g. lon 180.0000001 (row 7)"
+        );
+        assert_eq!(
+            out_of_range_exemplar_note(&[ex("lat", -90.000_2)]),
+            " e.g. lat -90.0002 (row 7)"
+        );
+        // 3857's edge (20037508.342789...) rounds UP at three decimals, so
+        // the short form already shows the excess.
+        assert_eq!(
+            out_of_range_exemplar_note(&[ex("x", WEBMERC_HALF_M + 0.0001)]),
+            " e.g. x 20037508.343 (row 7)"
+        );
+        // Clearly out of range: the short form.
+        assert_eq!(
+            out_of_range_exemplar_note(&[ex("lon", 180.548_123)]),
+            " e.g. lon 180.548 (row 7)"
+        );
+        assert_eq!(
+            out_of_range_exemplar_note(&[ex("x", 30_000_000.0)]),
+            " e.g. x 30000000.000 (row 7)"
+        );
     }
 
     /// The filter path reads the same columns but must NOT lose ±inf: it is a
@@ -11771,6 +11906,87 @@ mod tests {
             let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
             assert_eq!(ids, vec![1], "streaming={streaming}");
         }
+    }
+
+    /// #553 review: an out-of-range exemplar's `row` is the row in the
+    /// SOURCE FILE, not the feature's position in the pruned read stream.
+    /// `--filter` statistics pushdown drops row group 0 here, so the
+    /// offending feature (file row 2) is only the second row the scan sees;
+    /// reporting "row 1" would send the investigator to the wrong feature.
+    #[test]
+    fn out_of_range_exemplar_row_is_the_file_row_under_row_group_pruning() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let rows: Vec<AttrRow> = vec![
+            ((0.0, 0.0), Some(0.1), Some("soy")),
+            ((10.0, 10.0), Some(0.9), Some("corn")),
+            ((190.0, 20.0), Some(0.85), Some("soy")),
+            ((30.0, 30.0), None, Some("rice")),
+        ];
+        write_multi_rg_attr_input(tin.path(), &rows);
+
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                filter: Some("confidence > 0.8".to_string()),
+                streaming,
+                ..attr_opts()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap();
+            assert_eq!(
+                report.row_groups_read, 2,
+                "pushdown must prune (streaming={streaming})"
+            );
+            assert_eq!(report.out_of_range_features, 1, "streaming={streaming}");
+            assert_eq!(
+                report.out_of_range_exemplars,
+                vec![OutOfRangeExemplar {
+                    part: None,
+
+                    row: 2,
+                    axis: "lon",
+                    value: 190.0,
+                }],
+                "streaming={streaming}"
+            );
+        }
+    }
+
+    /// #553 review: on a multi-part input the exemplar names the part and
+    /// the row within that part's file, not the position in the
+    /// concatenated stream.
+    #[test]
+    fn out_of_range_exemplar_names_the_part_of_a_multi_part_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        let clean: Vec<AttrRow> = vec![
+            ((0.0, 0.0), Some(0.9), Some("soy")),
+            ((10.0, 10.0), Some(0.9), Some("corn")),
+        ];
+        let dirty: Vec<AttrRow> = vec![
+            ((20.0, 20.0), Some(0.9), Some("soy")),
+            ((191.5, 20.0), Some(0.9), Some("soy")),
+            ((30.0, 30.0), Some(0.9), Some("rice")),
+        ];
+        write_multi_rg_attr_input(&parts.join("part-000.parquet"), &clean);
+        write_multi_rg_attr_input(&parts.join("part-001.parquet"), &dirty);
+
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let report = convert_to_overviews(&parts, tout.path(), &attr_opts()).unwrap();
+        assert_eq!(report.out_of_range_features, 1);
+        assert_eq!(
+            report.out_of_range_exemplars,
+            vec![OutOfRangeExemplar {
+                part: Some(1),
+                row: 1,
+                axis: "lon",
+                value: 191.5,
+            }]
+        );
+        assert_eq!(
+            out_of_range_exemplar_note(&report.out_of_range_exemplars),
+            " e.g. lon 191.500 (part 1, row 1)"
+        );
     }
 
     /// String equality / IN, IS NULL, and OR-composition semantics.

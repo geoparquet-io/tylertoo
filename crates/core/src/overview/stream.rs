@@ -1841,7 +1841,18 @@ fn run_pass1_and_assign(
     // antimeridian suspects, and the #429 losses (outside the CRS range, or
     // outside the Web Mercator tiling domain). Warns once per kind and
     // refuses to "succeed" into an empty archive when ~everything is lost.
-    let tallies = super::convert::tally_feature_bboxes(&features, inputs.crs)?;
+    // #553: exemplars name the file row, not the position in the pruned
+    // stream; a multi-part input also names the part.
+    let locator = inputs
+        .source
+        .stream_row_locator(inputs.selected_row_groups)?;
+    let multi_part = inputs.source.parts().len() > 1;
+    let tallies = super::convert::tally_feature_bboxes(&features, inputs.crs, &|i| match locator
+        .locate(i)
+    {
+        Some((part, row)) => (multi_part.then_some(part), row),
+        None => (None, i),
+    })?;
 
     // Stage markers (#242): everything between pass 1 and the writer used to
     // run in total info-level silence — on planet-scale inputs that was tens

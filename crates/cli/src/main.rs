@@ -5840,11 +5840,13 @@ mod tests {
 
         let exemplars = vec![
             OutOfRangeExemplar {
+                part: None,
                 row: 1041,
                 axis: "lon",
                 value: 180.548,
             },
             OutOfRangeExemplar {
+                part: None,
                 row: 2210,
                 axis: "lon",
                 value: 180.101,

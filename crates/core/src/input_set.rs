@@ -156,6 +156,78 @@ pub struct OversizedRowGroup {
     pub uncompressed_bytes: u64,
 }
 
+/// Maps a row's position in a [`ConvertSource`]'s read stream back to the
+/// part and the row within that part's file (#553).
+///
+/// The streaming scan numbers features by their position in the stream it
+/// actually reads: the selected row groups of every part, concatenated in
+/// read order. That is the right key for the winner tables, and the wrong
+/// thing to show a person: once `--bbox`/`--filter`/`--shard` prunes a row
+/// group, or the input has more than one part, stream position 1041 is not
+/// row 1041 of any file. This rebuilds the file row from footer row counts
+/// alone, in the same part-then-selected-row-group order
+/// [`ConvertSource::open_stream`] reads.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamRowLocator {
+    /// One entry per selected, non-empty row group, in read order:
+    /// `(first stream row, part, first file row within the part)`.
+    starts: Vec<(u64, usize, u64)>,
+    /// Rows in the whole stream: one past the last stream row.
+    total: u64,
+}
+
+impl StreamRowLocator {
+    /// Build from per-part, per-row-group row counts
+    /// ([`ConvertSource::part_row_group_row_counts`]) and the selection the
+    /// stream reads (`None` = every row group of every part).
+    pub(crate) fn new(row_counts: &[Vec<i64>], selected: Option<&RowGroupSelection>) -> Self {
+        let mut starts = Vec::new();
+        let mut stream_row = 0u64;
+        for (part, counts) in row_counts.iter().enumerate() {
+            // A row group's first file row: the sum of every earlier group's
+            // rows, whether selected or not.
+            let mut first_rows = Vec::with_capacity(counts.len());
+            let mut acc = 0u64;
+            for &n in counts {
+                first_rows.push(acc);
+                acc += n.max(0) as u64;
+            }
+            let picked: Vec<usize> = match selected.and_then(|s| s.parts().get(part)) {
+                Some(p) => p.clone(),
+                None => (0..counts.len()).collect(),
+            };
+            for g in picked {
+                let (Some(&n), Some(&first)) = (counts.get(g), first_rows.get(g)) else {
+                    continue;
+                };
+                let n = n.max(0) as u64;
+                if n == 0 {
+                    continue;
+                }
+                starts.push((stream_row, part, first));
+                stream_row += n;
+            }
+        }
+        Self {
+            starts,
+            total: stream_row,
+        }
+    }
+
+    /// `(part, row within the part's file)` for stream position
+    /// `stream_row`, or `None` past the end of the stream.
+    pub(crate) fn locate(&self, stream_row: usize) -> Option<(usize, usize)> {
+        let r = stream_row as u64;
+        if r >= self.total {
+            return None;
+        }
+        // The last group starting at or before `r` holds it.
+        let i = self.starts.partition_point(|&(start, _, _)| start <= r);
+        let &(start, part, first) = self.starts.get(i.checked_sub(1)?)?;
+        Some((part, (first + (r - start)) as usize))
+    }
+}
+
 impl RowGroupSelection {
     /// Build from per-part local row-group index lists.
     pub fn from_parts(parts: Vec<Vec<usize>>) -> Self {
@@ -632,6 +704,18 @@ impl ConvertSource {
                     .collect()
             })
             .collect())
+    }
+
+    /// A [`StreamRowLocator`] for the stream this source reads under
+    /// `selected` (#553): footer row counts only, no data page read.
+    pub(crate) fn stream_row_locator(
+        &self,
+        selected: Option<&RowGroupSelection>,
+    ) -> Result<StreamRowLocator, InputError> {
+        Ok(StreamRowLocator::new(
+            &self.part_row_group_row_counts()?,
+            selected,
+        ))
     }
 
     /// Per-part bbox row-group selection (#102): applies the single-file
@@ -2502,6 +2586,44 @@ b.parquet
         assert_eq!(derive_layer_name(""), "layer");
         assert_eq!(derive_layer_name("s3://"), "layer");
         assert_eq!(derive_layer_name("/"), "layer");
+    }
+
+    // --- #553: stream position -> file row ---------------------------------
+
+    /// Without a selection, a single part's stream row IS its file row, and
+    /// a second part's rows restart at 0.
+    #[test]
+    fn stream_row_locator_maps_parts_without_a_selection() {
+        let counts = vec![vec![3, 2], vec![4]];
+        let loc = StreamRowLocator::new(&counts, None);
+        assert_eq!(loc.locate(0), Some((0, 0)));
+        assert_eq!(loc.locate(4), Some((0, 4)));
+        assert_eq!(loc.locate(5), Some((1, 0)));
+        assert_eq!(loc.locate(8), Some((1, 3)));
+        assert_eq!(loc.locate(9), None, "past the end of the stream");
+    }
+
+    /// A pruned row group shifts every later stream position; the locator
+    /// adds the pruned group's rows back, and skips empty row groups and
+    /// empty part selections the way the reader does.
+    #[test]
+    fn stream_row_locator_restores_rows_of_pruned_row_groups() {
+        // Part 0: groups of 3, 0, 2, 4 rows; groups 0 and 1 pruned.
+        // Part 1: groups of 5, 5; nothing selected.
+        // Part 2: groups of 2, 2; group 1 selected.
+        let counts = vec![vec![3, 0, 2, 4], vec![5, 5], vec![2, 2]];
+        let sel = RowGroupSelection::from_parts(vec![vec![1, 2, 3], vec![], vec![1]]);
+        let loc = StreamRowLocator::new(&counts, Some(&sel));
+        // Stream rows 0..2 are part 0's group 2 (file rows 3..5).
+        assert_eq!(loc.locate(0), Some((0, 3)));
+        assert_eq!(loc.locate(1), Some((0, 4)));
+        // Stream rows 2..6 are part 0's group 3 (file rows 5..9).
+        assert_eq!(loc.locate(2), Some((0, 5)));
+        assert_eq!(loc.locate(5), Some((0, 8)));
+        // Stream rows 6..8 are part 2's group 1 (file rows 2..4).
+        assert_eq!(loc.locate(6), Some((2, 2)));
+        assert_eq!(loc.locate(7), Some((2, 3)));
+        assert_eq!(loc.locate(8), None);
     }
 
     // --- #563: oversized-geometry-column preflight --------------------------
