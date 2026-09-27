@@ -123,6 +123,29 @@ CI mirrors the tiers: the Test matrix (ubuntu/macos × stable/beta) runs
 `quick`; the Slow Tests job runs exactly the set `quick` excludes, on
 ubuntu and macOS stable. Together they cover `full`.
 
+The weekly mutation-testing job (`.github/workflows/mutation-tests.yml`,
+Sundays, or `gh workflow run mutation-tests.yml`) runs `cargo mutants` on
+`tylertoo-core` under the `quick` tier too: `.cargo/mutants.toml` sets
+`test_tool = "nextest"`, so marking a test slow in `nextest.toml` also
+drops it from every mutant's test run. The ~8200 mutants are split over
+a `--shard k/n` matrix (`SHARD_COUNT` in the workflow) so each shard
+fits GitHub's 6-hour job limit; a `report` job sums the shards'
+`outcomes.json` into one score. The job is advisory — missed mutants and
+timeouts show up as the mutation score in the job summary, not as a red
+run — but a run that could not measure everything (a baseline failure,
+which needs the `geometry-test-data` submodule and the realdata
+fixtures, or a shard hitting its time limit) opens or updates a pinned
+`mutation-tests` issue. To reproduce locally, with the submodule and
+fixtures in place:
+
+```bash
+cargo install cargo-mutants cargo-nextest --locked
+cargo mutants --package tylertoo-core --list   # what would be mutated
+cargo mutants --package tylertoo-core \
+  -F 'simplify'                                # one module, minutes
+cargo mutants --package tylertoo-core          # the full sweep, hours
+```
+
 When a new test takes more than ~20s, add it to the slow set in
 `.config/nextest.toml`: the `default-filter` exclusion in
 `[profile.default]` (which `quick` inherits) and the matching
@@ -279,9 +302,11 @@ cargo semver-checks check-release \
   --package tylertoo-core \
   --baseline-rev origin/main
 
-# Convert regression guards (#558)
-# 1. structural signature of `overview` over fixtures-v1
-#    (bench.yml Convert regression guard; not a required check)
+# Convert regression guards (#558, #425)
+# 1. structural signature of `overview` -> `export-pmtiles`
+#    over fixtures-v1: per-level counts, per-zoom tile and
+#    feature counts (written + `decode`d back), archive
+#    bytes +-2% (e2e.yml Archive e2e; see "Archive e2e" below)
 cargo build --release --package tylertoo
 python3 benchmarks/overview/ci_guard.py --check
 # 2. golden tile digests of a full convert -> export build
@@ -357,6 +382,46 @@ uv run pip-audit -r /tmp/requirements.txt --disable-pip
 If you change a `#[pyo3(signature = ...)]` in
 `crates/python/src/lib.rs`, update `crates/python/tylertoo.pyi` —
 stubtest will fail otherwise.
+
+### Archive e2e (independent readers, #421 / #425)
+
+`.github/workflows/e2e.yml` builds the release binary, runs the
+convert+export guard above over the fixtures-v1 inputs, and then opens
+every archive it produced with readers that share no code with our
+PMTiles writer: go-pmtiles `pmtiles verify` (structure: header,
+directories, clustering, zoom bounds) and a uv script that walks the
+archive with the Python `pmtiles` reader and decodes sampled tiles at
+every zoom with `mapbox-vector-tile`. Locally:
+
+```bash
+cargo build --release --package tylertoo
+
+# 1. guard, keeping the archives for the reader checks
+python3 benchmarks/overview/ci_guard.py --check \
+  --keep-archives /tmp/e2e-archives
+
+# 2. go-pmtiles at the pinned release, sha256-checked,
+#    installed into .tools/ (gitignored)
+scripts/setup_go_pmtiles.sh
+eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+for f in /tmp/e2e-archives/*.pmtiles; do
+  "$PMTILES_BIN" verify "$f"
+done
+
+# 3. pmtiles + mapbox-vector-tile (PEP 723 inline deps,
+#    resolved by uv); the layer is the archive's stem
+for f in /tmp/e2e-archives/*.pmtiles; do
+  uv run scripts/verify_archive.py "$f" \
+    --layer "$(basename "$f" .pmtiles)" --per-zoom 5
+done
+```
+
+After an intended output change, regenerate the baseline with
+`python3 benchmarks/overview/ci_guard.py --update` (release build) and
+commit `benchmarks/overview/ci_baseline.json`. Archive bytes are compared
+with a 2% tolerance (`--tolerance`); everything else exactly. Only our
+own archives go through `pmtiles verify` — the tippecanoe-made
+`tests/fixtures/golden/*.pmtiles` are inputs, not outputs.
 
 ### Workflows
 
