@@ -50,7 +50,7 @@ Generate PMTiles vector tiles (the default pipeline)
 ###### **Arguments:**
 
 * `<INPUT>` — Input GeoParquet (EPSG:4326 or EPSG:3857): a local file, a directory or glob of partitions, or a remote URL (s3://, https://, gs://). s3://.../ and gs://.../ prefixes (trailing slash) are listed to their .parquet objects; remote inputs are read with byte-range requests. Omit when --files-from is given (then the one positional is OUTPUT)
-* `<OUTPUT>` — Output PMTiles file
+* `<OUTPUT>` — Output PMTiles file. Omitted under --plan-only, which writes no archive
 
 ###### **Options:**
 
@@ -99,6 +99,15 @@ Generate PMTiles vector tiles (the default pipeline)
    That zoom is the pivot, and the range owns every descendant of those tiles at every deeper zoom; tiles coarser than the pivot are outside it and are not emitted. Ranges that partition the pivot zoom partition every deeper zoom, so the archives are disjoint by construction and `tylertoo merge` concatenates them without re-encoding.
 
    This restricts the EXPORT only. `--shard` is the form that also prunes the convert's input to the row groups the range can reach, which is what makes a shard cheaper than the whole build rather than merely narrower — prefer it unless you are cutting by hand. The two are mutually exclusive: `--shard` derives its range from the shard plan
+* `--plan-only` — Write the convert plan (--save-plan) and stop: run pass 1 and the level assignment, skip the export entirely (#560). No PMTiles archive, no intermediate overview — omit the OUTPUT positional.
+
+   Requires --save-plan, which is then this run's only output.
+
+   For the fleet whose coarse tiles are DISCARDED: an aggregate-into-fields handover build, where cell aggregates from outside tylertoo own the coarse zooms and real geometry owns the fine ones, merged with `tylertoo merge`. The coarse job still has to run — the level assignment is dataset-global, so no data shard can recompute it — but only for its plan, so it skips pass 2 and the export.
+
+   For a fleet, pass `--shard coarse --shard-plan` as well: the data shards (`--shard I/N`) refuse a plan that does not record their shard plan's cut. Without them the plan is for an unsharded `tiles --plan` / `overview --plan` replay only. The pivot may equal --min-zoom here (the handover shape: the external archive owns every zoom below it), since a plan-only coarse job builds no zoom of its own.
+
+   Pass the same convert flags the fleet's shards will use, plus this one (export-only flags are refused): the plan is fingerprinted, so a plan-only run is byte-identical to the plan a full (or `--shard coarse`) run writes with the same options, and nothing else about the fleet changes.
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
 * `-f`, `--force` — Overwrite the output if it exists
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).

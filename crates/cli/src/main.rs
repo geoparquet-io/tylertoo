@@ -1726,8 +1726,12 @@ struct TilesArgs {
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     input: Option<PathBuf>,
 
-    /// Output PMTiles file.
-    #[arg(value_name = "OUTPUT", required_unless_present = "files_from")]
+    /// Output PMTiles file. Omitted under --plan-only, which writes no
+    /// archive.
+    #[arg(
+        value_name = "OUTPUT",
+        required_unless_present_any = ["files_from", "plan_only"]
+    )]
     output: Option<PathBuf>,
 
     /// Convert the inputs listed in this manifest instead of a positional
@@ -1924,6 +1928,43 @@ struct TilesArgs {
         help_heading = "Sharded builds"
     )]
     tile_range: Option<String>,
+
+    /// Write the convert plan (--save-plan) and stop: run pass 1 and the level
+    /// assignment, skip the export entirely (#560). No PMTiles archive, no
+    /// intermediate overview — omit the OUTPUT positional.
+    ///
+    /// Requires --save-plan, which is then this run's only output.
+    ///
+    /// For the fleet whose coarse tiles are DISCARDED: an
+    /// aggregate-into-fields handover build, where cell aggregates from
+    /// outside tylertoo own the coarse zooms and real geometry owns the fine
+    /// ones, merged with `tylertoo merge`. The coarse job still has to run —
+    /// the level assignment is dataset-global, so no data shard can recompute
+    /// it — but only for its plan, so it skips pass 2 and the export.
+    ///
+    /// For a fleet, pass `--shard coarse --shard-plan` as well: the data
+    /// shards (`--shard I/N`) refuse a plan that does not record their shard
+    /// plan's cut. Without them the plan is for an unsharded `tiles --plan` /
+    /// `overview --plan` replay only. The pivot may equal --min-zoom here
+    /// (the handover shape: the external archive owns every zoom below it),
+    /// since a plan-only coarse job builds no zoom of its own.
+    ///
+    /// Pass the same convert flags the fleet's shards will use, plus this one
+    /// (export-only flags are refused): the plan is fingerprinted, so a
+    /// plan-only run is byte-identical to the plan a full (or `--shard
+    /// coarse`) run writes with the same options, and nothing else about the
+    /// fleet changes.
+    #[arg(
+        long,
+        requires = "save_plan",
+        conflicts_with_all = [
+            "keep_overview", "report", "tile_range", "force", "layer_name",
+            "max_tile_size", "tile_buffer", "feature_order", "partition_wave",
+            "no_simple_clip_fastpath", "feature_id",
+        ],
+        help_heading = "Sharded builds"
+    )]
+    plan_only: bool,
 
     /// Enable verbose output (per-level and per-zoom breakdowns).
     #[arg(short, long)]
@@ -2439,6 +2480,7 @@ fn resolve_shard_job(
     shard_plan: Option<&Path>,
     min_zoom: u8,
     max_zoom: u8,
+    plan_only: bool,
 ) -> Result<Option<ShardJob>> {
     use tylertoo_core::shard::ShardRole;
 
@@ -2472,7 +2514,13 @@ fn resolve_shard_job(
     // the requested minimum leaves it nothing, and without this the whole
     // convert runs — potentially for hours — before the export refuses an
     // empty zoom restriction.
-    if matches!(role, ShardRole::Coarse) {
+    //
+    // #560: not under --plan-only, which builds no zoom at all — the coarse
+    // job there is only the plan's writer. A pivot AT --min-zoom is exactly
+    // the handover shape (an external archive owns every zoom below the
+    // pivot, and the fleet runs --min-zoom = pivot), so refusing it would
+    // refuse the one build plan-only exists for.
+    if matches!(role, ShardRole::Coarse) && !plan_only {
         anyhow::ensure!(
             plan.pivot_zoom > min_zoom,
             "--shard coarse with --shard-plan {} has no zoom to build: the coarse job owns \
@@ -2567,26 +2615,23 @@ fn reject_excluded_knob_columns(
     Ok(())
 }
 
-fn run_tiles(args: TilesArgs) -> Result<()> {
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+/// The convert half of `tiles`: the [`ConvertOptions`] the facade runs, and
+/// the sharded-fleet job they were derived from.
+///
+/// Shared by the full facade and `--plan-only` (#560). The convert plan is
+/// fingerprinted over these options, so the plan a plan-only run writes is
+/// byte-identical to a full run's only if both build the options the same way
+/// — which is guaranteed here by construction rather than by review.
+///
+/// [`ConvertOptions`]: tylertoo_core::overview::convert::ConvertOptions
+fn tiles_convert_options(
+    args: &TilesArgs,
+    spec: &InputSpec,
+) -> Result<(
+    tylertoo_core::overview::convert::ConvertOptions,
+    Option<ShardJob>,
+)> {
     use tylertoo_core::overview::level::Mode;
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
-
-    check_tiles_output(&output, args.force)?;
-
-    // Derive the layer name from the input if not given: file stem for a
-    // single file, last path segment for a directory or s3://gs:// prefix,
-    // last literal segment for a glob, manifest stem for --files-from
-    // (core owns the rules — see input_set::derive_layer_name).
-    let layer_name = args.layer_name.clone().unwrap_or_else(|| {
-        let p = match &spec {
-            InputSpec::Path(p) | InputSpec::Manifest(p) => p,
-        };
-        tylertoo_core::input_set::derive_layer_name(&p.to_string_lossy())
-    });
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
@@ -2603,20 +2648,13 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // the fleet shares, so a mis-specified `--shard 4/8` against a 16-way plan
     // fails in milliseconds rather than after an hour of tiling.
     let shard = resolve_shard_job(
-        &spec,
+        spec,
         args.shard.as_deref(),
         args.shard_plan.as_deref(),
         args.min_zoom,
         args.max_zoom,
+        args.plan_only,
     )?;
-    // A data shard's range prunes the convert's reads as well as the export;
-    // a hand-written `--tile-range` restricts the export only (the two flags
-    // conflict, so at most one is set).
-    let tile_range = match (&shard, &args.tile_range) {
-        (Some(job), _) => job.range,
-        (None, Some(text)) => Some(tylertoo_core::shard::TileRange::parse(text)?),
-        (None, None) => None,
-    };
     if let Some(job) = &shard {
         options.shard = job.range;
         // #498: fingerprinted, unlike `shard` itself — the cut is fleet-wide,
@@ -2634,11 +2672,204 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // back to the uncapped convert there. Its tiles are identical either
         // way — the export's own ceiling below is what bounds them — it just
         // pays for the finer levels, which is what the user opted into.
-        if job.range.is_none() && args.gsd.is_none() && options.streaming {
+        //
+        // #560: and not at all under --plan-only, which materializes no level
+        // whatsoever — core refuses a ceiling it has no pass 2 to apply it to.
+        if !args.plan_only && job.range.is_none() && args.gsd.is_none() && options.streaming {
             options.zoom_ceiling = Some(job.pivot.saturating_sub(1));
         }
-        log_shard_job(job, args.min_zoom, args.max_zoom);
+        if args.plan_only {
+            // The coarse job's usual line names the zooms it builds; this one
+            // builds none (and its pivot may sit at --min-zoom, #560).
+            log::info!(
+                "[tiles] shard job {}: plan only — writes the convert plan for pivot z{}, \
+                 builds no zoom",
+                job.role,
+                job.pivot
+            );
+        } else {
+            log_shard_job(job, args.min_zoom, args.max_zoom);
+        }
     }
+    Ok((options, shard))
+}
+
+/// `tiles --plan-only` (#560): pass 1 + the level assignment, `--save-plan`,
+/// stop. No archive, no intermediate overview, no export.
+///
+/// The fleet's coarse job splits into two products — the zooms below the pivot,
+/// and the plan the data shards consume. When an external archive owns those
+/// zooms (an aggregate-into-fields handover build) the tiles are thrown away,
+/// and this is the job without them.
+fn run_plan_only(args: TilesArgs) -> Result<()> {
+    use tylertoo_core::overview::convert::{write_convert_plan, write_convert_plan_sources};
+
+    // No OUTPUT is written, so none is accepted: a path on the command line
+    // that nothing would ever create is a misunderstanding worth failing on,
+    // not a silently ignored argument. (With --files-from the lone positional
+    // lands in `input`, which `resolve_io_for_planning` reports on.)
+    anyhow::ensure!(
+        args.output.is_none(),
+        "--plan-only writes no PMTiles archive, so it takes no OUTPUT: got {}. \
+         The plan goes to --save-plan; drop the output path",
+        args.output.as_ref().expect("checked").display()
+    );
+    let spec = resolve_io_for_planning(args.input.clone(), args.files_from.clone())?;
+
+    let (options, shard) = tiles_convert_options(&args, &spec)?;
+    // A data shard reads a subset of the input, so a plan it wrote would
+    // describe only that subset. Core refuses the pairing too (--shard with
+    // --save-plan); named here against the flag the user actually typed.
+    if let Some(job) = &shard {
+        anyhow::ensure!(
+            job.range.is_none(),
+            "--plan-only cannot be combined with a data shard (--shard I/N): the shard reads \
+             only the row groups its range reaches, so the plan it wrote would cover that \
+             subset and be useless to the rest of the fleet. The plan comes from the job that \
+             reads everything: `--shard coarse --shard-plan <the fleet's shard plan> \
+             --plan-only`"
+        );
+    }
+    let save_plan = args
+        .tuning
+        .save_plan
+        .clone()
+        .expect("clap requires --save-plan alongside --plan-only");
+
+    let start = std::time::Instant::now();
+    let report = match &spec {
+        InputSpec::Path(p) => write_convert_plan(p, &options),
+        InputSpec::Manifest(m) => {
+            let source = tylertoo_core::input_set::ConvertSource::from_manifest(m)?;
+            write_convert_plan_sources(&source, &options)
+        }
+    }
+    .context("writing the convert plan failed")?;
+
+    println!("✓ Wrote the convert plan (no tiles: --plan-only)");
+    println!("  input:  {}", spec.display());
+    println!(
+        "  plan:   {} ({})",
+        save_plan.display(),
+        HumanBytes(report.plan_bytes)
+    );
+    println!(
+        "  rows:   {} input row(s) → {} feature(s) ({} point, {} line, {} polygon)",
+        format_number(report.input_rows as u64),
+        format_number(report.input_features as u64),
+        format_number(report.points as u64),
+        format_number(report.lines as u64),
+        format_number(report.polygons as u64),
+    );
+    println!(
+        "  levels: {} planned level(s) populated{}",
+        report.levels.len(),
+        if report.skipped_empty_levels.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} empty and omitted (z{})",
+                report.skipped_empty_levels.len(),
+                report
+                    .skipped_empty_levels
+                    .iter()
+                    .map(|s| s.zoom.map_or_else(|| "-".to_string(), |z| z.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    );
+    // The provenance an operator most often wants to check before spending
+    // shard hours: which column decided every cell winner, and the ladder.
+    println!(
+        "  ranking: {}{}",
+        report.ranking.mode,
+        report
+            .ranking
+            .column
+            .as_deref()
+            .map_or_else(String::new, |c| format!(" on {c:?}"))
+    );
+    if let Some(spec) = &report.entry_zoom {
+        println!("  entry-zoom ladder: {spec}");
+    }
+    if args.verbose {
+        for l in &report.levels {
+            println!(
+                "  level {:<2} (z{:<2}) gsd {:>10.2} m: {:>9} feature(s)",
+                l.planned_level,
+                l.zoom.map_or_else(|| "-".to_string(), |z| z.to_string()),
+                l.gsd,
+                format_number(l.feature_count as u64),
+            );
+        }
+    }
+    println!(
+        "  time:   {:.2}s total (pass 1 {:.2}s, assignment {:.2}s)",
+        start.elapsed().as_secs_f64(),
+        report.pass1_secs,
+        report.assign_secs,
+    );
+    if shard.is_some() {
+        println!(
+            "  next:   give this plan to every data shard with --plan {}",
+            save_plan.display()
+        );
+    } else {
+        // No cut digest in the fingerprint, so a data shard (which presents
+        // its shard plan's) refuses this plan — say so here rather than at
+        // the first shard of the fleet.
+        println!(
+            "  next:   replay this plan in an unsharded run (`tiles --plan {0}` or \
+             `overview --plan {0}`). It records no shard plan, so a fleet's data shards \
+             refuse it: for a fleet, re-run with --shard coarse --shard-plan <the fleet's \
+             shard plan>",
+            save_plan.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_tiles(args: TilesArgs) -> Result<()> {
+    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // #560: the plan-writing half of the coarse job, on its own. Branches
+    // before the OUTPUT is resolved, because there is none.
+    if args.plan_only {
+        return run_plan_only(args);
+    }
+
+    let (spec, output) = resolve_io(
+        args.input.clone(),
+        args.output.clone(),
+        args.files_from.clone(),
+    )?;
+
+    check_tiles_output(&output, args.force)?;
+
+    // Derive the layer name from the input if not given: file stem for a
+    // single file, last path segment for a directory or s3://gs:// prefix,
+    // last literal segment for a glob, manifest stem for --files-from
+    // (core owns the rules — see input_set::derive_layer_name).
+    let layer_name = args.layer_name.clone().unwrap_or_else(|| {
+        let p = match &spec {
+            InputSpec::Path(p) | InputSpec::Manifest(p) => p,
+        };
+        tylertoo_core::input_set::derive_layer_name(&p.to_string_lossy())
+    });
+
+    let (options, shard) = tiles_convert_options(&args, &spec)?;
+
+    // A data shard's range prunes the convert's reads as well as the export;
+    // a hand-written `--tile-range` restricts the export only (the two flags
+    // conflict, so at most one is set).
+    let tile_range = match (&shard, &args.tile_range) {
+        (Some(job), _) => job.range,
+        (None, Some(text)) => Some(tylertoo_core::shard::TileRange::parse(text)?),
+        (None, None) => None,
+    };
 
     // The data shard's own range, kept past `tile_range`'s move into
     // `ExportOptions`: the empty-shard branch below needs the pivot zoom.
