@@ -10,7 +10,8 @@
 # between them, and the harness would silently have picked the wrong one.
 #
 # So: clone felt/tippecanoe at a pinned TAG, verify the commit SHA matches the
-# one recorded here, build it into ./.tools, and record version + SHA in
+# one recorded here, build it into the repo-root .tools/ (next to go-pmtiles;
+# TIPPECANOE_TOOLS_DIR overrides), and record version + SHA in
 # tippecanoe.lock.json, which run_e2e.py copies into every result file.
 #
 # Homebrew note: `brew install tippecanoe` currently also ships 2.79.0, so a
@@ -22,7 +23,8 @@
 # binary is recorded with sha null.
 #
 # Usage:
-#   ./setup_tippecanoe.sh            # build the pinned tag into ./.tools
+#   ./setup_tippecanoe.sh            # build the pinned tag into <repo>/.tools
+#   eval "$(./setup_tippecanoe.sh --print-path)"   # put that build on PATH
 #   TIPPECANOE_TAG=2.78.0 TIPPECANOE_SHA=<full commit sha> ./setup_tippecanoe.sh
 #                                    # pin something else: the SHA is required,
 #                                    # because verifying a tag against the SHA
@@ -33,7 +35,11 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLS="$HERE/.tools"
+ROOT="$(cd "$HERE/../.." && pwd)"
+# Built into the repo-root .tools/ (gitignored), next to go-pmtiles
+# (scripts/setup_go_pmtiles.sh), so one cache path covers every pinned
+# external binary. TIPPECANOE_TOOLS_DIR overrides it.
+TOOLS="${TIPPECANOE_TOOLS_DIR:-$ROOT/.tools}"
 
 # --- the pin -----------------------------------------------------------------
 # felt/tippecanoe 2.79.0, published 2025-07-24, the latest release as of
@@ -54,6 +60,15 @@ TIPPECANOE_REPO="${TIPPECANOE_REPO:-https://github.com/felt/tippecanoe.git}"
 SRC="$TOOLS/src-$TIPPECANOE_TAG"
 PREFIX="$TOOLS/tippecanoe-$TIPPECANOE_TAG"
 BIN="$PREFIX/bin/tippecanoe"
+
+# `--print-path`: emit shell that puts the pinned build on PATH (tippecanoe,
+# tippecanoe-decode, tile-join, ...) and names the binary, for `eval` in a
+# workflow step or a shell. Does not build.
+if [ "${1:-}" = "--print-path" ]; then
+  echo "export TIPPECANOE_BIN=\"$BIN\""
+  echo "export PATH=\"$PREFIX/bin:\$PATH\""
+  exit 0
+fi
 
 mkdir -p "$TOOLS"
 
@@ -97,7 +112,7 @@ else
   # Verify BEFORE building: nothing from an unverified checkout gets compiled.
   verify_sha
 
-  echo "building tippecanoe $TIPPECANOE_TAG ($got_sha) ..."
+  echo "building tippecanoe $TIPPECANOE_TAG ($TIPPECANOE_SHA) ..."
   make -C "$SRC" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" >"$TOOLS/build.log" 2>&1 || {
     echo "ERROR: build failed, see $TOOLS/build.log" >&2
     tail -30 "$TOOLS/build.log" >&2

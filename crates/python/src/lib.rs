@@ -995,13 +995,24 @@ fn overview(
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
 ///     (list of dicts with "zoom", "level", "level_feature_count",
-///     "tile_count", "tile_feature_count", "oversized_tiles"), "total_tiles",
-///     "total_tile_features", "oversized_tiles", "skipped_property_columns"
-///     (list of dicts with "name" and "data_type": the property columns the
-///     export dropped because their Arrow type has no MVT encoding, such as
-///     a binary column; each is also warned about once. Struct, list and map
-///     columns are not dropped: they reach the tiles as JSON strings, the
-///     tippecanoe convention for nested attributes), "duration_secs".
+///     "tile_count", "tile_feature_count", "oversized_tiles",
+///     "encode_dropped_features", "encode_quantized_features"), "total_tiles",
+///     "total_tile_features", "oversized_tiles", "encode_dropped_features",
+///     "encode_quantized_features", "skipped_property_columns",
+///     "duration_secs".
+///     ``encode_dropped_features`` counts tile members with nothing to encode
+///     (empty geometries, empty GeometryCollections); non-zero means content
+///     was lost after clipping, and a warning names the total.
+///     ``encode_quantized_features`` counts tile members whose geometry
+///     collapsed at the tile extent (zero-area polygon rings, lines of fewer
+///     than two points, typically clip slivers at a buffered tile edge);
+///     expected on ordinary data and never a warning.
+///     ``skipped_property_columns`` is a list of dicts with "name" and
+///     "data_type": the property columns the export dropped because their
+///     Arrow type has no MVT encoding, such as a binary column; each is also
+///     warned about once. Struct, list and map columns are not dropped: they
+///     reach the tiles as JSON strings, the tippecanoe convention for nested
+///     attributes.
 ///
 /// Raises:
 ///     RuntimeError: The export failed (not an overview file, unsupported
@@ -1068,6 +1079,8 @@ fn export_pmtiles(
         d.set_item("tile_count", z.tile_count)?;
         d.set_item("tile_feature_count", z.tile_feature_count)?;
         d.set_item("oversized_tiles", z.oversized_tiles)?;
+        d.set_item("encode_dropped_features", z.encode_dropped_features)?;
+        d.set_item("encode_quantized_features", z.encode_quantized_features)?;
         zooms.append(d)?;
     }
     dict.set_item("zooms", zooms)?;
@@ -1082,6 +1095,11 @@ fn export_pmtiles(
         skipped.append(d)?;
     }
     dict.set_item("skipped_property_columns", skipped)?;
+    dict.set_item("encode_dropped_features", report.encode_dropped_features)?;
+    dict.set_item(
+        "encode_quantized_features",
+        report.encode_quantized_features,
+    )?;
     dict.set_item("duration_secs", report.duration_secs)?;
     Ok(dict.into())
 }

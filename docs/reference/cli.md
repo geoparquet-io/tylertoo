@@ -548,7 +548,9 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--tile-size-limit <SIZE>` — Per-tile MVT size cap (e.g., "500K", "1M", or raw bytes). When a tile exceeds it, a single non-iterative drop pass sheds features for that tile only (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --max-tile-size for parity with the `tiles` command
 
   Default value: `500K`
-* `--report <PATH>` — Write the JSON export report to this path
+* `--report <PATH>` — Write the JSON export report to this path.
+
+   Besides per-zoom tile and feature counts and the oversized-tile tally, the report carries two encode tallies (total and per zoom, #431). `encode_dropped_features`: tile members with nothing to encode -- empty geometries or empty GeometryCollections; non-zero means content was lost after clipping, a warning names the total and the summary line repeats it. `encode_quantized_features`: tile members whose geometry collapsed at the tile extent -- zero-area polygon rings, lines of fewer than two points, typically clip slivers at a buffered tile edge; expected on ordinary data and never a warning.
 * `--no-simple-clip-fastpath` — Disable the simple-clip fast path (issue #239), forcing the i_overlay boundary-bridge fallback on every polygon clip. The fast path is on by default (render-equivalent on simple rings); pass this only when you need byte-stable tile output, since the fast path rotates simple rings to a different start vertex
 * `--partition-wave <N|auto>` — Partitions processed per band read during export (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
 
@@ -659,6 +661,13 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 
    Off by default: a band's premise is that its input is already the right resolution for the zooms it owns, so thinning and simplifying it would re-introduce exactly what banding avoids. Pass this when a band is raw features spanning several zooms and you do want the ladder inside it.
 * `--max-tile-size <SIZE>` — Per-tile MVT size cap for bands tiled here (e.g. "500K"). Unset means no cap, matching the verbatim default: a valve that sheds features to fit a byte budget would drop cells the band exists to draw
+* `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order for bands tiled here (#374): `input` (default) or a property name, optionally `:asc` / `:desc`.
+
+   Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361): MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a banded aggregate or nested choropleth usually wants — with ties kept in input order so output stays deterministic.
+
+   Applies to every GeoParquet band alike, like `--generalize` and `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps the order it was tiled with. Each band's export reads the column independently: a GeoParquet band that does not have it is exported in input order with a warning naming the band's layer, not an error.
+
+  Default value: `input`
 * `--work-dir <DIR>` — Directory for the per-band intermediates (removed on the way out). Defaults to the system temp directory
 * `--allow-missing-zooms` — Allow a pre-tiled band's declared zoom range to overshoot what its archive actually holds.
 

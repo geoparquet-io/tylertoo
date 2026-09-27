@@ -443,31 +443,12 @@ def main() -> int:
         return fail(f"tylertoo binary not found: {tylertoo}\n"
                     f"  build it: cargo build --release -p tylertoo")
 
-    lock_path = HERE / "tippecanoe.lock.json"
-    lock = json.loads(lock_path.read_text()) if lock_path.exists() else {}
-    tippecanoe = args.tippecanoe or lock.get("binary")
-    if not tippecanoe or not Path(tippecanoe).exists():
-        return fail("pinned tippecanoe not found.\n"
-                    "  run ./setup_tippecanoe.sh, or pass --tippecanoe PATH")
-
-    tip_version = subprocess.check_output([tippecanoe, "--version"],
-                                          stderr=subprocess.STDOUT,
-                                          text=True).strip().splitlines()[0]
-    mismatch_allowed = bool(os.environ.get("TIPPECANOE_ALLOW_MISMATCH"))
-    if tip_version != EXPECTED_TIPPECANOE_VERSION and not mismatch_allowed:
-        return fail(f"tippecanoe version mismatch: got {tip_version!r}, "
-                    f"pinned {EXPECTED_TIPPECANOE_VERSION!r}\n"
-                    "  set TIPPECANOE_ALLOW_MISMATCH=1 to override (recorded "
-                    "in the results; say so in the write-up)")
-
-    # The lockfile's tag + SHA describe the binary setup_tippecanoe.sh built.
-    # They are only true of THIS run if this run is using that binary; for any
-    # other binary (brew, --tippecanoe PATH) the build commit is unknown and
-    # is recorded as null rather than borrowed.
-    lock_bin = lock.get("binary")
-    is_lock_binary = bool(lock_bin) and Path(lock_bin).resolve() == Path(tippecanoe).resolve()
-    tip_tag = lock.get("tag") if is_lock_binary else None
-    tip_sha = lock.get("sha") if is_lock_binary else None
+    try:
+        tip = resolve_tippecanoe(args.tippecanoe)
+    except TippecanoeUnavailable as exc:
+        return fail(str(exc))
+    tippecanoe, tip_version = tip["binary"], tip["version"]
+    tip_tag, tip_sha = tip["tag"], tip["sha"]
 
     tyler_version = subprocess.check_output([tylertoo, "--version"],
                                             text=True).strip()
@@ -708,6 +689,57 @@ def main() -> int:
 def fail(msg: str) -> int:
     print(f"error: {msg}", file=sys.stderr)
     return 2
+
+
+class TippecanoeUnavailable(RuntimeError):
+    """No usable pinned tippecanoe; the message names the remedy."""
+
+
+def resolve_tippecanoe(explicit: str | None = None) -> dict:
+    """Find the pinned tippecanoe and enforce its version.
+
+    `explicit` (from --tippecanoe / $TIPPECANOE) wins; otherwise the binary
+    named in tippecanoe.lock.json (written by setup_tippecanoe.sh). Either way
+    `--version` must equal EXPECTED_TIPPECANOE_VERSION unless
+    TIPPECANOE_ALLOW_MISMATCH=1, so a missing lockfile never means "any binary
+    will do". Shared with compare_tippecanoe.py so the benchmark and the
+    parity gate cannot disagree about which tippecanoe is the baseline.
+
+    Returns binary, version, expected_version, version_mismatch_allowed, and
+    tag + sha — the last two only when the binary IS the one the lockfile
+    names (a brew or --tippecanoe binary has an unknown build commit, recorded
+    as None rather than borrowed from the lockfile).
+    """
+    lock_path = HERE / "tippecanoe.lock.json"
+    lock = json.loads(lock_path.read_text()) if lock_path.exists() else {}
+    binary = explicit or lock.get("binary")
+    if not binary or not Path(binary).exists():
+        raise TippecanoeUnavailable(
+            "pinned tippecanoe not found.\n"
+            "  run ./setup_tippecanoe.sh, or pass --tippecanoe PATH")
+
+    version = subprocess.check_output([binary, "--version"],
+                                      stderr=subprocess.STDOUT,
+                                      text=True).strip().splitlines()[0]
+    mismatch_allowed = bool(os.environ.get("TIPPECANOE_ALLOW_MISMATCH"))
+    if version != EXPECTED_TIPPECANOE_VERSION and not mismatch_allowed:
+        raise TippecanoeUnavailable(
+            f"tippecanoe version mismatch: got {version!r}, "
+            f"pinned {EXPECTED_TIPPECANOE_VERSION!r}\n"
+            "  set TIPPECANOE_ALLOW_MISMATCH=1 to override (recorded "
+            "in the results; say so in the write-up)")
+
+    lock_bin = lock.get("binary")
+    is_lock_binary = (bool(lock_bin)
+                      and Path(lock_bin).resolve() == Path(binary).resolve())
+    return {
+        "binary": binary,
+        "version": version,
+        "expected_version": EXPECTED_TIPPECANOE_VERSION,
+        "version_mismatch_allowed": version != EXPECTED_TIPPECANOE_VERSION,
+        "tag": lock.get("tag") if is_lock_binary else None,
+        "sha": lock.get("sha") if is_lock_binary else None,
+    }
 
 
 def first_error_line(text: str) -> str:

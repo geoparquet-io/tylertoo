@@ -32,10 +32,23 @@ use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::export::FeatureOrder;
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-/// Parse human-readable memory size (e.g., "8G", "16G", "512M") to bytes.
-fn parse_memory_size(s: &str) -> Result<usize, String> {
+/// Why a suffixed size did not parse: only the overflow branch should
+/// mention the ceiling, so the caller's message is built per branch.
+#[derive(Debug, PartialEq, Eq)]
+enum SizeParseError {
+    /// Not `<integer>[K|M|G]` at all.
+    Malformed,
+    /// Well-formed, but `n * multiplier` does not fit `usize` (#432).
+    Overflow,
+}
+
+/// Parse `<integer>[K|KB|M|MB|G|GB]` (case-insensitive) to bytes.
+///
+/// The suffix multiplication is checked (#432): `99999999999999999G` used to
+/// wrap in release builds and be accepted as a small byte count.
+fn parse_suffixed_size(s: &str) -> Result<usize, SizeParseError> {
     let s = s.trim().to_uppercase();
-    let (num_str, multiplier) = if s.ends_with("G") || s.ends_with("GB") {
+    let (num_str, multiplier): (&str, usize) = if s.ends_with("G") || s.ends_with("GB") {
         (
             s.trim_end_matches("GB").trim_end_matches("G"),
             1024 * 1024 * 1024,
@@ -49,16 +62,20 @@ fn parse_memory_size(s: &str) -> Result<usize, String> {
         (s.as_str(), 1)
     };
 
-    num_str
+    let n = num_str
         .trim()
         .parse::<usize>()
-        .map(|n| n * multiplier)
-        .map_err(|_| {
-            format!(
-                "Invalid memory size: '{}'. Use format like '8G', '16G', '512M'",
-                s
-            )
-        })
+        .map_err(|_| SizeParseError::Malformed)?;
+    n.checked_mul(multiplier).ok_or(SizeParseError::Overflow)
+}
+
+/// The ceiling clause appended to an overflow error, and nothing else: a
+/// malformed value gets the format hint alone.
+fn size_ceiling_hint(err: SizeParseError) -> String {
+    match err {
+        SizeParseError::Malformed => String::new(),
+        SizeParseError::Overflow => format!(" (the value must fit in {} bytes)", usize::MAX),
+    }
 }
 
 /// Parse a human-readable byte size (e.g., "500K", "1M", "2G") as usize.
@@ -66,8 +83,11 @@ fn parse_memory_size(s: &str) -> Result<usize, String> {
 /// A plain integer with no suffix is interpreted as raw bytes, so callers that
 /// previously passed a byte count (e.g. `--tile-size-limit 500000`) keep working.
 fn parse_size_bytes(s: &str) -> Result<usize, String> {
-    parse_memory_size(s).map_err(|_| {
-        format!("Invalid size: '{s}'. Use a byte count or a suffixed size like '500K', '1M', '2G'")
+    parse_suffixed_size(s).map_err(|err| {
+        format!(
+            "Invalid size: '{s}'. Use a byte count or a suffixed size like '500K', '1M', '2G'{}",
+            size_ceiling_hint(err)
+        )
     })
 }
 
@@ -338,6 +358,26 @@ pub struct PyramidArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
     pub max_tile_size: Option<usize>,
 
+    /// Within-tile feature order for bands tiled here (#374): `input`
+    /// (default) or a property name, optionally `:asc` / `:desc`.
+    ///
+    /// Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361):
+    /// MVT does not define draw order, but renderers paint features in the
+    /// order the tile lists them, so this is the paint order for any style
+    /// that does not override it. `input` emits source row order. Naming a
+    /// column sorts within each tile by that property — `--feature-order
+    /// level` puts high `level` on top, which is what a banded aggregate or
+    /// nested choropleth usually wants — with ties kept in input order so
+    /// output stays deterministic.
+    ///
+    /// Applies to every GeoParquet band alike, like `--generalize` and
+    /// `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps
+    /// the order it was tiled with. Each band's export reads the column
+    /// independently: a GeoParquet band that does not have it is exported in
+    /// input order with a warning naming the band's layer, not an error.
+    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
+    pub feature_order: FeatureOrder,
+
     /// Directory for the per-band intermediates (removed on the way out).
     /// Defaults to the system temp directory.
     #[arg(long, value_name = "DIR")]
@@ -587,6 +627,16 @@ struct ExportPmtilesArgs {
     tile_size_limit: usize,
 
     /// Write the JSON export report to this path.
+    ///
+    /// Besides per-zoom tile and feature counts and the oversized-tile tally,
+    /// the report carries two encode tallies (total and per zoom, #431).
+    /// `encode_dropped_features`: tile members with nothing to encode -- empty
+    /// geometries or empty GeometryCollections; non-zero means content was
+    /// lost after clipping, a warning names the total and the summary line
+    /// repeats it. `encode_quantized_features`: tile members whose geometry
+    /// collapsed at the tile extent -- zero-area polygon rings, lines of
+    /// fewer than two points, typically clip slivers at a buffered tile edge;
+    /// expected on ordinary data and never a warning.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
@@ -3111,9 +3161,13 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             convert_report.duration_secs + export_report.duration_secs,
             convert_report.out_of_range_features,
             convert_report.unprojectable_features,
+            export_report.encode_dropped_features,
         )
     );
     print_skipped_property_columns(&export_report.skipped_property_columns);
+    if let Some(note) = encode_quantized_note(export_report.encode_quantized_features) {
+        println!("  {note}");
+    }
     // #380: the summary line above covers the requested (declared) range,
     // which can be wider than the archive's own PMTiles header (#529, #522:
     // the header always reflects the zooms that actually hold a tile) — say
@@ -3200,6 +3254,7 @@ fn tiles_summary_line(
     secs: f64,
     out_of_range: usize,
     unprojectable: usize,
+    encode_dropped: usize,
 ) -> String {
     let zooms = format!("z{min_zoom}..z{max_zoom}");
     let tiles = format_number(total_tiles as u64);
@@ -3216,6 +3271,16 @@ fn tiles_summary_line(
             format_number(unprojectable as u64)
         ));
     }
+    if encode_dropped > 0 {
+        // #431: post-clip losses at MVT encode; the core's aggregate warning
+        // names the causes. Expected extent collapses are NOT a loss and go
+        // through `encode_quantized_note` instead.
+        losses.push(format!(
+            "{} tile feature(s) dropped at MVT encode (empty geometry or empty \
+             GeometryCollection)",
+            format_number(encode_dropped as u64)
+        ));
+    }
     if losses.is_empty() {
         return format!("{tiles} tiles across {zooms} in {secs:.2}s");
     }
@@ -3225,6 +3290,22 @@ fn tiles_summary_line(
     } else {
         format!("{tiles} tiles across {zooms} in {secs:.2}s — {dropped}")
     }
+}
+
+/// The informational note for members that collapsed at the tile extent
+/// (#431), if any. Deliberately NOT part of the summary line: a clip sliver
+/// that quantizes to zero area at a buffered tile edge is routine on any
+/// polygon export and is not content loss.
+fn encode_quantized_note(encode_quantized: usize) -> Option<String> {
+    (encode_quantized > 0).then(|| {
+        format!(
+            "note: {} tile feature(s) collapsed at the tile extent and were not encoded \
+             (zero-area polygon rings or lines of fewer than two points, typically clip \
+             slivers at a buffered tile edge) \u{2014} expected, see \
+             `encode_quantized_features` in the report",
+            format_number(encode_quantized as u64)
+        )
+    })
 }
 
 /// The pyramid build's skipped-tile line, if any (#514 S3).
@@ -3657,7 +3738,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     );
     for z in &report.zooms {
         println!(
-            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}",
+            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}{}{}",
             z.zoom,
             z.level,
             z.tile_count,
@@ -3666,17 +3747,40 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
                 format!(", {} oversized", z.oversized_tiles)
             } else {
                 String::new()
+            },
+            if z.encode_dropped_features > 0 {
+                format!(", {} unencodable", z.encode_dropped_features)
+            } else {
+                String::new()
+            },
+            if z.encode_quantized_features > 0 {
+                format!(", {} collapsed at extent", z.encode_quantized_features)
+            } else {
+                String::new()
             }
         );
     }
     println!(
-        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s",
+        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s{}",
         report.total_tiles,
         report.total_tile_features,
         report.oversized_tiles,
-        report.duration_secs
+        report.duration_secs,
+        if report.encode_dropped_features > 0 {
+            // #431: never let the summary read as an unqualified success.
+            format!(
+                " \u{2014} {} tile feature(s) dropped at MVT encode (empty geometry or \
+                 empty GeometryCollection); see the warning above",
+                report.encode_dropped_features
+            )
+        } else {
+            String::new()
+        }
     );
     print_skipped_property_columns(&report.skipped_property_columns);
+    if let Some(note) = encode_quantized_note(report.encode_quantized_features) {
+        println!("  {note}");
+    }
 
     if let Some(path) = &args.report {
         let json = serde_json::to_string_pretty(&report)
@@ -3736,9 +3840,7 @@ fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
-    use tylertoo_core::overview::convert::ConvertOptions;
-    use tylertoo_core::overview::export::ExportOptions;
-    use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band, PyramidOptions};
+    use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band};
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -3796,20 +3898,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         }
     }
 
-    let convert = if args.generalize {
-        ConvertOptions::default()
-    } else {
-        ConvertOptions::default().verbatim()
-    };
-    let opts = PyramidOptions {
-        convert,
-        export: ExportOptions {
-            tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
-            ..ExportOptions::default()
-        },
-        work_dir: args.work_dir.clone(),
-        allow_missing_zooms: args.allow_missing_zooms,
-    };
+    let opts = pyramid_options(&args);
 
     let report = build_pyramid(&bands, &args.output, &opts)
         .map_err(|e| anyhow::anyhow!("pyramid build failed: {e}"))?;
@@ -3834,6 +3923,34 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         format_number(report.total_tiles as u64)
     );
     Ok(())
+}
+
+/// The `pyramid` flags that apply to every GeoParquet band alike, as the
+/// library options `build_pyramid` substitutes each band's own layer name
+/// and zoom range into. Kept separate from `run_pyramid` so a test can
+/// check a flag actually reaches `PyramidOptions` (#374: `--feature-order`
+/// was documented for `tiles` and `export-pmtiles` but `pyramid` built its
+/// export options from `ExportOptions::default()`).
+fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions {
+    use tylertoo_core::overview::convert::ConvertOptions;
+    use tylertoo_core::overview::export::ExportOptions;
+    use tylertoo_core::pyramid::PyramidOptions;
+
+    let convert = if args.generalize {
+        ConvertOptions::default()
+    } else {
+        ConvertOptions::default().verbatim()
+    };
+    PyramidOptions {
+        convert,
+        export: ExportOptions {
+            tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
+            feature_order: args.feature_order.clone(),
+            ..ExportOptions::default()
+        },
+        work_dir: args.work_dir.clone(),
+        allow_missing_zooms: args.allow_missing_zooms,
+    }
 }
 
 /// A path's identity for "is this the same file?", resolved as far as the
@@ -4467,6 +4584,69 @@ mod tests {
         }
     }
 
+    fn parse_pyramid(flags: &[&str]) -> PyramidArgs {
+        let mut argv = vec![
+            "tylertoo",
+            "pyramid",
+            "out.pmtiles",
+            "--band",
+            "0-5:coarse.parquet",
+        ];
+        argv.extend_from_slice(flags);
+        match Cli::try_parse_from(argv)
+            .expect("pyramid args should parse")
+            .command
+        {
+            Command::Pyramid(a) => a,
+            other => panic!("expected pyramid subcommand, got {other:?}"),
+        }
+    }
+
+    /// #374: `pyramid` takes the same `--feature-order` as `tiles` and
+    /// `export-pmtiles`, once for the whole pyramid, and it has to reach
+    /// `PyramidOptions::export` — the library already honours it per band,
+    /// the CLI just never set it, so `ExportOptions::default()` always won.
+    #[test]
+    fn feature_order_flag_reaches_pyramid() {
+        let column = |name: &str, descending| FeatureOrder::Column {
+            name: name.to_string(),
+            descending,
+        };
+
+        assert_eq!(parse_pyramid(&[]).feature_order, FeatureOrder::Input);
+        assert_eq!(
+            pyramid_options(&parse_pyramid(&[])).export.feature_order,
+            FeatureOrder::Input
+        );
+
+        assert_eq!(
+            parse_pyramid(&["--feature-order", "level:desc"]).feature_order,
+            column("level", true)
+        );
+        let opts = pyramid_options(&parse_pyramid(&["--feature-order", "level:desc"]));
+        assert_eq!(opts.export.feature_order, column("level", true));
+        // The rest of the export options are untouched by the new knob.
+        assert_eq!(opts.export.tile_size_limit, None);
+        assert_eq!(
+            pyramid_options(&parse_pyramid(&["--feature-order", "level"]))
+                .export
+                .feature_order,
+            column("level", false)
+        );
+
+        // Same parser as the other two commands: a bad direction is rejected
+        // at parse time.
+        let mut argv = vec![
+            "tylertoo",
+            "pyramid",
+            "out.pmtiles",
+            "--band",
+            "0-5:a.parquet",
+        ];
+        argv.extend_from_slice(&["--feature-order", "level:dsc"]);
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+
     /// #361: the flag has to actually reach `ExportOptions` on both commands.
     /// `FromStr` coverage alone would pass with the flag wired to nothing.
     #[test]
@@ -4521,6 +4701,48 @@ mod tests {
         // A plain integer is raw bytes — keeps pre-reconciliation invocations working.
         assert_eq!(parse_size_bytes("500000").unwrap(), 500_000);
         assert!(parse_size_bytes("banana").is_err());
+    }
+
+    /// #432: a size whose suffix multiplication overflows `usize` must be a
+    /// parse error, not a wrapped (silently small) byte count. Before the
+    /// fix `99999999999999999G` wrapped in release builds and was accepted.
+    #[test]
+    fn parse_size_bytes_rejects_overflow() {
+        let ceiling = format!("must fit in {} bytes", usize::MAX);
+        for s in [
+            "99999999999999999G",
+            "9223372036854775808K",
+            "18446744073709551615M",
+        ] {
+            assert_eq!(parse_suffixed_size(s), Err(SizeParseError::Overflow), "{s}");
+            // The public message (--max-tile-size / --tile-size-limit) names
+            // the ceiling on this branch instead of hiding it behind the
+            // generic format hint.
+            let err = parse_size_bytes(s).expect_err(s);
+            assert!(err.starts_with("Invalid size: "), "{s}: {err}");
+            assert!(err.contains(&ceiling), "{s}: {err}");
+        }
+        // The largest representable value still parses.
+        assert_eq!(
+            parse_size_bytes(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+    }
+
+    /// The ceiling clause is for the overflow branch only: garbage gets the
+    /// format hint, not a 20-digit number that has nothing to do with it.
+    #[test]
+    fn malformed_size_error_does_not_mention_the_ceiling() {
+        for s in ["banana", "", "1.5G", "-1M", "G"] {
+            assert_eq!(
+                parse_suffixed_size(s),
+                Err(SizeParseError::Malformed),
+                "{s:?}"
+            );
+            let err = parse_size_bytes(s).expect_err(s);
+            assert!(err.starts_with("Invalid size: "), "{s:?}: {err}");
+            assert!(!err.contains("must fit in"), "{s:?}: {err}");
+        }
     }
 
     #[test]
@@ -5415,10 +5637,10 @@ mod tests {
     /// unqualified success.
     #[test]
     fn tiles_summary_line_names_out_of_range_losses() {
-        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0);
+        let clean = tiles_summary_line(1234, 0, 14, 1.5, 0, 0, 0);
         assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
 
-        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0);
+        let empty = tiles_summary_line(0, 0, 14, 0.05, 3, 0, 0);
         assert!(
             empty.starts_with(
                 "0 tiles \u{2014} 3 feature(s) dropped (outside the declared CRS range)"
@@ -5426,7 +5648,7 @@ mod tests {
             "a wrong-CRS run must not read as a clean success: {empty}"
         );
 
-        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0);
+        let partial = tiles_summary_line(10, 0, 14, 0.2, 1, 0, 0);
         assert!(
             partial.contains("10 tiles across z0..z14")
                 && partial.contains("1 feature(s) dropped (outside the declared CRS range)"),
@@ -5434,7 +5656,7 @@ mod tests {
         );
 
         // The Mercator-domain loss is named separately: nothing to reproject.
-        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7);
+        let polar = tiles_summary_line(0, 0, 14, 0.05, 0, 7, 0);
         assert!(
             polar.contains(
                 "7 feature(s) dropped (|lat| > 85.05\u{b0}, outside the Web Mercator \
@@ -5444,11 +5666,36 @@ mod tests {
         );
 
         // Both at once, both named.
-        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3);
+        let both = tiles_summary_line(5, 0, 14, 0.1, 2, 3, 0);
         assert!(
             both.contains("2 feature(s) dropped (outside the declared CRS range)")
                 && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
             "{both}"
+        );
+
+        // #431: encode-time drops are a post-clip loss and are named as such.
+        let encode = tiles_summary_line(5, 0, 14, 0.1, 0, 0, 4);
+        assert!(
+            encode.contains("5 tiles across z0..z14")
+                && encode.contains(
+                    "4 tile feature(s) dropped at MVT encode (empty geometry or empty \
+                     GeometryCollection)"
+                ),
+            "{encode}"
+        );
+    }
+
+    /// #431 review: extent collapses are expected and never qualify the
+    /// success line; they get their own note, naming what they are.
+    #[test]
+    fn encode_quantized_note_is_separate_and_silent_at_zero() {
+        assert_eq!(encode_quantized_note(0), None);
+        let note = encode_quantized_note(2).unwrap();
+        assert!(
+            note.contains("2 tile feature(s) collapsed at the tile extent")
+                && note.contains("lines of fewer than two points")
+                && !note.contains("dropped"),
+            "{note}"
         );
     }
 

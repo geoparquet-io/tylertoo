@@ -305,7 +305,11 @@ const IOVERLAY_MAX_ABS_COORD: f64 = 1e150;
 /// can be split at an interior vertex where the engine nodes it (see the
 /// pinned cases in `tests/line_clip_pinned.rs`). An empty result means
 /// nothing of the input lies within the bounds.
-pub(crate) fn clip_multilinestring_ioverlay(
+// `pub` only for the hostile-geometry harness (`tests/hostile_geometry_eval.rs`),
+// which scores the raw line clipper as its own engine column (#205); not
+// part of the supported API, hence hidden from the docs.
+#[doc(hidden)]
+pub fn clip_multilinestring_ioverlay(
     mls: &MultiLineString<f64>,
     bounds: &TileBounds,
 ) -> MultiLineString<f64> {
