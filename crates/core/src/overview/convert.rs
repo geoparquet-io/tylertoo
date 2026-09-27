@@ -1353,6 +1353,72 @@ pub enum ConvertError {
         /// feature table must exist in full regardless of `MemoryProfile`).
         limit_bytes: u64,
     },
+    /// A row group's geometry column exceeds the ~2 GiB uncompressed size
+    /// arrow's `BinaryArray` `i32` offsets can address (#563). Decoding such
+    /// a column fails deep in arrow-rs with an opaque `Parquet error: index
+    /// overflow decoding byte array` that names neither the row group nor
+    /// the fix — the failure mode a 20,118-feature raster-boundary file with
+    /// ~7 GB of WKB packed into one row group produced in the field. Caught
+    /// here, from footer column-chunk statistics alone
+    /// (`total_uncompressed_size`), before pass 1 (or pass 0's staging)
+    /// reads a single data page of the offending group.
+    #[error("{}", oversized_geometry_row_group_message(.offenders, .limit_bytes))]
+    OversizedGeometryRowGroup {
+        /// Every SELECTED row group (the ones this run would actually read)
+        /// whose geometry column chunk exceeds `limit_bytes`. Almost always
+        /// exactly one; the message names the worst.
+        offenders: Vec<crate::input_set::OversizedRowGroup>,
+        /// The `i32`-offset ceiling checked against
+        /// ([`OVERSIZED_GEOMETRY_LIMIT_BYTES`]).
+        limit_bytes: u64,
+    },
+}
+
+/// The largest geometry-column uncompressed size (bytes) a row group can
+/// carry and still decode into arrow's `BinaryArray`, whose offsets buffer
+/// is `i32` (#563). Set to the exact ceiling rather than leaving headroom:
+/// [`crate::input_set::ConvertSource::oversized_geometry_row_groups`] reads
+/// `total_uncompressed_size`, an upper bound on the decoded buffer size (it
+/// also counts per-value length-prefix / dictionary-index bytes the decoded
+/// buffer omits), so this preflight already errs toward firing a little
+/// early rather than late.
+pub(super) const OVERSIZED_GEOMETRY_LIMIT_BYTES: u64 = i32::MAX as u64;
+
+/// The message body of [`ConvertError::OversizedGeometryRowGroup`]: which
+/// row group, how big, and what to do about it (#563).
+fn oversized_geometry_row_group_message(
+    offenders: &[crate::input_set::OversizedRowGroup],
+    limit_bytes: &u64,
+) -> String {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let limit_gib = *limit_bytes as f64 / GIB;
+    let Some(worst) = offenders.iter().max_by_key(|o| o.uncompressed_bytes) else {
+        // Unreachable in practice (the caller only builds this error from a
+        // non-empty `offenders`), but keeps the function total.
+        return format!(
+            "a row group's geometry column exceeds {limit_gib:.2} GiB uncompressed, beyond \
+             what arrow's BinaryArray i32 offsets can address"
+        );
+    };
+    let gib = worst.uncompressed_bytes as f64 / GIB;
+    let where_ = if worst.part == 0 {
+        format!("row group {}", worst.row_group)
+    } else {
+        format!("row group {} of part {}", worst.row_group, worst.part)
+    };
+    let also = if offenders.len() > 1 {
+        format!(" ({} row groups exceed it in total)", offenders.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "{where_}'s geometry column is {gib:.2} GiB uncompressed{also}, beyond the \
+         {limit_gib:.2} GiB arrow's BinaryArray i32 offsets can address — decoding it would \
+         fail with an opaque 'index overflow decoding byte array' error. Rewrite the input \
+         with smaller row groups, e.g. `gpio sort hilbert <input> <output> \
+         --row-group-size-mb 128` (or DuckDB's `COPY ... TO ... (FORMAT PARQUET, \
+         ROW_GROUP_SIZE ...)`)."
+    )
 }
 
 /// #541: [`ConvertOptions::zoom_ceiling`]'s up-front checks, split out of

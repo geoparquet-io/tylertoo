@@ -140,6 +140,22 @@ pub struct MultiSource {
 #[derive(Debug, Clone)]
 pub struct RowGroupSelection(Vec<Vec<usize>>);
 
+/// One row group whose geometry column chunk's uncompressed size exceeds
+/// arrow's `BinaryArray` `i32` offset limit (#563): decoding it fails deep in
+/// arrow-rs with an opaque `Parquet error: index overflow decoding byte
+/// array` that names neither the row group nor the fix. See
+/// [`ConvertSource::oversized_geometry_row_groups`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OversizedRowGroup {
+    /// Index into the source's parts (0 for a [`ConvertSource::Single`]).
+    pub part: usize,
+    /// The row group's LOCAL index within its part.
+    pub row_group: usize,
+    /// The geometry column chunk's uncompressed size in bytes, straight
+    /// from the footer.
+    pub uncompressed_bytes: u64,
+}
+
 impl RowGroupSelection {
     /// Build from per-part local row-group index lists.
     pub fn from_parts(parts: Vec<Vec<usize>>) -> Self {
@@ -672,6 +688,61 @@ impl ConvertSource {
                 )
             })
             .sum())
+    }
+
+    /// Row groups (among `selected`, or every row group of every part when
+    /// `None`) whose `geom_column_name` column chunk's uncompressed size
+    /// exceeds `limit_bytes` (#563).
+    ///
+    /// Footer-only: `total_uncompressed_size` is a column-chunk statistic
+    /// every part's footer already carries, so this costs no extra I/O
+    /// beyond the metadata `num_row_groups_total` and friends already parse.
+    /// It over-reports slightly against the true decoded `BinaryArray`
+    /// buffer size (the chunk's on-disk PLAIN/dictionary encoding also
+    /// counts per-value length-prefix and dictionary-index bytes the decoded
+    /// buffer omits), which only makes this preflight fire a little earlier
+    /// than the real cliff — never later.
+    ///
+    /// Matches by column NAME rather than schema index: the geometry column
+    /// is never one of the #288 reserved names, so it is never renamed, and
+    /// name lookup stays correct regardless of `restrict_columns` (#386)
+    /// narrowing the Arrow-side schema index geometry would otherwise sit at.
+    pub(crate) fn oversized_geometry_row_groups(
+        &self,
+        geom_column_name: &str,
+        selected: Option<&RowGroupSelection>,
+        limit_bytes: u64,
+    ) -> Result<Vec<OversizedRowGroup>, InputError> {
+        let metas = self.metas()?;
+        let mut hits = Vec::new();
+        for (pi, m) in metas.iter().enumerate() {
+            let groups = m.parquet.row_groups();
+            let indices: Vec<usize> = match selected.and_then(|s| s.parts().get(pi)) {
+                Some(picked) => picked.clone(),
+                None => (0..groups.len()).collect(),
+            };
+            for gi in indices {
+                let Some(rg) = groups.get(gi) else {
+                    continue;
+                };
+                let Some(col) = rg
+                    .columns()
+                    .iter()
+                    .find(|c| c.column_descr().name() == geom_column_name)
+                else {
+                    continue;
+                };
+                let bytes = col.uncompressed_size().max(0) as u64;
+                if bytes > limit_bytes {
+                    hits.push(OversizedRowGroup {
+                        part: pi,
+                        row_group: gi,
+                        uncompressed_bytes: bytes,
+                    });
+                }
+            }
+        }
+        Ok(hits)
     }
 
     /// Fetch counters summed over remote parts (`None` when no part is
@@ -2431,5 +2502,119 @@ b.parquet
         assert_eq!(derive_layer_name(""), "layer");
         assert_eq!(derive_layer_name("s3://"), "layer");
         assert_eq!(derive_layer_name("/"), "layer");
+    }
+
+    // --- #563: oversized-geometry-column preflight --------------------------
+
+    /// A tiny fixture with a `geometry` (Binary) column, one row per row
+    /// group, so each group's footer-reported uncompressed size differs.
+    /// Real 2 GiB row groups are not needed to test the MECHANISM: the check
+    /// is a plain footer-stat comparison against a caller-supplied limit, so
+    /// a small file with a tiny limit exercises exactly the same code path
+    /// arrow's real ~2 GiB `i32` offset ceiling would (see
+    /// `oversized_geometry_row_groups_ignored_test` below for the
+    /// `#[ignore]`d real-file variant).
+    fn write_geometry_fixture_with_grouping(
+        path: &Path,
+        blob_sizes: &[usize],
+        max_row_group_size: Option<usize>,
+    ) {
+        use arrow_array::BinaryArray;
+
+        let blobs: Vec<Vec<u8>> = blob_sizes.iter().map(|&n| vec![0u8; n]).collect();
+        let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        write_parquet(
+            path,
+            vec![Field::new("geometry", DataType::Binary, false)],
+            vec![Arc::new(BinaryArray::from_vec(refs))],
+            max_row_group_size,
+        );
+    }
+
+    /// One row (one blob) per row group, so each group's footer-reported
+    /// uncompressed size differs.
+    fn write_geometry_fixture(path: &Path, blob_sizes: &[usize]) {
+        write_geometry_fixture_with_grouping(path, blob_sizes, Some(1));
+    }
+
+    #[test]
+    fn oversized_geometry_row_groups_names_the_offending_group() {
+        let dir = tmpdir();
+        let f = dir.path().join("geo.parquet");
+        // Row group 0: small. Row group 1: the "oversized" one.
+        write_geometry_fixture(&f, &[16, 4096]);
+
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let limit = 1024u64;
+        let hits = src
+            .oversized_geometry_row_groups("geometry", None, limit)
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "only row group 1 exceeds the limit: {hits:?}"
+        );
+        assert_eq!(hits[0].part, 0);
+        assert_eq!(hits[0].row_group, 1);
+        assert!(
+            hits[0].uncompressed_bytes > limit,
+            "reported size must exceed the limit: {hits:?}"
+        );
+    }
+
+    /// Nothing over the limit reports no hits.
+    #[test]
+    fn oversized_geometry_row_groups_clean_file_reports_nothing() {
+        let dir = tmpdir();
+        let f = dir.path().join("geo.parquet");
+        write_geometry_fixture(&f, &[16, 32]);
+
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let hits = src
+            .oversized_geometry_row_groups("geometry", None, 1_000_000)
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// A `selected` row-group restriction is honored: a row group pruned out
+    /// by `--bbox`/`--filter` before this check runs is never flagged, since
+    /// it will never actually be decoded.
+    #[test]
+    fn oversized_geometry_row_groups_respects_the_selection() {
+        let dir = tmpdir();
+        let f = dir.path().join("geo.parquet");
+        write_geometry_fixture(&f, &[16, 4096]);
+
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        // Only row group 0 (the small one) selected — row group 1 is pruned
+        // and must not be flagged even though it is oversized.
+        let selected = RowGroupSelection::from_parts(vec![vec![0]]);
+        let hits = src
+            .oversized_geometry_row_groups("geometry", Some(&selected), 1024)
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "the oversized group was pruned out of the selection: {hits:?}"
+        );
+    }
+
+    /// #563's real repro: a single legal-but-pathological row group whose
+    /// geometry column alone exceeds 2 GiB uncompressed. Ignored by default
+    /// (writing a multi-GB fixture is slow and disk-heavy); run explicitly
+    /// with `cargo test -- --ignored` to exercise it end to end.
+    #[test]
+    #[ignore = "writes a >2GiB parquet fixture; run explicitly with --ignored"]
+    fn oversized_geometry_row_groups_real_2gib_file() {
+        let dir = tmpdir();
+        let f = dir.path().join("huge.parquet");
+        // ~20,000 x 110KB blobs ≈ 2.1 GiB uncompressed, all in ONE row group.
+        let sizes = vec![110_000usize; 20_000];
+        write_geometry_fixture_with_grouping(&f, &sizes, None);
+        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
+        let hits = src
+            .oversized_geometry_row_groups("geometry", None, i32::MAX as u64)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }

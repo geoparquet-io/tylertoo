@@ -1412,21 +1412,26 @@ fn convert_preflight(
         options,
         super::pipeline::probe_preflight_memory_limit(),
         super::convert::skip_memory_preflight_from_env(),
+        super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
     )
 }
 
-/// [`convert_preflight`], parameterized on the pass-1 memory-floor limit and
-/// the escape-hatch decision (#543 test seam: mirrors
-/// [`build_writer_options_with_ceiling`]'s #509 pattern). Production always
-/// calls it via `convert_preflight` with the real uncached probe; tests pass
-/// a tiny mocked limit to prove the #543 hard error fires from
-/// footer-derived row counts alone — before `stage_input_pass0` or pass 1
-/// ever runs — without needing an actually memory-starved box.
+/// [`convert_preflight`], parameterized on the pass-1 memory-floor limit, the
+/// escape-hatch decision, and the #563 oversized-geometry-column ceiling
+/// (test seam: mirrors [`build_writer_options_with_ceiling`]'s #509
+/// pattern). Production always calls it via `convert_preflight` with the
+/// real uncached memory probe and the real
+/// [`super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES`]; tests pass a tiny
+/// mocked memory limit (#543) or geometry-column ceiling (#563) to prove
+/// each hard error fires from footer statistics alone — before
+/// `stage_input_pass0` or pass 1 ever runs — without needing an actually
+/// memory-starved box or an actually multi-GiB fixture.
 fn convert_preflight_with_memory_limit(
     source: &ConvertSource,
     options: &ConvertOptions,
     memory_limit: Option<super::pipeline::MemoryLimit>,
     skip_memory_preflight: bool,
+    oversized_geometry_limit_bytes: u64,
 ) -> Result<Preflight, ConvertError> {
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
@@ -1447,6 +1452,13 @@ fn convert_preflight_with_memory_limit(
     let mut resolved = options.clone();
     let (input_schema, renames) = resolve_reserved_column_collisions(&input_schema, &mut resolved);
     let options = &resolved;
+
+    // Found early (#563) so the oversized-geometry-column preflight below
+    // can name the column before any row-group selection or staging reads
+    // it. The geometry column is never one of the #288 reserved names, so
+    // it is never touched by the rename above.
+    let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_field = input_schema.field(geom_idx).clone();
 
     // Attribute filter (#315): parse + bind against the input schema.
     // Syntax was already validated in `validate_options`; binding resolves
@@ -1488,6 +1500,24 @@ fn convert_preflight_with_memory_limit(
             "[convert] shard {range}: reading {row_groups_read}/{row_groups_total} input row \
              groups (the groups whose bbox reaches this shard's tile range)"
         );
+    }
+    // #563: preflight the geometry column of every row group this run will
+    // actually read (the selection above already excludes anything a
+    // `--bbox`/`--filter`/`--shard` pruning will never touch) against
+    // arrow's `BinaryArray` i32-offset ceiling — footer statistics only, no
+    // data page read — so a pathological row group fails fast with an
+    // actionable message instead of the opaque decode-time
+    // "index overflow decoding byte array" arrow error.
+    let oversized = source.oversized_geometry_row_groups(
+        geom_field.name(),
+        selected_row_groups.as_ref(),
+        oversized_geometry_limit_bytes,
+    )?;
+    if !oversized.is_empty() {
+        return Err(ConvertError::OversizedGeometryRowGroup {
+            offenders: oversized,
+            limit_bytes: oversized_geometry_limit_bytes,
+        });
     }
     // #543: preflight the pass-1 feature table's memory floor from footer row
     // counts alone — no I/O beyond the footers already read above — BEFORE
@@ -1534,10 +1564,8 @@ fn convert_preflight_with_memory_limit(
     // pass 2 relabels non-geometry columns positionally into the renamed
     // source schema (`build_source_schema`). `options` was cloned so
     // by-name ranking/accumulate options could be rewritten to the renamed
-    // columns.)
-
-    let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
-    let geom_field = input_schema.field(geom_idx).clone();
+    // columns. `geom_idx` / `geom_field` were found above, before row-group
+    // selection, for the #563 preflight.)
 
     // Clustering schema checks + accumulate column resolution (Q4).
     let acc_cols = validate_cluster_schema(&input_schema, options)?;
@@ -4913,14 +4941,26 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
         // A generous mocked limit fits comfortably.
-        convert_preflight_with_memory_limit(&source, &options, hard_limit(1 << 40), false)
-            .expect("10 rows must fit a 1 TiB mocked limit");
+        convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1 << 40),
+            false,
+            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+        )
+        .expect("10 rows must fit a 1 TiB mocked limit");
 
         // A 1-byte mocked hard limit cannot possibly fit 10 rows' feature
         // table — this must fail from the footer row count alone, never
         // having opened a data page (the fixture is tiny; if this reached
         // pass 1 it would simply succeed, silently defeating the test).
-        match convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false) {
+        match convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1),
+            false,
+            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+        ) {
             Err(
                 err @ ConvertError::Pass1MemoryFloorExceeded {
                     rows: 10,
@@ -4942,8 +4982,14 @@ mod tests {
         }
 
         // The escape hatch downgrades it to a warning.
-        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), true)
-            .expect("the skip hatch must downgrade the hard error");
+        convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1),
+            true,
+            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+        )
+        .expect("the skip hatch must downgrade the hard error");
 
         // #543 review (S1-2): under a per-feature --bbox the footer count is
         // only an upper bound, so the same tiny hard limit only warns.
@@ -4951,8 +4997,67 @@ mod tests {
             bbox: Some([-180.0, -90.0, 180.0, 90.0]),
             ..options.clone()
         };
-        convert_preflight_with_memory_limit(&source, &bbox_options, hard_limit(1), false)
-            .expect("a --bbox extract must never hard-error on an upper-bound row count");
+        convert_preflight_with_memory_limit(
+            &source,
+            &bbox_options,
+            hard_limit(1),
+            false,
+            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+        )
+        .expect("a --bbox extract must never hard-error on an upper-bound row count");
+    }
+
+    /// #563: a row group whose geometry column exceeds the mocked
+    /// `i32`-offset ceiling fails fast with an actionable error naming the
+    /// row group, its size, and the fix — never reaching pass 1's arrow
+    /// decode, where the real ~2 GiB ceiling instead fails with an opaque
+    /// `Parquet error: index overflow decoding byte array`.
+    ///
+    /// The ceiling is a preflight parameter (mirroring `hard_limit` above)
+    /// precisely so this can be proven with a tiny fixture instead of an
+    /// actual multi-GiB parquet file.
+    #[test]
+    fn convert_preflight_fails_fast_on_an_oversized_geometry_row_group() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
+        let values: Vec<f64> = vec![1.0; geoms.len()];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+        // A generous ceiling (the real production one) fits comfortably.
+        convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1 << 40),
+            false,
+            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+        )
+        .expect("10 tiny points must fit the real ~2 GiB ceiling");
+
+        // A 1-byte mocked ceiling cannot possibly fit 10 points' WKB — this
+        // must fail from the footer's `total_uncompressed_size` alone, never
+        // having opened a data page (if this reached pass 1's decode it
+        // would simply succeed, silently defeating the test).
+        match convert_preflight_with_memory_limit(&source, &options, hard_limit(1 << 40), false, 1)
+        {
+            Err(err @ ConvertError::OversizedGeometryRowGroup { .. }) => {
+                let msg = err.to_string();
+                for want in ["row group 0", "GiB uncompressed", "gpio sort hilbert"] {
+                    assert!(msg.contains(want), "missing {want:?}: {msg}");
+                }
+            }
+            Err(err) => panic!("wrong error: {err}"),
+            Ok(_) => panic!("10 points must not fit a 1-byte geometry-column ceiling"),
+        }
     }
 
     // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
@@ -5017,8 +5122,14 @@ mod tests {
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
-        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false)
-            .expect("a --plan replay must skip the pass-1 memory preflight entirely");
+        convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1),
+            false,
+            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+        )
+        .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }
 
     /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh
