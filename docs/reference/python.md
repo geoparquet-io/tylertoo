@@ -55,7 +55,7 @@ This is the Python equivalent of `tylertoo overview` with the full CLI knob surf
 * `coalesce_lines` (`bool`) — Chain touching same-class line segments into single "stroke" LineStrings at non-canonical levels; the output gains a coalesced_count INT32 column. Defaults to True. Inert in partitioning mode (feature-once/verbatim contract).
 * `coalesce_snap` (`float`) — Endpoint snap tolerance in GSD multiples; <= 0 requires exact endpoint matches. Defaults to 1.0.
 * `coalesce_junction_angle` (`float`) — Junction continuation threshold in degrees; 0 disables (junctions terminate chains). Defaults to 0.0.
-* `coalesce_max_level_rows` (`int`) — Per-level candidate-line ceiling (memory guard); inputs over it skip coalescing with a log. Two limbs: this many candidate lines, and this value x 512 B of modelled line geometry (~1 GB by default, ~1.2 GiB resident) — exceeding either skips coalescing. The byte limb binds first on lines averaging over ~28 vertices (unsplit rivers, boundaries, contours); raise this to coalesce them, at a proportional memory cost. Defaults to 2_000_000.
+* `coalesce_max_level_rows` (`int`) — Per-level candidate-line ceiling (memory guard); larger levels skip coalescing with a log. Defaults to 2_000_000.
 * `cogp_compat` (`bool`) — Emit the optional COGP compatibility footer key. Defaults to False.
 * `row_group_size` (`int`) — Maximum output row-group size in rows (interpreted per level). Defaults to 10_000.
 * `full_column_stats` (`bool`) — Keep full Parquet statistics on every column instead of suppressing high-cardinality property and geometry stats. Defaults to False.
