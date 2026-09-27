@@ -132,12 +132,15 @@ jobs:
         run: |
           {
             echo "## Fuzz \`$TARGET\`: $OUTCOME"
-            n=$(ls "fuzz/artifacts/$TARGET" 2>/dev/null | wc -l)
-            if [ "$n" -gt 0 ]; then
+            crashes=()
+            for f in "fuzz/artifacts/$TARGET"/*; do
+              [ -e "$f" ] && crashes+=("${f##*/}")
+            done
+            if [ "${#crashes[@]}" -gt 0 ]; then
               echo ""
               echo "Crash inputs (in the \`fuzz-artifacts-$TARGET\` artifact):"
               echo '```'
-              ls "fuzz/artifacts/$TARGET"
+              printf '%s\n' "${crashes[@]}"
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
