@@ -41,8 +41,9 @@ name: tippecanoe parity
 on:
   push:
     branches: [main]
+  # Every PR, whatever its base: a stacked PR changes what lands on main
+  # just as much as one opened against it, and the gate is cheap enough.
   pull_request:
-    branches: [main]
   schedule:
     # Every Monday at 07:00 UTC (an hour after the security audit).
     - cron: '0 7 * * 1'
