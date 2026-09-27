@@ -420,6 +420,165 @@ fn geometry_collection_passes_through() {
     }
 }
 
+/// #431: a GeometryCollection must not vanish at MVT encode. It survives
+/// convert (above) and clip; export splits it into one single-type MVT feature
+/// per geometry kind, each carrying the collection's properties, and the
+/// report counts nothing as dropped at encode.
+#[test]
+fn geometry_collection_parts_reach_the_tiles() {
+    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+
+    let gc = GeometryCollection::from(vec![
+        Geometry::Point(Point::new(10.0, 10.0)),
+        Geometry::LineString(LineString::from(vec![(11.0, 10.0), (12.0, 11.0)])),
+        Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                (14.0, 14.0),
+                (16.0, 14.0),
+                (16.0, 16.0),
+                (14.0, 16.0),
+                (14.0, 14.0),
+            ]),
+            vec![],
+        )),
+    ]);
+    let mut geoms = spread_points(3);
+    geoms.push(Some(Geometry::GeometryCollection(gc)));
+    let gc_id = 3i64;
+
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tov = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, true, None);
+        convert_to_overviews(tin.path(), tov.path(), &opts(streaming)).unwrap();
+
+        let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
+            .unwrap_or_else(|e| panic!("streaming={streaming}: export failed: {e}"));
+        assert_eq!(
+            report.encode_dropped_features, 0,
+            "streaming={streaming}: nothing may be dropped at encode: {report:?}"
+        );
+        assert!(report.zooms.iter().all(|z| z.encode_dropped_features == 0));
+
+        // Decode the archive and look for every part of the collection at
+        // the canonical zoom under the collection's own id.
+        let dec = tempfile::NamedTempFile::new().unwrap();
+        decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
+        let rows = read_decoded_rows(dec.path());
+        let canonical = report.max_zoom;
+        let parts: Vec<&Geometry<f64>> = rows
+            .iter()
+            .filter(|(z, id, _)| *z == canonical && *id == Some(gc_id))
+            .map(|(_, _, g)| g)
+            .collect();
+        let kinds = [
+            (
+                "point",
+                parts
+                    .iter()
+                    .any(|g| matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_))),
+            ),
+            (
+                "line",
+                parts
+                    .iter()
+                    .any(|g| matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_))),
+            ),
+            (
+                "polygon",
+                parts
+                    .iter()
+                    .any(|g| matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_))),
+            ),
+        ];
+        for (kind, present) in kinds {
+            assert!(
+                present,
+                "streaming={streaming}: the collection's {kind} part is missing from z{canonical} \
+                 tiles; decoded parts for id {gc_id}: {parts:?}"
+            );
+        }
+        // The plain points are untouched by the split.
+        assert!(
+            rows.iter().any(|(z, id, g)| *z == canonical
+                && *id == Some(0)
+                && matches!(g, Geometry::Point(_))),
+            "streaming={streaming}: plain point feature 0 must still be tiled"
+        );
+    }
+}
+
+/// #431 review: a routine polygon export must not warn. Buildings clipped to
+/// sub-pixel slivers at a buffered tile edge legitimately quantize to zero
+/// area; those land in `encode_quantized_features`, never in
+/// `encode_dropped_features` (the gate for the warning and for the qualified
+/// CLI summary).
+#[test]
+fn ordinary_polygon_export_reports_no_unencodable_drops() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/realdata/open-buildings.parquet");
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
+    let tov = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let copts = ConvertOptions {
+        levels: LevelPlan::ZoomRange {
+            min_zoom: 8,
+            max_zoom: 14,
+        },
+        ..Default::default()
+    };
+    convert_to_overviews(&fixture, tov.path(), &copts).unwrap();
+    let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default()).unwrap();
+    assert!(report.total_tile_features > 0);
+    assert_eq!(
+        report.encode_dropped_features, 0,
+        "no building is empty or unsupported, so nothing is unencodable: {report:?}"
+    );
+    assert!(report.zooms.iter().all(|z| z.encode_dropped_features == 0));
+    // The quantized tally is where any edge slivers go; it is informational.
+    let quantized: usize = report
+        .zooms
+        .iter()
+        .map(|z| z.encode_quantized_features)
+        .sum();
+    assert_eq!(quantized, report.encode_quantized_features);
+}
+
+/// `(zoom, id, geometry)` for every row of a `decode_pmtiles` output.
+fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    use geoarrow::array::from_arrow_array;
+    use tylertoo_core::batch_processor::extract_geometries_from_array;
+
+    let file = std::fs::File::open(path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let mut out = Vec::new();
+    for batch in builder.build().unwrap() {
+        let batch = batch.unwrap();
+        let schema = batch.schema();
+        let zoom = batch
+            .column(schema.index_of("zoom").unwrap())
+            .as_primitive::<arrow_array::types::UInt8Type>()
+            .clone();
+        let ids = batch
+            .column(schema.index_of("id").unwrap())
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .clone();
+        let gidx = schema.index_of("geometry").unwrap();
+        let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
+        let mut geoms = Vec::new();
+        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        assert_eq!(geoms.len(), batch.num_rows(), "decoded rows have geometry");
+        for (i, g) in geoms.into_iter().enumerate() {
+            let id = (!ids.is_null(i)).then(|| ids.value(i));
+            out.push((zoom.value(i), id, g));
+        }
+    }
+    out
+}
+
 // ============================================================================
 // Class 4: antimeridian-crossing / pole-adjacent geometries
 // ============================================================================

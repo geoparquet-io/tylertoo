@@ -624,7 +624,10 @@ pub struct tylertoo_core::mvt::LayerBuilder
 impl tylertoo_core::mvt::LayerBuilder
 pub fn tylertoo_core::mvt::LayerBuilder::add_feature(&mut self, core::option::Option<u64>, &geo_types::geometry::Geometry, &[(alloc::string::String, tylertoo_core::mvt::PropertyValue)], &tylertoo_core::tile::TileBounds)
 pub fn tylertoo_core::mvt::LayerBuilder::build(self) -> tylertoo_core::vector_tile::tile::Layer
+pub fn tylertoo_core::mvt::LayerBuilder::dropped_features(&self) -> usize
+pub fn tylertoo_core::mvt::LayerBuilder::feature_count(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn tylertoo_core::mvt::LayerBuilder::quantized_features(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::with_extent(self, u32) -> Self
 impl core::marker::Freeze for tylertoo_core::mvt::LayerBuilder
 impl core::marker::Send for tylertoo_core::mvt::LayerBuilder
@@ -648,6 +651,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::mvt::TileBuilder
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::mvt::TileBuilder
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::mvt::TileBuilder
 pub const tylertoo_core::mvt::DEFAULT_EXTENT: u32
+pub const tylertoo_core::mvt::TILE_COORD_CLAMP: i32
 pub fn tylertoo_core::mvt::command_decode(u32) -> (u32, u32)
 pub fn tylertoo_core::mvt::command_encode(u32, u32) -> u32
 pub fn tylertoo_core::mvt::encode_geometry(&geo_types::geometry::Geometry, &tylertoo_core::tile::TileBounds, u32) -> (alloc::vec::Vec<u32>, tylertoo_core::vector_tile::tile::GeomType)
@@ -657,6 +661,7 @@ pub fn tylertoo_core::mvt::encode_multi_point(&geo_types::geometry::multi_point:
 pub fn tylertoo_core::mvt::encode_multi_polygon(&geo_types::geometry::multi_polygon::MultiPolygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_point(&geo_types::geometry::point::Point, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_polygon(&geo_types::geometry::polygon::Polygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
+pub fn tylertoo_core::mvt::flatten_geometry_collection(&geo_types::geometry::geometry_collection::GeometryCollection<f64>) -> alloc::vec::Vec<geo_types::geometry::Geometry>
 pub fn tylertoo_core::mvt::geo_to_tile_coords(f64, f64, &tylertoo_core::tile::TileBounds, u32) -> (i32, i32)
 pub fn tylertoo_core::mvt::orient_multi_polygon_for_mvt(&geo_types::geometry::multi_polygon::MultiPolygon) -> geo_types::geometry::multi_polygon::MultiPolygon
 pub fn tylertoo_core::mvt::orient_polygon_for_mvt(&geo_types::geometry::polygon::Polygon) -> geo_types::geometry::polygon::Polygon
@@ -873,6 +878,63 @@ pub fn tylertoo_core::overview::assign::assign_levels(&[tylertoo_core::overview:
 pub fn tylertoo_core::overview::assign::assign_levels_banded(&[tylertoo_core::overview::assign::AssignFeature], &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, &[tylertoo_core::overview::simplify::Representation]) -> tylertoo_core::overview::assign::Assignment
 pub fn tylertoo_core::overview::assign::assign_levels_bounded(&[tylertoo_core::overview::assign::AssignFeature], &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, u64, &[tylertoo_core::overview::simplify::Representation]) -> tylertoo_core::overview::assign::Assignment
 pub fn tylertoo_core::overview::assign::gsd_to_coord_units(f64, tylertoo_core::overview::level::Crs) -> f64
+pub mod tylertoo_core::overview::auto_zoom
+pub enum tylertoo_core::overview::auto_zoom::MaxZoom
+pub tylertoo_core::overview::auto_zoom::MaxZoom::Auto
+pub tylertoo_core::overview::auto_zoom::MaxZoom::Fixed(u8)
+impl tylertoo_core::overview::auto_zoom::MaxZoom
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::is_auto(self) -> bool
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::plan_zoom(self) -> u8
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::resolve(self, &tylertoo_core::input_set::ConvertSource, &mut tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<u8, tylertoo_core::overview::convert::ConvertError>
+impl core::clone::Clone for tylertoo_core::overview::auto_zoom::MaxZoom
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::clone(&self) -> tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::cmp::Eq for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::cmp::PartialEq for tylertoo_core::overview::auto_zoom::MaxZoom
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::eq(&self, &tylertoo_core::overview::auto_zoom::MaxZoom) -> bool
+impl core::convert::From<u8> for tylertoo_core::overview::auto_zoom::MaxZoom
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::from(u8) -> Self
+impl core::fmt::Debug for tylertoo_core::overview::auto_zoom::MaxZoom
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::auto_zoom::MaxZoom
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::str::traits::FromStr for tylertoo_core::overview::auto_zoom::MaxZoom
+pub type tylertoo_core::overview::auto_zoom::MaxZoom::Err = alloc::string::String
+pub fn tylertoo_core::overview::auto_zoom::MaxZoom::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::marker::Send for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::marker::Sync for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::marker::Unpin for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::auto_zoom::MaxZoom
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::auto_zoom::MaxZoom
+#[non_exhaustive] pub struct tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::ceiling: u8
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::chosen_zoom: u8
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::min_zoom: u8
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::nearby_spacing_m: f64
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::resolvable_m: f64
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::rows_read: u64
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::sampled_count: usize
+pub tylertoo_core::overview::auto_zoom::AutoZoomEvidence::typical_extent_m: f64
+impl core::clone::Clone for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+pub fn tylertoo_core::overview::auto_zoom::AutoZoomEvidence::clone(&self) -> tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::cmp::PartialEq for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+pub fn tylertoo_core::overview::auto_zoom::AutoZoomEvidence::eq(&self, &tylertoo_core::overview::auto_zoom::AutoZoomEvidence) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+pub fn tylertoo_core::overview::auto_zoom::AutoZoomEvidence::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::marker::Freeze for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::marker::Send for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::marker::Sync for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::marker::Unpin for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::auto_zoom::AutoZoomEvidence
+pub const tylertoo_core::overview::auto_zoom::AUTO_MAX_ZOOM_CEILING: u8
+pub fn tylertoo_core::overview::auto_zoom::estimate_max_zoom(&tylertoo_core::input_set::ConvertSource, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::auto_zoom::AutoZoomEvidence, tylertoo_core::overview::convert::ConvertError>
 pub mod tylertoo_core::overview::check
 pub enum tylertoo_core::overview::check::CheckError
 pub tylertoo_core::overview::check::CheckError::Io(core::io::error::Error)
@@ -1072,6 +1134,12 @@ pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::out_o
 pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::total: usize
 pub tylertoo_core::overview::convert::ConvertError::AllFeaturesOutOfRange::unprojectable: usize
 pub tylertoo_core::overview::convert::ConvertError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::overview::convert::ConvertError::AutoZoomMinAboveCeiling
+pub tylertoo_core::overview::convert::ConvertError::AutoZoomMinAboveCeiling::ceiling: u8
+pub tylertoo_core::overview::convert::ConvertError::AutoZoomMinAboveCeiling::min_zoom: u8
+pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal
+pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::rows: u64
+pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::sampled: usize
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnNotString
@@ -1286,6 +1354,61 @@ impl core::marker::Unpin for tylertoo_core::overview::convert::LevelReport
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::convert::LevelReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::convert::LevelReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::LevelReport
+#[non_exhaustive] pub struct tylertoo_core::overview::convert::PlanLevelReport
+pub tylertoo_core::overview::convert::PlanLevelReport::feature_count: usize
+pub tylertoo_core::overview::convert::PlanLevelReport::gsd: f64
+pub tylertoo_core::overview::convert::PlanLevelReport::planned_level: usize
+pub tylertoo_core::overview::convert::PlanLevelReport::zoom: core::option::Option<u8>
+impl core::clone::Clone for tylertoo_core::overview::convert::PlanLevelReport
+pub fn tylertoo_core::overview::convert::PlanLevelReport::clone(&self) -> tylertoo_core::overview::convert::PlanLevelReport
+impl core::cmp::PartialEq for tylertoo_core::overview::convert::PlanLevelReport
+pub fn tylertoo_core::overview::convert::PlanLevelReport::eq(&self, &tylertoo_core::overview::convert::PlanLevelReport) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::convert::PlanLevelReport
+pub fn tylertoo_core::overview::convert::PlanLevelReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::PlanLevelReport
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::PlanLevelReport
+pub fn tylertoo_core::overview::convert::PlanLevelReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::overview::convert::PlanLevelReport
+impl core::marker::Send for tylertoo_core::overview::convert::PlanLevelReport
+impl core::marker::Sync for tylertoo_core::overview::convert::PlanLevelReport
+impl core::marker::Unpin for tylertoo_core::overview::convert::PlanLevelReport
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::convert::PlanLevelReport
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::convert::PlanLevelReport
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::PlanLevelReport
+#[non_exhaustive] pub struct tylertoo_core::overview::convert::PlanReport
+pub tylertoo_core::overview::convert::PlanReport::assign_secs: f64
+pub tylertoo_core::overview::convert::PlanReport::duration_secs: f64
+pub tylertoo_core::overview::convert::PlanReport::entry_zoom: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::convert::PlanReport::input_features: usize
+pub tylertoo_core::overview::convert::PlanReport::input_rows: usize
+pub tylertoo_core::overview::convert::PlanReport::levels: alloc::vec::Vec<tylertoo_core::overview::convert::PlanLevelReport>
+pub tylertoo_core::overview::convert::PlanReport::lines: usize
+pub tylertoo_core::overview::convert::PlanReport::pass1_secs: f64
+pub tylertoo_core::overview::convert::PlanReport::path: std::path::PathBuf
+pub tylertoo_core::overview::convert::PlanReport::plan_bytes: u64
+pub tylertoo_core::overview::convert::PlanReport::points: usize
+pub tylertoo_core::overview::convert::PlanReport::polygons: usize
+pub tylertoo_core::overview::convert::PlanReport::ranking: tylertoo_core::overview::level::RankingProvenance
+pub tylertoo_core::overview::convert::PlanReport::remote_fetch: core::option::Option<tylertoo_core::input::FetchStats>
+pub tylertoo_core::overview::convert::PlanReport::row_groups_read: usize
+pub tylertoo_core::overview::convert::PlanReport::row_groups_total: usize
+pub tylertoo_core::overview::convert::PlanReport::skipped_empty_levels: alloc::vec::Vec<tylertoo_core::overview::convert::SkippedLevelReport>
+impl core::clone::Clone for tylertoo_core::overview::convert::PlanReport
+pub fn tylertoo_core::overview::convert::PlanReport::clone(&self) -> tylertoo_core::overview::convert::PlanReport
+impl core::cmp::PartialEq for tylertoo_core::overview::convert::PlanReport
+pub fn tylertoo_core::overview::convert::PlanReport::eq(&self, &tylertoo_core::overview::convert::PlanReport) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::convert::PlanReport
+pub fn tylertoo_core::overview::convert::PlanReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::PlanReport
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::PlanReport
+pub fn tylertoo_core::overview::convert::PlanReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::overview::convert::PlanReport
+impl core::marker::Send for tylertoo_core::overview::convert::PlanReport
+impl core::marker::Sync for tylertoo_core::overview::convert::PlanReport
+impl core::marker::Unpin for tylertoo_core::overview::convert::PlanReport
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::convert::PlanReport
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::convert::PlanReport
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::PlanReport
 pub struct tylertoo_core::overview::convert::RepresentationBand
 pub tylertoo_core::overview::convert::RepresentationBand::max_zoom: u8
 pub tylertoo_core::overview::convert::RepresentationBand::min_zoom: u8
@@ -1340,6 +1463,8 @@ pub fn tylertoo_core::overview::convert::parse_representation_spec(&str) -> core
 pub fn tylertoo_core::overview::convert::read_workers_ceiling() -> usize
 pub fn tylertoo_core::overview::convert::resolve_in_flight_batches(usize) -> usize
 pub fn tylertoo_core::overview::convert::resolve_read_workers(usize) -> usize
+pub fn tylertoo_core::overview::convert::write_convert_plan(impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::PlanReport, tylertoo_core::overview::convert::ConvertError>
+pub fn tylertoo_core::overview::convert::write_convert_plan_sources(&tylertoo_core::input_set::ConvertSource, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::PlanReport, tylertoo_core::overview::convert::ConvertError>
 pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
@@ -1353,6 +1478,8 @@ pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declar
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::reason: tylertoo_core::overview::export::FeatureIdColumnProblem
+pub tylertoo_core::overview::export::ExportError::InvalidExtent
+pub tylertoo_core::overview::export::ExportError::InvalidExtent::extent: u32
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::level: usize
@@ -1386,6 +1513,10 @@ pub tylertoo_core::overview::export::ExportError::Reader(tylertoo_core::overview
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::finest: u8
+pub tylertoo_core::overview::export::ExportError::SpillDirNotDirectory(std::path::PathBuf)
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWide
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::buffer: u32
+pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::max: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
@@ -1497,10 +1628,13 @@ pub tylertoo_core::overview::export::ExportOptions::min_zoom: core::option::Opti
 pub tylertoo_core::overview::export::ExportOptions::partition_wave: usize
 pub tylertoo_core::overview::export::ExportOptions::properties: tylertoo_core::overview::properties::PropertySelection
 pub tylertoo_core::overview::export::ExportOptions::simple_clip_fastpath: bool
+pub tylertoo_core::overview::export::ExportOptions::spill_dir: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::export::ExportOptions::tile_buffer: u32
 pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::export::ExportOptions::zoom_ceiling: core::option::Option<u8>
+impl tylertoo_core::overview::export::ExportOptions
+pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
 impl core::clone::Clone for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::clone(&self) -> tylertoo_core::overview::export::ExportOptions
 impl core::default::Default for tylertoo_core::overview::export::ExportOptions
@@ -1516,6 +1650,8 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportOptions
 pub struct tylertoo_core::overview::export::ExportReport
 pub tylertoo_core::overview::export::ExportReport::duration_secs: f64
+pub tylertoo_core::overview::export::ExportReport::encode_dropped_features: usize
+pub tylertoo_core::overview::export::ExportReport::encode_quantized_features: usize
 pub tylertoo_core::overview::export::ExportReport::max_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::min_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::mode: alloc::string::String
@@ -1540,6 +1676,8 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ExportReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ExportReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportReport
 pub struct tylertoo_core::overview::export::ZoomReport
+pub tylertoo_core::overview::export::ZoomReport::encode_dropped_features: usize
+pub tylertoo_core::overview::export::ZoomReport::encode_quantized_features: usize
 pub tylertoo_core::overview::export::ZoomReport::level: usize
 pub tylertoo_core::overview::export::ZoomReport::level_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::oversized_tiles: usize
@@ -1563,6 +1701,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ZoomReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ZoomReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ZoomReport
 pub const tylertoo_core::overview::export::DEFAULT_TILE_SIZE_LIMIT: usize
+pub const tylertoo_core::overview::export::MAX_TILE_BUFFER_PX: u32
 pub const tylertoo_core::overview::export::PARTITION_WAVE_AUTO: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_FALLBACK_MAX: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize

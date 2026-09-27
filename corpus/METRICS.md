@@ -62,6 +62,19 @@ Notes for the implementer:
 - Report per-zoom count ratio as the primary regression-tracked
   number; render side-by-side PNGs for the human gate.
 
+**Automated in CI (#420):** `benchmarks/e2e/compare_tippecanoe.py`,
+run by `.github/workflows/tippecanoe-compare.yml`, computes these
+per-zoom counts for the fixtures-v1 inputs against pinned tippecanoe
+2.79.0 — features at z (MVT instances on both sides, so tile clipping
+cancels), distinct feature ids at z (the dedup-by-id count above,
+where the dataset has a unique integer column carried through with
+`--feature-id` / `--use-attribute-for-id`), plus tile count, vertex
+count and stored bytes — and gates each ratio against the bands in
+`benchmarks/e2e/tippecanoe_tolerances.toml`. The corpus goldens here
+remain the manual, larger-corpus counterpart; the flags differ (the
+gate uses the `benchmarks/e2e/README.md` parity set), so the two sets
+of numbers are not interchangeable.
+
 ---
 
 ## 3. Storage metrics (V3)

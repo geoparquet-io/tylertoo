@@ -62,6 +62,20 @@ gsd(z) = 40075016.69 / gsd_base / 2^z          (meters, spec §5.2)
 | `--gsd G1,G2,…` | — | meters, strictly decreasing | explicit per-level GSDs; **overrides** the zoom range and `--gsd-base` |
 | `--min-zoom` / `--max-zoom` | `0` / `6` | Web Mercator zoom | coarsest / finest (canonical) level (max **30**) |
 
+**`--max-zoom auto` (#444, inspired by tippecanoe's `-zg`).** Instead of a
+number, estimate the finest zoom from the input's own features. A bounded,
+deterministic sample (at most 200,000 rows, honoring `--bbox` and `--filter`)
+of feature bboxes is read from the geometry column, and the finest zoom is
+picked where a standard 256 px tile pixel resolves about half the smaller of
+"median feature size" (features with an extent) and "10th-percentile spacing
+between nearby features", measured in Web Mercator meters and clamped to
+`[--min-zoom, 16]`. The chosen zoom and the measurements behind it are logged
+at `info`; treat it as a starting point, the way tippecanoe users treat `-zg`.
+An input with nothing to measure (one location, or only empty geometries) is
+an error, as with `-zg`; so is a `--min-zoom` above 16. With `--gsd` the value
+is unused and nothing is estimated. See `context/ARCHITECTURE.md`'s divergence
+table for how this differs from tippecanoe's formula.
+
 **Zoom ceiling: 30 — an addressability limit, not a recommendation.** Every
 zoom tylertoo writes must fit the tile arithmetic: tile coordinates are 32-bit
 (so z31 is the hard limit) and the PMTiles Hilbert tile id needs `4^z` of
@@ -1288,6 +1302,33 @@ instead.
 
 ---
 
+## Tile geometry knobs: `--tile-buffer`, `extent`
+
+Both act at export, on the tiles, not on the overview file.
+
+- **`--tile-buffer` (default 8, at most 256, tile pixels).** How far past its
+  edge a tile carries geometry, so a feature spanning a seam renders
+  continuously. The unit is the 256-pixel nominal tile, the same as
+  tippecanoe's `--buffer` (default 5). The cap is one full tile width: at 256
+  a tile already holds every feature of its eight neighbours, and past it a
+  tile would duplicate geometry from tiles it does not border. The cap is also
+  what keeps the export bounded — the buffer is what makes a feature belong to
+  more than one tile, so `--tile-buffer 100000` (≈390 tile widths) put every
+  feature in every tile and the export went O(features × tiles). A wider value
+  is refused up front, before any convert or export work runs (#433). A
+  sharded build's read-pruning margin is two pivot tiles (512 px), so this cap
+  sits inside it; see `docs/diving-deeper/sharded-builds.md`.
+- **`extent` (default 4096; Python `export_pmtiles(extent=...)`, not a CLI
+  flag).** The MVT tile-local coordinate resolution. Must be positive: `0`
+  quantizes every coordinate to the tile's origin — every line and polygon
+  degenerates and is dropped — and writes a layer that consumers divide by
+  zero on, so it is refused. The MVT spec recommends a power of two and
+  decoders assume one when they reason about coordinate precision; any other
+  positive value is accepted with a warning. `tylertoo decode` refuses an
+  archive whose layer declares `extent: 0` for the same reason.
+
+---
+
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
 These do not change *which* features or vertices survive — geometry and
@@ -1666,7 +1707,14 @@ compute stage and the write stage**:
   Note that `bounded` (and an `auto` that picks it) spills to the process temp
   directory, which on many Slurm and Kubernetes nodes is a tmpfs `/tmp` — RAM
   charged to the very same cgroup, so the spill does not relieve the limit.
-  Point `TMPDIR` (or `--spill-dir`) at real disk there.
+  Point `TMPDIR` (or `--spill-dir`) at real disk there. `--spill-dir` is the
+  one scratch-disk knob (#427): it places the remote-input spill, the pass-2
+  level spill files (`tylertoo-spill-*.arrow`), the `tiles` intermediate
+  overview, and — on `export-pmtiles` too, where the flag also exists — the
+  export's member spill. It must be an existing directory; both `overview`
+  and `export-pmtiles` refuse a missing one before doing any work. The
+  PMTiles archive is never spilled: it is assembled in place at
+  `OUTPUT.partial` beside the output and renamed over it at the end.
 
 The profile also governs the **pass-1 level-assignment grids** (#306). Level
 assignment builds one cell-winner grid per coarse level, concurrently across
@@ -1894,9 +1942,14 @@ writable at option-validation time — and if a plan is already sitting at that
 path, it must itself be writable, since it is about to be clobbered. `--plan`
 must be a readable convert plan (magic bytes checked, with a future format
 version named as such) — same fail-fast contract as `--spill-dir`.
-An existing plan at `--save-plan PATH` is **overwritten**, with a log line;
-that matches how `overview` treats its output. `tiles`, `pyramid`, `merge` and
-`shard-plan` instead refuse an existing output unless given `-f/--force`.
+An existing plan at `--save-plan PATH` is **overwritten**, with a log line.
+Every subcommand that writes a file — `overview`, `tiles`, `export-pmtiles`,
+`decode`, `pyramid`, `merge` and `shard-plan` — refuses an existing output
+unless given `-f/--force` (#427). The GeoParquet writers (`overview`,
+`decode`) also build their output in a uniquely named sibling
+(`OUTPUT.<random>.partial`) and rename it over `OUTPUT` only once the footer
+is written, so a run killed part-way leaves a previous output intact; a
+failed run removes the sibling, a killed one leaves it to be deleted by hand.
 Not yet exposed in the Python bindings.
 
 ---

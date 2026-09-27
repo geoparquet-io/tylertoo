@@ -113,6 +113,7 @@ stored, reusable level.
 | tippecanoe | tylertoo | Note |
 |---|---|---|
 | `-z` / `-Z` maximum/minimum zoom | `--max-zoom` / `--min-zoom` | Same zoom range |
+| `-zg` guess the maximum zoom | `--max-zoom auto` | Inspired by `-zg`, not a port: a bounded sample of feature extents and spacing, resolved at 256 px per tile and capped at z16. Like `-zg`, an input with nothing to measure is an error. The divergences are recorded in `context/ARCHITECTURE.md` |
 | `-l` layer name | `--layer-name` | Set at export |
 | `-L` one layer per input | `pyramid --band LO-HI:INPUT:LAYER …` with bands sharing a zoom range | Each band is its own ladder; tiles at shared zooms carry every layer |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
@@ -146,9 +147,9 @@ point CSV, plus GeoJSON on standard input. tylertoo reads GeoParquet in
 converts other formats first.
 
 **Ships tileset tooling.** `tile-join` merges tilesets and joins CSV attributes
-onto existing features, `-zg` guesses a maximum zoom from feature spacing, and
-`-e` writes a directory of tiles. tylertoo has no equivalent to these; it
-writes one PMTiles archive or the overview file. (`-L`, one layer per input
+onto existing features, and `-e` writes a directory of tiles. tylertoo has no
+equivalent to these; it writes one PMTiles archive or the overview file.
+(`-zg`, which guesses a maximum zoom, has a counterpart in `--max-zoom auto`.) (`-L`, one layer per input
 file, is covered by `pyramid` bands that share a zoom range.)
 
 ### Decoding tiles back

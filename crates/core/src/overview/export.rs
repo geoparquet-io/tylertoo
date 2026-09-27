@@ -94,7 +94,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -149,6 +149,25 @@ const DEFAULT_EXTENT: u32 = 4096;
 /// use 8 to match the tile pipeline's historical default).
 const DEFAULT_TILE_BUFFER_PX: u32 = 8;
 
+/// The widest `--tile-buffer` any export accepts, in tile pixels (#433).
+///
+/// One full tile width (`NOMINAL_TILE_PIXELS`): at the cap a tile carries
+/// every feature of its eight neighbours, which is already more than any
+/// renderer reads across a seam. Past it a tile starts duplicating geometry
+/// from tiles it does not even border, and the cost is not just bytes —
+/// membership widening is what makes a feature belong to `O(buffer²)` tiles,
+/// so `--tile-buffer 100000` (buffer ≈ 390 tile widths) put every feature in
+/// every tile and the export went `O(features × tiles)`. tippecanoe's
+/// `--buffer` has no cap; this is a divergence, and a deliberate one, since
+/// there is no output past this value that is not also reachable below it.
+///
+/// This is the one bound. The sharded path's read-pruning margin
+/// (`shard::SHARD_READ_MARGIN_TILES`, two pivot tiles = 512 px) is
+/// wider than this, so the cap satisfies it with 2x headroom; the
+/// compile-time check next to that constant keeps it so, and
+/// [`ExportError::TileBufferTooWideForShard`] is no longer raised.
+pub const MAX_TILE_BUFFER_PX: u32 = 256;
+
 /// Nominal tile size in pixels — the denominator that makes `tile_buffer` mean
 /// "tile pixels", the unit tippecanoe's `--buffer` uses and the one this crate
 /// documents.
@@ -159,7 +178,7 @@ const DEFAULT_TILE_BUFFER_PX: u32 = 8;
 /// the default 8 "pixels" was half a pixel and seam continuity was effectively
 /// off. A raised extent silently narrowed the buffer further, which is the
 /// clearest sign it was the wrong denominator.
-const NOMINAL_TILE_PIXELS: f64 = 256.0;
+pub(crate) const NOMINAL_TILE_PIXELS: f64 = 256.0;
 
 /// The tile buffer as a fraction of one tile's width, from `tile_buffer` in
 /// tile pixels.
@@ -186,10 +205,15 @@ pub struct ExportOptions {
     /// MVT layer name written into every tile and the archive metadata.
     pub layer_name: String,
     /// Per-tile edge buffer in **tile pixels**. Converted to coordinate units
-    /// per tile (`buffer_deg = tile_width * buffer_px / extent`) and applied as
+    /// per tile (`buffer_deg = tile_width * buffer_px / 256`) and applied as
     /// the clip margin, so features spanning a seam render continuously.
+    /// At most [`MAX_TILE_BUFFER_PX`] (one tile width); wider is
+    /// [`ExportError::TileBufferTooWide`] (#433).
     pub tile_buffer: u32,
-    /// MVT tile extent (integer tile-local resolution). Default 4096.
+    /// MVT tile extent (integer tile-local resolution). Default 4096. Must be
+    /// positive ([`ExportError::InvalidExtent`] otherwise); a value that is
+    /// not a power of two is accepted with a warning, since the MVT spec only
+    /// recommends one (#433).
     pub extent: u32,
     /// Per-tile MVT size limit in **bytes**. When `Some(limit)` with
     /// `limit > 0`, a tile whose encoded size exceeds the limit triggers the
@@ -321,6 +345,17 @@ pub struct ExportOptions {
     /// [`build_mvt`]). Whether that no-flag default should instead omit the
     /// id entirely is an open question (#443) this option does not decide.
     pub feature_id: Option<String>,
+    /// Directory for the export's member spill file (#427) -- the on-disk
+    /// backing the partitioning single-read pass 2 (#235) falls back to when
+    /// the buffered members would not fit the memory budget. Same name and
+    /// semantics as [`ConvertOptions::spill_dir`](super::convert::ConvertOptions::spill_dir):
+    /// the one scratch-disk knob, checked up front (it must be an existing
+    /// directory, [`ExportError::SpillDirNotDirectory`] otherwise). `None`
+    /// uses the process temp directory (`$TMPDIR`).
+    ///
+    /// The PMTiles archive itself is never spilled here: it is assembled in
+    /// place at `<output>.partial` beside the output (#459).
+    pub spill_dir: Option<PathBuf>,
 }
 
 impl Default for ExportOptions {
@@ -338,7 +373,51 @@ impl Default for ExportOptions {
             tile_range: None,
             zoom_ceiling: None,
             feature_id: None,
+            spill_dir: None,
         }
+    }
+}
+
+impl ExportOptions {
+    /// Check the option values that need no input file (#433): `extent`
+    /// must be positive and `tile_buffer` at most [`MAX_TILE_BUFFER_PX`].
+    ///
+    /// [`export_pmtiles`] runs this first, before the overview file is
+    /// opened, so a bad knob fails before any I/O. A front end that does
+    /// expensive work before exporting (the `tiles` facade converts the whole
+    /// input first) can call it up front and fail in milliseconds instead.
+    ///
+    /// A non-power-of-two `extent` is accepted with a `log::warn!`: the MVT
+    /// spec only recommends a power of two, but renderers and this crate's
+    /// own decoder (see `decode.rs`'s module docs) assume one when they
+    /// reason about precision.
+    pub fn validate(&self) -> Result<(), ExportError> {
+        if self.extent == 0 {
+            return Err(ExportError::InvalidExtent {
+                extent: self.extent,
+            });
+        }
+        if !self.extent.is_power_of_two() {
+            log::warn!(
+                "[export] extent {} is not a power of two; the MVT spec recommends one \
+                 (4096 is the default) and decoders assume one when reasoning about \
+                 coordinate precision",
+                self.extent
+            );
+        }
+        if self.tile_buffer > MAX_TILE_BUFFER_PX {
+            return Err(ExportError::TileBufferTooWide {
+                buffer: self.tile_buffer,
+                max: MAX_TILE_BUFFER_PX,
+            });
+        }
+        // #427: fail fast on a bad spill dir, like the convert side does.
+        if let Some(dir) = &self.spill_dir {
+            if !dir.is_dir() {
+                return Err(ExportError::SpillDirNotDirectory(dir.clone()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -358,6 +437,17 @@ pub struct ZoomReport {
     pub tile_feature_count: usize,
     /// Number of tiles at this zoom that hit the oversized safety valve.
     pub oversized_tiles: usize,
+    /// Tile members at this zoom that had nothing to encode (#431): empty
+    /// geometries and empty `GeometryCollection`s. Counted per (feature,
+    /// tile) pair, like `tile_feature_count`. Non-zero means content was lost
+    /// after clipping; a warning names the total at the end of the export.
+    pub encode_dropped_features: usize,
+    /// Tile members at this zoom whose geometry had coordinates but collapsed
+    /// at the tile extent and so produced no MVT feature (#431): polygon rings
+    /// of zero area, lines of fewer than two points — typically a clip sliver
+    /// at a buffered tile edge. Expected on ordinary data; informational, and
+    /// never a warning.
+    pub encode_quantized_features: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -384,6 +474,12 @@ pub struct ExportReport {
     pub total_tile_features: usize,
     /// Total tiles that hit the oversized safety valve.
     pub oversized_tiles: usize,
+    /// Total tile members with nothing to encode, across all zooms — see
+    /// [`ZoomReport::encode_dropped_features`] (#431).
+    pub encode_dropped_features: usize,
+    /// Total tile members that collapsed at the tile extent, across all
+    /// zooms — see [`ZoomReport::encode_quantized_features`] (#431).
+    pub encode_quantized_features: usize,
     /// Wall-clock export duration in seconds.
     pub duration_secs: f64,
 }
@@ -467,7 +563,41 @@ pub enum ExportError {
         gsd: f64,
     },
 
+    /// `extent` is zero (#433).
+    ///
+    /// Zero quantizes every coordinate to `(0, 0)`: every polygon and line
+    /// degenerates and is dropped, the points all land on one corner, and
+    /// the layer is still written with `extent: 0`, which every consumer
+    /// then divides by. There is no archive to write.
+    #[error(
+        "extent {extent} is not a valid MVT tile extent: the extent is the tile-local \
+         coordinate resolution and must be positive (the default is 4096)"
+    )]
+    InvalidExtent {
+        /// The rejected extent.
+        extent: u32,
+    },
+
+    /// `--tile-buffer` is wider than [`MAX_TILE_BUFFER_PX`] (#433).
+    #[error(
+        "--tile-buffer {buffer} is wider than the {max} tile pixel cap (one full tile width): \
+         past it a tile duplicates geometry from tiles it does not border and every feature \
+         belongs to O(buffer²) tiles. Lower --tile-buffer to {max} or less (the default is 8)."
+    )]
+    TileBufferTooWide {
+        /// The requested buffer, in tile pixels.
+        buffer: u32,
+        /// [`MAX_TILE_BUFFER_PX`].
+        max: u32,
+    },
+
     /// `--tile-buffer` is wider than a shard's read-pruning margin (#498).
+    ///
+    /// No longer raised since #433: the universal cap
+    /// ([`MAX_TILE_BUFFER_PX`], enforced as
+    /// [`TileBufferTooWide`](ExportError::TileBufferTooWide)) is at most the
+    /// shard margin, so a buffer that would trip this trips that first. Kept
+    /// so code matching on it keeps compiling.
     #[error(
         "--tile-buffer {buffer} is too wide for a sharded build: a shard prunes its input to \
          the row groups within {max} tile pixels of its range, so a wider buffer could pull \
@@ -613,6 +743,13 @@ pub enum ExportError {
         /// What is wrong with the value.
         reason: InvalidFeatureIdReason,
     },
+
+    /// [`ExportOptions::spill_dir`] is not an existing directory (#427).
+    /// Checked before any work, like the convert side's `--spill-dir`: the
+    /// spill is opened lazily, so an unusable directory would otherwise
+    /// only surface deep into the export.
+    #[error("spill-dir {} is not an existing directory", .0.display())]
+    SpillDirNotDirectory(PathBuf),
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -636,7 +773,15 @@ struct EncodedTile {
     data: Vec<u8>,
     hash: u64,
     raw_len: usize,
+    /// MVT features in the tile. `0` means every member encoded to nothing
+    /// (#431): the carrier exists only to deliver `encode_dropped` and is not
+    /// written to the archive.
     feature_count: usize,
+    /// Members with nothing to encode (#431); see [`TileMvt::unencodable`].
+    encode_dropped: usize,
+    /// Members that collapsed at the tile extent (#431); see
+    /// [`TileMvt::quantized`].
+    encode_quantized: usize,
     oversized: bool,
 }
 
@@ -1164,6 +1309,9 @@ fn export_pmtiles_impl(
     // for the standalone `export-pmtiles` path (which never runs convert's
     // own preflight); redundant but harmless in the `tiles` path.
     preflight_profile_json_path();
+    // #433: the knobs that need no file (`extent`, `tile_buffer`) are checked
+    // before any I/O, so a bad value fails here rather than after the open.
+    options.validate()?;
     let start = Instant::now();
     let input_path = input_path.as_ref();
 
@@ -1199,20 +1347,14 @@ fn export_pmtiles_impl(
             finest: max_zoom,
         });
     }
-    // #498: the read-pruning safety bound, enforced at the one place that can
-    // see both halves. A shard's convert prunes input row groups against its
-    // tile range widened by `SHARD_READ_MARGIN_TILES` pivot tiles; a buffer
-    // wider than that margin would let a feature render into a shard's tile
-    // from a row group the shard never read, and the tile would come out
-    // missing geometry the monolithic run has. Refused rather than silently
-    // wrong.
-    if options.tile_range.is_some() && options.tile_buffer > crate::shard::MAX_SHARD_TILE_BUFFER_PX
-    {
-        return Err(ExportError::TileBufferTooWideForShard {
-            buffer: options.tile_buffer,
-            max: crate::shard::MAX_SHARD_TILE_BUFFER_PX,
-        });
-    }
+    // #498: the read-pruning safety bound. A shard's convert prunes input row
+    // groups against its tile range widened by `SHARD_READ_MARGIN_TILES`
+    // pivot tiles; a buffer wider than that margin would let a feature render
+    // into a shard's tile from a row group the shard never read. Since #433
+    // the universal `MAX_TILE_BUFFER_PX` cap (checked in `validate` above) is
+    // at most that margin, so no buffer that reaches here can breach it; the
+    // `const` assertion beside `MAX_SHARD_TILE_BUFFER_PX` keeps that true.
+    debug_assert!(options.tile_buffer <= crate::shard::MAX_SHARD_TILE_BUFFER_PX);
     // #380: the archive may declare a coarser minimum than the file holds.
     let min_zoom = match options.min_zoom {
         // #371: the declared minimum is written into `vector_layers`, so it
@@ -1465,6 +1607,8 @@ fn export_pmtiles_impl(
     let total_tiles = zooms.iter().map(|z| z.tile_count).sum();
     let total_tile_features = zooms.iter().map(|z| z.tile_feature_count).sum();
     let oversized_tiles = zooms.iter().map(|z| z.oversized_tiles).sum();
+    let encode_dropped_features = warn_encode_drops(&zooms);
+    let encode_quantized_features = zooms.iter().map(|z| z.encode_quantized_features).sum();
 
     let mode = format!("{:?}", reader.mode()).to_lowercase();
     progress.profile.emit(&ExportProfileTarget {
@@ -1483,8 +1627,30 @@ fn export_pmtiles_impl(
         total_tiles,
         total_tile_features,
         oversized_tiles,
+        encode_dropped_features,
+        encode_quantized_features,
         duration_secs: start.elapsed().as_secs_f64(),
     })
+}
+
+/// Sum the per-zoom unencodable drops and, when there are any, say so once
+/// (#431).
+///
+/// Only members with nothing to encode count here: the expected collapses at
+/// the tile extent (`encode_quantized_features`) never warn, or every polygon
+/// export would. One aggregate `log::warn!` (the #429 out-of-range pattern)
+/// so the CLI's `env_logger` shows it and the summary never reads as an
+/// unqualified success. Returns the total for the report.
+fn warn_encode_drops(zooms: &[ZoomReport]) -> usize {
+    let total: usize = zooms.iter().map(|z| z.encode_dropped_features).sum();
+    if total > 0 {
+        log::warn!(
+            "{total} tile feature(s) had nothing to encode and were dropped at MVT encode \
+             (empty geometries or empty GeometryCollections); see \
+             `encode_dropped_features` in the report"
+        );
+    }
+    total
 }
 
 /// Every level's zoom, in level order, required to strictly ascend (#371 /
@@ -1755,6 +1921,8 @@ fn export_level(
     let mut tile_count = 0usize;
     let mut tile_feature_count = 0usize;
     let mut oversized = 0usize;
+    let mut encode_dropped = 0usize;
+    let mut encode_quantized = 0usize;
     let mut write_secs = 0f64;
     let mut bytes_written = 0u64;
     let total_waves = partitions.len().div_ceil(partition_wave);
@@ -1770,6 +1938,12 @@ fn export_level(
         let t_write = Instant::now();
         for tiles in &results {
             for t in tiles {
+                encode_dropped += t.encode_dropped;
+                encode_quantized += t.encode_quantized;
+                if t.feature_count == 0 {
+                    // #431: an all-dropped tile is a tally carrier, not a tile.
+                    continue;
+                }
                 tile_feature_count += t.feature_count;
                 bytes_written += t.data.len() as u64;
                 if t.oversized {
@@ -1784,8 +1958,8 @@ fn export_level(
                     t.raw_len,
                     t.feature_count,
                 )?;
+                tile_count += 1;
             }
-            tile_count += tiles.len();
         }
         let write_dur = t_write.elapsed();
         write_secs += write_dur.as_secs_f64();
@@ -1841,6 +2015,8 @@ fn export_level(
         tile_count,
         tile_feature_count,
         oversized_tiles: oversized,
+        encode_dropped_features: encode_dropped,
+        encode_quantized_features: encode_quantized,
     })
 }
 
@@ -2388,7 +2564,13 @@ struct MemberStore {
 }
 
 impl MemberStore {
-    fn new(plans: &[LevelPlan], backing: SinkBacking) -> Result<Self, ExportError> {
+    /// `spill_dir` places the spill file (#427); `None` is the process temp
+    /// dir.
+    fn new(
+        plans: &[LevelPlan],
+        backing: SinkBacking,
+        spill_dir: Option<&Path>,
+    ) -> Result<Self, ExportError> {
         let shape: Vec<usize> = plans
             .iter()
             .map(|p| p.partitions.len().div_ceil(p.wave.max(1)))
@@ -2401,7 +2583,7 @@ impl MemberStore {
         let spill = match backing {
             SinkBacking::Ram => None,
             SinkBacking::Spill => {
-                let temp = NamedTempFile::new()?;
+                let temp = super::pipeline::spill_temp_file(spill_dir)?;
                 let writer = BufWriter::new(temp.reopen()?);
                 let read = temp.reopen()?;
                 Some(MemberSpill {
@@ -2549,7 +2731,7 @@ fn fill_member_store(
     let timers = ctx.timers;
     let plans = ctx.plans;
     let num_levels = plans.len();
-    let mut store = MemberStore::new(plans, backing)?;
+    let mut store = MemberStore::new(plans, backing, ctx.opts.spill_dir.as_deref())?;
     let t_fill = Instant::now();
     let mut seq = 0u64;
     let store_ref = &mut store;
@@ -4041,13 +4223,26 @@ fn encode_members(
             let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
-            let (data, count, oversized) = encode_tile(g, &tb, opts);
-            if count == 0 {
-                return None;
+            let mvt = encode_tile(g, &tb, opts);
+            if mvt.features == 0 {
+                // Every member encoded to nothing (#431). There is no tile
+                // to write, but the drops must still reach the report, so
+                // hand back an empty carrier the writer loop skips.
+                return Some(Ok(EncodedTile {
+                    x,
+                    y,
+                    data: Vec::new(),
+                    hash: 0,
+                    raw_len: 0,
+                    feature_count: 0,
+                    encode_dropped: mvt.unencodable,
+                    encode_quantized: mvt.quantized,
+                    oversized: mvt.oversized,
+                }));
             }
-            let hash = TileHasher::hash(&data);
-            let raw_len = data.len();
-            let compressed = match compression::compress(&data, Compression::Gzip) {
+            let hash = TileHasher::hash(&mvt.data);
+            let raw_len = mvt.data.len();
+            let compressed = match compression::compress(&mvt.data, Compression::Gzip) {
                 Ok(c) => c,
                 Err(e) => return Some(Err(ExportError::from(e))),
             };
@@ -4057,8 +4252,10 @@ fn encode_members(
                 data: compressed,
                 hash,
                 raw_len,
-                feature_count: count,
-                oversized,
+                feature_count: mvt.features,
+                encode_dropped: mvt.unencodable,
+                encode_quantized: mvt.quantized,
+                oversized: mvt.oversized,
             }))
         })
         .collect()
@@ -4075,38 +4272,51 @@ fn bbox_within_buffered(bbox: &TileBounds, tb: &TileBounds, buffer: f64) -> bool
         && bbox.lat_max <= tb.lat_max + buffer
 }
 
+/// One tile's MVT bytes plus the encode tallies the report needs.
+struct TileMvt {
+    /// Raw (uncompressed) MVT bytes.
+    data: Vec<u8>,
+    /// MVT features actually written to the layer. A `GeometryCollection`
+    /// member contributes one per geometry kind it holds (#431).
+    features: usize,
+    /// Members with nothing to encode — empty geometries or empty
+    /// collections (#431). Content loss; gates the export warning.
+    unencodable: usize,
+    /// Members with coordinates that collapsed at the tile extent — polygon
+    /// rings of zero area, lines of fewer than two points (clip slivers at a
+    /// buffered edge). Expected; informational only.
+    quantized: usize,
+    /// Whether the oversized valve fired.
+    oversized: bool,
+}
+
 /// Encode a single tile's members to MVT bytes, applying the oversized valve.
-/// Returns `(bytes, features_encoded, oversized)`.
-fn encode_tile(
-    members: &[Member],
-    tb: &TileBounds,
-    opts: &ExportOptions,
-) -> (Vec<u8>, usize, bool) {
-    let data = build_mvt(members.iter(), tb, opts);
+fn encode_tile(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
+    let full = build_mvt(members.iter(), tb, opts);
 
     match opts.tile_size_limit {
         // `limit > 0` so `Some(0)` is a no-op off switch (the CLI/Python `0`
         // disable value never reaches here as `Some`, but guard the core API too).
-        Some(limit) if limit > 0 && data.len() > limit && members.len() > 1 => {
+        Some(limit) if limit > 0 && full.data.len() > limit && members.len() > 1 => {
             // Single, non-iterative drop pass. Keep a proportional count and let
             // `select_kept_members` decide *which* features survive.
-            let keep_frac = limit as f64 / data.len() as f64;
+            let keep_frac = limit as f64 / full.data.len() as f64;
             let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
             let kept = shed_to_fit(members, keep, opts);
             let keep = kept.len();
-            let data = build_mvt(kept, tb, opts);
+            let shed = build_mvt(kept, tb, opts);
             log::warn!(
                 "oversized tile ({} bytes > {limit} limit): dropped {} of {} features (one pass)",
-                data.len(),
+                shed.data.len(),
                 members.len() - keep,
                 members.len()
             );
-            (data, keep, true)
+            TileMvt {
+                oversized: true,
+                ..shed
+            }
         }
-        _ => {
-            let count = members.len();
-            (data, count, false)
-        }
+        _ => full,
     }
 }
 
@@ -4169,7 +4379,7 @@ fn build_mvt<'a>(
     members: impl IntoIterator<Item = &'a Member>,
     tb: &TileBounds,
     opts: &ExportOptions,
-) -> Vec<u8> {
+) -> TileMvt {
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
     for (i, m) in members.into_iter().enumerate() {
         // #443: a resolved `--feature-id` always wins; the no-flag default
@@ -4177,9 +4387,18 @@ fn build_mvt<'a>(
         let id = m.id.unwrap_or(i as u64);
         layer.add_feature(Some(id), &m.geom, &m.props, tb);
     }
+    let features = layer.feature_count();
+    let unencodable = layer.dropped_features();
+    let quantized = layer.quantized_features();
     let mut tb_builder = TileBuilder::new();
     tb_builder.add_layer(layer.build());
-    tb_builder.build().encode_to_vec()
+    TileMvt {
+        data: tb_builder.build().encode_to_vec(),
+        features,
+        unencodable,
+        quantized,
+        oversized: false,
+    }
 }
 
 // ============================================================================
@@ -4233,6 +4452,8 @@ fn encode_level_tiles(
     // the assertions in the tests below operate on the uncompressed payload.
     let mut tiles = encode_members(members, zoom, opts, &ExportTimers::default())
         .expect("in-memory gzip is infallible");
+    // #431: all-dropped carriers hold no tile bytes; the writer skips them too.
+    tiles.retain(|t| t.feature_count > 0);
     for t in &mut tiles {
         t.data = crate::compression::decompress_capped(
             &t.data,
@@ -5832,7 +6053,7 @@ mod tests {
             props: Arc::new(Vec::new()),
             id: None,
         };
-        build_mvt(std::iter::once(&m), &tb, opts)
+        build_mvt(std::iter::once(&m), &tb, opts).data
     }
 
     /// The recursive cascade must emit the same tile-key set as the direct
@@ -7049,7 +7270,7 @@ mod tests {
             props: Arc::new(vec![]),
             id: None,
         };
-        let expected = build_mvt([&member], &tc.bounds(), &opts);
+        let expected = build_mvt([&member], &tc.bounds(), &opts).data;
         assert_eq!(
             tiles[0].data, expected,
             "contained feature must bypass the clip (geometry emitted as-is)"
@@ -7593,9 +7814,11 @@ mod tests {
             tile_size_limit: Some(0),
             ..Default::default()
         };
-        let (_data, count, oversized) = encode_tile(&members, &tb, &opts);
-        assert!(!oversized, "Some(0) must disable the cap");
-        assert_eq!(count, members.len());
+        let mvt = encode_tile(&members, &tb, &opts);
+        assert!(!mvt.oversized, "Some(0) must disable the cap");
+        assert_eq!(mvt.features, members.len());
+        assert_eq!(mvt.unencodable, 0);
+        assert_eq!(mvt.quantized, 0);
     }
 
     // --- #235: partitioning single-read fan-out pass 2 -----------------------
@@ -7695,6 +7918,54 @@ mod tests {
         }
     }
 
+    /// #427: a `spill_dir` that is not an existing directory fails the
+    /// export before any tile is written, with a typed error.
+    #[test]
+    fn missing_spill_dir_is_rejected_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_fixture(
+            &input,
+            &[(vec![1], vec![Geometry::Point(Point::new(0.5, 0.5))])],
+        );
+        let out = dir.path().join("out.pmtiles");
+        let opts = ExportOptions {
+            spill_dir: Some(dir.path().join("no-such-dir")),
+            ..ExportOptions::default()
+        };
+        let err = export_pmtiles(&input, &out, &opts).unwrap_err();
+        assert!(matches!(err, ExportError::SpillDirNotDirectory(_)), "{err}");
+        assert!(
+            err.to_string().contains("not an existing directory"),
+            "{err}"
+        );
+        assert!(!out.exists(), "nothing written");
+    }
+
+    /// #427: the member spill file lives under `ExportOptions::spill_dir`
+    /// when one is given, and is removed with the store.
+    #[test]
+    fn member_store_spill_lives_under_spill_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10]),
+            wave: 1,
+        }];
+        let store = MemberStore::new(&plans, SinkBacking::Spill, Some(dir.path())).unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "one spill file under the spill dir"
+        );
+        drop(store);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "spill file removed"
+        );
+    }
+
     /// The member store's spill path: bucket flushes append segments to one
     /// temp file; `take_wave` reads a wave's segments back in append order
     /// (plus any RAM remainder), returning exactly the members pushed to it.
@@ -7706,7 +7977,7 @@ mod tests {
             partitions: partitions_with_members(&[10, 10]),
             wave: 1,
         }];
-        let mut store = MemberStore::new(&plans, SinkBacking::Spill).unwrap();
+        let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
         let mk = |key: u64, seq: u64| Member {
             key,
             seq,
@@ -7956,6 +8227,30 @@ mod tests {
         user_column: Option<&str>,
     ) {
         use arrow_array::Int32Array;
+        write_typed_counter_fixture(
+            path,
+            generalization,
+            Field::new(counter, DataType::Int32, false),
+            &counts
+                .iter()
+                .map(|c| Arc::new(Int32Array::from(c.clone())) as ArrayRef)
+                .collect::<Vec<_>>(),
+            user_column,
+        );
+    }
+
+    /// [`write_counter_fixture`] with the counter column's Arrow field and
+    /// per-level arrays supplied by the caller, for columns the converter
+    /// never writes itself (a pyarrow-style unsigned or nullable counter,
+    /// #399).
+    fn write_typed_counter_fixture(
+        path: &Path,
+        generalization: Generalization,
+        counter: Field,
+        counts: &[ArrayRef],
+        user_column: Option<&str>,
+    ) {
+        use arrow_array::Int32Array;
 
         let a = Geometry::Point(Point::new(-120.0, 40.0));
         let b = Geometry::Point(Point::new(120.0, -40.0));
@@ -7964,7 +8259,7 @@ mod tests {
             fields.push(Field::new(name, DataType::Int32, false));
         }
         fields.push(geometry_field());
-        fields.push(Field::new(counter, DataType::Int32, false));
+        fields.push(counter);
         let schema = Arc::new(Schema::new(fields));
         let specs: Vec<LevelSpec> = (0..counts.len())
             .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
@@ -7984,7 +8279,7 @@ mod tests {
                 columns.push(Arc::new(Int32Array::from(vec![7; n])));
             }
             columns.push(Arc::new(build_geometry_array(&geoms).to_array_ref()));
-            columns.push(Arc::new(Int32Array::from(level_counts.clone())));
+            columns.push(level_counts.clone());
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
             assert_eq!(
                 writer
@@ -8223,6 +8518,60 @@ mod tests {
         );
     }
 
+    /// #399: a foreign writer's nullable `coalesced_count` holding `{1, null}`
+    /// has max 1 but is not 1 everywhere — the null/1 distinction is data the
+    /// tiles would lose. The counter must stay exported.
+    #[test]
+    fn nullable_coalesced_count_with_nulls_is_not_withheld() {
+        use arrow_array::Int32Array;
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_typed_counter_fixture(
+            tin.path(),
+            coalescing_generalization(None),
+            Field::new("coalesced_count", DataType::Int32, true),
+            &[
+                Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(1), Some(1)])) as ArrayRef,
+            ],
+            None,
+        );
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        assert_eq!(
+            reader.int_column_max("coalesced_count"),
+            None,
+            "a row group with a null must not fold to a max"
+        );
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["coalesced_count", "id"]);
+    }
+
+    /// #399: a foreign writer's `UInt32` `coalesced_count` is compared as
+    /// signed by a naive statistics fold, so a row group whose real max is
+    /// 2^31 would fold *below* one whose max is 1 and the counter would be
+    /// withheld although it plainly carries information. It must stay
+    /// exported.
+    #[test]
+    fn unsigned_coalesced_count_is_not_withheld() {
+        use arrow_array::UInt32Array;
+
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_typed_counter_fixture(
+            tin.path(),
+            coalescing_generalization(None),
+            Field::new("coalesced_count", DataType::UInt32, false),
+            &[
+                Arc::new(UInt32Array::from(vec![1u32, 1 << 31])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![1u32, 1])) as ArrayRef,
+            ],
+            None,
+        );
+        let reader = OverviewReader::open(tin.path()).unwrap();
+        assert_eq!(reader.int_column_max("coalesced_count"), None);
+        let names = exported_property_names(tin.path());
+        assert_eq!(names, vec!["coalesced_count", "id"]);
+    }
+
     // --- declared minimum zoom (#380) ----------------------------------------
 
     /// The converter omits levels that generalize to nothing (§7.3), so an
@@ -8327,6 +8676,125 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--min-zoom"), "error names the flag: {msg}");
         assert!(msg.contains("30"), "error names the limit: {msg}");
+    }
+
+    /// #433: `extent` was validated nowhere. `extent = 0` quantizes every
+    /// coordinate to (0,0) — every polygon and line silently degenerates and
+    /// drops — and the layer is still written with `extent: 0`, which every
+    /// consumer then divides by. Refused before the file is even opened.
+    #[test]
+    fn export_rejects_extent_zero() {
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![a.clone()]), (vec![0], vec![a.clone()])],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            extent: 0,
+            ..ExportOptions::default()
+        };
+        let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
+        assert!(
+            matches!(err, ExportError::InvalidExtent { extent: 0 }),
+            "got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("extent"), "error names the knob: {msg}");
+        assert_eq!(
+            std::fs::metadata(tout.path()).unwrap().len(),
+            0,
+            "nothing is written for a rejected extent"
+        );
+    }
+
+    /// #433: `ExportOptions::validate` is the one gate. A non-power-of-two
+    /// extent is legal MVT (the spec only says "should"), so it is accepted
+    /// with a warning rather than refused; zero is refused; the default is
+    /// silent.
+    #[test]
+    fn export_options_validate_sorts_out_extents() {
+        let with_extent = |extent: u32| ExportOptions {
+            extent,
+            ..ExportOptions::default()
+        };
+        with_extent(DEFAULT_EXTENT).validate().unwrap();
+        with_extent(256).validate().unwrap();
+        // Warned about, not refused.
+        with_extent(4095).validate().unwrap();
+        with_extent(1000).validate().unwrap();
+        let err = with_extent(0).validate().unwrap_err();
+        assert!(
+            matches!(err, ExportError::InvalidExtent { extent: 0 }),
+            "got: {err}"
+        );
+    }
+
+    /// #433: `--tile-buffer 100000` was accepted, making the clip margin ~390
+    /// tile widths and the per-tile membership O(features × tiles). The cap is
+    /// one full tile width ([`MAX_TILE_BUFFER_PX`]); at the cap is fine, one
+    /// past it is refused naming the value and the cap.
+    #[test]
+    fn export_rejects_a_tile_buffer_past_the_cap() {
+        let with_buffer = |tile_buffer: u32| ExportOptions {
+            tile_buffer,
+            ..ExportOptions::default()
+        };
+        with_buffer(0).validate().unwrap();
+        with_buffer(MAX_TILE_BUFFER_PX).validate().unwrap();
+
+        let a = Geometry::Point(Point::new(-120.0, 40.0));
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_fixture(
+            tin.path(),
+            &[(vec![0], vec![a.clone()]), (vec![0], vec![a.clone()])],
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        for buffer in [MAX_TILE_BUFFER_PX + 1, 100_000] {
+            let err = export_pmtiles(tin.path(), tout.path(), &with_buffer(buffer)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ExportError::TileBufferTooWide { buffer: b, max }
+                        if b == buffer && max == MAX_TILE_BUFFER_PX
+                ),
+                "buffer {buffer}: got {err}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--tile-buffer")
+                    && msg.contains(&buffer.to_string())
+                    && msg.contains(&MAX_TILE_BUFFER_PX.to_string()),
+                "buffer {buffer}: error names the flag, the value and the cap: {msg}"
+            );
+        }
+    }
+
+    /// #433 reconciling #498: the universal cap is at most the shard
+    /// read-pruning margin, so one constant governs both — a sharded export
+    /// with a too-wide buffer gets the universal refusal, never the shard one
+    /// (whose "lower it to 512" advice would be wrong under a 256 cap).
+    #[test]
+    fn a_sharded_tile_buffer_is_governed_by_the_universal_cap() {
+        const _: () = assert!(MAX_TILE_BUFFER_PX <= crate::shard::MAX_SHARD_TILE_BUFFER_PX);
+        let opts = ExportOptions {
+            tile_buffer: crate::shard::MAX_SHARD_TILE_BUFFER_PX + 1,
+            tile_range: Some(crate::shard::TileRange::parse("5..12").unwrap()),
+            ..ExportOptions::default()
+        };
+        let err = opts.validate().unwrap_err();
+        assert!(
+            matches!(err, ExportError::TileBufferTooWide { .. }),
+            "got: {err}"
+        );
+        // At the universal cap a sharded export is fine too.
+        ExportOptions {
+            tile_buffer: MAX_TILE_BUFFER_PX,
+            ..opts
+        }
+        .validate()
+        .unwrap();
     }
 
     /// #371, end to end: an overview file written before the ceiling existed

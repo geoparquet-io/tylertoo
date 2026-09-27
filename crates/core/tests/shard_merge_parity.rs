@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use tylertoo_core::archive_index::ArchiveIndex;
 use tylertoo_core::merge::{merge_shards, MergeOptions};
 use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
-use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+use tylertoo_core::overview::convert::{
+    convert_to_overviews, write_convert_plan, ConvertOptions, LevelPlan,
+};
 use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
 use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 use tylertoo_core::shard::{ShardPlan, TileRange};
@@ -296,6 +298,44 @@ fn level_capped_coarse_overview(
     capped_overview
 }
 
+/// #560: cut the fleet's plan with `--plan-only` — pass 1 and the level
+/// assignment, no pass 2, no overview file — and assert it is the artifact the
+/// full coarse job just wrote.
+///
+/// `full_plan` is that job's plan. Byte-identity is the whole contract: a data
+/// shard verifies the fingerprint and then reads the plan's row-indexed tables
+/// verbatim, so "the coarse job's tiles can be skipped entirely" is only true
+/// if the file does not move. The caller then hands THIS path to every shard,
+/// so the tile-body parity it goes on to assert is parity of a fleet actually
+/// driven by a plan-only plan.
+fn plan_only_plan(input: &Path, dir: &Path, build: Build, full_plan: &Path) -> PathBuf {
+    let path = dir.join("plan-only.plan");
+    let report = write_convert_plan(
+        input,
+        &ConvertOptions {
+            save_plan: Some(path.clone()),
+            ..convert_options(build)
+        },
+    )
+    .expect("plan-only run");
+    assert_eq!(
+        std::fs::read(full_plan).expect("coarse plan"),
+        std::fs::read(&path).expect("plan-only plan"),
+        "a --plan-only run must write the plan the coarse job writes"
+    );
+    assert!(
+        !report.levels.is_empty() && report.input_features > 0,
+        "the plan-only report must describe the assignment: {report:?}"
+    );
+    eprintln!(
+        "[oracle] plan-only: {} level(s), {} feature(s), plan byte-identical; the fleet \
+         below consumes it",
+        report.levels.len(),
+        report.input_features,
+    );
+    path
+}
+
 /// The oracle.
 fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     let Build {
@@ -356,6 +396,11 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     )
     .expect("coarse convert");
 
+    // #560: the plan-writing HALF of that job, on its own. The fleet below is
+    // built from ITS artifact, so the tile-body parity at the end proves a
+    // plan-only plan drives a byte-identical build.
+    let plan_only_path = plan_only_plan(input, dir, build, &convert_plan);
+
     // #541: the same job again, this time materializing only the levels it
     // exports. Everything the fleet depends on has to be unchanged.
     let coarse_overview = if coarse_level_ceiling {
@@ -380,7 +425,8 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
     let mut archives = vec![coarse];
     for i in 0..shards {
         let range = shard_plan.range(i).expect("shard range");
-        archives.push(build_shard(input, dir, &convert_plan, range, i, build));
+        // #560: from the PLAN-ONLY artifact, not the full coarse job's.
+        archives.push(build_shard(input, dir, &plan_only_path, range, i, build));
     }
 
     // --- Step 3: one merge of coarse + shards. -------------------------
@@ -1028,18 +1074,41 @@ fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
     let coarse_overview = level_capped_coarse_overview(&input, dir, build, &full_plan);
 
     // The premise: the two files' own counters disagree, so a publish
-    // decision read from them would too.
-    let max = |p: &Path| {
-        OverviewReader::open(p)
-            .expect("open overview")
-            .int_column_max("coalesced_count")
+    // decision read from them would too. The monolithic file spans more
+    // than one count, which the statistic fold refuses (#399), so its max
+    // is read from the data.
+    let data_max = |p: &Path| -> i32 {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        let reader = OverviewReader::open(p).expect("open overview");
+        (0..reader.num_levels())
+            .flat_map(|k| reader.read_level(k, None).expect("read level"))
+            .map(|batch| {
+                let batch = batch.expect("batch");
+                let idx = batch
+                    .schema()
+                    .index_of("coalesced_count")
+                    .expect("counter column");
+                batch
+                    .column(idx)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(1)
+            })
+            .max()
+            .expect("at least one batch")
     };
     assert!(
-        max(&mono_overview).is_some_and(|m| m > 1),
+        data_max(&mono_overview) > 1,
         "the chains must merge somewhere in the monolithic build"
     );
     assert_eq!(
-        max(&coarse_overview),
+        OverviewReader::open(&coarse_overview)
+            .expect("open overview")
+            .int_column_max("coalesced_count"),
         Some(1),
         "the chains must merge only past the pivot, or this oracle proves nothing"
     );

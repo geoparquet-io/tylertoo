@@ -1,8 +1,28 @@
 # Weekly Mutation Tests — cargo-mutants on the core crate.
 #
 # Purpose: mutation testing is far too slow for the PR path, so it runs on a
-# weekly schedule (plus manual dispatch) and publishes its report as an
-# artifact + job summary. It is advisory, not a PR gate.
+# weekly schedule (plus manual dispatch) and publishes its report as
+# artifacts + a job summary. It is advisory, not a PR gate: missed mutants
+# and timeouts are reported in the summary, not turned into a red run.
+#
+# Layout: `plan` computes the shard list, `mutations` is a matrix that runs
+# one `--shard k/n` slice each, and `report` merges the per-shard
+# outcomes.json files into one score. `report` also opens or updates a
+# pinned `mutation-tests` issue whenever the matrix did not fully succeed:
+# a failed baseline, a usage or internal error, or a shard that hit its
+# time limit (which GitHub reports as cancelled, not failed).
+#
+# Why shards: the core crate yields ~8200 mutants and each one costs a
+# build plus a `quick`-tier nextest run (~50s locally, more on a runner),
+# so an unsharded sweep needs days and GitHub kills a job at 360 minutes.
+# The shard count below is sized so each shard finishes well inside that;
+# retune it from the per-shard durations of a real run.
+#
+# History (#419): every scheduled run from 2026-08 to 2026-09 failed in
+# silence because the checkout lacked `submodules: recursive`, so
+# tests/fixtures/geometry-test-data was empty in the scratch copy
+# cargo-mutants builds and invalid_geometry_clipping panicked in the
+# baseline. Configuration lives in .cargo/mutants.toml.
 
 name: Weekly Mutation Tests
 
@@ -18,14 +38,47 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Number of matrix shards. Sizing: ~8200 mutants / 32 = ~260 per shard;
+  # at ~60s per mutant with two in flight (-j 2 on a 4-vCPU runner) that
+  # is ~2.2h, under the 350-minute job limit below with headroom for a
+  # slow runner. Every shard must use the same value or the split is
+  # meaningless (https://mutants.rs/shards.html).
+  SHARD_COUNT: 32
 
 jobs:
-  mutations:
-    name: Mutation Testing
+  plan:
+    name: Plan shards
     runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+    steps:
+      - name: Enumerate shard indices
+        id: shards
+        # cargo-mutants shard indices are 0-based: 0..n-1.
+        run: |
+          shards=$(seq 0 $((SHARD_COUNT - 1)) | jq -cs .)
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "shards: $shards"
+
+  mutations:
+    name: Mutation Testing (shard ${{ matrix.shard }})
+    needs: plan
+    runs-on: ubuntu-latest
+    # GitHub's ceiling is 360 minutes; set it explicitly and a little
+    # under so the cutoff is a documented choice, not a surprise.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false  # one bad shard must not cancel the rest
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # geometry-test-data is a submodule; without it the baseline
+          # test run panics and no mutants get tested (#419).
+          submodules: recursive
           persist-credentials: false
 
       - name: Cache test fixtures
@@ -52,6 +105,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
+      # cargo-mutants runs the `quick` nextest tier for its baseline, which
+      # includes decode_roundtrip's tippecanoe-decode golden test; that test
+      # is a hard failure under CI when the binary is missing (#420), so the
+      # baseline needs the same pinned tippecanoe the Test job builds, or
+      # every weekly run fails before testing a single mutant.
+      - name: Install tippecanoe build deps
+        run: sudo apt-get install -y libsqlite3-dev zlib1g-dev
+
+      - name: Cache tippecanoe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools/tippecanoe-*
+            .tools/src-*
+          key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build tippecanoe (pinned tag + SHA) and put it on PATH
+        run: |
+          benchmarks/e2e/setup_tippecanoe.sh
+          eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+          dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
+
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -64,30 +139,244 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install cargo-mutants
+      - name: Install cargo-mutants and cargo-nextest
+        # nextest: .cargo/mutants.toml sets test_tool = "nextest" so the
+        # quick tier from .config/nextest.toml applies to every mutant.
         uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
-          tool: cargo-mutants
+          tool: cargo-mutants,cargo-nextest
+
+      - name: Sanity-check the scratch copy sees the fixtures
+        # Fail fast (seconds, not the ~3 min baseline) with a clear message
+        # if the checkout regresses again. The assertion mirrors what the
+        # baseline needs: the submodule's examples and the downloaded
+        # realdata parquet files. The list is this shard's slice.
+        run: |
+          test -d tests/fixtures/geometry-test-data/examples \
+            || { echo "::error::geometry-test-data submodule is empty — checkout needs submodules: recursive"; exit 1; }
+          test -f tests/fixtures/realdata/fieldmaps-boundaries.parquet \
+            || { echo "::error::realdata fixtures missing — gh release download failed"; exit 1; }
+          cargo mutants --package tylertoo-core --list --no-shuffle \
+            --sharding round-robin --shard "$SHARD/$SHARD_COUNT" > mutants.list
+          echo "$(wc -l < mutants.list) mutants queued for shard $SHARD/$SHARD_COUNT"
 
       - name: Run mutation tests on core
+        id: mutants
         # NB: package name is tylertoo-core (the old gpq2tiles-core spelling
         # made every scheduled run fail at startup).
-        run: cargo mutants --package tylertoo-core --output mutants.out
+        #
+        # round-robin sharding spreads each file's mutants across shards so
+        # the shards finish at similar times (slice sharding would hand one
+        # shard all of a slow module). Each shard runs its own baseline,
+        # which is what the timeout multiplier in mutants.toml keys off.
+        #
+        # Exit codes (https://mutants.rs/exit-codes.html): 0 all caught,
+        # 2 some missed, 3 some timed out — those three are a completed
+        # measurement and this job is advisory, so they pass. 4 = the
+        # unmutated baseline failed (nothing tested), 1 = usage error,
+        # 70 = internal error: those fail the shard, and `report` opens
+        # the issue.
+        #
+        # `--output DIR` creates mutants.out *inside* DIR: the old
+        # `--output mutants.out` nested it at mutants.out/mutants.out, which
+        # is why the summary step never found a report even on green runs.
+        run: |
+          set +e
+          cargo mutants --package tylertoo-core --output . -j 2 \
+            --sharding round-robin --shard "$SHARD/$SHARD_COUNT"
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0|2|3) echo "cargo mutants finished (exit $code)"; exit 0 ;;
+            4) echo "::error::cargo mutants: unmutated baseline failed, no mutants tested"; exit 1 ;;
+            *) echo "::error::cargo mutants failed with exit $code"; exit 1 ;;
+          esac
 
-      - name: Upload mutation report
+      - name: Upload shard report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: mutation-report
+          name: mutation-report-shard-${{ matrix.shard }}
           path: mutants.out/
+          if-no-files-found: warn
+
+  report:
+    name: Mutation score + notification
+    needs: [plan, mutations]
+    # Runs whatever happened to the matrix, including a time-limit
+    # cancellation, so the score and the issue never depend on the sweep
+    # finishing cleanly.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Download shard reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: mutation-report-shard-*
+          path: shards
+        # A shard that was cancelled before `Upload shard report` ran has
+        # no artifact; the summary below counts those explicitly.
+        continue-on-error: true
 
       - name: Post summary
-        if: always()
+        id: summary
+        env:
+          MATRIX_RESULT: ${{ needs.mutations.result }}
         run: |
-          echo "## Mutation Testing Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f mutants.out/outcomes.txt ]; then
-            cat mutants.out/outcomes.txt >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Mutation Testing Results"
+            echo ""
+            echo "Matrix result: **${MATRIX_RESULT}** (${SHARD_COUNT} shards)"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Every shard's report is at shards/mutation-report-shard-N/outcomes.json.
+          reports=$(find shards -name outcomes.json 2>/dev/null | sort -V)
+          n_reports=$(printf '%s\n' "$reports" | grep -c . || true)
+          missing=""
+          for ((k = 0; k < SHARD_COUNT; k++)); do
+            [ -f "shards/mutation-report-shard-$k/outcomes.json" ] || missing="$missing $k"
+          done
+          echo "shards_without_report=${missing# }" >> "$GITHUB_OUTPUT"
+
+          if [ "$n_reports" -eq 0 ]; then
+            {
+              echo "No mutation results found: no shard wrote outcomes.json."
+              echo "The run did not get past the baseline in any shard; see the shard logs."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "score=n/a" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # outcomes.json: top-level counts from cargo-mutants' LabOutcome,
+          # summed across shards. Score = caught / (caught + missed +
+          # timeout): unviable mutants (did not compile) are not a
+          # test-suite failure and are left out, matching how cargo-mutants
+          # itself reports.
+          # shellcheck disable=SC2086  # $reports is a newline-separated list of paths without spaces
+          read -r total caught missed timeout unviable < <(jq -rs \
+            '[(map(.total_mutants) | add), (map(.caught) | add), (map(.missed) | add), (map(.timeout) | add), (map(.unviable) | add)] | @sh' \
+            $reports | tr -d "'")
+          tested=$((caught + missed + timeout))
+          if [ "$tested" -gt 0 ]; then
+            score=$(awk -v c="$caught" -v t="$tested" 'BEGIN { printf "%.1f", 100 * c / t }')
           else
-            echo "No mutation results found" >> "$GITHUB_STEP_SUMMARY"
+            score="n/a"
+          fi
+          echo "score=$score" >> "$GITHUB_OUTPUT"
+          echo "missed=$missed" >> "$GITHUB_OUTPUT"
+          echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "**Mutation score: ${score}%** (${caught} caught / ${tested} tested, ${n_reports}/${SHARD_COUNT} shards reported)"
+            if [ -n "$missing" ]; then
+              echo ""
+              echo "Shards without a report (cancelled or failed before the baseline):${missing}"
+            fi
+            echo ""
+            echo "| Outcome | Count |"
+            echo "|---|---|"
+            echo "| Total mutants | ${total} |"
+            echo "| Caught | ${caught} |"
+            echo "| Missed | ${missed} |"
+            echo "| Timeout | ${timeout} |"
+            echo "| Unviable (did not compile) | ${unviable} |"
+            echo ""
+            for kind in missed timeout; do
+              # Merge the per-shard lists, sorted by path:line.
+              cat shards/mutation-report-shard-*/"${kind}.txt" 2>/dev/null | sort -V > "merged-${kind}.txt" || true
+              if [ -s "merged-${kind}.txt" ]; then
+                n=$(wc -l < "merged-${kind}.txt")
+                echo "<details><summary>${kind} (${n})</summary>"
+                echo ""
+                echo '```'
+                head -n 200 "merged-${kind}.txt"
+                [ "$n" -gt 200 ] && echo "... ($((n - 200)) more in the mutation-report-shard-* artifacts)"
+                echo '```'
+                echo "</details>"
+                echo ""
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the mutation-tests issue
+        # Ported from security.yml. Fires whenever the matrix did not
+        # succeed: `needs.mutations.result` is `failure` for a failed
+        # baseline / usage / internal error, `cancelled` when a shard hit
+        # timeout-minutes or the run was cancelled, `skipped` when `plan`
+        # failed. It never fires for a low score: that is the summary's job.
+        if: needs.mutations.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MATRIX_RESULT: ${{ needs.mutations.result }}
+          SCORE: ${{ steps.summary.outputs.score }}
+          MISSING_SHARDS: ${{ steps.summary.outputs.shards_without_report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Make sure the label exists (no-op if it already does).
+          gh label create mutation-tests \
+            --description "Automated weekly mutation-test run failures" \
+            --color B60205 2>/dev/null || true
+
+          # A failed baseline names the failing test in its log; surface the
+          # first failing shard's lines so the issue is actionable without
+          # opening the artifact.
+          BASELINE_TAIL=""
+          for log in shards/mutation-report-shard-*/log/baseline.log; do
+            [ -f "$log" ] || continue
+            lines=$(sed 's/\x1b\[[0-9;]*m//g' "$log" \
+              | grep -E "panicked at|FAIL|error(\[|:)" | tail -n 30 || true)
+            if [ -n "$lines" ]; then
+              BASELINE_TAIL="$log:
+          $lines"
+              break
+            fi
+          done
+
+          TITLE="Weekly mutation tests are failing"
+          BODY="The scheduled cargo-mutants run did not complete: the shard
+          matrix ended with result \`${MATRIX_RESULT}\` (\`failure\` = a shard's
+          unmutated baseline failed or cargo-mutants errored, so nothing was
+          tested there; \`cancelled\` = a shard hit its ${SHARD_COUNT}-shard time
+          limit, so its mutants are unmeasured; see
+          https://mutants.rs/exit-codes.html).
+
+          Run: $RUN_URL
+          Score from the shards that did report: ${SCORE:-n/a}%
+          Shards without a report: ${MISSING_SHARDS:-none}
+
+          Baseline log excerpt:
+          \`\`\`
+          ${BASELINE_TAIL:-(no baseline log in any shard shows a failure: a cancelled shard timed out after its baseline passed)}
+          \`\`\`
+
+          ---
+          _This issue is managed by .github/workflows/mutation-tests.yml. It is
+          updated (not duplicated) on every failing weekly run; close it once a
+          run completes. A low mutation score does not open this issue; the job
+          summary reports the score. If shards time out, raise SHARD_COUNT in
+          the workflow._"
+
+          EXISTING=$(gh issue list --label mutation-tests --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING"
+            gh issue edit "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still failing as of $RUN_URL (matrix result: ${MATRIX_RESULT})"
+          else
+            echo "Opening new issue"
+            NEW_URL=$(gh issue create --title "$TITLE" --label mutation-tests --body "$BODY")
+            # Pin it so it stays visible (best effort; needs no extra scope).
+            NUM=${NEW_URL##*/}
+            ISSUE_ID=$(gh api "repos/$GH_REPO/issues/$NUM" --jq .node_id)
+            # shellcheck disable=SC2016  # $id is a GraphQL variable, not shell
+            gh api graphql -f query='
+              mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { number } } }' \
+              -f id="$ISSUE_ID" || true
           fi
