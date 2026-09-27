@@ -58,6 +58,38 @@ groups — and tylertoo owns tiling. This keeps each tool focused, and the
 Hilbert sort and row-group sizing that `gpio` applies are the same
 optimizations the streaming reader depends on.
 
+**Every property column is encoded or warned about, never dropped silently.**
+MVT values are strings, numbers and booleans, so each Arrow column type is
+mapped onto one of those. Nested columns become JSON strings, which is what
+tippecanoe does with nested GeoJSON attributes and what keeps an Overture
+`names` struct or `sources` list on the feature instead of vanishing. A
+column with no mapping at all is dropped, but the export says so once per
+column (a `WARN` line naming the type), lists it in the export report under
+`skipped_property_columns`, and refuses an `--include-property` that names
+it with a message that says why.
+
+| Arrow type | In the tile | `vector_layers` type |
+|------------|-------------|----------------------|
+| `Utf8`, `LargeUtf8` | string | `String` |
+| `Boolean` | boolean | `Boolean` |
+| `Int8`…`Int64`, `UInt8`…`UInt64` | integer | `Number` |
+| `Float32`, `Float64` | float / double | `Number` |
+| `Decimal128`, `Decimal256` | integer when the scale is ≤ 0 and the value fits 64 bits, else double | `Number` |
+| `Date32`, `Date64`, `Time32`, `Time64`, `Timestamp` (naive or UTC) | ISO 8601 string | `String` |
+| `Struct`, `List`, `LargeList`, `FixedSizeList`, `Map` | JSON string, one per row (`{"primary":"…","common":{"fr":"…"}}`, `["osm","meta"]`) | `String` |
+| `Dictionary<_, T>` | as `T` | as `T` |
+| `Binary`, `LargeBinary`, `FixedSizeBinary`, a `Timestamp` with a named zone | **dropped, warned once, counted in the report** | not advertised |
+
+Inside a JSON string the leaves follow the same rules (a nested timestamp is
+an ISO 8601 string, a nested decimal a number); a nested leaf with no mapping
+renders as JSON `null`, and a null struct or list row carries no property at
+all, like any other null. A `Map` with string keys becomes a JSON object;
+with any other key type it becomes an array of `[key, value]` pairs. A
+column you would rather see in another shape — a binary column as hex, a
+struct flattened into `names_primary` — is a one-line `gpio` or DuckDB
+projection before tiling, applied once to the input rather than at every
+export.
+
 ## API walkthrough
 
 ### Meeting the coordinate-system contract
