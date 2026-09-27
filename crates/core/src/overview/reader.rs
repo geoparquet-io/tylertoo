@@ -366,6 +366,31 @@ impl OverviewReader {
         Ok(builder.with_projection(mask).build()?)
     }
 
+    /// Read exactly the row groups `row_groups` (ascending, file order),
+    /// projected to the top-level columns `roots`, with an explicit batch
+    /// size. Batches may straddle row-group boundaries.
+    ///
+    /// For the export's up-front `--feature-id` check (#443), which reads one
+    /// column of every row group its statistics cannot vouch for.
+    pub(crate) fn read_row_groups_projected(
+        &self,
+        row_groups: Vec<usize>,
+        batch_size: usize,
+        roots: &[usize],
+    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+        let file = File::open(&self.path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_row_groups(row_groups)
+            .with_batch_size(batch_size);
+        let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
+        Ok(builder.with_projection(mask).build()?)
+    }
+
+    /// The parsed Parquet footer (row-group sizes and column statistics).
+    pub(crate) fn parquet_metadata(&self) -> &ParquetMetaData {
+        &self.metadata
+    }
+
     /// A reader builder over `level_idx`'s own row-group band.
     fn band_builder(
         &self,
